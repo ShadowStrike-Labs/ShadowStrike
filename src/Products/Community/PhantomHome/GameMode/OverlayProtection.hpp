@@ -117,8 +117,8 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -141,8 +141,8 @@ namespace OverlayConstants {
     inline constexpr uint32_t VERSION_MINOR = 0;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
-    /// @brief Overlay window class name
-    inline constexpr const wchar_t* OVERLAY_CLASS_NAME = L"ShadowStrikeOverlay";
+    /// @brief Overlay window class name base prefix (runtime random suffix appended)
+    inline constexpr const wchar_t* OVERLAY_CLASS_NAME_PREFIX = L"ShadowStrikeOverlay_";
     
     /// @brief Integrity check interval (ms)
     inline constexpr uint32_t INTEGRITY_CHECK_INTERVAL_MS = 1000;
@@ -423,7 +423,32 @@ struct OverlayStatistics {
     std::atomic<uint64_t> overlaysShown{0};
     std::atomic<uint64_t> zOrderRestorations{0};
     TimePoint startTime = Clock::now();
-    
+
+    OverlayStatistics() = default;
+
+    OverlayStatistics(const OverlayStatistics& other) noexcept
+        : integrityChecks(other.integrityChecks.load(std::memory_order_relaxed))
+        , integrityFailures(other.integrityFailures.load(std::memory_order_relaxed))
+        , hooksDetected(other.hooksDetected.load(std::memory_order_relaxed))
+        , hooksBlocked(other.hooksBlocked.load(std::memory_order_relaxed))
+        , overlaysShown(other.overlaysShown.load(std::memory_order_relaxed))
+        , zOrderRestorations(other.zOrderRestorations.load(std::memory_order_relaxed))
+        , startTime(other.startTime)
+    {}
+
+    OverlayStatistics& operator=(const OverlayStatistics& other) noexcept {
+        if (this != &other) {
+            integrityChecks.store(other.integrityChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            integrityFailures.store(other.integrityFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hooksDetected.store(other.hooksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hooksBlocked.store(other.hooksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            overlaysShown.store(other.overlaysShown.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            zOrderRestorations.store(other.zOrderRestorations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -618,7 +643,7 @@ public:
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
-    [[nodiscard]] static std::string GetVersionString() noexcept;
+    [[nodiscard]] static std::string GetVersionString();
 
 private:
     OverlayProtection();
@@ -626,6 +651,8 @@ private:
     
     std::unique_ptr<OverlayProtectionImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
+
+    friend class OverlayProtectionImpl;
 };
 
 // ============================================================================

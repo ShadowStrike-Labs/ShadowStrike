@@ -32,18 +32,24 @@
  * - PIMPL pattern for ABI stability
  * - Meyers' Singleton for thread-safe instance management
  * - std::shared_mutex for concurrent read access
- * - RAII for all Windows resources (HWND, HDC, HMODULE)
+ * - RAII for all Windows resources (HWND, HDC, HMODULE, HBRUSH)
  * - Exception-safe with comprehensive error handling
+ *
+ * LOCK ORDERING (documented, non-negotiable):
+ *   m_mutex -> m_windowsMutex -> m_hooksMutex -> m_callbackMutex
+ *   m_whitelistMutex is independent (no nesting with the above chain)
  *
  * SECURITY FEATURES:
  * ==================
  * - Secure window creation with WS_EX_TOPMOST | WS_EX_LAYERED
  * - Z-order integrity monitoring and auto-restoration
  * - Graphics API hook detection (DirectX, Vulkan, OpenGL)
+ * - IAT/EAT/VTable hook detection with full PE parsing
  * - Known overlay whitelist (Discord, Steam, NVIDIA, AMD)
  * - DLL injection defense with module validation
  * - Message hook protection
- * - DWM composition verification
+ * - DWM composition verification (OS-version-aware)
+ * - Direct memory reads via SEH instead of ReadProcessMemory
  *
  * PERFORMANCE:
  * ============
@@ -63,15 +69,18 @@
 
 #include "pch.h"
 #include "OverlayProtection.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
 
 #include <algorithm>
 #include <execution>
 #include <sstream>
 #include <iomanip>
+#include <format>
+#include <random>
+#include <thread>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <dwmapi.h>
@@ -88,6 +97,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // Third-party JSON library
 #ifdef _MSC_VER
@@ -107,12 +117,13 @@ namespace GameMode {
 // ============================================================================
 
 namespace {
-    /// @brief Known overlay DLL patterns
-    constexpr std::array<std::wstring_view, 30> KNOWN_OVERLAY_MODULES = {
+    /// @brief Known overlay DLL patterns (all lowercase for case-insensitive match)
+    /// FIX #21: Removed duplicate RTSSHooks.dll, adjusted array size to 29
+    constexpr std::array<std::wstring_view, 29> KNOWN_OVERLAY_MODULES = {
         // Discord
         L"discord_hook.dll",
-        L"DiscordHook64.dll",
-        L"DiscordHook.dll",
+        L"discordhook64.dll",
+        L"discordhook.dll",
 
         // Steam
         L"gameoverlayrenderer.dll",
@@ -122,7 +133,7 @@ namespace {
         // NVIDIA
         L"nvapi64.dll",
         L"nvapi.dll",
-        L"NvCamera64.dll",
+        L"nvcamera64.dll",
         L"nvwgf2umx.dll",
 
         // AMD
@@ -131,8 +142,8 @@ namespace {
         L"atiadlxx.dll",
 
         // MSI Afterburner
-        L"RTSSHooks64.dll",
-        L"RTSSHooks.dll",
+        L"rtsshooks64.dll",
+        L"rtsshooks.dll",
 
         // OBS
         L"graphics-hook64.dll",
@@ -143,16 +154,15 @@ namespace {
         L"fraps32.dll",
 
         // RivaTuner
-        L"RTSS.dll",
-        L"RTSSHooks.dll",
+        L"rtss.dll",
 
         // Overwolf
         L"owclient.dll",
         L"owclient64.dll",
 
         // GeForce Experience
-        L"NvContainer.dll",
-        L"nvFrameViewHook.dll",
+        L"nvcontainer.dll",
+        L"nvframeviewhook.dll",
 
         // Accessibility
         L"magnification.dll",
@@ -183,15 +193,126 @@ namespace {
         "glDrawArrays"
     };
 
-    /// @brief Inline hook signature (x64 JMP)
-    constexpr std::array<uint8_t, 2> INLINE_HOOK_PATTERN_JMP = {0xFF, 0x25};  // JMP [RIP+offset]
-    constexpr uint8_t INLINE_HOOK_PATTERN_PUSH_RET = 0x68;  // PUSH imm32; RET
+    /// @brief Vulkan function patterns (FIX #4)
+    constexpr std::array<const char*, 4> VK_FUNCTIONS = {
+        "vkCreateDevice",
+        "vkQueuePresentKHR",
+        "vkCreateSwapchainKHR",
+        "vkAcquireNextImageKHR"
+    };
+
+    /// @brief Inline hook signatures
+    constexpr std::array<uint8_t, 2> INLINE_HOOK_PATTERN_JMP_INDIRECT = {0xFF, 0x25};  // JMP [RIP+offset]
+    constexpr uint8_t INLINE_HOOK_PATTERN_JMP_REL32 = 0xE9;   // JMP rel32 (FIX #5)
+    constexpr uint8_t INLINE_HOOK_PATTERN_CALL_REL32 = 0xE8;  // CALL rel32 (FIX #5)
+    constexpr uint8_t INLINE_HOOK_PATTERN_PUSH_RET = 0x68;    // PUSH imm32; RET
+
+    /// @brief Bytes to read for inline hook detection (FIX #13)
+    constexpr size_t HOOK_SCAN_BYTES = 32;
 
     /// @brief Integrity check interval
     constexpr auto INTEGRITY_CHECK_INTERVAL = std::chrono::seconds(1);
 
     /// @brief Maximum overlay windows
     constexpr size_t MAX_OVERLAY_WINDOWS = 10;
+
+    /// @brief Known VTable indices for hook detection (FIX #3)
+    constexpr uint32_t VTABLE_IDXGISwapChain_Present = 8;
+    constexpr uint32_t VTABLE_ID3D11DeviceContext_Draw = 13;
+    constexpr uint32_t VTABLE_IDirect3DDevice9_EndScene = 42;
+
+    /// @brief Helper: Extract filename from a full path (lowercase)
+    [[nodiscard]] std::wstring ExtractFilenameLower(const std::wstring& fullPath) noexcept {
+        try {
+            std::wstring result = fullPath;
+            const size_t pos = result.find_last_of(L"\\/");
+            if (pos != std::wstring::npos) {
+                result = result.substr(pos + 1);
+            }
+            std::transform(result.begin(), result.end(), result.begin(), ::towlower);
+            return result;
+        } catch (...) {
+            return {};
+        }
+    }
+
+    /// @brief Helper: Convert wstring to lowercase
+    [[nodiscard]] std::wstring ToLowerW(std::wstring s) noexcept {
+        try {
+            std::transform(s.begin(), s.end(), s.begin(), ::towlower);
+        } catch (...) {}
+        return s;
+    }
+
+    /// @brief Detect if running on Windows 8 or above (FIX #18)
+    [[nodiscard]] bool IsWindows8OrAbove() noexcept {
+        // Use RtlGetVersion to bypass manifest requirement
+        using RtlGetVersionFn = NTSTATUS(WINAPI*)(PRTL_OSVERSIONINFOW);
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (!hNtdll) return true;  // Assume modern OS if ntdll not found
+
+        auto pRtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+            GetProcAddress(hNtdll, "RtlGetVersion"));
+        if (!pRtlGetVersion) return true;
+
+        RTL_OSVERSIONINFOW osvi{};
+        osvi.dwOSVersionInfoSize = sizeof(osvi);
+        if (pRtlGetVersion(&osvi) == 0) {  // STATUS_SUCCESS
+            // Windows 8 is 6.2
+            return (osvi.dwMajorVersion > 6) ||
+                   (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion >= 2);
+        }
+        return true;  // Default to modern
+    }
+
+    /// @brief Check if an address falls within a module's loaded image range
+    [[nodiscard]] bool IsAddressWithinModule(HMODULE hModule, uint64_t address) noexcept {
+        __try {
+            MODULEINFO modInfo{};
+            if (GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(modInfo))) {
+                const auto base = reinterpret_cast<uint64_t>(modInfo.lpBaseOfDll);
+                return address >= base && address < (base + modInfo.SizeOfImage);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return false;
+    }
+
+    /// @brief Check if an address falls within any code section (.text) of a module
+    [[nodiscard]] bool IsAddressInCodeSection(HMODULE hModule, uint64_t address) noexcept {
+        __try {
+            auto base = reinterpret_cast<uint8_t*>(hModule);
+            auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+            auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+            auto section = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+                if (section->Characteristics & IMAGE_SCN_CNT_CODE) {
+                    const auto secStart = reinterpret_cast<uint64_t>(base + section->VirtualAddress);
+                    const auto secEnd = secStart + section->Misc.VirtualSize;
+                    if (address >= secStart && address < secEnd) return true;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return false;
+    }
+
+    /// @brief Generate a random hex suffix for window class name (FIX #15)
+    [[nodiscard]] std::wstring GenerateRandomClassSuffix() noexcept {
+        try {
+            std::random_device rd;
+            std::mt19937_64 gen(rd());
+            std::uniform_int_distribution<uint64_t> dist(0, UINT64_MAX);
+            const uint64_t val = dist(gen);
+            wchar_t buf[20]{};
+            swprintf_s(buf, L"%016llX", val);
+            return std::wstring(buf);
+        } catch (...) {
+            return L"DefaultSuffix";
+        }
+    }
 
 }  // anonymous namespace
 
@@ -206,7 +327,13 @@ namespace {
 class OverlayProtectionImpl final {
 public:
     OverlayProtectionImpl() = default;
-    ~OverlayProtectionImpl() = default;
+    ~OverlayProtectionImpl() {
+        // FIX #7: Clean up GDI brush on destruction
+        if (m_backgroundBrush) {
+            DeleteObject(m_backgroundBrush);
+            m_backgroundBrush = nullptr;
+        }
+    }
 
     // Non-copyable, non-movable
     OverlayProtectionImpl(const OverlayProtectionImpl&) = delete;
@@ -236,9 +363,9 @@ public:
     mutable std::shared_mutex m_hooksMutex;
     TimePoint m_lastHookScan = Clock::now();
 
-    // Integrity monitoring
+    // Integrity monitoring (FIX #27: std::jthread for RAII)
     std::atomic<bool> m_integrityMonitoring{false};
-    std::thread m_integrityThread;
+    std::jthread m_integrityThread;
 
     // Callbacks
     std::vector<HookDetectedCallback> m_hookCallbacks;
@@ -255,6 +382,15 @@ public:
     bool m_windowClassRegistered = false;
     ATOM m_windowClassAtom = 0;
 
+    // FIX #15: Runtime-generated unique class name
+    std::wstring m_overlayClassName;
+
+    // FIX #7: GDI brush handle for RAII cleanup
+    HBRUSH m_backgroundBrush = nullptr;
+
+    // FIX #18: Cached OS version check
+    bool m_isWindows8Plus = IsWindows8OrAbove();
+
     // ========================================================================
     // HELPER METHODS
     // ========================================================================
@@ -268,18 +404,28 @@ public:
         const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()).count();
 
-        std::ostringstream oss;
-        oss << "OVERLAY-" << timestamp << "-" << counter.fetch_add(1);
-        return oss.str();
+        try {
+            return std::format("OVERLAY-{}-{}", timestamp, counter.fetch_add(1));
+        } catch (...) {
+            return "OVERLAY-UNKNOWN";
+        }
     }
+
+    // FIX #22: All Fire*Callbacks methods copy the callback vector under lock,
+    // release the lock, THEN invoke copies. This prevents deadlocks and
+    // re-entrant mutex acquisition.
 
     /**
      * @brief Fire hook detection callbacks
      */
     void FireHookCallbacks(const HookDetectionResult& result) noexcept {
+        std::vector<HookDetectedCallback> callbacksCopy;
         try {
-            std::lock_guard lock(m_callbackMutex);
-            for (const auto& callback : m_hookCallbacks) {
+            {
+                std::lock_guard lock(m_callbackMutex);
+                callbacksCopy = m_hookCallbacks;
+            }
+            for (const auto& callback : callbacksCopy) {
                 if (callback) {
                     try {
                         callback(result);
@@ -296,9 +442,13 @@ public:
      * @brief Fire integrity callbacks
      */
     void FireIntegrityCallbacks(const OverlayIntegrityStatus& status) noexcept {
+        std::vector<IntegrityCallback> callbacksCopy;
         try {
-            std::lock_guard lock(m_callbackMutex);
-            for (const auto& callback : m_integrityCallbacks) {
+            {
+                std::lock_guard lock(m_callbackMutex);
+                callbacksCopy = m_integrityCallbacks;
+            }
+            for (const auto& callback : callbacksCopy) {
                 if (callback) {
                     try {
                         callback(status);
@@ -315,9 +465,13 @@ public:
      * @brief Fire overlay event callbacks
      */
     void FireOverlayEventCallbacks(const OverlayWindowInfo& info, bool created) noexcept {
+        std::vector<OverlayEventCallback> callbacksCopy;
         try {
-            std::lock_guard lock(m_callbackMutex);
-            for (const auto& callback : m_overlayEventCallbacks) {
+            {
+                std::lock_guard lock(m_callbackMutex);
+                callbacksCopy = m_overlayEventCallbacks;
+            }
+            for (const auto& callback : callbacksCopy) {
                 if (callback) {
                     try {
                         callback(info, created);
@@ -334,9 +488,13 @@ public:
      * @brief Fire error callbacks
      */
     void FireErrorCallbacks(const std::string& message, int code) noexcept {
+        std::vector<ErrorCallback> callbacksCopy;
         try {
-            std::lock_guard lock(m_callbackMutex);
-            for (const auto& callback : m_errorCallbacks) {
+            {
+                std::lock_guard lock(m_callbackMutex);
+                callbacksCopy = m_errorCallbacks;
+            }
+            for (const auto& callback : callbacksCopy) {
                 if (callback) {
                     try {
                         callback(message, code);
@@ -351,20 +509,21 @@ public:
 
     /**
      * @brief Check if module is known overlay
+     * FIX #16: Lowercase both pattern and input for case-insensitive matching
+     * FIX #20: Extract filename from full path, use exact match (==) not find()
      */
     [[nodiscard]] bool IsKnownOverlayModule(const std::wstring& moduleName) const noexcept {
         try {
-            std::wstring lowerName = moduleName;
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+            const std::wstring filename = ExtractFilenameLower(moduleName);
+            if (filename.empty()) return false;
 
             for (const auto& pattern : KNOWN_OVERLAY_MODULES) {
-                if (lowerName.find(pattern) != std::wstring::npos) {
+                // KNOWN_OVERLAY_MODULES entries are already lowercase (see array)
+                if (filename == pattern) {
                     return true;
                 }
             }
-
             return false;
-
         } catch (...) {
             return false;
         }
@@ -372,62 +531,92 @@ public:
 
     /**
      * @brief Detect inline hook at address
+     * FIX #12: Replace ReadProcessMemory with direct pointer dereference via SEH
+     * FIX #13: Read 32 bytes instead of 16
+     * FIX #5:  Add JMP rel32 (0xE9) and CALL rel32 (0xE8) detection
      */
     [[nodiscard]] bool DetectInlineHook(uint64_t address) const noexcept {
-        try {
-            if (address == 0) return false;
+        if (address == 0) return false;
 
-            // Read first few bytes
-            std::array<uint8_t, 16> bytes{};
-            SIZE_T bytesRead = 0;
+        std::array<uint8_t, HOOK_SCAN_BYTES> bytes{};
 
-            if (!ReadProcessMemory(GetCurrentProcess(),
-                                  reinterpret_cast<LPCVOID>(address),
-                                  bytes.data(),
-                                  bytes.size(),
-                                  &bytesRead)) {
-                return false;
-            }
-
-            if (bytesRead < 2) return false;
-
-            // Check for common hook patterns
-            // JMP [RIP+offset]
-            if (bytes[0] == INLINE_HOOK_PATTERN_JMP[0] &&
-                bytes[1] == INLINE_HOOK_PATTERN_JMP[1]) {
-                return true;
-            }
-
-            // PUSH imm32; RET
-            if (bytes[0] == INLINE_HOOK_PATTERN_PUSH_RET &&
-                bytesRead >= 6 &&
-                bytes[5] == 0xC3) {  // RET
-                return true;
-            }
-
-            // MOV RAX, imm64; JMP RAX
-            if (bytesRead >= 12 &&
-                bytes[0] == 0x48 && bytes[1] == 0xB8 &&  // MOV RAX, imm64
-                bytes[10] == 0xFF && bytes[11] == 0xE0) {  // JMP RAX
-                return true;
-            }
-
-            return false;
-
-        } catch (...) {
+        // FIX #12: Direct memory read via SEH instead of ReadProcessMemory
+        __try {
+            memcpy(bytes.data(), reinterpret_cast<const void*>(address), HOOK_SCAN_BYTES);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
             return false;
         }
+
+        // JMP [RIP+offset] (FF 25)
+        if (bytes[0] == INLINE_HOOK_PATTERN_JMP_INDIRECT[0] &&
+            bytes[1] == INLINE_HOOK_PATTERN_JMP_INDIRECT[1]) {
+            return true;
+        }
+
+        // FIX #5: JMP rel32 (E9 xx xx xx xx) - most common Detours pattern
+        if (bytes[0] == INLINE_HOOK_PATTERN_JMP_REL32) {
+            return true;
+        }
+
+        // FIX #5: CALL rel32 (E8 xx xx xx xx) - used by some hooking frameworks
+        if (bytes[0] == INLINE_HOOK_PATTERN_CALL_REL32) {
+            return true;
+        }
+
+        // PUSH imm32; RET (68 xx xx xx xx C3)
+        if (bytes[0] == INLINE_HOOK_PATTERN_PUSH_RET && bytes[5] == 0xC3) {
+            return true;
+        }
+
+        // MOV RAX, imm64; JMP RAX (48 B8 xx..xx FF E0)
+        if (bytes[0] == 0x48 && bytes[1] == 0xB8 &&
+            bytes[10] == 0xFF && bytes[11] == 0xE0) {
+            return true;
+        }
+
+        // MOV R10, imm64; JMP R10 (49 BA xx..xx 41 FF E2)
+        if (bytes[0] == 0x49 && bytes[1] == 0xBA &&
+            bytes[10] == 0x41 && bytes[11] == 0xFF && bytes[12] == 0xE2) {
+            return true;
+        }
+
+        // INT3 padding (CC CC...) often indicates detoured prologue
+        // Two or more INT3 at function start is suspicious
+        if (bytes[0] == 0xCC && bytes[1] == 0xCC) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief Compute hook destination for JMP rel32
+     * Returns 0 if not a rel32 jump.
+     */
+    [[nodiscard]] uint64_t GetJmpRel32Destination(uint64_t address) const noexcept {
+        __try {
+            const auto* p = reinterpret_cast<const uint8_t*>(address);
+            if (p[0] == INLINE_HOOK_PATTERN_JMP_REL32) {
+                int32_t rel = 0;
+                memcpy(&rel, p + 1, sizeof(rel));
+                return address + 5 + static_cast<int64_t>(rel);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return 0;
     }
 
     /**
      * @brief Get module name from address
+     * FIX #14: Add GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
      */
     [[nodiscard]] std::wstring GetModuleNameFromAddress(uint64_t address) const noexcept {
         try {
             HMODULE hModule = nullptr;
-            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                                   reinterpret_cast<LPCWSTR>(address),
-                                   &hModule)) {
+            if (!GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,  // FIX #14
+                    reinterpret_cast<LPCWSTR>(address),
+                    &hModule)) {
                 return L"Unknown";
             }
 
@@ -435,7 +624,7 @@ public:
             if (GetModuleFileNameW(hModule, moduleName.data(),
                                   static_cast<DWORD>(moduleName.size()))) {
                 std::wstring path(moduleName.data());
-                size_t pos = path.find_last_of(L"\\/");
+                const size_t pos = path.find_last_of(L"\\/");
                 if (pos != std::wstring::npos) {
                     return path.substr(pos + 1);
                 }
@@ -450,25 +639,79 @@ public:
     }
 
     /**
+     * @brief Build a HookDetectionResult for a detected hook
+     */
+    [[nodiscard]] HookDetectionResult BuildHookResult(
+        HookType type,
+        const char* funcName,
+        uint64_t origAddr,
+        uint64_t hookAddr,
+        uint64_t hookDest = 0) noexcept
+    {
+        HookDetectionResult result;
+        result.detectionId = GenerateDetectionId();
+        result.hookType = type;
+        result.functionName = funcName;
+        result.originalAddress = origAddr;
+        result.hookAddress = hookAddr;
+        result.hookDestination = hookDest;
+        result.timestamp = std::chrono::system_clock::now();
+
+        const std::wstring hookerModule = (hookDest != 0)
+            ? GetModuleNameFromAddress(hookDest)
+            : GetModuleNameFromAddress(hookAddr);
+        result.hookingModule = hookerModule;
+        result.isKnownOverlay = IsKnownOverlayModule(hookerModule);
+        result.isWhitelisted = IsWhitelistedInternal(hookerModule);
+
+        if (result.isWhitelisted || result.isKnownOverlay) {
+            result.threatLevel = OverlayThreatLevel::None;
+        } else {
+            result.threatLevel = OverlayThreatLevel::High;
+        }
+
+        return result;
+    }
+
+    /**
      * @brief Integrity monitoring thread
+     * FIX #10: Snapshot config fields under lock at top of each iteration
+     * FIX #17: Check WS_EX_TOPMOST style directly instead of GetTopWindow
+     * FIX #18: Skip DWM check on Windows 8+ (always enabled)
      */
     void IntegrityMonitoringThread() noexcept {
         Utils::Logger::Info("OverlayProtection: Integrity monitoring thread started");
 
         while (m_integrityMonitoring.load(std::memory_order_acquire)) {
             try {
-                // Check integrity
+                // FIX #10: Snapshot config under lock
+                bool enableHookDetection = false;
+                bool autoRestoreZOrder = false;
+                uint32_t intervalMs = OverlayConstants::INTEGRITY_CHECK_INTERVAL_MS;
+                {
+                    std::shared_lock lock(m_mutex);
+                    enableHookDetection = m_config.enableHookDetection;
+                    autoRestoreZOrder = m_config.autoRestoreZOrder;
+                    intervalMs = m_config.integrityCheckIntervalMs;
+                }
+
                 ++m_stats.integrityChecks;
 
                 OverlayIntegrityStatus status;
                 status.lastCheckTime = Clock::now();
 
-                // Check DWM composition
-                BOOL compositionEnabled = FALSE;
-                if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled))) {
-                    status.dwmCompositionEnabled = (compositionEnabled == TRUE);
+                // FIX #18: DWM composition check - skip on Win8+ where DWM is always on
+                if (m_isWindows8Plus) {
+                    status.dwmCompositionEnabled = true;
                 } else {
-                    status.dwmCompositionEnabled = false;
+                    BOOL compositionEnabled = FALSE;
+                    if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled))) {
+                        status.dwmCompositionEnabled = (compositionEnabled == TRUE);
+                    } else {
+                        // On Win7, DWM check failure is not an immediate failure
+                        status.dwmCompositionEnabled = false;
+                        Utils::Logger::Warn("OverlayProtection: DWM composition check failed on Win7");
+                    }
                 }
 
                 // Check window integrity
@@ -481,16 +724,15 @@ public:
                                                reinterpret_cast<uintptr_t>(hwnd));
                         }
 
-                        // Check Z-order
+                        // FIX #17: Check WS_EX_TOPMOST style directly
                         if (info.isTopmost) {
-                            HWND topmost = GetTopWindow(nullptr);
-                            if (topmost != hwnd) {
+                            const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                            if (!(exStyle & WS_EX_TOPMOST)) {
                                 status.zOrderCorrect = false;
                                 Utils::Logger::Warn("OverlayProtection: Z-order violation for HWND 0x{:X}",
                                                    reinterpret_cast<uintptr_t>(hwnd));
 
-                                // Auto-restore if configured
-                                if (m_config.autoRestoreZOrder) {
+                                if (autoRestoreZOrder) {
                                     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                                     ++m_stats.zOrderRestorations;
@@ -501,7 +743,7 @@ public:
                 }
 
                 // Scan for hooks periodically
-                if (m_config.enableHookDetection) {
+                if (enableHookDetection) {
                     const auto now = Clock::now();
                     if (now - m_lastHookScan >= INTEGRITY_CHECK_INTERVAL) {
                         auto hooks = ScanForHooksInternal();
@@ -531,112 +773,622 @@ public:
                 Utils::Logger::Error("OverlayProtection: Integrity monitoring error");
             }
 
-            // Sleep
-            std::this_thread::sleep_for(std::chrono::milliseconds(m_config.integrityCheckIntervalMs));
+            // Sleep using snapshotted interval
+            uint32_t sleepMs = OverlayConstants::INTEGRITY_CHECK_INTERVAL_MS;
+            {
+                std::shared_lock lock(m_mutex);
+                sleepMs = m_config.integrityCheckIntervalMs;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
         }
 
         Utils::Logger::Info("OverlayProtection: Integrity monitoring thread stopped");
     }
 
+    // ========================================================================
+    // MEMORY VALIDATION HELPER (C2712 workaround)
+    // ========================================================================
+    // MSVC forbids __try/__except in functions with C++ objects that require
+    // unwinding (std::wstring, std::vector, etc.). Instead of blanket SEH, we
+    // validate memory regions with VirtualQuery before dereferencing — this is
+    // actually a superior pattern because it prevents the fault rather than
+    // catching it, and provides precise diagnostics.
+
     /**
-     * @brief Internal hook scanning
+     * @brief Verify a memory range is committed and readable.
+     * @param addr  Start address to validate.
+     * @param size  Number of bytes that must be readable.
+     * @return true if the entire range is in committed, readable memory.
+     */
+    [[nodiscard]] static bool IsMemoryReadable(const void* addr, size_t size) noexcept {
+        if (!addr || size == 0) return false;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE |
+                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                    PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & kReadable) == 0) return false;
+        if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const auto regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        const auto requestEnd = reinterpret_cast<uintptr_t>(addr) + size;
+        return requestEnd <= regionEnd;
+    }
+
+    /**
+     * @brief SEH-safe vtable slot read (POD-only function — no C++ objects).
+     * Used by CheckVTableEntry to safely dereference potentially invalid vtable
+     * pointers without requiring C++ object unwinding.
+     */
+    __declspec(noinline) static void* SafeReadVTableSlot(
+        void** vtable, uint32_t index) noexcept
+    {
+        __try {
+            return vtable[index];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+    }
+
+    // ========================================================================
+    // IAT HOOK DETECTION (FIX #1)
+    // ========================================================================
+
+    /**
+     * @brief Scan a module's Import Address Table for hooks.
+     * For each imported function, compare the IAT entry against GetProcAddress.
+     * Any mismatch indicates an IAT hook.
+     *
+     * Uses VirtualQuery-based memory validation instead of SEH (__try/__except)
+     * to remain compatible with C++ objects in scope (MSVC C2712).
+     */
+    void ScanIATHooks(HMODULE hModule, const std::wstring& moduleName,
+                      std::vector<HookDetectionResult>& results) noexcept
+    {
+        auto base = reinterpret_cast<uint8_t*>(hModule);
+        if (!IsMemoryReadable(base, sizeof(IMAGE_DOS_HEADER))) {
+            Utils::Logger::Warn("OverlayProtection: IAT scan - base address not readable");
+            return;
+        }
+
+        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+        const auto ntOffset = static_cast<size_t>(dos->e_lfanew);
+        if (!IsMemoryReadable(base + ntOffset, sizeof(IMAGE_NT_HEADERS))) {
+            Utils::Logger::Warn("OverlayProtection: IAT scan - NT headers not readable");
+            return;
+        }
+
+        auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + ntOffset);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+        auto& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (importDir.VirtualAddress == 0 || importDir.Size == 0) return;
+
+        if (!IsMemoryReadable(base + importDir.VirtualAddress, sizeof(IMAGE_IMPORT_DESCRIPTOR))) {
+            return;
+        }
+
+        auto importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            base + importDir.VirtualAddress);
+
+        for (; importDesc->Name != 0; ++importDesc) {
+            if (!IsMemoryReadable(base + importDesc->Name, 1)) continue;
+            const char* dllName = reinterpret_cast<const char*>(base + importDesc->Name);
+
+            HMODULE hImportedDll = GetModuleHandleA(dllName);
+            if (!hImportedDll) continue;
+
+            if (!IsMemoryReadable(base + importDesc->OriginalFirstThunk, sizeof(IMAGE_THUNK_DATA)) ||
+                !IsMemoryReadable(base + importDesc->FirstThunk, sizeof(IMAGE_THUNK_DATA))) {
+                continue;
+            }
+
+            auto origThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+                base + importDesc->OriginalFirstThunk);
+            auto iatThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+                base + importDesc->FirstThunk);
+
+            for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk) {
+                // Skip ordinal imports
+                if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) continue;
+
+                if (!IsMemoryReadable(base + origThunk->u1.AddressOfData,
+                                      sizeof(IMAGE_IMPORT_BY_NAME))) {
+                    continue;
+                }
+
+                auto importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                    base + origThunk->u1.AddressOfData);
+                const char* funcName = importByName->Name;
+
+                FARPROC expected = GetProcAddress(hImportedDll, funcName);
+                if (!expected) continue;
+
+                const auto expectedAddr = reinterpret_cast<uint64_t>(expected);
+                const auto actualAddr = static_cast<uint64_t>(iatThunk->u1.Function);
+
+                if (actualAddr != expectedAddr) {
+                    auto result = BuildHookResult(
+                        HookType::IATHook,
+                        funcName,
+                        expectedAddr,
+                        actualAddr,
+                        actualAddr);
+
+                    result.moduleName = moduleName;
+
+                    Utils::Logger::Warn("OverlayProtection: IAT hook detected - {} in {} -> {}",
+                                       funcName,
+                                       Utils::StringUtils::ToNarrow(moduleName),
+                                       Utils::StringUtils::ToNarrow(result.hookingModule));
+
+                    results.push_back(std::move(result));
+                    ++m_stats.hooksDetected;
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // EAT HOOK DETECTION (FIX #2)
+    // ========================================================================
+
+    /**
+     * @brief Scan a module's Export Address Table for hooks.
+     * Verify each export RVA points within the module's code section.
+     * If it points outside, it is an EAT hook or suspicious forwarder.
+     *
+     * Uses VirtualQuery-based memory validation instead of SEH (__try/__except)
+     * to remain compatible with C++ objects in scope (MSVC C2712).
+     */
+    void ScanEATHooks(HMODULE hModule, const std::wstring& moduleName,
+                      std::vector<HookDetectionResult>& results) noexcept
+    {
+        auto base = reinterpret_cast<uint8_t*>(hModule);
+        if (!IsMemoryReadable(base, sizeof(IMAGE_DOS_HEADER))) {
+            Utils::Logger::Warn("OverlayProtection: EAT scan - base address not readable");
+            return;
+        }
+
+        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+        const auto ntOffset = static_cast<size_t>(dos->e_lfanew);
+        if (!IsMemoryReadable(base + ntOffset, sizeof(IMAGE_NT_HEADERS))) {
+            Utils::Logger::Warn("OverlayProtection: EAT scan - NT headers not readable");
+            return;
+        }
+
+        auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + ntOffset);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+        auto& exportDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (exportDir.VirtualAddress == 0 || exportDir.Size == 0) return;
+
+        if (!IsMemoryReadable(base + exportDir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY))) {
+            return;
+        }
+
+        auto exports = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(
+            base + exportDir.VirtualAddress);
+
+        const auto exportDirStart = exportDir.VirtualAddress;
+        const auto exportDirEnd = exportDir.VirtualAddress + exportDir.Size;
+
+        if (!IsMemoryReadable(base + exports->AddressOfFunctions,
+                              exports->NumberOfFunctions * sizeof(DWORD)) ||
+            !IsMemoryReadable(base + exports->AddressOfNames,
+                              exports->NumberOfNames * sizeof(DWORD)) ||
+            !IsMemoryReadable(base + exports->AddressOfNameOrdinals,
+                              exports->NumberOfNames * sizeof(WORD))) {
+            return;
+        }
+
+        auto functions = reinterpret_cast<DWORD*>(base + exports->AddressOfFunctions);
+        auto names = reinterpret_cast<DWORD*>(base + exports->AddressOfNames);
+        auto ordinals = reinterpret_cast<WORD*>(base + exports->AddressOfNameOrdinals);
+
+        for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+            const WORD ordinal = ordinals[i];
+            if (ordinal >= exports->NumberOfFunctions) continue;
+
+            const DWORD funcRva = functions[ordinal];
+
+            // Forwarder: RVA falls within the export directory itself (legitimate)
+            if (funcRva >= exportDirStart && funcRva < exportDirEnd) {
+                continue;
+            }
+
+            const auto funcAddr = reinterpret_cast<uint64_t>(base + funcRva);
+
+            if (!IsMemoryReadable(base + names[i], 1)) continue;
+            const char* funcName = reinterpret_cast<const char*>(base + names[i]);
+
+            // Check if the resolved address falls outside the module
+            if (!IsAddressWithinModule(hModule, funcAddr)) {
+                auto result = BuildHookResult(
+                    HookType::EATHook,
+                    funcName,
+                    funcAddr,
+                    funcAddr,
+                    funcAddr);
+
+                result.moduleName = moduleName;
+
+                Utils::Logger::Warn("OverlayProtection: EAT hook detected - {} in {} -> outside module",
+                                   funcName,
+                                   Utils::StringUtils::ToNarrow(moduleName));
+
+                results.push_back(std::move(result));
+                ++m_stats.hooksDetected;
+                continue;
+            }
+
+            // Also check if it points outside code sections (but within module)
+            if (!IsAddressInCodeSection(hModule, funcAddr)) {
+                auto result = BuildHookResult(
+                    HookType::EATHook,
+                    funcName,
+                    funcAddr,
+                    funcAddr,
+                    funcAddr);
+
+                result.moduleName = moduleName;
+                result.threatLevel = OverlayThreatLevel::Medium;
+
+                results.push_back(std::move(result));
+                ++m_stats.hooksDetected;
+            }
+        }
+    }
+
+    // ========================================================================
+    // VTABLE HOOK DETECTION (FIX #3)
+    // ========================================================================
+
+    /**
+     * @brief Check a single vtable entry against the expected module.
+     * Uses SafeReadVTableSlot (POD-only SEH function) to safely dereference
+     * the vtable pointer without violating MSVC C2712 restrictions.
+     * @return true if the entry is hooked (not within expectedModule).
+     */
+    [[nodiscard]] bool CheckVTableEntry(void** vtable, uint32_t index,
+                                        HMODULE expectedModule,
+                                        const char* funcName,
+                                        std::vector<HookDetectionResult>& results) noexcept
+    {
+        void* entry = SafeReadVTableSlot(vtable, index);
+        if (!entry) return false;
+
+        const auto addr = reinterpret_cast<uint64_t>(entry);
+        if (!IsAddressWithinModule(expectedModule, addr)) {
+            auto result = BuildHookResult(
+                HookType::VTableHook,
+                funcName,
+                0,  // original unknown
+                addr,
+                addr);
+
+            Utils::Logger::Warn("OverlayProtection: VTable hook detected - {} index {} -> 0x{:X}",
+                               funcName, index, addr);
+
+            results.push_back(std::move(result));
+            ++m_stats.hooksDetected;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Scan DirectX VTables for hooks by creating temporary null-driver devices.
+     */
+    void ScanVTableHooks(std::vector<HookDetectionResult>& results) noexcept {
+        // D3D9: IDirect3DDevice9::EndScene (vtable index 42)
+        {
+            HMODULE hD3D9 = GetModuleHandleW(L"d3d9.dll");
+            if (hD3D9) {
+                using Direct3DCreate9Fn = IDirect3D9*(WINAPI*)(UINT);
+                auto pDirect3DCreate9 = reinterpret_cast<Direct3DCreate9Fn>(
+                    GetProcAddress(hD3D9, "Direct3DCreate9"));
+
+                if (pDirect3DCreate9) {
+                    IDirect3D9* pD3D9 = nullptr;
+                    __try {
+                        pD3D9 = pDirect3DCreate9(D3D_SDK_VERSION);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        pD3D9 = nullptr;
+                    }
+
+                    if (pD3D9) {
+                        // Create a temporary hidden window for the device
+                        HWND tempWnd = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
+                                                       0, 0, 1, 1, nullptr, nullptr,
+                                                       GetModuleHandleW(nullptr), nullptr);
+                        if (tempWnd) {
+                            D3DPRESENT_PARAMETERS d3dpp{};
+                            d3dpp.Windowed = TRUE;
+                            d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+                            d3dpp.hDeviceWindow = tempWnd;
+
+                            IDirect3DDevice9* pDevice = nullptr;
+                            HRESULT hr = E_FAIL;
+                            __try {
+                                hr = pD3D9->CreateDevice(
+                                    D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, tempWnd,
+                                    D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                                hr = E_FAIL;
+                            }
+
+                            if (SUCCEEDED(hr) && pDevice) {
+                                auto** vtable = *reinterpret_cast<void***>(pDevice);
+                                (void)CheckVTableEntry(vtable, VTABLE_IDirect3DDevice9_EndScene,
+                                               hD3D9, "IDirect3DDevice9::EndScene", results);
+                                pDevice->Release();
+                            }
+                            DestroyWindow(tempWnd);
+                        }
+                        pD3D9->Release();
+                    }
+                }
+            }
+        }
+
+        // D3D11: ID3D11DeviceContext::Draw (vtable index 13)
+        //        IDXGISwapChain::Present (vtable index 8)
+        {
+            HMODULE hD3D11 = GetModuleHandleW(L"d3d11.dll");
+            HMODULE hDXGI = GetModuleHandleW(L"dxgi.dll");
+
+            if (hD3D11) {
+                HWND tempWnd = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
+                                               0, 0, 1, 1, nullptr, nullptr,
+                                               GetModuleHandleW(nullptr), nullptr);
+                if (!tempWnd) return;
+
+                DXGI_SWAP_CHAIN_DESC scd{};
+                scd.BufferCount = 1;
+                scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                scd.BufferDesc.Width = 1;
+                scd.BufferDesc.Height = 1;
+                scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                scd.OutputWindow = tempWnd;
+                scd.SampleDesc.Count = 1;
+                scd.Windowed = TRUE;
+                scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+                ID3D11Device* pDevice = nullptr;
+                ID3D11DeviceContext* pContext = nullptr;
+                IDXGISwapChain* pSwapChain = nullptr;
+
+                const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+                HRESULT hr = E_FAIL;
+                __try {
+                    hr = D3D11CreateDeviceAndSwapChain(
+                        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                        &featureLevel, 1, D3D11_SDK_VERSION,
+                        &scd, &pSwapChain, &pDevice, nullptr, &pContext);
+
+                    // Fall back to WARP if hardware fails
+                    if (FAILED(hr)) {
+                        hr = D3D11CreateDeviceAndSwapChain(
+                            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                            &featureLevel, 1, D3D11_SDK_VERSION,
+                            &scd, &pSwapChain, &pDevice, nullptr, &pContext);
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    hr = E_FAIL;
+                }
+
+                if (SUCCEEDED(hr)) {
+                    if (pContext && hD3D11) {
+                        auto** vtable = *reinterpret_cast<void***>(pContext);
+                        (void)CheckVTableEntry(vtable, VTABLE_ID3D11DeviceContext_Draw,
+                                       hD3D11, "ID3D11DeviceContext::Draw", results);
+                    }
+                    if (pSwapChain && hDXGI) {
+                        auto** vtable = *reinterpret_cast<void***>(pSwapChain);
+                        (void)CheckVTableEntry(vtable, VTABLE_IDXGISwapChain_Present,
+                                       hDXGI, "IDXGISwapChain::Present", results);
+                    }
+                }
+
+                if (pSwapChain) pSwapChain->Release();
+                if (pContext) pContext->Release();
+                if (pDevice) pDevice->Release();
+                DestroyWindow(tempWnd);
+            }
+        }
+    }
+
+    // ========================================================================
+    // VULKAN SCANNING (FIX #4)
+    // ========================================================================
+
+    /**
+     * @brief Scan Vulkan exports and enumerate implicit layers from registry.
+     */
+    void ScanVulkanHooks(std::vector<HookDetectionResult>& results) noexcept {
+        // Check vulkan-1.dll exports for inline hooks
+        HMODULE hVulkan = GetModuleHandleW(L"vulkan-1.dll");
+        if (hVulkan) {
+            for (const char* funcName : VK_FUNCTIONS) {
+                FARPROC proc = GetProcAddress(hVulkan, funcName);
+                if (proc) {
+                    const uint64_t addr = reinterpret_cast<uint64_t>(proc);
+                    if (DetectInlineHook(addr)) {
+                        auto result = BuildHookResult(
+                            HookType::InlineHook,
+                            funcName,
+                            addr,
+                            addr,
+                            GetJmpRel32Destination(addr));
+
+                        result.moduleName = L"vulkan-1.dll";
+
+                        Utils::Logger::Warn("OverlayProtection: Vulkan inline hook detected in {}",
+                                           funcName);
+
+                        results.push_back(std::move(result));
+                        ++m_stats.hooksDetected;
+                    }
+                }
+            }
+
+            // IAT and EAT scans on vulkan-1.dll
+            ScanIATHooks(hVulkan, L"vulkan-1.dll", results);
+            ScanEATHooks(hVulkan, L"vulkan-1.dll", results);
+        }
+
+        // Enumerate Vulkan implicit layers from registry
+        // Suspicious implicit layers can inject code into every Vulkan application.
+        // Registry APIs use error codes (not exceptions), so SEH is unnecessary.
+        // Removed __try/__except to satisfy MSVC C2712 (C++ objects in scope).
+        {
+            HKEY hKey = nullptr;
+            LSTATUS regStatus = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                             L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers",
+                             0, KEY_READ, &hKey);
+            if (regStatus == ERROR_SUCCESS)
+            {
+                DWORD index = 0;
+                wchar_t valueName[MAX_PATH]{};
+                DWORD valueNameLen = MAX_PATH;
+                DWORD type = 0;
+                DWORD data = 0;
+                DWORD dataSize = sizeof(data);
+
+                while (RegEnumValueW(hKey, index, valueName, &valueNameLen,
+                                     nullptr, &type, reinterpret_cast<LPBYTE>(&data),
+                                     &dataSize) == ERROR_SUCCESS)
+                {
+                    // data == 0 means layer is enabled
+                    if (type == REG_DWORD && data == 0) {
+                        const std::wstring layerPath(valueName, valueNameLen);
+                        const std::wstring filename = ExtractFilenameLower(layerPath);
+
+                        // Check if this is a known/trusted layer
+                        if (!IsKnownOverlayModule(filename) &&
+                            !IsWhitelistedInternal(filename))
+                        {
+                            Utils::Logger::Warn(
+                                "OverlayProtection: Suspicious Vulkan implicit layer: {}",
+                                Utils::StringUtils::ToNarrow(layerPath));
+                        }
+                    }
+
+                    // Reset for next iteration
+                    valueNameLen = MAX_PATH;
+                    dataSize = sizeof(data);
+                    ++index;
+                }
+
+                RegCloseKey(hKey);
+            }
+        }
+    }
+
+    // ========================================================================
+    // HOOK SCANNING CORE
+    // ========================================================================
+
+    /**
+     * @brief Internal hook scanning - inline + IAT + EAT + VTable + Vulkan
+     * FIX #1: IAT hook detection
+     * FIX #2: EAT hook detection
+     * FIX #3: VTable hook detection
+     * FIX #4: Vulkan scanning
      */
     [[nodiscard]] std::vector<HookDetectionResult> ScanForHooksInternal() noexcept {
         std::vector<HookDetectionResult> results;
 
         try {
-            // Enumerate loaded modules
-            HANDLE hProcess = GetCurrentProcess();
-            std::array<HMODULE, 1024> modules{};
-            DWORD needed = 0;
+            // ---- Inline hook scanning for DirectX functions ----
+            HMODULE hD3D9 = GetModuleHandleW(L"d3d9.dll");
+            HMODULE hD3D11 = GetModuleHandleW(L"d3d11.dll");
+            HMODULE hDXGI = GetModuleHandleW(L"dxgi.dll");
 
-            if (!EnumProcessModules(hProcess, modules.data(),
-                                   static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
-                                   &needed)) {
-                return results;
-            }
-
-            const DWORD moduleCount = needed / sizeof(HMODULE);
-
-            // Check DirectX functions
             for (const char* funcName : DX_FUNCTIONS) {
-                // Try to find function in common DLLs
-                HMODULE hD3D9 = GetModuleHandleW(L"d3d9.dll");
-                HMODULE hD3D11 = GetModuleHandleW(L"d3d11.dll");
-                HMODULE hDXGI = GetModuleHandleW(L"dxgi.dll");
-
                 for (HMODULE hMod : {hD3D9, hD3D11, hDXGI}) {
                     if (hMod) {
                         FARPROC proc = GetProcAddress(hMod, funcName);
                         if (proc) {
-                            uint64_t addr = reinterpret_cast<uint64_t>(proc);
+                            const uint64_t addr = reinterpret_cast<uint64_t>(proc);
                             if (DetectInlineHook(addr)) {
-                                HookDetectionResult result;
-                                result.detectionId = GenerateDetectionId();
-                                result.hookType = HookType::InlineHook;
-                                result.functionName = funcName;
-                                result.originalAddress = addr;
-                                result.hookAddress = addr;
-                                result.timestamp = std::chrono::system_clock::now();
-
-                                // Get hooking module
-                                result.hookingModule = GetModuleNameFromAddress(addr);
-
-                                // Check if known overlay
-                                result.isKnownOverlay = IsKnownOverlayModule(result.hookingModule);
-                                result.isWhitelisted = IsWhitelistedInternal(result.hookingModule);
-
-                                // Threat level
-                                if (result.isWhitelisted || result.isKnownOverlay) {
-                                    result.threatLevel = OverlayThreatLevel::None;
-                                } else {
-                                    result.threatLevel = OverlayThreatLevel::High;
-                                }
-
-                                results.push_back(result);
-                                ++m_stats.hooksDetected;
+                                auto result = BuildHookResult(
+                                    HookType::InlineHook,
+                                    funcName,
+                                    addr,
+                                    addr,
+                                    GetJmpRel32Destination(addr));
 
                                 Utils::Logger::Warn("OverlayProtection: Hook detected in {} by {}",
                                                    funcName,
-                                                   std::string(result.hookingModule.begin(),
-                                                             result.hookingModule.end()));
+                                                   Utils::StringUtils::ToNarrow(result.hookingModule));
+
+                                results.push_back(std::move(result));
+                                ++m_stats.hooksDetected;
                             }
                         }
                     }
                 }
             }
 
-            // Check OpenGL functions
+            // ---- Inline hook scanning for OpenGL functions ----
             HMODULE hOpenGL = GetModuleHandleW(L"opengl32.dll");
             if (hOpenGL) {
                 for (const char* funcName : GL_FUNCTIONS) {
                     FARPROC proc = GetProcAddress(hOpenGL, funcName);
                     if (proc) {
-                        uint64_t addr = reinterpret_cast<uint64_t>(proc);
+                        const uint64_t addr = reinterpret_cast<uint64_t>(proc);
                         if (DetectInlineHook(addr)) {
-                            HookDetectionResult result;
-                            result.detectionId = GenerateDetectionId();
-                            result.hookType = HookType::InlineHook;
-                            result.functionName = funcName;
-                            result.originalAddress = addr;
-                            result.hookAddress = addr;
-                            result.hookingModule = GetModuleNameFromAddress(addr);
-                            result.isKnownOverlay = IsKnownOverlayModule(result.hookingModule);
-                            result.isWhitelisted = IsWhitelistedInternal(result.hookingModule);
-                            result.timestamp = std::chrono::system_clock::now();
+                            auto result = BuildHookResult(
+                                HookType::InlineHook,
+                                funcName,
+                                addr,
+                                addr,
+                                GetJmpRel32Destination(addr));
 
-                            if (result.isWhitelisted || result.isKnownOverlay) {
-                                result.threatLevel = OverlayThreatLevel::None;
-                            } else {
-                                result.threatLevel = OverlayThreatLevel::High;
-                            }
-
-                            results.push_back(result);
+                            results.push_back(std::move(result));
                             ++m_stats.hooksDetected;
                         }
                     }
                 }
             }
+
+            // ---- FIX #1: IAT hook detection for graphics DLLs ----
+            struct ModuleScan {
+                HMODULE handle;
+                const wchar_t* name;
+            };
+            const std::array<ModuleScan, 5> graphicsModules = {{
+                {hD3D9, L"d3d9.dll"},
+                {hD3D11, L"d3d11.dll"},
+                {hDXGI, L"dxgi.dll"},
+                {hOpenGL, L"opengl32.dll"},
+                {GetModuleHandleW(L"vulkan-1.dll"), L"vulkan-1.dll"}
+            }};
+
+            for (const auto& mod : graphicsModules) {
+                if (mod.handle) {
+                    ScanIATHooks(mod.handle, mod.name, results);
+                }
+            }
+
+            // ---- FIX #2: EAT hook detection for graphics DLLs ----
+            for (const auto& mod : graphicsModules) {
+                if (mod.handle) {
+                    ScanEATHooks(mod.handle, mod.name, results);
+                }
+            }
+
+            // ---- FIX #3: VTable hook detection ----
+            ScanVTableHooks(results);
+
+            // ---- FIX #4: Vulkan scanning ----
+            ScanVulkanHooks(results);
 
         } catch (const std::exception& ex) {
             Utils::Logger::Error("OverlayProtection: Hook scanning failed: {}", ex.what());
@@ -649,11 +1401,13 @@ public:
 
     /**
      * @brief Internal whitelist check
+     * FIX #16: Normalize to lowercase before lookup
      */
     [[nodiscard]] bool IsWhitelistedInternal(const std::wstring& moduleName) const noexcept {
         try {
+            const std::wstring lower = ExtractFilenameLower(moduleName);
             std::shared_lock lock(m_whitelistMutex);
-            return m_moduleWhitelist.count(moduleName) > 0;
+            return m_moduleWhitelist.count(lower) > 0;
         } catch (...) {
             return false;
         }
@@ -733,12 +1487,21 @@ OverlayProtection::~OverlayProtection() {
     }
 }
 
+/**
+ * FIX #15: Generate unique class name at runtime with random suffix.
+ *          On ERROR_CLASS_ALREADY_EXISTS, verify the registered WndProc matches ours.
+ * FIX #7:  Store GDI brush in m_impl for RAII cleanup.
+ * FIX #26: On catch, unregister window class and delete brush if created.
+ *          Allow re-init from Error state.
+ */
 bool OverlayProtection::Initialize(const OverlayProtectionConfiguration& config) {
     try {
         std::unique_lock lock(m_impl->m_mutex);
 
+        // FIX #26: Allow re-init from Error state
         if (m_impl->m_status != OverlayProtectionStatus::Uninitialized &&
-            m_impl->m_status != OverlayProtectionStatus::Stopped) {
+            m_impl->m_status != OverlayProtectionStatus::Stopped &&
+            m_impl->m_status != OverlayProtectionStatus::Error) {
             Utils::Logger::Warn("OverlayProtection: Already initialized");
             return false;
         }
@@ -752,42 +1515,76 @@ bool OverlayProtection::Initialize(const OverlayProtectionConfiguration& config)
         m_impl->m_status = OverlayProtectionStatus::Initializing;
         m_impl->m_config = config;
 
-        // Register window class
+        // FIX #15: Generate unique class name with random suffix
+        m_impl->m_overlayClassName =
+            std::wstring(OverlayConstants::OVERLAY_CLASS_NAME_PREFIX) + GenerateRandomClassSuffix();
+
+        // FIX #7: Create brush and store handle for RAII cleanup
+        HBRUSH bgBrush = CreateSolidBrush(RGB(0, 0, 0));
+        if (!bgBrush) {
+            Utils::Logger::Error("OverlayProtection: Failed to create background brush");
+            m_impl->m_status = OverlayProtectionStatus::Error;
+            return false;
+        }
+        m_impl->m_backgroundBrush = bgBrush;
+
+        // Register window class with unique name
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(WNDCLASSEXW);
         wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = OverlayProtectionImpl::WindowProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
-        wc.lpszClassName = OverlayConstants::OVERLAY_CLASS_NAME;
+        wc.hbrBackground = m_impl->m_backgroundBrush;
+        wc.lpszClassName = m_impl->m_overlayClassName.c_str();
 
         m_impl->m_windowClassAtom = RegisterClassExW(&wc);
         if (m_impl->m_windowClassAtom == 0) {
             const DWORD error = GetLastError();
-            if (error != ERROR_CLASS_ALREADY_EXISTS) {
+            if (error == ERROR_CLASS_ALREADY_EXISTS) {
+                // FIX #15: Verify the registered WndProc matches ours
+                WNDCLASSEXW existingWc{};
+                existingWc.cbSize = sizeof(WNDCLASSEXW);
+                if (GetClassInfoExW(GetModuleHandleW(nullptr),
+                                    m_impl->m_overlayClassName.c_str(),
+                                    &existingWc)) {
+                    if (existingWc.lpfnWndProc != OverlayProtectionImpl::WindowProc) {
+                        // Class exists but with different WndProc - hijacked
+                        Utils::Logger::Fatal(
+                            "OverlayProtection: Window class already exists with different WndProc - potential hijack");
+                        DeleteObject(m_impl->m_backgroundBrush);
+                        m_impl->m_backgroundBrush = nullptr;
+                        m_impl->m_status = OverlayProtectionStatus::Error;
+                        return false;
+                    }
+                }
+                // WndProc matches, safe to proceed
+            } else {
                 Utils::Logger::Error("OverlayProtection: Failed to register window class (error: {})",
                                     error);
+                // FIX #26: Clean up brush on failure
+                DeleteObject(m_impl->m_backgroundBrush);
+                m_impl->m_backgroundBrush = nullptr;
                 m_impl->m_status = OverlayProtectionStatus::Error;
                 return false;
             }
         }
         m_impl->m_windowClassRegistered = true;
 
-        // Initialize whitelist
+        // Initialize whitelist (FIX #16: normalize to lowercase)
         {
             std::unique_lock whitelistLock(m_impl->m_whitelistMutex);
-            m_impl->m_moduleWhitelist.insert(config.moduleWhitelist.begin(),
-                                            config.moduleWhitelist.end());
-
-            // Add known safe overlays
+            for (const auto& wl : config.moduleWhitelist) {
+                m_impl->m_moduleWhitelist.insert(ToLowerW(wl));
+            }
+            // Add known safe overlays (already lowercase in array)
             for (const auto& module : KNOWN_OVERLAY_MODULES) {
                 m_impl->m_moduleWhitelist.insert(std::wstring(module));
             }
         }
 
         // Initialize statistics
-        m_impl->m_stats = OverlayStatistics{};
+        m_impl->m_stats.Reset();
         m_impl->m_stats.startTime = Clock::now();
 
         m_impl->m_status = OverlayProtectionStatus::Running;
@@ -799,33 +1596,63 @@ bool OverlayProtection::Initialize(const OverlayProtectionConfiguration& config)
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("OverlayProtection: Initialization failed: {}", ex.what());
+        // FIX #26: Clean up on exception
+        if (m_impl->m_windowClassRegistered) {
+            UnregisterClassW(m_impl->m_overlayClassName.c_str(), GetModuleHandleW(nullptr));
+            m_impl->m_windowClassRegistered = false;
+        }
+        if (m_impl->m_backgroundBrush) {
+            DeleteObject(m_impl->m_backgroundBrush);
+            m_impl->m_backgroundBrush = nullptr;
+        }
         m_impl->m_status = OverlayProtectionStatus::Error;
         return false;
     } catch (...) {
-        Utils::Logger::Critical("OverlayProtection: Initialization failed (unknown exception)");
+        Utils::Logger::Fatal("OverlayProtection: Initialization failed (unknown exception)");
+        if (m_impl->m_windowClassRegistered) {
+            UnregisterClassW(m_impl->m_overlayClassName.c_str(), GetModuleHandleW(nullptr));
+            m_impl->m_windowClassRegistered = false;
+        }
+        if (m_impl->m_backgroundBrush) {
+            DeleteObject(m_impl->m_backgroundBrush);
+            m_impl->m_backgroundBrush = nullptr;
+        }
         m_impl->m_status = OverlayProtectionStatus::Error;
         return false;
     }
 }
 
+/**
+ * FIX #8:  Release m_mutex before joining integrity thread to prevent deadlock.
+ *          Set Stopping under lock, release, signal+join, re-acquire for cleanup.
+ * FIX #7:  DeleteObject the HBRUSH.
+ */
 void OverlayProtection::Shutdown() {
     try {
-        std::unique_lock lock(m_impl->m_mutex);
+        // Phase 1: Set status to Stopping under lock, then release
+        {
+            std::unique_lock lock(m_impl->m_mutex);
 
-        if (m_impl->m_status == OverlayProtectionStatus::Uninitialized ||
-            m_impl->m_status == OverlayProtectionStatus::Stopped) {
-            return;
-        }
-
-        m_impl->m_status = OverlayProtectionStatus::Stopping;
-
-        // Stop integrity monitoring
-        if (m_impl->m_integrityMonitoring.load()) {
-            m_impl->m_integrityMonitoring.store(false, std::memory_order_release);
-            if (m_impl->m_integrityThread.joinable()) {
-                m_impl->m_integrityThread.join();
+            if (m_impl->m_status == OverlayProtectionStatus::Uninitialized ||
+                m_impl->m_status == OverlayProtectionStatus::Stopped) {
+                return;
             }
+
+            m_impl->m_status = OverlayProtectionStatus::Stopping;
         }
+        // m_mutex is released here
+
+        // Phase 2: Stop integrity monitoring thread WITHOUT holding m_mutex (FIX #8)
+        if (m_impl->m_integrityMonitoring.load(std::memory_order_acquire)) {
+            m_impl->m_integrityMonitoring.store(false, std::memory_order_release);
+        }
+        if (m_impl->m_integrityThread.joinable()) {
+            m_impl->m_integrityThread.request_stop();
+            m_impl->m_integrityThread.join();
+        }
+
+        // Phase 3: Re-acquire lock for cleanup
+        std::unique_lock lock(m_impl->m_mutex);
 
         // Destroy overlay windows
         {
@@ -855,9 +1682,15 @@ void OverlayProtection::Shutdown() {
 
         // Unregister window class
         if (m_impl->m_windowClassRegistered) {
-            UnregisterClassW(OverlayConstants::OVERLAY_CLASS_NAME,
+            UnregisterClassW(m_impl->m_overlayClassName.c_str(),
                            GetModuleHandleW(nullptr));
             m_impl->m_windowClassRegistered = false;
+        }
+
+        // FIX #7: Delete GDI brush
+        if (m_impl->m_backgroundBrush) {
+            DeleteObject(m_impl->m_backgroundBrush);
+            m_impl->m_backgroundBrush = nullptr;
         }
 
         m_impl->m_status = OverlayProtectionStatus::Stopped;
@@ -867,7 +1700,7 @@ void OverlayProtection::Shutdown() {
     } catch (const std::exception& ex) {
         Utils::Logger::Error("OverlayProtection: Shutdown error: {}", ex.what());
     } catch (...) {
-        Utils::Logger::Critical("OverlayProtection: Shutdown failed");
+        Utils::Logger::Fatal("OverlayProtection: Shutdown failed");
     }
 }
 
@@ -913,20 +1746,28 @@ OverlayProtectionConfiguration OverlayProtection::GetConfiguration() const {
 // OVERLAY SECURITY
 // ============================================================================
 
+/**
+ * FIX #9: Change shared_lock to unique_lock since we write m_status.
+ * FIX #18: OS-version-aware DWM check.
+ */
 bool OverlayProtection::SecureOverlay() {
     try {
-        std::shared_lock lock(m_impl->m_mutex);
+        // FIX #9: unique_lock because we write m_status
+        std::unique_lock lock(m_impl->m_mutex);
 
-        if (!IsInitialized()) {
+        if (m_impl->m_status != OverlayProtectionStatus::Running &&
+            m_impl->m_status != OverlayProtectionStatus::Protected) {
             Utils::Logger::Warn("OverlayProtection: Not initialized");
             return false;
         }
 
-        // Check DWM composition
-        BOOL compositionEnabled = FALSE;
-        if (FAILED(DwmIsCompositionEnabled(&compositionEnabled)) || !compositionEnabled) {
-            Utils::Logger::Warn("OverlayProtection: DWM composition not enabled");
-            return false;
+        // FIX #18: DWM check - skip on Win8+
+        if (!m_impl->m_isWindows8Plus) {
+            BOOL compositionEnabled = FALSE;
+            if (FAILED(DwmIsCompositionEnabled(&compositionEnabled)) || !compositionEnabled) {
+                Utils::Logger::Warn("OverlayProtection: DWM composition not enabled (Win7)");
+                return false;
+            }
         }
 
         // Scan for hooks
@@ -961,6 +1802,10 @@ bool OverlayProtection::SecureOverlay() {
     }
 }
 
+/**
+ * FIX #11: Check IsInitialized() BEFORE acquiring m_windowsMutex to prevent ABBA deadlock.
+ * Lock ordering: m_mutex -> m_windowsMutex -> m_hooksMutex -> m_callbackMutex
+ */
 HWND OverlayProtection::CreateSecureOverlay(
     OverlayType type,
     OverlayPosition position,
@@ -968,12 +1813,14 @@ HWND OverlayProtection::CreateSecureOverlay(
     uint32_t height)
 {
     try {
-        std::unique_lock lock(m_impl->m_windowsMutex);
-
+        // FIX #11: Check IsInitialized() BEFORE acquiring m_windowsMutex
+        // IsInitialized() acquires m_mutex (shared). This respects m_mutex -> m_windowsMutex ordering.
         if (!IsInitialized()) {
             Utils::Logger::Warn("OverlayProtection: Not initialized");
             return nullptr;
         }
+
+        std::unique_lock lock(m_impl->m_windowsMutex);
 
         if (m_impl->m_overlayWindows.size() >= MAX_OVERLAY_WINDOWS) {
             Utils::Logger::Error("OverlayProtection: Maximum overlay windows reached");
@@ -983,10 +1830,10 @@ HWND OverlayProtection::CreateSecureOverlay(
         // Calculate position
         RECT rect = CalculateOverlayPosition(position, width, height);
 
-        // Create layered topmost window
+        // Create layered topmost window (using runtime-generated class name)
         HWND hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-            OverlayConstants::OVERLAY_CLASS_NAME,
+            m_impl->m_overlayClassName.c_str(),
             L"ShadowStrike Overlay",
             WS_POPUP,
             rect.left, rect.top,
@@ -1075,9 +1922,12 @@ void OverlayProtection::DestroyOverlay(HWND hwnd) {
     }
 }
 
+/**
+ * FIX #23: Use unique_lock (we write isVisible) and update it->second.isVisible = true.
+ */
 void OverlayProtection::ShowOverlay(HWND hwnd) {
     try {
-        std::shared_lock lock(m_impl->m_windowsMutex);
+        std::unique_lock lock(m_impl->m_windowsMutex);
 
         auto it = m_impl->m_overlayWindows.find(hwnd);
         if (it == m_impl->m_overlayWindows.end()) {
@@ -1088,6 +1938,8 @@ void OverlayProtection::ShowOverlay(HWND hwnd) {
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
+        it->second.isVisible = true;
+
     } catch (const std::exception& ex) {
         Utils::Logger::Error("OverlayProtection: ShowOverlay failed: {}", ex.what());
     } catch (...) {
@@ -1095,9 +1947,24 @@ void OverlayProtection::ShowOverlay(HWND hwnd) {
     }
 }
 
+/**
+ * FIX #24: Check m_overlayWindows.count(hwnd) before calling ShowWindow.
+ *          Only hide windows we own.
+ */
 void OverlayProtection::HideOverlay(HWND hwnd) {
     try {
+        std::unique_lock lock(m_impl->m_windowsMutex);
+
+        auto it = m_impl->m_overlayWindows.find(hwnd);
+        if (it == m_impl->m_overlayWindows.end()) {
+            Utils::Logger::Warn("OverlayProtection: HideOverlay called for unowned HWND 0x{:X}",
+                               reinterpret_cast<uintptr_t>(hwnd));
+            return;
+        }
+
         ShowWindow(hwnd, SW_HIDE);
+        it->second.isVisible = false;
+
     } catch (...) {
     }
 }
@@ -1125,10 +1992,14 @@ OverlayIntegrityStatus OverlayProtection::CheckIntegrity() {
     try {
         ++m_impl->m_stats.integrityChecks;
 
-        // Check DWM composition
-        BOOL compositionEnabled = FALSE;
-        if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled))) {
-            status.dwmCompositionEnabled = (compositionEnabled == TRUE);
+        // FIX #18: DWM check - skip on Win8+
+        if (m_impl->m_isWindows8Plus) {
+            status.dwmCompositionEnabled = true;
+        } else {
+            BOOL compositionEnabled = FALSE;
+            if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled))) {
+                status.dwmCompositionEnabled = (compositionEnabled == TRUE);
+            }
         }
 
         // Check windows
@@ -1139,7 +2010,7 @@ OverlayIntegrityStatus OverlayProtection::CheckIntegrity() {
                     status.windowIntact = false;
                 }
 
-                // Check Z-order
+                // Check Z-order via WS_EX_TOPMOST
                 if (info.isTopmost) {
                     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     if (!(exStyle & WS_EX_TOPMOST)) {
@@ -1224,8 +2095,11 @@ void OverlayProtection::StartIntegrityMonitoring() {
         }
 
         m_impl->m_integrityMonitoring.store(true, std::memory_order_release);
-        m_impl->m_integrityThread = std::thread(
-            &OverlayProtectionImpl::IntegrityMonitoringThread, m_impl.get());
+        // FIX #27: Using std::jthread for RAII safety
+        m_impl->m_integrityThread = std::jthread(
+            [this](std::stop_token) {
+                m_impl->IntegrityMonitoringThread();
+            });
 
         Utils::Logger::Info("OverlayProtection: Integrity monitoring started");
 
@@ -1246,6 +2120,7 @@ void OverlayProtection::StopIntegrityMonitoring() {
         m_impl->m_integrityMonitoring.store(false, std::memory_order_release);
 
         if (m_impl->m_integrityThread.joinable()) {
+            m_impl->m_integrityThread.request_stop();
             m_impl->m_integrityThread.join();
         }
 
@@ -1297,10 +2172,19 @@ GraphicsAPIStatus OverlayProtection::GetGraphicsAPIStatus(GraphicsAPI api) {
     status.api = api;
 
     try {
-        auto allHooks = ScanForHooks();
+        // Use cached hooks to avoid redundant scanning
+        std::vector<HookDetectionResult> allHooks;
+        {
+            std::shared_lock lock(m_impl->m_hooksMutex);
+            allHooks = m_impl->m_detectedHooks;
+        }
+
+        // If cache is empty, do a fresh scan
+        if (allHooks.empty()) {
+            allHooks = ScanForHooks();
+        }
 
         for (const auto& hook : allHooks) {
-            // Classify by API
             bool matchesAPI = false;
 
             if (api == GraphicsAPI::DirectX9 ||
@@ -1308,10 +2192,13 @@ GraphicsAPIStatus OverlayProtection::GetGraphicsAPIStatus(GraphicsAPI api) {
                 api == GraphicsAPI::DirectX11 ||
                 api == GraphicsAPI::DirectX12) {
                 matchesAPI = (hook.functionName.find("D3D") != std::string::npos ||
-                             hook.functionName.find("DXGI") != std::string::npos);
+                             hook.functionName.find("DXGI") != std::string::npos ||
+                             hook.functionName.find("Direct3D") != std::string::npos);
             } else if (api == GraphicsAPI::OpenGL) {
                 matchesAPI = (hook.functionName.find("gl") != std::string::npos ||
                              hook.functionName.find("wgl") != std::string::npos);
+            } else if (api == GraphicsAPI::Vulkan) {
+                matchesAPI = (hook.functionName.find("vk") != std::string::npos);
             }
 
             if (matchesAPI) {
@@ -1319,7 +2206,7 @@ GraphicsAPIStatus OverlayProtection::GetGraphicsAPIStatus(GraphicsAPI api) {
                 ++status.hookCount;
 
                 if (hook.isKnownOverlay) {
-                    std::string name(hook.hookingModule.begin(), hook.hookingModule.end());
+                    std::string name = Utils::StringUtils::ToNarrow(hook.hookingModule);
                     status.knownOverlays.push_back(name);
                 } else if (!hook.isWhitelisted) {
                     status.suspiciousHooks.push_back(hook);
@@ -1336,15 +2223,61 @@ GraphicsAPIStatus OverlayProtection::GetGraphicsAPIStatus(GraphicsAPI api) {
     return status;
 }
 
+/**
+ * FIX #19: Call ScanForHooks once, cache results, then partition by API.
+ * The old code called GetGraphicsAPIStatus 5x, each calling ScanForHooks.
+ */
 std::vector<GraphicsAPIStatus> OverlayProtection::GetAllGraphicsAPIStatuses() {
     std::vector<GraphicsAPIStatus> statuses;
 
     try {
-        statuses.push_back(GetGraphicsAPIStatus(GraphicsAPI::DirectX9));
-        statuses.push_back(GetGraphicsAPIStatus(GraphicsAPI::DirectX11));
-        statuses.push_back(GetGraphicsAPIStatus(GraphicsAPI::DirectX12));
-        statuses.push_back(GetGraphicsAPIStatus(GraphicsAPI::OpenGL));
-        statuses.push_back(GetGraphicsAPIStatus(GraphicsAPI::Vulkan));
+        // Single scan, cached
+        auto allHooks = ScanForHooks();
+
+        // Now partition using cached results
+        constexpr std::array<GraphicsAPI, 5> apis = {
+            GraphicsAPI::DirectX9,
+            GraphicsAPI::DirectX11,
+            GraphicsAPI::DirectX12,
+            GraphicsAPI::OpenGL,
+            GraphicsAPI::Vulkan
+        };
+
+        for (const auto api : apis) {
+            GraphicsAPIStatus status;
+            status.api = api;
+
+            for (const auto& hook : allHooks) {
+                bool matchesAPI = false;
+
+                if (api == GraphicsAPI::DirectX9 ||
+                    api == GraphicsAPI::DirectX11 ||
+                    api == GraphicsAPI::DirectX12) {
+                    matchesAPI = (hook.functionName.find("D3D") != std::string::npos ||
+                                 hook.functionName.find("DXGI") != std::string::npos ||
+                                 hook.functionName.find("Direct3D") != std::string::npos);
+                } else if (api == GraphicsAPI::OpenGL) {
+                    matchesAPI = (hook.functionName.find("gl") != std::string::npos ||
+                                 hook.functionName.find("wgl") != std::string::npos);
+                } else if (api == GraphicsAPI::Vulkan) {
+                    matchesAPI = (hook.functionName.find("vk") != std::string::npos);
+                }
+
+                if (matchesAPI) {
+                    status.isHooked = true;
+                    ++status.hookCount;
+
+                    if (hook.isKnownOverlay) {
+                        std::string name = Utils::StringUtils::ToNarrow(hook.hookingModule);
+                        status.knownOverlays.push_back(name);
+                    } else if (!hook.isWhitelisted) {
+                        status.suspiciousHooks.push_back(hook);
+                    }
+                }
+            }
+
+            statuses.push_back(std::move(status));
+        }
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("OverlayProtection: GetAllGraphicsAPIStatuses failed: {}",
@@ -1427,14 +2360,18 @@ std::vector<KnownOverlay> OverlayProtection::GetKnownOverlays() const {
     return overlays;
 }
 
+/**
+ * FIX #16: Normalize to lowercase on insertion.
+ */
 bool OverlayProtection::AddToWhitelist(const std::wstring& moduleName) {
     try {
+        const std::wstring lower = ToLowerW(moduleName);
         std::unique_lock lock(m_impl->m_whitelistMutex);
-        const bool inserted = m_impl->m_moduleWhitelist.insert(moduleName).second;
+        const bool inserted = m_impl->m_moduleWhitelist.insert(lower).second;
 
         if (inserted) {
             Utils::Logger::Info("OverlayProtection: Added {} to whitelist",
-                               std::string(moduleName.begin(), moduleName.end()));
+                               Utils::StringUtils::ToNarrow(moduleName));
         }
 
         return inserted;
@@ -1448,14 +2385,18 @@ bool OverlayProtection::AddToWhitelist(const std::wstring& moduleName) {
     }
 }
 
+/**
+ * FIX #16: Normalize to lowercase on removal.
+ */
 bool OverlayProtection::RemoveFromWhitelist(const std::wstring& moduleName) {
     try {
+        const std::wstring lower = ToLowerW(moduleName);
         std::unique_lock lock(m_impl->m_whitelistMutex);
-        const bool removed = m_impl->m_moduleWhitelist.erase(moduleName) > 0;
+        const bool removed = m_impl->m_moduleWhitelist.erase(lower) > 0;
 
         if (removed) {
             Utils::Logger::Info("OverlayProtection: Removed {} from whitelist",
-                               std::string(moduleName.begin(), moduleName.end()));
+                               Utils::StringUtils::ToNarrow(moduleName));
         }
 
         return removed;
@@ -1469,10 +2410,14 @@ bool OverlayProtection::RemoveFromWhitelist(const std::wstring& moduleName) {
     }
 }
 
+/**
+ * FIX #16: Normalize to lowercase on lookup.
+ */
 bool OverlayProtection::IsWhitelisted(const std::wstring& moduleName) const {
     try {
+        const std::wstring lower = ToLowerW(moduleName);
         std::shared_lock lock(m_impl->m_whitelistMutex);
-        return m_impl->m_moduleWhitelist.count(moduleName) > 0;
+        return m_impl->m_moduleWhitelist.count(lower) > 0;
     } catch (...) {
         return false;
     }
@@ -1705,10 +2650,16 @@ bool OverlayProtection::SelfTest() {
             }
         }
 
-        // Test 2: Known overlay detection
+        // Test 2: Known overlay detection (using lowercase)
         {
             if (!m_impl->IsKnownOverlayModule(L"discord_hook.dll")) {
                 Utils::Logger::Error("OverlayProtection: Self-test failed (known overlay detection)");
+                return false;
+            }
+
+            // Case-insensitive test
+            if (!m_impl->IsKnownOverlayModule(L"DISCORD_HOOK.DLL")) {
+                Utils::Logger::Error("OverlayProtection: Self-test failed (case-insensitive overlay detection)");
                 return false;
             }
 
@@ -1716,13 +2667,23 @@ bool OverlayProtection::SelfTest() {
                 Utils::Logger::Error("OverlayProtection: Self-test failed (false positive)");
                 return false;
             }
+
+            // FIX #20: Ensure substring bypass is blocked
+            if (m_impl->IsKnownOverlayModule(L"not_discord_hook.dll_malware.exe")) {
+                Utils::Logger::Error("OverlayProtection: Self-test failed (substring bypass not blocked)");
+                return false;
+            }
         }
 
         // Test 3: DWM composition check
         {
-            BOOL compositionEnabled = FALSE;
-            if (FAILED(DwmIsCompositionEnabled(&compositionEnabled))) {
-                Utils::Logger::Warn("OverlayProtection: Self-test warning (DWM check failed)");
+            if (m_impl->m_isWindows8Plus) {
+                // On Win8+, DWM is always enabled
+            } else {
+                BOOL compositionEnabled = FALSE;
+                if (FAILED(DwmIsCompositionEnabled(&compositionEnabled))) {
+                    Utils::Logger::Warn("OverlayProtection: Self-test warning (DWM check failed)");
+                }
             }
         }
 
@@ -1733,6 +2694,21 @@ bool OverlayProtection::SelfTest() {
             }
         }
 
+        // Test 5: Inline hook detection on known-good address
+        {
+            // GetProcAddress of a known function should NOT be hooked in self-test
+            HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+            if (hKernel) {
+                FARPROC proc = GetProcAddress(hKernel, "GetLastError");
+                if (proc) {
+                    // This is informational - a hook here would be very unusual
+                    if (m_impl->DetectInlineHook(reinterpret_cast<uint64_t>(proc))) {
+                        Utils::Logger::Warn("OverlayProtection: Self-test warning (kernel32!GetLastError appears hooked)");
+                    }
+                }
+            }
+        }
+
         Utils::Logger::Info("OverlayProtection: Self-test PASSED");
         return true;
 
@@ -1740,17 +2716,19 @@ bool OverlayProtection::SelfTest() {
         Utils::Logger::Error("OverlayProtection: Self-test failed with exception: {}", ex.what());
         return false;
     } catch (...) {
-        Utils::Logger::Critical("OverlayProtection: Self-test failed (unknown exception)");
+        Utils::Logger::Fatal("OverlayProtection: Self-test failed (unknown exception)");
         return false;
     }
 }
 
-std::string OverlayProtection::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << OverlayConstants::VERSION_MAJOR << "."
-        << OverlayConstants::VERSION_MINOR << "."
-        << OverlayConstants::VERSION_PATCH;
-    return oss.str();
+/**
+ * FIX #25: Removed noexcept (std::format can throw). Signature updated in HPP.
+ */
+std::string OverlayProtection::GetVersionString() {
+    return std::format("{}.{}.{}",
+                       OverlayConstants::VERSION_MAJOR,
+                       OverlayConstants::VERSION_MINOR,
+                       OverlayConstants::VERSION_PATCH);
 }
 
 // ============================================================================
@@ -1949,6 +2927,11 @@ std::string_view GetThreatLevelName(OverlayThreatLevel level) noexcept {
     }
 }
 
+/**
+ * FIX #6: Multi-monitor support using EnumDisplayMonitors.
+ * Builds a vector of HMONITORs, indexes by monitorIndex, bounds-checks,
+ * and falls back to primary monitor.
+ */
 RECT CalculateOverlayPosition(
     OverlayPosition position,
     uint32_t width,
@@ -1958,7 +2941,6 @@ RECT CalculateOverlayPosition(
     RECT rect{};
 
     try {
-        // Get monitor info
         HMONITOR hMonitor = nullptr;
 
         if (monitorIndex < 0) {
@@ -1966,8 +2948,33 @@ RECT CalculateOverlayPosition(
             const POINT pt{0, 0};
             hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
         } else {
-            // TODO: Enumerate to specific monitor index
-            hMonitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+            // FIX #6: Enumerate monitors and index by monitorIndex
+            struct MonitorEnumData {
+                std::vector<HMONITOR> monitors;
+            };
+            MonitorEnumData enumData;
+
+            auto enumProc = [](HMONITOR hMon, HDC, LPRECT, LPARAM lParam) -> BOOL {
+                auto* data = reinterpret_cast<MonitorEnumData*>(lParam);
+                if (data->monitors.size() < 32) {  // Cap to prevent unbounded allocation
+                    data->monitors.push_back(hMon);
+                }
+                return TRUE;
+            };
+
+            EnumDisplayMonitors(nullptr, nullptr, enumProc,
+                              reinterpret_cast<LPARAM>(&enumData));
+
+            if (!enumData.monitors.empty() &&
+                static_cast<size_t>(monitorIndex) < enumData.monitors.size()) {
+                hMonitor = enumData.monitors[static_cast<size_t>(monitorIndex)];
+            } else {
+                // Bounds-check failed: fall back to primary
+                Utils::Logger::Warn("OverlayProtection: Monitor index {} out of range ({}). "
+                                   "Falling back to primary.",
+                                   monitorIndex, enumData.monitors.size());
+                hMonitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+            }
         }
 
         MONITORINFO mi{};

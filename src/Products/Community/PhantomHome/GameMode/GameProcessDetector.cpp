@@ -74,11 +74,11 @@
 #include <nlohmann/json.hpp>
 
 // ShadowStrike infrastructure
-#include "../Utils/Logger.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
 
 // Windows-specific headers
 #ifdef _WIN32
@@ -97,6 +97,79 @@ namespace GameMode {
 // ============================================================================
 
 namespace {
+
+// ============================================================================
+// INTERNAL NARROW STRING HELPERS (PhantomCore/Utils/StringUtils provides
+// wide variants; narrow variants live here for local lookup keys only)
+// ============================================================================
+
+/// @brief Locale-independent ASCII lowercase for narrow strings (safe for
+///        ASCII-only keys used in in-memory game-title search).
+[[nodiscard]] inline std::string NarrowToLower(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out.push_back(static_cast<char>(
+            (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c));
+    }
+    return out;
+}
+
+// ============================================================================
+// RAII HANDLE WRAPPER (Fix 8)
+// ============================================================================
+
+/**
+ * @brief RAII wrapper for Windows HANDLE resources.
+ *
+ * Automatically closes the handle on destruction. Supports both
+ * CreateToolhelp32Snapshot (INVALID_HANDLE_VALUE on error) and
+ * OpenProcess (NULL on error) patterns.
+ */
+class ScopedHandle final {
+public:
+    explicit ScopedHandle(HANDLE h = nullptr) noexcept : m_handle(h) {}
+    ~ScopedHandle() noexcept { Close(); }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = nullptr;
+    }
+
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            Close();
+            m_handle = other.m_handle;
+            other.m_handle = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return m_handle != nullptr && m_handle != INVALID_HANDLE_VALUE;
+    }
+
+    void Close() noexcept {
+        if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(m_handle);
+        }
+        m_handle = nullptr;
+    }
+
+    /// @brief Release ownership without closing
+    [[nodiscard]] HANDLE Release() noexcept {
+        HANDLE h = m_handle;
+        m_handle = nullptr;
+        return h;
+    }
+
+private:
+    HANDLE m_handle = nullptr;
+};
 
 /**
  * @brief Launcher database entry
@@ -131,7 +204,7 @@ const std::vector<LauncherDefinition> LAUNCHER_DATABASE = {
      L"SOFTWARE\\Amazon Games", L"Path"},
     {LauncherType::RiotClient, "Riot Client", {L"RiotClientServices.exe", L"LeagueClient.exe"},
      L"SOFTWARE\\Riot Games", L""},
-    {LauncherType::Rockstar, "Rockstar Games Launcher", {L"Launcher.exe", L"RockstarService.exe"},
+    {LauncherType::Rockstar, "Rockstar Games Launcher", {L"RockstarGamesLauncher.exe", L"RockstarService.exe"},
      L"SOFTWARE\\Rockstar Games\\Launcher", L"InstallFolder"},
     {LauncherType::Bethesda, "Bethesda.net Launcher", {L"BethesdaNetLauncher.exe"},
      L"SOFTWARE\\Bethesda Softworks\\Bethesda.net", L"installLocation"}
@@ -265,7 +338,7 @@ public:
     bool RemoveUserGame(const std::wstring& processName);
 
     // Callbacks
-    void RegisterGameDetectedCallback(GameDetectedCallback callback);
+    void RegisterGameDetectedCallback(DetectedGameCallback callback);
     void RegisterGameExitedCallback(GameExitedCallback callback);
     void RegisterFullscreenChangeCallback(FullscreenChangeCallback callback);
     void RegisterLauncherCallback(LauncherCallback callback);
@@ -323,7 +396,7 @@ private:
 
     // Callbacks
     mutable std::mutex m_callbackMutex;
-    GameDetectedCallback m_gameDetectedCallback;
+    DetectedGameCallback m_gameDetectedCallback;
     GameExitedCallback m_gameExitedCallback;
     FullscreenChangeCallback m_fullscreenCallback;
     LauncherCallback m_launcherCallback;
@@ -338,19 +411,19 @@ private:
 // ============================================================================
 
 GameProcessDetectorImpl::GameProcessDetectorImpl() {
-    Logger::Info("[GameProcessDetector] Instance created");
+    Utils::Logger::Info("[GameProcessDetector] Instance created");
 }
 
 GameProcessDetectorImpl::~GameProcessDetectorImpl() {
     Shutdown();
-    Logger::Info("[GameProcessDetector] Instance destroyed");
+    Utils::Logger::Info("[GameProcessDetector] Instance destroyed");
 }
 
 bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
-        Logger::Warn("[GameProcessDetector] Already initialized");
+        Utils::Logger::Warn("[GameProcessDetector] Already initialized");
         return true;
     }
 
@@ -359,7 +432,7 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
 
         // Validate configuration
         if (!config.IsValid()) {
-            Logger::Error("[GameProcessDetector] Invalid configuration");
+            Utils::Logger::Error("[GameProcessDetector] Invalid configuration");
             m_status.store(DetectorStatus::Error, std::memory_order_release);
             return false;
         }
@@ -377,7 +450,7 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
         for (const auto& gameName : m_config.userDefinedGames) {
             m_userDefinedGames.insert(gameName);
             GameEntry userEntry;
-            userEntry.title = StringUtils::WStringToString(gameName);
+            userEntry.title = Utils::StringUtils::WStringToString(gameName);
             userEntry.executableNames.push_back(gameName);
             userEntry.category = GameCategory::Unknown;
             m_gameDatabase[gameName] = userEntry;
@@ -409,25 +482,23 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
         m_initialized.store(true, std::memory_order_release);
         m_status.store(DetectorStatus::Running, std::memory_order_release);
 
-        Logger::Info("[GameProcessDetector] Initialized successfully (Version {}, {} games in database)",
+        Utils::Logger::Info("[GameProcessDetector] Initialized successfully (Version {}, {} games in database)",
             GameProcessDetector::GetVersionString(), m_gameDatabase.size());
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Critical("[GameProcessDetector] Initialization failed: {}", e.what());
+        Utils::Logger::Fatal("[GameProcessDetector] Initialization failed: {}", e.what());
         m_status.store(DetectorStatus::Error, std::memory_order_release);
         return false;
     } catch (...) {
-        Logger::Critical("[GameProcessDetector] Initialization failed: Unknown error");
+        Utils::Logger::Fatal("[GameProcessDetector] Initialization failed: Unknown error");
         m_status.store(DetectorStatus::Error, std::memory_order_release);
         return false;
     }
 }
 
 void GameProcessDetectorImpl::Shutdown() {
-    std::unique_lock lock(m_mutex);
-
     if (!m_initialized.load(std::memory_order_acquire)) {
         return;
     }
@@ -435,36 +506,45 @@ void GameProcessDetectorImpl::Shutdown() {
     try {
         m_status.store(DetectorStatus::Stopping, std::memory_order_release);
 
-        // Stop monitoring thread
-        if (m_monitoringActive.load(std::memory_order_acquire)) {
-            m_monitoringActive.store(false, std::memory_order_release);
-            m_monitoringCV.notify_all();
+        // Signal monitoring thread BEFORE acquiring m_mutex to avoid deadlock.
+        // The monitoring thread may be waiting on m_monitoringCV or holding
+        // m_mutex in ProcessMonitoringTick -- signaling first ensures it can exit.
+        m_monitoringActive.store(false, std::memory_order_release);
+        m_monitoringCV.notify_all();
 
-            if (m_monitoringThread && m_monitoringThread->joinable()) {
-                lock.unlock();  // Release lock before joining
-                m_monitoringThread->join();
-                lock.lock();
-            }
-            m_monitoringThread.reset();
+        // Join thread entirely outside m_mutex scope to prevent deadlock
+        // with MonitoringThreadFunc which acquires m_mutex in its tick.
+        std::unique_ptr<std::thread> threadToJoin;
+        {
+            std::unique_lock lock(m_mutex);
+            threadToJoin = std::move(m_monitoringThread);
         }
 
-        // Clear state
-        m_detectedGames.clear();
-        m_gameDatabase.clear();
-        m_userDefinedGames.clear();
+        if (threadToJoin && threadToJoin->joinable()) {
+            threadToJoin->join();
+        }
 
-        // Clear callbacks
+        // Now safe to clean up state under lock
+        {
+            std::unique_lock lock(m_mutex);
+
+            m_detectedGames.clear();
+            m_gameDatabase.clear();
+            m_userDefinedGames.clear();
+        }
+
+        // Clear callbacks (uses its own m_callbackMutex)
         UnregisterCallbacks();
 
         m_initialized.store(false, std::memory_order_release);
         m_status.store(DetectorStatus::Stopped, std::memory_order_release);
 
-        Logger::Info("[GameProcessDetector] Shutdown complete");
+        Utils::Logger::Info("[GameProcessDetector] Shutdown complete");
 
     } catch (const std::exception& e) {
-        Logger::Error("[GameProcessDetector] Shutdown error: {}", e.what());
+        Utils::Logger::Error("[GameProcessDetector] Shutdown error: {}", e.what());
     } catch (...) {
-        Logger::Error("[GameProcessDetector] Shutdown error: Unknown exception");
+        Utils::Logger::Error("[GameProcessDetector] Shutdown error: Unknown exception");
     }
 }
 
@@ -472,12 +552,12 @@ bool GameProcessDetectorImpl::UpdateConfiguration(const DetectorConfiguration& c
     std::unique_lock lock(m_mutex);
 
     if (!config.IsValid()) {
-        Logger::Error("[GameProcessDetector] Invalid configuration");
+        Utils::Logger::Error("[GameProcessDetector] Invalid configuration");
         return false;
     }
 
     m_config = config;
-    Logger::Info("[GameProcessDetector] Configuration updated");
+    Utils::Logger::Info("[GameProcessDetector] Configuration updated");
     return true;
 }
 
@@ -549,7 +629,7 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
         {
             std::shared_lock lock(m_mutex);
             for (const auto& excluded : m_config.excludedProcesses) {
-                if (StringUtils::EqualsIgnoreCase(processName, excluded)) {
+                if (Utils::StringUtils::IEquals(processName, excluded)) {
                     return std::nullopt;
                 }
             }
@@ -591,6 +671,8 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
         // Get window information
 #ifdef _WIN32
         HWND hwnd = nullptr;
+        // Fix 1: Named local variable to prevent dangling pointer from temporary
+        auto enumData = std::make_pair(pid, &hwnd);
         EnumWindows([](HWND h, LPARAM lParam) -> BOOL {
             auto* data = reinterpret_cast<std::pair<uint32_t, HWND*>*>(lParam);
             DWORD windowPid = 0;
@@ -600,7 +682,7 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
                 return FALSE;
             }
             return TRUE;
-        }, reinterpret_cast<LPARAM>(&std::make_pair(pid, &hwnd)));
+        }, reinterpret_cast<LPARAM>(&enumData));
 
         if (hwnd) {
             game.windowHandle = hwnd;
@@ -622,13 +704,13 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
         // Notify callback
         NotifyGameDetected(game);
 
-        Logger::Info("[GameProcessDetector] Detected game: {} (PID {}, confidence {}%)",
-            StringUtils::WStringToString(processName), pid, game.confidence);
+        Utils::Logger::Info("[GameProcessDetector] Detected game: {} (PID {}, confidence {}%)",
+            Utils::StringUtils::WStringToString(processName), pid, game.confidence);
 
         return game;
 
     } catch (const std::exception& e) {
-        Logger::Error("[GameProcessDetector] DetectGame failed for PID {}: {}", pid, e.what());
+        Utils::Logger::Error("[GameProcessDetector] DetectGame failed for PID {}: {}", pid, e.what());
         return std::nullopt;
     }
 }
@@ -827,9 +909,104 @@ VRPlatform GameProcessDetectorImpl::GetActiveVRPlatform() const noexcept {
 // ============================================================================
 
 bool GameProcessDetectorImpl::LoadDatabase(const std::wstring& path) {
-    // In production, load from file/registry
-    // For now, we use the built-in database
-    Logger::Info("[GameProcessDetector] Using built-in game database ({} entries)", KNOWN_GAMES_DATABASE.size());
+    // Determine file path: use provided path, fall back to config, then constant
+    std::wstring dbPath = path;
+    if (dbPath.empty()) {
+        std::shared_lock lock(m_mutex);
+        dbPath = m_config.customDatabasePath;
+    }
+    if (dbPath.empty()) {
+        dbPath = DetectorConstants::GAME_DATABASE_PATH;
+    }
+
+    // Attempt to load from file
+    std::string jsonContent;
+    Utils::FileUtils::Error fileErr;
+    if (Utils::FileUtils::Exists(dbPath) &&
+        Utils::FileUtils::ReadAllTextUtf8(dbPath, jsonContent, &fileErr)) {
+        try {
+            auto jsonArray = nlohmann::json::parse(jsonContent);
+            if (!jsonArray.is_array()) {
+                Utils::Logger::Error("[GameProcessDetector] Database file is not a JSON array: {}",
+                    Utils::StringUtils::WStringToString(dbPath));
+                return false;
+            }
+
+            std::unique_lock lock(m_mutex);
+
+            size_t loadedCount = 0;
+            for (const auto& item : jsonArray) {
+                // Cap allocation to prevent DoS from enormous database files
+                if (loadedCount >= 50000) {
+                    Utils::Logger::Warn("[GameProcessDetector] Database capped at 50000 entries");
+                    break;
+                }
+
+                GameEntry entry;
+                entry.gameId = item.value("gameId", static_cast<uint64_t>(0));
+                entry.title = item.value("title", std::string{});
+                entry.publisher = item.value("publisher", std::string{});
+                entry.category = static_cast<GameCategory>(item.value("category", 0));
+                entry.launcher = static_cast<LauncherType>(item.value("launcher", 0));
+                entry.isVR = item.value("isVR", false);
+                entry.requiresElevatedPerformance = item.value("requiresElevatedPerformance", false);
+
+                if (item.contains("executableNames") && item["executableNames"].is_array()) {
+                    for (const auto& exeItem : item["executableNames"]) {
+                        std::string exeNameNarrow = exeItem.get<std::string>();
+                        std::wstring exeNameWide = Utils::StringUtils::ToWide(exeNameNarrow);
+                        if (!exeNameWide.empty()) {
+                            entry.executableNames.push_back(exeNameWide);
+                        }
+                    }
+                }
+
+                if (item.contains("windowClasses") && item["windowClasses"].is_array()) {
+                    for (const auto& wcItem : item["windowClasses"]) {
+                        entry.windowClasses.push_back(wcItem.get<std::string>());
+                    }
+                }
+
+                // Register each executable name as a database key
+                for (const auto& exeName : entry.executableNames) {
+                    m_gameDatabase[exeName] = entry;
+                    ++loadedCount;
+                }
+            }
+
+            Utils::Logger::Info("[GameProcessDetector] Loaded {} game entries from file: {}",
+                loadedCount, Utils::StringUtils::WStringToString(dbPath));
+            return true;
+
+        } catch (const nlohmann::json::parse_error& e) {
+            Utils::Logger::Error("[GameProcessDetector] JSON parse error in database file: {}", e.what());
+            return false;
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("[GameProcessDetector] Database load error: {}", e.what());
+            return false;
+        }
+    }
+
+    // File not found or unreadable -- fall back to built-in database
+    if (fileErr.hasError()) {
+        Utils::Logger::Warn("[GameProcessDetector] Could not read database file (Win32 error {}): {}, falling back to built-in database",
+            fileErr.win32, fileErr.message);
+    } else {
+        Utils::Logger::Warn("[GameProcessDetector] Database file not found at {}, using built-in database",
+            Utils::StringUtils::WStringToString(dbPath));
+    }
+
+    // Ensure built-in database is loaded
+    {
+        std::unique_lock lock(m_mutex);
+        for (const auto& game : KNOWN_GAMES_DATABASE) {
+            for (const auto& exeName : game.executableNames) {
+                m_gameDatabase[exeName] = game;
+            }
+        }
+    }
+
+    Utils::Logger::Info("[GameProcessDetector] Using built-in game database ({} entries)", KNOWN_GAMES_DATABASE.size());
     return true;
 }
 
@@ -842,11 +1019,20 @@ std::vector<GameEntry> GameProcessDetectorImpl::SearchDatabase(const std::string
     std::shared_lock lock(m_mutex);
 
     std::vector<GameEntry> results;
-    std::string lowerQuery = StringUtils::ToLower(query);
+    std::unordered_set<uint64_t> seenIds;
+    std::string lowerQuery = NarrowToLower(query);
 
     for (const auto& [exeName, entry] : m_gameDatabase) {
-        std::string lowerTitle = StringUtils::ToLower(entry.title);
+        // Deduplicate: multiple exe names map to the same GameEntry
+        if (entry.gameId != 0 && seenIds.count(entry.gameId) > 0) {
+            continue;
+        }
+
+        std::string lowerTitle = NarrowToLower(entry.title);
         if (lowerTitle.find(lowerQuery) != std::string::npos) {
+            if (entry.gameId != 0) {
+                seenIds.insert(entry.gameId);
+            }
             results.push_back(entry);
             if (results.size() >= limit) {
                 break;
@@ -863,24 +1049,30 @@ bool GameProcessDetectorImpl::AddUserGame(const std::wstring& processName, const
     m_userDefinedGames.insert(processName);
 
     GameEntry entry;
-    entry.title = title.empty() ? StringUtils::WStringToString(processName) : title;
+    entry.title = title.empty() ? Utils::StringUtils::WStringToString(processName) : title;
     entry.executableNames.push_back(processName);
     entry.category = GameCategory::Unknown;
     entry.launcher = LauncherType::Custom;
 
     m_gameDatabase[processName] = entry;
 
-    Logger::Info("[GameProcessDetector] Added user-defined game: {}", entry.title);
+    Utils::Logger::Info("[GameProcessDetector] Added user-defined game: {}", entry.title);
     return true;
 }
 
 bool GameProcessDetectorImpl::RemoveUserGame(const std::wstring& processName) {
     std::unique_lock lock(m_mutex);
 
-    m_userDefinedGames.erase(processName);
-    m_gameDatabase.erase(processName);
+    const size_t userErased = m_userDefinedGames.erase(processName);
+    const size_t dbErased = m_gameDatabase.erase(processName);
 
-    Logger::Info("[GameProcessDetector] Removed user-defined game: {}", StringUtils::WStringToString(processName));
+    if (userErased == 0 && dbErased == 0) {
+        Utils::Logger::Warn("[GameProcessDetector] RemoveUserGame: entry not found: {}",
+            Utils::StringUtils::WStringToString(processName));
+        return false;
+    }
+
+    Utils::Logger::Info("[GameProcessDetector] Removed user-defined game: {}", Utils::StringUtils::WStringToString(processName));
     return true;
 }
 
@@ -888,7 +1080,7 @@ bool GameProcessDetectorImpl::RemoveUserGame(const std::wstring& processName) {
 // CALLBACKS
 // ============================================================================
 
-void GameProcessDetectorImpl::RegisterGameDetectedCallback(GameDetectedCallback callback) {
+void GameProcessDetectorImpl::RegisterGameDetectedCallback(DetectedGameCallback callback) {
     std::lock_guard lock(m_callbackMutex);
     m_gameDetectedCallback = std::move(callback);
 }
@@ -927,13 +1119,25 @@ void GameProcessDetectorImpl::UnregisterCallbacks() {
 // ============================================================================
 
 DetectorStatistics GameProcessDetectorImpl::GetStatistics() const {
-    return m_stats;
+    // Snapshot all atomics in sequence. Individual loads are atomic but the
+    // aggregate is only approximately consistent -- acceptable for telemetry.
+    // Document: this is a best-effort snapshot, not a transactional read.
+    DetectorStatistics snapshot;
+    snapshot.gamesDetected.store(m_stats.gamesDetected.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.fullscreenDetections.store(m_stats.fullscreenDetections.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.launcherDetections.store(m_stats.launcherDetections.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.vrDetections.store(m_stats.vrDetections.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.falsePositives.store(m_stats.falsePositives.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.processesScanned.store(m_stats.processesScanned.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.databaseLookups.store(m_stats.databaseLookups.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.startTime = m_stats.startTime;
+    return snapshot;
 }
 
 void GameProcessDetectorImpl::ResetStatistics() {
     m_stats.Reset();
     m_stats.startTime = Clock::now();
-    Logger::Info("[GameProcessDetector] Statistics reset");
+    Utils::Logger::Info("[GameProcessDetector] Statistics reset");
 }
 
 // ============================================================================
@@ -941,29 +1145,94 @@ void GameProcessDetectorImpl::ResetStatistics() {
 // ============================================================================
 
 void GameProcessDetectorImpl::MonitoringThreadFunc() {
-    Logger::Info("[GameProcessDetector] Monitoring thread started");
+    Utils::Logger::Info("[GameProcessDetector] Monitoring thread started");
 
     while (m_monitoringActive.load(std::memory_order_acquire)) {
         try {
             ProcessMonitoringTick();
 
-            // Sleep for poll interval
+            // Fix 7: Snapshot config under shared_lock for the sleep interval
+            uint32_t pollMs;
+            {
+                std::shared_lock lock(m_mutex);
+                pollMs = m_config.pollIntervalMs;
+            }
+
             std::unique_lock lock(m_monitoringMutex);
-            m_monitoringCV.wait_for(lock, std::chrono::milliseconds(m_config.pollIntervalMs),
+            m_monitoringCV.wait_for(lock, std::chrono::milliseconds(pollMs),
                 [this] { return !m_monitoringActive.load(std::memory_order_acquire); });
 
         } catch (const std::exception& e) {
-            Logger::Error("[GameProcessDetector] Monitoring error: {}", e.what());
+            Utils::Logger::Error("[GameProcessDetector] Monitoring error: {}", e.what());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 
-    Logger::Info("[GameProcessDetector] Monitoring thread stopped");
+    Utils::Logger::Info("[GameProcessDetector] Monitoring thread stopped");
 }
 
 void GameProcessDetectorImpl::ProcessMonitoringTick() {
-    // Update launcher detection
-    if (m_config.enableLauncherDetection) {
+    // Fix 7: Snapshot m_config under shared_lock at the top of tick
+    DetectorConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+
+    // Fix 3: Take a SINGLE process snapshot and iterate once for ALL launchers AND VR runtimes
+#ifdef _WIN32
+    // Per-launcher state collected during the single pass
+    struct LauncherScanResult {
+        bool isRunning = false;
+        std::vector<uint32_t> runningPids;
+    };
+
+    std::unordered_map<LauncherType, LauncherScanResult> launcherResults;
+    VRPlatform detectedVR = VRPlatform::None;
+
+    if (configSnapshot.enableLauncherDetection || configSnapshot.enableVRDetection) {
+        ScopedHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (hSnapshot) {
+            PROCESSENTRY32W pe32{};
+            pe32.dwSize = sizeof(pe32);
+
+            if (Process32FirstW(hSnapshot.Get(), &pe32)) {
+                do {
+                    // Match all launchers in this single iteration
+                    if (configSnapshot.enableLauncherDetection) {
+                        for (const auto& launcherDef : LAUNCHER_DATABASE) {
+                            for (const auto& processName : launcherDef.processNames) {
+                                if (Utils::StringUtils::IEquals(pe32.szExeFile, processName)) {
+                                    auto& result = launcherResults[launcherDef.type];
+                                    result.isRunning = true;
+                                    result.runningPids.push_back(pe32.th32ProcessID);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Match all VR runtimes in the same iteration
+                    if (configSnapshot.enableVRDetection && detectedVR == VRPlatform::None) {
+                        for (const auto& vrRuntime : VR_RUNTIMES) {
+                            for (const auto& processName : vrRuntime.processNames) {
+                                if (Utils::StringUtils::IEquals(pe32.szExeFile, processName)) {
+                                    detectedVR = vrRuntime.platform;
+                                    break;
+                                }
+                            }
+                            if (detectedVR != VRPlatform::None) break;
+                        }
+                    }
+
+                } while (Process32NextW(hSnapshot.Get(), &pe32));
+            }
+            // ScopedHandle automatically closes the snapshot
+        }
+    }
+
+    // Update launcher state
+    if (configSnapshot.enableLauncherDetection) {
         for (const auto& launcherDef : LAUNCHER_DATABASE) {
             bool wasRunning = false;
             {
@@ -974,102 +1243,48 @@ void GameProcessDetectorImpl::ProcessMonitoringTick() {
                 }
             }
 
-            // Check if any launcher process is running
-            bool isRunning = false;
-            std::vector<uint32_t> runningPids;
-
-#ifdef _WIN32
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (hSnapshot != INVALID_HANDLE_VALUE) {
-                PROCESSENTRY32W pe32{};
-                pe32.dwSize = sizeof(pe32);
-
-                if (Process32FirstW(hSnapshot, &pe32)) {
-                    do {
-                        for (const auto& processName : launcherDef.processNames) {
-                            if (StringUtils::EqualsIgnoreCase(pe32.szExeFile, processName)) {
-                                isRunning = true;
-                                runningPids.push_back(pe32.th32ProcessID);
-                                break;
-                            }
-                        }
-                    } while (Process32NextW(hSnapshot, &pe32));
-                }
-
-                CloseHandle(hSnapshot);
-            }
-#endif
+            auto& result = launcherResults[launcherDef.type];
 
             {
                 std::unique_lock lock(m_mutex);
                 auto& info = m_launchers[launcherDef.type];
-                info.isRunning = isRunning;
-                info.runningPids = runningPids;
+                info.isRunning = result.isRunning;
+                info.runningPids = std::move(result.runningPids);
             }
 
-            if (isRunning != wasRunning) {
-                NotifyLauncher(launcherDef.type, isRunning);
+            if (result.isRunning != wasRunning) {
+                NotifyLauncher(launcherDef.type, result.isRunning);
                 m_stats.launcherDetections++;
             }
         }
     }
 
-    // Update VR detection
-    if (m_config.enableVRDetection) {
-        VRPlatform detectedVR = VRPlatform::None;
-
-        for (const auto& vrRuntime : VR_RUNTIMES) {
-#ifdef _WIN32
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (hSnapshot != INVALID_HANDLE_VALUE) {
-                PROCESSENTRY32W pe32{};
-                pe32.dwSize = sizeof(pe32);
-
-                if (Process32FirstW(hSnapshot, &pe32)) {
-                    do {
-                        for (const auto& processName : vrRuntime.processNames) {
-                            if (StringUtils::EqualsIgnoreCase(pe32.szExeFile, processName)) {
-                                detectedVR = vrRuntime.platform;
-                                break;
-                            }
-                        }
-                        if (detectedVR != VRPlatform::None) break;
-                    } while (Process32NextW(hSnapshot, &pe32));
-                }
-
-                CloseHandle(hSnapshot);
-            }
-#endif
-            if (detectedVR != VRPlatform::None) break;
-        }
-
+    // Update VR state
+    if (configSnapshot.enableVRDetection) {
         VRPlatform previousVR = m_activeVRPlatform.load(std::memory_order_acquire);
         if (detectedVR != previousVR) {
             m_activeVRPlatform.store(detectedVR, std::memory_order_release);
             if (detectedVR != VRPlatform::None) {
                 m_stats.vrDetections++;
-                Logger::Info("[GameProcessDetector] VR platform active: {}", GetVRPlatformName(detectedVR));
+                Utils::Logger::Info("[GameProcessDetector] VR platform active: {}", GetVRPlatformName(detectedVR));
             }
         }
     }
 
-    // Check for exited games
+    // Fix 19: Check for exited games using PROCESS_QUERY_LIMITED_INFORMATION + ScopedHandle RAII
     std::vector<uint32_t> exitedPids;
     {
         std::shared_lock lock(m_mutex);
         for (const auto& [pid, game] : m_detectedGames) {
-#ifdef _WIN32
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
             if (!hProcess) {
                 exitedPids.push_back(pid);
             } else {
                 DWORD exitCode = 0;
-                if (GetExitCodeProcess(hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+                if (GetExitCodeProcess(hProcess.Get(), &exitCode) && exitCode != STILL_ACTIVE) {
                     exitedPids.push_back(pid);
                 }
-                CloseHandle(hProcess);
             }
-#endif
         }
     }
 
@@ -1080,10 +1295,11 @@ void GameProcessDetectorImpl::ProcessMonitoringTick() {
         }
         NotifyGameExited(pid);
     }
+#endif // _WIN32
 }
 
 bool GameProcessDetectorImpl::MatchGameDatabase(const std::wstring& processName,
-                                               const std::wstring& processPath,
+                                               const std::wstring& /*processPath*/,
                                                GameEntry& outEntry) {
     auto it = m_gameDatabase.find(processName);
     if (it != m_gameDatabase.end()) {
@@ -1113,15 +1329,17 @@ bool GameProcessDetectorImpl::MatchWindowClass(HWND hwnd) {
 }
 
 bool GameProcessDetectorImpl::IsHeuristicMatch(uint32_t pid, const std::wstring& processPath) {
-    // Heuristic indicators for games:
-    // - Process in common game directories
-    // - Has DirectX/Vulkan/OpenGL DLLs loaded
-    // - Window class matches game engines
-    // - High CPU/GPU usage
+    // Multi-signal convergence heuristic: require 2+ signals to classify as game.
+    // Signals:
+    //   1. Process in common game directories
+    //   2. Window class matches a known game engine
+    //   3. Graphics API modules loaded (d3d11, d3d12, vulkan, opengl)
 
-    std::wstring lowerPath = StringUtils::ToLower(processPath);
+    int signalCount = 0;
 
-    // Check for common game install directories
+    // Signal 1: Check for common game install directories
+    std::wstring lowerPath = Utils::StringUtils::ToLowerCopy(processPath);
+
     const std::vector<std::wstring> gameDirectories = {
         L"\\steam\\",
         L"\\steamapps\\",
@@ -1136,18 +1354,73 @@ bool GameProcessDetectorImpl::IsHeuristicMatch(uint32_t pid, const std::wstring&
 
     for (const auto& dir : gameDirectories) {
         if (lowerPath.find(dir) != std::wstring::npos) {
-            return true;
+            ++signalCount;
+            break;
         }
     }
 
-    return false;
+#ifdef _WIN32
+    // Signal 2: Check window class via MatchWindowClass (Fix 14: integrating it)
+    {
+        HWND hwnd = nullptr;
+        auto enumData = std::make_pair(pid, &hwnd);
+        EnumWindows([](HWND h, LPARAM lParam) -> BOOL {
+            auto* data = reinterpret_cast<std::pair<uint32_t, HWND*>*>(lParam);
+            DWORD windowPid = 0;
+            GetWindowThreadProcessId(h, &windowPid);
+            if (windowPid == data->first && IsWindowVisible(h)) {
+                *data->second = h;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&enumData));
+
+        if (hwnd && MatchWindowClass(hwnd)) {
+            ++signalCount;
+        }
+    }
+
+    // Signal 3: Enumerate loaded modules for graphics API DLLs
+    {
+        ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+        if (hProcess) {
+            HMODULE hMods[512] = {};
+            DWORD cbNeeded = 0;
+
+            if (EnumProcessModulesEx(hProcess.Get(), hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL)) {
+                const DWORD moduleCount = (std::min)(cbNeeded / static_cast<DWORD>(sizeof(HMODULE)),
+                                                     static_cast<DWORD>(std::size(hMods)));
+
+                const std::array<std::wstring_view, 4> graphicsModules = {
+                    L"d3d11.dll", L"d3d12.dll", L"vulkan-1.dll", L"opengl32.dll"
+                };
+
+                for (DWORD i = 0; i < moduleCount; ++i) {
+                    wchar_t modName[256] = {};
+                    if (GetModuleBaseNameW(hProcess.Get(), hMods[i], modName, static_cast<DWORD>(std::size(modName)))) {
+                        for (const auto& gfxMod : graphicsModules) {
+                            if (Utils::StringUtils::IEquals(modName, gfxMod)) {
+                                ++signalCount;
+                                goto done_modules; // Break out of both loops
+                            }
+                        }
+                    }
+                }
+                done_modules:;
+            }
+        }
+    }
+#endif // _WIN32
+
+    // Require 2+ converging signals for heuristic match
+    return signalCount >= 2;
 }
 
 LauncherType GameProcessDetectorImpl::DetectLauncherFromParent(uint32_t pid) {
 #ifdef _WIN32
-    // Get parent process
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
+    // Fix 18: Single-pass iteration to find both parentPid and parentName
+    ScopedHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!hSnapshot) {
         return LauncherType::Unknown;
     }
 
@@ -1155,32 +1428,32 @@ LauncherType GameProcessDetectorImpl::DetectLauncherFromParent(uint32_t pid) {
     pe32.dwSize = sizeof(pe32);
 
     uint32_t parentPid = 0;
-    if (Process32FirstW(hSnapshot, &pe32)) {
+    std::wstring parentName;
+
+    // First pass: find parent PID for the target process
+    if (Process32FirstW(hSnapshot.Get(), &pe32)) {
         do {
             if (pe32.th32ProcessID == pid) {
                 parentPid = pe32.th32ParentProcessID;
                 break;
             }
-        } while (Process32NextW(hSnapshot, &pe32));
+        } while (Process32NextW(hSnapshot.Get(), &pe32));
     }
 
     if (parentPid == 0) {
-        CloseHandle(hSnapshot);
         return LauncherType::Unknown;
     }
 
-    // Get parent process name
-    std::wstring parentName;
-    if (Process32FirstW(hSnapshot, &pe32)) {
+    // Single re-traverse to find parent name (same snapshot, no new handle)
+    if (Process32FirstW(hSnapshot.Get(), &pe32)) {
         do {
             if (pe32.th32ProcessID == parentPid) {
                 parentName = pe32.szExeFile;
                 break;
             }
-        } while (Process32NextW(hSnapshot, &pe32));
+        } while (Process32NextW(hSnapshot.Get(), &pe32));
     }
-
-    CloseHandle(hSnapshot);
+    // ScopedHandle closes automatically
 
     if (parentName.empty()) {
         return LauncherType::Unknown;
@@ -1189,7 +1462,7 @@ LauncherType GameProcessDetectorImpl::DetectLauncherFromParent(uint32_t pid) {
     // Match against launcher database
     for (const auto& launcher : LAUNCHER_DATABASE) {
         for (const auto& processName : launcher.processNames) {
-            if (StringUtils::EqualsIgnoreCase(parentName, processName)) {
+            if (Utils::StringUtils::IEquals(parentName, processName)) {
                 return launcher.type;
             }
         }
@@ -1205,7 +1478,7 @@ void GameProcessDetectorImpl::NotifyGameDetected(const DetectedGame& game) {
         try {
             m_gameDetectedCallback(game);
         } catch (const std::exception& e) {
-            Logger::Error("[GameProcessDetector] Game detected callback exception: {}", e.what());
+            Utils::Logger::Error("[GameProcessDetector] Game detected callback exception: {}", e.what());
         }
     }
 }
@@ -1216,7 +1489,7 @@ void GameProcessDetectorImpl::NotifyGameExited(uint32_t pid) {
         try {
             m_gameExitedCallback(pid);
         } catch (const std::exception& e) {
-            Logger::Error("[GameProcessDetector] Game exited callback exception: {}", e.what());
+            Utils::Logger::Error("[GameProcessDetector] Game exited callback exception: {}", e.what());
         }
     }
 }
@@ -1227,7 +1500,7 @@ void GameProcessDetectorImpl::NotifyFullscreenChange(bool isFullscreen, const Fu
         try {
             m_fullscreenCallback(isFullscreen, info);
         } catch (const std::exception& e) {
-            Logger::Error("[GameProcessDetector] Fullscreen callback exception: {}", e.what());
+            Utils::Logger::Error("[GameProcessDetector] Fullscreen callback exception: {}", e.what());
         }
     }
 }
@@ -1238,7 +1511,7 @@ void GameProcessDetectorImpl::NotifyLauncher(LauncherType type, bool isRunning) 
         try {
             m_launcherCallback(type, isRunning);
         } catch (const std::exception& e) {
-            Logger::Error("[GameProcessDetector] Launcher callback exception: {}", e.what());
+            Utils::Logger::Error("[GameProcessDetector] Launcher callback exception: {}", e.what());
         }
     }
 }
@@ -1249,7 +1522,7 @@ void GameProcessDetectorImpl::NotifyError(const std::string& message, int code) 
         try {
             m_errorCallback(message, code);
         } catch (const std::exception& e) {
-            Logger::Error("[GameProcessDetector] Error callback exception: {}", e.what());
+            Utils::Logger::Error("[GameProcessDetector] Error callback exception: {}", e.what());
         }
     }
 }
@@ -1288,13 +1561,13 @@ std::string GameProcessDetectorImpl::GetWindowTitle(HWND hwnd) {
 }
 
 bool GameProcessDetectorImpl::SelfTest() {
-    Logger::Info("[GameProcessDetector] Running self-test...");
+    Utils::Logger::Info("[GameProcessDetector] Running self-test...");
 
     try {
         // Test 1: Database integrity
         {
             if (m_gameDatabase.empty()) {
-                Logger::Error("[GameProcessDetector] Self-test failed: Empty game database");
+                Utils::Logger::Error("[GameProcessDetector] Self-test failed: Empty game database");
                 return false;
             }
         }
@@ -1302,7 +1575,7 @@ bool GameProcessDetectorImpl::SelfTest() {
         // Test 2: Launcher database
         {
             if (LAUNCHER_DATABASE.empty()) {
-                Logger::Error("[GameProcessDetector] Self-test failed: Empty launcher database");
+                Utils::Logger::Error("[GameProcessDetector] Self-test failed: Empty launcher database");
                 return false;
             }
         }
@@ -1310,7 +1583,7 @@ bool GameProcessDetectorImpl::SelfTest() {
         // Test 3: Process name matching
         {
             if (!IsKnownGame(L"Cyberpunk2077.exe")) {
-                Logger::Error("[GameProcessDetector] Self-test failed: Known game not recognized");
+                Utils::Logger::Error("[GameProcessDetector] Self-test failed: Known game not recognized");
                 return false;
             }
         }
@@ -1319,16 +1592,16 @@ bool GameProcessDetectorImpl::SelfTest() {
         {
             WindowState state = GetWindowState(nullptr);
             if (state != WindowState::Unknown) {
-                Logger::Error("[GameProcessDetector] Self-test failed: Invalid window state for null handle");
+                Utils::Logger::Error("[GameProcessDetector] Self-test failed: Invalid window state for null handle");
                 return false;
             }
         }
 
-        Logger::Info("[GameProcessDetector] Self-test PASSED");
+        Utils::Logger::Info("[GameProcessDetector] Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[GameProcessDetector] Self-test exception: {}", e.what());
+        Utils::Logger::Error("[GameProcessDetector] Self-test exception: {}", e.what());
         return false;
     }
 }
@@ -1459,7 +1732,7 @@ bool GameProcessDetector::RemoveUserGame(const std::wstring& processName) {
     return m_impl->RemoveUserGame(processName);
 }
 
-void GameProcessDetector::RegisterGameDetectedCallback(GameDetectedCallback callback) {
+void GameProcessDetector::RegisterGameDetectedCallback(DetectedGameCallback callback) {
     m_impl->RegisterGameDetectedCallback(std::move(callback));
 }
 
@@ -1547,7 +1820,7 @@ std::string GameEntry::ToJson() const {
 std::string DetectedGame::ToJson() const {
     nlohmann::json j;
     j["processId"] = processId;
-    j["processName"] = StringUtils::WStringToString(processName);
+    j["processName"] = Utils::StringUtils::WStringToString(processName);
     j["windowTitle"] = windowTitle;
     j["detectionMethod"] = static_cast<int>(detectionMethod);
     j["windowState"] = static_cast<int>(windowState);

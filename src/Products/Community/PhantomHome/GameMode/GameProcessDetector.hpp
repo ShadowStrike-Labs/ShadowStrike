@@ -122,9 +122,9 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -307,7 +307,7 @@ struct DetectedGame {
     /// @brief Executable path
     std::wstring executablePath;
     
-    /// @brief Window handle
+    /// @brief Window handle (may become stale if process creates/destroys windows)
     HWND windowHandle = nullptr;
     
     /// @brief Window title
@@ -328,6 +328,9 @@ struct DetectedGame {
     /// @brief Detected time
     SystemTimePoint detectedTime;
     
+    /// @brief Process creation time (for PID reuse detection)
+    FILETIME processCreationTime{};
+    
     /// @brief Last activity time
     TimePoint lastActivityTime;
     
@@ -341,6 +344,10 @@ struct DetectedGame {
     uint8_t confidence = 0;
     
     [[nodiscard]] std::string ToJson() const;
+    
+    /// @brief Re-query window handle for the process via EnumWindows.
+    /// Call this to refresh a potentially stale HWND.
+    void RefreshWindowHandle();
 };
 
 /**
@@ -417,7 +424,35 @@ struct DetectorStatistics {
     std::atomic<uint64_t> processesScanned{0};
     std::atomic<uint64_t> databaseLookups{0};
     TimePoint startTime = Clock::now();
-    
+
+    DetectorStatistics() = default;
+
+    // Snapshot-style copy: atomics are not trivially copyable. See comment
+    // in GameModeStatistics. Result is a best-effort snapshot.
+    DetectorStatistics(const DetectorStatistics& other) noexcept
+        : gamesDetected(other.gamesDetected.load(std::memory_order_relaxed)),
+          fullscreenDetections(other.fullscreenDetections.load(std::memory_order_relaxed)),
+          launcherDetections(other.launcherDetections.load(std::memory_order_relaxed)),
+          vrDetections(other.vrDetections.load(std::memory_order_relaxed)),
+          falsePositives(other.falsePositives.load(std::memory_order_relaxed)),
+          processesScanned(other.processesScanned.load(std::memory_order_relaxed)),
+          databaseLookups(other.databaseLookups.load(std::memory_order_relaxed)),
+          startTime(other.startTime) {}
+
+    DetectorStatistics& operator=(const DetectorStatistics& other) noexcept {
+        if (this != &other) {
+            gamesDetected.store(other.gamesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            fullscreenDetections.store(other.fullscreenDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            launcherDetections.store(other.launcherDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            vrDetections.store(other.vrDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            falsePositives.store(other.falsePositives.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            processesScanned.store(other.processesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            databaseLookups.store(other.databaseLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -466,7 +501,7 @@ struct DetectorConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using GameDetectedCallback = std::function<void(const DetectedGame&)>;
+using DetectedGameCallback = std::function<void(const DetectedGame&)>;
 using GameExitedCallback = std::function<void(uint32_t pid)>;
 using FullscreenChangeCallback = std::function<void(bool isFullscreen, const FullscreenInfo&)>;
 using LauncherCallback = std::function<void(LauncherType, bool isRunning)>;
@@ -583,7 +618,7 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterGameDetectedCallback(GameDetectedCallback callback);
+    void RegisterGameDetectedCallback(DetectedGameCallback callback);
     void RegisterGameExitedCallback(GameExitedCallback callback);
     void RegisterFullscreenChangeCallback(FullscreenChangeCallback callback);
     void RegisterLauncherCallback(LauncherCallback callback);
@@ -605,7 +640,6 @@ private:
     ~GameProcessDetector();
     
     std::unique_ptr<GameProcessDetectorImpl> m_impl;
-    std::unordered_set<std::wstring> m_gameExecutables;
     static std::atomic<bool> s_instanceCreated;
 };
 

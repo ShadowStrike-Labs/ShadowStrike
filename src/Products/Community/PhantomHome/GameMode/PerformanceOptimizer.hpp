@@ -116,8 +116,8 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -419,7 +419,34 @@ struct OptimizerStatistics {
     std::atomic<uint64_t> throttleActivations{0};
     std::atomic<uint64_t> totalBoostDurationSeconds{0};
     TimePoint startTime = Clock::now();
-    
+
+    OptimizerStatistics() = default;
+
+    OptimizerStatistics(const OptimizerStatistics& other) noexcept
+        : boostActivations(other.boostActivations.load(std::memory_order_relaxed))
+        , restorations(other.restorations.load(std::memory_order_relaxed))
+        , workingSetTrims(other.workingSetTrims.load(std::memory_order_relaxed))
+        , totalMemoryFreedMB(other.totalMemoryFreedMB.load(std::memory_order_relaxed))
+        , priorityChanges(other.priorityChanges.load(std::memory_order_relaxed))
+        , throttleActivations(other.throttleActivations.load(std::memory_order_relaxed))
+        , totalBoostDurationSeconds(other.totalBoostDurationSeconds.load(std::memory_order_relaxed))
+        , startTime(other.startTime)
+    {}
+
+    OptimizerStatistics& operator=(const OptimizerStatistics& other) noexcept {
+        if (this != &other) {
+            boostActivations.store(other.boostActivations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            restorations.store(other.restorations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            workingSetTrims.store(other.workingSetTrims.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalMemoryFreedMB.store(other.totalMemoryFreedMB.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            priorityChanges.store(other.priorityChanges.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            throttleActivations.store(other.throttleActivations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalBoostDurationSeconds.store(other.totalBoostDurationSeconds.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -565,7 +592,10 @@ public:
     
     /// @brief Is throttling active
     [[nodiscard]] bool IsThrottlingActive() const noexcept;
-    
+
+    /// @brief Should scan be throttled (rate-limiting check)
+    [[nodiscard]] bool ShouldThrottleScan() const;
+
     /// @brief Get throttle settings
     [[nodiscard]] ThrottleSettings GetThrottleSettings() const;
 
@@ -609,7 +639,7 @@ public:
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
-    [[nodiscard]] static std::string GetVersionString() noexcept;
+    [[nodiscard]] static std::string GetVersionString();
 
 private:
     PerformanceOptimizer();
