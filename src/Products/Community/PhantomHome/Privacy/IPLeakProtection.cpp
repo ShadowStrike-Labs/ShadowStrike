@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -83,6 +83,7 @@
 
 namespace {
     using namespace ShadowStrike::Privacy;
+    using namespace ShadowStrike::Utils;
 
     /// @brief Monitoring interval (ms)
     constexpr uint32_t MONITORING_INTERVAL_MS = 1000;
@@ -212,7 +213,7 @@ namespace {
 
         // Cap command line length
         if (cmdLine.size() > 1024) {
-            Utils::Logger::Error("RunNetshCommand: command line too long");
+            ::ShadowStrike::Utils::Logger::Error("RunNetshCommand: command line too long");
             return false;
         }
 
@@ -240,7 +241,7 @@ namespace {
             &pi);
 
         if (!created) {
-            Utils::Logger::Error("RunNetshCommand: CreateProcessW failed, error={}",
+            ::ShadowStrike::Utils::Logger::Error("RunNetshCommand: CreateProcessW failed, error={}",
                 ::GetLastError());
             return false;
         }
@@ -252,7 +253,7 @@ namespace {
         if (waitResult == WAIT_OBJECT_0) {
             ::GetExitCodeProcess(pi.hProcess, &exitCode);
         } else {
-            Utils::Logger::Warn("RunNetshCommand: timed out, terminating child");
+            ::ShadowStrike::Utils::Logger::Warn("RunNetshCommand: timed out, terminating child");
             ::TerminateProcess(pi.hProcess, 1);
         }
 
@@ -374,9 +375,9 @@ public:
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Error callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Error callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown error callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown error callback exception");
             }
         }
     }
@@ -390,9 +391,9 @@ public:
             try {
                 callback(leak);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Leak callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Leak callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown leak callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown leak callback exception");
             }
         }
     }
@@ -406,9 +407,9 @@ public:
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Kill switch callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Kill switch callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown kill switch callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown kill switch callback exception");
             }
         }
     }
@@ -422,9 +423,9 @@ public:
             try {
                 callback(status);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("VPN status callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("VPN status callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown VPN status callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown VPN status callback exception");
             }
         }
     }
@@ -438,9 +439,9 @@ public:
             try {
                 callback(adapter, added);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Adapter callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Adapter callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown adapter callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown adapter callback exception");
             }
         }
     }
@@ -543,7 +544,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("GetNetworkAdapters failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("GetNetworkAdapters failed: {}", e.what());
         }
 
         return adapters;
@@ -673,7 +674,7 @@ public:
                 while (::WinHttpQueryDataAvailable(hRequest.Get(), &bytesAvailable) && bytesAvailable > 0) {
                     // Cap total response size to prevent DoS
                     if (responseData.size() + bytesAvailable > MAX_PUBLIC_IP_RESPONSE_BYTES) {
-                        Utils::Logger::Warn("GetPublicIP: response exceeded size limit from {}",
+                        ::ShadowStrike::Utils::Logger::Warn("GetPublicIP: response exceeded size limit from {}",
                             Utils::StringUtils::ToNarrow(service.host));
                         responseData.clear();
                         break;
@@ -709,7 +710,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("GetPublicIP failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("GetPublicIP failed: {}", e.what());
         }
 
         return std::nullopt;
@@ -720,7 +721,7 @@ public:
      */
     [[nodiscard]] bool ActivateKillSwitch() {
         try {
-            Utils::Logger::Info("Activating kill switch");
+            ::ShadowStrike::Utils::Logger::Info("Activating kill switch");
 
             // Open WFP engine
             DWORD result = ::FwpmEngineOpen0(
@@ -731,14 +732,14 @@ public:
                 &m_wfpEngine);
 
             if (result != ERROR_SUCCESS) {
-                Utils::Logger::Error("Failed to open WFP engine: error={}", result);
+                ::ShadowStrike::Utils::Logger::Error("Failed to open WFP engine: error={}", result);
                 return false;
             }
 
             // Begin transaction for atomic filter installation
             result = ::FwpmTransactionBegin0(m_wfpEngine, 0);
             if (result != ERROR_SUCCESS) {
-                Utils::Logger::Error("Failed to begin WFP transaction: error={}", result);
+                ::ShadowStrike::Utils::Logger::Error("Failed to begin WFP transaction: error={}", result);
                 ::FwpmEngineClose0(m_wfpEngine);
                 m_wfpEngine = nullptr;
                 return false;
@@ -763,7 +764,7 @@ public:
 
             result = ::FwpmSubLayerAdd0(m_wfpEngine, &sublayer, nullptr);
             if (result != ERROR_SUCCESS && result != FWP_E_ALREADY_EXISTS) {
-                Utils::Logger::Error("Failed to add WFP sublayer: error={}", result);
+                ::ShadowStrike::Utils::Logger::Error("Failed to add WFP sublayer: error={}", result);
                 abortTransaction();
                 return false;
             }
@@ -797,7 +798,7 @@ public:
 
                 result = ::FwpmFilterAdd0(m_wfpEngine, &filter, nullptr, &filterId);
                 if (result != ERROR_SUCCESS) {
-                    Utils::Logger::Error("Failed to add loopback permit filter: error={}", result);
+                    ::ShadowStrike::Utils::Logger::Error("Failed to add loopback permit filter: error={}", result);
                     abortTransaction();
                     return false;
                 }
@@ -828,7 +829,7 @@ public:
 
                 result = ::FwpmFilterAdd0(m_wfpEngine, &filter, nullptr, &filterId);
                 if (result != ERROR_SUCCESS) {
-                    Utils::Logger::Error("Failed to add IPv6 loopback permit filter: error={}", result);
+                    ::ShadowStrike::Utils::Logger::Error("Failed to add IPv6 loopback permit filter: error={}", result);
                     abortTransaction();
                     return false;
                 }
@@ -932,7 +933,7 @@ public:
 
                 result = ::FwpmFilterAdd0(m_wfpEngine, &filter, nullptr, &filterId);
                 if (result != ERROR_SUCCESS) {
-                    Utils::Logger::Error("Failed to add IPv4 block filter: error={}", result);
+                    ::ShadowStrike::Utils::Logger::Error("Failed to add IPv4 block filter: error={}", result);
                     abortTransaction();
                     return false;
                 }
@@ -952,7 +953,7 @@ public:
 
                 result = ::FwpmFilterAdd0(m_wfpEngine, &filter, nullptr, &filterId);
                 if (result != ERROR_SUCCESS) {
-                    Utils::Logger::Error("Failed to add IPv6 block filter: error={}", result);
+                    ::ShadowStrike::Utils::Logger::Error("Failed to add IPv6 block filter: error={}", result);
                     abortTransaction();
                     return false;
                 }
@@ -963,7 +964,7 @@ public:
             transactionActive = false;
 
             if (result != ERROR_SUCCESS) {
-                Utils::Logger::Error("Failed to commit WFP transaction: error={}", result);
+                ::ShadowStrike::Utils::Logger::Error("Failed to commit WFP transaction: error={}", result);
                 ::FwpmEngineClose0(m_wfpEngine);
                 m_wfpEngine = nullptr;
                 return false;
@@ -990,11 +991,11 @@ public:
 
             NotifyKillSwitch(event);
 
-            Utils::Logger::Info("Kill switch activated: IPv4+IPv6 blocked, VPN/loopback/DHCP permitted");
+            ::ShadowStrike::Utils::Logger::Info("Kill switch activated: IPv4+IPv6 blocked, VPN/loopback/DHCP permitted");
             return true;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("ActivateKillSwitch failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("ActivateKillSwitch failed: {}", e.what());
             if (m_wfpEngine) {
                 ::FwpmEngineClose0(m_wfpEngine);
                 m_wfpEngine = nullptr;
@@ -1025,11 +1026,11 @@ public:
             }
 
             if (wasActive) {
-                Utils::Logger::Info("Kill switch deactivated");
+                ::ShadowStrike::Utils::Logger::Info("Kill switch deactivated");
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("DeactivateKillSwitch failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("DeactivateKillSwitch failed: {}", e.what());
         }
     }
 
@@ -1038,7 +1039,7 @@ public:
      */
     [[nodiscard]] bool BlockWebRTCInternal() {
         try {
-            Utils::Logger::Info("Blocking WebRTC leaks");
+            ::ShadowStrike::Utils::Logger::Info("Blocking WebRTC leaks");
             bool anySuccess = false;
 
             // ================================================================
@@ -1114,7 +1115,7 @@ public:
 
                         if (::FwpmTransactionCommit0(wfpEngine) == ERROR_SUCCESS) {
                             anySuccess = true;
-                            Utils::Logger::Info("WebRTC STUN/TURN ports blocked via WFP");
+                            ::ShadowStrike::Utils::Logger::Info("WebRTC STUN/TURN ports blocked via WFP");
                         } else {
                             ::FwpmTransactionAbort0(wfpEngine);
                         }
@@ -1123,7 +1124,7 @@ public:
                     // Store engine handle for cleanup in m_webRtcWfpEngine
                     m_webRtcWfpEngine = wfpEngine;
                 } else {
-                    Utils::Logger::Warn("Failed to open WFP engine for WebRTC blocking: error={}", result);
+                    ::ShadowStrike::Utils::Logger::Warn("Failed to open WFP engine for WebRTC blocking: error={}", result);
                 }
             }
 
@@ -1156,7 +1157,7 @@ public:
 
                     ::RegCloseKey(hKey);
                     anySuccess = true;
-                    Utils::Logger::Info("Chrome WebRTC policy set");
+                    ::ShadowStrike::Utils::Logger::Info("Chrome WebRTC policy set");
                 }
             }
 
@@ -1177,7 +1178,7 @@ public:
                         sizeof(disabled));
                     ::RegCloseKey(hKey);
                     anySuccess = true;
-                    Utils::Logger::Info("Firefox WebRTC policy set");
+                    ::ShadowStrike::Utils::Logger::Info("Firefox WebRTC policy set");
                 }
             }
 
@@ -1203,22 +1204,22 @@ public:
 
                     ::RegCloseKey(hKey);
                     anySuccess = true;
-                    Utils::Logger::Info("Edge WebRTC policy set");
+                    ::ShadowStrike::Utils::Logger::Info("Edge WebRTC policy set");
                 }
             }
 
             if (anySuccess) {
                 m_webRTCBlocked.store(true, std::memory_order_release);
                 m_stats.webRTCBlocked.fetch_add(1, std::memory_order_relaxed);
-                Utils::Logger::Info("WebRTC blocking enabled (WFP + browser policies)");
+                ::ShadowStrike::Utils::Logger::Info("WebRTC blocking enabled (WFP + browser policies)");
             } else {
-                Utils::Logger::Error("WebRTC blocking: all methods failed");
+                ::ShadowStrike::Utils::Logger::Error("WebRTC blocking: all methods failed");
             }
 
             return anySuccess;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("BlockWebRTC failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("BlockWebRTC failed: {}", e.what());
             return false;
         }
     }
@@ -1228,7 +1229,7 @@ public:
      */
     [[nodiscard]] bool UnblockWebRTCInternal() {
         try {
-            Utils::Logger::Info("Removing WebRTC blocks");
+            ::ShadowStrike::Utils::Logger::Info("Removing WebRTC blocks");
 
             // Remove WFP filters
             if (m_webRtcWfpEngine) {
@@ -1273,11 +1274,11 @@ public:
             }
 
             m_webRTCBlocked.store(false, std::memory_order_release);
-            Utils::Logger::Info("WebRTC blocking disabled");
+            ::ShadowStrike::Utils::Logger::Info("WebRTC blocking disabled");
             return true;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("UnblockWebRTC failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("UnblockWebRTC failed: {}", e.what());
             return false;
         }
     }
@@ -1287,7 +1288,7 @@ public:
      */
     [[nodiscard]] bool DisableIPv6Internal() {
         try {
-            Utils::Logger::Info("Disabling IPv6");
+            ::ShadowStrike::Utils::Logger::Info("Disabling IPv6");
 
             // Set registry key to disable IPv6
             // HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters
@@ -1316,16 +1317,16 @@ public:
                 if (result == ERROR_SUCCESS) {
                     m_ipv6Disabled.store(true, std::memory_order_release);
                     m_stats.ipv6Blocked++;
-                    Utils::Logger::Info("IPv6 disabled (requires reboot)");
+                    ::ShadowStrike::Utils::Logger::Info("IPv6 disabled (requires reboot)");
                     return true;
                 }
             }
 
-            Utils::Logger::Error("Failed to disable IPv6: {}", result);
+            ::ShadowStrike::Utils::Logger::Error("Failed to disable IPv6: {}", result);
             return false;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("DisableIPv6 failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("DisableIPv6 failed: {}", e.what());
             return false;
         }
     }
@@ -1357,7 +1358,7 @@ public:
 
                 if (result == ERROR_SUCCESS) {
                     m_ipv6Disabled.store(false, std::memory_order_release);
-                    Utils::Logger::Info("IPv6 enabled (requires reboot)");
+                    ::ShadowStrike::Utils::Logger::Info("IPv6 enabled (requires reboot)");
                     return true;
                 }
             }
@@ -1365,7 +1366,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("EnableIPv6 failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("EnableIPv6 failed: {}", e.what());
             return false;
         }
     }
@@ -1532,7 +1533,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("CheckForLeaks failed: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("CheckForLeaks failed: {}", e.what());
         }
 
         return leaks;
@@ -1542,7 +1543,7 @@ public:
      * @brief Monitoring thread function
      */
     void MonitoringThreadFunc() {
-        Utils::Logger::Info("IP leak monitoring thread started");
+        ::ShadowStrike::Utils::Logger::Info("IP leak monitoring thread started");
 
         while (m_monitoringActive.load(std::memory_order_acquire)) {
             try {
@@ -1580,15 +1581,15 @@ public:
                 CheckForLeaksInternal();
 
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Monitoring thread error: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Monitoring thread error: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown monitoring thread error");
+                ::ShadowStrike::Utils::Logger::Error("Unknown monitoring thread error");
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(MONITORING_INTERVAL_MS));
         }
 
-        Utils::Logger::Info("IP leak monitoring thread stopped");
+        ::ShadowStrike::Utils::Logger::Info("IP leak monitoring thread stopped");
     }
 
     /**
@@ -1623,13 +1624,13 @@ IPLeakProtection::IPLeakProtection()
     : m_impl(std::make_unique<IPLeakProtectionImpl>())
 {
     s_instanceCreated.store(true, std::memory_order_release);
-    Utils::Logger::Info("IPLeakProtection singleton created");
+    ::ShadowStrike::Utils::Logger::Info("IPLeakProtection singleton created");
 }
 
 IPLeakProtection::~IPLeakProtection() {
     try {
         Shutdown();
-        Utils::Logger::Info("IPLeakProtection singleton destroyed");
+        ::ShadowStrike::Utils::Logger::Info("IPLeakProtection singleton destroyed");
     } catch (...) {
         // Destructor must not throw
     }
@@ -1645,7 +1646,7 @@ IPLeakProtection::~IPLeakProtection() {
 
         if (m_impl->m_status != ModuleStatus::Uninitialized &&
             m_impl->m_status != ModuleStatus::Stopped) {
-            Utils::Logger::Warn("IPLeakProtection already initialized");
+            ::ShadowStrike::Utils::Logger::Warn("IPLeakProtection already initialized");
             return false;
         }
 
@@ -1653,7 +1654,7 @@ IPLeakProtection::~IPLeakProtection() {
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error("Invalid IPLeakProtection configuration");
+            ::ShadowStrike::Utils::Logger::Error("Invalid IPLeakProtection configuration");
             m_impl->m_status = ModuleStatus::Error;
             return false;
         }
@@ -1669,11 +1670,11 @@ IPLeakProtection::~IPLeakProtection() {
 
         m_impl->m_status = ModuleStatus::Running;
 
-        Utils::Logger::Info("IPLeakProtection initialized successfully");
+        ::ShadowStrike::Utils::Logger::Info("IPLeakProtection initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("IPLeakProtection initialization failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("IPLeakProtection initialization failed: {}", e.what());
         m_impl->m_status = ModuleStatus::Error;
         m_impl->NotifyError("Initialization failed: " + std::string(e.what()), -1);
         return false;
@@ -1710,10 +1711,10 @@ void IPLeakProtection::Shutdown() {
 
         m_impl->m_status = ModuleStatus::Stopped;
 
-        Utils::Logger::Info("IPLeakProtection shut down");
+        ::ShadowStrike::Utils::Logger::Info("IPLeakProtection shut down");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("Shutdown error: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("Shutdown error: {}", e.what());
     }
 }
 
@@ -1733,17 +1734,17 @@ void IPLeakProtection::Shutdown() {
         std::unique_lock lock(m_impl->m_mutex);
 
         if (!config.IsValid()) {
-            Utils::Logger::Error("Invalid configuration");
+            ::ShadowStrike::Utils::Logger::Error("Invalid configuration");
             return false;
         }
 
         m_impl->m_config = config;
 
-        Utils::Logger::Info("IPLeakProtection configuration updated");
+        ::ShadowStrike::Utils::Logger::Info("IPLeakProtection configuration updated");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("Configuration update failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("Configuration update failed: {}", e.what());
         return false;
     }
 }
@@ -1773,7 +1774,7 @@ void IPLeakProtection::Shutdown() {
 void IPLeakProtection::SetKillSwitchMode(KillSwitchMode mode) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config.killSwitchMode = mode;
-    Utils::Logger::Info("Kill switch mode set to: {}", static_cast<int>(mode));
+    ::ShadowStrike::Utils::Logger::Info("Kill switch mode set to: {}", static_cast<int>(mode));
 }
 
 [[nodiscard]] KillSwitchMode IPLeakProtection::GetKillSwitchMode() const noexcept {
@@ -1800,7 +1801,7 @@ void IPLeakProtection::SetKillSwitchMode(KillSwitchMode mode) {
 void IPLeakProtection::SetWebRTCBlockMethod(WebRTCBlockMethod method) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config.webRTCBlockMethod = method;
-    Utils::Logger::Info("WebRTC block method set to: {}", static_cast<int>(method));
+    ::ShadowStrike::Utils::Logger::Info("WebRTC block method set to: {}", static_cast<int>(method));
 }
 
 // ============================================================================
@@ -1810,7 +1811,7 @@ void IPLeakProtection::SetWebRTCBlockMethod(WebRTCBlockMethod method) {
 void IPLeakProtection::SetIPv6ProtectionMode(IPv6ProtectionMode mode) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config.ipv6Protection = mode;
-    Utils::Logger::Info("IPv6 protection mode set to: {}", static_cast<int>(mode));
+    ::ShadowStrike::Utils::Logger::Info("IPv6 protection mode set to: {}", static_cast<int>(mode));
 }
 
 [[nodiscard]] IPv6ProtectionMode IPLeakProtection::GetIPv6ProtectionMode() const noexcept {
@@ -1837,42 +1838,42 @@ void IPLeakProtection::SetIPv6ProtectionMode(IPv6ProtectionMode mode) {
         // Disable Teredo via netsh (safe subprocess)
         if (m_impl->m_config.blockTeredo) {
             if (!RunNetshCommand(L"interface teredo set state disabled")) {
-                Utils::Logger::Warn("Failed to disable Teredo tunnel");
+                ::ShadowStrike::Utils::Logger::Warn("Failed to disable Teredo tunnel");
                 allSuccess = false;
             } else {
-                Utils::Logger::Info("Teredo tunnel disabled");
+                ::ShadowStrike::Utils::Logger::Info("Teredo tunnel disabled");
             }
         }
 
         // Disable ISATAP
         if (m_impl->m_config.blockISATAP) {
             if (!RunNetshCommand(L"interface isatap set state disabled")) {
-                Utils::Logger::Warn("Failed to disable ISATAP tunnel");
+                ::ShadowStrike::Utils::Logger::Warn("Failed to disable ISATAP tunnel");
                 allSuccess = false;
             } else {
-                Utils::Logger::Info("ISATAP tunnel disabled");
+                ::ShadowStrike::Utils::Logger::Info("ISATAP tunnel disabled");
             }
         }
 
         // Disable 6to4
         if (m_impl->m_config.block6to4) {
             if (!RunNetshCommand(L"interface 6to4 set state disabled")) {
-                Utils::Logger::Warn("Failed to disable 6to4 tunnel");
+                ::ShadowStrike::Utils::Logger::Warn("Failed to disable 6to4 tunnel");
                 allSuccess = false;
             } else {
-                Utils::Logger::Info("6to4 tunnel disabled");
+                ::ShadowStrike::Utils::Logger::Info("6to4 tunnel disabled");
             }
         }
 
         if (allSuccess) {
-            Utils::Logger::Info("All IPv6 tunnels blocked successfully");
+            ::ShadowStrike::Utils::Logger::Info("All IPv6 tunnels blocked successfully");
         } else {
-            Utils::Logger::Warn("Some IPv6 tunnels could not be blocked (may require elevation)");
+            ::ShadowStrike::Utils::Logger::Warn("Some IPv6 tunnels could not be blocked (may require elevation)");
         }
         return allSuccess;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("BlockIPv6Tunnels failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("BlockIPv6Tunnels failed: {}", e.what());
         return false;
     }
 }
@@ -1884,7 +1885,7 @@ void IPLeakProtection::SetIPv6ProtectionMode(IPv6ProtectionMode mode) {
 [[nodiscard]] bool IPLeakProtection::StartVPNMonitoring() {
     try {
         if (m_impl->m_monitoringActive.load(std::memory_order_acquire)) {
-            Utils::Logger::Warn("Monitoring already active");
+            ::ShadowStrike::Utils::Logger::Warn("Monitoring already active");
             return true;
         }
 
@@ -1895,11 +1896,11 @@ void IPLeakProtection::SetIPv6ProtectionMode(IPv6ProtectionMode mode) {
         m_impl->m_monitoringThread = std::thread(
             &IPLeakProtectionImpl::MonitoringThreadFunc, m_impl.get());
 
-        Utils::Logger::Info("VPN monitoring started");
+        ::ShadowStrike::Utils::Logger::Info("VPN monitoring started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("StartVPNMonitoring failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("StartVPNMonitoring failed: {}", e.what());
         m_impl->NotifyError("Failed to start monitoring: " + std::string(e.what()), -1);
         return false;
     }
@@ -1913,7 +1914,7 @@ void IPLeakProtection::StopVPNMonitoring() {
     m_impl->m_status.compare_exchange_strong(expected, ModuleStatus::Running,
         std::memory_order_acq_rel);
 
-    Utils::Logger::Info("VPN monitoring stopped");
+    ::ShadowStrike::Utils::Logger::Info("VPN monitoring stopped");
 }
 
 [[nodiscard]] VPNStatus IPLeakProtection::GetVPNStatus() const noexcept {
@@ -2019,7 +2020,7 @@ void IPLeakProtection::ClearHistory() {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_recentLeaks.clear();
     m_impl->m_killSwitchEvents.clear();
-    Utils::Logger::Info("History cleared");
+    ::ShadowStrike::Utils::Logger::Info("History cleared");
 }
 
 // ============================================================================
@@ -2028,7 +2029,7 @@ void IPLeakProtection::ClearHistory() {
 
 [[nodiscard]] bool IPLeakProtection::AddAllowedAdapter(const std::string& adapterGuid) {
     if (adapterGuid.empty() || adapterGuid.size() > 512) {
-        Utils::Logger::Warn("AddAllowedAdapter: invalid adapter GUID");
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedAdapter: invalid adapter GUID");
         return false;
     }
 
@@ -2041,7 +2042,7 @@ void IPLeakProtection::ClearHistory() {
     }
 
     adapters.push_back(adapterGuid);
-    Utils::Logger::Info("Added allowed adapter: {}", adapterGuid);
+    ::ShadowStrike::Utils::Logger::Info("Added allowed adapter: {}", adapterGuid);
     return true;
 }
 
@@ -2049,13 +2050,13 @@ void IPLeakProtection::ClearHistory() {
     std::unique_lock lock(m_impl->m_mutex);
     auto& adapters = m_impl->m_config.allowedAdapters;
     adapters.erase(std::remove(adapters.begin(), adapters.end(), adapterGuid), adapters.end());
-    Utils::Logger::Info("Removed allowed adapter: {}", adapterGuid);
+    ::ShadowStrike::Utils::Logger::Info("Removed allowed adapter: {}", adapterGuid);
     return true;
 }
 
 [[nodiscard]] bool IPLeakProtection::AddAllowedProcess(const std::string& processName) {
     if (processName.empty() || processName.size() > 512) {
-        Utils::Logger::Warn("AddAllowedProcess: invalid process name");
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedProcess: invalid process name");
         return false;
     }
 
@@ -2067,7 +2068,7 @@ void IPLeakProtection::ClearHistory() {
     }
 
     processes.push_back(processName);
-    Utils::Logger::Info("Added allowed process: {}", processName);
+    ::ShadowStrike::Utils::Logger::Info("Added allowed process: {}", processName);
     return true;
 }
 
@@ -2075,19 +2076,19 @@ void IPLeakProtection::ClearHistory() {
     std::unique_lock lock(m_impl->m_mutex);
     auto& processes = m_impl->m_config.allowedProcesses;
     processes.erase(std::remove(processes.begin(), processes.end(), processName), processes.end());
-    Utils::Logger::Info("Removed allowed process: {}", processName);
+    ::ShadowStrike::Utils::Logger::Info("Removed allowed process: {}", processName);
     return true;
 }
 
 [[nodiscard]] bool IPLeakProtection::AddAllowedLocalNetwork(const std::string& cidr) {
     if (cidr.empty() || cidr.size() > 512) {
-        Utils::Logger::Warn("AddAllowedLocalNetwork: invalid CIDR");
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: invalid CIDR");
         return false;
     }
 
     // Basic CIDR format validation (must contain '/')
     if (cidr.find('/') == std::string::npos) {
-        Utils::Logger::Warn("AddAllowedLocalNetwork: CIDR must contain '/' separator");
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: CIDR must contain '/' separator");
         return false;
     }
 
@@ -2099,7 +2100,7 @@ void IPLeakProtection::ClearHistory() {
     }
 
     networks.push_back(cidr);
-    Utils::Logger::Info("Added allowed local network: {}", cidr);
+    ::ShadowStrike::Utils::Logger::Info("Added allowed local network: {}", cidr);
     return true;
 }
 
@@ -2151,7 +2152,7 @@ void IPLeakProtection::UnregisterCallbacks() {
     m_impl->m_adapterCallbacks.clear();
     m_impl->m_errorCallbacks.clear();
 
-    Utils::Logger::Info("All callbacks unregistered");
+    ::ShadowStrike::Utils::Logger::Info("All callbacks unregistered");
 }
 
 // ============================================================================
@@ -2183,19 +2184,19 @@ void IPLeakProtection::UnregisterCallbacks() {
 void IPLeakProtection::ResetStatistics() {
     m_impl->m_stats.Reset();
     m_impl->m_stats.startTime = Clock::now();
-    Utils::Logger::Info("Statistics reset");
+    ::ShadowStrike::Utils::Logger::Info("Statistics reset");
 }
 
 [[nodiscard]] bool IPLeakProtection::SelfTest() {
     try {
-        Utils::Logger::Info("Running IPLeakProtection self-test...");
+        ::ShadowStrike::Utils::Logger::Info("Running IPLeakProtection self-test...");
 
         bool allPassed = true;
 
         // Test 1: Configuration validation
         IPLeakConfiguration config;
         if (!config.IsValid()) {
-            Utils::Logger::Error("Self-test failed: Invalid default configuration");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Invalid default configuration");
             allPassed = false;
         }
 
@@ -2203,21 +2204,21 @@ void IPLeakProtection::ResetStatistics() {
         try {
             auto adapters = GetNetworkAdapters();
             if (adapters.empty()) {
-                Utils::Logger::Warn("Self-test: No network adapters found");
+                ::ShadowStrike::Utils::Logger::Warn("Self-test: No network adapters found");
             } else {
-                Utils::Logger::Debug("Self-test: Found {} network adapters", adapters.size());
+                ::ShadowStrike::Utils::Logger::Debug("Self-test: Found {} network adapters", adapters.size());
             }
         } catch (...) {
-            Utils::Logger::Error("Self-test failed: Adapter enumeration");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Adapter enumeration");
             allPassed = false;
         }
 
         // Test 3: VPN detection
         try {
             auto vpnAdapters = DetectVPNAdapters();
-            Utils::Logger::Debug("Self-test: Found {} VPN adapters", vpnAdapters.size());
+            ::ShadowStrike::Utils::Logger::Debug("Self-test: Found {} VPN adapters", vpnAdapters.size());
         } catch (...) {
-            Utils::Logger::Error("Self-test failed: VPN detection");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: VPN detection");
             allPassed = false;
         }
 
@@ -2225,25 +2226,25 @@ void IPLeakProtection::ResetStatistics() {
         try {
             auto addresses = GetAllIPAddresses();
             if (addresses.empty()) {
-                Utils::Logger::Warn("Self-test: No IP addresses found");
+                ::ShadowStrike::Utils::Logger::Warn("Self-test: No IP addresses found");
             } else {
-                Utils::Logger::Debug("Self-test: Found {} IP addresses", addresses.size());
+                ::ShadowStrike::Utils::Logger::Debug("Self-test: Found {} IP addresses", addresses.size());
             }
         } catch (...) {
-            Utils::Logger::Error("Self-test failed: IP address detection");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: IP address detection");
             allPassed = false;
         }
 
         if (allPassed) {
-            Utils::Logger::Info("Self-test PASSED - All tests successful");
+            ::ShadowStrike::Utils::Logger::Info("Self-test PASSED - All tests successful");
         } else {
-            Utils::Logger::Error("Self-test FAILED - See errors above");
+            ::ShadowStrike::Utils::Logger::Error("Self-test FAILED - See errors above");
         }
 
         return allPassed;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("Self-test exception: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("Self-test exception: {}", e.what());
         return false;
     }
 }

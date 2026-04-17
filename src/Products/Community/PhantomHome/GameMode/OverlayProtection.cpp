@@ -1608,7 +1608,7 @@ bool OverlayProtection::Initialize(const OverlayProtectionConfiguration& config)
         wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = OverlayProtectionImpl::WindowProc;
         wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
         wc.hbrBackground = m_impl->m_backgroundBrush;
         wc.lpszClassName = m_impl->m_overlayClassName.c_str();
 

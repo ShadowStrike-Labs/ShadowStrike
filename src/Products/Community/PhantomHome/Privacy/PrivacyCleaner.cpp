@@ -94,11 +94,17 @@
 // Windows-specific headers
 #ifdef _WIN32
 #include <shlobj.h>
+#include <shellapi.h>
+#include <cwctype>
 #include <comdef.h>
 #include <wbemidl.h>
 #include <iphlpapi.h>
 #include <tlhelp32.h>
 #include <windns.h>
+// DnsFlushResolverCache is exported by dnsapi.dll but is not prototyped by
+// windns.h in all Windows SDK revisions. Declare it here to guarantee the
+// symbol is visible regardless of SDK vintage. Linked via dnsapi.lib below.
+extern "C" BOOL WINAPI DnsFlushResolverCache(void);
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "wbemuuid.lib")

@@ -81,7 +81,7 @@
 #include <regex>
 
 // SQLite for browser database access
-#include <sqlite3.h>
+#include <SQLiteCpp/sqlite3.h>
 #pragma comment(lib, "sqlite3.lib")
 
 // Ensure SHGetFolderPathW / CSIDL_* are available (needed by Common.hpp helpers)

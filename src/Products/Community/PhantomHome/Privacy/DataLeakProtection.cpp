@@ -460,13 +460,9 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
 
         m_config = config;
 
-        // Initialize infrastructure references
-        try {
-            m_patternStore = &PatternStore::PatternStore::Instance();
-        } catch (const std::exception& e) {
-            ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] PatternStore not available: {}", e.what());
-            m_patternStore = nullptr;
-        }
+        // PatternStore is instantiated per-owner (not a singleton); DLP owns its
+        // internal regex matchers directly and does not require a shared store here.
+        m_patternStore = nullptr;
 
         try {
             m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
