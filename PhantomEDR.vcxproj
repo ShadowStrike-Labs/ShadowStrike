@@ -312,6 +312,9 @@
     <ClCompile Include="src\Products\Community\PhantomEDR\IncidentResponse\ContainmentEngine.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\IncidentResponse\IncidentManager.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\IncidentResponse\RemediationEngine.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\LiveResponse\FileInspector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\LiveResponse\ProcessInspector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\LiveResponse\RegistryInspector.cpp" />
     <ClCompile Include="src\PhantomCore\HashStore\BloomFilter_impl.cpp" />
     <ClCompile Include="src\PhantomCore\HashStore\HashBucket_impl.cpp" />
     <ClCompile Include="src\PhantomCore\HashStore\HashStore.cpp" />
@@ -520,6 +523,10 @@
     <ClInclude Include="src\Products\Community\PhantomEDR\IncidentResponse\IncidentManager.hpp" />
     <ClInclude Include="src\Products\Community\PhantomEDR\IncidentResponse\IncidentTypes.hpp" />
     <ClInclude Include="src\Products\Community\PhantomEDR\IncidentResponse\RemediationEngine.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomEDR\LiveResponse\FileInspector.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomEDR\LiveResponse\LiveResponseTypes.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomEDR\LiveResponse\ProcessInspector.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomEDR\LiveResponse\RegistryInspector.hpp" />
     <ClInclude Include="src\PhantomCore\FuzzyHasher\FuzzyHasher.hpp" />
     <ClInclude Include="src\PhantomCore\FuzzyHasher\DigestGenerator.hpp" />
     <ClInclude Include="src\PhantomCore\FuzzyHasher\DigestComparer.hpp" />
