@@ -159,6 +159,18 @@
     <ClCompile Include="src\PhantomCore\AntiEvasion\SandboxEvasionDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\TimeBasedEvasionDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\HomeProductEntry.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\BankingWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Config\ConfigWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\CryptoMinersWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameModeWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\IoT\IoTWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\PrivacyWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\WebProtectionWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupManager.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupScheduler.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\IncrementalBackup.cpp" />
@@ -323,7 +335,6 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameCheatDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameModeManager.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameProcessDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\GameMode\OverlayProtection.cpp" />
@@ -398,6 +409,7 @@
     <ClCompile Include="src\PhantomCore\Security\SelfDefense.cpp" />
     <ClCompile Include="src\PhantomCore\Security\TamperProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Service\AntivirusService.cpp" />
+    <ClCompile Include="src\PhantomCore\Service\ProductExtensions.cpp" />
     <ClCompile Include="src\PhantomCore\Service\PerformanceProfiler.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceCommunicator.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceController.cpp" />
@@ -628,6 +640,7 @@
     <ClInclude Include="src\PhantomCore\AntiEvasion\SandboxEvasionDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\TimeBasedEvasionDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupManager.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupScheduler.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\IncrementalBackup.hpp" />
@@ -658,6 +671,7 @@
     <ClInclude Include="src\PhantomCore\Performance\NetworkPerformanceMonitor.hpp" />
     <ClInclude Include="src\PhantomCore\Performance\PerformanceProfiler.hpp" />
     <ClInclude Include="src\PhantomCore\Service\AntivirusService.hpp" />
+    <ClInclude Include="src\PhantomCore\Service\ProductExtensions.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceCommunicator.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceController.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceInstaller.hpp" />
