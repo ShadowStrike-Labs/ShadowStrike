@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -432,19 +432,19 @@ private:
 // ============================================================================
 
 DataLeakProtectionImpl::DataLeakProtectionImpl() {
-    Logger::Info("[DataLeakProtection] Instance created");
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Instance created");
 }
 
 DataLeakProtectionImpl::~DataLeakProtectionImpl() {
     Shutdown();
-    Logger::Info("[DataLeakProtection] Instance destroyed");
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Instance destroyed");
 }
 
 bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
-        Logger::Warn("[DataLeakProtection] Already initialized");
+        ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Already initialized");
         return true;
     }
 
@@ -453,7 +453,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
 
         // Validate configuration
         if (!config.IsValid()) {
-            Logger::Error("[DataLeakProtection] Invalid configuration");
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Invalid configuration");
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
@@ -464,14 +464,14 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
         try {
             m_patternStore = &PatternStore::PatternStore::Instance();
         } catch (const std::exception& e) {
-            Logger::Warn("[DataLeakProtection] PatternStore not available: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] PatternStore not available: {}", e.what());
             m_patternStore = nullptr;
         }
 
         try {
             m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
         } catch (const std::exception& e) {
-            Logger::Warn("[DataLeakProtection] ThreatIntel not available: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] ThreatIntel not available: {}", e.what());
             m_threatIntel = nullptr;
         }
 
@@ -486,7 +486,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
                     std::regex_constants::ECMAScript | std::regex_constants::optimize
                 );
             } catch (const std::regex_error& e) {
-                Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
                     pattern.patternId, e.what());
                 pattern.enabled = false;
             }
@@ -501,7 +501,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
                 );
                 m_patterns.push_back(pattern);
             } catch (const std::regex_error& e) {
-                Logger::Error("[DataLeakProtection] Failed to compile custom pattern {}: {}",
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile custom pattern {}: {}",
                     pattern.patternId, e.what());
             }
         }
@@ -521,17 +521,17 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Logger::Info("[DataLeakProtection] Initialized successfully (Version {}, {} patterns, {} policies)",
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Initialized successfully (Version {}, {} patterns, {} policies)",
             DataLeakProtection::GetVersionString(), m_patterns.size(), m_policies.size());
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Critical("[DataLeakProtection] Initialization failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Initialization failed: {}", e.what());
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     } catch (...) {
-        Logger::Critical("[DataLeakProtection] Initialization failed: Unknown error");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Initialization failed: Unknown error");
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -565,12 +565,12 @@ void DataLeakProtectionImpl::Shutdown() {
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Logger::Info("[DataLeakProtection] Shutdown complete");
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Shutdown complete");
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] Shutdown error: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Shutdown error: {}", e.what());
     } catch (...) {
-        Logger::Error("[DataLeakProtection] Shutdown error: Unknown exception");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Shutdown error: Unknown exception");
     }
 }
 
@@ -578,7 +578,7 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
     std::unique_lock lock(m_mutex);
 
     if (!config.IsValid()) {
-        Logger::Error("[DataLeakProtection] Invalid configuration");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Invalid configuration");
         return false;
     }
 
@@ -594,7 +594,7 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
                 std::regex_constants::ECMAScript | std::regex_constants::optimize
             );
         } catch (const std::regex_error& e) {
-            Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
                 pattern.patternId, e.what());
             pattern.enabled = false;
         }
@@ -608,7 +608,7 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
             );
             m_patterns.push_back(custom);
         } catch (const std::regex_error& e) {
-            Logger::Error("[DataLeakProtection] Failed to compile custom pattern {}: {}",
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile custom pattern {}: {}",
                 custom.patternId, e.what());
         }
     }
@@ -623,7 +623,7 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
         StopClipboardMonitoringInternal(lock);
     }
 
-    Logger::Info("[DataLeakProtection] Configuration updated ({} patterns, {} policies)",
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Configuration updated ({} patterns, {} policies)",
         m_patterns.size(), m_policies.size());
     return true;
 }
@@ -639,7 +639,7 @@ DLPConfiguration DataLeakProtectionImpl::GetConfiguration() const {
 
 DLPScanResult DataLeakProtectionImpl::ScanBuffer(const std::vector<uint8_t>& buffer) {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[DataLeakProtection] Not initialized");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Not initialized");
         return {};
     }
 
@@ -658,7 +658,7 @@ DLPScanResult DataLeakProtectionImpl::ScanBuffer(const std::vector<uint8_t>& buf
 
 DLPScanResult DataLeakProtectionImpl::ScanString(const std::string& content) {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[DataLeakProtection] Not initialized");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Not initialized");
         return {};
     }
 
@@ -684,7 +684,7 @@ DLPScanResult DataLeakProtectionImpl::ScanString(const std::string& content) {
 
 DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[DataLeakProtection] Not initialized");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Not initialized");
         return {};
     }
 
@@ -712,20 +712,20 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
         // Open file first to avoid TOCTOU race (exists + size + open)
         std::ifstream file(filePath, std::ios::binary | std::ios::ate);
         if (!file) {
-            Logger::Warn("[DataLeakProtection] Cannot open file for DLP scanning");
+            ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Cannot open file for DLP scanning");
             return {};
         }
 
         // Get size from open handle (no TOCTOU)
         auto tellPos = file.tellg();
         if (tellPos < 0) {
-            Logger::Error("[DataLeakProtection] Failed to determine file size");
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to determine file size");
             return {};
         }
         auto fileSize = static_cast<size_t>(tellPos);
         if (fileSize == 0 || fileSize > m_config.maxContentSize) {
             if (fileSize > m_config.maxContentSize) {
-                Logger::Warn("[DataLeakProtection] File too large for DLP scan: {} bytes", fileSize);
+                ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] File too large for DLP scan: {} bytes", fileSize);
             }
             return {};
         }
@@ -733,7 +733,7 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
         file.seekg(0, std::ios::beg);
         std::vector<uint8_t> buffer(fileSize);
         if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(fileSize))) {
-            Logger::Error("[DataLeakProtection] Failed to read file content");
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to read file content");
             return {};
         }
 
@@ -750,13 +750,13 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
 
         NotifyScanResult(result);
 
-        Logger::Info("[DataLeakProtection] Scanned file ({} bytes, {} matches)",
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Scanned file ({} bytes, {} matches)",
             fileSize, result.totalMatches);
 
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] ScanFile exception: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] ScanFile exception: {}", e.what());
         return {};
     }
 }
@@ -775,7 +775,7 @@ DLPScanResult DataLeakProtectionImpl::ScanClipboard() {
         return ScanString(clipboardText);
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] ScanClipboard failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] ScanClipboard failed: {}", e.what());
         return {};
     }
 }
@@ -846,7 +846,7 @@ DLPScanResult DataLeakProtectionImpl::AnalyzeOutboundData(
                         result.recommendedAction = DLPAction::Block;
                     }
                 } catch (const std::exception& e) {
-                    Logger::Error("[DataLeakProtection] Pre-egress callback exception: {}", e.what());
+                    ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Pre-egress callback exception: {}", e.what());
                 }
             }
         }
@@ -966,7 +966,7 @@ bool DataLeakProtectionImpl::StartClipboardMonitoring() {
 
 bool DataLeakProtectionImpl::StartClipboardMonitoringInternal() {
     if (m_clipboardMonitoring.load(std::memory_order_acquire)) {
-        Logger::Warn("[DataLeakProtection] Clipboard monitoring already active");
+        ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Clipboard monitoring already active");
         return true;
     }
 
@@ -975,11 +975,11 @@ bool DataLeakProtectionImpl::StartClipboardMonitoringInternal() {
         m_clipboardThread = std::make_unique<std::thread>(
             &DataLeakProtectionImpl::ClipboardMonitoringThreadFunc, this);
 
-        Logger::Info("[DataLeakProtection] Clipboard monitoring started");
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Clipboard monitoring started");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] Start clipboard monitoring failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Start clipboard monitoring failed: {}", e.what());
         m_clipboardMonitoring.store(false, std::memory_order_release);
         return false;
     }
@@ -999,10 +999,10 @@ void DataLeakProtectionImpl::StopClipboardMonitoring() {
         }
         m_clipboardThread.reset();
 
-        Logger::Info("[DataLeakProtection] Clipboard monitoring stopped");
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Clipboard monitoring stopped");
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] Stop clipboard monitoring failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Stop clipboard monitoring failed: {}", e.what());
     }
 }
 
@@ -1020,7 +1020,7 @@ void DataLeakProtectionImpl::StopClipboardMonitoringInternal(
         try {
             m_clipboardThread->join();
         } catch (const std::exception& e) {
-            Logger::Error("[DataLeakProtection] Failed to join clipboard thread: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to join clipboard thread: {}", e.what());
         }
         lock.lock();
     }
@@ -1035,12 +1035,12 @@ bool DataLeakProtectionImpl::AddPattern(const PIIPattern& pattern) {
     std::unique_lock lock(m_mutex);
 
     if (pattern.patternId.empty() || pattern.regexPattern.empty()) {
-        Logger::Error("[DataLeakProtection] Invalid pattern: empty ID or regex");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Invalid pattern: empty ID or regex");
         return false;
     }
 
     if (m_patterns.size() >= DLPConstants::MAX_CUSTOM_PATTERNS) {
-        Logger::Error("[DataLeakProtection] Pattern limit reached ({})",
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Pattern limit reached ({})",
             DLPConstants::MAX_CUSTOM_PATTERNS);
         return false;
     }
@@ -1048,7 +1048,7 @@ bool DataLeakProtectionImpl::AddPattern(const PIIPattern& pattern) {
     // Check for duplicate pattern ID
     for (const auto& existing : m_patterns) {
         if (existing.patternId == pattern.patternId) {
-            Logger::Error("[DataLeakProtection] Duplicate pattern ID: {}", pattern.patternId);
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Duplicate pattern ID: {}", pattern.patternId);
             return false;
         }
     }
@@ -1064,11 +1064,11 @@ bool DataLeakProtectionImpl::AddPattern(const PIIPattern& pattern) {
 
         m_patterns.push_back(std::move(newPattern));
 
-        Logger::Info("[DataLeakProtection] Added pattern: {}", pattern.patternId);
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Added pattern: {}", pattern.patternId);
         return true;
 
     } catch (const std::regex_error& e) {
-        Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
             pattern.patternId, e.what());
         return false;
     }
@@ -1082,7 +1082,7 @@ bool DataLeakProtectionImpl::RemovePattern(const std::string& patternId) {
 
     if (it != m_patterns.end()) {
         m_patterns.erase(it, m_patterns.end());
-        Logger::Info("[DataLeakProtection] Removed pattern: {}", patternId);
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Removed pattern: {}", patternId);
         return true;
     }
 
@@ -1098,12 +1098,12 @@ bool DataLeakProtectionImpl::AddPolicy(const DLPPolicy& policy) {
     std::unique_lock lock(m_mutex);
 
     if (policy.policyId.empty()) {
-        Logger::Error("[DataLeakProtection] Invalid policy: empty ID");
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Invalid policy: empty ID");
         return false;
     }
 
     if (m_policies.size() >= DLPConstants::MAX_POLICIES) {
-        Logger::Error("[DataLeakProtection] Policy limit reached ({})",
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Policy limit reached ({})",
             DLPConstants::MAX_POLICIES);
         return false;
     }
@@ -1111,13 +1111,13 @@ bool DataLeakProtectionImpl::AddPolicy(const DLPPolicy& policy) {
     // Check for duplicate policy ID
     for (const auto& existing : m_policies) {
         if (existing.policyId == policy.policyId) {
-            Logger::Error("[DataLeakProtection] Duplicate policy ID: {}", policy.policyId);
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Duplicate policy ID: {}", policy.policyId);
             return false;
         }
     }
 
     m_policies.push_back(policy);
-    Logger::Info("[DataLeakProtection] Added policy: {}", policy.policyId);
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Added policy: {}", policy.policyId);
     return true;
 }
 
@@ -1129,7 +1129,7 @@ bool DataLeakProtectionImpl::RemovePolicy(const std::string& policyId) {
 
     if (it != m_policies.end()) {
         m_policies.erase(it, m_policies.end());
-        Logger::Info("[DataLeakProtection] Removed policy: {}", policyId);
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Removed policy: {}", policyId);
         return true;
     }
 
@@ -1305,7 +1305,7 @@ void DataLeakProtectionImpl::ReportIncident(const DLPIncident& incident) {
     // Notify outside m_incidentMutex to prevent deadlock if callback re-enters
     NotifyIncident(incident);
 
-    Logger::Warn("[DataLeakProtection] Incident reported: {} (Policy: {}, Action: {})",
+    ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Incident reported: {} (Policy: {}, Action: {})",
         incident.incidentId, incident.policyId, GetDLPActionName(incident.actionTaken));
 }
 
@@ -1381,7 +1381,7 @@ DLPStatisticsSnapshot DataLeakProtectionImpl::GetStatistics() const {
 void DataLeakProtectionImpl::ResetStatistics() {
     m_stats.Reset();
     m_stats.startTime = Clock::now();
-    Logger::Info("[DataLeakProtection] Statistics reset");
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Statistics reset");
 }
 
 // ============================================================================
@@ -1389,7 +1389,7 @@ void DataLeakProtectionImpl::ResetStatistics() {
 // ============================================================================
 
 void DataLeakProtectionImpl::ClipboardMonitoringThreadFunc() {
-    Logger::Info("[DataLeakProtection] Clipboard monitoring thread started");
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Clipboard monitoring thread started");
 
     while (m_clipboardMonitoring.load(std::memory_order_acquire)) {
         try {
@@ -1406,7 +1406,7 @@ void DataLeakProtectionImpl::ClipboardMonitoringThreadFunc() {
                 );
 
                 if (result.ShouldBlock()) {
-                    Logger::Warn("[DataLeakProtection] Blocked sensitive data in clipboard");
+                    ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Blocked sensitive data in clipboard");
 
                     // In production, clear clipboard here
                     // ClearClipboard();
@@ -1420,12 +1420,12 @@ void DataLeakProtectionImpl::ClipboardMonitoringThreadFunc() {
                 [this] { return !m_clipboardMonitoring.load(std::memory_order_acquire); });
 
         } catch (const std::exception& e) {
-            Logger::Error("[DataLeakProtection] Clipboard monitoring error: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Clipboard monitoring error: {}", e.what());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 
-    Logger::Info("[DataLeakProtection] Clipboard monitoring thread stopped");
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Clipboard monitoring thread stopped");
 }
 
 DLPScanResult DataLeakProtectionImpl::PerformScan(const std::string& content) {
@@ -1548,7 +1548,7 @@ std::vector<SensitiveDataMatch> DataLeakProtectionImpl::ScanWithPattern(
         }
 
     } catch (const std::regex_error& e) {
-        Logger::Error("[DataLeakProtection] Regex error for pattern {}: {}",
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Regex error for pattern {}: {}",
             pattern.patternId, e.what());
         return {};
     }
@@ -1648,7 +1648,7 @@ void DataLeakProtectionImpl::NotifyScanResult(const DLPScanResult& result) {
         try {
             m_scanCallback(result);
         } catch (const std::exception& e) {
-            Logger::Error("[DataLeakProtection] Scan callback exception: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Scan callback exception: {}", e.what());
         }
     }
 }
@@ -1659,7 +1659,7 @@ void DataLeakProtectionImpl::NotifyIncident(const DLPIncident& incident) {
         try {
             m_incidentCallback(incident);
         } catch (const std::exception& e) {
-            Logger::Error("[DataLeakProtection] Incident callback exception: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Incident callback exception: {}", e.what());
         }
     }
 }
@@ -1673,7 +1673,7 @@ void DataLeakProtectionImpl::NotifyPolicyViolation(
         try {
             m_policyCallback(policy, result);
         } catch (const std::exception& e) {
-            Logger::Error("[DataLeakProtection] Policy callback exception: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Policy callback exception: {}", e.what());
         }
     }
 }
@@ -1684,7 +1684,7 @@ void DataLeakProtectionImpl::NotifyError(const std::string& message, int code) {
         try {
             m_errorCallback(message, code);
         } catch (const std::exception& e) {
-            Logger::Error("[DataLeakProtection] Error callback exception: {}", e.what());
+            ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Error callback exception: {}", e.what());
         }
     }
 }
@@ -1710,7 +1710,7 @@ std::string DataLeakProtectionImpl::GetClipboardText() {
     try {
         // Cap clipboard read length to prevent memory exhaustion
         size_t len = wcsnlen(pszText, DLPConstants::MAX_CONTENT_SCAN_SIZE);
-        text = StringUtils::WStringToString(std::wstring_view(pszText, len));
+        text = ::ShadowStrike::Utils::StringUtils::WStringToString(std::wstring_view(pszText, len));
     } catch (...) {
         GlobalUnlock(hData);
         throw;
@@ -1737,18 +1737,18 @@ std::string DataLeakProtectionImpl::NormalizeNumber(const std::string& str) {
 }
 
 bool DataLeakProtectionImpl::SelfTest() {
-    Logger::Info("[DataLeakProtection] Running self-test...");
+    ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Running self-test...");
 
     try {
         // Test 1: Luhn validation
         {
             if (!LuhnCheck("4532015112830366")) {  // Valid Visa test number
-                Logger::Error("[DataLeakProtection] Self-test failed: Luhn validation");
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test failed: Luhn validation");
                 return false;
             }
 
             if (LuhnCheck("1234567890123456")) {  // Invalid
-                Logger::Error("[DataLeakProtection] Self-test failed: Luhn validation (false positive)");
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test failed: Luhn validation (false positive)");
                 return false;
             }
         }
@@ -1759,12 +1759,12 @@ bool DataLeakProtectionImpl::SelfTest() {
             auto result = ScanString(testContent);
 
             if (!result.hasSensitiveData) {
-                Logger::Error("[DataLeakProtection] Self-test failed: Pattern matching");
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test failed: Pattern matching");
                 return false;
             }
 
             if (result.totalMatches < 1) {
-                Logger::Error("[DataLeakProtection] Self-test failed: No matches found");
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test failed: No matches found");
                 return false;
             }
         }
@@ -1775,7 +1775,7 @@ bool DataLeakProtectionImpl::SelfTest() {
             std::string redacted = RedactValue(original, DataCategory::CreditCard);
 
             if (redacted == original) {
-                Logger::Error("[DataLeakProtection] Self-test failed: Redaction");
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test failed: Redaction");
                 return false;
             }
         }
@@ -1790,16 +1790,16 @@ bool DataLeakProtectionImpl::SelfTest() {
 
             int score = CalculateRiskScore(testResult);
             if (score < 50) {
-                Logger::Error("[DataLeakProtection] Self-test failed: Risk score calculation");
+                ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test failed: Risk score calculation");
                 return false;
             }
         }
 
-        Logger::Info("[DataLeakProtection] Self-test PASSED");
+        ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] Self-test exception: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Self-test exception: {}", e.what());
         return false;
     }
 }

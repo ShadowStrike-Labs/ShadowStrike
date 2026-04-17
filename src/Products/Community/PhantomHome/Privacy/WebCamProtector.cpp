@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -325,8 +325,8 @@ bool IsVirtualCameraDevice(const std::wstring& hardwareId, const std::wstring& f
     std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
 
     // Root-enumerated or software devices are typically virtual
-    if (hwLower.find(L"root\") != std::wstring::npos ||
-        hwLower.find(L"sw\") != std::wstring::npos) {
+    if (hwLower.find(L"root\\") != std::wstring::npos ||
+        hwLower.find(L"sw\\") != std::wstring::npos) {
         return true;
     }
     // Name-based heuristics for known virtual cameras

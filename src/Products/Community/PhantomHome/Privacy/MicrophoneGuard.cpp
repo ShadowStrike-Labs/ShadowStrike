@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -549,7 +549,7 @@ public:
     std::mutex m_callbacksMutex;
 
     /// @brief Infrastructure integrations
-    std::shared_ptr<Whitelist::WhiteListStore> m_whitelistStore;
+    std::shared_ptr<Whitelist::WhitelistStore> m_whitelistStore;
 
     /// @brief Monitoring thread
     std::unique_ptr<std::thread> m_monitorThread;
@@ -617,17 +617,17 @@ bool MicrophoneGuard::MicrophoneGuardImpl::Initialize(
 {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"MicrophoneGuard: Already initialized");
+            Utils::Logger::Warn("MicrophoneGuard: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"MicrophoneGuard: Initializing...");
+        Utils::Logger::Info("MicrophoneGuard: Initializing...");
 
         m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"MicrophoneGuard: Invalid configuration");
+            Utils::Logger::Error("MicrophoneGuard: Invalid configuration");
             m_initialized.store(false, std::memory_order_release);
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
@@ -642,29 +642,29 @@ bool MicrophoneGuard::MicrophoneGuardImpl::Initialize(
         try {
             auto& ti = ThreatIntel::ThreatIntelManager::Instance();
             if (!ti.IsInitialized()) {
-                Utils::Logger::Warn(L"MicrophoneGuard: ThreatIntel not yet initialized; "
+                Utils::Logger::Warn("MicrophoneGuard: ThreatIntel not yet initialized; "
                                     L"spyware checks will be deferred");
             }
         } catch (...) {
-            Utils::Logger::Warn(L"MicrophoneGuard: ThreatIntel unavailable");
+            Utils::Logger::Warn("MicrophoneGuard: ThreatIntel unavailable");
         }
 
         // Initialize whitelist store
-        m_whitelistStore = std::make_shared<Whitelist::WhiteListStore>();
+        m_whitelistStore = std::make_shared<Whitelist::WhitelistStore>();
 
         // Enumerate audio devices
         RefreshDevicesInternal();
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"MicrophoneGuard: Initialized successfully (mode: {})",
-                          Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(config.mode))));
+        Utils::Logger::Info("MicrophoneGuard: Initialized successfully (mode: {})",
+                          (std::string(GetProtectionModeName(config.mode))));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Initialization failed - {}",
+                           (e.what()));
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
@@ -677,7 +677,7 @@ void MicrophoneGuard::MicrophoneGuardImpl::Shutdown() {
             return;
         }
 
-        Utils::Logger::Info(L"MicrophoneGuard: Shutting down...");
+        Utils::Logger::Info("MicrophoneGuard: Shutting down...");
 
         m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
@@ -734,10 +734,10 @@ void MicrophoneGuard::MicrophoneGuardImpl::Shutdown() {
 
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"MicrophoneGuard: Shutdown complete");
+        Utils::Logger::Info("MicrophoneGuard: Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"MicrophoneGuard: Exception during shutdown");
+        Utils::Logger::Error("MicrophoneGuard: Exception during shutdown");
     }
 }
 
@@ -836,15 +836,15 @@ bool MicrophoneGuard::MicrophoneGuardImpl::RefreshDevicesInternal() {
             InvokeDeviceCallbacks(device, false);
         }
 
-        Utils::Logger::Info(L"MicrophoneGuard: Refreshed audio devices (total: {}, added: {}, removed: {})",
+        Utils::Logger::Info("MicrophoneGuard: Refreshed audio devices (total: {}, added: {}, removed: {})",
                           m_statistics.devicesMonitored.load(std::memory_order_relaxed),
                           addedDevices.size(), removedDevices.size());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Device enumeration failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Device enumeration failed - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1074,8 +1074,8 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
         return event.decision;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Access evaluation failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Access evaluation failed - {}",
+                           (e.what()));
         return AudioAccessDecision::Block;  // Fail secure
     }
 }
@@ -1083,19 +1083,19 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
 bool MicrophoneGuard::MicrophoneGuardImpl::BlockAudioForProcessInternal(uint32_t pid) {
     try {
         if (pid == 0) {
-            Utils::Logger::Error(L"MicrophoneGuard: Cannot block PID 0 (idle process)");
+            Utils::Logger::Error("MicrophoneGuard: Cannot block PID 0 (idle process)");
             return false;
         }
 
         std::unique_lock lock(m_blockedMutex);
         m_blockedProcesses.insert(pid);
 
-        Utils::Logger::Info(L"MicrophoneGuard: Blocked audio for PID {}", pid);
+        Utils::Logger::Info("MicrophoneGuard: Blocked audio for PID {}", pid);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to block process - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to block process - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1106,14 +1106,14 @@ bool MicrophoneGuard::MicrophoneGuardImpl::UnblockAudioForProcessInternal(uint32
         size_t removed = m_blockedProcesses.erase(pid);
 
         if (removed > 0) {
-            Utils::Logger::Info(L"MicrophoneGuard: Unblocked audio for PID {}", pid);
+            Utils::Logger::Info("MicrophoneGuard: Unblocked audio for PID {}", pid);
         }
 
         return removed > 0;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to unblock process - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to unblock process - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1121,19 +1121,19 @@ bool MicrophoneGuard::MicrophoneGuardImpl::UnblockAudioForProcessInternal(uint32
 bool MicrophoneGuard::MicrophoneGuardImpl::MuteAudioForProcessInternal(uint32_t pid) {
     try {
         if (pid == 0) {
-            Utils::Logger::Error(L"MicrophoneGuard: Cannot mute PID 0 (idle process)");
+            Utils::Logger::Error("MicrophoneGuard: Cannot mute PID 0 (idle process)");
             return false;
         }
 
         std::unique_lock lock(m_mutedMutex);
         m_mutedProcesses.insert(pid);
 
-        Utils::Logger::Info(L"MicrophoneGuard: Muted audio for PID {}", pid);
+        Utils::Logger::Info("MicrophoneGuard: Muted audio for PID {}", pid);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to mute process - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to mute process - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1147,27 +1147,27 @@ bool MicrophoneGuard::MicrophoneGuardImpl::AddToWhitelistInternal(
 {
     try {
         if (entry.entryId.empty()) {
-            Utils::Logger::Error(L"MicrophoneGuard: Empty entry ID");
+            Utils::Logger::Error("MicrophoneGuard: Empty entry ID");
             return false;
         }
 
         std::unique_lock lock(m_whitelistMutex);
 
         if (m_whitelist.size() >= MicrophoneConstants::MAX_WHITELIST) {
-            Utils::Logger::Error(L"MicrophoneGuard: Whitelist full");
+            Utils::Logger::Error("MicrophoneGuard: Whitelist full");
             return false;
         }
 
         m_whitelist[entry.entryId] = entry;
 
-        Utils::Logger::Info(L"MicrophoneGuard: Added to whitelist: {}",
-                          Utils::StringUtils::Utf8ToWide(entry.processPattern));
+        Utils::Logger::Info("MicrophoneGuard: Added to whitelist: {}",
+                          (entry.processPattern));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to add to whitelist - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to add to whitelist - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1183,14 +1183,14 @@ bool MicrophoneGuard::MicrophoneGuardImpl::RemoveFromWhitelistInternal(const std
 
         m_whitelist.erase(it);
 
-        Utils::Logger::Info(L"MicrophoneGuard: Removed from whitelist: {}",
-                          Utils::StringUtils::Utf8ToWide(entryId));
+        Utils::Logger::Info("MicrophoneGuard: Removed from whitelist: {}",
+                          (entryId));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to remove from whitelist - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to remove from whitelist - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1260,8 +1260,8 @@ void MicrophoneGuard::MicrophoneGuardImpl::RecordAccessEvent(const AudioAccessEv
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to record event - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to record event - {}",
+                           (e.what()));
     }
 }
 
@@ -1302,23 +1302,23 @@ bool MicrophoneGuard::MicrophoneGuardImpl::IsKnownSpywareInternal(uint32_t proce
                 std::string threatName;
                 if (threatIntel.IsKnownMalicious(hash, threatName)) {
                     Utils::Logger::Warn(
-                        L"MicrophoneGuard: Spyware detected (PID {}) threat='{}' hash='{}'",
+                        "MicrophoneGuard: Spyware detected (PID {}) threat='{}' hash='{}'",
                         processId,
-                        Utils::StringUtils::Utf8ToWide(threatName),
-                        Utils::StringUtils::Utf8ToWide(hash));
+                        (threatName),
+                        (hash));
                     return true;
                 }
             }
         } catch (const std::exception& ex) {
-            Utils::Logger::Debug(L"MicrophoneGuard: ThreatIntel query failed - {}",
-                                Utils::StringUtils::Utf8ToWide(ex.what()));
+            Utils::Logger::Debug("MicrophoneGuard: ThreatIntel query failed - {}",
+                                (ex.what()));
         }
 
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Spyware check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Spyware check failed - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1367,8 +1367,8 @@ AudioRiskLevel MicrophoneGuard::MicrophoneGuardImpl::AnalyzeProcessInternal(uint
         return risk;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Process analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Process analysis failed - {}",
+                           (e.what()));
         return AudioRiskLevel::Medium;  // Unknown = medium risk
     }
 }
@@ -1378,7 +1378,7 @@ AudioRiskLevel MicrophoneGuard::MicrophoneGuardImpl::AnalyzeProcessInternal(uint
 // ============================================================================
 
 void MicrophoneGuard::MicrophoneGuardImpl::MonitorThreadFunc() {
-    Utils::Logger::Info(L"MicrophoneGuard: Monitoring thread started");
+    Utils::Logger::Info("MicrophoneGuard: Monitoring thread started");
 
     while (m_monitoringActive.load(std::memory_order_acquire)) {
         try {
@@ -1439,9 +1439,9 @@ void MicrophoneGuard::MicrophoneGuardImpl::MonitorThreadFunc() {
 
                         InvokeStreamCallbacks(stream);
 
-                        Utils::Logger::Info(L"MicrophoneGuard: New audio stream from PID {} ({})",
+                        Utils::Logger::Info("MicrophoneGuard: New audio stream from PID {} ({})",
                                           pid,
-                                          Utils::StringUtils::Utf8ToWide(stream.processName));
+                                          (stream.processName));
                     }
                 }
             }
@@ -1451,12 +1451,12 @@ void MicrophoneGuard::MicrophoneGuardImpl::MonitorThreadFunc() {
                 std::chrono::milliseconds(MicrophoneConstants::POLLING_INTERVAL_MS));
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MicrophoneGuard: Monitoring error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("MicrophoneGuard: Monitoring error - {}",
+                               (e.what()));
         }
     }
 
-    Utils::Logger::Info(L"MicrophoneGuard: Monitoring thread stopped");
+    Utils::Logger::Info("MicrophoneGuard: Monitoring thread stopped");
 }
 
 std::vector<AudioStreamInfo> MicrophoneGuard::MicrophoneGuardImpl::GetActiveStreamsInternal() {
@@ -1484,8 +1484,8 @@ void MicrophoneGuard::MicrophoneGuardImpl::InvokeAccessCallbacks(const AudioAcce
         try {
             callback(event);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MicrophoneGuard: Access callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("MicrophoneGuard: Access callback error - {}",
+                               (e.what()));
         }
     }
 }
@@ -1496,8 +1496,8 @@ void MicrophoneGuard::MicrophoneGuardImpl::InvokeStreamCallbacks(const AudioStre
         try {
             callback(stream);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MicrophoneGuard: Stream callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("MicrophoneGuard: Stream callback error - {}",
+                               (e.what()));
         }
     }
 }
@@ -1511,8 +1511,8 @@ void MicrophoneGuard::MicrophoneGuardImpl::InvokeDeviceCallbacks(
         try {
             callback(device, added);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MicrophoneGuard: Device callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("MicrophoneGuard: Device callback error - {}",
+                               (e.what()));
         }
     }
 }
@@ -1530,8 +1530,8 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::InvokeDecisionCallback
     try {
         return m_decisionCallbacks[0](event);
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Decision callback error - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Decision callback error - {}",
+                           (e.what()));
         return AudioAccessDecision::Block;  // Fail secure
     }
 }
@@ -1573,14 +1573,14 @@ bool MicrophoneGuard::HasInstance() noexcept {
 MicrophoneGuard::MicrophoneGuard()
     : m_impl(std::make_unique<MicrophoneGuardImpl>())
 {
-    Utils::Logger::Info(L"MicrophoneGuard: Constructor called");
+    Utils::Logger::Info("MicrophoneGuard: Constructor called");
 }
 
 MicrophoneGuard::~MicrophoneGuard() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"MicrophoneGuard: Destructor called");
+    Utils::Logger::Info("MicrophoneGuard: Destructor called");
 }
 
 bool MicrophoneGuard::Initialize(const MicrophoneConfiguration& config) {
@@ -1604,7 +1604,7 @@ ModuleStatus MicrophoneGuard::GetStatus() const noexcept {
 
 bool MicrophoneGuard::UpdateConfiguration(const MicrophoneConfiguration& config) {
     if (!config.IsValid()) {
-        Utils::Logger::Error(L"MicrophoneGuard: Invalid configuration");
+        Utils::Logger::Error("MicrophoneGuard: Invalid configuration");
         return false;
     }
 
@@ -1615,7 +1615,7 @@ bool MicrophoneGuard::UpdateConfiguration(const MicrophoneConfiguration& config)
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config = config;
 
-    Utils::Logger::Info(L"MicrophoneGuard: Configuration updated");
+    Utils::Logger::Info("MicrophoneGuard: Configuration updated");
     return true;
 }
 
@@ -1638,8 +1638,8 @@ void MicrophoneGuard::SetProtectionMode(MicrophoneProtectionMode mode) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config.mode = mode;
 
-    Utils::Logger::Info(L"MicrophoneGuard: Protection mode changed to: {}",
-                      Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(mode))));
+    Utils::Logger::Info("MicrophoneGuard: Protection mode changed to: {}",
+                      (std::string(GetProtectionModeName(mode))));
 }
 
 MicrophoneProtectionMode MicrophoneGuard::GetProtectionMode() const noexcept {
@@ -1654,7 +1654,7 @@ bool MicrophoneGuard::SetGlobalMute(bool muted) {
 
     m_impl->m_globallyMuted.store(muted, std::memory_order_release);
 
-    Utils::Logger::Info(L"MicrophoneGuard: Microphone globally {}",
+    Utils::Logger::Info("MicrophoneGuard: Microphone globally {}",
                       muted ? L"MUTED" : L"UNMUTED");
 
     return true;
@@ -1677,14 +1677,14 @@ bool MicrophoneGuard::BlockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = true;
 
-        Utils::Logger::Info(L"MicrophoneGuard: Device blocked: {}",
-                          Utils::StringUtils::Utf8ToWide(deviceId));
+        Utils::Logger::Info("MicrophoneGuard: Device blocked: {}",
+                          (deviceId));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to block device - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to block device - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1702,14 +1702,14 @@ bool MicrophoneGuard::UnblockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = false;
 
-        Utils::Logger::Info(L"MicrophoneGuard: Device unblocked: {}",
-                          Utils::StringUtils::Utf8ToWide(deviceId));
+        Utils::Logger::Info("MicrophoneGuard: Device unblocked: {}",
+                          (deviceId));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to unblock device - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to unblock device - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1771,7 +1771,7 @@ bool MicrophoneGuard::MonitorAudioStreams() {
     if (!m_impl) return false;
 
     if (m_impl->m_monitoringActive.exchange(true, std::memory_order_acq_rel)) {
-        Utils::Logger::Warn(L"MicrophoneGuard: Monitoring already active");
+        Utils::Logger::Warn("MicrophoneGuard: Monitoring already active");
         return true;
     }
 
@@ -1785,12 +1785,12 @@ bool MicrophoneGuard::MonitorAudioStreams() {
         m_impl->m_monitorThread = std::make_unique<std::thread>(
             &MicrophoneGuardImpl::MonitorThreadFunc, m_impl.get());
 
-        Utils::Logger::Info(L"MicrophoneGuard: Audio stream monitoring started");
+        Utils::Logger::Info("MicrophoneGuard: Audio stream monitoring started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to start monitoring - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to start monitoring - {}",
+                           (e.what()));
         m_impl->m_monitoringActive.store(false, std::memory_order_release);
         return false;
     }
@@ -1805,7 +1805,7 @@ void MicrophoneGuard::StopMonitoring() {
         m_impl->m_monitorThread->join();
     }
 
-    Utils::Logger::Info(L"MicrophoneGuard: Audio stream monitoring stopped");
+    Utils::Logger::Info("MicrophoneGuard: Audio stream monitoring stopped");
 }
 
 bool MicrophoneGuard::IsMonitoringActive() const noexcept {
@@ -1847,7 +1847,7 @@ bool MicrophoneGuard::AllowProcessTemporarily(
     if (!m_impl) return false;
 
     if (processId == 0) {
-        Utils::Logger::Error(L"MicrophoneGuard: Cannot grant temporary access to PID 0");
+        Utils::Logger::Error("MicrophoneGuard: Cannot grant temporary access to PID 0");
         return false;
     }
 
@@ -1855,7 +1855,7 @@ bool MicrophoneGuard::AllowProcessTemporarily(
     static constexpr auto MAX_TEMP_DURATION = std::chrono::hours(24);
     if (duration <= std::chrono::seconds::zero() || duration > MAX_TEMP_DURATION) {
         Utils::Logger::Error(
-            L"MicrophoneGuard: Invalid temporary access duration {} seconds (max: {} hours)",
+            "MicrophoneGuard: Invalid temporary access duration {} seconds (max: {} hours)",
             duration.count(), MAX_TEMP_DURATION.count());
         return false;
     }
@@ -1866,14 +1866,14 @@ bool MicrophoneGuard::AllowProcessTemporarily(
         std::unique_lock lock(m_impl->m_temporaryMutex);
         m_impl->m_temporaryAccess[processId] = expiration;
 
-        Utils::Logger::Info(L"MicrophoneGuard: Temporary access granted to PID {} for {} seconds",
+        Utils::Logger::Info("MicrophoneGuard: Temporary access granted to PID {} for {} seconds",
                           processId, duration.count());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to grant temporary access - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to grant temporary access - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1918,14 +1918,14 @@ bool MicrophoneGuard::ImportDefaultTrustedApps() {
             m_impl->AddToWhitelistInternal(entry);
         }
 
-        Utils::Logger::Info(L"MicrophoneGuard: Imported {} default trusted apps",
+        Utils::Logger::Info("MicrophoneGuard: Imported {} default trusted apps",
                           std::size(MicrophoneConstants::DEFAULT_TRUSTED_APPS));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Failed to import default apps - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Failed to import default apps - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -1965,7 +1965,7 @@ void MicrophoneGuard::ClearEventHistory() {
     std::unique_lock lock(m_impl->m_eventsMutex);
     m_impl->m_events.clear();
 
-    Utils::Logger::Info(L"MicrophoneGuard: Event history cleared");
+    Utils::Logger::Info("MicrophoneGuard: Event history cleared");
 }
 
 // ============================================================================
@@ -2036,13 +2036,13 @@ MicrophoneStatisticsSnapshot MicrophoneGuard::GetStatistics() const {
 void MicrophoneGuard::ResetStatistics() {
     if (m_impl) {
         m_impl->m_statistics.Reset();
-        Utils::Logger::Info(L"MicrophoneGuard: Statistics reset");
+        Utils::Logger::Info("MicrophoneGuard: Statistics reset");
     }
 }
 
 bool MicrophoneGuard::SelfTest() {
     try {
-        Utils::Logger::Info(L"MicrophoneGuard: Starting self-test");
+        Utils::Logger::Info("MicrophoneGuard: Starting self-test");
 
         // Test 1: Initialization — only initialize if not already running
         if (!IsInitialized()) {
@@ -2051,7 +2051,7 @@ bool MicrophoneGuard::SelfTest() {
             config.notificationDurationMs = 5000;
 
             if (!Initialize(config)) {
-                Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Initialization");
+                Utils::Logger::Error("MicrophoneGuard: Self-test failed - Initialization");
                 return false;
             }
         }
@@ -2060,13 +2060,13 @@ bool MicrophoneGuard::SelfTest() {
         MicrophoneConfiguration testConfig;
         testConfig.notificationDurationMs = 5000;
         if (!testConfig.IsValid()) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Configuration invalid");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Configuration invalid");
             return false;
         }
 
         // Test 3: Device enumeration
         auto devices = GetAudioDevices();
-        Utils::Logger::Info(L"MicrophoneGuard: Enumerated {} devices", devices.size());
+        Utils::Logger::Info("MicrophoneGuard: Enumerated {} devices", devices.size());
 
         // Test 4: Whitelist management
         AudioWhitelistEntry entry;
@@ -2075,42 +2075,42 @@ bool MicrophoneGuard::SelfTest() {
         entry.enabled = true;
 
         if (!AddToWhitelist(entry)) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Whitelist add");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Whitelist add");
             return false;
         }
 
         if (!IsProcessWhitelisted("test.exe", fs::path{})) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Whitelist check");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Whitelist check");
             return false;
         }
 
         if (!RemoveFromWhitelist("TEST_ENTRY")) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Whitelist remove");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Whitelist remove");
             return false;
         }
 
         // Test 5: Protection control
         SetGlobalMute(true);
         if (!IsGloballyMuted()) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Global mute");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Global mute");
             return false;
         }
 
         SetGlobalMute(false);
         if (IsGloballyMuted()) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Global unmute");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Global unmute");
             return false;
         }
 
         // Test 6: Process blocking
         uint32_t testPid = GetCurrentProcessId();
         if (!BlockAudioForProcess(testPid)) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Block process");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Block process");
             return false;
         }
 
         if (!UnblockAudioForProcess(testPid)) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Unblock process");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Unblock process");
             return false;
         }
 
@@ -2119,22 +2119,22 @@ bool MicrophoneGuard::SelfTest() {
         ResetStatistics();
         stats = GetStatistics();
         if (stats.totalAccessAttempts != 0) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Statistics reset");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Statistics reset");
             return false;
         }
 
         // Test 8: Default trusted apps
         if (!ImportDefaultTrustedApps()) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Import default apps");
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Import default apps");
             return false;
         }
 
-        Utils::Logger::Info(L"MicrophoneGuard: Self-test PASSED");
+        Utils::Logger::Info("MicrophoneGuard: Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MicrophoneGuard: Self-test exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("MicrophoneGuard: Self-test exception - {}",
+                           (e.what()));
         return false;
     }
 }
@@ -2242,7 +2242,7 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
             reinterpret_cast<void**>(pEnumerator.put()));
 
         if (FAILED(hr)) {
-            Utils::Logger::Error(L"EnumerateAudioDevices: Failed to create device enumerator");
+            Utils::Logger::Error("EnumerateAudioDevices: Failed to create device enumerator");
             return devices;
         }
 
@@ -2253,7 +2253,7 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
             pCollection.put());
 
         if (FAILED(hr)) {
-            Utils::Logger::Error(L"EnumerateAudioDevices: Failed to enumerate endpoints");
+            Utils::Logger::Error("EnumerateAudioDevices: Failed to enumerate endpoints");
             return devices;
         }
 
@@ -2271,7 +2271,7 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
             // Get device ID
             LPWSTR pwszID = nullptr;
             if (SUCCEEDED(pDevice->GetId(&pwszID))) {
-                device.endpointId = Utils::StringUtils::WideToUtf8(pwszID);
+                device.endpointId = Utils::StringUtils::ToNarrow(pwszID);
                 device.deviceId = std::format("MIC_{}", i);
                 CoTaskMemFree(pwszID);
             }
@@ -2284,7 +2284,7 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
 
                 if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName)) &&
                     varName.pwszVal != nullptr) {
-                    device.friendlyName = Utils::StringUtils::WideToUtf8(varName.pwszVal);
+                    device.friendlyName = Utils::StringUtils::ToNarrow(varName.pwszVal);
 
                     // Heuristic device type detection from friendly name
                     std::string lowerName = device.friendlyName;
@@ -2320,7 +2320,7 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
                     eCapture, eConsole, pDefaultDevice.put()))) {
                 LPWSTR pwszDefaultID = nullptr;
                 if (SUCCEEDED(pDefaultDevice->GetId(&pwszDefaultID))) {
-                    std::string defaultId = Utils::StringUtils::WideToUtf8(pwszDefaultID);
+                    std::string defaultId = Utils::StringUtils::ToNarrow(pwszDefaultID);
                     device.isDefault = (device.endpointId == defaultId);
                     CoTaskMemFree(pwszDefaultID);
                 }
@@ -2348,8 +2348,8 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"EnumerateAudioDevices: Exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("EnumerateAudioDevices: Exception - {}",
+                           (e.what()));
     }
 #endif
 
@@ -2444,8 +2444,8 @@ std::vector<uint32_t> GetProcessesCapturingAudio() {
         processes.assign(uniquePids.begin(), uniquePids.end());
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"GetProcessesCapturingAudio: Exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("GetProcessesCapturingAudio: Exception - {}",
+                           (e.what()));
     }
 #endif
 

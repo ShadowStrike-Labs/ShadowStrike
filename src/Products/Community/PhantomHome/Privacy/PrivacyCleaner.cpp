@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -703,15 +703,15 @@ CleanResultDetails PrivacyCleanerImpl::CleanAll() {
 }
 
 CleanResultDetails PrivacyCleanerImpl::CleanBrowser(const std::wstring& browserName) {
-    std::wstring lowerName = StringUtils::ToLowerCopy(browserName);
+    std::wstring lowerName = Utils::StringUtils::ToLowerCopy(browserName);
 
     BrowserType browser = BrowserType::Unknown;
-    if (StringUtils::IContains(lowerName, L"chrome"))       browser = BrowserType::Chrome;
-    else if (StringUtils::IContains(lowerName, L"firefox")) browser = BrowserType::Firefox;
-    else if (StringUtils::IContains(lowerName, L"edge"))    browser = BrowserType::Edge;
-    else if (StringUtils::IContains(lowerName, L"opera"))   browser = BrowserType::Opera;
-    else if (StringUtils::IContains(lowerName, L"brave"))   browser = BrowserType::Brave;
-    else if (StringUtils::IContains(lowerName, L"vivaldi")) browser = BrowserType::Vivaldi;
+    if (Utils::StringUtils::IContains(lowerName, L"chrome"))       browser = BrowserType::Chrome;
+    else if (Utils::StringUtils::IContains(lowerName, L"firefox")) browser = BrowserType::Firefox;
+    else if (Utils::StringUtils::IContains(lowerName, L"edge"))    browser = BrowserType::Edge;
+    else if (Utils::StringUtils::IContains(lowerName, L"opera"))   browser = BrowserType::Opera;
+    else if (Utils::StringUtils::IContains(lowerName, L"brave"))   browser = BrowserType::Brave;
+    else if (Utils::StringUtils::IContains(lowerName, L"vivaldi")) browser = BrowserType::Vivaldi;
 
     if (browser == BrowserType::Unknown) {
         SS_LOG_WARN(L"PrivacyCleaner", L"CleanBrowser: unrecognized browser name '%ls'", browserName.c_str());
@@ -2643,8 +2643,8 @@ bool IsBrowserRunning(BrowserType browser) {
     }
 
     try {
-        std::wstring processNameW = StringUtils::ToWide(paths.processName);
-        return ProcessUtils::IsProcessRunning(processNameW);
+        std::wstring processNameW = Utils::StringUtils::ToWide(paths.processName);
+        return Utils::ProcessUtils::IsProcessRunning(processNameW);
     } catch (...) {
         return false;
     }
@@ -2658,7 +2658,7 @@ bool CloseBrowser(BrowserType browser) {
 
 #ifdef _WIN32
     try {
-        std::wstring processNameW = StringUtils::ToWide(paths.processName);
+        std::wstring processNameW = Utils::StringUtils::ToWide(paths.processName);
 
         // Enumerate processes to find PIDs matching the browser process name
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -2673,7 +2673,7 @@ bool CloseBrowser(BrowserType browser) {
         std::vector<DWORD> pids;
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                if (StringUtils::IEquals(pe32.szExeFile, processNameW)) {
+                if (Utils::StringUtils::IEquals(pe32.szExeFile, processNameW)) {
                     pids.push_back(pe32.th32ProcessID);
                 }
             } while (Process32NextW(hSnapshot, &pe32));
@@ -2687,7 +2687,7 @@ bool CloseBrowser(BrowserType browser) {
 
         bool anyTerminated = false;
         for (DWORD pid : pids) {
-            if (ProcessUtils::TerminateProcess(pid, 0)) {
+            if (Utils::ProcessUtils::TerminateProcess(pid, 0)) {
                 anyTerminated = true;
             }
         }
