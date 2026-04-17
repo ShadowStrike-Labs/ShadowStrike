@@ -474,6 +474,9 @@ public:
 #if SS_HAS_DXGI
     IDXGIFactory1* m_cachedDxgiFactory = nullptr;
     IDXGIAdapter3* m_cachedDxgiAdapter3 = nullptr;
+    // H5: Thread-safe lazy init and access for DXGI COM pointers
+    std::once_flag m_dxgiInitFlag;
+    std::mutex m_dxgiMutex;
 #endif
 
     // ========================================================================
@@ -926,13 +929,13 @@ public:
             return 0.0;
         }
 
-        // PO-H4: Lazily initialize and cache DXGI factory + adapter
-        if (!m_cachedDxgiFactory) {
+        // H5: Thread-safe lazy initialization of DXGI COM pointers
+        std::call_once(m_dxgiInitFlag, [&] {
             HRESULT hr = pCreateDXGIFactory1(__uuidof(IDXGIFactory1),
                                              reinterpret_cast<void**>(&m_cachedDxgiFactory));
             if (FAILED(hr) || !m_cachedDxgiFactory) {
                 m_cachedDxgiFactory = nullptr;
-                return 0.0;
+                return;
             }
 
             IDXGIAdapter1* adapter = nullptr;
@@ -944,7 +947,10 @@ public:
                     m_cachedDxgiAdapter3 = nullptr;
                 }
             }
-        }
+        });
+
+        // H5: Guard usage and potential release with mutex
+        std::lock_guard dxgiLock(m_dxgiMutex);
 
         if (!m_cachedDxgiAdapter3) {
             return 0.0;
@@ -1035,6 +1041,7 @@ public:
      */
     void ReleaseDxgiResources() {
 #if SS_HAS_DXGI
+        // H5: Must be called under m_dxgiMutex (or during destruction)
         if (m_cachedDxgiAdapter3) {
             m_cachedDxgiAdapter3->Release();
             m_cachedDxgiAdapter3 = nullptr;
@@ -1499,7 +1506,15 @@ PerformanceOptimizer::GetConfiguration() const {
         result.success = true;
         result.processesModified = processesModified;
         result.memoryFreedMB = memoryFreed;
-        result.estimatedGainPercent = processesModified > 0 ? 15.0 : 0.0;
+        // H6: Compute rough estimate based on actual throttle ratio
+        if (processesModified > 0) {
+            const auto totalProcesses = static_cast<uint32_t>(pids.size());
+            double throttleRatio = static_cast<double>(processesModified) /
+                                   std::max(1u, totalProcesses);
+            result.estimatedGainPercent = std::clamp(throttleRatio * 25.0, 1.0, 30.0);
+        } else {
+            result.estimatedGainPercent = 0.0;
+        }
 
         m_impl->m_stats.boostActivations++;
 
@@ -1551,6 +1566,35 @@ PerformanceOptimizer::GetConfiguration() const {
             if (state.currentAffinityMask != state.originalAffinityMask) {
                 ::SetProcessAffinityMask(hProcess.get(), state.originalAffinityMask);
                 state.currentAffinityMask = state.originalAffinityMask;
+            }
+
+            // C1: Restore I/O priority (mirrors Shutdown logic)
+            if (auto ntSetInfo = GetNtSetInformationProcess()) {
+                ULONG ioPriority = ToWindowsIOPriority(state.originalIOPriority);
+                NTSTATUS ntStatus = ntSetInfo(hProcess.get(), SS_ProcessIoPriority,
+                                              &ioPriority, sizeof(ioPriority));
+                if (ntStatus != 0) {
+                    Utils::Logger::Warn("RestoreSystem: NtSetInformationProcess(IoPriority) "
+                                        "failed for PID {}: NTSTATUS 0x{:08X}", pid,
+                                        static_cast<uint32_t>(ntStatus));
+                } else {
+                    state.currentIOPriority = state.originalIOPriority;
+                }
+            }
+
+            // C1: Restore memory priority (mirrors Shutdown logic)
+            if (auto ntSetInfo = GetNtSetInformationProcess()) {
+                SS_MEMORY_PRIORITY_INFORMATION memPriority{};
+                memPriority.MemoryPriority = ToWindowsMemoryPriority(state.originalMemoryPriority);
+                NTSTATUS ntStatus = ntSetInfo(hProcess.get(), SS_ProcessMemoryPriority,
+                                              &memPriority, sizeof(memPriority));
+                if (ntStatus != 0) {
+                    Utils::Logger::Warn("RestoreSystem: NtSetInformationProcess(MemoryPriority) "
+                                        "failed for PID {}: NTSTATUS 0x{:08X}", pid,
+                                        static_cast<uint32_t>(ntStatus));
+                } else {
+                    state.currentMemoryPriority = state.originalMemoryPriority;
+                }
             }
 
             state.isModified = false;
@@ -1608,6 +1652,13 @@ PerformanceOptimizer::GetConfiguration() const {
     ProcessPriorityClass priority)
 {
     try {
+        // M5: Reject REALTIME_PRIORITY_CLASS — never appropriate for a consumer security product
+        if (priority == ProcessPriorityClass::Realtime) {
+            Utils::Logger::Warn("SetProcessPriority: REALTIME_PRIORITY_CLASS rejected for "
+                                "PID {} — use High or lower for consumer endpoints", pid);
+            return false;
+        }
+
         // Fix #15: RAII handle
         ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
         if (!hProcess) {
@@ -2091,6 +2142,14 @@ void PerformanceOptimizer::DisableThrottling() {
 
 void PerformanceOptimizer::StartResourceMonitoring(uint32_t intervalMs) {
     try {
+        // M3: Validate and clamp intervalMs to [100, 60000]
+        const uint32_t originalInterval = intervalMs;
+        intervalMs = std::clamp(intervalMs, 100u, 60000u);
+        if (originalInterval != intervalMs) {
+            Utils::Logger::Warn("StartResourceMonitoring: intervalMs {} clamped to {} "
+                                "(valid range: 100-60000)", originalInterval, intervalMs);
+        }
+
         std::unique_lock lock(m_impl->m_mutex);
 
         if (m_impl->m_monitoringActive.load(std::memory_order_acquire)) {
@@ -2202,6 +2261,21 @@ void PerformanceOptimizer::StopResourceMonitoring() {
             std::shared_lock lock(m_impl->m_mutex);
             return m_impl->m_customProfile;
         }
+
+        // M6: Defensive default — log error and fall back to Normal profile
+        default:
+            Utils::Logger::Error("GetProfileSettings: unknown OptimizationProfile value {}",
+                                 static_cast<unsigned>(profile));
+            settings.name = "Normal";
+            settings.description = "Normal operation mode (fallback)";
+            settings.processPriority = ProcessPriorityClass::Normal;
+            settings.ioPriority = IOPriority::Normal;
+            settings.memoryPriority = MemoryPriority::VeryHigh;
+            settings.throttle.diskThroughputMBps = 0;
+            settings.throttle.cpuUsageLimit = 100;
+            settings.trimWorkingSet = false;
+            settings.deferBackgroundWork = false;
+            break;
     }
 
     return settings;

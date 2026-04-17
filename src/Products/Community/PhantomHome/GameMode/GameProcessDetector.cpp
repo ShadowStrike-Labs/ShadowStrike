@@ -171,6 +171,59 @@ private:
     HANDLE m_handle = nullptr;
 };
 
+// ============================================================================
+// RAII REGISTRY KEY WRAPPER
+// ============================================================================
+
+/**
+ * @brief RAII wrapper for Windows HKEY registry handles.
+ *
+ * Automatically closes via RegCloseKey on destruction.
+ */
+class ScopedRegKey final {
+public:
+    explicit ScopedRegKey(HKEY h = nullptr) noexcept : m_key(h) {}
+    ~ScopedRegKey() noexcept { Close(); }
+
+    ScopedRegKey(const ScopedRegKey&) = delete;
+    ScopedRegKey& operator=(const ScopedRegKey&) = delete;
+
+    ScopedRegKey(ScopedRegKey&& other) noexcept : m_key(other.m_key) {
+        other.m_key = nullptr;
+    }
+
+    ScopedRegKey& operator=(ScopedRegKey&& other) noexcept {
+        if (this != &other) {
+            Close();
+            m_key = other.m_key;
+            other.m_key = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] HKEY Get() const noexcept { return m_key; }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return m_key != nullptr;
+    }
+
+    /// @brief Receive a key via out-parameter (closes any previously held key)
+    [[nodiscard]] HKEY* Put() noexcept {
+        Close();
+        return &m_key;
+    }
+
+    void Close() noexcept {
+        if (m_key) {
+            ::RegCloseKey(m_key);
+        }
+        m_key = nullptr;
+    }
+
+private:
+    HKEY m_key = nullptr;
+};
+
 /**
  * @brief Launcher database entry
  */
@@ -439,10 +492,10 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
 
         m_config = config;
 
-        // Build game database from known games
+        // Build game database from known games (keys normalized to lowercase)
         for (const auto& game : KNOWN_GAMES_DATABASE) {
             for (const auto& exeName : game.executableNames) {
-                m_gameDatabase[exeName] = game;
+                m_gameDatabase[Utils::StringUtils::ToLowerCopy(exeName)] = game;
             }
         }
 
@@ -453,7 +506,7 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
             userEntry.title = Utils::StringUtils::WStringToString(gameName);
             userEntry.executableNames.push_back(gameName);
             userEntry.category = GameCategory::Unknown;
-            m_gameDatabase[gameName] = userEntry;
+            m_gameDatabase[Utils::StringUtils::ToLowerCopy(gameName)] = userEntry;
         }
 
         // Initialize launcher info
@@ -603,7 +656,7 @@ bool GameProcessDetectorImpl::IsKnownGame(const std::wstring& processName) {
 
     m_stats.databaseLookups++;
 
-    return m_gameDatabase.count(processName) > 0 ||
+    return m_gameDatabase.count(Utils::StringUtils::ToLowerCopy(processName)) > 0 ||
            m_userDefinedGames.count(processName) > 0;
 }
 
@@ -642,6 +695,19 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
         game.detectedTime = std::chrono::system_clock::now();
         game.lastActivityTime = Clock::now();
 
+        // Capture process creation time for PID-reuse detection
+#ifdef _WIN32
+        {
+            ScopedHandle hProc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+            if (hProc) {
+                FILETIME creation{}, exit{}, kernel{}, user{};
+                if (GetProcessTimes(hProc.Get(), &creation, &exit, &kernel, &user)) {
+                    game.processCreationTime = creation;
+                }
+            }
+        }
+#endif
+
         // Try database match
         GameEntry matchedEntry;
         bool foundInDatabase = false;
@@ -663,6 +729,17 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
         }
         else {
             return std::nullopt;
+        }
+
+        // Reject games below confidence threshold
+        {
+            std::shared_lock lock(m_mutex);
+            if (game.confidence < m_config.confidenceThreshold) {
+                Utils::Logger::Info("[GameProcessDetector] Game {} rejected - confidence {} below threshold {}",
+                    Utils::StringUtils::WStringToString(processName),
+                    game.confidence, m_config.confidenceThreshold);
+                return std::nullopt;
+            }
         }
 
         // Detect launcher
@@ -698,6 +775,11 @@ std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
         // Store in cache
         {
             std::unique_lock lock(m_mutex);
+            if (m_detectedGames.size() >= DetectorConstants::MAX_TRACKED_PROCESSES) {
+                Utils::Logger::Warn("[GameProcessDetector] Maximum tracked processes ({}) reached, not tracking PID {}",
+                    DetectorConstants::MAX_TRACKED_PROCESSES, pid);
+                return std::nullopt;
+            }
             m_detectedGames[pid] = game;
         }
 
@@ -814,12 +896,16 @@ WindowState GameProcessDetectorImpl::GetWindowState(HWND hwnd) {
     }
 
     RECT windowRect{};
-    GetWindowRect(hwnd, &windowRect);
+    if (!GetWindowRect(hwnd, &windowRect)) {
+        return WindowState::Unknown;
+    }
 
     HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
-    GetMonitorInfo(monitor, &monitorInfo);
+    if (!GetMonitorInfo(monitor, &monitorInfo)) {
+        return WindowState::Unknown;
+    }
 
     int windowWidth = windowRect.right - windowRect.left;
     int windowHeight = windowRect.bottom - windowRect.top;
@@ -967,9 +1053,9 @@ bool GameProcessDetectorImpl::LoadDatabase(const std::wstring& path) {
                     }
                 }
 
-                // Register each executable name as a database key
+                // Register each executable name as a database key (lowercase)
                 for (const auto& exeName : entry.executableNames) {
-                    m_gameDatabase[exeName] = entry;
+                    m_gameDatabase[Utils::StringUtils::ToLowerCopy(exeName)] = entry;
                     ++loadedCount;
                 }
             }
@@ -1001,7 +1087,7 @@ bool GameProcessDetectorImpl::LoadDatabase(const std::wstring& path) {
         std::unique_lock lock(m_mutex);
         for (const auto& game : KNOWN_GAMES_DATABASE) {
             for (const auto& exeName : game.executableNames) {
-                m_gameDatabase[exeName] = game;
+                m_gameDatabase[Utils::StringUtils::ToLowerCopy(exeName)] = game;
             }
         }
     }
@@ -1054,7 +1140,7 @@ bool GameProcessDetectorImpl::AddUserGame(const std::wstring& processName, const
     entry.category = GameCategory::Unknown;
     entry.launcher = LauncherType::Custom;
 
-    m_gameDatabase[processName] = entry;
+    m_gameDatabase[Utils::StringUtils::ToLowerCopy(processName)] = entry;
 
     Utils::Logger::Info("[GameProcessDetector] Added user-defined game: {}", entry.title);
     return true;
@@ -1064,7 +1150,7 @@ bool GameProcessDetectorImpl::RemoveUserGame(const std::wstring& processName) {
     std::unique_lock lock(m_mutex);
 
     const size_t userErased = m_userDefinedGames.erase(processName);
-    const size_t dbErased = m_gameDatabase.erase(processName);
+    const size_t dbErased = m_gameDatabase.erase(Utils::StringUtils::ToLowerCopy(processName));
 
     if (userErased == 0 && dbErased == 0) {
         Utils::Logger::Warn("[GameProcessDetector] RemoveUserGame: entry not found: {}",
@@ -1271,7 +1357,7 @@ void GameProcessDetectorImpl::ProcessMonitoringTick() {
         }
     }
 
-    // Fix 19: Check for exited games using PROCESS_QUERY_LIMITED_INFORMATION + ScopedHandle RAII
+    // Check for exited games — also detect PID reuse via creation-time comparison
     std::vector<uint32_t> exitedPids;
     {
         std::shared_lock lock(m_mutex);
@@ -1279,10 +1365,25 @@ void GameProcessDetectorImpl::ProcessMonitoringTick() {
             ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
             if (!hProcess) {
                 exitedPids.push_back(pid);
-            } else {
-                DWORD exitCode = 0;
-                if (GetExitCodeProcess(hProcess.Get(), &exitCode) && exitCode != STILL_ACTIVE) {
-                    exitedPids.push_back(pid);
+                continue;
+            }
+
+            DWORD exitCode = 0;
+            if (GetExitCodeProcess(hProcess.Get(), &exitCode) && exitCode != STILL_ACTIVE) {
+                exitedPids.push_back(pid);
+                continue;
+            }
+
+            // Guard against PID reuse: compare stored creation time
+            if (game.processCreationTime.dwLowDateTime != 0 ||
+                game.processCreationTime.dwHighDateTime != 0) {
+                FILETIME creation{}, exitFt{}, kernel{}, user{};
+                if (GetProcessTimes(hProcess.Get(), &creation, &exitFt, &kernel, &user)) {
+                    if (creation.dwLowDateTime != game.processCreationTime.dwLowDateTime ||
+                        creation.dwHighDateTime != game.processCreationTime.dwHighDateTime) {
+                        Utils::Logger::Info("[GameProcessDetector] PID {} reused by different process, treating as exited", pid);
+                        exitedPids.push_back(pid);
+                    }
                 }
             }
         }
@@ -1295,13 +1396,18 @@ void GameProcessDetectorImpl::ProcessMonitoringTick() {
         }
         NotifyGameExited(pid);
     }
+
+    // Update fullscreen/window state for surviving games
+    if (configSnapshot.enableFullscreenDetection) {
+        UpdateFullscreenState();
+    }
 #endif // _WIN32
 }
 
 bool GameProcessDetectorImpl::MatchGameDatabase(const std::wstring& processName,
                                                const std::wstring& /*processPath*/,
                                                GameEntry& outEntry) {
-    auto it = m_gameDatabase.find(processName);
+    auto it = m_gameDatabase.find(Utils::StringUtils::ToLowerCopy(processName));
     if (it != m_gameDatabase.end()) {
         outEntry = it->second;
         return true;
@@ -1473,10 +1579,14 @@ LauncherType GameProcessDetectorImpl::DetectLauncherFromParent(uint32_t pid) {
 }
 
 void GameProcessDetectorImpl::NotifyGameDetected(const DetectedGame& game) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_gameDetectedCallback) {
+    DetectedGameCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_gameDetectedCallback;
+    }
+    if (cb) {
         try {
-            m_gameDetectedCallback(game);
+            cb(game);
         } catch (const std::exception& e) {
             Utils::Logger::Error("[GameProcessDetector] Game detected callback exception: {}", e.what());
         }
@@ -1484,10 +1594,14 @@ void GameProcessDetectorImpl::NotifyGameDetected(const DetectedGame& game) {
 }
 
 void GameProcessDetectorImpl::NotifyGameExited(uint32_t pid) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_gameExitedCallback) {
+    GameExitedCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_gameExitedCallback;
+    }
+    if (cb) {
         try {
-            m_gameExitedCallback(pid);
+            cb(pid);
         } catch (const std::exception& e) {
             Utils::Logger::Error("[GameProcessDetector] Game exited callback exception: {}", e.what());
         }
@@ -1495,10 +1609,14 @@ void GameProcessDetectorImpl::NotifyGameExited(uint32_t pid) {
 }
 
 void GameProcessDetectorImpl::NotifyFullscreenChange(bool isFullscreen, const FullscreenInfo& info) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_fullscreenCallback) {
+    FullscreenChangeCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_fullscreenCallback;
+    }
+    if (cb) {
         try {
-            m_fullscreenCallback(isFullscreen, info);
+            cb(isFullscreen, info);
         } catch (const std::exception& e) {
             Utils::Logger::Error("[GameProcessDetector] Fullscreen callback exception: {}", e.what());
         }
@@ -1506,10 +1624,14 @@ void GameProcessDetectorImpl::NotifyFullscreenChange(bool isFullscreen, const Fu
 }
 
 void GameProcessDetectorImpl::NotifyLauncher(LauncherType type, bool isRunning) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_launcherCallback) {
+    LauncherCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_launcherCallback;
+    }
+    if (cb) {
         try {
-            m_launcherCallback(type, isRunning);
+            cb(type, isRunning);
         } catch (const std::exception& e) {
             Utils::Logger::Error("[GameProcessDetector] Launcher callback exception: {}", e.what());
         }
@@ -1517,31 +1639,64 @@ void GameProcessDetectorImpl::NotifyLauncher(LauncherType type, bool isRunning) 
 }
 
 void GameProcessDetectorImpl::NotifyError(const std::string& message, int code) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_errorCallback) {
+    ErrorCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_errorCallback;
+    }
+    if (cb) {
         try {
-            m_errorCallback(message, code);
+            cb(message, code);
         } catch (const std::exception& e) {
             Utils::Logger::Error("[GameProcessDetector] Error callback exception: {}", e.what());
         }
     }
 }
 
+void GameProcessDetectorImpl::UpdateFullscreenState() {
+#ifdef _WIN32
+    std::unique_lock lock(m_mutex);
+    for (auto& [pid, game] : m_detectedGames) {
+        if (!game.windowHandle) {
+            continue;
+        }
+
+        // Validate window still belongs to the expected process
+        DWORD windowPid = 0;
+        GetWindowThreadProcessId(game.windowHandle, &windowPid);
+        if (windowPid != pid) {
+            game.windowHandle = nullptr;
+            game.windowState = WindowState::Unknown;
+            game.isFullscreen = false;
+            continue;
+        }
+
+        game.windowState = GetWindowState(game.windowHandle);
+        bool wasFullscreen = game.isFullscreen;
+        game.isFullscreen = (game.windowState == WindowState::ExclusiveFullscreen ||
+                             game.windowState == WindowState::BorderlessWindowed);
+        game.isForeground = (GetForegroundWindow() == game.windowHandle);
+
+        if (game.isFullscreen != wasFullscreen) {
+            Utils::Logger::Debug("[GameProcessDetector] Fullscreen state changed for PID {}: {}",
+                pid, game.isFullscreen ? "fullscreen" : "windowed");
+        }
+    }
+#endif
+}
+
 std::wstring GameProcessDetectorImpl::GetProcessPath(uint32_t pid) {
 #ifdef _WIN32
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
     if (!hProcess) {
         return L"";
     }
 
     wchar_t path[MAX_PATH] = {};
     DWORD size = MAX_PATH;
-    if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
-        CloseHandle(hProcess);
+    if (QueryFullProcessImageNameW(hProcess.Get(), 0, path, &size)) {
         return path;
     }
-
-    CloseHandle(hProcess);
 #endif
     return L"";
 }
@@ -1852,6 +2007,30 @@ std::string FullscreenInfo::ToJson() const {
     return j.dump();
 }
 
+void DetectedGame::RefreshWindowHandle() {
+#ifdef _WIN32
+    if (processId == 0) {
+        windowHandle = nullptr;
+        return;
+    }
+
+    HWND found = nullptr;
+    auto enumData = std::make_pair(processId, &found);
+    EnumWindows([](HWND h, LPARAM lParam) -> BOOL {
+        auto* data = reinterpret_cast<std::pair<uint32_t, HWND*>*>(lParam);
+        DWORD windowPid = 0;
+        GetWindowThreadProcessId(h, &windowPid);
+        if (windowPid == data->first && IsWindowVisible(h)) {
+            *data->second = h;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&enumData));
+
+    windowHandle = found;
+#endif
+}
+
 bool DetectorConfiguration::IsValid() const noexcept {
     if (pollIntervalMs == 0 || pollIntervalMs > 60000) {
         return false;
@@ -1936,30 +2115,32 @@ std::wstring GetLauncherInstallPath(LauncherType type) {
     for (const auto& launcher : LAUNCHER_DATABASE) {
         if (launcher.type == type && !launcher.registryPath.empty()) {
 #ifdef _WIN32
-            HKEY hKey = nullptr;
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, launcher.registryPath.c_str(),
-                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                wchar_t buffer[MAX_PATH] = {};
-                DWORD bufferSize = sizeof(buffer);
-                if (RegQueryValueExW(hKey, launcher.registryValue.c_str(), nullptr,
-                                    nullptr, reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
-                    RegCloseKey(hKey);
-                    return buffer;
+            // HKLM
+            {
+                ScopedRegKey hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, launcher.registryPath.c_str(),
+                                 0, KEY_READ, hKey.Put()) == ERROR_SUCCESS) {
+                    wchar_t buffer[MAX_PATH] = {};
+                    DWORD bufferSize = sizeof(buffer);
+                    if (RegQueryValueExW(hKey.Get(), launcher.registryValue.c_str(), nullptr,
+                                        nullptr, reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
+                        return buffer;
+                    }
                 }
-                RegCloseKey(hKey);
             }
 
-            // Try HKEY_CURRENT_USER
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, launcher.registryPath.c_str(),
-                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                wchar_t buffer[MAX_PATH] = {};
-                DWORD bufferSize = sizeof(buffer);
-                if (RegQueryValueExW(hKey, launcher.registryValue.c_str(), nullptr,
-                                    nullptr, reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
-                    RegCloseKey(hKey);
-                    return buffer;
+            // HKCU
+            {
+                ScopedRegKey hKey;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, launcher.registryPath.c_str(),
+                                 0, KEY_READ, hKey.Put()) == ERROR_SUCCESS) {
+                    wchar_t buffer[MAX_PATH] = {};
+                    DWORD bufferSize = sizeof(buffer);
+                    if (RegQueryValueExW(hKey.Get(), launcher.registryValue.c_str(), nullptr,
+                                        nullptr, reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
+                        return buffer;
+                    }
                 }
-                RegCloseKey(hKey);
             }
 #endif
         }

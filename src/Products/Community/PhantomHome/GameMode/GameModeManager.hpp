@@ -469,6 +469,7 @@ using StateChangeCallback = std::function<void(bool active, ActivationReason rea
 using GameDetectedCallback = std::function<void(uint32_t pid, const std::wstring& processName)>;
 using ActionDeferredCallback = std::function<void(const DeferredAction&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using ActionDispatcherCallback = std::function<void(DeferredActionType, const std::map<std::string, std::string>&)>;
 
 // ============================================================================
 // GAME MODE MANAGER CLASS
@@ -614,6 +615,7 @@ public:
     void RegisterGameDetectedCallback(GameDetectedCallback callback);
     void RegisterActionDeferredCallback(ActionDeferredCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterActionDispatcher(ActionDispatcherCallback dispatcher);
     void UnregisterCallbacks();
 
     // ========================================================================
