@@ -72,6 +72,11 @@
 #include <iomanip>
 #include <regex>
 #include <fstream>
+#include <unordered_set>
+#include <cctype>
+#include <cwctype>
+#include <cstring>
+#include <limits>
 #include <psapi.h>
 
 // DbgHelp library
@@ -106,6 +111,9 @@ namespace {
     /// @brief Maximum PE size to extract
     constexpr size_t MAX_PE_SIZE = 100 * 1024 * 1024;  // 100MB
 
+    /// @brief Maximum reasonable PE section count for hostile inputs
+    constexpr WORD MAX_REASONABLE_PE_SECTIONS = 512;
+
     /// @brief String patterns for categorization
     const std::vector<std::pair<std::regex, std::string>> STRING_PATTERNS = {
         {std::regex(R"(https?://[^\s]+)"), "URL"},
@@ -114,6 +122,20 @@ namespace {
         {std::regex(R"(\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b)"), "Email"},
         {std::regex(R"(^[A-Z][a-zA-Z0-9]+(?:Ex)?[AW]?$)"), "API"},  // Simplified API pattern
     };
+
+    [[nodiscard]] bool IsPrintableAsciiChar(uint8_t value) noexcept {
+        const auto ch = static_cast<unsigned char>(value);
+        return std::isprint(ch) != 0 || std::isspace(ch) != 0;
+    }
+
+    [[nodiscard]] bool IsPrintableUtf16Char(uint16_t value) noexcept {
+        if (value == 0 || (value >= 0xD800 && value <= 0xDFFF)) {
+            return false;
+        }
+
+        const wchar_t ch = static_cast<wchar_t>(value);
+        return std::iswprint(ch) != 0 || std::iswspace(ch) != 0;
+    }
 
 }  // anonymous namespace
 
@@ -258,17 +280,33 @@ public:
      */
     [[nodiscard]] std::optional<Hash256> CalculateFileHash(const fs::path& filePath) const noexcept {
         try {
-            std::ifstream file(filePath, std::ios::binary);
-            if (!file) return std::nullopt;
-
-            // Read file in chunks and hash
-            std::vector<uint8_t> buffer(MEMORY_READ_CHUNK_SIZE);
             Hash256 hash{};
+            Utils::HashUtils::Error hashError{};
+            std::vector<uint8_t> digest;
+            const std::wstring path = filePath.wstring();
 
-            // Use infrastructure HashUtils if available
-            // For now, simplified placeholder
-            // In production: use Utils::HashUtils::SHA256File(filePath)
+            if (!Utils::HashUtils::ComputeFile(
+                    Utils::HashUtils::Algorithm::SHA256,
+                    path,
+                    digest,
+                    &hashError)) {
+                Utils::Logger::Warn(
+                    "MemoryDumper: SHA-256 calculation failed for {} (win32={}, ntstatus=0x{:08X})",
+                    Utils::StringUtils::ToNarrow(path),
+                    hashError.win32,
+                    static_cast<uint32_t>(hashError.ntstatus));
+                return std::nullopt;
+            }
 
+            if (digest.size() != hash.size()) {
+                Utils::Logger::Warn(
+                    "MemoryDumper: Unexpected SHA-256 digest size {} for {}",
+                    digest.size(),
+                    Utils::StringUtils::ToNarrow(path));
+                return std::nullopt;
+            }
+
+            std::copy_n(digest.begin(), hash.size(), hash.begin());
             return hash;
 
         } catch (...) {
@@ -1056,19 +1094,161 @@ std::vector<uint8_t> MemoryDumper::ExtractPEFromMemory(uint32_t pid, uint64_t ba
             return {};
         }
 
-        // Read DOS header to get PE offset
-        std::array<uint8_t, 64> dosHeader{};
-        SIZE_T bytesRead = 0;
+        const auto readExact = [hProcess](uint64_t address, void* buffer, size_t size) noexcept -> bool {
+            SIZE_T bytesRead = 0;
+            return ReadProcessMemory(hProcess,
+                                     reinterpret_cast<LPCVOID>(address),
+                                     buffer,
+                                     size,
+                                     &bytesRead) != FALSE &&
+                   bytesRead == size;
+        };
 
-        if (!ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(baseAddress),
-                              dosHeader.data(), dosHeader.size(), &bytesRead)) {
+        const auto addOffsetChecked = [](uint64_t base, uint64_t offset, uint64_t& result) noexcept -> bool {
+            if (offset > (std::numeric_limits<uint64_t>::max)() - base) {
+                return false;
+            }
+
+            result = base + offset;
+            return true;
+        };
+
+        std::array<uint8_t, 64> dosHeader{};
+        if (!readExact(baseAddress, dosHeader.data(), dosHeader.size())) {
             return {};
         }
 
-        const uint32_t peOffset = *reinterpret_cast<const uint32_t*>(&dosHeader[PE_SIGNATURE_OFFSET]);
+        uint16_t mzMagic = 0;
+        std::memcpy(&mzMagic, dosHeader.data(), sizeof(mzMagic));
+        if (mzMagic != MemoryDumpConstants::MZ_MAGIC) {
+            return {};
+        }
 
-        // Read size from PE headers (simplified - read fixed size)
-        const size_t estimatedSize = std::min<size_t>(MAX_PE_SIZE, 10 * 1024 * 1024);
+        uint32_t peOffset = 0;
+        std::memcpy(&peOffset, dosHeader.data() + PE_SIGNATURE_OFFSET, sizeof(peOffset));
+
+        if (peOffset < sizeof(IMAGE_DOS_HEADER) || peOffset > MAX_PE_SIZE) {
+            Utils::Logger::Warn("MemoryDumper: Suspicious PE header offset {} for PID {}", peOffset, pid);
+            return {};
+        }
+
+        uint64_t ntHeaderAddress = 0;
+        if (!addOffsetChecked(baseAddress, peOffset, ntHeaderAddress)) {
+            return {};
+        }
+
+        struct NtHeadersPrefix {
+            DWORD signature = 0;
+            IMAGE_FILE_HEADER fileHeader{};
+        } ntHeadersPrefix{};
+
+        if (!readExact(ntHeaderAddress, &ntHeadersPrefix, sizeof(ntHeadersPrefix))) {
+            return {};
+        }
+
+        if (ntHeadersPrefix.signature != MemoryDumpConstants::PE_SIGNATURE) {
+            return {};
+        }
+
+        const WORD numberOfSections = ntHeadersPrefix.fileHeader.NumberOfSections;
+        const WORD optionalHeaderSize = ntHeadersPrefix.fileHeader.SizeOfOptionalHeader;
+
+        if (numberOfSections == 0 || numberOfSections > MAX_REASONABLE_PE_SECTIONS) {
+            Utils::Logger::Warn(
+                "MemoryDumper: Invalid PE section count {} for PID {} at 0x{:X}",
+                numberOfSections,
+                pid,
+                baseAddress);
+            return {};
+        }
+
+        if (optionalHeaderSize < sizeof(WORD) || optionalHeaderSize > sizeof(IMAGE_OPTIONAL_HEADER64)) {
+            Utils::Logger::Warn(
+                "MemoryDumper: Invalid PE optional header size {} for PID {} at 0x{:X}",
+                optionalHeaderSize,
+                pid,
+                baseAddress);
+            return {};
+        }
+
+        uint64_t optionalHeaderAddress = 0;
+        if (!addOffsetChecked(ntHeaderAddress, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER), optionalHeaderAddress)) {
+            return {};
+        }
+
+        std::vector<uint8_t> optionalHeader(optionalHeaderSize);
+        if (!readExact(optionalHeaderAddress, optionalHeader.data(), optionalHeader.size())) {
+            return {};
+        }
+
+        WORD optionalMagic = 0;
+        std::memcpy(&optionalMagic, optionalHeader.data(), sizeof(optionalMagic));
+
+        size_t sizeOfImage = 0;
+        size_t sizeOfHeaders = 0;
+        if (optionalMagic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            if (optionalHeaderSize < sizeof(IMAGE_OPTIONAL_HEADER32)) {
+                return {};
+            }
+
+            IMAGE_OPTIONAL_HEADER32 header32{};
+            std::memcpy(&header32, optionalHeader.data(), sizeof(header32));
+            sizeOfImage = header32.SizeOfImage;
+            sizeOfHeaders = header32.SizeOfHeaders;
+        } else if (optionalMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            if (optionalHeaderSize < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+                return {};
+            }
+
+            IMAGE_OPTIONAL_HEADER64 header64{};
+            std::memcpy(&header64, optionalHeader.data(), sizeof(header64));
+            sizeOfImage = header64.SizeOfImage;
+            sizeOfHeaders = header64.SizeOfHeaders;
+        } else {
+            Utils::Logger::Warn(
+                "MemoryDumper: Unsupported PE optional header magic 0x{:04X} for PID {} at 0x{:X}",
+                optionalMagic,
+                pid,
+                baseAddress);
+            return {};
+        }
+
+        uint64_t sectionHeadersAddress = 0;
+        if (!addOffsetChecked(optionalHeaderAddress, optionalHeaderSize, sectionHeadersAddress)) {
+            return {};
+        }
+
+        const size_t sectionHeadersSize =
+            static_cast<size_t>(numberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+        if (sectionHeadersSize > MAX_PE_SIZE) {
+            return {};
+        }
+
+        std::vector<IMAGE_SECTION_HEADER> sectionHeaders(numberOfSections);
+        if (!readExact(sectionHeadersAddress, sectionHeaders.data(), sectionHeadersSize)) {
+            return {};
+        }
+
+        size_t sectionEstimate = sizeOfHeaders;
+        for (const auto& section : sectionHeaders) {
+            const uint64_t virtualSize = section.Misc.VirtualSize != 0
+                ? section.Misc.VirtualSize
+                : section.SizeOfRawData;
+            const uint64_t sectionEnd = static_cast<uint64_t>(section.VirtualAddress) + virtualSize;
+            const size_t boundedSectionEnd = static_cast<size_t>(std::min<uint64_t>(sectionEnd, MAX_PE_SIZE));
+            sectionEstimate = (std::max)(sectionEstimate, boundedSectionEnd);
+        }
+
+        size_t estimatedSize = sizeOfImage;
+        if (estimatedSize == 0 || estimatedSize < sectionEstimate) {
+            estimatedSize = sectionEstimate;
+        }
+
+        estimatedSize = (std::max)(estimatedSize, sizeOfHeaders);
+        estimatedSize = (std::min)(estimatedSize, MAX_PE_SIZE);
+        if (estimatedSize == 0) {
+            return {};
+        }
 
         return ReadMemoryRegion(pid, baseAddress, estimatedSize);
 
@@ -1330,10 +1510,14 @@ std::vector<ExtractedString> MemoryDumper::ExtractStringsFromDump(
     std::vector<ExtractedString> strings;
 
     try {
+        const std::filesystem::path dumpFilePath{std::wstring(dumpPath)};
+
         // Read dump file
-        std::ifstream file(dumpPath.data(), std::ios::binary);
+        std::ifstream file(dumpFilePath, std::ios::binary);
         if (!file) {
-            Utils::Logger::Error("MemoryDumper: Failed to open dump file");
+            Utils::Logger::Error(
+                "MemoryDumper: Failed to open dump file {}",
+                Utils::StringUtils::ToNarrow(dumpFilePath.wstring()));
             return strings;
         }
 
@@ -1346,6 +1530,70 @@ std::vector<ExtractedString> MemoryDumper::ExtractStringsFromDump(
         std::vector<uint8_t> buffer(MEMORY_READ_CHUNK_SIZE);
         size_t offset = 0;
         size_t totalStrings = 0;
+        std::unordered_set<std::string> seenStrings;
+        seenStrings.reserve((std::min)(options.maxStrings, static_cast<size_t>(65536)));
+
+        std::string asciiCarry;
+        uint64_t asciiCarryStart = 0;
+        std::wstring utf16Carry;
+        uint64_t utf16CarryStart = 0;
+
+        const auto addString = [&](std::string&& value,
+                                   uint64_t address,
+                                   StringType type) -> bool {
+            if (value.length() < options.minLength || value.length() > options.maxLength) {
+                return false;
+            }
+
+            if (type == StringType::ASCII && options.printableOnly && !m_impl->IsPrintable(value)) {
+                return false;
+            }
+
+            auto [_, inserted] = seenStrings.emplace(value);
+            if (!inserted) {
+                return false;
+            }
+
+            ExtractedString extracted;
+            extracted.value = std::move(value);
+            extracted.address = address;
+            extracted.type = type;
+
+            if (options.categorize) {
+                extracted.category = m_impl->CategorizeString(extracted.value);
+                extracted.isInteresting = (extracted.category != "Unknown");
+            }
+
+            strings.push_back(std::move(extracted));
+            ++totalStrings;
+            return totalStrings >= options.maxStrings;
+        };
+
+        const auto flushAscii = [&](std::string& current, uint64_t start) -> bool {
+            if (current.empty()) {
+                return false;
+            }
+
+            std::string completed = std::move(current);
+            current.clear();
+            return addString(std::move(completed), start, StringType::ASCII);
+        };
+
+        const auto flushUtf16 = [&](std::wstring& current, uint64_t start) -> bool {
+            if (current.empty()) {
+                return false;
+            }
+
+            std::wstring completedWide = std::move(current);
+            current.clear();
+
+            std::string narrow = Utils::StringUtils::ToNarrow(completedWide);
+            if (narrow.empty() && !completedWide.empty()) {
+                return false;
+            }
+
+            return addString(std::move(narrow), start, StringType::UTF16LE);
+        };
 
         while (offset < fileSize && totalStrings < options.maxStrings) {
             const size_t toRead = std::min(MEMORY_READ_CHUNK_SIZE, fileSize - offset);
@@ -1355,45 +1603,71 @@ std::vector<ExtractedString> MemoryDumper::ExtractStringsFromDump(
 
             if (bytesRead == 0) break;
 
-            // Extract ASCII strings (simplified)
-            std::string currentString;
+            if (options.extractASCII) {
+                std::string currentAscii = std::move(asciiCarry);
+                uint64_t asciiStart = currentAscii.empty() ? 0 : asciiCarryStart;
 
-            for (size_t i = 0; i < bytesRead; ++i) {
-                const char c = static_cast<char>(buffer[i]);
+                for (size_t i = 0; i < bytesRead; ++i) {
+                    const uint8_t value = buffer[i];
 
-                if (std::isprint(c) || std::isspace(c)) {
-                    currentString += c;
-                } else {
-                    if (currentString.length() >= options.minLength &&
-                        currentString.length() <= options.maxLength) {
-
-                        if (!options.printableOnly || m_impl->IsPrintable(currentString)) {
-                            ExtractedString str;
-                            str.value = currentString;
-                            str.address = offset + i - currentString.length();
-                            str.type = StringType::ASCII;
-
-                            if (options.categorize) {
-                                str.category = m_impl->CategorizeString(currentString);
-                                str.isInteresting = (str.category != "Unknown");
-                            }
-
-                            strings.push_back(str);
-                            ++totalStrings;
-
-                            if (totalStrings >= options.maxStrings) {
-                                break;
-                            }
+                    if (IsPrintableAsciiChar(value)) {
+                        if (currentAscii.empty()) {
+                            asciiStart = offset + i;
                         }
-                    }
 
-                    currentString.clear();
+                        if (currentAscii.length() <= options.maxLength) {
+                            currentAscii.push_back(static_cast<char>(value));
+                        }
+                    } else if (flushAscii(currentAscii, asciiStart)) {
+                        asciiCarry.clear();
+                        utf16Carry.clear();
+                        goto extraction_done;
+                    }
                 }
+
+                asciiCarry = std::move(currentAscii);
+                asciiCarryStart = asciiStart;
+            }
+
+            if (options.extractUTF16 && bytesRead >= sizeof(uint16_t)) {
+                std::wstring currentUtf16 = std::move(utf16Carry);
+                uint64_t utf16Start = currentUtf16.empty() ? 0 : utf16CarryStart;
+
+                for (size_t i = 0; i + 1 < bytesRead; i += sizeof(uint16_t)) {
+                    const uint16_t value = static_cast<uint16_t>(buffer[i]) |
+                                           (static_cast<uint16_t>(buffer[i + 1]) << 8);
+
+                    if (IsPrintableUtf16Char(value)) {
+                        if (currentUtf16.empty()) {
+                            utf16Start = offset + i;
+                        }
+
+                        if (currentUtf16.length() <= options.maxLength) {
+                            currentUtf16.push_back(static_cast<wchar_t>(value));
+                        }
+                    } else if (flushUtf16(currentUtf16, utf16Start)) {
+                        asciiCarry.clear();
+                        utf16Carry.clear();
+                        goto extraction_done;
+                    }
+                }
+
+                utf16Carry = std::move(currentUtf16);
+                utf16CarryStart = utf16Start;
             }
 
             offset += bytesRead;
         }
 
+        if (options.extractASCII && totalStrings < options.maxStrings) {
+            flushAscii(asciiCarry, asciiCarryStart);
+        }
+
+        if (options.extractUTF16 && totalStrings < options.maxStrings) {
+            flushUtf16(utf16Carry, utf16CarryStart);
+        }
+
+    extraction_done:
         Utils::Logger::Info("MemoryDumper: Extracted {} strings from dump", strings.size());
 
     } catch (const std::exception& ex) {

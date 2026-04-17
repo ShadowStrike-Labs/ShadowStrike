@@ -120,12 +120,7 @@ struct CollectionState {
  * @brief Hash hex conversion helper
  */
 std::string ToHexString(const uint8_t* data, size_t length) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for (size_t i = 0; i < length; ++i) {
-        oss << std::setw(2) << static_cast<int>(data[i]);
-    }
-    return oss.str();
+    return Utils::HashUtils::ToHexLower(data, length);
 }
 
 /**
@@ -134,26 +129,80 @@ std::string ToHexString(const uint8_t* data, size_t length) {
 Hash256 CalculateFileSHA256(const std::filesystem::path& path) {
     Hash256 result{};
     try {
-        std::ifstream file(path, std::ios::binary);
-        if (!file) {
+        Utils::HashUtils::Error hashError{};
+        std::vector<uint8_t> digest;
+        const std::wstring widePath = path.wstring();
+
+        if (!Utils::HashUtils::ComputeFile(
+                Utils::HashUtils::Algorithm::SHA256,
+                widePath,
+                digest,
+                &hashError)) {
+            Logger::Warn(
+                "[EvidenceCollector] SHA-256 calculation failed for {} (win32={}, ntstatus=0x{:08X})",
+                Utils::StringUtils::ToNarrow(widePath),
+                hashError.win32,
+                static_cast<uint32_t>(hashError.ntstatus));
             return result;
         }
 
-        // Simple hash calculation (in production, use proper crypto library)
-        std::vector<uint8_t> buffer(8192);
-        size_t totalRead = 0;
-
-        while (file.read(reinterpret_cast<char*>(buffer.data()), buffer.size()) || file.gcount() > 0) {
-            totalRead += static_cast<size_t>(file.gcount());
-            // Simplified hash - in production use OpenSSL/CryptoAPI
-            for (size_t i = 0; i < static_cast<size_t>(file.gcount()) && i < 32; ++i) {
-                result[i] ^= buffer[i];
-            }
+        if (digest.size() != result.size()) {
+            Logger::Warn(
+                "[EvidenceCollector] Unexpected SHA-256 digest size {} for {}",
+                digest.size(),
+                Utils::StringUtils::ToNarrow(widePath));
+            return result;
         }
+
+        std::copy_n(digest.begin(), result.size(), result.begin());
     } catch (...) {
-        // Return empty hash on error
+        Logger::Warn("[EvidenceCollector] Exception while hashing evidence file");
     }
     return result;
+}
+
+[[nodiscard]] SystemTimePoint FileTimeToSystemClock(const FILETIME& fileTime) noexcept {
+    constexpr uint64_t FILETIME_UNIX_EPOCH_OFFSET = 116444736000000000ULL;
+
+    ULARGE_INTEGER rawTime{};
+    rawTime.LowPart = fileTime.dwLowDateTime;
+    rawTime.HighPart = fileTime.dwHighDateTime;
+
+    if (rawTime.QuadPart < FILETIME_UNIX_EPOCH_OFFSET) {
+        return std::chrono::system_clock::now();
+    }
+
+    const auto duration = std::chrono::microseconds(
+        static_cast<int64_t>((rawTime.QuadPart - FILETIME_UNIX_EPOCH_OFFSET) / 10ULL));
+    return SystemTimePoint(duration);
+}
+
+[[nodiscard]] SystemTimePoint GetFileModificationTime(const std::filesystem::path& path) noexcept {
+    try {
+        const std::wstring longPath = Utils::FileUtils::AddLongPathPrefix(path.wstring());
+        WIN32_FILE_ATTRIBUTE_DATA attributes{};
+
+        if (!GetFileAttributesExW(longPath.c_str(), GetFileExInfoStandard, &attributes)) {
+            Logger::Warn(
+                "[EvidenceCollector] Failed to read file timestamps for {} (win32={})",
+                Utils::StringUtils::ToNarrow(path.wstring()),
+                GetLastError());
+            return std::chrono::system_clock::now();
+        }
+
+        return FileTimeToSystemClock(attributes.ftLastWriteTime);
+    } catch (const std::exception& ex) {
+        Logger::Warn(
+            "[EvidenceCollector] Exception while reading file timestamps for {}: {}",
+            Utils::StringUtils::ToNarrow(path.wstring()),
+            ex.what());
+    } catch (...) {
+        Logger::Warn(
+            "[EvidenceCollector] Unknown error while reading file timestamps for {}",
+            Utils::StringUtils::ToNarrow(path.wstring()));
+    }
+
+    return std::chrono::system_clock::now();
 }
 
 } // anonymous namespace
@@ -623,10 +672,10 @@ std::optional<EvidenceItem> EvidenceCollectorImpl::CollectFile(
 
         // Get file times
         try {
-            auto ftime = std::filesystem::last_write_time(path);
-            // Convert to system time (simplified)
+            item.modificationTime = GetFileModificationTime(path);
+        } catch (...) {
             item.modificationTime = std::chrono::system_clock::now();
-        } catch (...) {}
+        }
 
         // Get file size
         try {
