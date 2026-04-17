@@ -917,7 +917,7 @@ WindowState GameProcessDetectorImpl::GetWindowState(HWND hwnd) {
 
     if (coversMonitor) {
         // Check window style
-        LONG style = GetWindowLong(hwnd, GWL_STYLE);
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
 
         // Borderless windowed: no border, no caption
         if (!(style & WS_CAPTION) && !(style & WS_THICKFRAME)) {
@@ -1425,7 +1425,7 @@ bool GameProcessDetectorImpl::MatchWindowClass(HWND hwnd) {
     GetClassNameA(hwnd, className, sizeof(className));
 
     for (const auto& gameClass : GAME_WINDOW_CLASSES) {
-        if (std::string(className).find(gameClass) != std::string::npos) {
+        if (std::string_view(className).find(gameClass) != std::string_view::npos) {
             return true;
         }
     }
@@ -1923,7 +1923,7 @@ bool GameProcessDetector::SelfTest() {
     return m_impl->SelfTest();
 }
 
-std::string GameProcessDetector::GetVersionString() noexcept {
+std::string GameProcessDetector::GetVersionString() {
     return std::to_string(DetectorConstants::VERSION_MAJOR) + "." +
            std::to_string(DetectorConstants::VERSION_MINOR) + "." +
            std::to_string(DetectorConstants::VERSION_PATCH);

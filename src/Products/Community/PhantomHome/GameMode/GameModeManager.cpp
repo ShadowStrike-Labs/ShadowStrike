@@ -59,6 +59,7 @@
 #include <thread>
 #include <condition_variable>
 #include <cstdio>
+#include <format>
 
 #pragma comment(lib, "Psapi.lib")
 
@@ -156,15 +157,13 @@ inline constexpr uint32_t FULLSCREEN_CONSECUTIVE_THRESHOLD = 2;
 inline constexpr uint32_t FULLSCREEN_COOLDOWN_SECONDS = 60;
 
 /// @brief Generate unique session ID
+/// L2-FIX: Mix in PID and high-resolution clock for unpredictable session IDs.
 std::string GenerateSessionId() {
     static std::atomic<uint64_t> counter{0};
-    auto now = std::chrono::system_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-
-    std::ostringstream oss;
-    oss << "GM-" << std::hex << std::setw(12) << std::setfill('0') << ms
-        << "-" << std::setw(8) << std::setfill('0') << counter.fetch_add(1);
-    return oss.str();
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto pid = ::GetCurrentProcessId();
+    auto seq = counter.fetch_add(1, std::memory_order_relaxed);
+    return std::format("GS-{:X}-{:X}-{:04X}", now ^ pid, pid, seq & 0xFFFF);
 }
 
 /// @brief Generate unique action ID
@@ -1447,8 +1446,9 @@ void GameModeManagerImpl::UnregisterCallbacks() {
 // is approximate - each atomic is loaded independently, so the snapshot may reflect
 // a mix of states if counters are being updated concurrently. This is acceptable
 // for monitoring/telemetry purposes and avoids holding a lock across all loads.
+// L1-FIX: Removed shared_lock — all stats fields are std::atomic, so acquiring the
+// mutex adds contention on writers with no correctness benefit for readers.
 GameModeStatistics GameModeManagerImpl::GetStatistics() const {
-    std::shared_lock lock(m_mutex);
     GameModeStatistics snapshot;
     snapshot.totalSessions.store(m_stats.totalSessions.load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);

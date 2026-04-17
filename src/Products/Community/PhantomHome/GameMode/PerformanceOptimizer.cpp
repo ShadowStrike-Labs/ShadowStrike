@@ -229,7 +229,7 @@ namespace {
             }
             return *this;
         }
-        operator HANDLE() const noexcept { return h; }
+        explicit operator HANDLE() const noexcept { return h; }
         explicit operator bool() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
         [[nodiscard]] HANDLE get() const noexcept { return h; }
     };
@@ -298,7 +298,7 @@ namespace {
     // Fix #7: System-critical process blocklist for EmptyWorkingSet
     // ========================================================================
     [[nodiscard]] static bool IsSystemCriticalProcess(const std::wstring& processName) noexcept {
-        static const std::array<const wchar_t*, 8> kBlocklist = {
+        static const std::array<const wchar_t*, 17> kBlocklist = {
             L"csrss.exe",
             L"lsass.exe",
             L"smss.exe",
@@ -306,7 +306,16 @@ namespace {
             L"services.exe",
             L"svchost.exe",
             L"System",
-            L"wininit.exe"
+            L"wininit.exe",
+            L"fontdrvhost.exe",
+            L"conhost.exe",
+            L"WmiPrvSE.exe",
+            L"RuntimeBroker.exe",
+            L"SearchIndexer.exe",
+            L"Registry",
+            L"Memory Compression",
+            L"SecurityHealthService.exe",
+            L"MsMpEng.exe"
         };
         for (const auto* name : kBlocklist) {
             if (_wcsicmp(processName.c_str(), name) == 0) {
@@ -912,7 +921,7 @@ public:
     [[nodiscard]] double CaptureGPUUsage() {
 #if SS_HAS_DXGI
         // Dynamically load dxgi.dll to avoid hard dependency
-        static HMODULE hDxgi = ::LoadLibraryW(L"dxgi.dll");
+        static HMODULE hDxgi = ::GetModuleHandleW(L"dxgi.dll");
         if (!hDxgi) {
             static bool sWarned = false;
             if (!sWarned) {
@@ -2526,7 +2535,12 @@ void OptimizerStatistics::Reset() noexcept {
     j["processPriority"] = static_cast<int>(processPriority);
     j["ioPriority"] = static_cast<int>(ioPriority);
     j["memoryPriority"] = static_cast<int>(memoryPriority);
-    j["throttle"] = Json::parse(throttle.ToJson());
+    j["throttle"] = Json::object();
+    j["throttle"]["diskThroughputMBps"] = throttle.diskThroughputMBps;
+    j["throttle"]["iopsLimit"] = throttle.iopsLimit;
+    j["throttle"]["scanRateLimit"] = throttle.scanRateLimit;
+    j["throttle"]["networkBandwidthMbps"] = throttle.networkBandwidthMbps;
+    j["throttle"]["cpuUsageLimit"] = throttle.cpuUsageLimit;
     j["trimWorkingSet"] = trimWorkingSet;
     j["flushCaches"] = flushCaches;
     j["useEfficiencyCoresOnly"] = useEfficiencyCoresOnly;

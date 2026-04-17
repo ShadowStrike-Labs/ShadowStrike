@@ -426,6 +426,10 @@ struct OverlayStatistics {
 
     OverlayStatistics() = default;
 
+    // Snapshot-style copy: each atomic is loaded independently, so the resulting
+    // snapshot is NOT transactionally consistent across fields. This is intentional
+    // for diagnostics/display purposes — a fully consistent snapshot would require
+    // holding a lock across all loads, which is unnecessary overhead for telemetry.
     OverlayStatistics(const OverlayStatistics& other) noexcept
         : integrityChecks(other.integrityChecks.load(std::memory_order_relaxed))
         , integrityFailures(other.integrityFailures.load(std::memory_order_relaxed))
