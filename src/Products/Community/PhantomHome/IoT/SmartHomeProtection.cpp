@@ -344,7 +344,7 @@ bool SmartHomeConfiguration::IsValid() const noexcept {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class SmartHomeProtection::SmartHomeProtectionImpl {
+class SmartHomeProtectionImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -393,8 +393,8 @@ public:
     std::mutex m_callbacksMutex;
 
     /// @brief Infrastructure integrations
-    std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
-    std::shared_ptr<Whitelist::WhiteListStore> m_whitelist;
+    ThreatIntel::ThreatIntelManager* m_threatIntel = nullptr;
+    std::shared_ptr<Whitelist::WhitelistStore> m_whitelist;
 
     /// @brief Baseline window start times per device (protected by m_baselinesMutex)
     std::unordered_map<std::string, TimePoint> m_baselineWindowStarts;
@@ -468,22 +468,22 @@ public:
 // IMPL: INITIALIZATION
 // ============================================================================
 
-bool SmartHomeProtection::SmartHomeProtectionImpl::Initialize(
+bool SmartHomeProtectionImpl::Initialize(
     const SmartHomeConfiguration& config)
 {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"SmartHomeProtection: Already initialized");
+            ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"SmartHomeProtection: Initializing...");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Initializing...");
 
         m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Invalid configuration");
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Invalid configuration");
             m_initialized.store(false, std::memory_order_release);
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
@@ -492,32 +492,32 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::Initialize(
         m_config = config;
 
         // Initialize infrastructure integrations
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelManager>();
-        m_whitelist = std::make_shared<Whitelist::WhiteListStore>();
+        m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
+        m_whitelist = std::make_shared<Whitelist::WhitelistStore>();
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"SmartHomeProtection: Initialized successfully (mode: {})",
-                          Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(m_config.mode))));
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Initialized successfully (mode: {})",
+                          std::string(GetProtectionModeName(m_config.mode)));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Initialization failed - {}",
+                           e.what());
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::Shutdown() {
+void SmartHomeProtectionImpl::Shutdown() {
     try {
         if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
 
-        Utils::Logger::Info(L"SmartHomeProtection: Shutting down...");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Shutting down...");
 
         m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
@@ -557,10 +557,10 @@ void SmartHomeProtection::SmartHomeProtectionImpl::Shutdown() {
 
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"SmartHomeProtection: Shutdown complete");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"SmartHomeProtection: Exception during shutdown");
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Exception during shutdown");
     }
 }
 
@@ -568,45 +568,45 @@ void SmartHomeProtection::SmartHomeProtectionImpl::Shutdown() {
 // IMPL: PROTECTION
 // ============================================================================
 
-bool SmartHomeProtection::SmartHomeProtectionImpl::StartProtectionInternal() {
+bool SmartHomeProtectionImpl::StartProtectionInternal() {
     try {
         if (m_protectionActive.load(std::memory_order_acquire)) {
-            Utils::Logger::Warn(L"SmartHomeProtection: Already active");
+            ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Already active");
             return true;
         }
 
-        Utils::Logger::Info(L"SmartHomeProtection: Starting protection (mode: {})",
-                          Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(m_config.mode))));
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Starting protection (mode: {})",
+                          std::string(GetProtectionModeName(m_config.mode)));
 
         m_protectionActive.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Monitoring, std::memory_order_release);
 
-        Utils::Logger::Info(L"SmartHomeProtection: Protection started");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Protection started");
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to start protection - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to start protection - {}",
+                           e.what());
         return false;
     }
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::StopProtectionInternal() {
+void SmartHomeProtectionImpl::StopProtectionInternal() {
     try {
         if (!m_protectionActive.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
 
-        Utils::Logger::Info(L"SmartHomeProtection: Stopping protection");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Stopping protection");
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"SmartHomeProtection: Protection stopped");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Protection stopped");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Error stopping protection - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Error stopping protection - {}",
+                           e.what());
     }
 }
 
@@ -614,18 +614,18 @@ void SmartHomeProtection::SmartHomeProtectionImpl::StopProtectionInternal() {
 // IMPL: DEVICE MANAGEMENT
 // ============================================================================
 
-bool SmartHomeProtection::SmartHomeProtectionImpl::MonitorDeviceInternal(const std::string& macAddress) {
+bool SmartHomeProtectionImpl::MonitorDeviceInternal(const std::string& macAddress) {
     try {
         if (macAddress.empty()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Empty MAC address");
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Empty MAC address");
             return false;
         }
 
         // Validate and normalize MAC address format
         std::string normalizedMac = NormalizeMacAddress(macAddress);
         if (normalizedMac.empty()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Invalid MAC address format: {}",
-                               Utils::StringUtils::Utf8ToWide(macAddress));
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Invalid MAC address format: {}",
+                               macAddress);
             return false;
         }
 
@@ -634,14 +634,14 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::MonitorDeviceInternal(const s
 
             // Check if already monitoring
             if (m_devices.find(normalizedMac) != m_devices.end()) {
-                Utils::Logger::Warn(L"SmartHomeProtection: Device already monitored: {}",
-                                  Utils::StringUtils::Utf8ToWide(normalizedMac));
+                ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Device already monitored: {}",
+                                  normalizedMac);
                 return true;
             }
 
             // Check device limit
             if (m_devices.size() >= SmartHomeConstants::MAX_MONITORED_DEVICES) {
-                Utils::Logger::Error(L"SmartHomeProtection: Maximum monitored devices reached ({})",
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Maximum monitored devices reached ({})",
                                    SmartHomeConstants::MAX_MONITORED_DEVICES);
                 return false;
             }
@@ -669,21 +669,21 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::MonitorDeviceInternal(const s
         // Lock released BEFORE callback invocation — prevents deadlock
         // if callback re-enters any device method
 
-        Utils::Logger::Info(L"SmartHomeProtection: Now monitoring device: {}",
-                          Utils::StringUtils::Utf8ToWide(normalizedMac));
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Now monitoring device: {}",
+                          normalizedMac);
 
         InvokeEventCallbacks(normalizedMac, SmartDeviceEvent::DeviceOnline);
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to monitor device - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to monitor device - {}",
+                           e.what());
         return false;
     }
 }
 
-bool SmartHomeProtection::SmartHomeProtectionImpl::UnmonitorDeviceInternal(const std::string& macAddress) {
+bool SmartHomeProtectionImpl::UnmonitorDeviceInternal(const std::string& macAddress) {
     try {
         std::string lookupKey = NormalizeMacAddress(macAddress);
         if (lookupKey.empty()) {
@@ -695,8 +695,8 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::UnmonitorDeviceInternal(const
 
             auto it = m_devices.find(lookupKey);
             if (it == m_devices.end()) {
-                Utils::Logger::Warn(L"SmartHomeProtection: Device not found: {}",
-                                  Utils::StringUtils::Utf8ToWide(macAddress));
+                ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Device not found: {}",
+                                  macAddress);
                 return false;
             }
 
@@ -709,21 +709,21 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::UnmonitorDeviceInternal(const
         }
         // Lock released BEFORE callback invocation
 
-        Utils::Logger::Info(L"SmartHomeProtection: Stopped monitoring device: {}",
-                          Utils::StringUtils::Utf8ToWide(lookupKey));
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Stopped monitoring device: {}",
+                          lookupKey);
 
         InvokeEventCallbacks(lookupKey, SmartDeviceEvent::DeviceOffline);
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to unmonitor device - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to unmonitor device - {}",
+                           e.what());
         return false;
     }
 }
 
-std::vector<MonitoredDeviceInfo> SmartHomeProtection::SmartHomeProtectionImpl::GetMonitoredDevicesInternal() const {
+std::vector<MonitoredDeviceInfo> SmartHomeProtectionImpl::GetMonitoredDevicesInternal() const {
     std::shared_lock lock(m_devicesMutex);
 
     std::vector<MonitoredDeviceInfo> devices;
@@ -736,7 +736,7 @@ std::vector<MonitoredDeviceInfo> SmartHomeProtection::SmartHomeProtectionImpl::G
     return devices;
 }
 
-std::optional<MonitoredDeviceInfo> SmartHomeProtection::SmartHomeProtectionImpl::GetDeviceInfoInternal(
+std::optional<MonitoredDeviceInfo> SmartHomeProtectionImpl::GetDeviceInfoInternal(
     const std::string& deviceId) const
 {
     std::shared_lock lock(m_devicesMutex);
@@ -753,7 +753,7 @@ std::optional<MonitoredDeviceInfo> SmartHomeProtection::SmartHomeProtectionImpl:
 // IMPL: TRAFFIC ANALYSIS
 // ============================================================================
 
-DeviceTrafficStats SmartHomeProtection::SmartHomeProtectionImpl::GetDeviceTrafficInternal(
+DeviceTrafficStats SmartHomeProtectionImpl::GetDeviceTrafficInternal(
     const std::string& deviceId,
     std::chrono::hours period) const
 {
@@ -794,14 +794,14 @@ DeviceTrafficStats SmartHomeProtection::SmartHomeProtectionImpl::GetDeviceTraffi
             std::min(uniqueDests.size(), static_cast<size_t>(UINT32_MAX)));
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to get traffic stats - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to get traffic stats - {}",
+                           e.what());
     }
 
     return stats;
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
+void SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
     const std::string& sourceMac,
     const std::string& destIP,
     uint16_t destPort,
@@ -967,8 +967,8 @@ void SmartHomeProtection::SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Traffic processing error - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Traffic processing error - {}",
+                           e.what());
     }
 }
 
@@ -976,7 +976,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
 // IMPL: ALERT MANAGEMENT
 // ============================================================================
 
-std::vector<SmartHomeAlert> SmartHomeProtection::SmartHomeProtectionImpl::GetAlertsInternal(
+std::vector<SmartHomeAlert> SmartHomeProtectionImpl::GetAlertsInternal(
     size_t maxAlerts,
     bool unacknowledgedOnly) const
 {
@@ -994,7 +994,7 @@ std::vector<SmartHomeAlert> SmartHomeProtection::SmartHomeProtectionImpl::GetAle
     return result;
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::GenerateAlert(
+void SmartHomeProtectionImpl::GenerateAlert(
     const std::string& deviceId,
     SmartDeviceEvent eventType,
     AlertSeverity severity,
@@ -1079,16 +1079,16 @@ void SmartHomeProtection::SmartHomeProtectionImpl::GenerateAlert(
             }
         }
 
-        Utils::Logger::Warn(L"SmartHomeProtection: Alert generated - {} [{}]",
-                          Utils::StringUtils::Utf8ToWide(alertCopy.title),
-                          Utils::StringUtils::Utf8ToWide(
-                              std::string(GetAlertSeverityName(alertCopy.severity))));
+        ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Alert generated - {} [{}]",
+                          alertCopy.title,
+                          
+                              std::string(GetAlertSeverityName(alertCopy.severity)));
 
         InvokeAlertCallbacks(alertCopy);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to generate alert - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to generate alert - {}",
+                           e.what());
     }
 }
 
@@ -1096,7 +1096,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::GenerateAlert(
 // IMPL: ANALYSIS METHODS
 // ============================================================================
 
-void SmartHomeProtection::SmartHomeProtectionImpl::UpdateBaseline(
+void SmartHomeProtectionImpl::UpdateBaseline(
     const std::string& deviceId,
     uint64_t bytes)
 {
@@ -1146,12 +1146,12 @@ void SmartHomeProtection::SmartHomeProtectionImpl::UpdateBaseline(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Baseline update failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Baseline update failed - {}",
+                           e.what());
     }
 }
 
-bool SmartHomeProtection::SmartHomeProtectionImpl::IsAnomaly(
+bool SmartHomeProtectionImpl::IsAnomaly(
     const std::string& deviceId,
     uint64_t traffic) const
 {
@@ -1184,13 +1184,13 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::IsAnomaly(
         return traffic > anomalyLimit;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Anomaly check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Anomaly check failed - {}",
+                           e.what());
         return false;
     }
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::DetectAnomalies(
+void SmartHomeProtectionImpl::DetectAnomalies(
     const std::string& deviceId,
     uint64_t currentTraffic)
 {
@@ -1215,16 +1215,16 @@ void SmartHomeProtection::SmartHomeProtectionImpl::DetectAnomalies(
                 PrivacyConcern::HighBandwidthUsage
             );
 
-            Utils::Logger::Warn(L"SmartHomeProtection: Traffic anomaly detected for device: {}",
-                              Utils::StringUtils::Utf8ToWide(deviceId));
+            ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Traffic anomaly detected for device: {}",
+                              deviceId);
 
             // On anomaly, run deep traffic analysis
             AnalyzeTraffic(deviceId, currentTraffic);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Anomaly detection failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Anomaly detection failed - {}",
+                           e.what());
     }
 }
 
@@ -1232,7 +1232,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::DetectAnomalies(
 // IMPL: DEEP TRAFFIC ANALYSIS
 // ============================================================================
 
-void SmartHomeProtection::SmartHomeProtectionImpl::AnalyzeTraffic(
+void SmartHomeProtectionImpl::AnalyzeTraffic(
     const std::string& deviceId,
     uint64_t bytes)
 {
@@ -1327,8 +1327,8 @@ void SmartHomeProtection::SmartHomeProtectionImpl::AnalyzeTraffic(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Traffic analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Traffic analysis failed - {}",
+                           e.what());
     }
 }
 
@@ -1336,7 +1336,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::AnalyzeTraffic(
 // IMPL: CALLBACKS
 // ============================================================================
 
-void SmartHomeProtection::SmartHomeProtectionImpl::InvokeAlertCallbacks(const SmartHomeAlert& alert) {
+void SmartHomeProtectionImpl::InvokeAlertCallbacks(const SmartHomeAlert& alert) {
     // Copy callbacks under lock, then invoke without holding it.
     // This prevents deadlock if a callback re-enters the module
     // (e.g., registers another callback or queries device state).
@@ -1349,13 +1349,13 @@ void SmartHomeProtection::SmartHomeProtectionImpl::InvokeAlertCallbacks(const Sm
         try {
             if (callback) callback(alert);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"SmartHomeProtection: Alert callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Alert callback error - {}",
+                               e.what());
         }
     }
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::InvokeEventCallbacks(
+void SmartHomeProtectionImpl::InvokeEventCallbacks(
     const std::string& deviceId,
     SmartDeviceEvent event)
 {
@@ -1368,13 +1368,13 @@ void SmartHomeProtection::SmartHomeProtectionImpl::InvokeEventCallbacks(
         try {
             if (callback) callback(deviceId, event);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"SmartHomeProtection: Event callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Event callback error - {}",
+                               e.what());
         }
     }
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::InvokeConnectionCallbacks(const DeviceConnection& connection) {
+void SmartHomeProtectionImpl::InvokeConnectionCallbacks(const DeviceConnection& connection) {
     std::vector<ConnectionCallback> callbacks;
     {
         std::lock_guard lock(m_callbacksMutex);
@@ -1384,13 +1384,13 @@ void SmartHomeProtection::SmartHomeProtectionImpl::InvokeConnectionCallbacks(con
         try {
             if (callback) callback(connection);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"SmartHomeProtection: Connection callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Connection callback error - {}",
+                               e.what());
         }
     }
 }
 
-void SmartHomeProtection::SmartHomeProtectionImpl::InvokeErrorCallbacks(
+void SmartHomeProtectionImpl::InvokeErrorCallbacks(
     const std::string& message,
     int code)
 {
@@ -1431,14 +1431,14 @@ bool SmartHomeProtection::HasInstance() noexcept {
 SmartHomeProtection::SmartHomeProtection()
     : m_impl(std::make_unique<SmartHomeProtectionImpl>())
 {
-    Utils::Logger::Info(L"SmartHomeProtection: Constructor called");
+    ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Constructor called");
 }
 
 SmartHomeProtection::~SmartHomeProtection() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"SmartHomeProtection: Destructor called");
+    ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Destructor called");
 }
 
 bool SmartHomeProtection::Initialize(const SmartHomeConfiguration& config) {
@@ -1462,7 +1462,7 @@ ModuleStatus SmartHomeProtection::GetStatus() const noexcept {
 
 bool SmartHomeProtection::UpdateConfiguration(const SmartHomeConfiguration& config) {
     if (!config.IsValid()) {
-        Utils::Logger::Error(L"SmartHomeProtection: Invalid configuration");
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Invalid configuration");
         return false;
     }
 
@@ -1473,7 +1473,7 @@ bool SmartHomeProtection::UpdateConfiguration(const SmartHomeConfiguration& conf
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config = config;
 
-    Utils::Logger::Info(L"SmartHomeProtection: Configuration updated");
+    ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Configuration updated");
     return true;
 }
 
@@ -1510,8 +1510,8 @@ void SmartHomeProtection::SetProtectionMode(ProtectionMode mode) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config.mode = mode;
 
-    Utils::Logger::Info(L"SmartHomeProtection: Protection mode changed to: {}",
-                      Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(mode))));
+    ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Protection mode changed to: {}",
+                      std::string(GetProtectionModeName(mode)));
 }
 
 ProtectionMode SmartHomeProtection::GetProtectionMode() const noexcept {
@@ -1553,15 +1553,15 @@ bool SmartHomeProtection::SetDevicePriority(const std::string& deviceId, bool hi
 
         it->second.isHighPriority = highPriority;
 
-        Utils::Logger::Info(L"SmartHomeProtection: Device {} priority: {}",
-                          Utils::StringUtils::Utf8ToWide(deviceId),
-                          highPriority ? L"HIGH" : L"NORMAL");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Device {} priority: {}",
+                          deviceId,
+                          highPriority ? "HIGH" : "NORMAL");
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to set device priority - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to set device priority - {}",
+                           e.what());
         return false;
     }
 }
@@ -1578,15 +1578,15 @@ bool SmartHomeProtection::SetPrivacySensitive(const std::string& deviceId, bool 
 
         it->second.isPrivacySensitive = sensitive;
 
-        Utils::Logger::Info(L"SmartHomeProtection: Device {} privacy-sensitive: {}",
-                          Utils::StringUtils::Utf8ToWide(deviceId),
-                          sensitive ? L"YES" : L"NO");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Device {} privacy-sensitive: {}",
+                          deviceId,
+                          sensitive ? "YES" : "NO");
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to set privacy sensitivity - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to set privacy sensitivity - {}",
+                           e.what());
         return false;
     }
 }
@@ -1654,7 +1654,7 @@ bool SmartHomeProtection::AcknowledgeAlert(uint64_t alertId) {
         for (auto& alert : m_impl->m_alerts) {
             if (alert.alertId == alertId) {
                 alert.acknowledged = true;
-                Utils::Logger::Info(L"SmartHomeProtection: Alert {} acknowledged",
+                ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Alert {} acknowledged",
                                   alertId);
                 return true;
             }
@@ -1663,8 +1663,8 @@ bool SmartHomeProtection::AcknowledgeAlert(uint64_t alertId) {
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Failed to acknowledge alert - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to acknowledge alert - {}",
+                           e.what());
         return false;
     }
 }
@@ -1675,7 +1675,7 @@ void SmartHomeProtection::ClearAlerts() {
     std::unique_lock lock(m_impl->m_alertsMutex);
     m_impl->m_alerts.clear();
 
-    Utils::Logger::Info(L"SmartHomeProtection: Alerts cleared");
+    ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Alerts cleared");
 }
 
 // ============================================================================
@@ -1768,13 +1768,13 @@ SmartHomeStatistics SmartHomeProtection::GetStatistics() const {
 void SmartHomeProtection::ResetStatistics() {
     if (m_impl) {
         m_impl->m_statistics.Reset();
-        Utils::Logger::Info(L"SmartHomeProtection: Statistics reset");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Statistics reset");
     }
 }
 
 bool SmartHomeProtection::SelfTest() {
     try {
-        Utils::Logger::Info(L"SmartHomeProtection: Starting self-test");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Starting self-test");
 
         // ======================================================================
         // NOTE: SelfTest MUST NOT modify singleton production state.
@@ -1791,21 +1791,21 @@ bool SmartHomeProtection::SelfTest() {
             validConfig.anomalyThreshold = 3.0f;
 
             if (!validConfig.IsValid()) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - valid config rejected");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - valid config rejected");
                 return false;
             }
 
             SmartHomeConfiguration invalidConfig1;
             invalidConfig1.offHoursStart = 25;  // Out of range
             if (invalidConfig1.IsValid()) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - invalid offHoursStart accepted");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - invalid offHoursStart accepted");
                 return false;
             }
 
             SmartHomeConfiguration invalidConfig2;
             invalidConfig2.anomalyThreshold = -1.0f;
             if (invalidConfig2.IsValid()) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - negative threshold accepted");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - negative threshold accepted");
                 return false;
             }
         }
@@ -1813,27 +1813,27 @@ bool SmartHomeProtection::SelfTest() {
         // Test 2: IP classification helpers
         {
             if (!IsExternalIP("8.8.8.8")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 8.8.8.8 not external");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - 8.8.8.8 not external");
                 return false;
             }
             if (IsExternalIP("192.168.1.1")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 192.168.1.1 is external");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - 192.168.1.1 is external");
                 return false;
             }
             if (IsExternalIP("10.0.0.1")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 10.0.0.1 is external");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - 10.0.0.1 is external");
                 return false;
             }
             if (IsExternalIP("172.16.0.1")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 172.16.0.1 is external");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - 172.16.0.1 is external");
                 return false;
             }
             if (IsExternalIP("169.254.1.1")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - link-local is external");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - link-local is external");
                 return false;
             }
             if (IsExternalIP("127.0.0.1")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - loopback is external");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - loopback is external");
                 return false;
             }
         }
@@ -1841,23 +1841,23 @@ bool SmartHomeProtection::SelfTest() {
         // Test 3: MAC address validation
         {
             if (!IsValidMacAddress("00:11:22:33:44:55")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - valid MAC rejected");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - valid MAC rejected");
                 return false;
             }
             if (!IsValidMacAddress("AA-BB-CC-DD-EE-FF")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - dash-format MAC rejected");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - dash-format MAC rejected");
                 return false;
             }
             if (IsValidMacAddress("invalid")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - garbage MAC accepted");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - garbage MAC accepted");
                 return false;
             }
             if (IsValidMacAddress("00:11:22:33:44:GG")) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - non-hex MAC accepted");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - non-hex MAC accepted");
                 return false;
             }
             if (NormalizeMacAddress("aa-bb-cc-dd-ee-ff") != "AA:BB:CC:DD:EE:FF") {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - MAC normalization");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - MAC normalization");
                 return false;
             }
         }
@@ -1865,11 +1865,11 @@ bool SmartHomeProtection::SelfTest() {
         // Test 4: Privacy port detection
         {
             if (!IsPrivacyPort(554)) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - RTSP port 554 not detected");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - RTSP port 554 not detected");
                 return false;
             }
             if (IsPrivacyPort(80)) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - port 80 marked as privacy");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - port 80 marked as privacy");
                 return false;
             }
         }
@@ -1877,37 +1877,37 @@ bool SmartHomeProtection::SelfTest() {
         // Test 5: Utility function coverage
         {
             if (GetSmartDeviceTypeName(SmartDeviceType::Camera) != "Camera") {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - device type name");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - device type name");
                 return false;
             }
             if (!IsPrivacySensitiveDevice(SmartDeviceType::Camera)) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - camera not privacy-sensitive");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - camera not privacy-sensitive");
                 return false;
             }
             if (IsPrivacySensitiveDevice(SmartDeviceType::LightBulb)) {
-                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - lightbulb marked privacy-sensitive");
+                ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - lightbulb marked privacy-sensitive");
                 return false;
             }
         }
 
         // Test 6: Verify impl pointer integrity
         if (!m_impl) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - null impl pointer");
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - null impl pointer");
             return false;
         }
 
         // Test 7: Version string
         if (GetVersionString().empty()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - empty version string");
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test FAILED - empty version string");
             return false;
         }
 
-        Utils::Logger::Info(L"SmartHomeProtection: Self-test PASSED (all 7 checks)");
+        ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Self-test PASSED (all 7 checks)");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"SmartHomeProtection: Self-test exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Self-test exception - {}",
+                           e.what());
         return false;
     }
 }

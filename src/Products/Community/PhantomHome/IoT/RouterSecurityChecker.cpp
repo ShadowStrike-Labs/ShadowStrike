@@ -369,10 +369,10 @@ const KnownRouterCVE g_knownRouterCVEs[] = {
  */
 [[nodiscard]] bool ParseToIpAddress(
     const std::string& ip,
-    Utils::NetworkUtils::IpAddress& out)
+    ::ShadowStrike::Utils::NetworkUtils::IpAddress& out)
 {
-    std::wstring wideIP = Utils::StringUtils::ToWide(ip);
-    return Utils::NetworkUtils::ParseIpAddress(wideIP, out);
+    std::wstring wideIP = ::ShadowStrike::Utils::StringUtils::ToWide(ip);
+    return ::ShadowStrike::Utils::NetworkUtils::ParseIpAddress(wideIP, out);
 }
 
 /**
@@ -645,7 +645,7 @@ bool RouterCheckerConfiguration::IsValid() const noexcept {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class RouterSecurityChecker::RouterSecurityCheckerImpl {
+class RouterSecurityCheckerImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -733,22 +733,22 @@ public:
 // IMPL: INITIALIZATION
 // ============================================================================
 
-bool RouterSecurityChecker::RouterSecurityCheckerImpl::Initialize(
+bool RouterSecurityCheckerImpl::Initialize(
     const RouterCheckerConfiguration& config)
 {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: Already initialized");
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Initializing...");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Initializing...");
 
         m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Invalid configuration");
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Invalid configuration");
             m_initialized.store(false, std::memory_order_release);
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
@@ -761,19 +761,19 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::Initialize(
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Initialized successfully");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Initialized successfully");
 
         // Auto-assess if configured — use stored future (NOT detached thread)
         // to ensure safe lifetime management
         if (m_config.autoAssessOnStartup && m_config.enabled) {
-            Utils::Logger::Info(L"RouterSecurityChecker: Auto-assessing gateway on startup");
+            ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Auto-assessing gateway on startup");
             m_autoAssessmentFuture = std::async(std::launch::async, [this]() {
                 try {
                     auto report = AuditGatewaySyncInternal("", m_config.defaultAssessmentConfig);
                     InvokeAssessmentCallbacks(report);
                 } catch (const std::exception& e) {
-                    Utils::Logger::Error(L"RouterSecurityChecker: Auto-assessment failed - {}",
-                                       Utils::StringUtils::Utf8ToWide(e.what()));
+                    ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Auto-assessment failed - {}",
+                                       e.what());
                 }
             });
         }
@@ -781,21 +781,21 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::Initialize(
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Initialization failed - {}",
+                           e.what());
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
 }
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::Shutdown() {
+void RouterSecurityCheckerImpl::Shutdown() {
     try {
         if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Shutting down...");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Shutting down...");
 
         m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
@@ -808,7 +808,7 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::Shutdown() {
                 // Wait up to 5 seconds, then abandon
                 auto status = m_autoAssessmentFuture.wait_for(std::chrono::seconds(5));
                 if (status == std::future_status::timeout) {
-                    Utils::Logger::Warn(L"RouterSecurityChecker: Auto-assessment did not finish within shutdown timeout");
+                    ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Auto-assessment did not finish within shutdown timeout");
                 }
             } catch (...) {}
         }
@@ -829,10 +829,10 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::Shutdown() {
 
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Shutdown complete");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Exception during shutdown");
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Exception during shutdown");
     }
 }
 
@@ -840,7 +840,7 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::Shutdown() {
 // IMPL: ASSESSMENT
 // ============================================================================
 
-RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
+RouterSecurityReport RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
     const std::string& gatewayIP,
     const RouterAssessmentConfig& config)
 {
@@ -862,7 +862,7 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
             UpdateProgress(5.0f, "Detecting default gateway");
             targetIP = GetDefaultGatewayInternal();
             if (targetIP.empty()) {
-                Utils::Logger::Error(L"RouterSecurityChecker: Failed to detect gateway");
+                ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Failed to detect gateway");
                 report.status = AssessmentStatus::Failed;
                 return report;
             }
@@ -872,13 +872,13 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
 
         // Validate target IP format
         if (!IsValidIPv4(targetIP)) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Invalid gateway IP format");
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Invalid gateway IP format");
             report.status = AssessmentStatus::Failed;
             return report;
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Auditing router at {}",
-                          Utils::StringUtils::Utf8ToWide(targetIP));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Auditing router at {}",
+                          targetIP);
 
         // Check cancellation early
         if (m_cancelRequested.load(std::memory_order_acquire)) {
@@ -1070,15 +1070,15 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
 
         UpdateProgress(100.0f, "Assessment complete");
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Assessment complete - Score: {}, Risk: {}",
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Assessment complete - Score: {}, Risk: {}",
                           report.securityScore,
-                          Utils::StringUtils::Utf8ToWide(std::string(GetSecurityRiskLevelName(report.overallRisk))));
+                          std::string(GetSecurityRiskLevelName(report.overallRisk)));
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Assessment failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Assessment failed - {}",
+                           e.what());
         report.status = AssessmentStatus::Failed;
         InvokeErrorCallbacks(e.what(), -1);
     }
@@ -1086,7 +1086,7 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
     return report;
 }
 
-RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::QuickSecurityCheckInternal(
+RouterSecurityReport RouterSecurityCheckerImpl::QuickSecurityCheckInternal(
     const std::string& gatewayIP)
 {
     RouterAssessmentConfig quickConfig;
@@ -1106,15 +1106,15 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::QuickSecu
 // IMPL: SPECIFIC CHECKS
 // ============================================================================
 
-bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDefaultCredentialsInternal(
+bool RouterSecurityCheckerImpl::CheckDefaultCredentialsInternal(
     const std::string& ip)
 {
     try {
         auto credDatabase = GetDefaultCredentialsDatabase();
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Testing {} default credentials for {}",
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Testing {} default credentials for {}",
                           credDatabase.size(),
-                          Utils::StringUtils::Utf8ToWide(ip));
+                          ip);
 
         // Attempt HTTP Basic Authentication against common admin endpoints
         constexpr uint16_t adminPorts[] = { 80, 443, 8080, 8443 };
@@ -1135,32 +1135,32 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDefaultCredentialsIn
                 if (m_cancelRequested.load(std::memory_order_acquire)) return false;
 
                 std::wstring baseURL = std::format(L"{}://{}:{}{}", proto,
-                    Utils::StringUtils::ToWide(ip), port, path);
+                    ::ShadowStrike::Utils::StringUtils::ToWide(ip), port, path);
 
                 for (const auto& cred : credDatabase) {
                     if (m_cancelRequested.load(std::memory_order_acquire)) return false;
                     if (++attemptCount > kMaxAttempts) {
-                        Utils::Logger::Info(
-                            L"RouterSecurityChecker: Reached credential test cap ({} attempts)",
+                        ::ShadowStrike::Utils::Logger::Info(
+                            "RouterSecurityChecker: Reached credential test cap ({} attempts)",
                             kMaxAttempts);
                         return false;
                     }
 
                     // Build HTTP Basic Auth header: base64(username:password)
                     std::string authPlain = cred.username + ":" + cred.password;
-                    std::string authEncoded = Utils::CryptoUtils::Base64::Encode(
+                    std::string authEncoded = ::ShadowStrike::Utils::CryptoUtils::Base64::Encode(
                         reinterpret_cast<const uint8_t*>(authPlain.data()), authPlain.size());
 
-                    Utils::NetworkUtils::HttpRequestOptions opts;
+                    ::ShadowStrike::Utils::NetworkUtils::HttpRequestOptions opts;
                     opts.timeoutMs = std::min(m_config.defaultAssessmentConfig.timeoutMs, 5000u);
                     opts.headers.push_back({L"Authorization",
-                        std::format(L"Basic {}", Utils::StringUtils::ToWide(authEncoded))});
+                        std::format(L"Basic {}", ::ShadowStrike::Utils::StringUtils::ToWide(authEncoded))});
                     opts.allowRedirects = false; // Don't follow redirects (avoid loops)
                     opts.verifySSL = false; // Router self-signed certs are common
 
-                    Utils::NetworkUtils::HttpResponse response;
-                    Utils::NetworkUtils::Error netErr;
-                    bool ok = Utils::NetworkUtils::HttpRequest(baseURL, response, opts, &netErr);
+                    ::ShadowStrike::Utils::NetworkUtils::HttpResponse response;
+                    ::ShadowStrike::Utils::NetworkUtils::Error netErr;
+                    bool ok = ::ShadowStrike::Utils::NetworkUtils::HttpRequest(baseURL, response, opts, &netErr);
 
                     if (!ok) {
                         // Connection refused or timeout — try next port
@@ -1169,10 +1169,10 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDefaultCredentialsIn
 
                     // 200 or 301/302 (authenticated redirect) means creds work
                     if (response.statusCode == 200 || response.statusCode == 301 || response.statusCode == 302) {
-                        Utils::Logger::Warn(
-                            L"RouterSecurityChecker: DEFAULT CREDENTIALS ACCEPTED on {}:{} user={}",
-                            Utils::StringUtils::ToWide(ip), port,
-                            Utils::StringUtils::ToWide(cred.username));
+                        ::ShadowStrike::Utils::Logger::Warn(
+                            "RouterSecurityChecker: DEFAULT CREDENTIALS ACCEPTED on {}:{} user={}",
+                            ip, port,
+                            cred.username);
                         return true;
                     }
 
@@ -1189,24 +1189,24 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDefaultCredentialsIn
             }
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: No default credentials found for {}",
-                          Utils::StringUtils::Utf8ToWide(ip));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: No default credentials found for {}",
+                          ip);
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Credential check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Credential check failed - {}",
+                           e.what());
         return false;
     }
 }
 
-UPnPInfo RouterSecurityChecker::RouterSecurityCheckerImpl::CheckUPnPInternal(const std::string& ip) {
+UPnPInfo RouterSecurityCheckerImpl::CheckUPnPInternal(const std::string& ip) {
     UPnPInfo info;
     info.enabled = false;
 
     try {
-        Utils::Logger::Info(L"RouterSecurityChecker: Checking UPnP for {}",
-                          Utils::StringUtils::Utf8ToWide(ip));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Checking UPnP for {}",
+                          ip);
 
 #ifdef _WIN32
         // Send SSDP M-SEARCH multicast to discover UPnP devices
@@ -1217,7 +1217,7 @@ UPnPInfo RouterSecurityChecker::RouterSecurityCheckerImpl::CheckUPnPInternal(con
 
         SocketGuard sock(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
         if (!sock.IsValid()) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: Failed to create SSDP socket");
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Failed to create SSDP socket");
             return info;
         }
 
@@ -1248,7 +1248,7 @@ UPnPInfo RouterSecurityChecker::RouterSecurityCheckerImpl::CheckUPnPInternal(con
         int sent = sendto(sock.Get(), mSearch.c_str(), static_cast<int>(mSearch.size()), 0,
                           reinterpret_cast<struct sockaddr*>(&destAddr), sizeof(destAddr));
         if (sent <= 0) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: Failed to send SSDP M-SEARCH");
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Failed to send SSDP M-SEARCH");
             return info;
         }
 
@@ -1317,13 +1317,13 @@ UPnPInfo RouterSecurityChecker::RouterSecurityCheckerImpl::CheckUPnPInternal(con
 
         // If we have a LOCATION URL, try to fetch device description for more info
         if (!locationUrl.empty() && locationUrl.size() < 512) {
-            Utils::NetworkUtils::HttpRequestOptions opts;
+            ::ShadowStrike::Utils::NetworkUtils::HttpRequestOptions opts;
             opts.timeoutMs = 3000;
             opts.verifySSL = false;
-            Utils::NetworkUtils::HttpResponse xmlResp;
-            std::wstring wideLocUrl = Utils::StringUtils::ToWide(locationUrl);
+            ::ShadowStrike::Utils::NetworkUtils::HttpResponse xmlResp;
+            std::wstring wideLocUrl = ::ShadowStrike::Utils::StringUtils::ToWide(locationUrl);
 
-            if (Utils::NetworkUtils::HttpRequest(wideLocUrl, xmlResp, opts) &&
+            if (::ShadowStrike::Utils::NetworkUtils::HttpRequest(wideLocUrl, xmlResp, opts) &&
                 xmlResp.statusCode == 200 && !xmlResp.body.empty())
             {
                 // Parse XML for friendlyName and manufacturer (lightweight text search)
@@ -1350,21 +1350,21 @@ UPnPInfo RouterSecurityChecker::RouterSecurityCheckerImpl::CheckUPnPInternal(con
             }
         }
 
-        Utils::Logger::Warn(L"RouterSecurityChecker: UPnP ENABLED on {} - device: {}",
-                          Utils::StringUtils::Utf8ToWide(ip),
-                          Utils::StringUtils::ToWide(info.friendlyName.empty() ? "(unknown)" : info.friendlyName));
+        ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: UPnP ENABLED on {} - device: {}",
+                          ip,
+                          info.friendlyName.empty() ? "(unknown)" : info.friendlyName);
 #endif
 
         return info;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: UPnP check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: UPnP check failed - {}",
+                           e.what());
         return info;
     }
 }
 
-bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDNSHijackingInternal() {
+bool RouterSecurityCheckerImpl::CheckDNSHijackingInternal() {
     try {
         auto dnsServers = GetDNSServers();
         auto knownGood = GetKnownGoodDNS();
@@ -1399,8 +1399,8 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDNSHijackingInternal
 
             if (!isKnownGood && !isLocal) {
                 // Suspicious DNS server
-                Utils::Logger::Warn(L"RouterSecurityChecker: Suspicious DNS server: {}",
-                                  Utils::StringUtils::Utf8ToWide(dns));
+                ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Suspicious DNS server: {}",
+                                  dns);
                 return true;
             }
         }
@@ -1408,13 +1408,13 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDNSHijackingInternal
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: DNS check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: DNS check failed - {}",
+                           e.what());
         return false;
     }
 }
 
-std::string RouterSecurityChecker::RouterSecurityCheckerImpl::GetDefaultGatewayInternal() const {
+std::string RouterSecurityCheckerImpl::GetDefaultGatewayInternal() const {
     try {
 #ifdef _WIN32
         ULONG bufferSize = sizeof(IP_ADAPTER_INFO);
@@ -1425,7 +1425,7 @@ std::string RouterSecurityChecker::RouterSecurityCheckerImpl::GetDefaultGatewayI
         DWORD result = GetAdaptersInfo(pAdapterInfo, &bufferSize);
         if (result == ERROR_BUFFER_OVERFLOW) {
             if (bufferSize > 256 * 1024) {
-                Utils::Logger::Warn(L"RouterSecurityChecker: GetAdaptersInfo requested excessive buffer");
+                ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: GetAdaptersInfo requested excessive buffer");
                 return "192.168.1.1";
             }
             buffer.resize(bufferSize);
@@ -1442,8 +1442,8 @@ std::string RouterSecurityChecker::RouterSecurityCheckerImpl::GetDefaultGatewayI
                     pAdapter->Type == IF_TYPE_IEEE80211) {
                     std::string gateway = pAdapter->GatewayList.IpAddress.String;
                     if (!gateway.empty() && gateway != "0.0.0.0" && IsValidIPv4(gateway)) {
-                        Utils::Logger::Info(L"RouterSecurityChecker: Detected gateway: {}",
-                                          Utils::StringUtils::Utf8ToWide(gateway));
+                        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Detected gateway: {}",
+                                          gateway);
                         return gateway;
                     }
                 }
@@ -1457,8 +1457,8 @@ std::string RouterSecurityChecker::RouterSecurityCheckerImpl::GetDefaultGatewayI
         return "192.168.1.1";
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Failed to get gateway - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Failed to get gateway - {}",
+                           e.what());
         return "192.168.1.1";
     }
 }
@@ -1467,7 +1467,7 @@ std::string RouterSecurityChecker::RouterSecurityCheckerImpl::GetDefaultGatewayI
 // IMPL: HELPER METHODS
 // ============================================================================
 
-std::vector<WirelessNetworkInfo> RouterSecurityChecker::RouterSecurityCheckerImpl::GetWirelessNetworks(
+std::vector<WirelessNetworkInfo> RouterSecurityCheckerImpl::GetWirelessNetworks(
     const std::string& ip)
 {
     std::vector<WirelessNetworkInfo> networks;
@@ -1476,7 +1476,7 @@ std::vector<WirelessNetworkInfo> RouterSecurityChecker::RouterSecurityCheckerImp
 #ifdef _WIN32
         WlanHandleGuard wlanHandle;
         if (!wlanHandle.Open()) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: WLAN API not available");
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: WLAN API not available");
             return networks;
         }
 
@@ -1484,7 +1484,7 @@ std::vector<WirelessNetworkInfo> RouterSecurityChecker::RouterSecurityCheckerImp
         PWLAN_INTERFACE_INFO_LIST pInterfaceList = nullptr;
         DWORD result = WlanEnumInterfaces(wlanHandle.Get(), nullptr, &pInterfaceList);
         if (result != ERROR_SUCCESS || !pInterfaceList) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: No wireless interfaces found");
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: No wireless interfaces found");
             return networks;
         }
 
@@ -1645,18 +1645,18 @@ std::vector<WirelessNetworkInfo> RouterSecurityChecker::RouterSecurityCheckerImp
             }
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Found {} wireless networks", networks.size());
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Found {} wireless networks", networks.size());
 #endif
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Wireless enumeration failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Wireless enumeration failed - {}",
+                           e.what());
     }
 
     return networks;
 }
 
-std::vector<std::string> RouterSecurityChecker::RouterSecurityCheckerImpl::GetDNSServers() {
+std::vector<std::string> RouterSecurityCheckerImpl::GetDNSServers() {
     std::vector<std::string> dnsServers;
 
     try {
@@ -1670,7 +1670,7 @@ std::vector<std::string> RouterSecurityChecker::RouterSecurityCheckerImpl::GetDN
             // Reallocate with the size the API told us
             if (bufferSize > 64 * 1024) {
                 // Sanity cap — prevent hostile allocation
-                Utils::Logger::Warn(L"RouterSecurityChecker: GetNetworkParams requested excessive buffer ({})", bufferSize);
+                ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: GetNetworkParams requested excessive buffer ({})", bufferSize);
                 return dnsServers;
             }
             buffer.resize(bufferSize);
@@ -1691,26 +1691,26 @@ std::vector<std::string> RouterSecurityChecker::RouterSecurityCheckerImpl::GetDN
                 ++count;
             }
         } else {
-            Utils::Logger::Warn(L"RouterSecurityChecker: GetNetworkParams failed with error {}", result);
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: GetNetworkParams failed with error {}", result);
         }
 #endif
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: DNS server enumeration failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: DNS server enumeration failed - {}",
+                           e.what());
     }
 
     return dnsServers;
 }
 
-std::vector<uint16_t> RouterSecurityChecker::RouterSecurityCheckerImpl::ScanOpenPorts(
+std::vector<uint16_t> RouterSecurityCheckerImpl::ScanOpenPorts(
     const std::string& ip)
 {
     std::vector<uint16_t> openPorts;
 
     try {
-        Utils::Logger::Info(L"RouterSecurityChecker: Scanning ports on {}",
-                          Utils::StringUtils::Utf8ToWide(ip));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Scanning ports on {}",
+                          ip);
 
         // Common ports of interest on router WAN interfaces
         const std::vector<uint16_t> portsToScan = {
@@ -1738,13 +1738,13 @@ std::vector<uint16_t> RouterSecurityChecker::RouterSecurityCheckerImpl::ScanOpen
         };
 
         // Use NetworkUtils::ScanPorts for real TCP connect scanning
-        Utils::NetworkUtils::IpAddress targetAddr;
-        std::wstring wideIP = Utils::StringUtils::ToWide(ip);
-        Utils::NetworkUtils::Error netErr;
+        ::ShadowStrike::Utils::NetworkUtils::IpAddress targetAddr;
+        std::wstring wideIP = ::ShadowStrike::Utils::StringUtils::ToWide(ip);
+        ::ShadowStrike::Utils::NetworkUtils::Error netErr;
 
-        if (!Utils::NetworkUtils::ParseIpAddress(wideIP, targetAddr, &netErr)) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: Failed to parse IP for port scan: {}",
-                              Utils::StringUtils::Utf8ToWide(ip));
+        if (!::ShadowStrike::Utils::NetworkUtils::ParseIpAddress(wideIP, targetAddr, &netErr)) {
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Failed to parse IP for port scan: {}",
+                              ip);
             return openPorts;
         }
 
@@ -1752,9 +1752,9 @@ std::vector<uint16_t> RouterSecurityChecker::RouterSecurityCheckerImpl::ScanOpen
         uint32_t timeoutMs = std::min(m_config.defaultAssessmentConfig.timeoutMs / 10, 2000u);
         if (timeoutMs < 500) timeoutMs = 500;
 
-        std::vector<Utils::NetworkUtils::PortScanResult> scanResults;
-        if (!Utils::NetworkUtils::ScanPorts(targetAddr, portsToScan, scanResults, timeoutMs, &netErr)) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: Port scan call failed");
+        std::vector<::ShadowStrike::Utils::NetworkUtils::PortScanResult> scanResults;
+        if (!::ShadowStrike::Utils::NetworkUtils::ScanPorts(targetAddr, portsToScan, scanResults, timeoutMs, &netErr)) {
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Port scan call failed");
             return openPorts;
         }
 
@@ -1764,37 +1764,39 @@ std::vector<uint16_t> RouterSecurityChecker::RouterSecurityCheckerImpl::ScanOpen
             if (result.isOpen) {
                 openPorts.push_back(result.port);
 
-                Utils::Logger::Warn(L"RouterSecurityChecker: Open port {} ({}) on {}",
+                ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Open port {} ({}) on {}",
                                   result.port,
-                                  result.serviceName.empty() ? L"unknown" : result.serviceName,
-                                  Utils::StringUtils::Utf8ToWide(ip));
+                                  result.serviceName.empty()
+                                      ? std::string("unknown")
+                                      : ::ShadowStrike::Utils::StringUtils::WStringToString(result.serviceName),
+                                  ip);
             }
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Port scan complete - {} open ports found",
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Port scan complete - {} open ports found",
                           openPorts.size());
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Port scan failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Port scan failed - {}",
+                           e.what());
     }
 
     return openPorts;
 }
 
-RouterVendor RouterSecurityChecker::RouterSecurityCheckerImpl::DetectVendor(const std::string& ip) {
+RouterVendor RouterSecurityCheckerImpl::DetectVendor(const std::string& ip) {
     try {
-        Utils::Logger::Info(L"RouterSecurityChecker: Detecting vendor for {}",
-                          Utils::StringUtils::Utf8ToWide(ip));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Detecting vendor for {}",
+                          ip);
 
         // Strategy 1: MAC OUI lookup via ARP table / GetMacAddress
-        Utils::NetworkUtils::IpAddress targetAddr;
-        std::wstring wideIP = Utils::StringUtils::ToWide(ip);
-        Utils::NetworkUtils::Error netErr;
+        ::ShadowStrike::Utils::NetworkUtils::IpAddress targetAddr;
+        std::wstring wideIP = ::ShadowStrike::Utils::StringUtils::ToWide(ip);
+        ::ShadowStrike::Utils::NetworkUtils::Error netErr;
 
-        if (Utils::NetworkUtils::ParseIpAddress(wideIP, targetAddr, &netErr)) {
-            Utils::NetworkUtils::MacAddress mac;
-            if (Utils::NetworkUtils::GetMacAddress(targetAddr, mac, &netErr)) {
+        if (::ShadowStrike::Utils::NetworkUtils::ParseIpAddress(wideIP, targetAddr, &netErr)) {
+            ::ShadowStrike::Utils::NetworkUtils::MacAddress mac;
+            if (::ShadowStrike::Utils::NetworkUtils::GetMacAddress(targetAddr, mac, &netErr)) {
                 // Format MAC as string for OUI lookup
                 char macStr[18]{};
                 snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -1803,8 +1805,8 @@ RouterVendor RouterSecurityChecker::RouterSecurityCheckerImpl::DetectVendor(cons
 
                 RouterVendor ouiVendor = LookupOUI(std::string(macStr));
                 if (ouiVendor != RouterVendor::Unknown) {
-                    Utils::Logger::Info(L"RouterSecurityChecker: Vendor identified by OUI: {}",
-                                      Utils::StringUtils::ToWide(std::string(GetRouterVendorName(ouiVendor))));
+                    ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Vendor identified by OUI: {}",
+                                      std::string(GetRouterVendorName(ouiVendor)));
                     return ouiVendor;
                 }
             }
@@ -1818,15 +1820,15 @@ RouterVendor RouterSecurityChecker::RouterSecurityCheckerImpl::DetectVendor(cons
             bool useTLS = (port == 443);
             std::wstring url = std::format(L"{}://{}:{}/",
                 useTLS ? L"https" : L"http",
-                Utils::StringUtils::ToWide(ip), port);
+                ::ShadowStrike::Utils::StringUtils::ToWide(ip), port);
 
-            Utils::NetworkUtils::HttpRequestOptions opts;
+            ::ShadowStrike::Utils::NetworkUtils::HttpRequestOptions opts;
             opts.timeoutMs = 3000;
             opts.verifySSL = false;
             opts.allowRedirects = false;
 
-            Utils::NetworkUtils::HttpResponse response;
-            if (Utils::NetworkUtils::HttpRequest(url, response, opts) &&
+            ::ShadowStrike::Utils::NetworkUtils::HttpResponse response;
+            if (::ShadowStrike::Utils::NetworkUtils::HttpRequest(url, response, opts) &&
                 response.statusCode > 0)
             {
                 // Collect all headers and body for banner analysis
@@ -1852,28 +1854,28 @@ RouterVendor RouterSecurityChecker::RouterSecurityCheckerImpl::DetectVendor(cons
                 // Use the DetectRouterVendor helper
                 RouterVendor bannerVendor = DetectRouterVendor("", banner);
                 if (bannerVendor != RouterVendor::Unknown) {
-                    Utils::Logger::Info(L"RouterSecurityChecker: Vendor identified by banner: {}",
-                                      Utils::StringUtils::ToWide(std::string(GetRouterVendorName(bannerVendor))));
+                    ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Vendor identified by banner: {}",
+                                      std::string(GetRouterVendorName(bannerVendor)));
                     return bannerVendor;
                 }
             }
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Could not identify vendor for {}",
-                          Utils::StringUtils::Utf8ToWide(ip));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Could not identify vendor for {}",
+                          ip);
         return RouterVendor::Unknown;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Vendor detection failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Vendor detection failed - {}",
+                           e.what());
         return RouterVendor::Unknown;
     }
 }
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::AnalyzeCVEs(RouterSecurityReport& report) {
+void RouterSecurityCheckerImpl::AnalyzeCVEs(RouterSecurityReport& report) {
     try {
-        Utils::Logger::Info(L"RouterSecurityChecker: Analyzing CVEs for vendor {}",
-                          Utils::StringUtils::ToWide(std::string(GetRouterVendorName(report.vendor))));
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Analyzing CVEs for vendor {}",
+                          std::string(GetRouterVendorName(report.vendor)));
 
         // Step 1: Match CVEs from our curated known-router-CVE database by vendor
         std::vector<const KnownRouterCVE*> matchedCVEs;
@@ -1933,16 +1935,16 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::AnalyzeCVEs(RouterSecurit
             m_statistics.cvesMatched.fetch_add(
                 static_cast<uint64_t>(matchedCVEs.size()), std::memory_order_relaxed);
 
-            Utils::Logger::Warn(L"RouterSecurityChecker: {} potential CVEs matched for {}",
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: {} potential CVEs matched for {}",
                               matchedCVEs.size(),
-                              Utils::StringUtils::ToWide(std::string(GetRouterVendorName(report.vendor))));
+                              std::string(GetRouterVendorName(report.vendor)));
         } else {
-            Utils::Logger::Info(L"RouterSecurityChecker: No known CVEs matched for vendor");
+            ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: No known CVEs matched for vendor");
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: CVE analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: CVE analysis failed - {}",
+                           e.what());
     }
 }
 
@@ -1950,7 +1952,7 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::AnalyzeCVEs(RouterSecurit
 // IMPL: CALLBACKS
 // ============================================================================
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeAssessmentCallbacks(
+void RouterSecurityCheckerImpl::InvokeAssessmentCallbacks(
     const RouterSecurityReport& report)
 {
     // Copy callbacks under lock, then invoke outside lock to prevent deadlock
@@ -1963,13 +1965,13 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeAssessmentCallbacks
         try {
             callback(report);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Assessment callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Assessment callback error - {}",
+                               e.what());
         }
     }
 }
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeIssueCallbacks(
+void RouterSecurityCheckerImpl::InvokeIssueCallbacks(
     const SecurityIssue& issue)
 {
     // Copy callbacks under lock, then invoke outside lock to prevent deadlock
@@ -1982,13 +1984,13 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeIssueCallbacks(
         try {
             callback(issue);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Issue callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Issue callback error - {}",
+                               e.what());
         }
     }
 }
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeProgressCallbacks(
+void RouterSecurityCheckerImpl::InvokeProgressCallbacks(
     float progress,
     const std::string& status)
 {
@@ -2001,13 +2003,13 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeProgressCallbacks(
         try {
             callback(progress, status);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Progress callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Progress callback error - {}",
+                               e.what());
         }
     }
 }
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeErrorCallbacks(
+void RouterSecurityCheckerImpl::InvokeErrorCallbacks(
     const std::string& message,
     int code)
 {
@@ -2025,7 +2027,7 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeErrorCallbacks(
     }
 }
 
-void RouterSecurityChecker::RouterSecurityCheckerImpl::UpdateProgress(
+void RouterSecurityCheckerImpl::UpdateProgress(
     float progress,
     const std::string& status)
 {
@@ -2056,14 +2058,14 @@ bool RouterSecurityChecker::HasInstance() noexcept {
 RouterSecurityChecker::RouterSecurityChecker()
     : m_impl(std::make_unique<RouterSecurityCheckerImpl>())
 {
-    Utils::Logger::Info(L"RouterSecurityChecker: Constructor called");
+    ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Constructor called");
 }
 
 RouterSecurityChecker::~RouterSecurityChecker() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"RouterSecurityChecker: Destructor called");
+    ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Destructor called");
 }
 
 bool RouterSecurityChecker::Initialize(const RouterCheckerConfiguration& config) {
@@ -2087,7 +2089,7 @@ ModuleStatus RouterSecurityChecker::GetStatus() const noexcept {
 
 bool RouterSecurityChecker::UpdateConfiguration(const RouterCheckerConfiguration& config) {
     if (!config.IsValid()) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Invalid configuration");
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Invalid configuration");
         return false;
     }
 
@@ -2098,7 +2100,7 @@ bool RouterSecurityChecker::UpdateConfiguration(const RouterCheckerConfiguration
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config = config;
 
-    Utils::Logger::Info(L"RouterSecurityChecker: Configuration updated");
+    ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Configuration updated");
     return true;
 }
 
@@ -2139,7 +2141,7 @@ RouterSecurityReport RouterSecurityChecker::QuickSecurityCheck(const std::string
 void RouterSecurityChecker::CancelAssessment() {
     if (m_impl) {
         m_impl->m_cancelRequested.store(true, std::memory_order_release);
-        Utils::Logger::Info(L"RouterSecurityChecker: Assessment cancellation requested");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Assessment cancellation requested");
     }
 }
 
@@ -2252,13 +2254,13 @@ RouterStatistics RouterSecurityChecker::GetStatistics() const {
 void RouterSecurityChecker::ResetStatistics() {
     if (m_impl) {
         m_impl->m_statistics.Reset();
-        Utils::Logger::Info(L"RouterSecurityChecker: Statistics reset");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Statistics reset");
     }
 }
 
 bool RouterSecurityChecker::SelfTest() {
     try {
-        Utils::Logger::Info(L"RouterSecurityChecker: Starting self-test");
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Starting self-test");
 
         // Test 1: Initialization
         RouterCheckerConfiguration config;
@@ -2267,51 +2269,50 @@ bool RouterSecurityChecker::SelfTest() {
         config.defaultAssessmentConfig.timeoutMs = 10000;
 
         if (!Initialize(config)) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Self-test failed - Initialization");
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test failed - Initialization");
             return false;
         }
 
         // Test 2: Configuration validation
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Self-test failed - Configuration invalid");
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test failed - Configuration invalid");
             return false;
         }
 
         // Test 3: Gateway detection
         auto gateway = GetDefaultGateway();
         if (gateway.empty()) {
-            Utils::Logger::Warn(L"RouterSecurityChecker: Gateway detection returned empty (non-fatal)");
+            ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: Gateway detection returned empty (non-fatal)");
         }
 
         // Test 4: DNS enumeration
         if (m_impl) {
             auto dnsServers = m_impl->GetDNSServers();
-            Utils::Logger::Info(L"RouterSecurityChecker: DNS servers: {}", dnsServers.size());
+            ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: DNS servers: {}", dnsServers.size());
         }
 
         // Test 5: Statistics
-        auto stats = GetStatistics();
         ResetStatistics();
-        stats = GetStatistics();
+        auto stats = GetStatistics();
         if (stats.totalAssessments.load() != 0) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Self-test failed - Statistics reset");
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test failed - Statistics reset");
             return false;
         }
 
         // Test 6: Default credentials database
         auto credDb = GetDefaultCredentialsDatabase();
         if (credDb.empty()) {
-            Utils::Logger::Error(L"RouterSecurityChecker: Self-test failed - No credentials in database");
+            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test failed - No credentials in database");
             return false;
         }
 
-        Utils::Logger::Info(L"RouterSecurityChecker: Self-test PASSED ({} default credentials)",
+        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Self-test PASSED ({} default credentials)",
                           credDb.size());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"RouterSecurityChecker: Self-test exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test exception - {}",
+                           e.what());
         return false;
     }
 }

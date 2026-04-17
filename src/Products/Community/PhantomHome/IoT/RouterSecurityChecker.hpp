@@ -562,7 +562,32 @@ struct RouterStatistics {
     std::atomic<uint64_t> cvesMatched{0};
     std::atomic<uint64_t> dnsHijackingDetected{0};
     TimePoint startTime = Clock::now();
-    
+
+    RouterStatistics() noexcept = default;
+    RouterStatistics(const RouterStatistics& other) noexcept {
+        totalAssessments.store(other.totalAssessments.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        completedAssessments.store(other.completedAssessments.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        defaultCredsFound.store(other.defaultCredsFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        criticalIssuesFound.store(other.criticalIssuesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        highIssuesFound.store(other.highIssuesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cvesMatched.store(other.cvesMatched.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dnsHijackingDetected.store(other.dnsHijackingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        startTime = other.startTime;
+    }
+    RouterStatistics& operator=(const RouterStatistics& other) noexcept {
+        if (this != &other) {
+            totalAssessments.store(other.totalAssessments.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            completedAssessments.store(other.completedAssessments.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            defaultCredsFound.store(other.defaultCredsFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            criticalIssuesFound.store(other.criticalIssuesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            highIssuesFound.store(other.highIssuesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cvesMatched.store(other.cvesMatched.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dnsHijackingDetected.store(other.dnsHijackingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

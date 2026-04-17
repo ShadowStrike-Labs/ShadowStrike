@@ -285,11 +285,13 @@ namespace {
      * @brief Generate deterministic device ID from MAC address
      */
     [[nodiscard]] std::string GenerateDeviceId(const std::string& mac) {
-        auto hash = Utils::HashUtils::ComputeSHA256(
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(mac.data()),
-                mac.size()));
-        return Utils::HashUtils::ToHexString(hash).substr(0, 16);
+        std::string hex;
+        if (!::ShadowStrike::Utils::HashUtils::ComputeHex(
+                ::ShadowStrike::Utils::HashUtils::Algorithm::SHA256,
+                mac.data(), mac.size(), hex)) {
+            return {};
+        }
+        return hex.substr(0, 16);
     }
 
     /**
@@ -355,13 +357,13 @@ namespace {
         int prefixLen = 0;
         auto [ptr, ec] = std::from_chars(maskStr.data(), maskStr.data() + maskStr.size(), prefixLen);
         if (ec != std::errc{} || prefixLen < 0 || prefixLen > 32) {
-            Utils::Logger::Error("Invalid CIDR prefix length: {}", cidr);
+            ::ShadowStrike::Utils::Logger::Error("Invalid CIDR prefix length: {}", cidr);
             return hosts;
         }
 
         in_addr addr{};
         if (::inet_pton(AF_INET, ipStr.c_str(), &addr) != 1) {
-            Utils::Logger::Error("Invalid CIDR IP address: {}", cidr);
+            ::ShadowStrike::Utils::Logger::Error("Invalid CIDR IP address: {}", cidr);
             return hosts;
         }
 
@@ -384,7 +386,7 @@ namespace {
         uint32_t hostCount = broadcast - network - 1;
         if (hostCount > IoTConstants::MAX_SUBNET_HOSTS) {
             hostCount = IoTConstants::MAX_SUBNET_HOSTS;
-            Utils::Logger::Warn("CIDR {} exceeds max host limit, capped at {}", cidr,
+            ::ShadowStrike::Utils::Logger::Warn("CIDR {} exceeds max host limit, capped at {}", cidr,
                                 IoTConstants::MAX_SUBNET_HOSTS);
         }
 
@@ -439,7 +441,7 @@ public:
     IoTDeviceScannerImpl() {
         WSADATA wsaData{};
         if (::WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            Utils::Logger::Error("WSAStartup failed: {}", ::WSAGetLastError());
+            ::ShadowStrike::Utils::Logger::Error("WSAStartup failed: {}", ::WSAGetLastError());
         }
     }
 
@@ -493,9 +495,9 @@ public:
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Error callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Error callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown error callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown error callback exception");
             }
         }
     }
@@ -506,9 +508,9 @@ public:
             try {
                 callback(device);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("DeviceFound callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("DeviceFound callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown DeviceFound callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown DeviceFound callback exception");
             }
         }
     }
@@ -519,9 +521,9 @@ public:
             try {
                 callback(device, risk);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Vulnerability callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Vulnerability callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown Vulnerability callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown Vulnerability callback exception");
             }
         }
     }
@@ -532,9 +534,9 @@ public:
             try {
                 callback(progress);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Progress callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Progress callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown Progress callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown Progress callback exception");
             }
         }
     }
@@ -545,9 +547,9 @@ public:
             try {
                 callback(summary);
             } catch (const std::exception& e) {
-                Utils::Logger::Error("Complete callback exception: {}", e.what());
+                ::ShadowStrike::Utils::Logger::Error("Complete callback exception: {}", e.what());
             } catch (...) {
-                Utils::Logger::Error("Unknown Complete callback exception");
+                ::ShadowStrike::Utils::Logger::Error("Unknown Complete callback exception");
             }
         }
     }
@@ -831,7 +833,7 @@ public:
             }
 
             if (TryHTTPBasicAuth(device.ipAddress, httpPort, cred.username, cred.password)) {
-                Utils::Logger::Warn("Default credentials found on {} ({}:****)",
+                ::ShadowStrike::Utils::Logger::Warn("Default credentials found on {} ({}:****)",
                                     device.ipAddress, cred.username);
                 m_stats.defaultCredentialsFound++;
                 return true;
@@ -1055,7 +1057,7 @@ public:
             lock.unlock();
             NotifyDeviceFound(device);
 
-            Utils::Logger::Debug("ARP: Discovered {} ({}) at {}", senderMAC,
+            ::ShadowStrike::Utils::Logger::Debug("ARP: Discovered {} ({}) at {}", senderMAC,
                                  device.vendor, senderIP);
         }
     }
@@ -1178,7 +1180,7 @@ public:
                 if (it != m_devices.end() && it->second.hostName.empty()) {
                     it->second.hostName = hostname;
                     lock.unlock();
-                    Utils::Logger::Debug("DNS: Resolved hostname '{}' for {}",
+                    ::ShadowStrike::Utils::Logger::Debug("DNS: Resolved hostname '{}' for {}",
                                          hostname, ip);
                 }
             }
@@ -1192,7 +1194,7 @@ public:
     // ========================================================================
 
     void PassiveMonitorThreadFunc() {
-        Utils::Logger::Info("Passive monitoring thread started");
+        ::ShadowStrike::Utils::Logger::Info("Passive monitoring thread started");
 
         while (m_passiveMonitoring.load(std::memory_order_acquire)) {
             // Monitor loop — in production this would read from a packet
@@ -1227,7 +1229,7 @@ public:
             }
         }
 
-        Utils::Logger::Info("Passive monitoring thread stopped");
+        ::ShadowStrike::Utils::Logger::Info("Passive monitoring thread stopped");
     }
 
     // ========================================================================
@@ -1283,7 +1285,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("Deep scan failed for {}: {}", ipAddress, e.what());
+            ::ShadowStrike::Utils::Logger::Error("Deep scan failed for {}: {}", ipAddress, e.what());
         }
 
         return device;
@@ -1333,7 +1335,7 @@ public:
     // ========================================================================
 
     void ScanThreadFunc(std::vector<std::string> targets) {
-        Utils::Logger::Info("Scan thread started for {} targets", targets.size());
+        ::ShadowStrike::Utils::Logger::Info("Scan thread started for {} targets", targets.size());
 
         auto scanStartTime = std::chrono::system_clock::now();
         UpdateProgress(ScanStatus::Discovering, 0.0f, "");
@@ -1394,7 +1396,7 @@ public:
         // Generate summary
         GenerateScanSummary(scanStartTime);
 
-        Utils::Logger::Info("Scan thread {} — {} devices found on {} targets",
+        ::ShadowStrike::Utils::Logger::Info("Scan thread {} — {} devices found on {} targets",
                             cancelled ? "cancelled" : "completed",
                             m_progress.devicesFound, targets.size());
     }
@@ -1464,7 +1466,7 @@ public:
         auto* adapter = reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data());
 
         if (::GetAdaptersInfo(adapter, &bufferSize) != ERROR_SUCCESS) {
-            Utils::Logger::Error("GetAdaptersInfo failed: {}", ::GetLastError());
+            ::ShadowStrike::Utils::Logger::Error("GetAdaptersInfo failed: {}", ::GetLastError());
             return interfaces;
         }
 
@@ -1517,13 +1519,13 @@ IoTDeviceScanner::IoTDeviceScanner()
     : m_impl(std::make_unique<IoTDeviceScannerImpl>())
 {
     s_instanceCreated.store(true, std::memory_order_release);
-    Utils::Logger::Info("IoTDeviceScanner singleton created");
+    ::ShadowStrike::Utils::Logger::Info("IoTDeviceScanner singleton created");
 }
 
 IoTDeviceScanner::~IoTDeviceScanner() {
     try {
         Shutdown();
-        Utils::Logger::Info("IoTDeviceScanner singleton destroyed");
+        ::ShadowStrike::Utils::Logger::Info("IoTDeviceScanner singleton destroyed");
     } catch (...) {
         // Destructor must not throw
     }
@@ -1541,14 +1543,14 @@ IoTDeviceScanner::~IoTDeviceScanner() {
 
         if (m_impl->m_status != ModuleStatus::Uninitialized &&
             m_impl->m_status != ModuleStatus::Stopped) {
-            Utils::Logger::Warn("IoTDeviceScanner already initialized");
+            ::ShadowStrike::Utils::Logger::Warn("IoTDeviceScanner already initialized");
             return false;
         }
 
         m_impl->m_status = ModuleStatus::Initializing;
 
         if (!config.IsValid()) {
-            Utils::Logger::Error("Invalid IoTDeviceScanner configuration");
+            ::ShadowStrike::Utils::Logger::Error("Invalid IoTDeviceScanner configuration");
             m_impl->m_status = ModuleStatus::Error;
             return false;
         }
@@ -1559,7 +1561,7 @@ IoTDeviceScanner::~IoTDeviceScanner() {
 
         m_impl->m_status = ModuleStatus::Running;
 
-        Utils::Logger::Info("IoTDeviceScanner initialized successfully (v{})", GetVersionString());
+        ::ShadowStrike::Utils::Logger::Info("IoTDeviceScanner initialized successfully (v{})", GetVersionString());
 
         if (config.autoDiscoveryOnStartup && config.enabled) {
             lock.unlock();
@@ -1569,7 +1571,7 @@ IoTDeviceScanner::~IoTDeviceScanner() {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("IoTDeviceScanner initialization failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("IoTDeviceScanner initialization failed: {}", e.what());
         m_impl->m_status = ModuleStatus::Error;
         m_impl->NotifyError("Initialization failed: " + std::string(e.what()), -1);
         return false;
@@ -1604,10 +1606,10 @@ void IoTDeviceScanner::Shutdown() {
 
         m_impl->m_status = ModuleStatus::Stopped;
 
-        Utils::Logger::Info("IoTDeviceScanner shut down");
+        ::ShadowStrike::Utils::Logger::Info("IoTDeviceScanner shut down");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("Shutdown error: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("Shutdown error: {}", e.what());
     }
 }
 
@@ -1627,18 +1629,18 @@ void IoTDeviceScanner::Shutdown() {
 {
     try {
         if (!config.IsValid()) {
-            Utils::Logger::Error("Invalid configuration");
+            ::ShadowStrike::Utils::Logger::Error("Invalid configuration");
             return false;
         }
 
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_config = config;
 
-        Utils::Logger::Info("IoTDeviceScanner configuration updated");
+        ::ShadowStrike::Utils::Logger::Info("IoTDeviceScanner configuration updated");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("Configuration update failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("Configuration update failed: {}", e.what());
         return false;
     }
 }
@@ -1659,7 +1661,7 @@ void IoTDeviceScanner::Shutdown() {
         bool expected = false;
         if (!m_impl->m_scanActive.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn("Scan already in progress");
+            ::ShadowStrike::Utils::Logger::Warn("Scan already in progress");
             return false;
         }
 
@@ -1670,7 +1672,7 @@ void IoTDeviceScanner::Shutdown() {
         };
 
         if (!IsInitialized()) {
-            Utils::Logger::Error("Scanner not initialized");
+            ::ShadowStrike::Utils::Logger::Error("Scanner not initialized");
             releaseOnFailure();
             return false;
         }
@@ -1690,7 +1692,7 @@ void IoTDeviceScanner::Shutdown() {
                     if (!cidr.empty()) {
                         auto hosts = ParseCIDRToHosts(cidr);
                         targets.insert(targets.end(), hosts.begin(), hosts.end());
-                        Utils::Logger::Info("Auto-detected subnet: {} ({} hosts)", cidr, hosts.size());
+                        ::ShadowStrike::Utils::Logger::Info("Auto-detected subnet: {} ({} hosts)", cidr, hosts.size());
                     }
                 }
             }
@@ -1714,12 +1716,12 @@ void IoTDeviceScanner::Shutdown() {
         }
 
         if (targets.empty()) {
-            Utils::Logger::Error("No targets to scan");
+            ::ShadowStrike::Utils::Logger::Error("No targets to scan");
             releaseOnFailure();
             return false;
         }
 
-        Utils::Logger::Info("Starting IoT scan of {} targets", targets.size());
+        ::ShadowStrike::Utils::Logger::Info("Starting IoT scan of {} targets", targets.size());
 
         // Reset progress
         {
@@ -1743,7 +1745,7 @@ void IoTDeviceScanner::Shutdown() {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("StartDiscovery failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("StartDiscovery failed: {}", e.what());
         m_impl->m_scanActive.store(false, std::memory_order_release);
         m_impl->NotifyError("Failed to start discovery: " + std::string(e.what()), -1);
         return false;
@@ -1762,7 +1764,7 @@ void IoTDeviceScanner::StopScan() {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_progress.status = ScanStatus::Cancelled;
 
-    Utils::Logger::Info("Scan stopped");
+    ::ShadowStrike::Utils::Logger::Info("Scan stopped");
 }
 
 [[nodiscard]] IoTDeviceInfo IoTDeviceScanner::DeepScanDevice(
@@ -1771,18 +1773,18 @@ void IoTDeviceScanner::StopScan() {
     try {
         // Validate IP address before passing to network APIs
         if (ipAddress.empty() || ipAddress.size() > 45) {
-            Utils::Logger::Error("DeepScanDevice: invalid IP address length");
+            ::ShadowStrike::Utils::Logger::Error("DeepScanDevice: invalid IP address length");
             return IoTDeviceInfo{};
         }
 
         in_addr validateAddr{};
         if (::inet_pton(AF_INET, ipAddress.c_str(), &validateAddr) != 1) {
-            Utils::Logger::Error("DeepScanDevice: invalid IPv4 address: {}",
+            ::ShadowStrike::Utils::Logger::Error("DeepScanDevice: invalid IPv4 address: {}",
                                  ipAddress);
             return IoTDeviceInfo{};
         }
 
-        Utils::Logger::Debug("Deep scanning device: {}", ipAddress);
+        ::ShadowStrike::Utils::Logger::Debug("Deep scanning device: {}", ipAddress);
 
         auto device = m_impl->PerformDeepScan(ipAddress);
 
@@ -1797,7 +1799,7 @@ void IoTDeviceScanner::StopScan() {
         return device;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("DeepScanDevice failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("DeepScanDevice failed: {}", e.what());
         return IoTDeviceInfo{};
     }
 }
@@ -1915,7 +1917,7 @@ void IoTDeviceScanner::ProcessARPPacket(std::span<const uint8_t> packet) {
         m_impl->ParseARPPacket(packet);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("ProcessARPPacket failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("ProcessARPPacket failed: {}", e.what());
     }
 }
 
@@ -1929,7 +1931,7 @@ void IoTDeviceScanner::ProcessDNSPacket(std::span<const uint8_t> packet) {
         m_impl->ParseDNSPacket(packet);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("ProcessDNSPacket failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("ProcessDNSPacket failed: {}", e.what());
     }
 }
 
@@ -1940,7 +1942,7 @@ void IoTDeviceScanner::ProcessDNSPacket(std::span<const uint8_t> packet) {
         }
 
         if (!IsInitialized()) {
-            Utils::Logger::Error("Cannot start passive monitoring: not initialized");
+            ::ShadowStrike::Utils::Logger::Error("Cannot start passive monitoring: not initialized");
             return false;
         }
 
@@ -1955,11 +1957,11 @@ void IoTDeviceScanner::ProcessDNSPacket(std::span<const uint8_t> packet) {
 
         m_impl->m_status = ModuleStatus::Monitoring;
 
-        Utils::Logger::Info("Passive monitoring started");
+        ::ShadowStrike::Utils::Logger::Info("Passive monitoring started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("StartPassiveMonitoring failed: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("StartPassiveMonitoring failed: {}", e.what());
         return false;
     }
 }
@@ -1975,7 +1977,7 @@ void IoTDeviceScanner::StopPassiveMonitoring() {
         m_impl->m_status = ModuleStatus::Running;
     }
 
-    Utils::Logger::Info("Passive monitoring stopped");
+    ::ShadowStrike::Utils::Logger::Info("Passive monitoring stopped");
 }
 
 // ============================================================================
@@ -2026,7 +2028,7 @@ void IoTDeviceScanner::UnregisterCallbacks() {
     m_impl->m_completeCallbacks.clear();
     m_impl->m_errorCallbacks.clear();
 
-    Utils::Logger::Info("All callbacks unregistered");
+    ::ShadowStrike::Utils::Logger::Info("All callbacks unregistered");
 }
 
 // ============================================================================
@@ -2041,26 +2043,26 @@ void IoTDeviceScanner::ResetStatistics() {
     m_impl->m_stats.Reset();
     m_impl->m_stats.startTime = Clock::now();
 
-    Utils::Logger::Info("Statistics reset");
+    ::ShadowStrike::Utils::Logger::Info("Statistics reset");
 }
 
 [[nodiscard]] bool IoTDeviceScanner::SelfTest() {
     try {
-        Utils::Logger::Info("Running IoTDeviceScanner self-test...");
+        ::ShadowStrike::Utils::Logger::Info("Running IoTDeviceScanner self-test...");
 
         bool allPassed = true;
 
         // Test 1: Configuration validation
         IoTScannerConfiguration config;
         if (!config.IsValid()) {
-            Utils::Logger::Error("Self-test failed: Invalid default configuration");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Invalid default configuration");
             allPassed = false;
         }
 
         // Test 2: Scan config validation
         IoTScanConfig scanConfig;
         if (!scanConfig.IsValid()) {
-            Utils::Logger::Error("Self-test failed: Invalid default scan config");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Invalid default scan config");
             allPassed = false;
         }
 
@@ -2068,7 +2070,7 @@ void IoTDeviceScanner::ResetStatistics() {
         IoTScanConfig badConfig;
         badConfig.scanTimeoutMs = 0;
         if (badConfig.IsValid()) {
-            Utils::Logger::Error("Self-test failed: Zero-timeout config should be invalid");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Zero-timeout config should be invalid");
             allPassed = false;
         }
 
@@ -2076,12 +2078,12 @@ void IoTDeviceScanner::ResetStatistics() {
         try {
             auto interfaces = GetNetworkInterfaces();
             if (interfaces.empty()) {
-                Utils::Logger::Warn("Self-test: No network interfaces found");
+                ::ShadowStrike::Utils::Logger::Warn("Self-test: No network interfaces found");
             } else {
-                Utils::Logger::Debug("Self-test: Found {} network interfaces", interfaces.size());
+                ::ShadowStrike::Utils::Logger::Debug("Self-test: Found {} network interfaces", interfaces.size());
             }
         } catch (...) {
-            Utils::Logger::Error("Self-test failed: Interface enumeration");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Interface enumeration");
             allPassed = false;
         }
 
@@ -2091,19 +2093,19 @@ void IoTDeviceScanner::ResetStatistics() {
         auto id3 = GenerateDeviceId("AA:BB:CC:DD:EE:FF");
 
         if (id1 != id2) {
-            Utils::Logger::Error("Self-test failed: Inconsistent device ID generation");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Inconsistent device ID generation");
             allPassed = false;
         }
 
         if (id1 == id3) {
-            Utils::Logger::Error("Self-test failed: Device ID collision");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Device ID collision");
             allPassed = false;
         }
 
         // Test 6: CIDR parser
         auto hosts = ParseCIDRToHosts("192.168.1.0/30");
         if (hosts.size() != 2) { // /30 = 4 IPs, 2 hosts (minus network and broadcast)
-            Utils::Logger::Error("Self-test failed: CIDR /30 should produce 2 hosts, got {}",
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: CIDR /30 should produce 2 hosts, got {}",
                                  hosts.size());
             allPassed = false;
         }
@@ -2111,13 +2113,13 @@ void IoTDeviceScanner::ResetStatistics() {
         // Test 7: MAC vendor lookup
         auto vendor = LookupMACVendor("B8:27:EB:00:00:00");
         if (vendor == "Unknown") {
-            Utils::Logger::Warn("Self-test: MAC vendor lookup returned Unknown for Raspberry Pi OUI");
+            ::ShadowStrike::Utils::Logger::Warn("Self-test: MAC vendor lookup returned Unknown for Raspberry Pi OUI");
         }
 
         // Test 8: Base64 encoding
         auto encoded = Base64Encode("admin:admin");
         if (encoded != "YWRtaW46YWRtaW4=") {
-            Utils::Logger::Error("Self-test failed: Base64 encoding mismatch");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: Base64 encoding mismatch");
             allPassed = false;
         }
 
@@ -2126,20 +2128,20 @@ void IoTDeviceScanner::ResetStatistics() {
         if (!HasFlag(combined, RiskFactor::OpenTelnet) ||
             !HasFlag(combined, RiskFactor::DefaultCredentials) ||
             HasFlag(combined, RiskFactor::KnownCVE)) {
-            Utils::Logger::Error("Self-test failed: RiskFactor bitwise operators");
+            ::ShadowStrike::Utils::Logger::Error("Self-test failed: RiskFactor bitwise operators");
             allPassed = false;
         }
 
         if (allPassed) {
-            Utils::Logger::Info("Self-test PASSED - All tests successful");
+            ::ShadowStrike::Utils::Logger::Info("Self-test PASSED - All tests successful");
         } else {
-            Utils::Logger::Error("Self-test FAILED - See errors above");
+            ::ShadowStrike::Utils::Logger::Error("Self-test FAILED - See errors above");
         }
 
         return allPassed;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("Self-test exception: {}", e.what());
+        ::ShadowStrike::Utils::Logger::Error("Self-test exception: {}", e.what());
         return false;
     }
 }

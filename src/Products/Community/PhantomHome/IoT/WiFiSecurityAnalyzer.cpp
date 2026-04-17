@@ -468,7 +468,7 @@ bool WiFiSecurityAnalyzerImpl::Initialize(const WiFiAnalyzerConfiguration& confi
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        SS_LOG_INFO(LOG_CAT, L"Initialized successfully (Version %hs)", GetVersionString().c_str());
+        SS_LOG_INFO(LOG_CAT, L"Initialized successfully (Version %hs)", WiFiSecurityAnalyzer::GetVersionString().c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1328,7 +1328,7 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::QueryNetworksWLAN() {
             result = WlanGetNetworkBssList(
                 m_wlanHandle,
                 &m_interfaceGuid,
-                &entry.dot11Ssid,
+                const_cast<PDOT11_SSID>(&entry.dot11Ssid),
                 entry.dot11BssType,
                 FALSE,
                 nullptr,
@@ -2147,8 +2147,8 @@ std::string EvilTwinDetectionResult::ToJson() const {
     j["detectionReason"] = detectionReason;
     j["signalDifference"] = signalDifference;
     j["bssidSimilarity"] = bssidSimilarity;
-    j["suspectedBSSID"] = suspectedBSSID;
-    j["legitimateBSSID"] = legitimateBSSID;
+    j["suspectedBSSID"] = suspectedTwin.bssid;
+    j["legitimateBSSID"] = originalNetwork.bssid;
     return j.dump();
 }
 
