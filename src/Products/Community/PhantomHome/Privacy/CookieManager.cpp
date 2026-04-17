@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -995,7 +995,7 @@ bool CookieManager::Initialize(const CookieConfiguration& config) {
         m_impl->m_status = ModuleStatus::Error;
         return false;
     } catch (...) {
-        Utils::Logger::Critical("CookieManager: Initialization failed (unknown exception)");
+        Utils::Logger::Error("CookieManager: Initialization failed (unknown exception)");
         m_impl->m_status = ModuleStatus::Error;
         return false;
     }
@@ -1034,7 +1034,7 @@ void CookieManager::Shutdown() {
     } catch (const std::exception& ex) {
         Utils::Logger::Error("CookieManager: Shutdown error: {}", ex.what());
     } catch (...) {
-        Utils::Logger::Critical("CookieManager: Shutdown failed");
+        Utils::Logger::Error("CookieManager: Shutdown failed");
     }
 }
 
@@ -2205,7 +2205,7 @@ bool CookieManager::SelfTest() {
         Utils::Logger::Error("CookieManager: Self-test failed with exception: {}", ex.what());
         return false;
     } catch (...) {
-        Utils::Logger::Critical("CookieManager: Self-test failed (unknown exception)");
+        Utils::Logger::Error("CookieManager: Self-test failed (unknown exception)");
         return false;
     }
 }

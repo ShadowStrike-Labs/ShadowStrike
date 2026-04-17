@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -1513,7 +1513,7 @@ bool LocationPrivacyImpl::SelfTest() {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Critical("Self-test failed with exception: {}", e.what());
+        Utils::Logger::Error("Self-test failed with exception: {}", e.what());
         return false;
     }
 }

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -482,8 +482,8 @@ public:
                         info.guid = adapter->AdapterName;
                     }
 
-                    info.name = Utils::StringUtils::WideToUtf8(adapter->FriendlyName);
-                    info.description = Utils::StringUtils::WideToUtf8(adapter->Description);
+                    info.name = Utils::StringUtils::ToNarrow(adapter->FriendlyName);
+                    info.description = Utils::StringUtils::ToNarrow(adapter->Description);
 
                     // Detect type
                     info.type = DetectAdapterTypeInternal(info.description);
@@ -674,7 +674,7 @@ public:
                     // Cap total response size to prevent DoS
                     if (responseData.size() + bytesAvailable > MAX_PUBLIC_IP_RESPONSE_BYTES) {
                         Utils::Logger::Warn("GetPublicIP: response exceeded size limit from {}",
-                            Utils::StringUtils::WideToUtf8(service.host));
+                            Utils::StringUtils::ToNarrow(service.host));
                         responseData.clear();
                         break;
                     }
