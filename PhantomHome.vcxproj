@@ -100,7 +100,7 @@
       <PrecompiledHeaderOutputFile>$(IntDir)$pch.pch</PrecompiledHeaderOutputFile>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;C:\Program Files (x86)\Windows Kits\10\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;C:\Program Files (x86)\Windows Kits\10\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
@@ -132,7 +132,7 @@
       <PrecompiledHeaderOutputFile>$(IntDir)$pch.pch</PrecompiledHeaderOutputFile>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;C:\Program Files (x86)\Windows Kits\10\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;C:\Program Files (x86)\Windows Kits\10\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
@@ -151,7 +151,6 @@
   <ItemGroup>
     <ClCompile Include="src\PhantomCore\AntiEvasion\DebuggerEvasionDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\EnvironmentEvasionDetector.cpp" />
-    <ClCompile Include="src\PhantomCore\AntiEvasion\MetamorphicDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\metamorphic_polymorphicdetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\NetworkBasedEvasionDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\PackerDetector.cpp" />
@@ -212,7 +211,6 @@
     <ClCompile Include="src\PhantomCore\Core\Engine\QuarantineManager.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Engine\SandboxAnalyzer.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Engine\ScanEngine.cpp" />
-    <ClCompile Include="src\PhantomCore\Core\Engine\SignatureDatabase_Manager.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Engine\ThreatDetector.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Engine\ZeroDayDetector.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\ArchiveExtractor.cpp" />
@@ -223,7 +221,6 @@
     <ClCompile Include="src\PhantomCore\Core\FileSystem\FileLockManager.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\FileReputation.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.cpp" />
-    <ClCompile Include="src\PhantomCore\Core\FileSystem\FileWatcher.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\MediaFileScanner.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\MountPointMonitor.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Network\BotnetDetector.cpp" />
@@ -270,11 +267,6 @@
     <ClCompile Include="src\PhantomCore\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\PhantomCore\Database\LogDB.cpp" />
     <ClCompile Include="src\PhantomCore\Database\QuarantineDB.cpp" />
-    <ClCompile Include="src\Drivers\FileFilterCallbacks.cpp" />
-    <ClCompile Include="src\Drivers\FilterCommunication.cpp" />
-    <ClCompile Include="src\Drivers\FilterDriver.cpp" />
-    <ClCompile Include="src\Drivers\ProcessFilterCallbacks.cpp" />
-    <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\AttachmentScanner.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailProtection.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\OutlookScanner.cpp" />
@@ -373,9 +365,7 @@
     </ClCompile>
     <ClCompile Include="src\PhantomCore\Performance\CPUMonitor.cpp" />
     <ClCompile Include="src\PhantomCore\Performance\DiskMonitor.cpp" />
-    <ClCompile Include="src\PhantomCore\Performance\MemoryProfiler.cpp" />
     <ClCompile Include="src\PhantomCore\Performance\NetworkPerformanceMonitor.cpp" />
-    <ClCompile Include="src\PhantomCore\Performance\PerformanceProfiler.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\CookieManager.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\DataLeakProtection.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\DNSLeakProtection.cpp" />
@@ -422,7 +412,6 @@
     <ClCompile Include="src\PhantomCore\Security\TamperProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Service\AntivirusService.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ProductExtensions.cpp" />
-    <ClCompile Include="src\PhantomCore\Service\PerformanceProfiler.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceCommunicator.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceController.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceInstaller.cpp" />
@@ -643,7 +632,6 @@
     <ClInclude Include="include\yara\yara\utils.h" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\DebuggerEvasionDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\EnvironmentEvasionDetector.hpp" />
-    <ClInclude Include="src\PhantomCore\AntiEvasion\MetamorphicDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\metamorphic_polymorphicdetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\NetworkBasedEvasionDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\nt_undocumented.h" />
@@ -669,19 +657,12 @@
     <ClInclude Include="src\PhantomCore\Database\DatabaseManager.hpp" />
     <ClInclude Include="src\PhantomCore\Database\LogDB.hpp" />
     <ClInclude Include="src\PhantomCore\Database\QuarantineDB.hpp" />
-    <ClInclude Include="src\Drivers\FileFilterCallbacks.hpp" />
-    <ClInclude Include="src\Drivers\FilterCommunication.hpp" />
-    <ClInclude Include="src\Drivers\FilterDriver.hpp" />
-    <ClInclude Include="src\Drivers\ProcessFilterCallbacks.hpp" />
-    <ClInclude Include="src\Drivers\RegistryFilterCallbacks.hpp" />
     <ClInclude Include="src\PhantomCore\HashStore\HashStore.hpp" />
     <ClInclude Include="src\PhantomCore\PatternStore\PatternStore.hpp" />
     <ClInclude Include="src\pch.h" />
     <ClInclude Include="src\PhantomCore\Performance\CPUMonitor.hpp" />
     <ClInclude Include="src\PhantomCore\Performance\DiskMonitor.hpp" />
-    <ClInclude Include="src\PhantomCore\Performance\MemoryProfiler.hpp" />
     <ClInclude Include="src\PhantomCore\Performance\NetworkPerformanceMonitor.hpp" />
-    <ClInclude Include="src\PhantomCore\Performance\PerformanceProfiler.hpp" />
     <ClInclude Include="src\PhantomCore\Service\AntivirusService.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ProductExtensions.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceCommunicator.hpp" />
