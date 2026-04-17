@@ -81,7 +81,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
     ok &= RegKeyRange<uint32_t>(std::string(Keys::ScanHeuristicLevel),
         "Scan", "Heuristic analysis level", 2, 0, 4);
     ok &= RegKey<bool>(std::string(Keys::ScanCloudLookupEnabled),
-        "Scan", "Cloud-based file reputation lookup", true);
+        "Scan", "Cloud-based file reputation lookup", false);
     ok &= RegKeyRange<uint32_t>(std::string(Keys::ScanConcurrentLimit),
         "Scan", "Maximum concurrent scan operations", 4, 1, 32);
 
@@ -273,7 +273,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
         scanPolicy.settings.push_back({std::string(Keys::ScanArchives), "true", EnforcementLevel::Default});
         scanPolicy.settings.push_back({std::string(Keys::ScanMaxFileSize), "256", EnforcementLevel::Default});
         scanPolicy.settings.push_back({std::string(Keys::ScanHeuristicLevel), "2", EnforcementLevel::Default});
-        scanPolicy.settings.push_back({std::string(Keys::ScanCloudLookupEnabled), "true", EnforcementLevel::Default});
+        scanPolicy.settings.push_back({std::string(Keys::ScanCloudLookupEnabled), "false", EnforcementLevel::Default});
 
         ok &= PM::Instance().ApplyPolicy(scanPolicy);
     }

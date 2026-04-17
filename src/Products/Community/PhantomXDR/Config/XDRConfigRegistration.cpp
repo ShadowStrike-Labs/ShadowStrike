@@ -290,7 +290,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
         corrProfile.scanSettings.archiveScanning = true;
         corrProfile.scanSettings.scanNetworkFiles = true;
         corrProfile.scanSettings.heuristicLevel = 3;
-        corrProfile.scanSettings.cloudLookup = true;
+        corrProfile.scanSettings.cloudLookup = false;
 
         ok &= ProfM::Instance().CreateCustomProfile(corrProfile);
     }
