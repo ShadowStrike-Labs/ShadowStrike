@@ -308,7 +308,14 @@
     <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameModeWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\IoT\IoTWiring.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\PrivacyWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\CookieManagerWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\LocationPrivacyWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\MicrophoneGuardWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\WebcamProtectorWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\DataLeakProtectionWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\DNSLeakProtectionWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\IPLeakProtectionWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\PrivacyCleanerWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\WebProtectionWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupManager.cpp" />
