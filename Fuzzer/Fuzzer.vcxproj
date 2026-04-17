@@ -107,6 +107,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorPEHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\BehaviorHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ScanEngineHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DatabaseConfigHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\IPCHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ServiceProtocolHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\TrafficHarness.hpp" />
@@ -135,6 +136,7 @@
     <ClCompile Include="src\BehaviorHarnessDepsStub.cpp" />
     <ClCompile Include="src\ScanEngineHarness.cpp" />
     <ClCompile Include="src\ScanEngineHarnessDepsStub.cpp" />
+    <ClCompile Include="src\DatabaseConfigHarness.cpp" />
     <ClCompile Include="src\IPCHarness.cpp" />
     <ClCompile Include="src\ServiceProtocolHarness.cpp" />
     <ClCompile Include="src\TrafficHarness.cpp" />
@@ -217,6 +219,8 @@
     <ClCompile Include="..\src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.cpp" />
     <ClCompile Include="..\src\PhantomCore\Core\Network\TrafficAnalyzer.cpp" />
     <ClCompile Include="..\src\PhantomCore\Communication\ServiceCommunication.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Database\DatabaseManager.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Database\ConfigurationDB.cpp" />
     <ClCompile Include="..\src\PhantomCore\RealTime\BehaviorBlocker.cpp" />
     <ClCompile Include="..\src\PhantomCore\RealTime\NetworkTrafficFilter.cpp" />
     <ClCompile Include="..\src\PhantomCore\SelfProtection\CryptoManager.cpp" />
@@ -229,6 +233,14 @@
     <ClCompile Include="..\src\PhantomCore\Utils\Base64Utils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\CompressionUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\External\pugixml\pugixml.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Backup.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Column.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Database.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Exception.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Savepoint.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\sqlite3.c" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Statement.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\sqlitecpp\Transaction.cpp" />
     <!-- Crypto / Certificate / Hash -->
     <ClCompile Include="..\src\PhantomCore\Utils\CertUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils.cpp" />
