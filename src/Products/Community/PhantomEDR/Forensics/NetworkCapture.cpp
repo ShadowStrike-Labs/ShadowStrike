@@ -46,6 +46,8 @@
 #include <Ws2tcpip.h>
 #include <iphlpapi.h>
 #include <algorithm>
+#include <cctype>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <iomanip>
@@ -127,6 +129,315 @@ namespace TCPFlags {
     constexpr uint8_t PSH = 0x08;
     constexpr uint8_t ACK = 0x10;
     constexpr uint8_t URG = 0x20;
+}
+
+constexpr size_t DNS_HEADER_SIZE = 12;
+constexpr size_t MAX_DNS_NAME_LENGTH = 255;
+constexpr size_t MAX_DNS_POINTER_DEPTH = 16;
+constexpr size_t MAX_DNS_LABEL_COUNT = 64;
+constexpr double HIGH_CONFIDENCE_BEACON_CV = 0.1;
+constexpr double MEDIUM_CONFIDENCE_BEACON_CV = 0.3;
+constexpr double DNS_TUNNELING_ENTROPY_THRESHOLD = 3.5;
+constexpr size_t DNS_TUNNELING_LENGTH_THRESHOLD = 50;
+constexpr size_t DNS_TUNNELING_QUERY_THRESHOLD = 20;
+constexpr size_t DNS_TUNNELING_TXT_NULL_THRESHOLD = 10;
+
+[[nodiscard]] bool IsUnsetTime(const SystemTimePoint& timePoint) noexcept {
+    return timePoint.time_since_epoch().count() == 0;
+}
+
+[[nodiscard]] SystemTimePoint ResolveSessionEndTime(const CaptureSession& session) {
+    return IsUnsetTime(session.endTime) ? std::chrono::system_clock::now() : session.endTime;
+}
+
+[[nodiscard]] std::string ToLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+[[nodiscard]] bool ContainsAsciiInsensitive(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+
+    const auto loweredHaystack = ToLowerAscii(std::string(haystack));
+    const auto loweredNeedle = ToLowerAscii(std::string(needle));
+    return loweredHaystack.find(loweredNeedle) != std::string::npos;
+}
+
+[[nodiscard]] bool MatchesTimeWindow(const SystemTimePoint& itemStart,
+                                     const SystemTimePoint& itemEnd,
+                                     const SystemTimePoint& windowStart,
+                                     const SystemTimePoint& windowEnd) {
+    const auto normalizedEnd = IsUnsetTime(itemEnd) ? itemStart : itemEnd;
+    return itemStart <= windowEnd && normalizedEnd >= windowStart;
+}
+
+[[nodiscard]] bool StreamMatchesFilter(const TCPStream& stream, const CaptureFilter& filter) {
+    if (!filter.isEnabled) {
+        return false;
+    }
+
+    if (!filter.processIds.empty() &&
+        std::find(filter.processIds.begin(), filter.processIds.end(), stream.processId) == filter.processIds.end()) {
+        return false;
+    }
+
+    if (!filter.sourceIPs.empty() &&
+        std::find(filter.sourceIPs.begin(), filter.sourceIPs.end(), stream.sourceIP) == filter.sourceIPs.end()) {
+        return false;
+    }
+
+    if (!filter.destIPs.empty() &&
+        std::find(filter.destIPs.begin(), filter.destIPs.end(), stream.destIP) == filter.destIPs.end()) {
+        return false;
+    }
+
+    if (!filter.sourcePorts.empty() &&
+        std::find(filter.sourcePorts.begin(), filter.sourcePorts.end(), stream.sourcePort) == filter.sourcePorts.end()) {
+        return false;
+    }
+
+    if (!filter.destPorts.empty() &&
+        std::find(filter.destPorts.begin(), filter.destPorts.end(), stream.destPort) == filter.destPorts.end()) {
+        return false;
+    }
+
+    if (!filter.protocols.empty() &&
+        std::find(filter.protocols.begin(), filter.protocols.end(), ProtocolType::TCP) == filter.protocols.end()) {
+        return false;
+    }
+
+    if (!filter.domainPatterns.empty()) {
+        const bool matchedDomain = std::any_of(
+            filter.domainPatterns.begin(),
+            filter.domainPatterns.end(),
+            [&stream](const std::string& pattern) {
+                return (!stream.httpHost.empty() && ContainsAsciiInsensitive(stream.httpHost, pattern)) ||
+                       (!stream.tlsSNI.empty() && ContainsAsciiInsensitive(stream.tlsSNI, pattern));
+            });
+        if (!matchedDomain) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+[[nodiscard]] bool StreamMatchesSession(const TCPStream& stream, const CaptureSession& session) {
+    if (session.targetPid != 0 && stream.processId != session.targetPid) {
+        return false;
+    }
+
+    const auto sessionEnd = ResolveSessionEndTime(session);
+    if (!MatchesTimeWindow(stream.startTime, stream.endTime, session.startTime, sessionEnd)) {
+        return false;
+    }
+
+    if (session.filters.empty()) {
+        return true;
+    }
+
+    return std::any_of(session.filters.begin(), session.filters.end(), [&stream](const CaptureFilter& filter) {
+        return filter.action != FilterAction::Drop && StreamMatchesFilter(stream, filter);
+    });
+}
+
+[[nodiscard]] bool DNSMatchesSession(const DNSTransaction& transaction, const CaptureSession& session) {
+    if (session.targetPid != 0 && transaction.processId != session.targetPid) {
+        return false;
+    }
+
+    const auto eventTime = !IsUnsetTime(transaction.queryTime) ? transaction.queryTime : transaction.responseTime;
+    const auto sessionEnd = ResolveSessionEndTime(session);
+    return eventTime >= session.startTime && eventTime <= sessionEnd;
+}
+
+[[nodiscard]] std::optional<uint16_t> ReadUint16BE(std::span<const uint8_t> data, size_t offset) noexcept {
+    if (offset + sizeof(uint16_t) > data.size()) {
+        return std::nullopt;
+    }
+
+    return static_cast<uint16_t>((static_cast<uint16_t>(data[offset]) << 8) |
+                                 static_cast<uint16_t>(data[offset + 1]));
+}
+
+[[nodiscard]] std::optional<uint32_t> ReadUint32BE(std::span<const uint8_t> data, size_t offset) noexcept {
+    if (offset + sizeof(uint32_t) > data.size()) {
+        return std::nullopt;
+    }
+
+    return (static_cast<uint32_t>(data[offset]) << 24) |
+           (static_cast<uint32_t>(data[offset + 1]) << 16) |
+           (static_cast<uint32_t>(data[offset + 2]) << 8) |
+           static_cast<uint32_t>(data[offset + 3]);
+}
+
+[[nodiscard]] std::string FormatDnsLabelByte(uint8_t value) {
+    if (std::isalnum(value) || value == '-' || value == '_') {
+        return std::string(1, static_cast<char>(value));
+    }
+
+    std::ostringstream oss;
+    oss << "\\x" << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(value);
+    return oss.str();
+}
+
+[[nodiscard]] bool ReadDnsName(std::span<const uint8_t> data,
+                               size_t offset,
+                               std::string& name,
+                               size_t& nextOffset,
+                               size_t depth = 0) {
+    if (depth > MAX_DNS_POINTER_DEPTH || offset >= data.size()) {
+        return false;
+    }
+
+    std::string result;
+    size_t cursor = offset;
+    size_t labelCount = 0;
+    bool jumped = false;
+    nextOffset = offset;
+
+    while (cursor < data.size()) {
+        const uint8_t length = data[cursor];
+
+        if ((length & 0xC0U) == 0xC0U) {
+            if (cursor + 1 >= data.size()) {
+                return false;
+            }
+
+            const uint16_t pointer = static_cast<uint16_t>(((length & 0x3FU) << 8) | data[cursor + 1]);
+            if (pointer >= data.size()) {
+                return false;
+            }
+
+            if (!jumped) {
+                nextOffset = cursor + 2;
+                jumped = true;
+            }
+
+            std::string pointedName;
+            size_t ignoredOffset = 0;
+            if (!ReadDnsName(data, pointer, pointedName, ignoredOffset, depth + 1)) {
+                return false;
+            }
+
+            if (!pointedName.empty()) {
+                if (!result.empty()) {
+                    result.push_back('.');
+                }
+                if (result.size() + pointedName.size() > MAX_DNS_NAME_LENGTH) {
+                    return false;
+                }
+                result += pointedName;
+            }
+
+            name = std::move(result);
+            return true;
+        }
+
+        if ((length & 0xC0U) != 0) {
+            return false;
+        }
+
+        ++cursor;
+        if (length == 0) {
+            if (!jumped) {
+                nextOffset = cursor;
+            }
+            name = std::move(result);
+            return true;
+        }
+
+        if (length > 63 || cursor + length > data.size()) {
+            return false;
+        }
+
+        if (++labelCount > MAX_DNS_LABEL_COUNT) {
+            return false;
+        }
+
+        if (!result.empty()) {
+            result.push_back('.');
+        }
+
+        for (size_t index = 0; index < length; ++index) {
+            const auto fragment = FormatDnsLabelByte(data[cursor + index]);
+            if (result.size() + fragment.size() > MAX_DNS_NAME_LENGTH) {
+                return false;
+            }
+            result += fragment;
+        }
+
+        cursor += length;
+        if (!jumped) {
+            nextOffset = cursor;
+        }
+    }
+
+    return false;
+}
+
+[[nodiscard]] std::string GetBaseDomain(std::string_view domain) {
+    const auto normalized = ToLowerAscii(std::string(domain));
+    std::vector<std::string> labels;
+    std::stringstream ss(normalized);
+    std::string label;
+    while (std::getline(ss, label, '.')) {
+        if (!label.empty()) {
+            labels.push_back(label);
+        }
+    }
+
+    if (labels.size() <= 2) {
+        return normalized;
+    }
+
+    return labels[labels.size() - 2] + "." + labels[labels.size() - 1];
+}
+
+[[nodiscard]] std::string GetSubdomainComponent(std::string_view domain) {
+    const auto baseDomain = GetBaseDomain(domain);
+    if (baseDomain.empty() || domain.size() <= baseDomain.size()) {
+        return {};
+    }
+
+    const size_t suffixStart = domain.size() - baseDomain.size();
+    if (suffixStart == 0) {
+        return {};
+    }
+
+    std::string subdomain(domain.substr(0, suffixStart));
+    while (!subdomain.empty() && subdomain.back() == '.') {
+        subdomain.pop_back();
+    }
+    return ToLowerAscii(std::move(subdomain));
+}
+
+[[nodiscard]] double CalculateShannonEntropy(std::string_view text) {
+    if (text.empty()) {
+        return 0.0;
+    }
+
+    std::array<size_t, 256> counts{};
+    for (unsigned char ch : text) {
+        ++counts[ch];
+    }
+
+    double entropy = 0.0;
+    const double length = static_cast<double>(text.size());
+    for (const size_t count : counts) {
+        if (count == 0) {
+            continue;
+        }
+
+        const double probability = static_cast<double>(count) / length;
+        entropy -= probability * std::log2(probability);
+    }
+
+    return entropy;
 }
 
 } // anonymous namespace
@@ -915,11 +1226,21 @@ std::vector<TCPStream> NetworkCaptureImpl::GetTCPStreams(const std::string& sess
     std::shared_lock lock(m_mutex);
 
     std::vector<TCPStream> streams;
-
-    // Filter streams by session (simplified - would track session association)
-    for (const auto& [_, stream] : m_tcpStreams) {
-        streams.push_back(stream);
+    const auto sessionIt = m_sessions.find(sessionId);
+    if (sessionIt == m_sessions.end()) {
+        Utils::Logger::Warn("Requested TCP streams for unknown session {}", sessionId);
+        return streams;
     }
+
+    for (const auto& [_, stream] : m_tcpStreams) {
+        if (StreamMatchesSession(stream, sessionIt->second)) {
+            streams.push_back(stream);
+        }
+    }
+
+    std::sort(streams.begin(), streams.end(), [](const TCPStream& left, const TCPStream& right) {
+        return left.startTime < right.startTime;
+    });
 
     return streams;
 }
@@ -1028,7 +1349,29 @@ void NetworkCaptureImpl::UpdateTCPStream(const CapturedPacket& packet) {
 std::vector<DNSTransaction> NetworkCaptureImpl::GetDNSTransactions(
     const std::string& sessionId) const {
     std::shared_lock lock(m_mutex);
-    return m_dnsTransactions;
+
+    std::vector<DNSTransaction> transactions;
+    const auto sessionIt = m_sessions.find(sessionId);
+    if (sessionIt == m_sessions.end()) {
+        Utils::Logger::Warn("Requested DNS transactions for unknown session {}", sessionId);
+        return transactions;
+    }
+
+    transactions.reserve(m_dnsTransactions.size());
+    for (const auto& transaction : m_dnsTransactions) {
+        if (DNSMatchesSession(transaction, sessionIt->second)) {
+            transactions.push_back(transaction);
+        }
+    }
+
+    std::sort(transactions.begin(), transactions.end(),
+        [](const DNSTransaction& left, const DNSTransaction& right) {
+            const auto leftTime = !IsUnsetTime(left.queryTime) ? left.queryTime : left.responseTime;
+            const auto rightTime = !IsUnsetTime(right.queryTime) ? right.queryTime : right.responseTime;
+            return leftTime < rightTime;
+        });
+
+    return transactions;
 }
 
 std::vector<DNSTransaction> NetworkCaptureImpl::GetDNSForDomain(std::string_view domain) const {
@@ -1054,29 +1397,174 @@ void NetworkCaptureImpl::ProcessDNSPacket(const CapturedPacket& packet) {
         return;
     }
 
-    // Simplified DNS parsing
-    // In production, would fully parse DNS packets
+    std::span<const uint8_t> dnsData(packet.data);
+    if (packet.protocol == ProtocolType::TCP) {
+        if (dnsData.size() < DNS_HEADER_SIZE + sizeof(uint16_t)) {
+            return;
+        }
+
+        const auto tcpDnsLength = ReadUint16BE(dnsData, 0);
+        if (!tcpDnsLength.has_value()) {
+            return;
+        }
+
+        if (*tcpDnsLength > dnsData.size() - sizeof(uint16_t)) {
+            Utils::Logger::Debug("Discarding malformed DNS-over-TCP packet from PID {}", packet.processId);
+            return;
+        }
+
+        dnsData = dnsData.subspan(sizeof(uint16_t), *tcpDnsLength);
+    }
+
+    if (dnsData.size() < DNS_HEADER_SIZE) {
+        return;
+    }
+
+    const auto transactionId = ReadUint16BE(dnsData, 0);
+    const auto flags = ReadUint16BE(dnsData, 2);
+    const auto questionCount = ReadUint16BE(dnsData, 4);
+    const auto answerCount = ReadUint16BE(dnsData, 6);
+    if (!transactionId.has_value() || !flags.has_value() ||
+        !questionCount.has_value() || !answerCount.has_value()) {
+        return;
+    }
+
+    const bool isResponse = ((*flags & 0x8000U) != 0);
+    size_t offset = DNS_HEADER_SIZE;
+
+    DNSTransaction transaction;
+    transaction.transactionId = *transactionId;
+    transaction.queryTime = isResponse ? SystemTimePoint{} : packet.timestamp;
+    transaction.responseTime = isResponse ? packet.timestamp : SystemTimePoint{};
+    transaction.sourceIP = isResponse ? packet.destIP : packet.sourceIP;
+    transaction.dnsServer = isResponse ? packet.sourceIP : packet.destIP;
+    transaction.processId = packet.processId;
+    transaction.responseCode = static_cast<uint8_t>(*flags & 0x0FU);
+
+    for (uint16_t questionIndex = 0; questionIndex < *questionCount; ++questionIndex) {
+        std::string domainName;
+        size_t nextOffset = offset;
+        if (!ReadDnsName(dnsData, offset, domainName, nextOffset)) {
+            Utils::Logger::Debug("Malformed DNS question name in transaction {}", *transactionId);
+            return;
+        }
+
+        const auto queryType = ReadUint16BE(dnsData, nextOffset);
+        const auto queryClass = ReadUint16BE(dnsData, nextOffset + sizeof(uint16_t));
+        if (!queryType.has_value() || !queryClass.has_value()) {
+            return;
+        }
+        (void)queryClass;
+
+        if (questionIndex == 0) {
+            transaction.queryDomain = ToLowerAscii(domainName);
+            transaction.queryType = *queryType;
+        }
+
+        offset = nextOffset + sizeof(uint16_t) + sizeof(uint16_t);
+        if (offset > dnsData.size()) {
+            return;
+        }
+    }
+
+    std::vector<uint32_t> ttlValues;
+    for (uint16_t answerIndex = 0; answerIndex < *answerCount; ++answerIndex) {
+        std::string answerName;
+        size_t nextOffset = offset;
+        if (!ReadDnsName(dnsData, offset, answerName, nextOffset)) {
+            Utils::Logger::Debug("Malformed DNS answer name in transaction {}", *transactionId);
+            return;
+        }
+
+        const auto recordType = ReadUint16BE(dnsData, nextOffset);
+        const auto recordClass = ReadUint16BE(dnsData, nextOffset + sizeof(uint16_t));
+        const auto ttl = ReadUint32BE(dnsData, nextOffset + sizeof(uint16_t) * 2);
+        const auto rdataLength = ReadUint16BE(dnsData, nextOffset + sizeof(uint16_t) * 2 + sizeof(uint32_t));
+        if (!recordType.has_value() || !recordClass.has_value() || !ttl.has_value() || !rdataLength.has_value()) {
+            return;
+        }
+        (void)recordClass;
+
+        const size_t rdataOffset = nextOffset + sizeof(uint16_t) * 3 + sizeof(uint32_t);
+        if (rdataOffset + *rdataLength > dnsData.size()) {
+            return;
+        }
+
+        ttlValues.push_back(*ttl);
+        if (transaction.queryDomain.empty()) {
+            transaction.queryDomain = ToLowerAscii(answerName);
+            transaction.queryType = *recordType;
+        }
+
+        if (*recordType == 1 && *rdataLength == 4) {
+            IN_ADDR address{};
+            std::memcpy(&address, dnsData.data() + rdataOffset, sizeof(address));
+            IPAddress resolved;
+            resolved.family = AF_INET;
+            resolved.v4 = ntohl(address.S_un.S_addr);
+            transaction.resolvedAddresses.push_back(resolved);
+        } else if (*recordType == 28 && *rdataLength == 16) {
+            IPAddress resolved;
+            resolved.family = AF_INET6;
+            std::memcpy(resolved.v6.data(), dnsData.data() + rdataOffset, resolved.v6.size());
+            transaction.resolvedAddresses.push_back(resolved);
+        }
+
+        offset = rdataOffset + *rdataLength;
+    }
+
+    transaction.isSuspicious =
+        transaction.queryDomain.size() > DNS_TUNNELING_LENGTH_THRESHOLD ||
+        transaction.responseCode != 0;
 
     std::unique_lock lock(m_mutex);
+    DNSTransaction* callbackTransaction = nullptr;
 
-    DNSTransaction trans;
-    trans.transactionId = static_cast<uint16_t>(m_dnsTransactions.size());
-    trans.queryTime = packet.timestamp;
-    trans.sourceIP = packet.sourceIP;
-    trans.dnsServer = packet.destIP;
-    trans.processId = packet.processId;
+    if (isResponse) {
+        for (auto existing = m_dnsTransactions.rbegin(); existing != m_dnsTransactions.rend(); ++existing) {
+            if (existing->transactionId == transaction.transactionId &&
+                existing->processId == transaction.processId &&
+                existing->sourceIP == transaction.sourceIP &&
+                existing->dnsServer == transaction.dnsServer &&
+                IsUnsetTime(existing->responseTime)) {
 
-    // Simplified - would parse actual DNS query
-    trans.queryDomain = "example.com";
-    trans.queryType = 1; // A record
+                if (existing->queryDomain.empty()) {
+                    existing->queryDomain = transaction.queryDomain;
+                }
+                if (existing->queryType == 0) {
+                    existing->queryType = transaction.queryType;
+                }
+                existing->responseTime = packet.timestamp;
+                existing->responseCode = transaction.responseCode;
+                existing->isSuspicious = existing->isSuspicious || transaction.isSuspicious;
+                existing->resolvedAddresses.insert(existing->resolvedAddresses.end(),
+                    transaction.resolvedAddresses.begin(),
+                    transaction.resolvedAddresses.end());
+                callbackTransaction = &(*existing);
+                break;
+            }
+        }
+    }
 
-    m_dnsTransactions.push_back(trans);
-    m_stats.dnsTransactions++;
+    if (callbackTransaction == nullptr) {
+        m_dnsTransactions.push_back(std::move(transaction));
+        callbackTransaction = &m_dnsTransactions.back();
+        m_stats.dnsTransactions++;
+    }
+
+    const DNSTransaction transactionCopy = *callbackTransaction;
+    if (!ttlValues.empty() && m_config.verboseLogging) {
+        Utils::Logger::Debug("Parsed DNS transaction {} for '{}' with {} answers and {} TTL values",
+            transactionCopy.transactionId,
+            transactionCopy.queryDomain,
+            transactionCopy.resolvedAddresses.size(),
+            ttlValues.size());
+    }
 
     if (m_dnsCallback) {
         lock.unlock();
         try {
-            m_dnsCallback(trans);
+            m_dnsCallback(transactionCopy);
         } catch (const std::exception& e) {
             Utils::Logger::Error("DNS callback exception: {}", e.what());
         }
@@ -1173,48 +1661,70 @@ std::vector<std::pair<IPAddress, double>> NetworkCaptureImpl::DetectBeaconing(
     std::vector<std::pair<IPAddress, double>> beacons;
 
     std::shared_lock lock(m_mutex);
-
-    // Simplified beaconing detection
-    // In production: analyze packet timing intervals for regularity
+    const auto sessionIt = m_sessions.find(sessionId);
+    if (sessionIt == m_sessions.end()) {
+        Utils::Logger::Warn("Requested beaconing analysis for unknown session {}", sessionId);
+        return beacons;
+    }
 
     std::unordered_map<std::string, std::vector<SystemTimePoint>> ipTimestamps;
 
-    // Collect timestamps per IP (would filter by session)
     for (const auto& [_, stream] : m_tcpStreams) {
-        std::string ipStr = stream.destIP.ToString();
+        if (!StreamMatchesSession(stream, sessionIt->second)) {
+            continue;
+        }
+
+        const std::string ipStr = stream.destIP.ToString();
         ipTimestamps[ipStr].push_back(stream.startTime);
     }
 
-    // Analyze regularity
     for (const auto& [ipStr, timestamps] : ipTimestamps) {
         if (timestamps.size() < 3) continue;
 
-        // Calculate interval variance
+        std::vector<SystemTimePoint> sortedTimestamps = timestamps;
+        std::sort(sortedTimestamps.begin(), sortedTimestamps.end());
+
         std::vector<int64_t> intervals;
-        for (size_t i = 1; i < timestamps.size(); ++i) {
+        intervals.reserve(sortedTimestamps.size() - 1);
+        for (size_t i = 1; i < sortedTimestamps.size(); ++i) {
             auto interval = std::chrono::duration_cast<std::chrono::milliseconds>(
-                timestamps[i] - timestamps[i - 1]).count();
-            intervals.push_back(interval);
+                sortedTimestamps[i] - sortedTimestamps[i - 1]).count();
+            if (interval >= static_cast<int64_t>(minIntervalMs)) {
+                intervals.push_back(interval);
+            }
         }
 
-        // Calculate mean
+        if (intervals.size() < 2) {
+            continue;
+        }
+
         double mean = 0;
         for (auto interval : intervals) {
-            mean += interval;
+            mean += static_cast<double>(interval);
         }
-        mean /= intervals.size();
+        mean /= static_cast<double>(intervals.size());
+        if (mean <= 0.0) {
+            continue;
+        }
 
-        // Calculate variance
         double variance = 0;
         for (auto interval : intervals) {
-            variance += (interval - mean) * (interval - mean);
+            const double diff = static_cast<double>(interval) - mean;
+            variance += diff * diff;
         }
-        variance /= intervals.size();
+        variance /= static_cast<double>(intervals.size());
 
-        // Low variance = beaconing
-        double score = 100.0 / (1.0 + std::sqrt(variance) / mean);
+        const double stddev = std::sqrt(variance);
+        const double coefficientOfVariation = stddev / mean;
+        double score = 0.0;
+        if (coefficientOfVariation < HIGH_CONFIDENCE_BEACON_CV) {
+            score = 90.0 + std::max(0.0, 10.0 * (1.0 - coefficientOfVariation / HIGH_CONFIDENCE_BEACON_CV));
+        } else if (coefficientOfVariation < MEDIUM_CONFIDENCE_BEACON_CV) {
+            score = 70.0 + 20.0 * (1.0 - ((coefficientOfVariation - HIGH_CONFIDENCE_BEACON_CV) /
+                                           (MEDIUM_CONFIDENCE_BEACON_CV - HIGH_CONFIDENCE_BEACON_CV)));
+        }
 
-        if (score > 70.0) {  // High regularity
+        if (score >= 70.0) {
             auto ip = IPAddress::FromString(ipStr);
             if (ip.has_value()) {
                 beacons.push_back({*ip, score});
@@ -1232,35 +1742,73 @@ std::vector<std::string> NetworkCaptureImpl::DetectDNSTunneling(const std::strin
     std::vector<std::string> suspiciousDomains;
 
     std::shared_lock lock(m_mutex);
-
-    // Simplified DNS tunneling detection
-    // Check for long domain names, high entropy, excessive queries
-
-    std::unordered_map<std::string, size_t> domainCounts;
-
-    for (const auto& trans : m_dnsTransactions) {
-        const auto& domain = trans.queryDomain;
-
-        // Check length (tunneling often uses long subdomains)
-        if (domain.length() > 50) {
-            if (std::find(suspiciousDomains.begin(), suspiciousDomains.end(), domain)
-                == suspiciousDomains.end()) {
-                suspiciousDomains.push_back(domain);
-            }
-        }
-
-        // Count queries per domain
-        domainCounts[domain]++;
+    const auto sessionIt = m_sessions.find(sessionId);
+    if (sessionIt == m_sessions.end()) {
+        Utils::Logger::Warn("Requested DNS tunneling analysis for unknown session {}", sessionId);
+        return suspiciousDomains;
     }
 
-    // High query volume can indicate tunneling
-    for (const auto& [domain, count] : domainCounts) {
-        if (count > 100) {  // Threshold
-            if (std::find(suspiciousDomains.begin(), suspiciousDomains.end(), domain)
-                == suspiciousDomains.end()) {
-                suspiciousDomains.push_back(domain);
-            }
+    struct DomainMetrics {
+        size_t queryCount = 0;
+        size_t txtNullCount = 0;
+        size_t maxLength = 0;
+        double maxEntropy = 0.0;
+    };
+
+    std::unordered_map<std::string, DomainMetrics> metricsByBaseDomain;
+    for (const auto& transaction : m_dnsTransactions) {
+        if (!DNSMatchesSession(transaction, sessionIt->second) || transaction.queryDomain.empty()) {
+            continue;
         }
+
+        const auto normalizedDomain = ToLowerAscii(transaction.queryDomain);
+        const auto baseDomain = GetBaseDomain(normalizedDomain);
+        auto& metrics = metricsByBaseDomain[baseDomain];
+        metrics.queryCount++;
+        metrics.maxLength = std::max(metrics.maxLength, normalizedDomain.size());
+
+        const auto subdomain = GetSubdomainComponent(normalizedDomain);
+        metrics.maxEntropy = std::max(metrics.maxEntropy, CalculateShannonEntropy(subdomain));
+        if (transaction.queryType == 10 || transaction.queryType == 16) {
+            metrics.txtNullCount++;
+        }
+    }
+
+    std::vector<std::pair<std::string, double>> rankedDomains;
+    for (const auto& [domain, metrics] : metricsByBaseDomain) {
+        double suspicionScore = 0.0;
+        if (metrics.maxLength > DNS_TUNNELING_LENGTH_THRESHOLD) {
+            suspicionScore += 40.0;
+        }
+        if (metrics.maxEntropy > DNS_TUNNELING_ENTROPY_THRESHOLD) {
+            suspicionScore += 35.0;
+        }
+        if (metrics.queryCount >= DNS_TUNNELING_QUERY_THRESHOLD) {
+            suspicionScore += 15.0;
+        }
+        if (metrics.txtNullCount >= DNS_TUNNELING_TXT_NULL_THRESHOLD) {
+            suspicionScore += 20.0;
+        }
+
+        const bool suspicious =
+            metrics.maxLength > DNS_TUNNELING_LENGTH_THRESHOLD ||
+            (metrics.maxEntropy > DNS_TUNNELING_ENTROPY_THRESHOLD &&
+             metrics.queryCount >= DNS_TUNNELING_QUERY_THRESHOLD) ||
+            metrics.txtNullCount >= DNS_TUNNELING_TXT_NULL_THRESHOLD;
+
+        if (suspicious) {
+            rankedDomains.emplace_back(domain, suspicionScore);
+        }
+    }
+
+    std::sort(rankedDomains.begin(), rankedDomains.end(),
+        [](const auto& left, const auto& right) {
+            return left.second > right.second;
+        });
+
+    suspiciousDomains.reserve(rankedDomains.size());
+    for (const auto& [domain, _] : rankedDomains) {
+        suspiciousDomains.push_back(domain);
     }
 
     return suspiciousDomains;
@@ -1269,11 +1817,19 @@ std::vector<std::string> NetworkCaptureImpl::DetectDNSTunneling(const std::strin
 std::vector<std::tuple<IPAddress, uint16_t, uint64_t>>
 NetworkCaptureImpl::GetConnectionSummary(const std::string& sessionId) const {
     std::shared_lock lock(m_mutex);
+    const auto sessionIt = m_sessions.find(sessionId);
+    if (sessionIt == m_sessions.end()) {
+        Utils::Logger::Warn("Requested connection summary for unknown session {}", sessionId);
+        return {};
+    }
 
     std::map<std::pair<std::string, uint16_t>, uint64_t> connections;
 
-    // Aggregate by destination
     for (const auto& [_, stream] : m_tcpStreams) {
+        if (!StreamMatchesSession(stream, sessionIt->second)) {
+            continue;
+        }
+
         std::string ipStr = stream.destIP.ToString();
         auto key = std::make_pair(ipStr, stream.destPort);
         connections[key] += stream.bytesFromClient + stream.bytesToClient;
