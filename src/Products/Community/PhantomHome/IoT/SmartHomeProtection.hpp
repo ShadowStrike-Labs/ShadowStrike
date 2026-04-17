@@ -516,7 +516,46 @@ struct SmartHomeStatistics {
     std::array<std::atomic<uint64_t>, 32> byEventType{};
     std::array<std::atomic<uint64_t>, 32> byDeviceType{};
     TimePoint startTime = Clock::now();
-    
+
+    SmartHomeStatistics() noexcept = default;
+    SmartHomeStatistics(const SmartHomeStatistics& other) noexcept {
+        totalEventsProcessed.store(other.totalEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        alertsGenerated.store(other.alertsGenerated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        privacyConcernsDetected.store(other.privacyConcernsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        anomaliesDetected.store(other.anomaliesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        streamingSessionsDetected.store(other.streamingSessionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        externalConnectionsBlocked.store(other.externalConnectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalBytesMonitored.store(other.totalBytesMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        devicesMonitored.store(other.devicesMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byEventType.size(); ++i) {
+            byEventType[i].store(other.byEventType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byDeviceType.size(); ++i) {
+            byDeviceType[i].store(other.byDeviceType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        startTime = other.startTime;
+    }
+    SmartHomeStatistics& operator=(const SmartHomeStatistics& other) noexcept {
+        if (this != &other) {
+            totalEventsProcessed.store(other.totalEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            alertsGenerated.store(other.alertsGenerated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            privacyConcernsDetected.store(other.privacyConcernsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            anomaliesDetected.store(other.anomaliesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            streamingSessionsDetected.store(other.streamingSessionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            externalConnectionsBlocked.store(other.externalConnectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalBytesMonitored.store(other.totalBytesMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            devicesMonitored.store(other.devicesMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byEventType.size(); ++i) {
+                byEventType[i].store(other.byEventType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+            for (size_t i = 0; i < byDeviceType.size(); ++i) {
+                byDeviceType[i].store(other.byDeviceType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
