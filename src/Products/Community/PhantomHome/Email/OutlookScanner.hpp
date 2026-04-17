@@ -128,12 +128,12 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/COMUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 #include "EmailCommon.hpp"
+#include "EmailProtection.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -145,7 +145,6 @@ struct IUnknown;
 namespace ShadowStrike::Email {
     class OutlookScannerImpl;
     struct EmailMessage;
-    struct EmailScanResult;
 }
 
 namespace ShadowStrike {
@@ -406,7 +405,29 @@ struct MailScanEvent {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (copyable, for GetStatistics return)
+ */
+struct OutlookScannerStatisticsSnapshot {
+    uint64_t totalScanned = 0;
+    uint64_t newMailScanned = 0;
+    uint64_t outboundScanned = 0;
+    uint64_t threatsDetected = 0;
+    uint64_t malwareBlocked = 0;
+    uint64_t phishingBlocked = 0;
+    uint64_t spamTagged = 0;
+    uint64_t attachmentsStripped = 0;
+    uint64_t sendBlocked = 0;
+    uint64_t allowed = 0;
+    uint64_t quarantined = 0;
+    uint64_t scanErrors = 0;
+    std::array<uint64_t, 16> byEventType{};
+    TimePoint startTime = Clock::now();
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Statistics (internal, non-copyable with atomics)
  */
 struct OutlookScannerStatistics {
     std::atomic<uint64_t> totalScanned{0};
@@ -425,6 +446,7 @@ struct OutlookScannerStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+    [[nodiscard]] OutlookScannerStatisticsSnapshot ToSnapshot() const noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -500,7 +522,7 @@ struct OutlookScannerConfiguration {
 // ============================================================================
 
 using MailEventCallback = std::function<void(const MailScanEvent&)>;
-using ScanResultCallback = std::function<void(const MailItemInfo&, const EmailScanResult&)>;
+using OutlookScanResultCallback = std::function<void(const MailItemInfo&, const EmailScanResult&)>;
 using BlockCallback = std::function<void(const MailItemInfo&, OutlookScanAction)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
@@ -565,25 +587,25 @@ public:
     // ========================================================================
     
     /// @brief Called on new mail
-    void OnNewMail(void* pDispatchMailItem);
+    void OnNewMail(IDispatch* pDispatchMailItem);
     
     /// @brief Called on new mail (multiple items)
     void OnNewMailEx(const std::string& entryIdCollection);
     
     /// @brief Called before item send (return false to cancel)
-    [[nodiscard]] bool OnItemSend(void* pDispatchMailItem, bool& cancel);
+    [[nodiscard]] bool OnItemSend(IDispatch* pDispatchMailItem, bool& cancel);
     
     /// @brief Called on item add to folder
-    void OnItemAdd(void* pDispatchItem);
+    void OnItemAdd(IDispatch* pDispatchItem);
     
     /// @brief Called on item change
-    void OnItemChange(void* pDispatchItem);
+    void OnItemChange(IDispatch* pDispatchItem);
     
     /// @brief Called before delete
-    void OnBeforeDelete(void* pDispatchItem, bool& cancel);
+    void OnBeforeDelete(IDispatch* pDispatchItem, bool& cancel);
     
     /// @brief Called on attachment add
-    void OnAttachmentAdd(void* pDispatchAttachment, bool& cancel);
+    void OnAttachmentAdd(IDispatch* pDispatchAttachment, bool& cancel);
 
     // ========================================================================
     // SCANNING
@@ -596,11 +618,11 @@ public:
     [[nodiscard]] EmailScanResult ScanMailItemById(const std::string& entryId);
     
     /// @brief Get mail item info from IDispatch
-    [[nodiscard]] std::optional<MailItemInfo> GetMailItemInfo(void* pDispatch);
+    [[nodiscard]] std::optional<MailItemInfo> GetMailItemInfo(IDispatch* pDispatch);
     
     /// @brief Extract attachment to temp file
     [[nodiscard]] std::optional<fs::path> ExtractAttachment(
-        void* pDispatch,
+        IDispatch* pDispatch,
         size_t attachmentIndex);
 
     // ========================================================================
@@ -644,7 +666,7 @@ public:
     // ========================================================================
     
     void RegisterMailEventCallback(MailEventCallback callback);
-    void RegisterScanCallback(ScanResultCallback callback);
+    void RegisterScanCallback(OutlookScanResultCallback callback);
     void RegisterBlockCallback(BlockCallback callback);
     void RegisterPreSendCallback(PreSendCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
@@ -654,7 +676,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] OutlookScannerStatistics GetStatistics() const;
+    [[nodiscard]] OutlookScannerStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

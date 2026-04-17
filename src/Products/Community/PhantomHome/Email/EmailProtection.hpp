@@ -77,8 +77,6 @@
  * @version 3.0.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
- *
- * LICENSE: Proprietary - ShadowStrike Enterprise License
  * ============================================================================
  */
 
@@ -127,15 +125,15 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/CryptoUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 #include "EmailCommon.hpp"
 
 // ============================================================================
@@ -691,6 +689,36 @@ struct EmailProtectionConfiguration {
 };
 
 /**
+ * @brief Statistics (thread-safe snapshot for returning)
+ */
+struct EmailProtectionStatisticsSnapshot {
+    uint64_t totalScanned = 0;
+    uint64_t cleanEmails = 0;
+    uint64_t spamDetected = 0;
+    uint64_t phishingDetected = 0;
+    uint64_t malwareDetected = 0;
+    uint64_t becDetected = 0;
+    uint64_t dlpViolations = 0;
+    uint64_t attachmentsScanned = 0;
+    uint64_t maliciousAttachments = 0;
+    uint64_t urlsScanned = 0;
+    uint64_t maliciousUrls = 0;
+    uint64_t quarantined = 0;
+    uint64_t blocked = 0;
+    uint64_t tagged = 0;
+    uint64_t allowed = 0;
+    uint64_t spfFailed = 0;
+    uint64_t dkimFailed = 0;
+    uint64_t dmarcFailed = 0;
+    uint64_t scanErrors = 0;
+    std::array<uint64_t, 16> bySource{};
+    std::array<uint64_t, 3> byDirection{};
+    TimePoint startTime;
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Statistics
  */
 struct EmailProtectionStatistics {
@@ -869,10 +897,14 @@ public:
     [[nodiscard]] std::optional<QuarantineEntry> GetQuarantineEntry(
         const std::string& quarantineId);
     
-    /// @brief Release from quarantine
+    /// @brief Release from quarantine (requires authorization)
+    /// @param quarantineId The ID of the quarantine entry
+    /// @param releasedBy The identity releasing the email (must be admin or security team)
+    /// @param authorizationToken Authorization token for release operation
     [[nodiscard]] bool ReleaseFromQuarantine(
         const std::string& quarantineId,
-        const std::string& releasedBy);
+        const std::string& releasedBy,
+        const std::string& authorizationToken = "");
     
     /// @brief Delete from quarantine
     [[nodiscard]] bool DeleteFromQuarantine(const std::string& quarantineId);
@@ -922,7 +954,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] EmailProtectionStatistics GetStatistics() const;
+    [[nodiscard]] EmailProtectionStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

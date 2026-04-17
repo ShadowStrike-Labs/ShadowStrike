@@ -108,6 +108,11 @@
 #include <thread>
 
 // ============================================================================
+// JSON LIBRARY (L1 fix)
+// ============================================================================
+#include <nlohmann/json.hpp>
+
+// ============================================================================
 // WINDOWS SDK INCLUDES
 // ============================================================================
 
@@ -125,12 +130,13 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 #include "EmailCommon.hpp"
+#include "EmailProtection.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -139,7 +145,6 @@
 namespace ShadowStrike::Email {
     class ThunderbirdScannerImpl;
     struct EmailMessage;
-    struct EmailScanResult;
 }
 
 namespace ShadowStrike {
@@ -172,10 +177,19 @@ namespace ThunderbirdConstants {
     
     /// @brief Maximum message size
     inline constexpr size_t MAX_MESSAGE_SIZE = 50 * 1024 * 1024;  // 50MB
+    
+    /// @brief Maximum mbox file size for parsing (C4 fix - 2GB)
+    inline constexpr size_t MAX_MBOX_FILE_SIZE = 2ULL * 1024 * 1024 * 1024;
+    
+    /// @brief Maximum messages to parse per mbox file (C4 fix)
+    inline constexpr size_t MAX_MESSAGES_PER_MBOX = 100000;
+    
+    /// @brief Default body text size limit (M6 fix - 64KB configurable)
+    inline constexpr size_t DEFAULT_BODY_TEXT_LIMIT = 64 * 1024;
 
-    /// @brief Mbox file extensions
+    /// @brief Mbox file extensions (L4 fix - removed empty string)
     inline constexpr const char* MBOX_EXTENSIONS[] = {
-        "", ".msf", ".mbox"
+        ".msf", ".mbox"
     };
 
     /// @brief Profile locations (relative to user profile)
@@ -495,6 +509,28 @@ struct ThunderbirdScanEvent {
 };
 
 /**
+ * @brief Statistics snapshot (M1 fix - copyable version for GetStatistics)
+ */
+struct ThunderbirdScannerStatisticsSnapshot {
+    uint64_t totalScanned = 0;
+    uint64_t newMessagesScanned = 0;
+    uint64_t foldersMonitored = 0;
+    uint64_t threatsDetected = 0;
+    uint64_t malwareBlocked = 0;
+    uint64_t phishingBlocked = 0;
+    uint64_t spamMarked = 0;
+    uint64_t nativeMessagesReceived = 0;
+    uint64_t nativeMessagesProcessed = 0;
+    uint64_t fileChangesDetected = 0;
+    uint64_t parseErrors = 0;
+    uint64_t scanErrors = 0;
+    std::array<uint64_t, 8> byEventType{};
+    TimePoint startTime = Clock::now();
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Statistics
  */
 struct ThunderbirdScannerStatistics {
@@ -514,6 +550,7 @@ struct ThunderbirdScannerStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+    [[nodiscard]] ThunderbirdScannerStatisticsSnapshot ToSnapshot() const noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -554,7 +591,7 @@ struct ThunderbirdScannerConfiguration {
     /// @brief Excluded folders
     std::vector<std::string> excludedFolders;
     
-    /// @brief Trusted senders
+    /// @brief Trusted senders (exact email addresses or @domain.com suffixes)
     std::vector<std::string> trustedSenders;
     
     /// @brief File change debounce
@@ -562,6 +599,9 @@ struct ThunderbirdScannerConfiguration {
     
     /// @brief Maximum message size
     size_t maxMessageSize = ThunderbirdConstants::MAX_MESSAGE_SIZE;
+    
+    /// @brief Maximum body text size (M6 fix)
+    size_t maxBodyTextSize = ThunderbirdConstants::DEFAULT_BODY_TEXT_LIMIT;
     
     /// @brief Verbose logging
     bool verboseLogging = false;
@@ -574,7 +614,7 @@ struct ThunderbirdScannerConfiguration {
 // ============================================================================
 
 using MessageEventCallback = std::function<void(const ThunderbirdScanEvent&)>;
-using ScanResultCallback = std::function<void(const MboxMessage&, const EmailScanResult&)>;
+using ThunderbirdScanResultCallback = std::function<void(const MboxMessage&, const EmailScanResult&)>;
 using NativeMessageCallback = std::function<NativeMessageResponse(const NativeMessageRequest&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
@@ -699,7 +739,7 @@ public:
     // ========================================================================
     
     void RegisterMessageEventCallback(MessageEventCallback callback);
-    void RegisterScanCallback(ScanResultCallback callback);
+    void RegisterScanCallback(ThunderbirdScanResultCallback callback);
     void RegisterNativeMessageCallback(NativeMessageCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
@@ -708,7 +748,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] ThunderbirdScannerStatistics GetStatistics() const;
+    [[nodiscard]] ThunderbirdScannerStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

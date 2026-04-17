@@ -133,24 +133,20 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Scripts/MacroDetector.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Scripts/MacroDetector.hpp"
 #include "EmailCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
-
-namespace ShadowStrike::Email {
-    class AttachmentScannerImpl;
-}
 
 namespace ShadowStrike {
 namespace Email {
@@ -449,7 +445,32 @@ struct AttachmentScanConfig {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (copyable, returned to callers)
+ *
+ * Internal counters use std::atomic; this struct captures a point-in-time
+ * snapshot with plain integers so callers can copy/serialize freely.
+ */
+struct AttachmentStatisticsSnapshot {
+    uint64_t totalScans{0};
+    uint64_t maliciousDetected{0};
+    uint64_t suspiciousDetected{0};
+    uint64_t cleanDetected{0};
+    uint64_t archivesExtracted{0};
+    uint64_t nestedFilesScanned{0};
+    uint64_t macrosDetected{0};
+    uint64_t passwordProtectedBlocked{0};
+    uint64_t highRiskExtensionsBlocked{0};
+    uint64_t scanErrors{0};
+    uint64_t totalBytesScanned{0};
+    std::array<uint64_t, 16> byFileType{};
+    std::array<uint64_t, 16> byThreatType{};
+    TimePoint startTime{};
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Internal statistics with atomics (non-copyable)
  */
 struct AttachmentStatistics {
     std::atomic<uint64_t> totalScans{0};
@@ -468,7 +489,7 @@ struct AttachmentStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] AttachmentStatisticsSnapshot ToSnapshot() const noexcept;
 };
 
 /**
@@ -500,10 +521,10 @@ struct AttachmentScannerConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using ScanResultCallback = std::function<void(const AttachmentScanResult&)>;
-using ThreatDetectedCallback = std::function<void(const AttachmentScanResult&)>;
-using ProgressCallback = std::function<void(float progress, const std::string& currentFile)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using AttachmentScanResultCallback = std::function<void(const AttachmentScanResult&)>;
+using AttachmentThreatCallback = std::function<void(const AttachmentScanResult&)>;
+using AttachmentProgressCallback = std::function<void(float progress, const std::string& currentFile)>;
+using AttachmentErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // ATTACHMENT SCANNER CLASS
@@ -598,17 +619,17 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterScanResultCallback(ScanResultCallback callback);
-    void RegisterThreatCallback(ThreatDetectedCallback callback);
-    void RegisterProgressCallback(ProgressCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterScanResultCallback(AttachmentScanResultCallback callback);
+    void RegisterThreatCallback(AttachmentThreatCallback callback);
+    void RegisterProgressCallback(AttachmentProgressCallback callback);
+    void RegisterErrorCallback(AttachmentErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] AttachmentStatistics GetStatistics() const;
+    [[nodiscard]] AttachmentStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
@@ -618,6 +639,7 @@ private:
     AttachmentScanner();
     ~AttachmentScanner();
     
+    class AttachmentScannerImpl;
     std::unique_ptr<AttachmentScannerImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
 };
