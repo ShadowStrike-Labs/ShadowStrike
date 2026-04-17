@@ -1186,6 +1186,7 @@
     <ClCompile Include="tests\integration\scan_pipeline\ScanPipeline_Integration_Tests.cpp" />
     <ClCompile Include="tests\integration\self_protection\SelfProtectionStack_Integration_Tests.cpp" />
     <ClCompile Include="tests\integration\update_lifecycle\UpdateLifecycle_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\product_orchestrator\HomeProductOrchestrator_Integration_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\CortexConfig_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\FeatureExtractor_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\ModelCache_Tests.cpp" />
