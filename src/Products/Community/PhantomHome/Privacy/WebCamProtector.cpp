@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -459,7 +459,7 @@ bool WebcamConfiguration::IsValid() const noexcept {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class WebcamProtector::WebcamProtectorImpl {
+class WebcamProtectorImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -572,7 +572,7 @@ public:
 // IMPL: INITIALIZATION
 // ============================================================================
 
-bool WebcamProtector::WebcamProtectorImpl::Initialize(
+bool WebcamProtectorImpl::Initialize(
     const WebcamConfiguration& config)
 {
     try {
@@ -613,7 +613,7 @@ bool WebcamProtector::WebcamProtectorImpl::Initialize(
     }
 }
 
-void WebcamProtector::WebcamProtectorImpl::Shutdown() {
+void WebcamProtectorImpl::Shutdown() {
     try {
         if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
             return;
@@ -668,7 +668,7 @@ void WebcamProtector::WebcamProtectorImpl::Shutdown() {
 // IMPL: DEVICE MANAGEMENT
 // ============================================================================
 
-std::vector<CameraDevice> WebcamProtector::WebcamProtectorImpl::GetCameraDevicesInternal() {
+std::vector<CameraDevice> WebcamProtectorImpl::GetCameraDevicesInternal() {
     std::shared_lock lock(m_devicesMutex);
 
     std::vector<CameraDevice> devices;
@@ -681,7 +681,7 @@ std::vector<CameraDevice> WebcamProtector::WebcamProtectorImpl::GetCameraDevices
     return devices;
 }
 
-std::optional<CameraDevice> WebcamProtector::WebcamProtectorImpl::GetDeviceInternal(
+std::optional<CameraDevice> WebcamProtectorImpl::GetDeviceInternal(
     const std::string& deviceId)
 {
     std::shared_lock lock(m_devicesMutex);
@@ -694,7 +694,7 @@ std::optional<CameraDevice> WebcamProtector::WebcamProtectorImpl::GetDeviceInter
     return it->second;
 }
 
-bool WebcamProtector::WebcamProtectorImpl::RefreshDevicesInternal() {
+bool WebcamProtectorImpl::RefreshDevicesInternal() {
     try {
         auto newDevices = EnumerateCameraDevices();
 
@@ -741,7 +741,7 @@ bool WebcamProtector::WebcamProtectorImpl::RefreshDevicesInternal() {
 // IMPL: ACCESS CONTROL
 // ============================================================================
 
-CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInternal(
+CameraAccessDecision WebcamProtectorImpl::EvaluateAccessInternal(
     uint32_t processId,
     const std::string& deviceId)
 {
@@ -947,7 +947,7 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInterna
     }
 }
 
-bool WebcamProtector::WebcamProtectorImpl::OnCameraAccessAttemptInternal(uint32_t pid) {
+bool WebcamProtectorImpl::OnCameraAccessAttemptInternal(uint32_t pid) {
     try {
         if (!m_monitoringActive.load(std::memory_order_acquire)) {
             return true;
@@ -984,7 +984,7 @@ bool WebcamProtector::WebcamProtectorImpl::OnCameraAccessAttemptInternal(uint32_
 // IMPL: WHITELIST MANAGEMENT
 // ============================================================================
 
-bool WebcamProtector::WebcamProtectorImpl::AddToWhitelistInternal(
+bool WebcamProtectorImpl::AddToWhitelistInternal(
     const CameraWhitelistEntry& entry)
 {
     try {
@@ -1012,7 +1012,7 @@ bool WebcamProtector::WebcamProtectorImpl::AddToWhitelistInternal(
     }
 }
 
-bool WebcamProtector::WebcamProtectorImpl::RemoveFromWhitelistInternal(const std::string& entryId) {
+bool WebcamProtectorImpl::RemoveFromWhitelistInternal(const std::string& entryId) {
     try {
         std::unique_lock lock(m_whitelistMutex);
 
@@ -1033,7 +1033,7 @@ bool WebcamProtector::WebcamProtectorImpl::RemoveFromWhitelistInternal(const std
     }
 }
 
-bool WebcamProtector::WebcamProtectorImpl::IsProcessWhitelistedInternal(
+bool WebcamProtectorImpl::IsProcessWhitelistedInternal(
     const std::string& processName,
     const fs::path& processPath)
 {
@@ -1072,7 +1072,7 @@ bool WebcamProtector::WebcamProtectorImpl::IsProcessWhitelistedInternal(
     return false;
 }
 
-std::vector<CameraWhitelistEntry> WebcamProtector::WebcamProtectorImpl::GetWhitelistInternal() const {
+std::vector<CameraWhitelistEntry> WebcamProtectorImpl::GetWhitelistInternal() const {
     std::shared_lock lock(m_whitelistMutex);
 
     std::vector<CameraWhitelistEntry> entries;
@@ -1089,7 +1089,7 @@ std::vector<CameraWhitelistEntry> WebcamProtector::WebcamProtectorImpl::GetWhite
 // IMPL: EVENT TRACKING
 // ============================================================================
 
-void WebcamProtector::WebcamProtectorImpl::RecordAccessEvent(const CameraAccessEvent& event) {
+void WebcamProtectorImpl::RecordAccessEvent(const CameraAccessEvent& event) {
     try {
         std::unique_lock lock(m_eventsMutex);
 
@@ -1103,7 +1103,7 @@ void WebcamProtector::WebcamProtectorImpl::RecordAccessEvent(const CameraAccessE
     }
 }
 
-std::vector<CameraAccessEvent> WebcamProtector::WebcamProtectorImpl::GetRecentEventsInternal(
+std::vector<CameraAccessEvent> WebcamProtectorImpl::GetRecentEventsInternal(
     size_t limit,
     std::optional<SystemTimePoint> since)
 {
@@ -1126,7 +1126,7 @@ std::vector<CameraAccessEvent> WebcamProtector::WebcamProtectorImpl::GetRecentEv
 // IMPL: SPYWARE DETECTION
 // ============================================================================
 
-bool WebcamProtector::WebcamProtectorImpl::IsKnownSpywareInternal(uint32_t processId) {
+bool WebcamProtectorImpl::IsKnownSpywareInternal(uint32_t processId) {
     try {
         auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
         if (!threatIntel.IsInitialized()) {
@@ -1156,7 +1156,7 @@ bool WebcamProtector::WebcamProtectorImpl::IsKnownSpywareInternal(uint32_t proce
     }
 }
 
-CameraRiskLevel WebcamProtector::WebcamProtectorImpl::AnalyzeProcessInternal(uint32_t processId) {
+CameraRiskLevel WebcamProtectorImpl::AnalyzeProcessInternal(uint32_t processId) {
     try {
         auto optPath = Utils::ProcessUtils::GetProcessPath(processId);
         if (!optPath.has_value()) {
@@ -1208,7 +1208,7 @@ CameraRiskLevel WebcamProtector::WebcamProtectorImpl::AnalyzeProcessInternal(uin
 // IMPL: CALLBACKS
 // ============================================================================
 
-void WebcamProtector::WebcamProtectorImpl::InvokeAccessCallbacks(const CameraAccessEvent& event) {
+void WebcamProtectorImpl::InvokeAccessCallbacks(const CameraAccessEvent& event) {
     std::lock_guard lock(m_callbacksMutex);
     for (const auto& callback : m_accessCallbacks) {
         try {
@@ -1219,7 +1219,7 @@ void WebcamProtector::WebcamProtectorImpl::InvokeAccessCallbacks(const CameraAcc
     }
 }
 
-void WebcamProtector::WebcamProtectorImpl::InvokeDeviceCallbacks(
+void WebcamProtectorImpl::InvokeDeviceCallbacks(
     const CameraDevice& device,
     bool added)
 {
@@ -1233,7 +1233,7 @@ void WebcamProtector::WebcamProtectorImpl::InvokeDeviceCallbacks(
     }
 }
 
-CameraAccessDecision WebcamProtector::WebcamProtectorImpl::InvokeDecisionCallbacks(
+CameraAccessDecision WebcamProtectorImpl::InvokeDecisionCallbacks(
     const CameraAccessEvent& event)
 {
     std::lock_guard lock(m_callbacksMutex);
@@ -1251,7 +1251,7 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::InvokeDecisionCallbac
     }
 }
 
-void WebcamProtector::WebcamProtectorImpl::InvokeErrorCallbacks(
+void WebcamProtectorImpl::InvokeErrorCallbacks(
     const std::string& message,
     int code)
 {
@@ -1269,7 +1269,7 @@ void WebcamProtector::WebcamProtectorImpl::InvokeErrorCallbacks(
 // IMPL: COOLDOWN
 // ============================================================================
 
-bool WebcamProtector::WebcamProtectorImpl::IsInCooldown(uint32_t processId) {
+bool WebcamProtectorImpl::IsInCooldown(uint32_t processId) {
     std::lock_guard lock(m_cooldownMutex);
 
     auto it = m_cooldownTracker.find(processId);
@@ -1283,7 +1283,7 @@ bool WebcamProtector::WebcamProtectorImpl::IsInCooldown(uint32_t processId) {
     return elapsed < WebcamConstants::ACCESS_COOLDOWN_MS;
 }
 
-void WebcamProtector::WebcamProtectorImpl::UpdateCooldown(uint32_t processId) {
+void WebcamProtectorImpl::UpdateCooldown(uint32_t processId) {
     std::lock_guard lock(m_cooldownMutex);
     m_cooldownTracker[processId] = SystemClock::now();
 

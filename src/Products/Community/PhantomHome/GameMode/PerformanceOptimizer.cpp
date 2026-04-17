@@ -1212,7 +1212,7 @@ PerformanceOptimizer::~PerformanceOptimizer() {
         m_impl->m_config = config;
 
         // PO-M3: Enable SeDebugPrivilege for cross-process operations
-        if (!EnablePrivilege(SE_DEBUG_NAME)) {
+        if (!EnablePrivilege(L"SeDebugPrivilege")) {
             Utils::Logger::Warn("Failed to enable SE_DEBUG_NAME privilege; "
                                 "some cross-process operations may fail");
         }
@@ -1997,7 +1997,7 @@ void PerformanceOptimizer::FlushCaches() {
         Utils::Logger::Info("Flushing system caches");
 
         // Attempt to enable SE_INCREASE_QUOTA_NAME privilege
-        bool hasPrivilege = EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+        bool hasPrivilege = EnablePrivilege(L"SeIncreaseQuotaPrivilege");
 
         if (hasPrivilege) {
             // Use SetSystemFileCacheSize to flush standby page list.

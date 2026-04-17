@@ -25,7 +25,7 @@
 #include <iomanip>
 #include <chrono>
 #include <exception>
-#include "../../src/Utils/Logger.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
 
 using namespace ShadowStrike::Utils;
 
