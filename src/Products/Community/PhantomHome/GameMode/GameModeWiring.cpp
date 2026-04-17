@@ -31,6 +31,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "GameModeManager.hpp"
 #include "GameProcessDetector.hpp"
 #include "OverlayProtection.hpp"
