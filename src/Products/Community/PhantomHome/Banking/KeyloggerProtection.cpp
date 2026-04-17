@@ -55,6 +55,8 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <shlwapi.h>
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -290,7 +292,7 @@ std::string ClipboardThreatInfo::ToJson() const {
     return oss.str();
 }
 
-std::string ProtectedWindowInfo::ToJson() const {
+std::string KeyloggerProtectedWindow::ToJson() const {
     std::ostringstream oss;
     oss << "{"
         << "\"windowHandle\":" << windowHandle << ","
@@ -547,7 +549,7 @@ public:
             }
         }
 
-        ProtectedWindowInfo info{};
+        KeyloggerProtectedWindow info{};
         info.windowHandle = windowHandle;
 
         wchar_t title[256]{};
@@ -562,7 +564,7 @@ public:
         ::GetWindowThreadProcessId(hwnd, &pid);
         info.processId = pid;
 
-        auto procName = Utils::GetProcessName(static_cast<Utils::ProcessId>(pid));
+        auto procName = Utils::ProcessUtils::GetProcessName(static_cast<Utils::ProcessUtils::ProcessId>(pid));
         if (procName.has_value()) {
             info.processName = procName.value();
         }
@@ -577,7 +579,7 @@ public:
 
         // Insert or update (keyed by window handle)
         auto it = std::find_if(m_protectedWindows.begin(), m_protectedWindows.end(),
-            [windowHandle](const ProtectedWindowInfo& p) {
+            [windowHandle](const KeyloggerProtectedWindow& p) {
                 return p.windowHandle == windowHandle;
             });
         if (it != m_protectedWindows.end()) {
@@ -600,7 +602,7 @@ public:
         }
 
         auto it = std::remove_if(m_protectedWindows.begin(), m_protectedWindows.end(),
-            [windowHandle](const ProtectedWindowInfo& p) {
+            [windowHandle](const KeyloggerProtectedWindow& p) {
                 return p.windowHandle == windowHandle;
             });
         if (it != m_protectedWindows.end()) {
@@ -767,8 +769,8 @@ public:
                 // Classify the threat
                 ClassifySuspiciousProcess(pe32.th32ProcessID, exeName, event);
 
-                auto procPath = Utils::GetProcessPath(
-                    static_cast<Utils::ProcessId>(pe32.th32ProcessID));
+                auto procPath = Utils::ProcessUtils::GetProcessPath(
+                    static_cast<Utils::ProcessUtils::ProcessId>(pe32.th32ProcessID));
                 if (procPath.has_value()) {
                     event.processPath = procPath.value();
                 }
@@ -1002,9 +1004,9 @@ public:
             info.detectionTime = Now();
             info.confidence = 0.75;
 
-            auto procName = Utils::GetProcessName(static_cast<Utils::ProcessId>(processId));
+            auto procName = Utils::ProcessUtils::GetProcessName(static_cast<Utils::ProcessUtils::ProcessId>(processId));
             if (procName.has_value()) info.processName = procName.value();
-            auto procPath = Utils::GetProcessPath(static_cast<Utils::ProcessId>(processId));
+            auto procPath = Utils::ProcessUtils::GetProcessPath(static_cast<Utils::ProcessUtils::ProcessId>(processId));
             if (procPath.has_value()) info.processPath = procPath.value();
 
             hooks.push_back(std::move(info));
@@ -1096,8 +1098,8 @@ public:
             return false;
         }
 
-        Utils::ProcessHandle hProcess(
-            static_cast<Utils::ProcessId>(processId), PROCESS_TERMINATE);
+        Utils::ProcessUtils::ProcessHandle hProcess(
+            static_cast<Utils::ProcessUtils::ProcessId>(processId), PROCESS_TERMINATE);
         if (!hProcess.IsValid()) {
             SS_LOG_ERROR(LOG_CATEGORY,
                          L"TerminateKeylogger: OpenProcess failed for PID=%u, error=%lu",
@@ -1105,7 +1107,7 @@ public:
             return false;
         }
 
-        auto procName = Utils::GetProcessName(static_cast<Utils::ProcessId>(processId));
+        auto procName = Utils::ProcessUtils::GetProcessName(static_cast<Utils::ProcessUtils::ProcessId>(processId));
         if (!::TerminateProcess(hProcess.Get(), 1)) {
             SS_LOG_ERROR(LOG_CATEGORY,
                          L"TerminateKeylogger: TerminateProcess failed for PID=%u (%s), error=%lu",
@@ -1122,7 +1124,7 @@ public:
     }
 
     bool RemovePersistence(uint32_t processId) {
-        auto procPath = Utils::GetProcessPath(static_cast<Utils::ProcessId>(processId));
+        auto procPath = Utils::ProcessUtils::GetProcessPath(static_cast<Utils::ProcessUtils::ProcessId>(processId));
         if (!procPath.has_value()) {
             SS_LOG_WARN(LOG_CATEGORY,
                         L"RemovePersistence: could not resolve path for PID=%u", processId);
@@ -1152,7 +1154,7 @@ public:
         if (m_whitelistedPids.count(processId) > 0) return true;
 
         // Check configured whitelist by process name
-        auto procName = Utils::GetProcessName(static_cast<Utils::ProcessId>(processId));
+        auto procName = Utils::ProcessUtils::GetProcessName(static_cast<Utils::ProcessUtils::ProcessId>(processId));
         if (procName.has_value()) {
             for (const auto& wp : m_config.whitelistedProcesses) {
                 if (_wcsicmp(procName.value().c_str(), wp.c_str()) == 0) return true;
@@ -1160,7 +1162,7 @@ public:
         }
 
         // Check path whitelist
-        auto procPath = Utils::GetProcessPath(static_cast<Utils::ProcessId>(processId));
+        auto procPath = Utils::ProcessUtils::GetProcessPath(static_cast<Utils::ProcessUtils::ProcessId>(processId));
         if (procPath.has_value()) {
             for (const auto& path : m_whitelistedPaths) {
                 if (_wcsicmp(procPath.value().c_str(), path.c_str()) == 0) return true;
@@ -1257,7 +1259,7 @@ public:
         SS_LOG_DEBUG(LOG_CATEGORY, L"Statistics reset");
     }
 
-    [[nodiscard]] std::vector<ProtectedWindowInfo> GetProtectedWindows() const {
+    [[nodiscard]] std::vector<KeyloggerProtectedWindow> GetProtectedWindows() const {
         std::shared_lock lock(m_mutex);
         return m_protectedWindows;
     }
@@ -1300,7 +1302,7 @@ public:
 
         // 3. Verify we can read our own process info
         DWORD ownPid = ::GetCurrentProcessId();
-        auto ownName = Utils::GetProcessName(static_cast<Utils::ProcessId>(ownPid));
+        auto ownName = Utils::ProcessUtils::GetProcessName(static_cast<Utils::ProcessUtils::ProcessId>(ownPid));
         if (!ownName.has_value()) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Self-test FAILED: cannot resolve own process name");
             return false;
@@ -1472,7 +1474,7 @@ private:
 
     std::thread m_monitorThread;
 
-    std::vector<ProtectedWindowInfo> m_protectedWindows;
+    std::vector<KeyloggerProtectedWindow> m_protectedWindows;
     std::set<uint32_t> m_whitelistedPids;
     std::set<std::wstring, std::less<>> m_whitelistedPaths;
 
@@ -1580,7 +1582,7 @@ bool KeyloggerProtection::IsSecureInputActive() const noexcept {
     return !m_impl->GetProtectedWindows().empty();
 }
 
-std::vector<ProtectedWindowInfo> KeyloggerProtection::GetProtectedWindows() const {
+std::vector<KeyloggerProtectedWindow> KeyloggerProtection::GetProtectedWindows() const {
     return m_impl->GetProtectedWindows();
 }
 
@@ -1648,11 +1650,11 @@ KeyloggerDetectionEvent KeyloggerProtection::ScanProcess(uint32_t processId) {
     event.processId = processId;
     event.detectionTime = Now();
 
-    auto procName = Utils::GetProcessName(static_cast<Utils::ProcessId>(processId));
+    auto procName = Utils::ProcessUtils::GetProcessName(static_cast<Utils::ProcessUtils::ProcessId>(processId));
     if (procName.has_value()) {
         event.processName = procName.value();
     }
-    auto procPath = Utils::GetProcessPath(static_cast<Utils::ProcessId>(processId));
+    auto procPath = Utils::ProcessUtils::GetProcessPath(static_cast<Utils::ProcessUtils::ProcessId>(processId));
     if (procPath.has_value()) {
         event.processPath = procPath.value();
     }
@@ -1708,7 +1710,7 @@ bool KeyloggerProtection::TerminateKeylogger(uint32_t processId) {
 
 bool KeyloggerProtection::QuarantineKeylogger(uint32_t processId) {
     // Quarantine = terminate + remove persistence + log for forensics
-    auto procPath = Utils::GetProcessPath(static_cast<Utils::ProcessId>(processId));
+    auto procPath = Utils::ProcessUtils::GetProcessPath(static_cast<Utils::ProcessUtils::ProcessId>(processId));
     bool terminated = m_impl->TerminateKeylogger(processId);
     bool cleaned = m_impl->RemovePersistence(processId);
 

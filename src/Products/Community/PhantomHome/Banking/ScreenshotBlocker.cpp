@@ -281,7 +281,7 @@ namespace ShadowStrike::Banking {
             }
 
             WindowProtectionCallback callbackCopy;
-            ProtectedWindowInfo info;
+            ScreenshotProtectedWindow info;
 
             if (success) {
                 info.hwnd = hwnd;
@@ -294,7 +294,7 @@ namespace ShadowStrike::Banking {
                 ::GetWindowThreadProcessId(nativeHwnd, &pid);
                 info.processId = pid;
 
-                if (auto name = ProcessUtils::GetProcessName(pid)) {
+                if (auto name = Utils::ProcessUtils::GetProcessName(pid)) {
                     info.processName = *name;
                 }
 
@@ -343,7 +343,7 @@ namespace ShadowStrike::Banking {
                 ::SetWindowDisplayAffinity(nativeHwnd, WDA_NONE);
             }
 
-            ProtectedWindowInfo info = it->second;
+            ScreenshotProtectedWindow info = it->second;
             m_protectedWindows.erase(it);
 
             if (m_stats.currentlyProtected.load(std::memory_order_relaxed) > 0) {
@@ -369,7 +369,7 @@ namespace ShadowStrike::Banking {
             return m_protectedWindows.count(hwnd) > 0;
         }
 
-        [[nodiscard]] std::optional<ProtectedWindowInfo> GetWindowInfo(WindowHandle hwnd) const {
+        [[nodiscard]] std::optional<ScreenshotProtectedWindow> GetWindowInfo(WindowHandle hwnd) const {
             std::shared_lock lock(m_mutex);
             auto it = m_protectedWindows.find(hwnd);
             if (it != m_protectedWindows.end()) {
@@ -469,7 +469,7 @@ namespace ShadowStrike::Banking {
         }
 
         [[nodiscard]] bool IsWhitelisted(uint32_t processId) const {
-            auto procName = ProcessUtils::GetProcessName(processId);
+            auto procName = Utils::ProcessUtils::GetProcessName(processId);
             if (!procName) {
                 return false;
             }
@@ -483,7 +483,7 @@ namespace ShadowStrike::Banking {
             }
 
             // Also check by full path
-            auto procPath = ProcessUtils::GetProcessPath(processId);
+            auto procPath = Utils::ProcessUtils::GetProcessPath(processId);
             if (procPath && m_whitelistedApps.count(*procPath) > 0) {
                 return true;
             }
@@ -603,9 +603,9 @@ namespace ShadowStrike::Banking {
             SS_LOG_INFO(L"ScreenshotBlocker", L"Statistics reset");
         }
 
-        [[nodiscard]] std::vector<ProtectedWindowInfo> GetProtectedWindows() const {
+        [[nodiscard]] std::vector<ScreenshotProtectedWindow> GetProtectedWindows() const {
             std::shared_lock lock(m_mutex);
-            std::vector<ProtectedWindowInfo> windows;
+            std::vector<ScreenshotProtectedWindow> windows;
             windows.reserve(m_protectedWindows.size());
             for (const auto& [hwnd, info] : m_protectedWindows) {
                 windows.push_back(info);
@@ -734,7 +734,7 @@ namespace ShadowStrike::Banking {
         ScreenshotBlockerConfiguration m_config;
         ModuleStatus m_status = ModuleStatus::Uninitialized;
 
-        std::unordered_map<WindowHandle, ProtectedWindowInfo> m_protectedWindows;
+        std::unordered_map<WindowHandle, ScreenshotProtectedWindow> m_protectedWindows;
         std::unordered_set<std::wstring> m_whitelistedApps;
         std::unordered_set<std::wstring> m_whitelistedProcesses;
         std::unordered_set<std::wstring> m_blockedApplications;
@@ -966,11 +966,11 @@ namespace ShadowStrike::Banking {
         return info ? info->status : ProtectionStatus::Unprotected;
     }
 
-    std::optional<ProtectedWindowInfo> ScreenshotBlocker::GetProtectedWindowInfo(WindowHandle hwnd) const {
+    std::optional<ScreenshotProtectedWindow> ScreenshotBlocker::GetProtectedWindowInfo(WindowHandle hwnd) const {
         return m_impl->GetWindowInfo(hwnd);
     }
 
-    std::vector<ProtectedWindowInfo> ScreenshotBlocker::GetProtectedWindows() const {
+    std::vector<ScreenshotProtectedWindow> ScreenshotBlocker::GetProtectedWindows() const {
         return m_impl->GetProtectedWindows();
     }
 
@@ -1184,7 +1184,7 @@ namespace ShadowStrike::Banking {
     // SERIALIZATION
     // ========================================================================
 
-    std::string ProtectedWindowInfo::ToJson() const {
+    std::string ScreenshotProtectedWindow::ToJson() const {
         nlohmann::json j;
         j["hwnd"] = static_cast<uint64_t>(hwnd);
         j["pid"] = processId;

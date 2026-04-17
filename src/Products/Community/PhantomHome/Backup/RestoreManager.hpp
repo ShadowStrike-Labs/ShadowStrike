@@ -483,6 +483,38 @@ struct RestoreStatistics {
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
+
+    struct Snapshot {
+        uint64_t totalRestores{0};
+        uint64_t successfulRestores{0};
+        uint64_t failedRestores{0};
+        uint64_t totalFilesRestored{0};
+        uint64_t totalBytesRestored{0};
+        uint64_t conflictsResolved{0};
+        uint64_t filesSkipped{0};
+        uint64_t aclsRestored{0};
+        uint64_t verificationsPerformed{0};
+        uint64_t rollbacksPerformed{0};
+        TimePoint startTime{Clock::now()};
+
+        [[nodiscard]] std::string ToJson() const;
+    };
+
+    [[nodiscard]] Snapshot TakeSnapshot() const noexcept {
+        Snapshot s;
+        s.totalRestores = totalRestores.load(std::memory_order_relaxed);
+        s.successfulRestores = successfulRestores.load(std::memory_order_relaxed);
+        s.failedRestores = failedRestores.load(std::memory_order_relaxed);
+        s.totalFilesRestored = totalFilesRestored.load(std::memory_order_relaxed);
+        s.totalBytesRestored = totalBytesRestored.load(std::memory_order_relaxed);
+        s.conflictsResolved = conflictsResolved.load(std::memory_order_relaxed);
+        s.filesSkipped = filesSkipped.load(std::memory_order_relaxed);
+        s.aclsRestored = aclsRestored.load(std::memory_order_relaxed);
+        s.verificationsPerformed = verificationsPerformed.load(std::memory_order_relaxed);
+        s.rollbacksPerformed = rollbacksPerformed.load(std::memory_order_relaxed);
+        s.startTime = startTime;
+        return s;
+    }
 };
 
 // ============================================================================
@@ -645,7 +677,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] RestoreStatistics GetStatistics() const;
+    [[nodiscard]] RestoreStatistics::Snapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

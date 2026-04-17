@@ -276,6 +276,8 @@ enum class BlockingResult : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
+#define SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized           = 0,
     Initializing            = 1,
@@ -285,6 +287,7 @@ enum class ModuleStatus : uint8_t {
     Stopped                 = 5,
     Error                   = 6
 };
+#endif  // SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -293,7 +296,7 @@ enum class ModuleStatus : uint8_t {
 /**
  * @brief Protected window info
  */
-struct ProtectedWindowInfo {
+struct ScreenshotProtectedWindow {
     /// @brief Window handle
     WindowHandle hwnd = 0;
 
@@ -572,7 +575,7 @@ struct ScreenshotBlockerConfiguration {
 using CaptureAttemptCallback = std::function<void(const CaptureAttemptEvent&)>;
 
 /// @brief Window protection callback
-using WindowProtectionCallback = std::function<void(const ProtectedWindowInfo&, bool protected_)>;
+using WindowProtectionCallback = std::function<void(const ScreenshotProtectedWindow&, bool protected_)>;
 
 /// @brief Error callback
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
@@ -720,13 +723,13 @@ public:
     /**
      * @brief Get protected window info
      */
-    [[nodiscard]] std::optional<ProtectedWindowInfo> GetProtectedWindowInfo(
+    [[nodiscard]] std::optional<ScreenshotProtectedWindow> GetProtectedWindowInfo(
         WindowHandle hwnd) const;
 
     /**
      * @brief Get all protected windows
      */
-    [[nodiscard]] std::vector<ProtectedWindowInfo> GetProtectedWindows() const;
+    [[nodiscard]] std::vector<ScreenshotProtectedWindow> GetProtectedWindows() const;
 
     /**
      * @brief Protect all windows of process
@@ -939,6 +942,8 @@ private:
     // ========================================================================
 
     std::unique_ptr<ScreenshotBlockerImpl> m_impl;
+
+    friend class ScreenshotBlockerImpl;
 
     // ========================================================================
     // STATIC INSTANCE FLAG

@@ -1941,8 +1941,8 @@ void BackupManager::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-BackupStatistics BackupManager::GetStatistics() const {
-    BackupStatistics s;
+BackupStatistics::Snapshot BackupManager::GetStatistics() const {
+    BackupStatistics::Snapshot s;
     s.totalBackups = m_impl->m_stats.totalBackups.load(std::memory_order_relaxed);
     s.successfulBackups = m_impl->m_stats.successfulBackups.load(std::memory_order_relaxed);
     s.failedBackups = m_impl->m_stats.failedBackups.load(std::memory_order_relaxed);

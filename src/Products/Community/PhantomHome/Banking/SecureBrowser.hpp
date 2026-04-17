@@ -321,6 +321,8 @@ enum class SecurityEventType : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
+#define SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -330,6 +332,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 5,
     Error           = 6
 };
+#endif  // SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -571,6 +574,34 @@ struct SessionStatistics {
      * @brief Serialize to JSON
      */
     [[nodiscard]] std::string ToJson() const;
+
+    SessionStatistics() = default;
+
+    SessionStatistics(const SessionStatistics& other) noexcept
+        : duration{other.duration},
+          blockedInjections{other.blockedInjections.load(std::memory_order_relaxed)},
+          blockedScreenshots{other.blockedScreenshots.load(std::memory_order_relaxed)},
+          blockedKeyloggers{other.blockedKeyloggers.load(std::memory_order_relaxed)},
+          blockedNetworkRequests{other.blockedNetworkRequests.load(std::memory_order_relaxed)},
+          integrityChecksPassed{other.integrityChecksPassed.load(std::memory_order_relaxed)},
+          integrityChecksFailed{other.integrityChecksFailed.load(std::memory_order_relaxed)},
+          pagesVisited{other.pagesVisited.load(std::memory_order_relaxed)},
+          wasCompromised{other.wasCompromised} {}
+
+    SessionStatistics& operator=(const SessionStatistics& other) noexcept {
+        if (this != &other) {
+            duration = other.duration;
+            blockedInjections.store(other.blockedInjections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blockedScreenshots.store(other.blockedScreenshots.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blockedKeyloggers.store(other.blockedKeyloggers.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blockedNetworkRequests.store(other.blockedNetworkRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            integrityChecksPassed.store(other.integrityChecksPassed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            integrityChecksFailed.store(other.integrityChecksFailed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            pagesVisited.store(other.pagesVisited.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            wasCompromised = other.wasCompromised;
+        }
+        return *this;
+    }
 };
 
 /**
@@ -607,6 +638,30 @@ struct SecureBrowserStatistics {
      * @brief Serialize to JSON
      */
     [[nodiscard]] std::string ToJson() const;
+
+    SecureBrowserStatistics() = default;
+
+    SecureBrowserStatistics(const SecureBrowserStatistics& other) noexcept
+        : totalSessions{other.totalSessions.load(std::memory_order_relaxed)},
+          activeSessions{other.activeSessions.load(std::memory_order_relaxed)},
+          totalSecurityEvents{other.totalSecurityEvents.load(std::memory_order_relaxed)},
+          blockedInjections{other.blockedInjections.load(std::memory_order_relaxed)},
+          compromisedSessions{other.compromisedSessions.load(std::memory_order_relaxed)},
+          avgSessionDurationSecs{other.avgSessionDurationSecs.load(std::memory_order_relaxed)},
+          startTime{other.startTime} {}
+
+    SecureBrowserStatistics& operator=(const SecureBrowserStatistics& other) noexcept {
+        if (this != &other) {
+            totalSessions.store(other.totalSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            activeSessions.store(other.activeSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalSecurityEvents.store(other.totalSecurityEvents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blockedInjections.store(other.blockedInjections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            compromisedSessions.store(other.compromisedSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            avgSessionDurationSecs.store(other.avgSessionDurationSecs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
 };
 
 /**
