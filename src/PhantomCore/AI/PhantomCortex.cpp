@@ -104,7 +104,7 @@ namespace {
     constexpr size_t kModelOutputClasses[CortexConstants::MODEL_COUNT] = {
         1,      // Static — single probability (malicious)
         20,     // Behavioral — 20-class softmax (BehaviorCategory)
-        5,      // Memory — 5-class (MemoryThreatType)
+        4,      // Memory — 4-class (MemoryThreatType: Benign/Trojan/Ransomware/Spyware)
         8,      // Network — 8-class (NetworkThreatType)
         3       // Emulation — 3-class (Benign, Suspicious, Malicious)
     };
@@ -552,10 +552,11 @@ CortexVerdict PhantomCortex::AnalyzeBehavior(
         return MakeErrorVerdict(kSource, L"Feature vector dimension mismatch");
     }
 
-    // ---- Model inference ----
-    const std::array<int64_t, 2> shape = {
+    // ---- Model inference (3D tensor: [batch=1, seq_len=512, feat_dim=4]) ----
+    const std::array<int64_t, 3> shape = {
         1,
-        static_cast<int64_t>(CortexConstants::BEHAVIORAL_FEATURE_COUNT)
+        static_cast<int64_t>(CortexConstants::BEHAVIORAL_SEQ_LENGTH),
+        static_cast<int64_t>(CortexConstants::BEHAVIORAL_FEATURES_PER_STEP)
     };
 
     auto output = ModelInference::Instance().Infer(
@@ -677,13 +678,13 @@ CortexVerdict PhantomCortex::AnalyzeMemory(
         return MakeErrorVerdict(kSource, L"Model inference failed");
     }
 
-    // ---- Interpret: 5-class output → MemoryThreatType ----
+    // ---- Interpret: 4-class output → MemoryThreatType ----
     const auto argmax = FindArgMax(
         std::span<const float>(output->data(), kModelOutputClasses[static_cast<size_t>(kSource)]));
 
     const float confidence = ClampProbability(argmax.value);
     const auto threatType = static_cast<MemoryThreatType>(
-        std::min(argmax.index, static_cast<size_t>(4)));
+        std::min(argmax.index, static_cast<size_t>(3)));
 
     const float threshold = GetThresholdForModel(m_impl->config, kSource);
 
@@ -857,10 +858,11 @@ CortexVerdict PhantomCortex::AnalyzeEmulationTrace(
         return MakeErrorVerdict(kSource, L"Feature vector dimension mismatch");
     }
 
-    // ---- Model inference ----
-    const std::array<int64_t, 2> shape = {
+    // ---- Model inference (3D tensor: [batch=1, seq_len=1024, feat_dim=4]) ----
+    const std::array<int64_t, 3> shape = {
         1,
-        static_cast<int64_t>(CortexConstants::EMULATION_FEATURE_COUNT)
+        static_cast<int64_t>(CortexConstants::EMULATION_SEQ_LENGTH),
+        static_cast<int64_t>(CortexConstants::EMULATION_FEATURES_PER_STEP)
     };
 
     auto output = ModelInference::Instance().Infer(
