@@ -28,6 +28,8 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.utils.data
+from torch.utils.data import DataLoader, TensorDataset
 
 from PhantomCortex.training.data.network_generator import (
     CLASS_NAMES,
@@ -96,9 +98,10 @@ def run_training(
     checkpoint_every: int,
     opset: int,
     latent_dim: int,
-    dataset_mode: str = "real",
+    dataset_mode: str = "hybrid",
     unsw_data_dir: str | None = None,
     ae_pretrain_epochs: int = 50,
+    max_samples: int | None = None,
 ) -> None:
     """Execute the full Cortex-Network training pipeline.
 
@@ -116,6 +119,10 @@ def run_training(
         checkpoint_every: Checkpoint save frequency (epochs).
         opset: ONNX opset version.
         latent_dim: Autoencoder latent dimension.
+        dataset_mode: Data source mode (real/hybrid/synthetic).
+        unsw_data_dir: Path to UNSW-NB15 raw data.
+        ae_pretrain_epochs: AE pretraining epochs on Normal-only traffic.
+        max_samples: Cap on UNSW-NB15 samples (None = use all available).
     """
     run_start = time.monotonic()
     out_path = Path(output_dir)
@@ -131,13 +138,21 @@ def run_training(
     logger.info("=" * 70)
 
     # ---- Step 1: Load data ----
+    # Resolve max_samples: None means use all available data (pass a large cap)
+    _max_samples = max_samples if max_samples is not None else 10_000_000
+
     if dataset_mode == "real":
-        logger.info("[1/4] Loading UNSW-NB15 real network data...")
+        logger.info("[1/5] Loading UNSW-NB15 real network data...")
+        logger.warning(
+            "  WARNING: 'real' mode only provides 5 of 8 classes from UNSW-NB15. "
+            "Classes DGADomain/DNSTunnel/CryptoMining have no real data. "
+            "Consider --dataset-mode hybrid for full 8-class coverage."
+        )
         data_start = time.monotonic()
         X, y, unsw_meta = load_unsw_nb15(
             data_dir=unsw_data_dir,
             seed=seed,
-            max_samples=500_000,
+            max_samples=_max_samples,
             input_dim=FEATURE_DIM,
         )
         data_elapsed = time.monotonic() - data_start
@@ -158,12 +173,12 @@ def run_training(
             X_test, y_test, batch_size=batch_size, shuffle=False, num_workers=0,
         )
     elif dataset_mode == "hybrid":
-        logger.info("[1/4] Loading UNSW-NB15 + synthetic augmentation...")
+        logger.info("[1/5] Loading UNSW-NB15 + synthetic augmentation...")
         data_start = time.monotonic()
         X_real, y_real, unsw_meta = load_unsw_nb15(
             data_dir=unsw_data_dir,
             seed=seed,
-            max_samples=500_000,
+            max_samples=_max_samples,
             input_dim=FEATURE_DIM,
         )
         logger.info("  UNSW-NB15 real: %d samples", X_real.shape[0])
@@ -194,7 +209,7 @@ def run_training(
             X_test, y_test, batch_size=batch_size, shuffle=False, num_workers=0,
         )
     else:
-        logger.info("[1/4] Generating synthetic network flow data...")
+        logger.info("[1/5] Generating synthetic network flow data...")
         data_start = time.monotonic()
         split = generate_network_dataset(
             samples_per_class=samples_per_class,
@@ -213,10 +228,11 @@ def run_training(
         train_loader = split.train_loader
         val_loader = split.val_loader
         test_loader = split.test_loader
+        # For synthetic mode, we don't have raw X_train arrays
+        X_train = split.X_train
+        y_train = split.y_train
 
-    # ---- Step 2: Train ----
-    logger.info("[2/4] Training CortexNetworkNet (autoencoder + classifier)...")
-
+    # ---- Instantiate trainer ----
     trainer = CortexNetworkTrainer(
         input_dim=FEATURE_DIM,
         latent_dim=latent_dim,
@@ -228,6 +244,31 @@ def run_training(
         log_dir=log_dir,
     )
 
+    # ---- Step 2: AE Pretraining (Normal traffic only) ----
+    pretrained_model = None
+    if ae_pretrain_epochs > 0 and dataset_mode in ("real", "hybrid"):
+        logger.info("[2/5] Pretraining autoencoder on Normal traffic only...")
+        # Extract Normal-only subset (class 0) for unsupervised AE training
+        normal_mask = y_train == 0
+        X_normal = X_train[normal_mask]
+        logger.info("  Normal samples for AE pretraining: %d", X_normal.shape[0])
+
+        if X_normal.shape[0] > 0:
+            normal_tensor = torch.from_numpy(X_normal).float()
+            normal_dataset = TensorDataset(normal_tensor)
+            normal_loader = DataLoader(
+                normal_dataset, batch_size=batch_size, shuffle=True, num_workers=0,
+            )
+            pretrained_model = trainer.train_autoencoder(
+                normal_loader, epochs=ae_pretrain_epochs, grad_clip=grad_clip,
+            )
+            logger.info("  AE pretraining complete — reconstruction baseline established")
+        else:
+            logger.warning("  No Normal samples found — skipping AE pretraining")
+
+    # ---- Step 3: Joint Training ----
+    logger.info("[3/5] Training CortexNetworkNet (autoencoder + classifier)...")
+
     train_start = time.monotonic()
     model = trainer.train(
         train_loader,
@@ -237,13 +278,14 @@ def run_training(
         recon_weight=recon_weight,
         checkpoint_dir=str(checkpoint_dir),
         checkpoint_every=checkpoint_every,
+        pretrained_model=pretrained_model,
     )
     train_elapsed = time.monotonic() - train_start
 
     logger.info("  Training completed in %.2fs", train_elapsed)
 
-    # ---- Step 3: Evaluate ----
-    logger.info("[3/4] Evaluating on test set...")
+    # ---- Step 4: Evaluate ----
+    logger.info("[4/5] Evaluating on test set...")
 
     eval_start = time.monotonic()
     report = trainer.evaluate(model, test_loader)
@@ -270,8 +312,8 @@ def run_training(
 
     logger.info("  Confusion matrix:\n%s", report.confusion_matrix)
 
-    # ---- Step 4: Export ----
-    logger.info("[4/4] Exporting to ONNX...")
+    # ---- Step 5: Export ----
+    logger.info("[5/5] Exporting to ONNX...")
 
     trainer.export_onnx(model, onnx_path, opset=opset)
 
@@ -340,15 +382,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-mode",
         type=str,
-        default="real",
+        default="hybrid",
         choices=("synthetic", "real", "hybrid"),
-        help="Data source: 'real' uses UNSW-NB15, 'hybrid' adds synthetic augmentation.",
+        help=(
+            "Data source: 'hybrid' (default) uses UNSW-NB15 real data for classes 0-4 "
+            "plus synthetic backfill for DGADomain/DNSTunnel/CryptoMining. "
+            "'real' uses UNSW-NB15 only (WARNING: missing 3 of 8 classes). "
+            "'synthetic' uses only generated data."
+        ),
     )
     parser.add_argument(
         "--unsw-data-dir",
         type=str,
         default=None,
         help="UNSW-NB15 dataset directory (auto-detected if omitted).",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Cap UNSW-NB15 samples (0 = no cap, use full 2.2M). Default: no cap.",
     )
     parser.add_argument(
         "--ae-pretrain-epochs",
@@ -408,7 +461,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--gpu",
         action="store_true",
         default=False,
-        help="Use GPU if available",
+        help="Use GPU if available (deprecated: prefer --device cuda)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="PyTorch device (cpu/cuda). Overrides --gpu flag.",
     )
     parser.add_argument(
         "--output-dir",
@@ -440,7 +499,12 @@ def main() -> None:
     )
 
     args = _build_parser().parse_args()
-    device = _resolve_device(args.gpu)
+    if args.device is not None:
+        device = args.device
+    else:
+        device = _resolve_device(args.gpu)
+
+    max_samples = args.max_samples if args.max_samples > 0 else 10_000_000
 
     run_training(
         samples_per_class=args.samples_per_class,
@@ -459,6 +523,7 @@ def main() -> None:
         dataset_mode=args.dataset_mode,
         unsw_data_dir=args.unsw_data_dir,
         ae_pretrain_epochs=args.ae_pretrain_epochs,
+        max_samples=max_samples,
     )
 
 

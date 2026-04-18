@@ -30,13 +30,15 @@ import numpy as np
 import torch
 
 from PhantomCortex.training.data.memory_generator import (
-    CLASS_NAMES,
+    CLASS_NAMES as SYNTH_CLASS_NAMES,
     FEATURE_DIM,
-    NUM_CLASSES,
+    NUM_CLASSES as SYNTH_NUM_CLASSES,
     generate_memory_dataset,
 )
 from PhantomCortex.training.data.memory_external_loader import (
     load_memory_external_dataset,
+    NUM_CLASSES as REAL_NUM_CLASSES,
+    REAL_CLASS_NAMES,
 )
 from PhantomCortex.training.data.dataset_utils import (
     compute_class_weights,
@@ -96,6 +98,7 @@ def run_training(
     opset: int,
     dataset_mode: str = "real",
     memory_data_dir: str | None = None,
+    min_class_samples: int = 0,
 ) -> None:
     """Execute the full Cortex-Memory training pipeline.
 
@@ -126,16 +129,28 @@ def run_training(
     logger.info("=" * 70)
 
     # ---- Step 1: Load data ----
+    class_weights = None
+    active_class_names = SYNTH_CLASS_NAMES
+
     if dataset_mode == "real":
         logger.info("[1/4] Loading real memory forensics data (CIC-MalMem-2022 + MemMal-D2024)...")
+        active_class_names = REAL_CLASS_NAMES
         data_start = time.monotonic()
         raw_dir = memory_data_dir or str(
             Path(__file__).resolve().parent.parent / "data" / "raw"
         )
+
+        # Force fresh load (delete stale cache that may have different preprocessing)
+        stale_cache = Path(raw_dir) / "memory_external_combined.npz"
+        if stale_cache.exists():
+            logger.info("  Deleting stale cache: %s", stale_cache)
+            stale_cache.unlink()
+
         X, y, mem_meta = load_memory_external_dataset(
             data_dir=raw_dir,
             max_samples_per_class=samples_per_class,
             seed=seed,
+            cache=False,
         )
         data_elapsed = time.monotonic() - data_start
         logger.info(
@@ -143,7 +158,31 @@ def run_training(
             X.shape[0], X.shape[1], data_elapsed,
         )
 
+        # Class-aware oversampling for underrepresented classes
+        if min_class_samples > 0:
+            oversample_rng = np.random.default_rng(seed + 7)
+            unique_cls, counts = np.unique(y, return_counts=True)
+            parts_X: list[np.ndarray] = []
+            parts_y: list[np.ndarray] = []
+            for cls, cnt in zip(unique_cls, counts):
+                if cnt < min_class_samples:
+                    deficit = min_class_samples - cnt
+                    cls_idx = np.where(y == cls)[0]
+                    dup_idx = oversample_rng.choice(cls_idx, size=deficit, replace=True)
+                    parts_X.append(X[dup_idx])
+                    parts_y.append(y[dup_idx])
+                    cls_label = REAL_CLASS_NAMES[cls] if cls < len(REAL_CLASS_NAMES) else f"class_{cls}"
+                    logger.info("  Oversampled %s: %d -> %d", cls_label, cnt, min_class_samples)
+            if parts_X:
+                X = np.concatenate([X] + parts_X, axis=0)
+                y = np.concatenate([y] + parts_y, axis=0)
+                logger.info("  After oversampling: %d total samples", y.shape[0])
+
         (X_train, y_train), (X_val, y_val), (X_test, y_test) = split_data(X, y, seed=seed)
+
+        class_weights = compute_class_weights(y_train)
+        logger.info("  Class weights (inverse frequency): %s", class_weights.tolist())
+
         train_loader = create_dataloader(
             X_train, y_train, batch_size=batch_size, shuffle=True, num_workers=0,
         )
@@ -181,6 +220,25 @@ def run_training(
         data_elapsed = time.monotonic() - data_start
         logger.info("  Hybrid: %d total in %.2fs", y.shape[0], data_elapsed)
 
+        # Class-aware oversampling for underrepresented classes
+        if min_class_samples > 0:
+            oversample_rng = np.random.default_rng(seed + 7)
+            unique_cls, counts = np.unique(y, return_counts=True)
+            parts_X = []
+            parts_y = []
+            for cls, cnt in zip(unique_cls, counts):
+                if cnt < min_class_samples:
+                    deficit = min_class_samples - cnt
+                    cls_idx = np.where(y == cls)[0]
+                    dup_idx = oversample_rng.choice(cls_idx, size=deficit, replace=True)
+                    parts_X.append(X[dup_idx])
+                    parts_y.append(y[dup_idx])
+                    logger.info("  Oversampled class %d: %d -> %d", cls, cnt, min_class_samples)
+            if parts_X:
+                X = np.concatenate([X] + parts_X, axis=0)
+                y = np.concatenate([y] + parts_y, axis=0)
+                logger.info("  After oversampling: %d total", y.shape[0])
+
         (X_train, y_train), (X_val, y_val), (X_test, y_test) = split_data(X, y, seed=seed)
         train_loader = create_dataloader(
             X_train, y_train, batch_size=batch_size, shuffle=True, num_workers=0,
@@ -213,11 +271,12 @@ def run_training(
         test_loader = split.test_loader
 
     # ---- Step 2: Train ----
-    logger.info("[2/4] Training CortexMemoryNet...")
+    num_classes = REAL_NUM_CLASSES if dataset_mode in ("real", "hybrid") else SYNTH_NUM_CLASSES
+    logger.info("[2/4] Training CortexMemoryNet (%d classes)...", num_classes)
 
     trainer = CortexMemoryTrainer(
         input_dim=FEATURE_DIM,
-        num_classes=NUM_CLASSES,
+        num_classes=num_classes,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         device=device,
@@ -233,6 +292,7 @@ def run_training(
         grad_clip=grad_clip,
         checkpoint_dir=str(checkpoint_dir),
         checkpoint_every=checkpoint_every,
+        class_weights=class_weights,
     )
     train_elapsed = time.monotonic() - train_start
 
@@ -242,7 +302,10 @@ def run_training(
     logger.info("[3/4] Evaluating on test set...")
 
     eval_start = time.monotonic()
-    report = trainer.evaluate(model, test_loader)
+    report = trainer.evaluate(
+        model, test_loader,
+        class_names=active_class_names if dataset_mode in ("real", "hybrid") else None,
+    )
     eval_elapsed = time.monotonic() - eval_start
 
     logger.info("  Evaluation completed in %.2fs", eval_elapsed)
@@ -250,7 +313,7 @@ def run_training(
     logger.info("  Test macro-F1:  %.4f", report.macro_f1)
     logger.info("  Test loss:      %.6f", report.loss)
 
-    for cls_name in CLASS_NAMES:
+    for cls_name in active_class_names:
         f1 = report.per_class_f1.get(cls_name, 0.0)
         prec = report.per_class_precision.get(cls_name, 0.0)
         rec = report.per_class_recall.get(cls_name, 0.0)
@@ -276,7 +339,7 @@ def run_training(
         **report.to_dict(),
         "training_config": {
             "samples_per_class": samples_per_class,
-            "total_samples": samples_per_class * NUM_CLASSES,
+            "total_samples": int(len(y_train) + len(y_val) + len(y_test)) if dataset_mode in ("real", "hybrid") else samples_per_class * SYNTH_NUM_CLASSES,
             "epochs": epochs,
             "batch_size": batch_size,
             "learning_rate": learning_rate,
@@ -285,8 +348,9 @@ def run_training(
             "seed": seed,
             "device": device,
             "feature_dim": FEATURE_DIM,
-            "num_classes": NUM_CLASSES,
-            "class_names": CLASS_NAMES,
+            "num_classes": num_classes,
+            "class_names": active_class_names,
+            "dataset_mode": dataset_mode,
         },
         "timing": {
             "data_generation_sec": round(data_elapsed, 3),
@@ -402,6 +466,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=17,
         help="ONNX opset version for export",
     )
+    parser.add_argument(
+        "--min-class-samples",
+        type=int,
+        default=5000,
+        help="Minimum samples per class. Underrepresented classes are "
+             "oversampled (duplicated) to this threshold.",
+    )
     return parser
 
 
@@ -430,6 +501,7 @@ def main() -> None:
         opset=args.opset,
         dataset_mode=args.dataset_mode,
         memory_data_dir=args.memory_data_dir,
+        min_class_samples=args.min_class_samples,
     )
 
 

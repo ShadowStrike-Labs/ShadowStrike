@@ -399,12 +399,20 @@ class CortexMemoryTrainer:
         return total_loss / max(total, 1), correct / max(total, 1)
 
     @torch.no_grad()
-    def evaluate(self, model: nn.Module, test_loader: DataLoader) -> MetricsReport:
+    def evaluate(
+        self,
+        model: nn.Module,
+        test_loader: DataLoader,
+        *,
+        class_names: list[str] | None = None,
+    ) -> MetricsReport:
         """Evaluate model with per-class metrics and confusion matrix.
 
         Args:
             model: Trained CortexMemoryNet.
             test_loader: DataLoader yielding (X, y) batches.
+            class_names: Optional custom class names for labeling metrics.
+                         Defaults to MemoryRegionClass enum names.
 
         Returns:
             MetricsReport with detailed per-class breakdown.
@@ -440,7 +448,10 @@ class CortexMemoryTrainer:
         f1_scores: list[float] = []
 
         for cls_idx in range(self._num_classes):
-            cls_name = MemoryRegionClass(cls_idx).name
+            if class_names is not None:
+                cls_name = class_names[cls_idx]
+            else:
+                cls_name = MemoryRegionClass(cls_idx).name
             tp = int(cm[cls_idx, cls_idx])
             fp = int(cm[:, cls_idx].sum() - tp)
             fn = int(cm[cls_idx, :].sum() - tp)

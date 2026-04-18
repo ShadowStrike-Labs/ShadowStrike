@@ -144,6 +144,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"HPO timeout in seconds (default: {DEFAULT_HPO_TIMEOUT}).",
     )
     parser.add_argument(
+        "--hpo-max-samples",
+        type=int,
+        default=1_000_000,
+        help=(
+            "Maximum samples for HPO cross-validation (stratified subsample). "
+            "EMBER 2024 full dataset (3.7M) exceeds 32GB RAM for CV folds. "
+            "1M samples provides statistically equivalent HPO results. "
+            "Final model trains on the full dataset. (default: 1000000)."
+        ),
+    )
+    parser.add_argument(
         "--params",
         type=str,
         default=None,
@@ -205,6 +216,27 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip INT8 quantization step.",
     )
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=1_000_000,
+        help=(
+            "Training samples for HPO phase. EMBER 2024 (48GB float32) exceeds "
+            "31GB RAM for cross-validation. 1M is optimal for HPO. "
+            "Set to 0 for no limit. (default: 1000000)."
+        ),
+    )
+    parser.add_argument(
+        "--final-train-samples",
+        type=int,
+        default=2_000_000,
+        help=(
+            "Training samples for FINAL model (after HPO). After HPO completes, "
+            "memory is freed and data reloaded with this larger budget. "
+            "This maximizes final model quality within hardware constraints. "
+            "Set to 0 to reuse HPO data. (default: 2000000)."
+        ),
+    )
 
     return parser
 
@@ -232,9 +264,14 @@ def _load_data(
     if args.dataset == "ember2024-pe":
         from PhantomCortex.training.data.ember2024_loader import load_ember2024
 
+        max_train = getattr(args, "max_train_samples", 0)
+        # Test set capped at 200K (2.1GB) — sufficient for evaluation, preserves RAM
+        max_test = min(200_000, 0) if max_train == 0 else 200_000
         X_train, y_train, X_test, y_test = load_ember2024(
             data_dir=args.data_dir,
             download=not args.no_download,
+            max_train_samples=max_train,
+            max_test_samples=max_test,
         )
     else:
         from PhantomCortex.training.data.ember_loader import load_ember
@@ -295,17 +332,43 @@ def _run_hpo(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     """Stage 2: Bayesian hyperparameter optimisation via Optuna."""
+    # Subsample for HPO if dataset exceeds memory budget for CV folds.
+    # EMBER 2024 full (3.74M × 2568 × float32) = 35.8GB per fold — exceeds 32GB RAM.
+    # 1M stratified subsample provides equivalent HPO signal.
+    hpo_max = getattr(args, "hpo_max_samples", 1_000_000)
+    if X_train.shape[0] > hpo_max:
+        log.info(
+            "stage.hpo.subsample",
+            original_samples=X_train.shape[0],
+            subsample_size=hpo_max,
+            reason="memory_budget_cv_folds",
+        )
+        from sklearn.model_selection import StratifiedShuffleSplit
+
+        sss = StratifiedShuffleSplit(
+            n_splits=1,
+            train_size=hpo_max,
+            random_state=args.seed,
+        )
+        idx, _ = next(sss.split(X_train, y_train))
+        X_hpo = X_train[idx]
+        y_hpo = y_train[idx]
+    else:
+        X_hpo = X_train
+        y_hpo = y_train
+
     log.info(
         "stage.hpo.start",
         trials=args.hpo_trials,
         cv_folds=args.hpo_cv_folds,
         timeout_sec=args.hpo_timeout,
+        hpo_samples=X_hpo.shape[0],
     )
     t0 = time.monotonic()
 
     best_params = trainer.optimize_hyperparams(
-        X_train,
-        y_train,
+        X_hpo,
+        y_hpo,
         n_trials=args.hpo_trials,
         cv_folds=args.hpo_cv_folds,
         timeout=args.hpo_timeout,
@@ -557,6 +620,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     # ---- 1. Load data -----------------------------------------------------
+    # Two-phase memory strategy for large datasets (EMBER 2024 = 48GB float32):
+    #   Phase A: Load subsampled data for HPO (HPO doesn't need full dataset)
+    #   Phase B: Reload maximum feasible data for final model training
+    # This ensures we maximize training data within 31GB RAM constraints.
     X_train_full, y_train_full, X_test, y_test = _load_data(args)
     feature_count = int(X_train_full.shape[1])
 
@@ -583,6 +650,44 @@ def main(argv: list[str] | None = None) -> None:
         if hpo_params is not None:
             optuna_best.update(hpo_params)
         hpo_params = optuna_best
+
+    # ---- 3b. Reload larger dataset for final training if needed -----------
+    # After HPO completes, free HPO memory and reload with more samples
+    # for the final model. HPO found good params on 500K; now train on max.
+    max_train = getattr(args, "max_train_samples", 0)
+    final_train_samples = getattr(args, "final_train_samples", 0)
+    if final_train_samples > 0 and final_train_samples > max_train:
+        log.info(
+            "stage.reload_for_final_training",
+            hpo_samples=X_train_full.shape[0],
+            final_samples=final_train_samples,
+            reason="maximize_data_for_production_model",
+        )
+        # Free current training data to make room
+        del X_train_full, y_train_full
+        import gc
+        gc.collect()
+
+        # Reload with larger sample budget
+        if args.dataset == "ember2024-pe":
+            from PhantomCortex.training.data.ember2024_loader import load_ember2024
+            X_train_full, y_train_full, _, _ = load_ember2024(
+                data_dir=args.data_dir,
+                download=False,
+                max_train_samples=final_train_samples,
+                max_test_samples=1,  # Don't reload test (already have it)
+            )
+        else:
+            from PhantomCortex.training.data.ember_loader import load_ember
+            X_train_full, y_train_full, _, _ = load_ember(
+                data_dir=args.data_dir,
+                download=False,
+                cache=not args.no_cache,
+            )
+        log.info(
+            "stage.reload_complete",
+            final_train_samples=X_train_full.shape[0],
+        )
 
     # ---- 4. Train/val split -----------------------------------------------
     X_tr, y_tr, X_val, y_val = _split_validation(

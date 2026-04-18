@@ -39,7 +39,16 @@ from numpy.typing import NDArray
 logger = logging.getLogger("PhantomCortex.Data.MemoryExternal")
 
 TARGET_DIM: int = 128
-NUM_CLASSES: int = 5
+# Real-data taxonomy: 4 classes (CIC-MalMem-2022 subtypes)
+# MemMal-D2024 malware is excluded because it has only binary labels
+# (benign/malware) without subtype information, causing class confusion.
+NUM_CLASSES: int = 4
+REAL_CLASS_NAMES: list[str] = [
+    "Benign",
+    "Trojan_Injector",
+    "Ransomware",
+    "Spyware",
+]
 
 _CIC_CATEGORY_MAP: dict[str, int] = {
     "Benign":                0,
@@ -239,38 +248,36 @@ def _load_cic_malmem_2022(data_dir: Path) -> tuple[NDArray, NDArray]:
 
 
 def _load_memmal_d2024(data_dir: Path) -> tuple[NDArray, NDArray]:
-    """Load MemMal-D2024 dataset (benign + malware CSVs)."""
-    benign_path = data_dir / "memmal_d2024" / "benign.csv"
-    malware_path = data_dir / "memmal_d2024" / "malware.csv"
+    """Load MemMal-D2024 dataset — benign samples only.
 
-    if not benign_path.exists() or not malware_path.exists():
+    MemMal-D2024 has binary labels (Benign / Malware) without malware
+    subtype information. Including its malware as "MalwareGeneric" causes
+    class confusion with CIC-MalMem-2022's labeled subtypes (Trojan,
+    Ransomware, Spyware) since the features are indistinguishable.
+
+    We use MemMal-D2024 benign samples to augment the Benign class.
+    """
+    benign_path = data_dir / "memmal_d2024" / "benign.csv"
+
+    if not benign_path.exists():
         raise FileNotFoundError(
             f"MemMal-D2024 not found at {data_dir / 'memmal_d2024'}. "
             "Download from https://github.com/mpasco/MemMal-D2024"
         )
 
-    logger.info("Loading MemMal-D2024 from %s", data_dir / "memmal_d2024")
+    logger.info("Loading MemMal-D2024 (benign only) from %s", data_dir / "memmal_d2024")
     benign_df = pd.read_csv(benign_path)
-    malware_df = pd.read_csv(malware_path)
 
-    # MemMal-D2024 has binary labels only (Benign / not-Benign)
-    # Assign: Benign→0, all Malware→4 (MalwareGeneric)
     feature_cols = [c for c in _VOLATILITY_FEATURES if c in benign_df.columns]
 
     X_b = benign_df[feature_cols].fillna(0).values.astype(np.float32)
     y_b = np.zeros(X_b.shape[0], dtype=np.int64)
 
-    X_m = malware_df[feature_cols].fillna(0).values.astype(np.float32)
-    y_m = np.full(X_m.shape[0], 4, dtype=np.int64)  # MalwareGeneric
-
-    X = np.concatenate([X_b, X_m], axis=0)
-    y = np.concatenate([y_b, y_m], axis=0)
-
     logger.info(
-        "MemMal-D2024: %d samples, %d features (benign=%d, malware=%d)",
-        X.shape[0], X.shape[1], X_b.shape[0], X_m.shape[0],
+        "MemMal-D2024: %d benign samples, %d features (malware excluded — binary labels only)",
+        X_b.shape[0], X_b.shape[1],
     )
-    return X, y
+    return X_b, y_b
 
 
 def load_memory_external_dataset(
