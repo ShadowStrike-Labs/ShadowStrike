@@ -272,7 +272,7 @@ public:
         const std::string& collectionId) const;
 
     // Callbacks
-    void SetProgressCallback(ProgressCallback callback);
+    void SetProgressCallback(CollectionProgressCallback callback);
     void SetEvidenceCallback(EvidenceCallback callback);
     void SetErrorCallback(ErrorCallback callback);
     void SetCompletionCallback(CompletionCallback callback);
@@ -319,7 +319,7 @@ private:
 
     // Callbacks
     mutable std::mutex m_callbackMutex;
-    ProgressCallback m_progressCallback;
+    CollectionProgressCallback m_progressCallback;
     EvidenceCallback m_evidenceCallback;
     ErrorCallback m_errorCallback;
     CompletionCallback m_completionCallback;
@@ -1142,7 +1142,7 @@ EvidenceCollectorImpl::VerifyCollectionIntegrity(const std::string& collectionId
 // CALLBACKS
 // ============================================================================
 
-void EvidenceCollectorImpl::SetProgressCallback(ProgressCallback callback) {
+void EvidenceCollectorImpl::SetProgressCallback(CollectionProgressCallback callback) {
     std::lock_guard lock(m_callbackMutex);
     m_progressCallback = std::move(callback);
 }
@@ -1731,7 +1731,7 @@ EvidenceCollector::VerifyCollectionIntegrity(const std::string& collectionId) co
     return m_impl->VerifyCollectionIntegrity(collectionId);
 }
 
-void EvidenceCollector::SetProgressCallback(ProgressCallback callback) {
+void EvidenceCollector::SetProgressCallback(CollectionProgressCallback callback) {
     m_impl->SetProgressCallback(std::move(callback));
 }
 
