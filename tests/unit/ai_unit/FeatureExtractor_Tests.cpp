@@ -184,7 +184,9 @@ TEST_F(FeatureExtractorTest, ExtractBehavioralFeaturesRejectsEmptyInput) {
 }
 
 TEST_F(FeatureExtractorTest, ExtractBehavioralFeaturesUsesMostRecentCallsAndNormalizesFields) {
-    std::vector<APICallRecord> calls(130);
+    // Send 514 calls so the extractor truncates to the most recent 512.
+    // With SEQ_LENGTH=512, startIdx = 514-512 = 2, so first slot = call[2].
+    std::vector<APICallRecord> calls(514);
     for (size_t i = 0; i < calls.size(); ++i) {
         calls[i].apiNameHash = static_cast<uint32_t>(1000 + i);
         calls[i].argSummaryHash = static_cast<uint32_t>(2000 + i);
@@ -199,16 +201,18 @@ TEST_F(FeatureExtractorTest, ExtractBehavioralFeaturesUsesMostRecentCallsAndNorm
     constexpr float kHashNorm = 1.0f / static_cast<float>(UINT32_MAX);
     constexpr float kRetNorm = 1.0f / static_cast<float>(INT32_MAX);
 
+    // First slot encodes call[2] (startIdx=2).
     EXPECT_NEAR((*features)[0], static_cast<float>(1002u) * kHashNorm, 1e-9f);
     EXPECT_NEAR((*features)[1], static_cast<float>(2002u) * kHashNorm, 1e-9f);
     EXPECT_NEAR((*features)[2], 2.0f * kRetNorm, 1e-9f);
     EXPECT_NEAR((*features)[3], std::log1pf(2.0f), 1e-6f);
 
-    const size_t lastBase = (128u - 1u) * 4u;
-    EXPECT_NEAR((*features)[lastBase + 0], static_cast<float>(1129u) * kHashNorm, 1e-9f);
-    EXPECT_NEAR((*features)[lastBase + 1], static_cast<float>(2129u) * kHashNorm, 1e-9f);
-    EXPECT_NEAR((*features)[lastBase + 2], 129.0f * kRetNorm, 1e-9f);
-    EXPECT_NEAR((*features)[lastBase + 3], std::log1pf(129.0f), 1e-6f);
+    // Last slot (index 511) encodes call[2+511] = call[513].
+    const size_t lastBase = (512u - 1u) * 4u;
+    EXPECT_NEAR((*features)[lastBase + 0], static_cast<float>(1513u) * kHashNorm, 1e-9f);
+    EXPECT_NEAR((*features)[lastBase + 1], static_cast<float>(2513u) * kHashNorm, 1e-9f);
+    EXPECT_NEAR((*features)[lastBase + 2], 513.0f * kRetNorm, 1e-9f);
+    EXPECT_NEAR((*features)[lastBase + 3], std::log1pf(513.0f), 1e-6f);
 }
 
 TEST_F(FeatureExtractorTest, ExtractBehavioralFeaturesClampsExtremeReturnValuesAndNegativeTimestamps) {
@@ -248,17 +252,19 @@ TEST_F(FeatureExtractorTest, ExtractMemoryFeaturesEncodesHeuristicsAndProtection
     ASSERT_TRUE(features.has_value());
     ASSERT_EQ(features->size(), CortexConstants::MEMORY_FEATURE_COUNT);
 
-    constexpr size_t kEntropyIndex = 32;
-    constexpr size_t kInstructionDensityIndex = 33;
-    constexpr size_t kNopSledIndex = 34;
-    constexpr size_t kNullRatioIndex = 35;
-    constexpr size_t kPrintableRatioIndex = 36;
-    constexpr size_t kAlignmentIndex = 37;
-    constexpr size_t kRopDensityIndex = 38;
-    constexpr size_t kReadFlagIndex = 40;
-    constexpr size_t kWriteFlagIndex = 41;
-    constexpr size_t kExecuteFlagIndex = 42;
-    constexpr size_t kGuardFlagIndex = 43;
+    // New layout: 16 compressed bins [0-15], then heuristics.
+    constexpr size_t kEntropyIndex = 16;
+    constexpr size_t kInstructionDensityIndex = 17;
+    constexpr size_t kNopSledIndex = 18;
+    constexpr size_t kNullRatioIndex = 19;
+    constexpr size_t kPrintableRatioIndex = 20;
+    constexpr size_t kAlignmentIndex = 21;
+    constexpr size_t kRopDensityIndex = 22;
+    // Index 23 = compression ratio, then protection flags.
+    constexpr size_t kReadFlagIndex = 24;
+    constexpr size_t kWriteFlagIndex = 25;
+    constexpr size_t kExecuteFlagIndex = 26;
+    constexpr size_t kGuardFlagIndex = 27;
 
     EXPECT_GT((*features)[kEntropyIndex], 0.0f);
     EXPECT_GT((*features)[kInstructionDensityIndex], 0.9f);
@@ -357,7 +363,9 @@ TEST_F(FeatureExtractorTest, ExtractEmulationFeaturesRejectsEmptyTrace) {
     EXPECT_FALSE(FeatureExtractor::Instance().ExtractEmulationFeatures({}).has_value());
 }
 
-TEST_F(FeatureExtractorTest, ExtractEmulationFeaturesBuildsHistogramsAndTemporalWindows) {
+TEST_F(FeatureExtractorTest, ExtractEmulationFeaturesBuildsSequenceEncoding) {
+    // Emulation v2 uses flat sequence encoding: 1024 steps × 4 features per step.
+    // Each event maps to [opcodeCat/15, memAccess/3, apiCallId/65535, eflags/255].
     const std::array<EmulationEvent, 4> events = {{
         {1, 0, 42, 0b00000011},
         {1, 1, 42, 0b00000010},
@@ -369,49 +377,63 @@ TEST_F(FeatureExtractorTest, ExtractEmulationFeaturesBuildsHistogramsAndTemporal
     ASSERT_TRUE(features.has_value());
     ASSERT_EQ(features->size(), CortexConstants::EMULATION_FEATURE_COUNT);
 
-    EXPECT_NEAR((*features)[1], 0.50f, 1e-6f);
-    EXPECT_NEAR((*features)[2], 0.25f, 1e-6f);
-    EXPECT_NEAR((*features)[3], 0.25f, 1e-6f);
+    constexpr float kOpNorm   = 1.0f / 15.0f;
+    constexpr float kMemNorm  = 1.0f / 3.0f;
+    constexpr float kApiNorm  = 1.0f / 65535.0f;
+    constexpr float kEfNorm   = 1.0f / 255.0f;
 
-    EXPECT_NEAR((*features)[16], 0.25f, 1e-6f);
-    EXPECT_NEAR((*features)[17], 0.50f, 1e-6f);
-    EXPECT_NEAR((*features)[19], 0.25f, 1e-6f);
+    // Event 0 at base=0
+    EXPECT_NEAR((*features)[0], 1.0f * kOpNorm,  1e-6f);
+    EXPECT_NEAR((*features)[1], 0.0f * kMemNorm, 1e-6f);
+    EXPECT_NEAR((*features)[2], 42.0f * kApiNorm, 1e-6f);
+    EXPECT_NEAR((*features)[3], 3.0f * kEfNorm,  1e-6f);
 
-    EXPECT_NEAR((*features)[20], 0.50f, 1e-6f);
-    EXPECT_NEAR((*features)[21], 0.25f, 1e-6f);
+    // Event 1 at base=4
+    EXPECT_NEAR((*features)[4], 1.0f * kOpNorm,  1e-6f);
+    EXPECT_NEAR((*features)[5], 1.0f * kMemNorm, 1e-6f);
+    EXPECT_NEAR((*features)[6], 42.0f * kApiNorm, 1e-6f);
+    EXPECT_NEAR((*features)[7], 2.0f * kEfNorm,  1e-6f);
 
-    constexpr size_t kEflagsOffset = 120;
-    EXPECT_NEAR((*features)[kEflagsOffset + 0], 0.25f, 1e-6f);
-    EXPECT_NEAR((*features)[kEflagsOffset + 1], 0.50f, 1e-6f);
-    EXPECT_NEAR((*features)[kEflagsOffset + 2], 0.25f, 1e-6f);
+    // Event 2 at base=8
+    EXPECT_NEAR((*features)[8],  2.0f * kOpNorm,  1e-6f);
+    EXPECT_NEAR((*features)[9],  1.0f * kMemNorm, 1e-6f);
+    EXPECT_NEAR((*features)[10], 7.0f * kApiNorm, 1e-6f);
+    EXPECT_NEAR((*features)[11], 4.0f * kEfNorm,  1e-6f);
 
-    const float ngramSum = std::accumulate(features->begin() + 128, features->begin() + 256, 0.0f);
-    EXPECT_GT(ngramSum, 0.0f);
+    // Event 3 at base=12
+    EXPECT_NEAR((*features)[12], 3.0f * kOpNorm,  1e-6f);
+    EXPECT_NEAR((*features)[13], 3.0f * kMemNorm, 1e-6f);
+    EXPECT_FLOAT_EQ((*features)[14], 0.0f);
+    EXPECT_FLOAT_EQ((*features)[15], 0.0f);
 
-    constexpr size_t kTemporalOffset = 256;
-    EXPECT_FLOAT_EQ((*features)[kTemporalOffset + 0], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[kTemporalOffset + 1], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[kTemporalOffset + 2], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[kTemporalOffset + 3], 1.0f);
+    // Beyond the 4 events, remaining features should be zero-padded.
+    EXPECT_FLOAT_EQ((*features)[16], 0.0f);
+    EXPECT_FLOAT_EQ((*features)[17], 0.0f);
+    EXPECT_FLOAT_EQ((*features)[CortexConstants::EMULATION_FEATURE_COUNT - 1], 0.0f);
 }
 
-TEST_F(FeatureExtractorTest, ExtractEmulationFeaturesWithSingleEventLeavesNgramsEmpty) {
+TEST_F(FeatureExtractorTest, ExtractEmulationFeaturesWithSingleEventPadsRemainder) {
     const std::array<EmulationEvent, 1> events = {{{15, 3, 99, 0b00000101}}};
 
     auto features = FeatureExtractor::Instance().ExtractEmulationFeatures(events);
     ASSERT_TRUE(features.has_value());
     ASSERT_EQ(features->size(), CortexConstants::EMULATION_FEATURE_COUNT);
 
-    EXPECT_FLOAT_EQ((*features)[15], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[16 + 3], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[20], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[120 + 0], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[120 + 2], 1.0f);
+    constexpr float kOpNorm  = 1.0f / 15.0f;
+    constexpr float kMemNorm = 1.0f / 3.0f;
+    constexpr float kApiNorm = 1.0f / 65535.0f;
+    constexpr float kEfNorm  = 1.0f / 255.0f;
 
-    const float ngramSum = std::accumulate(features->begin() + 128, features->begin() + 256, 0.0f);
-    EXPECT_FLOAT_EQ(ngramSum, 0.0f);
-    EXPECT_FLOAT_EQ((*features)[256], 1.0f);
-    EXPECT_FLOAT_EQ((*features)[257], 0.0f);
+    // Single event at base=0: opcodeCategory 15 saturates to 1.0, memAccess 3 → 1.0.
+    EXPECT_FLOAT_EQ((*features)[0], 15.0f * kOpNorm);  // 1.0
+    EXPECT_FLOAT_EQ((*features)[1], 3.0f * kMemNorm);   // 1.0
+    EXPECT_NEAR((*features)[2], 99.0f * kApiNorm, 1e-6f);
+    EXPECT_NEAR((*features)[3], 5.0f * kEfNorm, 1e-6f);
+
+    // All remaining slots are zero-padded.
+    EXPECT_FLOAT_EQ((*features)[4], 0.0f);
+    EXPECT_FLOAT_EQ((*features)[5], 0.0f);
+    EXPECT_FLOAT_EQ((*features)[CortexConstants::EMULATION_FEATURE_COUNT - 1], 0.0f);
 }
 
 }  // namespace ShadowStrike::AI::Test
