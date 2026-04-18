@@ -44,7 +44,7 @@ function Run-Training {
     param(
         [string]$Name,
         [string]$OutputDir,
-        [string[]]$Args
+        [string[]]$TrainArgs
     )
     $start = Get-Date
     Write-Log "Starting $Name training..."
@@ -55,7 +55,7 @@ function Run-Training {
     $stdErr = Join-Path $OutputDir "stderr.log"
 
     try {
-        $proc = Start-Process -FilePath $PythonExe -ArgumentList $Args `
+        $proc = Start-Process -FilePath $PythonExe -ArgumentList $TrainArgs `
             -WorkingDirectory $RepoRoot -NoNewWindow -PassThru -Wait `
             -RedirectStandardOutput $stdOut `
             -RedirectStandardError $stdErr
