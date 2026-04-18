@@ -43,6 +43,7 @@
 #include "../AI/PhantomCortex.hpp"
 
 #include <algorithm>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -58,9 +59,7 @@ namespace RealTime {
 // STATIC MEMBER INITIALIZATION
 // ============================================================================
 
-// Singleton instance is static local in Instance() method in C++11+,
-// but we follow the pattern if needed.
-// Using Meyer's Singleton as per CLAUDE.md, so no static member init needed here for instance.
+// Meyers' Singleton — static local in Instance() guarantees thread-safe init (C++11+).
 
 // ============================================================================
 // INTERNAL HELPERS
@@ -73,6 +72,153 @@ namespace {
 #else
     constexpr bool kFocusedUserModeBuild = false;
 #endif
+
+    thread_local std::unordered_map<const void*, size_t> g_createCallbackDispatchDepths;
+    thread_local std::unordered_map<const void*, size_t> g_terminateCallbackDispatchDepths;
+    thread_local std::unordered_map<const void*, size_t> g_suspiciousCallbackDispatchDepths;
+    thread_local size_t g_processHandlerDepth = 0;
+
+    template <typename CallbackT>
+    struct CallbackRegistration {
+        explicit CallbackRegistration(CallbackT cb)
+            : callback(std::move(cb)) {}
+
+        CallbackT callback;
+        mutable std::mutex dispatchMutex;
+        std::condition_variable dispatchCv;
+        size_t inFlight = 0;
+        bool active = true;
+    };
+
+    template <typename CallbackMap>
+    [[nodiscard]] auto SnapshotCallbacks(const CallbackMap& callbacks, std::shared_mutex& callbacksMutex) {
+        using RegistrationPtr = typename CallbackMap::mapped_type;
+
+        std::vector<RegistrationPtr> snapshot;
+        try {
+            std::shared_lock lock(callbacksMutex);
+            snapshot.reserve(callbacks.size());
+            for (const auto& [id, registration] : callbacks) {
+                snapshot.push_back(registration);
+            }
+        } catch (...) {
+            snapshot.clear();
+        }
+
+        return snapshot;
+    }
+
+    template <typename RegistrationT, typename DispatchDepthMap>
+    [[nodiscard]] bool BeginCallbackDispatch(
+        const std::shared_ptr<RegistrationT>& registration,
+        const std::atomic<bool>& dispatchEnabled,
+        DispatchDepthMap& dispatchDepths)
+    {
+        if (!registration) {
+            return false;
+        }
+
+        if (!dispatchEnabled.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        std::unique_lock lock(registration->dispatchMutex);
+        if (!registration->active || !dispatchEnabled.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        try {
+            ++dispatchDepths[registration.get()];
+        } catch (...) {
+            return false;
+        }
+
+        ++registration->inFlight;
+        return true;
+    }
+
+    template <typename RegistrationT, typename DispatchDepthMap>
+    void EndCallbackDispatch(
+        const std::shared_ptr<RegistrationT>& registration,
+        DispatchDepthMap& dispatchDepths)
+    {
+        if (!registration) {
+            return;
+        }
+
+        auto depthIt = dispatchDepths.find(registration.get());
+        if (depthIt != dispatchDepths.end()) {
+            if (depthIt->second > 1) {
+                --depthIt->second;
+            } else {
+                dispatchDepths.erase(depthIt);
+            }
+        }
+
+        std::unique_lock lock(registration->dispatchMutex);
+        if (registration->inFlight != 0) {
+            --registration->inFlight;
+        }
+        registration->dispatchCv.notify_all();
+    }
+
+    template <typename CallbackMap, typename DispatchDepthMap>
+    void DrainCallbackDispatches(
+        const CallbackMap& callbacks,
+        std::shared_mutex& callbacksMutex,
+        const DispatchDepthMap& dispatchDepths)
+    {
+        const auto registrations = SnapshotCallbacks(callbacks, callbacksMutex);
+        for (const auto& registration : registrations) {
+            if (!registration) {
+                continue;
+            }
+
+            size_t ownedDepth = 0;
+            if (const auto depthIt = dispatchDepths.find(registration.get()); depthIt != dispatchDepths.end()) {
+                ownedDepth = depthIt->second;
+            }
+
+            std::unique_lock lock(registration->dispatchMutex);
+            registration->dispatchCv.wait(lock, [&registration, ownedDepth]() {
+                return registration->inFlight <= ownedDepth;
+            });
+        }
+    }
+
+    template <typename CallbackMap, typename DispatchDepthMap>
+    bool UnregisterCallbackRegistration(
+        CallbackMap& callbacks,
+        std::shared_mutex& callbacksMutex,
+        uint64_t callbackId,
+        const DispatchDepthMap& dispatchDepths)
+    {
+        using RegistrationPtr = typename CallbackMap::mapped_type;
+
+        RegistrationPtr registration;
+        {
+            std::unique_lock lock(callbacksMutex);
+            auto it = callbacks.find(callbackId);
+            if (it == callbacks.end()) {
+                return false;
+            }
+
+            registration = std::move(it->second);
+            callbacks.erase(it);
+        }
+
+        std::unique_lock lock(registration->dispatchMutex);
+        registration->active = false;
+        size_t targetInFlight = 0;
+        if (const auto depthIt = dispatchDepths.find(registration.get()); depthIt != dispatchDepths.end()) {
+            targetInFlight = depthIt->second;
+        }
+        registration->dispatchCv.wait(lock, [&registration, targetInFlight]() {
+            return registration->inFlight <= targetInFlight;
+        });
+
+        return true;
+    }
 
     // -------------------------------------------------------------------------
     // INTERNAL ATOMIC STATS (bridges atomic writes → public copyable snapshot)
@@ -276,6 +422,13 @@ struct ProcessCreationMonitor::Impl {
     ProcessMonitorStatsInternal stats;
     std::atomic<bool> isRunning{false};
     std::atomic<bool> isInitialized{false};
+    std::atomic<bool> callbackDispatchEnabled{false};
+    mutable std::mutex lifecycleMutex;
+    mutable std::mutex handlerStateMutex;
+    std::condition_variable handlerStateCv;
+    size_t inFlightHandlers = 0;
+    bool processHandlingEnabled = false;
+    bool terminateHandlingEnabled = false;
 
     // Resources
     std::shared_ptr<Utils::ThreadPool> threadPool;
@@ -300,20 +453,186 @@ struct ProcessCreationMonitor::Impl {
 
     // Callbacks
     mutable std::shared_mutex callbacksMutex;
-    std::map<uint64_t, ProcessCreateCallback> createCallbacks;
-    std::map<uint64_t, ProcessTerminateCallback> terminateCallbacks;
-    std::map<uint64_t, SuspiciousProcessCallback> suspiciousCallbacks;
+    using CreateCallbackRegistration = CallbackRegistration<ProcessCreateCallback>;
+    using TerminateCallbackRegistration = CallbackRegistration<ProcessTerminateCallback>;
+    using SuspiciousCallbackRegistration = CallbackRegistration<SuspiciousProcessCallback>;
+
+    std::map<uint64_t, std::shared_ptr<CreateCallbackRegistration>> createCallbacks;
+    std::map<uint64_t, std::shared_ptr<TerminateCallbackRegistration>> terminateCallbacks;
+    std::map<uint64_t, std::shared_ptr<SuspiciousCallbackRegistration>> suspiciousCallbacks;
     std::atomic<uint64_t> nextCallbackId{1};
 
     // -------------------------------------------------------------------------
     // Implementation Methods
     // -------------------------------------------------------------------------
 
+    enum class HandlerKind {
+        Create,
+        Terminate
+    };
+
+    struct HandlerActivityGuard {
+        HandlerActivityGuard(Impl& ownerImpl, HandlerKind handlerKind)
+            : owner(ownerImpl),
+              active(ownerImpl.TryEnterProcessHandler(handlerKind)) {}
+
+        ~HandlerActivityGuard() {
+            if (active) {
+                owner.LeaveProcessHandler();
+            }
+        }
+
+        explicit operator bool() const noexcept {
+            return active;
+        }
+
+        Impl& owner;
+        bool active;
+    };
+
     Impl() {
         stats.Reset();
     }
 
+    [[nodiscard]] bool TryEnterProcessHandler(HandlerKind handlerKind) {
+        std::unique_lock lock(handlerStateMutex);
+        if (!isInitialized.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        const bool handlerEnabled =
+            (handlerKind == HandlerKind::Create) ? processHandlingEnabled : terminateHandlingEnabled;
+        if (!handlerEnabled) {
+            return false;
+        }
+
+        if (handlerKind == HandlerKind::Create &&
+            !isRunning.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        ++g_processHandlerDepth;
+        ++inFlightHandlers;
+        return true;
+    }
+
+    [[nodiscard]] bool ShouldContinueCreateHandling() const {
+        if (!isInitialized.load(std::memory_order_acquire) ||
+            !isRunning.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        std::unique_lock lock(handlerStateMutex);
+        return processHandlingEnabled;
+    }
+
+    void LeaveProcessHandler() {
+        std::unique_lock lock(handlerStateMutex);
+        if (g_processHandlerDepth != 0) {
+            --g_processHandlerDepth;
+        }
+        if (inFlightHandlers != 0) {
+            --inFlightHandlers;
+        }
+        handlerStateCv.notify_all();
+    }
+
+    void StopUnlocked() {
+        const bool wasRunning = isRunning.exchange(false, std::memory_order_acq_rel);
+
+        {
+            std::unique_lock handlerLock(handlerStateMutex);
+            processHandlingEnabled = false;
+            terminateHandlingEnabled = false;
+            handlerStateCv.wait(handlerLock, [this]() {
+                return inFlightHandlers <= g_processHandlerDepth;
+            });
+        }
+
+        callbackDispatchEnabled.store(false, std::memory_order_release);
+        DrainCallbackDispatches(createCallbacks, callbacksMutex, g_createCallbackDispatchDepths);
+        DrainCallbackDispatches(terminateCallbacks, callbacksMutex, g_terminateCallbackDispatchDepths);
+        DrainCallbackDispatches(suspiciousCallbacks, callbacksMutex, g_suspiciousCallbackDispatchDepths);
+        {
+            std::unique_lock lock(processMutex);
+            activeProcesses.clear();
+            processTree.clear();
+        }
+        stats.trackedProcesses.store(0, std::memory_order_relaxed);
+
+        if (wasRunning) {
+            Utils::Logger::Info("ProcessCreationMonitor stopped");
+        }
+    }
+
+    void RemoveTrackedProcessLocked(uint32_t pid) {
+        activeProcesses.erase(pid);
+        processTree.erase(pid);
+
+        for (auto& [nodePid, node] : processTree) {
+            node.childPids.erase(
+                std::remove(node.childPids.begin(), node.childPids.end(), pid),
+                node.childPids.end());
+        }
+    }
+
+    void PruneTrackedProcessesLocked(
+        const ProcessMonitorConfig& cfg,
+        const std::chrono::system_clock::time_point& now)
+    {
+        std::vector<uint32_t> expired;
+        expired.reserve(activeProcesses.size());
+
+        for (const auto& [pid, info] : activeProcesses) {
+            if (info.state != ProcessState::Terminated) {
+                continue;
+            }
+
+            if (info.terminationTime != std::chrono::system_clock::time_point{} &&
+                now - info.terminationTime >= cfg.historyRetention) {
+                expired.push_back(pid);
+            }
+        }
+
+        for (uint32_t pid : expired) {
+            RemoveTrackedProcessLocked(pid);
+        }
+
+        if (activeProcesses.size() <= cfg.maxTrackedProcesses) {
+            stats.trackedProcesses.store(activeProcesses.size(), std::memory_order_relaxed);
+            return;
+        }
+
+        struct RetiredProcessCandidate {
+            uint32_t pid = 0;
+            std::chrono::system_clock::time_point terminationTime{};
+        };
+
+        std::vector<RetiredProcessCandidate> retired;
+        retired.reserve(activeProcesses.size());
+        for (const auto& [pid, info] : activeProcesses) {
+            if (info.state == ProcessState::Terminated) {
+                retired.push_back({ pid, info.terminationTime });
+            }
+        }
+
+        std::sort(retired.begin(), retired.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.terminationTime < rhs.terminationTime;
+        });
+
+        for (const auto& candidate : retired) {
+            if (activeProcesses.size() <= cfg.maxTrackedProcesses) {
+                break;
+            }
+
+            RemoveTrackedProcessLocked(candidate.pid);
+        }
+
+        stats.trackedProcesses.store(activeProcesses.size(), std::memory_order_relaxed);
+    }
+
     bool Initialize(std::shared_ptr<Utils::ThreadPool> tp, const ProcessMonitorConfig& cfg) {
+        std::lock_guard lifecycleLock(lifecycleMutex);
         if (isInitialized.load(std::memory_order_acquire)) {
             Utils::Logger::Warn("ProcessCreationMonitor already initialized");
             return true;
@@ -326,14 +645,21 @@ struct ProcessCreationMonitor::Impl {
         }
 
         stats.Reset();
+        {
+            std::unique_lock handlerLock(handlerStateMutex);
+            processHandlingEnabled = false;
+            terminateHandlingEnabled = false;
+            inFlightHandlers = 0;
+        }
         isInitialized.store(true, std::memory_order_release);
         Utils::Logger::Info("ProcessCreationMonitor initialized");
         return true;
     }
 
     void Shutdown() {
-        if (!isInitialized) return;
-        Stop();
+        std::lock_guard lifecycleLock(lifecycleMutex);
+        if (!isInitialized.load(std::memory_order_acquire)) return;
+        StopUnlocked();
 
         {
             std::unique_lock lock(processMutex);
@@ -341,27 +667,34 @@ struct ProcessCreationMonitor::Impl {
             processTree.clear();
         }
 
-        isInitialized = false;
+        callbackDispatchEnabled.store(false, std::memory_order_release);
+        isInitialized.store(false, std::memory_order_release);
         Utils::Logger::Info("ProcessCreationMonitor shutdown");
     }
 
     void Start() {
-        if (!isInitialized || isRunning) return;
+        std::lock_guard lifecycleLock(lifecycleMutex);
+        if (!isInitialized.load(std::memory_order_acquire) ||
+            isRunning.load(std::memory_order_acquire)) {
+            return;
+        }
 
         // In a real implementation, this would register with the kernel driver
         // via FilterSendMessage or IOCTL
 
-        isRunning = true;
+        {
+            std::unique_lock handlerLock(handlerStateMutex);
+            processHandlingEnabled = true;
+            terminateHandlingEnabled = true;
+        }
+        callbackDispatchEnabled.store(true, std::memory_order_release);
+        isRunning.store(true, std::memory_order_release);
         Utils::Logger::Info("ProcessCreationMonitor started");
     }
 
     void Stop() {
-        if (!isRunning) return;
-
-        // Unregister from kernel driver
-
-        isRunning = false;
-        Utils::Logger::Info("ProcessCreationMonitor stopped");
+        std::lock_guard lifecycleLock(lifecycleMutex);
+        StopUnlocked();
     }
 
     // -------------------------------------------------------------------------
@@ -369,6 +702,11 @@ struct ProcessCreationMonitor::Impl {
     // -------------------------------------------------------------------------
 
     ProcessVerdict HandleProcessCreate(const ProcessCreateEvent& event) {
+        HandlerActivityGuard handlerGuard(*this, HandlerKind::Create);
+        if (!handlerGuard) {
+            return ProcessVerdict::Allow;
+        }
+
         stats.totalProcessCreations.fetch_add(1, std::memory_order_relaxed);
         auto startTime = std::chrono::high_resolution_clock::now();
 
@@ -477,14 +815,17 @@ struct ProcessCreationMonitor::Impl {
         std::vector<SuspiciousPattern> patterns;
         double riskScore = CalculateRiskScore(event, cmdAnalysis, patterns);
 
-        ProcessVerdict finalVerdict = ProcessVerdict::Allow;
+        const bool monitoredByScan = (scanVerdict == ProcessVerdict::AllowMonitored);
+        ProcessVerdict finalVerdict = monitoredByScan ? ProcessVerdict::AllowMonitored : ProcessVerdict::Allow;
 
         if (riskScore >= cfg.blockThreshold) {
             finalVerdict = ProcessVerdict::Block;
             stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
         } else if (riskScore >= cfg.alertThreshold) {
             finalVerdict = ProcessVerdict::AllowMonitored;
-            stats.processesSuspicious.fetch_add(1, std::memory_order_relaxed);
+            if (!monitoredByScan) {
+                stats.processesSuspicious.fetch_add(1, std::memory_order_relaxed);
+            }
 
             // Create ProcessInfo for callback
             ProcessInfo info = CreateProcessInfoFromEvent(event);
@@ -492,9 +833,16 @@ struct ProcessCreationMonitor::Impl {
             info.suspiciousPatterns = patterns;
 
             NotifySuspicious(info, patterns);
+            if (!ShouldContinueCreateHandling()) {
+                return finalVerdict;
+            }
         } else {
-            finalVerdict = ProcessVerdict::Allow;
-            stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
+            if (monitoredByScan) {
+                stats.processesSuspicious.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                finalVerdict = ProcessVerdict::Allow;
+                stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         // 8. Forward to BehaviorAnalyzer for cross-process correlation and APT hunting
@@ -559,6 +907,16 @@ struct ProcessCreationMonitor::Impl {
         if (!cfg.trackParentChild || event.processId == 0) return;
 
         std::unique_lock lock(processMutex);
+        PruneTrackedProcessesLocked(cfg, std::chrono::system_clock::now());
+        if (activeProcesses.size() >= cfg.maxTrackedProcesses &&
+            activeProcesses.find(event.processId) == activeProcesses.end()) {
+            SS_LOG_WARN(L"ProcessCreationMonitor",
+                L"Tracking capacity reached (%zu); skipping PID=%u state insertion",
+                cfg.maxTrackedProcesses,
+                event.processId);
+            stats.trackedProcesses.store(activeProcesses.size(), std::memory_order_relaxed);
+            return;
+        }
 
         // Create ProcessInfo
         ProcessInfo info = CreateProcessInfoFromEvent(event);
@@ -591,7 +949,17 @@ struct ProcessCreationMonitor::Impl {
     }
 
     void HandleProcessTerminate(uint32_t pid, uint32_t exitCode) {
+        HandlerActivityGuard handlerGuard(*this, HandlerKind::Terminate);
+        if (!handlerGuard) {
+            return;
+        }
+
         stats.processTerminations.fetch_add(1, std::memory_order_relaxed);
+        ProcessMonitorConfig cfg;
+        {
+            std::shared_lock cfgLock(configMutex);
+            cfg = config;
+        }
 
         // Forward termination to BehaviorAnalyzer for state cleanup (PID reuse protection)
 #if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
@@ -623,8 +991,7 @@ struct ProcessCreationMonitor::Impl {
                 it->second.exitCode = exitCode;
                 it->second.terminationTime = std::chrono::system_clock::now();
 
-                // We don't remove immediately to allow for history retention
-                // Cleanup is handled by a separate maintenance task
+                PruneTrackedProcessesLocked(cfg, it->second.terminationTime);
             }
         }
 
@@ -1118,31 +1485,49 @@ struct ProcessCreationMonitor::Impl {
     // -------------------------------------------------------------------------
 
     void NotifyCreate(const ProcessCreateEvent& event, ProcessVerdict verdict) {
-        std::shared_lock lock(callbacksMutex);
-        for (const auto& [id, callback] : createCallbacks) {
+        const auto callbacks = SnapshotCallbacks(createCallbacks, callbacksMutex);
+        for (const auto& callback : callbacks) {
+            if (!BeginCallbackDispatch(callback, callbackDispatchEnabled, g_createCallbackDispatchDepths)) {
+                continue;
+            }
+
             try {
                 // Note: Kernel event expects verdict return, but here we just notify async observers
                 // The actual verdict was already decided
-                callback(event);
+                (void)callback->callback(event);
             } catch (...) {}
+
+            EndCallbackDispatch(callback, g_createCallbackDispatchDepths);
         }
     }
 
     void NotifyTerminate(uint32_t pid, uint32_t exitCode) {
-        std::shared_lock lock(callbacksMutex);
-        for (const auto& [id, callback] : terminateCallbacks) {
+        const auto callbacks = SnapshotCallbacks(terminateCallbacks, callbacksMutex);
+        for (const auto& callback : callbacks) {
+            if (!BeginCallbackDispatch(callback, callbackDispatchEnabled, g_terminateCallbackDispatchDepths)) {
+                continue;
+            }
+
             try {
-                callback(pid, exitCode);
+                callback->callback(pid, exitCode);
             } catch (...) {}
+
+            EndCallbackDispatch(callback, g_terminateCallbackDispatchDepths);
         }
     }
 
     void NotifySuspicious(const ProcessInfo& info, const std::vector<SuspiciousPattern>& patterns) {
-        std::shared_lock lock(callbacksMutex);
-        for (const auto& [id, callback] : suspiciousCallbacks) {
+        const auto callbacks = SnapshotCallbacks(suspiciousCallbacks, callbacksMutex);
+        for (const auto& callback : callbacks) {
+            if (!BeginCallbackDispatch(callback, callbackDispatchEnabled, g_suspiciousCallbackDispatchDepths)) {
+                continue;
+            }
+
             try {
-                callback(info, patterns);
+                callback->callback(info, patterns);
             } catch (...) {}
+
+            EndCallbackDispatch(callback, g_suspiciousCallbackDispatchDepths);
         }
     }
 };
@@ -1569,37 +1954,46 @@ void ProcessCreationMonitor::ResetStats() {
 uint64_t ProcessCreationMonitor::RegisterCreateCallback(ProcessCreateCallback callback) {
     std::unique_lock lock(m_impl->callbacksMutex);
     uint64_t id = m_impl->nextCallbackId++;
-    m_impl->createCallbacks[id] = callback;
+    m_impl->createCallbacks[id] = std::make_shared<Impl::CreateCallbackRegistration>(std::move(callback));
     return id;
 }
 
 bool ProcessCreationMonitor::UnregisterCreateCallback(uint64_t callbackId) {
-    std::unique_lock lock(m_impl->callbacksMutex);
-    return m_impl->createCallbacks.erase(callbackId) > 0;
+    return UnregisterCallbackRegistration(
+        m_impl->createCallbacks,
+        m_impl->callbacksMutex,
+        callbackId,
+        g_createCallbackDispatchDepths);
 }
 
 uint64_t ProcessCreationMonitor::RegisterTerminateCallback(ProcessTerminateCallback callback) {
     std::unique_lock lock(m_impl->callbacksMutex);
     uint64_t id = m_impl->nextCallbackId++;
-    m_impl->terminateCallbacks[id] = callback;
+    m_impl->terminateCallbacks[id] = std::make_shared<Impl::TerminateCallbackRegistration>(std::move(callback));
     return id;
 }
 
 bool ProcessCreationMonitor::UnregisterTerminateCallback(uint64_t callbackId) {
-    std::unique_lock lock(m_impl->callbacksMutex);
-    return m_impl->terminateCallbacks.erase(callbackId) > 0;
+    return UnregisterCallbackRegistration(
+        m_impl->terminateCallbacks,
+        m_impl->callbacksMutex,
+        callbackId,
+        g_terminateCallbackDispatchDepths);
 }
 
 uint64_t ProcessCreationMonitor::RegisterSuspiciousCallback(SuspiciousProcessCallback callback) {
     std::unique_lock lock(m_impl->callbacksMutex);
     uint64_t id = m_impl->nextCallbackId++;
-    m_impl->suspiciousCallbacks[id] = callback;
+    m_impl->suspiciousCallbacks[id] = std::make_shared<Impl::SuspiciousCallbackRegistration>(std::move(callback));
     return id;
 }
 
 bool ProcessCreationMonitor::UnregisterSuspiciousCallback(uint64_t callbackId) {
-    std::unique_lock lock(m_impl->callbacksMutex);
-    return m_impl->suspiciousCallbacks.erase(callbackId) > 0;
+    return UnregisterCallbackRegistration(
+        m_impl->suspiciousCallbacks,
+        m_impl->callbacksMutex,
+        callbackId,
+        g_suspiciousCallbackDispatchDepths);
 }
 
 // Integration
@@ -1708,14 +2102,40 @@ std::wstring ProcessTreeNode::GetProcessChainString() const {
 
 // Pause / Resume
 void ProcessCreationMonitor::Pause() {
+    std::lock_guard lifecycleLock(m_impl->lifecycleMutex);
     const bool wasRunning = m_impl->isRunning.exchange(false, std::memory_order_acq_rel);
     if (wasRunning) {
+        {
+            std::unique_lock handlerLock(m_impl->handlerStateMutex);
+            m_impl->processHandlingEnabled = false;
+            m_impl->terminateHandlingEnabled = false;
+            m_impl->handlerStateCv.wait(handlerLock, [impl = m_impl.get()]() {
+                return impl->inFlightHandlers <= g_processHandlerDepth;
+            });
+        }
+        m_impl->callbackDispatchEnabled.store(false, std::memory_order_release);
+        DrainCallbackDispatches(m_impl->createCallbacks, m_impl->callbacksMutex, g_createCallbackDispatchDepths);
+        DrainCallbackDispatches(m_impl->terminateCallbacks, m_impl->callbacksMutex, g_terminateCallbackDispatchDepths);
+        DrainCallbackDispatches(m_impl->suspiciousCallbacks, m_impl->callbacksMutex, g_suspiciousCallbackDispatchDepths);
+        {
+            std::unique_lock lock(m_impl->processMutex);
+            m_impl->activeProcesses.clear();
+            m_impl->processTree.clear();
+        }
+        m_impl->stats.trackedProcesses.store(0, std::memory_order_relaxed);
         SS_LOG_INFO(L"ProcessCreationMonitor", L"Monitoring paused");
     }
 }
 
 void ProcessCreationMonitor::Resume() {
+    std::lock_guard lifecycleLock(m_impl->lifecycleMutex);
     if (!m_impl->isInitialized.load(std::memory_order_acquire)) return;
+    {
+        std::unique_lock handlerLock(m_impl->handlerStateMutex);
+        m_impl->processHandlingEnabled = true;
+        m_impl->terminateHandlingEnabled = true;
+    }
+    m_impl->callbackDispatchEnabled.store(true, std::memory_order_release);
     const bool wasPaused = !m_impl->isRunning.exchange(true, std::memory_order_acq_rel);
     if (wasPaused) {
         SS_LOG_INFO(L"ProcessCreationMonitor", L"Monitoring resumed");
