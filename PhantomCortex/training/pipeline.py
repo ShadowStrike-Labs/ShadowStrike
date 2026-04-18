@@ -958,7 +958,8 @@ class PhantomCortexPipeline:
         """Look for evaluation metrics written by the evaluate step."""
         for result in self._results:
             if result.name == "evaluate" and result.metrics:
-                per_model = result.metrics.get("per_model", {})
+                # evaluate_all() stores per-model results under "models"
+                per_model = result.metrics.get("models", {})
                 if model_name in per_model:
                     return per_model[model_name]  # type: ignore[no-any-return]
         return None

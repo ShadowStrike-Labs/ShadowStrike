@@ -49,11 +49,11 @@ cortex_behavioral:
 cortex_memory:
   model_type: "mlp"
   input_dim: 128
-  num_classes: 5
-  epochs: 100                        # More epochs for real data (was 50)
-  batch_size: 256                    # Smaller batches for convergence (was 512)
-  learning_rate: 0.0005              # Lower LR for real data (was 0.001)
-  weight_decay: 0.0005               # Explicit regularization
+  num_classes: 4                      # CIC-MalMem-2022 real classes (was 5 synthetic)
+  epochs: 150                         # More epochs for real data (was 50)
+  batch_size: 256                     # Smaller batches for convergence (was 512)
+  learning_rate: 0.0005               # Lower LR for real data (was 0.001)
+  weight_decay: 0.0005                # Explicit regularization
 
 cortex_network:
   model_type: "autoencoder_classifier"

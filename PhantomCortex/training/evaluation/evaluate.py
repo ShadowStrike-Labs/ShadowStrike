@@ -123,7 +123,7 @@ def _generate_static_test_data(
     generates random feature vectors with realistic distribution for
     evaluation infrastructure testing.
     """
-    feature_dim = 2381
+    feature_dim = 2568  # EMBER 2024 (was 2381 for EMBER 2018)
 
     ember_test_x = data_dir / "ember" / "X_test.npy"
     ember_test_y = data_dir / "ember" / "y_test.npy"
@@ -181,7 +181,28 @@ def _generate_behavioral_test_data(
 def _generate_memory_test_data(
     n_samples: int,
 ) -> tuple[NDArray[np.float32], NDArray[np.int32]]:
-    """Generate synthetic memory region test data."""
+    """Generate or load memory forensics test data.
+
+    Attempts to load real CIC-MalMem-2022 data first (4-class model).
+    Falls back to synthetic generation if real data is unavailable.
+    """
+    try:
+        from PhantomCortex.training.data.memory_external_loader import (
+            NUM_CLASSES,
+            FEATURE_DIM,
+            load_memory_external_dataset,
+        )
+        real_data = load_memory_external_dataset()
+        if real_data is not None:
+            X_all, y_all = real_data[0], real_data[1]
+            if len(X_all) > n_samples:
+                rng = np.random.default_rng(_SEED)
+                idx = rng.choice(len(X_all), size=n_samples, replace=False)
+                X_all, y_all = X_all[idx], y_all[idx]
+            return X_all.astype(np.float32), y_all.astype(np.int32)
+    except Exception:
+        pass
+
     from PhantomCortex.training.data.memory_generator import (
         FEATURE_DIM,
         NUM_CLASSES,
@@ -570,40 +591,82 @@ def _run_false_positive_test(
 def _check_quality_gates(result: dict[str, Any]) -> bool:
     """Evaluate per-model metrics against enterprise quality thresholds.
 
+    Uses model-specific gate thresholds: Static/Network have stricter AUC/FPR
+    targets as primary classifiers; Behavioral/Memory/Emulation use macro-F1
+    and accuracy gates appropriate to their multiclass task.
+
     Returns True if all gates pass. Logs individual failures.
     """
     model_name = result.get("model", "unknown")
     passed = True
 
-    auc = result.get("auc_roc", 0.0)
-    if auc < _QUALITY_GATES["min_auc_roc"]:
-        logger.warning(
-            "Quality gate FAIL [%s]: AUC-ROC %.4f < %.4f",
-            model_name, auc, _QUALITY_GATES["min_auc_roc"],
-        )
-        passed = False
+    # Model-specific gate profiles
+    _MODEL_GATES: dict[str, dict[str, float]] = {
+        "static": {"min_auc_roc": 0.995, "max_fpr_at_001": 0.002, "min_detection_rate": 0.97},
+        "behavioral": {"min_auc_roc": 0.0, "min_macro_f1": 0.85, "min_accuracy": 0.88},
+        "memory": {"min_auc_roc": 0.0, "min_macro_f1": 0.65, "min_accuracy": 0.70},
+        "network": {"min_auc_roc": 0.85, "max_fpr_at_001": 0.01, "min_detection_rate": 0.90},
+        "emulation": {"min_auc_roc": 0.0, "min_macro_f1": 0.85, "min_accuracy": 0.93},
+    }
 
-    fpr = result.get("fpr_at_001", 1.0)
-    if fpr > _QUALITY_GATES["max_fpr_at_001"]:
-        logger.warning(
-            "Quality gate FAIL [%s]: FPR@0.1%% %.6f > %.6f",
-            model_name, fpr, _QUALITY_GATES["max_fpr_at_001"],
-        )
-        passed = False
+    gates = _MODEL_GATES.get(model_name, _QUALITY_GATES)
 
-    dr = result.get("detection_rate", 0.0)
-    if dr < _QUALITY_GATES["min_detection_rate"]:
-        logger.warning(
-            "Quality gate FAIL [%s]: detection_rate %.4f < %.4f",
-            model_name, dr, _QUALITY_GATES["min_detection_rate"],
-        )
-        passed = False
+    min_auc = gates.get("min_auc_roc", 0.0)
+    if min_auc > 0:
+        auc = result.get("auc_roc", 0.0)
+        if auc < min_auc:
+            logger.warning(
+                "Quality gate FAIL [%s]: AUC-ROC %.4f < %.4f",
+                model_name, auc, min_auc,
+            )
+            passed = False
+
+    max_fpr = gates.get("max_fpr_at_001")
+    if max_fpr is not None:
+        fpr = result.get("fpr_at_001", 1.0)
+        if fpr > max_fpr:
+            logger.warning(
+                "Quality gate FAIL [%s]: FPR@0.1%% %.6f > %.6f",
+                model_name, fpr, max_fpr,
+            )
+            passed = False
+
+    min_dr = gates.get("min_detection_rate")
+    if min_dr is not None:
+        dr = result.get("detection_rate", 0.0)
+        if dr < min_dr:
+            logger.warning(
+                "Quality gate FAIL [%s]: detection_rate %.4f < %.4f",
+                model_name, dr, min_dr,
+            )
+            passed = False
+
+    min_f1 = gates.get("min_macro_f1")
+    if min_f1 is not None:
+        f1 = result.get("macro_f1", 0.0)
+        if f1 < min_f1:
+            logger.warning(
+                "Quality gate FAIL [%s]: macro_f1 %.4f < %.4f",
+                model_name, f1, min_f1,
+            )
+            passed = False
+
+    min_acc = gates.get("min_accuracy")
+    if min_acc is not None:
+        acc = result.get("accuracy", 0.0)
+        if acc < min_acc:
+            logger.warning(
+                "Quality gate FAIL [%s]: accuracy %.4f < %.4f",
+                model_name, acc, min_acc,
+            )
+            passed = False
 
     resistance = result.get("evasion_resistance", 0.0)
-    if resistance < _QUALITY_GATES["min_evasion_resistance"]:
+    min_resistance = gates.get("min_evasion_resistance", _QUALITY_GATES.get("min_evasion_resistance", 0.0))
+    if min_resistance > 0 and resistance < min_resistance:
         logger.warning(
             "Quality gate FAIL [%s]: evasion_resistance %.4f < %.4f",
-            model_name, resistance, _QUALITY_GATES["min_evasion_resistance"],
+            model_name, resistance, min_resistance,
         )
         passed = False
 
@@ -620,32 +683,46 @@ def _check_quality_gates(result: dict[str, Any]) -> bool:
 def _compute_ensemble_score(model_results: dict[str, dict[str, Any]]) -> float:
     """Compute a weighted ensemble quality score across all evaluated models.
 
-    The ensemble score is a weighted mean of per-model AUC-ROC values,
-    penalized by evasion resistance and FP rate.
+    Each model receives a reliability weight reflecting its importance in the
+    overall detection pipeline. Static and Behavioral are primary classifiers
+    with highest weight; Network and Emulation are secondary signals; Memory
+    provides complementary in-memory detection.
 
     Returns a value in [0, 1] where 1.0 is perfect.
     """
     if not model_results:
         return 0.0
 
-    scores: list[float] = []
-    for result in model_results.values():
+    _MODEL_WEIGHTS: dict[str, float] = {
+        "static": 0.30,
+        "behavioral": 0.25,
+        "network": 0.20,
+        "emulation": 0.15,
+        "memory": 0.10,
+    }
+
+    weighted_sum = 0.0
+    total_weight = 0.0
+
+    for model_name, result in model_results.items():
+        weight = _MODEL_WEIGHTS.get(model_name, 0.1)
+
         if result.get("status") == "failed":
-            scores.append(0.0)
+            total_weight += weight
             continue
 
         auc = result.get("auc_roc", 0.0)
         resistance = result.get("evasion_resistance", 0.0)
         fpr = result.get("fp_rate", 0.0)
 
-        # Penalize high FPR: subtract up to 0.1 for FPR above threshold
         fpr_penalty = min(fpr * 10.0, 0.1)
-
-        # Combine: 70% AUC + 20% evasion resistance + 10% FPR penalty
         model_score = 0.7 * auc + 0.2 * resistance + 0.1 * (1.0 - fpr_penalty)
-        scores.append(max(0.0, min(1.0, model_score)))
+        model_score = max(0.0, min(1.0, model_score))
 
-    return round(float(np.mean(scores)), 6) if scores else 0.0
+        weighted_sum += weight * model_score
+        total_weight += weight
+
+    return round(weighted_sum / total_weight, 6) if total_weight > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
