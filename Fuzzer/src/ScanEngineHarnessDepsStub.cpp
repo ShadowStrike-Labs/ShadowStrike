@@ -826,6 +826,26 @@ CortexVerdict PhantomCortex::AnalyzeFile(std::span<const uint8_t>) noexcept {
     return CortexVerdict{};
 }
 
+CortexVerdict PhantomCortex::AnalyzeBehavior(
+    std::span<const APICallRecord>) noexcept {
+    return CortexVerdict{};
+}
+
+CortexVerdict PhantomCortex::AnalyzeMemory(
+    const MemoryRegionInfo&) noexcept {
+    return CortexVerdict{};
+}
+
+CortexVerdict PhantomCortex::AnalyzeNetwork(
+    const NetworkFlowInfo&) noexcept {
+    return CortexVerdict{};
+}
+
+CortexVerdict PhantomCortex::AnalyzeEmulationTrace(
+    std::span<const EmulationEvent>) noexcept {
+    return CortexVerdict{};
+}
+
 CortexEnsembleVerdict PhantomCortex::EnsembleVerdict(
     std::optional<CortexVerdict>,
     std::optional<CortexVerdict>,

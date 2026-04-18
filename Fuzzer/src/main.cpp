@@ -21,12 +21,19 @@
 #include "ShadowStrike/Fuzzer/Harnesses/ServiceProtocolHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/TrafficHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/CryptoCertHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/ConfigParserHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/CompressionHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/AntiEvasionHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ParserUtilsHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/SignaturePatternHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/StringPathHashHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ThreatIntelHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ThreatIntelFormatHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/AIFeatureHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/FuzzyHasherHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/ScriptScannerHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/ExploitDetectorHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/RansomwareAnalysisHarness.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageFactory.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageSchema.hpp"
 #include "ShadowStrike/Fuzzer/Targets/KernelTargetCatalog.hpp"
@@ -84,6 +91,13 @@ void PrintUsage() {
         << "  ShadowStrikeFuzzer --fuzz-service-proto <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-traffic <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-crypto <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-config-parser <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-anti-evasion <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-ai-feature <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-fuzzy-hasher <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-script-scanner <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-exploit-detector <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-ransomware <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-compression <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-parsers <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-signature-pattern <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
@@ -1367,6 +1381,328 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         return SSF::RunCryptoCertFuzzer(argv[2], config);
+    }
+
+    // Config and Policy Parser Fuzzing Command
+    if (command == L"--fuzz-config-parser") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-config-parser requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 1024 * 1024;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunConfigParserFuzzer(argv[2], config);
+    }
+
+    // Anti-Evasion Detector Fuzzing Command
+    if (command == L"--fuzz-anti-evasion") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-anti-evasion requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 1024 * 1024;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunAntiEvasionFuzzer(argv[2], config);
+    }
+
+    // AI Feature Extraction Fuzzing Command
+    if (command == L"--fuzz-ai-feature") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-ai-feature requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 1024 * 1024;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunAIFeatureFuzzer(argv[2], config);
+    }
+
+    // FuzzyHasher Fuzzing Command
+    if (command == L"--fuzz-fuzzy-hasher") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-fuzzy-hasher requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 1024 * 1024;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunFuzzyHasherFuzzer(argv[2], config);
+    }
+
+    // Script Scanner Fuzzing Command
+    if (command == L"--fuzz-script-scanner") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-script-scanner requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 65536;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunScriptScannerFuzzer(argv[2], config);
+    }
+
+    // Exploit Detector Fuzzing Command
+    if (command == L"--fuzz-exploit-detector") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-exploit-detector requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 1024 * 1024;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunExploitDetectorFuzzer(argv[2], config);
+    }
+
+    // Ransomware Analysis Fuzzing Command
+    if (command == L"--fuzz-ransomware") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-ransomware requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 1024 * 1024;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunRansomwareAnalysisFuzzer(argv[2], config);
     }
 
     // Parser Utilities Fuzzing Command
