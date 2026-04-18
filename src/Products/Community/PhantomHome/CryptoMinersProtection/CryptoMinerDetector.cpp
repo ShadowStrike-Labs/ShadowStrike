@@ -1080,16 +1080,31 @@ void CryptoMinerDetectorImpl::Shutdown() {
     m_startedBrowser = false;
     m_startedPool = false;
     m_healthCheckFailures = 0;
-    m_recentDetections.clear();
-    m_poolDatabase.clear();
-    m_whitelistedPids.clear();
-    m_whitelistedPaths.clear();
-    m_whitelistedProcessNames.clear();
-    m_whitelistedPools.clear();
-    m_detectionCooldowns.clear();
-    m_detectionCallbacks.clear();
-    m_resourceCallbacks.clear();
-    m_errorCallbacks.clear();
+    {
+        std::unique_lock detLock(m_detectionsMutex);
+        m_recentDetections.clear();
+    }
+    {
+        std::unique_lock poolLock(m_poolMutex);
+        m_poolDatabase.clear();
+    }
+    {
+        std::unique_lock wlLock(m_whitelistMutex);
+        m_whitelistedPids.clear();
+        m_whitelistedPaths.clear();
+        m_whitelistedProcessNames.clear();
+        m_whitelistedPools.clear();
+    }
+    {
+        std::lock_guard coolLock(m_cooldownMutex);
+        m_detectionCooldowns.clear();
+    }
+    {
+        std::lock_guard cbLock(m_callbackMutex);
+        m_detectionCallbacks.clear();
+        m_resourceCallbacks.clear();
+        m_errorCallbacks.clear();
+    }
     m_status.store(ModuleStatus::Uninitialized, std::memory_order_release);
 }
 
@@ -1140,6 +1155,9 @@ void CryptoMinerDetectorImpl::OnCPUHighLoad(const HighLoadEvent& event) {
         return;
     }
 
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
+
     if (event.isMiningBehavior && event.signature.processId != 0) {
         auto result = ScanProcessInternal(event.signature.processId);
         if (result.isMinerDetected) {
@@ -1153,6 +1171,9 @@ void CryptoMinerDetectorImpl::OnCPUMiningDetected(const ProcessCPUSignature& sig
     if (!m_running.load(std::memory_order_acquire) || m_paused.load(std::memory_order_acquire)) {
         return;
     }
+
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
 
     if (signature.processId != 0) {
         auto result = ScanProcessInternal(signature.processId);
@@ -1168,6 +1189,9 @@ void CryptoMinerDetectorImpl::OnGPUAnomaly(const GPUDeviceStats& stats) {
         return;
     }
 
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
+
     ResourceUsageStats anomaly{};
     anomaly.gpuUsagePercent = stats.gpuLoadPercent;
     anomaly.gpuTemperatureCelsius = stats.temperatureC;
@@ -1178,6 +1202,9 @@ void CryptoMinerDetectorImpl::OnGPUMiningDetected(const GPUMiningDetectionResult
     if (!m_running.load(std::memory_order_acquire) || m_paused.load(std::memory_order_acquire)) {
         return;
     }
+
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
 
     if (gpuResult.isMiningDetected && !gpuResult.miningProcesses.empty()) {
         for (const auto& proc : gpuResult.miningProcesses) {
@@ -1196,6 +1223,9 @@ void CryptoMinerDetectorImpl::OnPoolConnection(const PoolConnectionInfo& connect
         return;
     }
 
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
+
     if (connection.processId != 0) {
         auto result = ScanProcessInternal(connection.processId);
         if (result.isMinerDetected) {
@@ -1209,6 +1239,9 @@ void CryptoMinerDetectorImpl::OnStratumDetected(const PoolDetectionResult& poolR
     if (!m_running.load(std::memory_order_acquire) || m_paused.load(std::memory_order_acquire)) {
         return;
     }
+
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
 
     if (poolResult.isPoolConnectionDetected && poolResult.connectionInfo.processId != 0) {
         auto result = ScanProcessInternal(poolResult.connectionInfo.processId);
@@ -1227,6 +1260,9 @@ void CryptoMinerDetectorImpl::OnBrowserMinerFound(
         return;
     }
 
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
+
     if (browserResult.isMinerDetected && script.browserPid != 0) {
         auto result = ScanProcessInternal(script.browserPid);
         if (result.isMinerDetected) {
@@ -1240,6 +1276,9 @@ void CryptoMinerDetectorImpl::OnBrowserTabMining(const TabMiningInfo& info) {
     if (!m_running.load(std::memory_order_acquire) || m_paused.load(std::memory_order_acquire)) {
         return;
     }
+
+    ActiveOperation operation(*this);
+    if (!operation.Acquired()) return;
 
     if (info.isMining && info.browserPid != 0) {
         auto result = ScanProcessInternal(info.browserPid);
@@ -1449,6 +1488,13 @@ MinerDetectionResult CryptoMinerDetectorImpl::ScanProcessInternal(uint32_t proce
     result.processInfo.processId = processId;
     m_statistics.totalScans.fetch_add(1, std::memory_order_relaxed);
 
+    // Snapshot config under lock to prevent data race with UpdateConfiguration
+    CryptoMinerDetectorConfiguration configSnap;
+    {
+        std::shared_lock lock(m_stateMutex);
+        configSnap = m_config;
+    }
+
     std::string whitelistReason;
     if (IsWhitelistedInternal(processId, &whitelistReason)) {
         result.isWhitelisted = true;
@@ -1465,15 +1511,15 @@ MinerDetectionResult CryptoMinerDetectorImpl::ScanProcessInternal(uint32_t proce
 
     std::vector<DetectionSource> sources;
 
-    if (m_config.enableCPUMonitoring && DetectCPUMining(processId, result)) {
+    if (configSnap.enableCPUMonitoring && DetectCPUMining(processId, result)) {
         sources.push_back(DetectionSource::CPUHeuristic);
         result.isMinerDetected = true;
     }
-    if (m_config.enableGPUMonitoring && DetectGPUMining(processId, result)) {
+    if (configSnap.enableGPUMonitoring && DetectGPUMining(processId, result)) {
         sources.push_back(DetectionSource::GPUHeuristic);
         result.isMinerDetected = true;
     }
-    if (m_config.enableNetworkMonitoring && DetectNetworkMining(processId, result)) {
+    if (configSnap.enableNetworkMonitoring && DetectNetworkMining(processId, result)) {
         const auto primaryNetworkSource = std::any_of(result.networkConnections.begin(), result.networkConnections.end(),
             [](const auto& connection) {
                 return connection.protocol == MiningProtocol::Stratum ||
@@ -1484,15 +1530,15 @@ MinerDetectionResult CryptoMinerDetectorImpl::ScanProcessInternal(uint32_t proce
         sources.push_back(primaryNetworkSource);
         result.isMinerDetected = true;
     }
-    if (m_config.enableBrowserScanning && DetectBrowserMining(processId, result)) {
+    if (configSnap.enableBrowserScanning && DetectBrowserMining(processId, result)) {
         sources.push_back(result.browserInfo.has_value() && result.browserInfo->isWASM ? DetectionSource::BrowserWASM : DetectionSource::BrowserScript);
         result.isMinerDetected = true;
     }
-    if (m_config.enableSignatureScanning && DetectSignatureMining(processId, result)) {
+    if (configSnap.enableSignatureScanning && DetectSignatureMining(processId, result)) {
         sources.push_back(DetectionSource::SignatureBinary);
         result.isMinerDetected = true;
     }
-    if (m_config.enableBehavioralAnalysis && DetectBehavioralMining(processId, result)) {
+    if (configSnap.enableBehavioralAnalysis && DetectBehavioralMining(processId, result)) {
         sources.push_back(DetectionSource::ProcessBehavior);
         result.isMinerDetected = true;
     }
@@ -1529,8 +1575,15 @@ std::vector<MinerDetectionResult> CryptoMinerDetectorImpl::ScanAllProcessesInter
 std::vector<uint32_t> CryptoMinerDetectorImpl::CollectQuickScanTargets() const {
     std::set<uint32_t> targets;
 
+    // Snapshot threshold under lock to avoid data race with UpdateConfiguration
+    double cpuThreshold;
+    {
+        std::shared_lock lock(m_stateMutex);
+        cpuThreshold = m_config.cpuUsageThreshold;
+    }
+
     if (m_cpuDetector) {
-        for (const auto& signature : m_cpuDetector->GetHighCPUProcesses(m_config.cpuUsageThreshold)) {
+        for (const auto& signature : m_cpuDetector->GetHighCPUProcesses(cpuThreshold)) {
             if (signature.processId != 0) {
                 targets.insert(signature.processId);
             }
@@ -2006,6 +2059,13 @@ void CryptoMinerDetectorImpl::PublishDetection(MinerDetectionResult& result, boo
     }
 
     if (executeRemediation) {
+        // Snapshot config for remediation decisions (race-safe vs UpdateConfiguration)
+        CryptoMinerDetectorConfiguration remediationConfig;
+        {
+            std::shared_lock lock(m_stateMutex);
+            remediationConfig = m_config;
+        }
+
         // Graduated response ladder: severity determines maximum escalation level.
         // The ladder is: Alert → BlockNetwork → Terminate/Quarantine
         // Higher severity unlocks more aggressive responses. Config flags act as
@@ -2014,12 +2074,12 @@ void CryptoMinerDetectorImpl::PublishDetection(MinerDetectionResult& result, boo
         const auto pid = result.processInfo.processId;
 
         // Step 1 (always): Alert — notify operators of the detection
-        if (m_config.alertOnDetection) {
+        if (remediationConfig.alertOnDetection) {
             result.actionTaken = DetectionAction::Alert;
         }
 
         // Step 2 (Medium+): Block network — sever mining pool connections
-        if (severity >= ThreatSeverity::Medium && m_config.blockStratumProtocol) {
+        if (severity >= ThreatSeverity::Medium && remediationConfig.blockStratumProtocol) {
             bool blocked = false;
             if (result.browserInfo.has_value() && m_browserDetector && !result.browserInfo->domain.empty()) {
                 m_browserDetector->BlockDomain(result.browserInfo->domain);
@@ -2034,7 +2094,7 @@ void CryptoMinerDetectorImpl::PublishDetection(MinerDetectionResult& result, boo
         }
 
         // Step 3 (Critical only): Terminate — kill the miner process outright
-        if (severity >= ThreatSeverity::Critical && m_config.terminateOnDetection) {
+        if (severity >= ThreatSeverity::Critical && remediationConfig.terminateOnDetection) {
             if (TerminateMinerInternal(pid)) {
                 result.actionTaken = DetectionAction::Terminate;
             }
@@ -2537,7 +2597,13 @@ bool CryptoMinerDetectorImpl::SelfTest() const {
         return false;
     }
 
-    if (m_config.enableNetworkMonitoring && !IsMiningPoolInternal("supportxmr.com", MinerConstants::STRATUM_PORT_DEFAULT)) {
+    bool networkEnabled;
+    {
+        std::shared_lock lock(m_stateMutex);
+        networkEnabled = m_config.enableNetworkMonitoring;
+    }
+
+    if (networkEnabled && !IsMiningPoolInternal("supportxmr.com", MinerConstants::STRATUM_PORT_DEFAULT)) {
         return false;
     }
 
@@ -2771,14 +2837,30 @@ bool CryptoMinerDetector::UpdateConfiguration(const CryptoMinerDetectorConfigura
     }
 
     std::unique_lock lock(m_impl->m_stateMutex);
+    const auto oldBlacklistPath = m_impl->m_config.poolBlacklistPath;
     m_impl->m_config = config;
-    m_impl->m_whitelistedProcessNames.clear();
-    m_impl->m_whitelistedPools.clear();
-    for (const auto& name : config.whitelistedApplications) {
-        m_impl->m_whitelistedProcessNames.insert(ToLowerWide(name));
+    {
+        std::unique_lock wlLock(m_impl->m_whitelistMutex);
+        m_impl->m_whitelistedProcessNames.clear();
+        m_impl->m_whitelistedPools.clear();
+        for (const auto& name : config.whitelistedApplications) {
+            m_impl->m_whitelistedProcessNames.insert(ToLowerWide(name));
+        }
+        for (const auto& pool : config.whitelistedPools) {
+            m_impl->m_whitelistedPools.insert(TrimAndNormalizeHost(pool));
+        }
     }
-    for (const auto& pool : config.whitelistedPools) {
-        m_impl->m_whitelistedPools.insert(TrimAndNormalizeHost(pool));
+
+    // Reload pool blacklist if path changed
+    if (config.poolBlacklistPath != oldBlacklistPath) {
+        {
+            std::unique_lock poolLock(m_impl->m_poolMutex);
+            m_impl->m_poolDatabase.clear();
+        }
+        m_impl->LoadBuiltinPools();
+        if (!config.poolBlacklistPath.empty()) {
+            (void)m_impl->LoadPoolBlacklistInternal(config.poolBlacklistPath);
+        }
     }
 
     if (m_impl->m_cpuDetector) {

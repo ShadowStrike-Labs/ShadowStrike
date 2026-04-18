@@ -333,7 +333,11 @@ struct RuntimeStatistics {
     std::atomic<uint64_t> processesTerminated{0};
     std::atomic<uint64_t> dagDetections{0};
     std::array<std::atomic<uint64_t>, 16> byAlgorithm{};
-    TimePoint startTime = Clock::now();
+    std::atomic<int64_t> startTimeNs{Clock::now().time_since_epoch().count()};
+
+    [[nodiscard]] TimePoint GetStartTime() const noexcept {
+        return TimePoint(Clock::duration(startTimeNs.load(std::memory_order_relaxed)));
+    }
 
     void Reset() noexcept {
         totalScans.store(0, std::memory_order_relaxed);
@@ -344,7 +348,7 @@ struct RuntimeStatistics {
         for (auto& counter : byAlgorithm) {
             counter.store(0, std::memory_order_relaxed);
         }
-        startTime = Clock::now();
+        startTimeNs.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
     }
 };
 
@@ -869,10 +873,12 @@ void GPUMiningStatistics::Reset() noexcept {
 }
 
 [[nodiscard]] bool GPUMiningDetectorConfiguration::IsValid() const noexcept {
+    static constexpr size_t kMaxWhitelistedApps = 256;
     return std::isfinite(gpuLoadThreshold) && gpuLoadThreshold >= 0.0 && gpuLoadThreshold <= 100.0 &&
            std::isfinite(memoryThreshold) && memoryThreshold >= 0.0 && memoryThreshold <= 100.0 &&
            std::isfinite(temperatureWarning) && temperatureWarning >= 0.0 && temperatureWarning <= 150.0 &&
-           scanIntervalMs >= 500U && scanIntervalMs <= 60000U;
+           scanIntervalMs >= 500U && scanIntervalMs <= 60000U &&
+           whitelistedApplications.size() <= kMaxWhitelistedApps;
 }
 
 class GPUMiningDetectorImpl final {
@@ -1282,7 +1288,7 @@ public:
         snapshot.miningDetections = m_stats.miningDetections.load(std::memory_order_relaxed);
         snapshot.processesTerminated = m_stats.processesTerminated.load(std::memory_order_relaxed);
         snapshot.dagDetections = m_stats.dagDetections.load(std::memory_order_relaxed);
-        snapshot.startTime = m_stats.startTime;
+        snapshot.startTime = m_stats.GetStartTime();
         for (size_t index = 0; index < snapshot.byAlgorithm.size(); ++index) {
             snapshot.byAlgorithm[index] = m_stats.byAlgorithm[index].load(std::memory_order_relaxed);
         }
