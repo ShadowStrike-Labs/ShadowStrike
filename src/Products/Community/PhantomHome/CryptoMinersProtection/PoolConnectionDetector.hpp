@@ -493,7 +493,11 @@ struct PoolDetectorStatistics {
     std::atomic<uint64_t> sharesDetected{0};
     std::array<std::atomic<uint64_t>, 16> byProtocol{};
     std::array<std::atomic<uint64_t>, 16> byCrypto{};
-    TimePoint startTime = Clock::now();
+    std::atomic<int64_t> startTimeNs{Clock::now().time_since_epoch().count()};
+
+    [[nodiscard]] TimePoint GetStartTime() const noexcept {
+        return TimePoint(Clock::duration(startTimeNs.load(std::memory_order_relaxed)));
+    }
 
     PoolDetectorStatistics() = default;
     PoolDetectorStatistics(const PoolDetectorStatistics& other) noexcept;

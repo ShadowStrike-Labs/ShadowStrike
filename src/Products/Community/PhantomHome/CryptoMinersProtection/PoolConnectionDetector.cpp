@@ -2298,7 +2298,7 @@ PoolDetectorStatistics& PoolDetectorStatistics::operator=(const PoolDetectorStat
     for (size_t i = 0; i < byCrypto.size(); ++i) {
         byCrypto[i].store(other.byCrypto[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
-    startTime = other.startTime;
+    startTimeNs.store(other.startTimeNs.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return *this;
 }
 
@@ -2315,7 +2315,7 @@ void PoolDetectorStatistics::Reset() noexcept {
     for (auto& counter : byCrypto) {
         counter.store(0, std::memory_order_relaxed);
     }
-    startTime = Clock::now();
+    startTimeNs.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
 
 std::string PoolDetectorStatistics::ToJson() const {
