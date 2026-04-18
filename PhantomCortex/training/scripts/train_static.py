@@ -675,7 +675,7 @@ def main(argv: list[str] | None = None) -> None:
                 data_dir=args.data_dir,
                 download=False,
                 max_train_samples=final_train_samples,
-                max_test_samples=1,  # Don't reload test (already have it)
+                max_test_samples=2,  # Minimal test (1 per class); real test already held
             )
         else:
             from PhantomCortex.training.data.ember_loader import load_ember
