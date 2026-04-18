@@ -8,7 +8,7 @@ deployment:
     min_auc_roc: 0.995
     max_fpr_at_001: 0.001       # FPR at 0.1% threshold
     min_detection_rate: 0.995
-    max_model_size_mb: 20
+    max_model_size_mb: 30
     max_inference_ms: 5.0
     max_regression_pct: 0.5     # max % drop vs previous model
 

@@ -1096,6 +1096,11 @@ EngineResult ScanEngine::ScanFile(
         }
 
         // ====================================================================
+        // Cross-stage ML data: preserved across stages for Stage 10 ensemble
+        // ====================================================================
+        std::optional<EmulationResult> emulTraceForML;  // Populated by Stage 8
+
+        // ====================================================================
         // STAGE 1: WHITELIST CHECK (Fastest - Bloom Filter + Trie)
         // ====================================================================
 
@@ -2070,6 +2075,11 @@ EngineResult ScanEngine::ScanFile(
                     EmulationConfig emuConfig = EmulationConfig::CreateDefault();
                     auto emuResult = m_impl->m_emulationEngine->EmulatePE(emuBuffer, emuConfig);
 
+                    // Preserve trace for PhantomCortex ML ensemble (Stage 10)
+                    if (emuResult.emulationComplete && !emuResult.apiCalls.empty()) {
+                        emulTraceForML = emuResult;
+                    }
+
                     if (emuResult.isMalicious) {
                         m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
@@ -2163,14 +2173,63 @@ EngineResult ScanEngine::ScanFile(
                             auto staticVerdict = cortex.AnalyzeFile(
                                 std::span<const uint8_t>(fileBuffer));
 
-                            // Ensemble — currently static-only; behavioral/memory/network
-                            // verdicts will be plumbed once hook infrastructure is wired
+                            // Behavioral analysis from emulation API traces (Stage 8)
+                            // Convert EmulationEngine::APICallRecord → AI::APICallRecord
+                            std::optional<ShadowStrike::AI::CortexVerdict> behavioralVerdict;
+                            if (emulTraceForML.has_value() &&
+                                !emulTraceForML->apiCalls.empty()) {
+
+                                const auto& emuCalls = emulTraceForML->apiCalls;
+                                std::vector<ShadowStrike::AI::APICallRecord> aiCalls;
+                                aiCalls.reserve(emuCalls.size());
+
+                                auto prevTs = emuCalls.front().timestamp;
+                                for (const auto& ec : emuCalls) {
+                                    ShadowStrike::AI::APICallRecord ar{};
+                                    // FNV-1a hash of the function name for compact representation
+                                    uint32_t fnvHash = 0x811c9dc5u;
+                                    for (char c : ec.functionName) {
+                                        fnvHash ^= static_cast<uint8_t>(c);
+                                        fnvHash *= 0x01000193u;
+                                    }
+                                    ar.apiNameHash = fnvHash;
+
+                                    // Hash of argument summary
+                                    uint32_t argHash = 0x811c9dc5u;
+                                    for (const auto& arg : ec.arguments) {
+                                        for (char c : arg) {
+                                            argHash ^= static_cast<uint8_t>(c);
+                                            argHash *= 0x01000193u;
+                                        }
+                                    }
+                                    ar.argSummaryHash = argHash;
+
+                                    ar.returnValue = static_cast<int32_t>(
+                                        ec.returnValue & 0xFFFFFFFF);
+
+                                    const auto delta = std::chrono::duration_cast<
+                                        std::chrono::microseconds>(ec.timestamp - prevTs);
+                                    ar.timestampDeltaMs = static_cast<float>(
+                                        delta.count()) / 1000.0f;
+                                    prevTs = ec.timestamp;
+
+                                    aiCalls.push_back(ar);
+                                }
+
+                                behavioralVerdict = cortex.AnalyzeBehavior(
+                                    std::span<const ShadowStrike::AI::APICallRecord>(aiCalls));
+                            }
+
+                            // Ensemble verdict: static + behavioral (when available)
+                            // Memory/network require runtime data (ProcessMonitor, NetworkSensor)
+                            // and are wired via their respective EDR subsystems, not file scan.
+                            // Emulation ML model awaits EmulationEngine instruction-trace export.
                             auto ensemble = cortex.EnsembleVerdict(
-                                staticVerdict,      // static model
-                                std::nullopt,        // behavioral (future)
-                                std::nullopt,        // memory (future)
-                                std::nullopt,        // network (future)
-                                std::nullopt         // emulation (future)
+                                staticVerdict,           // static model ✅
+                                behavioralVerdict,       // behavioral from emulation API trace
+                                std::nullopt,            // memory (runtime: MemoryScanner)
+                                std::nullopt,            // network (runtime: NetworkSensor)
+                                std::nullopt             // emulation ML (pending trace export)
                             );
 
                             using ThreatVerdict = ShadowStrike::AI::ThreatVerdict;

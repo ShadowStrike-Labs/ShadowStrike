@@ -77,23 +77,35 @@ namespace CortexConstants {
     /// @brief Number of distinct model types in the ensemble
     inline constexpr size_t MODEL_COUNT = 5;
 
-    /// @brief Feature vector size for the static PE model (EMBER-aligned)
-    inline constexpr size_t STATIC_FEATURE_COUNT = 2381;
+    /// @brief Feature vector size for the static PE model (EMBER 2024 aligned)
+    inline constexpr size_t STATIC_FEATURE_COUNT = 2568;
 
     /// @brief Maximum API call sequence length for the behavioral model
     inline constexpr size_t MAX_API_SEQUENCE_LENGTH = 2048;
 
-    /// @brief Feature vector size for the behavioral model
-    inline constexpr size_t BEHAVIORAL_FEATURE_COUNT = 512;
+    /// @brief Behavioral model: number of timesteps in the API call sequence
+    inline constexpr size_t BEHAVIORAL_SEQ_LENGTH = 512;
 
-    /// @brief Feature vector size for the memory scanner model
-    inline constexpr size_t MEMORY_FEATURE_COUNT = 256;
+    /// @brief Behavioral model: features per timestep (apiHash, argHash, retVal, deltaMs)
+    inline constexpr size_t BEHAVIORAL_FEATURES_PER_STEP = 4;
 
-    /// @brief Feature vector size for the network flow model
-    inline constexpr size_t NETWORK_FEATURE_COUNT = 128;
+    /// @brief Total flat feature count for the behavioral model (SEQ_LENGTH × FEATURES_PER_STEP)
+    inline constexpr size_t BEHAVIORAL_FEATURE_COUNT = BEHAVIORAL_SEQ_LENGTH * BEHAVIORAL_FEATURES_PER_STEP;
 
-    /// @brief Feature vector size for the emulation trace model
-    inline constexpr size_t EMULATION_FEATURE_COUNT = 384;
+    /// @brief Feature vector size for the memory scanner model (CIC-MalMem-2022 aligned)
+    inline constexpr size_t MEMORY_FEATURE_COUNT = 128;
+
+    /// @brief Feature vector size for the network flow model (UNSW-NB15 aligned)
+    inline constexpr size_t NETWORK_FEATURE_COUNT = 64;
+
+    /// @brief Emulation model: number of timesteps in the event trace
+    inline constexpr size_t EMULATION_SEQ_LENGTH = 1024;
+
+    /// @brief Emulation model: features per timestep (opcodeCategory, memAccessType, apiCallId, eflagsChange)
+    inline constexpr size_t EMULATION_FEATURES_PER_STEP = 4;
+
+    /// @brief Total flat feature count for the emulation trace model (SEQ_LENGTH × FEATURES_PER_STEP)
+    inline constexpr size_t EMULATION_FEATURE_COUNT = EMULATION_SEQ_LENGTH * EMULATION_FEATURES_PER_STEP;
 
     /// @brief Maximum batch size for inference requests
     inline constexpr uint32_t MAX_BATCH_SIZE = 128;
@@ -180,13 +192,15 @@ enum class BehaviorCategory : uint8_t {
 
 /**
  * @brief Memory region threat classification.
+ *
+ * Aligned with CIC-MalMem-2022 + MemMal-D2024 training taxonomy.
+ * 4-class: Benign / Trojan / Ransomware / Spyware.
  */
 enum class MemoryThreatType : uint8_t {
     Benign      = 0,
-    Shellcode   = 1,
-    ROP         = 2,
-    Encrypted   = 3,
-    Packed      = 4
+    Trojan      = 1,
+    Ransomware  = 2,
+    Spyware     = 3
 };
 
 /**

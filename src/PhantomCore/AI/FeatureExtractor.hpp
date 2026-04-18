@@ -30,15 +30,15 @@
  *
  * FEATURE VECTOR SIZES (must match training):
  * ============================================
- * ┌──────────────┬──────────────────────────────────┐
- * │ Model        │ Feature Count                    │
- * ├──────────────┼──────────────────────────────────┤
- * │ Static (PE)  │ 2381 (EMBER-aligned)             │
- * │ Behavioral   │  512 (API sequence embedding)    │
- * │ Memory       │  256 (byte histogram + entropy)  │
- * │ Network      │  128 (flow statistics + TLS)     │
- * │ Emulation    │  384 (opcode/mem/API sequence)   │
- * └──────────────┴──────────────────────────────────┘
+ * ┌──────────────┬────────────────────────────────────────────┐
+ * │ Model        │ Feature Count                              │
+ * ├──────────────┼────────────────────────────────────────────┤
+ * │ Static (PE)  │ 2568 (EMBER 2024 aligned)                  │
+ * │ Behavioral   │ 2048 (512 steps × 4 features, 3D tensor)   │
+ * │ Memory       │  128 (CIC-MalMem-2022 aligned)             │
+ * │ Network      │   64 (UNSW-NB15 aligned)                   │
+ * │ Emulation    │ 4096 (1024 steps × 4 features, 3D tensor)  │
+ * └──────────────┴────────────────────────────────────────────┘
  *
  * SECURITY CONSIDERATIONS:
  * ========================

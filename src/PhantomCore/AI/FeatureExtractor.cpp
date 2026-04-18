@@ -28,7 +28,7 @@
  * to the Python training pipeline. Any divergence will silently degrade
  * detection accuracy.
  *
- * FEATURE VECTOR LAYOUT (EMBER-aligned for PE):
+ * FEATURE VECTOR LAYOUT (EMBER 2024 aligned for PE):
  * ──────────────────────────────────────────────
  * [  0 – 255 ] ByteHistogram            256
  * [256 – 511 ] ByteEntropyHistogram      256
@@ -36,11 +36,11 @@
  * [616 – 625 ] GeneralFileInfo            10
  * [626 – 687 ] HeaderFileInfo             62
  * [688 – 942 ] SectionInfo               255
- * [943 –2222 ] ImportsInfo              1280
- * [2223–2350 ] ExportsInfo               128
- * [2351–2380 ] DataDirectories            30
+ * [943 –2409 ] ImportsInfo              1467
+ * [2410–2537 ] ExportsInfo               128
+ * [2538–2567 ] DataDirectories            30
  *                                      ─────
- *                                       2381
+ *                                       2568
  *
  * SECURITY: All buffer accesses are bounds-checked via SafeReader. Malformed
  * PE files, truncated traces, and adversarial inputs return std::nullopt
@@ -101,10 +101,10 @@ constexpr size_t kHeaderInfoSize       = 62;
 constexpr size_t kSectionInfoOffset    = 688;
 constexpr size_t kSectionInfoSize      = 255;
 constexpr size_t kImportsInfoOffset    = 943;
-constexpr size_t kImportsInfoSize      = 1280;
-constexpr size_t kExportsInfoOffset    = 2223;
+constexpr size_t kImportsInfoSize      = 1467;
+constexpr size_t kExportsInfoOffset    = 2410;
 constexpr size_t kExportsInfoSize      = 128;
-constexpr size_t kDataDirOffset        = 2351;
+constexpr size_t kDataDirOffset        = 2538;
 constexpr size_t kDataDirSize          = 30;
 
 // --- Byte-Entropy Histogram Parameters ---
@@ -118,7 +118,7 @@ constexpr size_t kMinStringLength      = 5;
 constexpr size_t kMaxStringsCollected  = 100000;
 
 // --- Import/Export Hashing ---
-constexpr size_t kImportBins           = 1280;
+constexpr size_t kImportBins           = 1467;
 constexpr size_t kExportBins           = 128;
 
 // --- Section Feature Extraction ---
@@ -128,12 +128,12 @@ constexpr size_t kSectionAggregateStart  = 100;
 constexpr size_t kNumKnownSectionNames   = 17;
 
 // --- Behavioral ---
-constexpr size_t kBehavioralCalls      = 128;
-constexpr size_t kFeaturesPerCall      = 4;
+constexpr size_t kBehavioralCalls      = CortexConstants::BEHAVIORAL_SEQ_LENGTH;
+constexpr size_t kFeaturesPerCall      = CortexConstants::BEHAVIORAL_FEATURES_PER_STEP;
 
-// --- Memory ---
-constexpr size_t kMemCompressedBins    = 32;
-constexpr size_t kMemBigramFeatures    = 100;
+// --- Memory (CIC-MalMem-2022 aligned: 128 features) ---
+constexpr size_t kMemCompressedBins    = 16;
+constexpr size_t kMemBigramFeatures    = 50;
 constexpr size_t kMemBlockEntropyStats = 8;
 constexpr size_t kMemBlockSize         = 256;
 
@@ -997,7 +997,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
     }
 
     // ====================================================================
-    // GROUP 7: ImportsInfo (1280 features, indices 943-2222)
+    // GROUP 7: ImportsInfo (1467 features, indices 943-2409)
     // ====================================================================
     {
         float* impf = &features[kImportsInfoOffset];
@@ -1105,7 +1105,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
     }
 
     // ====================================================================
-    // GROUP 8: ExportsInfo (128 features, indices 2223-2350)
+    // GROUP 8: ExportsInfo (128 features, indices 2410-2537)
     // ====================================================================
     {
         float* expf = &features[kExportsInfoOffset];
@@ -1169,7 +1169,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
     }
 
     // ====================================================================
-    // GROUP 9: DataDirectories (30 features, indices 2351-2380)
+    // GROUP 9: DataDirectories (30 features, indices 2538-2567)
     // ====================================================================
     {
         float* ddf = &features[kDataDirOffset];
@@ -1185,7 +1185,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
 }
 
 // ============================================================================
-// ExtractBehavioralFeatures  (512 features)
+// ExtractBehavioralFeatures  (2048 features = 512 steps × 4)
 // ============================================================================
 
 std::optional<std::vector<float>> FeatureExtractor::ExtractBehavioralFeatures(
@@ -1208,8 +1208,8 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractBehavioralFeatures(
 
     std::vector<float> features(CortexConstants::BEHAVIORAL_FEATURE_COUNT, 0.0f);
 
-    // Take the most recent kBehavioralCalls (128) calls for the feature vector.
-    // If more than 128, take the last 128.
+    // Take the most recent kBehavioralCalls (512) calls for the sequence tensor.
+    // If more than 512, take the last 512.
     const size_t startIdx = (apiCalls.size() > kBehavioralCalls)
                             ? apiCalls.size() - kBehavioralCalls
                             : 0;
@@ -1240,7 +1240,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractBehavioralFeatures(
 }
 
 // ============================================================================
-// ExtractMemoryFeatures  (256 features)
+// ExtractMemoryFeatures  (128 features, CIC-MalMem-2022 aligned)
 // ============================================================================
 
 std::optional<std::vector<float>> FeatureExtractor::ExtractMemoryFeatures(
@@ -1267,7 +1267,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractMemoryFeatures(
     std::vector<float> features(CortexConstants::MEMORY_FEATURE_COUNT, 0.0f);
     size_t idx = 0;
 
-    // ---- Byte histogram (full 256-bin), compressed to 32 bins ----
+    // ---- Byte histogram (full 256-bin), compressed to 16 bins ----
     {
         std::array<size_t, 256> counts{};
         for (size_t i = 0; i < dataSize; ++i) {
@@ -1276,10 +1276,10 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractMemoryFeatures(
         const float invSize = 1.0f / static_cast<float>(dataSize);
         for (size_t bin = 0; bin < kMemCompressedBins; ++bin) {
             float sum = 0.0f;
-            for (size_t j = 0; j < 8; ++j) {
-                sum += static_cast<float>(counts[bin * 8 + j]) * invSize;
+            for (size_t j = 0; j < 16; ++j) {
+                sum += static_cast<float>(counts[bin * 16 + j]) * invSize;
             }
-            features[idx++] = sum / 8.0f;
+            features[idx++] = sum / 16.0f;
         }
     }
 
@@ -1498,7 +1498,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractMemoryFeatures(
 }
 
 // ============================================================================
-// ExtractNetworkFeatures  (128 features)
+// ExtractNetworkFeatures  (64 features, UNSW-NB15 aligned)
 // ============================================================================
 
 std::optional<std::vector<float>> FeatureExtractor::ExtractNetworkFeatures(
@@ -1620,7 +1620,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractNetworkFeatures(
 }
 
 // ============================================================================
-// ExtractEmulationFeatures  (384 features)
+// ExtractEmulationFeatures  (4096 features = 1024 steps × 4)
 // ============================================================================
 
 std::optional<std::vector<float>> FeatureExtractor::ExtractEmulationFeatures(
@@ -1636,132 +1636,43 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractEmulationFeatures(
         return std::nullopt;
     }
 
+    constexpr size_t kSeqLen = CortexConstants::EMULATION_SEQ_LENGTH;
+    constexpr size_t kFeatPerStep = CortexConstants::EMULATION_FEATURES_PER_STEP;
+
     std::vector<float> features(CortexConstants::EMULATION_FEATURE_COUNT, 0.0f);
-    size_t idx = 0;
-    const size_t numEvents = events.size();
-    const float invEvents = 1.0f / static_cast<float>(numEvents);
 
-    // ---- Opcode category histogram (16 categories) ----
-    {
-        std::array<uint32_t, kOpcodeCategories> opHist{};
-        for (const auto& ev : events) {
-            uint16_t cat = ev.opcodeCategory;
-            if (cat < kOpcodeCategories) ++opHist[cat];
-        }
-        for (size_t i = 0; i < kOpcodeCategories; ++i) {
-            features[idx++] = static_cast<float>(opHist[i]) * invEvents;
-        }
+    // Truncate or pad to kSeqLen events. If more events than kSeqLen,
+    // take the most recent kSeqLen (tail of the trace is most indicative).
+    const size_t startIdx = (events.size() > kSeqLen)
+                            ? events.size() - kSeqLen
+                            : 0;
+    const size_t count = std::min<size_t>(events.size(), kSeqLen);
+
+    constexpr float kOpcodeCatNorm = 1.0f / 15.0f;   // 16 categories → [0, 1]
+    constexpr float kMemAccessNorm = 1.0f / 3.0f;     // 4 access types → [0, 1]
+    constexpr float kApiIdNorm     = 1.0f / 65535.0f;  // uint16_t → [0, 1]
+    constexpr float kEflagsNorm    = 1.0f / 255.0f;    // uint8_t → [0, 1]
+
+    for (size_t i = 0; i < count; ++i) {
+        const auto& ev = events[startIdx + i];
+        const size_t base = i * kFeatPerStep;
+
+        // [0] opcodeCategory normalized to [0, 1]
+        features[base + 0] = static_cast<float>(
+            std::min<uint16_t>(ev.opcodeCategory, 15)) * kOpcodeCatNorm;
+
+        // [1] memoryAccessType normalized to [0, 1]
+        features[base + 1] = static_cast<float>(
+            std::min<uint8_t>(ev.memoryAccessType, 3)) * kMemAccessNorm;
+
+        // [2] apiCallId normalized to [0, 1]
+        features[base + 2] = static_cast<float>(ev.apiCallId) * kApiIdNorm;
+
+        // [3] eflagsChange normalized to [0, 1]
+        features[base + 3] = static_cast<float>(ev.eflagsChange) * kEflagsNorm;
     }
 
-    // ---- Memory access pattern histogram (4 types) ----
-    {
-        std::array<uint32_t, kMemAccessTypes> memHist{};
-        for (const auto& ev : events) {
-            uint8_t t = ev.memoryAccessType;
-            if (t < kMemAccessTypes) ++memHist[t];
-        }
-        for (size_t i = 0; i < kMemAccessTypes; ++i) {
-            features[idx++] = static_cast<float>(memHist[i]) * invEvents;
-        }
-    }
-
-    // ---- API call frequency histogram (top 100 APIs by ID) ----
-    {
-        std::unordered_map<uint16_t, uint32_t> apiCounts;
-        for (const auto& ev : events) {
-            if (ev.apiCallId != 0) {
-                ++apiCounts[ev.apiCallId];
-            }
-        }
-
-        std::vector<std::pair<uint32_t, uint16_t>> sorted;
-        sorted.reserve(apiCounts.size());
-        for (const auto& [id, cnt] : apiCounts) {
-            sorted.push_back({cnt, id});
-        }
-        std::partial_sort(sorted.begin(),
-                          sorted.begin() + std::min<size_t>(sorted.size(), kTopAPIs),
-                          sorted.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-
-        const size_t topN = std::min<size_t>(sorted.size(), kTopAPIs);
-        for (size_t i = 0; i < topN; ++i) {
-            features[idx + i] = static_cast<float>(sorted[i].first) * invEvents;
-        }
-        idx += kTopAPIs;
-    }
-
-    // ---- EFLAGS change histogram (8 bits) ----
-    {
-        std::array<uint32_t, kEflagsBits> efHist{};
-        for (const auto& ev : events) {
-            for (size_t bit = 0; bit < kEflagsBits; ++bit) {
-                if (ev.eflagsChange & (1u << bit)) ++efHist[bit];
-            }
-        }
-        for (size_t i = 0; i < kEflagsBits; ++i) {
-            features[idx++] = static_cast<float>(efHist[i]) * invEvents;
-        }
-    }
-
-    // ---- Sequence n-grams: opcode category bigrams + trigrams ----
-    {
-        // Build bigram and trigram histograms using feature hashing into
-        // kNgramFeatures (128) bins. First 64 for bigrams, last 64 for trigrams.
-        constexpr size_t kBigramBins = 64;
-        constexpr size_t kTrigramBins = 64;
-
-        if (numEvents >= 2) {
-            for (size_t i = 0; i + 1 < numEvents; ++i) {
-                uint16_t a = events[i].opcodeCategory % kOpcodeCategories;
-                uint16_t b = events[i + 1].opcodeCategory % kOpcodeCategories;
-                uint32_t bigramKey = (static_cast<uint32_t>(a) << 16) | b;
-                uint32_t h = MurmurHash3_x86_32(&bigramKey, sizeof(bigramKey), 42);
-                features[idx + h % kBigramBins] += invEvents;
-            }
-        }
-        idx += kBigramBins;
-
-        if (numEvents >= 3) {
-            for (size_t i = 0; i + 2 < numEvents; ++i) {
-                uint16_t a = events[i].opcodeCategory % kOpcodeCategories;
-                uint16_t b = events[i + 1].opcodeCategory % kOpcodeCategories;
-                uint16_t c = events[i + 2].opcodeCategory % kOpcodeCategories;
-                uint64_t trigramKey = (static_cast<uint64_t>(a) << 32)
-                                    | (static_cast<uint64_t>(b) << 16) | c;
-                uint32_t h = MurmurHash3_x86_32(&trigramKey, sizeof(trigramKey), 42);
-                features[idx + h % kTrigramBins] += invEvents;
-            }
-        }
-        idx += kTrigramBins;
-    }
-
-    // ---- Temporal features: instruction mix over time windows ----
-    {
-        // Divide the trace into kTemporalFeatures (128) windows and encode
-        // the dominant opcode category fraction per window.
-        const size_t windowSize = std::max<size_t>(1, numEvents / kTemporalFeatures);
-
-        for (size_t w = 0; w < kTemporalFeatures; ++w) {
-            const size_t wStart = w * windowSize;
-            if (wStart >= numEvents) break;
-            const size_t wEnd = std::min(wStart + windowSize, numEvents);
-            const size_t wLen = wEnd - wStart;
-
-            std::array<uint32_t, kOpcodeCategories> localHist{};
-            for (size_t i = wStart; i < wEnd; ++i) {
-                uint16_t cat = events[i].opcodeCategory;
-                if (cat < kOpcodeCategories) ++localHist[cat];
-            }
-
-            // Dominant category fraction as the feature.
-            uint32_t maxCount = *std::max_element(localHist.begin(), localHist.end());
-            features[idx + w] = static_cast<float>(maxCount) / static_cast<float>(wLen);
-        }
-        idx += kTemporalFeatures;
-    }
-
-    // Remaining features are zero-padded to EMULATION_FEATURE_COUNT.
+    // Remaining slots (beyond count * kFeatPerStep) stay zero-padded.
     return features;
 }
 
