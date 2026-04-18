@@ -354,18 +354,9 @@ enum class AnalysisMode : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief Module status (shared definition in ForensicsCommon.hpp)
  */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Analyzing       = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+#include "ForensicsCommon.hpp"
 
 // ============================================================================
 // STRUCTURES
@@ -803,7 +794,7 @@ using EventCallback = std::function<void(const TimelineEvent&)>;
 using ChainCallback = std::function<void(const AttackChain&)>;
 
 /// @brief Progress callback
-using ProgressCallback = std::function<void(uint64_t processed, uint64_t total)>;
+using TimelineProgressCallback = std::function<void(uint64_t processed, uint64_t total)>;
 
 // ============================================================================
 // TIMELINE ANALYZER CLASS
@@ -1048,7 +1039,7 @@ public:
     /**
      * @brief Set progress callback
      */
-    void SetProgressCallback(ProgressCallback callback);
+    void SetProgressCallback(TimelineProgressCallback callback);
     
     // ========================================================================
     // STATISTICS

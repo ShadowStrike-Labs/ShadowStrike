@@ -353,18 +353,9 @@ enum class FilterAction : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief Module status (shared definition in ForensicsCommon.hpp)
  */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+#include "ForensicsCommon.hpp"
 
 // ============================================================================
 // STRUCTURES

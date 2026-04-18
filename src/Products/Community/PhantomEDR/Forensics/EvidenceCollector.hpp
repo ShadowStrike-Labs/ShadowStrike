@@ -372,18 +372,9 @@ inline constexpr CollectionFlags operator&(CollectionFlags a, CollectionFlags b)
 }
 
 /**
- * @brief Module status
+ * @brief Module status (shared definition in ForensicsCommon.hpp)
  */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+#include "ForensicsCommon.hpp"
 
 // ============================================================================
 // STRUCTURES
@@ -810,7 +801,7 @@ struct CollectionStatistics {
 // ============================================================================
 
 /// @brief Collection progress callback
-using ProgressCallback = std::function<void(const CollectionProgress&)>;
+using CollectionProgressCallback = std::function<void(const CollectionProgress&)>;
 
 /// @brief Evidence item callback
 using EvidenceCallback = std::function<void(const EvidenceItem&)>;
@@ -1088,7 +1079,7 @@ public:
     /**
      * @brief Set progress callback
      */
-    void SetProgressCallback(ProgressCallback callback);
+    void SetProgressCallback(CollectionProgressCallback callback);
     
     /**
      * @brief Set evidence callback

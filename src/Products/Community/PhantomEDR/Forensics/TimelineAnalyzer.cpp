@@ -460,7 +460,7 @@ public:
     // Callbacks
     void SetEventCallback(EventCallback callback);
     void SetChainCallback(ChainCallback callback);
-    void SetProgressCallback(ProgressCallback callback);
+    void SetProgressCallback(TimelineProgressCallback callback);
 
     // Statistics
     TimelineStatistics GetStatistics() const;
@@ -502,7 +502,7 @@ private:
     mutable std::mutex m_callbackMutex;
     EventCallback m_eventCallback;
     ChainCallback m_chainCallback;
-    ProgressCallback m_progressCallback;
+    TimelineProgressCallback m_progressCallback;
 
     // Statistics
     mutable TimelineStatistics m_stats;
@@ -1501,7 +1501,7 @@ void TimelineAnalyzerImpl::SetChainCallback(ChainCallback callback) {
     m_chainCallback = std::move(callback);
 }
 
-void TimelineAnalyzerImpl::SetProgressCallback(ProgressCallback callback) {
+void TimelineAnalyzerImpl::SetProgressCallback(TimelineProgressCallback callback) {
     std::lock_guard lock(m_callbackMutex);
     m_progressCallback = std::move(callback);
 }
@@ -2091,7 +2091,7 @@ void TimelineAnalyzer::SetChainCallback(ChainCallback callback) {
     m_impl->SetChainCallback(std::move(callback));
 }
 
-void TimelineAnalyzer::SetProgressCallback(ProgressCallback callback) {
+void TimelineAnalyzer::SetProgressCallback(TimelineProgressCallback callback) {
     m_impl->SetProgressCallback(std::move(callback));
 }
 
