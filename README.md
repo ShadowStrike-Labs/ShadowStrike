@@ -71,7 +71,7 @@ This is not a wrapper around existing tools. This is not a PoC. This is a produc
 
 > **1.5 million lines** of C, C++20, x86 Assembly, and Python.
 
-> **Current state:** Alpha. Kernel driver is complete and Coverity-verified. User-mode infrastructure in active module-by-module security audit. AI models trained on 452K real PE samples (EMBER 2018). Emulation engine operational. On track for public beta early 2027.
+> **Current state:** Alpha. Kernel driver is complete and Coverity-verified. PhantomCore is ready. AI models trained on 3.5M+ real PE samples (EMBER 2018 + EMBER 2024). Emulation engine operational. On track for public beta early 2027.
 
 ---
 
@@ -93,14 +93,14 @@ ShadowStrike Phantom is the alternative:
 |-----------|--------|--------|
 | Architecture | ✅ Complete | Designed and documented |
 | PhantomSensor.sys | ✅ Complete | 20 subsystems · Coverity 0.25 defect/KLoC · Driver Verifier passed |
-| User-Mode Shared Modules | 🔧 %96 | 23 modules — security audit phase |
-| PhantomEmulator | 🔧 95% | CPU emulation · 10 DLL stubs · Analysis suite |
+| PhantomCore | ✅ Complete | 23 modules — security audit phase |
+| PhantomEmulator | ✅ Complete | CPU emulation · 10 DLL stubs · Analysis suite |
 | PhantomCortex AI/ML | 🔧 85% | 5 models trained · ONNX inference · Nightly retraining pipeline |
 | PhantomDisassembler | ✅ Complete | Custom x86/x64 decoder — replacing Zydis dependency |
 | Kernel ↔ User-Mode Wiring | ✅ Complete | Encrypted IPC · Module-by-module integration in progress |
-| Product Tiers (Home/EDR/XDR) | 📋 Planned | After shared infrastructure |
-| Management Dashboard | 📋 Planned | EDR/XDR fleet management |
-| Public Beta | 🎯 Early 2027 | |
+| Product Tiers (Home/EDR/XDR) | 🔧 58% | After shared infrastructure |
+| Management Dashboard | 🔧 38% | EDR/XDR fleet management |
+| Public Beta | 🎯 1st day of 2027 | |
 
 ---
 
@@ -173,7 +173,7 @@ ShadowStrike Phantom is the alternative:
 
 ## 🛡️ PhantomSensor — Kernel Driver
 
-A **380,000-line WDM minifilter** kernel driver that intercepts, analyzes, and blocks threats at the lowest software level. Coverity static analysis at **0.25 defects/KLoC**. Driver Verifier: zero violations.
+A **From scratch WDM minifilter** kernel driver that intercepts, analyzes, and blocks threats at the lowest software level. Coverity static analysis at **0.25 defects/KLoC**. Driver Verifier: zero violations.
 
 | Subsystem | Techniques Covered |
 |-----------|-------------------|
@@ -209,7 +209,7 @@ A **380,000-line WDM minifilter** kernel driver that intercepts, analyzes, and b
 
 ## 🧠 PhantomCortex — On-Device AI/ML
 
-Five purpose-built neural network models running inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on **452,000 real PE samples** from the EMBER 2018 dataset plus synthetic behavioral, memory, network, and emulation data.
+Five purpose-built neural network models running inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on **3.5-3.6M real PE samples** from the EMBER 2018-2024 datasets plus synthetic behavioral, memory, network, and emulation data.
 
 | Model | Architecture | Input | Purpose |
 |-------|-------------|-------|---------|
@@ -309,7 +309,7 @@ The PhantomEmulator's existing instruction decoder (VEX/EVEX/AVX-512 support) se
 
 ---
 
-## 🔍 Shared Modules — User-Mode Detection Infrastructure
+## 🔍 PhantomCore - Main Malware Hunting Engine which is shared for the Phantom EDR - XDR - Home products
 
 **23 module families** comprising the user-mode detection, protection, and intelligence stack:
 
@@ -535,7 +535,7 @@ Any derivative work must also be released under AGPL-3.0. For commercial licensi
 
 **ShadowStrike-Labs** · Alpha · [shadowstrike.dev](https://www.shadowstrike.dev)
 
-*1.5 million lines of code. Every line auditable.*
+*Every line auditable.*
 
 For business inquiries: [contact@shadowstrike.dev](mailto:contact@shadowstrike.dev)
 
