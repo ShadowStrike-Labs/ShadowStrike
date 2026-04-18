@@ -197,7 +197,7 @@ enum class BackupSchedule : uint32_t {
 [[nodiscard]] bool MigrateConfiguration(uint32_t fromVersion);
 
 /// @brief Exports user-layer Home configuration to a JSON file.
-///        Sensitive keys are encrypted; factory defaults are excluded.
+///        Sensitive keys are included but encrypted; factory defaults are excluded.
 /// @param outputPath  Destination file path (parent directory must exist)
 /// @return true if export succeeded
 [[nodiscard]] bool ExportUserConfiguration(const std::filesystem::path& outputPath);
