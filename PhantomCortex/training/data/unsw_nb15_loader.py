@@ -29,7 +29,16 @@ UNSW-NB15 Attack Categories → NetworkThreatClass mapping:
     DoS               → Normal (0)   — autoencoder anomaly detection handles this
     Generic           → Normal (0)   — too vague for direct classification
 
-License: UNSW-NB15 is publicly available for research purposes.
+License: UNSW-NB15 is publicly available with citation requirements.
+    The dataset page states "For the academic/public use of this dataset, the
+    authors have to cite the following papers."  There is no explicit open-source
+    license (Apache-2.0 / MIT / CC-BY).  Legal review is recommended before
+    shipping in a commercial product.  Alternatives with clearer licensing:
+      - CSE-CIC-IDS2018 (AWS Open Data, CC-BY-SA 4.0 implied, 80 features)
+      - NF-UNSW-NB15-v3 (UQ Research Data, same base data, NetFlow-53 features)
+    Attribution papers (required by UNSW):
+      - Moustafa & Slay, MilCIS 2015
+      - Moustafa & Slay, ISJ 2016
 """
 
 from __future__ import annotations

@@ -56,7 +56,7 @@ logger = logging.getLogger("PhantomCortex.StaticTrainer")
 # Constants
 # ---------------------------------------------------------------------------
 
-EMBER_FEATURE_COUNT: int = 2381
+EMBER_FEATURE_COUNT: int = 2568  # EMBER 2024 (was 2381 for EMBER 2018)
 DEFAULT_SEED: int = 42
 MAX_OPTUNA_PARALLELISM: int = 4
 

@@ -35,6 +35,14 @@ from PhantomCortex.training.data.memory_generator import (
     NUM_CLASSES,
     generate_memory_dataset,
 )
+from PhantomCortex.training.data.memory_external_loader import (
+    load_memory_external_dataset,
+)
+from PhantomCortex.training.data.dataset_utils import (
+    compute_class_weights,
+    create_dataloader,
+    split_data,
+)
 from PhantomCortex.training.models.memory_mlp import CortexMemoryTrainer
 
 logger = logging.getLogger("PhantomCortex.Scripts.TrainMemory")
@@ -86,6 +94,8 @@ def run_training(
     output_dir: str,
     checkpoint_every: int,
     opset: int,
+    dataset_mode: str = "real",
+    memory_data_dir: str | None = None,
 ) -> None:
     """Execute the full Cortex-Memory training pipeline.
 
@@ -115,25 +125,92 @@ def run_training(
     logger.info("Cortex-Memory Training Pipeline")
     logger.info("=" * 70)
 
-    # ---- Step 1: Generate data ----
-    logger.info("[1/4] Generating synthetic memory region data...")
+    # ---- Step 1: Load data ----
+    if dataset_mode == "real":
+        logger.info("[1/4] Loading real memory forensics data (CIC-MalMem-2022 + MemMal-D2024)...")
+        data_start = time.monotonic()
+        raw_dir = memory_data_dir or str(
+            Path(__file__).resolve().parent.parent / "data" / "raw"
+        )
+        X, y, mem_meta = load_memory_external_dataset(
+            data_dir=raw_dir,
+            max_samples_per_class=samples_per_class,
+            seed=seed,
+        )
+        data_elapsed = time.monotonic() - data_start
+        logger.info(
+            "  Real memory data: %d samples, %d features in %.2fs",
+            X.shape[0], X.shape[1], data_elapsed,
+        )
 
-    data_start = time.monotonic()
-    split = generate_memory_dataset(
-        samples_per_class=samples_per_class,
-        seed=seed,
-        batch_size=batch_size,
-        output_dir=str(out_path / "data"),
-    )
-    data_elapsed = time.monotonic() - data_start
+        (X_train, y_train), (X_val, y_val), (X_test, y_test) = split_data(X, y, seed=seed)
+        train_loader = create_dataloader(
+            X_train, y_train, batch_size=batch_size, shuffle=True, num_workers=0,
+        )
+        val_loader = create_dataloader(
+            X_val, y_val, batch_size=batch_size, shuffle=False, num_workers=0,
+        )
+        test_loader = create_dataloader(
+            X_test, y_test, batch_size=batch_size, shuffle=False, num_workers=0,
+        )
+    elif dataset_mode == "hybrid":
+        logger.info("[1/4] Loading real memory data + synthetic augmentation...")
+        data_start = time.monotonic()
+        raw_dir = memory_data_dir or str(
+            Path(__file__).resolve().parent.parent / "data" / "raw"
+        )
+        X_real, y_real, mem_meta = load_memory_external_dataset(
+            data_dir=raw_dir,
+            max_samples_per_class=samples_per_class,
+            seed=seed,
+        )
+        logger.info("  Real: %d samples", X_real.shape[0])
 
-    logger.info(
-        "  Data generated in %.2fs: train=%d val=%d test=%d",
-        data_elapsed,
-        len(split.X_train),
-        len(split.X_val),
-        len(split.X_test),
-    )
+        split_syn = generate_memory_dataset(
+            samples_per_class=samples_per_class,
+            seed=seed,
+            batch_size=batch_size,
+            output_dir=str(out_path / "data"),
+        )
+        X_syn = np.concatenate([split_syn.X_train, split_syn.X_val, split_syn.X_test])
+        y_syn = np.concatenate([split_syn.y_train, split_syn.y_val, split_syn.y_test])
+        logger.info("  Synthetic: %d samples", y_syn.shape[0])
+
+        X = np.concatenate((X_real, X_syn), axis=0)
+        y = np.concatenate((y_real, y_syn), axis=0)
+        data_elapsed = time.monotonic() - data_start
+        logger.info("  Hybrid: %d total in %.2fs", y.shape[0], data_elapsed)
+
+        (X_train, y_train), (X_val, y_val), (X_test, y_test) = split_data(X, y, seed=seed)
+        train_loader = create_dataloader(
+            X_train, y_train, batch_size=batch_size, shuffle=True, num_workers=0,
+        )
+        val_loader = create_dataloader(
+            X_val, y_val, batch_size=batch_size, shuffle=False, num_workers=0,
+        )
+        test_loader = create_dataloader(
+            X_test, y_test, batch_size=batch_size, shuffle=False, num_workers=0,
+        )
+    else:
+        logger.info("[1/4] Generating synthetic memory region data...")
+        data_start = time.monotonic()
+        split = generate_memory_dataset(
+            samples_per_class=samples_per_class,
+            seed=seed,
+            batch_size=batch_size,
+            output_dir=str(out_path / "data"),
+        )
+        data_elapsed = time.monotonic() - data_start
+        logger.info(
+            "  Data generated in %.2fs: train=%d val=%d test=%d",
+            data_elapsed,
+            len(split.X_train),
+            len(split.X_val),
+            len(split.X_test),
+        )
+        train_loader = split.train_loader
+        val_loader = split.val_loader
+        test_loader = split.test_loader
 
     # ---- Step 2: Train ----
     logger.info("[2/4] Training CortexMemoryNet...")
@@ -150,8 +227,8 @@ def run_training(
 
     train_start = time.monotonic()
     model = trainer.train(
-        split.train_loader,
-        split.val_loader,
+        train_loader,
+        val_loader,
         epochs=epochs,
         grad_clip=grad_clip,
         checkpoint_dir=str(checkpoint_dir),
@@ -165,7 +242,7 @@ def run_training(
     logger.info("[3/4] Evaluating on test set...")
 
     eval_start = time.monotonic()
-    report = trainer.evaluate(model, split.test_loader)
+    report = trainer.evaluate(model, test_loader)
     eval_elapsed = time.monotonic() - eval_start
 
     logger.info("  Evaluation completed in %.2fs", eval_elapsed)
@@ -250,30 +327,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "--samples-per-class",
         type=int,
         default=10_000,
-        help="Synthetic samples per class",
+        help="Samples per class (for synthetic or max cap for real data)",
+    )
+    parser.add_argument(
+        "--dataset-mode",
+        type=str,
+        default="real",
+        choices=("synthetic", "real", "hybrid"),
+        help="Data source: 'real' uses CIC-MalMem-2022 + MemMal-D2024, 'hybrid' adds synthetic.",
+    )
+    parser.add_argument(
+        "--memory-data-dir",
+        type=str,
+        default=None,
+        help="Root directory containing memory forensics datasets (auto-detected if omitted).",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=50,
+        default=100,
         help="Maximum training epochs",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=512,
+        default=256,
         help="Training batch size",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-3,
+        default=5e-4,
         help="Peak learning rate",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=1e-4,
+        default=5e-4,
         help="AdamW weight decay",
     )
     parser.add_argument(
@@ -338,6 +428,8 @@ def main() -> None:
         output_dir=args.output_dir,
         checkpoint_every=args.checkpoint_every,
         opset=args.opset,
+        dataset_mode=args.dataset_mode,
+        memory_data_dir=args.memory_data_dir,
     )
 
 

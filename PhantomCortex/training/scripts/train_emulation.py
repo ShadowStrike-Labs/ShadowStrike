@@ -47,6 +47,9 @@ from PhantomCortex.training.data.emulation_generator import (
     generate_emulation_dataset,
     get_emulation_dataloaders,
 )
+from PhantomCortex.training.data.quo_vadis_loader import (
+    load_quovadis_emulation,
+)
 from PhantomCortex.training.models.emulation_gru import (
     CortexEmulationTrainer,
     EmulationVerdict,
@@ -65,16 +68,18 @@ def run_training(
     *,
     output_dir: str,
     dataset_path: Optional[str] = None,
+    dataset_mode: str = "real",
+    quovadis_dir: Optional[str] = None,
     n_samples: int = 60000,
     n_benign: Optional[int] = None,
     n_suspicious: Optional[int] = None,
     n_malicious: Optional[int] = None,
     seq_length: int = 1024,
-    batch_size: int = 128,
-    epochs: int = 80,
+    batch_size: int = 64,
+    epochs: int = 120,
     hidden_dim: int = 256,
-    num_layers: int = 2,
-    learning_rate: float = 1e-3,
+    num_layers: int = 3,
+    learning_rate: float = 3e-4,
     weight_decay: float = 1e-4,
     grad_clip: float = 1.0,
     device: Optional[str] = None,
@@ -148,6 +153,49 @@ def run_training(
     if dataset_path is not None:
         logger.info("Loading dataset from %s", dataset_path)
         X_tr, y_tr, X_val, y_val, X_te, y_te = load_dataset(dataset_path)
+    elif dataset_mode == "real":
+        logger.info("Loading Quo Vadis Speakeasy real emulation data...")
+        t_gen = time.perf_counter()
+        X, y, qv_meta = load_quovadis_emulation(
+            data_dir=quovadis_dir,
+            seed=seed,
+            sequence_length=seq_length,
+        )
+        gen_time = time.perf_counter() - t_gen
+        logger.info(
+            "Quo Vadis emulation: %d samples in %.1fs — %s",
+            y.shape[0], gen_time, qv_meta.get("class_distribution", ""),
+        )
+        summary["data_source"] = "quovadis_real"
+        summary["data_load_time_s"] = round(gen_time, 2)
+        (X_tr, y_tr), (X_val, y_val), (X_te, y_te) = split_data(X, y, seed=seed)
+    elif dataset_mode == "hybrid":
+        logger.info("Loading Quo Vadis real data + synthetic augmentation...")
+        t_gen = time.perf_counter()
+        X_real, y_real, qv_meta = load_quovadis_emulation(
+            data_dir=quovadis_dir,
+            seed=seed,
+            sequence_length=seq_length,
+        )
+        logger.info("Quo Vadis real: %d samples", y_real.shape[0])
+
+        X_syn, y_syn = generate_emulation_dataset(
+            n_samples=n_samples,
+            seq_length=seq_length,
+            seed=seed,
+            n_benign=n_benign,
+            n_suspicious=n_suspicious,
+            n_malicious=n_malicious,
+        )
+        logger.info("Synthetic: %d samples", y_syn.shape[0])
+
+        X = np.concatenate((X_real, X_syn), axis=0)
+        y = np.concatenate((y_real, y_syn), axis=0)
+        gen_time = time.perf_counter() - t_gen
+        logger.info("Hybrid corpus: %d total in %.1fs", y.shape[0], gen_time)
+        summary["data_source"] = "hybrid"
+        summary["data_load_time_s"] = round(gen_time, 2)
+        (X_tr, y_tr), (X_val, y_val), (X_te, y_te) = split_data(X, y, seed=seed)
     else:
         logger.info("Generating synthetic emulation data...")
         t_gen = time.perf_counter()
@@ -289,16 +337,25 @@ def main() -> None:
         help="Directory for checkpoints, ONNX model, and reports",
     )
     parser.add_argument("--dataset-path", type=str, default=None, help="Pre-saved .npz dataset")
+    parser.add_argument(
+        "--dataset-mode", type=str, default="real",
+        choices=("synthetic", "real", "hybrid"),
+        help="Data source: 'real' uses Quo Vadis Speakeasy, 'hybrid' adds synthetic augmentation.",
+    )
+    parser.add_argument(
+        "--quovadis-dir", type=str, default=None,
+        help="Quo Vadis Speakeasy dataset directory (auto-detected if omitted).",
+    )
     parser.add_argument("--n-samples", type=int, default=60000, help="Total synthetic samples")
     parser.add_argument("--n-benign", type=int, default=None, help="Benign count override")
     parser.add_argument("--n-suspicious", type=int, default=None, help="Suspicious count override")
     parser.add_argument("--n-malicious", type=int, default=None, help="Malicious count override")
     parser.add_argument("--seq-length", type=int, default=1024, help="Sequence length")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=80, help="Max training epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=120, help="Max training epochs")
     parser.add_argument("--hidden-dim", type=int, default=256, help="GRU hidden dimension")
-    parser.add_argument("--num-layers", type=int, default=2, help="GRU layer count")
-    parser.add_argument("--learning-rate", type=float, default=1e-3, help="Initial LR")
+    parser.add_argument("--num-layers", type=int, default=3, help="GRU layer count")
+    parser.add_argument("--learning-rate", type=float, default=3e-4, help="Initial LR")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument("--device", type=str, default=None, help="PyTorch device (cpu/cuda)")
@@ -325,6 +382,8 @@ def main() -> None:
     run_training(
         output_dir=args.output_dir,
         dataset_path=args.dataset_path,
+        dataset_mode=args.dataset_mode,
+        quovadis_dir=args.quovadis_dir,
         n_samples=args.n_samples,
         n_benign=args.n_benign,
         n_suspicious=args.n_suspicious,

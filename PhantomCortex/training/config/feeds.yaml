@@ -39,9 +39,16 @@ feeds:
 
   ember:
     enabled: true
+    dataset_version: "2024_pe"
+    loader: "ember2024"
+    note: "EMBER 2024 PE subset via thrember package (Apache-2.0). 4.68M train + 1.08M test, 2568 features."
+
+  ember_legacy:
+    enabled: false
     dataset_version: "2018_2"
     download_url: "https://ember.elastic.co/ember_dataset_2018_2.tar.bz2"
     expected_sha256: "b6052eb8d350a49a8d5a5396fbe7d16cf42848b86ff969b77464434cf2997812"
+    note: "EMBER 2018 — deprecated, kept for backward compatibility only."
 
   feodo:
     enabled: true
