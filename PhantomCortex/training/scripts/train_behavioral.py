@@ -264,6 +264,29 @@ def run_training(args: argparse.Namespace) -> None:
             y.shape[0],
         )
 
+    # ── Class-aware oversampling for underrepresented classes ────────
+    if args.min_class_samples > 0:
+        oversample_rng = np.random.default_rng(args.seed + 7)
+        unique_cls, counts = np.unique(y, return_counts=True)
+        oversample_X_parts: list[np.ndarray] = []
+        oversample_y_parts: list[np.ndarray] = []
+        for cls, cnt in zip(unique_cls, counts):
+            if cnt < args.min_class_samples:
+                deficit = args.min_class_samples - cnt
+                cls_idx = np.where(y == cls)[0]
+                dup_idx = oversample_rng.choice(cls_idx, size=deficit, replace=True)
+                oversample_X_parts.append(X[dup_idx])
+                oversample_y_parts.append(y[dup_idx])
+                cls_name = BehaviorCategory(cls).name if cls < len(BehaviorCategory) else f"class_{cls}"
+                logger.info(
+                    "  Oversampled class %d (%s): %d -> %d",
+                    cls, cls_name, cnt, args.min_class_samples,
+                )
+        if oversample_X_parts:
+            X = np.concatenate([X] + oversample_X_parts, axis=0)
+            y = np.concatenate([y] + oversample_y_parts, axis=0)
+            logger.info("  After oversampling: %d total samples", y.shape[0])
+
     (X_train, y_train), (X_val, y_val), (X_test, y_test) = split_data(X, y, seed=args.seed)
     class_weights = compute_class_weights(y_train)
     train_loader = create_dataloader(
@@ -419,6 +442,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Disable the external-dataset NPZ cache.",
+    )
+    data.add_argument(
+        "--min-class-samples",
+        type=int,
+        default=3000,
+        help="Minimum samples per class. Underrepresented classes are "
+             "oversampled (duplicated) to reach this threshold.",
     )
     data.add_argument(
         "--samples-per-class",

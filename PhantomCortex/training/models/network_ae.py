@@ -324,6 +324,7 @@ class CortexNetworkTrainer:
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 10,
         class_weights: Optional[torch.Tensor] = None,
+        pretrained_model: Optional[nn.Module] = None,
     ) -> nn.Module:
         """Joint training of autoencoder + classifier with combined loss.
 
@@ -339,11 +340,15 @@ class CortexNetworkTrainer:
             checkpoint_dir: Path for periodic checkpoints.
             checkpoint_every: Checkpoint frequency in epochs.
             class_weights: Per-class weights for cross-entropy.
+            pretrained_model: Optional model with pretrained encoder/decoder
+                weights (e.g., from ``train_autoencoder``). If provided, joint
+                training starts from these weights rather than random init.
 
         Returns:
             Best model by validation loss.
         """
-        model = self.build_model()
+        model = pretrained_model if pretrained_model is not None else self.build_model()
+        model = model.to(self._device)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=self._lr, weight_decay=self._weight_decay
         )
