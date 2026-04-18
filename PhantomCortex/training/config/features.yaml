@@ -10,8 +10,8 @@ pe_features:
   max_sections: 10
   import_hash_bins: 1280       # 256 library bins + 1024 function bins
   export_hash_bins: 128
-  total_features: 2381         # EMBER v2 compatible
-  feature_version: 2
+  total_features: 2568         # EMBER 2024 compatible (was 2381 for EMBER 2018)
+  feature_version: 3           # v3 = EMBER 2024 schema
 
 behavioral_features:
   max_sequence_length: 512

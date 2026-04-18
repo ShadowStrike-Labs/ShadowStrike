@@ -65,7 +65,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _TRAINING_DIR = _SCRIPT_DIR.parent
 _DEFAULT_OUTPUT_DIR = _TRAINING_DIR / "data" / "models" / "cortex_static"
 
-DEFAULT_FEATURE_COUNT: int = 2381
+DEFAULT_FEATURE_COUNT: int = 2568
 VALIDATION_FRACTION: float = 0.10
 DEFAULT_HPO_TRIALS: int = 100
 DEFAULT_HPO_CV_FOLDS: int = 5
@@ -93,10 +93,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dataset",
         type=str,
         choices=("ember2018", "ember2024-pe"),
-        default="ember2018",
+        default="ember2024-pe",
         help=(
             "Dataset source. 'ember2024-pe' uses EMBER2024 PE subsets via "
-            "the thrember package; 'ember2018' preserves the legacy loader."
+            "the thrember package (default); 'ember2018' is the legacy loader."
         ),
     )
     parser.add_argument(

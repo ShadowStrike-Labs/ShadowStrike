@@ -81,7 +81,7 @@ feeds:
     - "threatfox"
     - "otx"
     - "urlhaus"
-    - "ember"
+    - "ember"                          # Now points to EMBER 2024 via feeds.yaml
     - "feodo"
 
 # ---------------------------------------------------------------------------

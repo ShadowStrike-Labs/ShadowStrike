@@ -43,15 +43,15 @@ logger = logging.getLogger("PhantomCortex.Training.Bridge")
 _BEHAVIORAL_DEFAULTS: dict[str, Any] = {
     "samples_per_class": 5_000,
     "sequence_length": 512,
-    "dataset_mode": "hybrid",
+    "dataset_mode": "hybrid_real_first",  # Prioritize real data
     "noise_low": 0.10,
     "noise_high": 0.30,
     "failure_rate": 0.05,
-    "epochs": 100,
-    "batch_size": 256,
-    "learning_rate": 1e-3,
-    "weight_decay": 1e-4,
-    "embed_dim": 64,
+    "epochs": 150,                   # Increased for real data (was 100)
+    "batch_size": 128,               # Smaller for generalization (was 256)
+    "learning_rate": 5e-4,           # Lower for real data (was 1e-3)
+    "weight_decay": 5e-4,            # Stronger regularization (was 1e-4)
+    "embed_dim": 128,                # Richer representations (was 64)
     "grad_clip": 1.0,
     "seed": 42,
     "onnx_opset": 17,
@@ -60,10 +60,10 @@ _BEHAVIORAL_DEFAULTS: dict[str, Any] = {
 
 _MEMORY_DEFAULTS: dict[str, Any] = {
     "samples_per_class": 10_000,
-    "epochs": 50,
-    "batch_size": 512,
-    "learning_rate": 1e-3,
-    "weight_decay": 1e-4,
+    "epochs": 100,                   # Increased for real data (was 50)
+    "batch_size": 256,               # Smaller for convergence (was 512)
+    "learning_rate": 5e-4,           # Lower for real data (was 1e-3)
+    "weight_decay": 5e-4,            # Explicit regularization (was 1e-4)
     "grad_clip": 1.0,
     "seed": 42,
     "checkpoint_every": 10,
@@ -72,12 +72,12 @@ _MEMORY_DEFAULTS: dict[str, Any] = {
 
 _NETWORK_DEFAULTS: dict[str, Any] = {
     "samples_per_class": 10_000,
-    "epochs": 100,
-    "batch_size": 256,
-    "learning_rate": 1e-3,
+    "epochs": 200,                   # Increased for UNSW-NB15 (was 100)
+    "batch_size": 512,               # Larger for 2.2M dataset (was 256)
+    "learning_rate": 5e-4,           # Explicit LR for real data (was 1e-3)
     "weight_decay": 1e-4,
     "grad_clip": 1.0,
-    "recon_weight": 0.5,
+    "recon_weight": 0.7,             # Prioritize reconstruction (was 0.5)
     "latent_dim": 32,
     "seed": 42,
     "checkpoint_every": 10,
@@ -87,11 +87,11 @@ _NETWORK_DEFAULTS: dict[str, Any] = {
 _EMULATION_DEFAULTS: dict[str, Any] = {
     "n_samples": 60_000,
     "seq_length": 1024,
-    "batch_size": 128,
-    "epochs": 80,
+    "batch_size": 64,                # Smaller for complex sequences (was 128)
+    "epochs": 120,                   # Increased for real data (was 80)
     "hidden_dim": 256,
-    "num_layers": 2,
-    "learning_rate": 1e-3,
+    "num_layers": 3,                 # Deeper for complex patterns (was 2)
+    "learning_rate": 3e-4,           # Lower for real data (was 1e-3)
     "weight_decay": 1e-4,
     "grad_clip": 1.0,
     "seed": 42,
@@ -105,7 +105,7 @@ _STATIC_DEFAULTS: dict[str, Any] = {
     "n_jobs": -1,
     "early_stopping": 50,
     "threshold": 0.5,
-    "hpo_trials": 100,
+    "hpo_trials": 150,               # More trials for better HPO (was 100)
     "hpo_cv_folds": 5,
     "hpo_timeout": 3600,
     "opset": 17,
@@ -207,8 +207,10 @@ def _train_behavioral(output_dir: Path, data_dir: Path, device: str) -> dict[str
 
     ns = argparse.Namespace(
         output_dir=model_output,
-        data_dir=str(data_dir / "behavioral"),
+        data_dir=str(data_dir / "raw" / "behavioral_external"),
+        quovadis_dir=str(data_dir / "raw" / "quovadis_speakeasy"),
         dataset_mode=defaults["dataset_mode"],
+        real_data_fraction=0.70,
         no_download=False,
         no_cache=False,
         device=device,
@@ -282,6 +284,8 @@ def _train_memory(output_dir: Path, data_dir: Path, device: str) -> dict[str, An
         output_dir=model_output,
         checkpoint_every=defaults["checkpoint_every"],
         opset=defaults["opset"],
+        dataset_mode="real",
+        memory_data_dir=str(data_dir / "raw"),
     )
     elapsed = time.monotonic() - t0
 
@@ -331,6 +335,8 @@ def _train_network(output_dir: Path, data_dir: Path, device: str) -> dict[str, A
         checkpoint_every=defaults["checkpoint_every"],
         opset=defaults["opset"],
         latent_dim=defaults["latent_dim"],
+        dataset_mode="real",
+        unsw_data_dir=str(data_dir / "raw" / "unsw_nb15"),
     )
     elapsed = time.monotonic() - t0
 
@@ -369,6 +375,8 @@ def _train_emulation(output_dir: Path, data_dir: Path, device: str) -> dict[str,
     t0 = time.monotonic()
     summary = run_training(
         output_dir=model_output,
+        dataset_mode="real",
+        quovadis_dir=str(data_dir / "raw" / "quovadis_speakeasy"),
         n_samples=defaults["n_samples"],
         seq_length=defaults["seq_length"],
         batch_size=defaults["batch_size"],

@@ -13,62 +13,82 @@
 
 cortex_static:
   model_type: "lightgbm"
-  feature_count: 2381
-  n_estimators: 2000
-  learning_rate: 0.05
-  num_leaves: 127
-  max_depth: 10
+  dataset: "ember2024-pe"            # EMBER 2024 (was ember2018)
+  feature_count: 2568                # EMBER 2024 dimension (was 2381)
+  n_estimators: 3000                 # Higher ceiling for HPO (was 2000)
+  learning_rate: 0.03                # Lower for larger dataset (was 0.05)
+  num_leaves: 255                    # More capacity (was 127)
+  max_depth: 15                      # Deeper for 2568 features (was 10)
+  min_child_samples: 50              # Regularization for larger dataset
+  subsample: 0.8
+  colsample_bytree: 0.7             # Slight reduction for 2568 features
+  reg_alpha: 5.0                     # Stronger L1 regularization (was 0.1)
+  reg_lambda: 0.01                   # Lighter L2 (was 1.0)
   objective: "binary"
   metric: "auc"
   early_stopping_rounds: 50
-  optuna_trials: 100
+  optuna_trials: 150                 # More trials for better HPO (was 100)
   cv_folds: 5
   detection_threshold: 0.5
-  target_fpr: 0.001        # 0.1%
-  target_detection_rate: 0.995  # 99.5%
+  target_fpr: 0.001                  # 0.1%
+  target_detection_rate: 0.995       # 99.5%
 
 cortex_behavioral:
   model_type: "cnn_attention"
   sequence_length: 512
   feature_dim: 4
-  embed_dim: 64
+  embed_dim: 128                     # Richer representations (was 64)
   num_classes: 20
-  epochs: 100
-  batch_size: 256
-  learning_rate: 0.001
-  weight_decay: 0.0001
+  epochs: 150                        # More epochs for real data (was 100)
+  batch_size: 128                    # Smaller batches for generalization (was 256)
+  learning_rate: 0.0005              # Lower LR for real data (was 0.001)
+  weight_decay: 0.0005               # Stronger regularization (was 0.0001)
+  dataset_mode: "hybrid_real_first"  # Prioritize real data over synthetic
+  real_data_fraction: 0.70           # 70% real, 20% external, 10% synthetic
 
 cortex_memory:
   model_type: "mlp"
   input_dim: 128
   num_classes: 5
-  epochs: 50
-  batch_size: 512
-  learning_rate: 0.001
+  epochs: 100                        # More epochs for real data (was 50)
+  batch_size: 256                    # Smaller batches for convergence (was 512)
+  learning_rate: 0.0005              # Lower LR for real data (was 0.001)
+  weight_decay: 0.0005               # Explicit regularization
 
 cortex_network:
   model_type: "autoencoder_classifier"
   latent_dim: 32
   num_classes: 8
-  epochs: 100
-  batch_size: 128
+  epochs: 200                        # More epochs for UNSW-NB15 convergence (was 100)
+  batch_size: 512                    # Larger batches for 2.2M dataset (was 128)
+  learning_rate: 0.0005              # Explicit LR for real data
   anomaly_threshold: 0.95
+  recon_weight: 0.7                  # Prioritize reconstruction (was implicit 0.5)
+  ae_pretrain_epochs: 50             # Pretrain autoencoder on Normal traffic only
 
 cortex_emulation:
   model_type: "gru"
   sequence_length: 1024
   feature_dim: 4
   hidden_dim: 256
-  num_layers: 2
+  num_layers: 3                      # Deeper for complex patterns (was 2)
   num_classes: 3
-  epochs: 80
-  batch_size: 128
+  epochs: 120                        # More epochs for real data (was 80)
+  batch_size: 64                     # Smaller for complex sequences (was 128)
+  learning_rate: 0.0003              # Explicit LR for real data
+  dropout: 0.4                       # Stronger dropout to prevent overfitting (was 0.3)
 
 quantization:
-  method: "dynamic"        # dynamic or static
+  default_method: "dynamic"          # dynamic or static
   weight_type: "INT8"
   max_model_size_mb: 20
   max_inference_ms: 5.0
+  per_model:
+    static: "none"                   # LightGBM is a tree model — INT8 quantization has no effect
+    behavioral: "dynamic"
+    memory: "dynamic"
+    network: "dynamic"
+    emulation: "static"              # GRU benefits from static quantization with calibration data
 
 deployment:
   model_dir: "../data/models"

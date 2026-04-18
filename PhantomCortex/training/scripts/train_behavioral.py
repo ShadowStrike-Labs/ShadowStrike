@@ -56,6 +56,9 @@ from PhantomCortex.training.data.behavioral_generator import (  # noqa: E402
 from PhantomCortex.training.data.behavioral_external_loader import (  # noqa: E402
     load_behavioral_external_dataset,
 )
+from PhantomCortex.training.data.quo_vadis_loader import (  # noqa: E402
+    load_quovadis_behavioral,
+)
 from PhantomCortex.training.data.dataset_utils import (  # noqa: E402
     compute_class_weights,
     create_dataloader,
@@ -182,6 +185,66 @@ def run_training(args: argparse.Namespace) -> None:
             cache=not args.no_cache,
         )
         logger.info("External dataset summary: %s", external_meta)
+    elif args.dataset_mode == "hybrid_real_first":
+        # ── Real-data-first hybrid: Quo Vadis + external + synthetic backfill
+        logger.info("Loading Quo Vadis real behavioral data")
+        X_qv, y_qv, qv_meta = load_quovadis_behavioral(
+            data_dir=args.quovadis_dir,
+            seed=args.seed,
+            max_samples_per_class=args.samples_per_class,
+            sequence_length=args.sequence_length,
+            cache=not args.no_cache,
+        )
+        logger.info(
+            "Quo Vadis: %d samples — %s",
+            y_qv.shape[0], qv_meta.get("class_distribution", ""),
+        )
+
+        logger.info("Loading external behavioral corpus")
+        X_ext, y_ext, ext_meta = load_behavioral_external_dataset(
+            data_dir=args.data_dir,
+            sequence_length=args.sequence_length,
+            download=not args.no_download,
+            cache=not args.no_cache,
+        )
+        logger.info("External: %d samples — %s", y_ext.shape[0], ext_meta)
+
+        # Compute how many synthetic samples are needed for backfill
+        real_total = y_qv.shape[0] + y_ext.shape[0]
+        target_synthetic_fraction = 1.0 - args.real_data_fraction
+        synthetic_target = max(
+            0,
+            int(real_total * target_synthetic_fraction / max(args.real_data_fraction, 0.01)),
+        )
+        logger.info(
+            "Generating %d synthetic samples for backfill (target %.0f%% real)",
+            synthetic_target, args.real_data_fraction * 100,
+        )
+
+        if synthetic_target > 0:
+            backfill_per_class = max(1, synthetic_target // len(BehaviorCategory))
+            gen_cfg_backfill = GeneratorConfig(
+                samples_per_class=backfill_per_class,
+                sequence_length=args.sequence_length,
+                noise_ratio_low=args.noise_low,
+                noise_ratio_high=args.noise_high,
+                failure_rate=args.failure_rate,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                num_workers=effective_num_workers,
+            )
+            gen_backfill = BehavioralDataGenerator(gen_cfg_backfill)
+            X_syn, y_syn = gen_backfill.generate_dataset()
+        else:
+            X_syn = np.empty((0, args.sequence_length, 4), dtype=np.float32)
+            y_syn = np.empty((0,), dtype=np.int64)
+
+        X = np.concatenate((X_qv, X_ext, X_syn), axis=0)
+        y = np.concatenate((y_qv, y_ext, y_syn), axis=0)
+        logger.info(
+            "Hybrid real-first corpus — quovadis=%d external=%d synthetic=%d total=%d",
+            y_qv.shape[0], y_ext.shape[0], y_syn.shape[0], y.shape[0],
+        )
     else:
         logger.info("Generating synthetic corpus and augmenting with external traces")
         X_syn, y_syn = generator.generate_dataset()
@@ -322,15 +385,28 @@ def build_parser() -> argparse.ArgumentParser:
     data = p.add_argument_group("data generation")
     data.add_argument(
         "--dataset-mode",
-        choices=("synthetic", "external", "hybrid"),
-        default="synthetic",
-        help="Training corpus selection strategy.",
+        choices=("synthetic", "external", "hybrid", "hybrid_real_first"),
+        default="hybrid_real_first",
+        help="Training corpus selection strategy. 'hybrid_real_first' uses "
+             "Quo Vadis real data + external + synthetic backfill.",
     )
     data.add_argument(
         "--data-dir",
         type=str,
         default=str(_TRAINING_DIR / "data" / "raw" / "behavioral_external"),
         help="Directory containing external behavioral datasets and caches.",
+    )
+    data.add_argument(
+        "--quovadis-dir",
+        type=str,
+        default=str(_TRAINING_DIR / "data" / "raw" / "quovadis_speakeasy"),
+        help="Directory containing the Quo Vadis Speakeasy dataset.",
+    )
+    data.add_argument(
+        "--real-data-fraction",
+        type=float,
+        default=0.70,
+        help="Target fraction of real data in hybrid_real_first mode.",
     )
     data.add_argument(
         "--no-download",
@@ -377,11 +453,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Training
     train = p.add_argument_group("training")
-    train.add_argument("--epochs", type=int, default=100)
-    train.add_argument("--batch-size", type=int, default=256)
-    train.add_argument("--learning-rate", type=float, default=1e-3)
-    train.add_argument("--weight-decay", type=float, default=1e-4)
-    train.add_argument("--embed-dim", type=int, default=64)
+    train.add_argument("--epochs", type=int, default=150)
+    train.add_argument("--batch-size", type=int, default=128)
+    train.add_argument("--learning-rate", type=float, default=5e-4)
+    train.add_argument("--weight-decay", type=float, default=5e-4)
+    train.add_argument("--embed-dim", type=int, default=128)
     train.add_argument("--grad-clip", type=float, default=1.0)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument(
