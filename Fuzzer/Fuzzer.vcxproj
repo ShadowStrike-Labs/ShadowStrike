@@ -108,6 +108,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\BehaviorHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ScanEngineHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DatabaseConfigHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ProcessCommandLineHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\IPCHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ServiceProtocolHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\TrafficHarness.hpp" />
@@ -137,6 +138,7 @@
     <ClCompile Include="src\ScanEngineHarness.cpp" />
     <ClCompile Include="src\ScanEngineHarnessDepsStub.cpp" />
     <ClCompile Include="src\DatabaseConfigHarness.cpp" />
+    <ClCompile Include="src\ProcessCommandLineHarness.cpp" />
     <ClCompile Include="src\IPCHarness.cpp" />
     <ClCompile Include="src\ServiceProtocolHarness.cpp" />
     <ClCompile Include="src\TrafficHarness.cpp" />
@@ -222,6 +224,9 @@
     <ClCompile Include="..\src\PhantomCore\Database\DatabaseManager.cpp" />
     <ClCompile Include="..\src\PhantomCore\Database\ConfigurationDB.cpp" />
     <ClCompile Include="..\src\PhantomCore\RealTime\BehaviorBlocker.cpp" />
+    <ClCompile Include="..\src\PhantomCore\RealTime\ProcessCreationMonitor.cpp">
+      <PreprocessorDefinitions>SHADOWSTRIKE_RTP_FOCUSED_BUILD=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="..\src\PhantomCore\RealTime\NetworkTrafficFilter.cpp" />
     <ClCompile Include="..\src\PhantomCore\SelfProtection\CryptoManager.cpp" />
     <!-- ThreatIntel feed parsers -->

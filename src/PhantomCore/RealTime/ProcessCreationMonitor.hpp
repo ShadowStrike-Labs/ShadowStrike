@@ -1394,7 +1394,7 @@ public:
     void Stop();
 
     /**
-     * @brief Pause monitoring temporarily (protection suspended while keeping state).
+     * @brief Pause monitoring temporarily and quiesce transient tracked state.
      */
     void Pause();
 
