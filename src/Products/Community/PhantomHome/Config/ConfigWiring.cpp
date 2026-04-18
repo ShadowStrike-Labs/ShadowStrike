@@ -80,9 +80,29 @@ struct HomeConfigRegistrar final {
                 },
 
                 .start = []() -> bool {
-                    // Config registration is complete after Initialize(); no
-                    // background threads or callbacks to start here.
-                    return true;
+                    // Config registration completed in Initialize(). Now
+                    // validate the assembled configuration before feature
+                    // modules begin reading it during their Start() calls.
+                    try {
+                        namespace Cfg = ShadowStrike::Products::PhantomHome::Config;
+                        if (!Cfg::ValidateConfiguration()) {
+                            SS_LOG_WARN(kLogCategory,
+                                L"HomeConfig: ValidateConfiguration() found issues — "
+                                L"continuing with best-effort defaults");
+                            // Non-fatal: validation warnings should not block
+                            // the entire product. Issues are already logged
+                            // individually by ValidateConfiguration().
+                        }
+                        return true;
+                    } catch (const std::exception& ex) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"HomeConfig: start() threw: %hs", ex.what());
+                        return true; // Non-fatal — validation is advisory
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"HomeConfig: start() threw unknown exception");
+                        return true;
+                    }
                 },
 
                 .shutdown = []() noexcept {

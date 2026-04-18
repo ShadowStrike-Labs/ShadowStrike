@@ -152,16 +152,21 @@ public:
      * @brief Initialize every registered module whose config gate is enabled.
      *
      * Ordering:
-     *   1. Call HomeConfigRegistration::RegisterProductDefaults().
-     *   2. Call HomeConfigRegistration::RegisterProfilePresets().
-     *   3. Iterate modules in phase order; for each:
+     *   1. Iterate modules in phase order; Foundation modules first.
+     *   2. For each module:
      *        - read the enabled config key (default true if missing)
      *        - if enabled, invoke initialize() in try/catch
      *        - update state to Initialized or Failed
      *
+     * Config defaults and profile presets are registered by the HomeConfig
+     * Foundation-phase module (ConfigWiring.cpp), guaranteeing all keys
+     * exist before any feature module reads them.
+     *
      * Returns true iff every ENABLED module initialized successfully. A single
      * module failure does not abort the pass - we always attempt every
      * enabled module so one broken subsystem doesn't hide others' issues.
+     *
+     * Sets IsInitialized() to true only if at least one module succeeded.
      */
     [[nodiscard]] bool Initialize() noexcept;
 
@@ -225,7 +230,6 @@ private:
 
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_running{false};
-    std::atomic<bool> m_configBootstrapped{false};
 };
 
 }  // namespace Home

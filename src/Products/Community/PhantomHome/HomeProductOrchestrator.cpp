@@ -13,8 +13,6 @@
 
 #include "HomeProductOrchestrator.hpp"
 
-#include "Config/HomeConfigRegistration.hpp"
-
 #include "../../../PhantomCore/Config/ConfigManager.hpp"
 #include "../../../PhantomCore/Utils/Logger.hpp"
 
@@ -125,37 +123,12 @@ bool HomeProductOrchestrator::Initialize() noexcept {
 }
 
 bool HomeProductOrchestrator::InitializeLocked() noexcept {
-    // Step 1 - bootstrap config defaults and profile presets exactly once.
-    // This must happen BEFORE any per-module initialize() runs because every
-    // module reads config keys during its Initialize.
-    if (!m_configBootstrapped.load(std::memory_order_acquire)) {
-        SS_LOG_INFO(kLogCategory, L"Bootstrapping PhantomHome config defaults");
-        try {
-            using namespace ::ShadowStrike::Products::PhantomHome::Config;
-            const bool defaultsOk = RegisterProductDefaults();
-            if (!defaultsOk) {
-                SS_LOG_ERROR(kLogCategory,
-                    L"HomeConfigRegistration::RegisterProductDefaults() returned false");
-                // Non-fatal: modules can still run with ConfigManager's
-                // built-in defaults; we just lose Home-specific tuning.
-            }
-            const bool presetsOk = RegisterProfilePresets();
-            if (!presetsOk) {
-                SS_LOG_ERROR(kLogCategory,
-                    L"HomeConfigRegistration::RegisterProfilePresets() returned false");
-            }
-            m_configBootstrapped.store(true, std::memory_order_release);
-        } catch (const std::exception& e) {
-            SS_LOG_FATAL(kLogCategory,
-                L"HomeConfigRegistration bootstrap threw: %hs", e.what());
-            return false;
-        } catch (...) {
-            SS_LOG_FATAL(kLogCategory, L"HomeConfigRegistration bootstrap threw unknown exception");
-            return false;
-        }
-    }
+    // Config defaults and profile presets are registered by the HomeConfig
+    // Foundation-phase module (ConfigWiring.cpp). Because Foundation runs
+    // first in phase order, all keys are available before any feature module
+    // reads them. No duplicate bootstrap here — single source of truth.
 
-    // Step 2 - iterate modules in phase order, initializing each enabled one.
+    // Iterate modules in phase order, initializing each enabled one.
     // We take a snapshot of the registry under a shared lock so concurrent
     // RegisterModule calls (from late-arriving static initializers) don't
     // invalidate our iterators.
@@ -239,9 +212,19 @@ bool HomeProductOrchestrator::InitializeLocked() noexcept {
         }
     }
 
-    m_initialized.store(true, std::memory_order_release);
+    // Only report initialized if at least one module reached Initialized/Running.
+    {
+        std::shared_lock regLock(m_registryMutex);
+        const bool anyInitialized = std::any_of(m_modules.begin(), m_modules.end(),
+            [](const ModuleRecord& r) {
+                return r.state == ModuleState::Initialized ||
+                       r.state == ModuleState::Running;
+            });
+        m_initialized.store(anyInitialized, std::memory_order_release);
+    }
     SS_LOG_INFO(kLogCategory,
-        L"PhantomHome Initialize phase complete (allOk=%d)", allOk ? 1 : 0);
+        L"PhantomHome Initialize phase complete (allOk=%d, initialized=%d)",
+        allOk ? 1 : 0, m_initialized.load(std::memory_order_relaxed) ? 1 : 0);
     return allOk;
 }
 
@@ -316,9 +299,18 @@ bool HomeProductOrchestrator::StartLocked() noexcept {
         }
     }
 
-    m_running.store(true, std::memory_order_release);
+    // Only report running if at least one module reached Running state.
+    {
+        std::shared_lock regLock(m_registryMutex);
+        const bool anyRunning = std::any_of(m_modules.begin(), m_modules.end(),
+            [](const ModuleRecord& r) {
+                return r.state == ModuleState::Running;
+            });
+        m_running.store(anyRunning, std::memory_order_release);
+    }
     SS_LOG_INFO(kLogCategory,
-        L"PhantomHome Start phase complete (allOk=%d)", allOk ? 1 : 0);
+        L"PhantomHome Start phase complete (allOk=%d, running=%d)",
+        allOk ? 1 : 0, m_running.load(std::memory_order_relaxed) ? 1 : 0);
     return allOk;
 }
 

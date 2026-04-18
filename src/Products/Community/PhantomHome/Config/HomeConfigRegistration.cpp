@@ -492,7 +492,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
 [[nodiscard]] bool ResetToDefaults() {
     auto& cm = CM::Instance();
 
-    Utils::Logger::Info("[Home Config] Resetting all Home configuration to factory defaults");
+    Utils::Logger::Info("[Home Config] Resetting Home configuration keys to factory defaults");
 
     auto snapshotId = cm.CreateSnapshot("Pre-reset backup");
     if (snapshotId == 0) {
@@ -500,7 +500,30 @@ bool RegKeyRange(const std::string& key, const std::string& category,
                             "proceeding without backup");
     }
 
-    cm.ResetToDefaults(ShadowStrike::Config::ConfigLayer::User);
+    // Only reset keys under the "Home/" prefix — never touch EDR/XDR/Core
+    // keys that may share the same User layer on co-installed products.
+    constexpr std::string_view kHomePrefix = "Home/";
+    const auto allKeys = cm.GetAllKeys();
+    bool anyFailure = false;
+
+    for (const auto& key : allKeys) {
+        if (key.size() >= kHomePrefix.size() &&
+            key.compare(0, kHomePrefix.size(), kHomePrefix) == 0) {
+            if (!cm.ResetKeyToDefault(key)) {
+                Utils::Logger::Warn("[Home Config] Failed to reset key '{}'", key);
+                anyFailure = true;
+            }
+        }
+    }
+
+    if (anyFailure) {
+        Utils::Logger::Error("[Home Config] Some keys failed to reset — "
+                             "attempting snapshot restore");
+        if (snapshotId != 0) {
+            cm.RestoreSnapshot(snapshotId);
+        }
+        return false;
+    }
 
     auto errors = cm.ValidateAll();
     if (!errors.empty()) {
@@ -582,8 +605,8 @@ bool RegKeyRange(const std::string& key, const std::string& category,
 
     ShadowStrike::Config::ConfigIOOptions options{};
     options.includeDefaults = false;
-    options.includeSensitive = false;
-    options.encryptSensitive = true;
+    options.includeSensitive = true;      // Include sensitive keys (e.g. TrustedBankingSites)
+    options.encryptSensitive = true;      // … but encrypt them in the export file
     options.layers = { ShadowStrike::Config::ConfigLayer::User };
 
     bool result = CM::Instance().ExportToFile(outputPath, options);
@@ -619,8 +642,9 @@ bool RegKeyRange(const std::string& key, const std::string& category,
 
     bool imported = cm.ImportFromFile(inputPath, ShadowStrike::Config::ConfigLayer::User);
     if (!imported) {
-        Utils::Logger::Error("[Home Config] Failed to parse import file '{}'",
+        Utils::Logger::Error("[Home Config] Failed to parse import file '{}' — rolling back",
                              inputPath.string());
+        cm.RestoreSnapshot(snapshotId);
         return false;
     }
 
