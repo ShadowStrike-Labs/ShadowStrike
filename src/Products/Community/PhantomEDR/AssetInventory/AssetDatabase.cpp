@@ -888,7 +888,8 @@ std::vector<AssetRecord> AssetDatabase::QueryAssetsByField(
         { "hardware_info", "h" },
         { "network_adapters", "n" },
         { "local_users", "u" },
-        { "installed_patches", "p" }
+        { "installed_patches", "p" },
+        { "software_inventory", "s" }
     };
 
     std::unordered_set<std::string> assetIds;
@@ -996,7 +997,7 @@ bool AssetDatabase::DeleteAssetRecord(std::string_view assetId) {
         return LogDatabaseFailure("DeleteAssetRecord(BeginTransaction)", error);
     }
 
-    const std::array<std::string_view, 6> tables{
+    std::vector<std::string> tables{
         "disk_volumes",
         "network_adapters",
         "local_users",
@@ -1004,6 +1005,12 @@ bool AssetDatabase::DeleteAssetRecord(std::string_view assetId) {
         "hardware_info",
         "assets"
     };
+
+    if (db.TableExists("software_inventory", &error)) {
+        tables.emplace_back("software_inventory");
+    } else if (error.HasError()) {
+        return LogDatabaseFailure("DeleteAssetRecord(TableExists)", error);
+    }
 
     for (const auto& table : tables) {
         const std::string sql = "DELETE FROM " + std::string(table) + " WHERE asset_id = ?";

@@ -844,13 +844,15 @@ void CollectWmiMemory(const WmiSession& wmi, HardwareInventory& hardware) {
 }
 
 void CollectWmiDiskData(const WmiSession& wmi, HardwareInventory& hardware) {
+    uint32_t physicalDiskCount = 0;
     (void)wmi.ForEach(L"SELECT Model FROM Win32_DiskDrive",
-        [&hardware](IWbemClassObject* object) {
+        [&physicalDiskCount](IWbemClassObject* object) {
             const std::wstring model = GetWmiString(object, L"Model");
             if (!model.empty()) {
-                ++hardware.diskCount;
+                ++physicalDiskCount;
             }
         });
+    hardware.diskCount = std::max(hardware.diskCount, physicalDiskCount);
 }
 
 void CollectWmiPatches(const WmiSession& wmi, AssetRecord& record) {
