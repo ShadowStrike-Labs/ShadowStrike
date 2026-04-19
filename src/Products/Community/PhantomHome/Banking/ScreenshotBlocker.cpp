@@ -39,6 +39,18 @@ namespace ShadowStrike::Banking {
 
     using namespace Utils;
 
+    namespace {
+        template <typename T>
+        [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+            return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+        }
+
+        template <typename T>
+        void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+            std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+        }
+    }
+
     // ========================================================================
     // CONSTANTS
     // ========================================================================
@@ -570,10 +582,13 @@ namespace ShadowStrike::Banking {
             if (m_captureHistory.size() > ScreenshotConstants::MAX_CAPTURE_HISTORY) {
                 m_captureHistory.pop_front();
             }
-
-            CaptureAttemptCallback callbackCopy = m_captureCallback;
             lock.unlock();
 
+            CaptureAttemptCallback callbackCopy;
+            {
+                std::shared_lock callbackLock(m_mutex);
+                callbackCopy = m_captureCallback;
+            }
             if (callbackCopy) {
                 callbackCopy(event);
             }
@@ -584,7 +599,38 @@ namespace ShadowStrike::Banking {
         // --------------------------------------------------------------------
 
         [[nodiscard]] ScreenshotBlockerStatistics GetStatistics() const {
-            return m_stats;
+            ScreenshotBlockerStatistics stats;
+            stats.totalProtectedWindows.store(
+                m_stats.totalProtectedWindows.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.currentlyProtected.store(
+                m_stats.currentlyProtected.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.captureAttemptsDetected.store(
+                m_stats.captureAttemptsDetected.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.captureAttemptsBlocked.store(
+                m_stats.captureAttemptsBlocked.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.clipboardEventsFiltered.store(
+                m_stats.clipboardEventsFiltered.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.gdiCallsIntercepted.store(
+                m_stats.gdiCallsIntercepted.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.dxCallsIntercepted.store(
+                m_stats.dxCallsIntercepted.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            stats.whitelistedPasses.store(
+                m_stats.whitelistedPasses.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            for (size_t i = 0; i < stats.byCaptureType.size(); ++i) {
+                stats.byCaptureType[i].store(
+                    m_stats.byCaptureType[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            stats.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
+            return stats;
         }
 
         void ResetStatistics() {
@@ -599,7 +645,7 @@ namespace ShadowStrike::Banking {
             for (auto& counter : m_stats.byCaptureType) {
                 counter.store(0, std::memory_order_relaxed);
             }
-            m_stats.startTime = Clock::now();
+            AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
             SS_LOG_INFO(L"ScreenshotBlocker", L"Statistics reset");
         }
 
@@ -1258,7 +1304,7 @@ namespace ShadowStrike::Banking {
         for (auto& counter : byCaptureType) {
             counter.store(0, std::memory_order_relaxed);
         }
-        startTime = Clock::now();
+        AtomicValueStoreRelaxed(startTime, Clock::now());
     }
 
     // ========================================================================

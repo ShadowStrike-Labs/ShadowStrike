@@ -106,6 +106,16 @@ namespace {
         L"GetRawInputData",
     };
 
+    template <typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template <typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     std::string EscapeJson(const std::string& s) {
         std::ostringstream o;
         for (char c : s) {
@@ -333,12 +343,13 @@ void KeyloggerProtectionStatistics::Reset() noexcept {
     clipboardBlocked.store(0, std::memory_order_relaxed);
     protectedKeystrokes.store(0, std::memory_order_relaxed);
     falsePositives.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
+    AtomicValueStoreRelaxed(lastDetectionTime, SystemTimePoint{});
 }
 
 std::string KeyloggerProtectionStatistics::ToJson() const {
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     std::ostringstream oss;
     oss << "{"
         << "\"totalScans\":" << totalScans.load(std::memory_order_relaxed) << ","
@@ -448,6 +459,10 @@ public:
         std::unique_lock lock(m_mutex);
         auto currentStatus = m_status.load(std::memory_order_acquire);
         if (currentStatus == ModuleStatus::Running) return true;
+        if (currentStatus == ModuleStatus::Stopping) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Cannot Start while stop is still in progress");
+            return false;
+        }
         if (currentStatus == ModuleStatus::Uninitialized) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Cannot Start before Initialize");
             return false;
@@ -1250,8 +1265,17 @@ public:
     }
 
     [[nodiscard]] KeyloggerProtectionStatistics GetStatistics() const {
-        // Atomic members are safe to copy; non-atomic startTime is set once at Reset
-        return m_stats;
+        KeyloggerProtectionStatistics stats;
+        stats.totalScans.store(m_stats.totalScans.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.threatsDetected.store(m_stats.threatsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.hooksBlocked.store(m_stats.hooksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.apiCallsIntercepted.store(m_stats.apiCallsIntercepted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.clipboardBlocked.store(m_stats.clipboardBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.protectedKeystrokes.store(m_stats.protectedKeystrokes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.falsePositives.store(m_stats.falsePositives.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stats.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
+        stats.lastDetectionTime = AtomicValueLoadRelaxed(m_stats.lastDetectionTime);
+        return stats;
     }
 
     void ResetStatistics() {

@@ -71,6 +71,16 @@ namespace {
 
     constexpr const wchar_t* LOG_CAT = L"CertPinning";
 
+    template <typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template <typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     std::string ToHex(const uint8_t* data, size_t len) {
         return Utils::HashUtils::ToHexLower(data, len);
     }
@@ -705,8 +715,12 @@ public:
     }
 
     void NotifyViolation(const ValidationResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& cb : m_violationCallbacks) {
+        std::vector<ViolationCallback> callbacks;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbacks = m_violationCallbacks;
+        }
+        for (const auto& cb : callbacks) {
             if (!cb) continue;
             try {
                 cb(result);
@@ -722,8 +736,12 @@ public:
     }
 
     void NotifyError(const std::string& message, int code) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& cb : m_errorCallbacks) {
+        std::vector<ErrorCallback> callbacks;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbacks = m_errorCallbacks;
+        }
+        for (const auto& cb : callbacks) {
             if (!cb) continue;
             try {
                 cb(message, code);
@@ -1529,7 +1547,7 @@ PinningStatistics CertificatePinning::GetStatistics() const {
     s.ctViolations.store(m_impl->m_stats.ctViolations.load(std::memory_order_relaxed));
     s.connectionsBlocked.store(m_impl->m_stats.connectionsBlocked.load(std::memory_order_relaxed));
     s.cacheHits.store(m_impl->m_stats.cacheHits.load(std::memory_order_relaxed));
-    s.startTime = m_impl->m_stats.startTime;
+    s.startTime = AtomicValueLoadRelaxed(m_impl->m_stats.startTime);
     return s;
 }
 
@@ -1741,7 +1759,7 @@ void PinningStatistics::Reset() noexcept {
     ctViolations.store(0, std::memory_order_relaxed);
     connectionsBlocked.store(0, std::memory_order_relaxed);
     cacheHits.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 // ============================================================================

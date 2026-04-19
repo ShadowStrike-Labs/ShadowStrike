@@ -346,7 +346,7 @@ void IncrementalStatistics::Reset() noexcept {
     for (auto& counter : byCompression) {
         counter.store(0, std::memory_order_relaxed);
     }
-    startTime = Clock::now();
+    startTime.store(Clock::now(), std::memory_order_relaxed);
 }
 
 std::string IncrementalStatistics::ToJson() const {
@@ -416,7 +416,7 @@ public:
 
             m_initialized.store(true, std::memory_order_release);
             m_status.store(ModuleStatus::Ready, std::memory_order_release);
-            m_stats.startTime = Clock::now();
+            m_stats.startTime.store(Clock::now(), std::memory_order_relaxed);
 
             SS_LOG_INFO(LOG_CATEGORY, L"IncrementalBackup initialized successfully");
             return true;
@@ -1355,13 +1355,25 @@ private:
             }
         }
 
-        // Move result to completed history; do NOT erase from activeSyncs here
-        // (the owning thread or Shutdown will handle joining and cleanup).
+        // Move result to completed history, then detach and erase the finished
+        // worker from activeSyncs so its std::thread handle is reclaimed.
+        // This thread is about to return; all member accesses above are done.
         {
             std::unique_lock lock(m_mutex);
             m_completedSyncs[ctx->syncId] = ctx->result;
             if (m_completedSyncs.size() > MAX_COMPLETED_RESULTS) {
                 m_completedSyncs.erase(m_completedSyncs.begin());
+            }
+
+            // The worker thread (us) is about to exit.  Detach so the
+            // std::thread destructor won't call std::terminate, then remove
+            // the entry from m_activeSyncs to reclaim memory.
+            auto it = m_activeSyncs.find(ctx->syncId);
+            if (it != m_activeSyncs.end()) {
+                if (it->second->worker.joinable()) {
+                    it->second->worker.detach();
+                }
+                m_activeSyncs.erase(it);
             }
         }
     }

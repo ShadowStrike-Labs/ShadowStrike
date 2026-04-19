@@ -473,12 +473,51 @@ public:
         // Build command line
         std::wstring cmdLine = BuildCommandLine(browserPath, config, profilePath);
 
-        // Launch process SUSPENDED so we can apply protections before execution
+        // Apply process mitigation policies via PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+        // during process creation so they target the child process, not the agent.
+        DWORD64 mitigationPolicy =
+            PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE |
+            PROCESS_CREATION_MITIGATION_POLICY_DEP_ATL_THUNK_ENABLE |
+            PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE |
+            PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_STRICT_HANDLE_CHECKS_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON;
+
+        SIZE_T attrListSize = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attrListSize);
+        std::vector<BYTE> attrListBuf(attrListSize);
+        LPPROC_THREAD_ATTRIBUTE_LIST attrList =
+            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrListBuf.data());
+
+        if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrListSize)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"InitializeProcThreadAttributeList failed: %u", GetLastError());
+            attrList = nullptr;
+        }
+
+        if (attrList && !UpdateProcThreadAttribute(attrList, 0,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                &mitigationPolicy, sizeof(mitigationPolicy),
+                nullptr, nullptr)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"UpdateProcThreadAttribute (mitigation) failed: %u", GetLastError());
+            DeleteProcThreadAttributeList(attrList);
+            attrList = nullptr;
+        }
+
+        STARTUPINFOEXW siex{};
+        siex.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+        if (attrList) {
+            siex.lpAttributeList = attrList;
+        } else {
+            siex.StartupInfo.cb = sizeof(STARTUPINFOW); // Fallback to plain STARTUPINFOW
+        }
+
         PROCESS_INFORMATION pi{};
-        STARTUPINFOW si{};
-        si.cb = sizeof(STARTUPINFOW);
 
         DWORD creationFlags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+        if (attrList) creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
 
         BOOL success = CreateProcessW(
             browserPath.c_str(),
@@ -487,9 +526,14 @@ public:
             creationFlags,
             nullptr,
             nullptr,
-            &si,
+            &siex.StartupInfo,
             &pi
         );
+
+        if (attrList) {
+            DeleteProcThreadAttributeList(attrList);
+            attrList = nullptr;
+        }
 
         if (!success) {
             DWORD err = GetLastError();
@@ -510,15 +554,14 @@ public:
             }
         );
 
-        // Apply process mitigation policies (DEP, ASLR, DLL signing)
-        ApplyProcessMitigations(pi.hProcess);
-
-        // Assign to a Job Object for resource/privilege restriction
-        AssignToJobObject(pi.hProcess);
+        // Assign to a Job Object for resource/privilege restriction.
+        // The returned handle is stored per-session and closed at EndSession().
+        HANDLE hJob = CreateAndAssignJobObject(pi.hProcess);
 
         // Resume the process now that protections are in place
         if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to resume browser process thread: Win32 error %u", GetLastError());
+            if (hJob) CloseHandle(hJob);
             return std::nullopt; // Guard will terminate
         }
 
@@ -537,13 +580,16 @@ public:
         session.startTime = std::chrono::system_clock::now();
         session.currentUrl = config.startingUrl;
         session.profilePath = profilePath;
-        session.isProtected = false;
+        session.isProtected = false; // Promoted to true once window-level protections succeed
 
         {
             std::unique_lock lock(m_mutex);
             m_activeSessions[sessionId] = session;
             m_sessionConfigs[sessionId] = config;
             m_sessionStats[sessionId] = SessionStatistics();
+            if (hJob) {
+                m_sessionJobHandles[sessionId] = hJob;
+            }
 
             // Initialize per-session domain whitelist from config
             if (!config.allowedDomains.empty()) {
@@ -558,22 +604,34 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Launched secure session %hs (PID: %u) with CREATE_SUSPENDED + mitigations",
                     sessionId.c_str(), pi.dwProcessId);
 
-        // Notify callback (read under callback lock)
+        // Capture callback under its lock, then invoke OUTSIDE any lock to prevent deadlocks
+        SessionStatusCallback statusCb;
         {
             std::shared_lock cbLock(m_callbackMutex);
-            if (m_sessionStatusCallback) {
-                m_sessionStatusCallback(session);
-            }
+            statusCb = m_sessionStatusCallback;
+        }
+        if (statusCb) {
+            statusCb(session);
         }
 
         // Apply higher-level protections (keylogger, screenshot)
         // These may fail on first attempt if window is not yet created;
         // the monitor loop will retry.
+        bool protectionsOk = false;
         if (config.enableKeyloggerProtection) {
-            EnableKeyloggerProtection(sessionId);
+            protectionsOk |= EnableKeyloggerProtection(sessionId);
         }
         if (config.enableScreenshotProtection) {
-            EnableScreenProtection(sessionId);
+            protectionsOk |= EnableScreenProtection(sessionId);
+        }
+
+        // Mark session as protected if at least one protection layer is active
+        if (protectionsOk) {
+            std::unique_lock lock(m_mutex);
+            auto it = m_activeSessions.find(sessionId);
+            if (it != m_activeSessions.end()) {
+                it->second.isProtected = true;
+            }
         }
 
         return sessionId;
@@ -597,19 +655,33 @@ public:
         // Copy for callback before erasing
         BrowserSessionInfo terminated = it->second;
 
+        // Close the job object handle for this session (prevents handle leak)
+        auto jobIt = m_sessionJobHandles.find(sessionId);
+        if (jobIt != m_sessionJobHandles.end()) {
+            if (jobIt->second) CloseHandle(jobIt->second);
+            m_sessionJobHandles.erase(jobIt);
+        }
+
         m_activeSessions.erase(it);
         m_sessionConfigs.erase(sessionId);
         m_sessionStats.erase(sessionId);
         m_sessionDomains.erase(sessionId);
 
-        m_stats.activeSessions--;
+        if (m_stats.activeSessions > 0) {
+            m_stats.activeSessions--;
+        }
 
         lock.unlock();
 
-        // Notify callback outside the lock
-        std::shared_lock cbLock(m_callbackMutex);
-        if (m_sessionStatusCallback) {
-            m_sessionStatusCallback(terminated);
+        // Capture callback outside all locks to prevent deadlock if the callback
+        // itself calls back into SecureBrowser
+        SessionStatusCallback cb;
+        {
+            std::shared_lock cbLock(m_callbackMutex);
+            cb = m_sessionStatusCallback;
+        }
+        if (cb) {
+            cb(terminated);
         }
     }
 
@@ -620,10 +692,18 @@ public:
             CleanupProfile(session.profilePath);
         }
 
+        // Release all job object handles before clearing the map
+        for (auto& [id, hJob] : m_sessionJobHandles) {
+            if (hJob) {
+                CloseHandle(hJob);
+            }
+        }
+
         m_activeSessions.clear();
         m_sessionConfigs.clear();
         m_sessionStats.clear();
         m_sessionDomains.clear();
+        m_sessionJobHandles.clear();
         m_stats.activeSessions = 0;
     }
 
@@ -713,8 +793,14 @@ public:
     // ========================================================================
 
     void StartMonitor() {
-        if (m_monitorRunning) return;
-        m_monitorRunning = true;
+        // CAS ensures exactly one monitor thread is ever started, even under
+        // concurrent calls from Initialize(), UpdateConfiguration(), etc.
+        bool expected = false;
+        if (!m_monitorRunning.compare_exchange_strong(expected, true,
+                                                      std::memory_order_acquire,
+                                                      std::memory_order_relaxed)) {
+            return; // Already running
+        }
         m_monitorThread = std::thread(&SecureBrowserImpl::MonitorLoop, this);
     }
 
@@ -1066,11 +1152,13 @@ public:
         }
     }
 
-    void AssignToJobObject(HANDLE hProcess) {
+    // Returns an OWNING job handle on success, NULL on failure.
+    // The caller MUST store and CloseHandle() it at session teardown.
+    [[nodiscard]] HANDLE CreateAndAssignJobObject(HANDLE hProcess) {
         HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
         if (!hJob) {
             SS_LOG_WARN(LOG_CATEGORY, L"Failed to create job object: %u", GetLastError());
-            return;
+            return nullptr;
         }
 
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo{};
@@ -1082,15 +1170,16 @@ public:
                                      &jobInfo, sizeof(jobInfo))) {
             SS_LOG_WARN(LOG_CATEGORY, L"Failed to set job object limits: %u", GetLastError());
             CloseHandle(hJob);
-            return;
+            return nullptr;
         }
 
         if (!AssignProcessToJobObject(hJob, hProcess)) {
             SS_LOG_WARN(LOG_CATEGORY, L"Failed to assign process to job object: %u", GetLastError());
+            CloseHandle(hJob);
+            return nullptr;
         }
 
-        // Keep job handle alive (closes on process termination via KILL_ON_JOB_CLOSE)
-        // In a production system, we'd store this handle per-session for explicit management
+        return hJob; // Caller owns this handle
     }
 
     bool LoadBankingDomainsInternal(const std::wstring& path) {
@@ -1178,6 +1267,7 @@ public:
     std::unordered_map<std::string, BrowserSessionConfiguration> m_sessionConfigs;
     std::unordered_map<std::string, SessionStatistics> m_sessionStats;
     std::unordered_map<std::string, std::unordered_set<std::string>> m_sessionDomains;
+    std::unordered_map<std::string, HANDLE> m_sessionJobHandles;
 
     // Domain Data
     std::vector<std::string> m_bankingDomains;

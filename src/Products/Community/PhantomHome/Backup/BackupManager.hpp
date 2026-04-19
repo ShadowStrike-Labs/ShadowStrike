@@ -546,7 +546,7 @@ struct BackupStatistics {
     std::atomic<uint64_t> bytesSavedByCompression{0};
     std::atomic<uint64_t> vssSnapshotsCreated{0};
     std::atomic<uint64_t> ransomwareBlockedAttempts{0};
-    TimePoint startTime = Clock::now();
+    std::atomic<TimePoint> startTime{Clock::now()};
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
@@ -581,7 +581,7 @@ struct BackupStatistics {
         s.bytesSavedByCompression = bytesSavedByCompression.load(std::memory_order_relaxed);
         s.vssSnapshotsCreated = vssSnapshotsCreated.load(std::memory_order_relaxed);
         s.ransomwareBlockedAttempts = ransomwareBlockedAttempts.load(std::memory_order_relaxed);
-        s.startTime = startTime;
+        s.startTime = startTime.load(std::memory_order_relaxed);
         return s;
     }
 };

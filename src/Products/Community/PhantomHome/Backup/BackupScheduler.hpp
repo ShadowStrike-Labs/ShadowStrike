@@ -491,7 +491,7 @@ struct SchedulerStatistics {
     std::atomic<uint64_t> currentQueueSize{0};
     std::atomic<uint64_t> maxQueueSize{0};
     std::array<std::atomic<uint64_t>, 8> byThrottleReason{};
-    TimePoint startTime = Clock::now();
+    std::atomic<TimePoint> startTime{Clock::now()};
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;

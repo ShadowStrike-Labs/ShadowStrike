@@ -56,6 +56,16 @@ namespace Banking {
 
 namespace {
     constexpr const wchar_t* LOG_CATEGORY = L"TransactionMonitor";
+
+    template <typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template <typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
 }
 
 // ============================================================================
@@ -326,7 +336,7 @@ void TransactionMonitorStatistics::Reset() noexcept {
     uiPayloadMismatches = 0;
     newBeneficiaries = 0;
     totalAmountMonitoredCents = 0;
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 
     for (auto& val : byAttackVector) val = 0;
     for (auto& val : byRiskLevel) val = 0;
@@ -419,7 +429,7 @@ public:
 
             m_initialized = true;
             m_status = ModuleStatus::Stopped; // Ready but not running
-            m_stats.startTime = Clock::now();
+            AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
             SS_LOG_INFO(LOG_CATEGORY, L"TransactionMonitor initialized successfully");
             return true;
@@ -1296,7 +1306,46 @@ void TransactionMonitor::RegisterAnomalyCallback(AnomalyCallback callback) {
 }
 
 TransactionMonitorStatistics TransactionMonitor::GetStatistics() const {
-    return m_impl->m_stats;
+    TransactionMonitorStatistics stats;
+    stats.totalTransactionsMonitored.store(
+        m_impl->m_stats.totalTransactionsMonitored.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.transactionsValidated.store(
+        m_impl->m_stats.transactionsValidated.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.anomaliesDetected.store(
+        m_impl->m_stats.anomaliesDetected.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.transactionsBlocked.store(
+        m_impl->m_stats.transactionsBlocked.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.userConfirmations.store(
+        m_impl->m_stats.userConfirmations.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.domManipulationsDetected.store(
+        m_impl->m_stats.domManipulationsDetected.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.uiPayloadMismatches.store(
+        m_impl->m_stats.uiPayloadMismatches.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.newBeneficiaries.store(
+        m_impl->m_stats.newBeneficiaries.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    stats.totalAmountMonitoredCents.store(
+        m_impl->m_stats.totalAmountMonitoredCents.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    for (size_t i = 0; i < stats.byAttackVector.size(); ++i) {
+        stats.byAttackVector[i].store(
+            m_impl->m_stats.byAttackVector[i].load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < stats.byRiskLevel.size(); ++i) {
+        stats.byRiskLevel[i].store(
+            m_impl->m_stats.byRiskLevel[i].load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+    }
+    stats.startTime = AtomicValueLoadRelaxed(m_impl->m_stats.startTime);
+    return stats;
 }
 
 void TransactionMonitor::ResetStatistics() {

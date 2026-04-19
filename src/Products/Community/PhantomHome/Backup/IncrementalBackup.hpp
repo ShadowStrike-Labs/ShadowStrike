@@ -492,7 +492,7 @@ struct IncrementalStatistics {
     std::atomic<uint64_t> uniqueChunks{0};
     std::atomic<uint64_t> duplicateChunks{0};
     std::array<std::atomic<uint64_t>, 8> byCompression{};
-    TimePoint startTime = Clock::now();
+    std::atomic<TimePoint> startTime{Clock::now()};
 
     IncrementalStatistics() noexcept = default;
 
@@ -509,7 +509,7 @@ struct IncrementalStatistics {
         , bytesSavedByCompression(o.bytesSavedByCompression.load(std::memory_order_relaxed))
         , uniqueChunks(o.uniqueChunks.load(std::memory_order_relaxed))
         , duplicateChunks(o.duplicateChunks.load(std::memory_order_relaxed))
-        , startTime(o.startTime)
+        , startTime(o.startTime.load(std::memory_order_relaxed))
     {
         for (size_t i = 0; i < byCompression.size(); ++i) {
             byCompression[i].store(
@@ -531,7 +531,7 @@ struct IncrementalStatistics {
             bytesSavedByCompression.store(o.bytesSavedByCompression.load(std::memory_order_relaxed), std::memory_order_relaxed);
             uniqueChunks.store(o.uniqueChunks.load(std::memory_order_relaxed), std::memory_order_relaxed);
             duplicateChunks.store(o.duplicateChunks.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = o.startTime;
+            startTime.store(o.startTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
             for (size_t i = 0; i < byCompression.size(); ++i) {
                 byCompression[i].store(
                     o.byCompression[i].load(std::memory_order_relaxed),

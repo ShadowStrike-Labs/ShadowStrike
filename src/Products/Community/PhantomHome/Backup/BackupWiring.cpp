@@ -52,9 +52,36 @@
 
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
+#include <ShlObj.h>   // SHGetKnownFolderPath, FOLDERID_LocalAppData
+#include <filesystem>
+
 namespace {
 
 constexpr const wchar_t* kLogCategory = L"BackupWiring";
+
+/// @brief Resolve a default vault path under %LOCALAPPDATA%\ShadowStrike.
+/// Falls back to a temp-based path if SHGetKnownFolderPath fails.
+[[nodiscard]] std::filesystem::path ResolveDefaultVaultPath() noexcept {
+    try {
+        PWSTR appDataRaw = nullptr;
+        HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &appDataRaw);
+        if (SUCCEEDED(hr) && appDataRaw) {
+            std::filesystem::path vaultPath =
+                std::filesystem::path(appDataRaw) / L"ShadowStrike" / L".ShadowStrikeVault";
+            CoTaskMemFree(appDataRaw);
+            return vaultPath;
+        }
+        if (appDataRaw) CoTaskMemFree(appDataRaw);
+    } catch (...) { /* fall through */ }
+
+    // Fallback: use temp directory
+    std::error_code ec;
+    auto tmp = std::filesystem::temp_directory_path(ec);
+    if (!ec) {
+        return tmp / L"ShadowStrike" / L".ShadowStrikeVault";
+    }
+    return L"C:\\ProgramData\\ShadowStrike\\.ShadowStrikeVault";
+}
 
 struct BackupWiringRegistrar final {
     BackupWiringRegistrar() noexcept {
@@ -72,11 +99,16 @@ struct BackupWiringRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        // BackupManager is the facade; Initialize() brings the
-                        // vault layer, incremental-sync engine, scheduler, and
-                        // restore pipeline up in dependency order.
-                        if (!BackupManager::Instance()
-                                .Initialize(BackupConfiguration{})) {
+                        // Build a valid BackupConfiguration with a default vault
+                        // path.  BackupConfiguration{} would have an empty
+                        // vaultPath and fail IsValid().
+                        BackupConfiguration config;
+                        config.defaultVault.vaultPath = ResolveDefaultVaultPath();
+                        config.defaultVault.encryption = ::ShadowStrike::Backup::EncryptionMode::AES256;
+                        config.defaultVault.compression = ::ShadowStrike::Backup::CompressionLevel::Normal;
+                        config.defaultVault.hideVault = true;
+
+                        if (!BackupManager::Instance().Initialize(config)) {
                             SS_LOG_ERROR(kLogCategory,
                                 L"BackupManager::Initialize() returned false");
                             return false;
