@@ -60,6 +60,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <format>
+#include <atomic>
 
 #pragma comment(lib, "Psapi.lib")
 
@@ -80,6 +81,16 @@ std::atomic<bool> GameModeManager::s_instanceCreated{false};
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
 // ---- Fix #18: RAII wrapper for Win32 HANDLE from snapshot APIs ----
 class ScopedHandle final {
@@ -394,12 +405,12 @@ void GameModeStatistics::Reset() noexcept {
     actionsDeferred = 0;
     scansPostponed = 0;
     notificationsSuppressed = 0;
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string GameModeStatistics::ToJson() const {
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
 
     json j;
     j["uptimeSeconds"] = uptime;
@@ -1466,7 +1477,7 @@ GameModeStatistics GameModeManagerImpl::GetStatistics() const {
                                   std::memory_order_relaxed);
     snapshot.notificationsSuppressed.store(m_stats.notificationsSuppressed.load(std::memory_order_relaxed),
                                            std::memory_order_relaxed);
-    snapshot.startTime = m_stats.startTime;
+    snapshot.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
     return snapshot;
 }
 

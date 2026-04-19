@@ -63,6 +63,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <atomic>
 
 namespace fs = std::filesystem;
 
@@ -86,6 +87,16 @@ std::atomic<bool> USBScanner::s_instanceCreated{false};
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
 // ────────────────────────────────────────────────────────────────────────────
 // RAII wrapper for Win32 HANDLE (prevents leaks on every exit path)
@@ -803,7 +814,7 @@ public:
             snap.byDetectionType[i] = m_statistics.byDetectionType[i].load(std::memory_order_relaxed);
         }
 
-        snap.startTime = m_statistics.startTime;
+        snap.startTime = AtomicValueLoadRelaxed(m_statistics.startTime);
         return snap;
     }
 
@@ -1694,7 +1705,7 @@ void USBScanStatistics::Reset() noexcept {
         counter.store(0, std::memory_order_relaxed);
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 // ============================================================================
@@ -1718,7 +1729,7 @@ std::string USBScanStatisticsSnapshot::ToJson() const {
     json["heuristicDetections"]   = heuristicDetections;
 
     auto uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     json["uptimeSeconds"]         = uptimeSeconds;
     return json.dump();
 }

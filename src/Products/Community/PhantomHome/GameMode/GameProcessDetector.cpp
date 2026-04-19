@@ -85,6 +85,7 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <dwmapi.h>
+#include <atomic>
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "dwmapi.lib")
 #endif
@@ -97,6 +98,16 @@ namespace GameMode {
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
 // ============================================================================
 // INTERNAL NARROW STRING HELPERS (PhantomCore/Utils/StringUtils provides
@@ -524,7 +535,7 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
 
         // Reset statistics
         m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
         // Start monitoring thread if enabled
         if (m_config.enabled) {
@@ -1216,13 +1227,13 @@ DetectorStatistics GameProcessDetectorImpl::GetStatistics() const {
     snapshot.falsePositives.store(m_stats.falsePositives.load(std::memory_order_acquire), std::memory_order_relaxed);
     snapshot.processesScanned.store(m_stats.processesScanned.load(std::memory_order_acquire), std::memory_order_relaxed);
     snapshot.databaseLookups.store(m_stats.databaseLookups.load(std::memory_order_acquire), std::memory_order_relaxed);
-    snapshot.startTime = m_stats.startTime;
+    snapshot.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
     return snapshot;
 }
 
 void GameProcessDetectorImpl::ResetStatistics() {
     m_stats.Reset();
-    m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
     Utils::Logger::Info("[GameProcessDetector] Statistics reset");
 }
 
@@ -1941,7 +1952,7 @@ void DetectorStatistics::Reset() noexcept {
     falsePositives.store(0, std::memory_order_release);
     processesScanned.store(0, std::memory_order_release);
     databaseLookups.store(0, std::memory_order_release);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string DetectorStatistics::ToJson() const {
@@ -1954,7 +1965,7 @@ std::string DetectorStatistics::ToJson() const {
     j["processesScanned"] = processesScanned.load(std::memory_order_acquire);
     j["databaseLookups"] = databaseLookups.load(std::memory_order_acquire);
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - startTime).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = elapsed;
 
     return j.dump();

@@ -72,6 +72,7 @@
 #include <bit>
 #include <charconv>
 #include <numeric>
+#include <atomic>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -81,6 +82,16 @@
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     using namespace ShadowStrike::IoT;
 
     /// @brief ARP hardware type (Ethernet)
@@ -1408,7 +1419,7 @@ public:
     void GenerateScanSummary(std::chrono::system_clock::time_point startTime) {
         IoTScanResultSummary summary;
         summary.status = ScanStatus::Completed;
-        summary.startTime = startTime;
+        summary.startTime = AtomicValueLoadRelaxed(startTime);
         summary.endTime = std::chrono::system_clock::now();
         summary.duration = std::chrono::duration_cast<std::chrono::seconds>(
             summary.endTime - summary.startTime);
@@ -1557,7 +1568,7 @@ IoTDeviceScanner::~IoTDeviceScanner() {
 
         m_impl->m_config = config;
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         m_impl->m_status = ModuleStatus::Running;
 
@@ -2041,7 +2052,7 @@ void IoTDeviceScanner::UnregisterCallbacks() {
 
 void IoTDeviceScanner::ResetStatistics() {
     m_impl->m_stats.Reset();
-    m_impl->m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
     ::ShadowStrike::Utils::Logger::Info("Statistics reset");
 }
@@ -2185,7 +2196,7 @@ void IoTScanStatistics::Reset() noexcept {
     snap.cvesMatched = cvesMatched.load(std::memory_order_relaxed);
     snap.packetsAnalyzed = packetsAnalyzed.load(std::memory_order_relaxed);
     snap.activeDevices = activeDevices.load(std::memory_order_relaxed);
-    snap.startTime = startTime;
+    snap.startTime = AtomicValueLoadRelaxed(startTime);
 
     for (size_t i = 0; i < byCategory.size(); ++i) {
         snap.byCategory[i] = byCategory[i].load(std::memory_order_relaxed);
@@ -2212,7 +2223,7 @@ void IoTScanStatistics::Reset() noexcept {
     j["activeDevices"] = activeDevices.load(std::memory_order_relaxed);
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = uptime;
 
     return j.dump(2);
@@ -2233,7 +2244,7 @@ void IoTScanStatistics::Reset() noexcept {
     j["activeDevices"] = activeDevices;
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = uptime;
 
     return j.dump(2);

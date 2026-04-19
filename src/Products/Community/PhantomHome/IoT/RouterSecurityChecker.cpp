@@ -97,6 +97,7 @@
 // THIRD-PARTY INCLUDES
 // ============================================================================
 #include <nlohmann/json.hpp>
+#include <atomic>
 
 namespace ShadowStrike {
 namespace IoT {
@@ -109,6 +110,16 @@ using SystemClock = std::chrono::system_clock;
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
 /**
  * @brief Default credential database entry
@@ -621,7 +632,7 @@ void RouterStatistics::Reset() noexcept {
     highIssuesFound.store(0, std::memory_order_relaxed);
     cvesMatched.store(0, std::memory_order_relaxed);
     dnsHijackingDetected.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string RouterStatistics::ToJson() const {
@@ -1057,7 +1068,7 @@ RouterSecurityReport RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
 
         report.status = AssessmentStatus::Completed;
         report.assessmentDuration = std::chrono::duration_cast<std::chrono::seconds>(
-            SystemClock::now() - startTime);
+            SystemClock::now() - AtomicValueLoadRelaxed(startTime));
 
         // Cache report
         {

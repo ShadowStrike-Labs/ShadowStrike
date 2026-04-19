@@ -105,6 +105,7 @@
 #  pragma warning(disable: 4996)
 #endif
 #include <nlohmann/json.hpp>
+#include <atomic>
 #ifdef _MSC_VER
 #  pragma warning(pop)
 #endif
@@ -117,6 +118,16 @@ namespace GameMode {
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     /// @brief Known overlay DLL patterns (all lowercase for case-insensitive match)
     /// FIX #21: Removed duplicate RTSSHooks.dll, adjusted array size
     constexpr std::array<std::wstring_view, 33> KNOWN_OVERLAY_MODULES = {
@@ -1659,7 +1670,7 @@ bool OverlayProtection::Initialize(const OverlayProtectionConfiguration& config)
 
         // Initialize statistics
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         m_impl->m_status = OverlayProtectionStatus::Running;
 
@@ -2726,7 +2737,7 @@ void OverlayProtection::ResetStatistics() {
         std::unique_lock lock(m_impl->m_mutex);
 
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         Utils::Logger::Info("OverlayProtection: Statistics reset");
 
@@ -2928,7 +2939,7 @@ void OverlayStatistics::Reset() noexcept {
     hooksBlocked.store(0);
     overlaysShown.store(0);
     zOrderRestorations.store(0);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string OverlayStatistics::ToJson() const {
@@ -2941,7 +2952,7 @@ std::string OverlayStatistics::ToJson() const {
         j["overlaysShown"] = overlaysShown.load();
         j["zOrderRestorations"] = zOrderRestorations.load();
 
-        const auto elapsed = Clock::now() - startTime;
+        const auto elapsed = Clock::now() - AtomicValueLoadRelaxed(startTime);
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
         j["uptimeSeconds"] = seconds;
 

@@ -58,9 +58,23 @@
 #include <lmaccess.h>
 #include <lmapibuf.h>
 #include <sddl.h>
+#include <atomic>
 
 #pragma comment(lib, "netapi32.lib")
 #pragma comment(lib, "advapi32.lib")
+
+
+namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+} // namespace
 
 namespace ShadowStrike {
 namespace USB {
@@ -146,7 +160,7 @@ public:
 
         m_config = config;
         m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
         // Generate next audit entry ID
         m_nextAuditEntryId = 1;
@@ -830,7 +844,7 @@ public:
         snap.policyErrors = m_stats.policyErrors.load(std::memory_order_relaxed);
         snap.activeRules = m_stats.activeRules.load(std::memory_order_relaxed);
         snap.disabledRules = m_stats.disabledRules.load(std::memory_order_relaxed);
-        snap.startTime = m_stats.startTime;
+        snap.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
         
         return snap;
     }
@@ -1760,7 +1774,7 @@ void DeviceControlStatistics::Reset() noexcept {
     policyErrors.store(0, std::memory_order_relaxed);
     activeRules.store(0, std::memory_order_relaxed);
     disabledRules.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 // H3 FIX: Snapshot has ToJson, not the non-copyable original
@@ -1778,7 +1792,7 @@ std::string DeviceControlStatisticsSnapshot::ToJson() const {
     json["disabledRules"] = disabledRules;
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     json["uptimeSeconds"] = uptime;
 
     return json.dump();

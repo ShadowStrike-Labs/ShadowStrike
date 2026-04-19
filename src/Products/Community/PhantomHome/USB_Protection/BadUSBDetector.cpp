@@ -61,9 +61,23 @@
 #include <SetupAPI.h>
 #include <cfgmgr32.h>
 #include <hidsdi.h>
+#include <atomic>
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 #endif
+
+
+namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+} // namespace
 
 namespace ShadowStrike {
 namespace USB {
@@ -241,7 +255,7 @@ public:
 
         m_config = config;
         m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
         m_deviceStates.clear();
 
@@ -587,7 +601,7 @@ public:
         for (size_t i = 0; i < snap.byPatternType.size(); ++i) {
             snap.byPatternType[i] = m_stats.byPatternType[i].load(std::memory_order_relaxed);
         }
-        snap.startTime = m_stats.startTime;
+        snap.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
         return snap;
     }
 
@@ -1932,7 +1946,7 @@ void BadUSBStatistics::Reset() noexcept {
         counter.store(0);
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string BadUSBStatisticsSnapshot::ToJson() const {
@@ -1948,7 +1962,7 @@ std::string BadUSBStatisticsSnapshot::ToJson() const {
     json["totalBurstEventsDetected"] = totalBurstEventsDetected;
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     json["uptimeSeconds"] = uptime;
 
     return json.dump();
