@@ -503,8 +503,6 @@ ShadowStrike/
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting anything.
 
-> ShadowStrike is not actively accepting external code contributions during the alpha phase. Contribution guidelines will be published when the project reaches beta. Issues and discussions are welcome.
-
 ---
 
 ## Security
