@@ -83,6 +83,16 @@
 // ============================================================================
 
 namespace {
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     using namespace ShadowStrike::Privacy;
 
     /// @brief DNS header size
@@ -552,7 +562,7 @@ public:
                 &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
 
             if (statusCode != 200) {
-                Utils::Logger::Warn("DoH: HTTP {} for domain '{}'", statusCode, domain);
+                Utils::Logger::Warn("DoH: HTTP {} for requested domain", statusCode);
                 response.status = DNSResponseStatus::ServerFailure;
                 return response;
             }
@@ -565,8 +575,8 @@ public:
             while (::WinHttpQueryDataAvailable(hRequest.get(), &bytesAvailable) &&
                    bytesAvailable > 0) {
                 if (responseData.size() + bytesAvailable > MAX_DOH_RESPONSE_BYTES) {
-                    Utils::Logger::Warn("DoH: Response exceeded {}B limit for '{}'",
-                        MAX_DOH_RESPONSE_BYTES, domain);
+                        Utils::Logger::Warn("DoH: Response exceeded {}B limit for requested domain",
+                            MAX_DOH_RESPONSE_BYTES);
                     break;
                 }
 
@@ -585,7 +595,7 @@ public:
                     auto json = Json::parse(responseData, nullptr, false);
 
                     if (json.is_discarded()) {
-                        Utils::Logger::Error("DoH: Invalid JSON response for '{}'", domain);
+                        Utils::Logger::Error("DoH: Invalid JSON response for requested domain");
                         return response;
                     }
 
@@ -631,7 +641,7 @@ public:
                     response.dnssecValidated = json.value("AD", false);
 
                 } catch (const std::exception& e) {
-                    Utils::Logger::Error("DoH: JSON parse error for '{}': {}", domain, e.what());
+                    Utils::Logger::Error("DoH: JSON parse error for requested domain: {}", e.what());
                     response.status = DNSResponseStatus::NetworkError;
                     return response;
                 }
@@ -647,7 +657,7 @@ public:
             m_stats.encryptedQueries++;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("DoH query failed for '{}': {}", domain, e.what());
+            Utils::Logger::Error("DoH query failed for requested domain: {}", e.what());
             response.status = DNSResponseStatus::NetworkError;
         }
 
@@ -1158,7 +1168,7 @@ DNSLeakProtection::~DNSLeakProtection() {
 
         // Reset statistics
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         // Enable secure DNS if configured
         if (config.forceEncryptedDNS) {
@@ -1612,7 +1622,7 @@ void DNSLeakProtection::StopMonitoring() {
         } else if (response1.addresses.empty() || response2.addresses.empty()) {
             return PoisoningStatus::Clean;
         } else {
-            Utils::Logger::Warn("DNS poisoning suspected for domain: {}", domain);
+            Utils::Logger::Warn("DNS poisoning suspected for requested domain");
             m_impl->m_stats.poisoningAttemptsDetected++;
             return PoisoningStatus::Suspicious;
         }
@@ -1745,7 +1755,7 @@ void DNSLeakProtection::StopMonitoring() {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("ResolveDomain failed for '{}': {}", domain, e.what());
+        Utils::Logger::Error("ResolveDomain failed for requested domain: {}", e.what());
         response.status = DNSResponseStatus::NetworkError;
     }
 
@@ -1787,7 +1797,7 @@ void DNSLeakProtection::StopMonitoring() {
 [[nodiscard]] bool DNSLeakProtection::BlockDomain(const std::string& domain) {
     try {
         if (!IsValidDomainName(domain)) {
-            Utils::Logger::Warn("BlockDomain: Invalid domain name '{}'", domain);
+            Utils::Logger::Warn("BlockDomain: Invalid domain name rejected");
             return false;
         }
 
@@ -1795,7 +1805,7 @@ void DNSLeakProtection::StopMonitoring() {
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_blockedDomains.insert(std::move(normalized));
 
-        Utils::Logger::Info("Domain blocked: {}", domain);
+        Utils::Logger::Info("Domain blocked");
         return true;
 
     } catch (const std::exception& e) {
@@ -1810,7 +1820,7 @@ void DNSLeakProtection::StopMonitoring() {
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_blockedDomains.erase(normalized);
 
-        Utils::Logger::Info("Domain unblocked: {}", domain);
+        Utils::Logger::Info("Domain unblocked");
         return true;
 
     } catch (const std::exception& e) {
@@ -1828,7 +1838,7 @@ void DNSLeakProtection::StopMonitoring() {
 [[nodiscard]] bool DNSLeakProtection::WhitelistDomain(const std::string& domain) {
     try {
         if (!IsValidDomainName(domain)) {
-            Utils::Logger::Warn("WhitelistDomain: Invalid domain name '{}'", domain);
+            Utils::Logger::Warn("WhitelistDomain: Invalid domain name rejected");
             return false;
         }
 
@@ -1836,7 +1846,7 @@ void DNSLeakProtection::StopMonitoring() {
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_whitelistedDomains.insert(std::move(normalized));
 
-        Utils::Logger::Info("Domain whitelisted: {}", domain);
+        Utils::Logger::Info("Domain whitelisted");
         return true;
 
     } catch (const std::exception& e) {
@@ -1930,8 +1940,8 @@ void DNSLeakProtection::StopMonitoring() {
             }
         }
 
-        Utils::Logger::Info("Imported {} domains from blocklist '{}'",
-            validDomains.size(), listPath.filename().string());
+        Utils::Logger::Info("Imported {} domains from blocklist",
+            validDomains.size());
         return true;
 
     } catch (const std::exception& e) {
@@ -1987,13 +1997,30 @@ void DNSLeakProtection::UnregisterCallbacks() {
 
 [[nodiscard]] DNSStatistics DNSLeakProtection::GetStatistics() const {
     std::shared_lock lock(m_impl->m_mutex);
-    return m_impl->m_stats;
+    DNSStatistics snapshot;
+    snapshot.totalQueries.store(m_impl->m_stats.totalQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.encryptedQueries.store(m_impl->m_stats.encryptedQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.leaksDetected.store(m_impl->m_stats.leaksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.leaksBlocked.store(m_impl->m_stats.leaksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.hijackAttemptsDetected.store(m_impl->m_stats.hijackAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.poisoningAttemptsDetected.store(m_impl->m_stats.poisoningAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.cacheHits.store(m_impl->m_stats.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.cacheMisses.store(m_impl->m_stats.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.blockedDomains.store(m_impl->m_stats.blockedDomains.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.dnssecValidations.store(m_impl->m_stats.dnssecValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.dnssecFailures.store(m_impl->m_stats.dnssecFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.averageResponseTimeMs.store(m_impl->m_stats.averageResponseTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    for (size_t i = 0; i < m_impl->m_stats.byProtocol.size(); ++i) {
+        snapshot.byProtocol[i].store(m_impl->m_stats.byProtocol[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    AtomicValueStoreRelaxed(snapshot.startTime, AtomicValueLoadRelaxed(m_impl->m_stats.startTime));
+    return snapshot;
 }
 
 void DNSLeakProtection::ResetStatistics() {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_stats.Reset();
-    m_impl->m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
     Utils::Logger::Info("Statistics reset");
 }
@@ -2195,6 +2222,7 @@ void DNSStatistics::Reset() noexcept {
     for (auto& proto : byProtocol) {
         proto.store(0, std::memory_order_relaxed);
     }
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 [[nodiscard]] std::string DNSStatistics::ToJson() const {
@@ -2216,7 +2244,7 @@ void DNSStatistics::Reset() noexcept {
     j["averageResponseTimeMs"] = averageResponseTimeMs.load(std::memory_order_relaxed);
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = uptime;
 
     return j.dump(2);

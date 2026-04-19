@@ -105,6 +105,16 @@ namespace Privacy {
 // ============================================================================
 
 namespace {
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     /// @brief Chrome profile paths
     const std::vector<std::wstring> CHROME_PROFILES = {
         L"\\Google\\Chrome\\User Data\\Default",
@@ -981,7 +991,7 @@ bool CookieManager::Initialize(const CookieConfiguration& config) {
 
         // Reset statistics
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         m_impl->m_status = ModuleStatus::Running;
 
@@ -1170,8 +1180,8 @@ std::vector<BrowserCookie> CookieManager::GetCookiesForDomain(const std::string&
                          cookieDomain[cookieDomain.size() - sanitized.size() - 1] == '.'));
             });
 
-        Utils::Logger::Debug("CookieManager: Found {} cookies for domain {}",
-                            result.size(), domain);
+        Utils::Logger::Debug("CookieManager: Found {} cookies for requested domain",
+                            result.size());
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("CookieManager: GetCookiesForDomain failed: {}", ex.what());
@@ -1679,8 +1689,7 @@ bool CookieManager::DeleteCookie(const BrowserCookie& cookie) {
 
         int changes = sqlite3_changes(db);
         if (changes > 0) {
-            Utils::Logger::Debug("CookieManager: Deleted cookie {}@{} from {}",
-                                cookie.name, cookie.domain,
+            Utils::Logger::Debug("CookieManager: Deleted a cookie from {}",
                                 std::string(GetBrowserTypeName(cookie.browser)));
             return true;
         }
@@ -1716,8 +1725,8 @@ uint64_t CookieManager::DeleteCookiesForDomain(const std::string& domain) {
 
         m_impl->m_stats.totalCookiesDeleted += deleted;
 
-        Utils::Logger::Info("CookieManager: Deleted {} cookies for domain {}",
-                           deleted, sanitized);
+        Utils::Logger::Info("CookieManager: Deleted {} cookies for requested domain",
+                           deleted);
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("CookieManager: DeleteCookiesForDomain failed: {}", ex.what());
@@ -1841,7 +1850,7 @@ bool CookieManager::AddToWhitelist(const CookieWhitelistEntry& entry) {
 
         m_impl->m_whitelist[entry.entryId] = entry;
 
-        Utils::Logger::Info("CookieManager: Added to whitelist: {}", entry.domainPattern);
+        Utils::Logger::Info("CookieManager: Added a whitelist entry");
         return true;
 
     } catch (const std::exception& ex) {
@@ -2119,7 +2128,7 @@ CookieStatisticsSnapshot CookieManager::GetStatistics() const {
         snap.byCategory[i] = m_impl->m_stats.byCategory[i].load(std::memory_order_relaxed);
     }
 
-    snap.startTime = m_impl->m_stats.startTime;
+    snap.startTime = AtomicValueLoadRelaxed(m_impl->m_stats.startTime);
     return snap;
 }
 
@@ -2128,7 +2137,7 @@ void CookieManager::ResetStatistics() {
         std::unique_lock lock(m_impl->m_mutex);
 
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         Utils::Logger::Info("CookieManager: Statistics reset");
 
@@ -2347,7 +2356,7 @@ void CookieStatistics::Reset() noexcept {
         counter.store(0);
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string CookieStatisticsSnapshot::ToJson() const {
@@ -2364,7 +2373,7 @@ std::string CookieStatisticsSnapshot::ToJson() const {
         j["domainsScanned"] = domainsScanned;
         j["bytesReclaimed"] = bytesReclaimed;
 
-        const auto elapsed = Clock::now() - startTime;
+        const auto elapsed = Clock::now() - AtomicValueLoadRelaxed(startTime);
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
         j["uptimeSeconds"] = seconds;
 
@@ -2388,7 +2397,7 @@ std::string CookieStatistics::ToJson() const {
         j["domainsScanned"] = domainsScanned.load();
         j["bytesReclaimed"] = bytesReclaimed.load();
 
-        const auto elapsed = Clock::now() - startTime;
+        const auto elapsed = Clock::now() - AtomicValueLoadRelaxed(startTime);
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
         j["uptimeSeconds"] = seconds;
 

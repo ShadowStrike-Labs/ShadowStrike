@@ -124,6 +124,15 @@ static const GUID s_ksCategoryVideo =
 // ============================================================================
 
 namespace {
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
 
 /**
  * @brief Generate unique event ID
@@ -430,7 +439,7 @@ void WebcamStatistics::Reset() noexcept {
     whitelistHits.store(0, std::memory_order_relaxed);
     devicesMonitored.store(0, std::memory_order_relaxed);
     virtualCameraBlocked.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string WebcamStatistics::ToJson() const {
@@ -1002,7 +1011,7 @@ bool WebcamProtectorImpl::AddToWhitelistInternal(
 
         m_whitelist[entry.entryId] = entry;
 
-        SS_LOG_INFO(L"WebcamProtector", L"Added to whitelist: %hs", entry.processPattern.c_str());
+        SS_LOG_INFO(L"WebcamProtector", L"Added a whitelist entry");
 
         return true;
 
@@ -1023,7 +1032,7 @@ bool WebcamProtectorImpl::RemoveFromWhitelistInternal(const std::string& entryId
 
         m_whitelist.erase(it);
 
-        SS_LOG_INFO(L"WebcamProtector", L"Removed from whitelist: %hs", entryId.c_str());
+        SS_LOG_INFO(L"WebcamProtector", L"Removed a whitelist entry");
 
         return true;
 
@@ -1430,7 +1439,7 @@ bool WebcamProtector::BlockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = true;
 
-        SS_LOG_INFO(L"WebcamProtector", L"Device blocked: %hs", deviceId.c_str());
+        SS_LOG_INFO(L"WebcamProtector", L"Device blocked");
 
         return true;
 
@@ -1453,7 +1462,7 @@ bool WebcamProtector::UnblockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = false;
 
-        SS_LOG_INFO(L"WebcamProtector", L"Device unblocked: %hs", deviceId.c_str());
+        SS_LOG_INFO(L"WebcamProtector", L"Device unblocked");
 
         return true;
 
@@ -1725,7 +1734,23 @@ void WebcamProtector::UnregisterCallbacks() {
 // ============================================================================
 
 WebcamStatistics WebcamProtector::GetStatistics() const {
-    return m_impl ? m_impl->m_statistics : WebcamStatistics{};
+    if (!m_impl) {
+        return WebcamStatistics{};
+    }
+
+    WebcamStatistics snapshot;
+    snapshot.totalAccessAttempts.store(m_impl->m_statistics.totalAccessAttempts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.accessAllowed.store(m_impl->m_statistics.accessAllowed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.accessBlocked.store(m_impl->m_statistics.accessBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.accessPrompted.store(m_impl->m_statistics.accessPrompted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.suspiciousAccess.store(m_impl->m_statistics.suspiciousAccess.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.malwareBlocked.store(m_impl->m_statistics.malwareBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.ratDetected.store(m_impl->m_statistics.ratDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.whitelistHits.store(m_impl->m_statistics.whitelistHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.devicesMonitored.store(m_impl->m_statistics.devicesMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.virtualCameraBlocked.store(m_impl->m_statistics.virtualCameraBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    AtomicValueStoreRelaxed(snapshot.startTime, AtomicValueLoadRelaxed(m_impl->m_statistics.startTime));
+    return snapshot;
 }
 
 void WebcamProtector::ResetStatistics() {

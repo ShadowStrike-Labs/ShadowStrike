@@ -1709,10 +1709,14 @@ float WiFiSecurityAnalyzerImpl::CalculateBSSIDSimilarity(const std::string& bssi
 }
 
 void WiFiSecurityAnalyzerImpl::NotifyNetworkFound(const WiFiNetworkInfo& network) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_networkFoundCallback) {
+    NetworkFoundCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_networkFoundCallback;
+    }
+    if (cb) {
         try {
-            m_networkFoundCallback(network);
+            cb(network);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CAT, L"Network found callback exception: %hs", e.what());
         }
@@ -1720,10 +1724,14 @@ void WiFiSecurityAnalyzerImpl::NotifyNetworkFound(const WiFiNetworkInfo& network
 }
 
 void WiFiSecurityAnalyzerImpl::NotifyThreat(const WiFiSecurityThreat& threat) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_threatCallback) {
+    ThreatDetectedCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_threatCallback;
+    }
+    if (cb) {
         try {
-            m_threatCallback(threat);
+            cb(threat);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CAT, L"Threat callback exception: %hs", e.what());
         }
@@ -1731,10 +1739,14 @@ void WiFiSecurityAnalyzerImpl::NotifyThreat(const WiFiSecurityThreat& threat) {
 }
 
 void WiFiSecurityAnalyzerImpl::NotifyEvilTwin(const EvilTwinDetectionResult& result) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_evilTwinCallback) {
+    EvilTwinCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_evilTwinCallback;
+    }
+    if (cb) {
         try {
-            m_evilTwinCallback(result);
+            cb(result);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CAT, L"Evil twin callback exception: %hs", e.what());
         }
@@ -1742,10 +1754,14 @@ void WiFiSecurityAnalyzerImpl::NotifyEvilTwin(const EvilTwinDetectionResult& res
 }
 
 void WiFiSecurityAnalyzerImpl::NotifyConnectionChange(const WiFiConnectionInfo& conn) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_connectionCallback) {
+    ConnectionChangeCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_connectionCallback;
+    }
+    if (cb) {
         try {
-            m_connectionCallback(conn);
+            cb(conn);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CAT, L"Connection callback exception: %hs", e.what());
         }
@@ -1753,10 +1769,14 @@ void WiFiSecurityAnalyzerImpl::NotifyConnectionChange(const WiFiConnectionInfo& 
 }
 
 void WiFiSecurityAnalyzerImpl::NotifyError(const std::string& message, int code) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_errorCallback) {
+    ErrorCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_errorCallback;
+    }
+    if (cb) {
         try {
-            m_errorCallback(message, code);
+            cb(message, code);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CAT, L"Error callback exception: %hs", e.what());
         }

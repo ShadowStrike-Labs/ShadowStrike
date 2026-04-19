@@ -116,6 +116,15 @@ using SystemClock = std::chrono::system_clock;
 // ============================================================================
 
 namespace {
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
 
 /**
  * @brief Safely resolve process path; returns empty wstring on failure.
@@ -451,7 +460,7 @@ void MicrophoneStatistics::Reset() noexcept {
     for (auto& counter : byAPI) {
         counter.store(0, std::memory_order_relaxed);
     }
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string MicrophoneStatistics::ToJson() const {
@@ -489,7 +498,7 @@ MicrophoneStatisticsSnapshot MicrophoneStatistics::TakeSnapshot() const noexcept
     for (size_t i = 0; i < byAPI.size(); ++i) {
         snap.byAPI[i] = byAPI[i].load(std::memory_order_relaxed);
     }
-    snap.startTime = startTime;
+    snap.startTime = AtomicValueLoadRelaxed(startTime);
     return snap;
 }
 
@@ -1203,8 +1212,7 @@ bool MicrophoneGuardImpl::AddToWhitelistInternal(
 
         m_whitelist[entry.entryId] = entry;
 
-        Utils::Logger::Info("MicrophoneGuard: Added to whitelist: {}",
-                          (entry.processPattern));
+        Utils::Logger::Info("MicrophoneGuard: Added a whitelist entry");
 
         return true;
 
@@ -1226,8 +1234,7 @@ bool MicrophoneGuardImpl::RemoveFromWhitelistInternal(const std::string& entryId
 
         m_whitelist.erase(it);
 
-        Utils::Logger::Info("MicrophoneGuard: Removed from whitelist: {}",
-                          (entryId));
+        Utils::Logger::Info("MicrophoneGuard: Removed a whitelist entry");
 
         return true;
 
@@ -1496,9 +1503,8 @@ void MicrophoneGuardImpl::MonitorThreadFunc() {
 
                         InvokeStreamCallbacks(stream);
 
-                        Utils::Logger::Info("MicrophoneGuard: New audio stream from PID {} ({})",
-                                          pid,
-                                          (stream.processName));
+                        Utils::Logger::Info("MicrophoneGuard: New audio stream detected for PID {}",
+                                          pid);
                     }
                 }
             }
@@ -1734,8 +1740,7 @@ bool MicrophoneGuard::BlockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = true;
 
-        Utils::Logger::Info("MicrophoneGuard: Device blocked: {}",
-                          (deviceId));
+        Utils::Logger::Info("MicrophoneGuard: Device blocked");
 
         return true;
 
@@ -1759,8 +1764,7 @@ bool MicrophoneGuard::UnblockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = false;
 
-        Utils::Logger::Info("MicrophoneGuard: Device unblocked: {}",
-                          (deviceId));
+        Utils::Logger::Info("MicrophoneGuard: Device unblocked");
 
         return true;
 
