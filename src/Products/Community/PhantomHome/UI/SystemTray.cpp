@@ -51,8 +51,25 @@
 #include "PhantomCore/Communication/AlertSystem.hpp"
 #include "PhantomCore/Communication/NotificationManager.hpp"
 
+#include <atomic>
+
 namespace ShadowStrike {
 namespace UI {
+
+// ============================================================================
+// ATOMIC HELPERS — Lock-free access to trivially-copyable timestamp fields
+// ============================================================================
+
+namespace {
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+}
 
 // ============================================================================
 // ICON COLORS — RGBA 32-bit premultiplied alpha
@@ -570,7 +587,7 @@ bool SystemTrayImpl::Initialize(const SystemTrayConfig& config) {
     m_shutdownRequested.store(false, std::memory_order_release);
     m_initDone = false;
     m_initSuccess = false;
-    m_startTime = std::chrono::steady_clock::now();
+    AtomicValueStoreRelaxed(m_startTime, std::chrono::steady_clock::now());
 
     // Launch dedicated message-pump thread
     m_thread = std::thread(&SystemTrayImpl::ThreadProc, this);
@@ -782,6 +799,29 @@ LRESULT CALLBACK SystemTrayImpl::WndProc(HWND hwnd, UINT msg,
     switch (msg) {
         case TrayConstants::WM_TRAY_CALLBACK:
             self->HandleTrayMessage(lp);
+            return 0;
+
+        case WM_APP + 0x101: {
+            // Icon state changed — run all UI work on the message pump thread.
+            // wp = previous state, lp = new state (passed from SetIconState).
+            auto prevState = static_cast<TrayIconState>(wp);
+            auto newState  = static_cast<TrayIconState>(lp);
+
+            // Manage animation (SetTimer/KillTimer require message-pump thread)
+            if (newState == TrayIconState::Scanning) {
+                self->StartAnimation();
+            } else if (prevState == TrayIconState::Scanning) {
+                self->StopAnimation();
+            }
+
+            self->UpdateIcon();
+            self->UpdateTooltipInternal();
+            return 0;
+        }
+
+        case WM_APP + 0x102:
+            // Tooltip text changed — update on message pump thread
+            self->UpdateTooltipInternal();
             return 0;
 
         case WM_COMMAND: {
@@ -1199,22 +1239,13 @@ void SystemTrayImpl::SetIconState(TrayIconState state) {
 
     m_statIconStateChanges.fetch_add(1, std::memory_order_relaxed);
 
-    // Manage animation
-    if (state == TrayIconState::Scanning) {
-        StartAnimation();
-    } else if (prev == TrayIconState::Scanning) {
-        StopAnimation();
-    }
-
-    // Update icon on the message thread
+    // Post to message pump thread for all UI work (SetTimer, Shell_NotifyIconW).
+    // The WM_APP+0x101 handler calls UpdateIcon() + UpdateTooltipInternal() and
+    // manages animation start/stop on the correct thread.
     if (m_hwnd) {
-        // PostMessage is thread-safe; the actual Shell_NotifyIconW call
-        // happens on the message-pump thread via WM_APP+0x101.
-        PostMessageW(m_hwnd, WM_APP + 0x101, 0, 0);
+        PostMessageW(m_hwnd, WM_APP + 0x101, static_cast<WPARAM>(prev),
+                     static_cast<LPARAM>(state));
     }
-
-    // Update tooltip
-    UpdateTooltipInternal();
 }
 
 void SystemTrayImpl::SetTooltip(std::wstring_view tooltip) {
@@ -1222,7 +1253,10 @@ void SystemTrayImpl::SetTooltip(std::wstring_view tooltip) {
         std::unique_lock lock(m_mutex);
         m_tooltipOverride = std::wstring(tooltip);
     }
-    UpdateTooltipInternal();
+    // Update tooltip on the message pump thread where Shell_NotifyIconW is safe
+    if (m_hwnd) {
+        PostMessageW(m_hwnd, WM_APP + 0x102, 0, 0);
+    }
 }
 
 std::wstring SystemTrayImpl::GetTooltip() const {
@@ -1518,7 +1552,7 @@ SystemTrayStatistics SystemTrayImpl::GetStatistics() const {
     stats.explorerRestarts  = m_statExplorerRestarts.load(std::memory_order_relaxed);
     stats.balloonsSent      = m_statBalloonsSent.load(std::memory_order_relaxed);
     stats.uptimeSeconds     = std::chrono::duration_cast<std::chrono::seconds>(
-                                  now - m_startTime).count();
+                                  now - AtomicValueLoadRelaxed(m_startTime)).count();
     return stats;
 }
 
@@ -1531,7 +1565,7 @@ void SystemTrayImpl::ResetStatistics() {
     m_statIconStateChanges.store(0, std::memory_order_relaxed);
     m_statExplorerRestarts.store(0, std::memory_order_relaxed);
     m_statBalloonsSent.store(0, std::memory_order_relaxed);
-    m_startTime = std::chrono::steady_clock::now();
+    AtomicValueStoreRelaxed(m_startTime, std::chrono::steady_clock::now());
 }
 
 bool SystemTrayImpl::SelfTest() {
