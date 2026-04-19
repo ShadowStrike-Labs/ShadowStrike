@@ -63,6 +63,7 @@
 #include <regex>
 #include <cmath>
 #include <unordered_set>
+#include <atomic>
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Iphlpapi.lib")
@@ -84,6 +85,16 @@ std::atomic<bool> IPLeakProtection::s_instanceCreated{false};
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
 // ============================================================================
 // FIREWALL RULE NAMES (kill switch / IPv6 block)
@@ -681,12 +692,12 @@ void IPLeakStatistics::Reset() noexcept {
         count = 0;
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string IPLeakStatistics::ToJson() const {
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
 
     json j;
     j["uptimeSeconds"] = uptime;

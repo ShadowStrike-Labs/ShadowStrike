@@ -72,7 +72,8 @@
 #include <iomanip>
 #include <algorithm>
 #include <thread>
-#include <filesystem>            // Fix #2: missing include
+#include <filesystem>
+#include <atomic>            // Fix #2: missing include
 
 #if __has_include(<dxgi1_4.h>)
 #  include <dxgi1_4.h>
@@ -91,6 +92,16 @@
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     using namespace ShadowStrike::GameMode;
     namespace Utils = ShadowStrike::Utils;
 
@@ -1219,7 +1230,7 @@ PerformanceOptimizer::~PerformanceOptimizer() {
 
         // Reset statistics
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         // Initialize default profile
         m_impl->m_currentProfile.store(config.defaultProfile, std::memory_order_release);
@@ -2344,7 +2355,7 @@ void PerformanceOptimizer::UnregisterCallbacks() {
 void PerformanceOptimizer::ResetStatistics() {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_stats.Reset();
-    m_impl->m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
     Utils::Logger::Info("Statistics reset");
 }
@@ -2459,7 +2470,7 @@ void OptimizerStatistics::Reset() noexcept {
     j["totalBoostDurationSeconds"] = totalBoostDurationSeconds.load(std::memory_order_relaxed);
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = uptime;
 
     return j.dump(2);

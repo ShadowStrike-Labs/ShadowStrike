@@ -61,6 +61,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <atomic>
 
 #pragma comment(lib, "Setupapi.lib")
 #pragma comment(lib, "Cfgmgr32.lib")
@@ -80,6 +81,16 @@ std::atomic<bool> USBDeviceMonitor::s_instanceCreated{false};
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     const wchar_t* const CLASS_NAME = L"ShadowStrikeUSBMonitorWindow";
     const wchar_t* const WINDOW_NAME = L"ShadowStrikeUSBMonitor";
 
@@ -243,7 +254,7 @@ bool USBDeviceMonitorImpl::Initialize(const USBMonitorConfiguration& config) {
 
     m_config = config;
     m_status.store(MonitorModuleStatus::Initializing, std::memory_order_release);
-    m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
     m_status.store(MonitorModuleStatus::Running, std::memory_order_release);
 
     SS_LOG_INFO(L"USBMonitor", L"Initialized with history size: %zu", m_config.deviceHistorySize);
@@ -997,7 +1008,7 @@ USBMonitorStatisticsSnapshot USBDeviceMonitorImpl::GetStatistics() const {
     for (size_t i = 0; i < m_stats.byEventType.size(); ++i) {
         snap.byEventType[i] = m_stats.byEventType[i].load(std::memory_order_relaxed);
     }
-    snap.startTime = m_stats.startTime;
+    snap.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
     return snap;
 }
 
@@ -1351,7 +1362,7 @@ void USBMonitorStatistics::Reset() noexcept {
     for (auto& counter : byEventType) {
         counter.store(0, std::memory_order_relaxed);
     }
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 bool USBMonitorConfiguration::IsValid() const noexcept {

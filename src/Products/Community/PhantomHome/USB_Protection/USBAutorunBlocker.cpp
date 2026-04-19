@@ -54,6 +54,7 @@
 // ============================================================================
 #include "PhantomCore/Core/Engine/QuarantineManager.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include <atomic>
 
 namespace ShadowStrike {
 namespace USB {
@@ -72,6 +73,16 @@ std::atomic<bool> USBAutorunBlocker::s_instanceCreated{false};
 // ANONYMOUS HELPER UTILITIES
 // ============================================================================
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
     /// RAII wrapper for Win32 HANDLE (file handles from CreateFileW).
     struct ScopedHandle {
@@ -297,7 +308,7 @@ void AutorunStatistics::Reset() noexcept {
     drivesVaccinated.store(0, std::memory_order_relaxed);
     vaccinationFailures.store(0, std::memory_order_relaxed);
     for (auto& count : byThreatType) count.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 // H3: AutorunStatisticsSnapshot::ToJson – the copyable snapshot type.
@@ -314,7 +325,7 @@ std::string AutorunStatisticsSnapshot::ToJson() const {
         << "\"drivesVaccinated\":" << drivesVaccinated << ","
         << "\"vaccinationFailures\":" << vaccinationFailures << ","
         << "\"uptimeSeconds\":"
-        << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - startTime).count()
+        << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - AtomicValueLoadRelaxed(startTime)).count()
         << "}";
     return oss.str();
 }
@@ -973,7 +984,7 @@ public:
         for (size_t i = 0; i < snap.byThreatType.size(); ++i) {
             snap.byThreatType[i] = m_stats.byThreatType[i].load(std::memory_order_relaxed);
         }
-        snap.startTime = m_stats.startTime;
+        snap.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
         return snap;
     }
 

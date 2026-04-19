@@ -88,6 +88,7 @@
 #include <windot11.h>
 #include <objbase.h>
 #include <iphlpapi.h>
+#include <atomic>
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -101,6 +102,16 @@ namespace IoT {
 // ============================================================================
 
 namespace {
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
 
 // ============================================================================
 // LOG CATEGORY
@@ -463,7 +474,7 @@ bool WiFiSecurityAnalyzerImpl::Initialize(const WiFiAnalyzerConfiguration& confi
 
         // Reset statistics
         m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
@@ -1170,7 +1181,7 @@ WiFiStatistics WiFiSecurityAnalyzerImpl::GetStatistics() const {
 
 void WiFiSecurityAnalyzerImpl::ResetStatistics() {
     m_stats.Reset();
-    m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
     SS_LOG_INFO(LOG_CAT, L"Statistics reset");
 }
 
@@ -2032,7 +2043,7 @@ void WiFiStatistics::Reset() noexcept {
         counter.store(0, std::memory_order_release);
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string WiFiStatistics::ToJson() const {
@@ -2046,7 +2057,7 @@ std::string WiFiStatistics::ToJson() const {
     j["deauthAttacksDetected"] = deauthAttacksDetected.load(std::memory_order_acquire);
     j["currentNetworksTracked"] = currentNetworksTracked.load(std::memory_order_acquire);
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - startTime).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = elapsed;
 
     return j.dump();
