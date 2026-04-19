@@ -70,6 +70,15 @@ std::atomic<bool> LocationPrivacy::s_instanceCreated{false};
 // ============================================================================
 
 namespace {
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
 
 /// @brief Generate unique event ID
 uint64_t GenerateEventId() {
@@ -321,12 +330,12 @@ void LocationStatistics::Reset() noexcept {
         count = 0;
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string LocationStatistics::ToJson() const {
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
 
     json j;
     j["uptimeSeconds"] = uptime;
@@ -358,7 +367,7 @@ LocationStatisticsSnapshot LocationStatistics::Snapshot() const noexcept {
         snap.bySource[i] = bySource[i].load(std::memory_order_relaxed);
     }
     snap.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     return snap;
 }
 
@@ -783,7 +792,7 @@ void LocationPrivacyImpl::SetMockLocation(const GeoLocation& loc) {
     }
 
     m_mockLocation = loc;
-    Utils::Logger::Info("Mock location set: {}, {}", loc.latitude, loc.longitude);
+    Utils::Logger::Info("Mock location updated");
 }
 
 std::optional<GeoLocation> LocationPrivacyImpl::GetMockLocation() const {
@@ -808,7 +817,7 @@ bool LocationPrivacyImpl::SetRandomMockLocation(const GeofenceRegion& region) {
 
             m_mockLocation = randomLoc;
 
-            Utils::Logger::Info("Random mock location set within region: {}", region.name);
+            Utils::Logger::Info("Random mock location updated for configured region");
             return true;
         }
 
@@ -869,7 +878,7 @@ bool LocationPrivacyImpl::AddRoute(const MockRoute& route) {
             m_routes.push_back(route);
         }
 
-        Utils::Logger::Info("Route added: {} ({} waypoints)", route.name, route.waypoints.size());
+        Utils::Logger::Info("Route added ({} waypoints)", route.waypoints.size());
         return true;
 
     } catch (const std::exception& e) {
@@ -887,7 +896,7 @@ bool LocationPrivacyImpl::RemoveRoute(const std::string& routeId) {
 
         if (it != m_routes.end()) {
             m_routes.erase(it, m_routes.end());
-            Utils::Logger::Info("Route removed: {}", routeId);
+            Utils::Logger::Info("Route removed");
             return true;
         }
 
@@ -907,7 +916,7 @@ bool LocationPrivacyImpl::StartRoute(const std::string& routeId) {
             [&routeId](const MockRoute& r) { return r.routeId == routeId; });
 
         if (it == m_routes.end()) {
-            Utils::Logger::Error("Route not found: {}", routeId);
+            Utils::Logger::Error("Route not found");
             return false;
         }
 
@@ -918,7 +927,7 @@ bool LocationPrivacyImpl::StartRoute(const std::string& routeId) {
 
         m_activeRoute = activeRoute;
 
-        Utils::Logger::Info("Route started: {}", activeRoute.name);
+        Utils::Logger::Info("Route started");
         return true;
 
     } catch (const std::exception& e) {
@@ -971,7 +980,7 @@ bool LocationPrivacyImpl::AddGeofence(const GeofenceRegion& region) {
             m_geofences.push_back(region);
         }
 
-        Utils::Logger::Info("Geofence added: {}", region.name);
+        Utils::Logger::Info("Geofence added");
         return true;
 
     } catch (const std::exception& e) {
@@ -989,7 +998,7 @@ bool LocationPrivacyImpl::RemoveGeofence(const std::string& regionId) {
 
         if (it != m_geofences.end()) {
             m_geofences.erase(it, m_geofences.end());
-            Utils::Logger::Info("Geofence removed: {}", regionId);
+            Utils::Logger::Info("Geofence removed");
             return true;
         }
 
@@ -1010,11 +1019,11 @@ bool LocationPrivacyImpl::UpdateGeofence(const GeofenceRegion& region) {
 
         if (it != m_geofences.end()) {
             *it = region;
-            Utils::Logger::Info("Geofence updated: {}", region.name);
+            Utils::Logger::Info("Geofence updated");
             return true;
         }
 
-        Utils::Logger::Error("Geofence not found: {}", region.regionId);
+        Utils::Logger::Error("Geofence not found");
         return false;
 
     } catch (const std::exception& e) {
@@ -1263,7 +1272,7 @@ bool LocationPrivacyImpl::AddToWhitelist(const LocationWhitelistEntry& entry) {
             m_whitelist.push_back(entry);
         }
 
-        Utils::Logger::Info("Whitelist entry added: {}", entry.processPattern);
+        Utils::Logger::Info("Whitelist entry added");
         return true;
 
     } catch (const std::exception& e) {
@@ -1281,7 +1290,7 @@ bool LocationPrivacyImpl::RemoveFromWhitelist(const std::string& entryId) {
 
         if (it != m_whitelist.end()) {
             m_whitelist.erase(it, m_whitelist.end());
-            Utils::Logger::Info("Whitelist entry removed: {}", entryId);
+            Utils::Logger::Info("Whitelist entry removed");
             return true;
         }
 
@@ -1340,7 +1349,7 @@ bool LocationPrivacyImpl::AddBlockedGeolocationDomain(const std::string& domain)
     }
 
     m_blockedDomains.insert(domain);
-    Utils::Logger::Info("Blocked geolocation domain added: {}", domain);
+    Utils::Logger::Info("Blocked geolocation domain added");
     return true;
 }
 

@@ -110,6 +110,15 @@ namespace Privacy {
 // ============================================================================
 
 namespace {
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
 
 /**
  * @brief Built-in PII patterns
@@ -507,7 +516,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
 
         // Reset statistics
         m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
         // Start clipboard monitoring if enabled
         if (m_config.monitorClipboard) {
@@ -1299,7 +1308,7 @@ void DataLeakProtectionImpl::ReportIncident(const DLPIncident& incident) {
     m_stats.incidentsLogged++;
 
     // Notify outside m_incidentMutex to prevent deadlock if callback re-enters
-    NotifyIncident(incident);
+    NotifyIncident(sanitized);
 
     ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Incident reported: {} (Policy: {}, Action: {})",
         incident.incidentId, incident.policyId, GetDLPActionName(incident.actionTaken));
@@ -1370,13 +1379,13 @@ DLPStatisticsSnapshot DataLeakProtectionImpl::GetStatistics() const {
     for (size_t i = 0; i < m_stats.bySeverity.size(); ++i) {
         snapshot.bySeverity[i] = m_stats.bySeverity[i].load(std::memory_order_acquire);
     }
-    snapshot.startTime = m_stats.startTime;
+    snapshot.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
     return snapshot;
 }
 
 void DataLeakProtectionImpl::ResetStatistics() {
     m_stats.Reset();
-    m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
     ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Statistics reset");
 }
 
@@ -2030,7 +2039,7 @@ void DLPStatistics::Reset() noexcept {
         counter.store(0, std::memory_order_release);
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string DLPStatistics::ToJson() const {
@@ -2049,7 +2058,7 @@ std::string DLPStatistics::ToJson() const {
     j["piiDetected"] = piiDetected.load(std::memory_order_acquire);
 
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = elapsed;
 
     return j.dump();

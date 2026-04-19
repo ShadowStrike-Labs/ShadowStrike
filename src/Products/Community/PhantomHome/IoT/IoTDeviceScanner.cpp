@@ -497,12 +497,17 @@ public:
     std::vector<ErrorCallback>          m_errorCallbacks;
 
     // ========================================================================
-    // CALLBACK INVOCATION (lock-free from m_mutex perspective)
+    // ========================================================================
+    // CALLBACK INVOCATION — copy-under-lock, invoke-outside-lock
     // ========================================================================
 
     void NotifyError(const std::string& message, int code = 0) {
-        std::lock_guard lock(m_callbackMutex);
-        for (const auto& callback : m_errorCallbacks) {
+        std::vector<ErrorCallback> cbs;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cbs = m_errorCallbacks;
+        }
+        for (const auto& callback : cbs) {
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
@@ -514,8 +519,12 @@ public:
     }
 
     void NotifyDeviceFound(const IoTDeviceInfo& device) {
-        std::lock_guard lock(m_callbackMutex);
-        for (const auto& callback : m_deviceFoundCallbacks) {
+        std::vector<DeviceFoundCallback> cbs;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cbs = m_deviceFoundCallbacks;
+        }
+        for (const auto& callback : cbs) {
             try {
                 callback(device);
             } catch (const std::exception& e) {
@@ -527,8 +536,12 @@ public:
     }
 
     void NotifyVulnerability(const IoTDeviceInfo& device, RiskFactor risk) {
-        std::lock_guard lock(m_callbackMutex);
-        for (const auto& callback : m_vulnerabilityCallbacks) {
+        std::vector<VulnerabilityCallback> cbs;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cbs = m_vulnerabilityCallbacks;
+        }
+        for (const auto& callback : cbs) {
             try {
                 callback(device, risk);
             } catch (const std::exception& e) {
@@ -540,8 +553,12 @@ public:
     }
 
     void NotifyProgress(const IoTScanProgress& progress) {
-        std::lock_guard lock(m_callbackMutex);
-        for (const auto& callback : m_progressCallbacks) {
+        std::vector<ScanProgressCallback> cbs;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cbs = m_progressCallbacks;
+        }
+        for (const auto& callback : cbs) {
             try {
                 callback(progress);
             } catch (const std::exception& e) {
@@ -553,8 +570,12 @@ public:
     }
 
     void NotifyComplete(const IoTScanResultSummary& summary) {
-        std::lock_guard lock(m_callbackMutex);
-        for (const auto& callback : m_completeCallbacks) {
+        std::vector<ScanCompleteCallback> cbs;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cbs = m_completeCallbacks;
+        }
+        for (const auto& callback : cbs) {
             try {
                 callback(summary);
             } catch (const std::exception& e) {

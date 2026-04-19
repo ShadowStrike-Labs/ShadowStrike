@@ -85,6 +85,16 @@ namespace {
     using namespace ShadowStrike::Privacy;
     using namespace ShadowStrike::Utils;
 
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     /// @brief Monitoring interval (ms)
     constexpr uint32_t MONITORING_INTERVAL_MS = 1000;
 
@@ -1663,7 +1673,7 @@ IPLeakProtection::~IPLeakProtection() {
 
         // Reset statistics
         m_impl->m_stats.Reset();
-        m_impl->m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
         // Detect initial VPN status
         m_impl->m_vpnStatus.store(m_impl->DetectVPNStatus(), std::memory_order_release);
@@ -2068,7 +2078,7 @@ void IPLeakProtection::ClearHistory() {
     }
 
     processes.push_back(processName);
-    ::ShadowStrike::Utils::Logger::Info("Added allowed process: {}", processName);
+    ::ShadowStrike::Utils::Logger::Info("Added allowed process rule");
     return true;
 }
 
@@ -2076,7 +2086,7 @@ void IPLeakProtection::ClearHistory() {
     std::unique_lock lock(m_impl->m_mutex);
     auto& processes = m_impl->m_config.allowedProcesses;
     processes.erase(std::remove(processes.begin(), processes.end(), processName), processes.end());
-    ::ShadowStrike::Utils::Logger::Info("Removed allowed process: {}", processName);
+    ::ShadowStrike::Utils::Logger::Info("Removed allowed process rule");
     return true;
 }
 
@@ -2176,14 +2186,14 @@ void IPLeakProtection::UnregisterCallbacks() {
     for (size_t i = 0; i < m_impl->m_stats.byLeakType.size(); ++i) {
         snapshot.byLeakType[i].store(m_impl->m_stats.byLeakType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
-    snapshot.startTime = m_impl->m_stats.startTime;
+    AtomicValueStoreRelaxed(snapshot.startTime, AtomicValueLoadRelaxed(m_impl->m_stats.startTime));
 
     return snapshot;
 }
 
 void IPLeakProtection::ResetStatistics() {
     m_impl->m_stats.Reset();
-    m_impl->m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
     ::ShadowStrike::Utils::Logger::Info("Statistics reset");
 }
 
@@ -2357,7 +2367,7 @@ void IPLeakProtection::ResetStatistics() {
 }
 
 IPLeakStatistics::IPLeakStatistics(const IPLeakStatistics& other) noexcept
-    : startTime(other.startTime)
+    : startTime(AtomicValueLoadRelaxed(other.startTime))
 {
     leaksDetected.store(other.leaksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
     leaksBlocked.store(other.leaksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -2387,7 +2397,7 @@ IPLeakStatistics& IPLeakStatistics::operator=(const IPLeakStatistics& other) noe
         for (size_t i = 0; i < byLeakType.size(); ++i) {
             byLeakType[i].store(other.byLeakType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
-        startTime = other.startTime;
+        AtomicValueStoreRelaxed(startTime, AtomicValueLoadRelaxed(other.startTime));
     }
     return *this;
 }
@@ -2406,6 +2416,7 @@ void IPLeakStatistics::Reset() noexcept {
     for (auto& type : byLeakType) {
         type.store(0, std::memory_order_relaxed);
     }
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 [[nodiscard]] std::string IPLeakStatistics::ToJson() const {
@@ -2424,7 +2435,7 @@ void IPLeakStatistics::Reset() noexcept {
     j["connectionsBlocked"] = connectionsBlocked.load(std::memory_order_relaxed);
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = uptime;
 
     return j.dump(2);

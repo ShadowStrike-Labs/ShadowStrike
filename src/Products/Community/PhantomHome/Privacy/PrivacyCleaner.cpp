@@ -114,6 +114,18 @@ extern "C" BOOL WINAPI DnsFlushResolverCache(void);
 namespace ShadowStrike {
 namespace Privacy {
 
+namespace {
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
+}  // namespace
+
 // ============================================================================
 // INTERNAL STRUCTURES
 // ============================================================================
@@ -394,7 +406,7 @@ bool PrivacyCleanerImpl::Initialize(const CleanerConfiguration& config) {
 
         // Reset statistics
         m_stats.Reset();
-        m_stats.startTime = Clock::now();
+        AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
 
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Ready, std::memory_order_release);
@@ -1429,13 +1441,13 @@ CleanerStatistics PrivacyCleanerImpl::GetStatistics() const {
     for (size_t i = 0; i < m_stats.byBrowser.size(); ++i) {
         snapshot.byBrowser[i].store(m_stats.byBrowser[i].load(std::memory_order_acquire), std::memory_order_relaxed);
     }
-    snapshot.startTime = m_stats.startTime;
+    AtomicValueStoreRelaxed(snapshot.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
     return snapshot;
 }
 
 void PrivacyCleanerImpl::ResetStatistics() {
     m_stats.Reset();
-    m_stats.startTime = Clock::now();
+    AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
     SS_LOG_INFO(L"PrivacyCleaner", L"Statistics reset");
 }
 
@@ -2427,7 +2439,7 @@ std::string PrivacyCleaner::GetVersionString() noexcept {
 // ============================================================================
 
 CleanerStatistics::CleanerStatistics(const CleanerStatistics& other) noexcept
-    : startTime(other.startTime) {
+    : startTime(AtomicValueLoadRelaxed(other.startTime)) {
     totalCleanOperations.store(other.totalCleanOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
     totalBytesReclaimed.store(other.totalBytesReclaimed.load(std::memory_order_acquire), std::memory_order_relaxed);
     totalFilesDeleted.store(other.totalFilesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
@@ -2460,7 +2472,7 @@ CleanerStatistics& CleanerStatistics::operator=(const CleanerStatistics& other) 
         for (size_t i = 0; i < byBrowser.size(); ++i) {
             byBrowser[i].store(other.byBrowser[i].load(std::memory_order_acquire), std::memory_order_relaxed);
         }
-        startTime = other.startTime;
+        AtomicValueStoreRelaxed(startTime, AtomicValueLoadRelaxed(other.startTime));
     }
     return *this;
 }
@@ -2482,7 +2494,7 @@ void CleanerStatistics::Reset() noexcept {
         counter.store(0, std::memory_order_release);
     }
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string CleanerStatistics::ToJson() const {
@@ -2500,7 +2512,7 @@ std::string CleanerStatistics::ToJson() const {
     j["historyCleared"] = historyCleared.load(std::memory_order_acquire);
 
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - AtomicValueLoadRelaxed(startTime)).count();
     j["uptimeSeconds"] = elapsed;
 
     return j.dump();
