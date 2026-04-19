@@ -70,6 +70,16 @@ constexpr size_t MIN_NOP_SLED_LENGTH = 16;
 /// Memory read chunk size for scanning
 constexpr SIZE_T MEM_SCAN_CHUNK = 4096;
 
+template <typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template <typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
+
 /// DGA entropy threshold — legitimate domains rarely exceed this
 constexpr double DGA_ENTROPY_THRESHOLD = 3.7;
 
@@ -449,7 +459,8 @@ void DetectionStatistics::Reset() noexcept {
     whitelistHits.store(0, std::memory_order_relaxed);
     for (auto& f : byFamily) f.store(0, std::memory_order_relaxed);
     for (auto& m : byMethod) m.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
+    AtomicValueStoreRelaxed(lastDetectionTime, SystemTimePoint{});
 }
 
 bool BankingTrojanDetectorConfiguration::IsValid() const noexcept {
@@ -576,6 +587,10 @@ public:
         std::unique_lock lock(m_mutex);
         if (!m_initialized.load(std::memory_order_relaxed)) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Cannot start: not initialized");
+            return false;
+        }
+        if (m_status.load(std::memory_order_acquire) == ModuleStatus::Stopping) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Cannot start while stop is still in progress");
             return false;
         }
         if (m_running.load(std::memory_order_relaxed)) return true;
@@ -850,7 +865,7 @@ public:
                 for (const auto& dm : result.detectionMethods) {
                     m_stats.byMethod[SafeMethodIndex(dm)].fetch_add(1, std::memory_order_relaxed);
                 }
-                m_stats.lastDetectionTime = std::chrono::system_clock::now();
+                AtomicValueStoreRelaxed(m_stats.lastDetectionTime, std::chrono::system_clock::now());
 
                 // Save to history
                 {
@@ -1680,8 +1695,8 @@ public:
             snap.byFamily[i] = m_stats.byFamily[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < 16; ++i)
             snap.byMethod[i] = m_stats.byMethod[i].load(std::memory_order_relaxed);
-        snap.startTime = m_stats.startTime;
-        snap.lastDetectionTime = m_stats.lastDetectionTime;
+        snap.startTime = AtomicValueLoadRelaxed(m_stats.startTime);
+        snap.lastDetectionTime = AtomicValueLoadRelaxed(m_stats.lastDetectionTime);
         return snap;
     }
 

@@ -208,13 +208,13 @@ void SchedulerStatistics::Reset() noexcept {
     successfulRuns.store(0, std::memory_order_relaxed);
     currentQueueSize.store(0, std::memory_order_relaxed);
     maxQueueSize.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    startTime.store(Clock::now(), std::memory_order_relaxed);
     for (auto& v : byThrottleReason) v.store(0, std::memory_order_relaxed);
 }
 
 std::string SchedulerStatistics::ToJson() const {
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - startTime).count();
+        Clock::now() - startTime.load(std::memory_order_relaxed)).count();
     std::ostringstream oss;
     oss << "{"
         << "\"scheduledRuns\":" << scheduledRuns.load(std::memory_order_relaxed) << ","
@@ -830,7 +830,7 @@ public:
             snapshot.byThrottleReason[i] =
                 m_stats.byThrottleReason[i].load(std::memory_order_relaxed);
         }
-        snapshot.startTime = m_stats.startTime;
+        snapshot.startTime = m_stats.startTime.load(std::memory_order_relaxed);
         return snapshot;
     }
 

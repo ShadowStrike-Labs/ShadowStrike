@@ -501,11 +501,14 @@ public:
     void CloseVault() {
         std::unique_lock lock(m_mutex);
 
-        // Don't close if backups are running
-        if (!m_activeBackups.empty()) {
-            SS_LOG_WARN(L"BackupManager", L"Cannot close vault: %zu active backups",
-                        m_activeBackups.size());
-            return;
+        // Don't close if backups are running (m_activeBackups is protected by m_progressMutex)
+        {
+            std::shared_lock plock(m_progressMutex);
+            if (!m_activeBackups.empty()) {
+                SS_LOG_WARN(L"BackupManager", L"Cannot close vault: %zu active backups",
+                            m_activeBackups.size());
+                return;
+            }
         }
 
         m_vaultKey.Clear();
@@ -721,11 +724,14 @@ public:
                 return {};
             }
 
-            // Check concurrent operation limit
-            if (m_activeBackups.size() >= m_config.maxConcurrentOperations) {
-                NotifyError("Maximum concurrent operations reached (" +
-                            std::to_string(m_config.maxConcurrentOperations) + ")", 108);
-                return {};
+            // Check concurrent operation limit (m_activeBackups guarded by m_progressMutex)
+            {
+                std::shared_lock plock(m_progressMutex);
+                if (m_activeBackups.size() >= m_config.maxConcurrentOperations) {
+                    NotifyError("Maximum concurrent operations reached (" +
+                                std::to_string(m_config.maxConcurrentOperations) + ")", 108);
+                    return {};
+                }
             }
 
             m_backups.push_back(bp);
@@ -1954,7 +1960,7 @@ BackupStatistics::Snapshot BackupManager::GetStatistics() const {
     s.bytesSavedByCompression = m_impl->m_stats.bytesSavedByCompression.load(std::memory_order_relaxed);
     s.vssSnapshotsCreated = m_impl->m_stats.vssSnapshotsCreated.load(std::memory_order_relaxed);
     s.ransomwareBlockedAttempts = m_impl->m_stats.ransomwareBlockedAttempts.load(std::memory_order_relaxed);
-    s.startTime = m_impl->m_stats.startTime;
+    s.startTime = m_impl->m_stats.startTime.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -2090,7 +2096,7 @@ void BackupStatistics::Reset() noexcept {
     bytesSavedByCompression = 0;
     vssSnapshotsCreated = 0;
     ransomwareBlockedAttempts = 0;
-    startTime = Clock::now();
+    startTime.store(Clock::now(), std::memory_order_relaxed);
 }
 
 // ============================================================================

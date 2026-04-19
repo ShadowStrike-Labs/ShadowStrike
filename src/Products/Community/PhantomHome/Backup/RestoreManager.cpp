@@ -171,7 +171,8 @@ namespace {
             if (!fs::exists(backupDataDir) || !fs::is_directory(backupDataDir)) {
                 return files;
             }
-            for (const auto& entry : fs::directory_iterator(backupDataDir)) {
+            // Recurse into subdirectories — backup preserves directory structure
+            for (const auto& entry : fs::recursive_directory_iterator(backupDataDir)) {
                 if (entry.is_regular_file()) {
                     files.push_back(entry.path());
                 }
@@ -467,10 +468,14 @@ public:
             return;
         }
 
-        // Build a filename->path map for fast lookup
+        // Build a relative-path->absolute-path map for fast lookup.
+        // Backup preserves directory structure under backupDataDir, so we
+        // key by vault-relative path (not just filename) to handle files
+        // with identical basenames in different subdirectories.
         std::unordered_map<std::wstring, fs::path> backupFileMap;
         for (const auto& bf : backupFiles) {
-            backupFileMap[bf.filename().wstring()] = bf;
+            auto relPath = fs::relative(bf, backupDataDir);
+            backupFileMap[relPath.wstring()] = bf;
         }
 
         const uint64_t totalFiles = static_cast<uint64_t>(backupFiles.size());
@@ -500,14 +505,24 @@ public:
             // Determine which backup files to restore for this target
             std::vector<const fs::path*> filesToRestore;
             if (!target.sourcePath.empty() && !target.isDirectory) {
-                // Selective single-file restore: match by filename
-                auto it = backupFileMap.find(target.sourcePath.filename().wstring());
-                if (it != backupFileMap.end()) {
-                    filesToRestore.push_back(&it->second);
+                // Selective single-file restore: match by relative path within backup
+                auto relKey = target.sourcePath.wstring();
+                auto it = backupFileMap.find(relKey);
+                if (it == backupFileMap.end()) {
+                    // Fallback: try matching by filename only for backwards compatibility
+                    for (auto& [key, val] : backupFileMap) {
+                        if (fs::path(key).filename() == target.sourcePath.filename()) {
+                            filesToRestore.push_back(&val);
+                            break;
+                        }
+                    }
+                    if (filesToRestore.empty()) {
+                        std::string msg = "File not found in backup: " + target.sourcePath.string();
+                        errors.push_back(msg);
+                        SS_LOG_WARN(L"RestoreManager", L"%hs", msg.c_str());
+                    }
                 } else {
-                    std::string msg = "File not found in backup: " + target.sourcePath.string();
-                    errors.push_back(msg);
-                    SS_LOG_WARN(L"RestoreManager", L"%hs", msg.c_str());
+                    filesToRestore.push_back(&it->second);
                 }
             } else {
                 // Full/directory restore: restore all backup files to target
@@ -535,7 +550,26 @@ public:
                 if (IsCancelledOrStopped(restoreId, cancelFlag)) break;
 
                 const fs::path& srcFile = *srcFilePtr;
-                fs::path destPath = targetDir / srcFile.filename();
+                // Preserve original directory structure: compute the vault-
+                // relative path and recreate it under the restore target.
+                fs::path relPath = fs::relative(srcFile, backupDataDir);
+                fs::path destPath = targetDir / relPath;
+
+                // Ensure parent directories exist for nested files
+                {
+                    std::error_code ec;
+                    if (destPath.has_parent_path()) {
+                        fs::create_directories(destPath.parent_path(), ec);
+                        if (ec) {
+                            std::string msg = "Failed to create restore subdirectory: " +
+                                              destPath.parent_path().string() + ": " + ec.message();
+                            errors.push_back(msg);
+                            filesFailed++;
+                            if (!options.continueOnError) break;
+                            continue;
+                        }
+                    }
+                }
 
                 // Security: re-validate final destination
                 if (!IsPathSafe(destPath, targetDir)) {
@@ -548,7 +582,7 @@ public:
                 // File callback — let caller filter
                 {
                     BackupFileEntry entry;
-                    entry.path = srcFile.filename();
+                    entry.path = relPath;
                     std::error_code ec;
                     entry.size = fs::file_size(srcFile, ec);
                     if (!InvokeFileCallback(entry)) {
@@ -747,14 +781,11 @@ public:
                 m_rollbackJournals.erase(restoreId);
             }
 
-            // Reclaim the thread handle (it's about to exit)
-            auto threadIt = m_workerThreads.find(restoreId);
-            if (threadIt != m_workerThreads.end()) {
-                if (threadIt->second.joinable()) {
-                    threadIt->second.detach();  // Safe: we're inside this thread
-                }
-                m_workerThreads.erase(threadIt);
-            }
+            // Do NOT detach or erase the thread here.  This worker is still
+            // executing (lines below log + fire callbacks).  Removing it from
+            // m_workerThreads would let Shutdown() believe there are no workers
+            // to join, destroy the Impl, and cause a use-after-free.
+            // JoinAllWorkers() called by Shutdown will join it once it exits.
 
             // Update module status if no more active restores
             if (m_activeRestores.empty() && m_status == RestoreModuleStatus::Restoring) {
@@ -1338,17 +1369,19 @@ std::vector<BackupFileEntry> RestoreManager::GetFileVersions(const fs::path& fil
         std::error_code ec;
         if (!fs::exists(backupDataDir, ec) || ec) continue;
 
-        // Search for matching filename in this backup's data dir
-        for (const auto& entry : fs::directory_iterator(backupDataDir, ec)) {
+        // Search for matching file in this backup's data dir (recurse into subdirectories)
+        for (const auto& entry : fs::recursive_directory_iterator(backupDataDir, ec)) {
             if (ec) break;
             if (!entry.is_regular_file()) continue;
 
-            // Match by filename (BackupManager flattens structure)
-            std::wstring entryName = entry.path().filename().wstring();
-            if (entryName == targetFilename ||
+            // Match by relative path or filename for backwards compatibility
+            auto relPath = fs::relative(entry.path(), backupDataDir);
+            std::wstring entryName = relPath.filename().wstring();
+            if (relPath.wstring() == filePath.wstring() ||
+                entryName == targetFilename ||
                 entryName.find(filePath.stem().wstring()) == 0) {
                 BackupFileEntry bfe;
-                bfe.path = entry.path().filename();
+                bfe.path = relPath;
                 bfe.isDirectory = false;
                 bfe.size = entry.file_size(ec);
                 bfe.modifiedTime = bp.endTime;
@@ -1417,24 +1450,24 @@ std::vector<BackupFileEntry> RestoreManager::ListBackupFiles(const std::string& 
     std::error_code ec;
     if (!fs::exists(backupDataDir, ec) || ec) return entries;
 
-    for (const auto& entry : fs::directory_iterator(backupDataDir, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file()) continue;
+    // If a subdirectory filter is supplied, browse that subdirectory.
+    fs::path browseDir = backupDataDir;
+    if (!directory.empty()) {
+        browseDir = backupDataDir / directory;
+        if (!fs::exists(browseDir, ec) || ec) return entries;
+    }
 
-        // If a directory filter is provided, match against it
-        if (!directory.empty()) {
-            std::wstring entryName = entry.path().filename().wstring();
-            std::wstring filter = directory.filename().wstring();
-            if (!filter.empty() && entryName.find(filter) == std::wstring::npos) {
-                continue;
-            }
-        }
+    for (const auto& entry : fs::recursive_directory_iterator(browseDir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file() && !entry.is_directory()) continue;
 
         BackupFileEntry bfe;
-        bfe.path = entry.path().filename();
-        bfe.isDirectory = false;
-        bfe.size = entry.file_size(ec);
-        bfe.compressedSize = bfe.size;  // No compression in current BackupManager
+        bfe.path = fs::relative(entry.path(), backupDataDir);
+        bfe.isDirectory = entry.is_directory();
+        if (!bfe.isDirectory) {
+            bfe.size = entry.file_size(ec);
+            bfe.compressedSize = bfe.size;
+        }
         entries.push_back(std::move(bfe));
     }
 
@@ -1477,7 +1510,8 @@ std::vector<uint8_t> RestoreManager::PreviewFile(const std::string& backupId,
     auto vaultInfo = BackupManager::Instance().GetVaultInfo();
     if (vaultInfo.path.empty()) return {};
 
-    fs::path fullPath = vaultInfo.path / backupId / "data" / filePath.filename();
+    // Use full relative path within backup (not just filename)
+    fs::path fullPath = vaultInfo.path / backupId / "data" / filePath;
     std::error_code ec;
     if (!fs::exists(fullPath, ec) || ec) return {};
 
