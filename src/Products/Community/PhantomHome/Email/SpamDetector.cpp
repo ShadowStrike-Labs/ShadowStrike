@@ -93,6 +93,12 @@ namespace {
     return result;
 }
 
+inline constexpr size_t kMinBase64SpamRun = 100;
+inline constexpr size_t kMaxBase64InspectionBytes = 64 * 1024;
+inline constexpr uint64_t kMaxSerializedCorpusBytes = 64ULL * 1024ULL * 1024ULL;
+inline constexpr uint64_t kMaxSerializedTokenCount = 500000;
+inline constexpr uint32_t kMaxSerializedTokenLength = 512;
+
 /**
  * @brief Tokenize text into words/n-grams
  */
@@ -239,11 +245,50 @@ double CalculateImageToTextRatio(const std::string& html, const std::string& tex
  * @brief Detect Base64-encoded content
  */
 bool HasBase64Spam(const std::string& content) {
-    if (content.length() < 100) return false;
+    if (content.length() < kMinBase64SpamRun) {
+        return false;
+    }
 
-    // Look for long Base64 sequences
-    std::regex base64Regex(R"([A-Za-z0-9+/]{100,}={0,2})");
-    return std::regex_search(content, base64Regex);
+    const size_t inspectionLength = std::min(content.length(), kMaxBase64InspectionBytes);
+    size_t runLength = 0;
+    size_t paddingLength = 0;
+
+    const auto flushRun = [&]() -> bool {
+        const bool detected = runLength >= kMinBase64SpamRun;
+        runLength = 0;
+        paddingLength = 0;
+        return detected;
+    };
+
+    for (size_t i = 0; i < inspectionLength; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(content[i]);
+        if (std::isalnum(ch) || ch == '+' || ch == '/') {
+            if (paddingLength != 0) {
+                if (flushRun()) {
+                    return true;
+                }
+            }
+            ++runLength;
+            continue;
+        }
+
+        if (ch == '=') {
+            if (runLength == 0 || ++paddingLength > 2) {
+                if (flushRun()) {
+                    return true;
+                }
+            } else {
+                ++runLength;
+            }
+            continue;
+        }
+
+        if (flushRun()) {
+            return true;
+        }
+    }
+
+    return runLength >= kMinBase64SpamRun;
 }
 
 /**
@@ -567,36 +612,80 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            std::ifstream ifs(filePath, std::ios::binary);
-            if (!ifs) return false;
+            std::ifstream ifs(filePath, std::ios::binary | std::ios::ate);
+            if (!ifs) {
+                Logger::Warn("BayesianClassifier: Corpus file is unavailable: {}", filePath);
+                return false;
+            }
 
-            // Read header
-            ifs.read(reinterpret_cast<char*>(&m_totalSpamEmails), sizeof(m_totalSpamEmails));
-            ifs.read(reinterpret_cast<char*>(&m_totalHamEmails), sizeof(m_totalHamEmails));
+            const std::streamoff serializedSize = ifs.tellg();
+            if (serializedSize < 0 || static_cast<uint64_t>(serializedSize) > kMaxSerializedCorpusBytes) {
+                Logger::Error("BayesianClassifier: Corpus file '{}' exceeds safe size limit", filePath);
+                return false;
+            }
+            ifs.seekg(0, std::ios::beg);
 
-            // Read token count
+            const auto readExact = [&](void* buffer, std::streamsize bytes, const char* fieldName) -> bool {
+                ifs.read(static_cast<char*>(buffer), bytes);
+                if (ifs.gcount() != bytes) {
+                    Logger::Error("BayesianClassifier: Truncated corpus while reading {} from '{}'", fieldName, filePath);
+                    return false;
+                }
+                return true;
+            };
+
+            decltype(m_totalSpamEmails) totalSpamEmails = 0;
+            decltype(m_totalHamEmails) totalHamEmails = 0;
+            if (!readExact(&totalSpamEmails, sizeof(totalSpamEmails), "totalSpamEmails") ||
+                !readExact(&totalHamEmails, sizeof(totalHamEmails), "totalHamEmails")) {
+                return false;
+            }
+
             uint64_t tokenCount = 0;
-            ifs.read(reinterpret_cast<char*>(&tokenCount), sizeof(tokenCount));
+            if (!readExact(&tokenCount, sizeof(tokenCount), "tokenCount")) {
+                return false;
+            }
+            if (tokenCount > kMaxSerializedTokenCount) {
+                Logger::Error("BayesianClassifier: Corpus token count {} exceeds safe limit", tokenCount);
+                return false;
+            }
 
-            m_tokenStats.clear();
-
-            // Read tokens
+            decltype(m_tokenStats) loadedTokenStats;
             for (uint64_t i = 0; i < tokenCount; ++i) {
                 uint32_t tokenLen = 0;
-                ifs.read(reinterpret_cast<char*>(&tokenLen), sizeof(tokenLen));
+                if (!readExact(&tokenLen, sizeof(tokenLen), "tokenLength")) {
+                    return false;
+                }
+                if (tokenLen == 0 || tokenLen > kMaxSerializedTokenLength) {
+                    Logger::Error("BayesianClassifier: Invalid token length {} in '{}'", tokenLen, filePath);
+                    return false;
+                }
 
                 std::string token(tokenLen, '\0');
-                ifs.read(token.data(), tokenLen);
+                if (!readExact(token.data(), static_cast<std::streamsize>(tokenLen), "tokenBytes")) {
+                    return false;
+                }
 
                 TokenStatistics stats;
                 stats.token = token;
-                ifs.read(reinterpret_cast<char*>(&stats.spamCount), sizeof(stats.spamCount));
-                ifs.read(reinterpret_cast<char*>(&stats.hamCount), sizeof(stats.hamCount));
+                if (!readExact(&stats.spamCount, sizeof(stats.spamCount), "spamCount") ||
+                    !readExact(&stats.hamCount, sizeof(stats.hamCount), "hamCount")) {
+                    return false;
+                }
 
                 UpdateProbability(stats);
-                m_tokenStats[token] = stats;
+                loadedTokenStats.emplace(token, std::move(stats));
             }
 
+            char trailingByte = 0;
+            ifs.read(&trailingByte, sizeof(trailingByte));
+            if (ifs.gcount() != 0) {
+                Logger::Warn("BayesianClassifier: Ignoring trailing data in corpus '{}'", filePath);
+            }
+
+            m_totalSpamEmails = totalSpamEmails;
+            m_totalHamEmails = totalHamEmails;
+            m_tokenStats = std::move(loadedTokenStats);
             return true;
 
         } catch (const std::exception& e) {

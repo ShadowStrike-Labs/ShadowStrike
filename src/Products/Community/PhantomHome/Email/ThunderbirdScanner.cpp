@@ -107,6 +107,28 @@ inline bool IEquals(std::string_view a, std::string_view b) noexcept {
     return true;
 }
 
+inline constexpr uint32_t kMaxNativeMessageSize = 1024 * 1024;
+
+[[nodiscard]] bool ReadExactFromStdIn(void* buffer, std::streamsize bytes) {
+    std::cin.read(static_cast<char*>(buffer), bytes);
+    return std::cin.good() && std::cin.gcount() == bytes;
+}
+
+[[nodiscard]] bool IsValidNativeHostName(std::string_view hostName) noexcept {
+    if (hostName.empty() || hostName.size() > 128) {
+        return false;
+    }
+
+    for (unsigned char ch : hostName) {
+        if (std::isalnum(ch) || ch == '.' || ch == '_' || ch == '-') {
+            continue;
+        }
+        return false;
+    }
+
+    return true;
+}
+
 /**
  * @brief Parse From_ line in mbox format.
  */
@@ -2411,17 +2433,24 @@ public:
             try {
                 // Read message length (4 bytes)
                 uint32_t messageLength = 0;
-                std::cin.read(reinterpret_cast<char*>(&messageLength), 4);
-
-                if (std::cin.eof() || messageLength == 0 || messageLength > 1024 * 1024) {
-                    break;  // Invalid or end of stream
+                if (!ReadExactFromStdIn(&messageLength, sizeof(messageLength))) {
+                    if (!std::cin.eof()) {
+                        Logger::Warn("ThunderbirdScanner: Native messaging stream terminated mid-frame");
+                    }
+                    break;
                 }
 
-                // Read message
-                std::vector<char> buffer(messageLength);
-                std::cin.read(buffer.data(), messageLength);
+                if (messageLength == 0 || messageLength > kMaxNativeMessageSize) {
+                    Logger::Warn("ThunderbirdScanner: Rejected native message with invalid length {}", messageLength);
+                    break;
+                }
 
-                std::string jsonMessage(buffer.begin(), buffer.end());
+                std::string jsonMessage(messageLength, '\0');
+                if (!ReadExactFromStdIn(jsonMessage.data(), static_cast<std::streamsize>(messageLength))) {
+                    Logger::Warn("ThunderbirdScanner: Truncated native message payload (expected {} bytes)",
+                                 messageLength);
+                    break;
+                }
 
                 m_stats.nativeMessagesReceived.fetch_add(1, std::memory_order_relaxed);
 
@@ -2556,6 +2585,11 @@ public:
                     Logger::Error("ThunderbirdScanner: Failed to write manifest file");
                     return false;
                 }
+            }
+
+            if (!IsValidNativeHostName(ThunderbirdConstants::NATIVE_HOST_NAME)) {
+                Logger::Error("ThunderbirdScanner: Invalid native host name '{}'", ThunderbirdConstants::NATIVE_HOST_NAME);
+                return false;
             }
 
             // Write registry key pointing to the manifest
