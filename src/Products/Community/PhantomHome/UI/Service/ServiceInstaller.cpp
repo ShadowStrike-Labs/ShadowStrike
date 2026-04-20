@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "PhantomCore/Utils/Logger.hpp"
+#include "Products/Community/PhantomHome/UI/Service/ServiceInstaller.hpp"
 
 namespace ShadowStrike::PhantomHome::UI::Service {
 
@@ -43,6 +44,18 @@ constexpr const wchar_t* kServiceName        = L"ShadowStrikePhantomService";
 constexpr const wchar_t* kServiceDisplayName = L"ShadowStrike Phantom Service";
 constexpr const wchar_t* kServiceDescription =
     L"Provides ShadowStrike Phantom Home real-time protection, scanning, and telemetry.";
+
+// Machine-wide Run key. Writing here requires administrator rights, which is
+// exactly what we want: only the installer running elevated may toggle the
+// tray autostart, matching the trust boundary of the service itself.
+constexpr const wchar_t* kRunKeyPath =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr const wchar_t* kRunValueName = L"ShadowStrikePhantomTray";
+
+// Bounded to keep corrupt/hostile environments from causing runaway string
+// operations during install. Windows cannot launch from paths longer than
+// this via the Run key anyway.
+constexpr std::size_t kMaxAutostartPathChars = 32'767;
 
 struct ScmHandle {
     SC_HANDLE h{nullptr};
@@ -118,6 +131,95 @@ struct ScmHandle {
 
     ShadowStrike::Utils::Logger::Info("InstallService: installed '{}'",
                                       std::string("ShadowStrikePhantomService"));
+    return true;
+}
+
+[[nodiscard]] bool InstallTrayAutostart(const std::wstring& tray_path) {
+    if (tray_path.empty() || tray_path.size() > kMaxAutostartPathChars) {
+        ShadowStrike::Utils::Logger::Error(
+            "InstallTrayAutostart: tray_path has invalid length {}", tray_path.size());
+        return false;
+    }
+    // Embedded NUL or existing quote characters indicate caller-supplied
+    // garbage and must never be written to the registry.
+    if (tray_path.find(L'\0') != std::wstring::npos ||
+        tray_path.find(L'"')  != std::wstring::npos) {
+        ShadowStrike::Utils::Logger::Error(
+            "InstallTrayAutostart: refusing to register a path containing quotes or NULs");
+        return false;
+    }
+
+    HKEY key{nullptr};
+    const LSTATUS open_st = ::RegCreateKeyExW(
+        HKEY_LOCAL_MACHINE,
+        kRunKeyPath,
+        0,
+        nullptr,
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE | KEY_WOW64_64KEY,
+        nullptr,
+        &key,
+        nullptr);
+    if (open_st != ERROR_SUCCESS || key == nullptr) {
+        ShadowStrike::Utils::Logger::Error(
+            "InstallTrayAutostart: RegCreateKeyExW failed status={}", open_st);
+        return false;
+    }
+
+    // Always quote the path so explorer/cmd do not treat embedded spaces as
+    // argument separators (the unquoted-service-path trick also applies to
+    // Run entries when a future tray build accepts positional args).
+    std::wstring quoted;
+    quoted.reserve(tray_path.size() + 2);
+    quoted.push_back(L'"');
+    quoted.append(tray_path);
+    quoted.push_back(L'"');
+
+    const DWORD cb = static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t));
+    const LSTATUS set_st = ::RegSetValueExW(
+        key,
+        kRunValueName,
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(quoted.c_str()),
+        cb);
+    ::RegCloseKey(key);
+
+    if (set_st != ERROR_SUCCESS) {
+        ShadowStrike::Utils::Logger::Error(
+            "InstallTrayAutostart: RegSetValueExW failed status={}", set_st);
+        return false;
+    }
+    ShadowStrike::Utils::Logger::Info("InstallTrayAutostart: tray autostart registered");
+    return true;
+}
+
+[[nodiscard]] bool UninstallTrayAutostart() {
+    HKEY key{nullptr};
+    const LSTATUS open_st = ::RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE,
+        kRunKeyPath,
+        0,
+        KEY_SET_VALUE | KEY_WOW64_64KEY,
+        &key);
+    if (open_st == ERROR_FILE_NOT_FOUND) {
+        return true;  // never installed; idempotent success.
+    }
+    if (open_st != ERROR_SUCCESS || key == nullptr) {
+        ShadowStrike::Utils::Logger::Error(
+            "UninstallTrayAutostart: RegOpenKeyExW failed status={}", open_st);
+        return false;
+    }
+
+    const LSTATUS del_st = ::RegDeleteValueW(key, kRunValueName);
+    ::RegCloseKey(key);
+
+    if (del_st != ERROR_SUCCESS && del_st != ERROR_FILE_NOT_FOUND) {
+        ShadowStrike::Utils::Logger::Error(
+            "UninstallTrayAutostart: RegDeleteValueW failed status={}", del_st);
+        return false;
+    }
+    ShadowStrike::Utils::Logger::Info("UninstallTrayAutostart: tray autostart removed");
     return true;
 }
 
