@@ -84,10 +84,12 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\SystemTray.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Tray\TrayMain.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\Products\Community\PhantomHome\UI\SystemTray.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
