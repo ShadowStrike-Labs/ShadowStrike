@@ -205,12 +205,15 @@ static constexpr std::array<MagicSignature, 11> g_magicSignatures = {{
     // Get PE offset using memcpy to avoid unaligned access
     uint32_t peOffset = 0;
     std::memcpy(&peOffset, &data[60], sizeof(peOffset));
-    
-    if (peOffset + 4 > data.size()) return false;
+
+    const size_t peOffsetSize = static_cast<size_t>(peOffset);
+    if (peOffsetSize > data.size() || data.size() - peOffsetSize < 4) {
+        return false;
+    }
 
     // Check PE signature
-    return (data[peOffset] == 'P' && data[peOffset + 1] == 'E' &&
-            data[peOffset + 2] == 0x00 && data[peOffset + 3] == 0x00);
+    return (data[peOffsetSize] == 'P' && data[peOffsetSize + 1] == 'E' &&
+            data[peOffsetSize + 2] == 0x00 && data[peOffsetSize + 3] == 0x00);
 }
 
 /**
