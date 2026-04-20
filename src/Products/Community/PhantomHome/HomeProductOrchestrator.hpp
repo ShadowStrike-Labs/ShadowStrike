@@ -197,6 +197,41 @@ public:
     /// @brief Retrieve status for a single named module, or nullopt if unknown.
     [[nodiscard]] std::optional<ModuleStatus> GetModuleStatus(std::string_view name) const;
 
+    /**
+     * @brief Enable or disable a named module at runtime.
+     *
+     * If disabling a Running module: calls its shutdown() callback.
+     * If enabling a Disabled/Stopped module: calls initialize() then start().
+     * The corresponding ConfigManager key is also updated so the change
+     * persists across restarts.
+     *
+     * @return true if the module was found and the transition succeeded.
+     */
+    [[nodiscard]] bool SetModuleEnabled(std::string_view name, bool enabled) noexcept;
+
+    /**
+     * @brief Pause all currently Running modules.
+     *
+     * Calls shutdown() on every Running module and records their names so
+     * ResumeAllModules() can re-initialize and re-start them. IsPaused()
+     * returns true until ResumeAllModules() is called.
+     *
+     * Does NOT change the config-gate keys — modules are not "disabled",
+     * they are temporarily quiesced.
+     */
+    void PauseAllModules() noexcept;
+
+    /**
+     * @brief Resume modules that were quiesced by PauseAllModules().
+     *
+     * Re-initializes and re-starts every module that was Running before
+     * the last pause. No-op if !IsPaused().
+     */
+    void ResumeAllModules() noexcept;
+
+    /// @brief Whether protection is currently paused via PauseAllModules().
+    [[nodiscard]] bool IsPaused() const noexcept;
+
     HomeProductOrchestrator(const HomeProductOrchestrator&) = delete;
     HomeProductOrchestrator& operator=(const HomeProductOrchestrator&) = delete;
     HomeProductOrchestrator(HomeProductOrchestrator&&) = delete;
@@ -230,6 +265,8 @@ private:
 
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_paused{false};
+    std::vector<std::string> m_pausedModuleNames;  // guarded by m_lifecycleMutex
 };
 
 }  // namespace Home

@@ -599,4 +599,225 @@ struct PauseProtectionRequest {
     }
 };
 
+// ---- Scan cancel ---------------------------------------------------------
+
+struct ScanCancelRequest {
+    std::uint64_t scan_id{0};
+
+    [[nodiscard]] nlohmann::json ToJson() const { return {{"sid", scan_id}}; }
+    [[nodiscard]] static std::optional<ScanCancelRequest> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        ScanCancelRequest r;
+        if (!detail::GetUint(j, "sid", r.scan_id)) return std::nullopt;
+        return r;
+    }
+};
+
+// ---- Scan completed (server push) ----------------------------------------
+
+struct ScanCompletedEvent {
+    std::uint64_t scan_id{0};
+    std::uint64_t files_scanned{0};
+    std::uint64_t threats_found{0};
+    std::uint32_t duration_seconds{0};
+    bool          cancelled{false};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {{"sid", scan_id}, {"fs", files_scanned},
+                {"tf", threats_found}, {"ds", duration_seconds}, {"c", cancelled}};
+    }
+    [[nodiscard]] static std::optional<ScanCompletedEvent> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        ScanCompletedEvent e;
+        if (!detail::GetUint(j, "sid", e.scan_id)) return std::nullopt;
+        if (!detail::GetUint(j, "fs", e.files_scanned)) return std::nullopt;
+        if (!detail::GetUint(j, "tf", e.threats_found)) return std::nullopt;
+        if (!detail::GetUint(j, "ds", e.duration_seconds)) return std::nullopt;
+        if (!detail::GetBool(j, "c", e.cancelled)) return std::nullopt;
+        return e;
+    }
+};
+
+// ---- Quarantine ----------------------------------------------------------
+
+struct QuarantineListEntry {
+    std::uint64_t entry_id{0};
+    std::string   original_path{};
+    std::string   threat_name{};
+    std::string   detection_source{};
+    std::uint64_t original_size{0};
+    std::uint64_t quarantine_time{0};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {{"eid", entry_id}, {"op", original_path}, {"tn", threat_name},
+                {"ds", detection_source}, {"os", original_size}, {"qt", quarantine_time}};
+    }
+    [[nodiscard]] static std::optional<QuarantineListEntry> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        QuarantineListEntry e;
+        if (!detail::GetUint(j, "eid", e.entry_id)) return std::nullopt;
+        if (!detail::GetStringBounded(j, "op", e.original_path, 2048)) return std::nullopt;
+        if (!detail::GetStringBounded(j, "tn", e.threat_name, 256)) return std::nullopt;
+        if (!detail::GetStringBounded(j, "ds", e.detection_source, 128)) return std::nullopt;
+        if (!detail::GetUint(j, "os", e.original_size)) return std::nullopt;
+        if (!detail::GetUint(j, "qt", e.quarantine_time)) return std::nullopt;
+        return e;
+    }
+};
+
+struct QuarantineListReply {
+    std::vector<QuarantineListEntry> entries{};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& e : entries) arr.push_back(e.ToJson());
+        return {{"e", arr}};
+    }
+    [[nodiscard]] static std::optional<QuarantineListReply> FromJson(const nlohmann::json& j) {
+        if (!j.is_object() || !j.contains("e") || !j["e"].is_array()) return std::nullopt;
+        const auto& arr = j["e"];
+        if (arr.size() > kMaxArrayElements) return std::nullopt;
+        QuarantineListReply r;
+        r.entries.reserve(arr.size());
+        for (const auto& item : arr) {
+            auto e = QuarantineListEntry::FromJson(item);
+            if (!e) return std::nullopt;
+            r.entries.push_back(std::move(*e));
+        }
+        return r;
+    }
+};
+
+struct QuarantineActionRequest {
+    std::uint64_t entry_id{0};
+
+    [[nodiscard]] nlohmann::json ToJson() const { return {{"eid", entry_id}}; }
+    [[nodiscard]] static std::optional<QuarantineActionRequest> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        QuarantineActionRequest r;
+        if (!detail::GetUint(j, "eid", r.entry_id)) return std::nullopt;
+        return r;
+    }
+};
+
+// ---- Exclusions ----------------------------------------------------------
+
+struct ExclusionEntry {
+    std::string pattern{};
+    std::string type{};     // "path", "extension", "process", "hash"
+    bool        enabled{true};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {{"p", pattern}, {"t", type}, {"e", enabled}};
+    }
+    [[nodiscard]] static std::optional<ExclusionEntry> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        ExclusionEntry e;
+        if (!detail::GetStringBounded(j, "p", e.pattern, 2048)) return std::nullopt;
+        if (!detail::GetStringBounded(j, "t", e.type, 32)) return std::nullopt;
+        if (!detail::GetBool(j, "e", e.enabled)) return std::nullopt;
+        return e;
+    }
+};
+
+struct GetExclusionsReply {
+    std::vector<ExclusionEntry> exclusions{};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& e : exclusions) arr.push_back(e.ToJson());
+        return {{"x", arr}};
+    }
+    [[nodiscard]] static std::optional<GetExclusionsReply> FromJson(const nlohmann::json& j) {
+        if (!j.is_object() || !j.contains("x") || !j["x"].is_array()) return std::nullopt;
+        const auto& arr = j["x"];
+        if (arr.size() > kMaxArrayElements) return std::nullopt;
+        GetExclusionsReply r;
+        r.exclusions.reserve(arr.size());
+        for (const auto& item : arr) {
+            auto e = ExclusionEntry::FromJson(item);
+            if (!e) return std::nullopt;
+            r.exclusions.push_back(std::move(*e));
+        }
+        return r;
+    }
+};
+
+struct SetExclusionsRequest {
+    std::vector<ExclusionEntry> exclusions{};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& e : exclusions) arr.push_back(e.ToJson());
+        return {{"x", arr}};
+    }
+    [[nodiscard]] static std::optional<SetExclusionsRequest> FromJson(const nlohmann::json& j) {
+        if (!j.is_object() || !j.contains("x") || !j["x"].is_array()) return std::nullopt;
+        const auto& arr = j["x"];
+        if (arr.size() > kMaxArrayElements) return std::nullopt;
+        SetExclusionsRequest r;
+        r.exclusions.reserve(arr.size());
+        for (const auto& item : arr) {
+            auto e = ExclusionEntry::FromJson(item);
+            if (!e) return std::nullopt;
+            r.exclusions.push_back(std::move(*e));
+        }
+        return r;
+    }
+};
+
+// ---- Detection action ----------------------------------------------------
+
+struct GetDetectionActionReply {
+    DetectionAction action{DetectionAction::Quarantine};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {{"a", static_cast<std::uint8_t>(action)}};
+    }
+    [[nodiscard]] static std::optional<GetDetectionActionReply> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        GetDetectionActionReply r;
+        std::uint8_t a{};
+        if (!detail::GetUint(j, "a", a)) return std::nullopt;
+        r.action = static_cast<DetectionAction>(a);
+        return r;
+    }
+};
+
+struct SetDetectionActionRequest {
+    DetectionAction action{DetectionAction::Quarantine};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {{"a", static_cast<std::uint8_t>(action)}};
+    }
+    [[nodiscard]] static std::optional<SetDetectionActionRequest> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        SetDetectionActionRequest r;
+        std::uint8_t a{};
+        if (!detail::GetUint(j, "a", a)) return std::nullopt;
+        r.action = static_cast<DetectionAction>(a);
+        return r;
+    }
+};
+
+// ---- Update status -------------------------------------------------------
+
+struct UpdateStatusReply {
+    bool          up_to_date{true};
+    std::string   current_version{};
+    std::uint64_t last_check_unix{0};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {{"ok", up_to_date}, {"v", current_version}, {"lc", last_check_unix}};
+    }
+    [[nodiscard]] static std::optional<UpdateStatusReply> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        UpdateStatusReply r;
+        if (!detail::GetBool(j, "ok", r.up_to_date)) return std::nullopt;
+        if (!detail::GetStringBounded(j, "v", r.current_version, 64)) return std::nullopt;
+        if (!detail::GetUint(j, "lc", r.last_check_unix)) return std::nullopt;
+        return r;
+    }
+};
+
 }  // namespace ShadowStrike::PhantomHome::IPC
