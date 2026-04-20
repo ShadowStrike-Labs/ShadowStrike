@@ -92,7 +92,10 @@ struct WebProtectionRegistrar final {
             .phase           = ModulePhase::CoreProtections,
             .initialize      = []() noexcept -> bool {
                 try {
-                    return SafeBrowsingAPI::Instance().Initialize();
+                    SafeBrowsingConfig config{};
+                    config.enableCloudLookups = false;
+                    config.enableTelemetry = false;
+                    return SafeBrowsingAPI::Instance().Initialize(config);
                 } catch (const std::exception& e) {
                     SS_LOG_ERROR(kCat,
                         L"SafeBrowsingAPI::Initialize threw: %hs", e.what());
@@ -104,7 +107,7 @@ struct WebProtectionRegistrar final {
                 }
             },
             .start           = []() noexcept -> bool {
-                return true; // lookup-on-demand; no background thread needed
+                return SafeBrowsingAPI::Instance().IsInitialized();
             },
             .shutdown        = []() noexcept {
                 try {
@@ -140,7 +143,7 @@ struct WebProtectionRegistrar final {
                 }
             },
             .start           = []() noexcept -> bool {
-                return true;
+                return PhishingDetector::Instance().IsInitialized();
             },
             .shutdown        = []() noexcept {
                 try {
@@ -176,7 +179,7 @@ struct WebProtectionRegistrar final {
                 }
             },
             .start           = []() noexcept -> bool {
-                return true;
+                return AdBlocker::Instance().IsInitialized();
             },
             .shutdown        = []() noexcept {
                 try {
@@ -212,7 +215,7 @@ struct WebProtectionRegistrar final {
                 }
             },
             .start           = []() noexcept -> bool {
-                return true;
+                return TrackerBlocker::Instance().IsInitialized();
             },
             .shutdown        = []() noexcept {
                 try {
@@ -367,7 +370,7 @@ struct WebProtectionRegistrar final {
                 }
             },
             .start           = []() noexcept -> bool {
-                return true;
+                return ChromeExtensionScanner::Instance().IsInitialized();
             },
             .shutdown        = []() noexcept {
                 try {
@@ -403,7 +406,7 @@ struct WebProtectionRegistrar final {
                 }
             },
             .start           = []() noexcept -> bool {
-                return true;
+                return FirefoxAddonScanner::Instance().IsInitialized();
             },
             .shutdown        = []() noexcept {
                 try {

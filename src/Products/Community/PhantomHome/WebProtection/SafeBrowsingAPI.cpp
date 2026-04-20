@@ -65,6 +65,16 @@ using namespace Utils;
 using namespace ThreatIntel;
 using json = nlohmann::json;
 
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
+
 // ============================================================================
 // LOGGING MACROS
 // ============================================================================
@@ -77,6 +87,50 @@ using json = nlohmann::json;
 // ============================================================================
 // UTILITY FUNCTIONS IMPLEMENTATION
 // ============================================================================
+
+[[nodiscard]] bool ContainsUnsafeUrlText(std::string_view value) noexcept {
+    return std::any_of(value.begin(), value.end(), [](unsigned char c) {
+        return c < 0x20 || c == 0x7F;
+    });
+}
+
+[[nodiscard]] bool IsValidDomainLabelCharacter(char c) noexcept {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    return std::isalnum(uc) != 0 || c == '.' || c == '-';
+}
+
+[[nodiscard]] bool IsSafeDomainInput(std::string_view value) noexcept {
+    if (value.empty() || value.size() > 253 || ContainsUnsafeUrlText(value)) {
+        return false;
+    }
+
+    if (value.find("://") != std::string_view::npos ||
+        value.find('/') != std::string_view::npos ||
+        value.find('\\') != std::string_view::npos ||
+        value.find('@') != std::string_view::npos ||
+        value.front() == '.' || value.front() == '-') {
+        return false;
+    }
+
+    bool lastWasDot = true;
+    for (char c : value) {
+        if (!IsValidDomainLabelCharacter(c)) {
+            return false;
+        }
+
+        if (c == '.') {
+            if (lastWasDot) {
+                return false;
+            }
+            lastWasDot = true;
+            continue;
+        }
+
+        lastWasDot = false;
+    }
+
+    return !lastWasDot;
+}
 
 std::string_view GetSeverityName(ThreatSeverity severity) noexcept {
     switch (severity) {
@@ -119,6 +173,7 @@ std::string_view GetStatusName(SafeBrowsingStatus status) noexcept {
 bool SafeBrowsingConfig::IsValid() const noexcept {
     if (maxCacheEntries == 0 && enableLocalCache) return false;
     if (minConfidenceThreshold > 100) return false;
+    if (lookupTimeout.count() <= 0) return false;
     return true;
 }
 
@@ -136,6 +191,7 @@ std::string SafeBrowsingConfig::ToJson() const {
     j["enableAsyncLookups"] = enableAsyncLookups;
     j["lookupTimeout"] = lookupTimeout.count();
     j["failClosed"] = failClosed;
+    j["enableCloudLookups"] = enableCloudLookups;
     j["enableTelemetry"] = enableTelemetry;
     j["verboseLogging"] = verboseLogging;
     return j.dump();
@@ -208,7 +264,7 @@ void SafeBrowsingStatistics::Reset() noexcept {
     totalBlocked = 0;
     lookupErrors = 0;
     totalProcessingTimeUs = 0;
-    startTime = std::chrono::steady_clock::now();
+    AtomicValueStoreRelaxed(startTime, std::chrono::steady_clock::now());
 }
 
 double SafeBrowsingStatistics::GetCacheHitRatio() const noexcept {
@@ -224,7 +280,7 @@ double SafeBrowsingStatistics::GetAverageLookupTimeUs() const noexcept {
 }
 
 double SafeBrowsingStatistics::GetLookupsPerSecond() const noexcept {
-    auto elapsed = std::chrono::steady_clock::now() - startTime;
+    auto elapsed = std::chrono::steady_clock::now() - AtomicValueLoadRelaxed(startTime);
     auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
     if (seconds == 0) return 0.0;
     return static_cast<double>(totalLookups.load()) / static_cast<double>(seconds);
@@ -248,7 +304,7 @@ std::string SafeBrowsingStatistics::ToJson() const {
     j["averageLookupTimeUs"] = GetAverageLookupTimeUs();
     j["lookupsPerSecond"] = GetLookupsPerSecond();
 
-    auto elapsed = std::chrono::steady_clock::now() - startTime;
+    auto elapsed = std::chrono::steady_clock::now() - AtomicValueLoadRelaxed(startTime);
     j["uptimeSeconds"] = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 
     return j.dump();
@@ -290,6 +346,12 @@ public:
         }
 
         m_config = config;
+        if (m_config.enableCloudLookups) {
+            SB_LOG_WARN("Cloud lookup opt-in requested, but Community tier has no external Safe Browsing client; forcing local-only mode");
+            m_config.enableCloudLookups = false;
+        } else {
+            SB_LOG_INFO("Cloud lookup path remains disabled (Community default)");
+        }
 
         // Set up threat intelligence integration
         if (lookup) {
@@ -319,27 +381,31 @@ public:
     }
 
     void Shutdown() {
-        std::unique_lock lock(m_mutex);
-
-        if (m_status == SafeBrowsingStatus::Stopped ||
-            m_status == SafeBrowsingStatus::Uninitialized) {
-            return;
-        }
-
-        // Clear caches
-        ClearCacheInternal();
-
-        // Clear callbacks
         {
-            std::unique_lock cbLock(m_callbackMutex);
-            m_threatCallbacks.clear();
+            std::unique_lock lock(m_mutex);
+
+            if (m_status == SafeBrowsingStatus::Stopped ||
+                m_status == SafeBrowsingStatus::Uninitialized) {
+                return;
+            }
+
+            // Clear caches
+            ClearCacheInternal();
+
+            // Clear callbacks
+            {
+                std::unique_lock cbLock(m_callbackMutex);
+                m_threatCallbacks.clear();
+            }
+
+            if (m_ownsLookup && m_threatLookup) {
+                m_threatLookup = nullptr;
+            }
+
+            m_status = SafeBrowsingStatus::Stopped;
         }
 
-        if (m_ownsLookup && m_threatLookup) {
-            m_threatLookup = nullptr;
-        }
-
-        m_status = SafeBrowsingStatus::Stopped;
+        WaitForCallbackTasks();
         SB_LOG_INFO("SafeBrowsingAPI shutdown complete");
     }
 
@@ -371,6 +437,12 @@ public:
 
         if (url.length() > SafeBrowsingConstants::MAX_URL_LENGTH) {
             result.details = "URL exceeds maximum length";
+            m_stats.lookupErrors++;
+            return result;
+        }
+
+        if (ContainsUnsafeUrlText(url)) {
+            result.details = "URL contains control characters";
             m_stats.lookupErrors++;
             return result;
         }
@@ -459,12 +531,21 @@ public:
     }
 
     void CheckUrlWithCallback(std::string url, LookupCompleteCallback callback) {
-        std::thread([this, u = std::move(url), cb = std::move(callback)]() {
-            auto result = this->CheckUrl(u);
-            if (cb) {
-                cb(result);
-            }
-        }).detach();
+        ReapCompletedCallbackTasks();
+        std::lock_guard taskLock(m_callbackTaskMutex);
+        m_callbackTasks.emplace_back(std::async(std::launch::async,
+            [this, u = std::move(url), cb = std::move(callback)]() mutable {
+                try {
+                    auto result = this->CheckUrl(u);
+                    if (cb) {
+                        cb(result);
+                    }
+                } catch (const std::exception& e) {
+                    SB_LOG_ERROR("Async callback lookup failed: {}", e.what());
+                } catch (...) {
+                    SB_LOG_ERROR("Async callback lookup failed with unknown exception");
+                }
+            }));
     }
 
     [[nodiscard]] BatchLookupResult CheckUrls(std::span<const std::string> urls) {
@@ -518,10 +599,17 @@ public:
             return result;
         }
 
+        if (!IsSafeDomainInput(domain)) {
+            result.details = "Invalid domain";
+            m_stats.lookupErrors++;
+            return result;
+        }
+
         std::string domainStr(domain);
 
         // Normalize domain
-        std::transform(domainStr.begin(), domainStr.end(), domainStr.begin(), ::tolower);
+        std::transform(domainStr.begin(), domainStr.end(), domainStr.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
         m_stats.totalLookups++;
         m_stats.domainLookups++;
@@ -773,7 +861,7 @@ public:
         stats.totalBlocked = m_stats.totalBlocked.load();
         stats.lookupErrors = m_stats.lookupErrors.load();
         stats.totalProcessingTimeUs = m_stats.totalProcessingTimeUs.load();
-        stats.startTime = m_stats.startTime;
+        AtomicValueStoreRelaxed(stats.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
         return stats;
     }
 
@@ -844,6 +932,7 @@ private:
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_cacheMutex;
     mutable std::shared_mutex m_callbackMutex;
+    mutable std::mutex m_callbackTaskMutex;
 
     SafeBrowsingStatus m_status{SafeBrowsingStatus::Uninitialized};
     SafeBrowsingConfig m_config;
@@ -859,6 +948,7 @@ private:
     // Callbacks
     std::unordered_map<uint64_t, ThreatDetectedCallback> m_threatCallbacks;
     std::atomic<uint64_t> m_nextCallbackId{1};
+    std::vector<std::future<void>> m_callbackTasks;
 
     // Statistics
     mutable SafeBrowsingStatistics m_stats;
@@ -1062,6 +1152,34 @@ private:
         }
     }
 
+    void ReapCompletedCallbackTasks() {
+        std::lock_guard taskLock(m_callbackTaskMutex);
+        auto it = m_callbackTasks.begin();
+        while (it != m_callbackTasks.end()) {
+            if (it->valid() &&
+                it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                it->wait();
+                it = m_callbackTasks.erase(it);
+                continue;
+            }
+            ++it;
+        }
+    }
+
+    void WaitForCallbackTasks() {
+        std::vector<std::future<void>> tasks;
+        {
+            std::lock_guard taskLock(m_callbackTaskMutex);
+            tasks.swap(m_callbackTasks);
+        }
+
+        for (auto& task : tasks) {
+            if (task.valid()) {
+                task.wait();
+            }
+        }
+    }
+
     [[nodiscard]] std::optional<SafeBrowsingResult> GetFromCache(const std::string& key) {
         std::unique_lock lock(m_cacheMutex);
 
@@ -1252,3 +1370,4 @@ std::string SafeBrowsingAPI::GetVersionString() noexcept {
 
 }  // namespace WebBrowser
 }  // namespace ShadowStrike
+
