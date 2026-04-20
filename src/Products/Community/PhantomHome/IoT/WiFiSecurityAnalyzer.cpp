@@ -76,11 +76,11 @@
 #include <nlohmann/json.hpp>
 
 // ShadowStrike infrastructure
-#include "../Utils/Logger.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 
 // Windows-specific headers
 #ifdef _WIN32
@@ -708,21 +708,48 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
         return {};
     }
 
+    WiFiAnalyzerConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+
+    if (!configSnapshot.allowNearbyNetworkEnumeration) {
+        auto connection = QueryConnectionWLAN();
+        if (!connection.isConnected) {
+            return {};
+        }
+
+        connection.network.isConnected = true;
+        connection.network.securityLevel = CalculateSecurityLevel(connection.network);
+        connection.network.threats = AnalyzeThreats(connection.network);
+        if (!connection.network.bssid.empty()) {
+            connection.network.vendor = GetVendorFromBSSID(connection.network.bssid);
+        }
+
+        std::vector<WiFiSecurityThreat> threats = CheckNetworkSecurity(connection.network);
+        for (const auto& threat : threats) {
+            NotifyThreat(threat);
+        }
+
+        return {connection.network};
+    }
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(LOG_CAT, L"Scan requested before initialization");
+        return {};
+    }
+
     m_status.store(ModuleStatus::Scanning, std::memory_order_release);
     m_stats.totalScans++;
 
     try {
         auto networks = QueryNetworksWLAN();
-
-        // Collect notification payloads outside the lock to avoid deadlocks.
-        // Callbacks are user-provided and could re-enter the analyzer.
         std::vector<WiFiNetworkInfo> newNetworks;
         std::vector<WiFiSecurityThreat> allThreats;
 
         {
             std::unique_lock lock(m_mutex);
-
-            // Evict stale networks if we're at the tracking cap
             if (m_trackedNetworks.size() >= WiFiConstants::MAX_TRACKED_NETWORKS) {
                 auto now = std::chrono::system_clock::now();
                 std::erase_if(m_trackedNetworks, [&](const auto& pair) {
@@ -732,19 +759,11 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
             }
 
             for (auto& network : networks) {
-                // Calculate security level
                 network.securityLevel = CalculateSecurityLevel(network);
-
-                // Analyze threats
                 network.threats = AnalyzeThreats(network);
-
-                // Get vendor
                 network.vendor = GetVendorFromBSSID(network.bssid);
-
-                // Check internal BSSID whitelist
                 network.isWhitelisted = m_whitelistedBSSIDs.contains(network.bssid);
 
-                // Update timestamps
                 auto now = std::chrono::system_clock::now();
                 auto it = m_trackedNetworks.find(network.bssid);
                 if (it == m_trackedNetworks.end()) {
@@ -757,18 +776,15 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
                     network.lastSeen = now;
                 }
 
-                // Enforce tracking cap — skip insertion if at limit after eviction
                 if (m_trackedNetworks.size() < WiFiConstants::MAX_TRACKED_NETWORKS ||
                     m_trackedNetworks.contains(network.bssid)) {
                     m_trackedNetworks[network.bssid] = network;
                 }
 
-                // Update BSSID history
                 if (m_config.trackBSSIDHistory) {
                     UpdateBSSIDHistory(network);
                 }
 
-                // Collect threats for notification (outside lock later)
                 if (network.threats != WiFiThreatType::None) {
                     auto threats = CheckNetworkSecurity(network);
                     allThreats.insert(allThreats.end(),
@@ -779,9 +795,7 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
 
             m_stats.currentNetworksTracked = static_cast<uint32_t>(m_trackedNetworks.size());
         }
-        // Lock released — safe to invoke callbacks now
 
-        // Fire notifications without holding m_mutex
         for (const auto& net : newNetworks) {
             NotifyNetworkFound(net);
         }
@@ -790,7 +804,6 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
         }
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
-
         SS_LOG_INFO(LOG_CAT, L"Scan complete: %zu networks found", networks.size());
         return networks;
 
@@ -1287,10 +1300,10 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::QueryNetworksWLAN() {
                             entry.dot11Ssid.uSSIDLength);
                 continue;
             }
-            network.ssid = std::string(
+            network.ssid = SanitizeSSID(std::string(
                 reinterpret_cast<const char*>(entry.dot11Ssid.ucSSID),
                 entry.dot11Ssid.uSSIDLength
-            );
+            ));
 
             // Hidden SSID detection: empty SSID or all-zero SSID bytes
             network.isHidden = (entry.dot11Ssid.uSSIDLength == 0);
@@ -1425,10 +1438,10 @@ WiFiConnectionInfo WiFiSecurityAnalyzerImpl::QueryConnectionWLAN() {
                 // SSID — validate length before use
                 const auto ssidLen = connAttr->wlanAssociationAttributes.dot11Ssid.uSSIDLength;
                 if (ssidLen <= DOT11_SSID_MAX_LENGTH) {
-                    connInfo.network.ssid = std::string(
+                    connInfo.network.ssid = SanitizeSSID(std::string(
                         reinterpret_cast<const char*>(connAttr->wlanAssociationAttributes.dot11Ssid.ucSSID),
                         ssidLen
-                    );
+                    ));
                 }
 
                 // BSSID
