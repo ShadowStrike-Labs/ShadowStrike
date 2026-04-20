@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   ShadowStrike Phantom Home - WiX v4 MSI authoring.
+
+   Build:
+     wix build -arch x64 -d ProductVersion=1.0.0 -d BinDir=bin\Release ^
+       -ext WixToolset.Util.wixext ^
+       packaging\wix\ShadowStrikePhantomHome.wxs ^
+       -o bin\Release\ShadowStrikePhantomHome.msi
+
+   Notes:
+     * The MSI installs the service via MSI's native ServiceInstall element
+       rather than invoking --install out-of-band. This gives the MSI engine
+       full control over rollback and uninstall so half-installed states
+       are impossible.
+     * The tray is registered in the machine-wide Run key at install time
+       so it launches for every interactive user on logon.
+     * UpgradeCode must remain stable across all future releases; changing
+       it would break the upgrade path for every existing customer.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="ShadowStrike Phantom Home"
+           Manufacturer="ShadowStrike-Labs"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="D8A6D9E2-4E2F-4A8B-9D3E-7F6B0E2C1A11"
+           InstallerVersion="500"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <Property Id="ARPHELPLINK"     Value="https://shadowstrike.dev/support" />
+    <Property Id="ARPURLINFOABOUT" Value="https://shadowstrike.dev" />
+    <Property Id="ARPNOREPAIR"     Value="1" />
+    <Property Id="ARPNOMODIFY"     Value="1" />
+
+    <Launch Condition="Installed OR (VersionNT64 &gt;= 603)"
+            Message="ShadowStrike Phantom Home requires 64-bit Windows 10 or later." />
+    <Launch Condition="Installed OR Privileged"
+            Message="ShadowStrike Phantom Home must be installed with administrator privileges." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainFeature"
+             Title="ShadowStrike Phantom Home"
+             Level="1"
+             ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentRef Id="ServiceExecutable" />
+      <ComponentRef Id="TrayExecutable"    />
+      <ComponentRef Id="UIExecutable"      />
+      <ComponentRef Id="TrayAutostart"     />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="CompanyFolder" Name="ShadowStrike">
+        <Directory Id="INSTALLFOLDER" Name="Phantom" />
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="ServiceExecutable"
+               Directory="INSTALLFOLDER"
+               Guid="8A1B0C7E-4F3A-4D1E-AC2D-9F6E2A1B3C41"
+               Bitness="always64">
+      <File Id="ServiceExe"
+            Name="ShadowStrikePhantomService.exe"
+            Source="$(var.BinDir)\ShadowStrikePhantomService.exe"
+            KeyPath="yes" />
+
+      <ServiceInstall Id="SvcInstall"
+                      Name="ShadowStrikePhantomService"
+                      DisplayName="ShadowStrike Phantom Service"
+                      Description="Provides ShadowStrike Phantom Home real-time protection, scanning, and telemetry."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Vital="yes"
+                      Account="LocalSystem">
+        <util:ServiceConfig FirstFailureActionType="restart"
+                            SecondFailureActionType="restart"
+                            ThirdFailureActionType="none"
+                            RestartServiceDelayInSeconds="60"
+                            ResetPeriodInDays="1" />
+      </ServiceInstall>
+
+      <ServiceControl Id="SvcStartStop"
+                      Name="ShadowStrikePhantomService"
+                      Start="install"
+                      Stop="both"
+                      Remove="uninstall"
+                      Wait="yes" />
+    </Component>
+
+    <Component Id="TrayExecutable"
+               Directory="INSTALLFOLDER"
+               Guid="71C7E2F4-2E9A-4B1D-8D5A-5A0F6C3E2D22"
+               Bitness="always64">
+      <File Id="TrayExe"
+            Name="ShadowStrikePhantomTray.exe"
+            Source="$(var.BinDir)\ShadowStrikePhantomTray.exe"
+            KeyPath="yes" />
+    </Component>
+
+    <Component Id="UIExecutable"
+               Directory="INSTALLFOLDER"
+               Guid="B3F4A5E6-7C8D-4E9F-A0B1-2C3D4E5F6071"
+               Bitness="always64">
+      <File Id="UIExe"
+            Name="ShadowStrikePhantomUI.exe"
+            Source="$(var.BinDir)\ShadowStrikePhantomUI.exe"
+            KeyPath="yes" />
+    </Component>
+
+    <Component Id="TrayAutostart"
+               Directory="INSTALLFOLDER"
+               Guid="C4D5E6F7-8091-4A2B-B3C4-5D6E7F809102"
+               Bitness="always64">
+      <RegistryValue Root="HKLM"
+                     Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                     Name="ShadowStrikePhantomTray"
+                     Type="string"
+                     Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomTray.exe&quot;"
+                     KeyPath="yes" />
+    </Component>
+
+  </Package>
+</Wix>
