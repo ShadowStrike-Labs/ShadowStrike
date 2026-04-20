@@ -135,11 +135,13 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../PatternStore/PatternStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/PatternStore/PatternStore.hpp"
+
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -284,20 +286,6 @@ enum class AssessmentStatus : uint8_t {
     Failed          = 3,
     Cancelled       = 4,
     PartialSuccess  = 5
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Assessing       = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
@@ -522,8 +510,20 @@ struct RouterAssessmentConfig {
     /// @brief Target gateway IP (empty = auto-detect)
     std::string gatewayIP;
     
-    /// @brief Check default credentials
-    bool checkDefaultCredentials = true;
+    /// @brief Require the target to match the locally discovered default route
+    bool requireLocalGateway = true;
+    
+    /// @brief Check default credentials (default-off; explicit opt-in only)
+    bool checkDefaultCredentials = false;
+    
+    /// @brief Permit live credential probing against the local gateway
+    bool allowCredentialProbe = false;
+    
+    /// @brief Hard cap on credential attempts to avoid lockout or abuse
+    uint32_t maxCredentialAttempts = 5;
+    
+    /// @brief Jitter between credential attempts (ms)
+    uint32_t credentialProbeJitterMs = 350;
     
     /// @brief Check UPnP
     bool checkUPnP = true;
@@ -602,8 +602,8 @@ struct RouterCheckerConfiguration {
     /// @brief Default assessment config
     RouterAssessmentConfig defaultAssessmentConfig;
     
-    /// @brief Auto-assess gateway on startup
-    bool autoAssessOnStartup = true;
+    /// @brief Auto-assess gateway on startup (default-off; on-demand only)
+    bool autoAssessOnStartup = false;
     
     /// @brief Periodic assessment interval (hours, 0 = disabled)
     uint32_t periodicAssessmentHours = 24;

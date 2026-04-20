@@ -134,12 +134,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Whitelist/WhiteListStore.hpp"
+
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -277,20 +279,6 @@ enum class DNSServerType : uint8_t {
     DNSCrypt        = 5,
     DoH             = 6,    // DNS over HTTPS
     DoT             = 7     // DNS over TLS
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Monitoring      = 3,
-    Protected       = 4,
-    Vulnerable      = 5,
-    Error           = 6,
-    Stopped         = 7
 };
 
 // ============================================================================
@@ -532,6 +520,9 @@ struct IPLeakProtectionConfiguration {
     /// @brief Enable protection
     bool enabled = true;
 
+    /// @brief Allow outbound probes to the curated endpoint allowlist
+    bool allowExternalEndpointProbes = false;
+
     /// @brief Enable VPN monitoring
     bool enableVPNMonitoring = true;
 
@@ -573,6 +564,16 @@ struct IPLeakProtectionConfiguration {
 
     /// @brief Whitelisted IPs
     std::vector<std::string> whitelistedIPs;
+
+    /// @brief Curated allowlist for outbound leak-detection probes
+    std::vector<std::string> allowedProbeHosts{
+        "api.ipify.org",
+        "checkip.amazonaws.com",
+        "ifconfig.me",
+        "whoami.akamai.net",
+        "resolver.dnscrypt.info",
+        "o-o.myaddr.l.google.com"
+    };
 
     /// @brief Verbose logging
     bool verboseLogging = false;
