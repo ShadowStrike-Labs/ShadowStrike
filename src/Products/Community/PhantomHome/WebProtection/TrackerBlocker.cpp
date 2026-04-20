@@ -68,6 +68,41 @@ namespace WebBrowser {
 using namespace Utils;
 using json = nlohmann::json;
 
+namespace {
+inline constexpr uint64_t MAX_BLOCKLIST_BYTES = 64ULL * 1024ULL * 1024ULL;
+
+[[nodiscard]] bool IsStrictUtf8(std::string_view value) noexcept {
+    if (value.empty()) {
+        return true;
+    }
+
+    const int required = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0);
+    return required > 0;
+}
+
+[[nodiscard]] bool ContainsEmbeddedLineBreak(std::string_view value) noexcept {
+    return value.find('\r') != std::string_view::npos ||
+           value.find('\n') != std::string_view::npos ||
+           value.find('\0') != std::string_view::npos;
+}
+}  // namespace
+
+template<typename T>
+[[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+}
+
+template<typename T>
+void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+    std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+}
+
 // ============================================================================
 // LOGGING MACROS
 // ============================================================================
@@ -293,7 +328,8 @@ void TrackerBlockerStatistics::Reset() noexcept {
     }
     activeRuleCount = 0;
     whitelistExceptions = 0;
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
+    AtomicValueStoreRelaxed(lastEventTime, TimePoint{});
 }
 
 double TrackerBlockerStatistics::GetCacheHitRatio() const noexcept {
@@ -322,7 +358,7 @@ std::string TrackerBlockerStatistics::ToJson() const {
     j["activeRuleCount"] = activeRuleCount.load();
     j["whitelistExceptions"] = whitelistExceptions.load();
 
-    auto elapsed = Clock::now() - startTime;
+    auto elapsed = Clock::now() - AtomicValueLoadRelaxed(startTime);
     j["uptimeSeconds"] = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 
     return j.dump();
@@ -730,8 +766,17 @@ public:
         std::vector<uint8_t> data;
         NetworkUtils::HttpRequestOptions options;
         options.timeoutMs = 30000;
+        options.allowRedirects = false;
+        options.verifySSL = true;
         options.userAgent = L"ShadowStrike-AntiVirus/3.0";
         NetworkUtils::Error netErr;
+
+        NetworkUtils::UrlComponents components;
+        if (!NetworkUtils::ParseUrl(wideUrl, components, &netErr) ||
+            !StringUtils::IEquals(components.scheme, L"https")) {
+            TB_LOG_ERROR("Blocklist URL must use HTTPS");
+            return false;
+        }
 
         if (!NetworkUtils::HttpGet(wideUrl, data, options, &netErr)) {
             TB_LOG_ERROR("Failed to download blocklist from URL: HTTP error code {}",
@@ -743,8 +788,16 @@ public:
             TB_LOG_WARN("Downloaded blocklist is empty");
             return false;
         }
+        if (data.size() > MAX_BLOCKLIST_BYTES) {
+            TB_LOG_ERROR("Downloaded blocklist exceeds maximum size");
+            return false;
+        }
 
         std::string blocklistContent(data.begin(), data.end());
+        if (!IsStrictUtf8(blocklistContent)) {
+            TB_LOG_ERROR("Downloaded blocklist is not valid UTF-8");
+            return false;
+        }
         std::string blocklistId = std::string(name.empty() ? url.substr(url.rfind('/') + 1) : name);
 
         std::unique_lock lock(m_mutex);
@@ -753,6 +806,11 @@ public:
         std::string line;
 
         while (std::getline(stream, line)) {
+            if (line.size() > TrackerBlockerConstants::MAX_PATTERN_LENGTH ||
+                ContainsEmbeddedLineBreak(line) ||
+                !IsStrictUtf8(line)) {
+                continue;
+            }
             if (line.empty() || line[0] == '!' || line[0] == '#' || line[0] == '[') {
                 continue;
             }
@@ -772,6 +830,9 @@ public:
                         }
                     }
                     ruleCount++;
+                } else {
+                    TB_LOG_WARN("Reached maximum blocklist rule count; stopping parse");
+                    break;
                 }
             }
         }
@@ -1075,7 +1136,8 @@ public:
         stats.totalProcessingTimeUs = m_stats.totalProcessingTimeUs.load();
         stats.activeRuleCount = m_stats.activeRuleCount.load();
         stats.whitelistExceptions = m_stats.whitelistExceptions.load();
-        stats.startTime = m_stats.startTime;
+        AtomicValueStoreRelaxed(stats.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
+        AtomicValueStoreRelaxed(stats.lastEventTime, AtomicValueLoadRelaxed(m_stats.lastEventTime));
         return stats;
     }
 
@@ -1313,45 +1375,39 @@ private:
         path.clear();
         query.clear();
 
-        size_t schemeEnd = url.find("://");
-        if (schemeEnd == std::string_view::npos) {
-            schemeEnd = 0;
-        } else {
-            schemeEnd += 3;
+        const std::wstring wideUrl = StringUtils::ToWide(std::string(url));
+        if (!wideUrl.empty()) {
+            NetworkUtils::UrlComponents components;
+            NetworkUtils::Error parseError;
+            if (NetworkUtils::ParseUrl(wideUrl, components, &parseError)) {
+                domain = StringUtils::ToNarrow(components.host);
+                path = StringUtils::ToNarrow(components.path);
+                query = StringUtils::ToNarrow(components.query);
+                std::transform(domain.begin(), domain.end(), domain.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                return !domain.empty() || !path.empty();
+            }
         }
 
-        size_t pathStart = url.find('/', schemeEnd);
-        if (pathStart == std::string_view::npos) {
-            domain = std::string(url.substr(schemeEnd));
-            return true;
+        if (url.find("://") == std::string_view::npos &&
+            url.find('/') == std::string_view::npos &&
+            url.find('?') == std::string_view::npos &&
+            url.find('#') == std::string_view::npos)
+        {
+            domain = std::string(url);
+            std::transform(domain.begin(), domain.end(), domain.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return !domain.empty();
         }
 
-        domain = std::string(url.substr(schemeEnd, pathStart - schemeEnd));
-
-        size_t queryStart = url.find('?', pathStart);
-        if (queryStart == std::string_view::npos) {
-            path = std::string(url.substr(pathStart));
-        } else {
-            path = std::string(url.substr(pathStart, queryStart - pathStart));
-            query = std::string(url.substr(queryStart + 1));
-        }
-
-        return true;
+        return false;
     }
 
     [[nodiscard]] static std::string ExtractDomainInternal(std::string_view url) {
         std::string domain, path, query;
         ParseUrlInternal(url, domain, path, query);
-
-        // Remove port if present
-        size_t portPos = domain.find(':');
-        if (portPos != std::string::npos) {
-            domain = domain.substr(0, portPos);
-        }
-
-        // Lowercase
-        std::transform(domain.begin(), domain.end(), domain.begin(), ::tolower);
-
         return domain;
     }
 
@@ -1618,7 +1674,14 @@ private:
         std::unique_lock lock(m_mutex);
 
         try {
-            std::ifstream file(path);
+            std::error_code fileSizeError;
+            const auto fileSize = fs::file_size(path, fileSizeError);
+            if (!fileSizeError && fileSize > MAX_BLOCKLIST_BYTES) {
+                TB_LOG_ERROR("Blocklist file exceeds maximum allowed size: {}", path.string());
+                return false;
+            }
+
+            std::ifstream file(path, std::ios::binary);
             if (!file.is_open()) {
                 TB_LOG_ERROR("Failed to open blocklist: {}", path.string());
                 return false;
@@ -1629,6 +1692,11 @@ private:
             std::string line;
 
             while (std::getline(file, line)) {
+                if (line.size() > TrackerBlockerConstants::MAX_PATTERN_LENGTH ||
+                    ContainsEmbeddedLineBreak(line) ||
+                    !IsStrictUtf8(line)) {
+                    continue;
+                }
                 // Skip comments and empty lines
                 if (line.empty() || line[0] == '!' || line[0] == '#' ||
                     line[0] == '[') {
@@ -1638,6 +1706,10 @@ private:
                 // Parse rule
                 BlockRule rule = ParseBlocklistRule(line, source);
                 if (!rule.pattern.empty()) {
+                    if (m_rules.size() >= TrackerBlockerConstants::MAX_BLOCKLIST_RULES) {
+                        TB_LOG_WARN("Reached maximum blocklist rule count; stopping parse");
+                        break;
+                    }
                     AddRule(rule);
                     ruleCount++;
                 }
@@ -1673,6 +1745,10 @@ private:
         if (pattern.starts_with("@@")) {
             rule.isException = true;
             pattern = pattern.substr(2);
+        }
+
+        if (pattern.size() > TrackerBlockerConstants::MAX_PATTERN_LENGTH) {
+            return {};
         }
 
         // Check for domain anchor (||)
@@ -1774,8 +1850,12 @@ private:
     }
 
     void NotifyBlockCallbacks(const WebRequest& request, const BlockResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, callback] : m_blockCallbacks) {
+        std::unordered_map<uint64_t, BlockEventCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbacksCopy = m_blockCallbacks;
+        }
+        for (const auto& [id, callback] : callbacksCopy) {
             try {
                 callback(request, result);
             } catch (const std::exception& e) {
