@@ -544,6 +544,18 @@ struct ThreatFeedConfig {
     /// @brief Create ThreatFox feed config
     [[nodiscard]] static ThreatFeedConfig CreateThreatFox(const std::string& apiKey = "");
     
+    /// @brief Create Feodo Tracker feed config (C2 botnet IPs, no auth)
+    [[nodiscard]] static ThreatFeedConfig CreateFeodoTracker();
+    
+    /// @brief Create Emerging Threats Open feed config (IP reputation, no auth)
+    [[nodiscard]] static ThreatFeedConfig CreateETOpen();
+    
+    /// @brief Create PhishTank feed config (phishing URLs, optional free API key)
+    [[nodiscard]] static ThreatFeedConfig CreatePhishTank(const std::string& apiKey = "");
+    
+    /// @brief Create Botvrij.eu OSINT feed config (MISP-format IOCs, no auth)
+    [[nodiscard]] static ThreatFeedConfig CreateBotvrij();
+    
     /// @brief Create MISP feed config
     [[nodiscard]] static ThreatFeedConfig CreateMISP(const std::string& baseUrl, const std::string& apiKey);
     
