@@ -73,6 +73,8 @@
 #include "PhantomCore/Utils/JSONUtils.hpp"
 #include "PhantomCore/Utils/SystemUtils.hpp"
 #include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/PE_sig_verf.hpp"
 
 #include <algorithm>
 #include <execution>
@@ -81,6 +83,7 @@
 #include <format>
 #include <random>
 #include <thread>
+#include <condition_variable>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <dwmapi.h>
@@ -127,6 +130,9 @@ namespace {
     void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
         std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
     }
+
+    namespace HashUtils = ShadowStrike::Utils::HashUtils;
+    namespace PESig = ShadowStrike::Utils::pe_sig_utils;
 
     /// @brief Known overlay DLL patterns (all lowercase for case-insensitive match)
     /// FIX #21: Removed duplicate RTSSHooks.dll, adjusted array size
@@ -425,6 +431,13 @@ public:
     // Integrity monitoring (FIX #27: std::jthread for RAII)
     std::atomic<bool> m_integrityMonitoring{false};
     std::jthread m_integrityThread;
+    std::mutex m_integrityWaitMutex;
+    std::condition_variable m_integrityWaitCv;
+
+    // Graphics module integrity baseline (signature + SHA-256)
+    std::mutex m_graphicsIntegrityMutex;
+    std::unordered_map<std::wstring, std::string> m_graphicsModuleHashes;
+    TimePoint m_lastGraphicsIntegrityCheck{};
 
     // Callbacks
     std::vector<HookDetectedCallback> m_hookCallbacks;
@@ -467,6 +480,89 @@ public:
             return std::format("OVERLAY-{}-{}", timestamp, counter.fetch_add(1));
         } catch (...) {
             return "OVERLAY-UNKNOWN";
+        }
+    }
+
+    [[nodiscard]] bool ShouldCheckGraphicsModuleIntegrity() {
+        constexpr auto kIntegrityRehashInterval = std::chrono::minutes(5);
+        std::lock_guard lock(m_graphicsIntegrityMutex);
+        const auto now = Clock::now();
+        if (!m_graphicsModuleHashes.empty() &&
+            m_lastGraphicsIntegrityCheck.time_since_epoch().count() != 0 &&
+            (now - m_lastGraphicsIntegrityCheck) < kIntegrityRehashInterval) {
+            return false;
+        }
+
+        m_lastGraphicsIntegrityCheck = now;
+        return true;
+    }
+
+    void ValidateGraphicsModuleIntegrity(HMODULE hModule,
+                                         const wchar_t* moduleTag,
+                                         std::vector<HookDetectionResult>& results) noexcept {
+        if (!hModule || !moduleTag) {
+            return;
+        }
+
+        std::array<wchar_t, 32768> modulePath{};
+        const DWORD pathLen = ::GetModuleFileNameW(hModule, modulePath.data(),
+                                                   static_cast<DWORD>(modulePath.size()));
+        if (pathLen == 0 || pathLen >= modulePath.size()) {
+            Utils::Logger::Warn("OverlayProtection: unable to resolve path for module {}",
+                               Utils::StringUtils::ToNarrow(moduleTag));
+            return;
+        }
+
+        const std::wstring modulePathStr(modulePath.data(), pathLen);
+        const std::wstring moduleKey = ExtractFilenameLower(modulePathStr);
+        const std::string moduleTagNarrow = Utils::StringUtils::ToNarrow(moduleTag);
+
+        PESig::PEFileSignatureVerifier verifier;
+        verifier.SetRevocationMode(PESig::RevocationMode::OfflineAllowed);
+        PESig::SignatureInfo sigInfo;
+        PESig::Error sigError;
+        if (!verifier.VerifyPESignature(modulePathStr, sigInfo, &sigError) ||
+            !(sigInfo.isSigned && sigInfo.isVerified && sigInfo.isChainTrusted)) {
+            auto result = BuildHookResult(HookType::Unknown,
+                                          moduleTagNarrow.c_str(),
+                                          0,
+                                          reinterpret_cast<uint64_t>(hModule),
+                                          reinterpret_cast<uint64_t>(hModule));
+            result.moduleName = moduleTag;
+            result.hookingModule = modulePathStr;
+            result.threatLevel = OverlayThreatLevel::High;
+            results.push_back(std::move(result));
+            Utils::Logger::Warn("OverlayProtection: unsigned or untrusted graphics module detected: {} ({})",
+                               moduleTagNarrow,
+                               sigError.message.empty() ? "signature validation failed" : Utils::StringUtils::ToNarrow(sigError.message));
+            return;
+        }
+
+        std::vector<uint8_t> digest;
+        HashUtils::Error hashError;
+        if (!HashUtils::ComputeFile(HashUtils::Algorithm::SHA256, modulePathStr, digest, &hashError)) {
+            Utils::Logger::Warn("OverlayProtection: failed to hash graphics module {} (win32={}, ntstatus=0x{:08X})",
+                               moduleTagNarrow,
+                               hashError.win32,
+                               static_cast<uint32_t>(hashError.ntstatus));
+            return;
+        }
+
+        const std::string digestHex = HashUtils::ToHexLower(digest);
+        std::lock_guard lock(m_graphicsIntegrityMutex);
+        auto [it, inserted] = m_graphicsModuleHashes.emplace(moduleKey, digestHex);
+        if (!inserted && it->second != digestHex) {
+            auto result = BuildHookResult(HookType::Unknown,
+                                          moduleTagNarrow.c_str(),
+                                          0,
+                                          reinterpret_cast<uint64_t>(hModule),
+                                          reinterpret_cast<uint64_t>(hModule));
+            result.moduleName = moduleTag;
+            result.hookingModule = modulePathStr;
+            result.threatLevel = OverlayThreatLevel::High;
+            results.push_back(std::move(result));
+            Utils::Logger::Warn("OverlayProtection: graphics module hash changed after baseline: {}",
+                               moduleTagNarrow);
         }
     }
 
@@ -781,6 +877,7 @@ public:
                             status.windowIntact = false;
                             Utils::Logger::Warn("OverlayProtection: Window integrity lost for HWND 0x{:X}",
                                                reinterpret_cast<uintptr_t>(hwnd));
+                            continue;
                         }
 
                         // FIX #17: Check WS_EX_TOPMOST style directly
@@ -832,13 +929,19 @@ public:
                 Utils::Logger::Error("OverlayProtection: Integrity monitoring error");
             }
 
-            // Sleep using snapshotted interval
+            // Sleep using snapshotted interval, but wake promptly on shutdown.
             uint32_t sleepMs = OverlayConstants::INTEGRITY_CHECK_INTERVAL_MS;
             {
                 std::shared_lock lock(m_mutex);
                 sleepMs = m_config.integrityCheckIntervalMs;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+
+            std::unique_lock waitLock(m_integrityWaitMutex);
+            m_integrityWaitCv.wait_for(waitLock,
+                                       std::chrono::milliseconds(sleepMs),
+                                       [this] {
+                                           return !m_integrityMonitoring.load(std::memory_order_acquire);
+                                       });
         }
 
         Utils::Logger::Info("OverlayProtection: Integrity monitoring thread stopped");
@@ -1387,6 +1490,16 @@ public:
             HMODULE hD3D9 = GetModuleHandleW(L"d3d9.dll");
             HMODULE hD3D11 = GetModuleHandleW(L"d3d11.dll");
             HMODULE hDXGI = GetModuleHandleW(L"dxgi.dll");
+            HMODULE hOpenGL = GetModuleHandleW(L"opengl32.dll");
+            HMODULE hVulkan = GetModuleHandleW(L"vulkan-1.dll");
+
+            if (ShouldCheckGraphicsModuleIntegrity()) {
+                ValidateGraphicsModuleIntegrity(hD3D9, L"d3d9.dll", results);
+                ValidateGraphicsModuleIntegrity(hD3D11, L"d3d11.dll", results);
+                ValidateGraphicsModuleIntegrity(hDXGI, L"dxgi.dll", results);
+                ValidateGraphicsModuleIntegrity(hOpenGL, L"opengl32.dll", results);
+                ValidateGraphicsModuleIntegrity(hVulkan, L"vulkan-1.dll", results);
+            }
 
             for (const char* funcName : DX_EXPORTED_FUNCTIONS) {
                 for (HMODULE hMod : {hD3D9, hD3D11, hDXGI}) {
@@ -1415,7 +1528,6 @@ public:
             }
 
             // ---- Inline hook scanning for OpenGL functions ----
-            HMODULE hOpenGL = GetModuleHandleW(L"opengl32.dll");
             if (hOpenGL) {
                 for (const char* funcName : GL_FUNCTIONS) {
                     FARPROC proc = GetProcAddress(hOpenGL, funcName);
@@ -1730,6 +1842,7 @@ void OverlayProtection::Shutdown() {
         // Phase 2: Stop integrity monitoring thread WITHOUT holding m_mutex (FIX #8)
         if (m_impl->m_integrityMonitoring.load(std::memory_order_acquire)) {
             m_impl->m_integrityMonitoring.store(false, std::memory_order_release);
+            m_impl->m_integrityWaitCv.notify_all();
         }
         if (m_impl->m_integrityThread.joinable()) {
             m_impl->m_integrityThread.request_stop();
@@ -1776,6 +1889,12 @@ void OverlayProtection::Shutdown() {
         if (m_impl->m_backgroundBrush) {
             DeleteObject(m_impl->m_backgroundBrush);
             m_impl->m_backgroundBrush = nullptr;
+        }
+
+        {
+            std::lock_guard graphicsLock(m_impl->m_graphicsIntegrityMutex);
+            m_impl->m_graphicsModuleHashes.clear();
+            m_impl->m_lastGraphicsIntegrityCheck = {};
         }
 
         m_impl->m_status = OverlayProtectionStatus::Stopped;
@@ -1928,8 +2047,13 @@ HWND OverlayProtection::CreateSecureOverlay(
         RECT rect = CalculateOverlayPosition(position, width, height);
 
         // Create layered topmost window (using runtime-generated class name)
+        DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE;
+        if (m_impl->m_config.defaultClickThrough) {
+            exStyle |= WS_EX_TRANSPARENT;
+        }
+
         HWND hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            exStyle,
             m_impl->m_overlayClassName.c_str(),
             L"ShadowStrike Overlay",
             WS_POPUP,
@@ -2115,6 +2239,7 @@ OverlayIntegrityStatus OverlayProtection::CheckIntegrity() {
             for (const auto& [hwnd, info] : m_impl->m_overlayWindows) {
                 if (!IsWindow(hwnd)) {
                     status.windowIntact = false;
+                    continue;
                 }
 
                 // Check Z-order via WS_EX_TOPMOST
@@ -2165,7 +2290,25 @@ bool OverlayProtection::VerifyWindowIntegrity(HWND hwnd) {
         }
 
         std::shared_lock lock(m_impl->m_windowsMutex);
-        return m_impl->m_overlayWindows.count(hwnd) > 0;
+        const auto it = m_impl->m_overlayWindows.find(hwnd);
+        if (it == m_impl->m_overlayWindows.end()) {
+            return false;
+        }
+
+        wchar_t className[256]{};
+        if (::GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) == 0 ||
+            m_impl->m_overlayClassName != className) {
+            return false;
+        }
+
+        DWORD ownerPid = 0;
+        ::GetWindowThreadProcessId(hwnd, &ownerPid);
+        if (ownerPid != ::GetCurrentProcessId()) {
+            return false;
+        }
+
+        const auto wndProc = reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+        return wndProc == OverlayProtectionImpl::WindowProc;
 
     } catch (...) {
         return false;
@@ -2201,7 +2344,13 @@ void OverlayProtection::StartIntegrityMonitoring() {
             return;
         }
 
+        if (!IsInitialized()) {
+            Utils::Logger::Warn("OverlayProtection: cannot start integrity monitoring before initialization");
+            return;
+        }
+
         m_impl->m_integrityMonitoring.store(true, std::memory_order_release);
+        m_impl->m_integrityWaitCv.notify_all();
         // FIX #27: Using std::jthread for RAII safety
         m_impl->m_integrityThread = std::jthread(
             [this](std::stop_token) {
@@ -2225,6 +2374,7 @@ void OverlayProtection::StopIntegrityMonitoring() {
         }
 
         m_impl->m_integrityMonitoring.store(false, std::memory_order_release);
+        m_impl->m_integrityWaitCv.notify_all();
 
         if (m_impl->m_integrityThread.joinable()) {
             m_impl->m_integrityThread.request_stop();
