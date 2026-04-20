@@ -10,7 +10,7 @@
 
    Notes:
      * The MSI installs the service via MSI's native ServiceInstall element
-       rather than invoking --install out-of-band. This gives the MSI engine
+       rather than invoking a separate install flag. This gives the MSI engine
        full control over rollback and uninstall so half-installed states
        are impossible.
      * The tray is registered in the machine-wide Run key at install time
@@ -50,12 +50,22 @@
       <ComponentRef Id="ServiceExecutable" />
       <ComponentRef Id="TrayExecutable"    />
       <ComponentRef Id="UIExecutable"      />
+      <ComponentRef Id="QtCoreRuntime"     />
+      <ComponentRef Id="QtStyleRuntime"    />
+      <ComponentRef Id="VendorRuntime"     />
+      <ComponentRef Id="QtPlatforms"       />
+      <ComponentRef Id="QtImageFormats"    />
+      <ComponentRef Id="QtIconEngines"     />
       <ComponentRef Id="TrayAutostart"     />
     </Feature>
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="CompanyFolder" Name="ShadowStrike">
-        <Directory Id="INSTALLFOLDER" Name="Phantom" />
+        <Directory Id="INSTALLFOLDER" Name="Phantom">
+          <Directory Id="PlatformsDir"    Name="platforms" />
+          <Directory Id="ImageFormatsDir" Name="imageformats" />
+          <Directory Id="IconEnginesDir"  Name="iconengines" />
+        </Directory>
       </Directory>
     </StandardDirectory>
 
@@ -110,6 +120,78 @@
             Name="ShadowStrikePhantomUI.exe"
             Source="$(var.BinDir)\ShadowStrikePhantomUI.exe"
             KeyPath="yes" />
+    </Component>
+
+    <!-- Qt6 core runtime DLLs (harvested by windeployqt) -->
+    <Component Id="QtCoreRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C51"
+               Bitness="always64">
+      <File Id="Qt6Core"         Name="Qt6Core$(var.QtSuffix).dll"         Source="$(var.BinDir)\Qt6Core$(var.QtSuffix).dll"         KeyPath="yes" />
+      <File Id="Qt6Gui"          Name="Qt6Gui$(var.QtSuffix).dll"          Source="$(var.BinDir)\Qt6Gui$(var.QtSuffix).dll" />
+      <File Id="Qt6Network"      Name="Qt6Network$(var.QtSuffix).dll"      Source="$(var.BinDir)\Qt6Network$(var.QtSuffix).dll" />
+      <File Id="Qt6Qml"          Name="Qt6Qml$(var.QtSuffix).dll"          Source="$(var.BinDir)\Qt6Qml$(var.QtSuffix).dll" />
+      <File Id="Qt6QmlModels"    Name="Qt6QmlModels$(var.QtSuffix).dll"    Source="$(var.BinDir)\Qt6QmlModels$(var.QtSuffix).dll" />
+      <File Id="Qt6Quick"        Name="Qt6Quick$(var.QtSuffix).dll"        Source="$(var.BinDir)\Qt6Quick$(var.QtSuffix).dll" />
+      <File Id="Qt6QuickCtrl2"   Name="Qt6QuickControls2$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2$(var.QtSuffix).dll" />
+      <File Id="Qt6QuickCtrl2Impl" Name="Qt6QuickControls2Impl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2Impl$(var.QtSuffix).dll" />
+      <File Id="Qt6QuickLayouts" Name="Qt6QuickLayouts$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickLayouts$(var.QtSuffix).dll" />
+      <File Id="Qt6QuickTemplates2" Name="Qt6QuickTemplates2$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickTemplates2$(var.QtSuffix).dll" />
+      <File Id="Qt6Svg"          Name="Qt6Svg$(var.QtSuffix).dll"          Source="$(var.BinDir)\Qt6Svg$(var.QtSuffix).dll" />
+      <File Id="Qt6OpenGL"       Name="Qt6OpenGL$(var.QtSuffix).dll"       Source="$(var.BinDir)\Qt6OpenGL$(var.QtSuffix).dll" />
+    </Component>
+
+    <!-- Qt6 QuickControls2 style DLLs -->
+    <Component Id="QtStyleRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C52"
+               Bitness="always64">
+      <File Id="Qt6QC2Basic"        Name="Qt6QuickControls2Basic$(var.QtSuffix).dll"        Source="$(var.BinDir)\Qt6QuickControls2Basic$(var.QtSuffix).dll" KeyPath="yes" />
+      <File Id="Qt6QC2BasicImpl"    Name="Qt6QuickControls2BasicStyleImpl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2BasicStyleImpl$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2Fusion"       Name="Qt6QuickControls2Fusion$(var.QtSuffix).dll"       Source="$(var.BinDir)\Qt6QuickControls2Fusion$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2FusionImpl"   Name="Qt6QuickControls2FusionStyleImpl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2FusionStyleImpl$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2Imagine"      Name="Qt6QuickControls2Imagine$(var.QtSuffix).dll"      Source="$(var.BinDir)\Qt6QuickControls2Imagine$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2ImagineImpl"  Name="Qt6QuickControls2ImagineStyleImpl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2ImagineStyleImpl$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2Material"     Name="Qt6QuickControls2Material$(var.QtSuffix).dll"     Source="$(var.BinDir)\Qt6QuickControls2Material$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2MaterialImpl" Name="Qt6QuickControls2MaterialStyleImpl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2MaterialStyleImpl$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2Universal"    Name="Qt6QuickControls2Universal$(var.QtSuffix).dll"    Source="$(var.BinDir)\Qt6QuickControls2Universal$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2UniversalImpl" Name="Qt6QuickControls2UniversalStyleImpl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2UniversalStyleImpl$(var.QtSuffix).dll" />
+      <File Id="Qt6QC2WinImpl"      Name="Qt6QuickControls2WindowsStyleImpl$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickControls2WindowsStyleImpl$(var.QtSuffix).dll" />
+      <File Id="Qt6QuickShapes"     Name="Qt6QuickShapes$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QuickShapes$(var.QtSuffix).dll" />
+      <File Id="Qt6QmlWorkerScript" Name="Qt6QmlWorkerScript$(var.QtSuffix).dll" Source="$(var.BinDir)\Qt6QmlWorkerScript$(var.QtSuffix).dll" />
+    </Component>
+
+    <!-- Vendor runtime DLLs (OpenSSL) -->
+    <Component Id="VendorRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C53"
+               Bitness="always64">
+      <File Id="libcrypto" Name="libcrypto-3-x64.dll" Source="$(var.BinDir)\libcrypto-3-x64.dll" KeyPath="yes" />
+      <File Id="libssl"    Name="libssl-3-x64.dll"    Source="$(var.BinDir)\libssl-3-x64.dll" />
+    </Component>
+
+    <!-- Qt plugin: platforms -->
+    <Component Id="QtPlatforms"
+               Directory="PlatformsDir"
+               Guid="A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C54"
+               Bitness="always64">
+      <File Id="qwindows" Name="qwindows$(var.QtSuffix).dll" Source="$(var.BinDir)\platforms\qwindows$(var.QtSuffix).dll" KeyPath="yes" />
+    </Component>
+
+    <!-- Qt plugin: imageformats -->
+    <Component Id="QtImageFormats"
+               Directory="ImageFormatsDir"
+               Guid="A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C55"
+               Bitness="always64">
+      <File Id="qsvg" Name="qsvg$(var.QtSuffix).dll" Source="$(var.BinDir)\imageformats\qsvg$(var.QtSuffix).dll" KeyPath="yes" />
+    </Component>
+
+    <!-- Qt plugin: iconengines -->
+    <Component Id="QtIconEngines"
+               Directory="IconEnginesDir"
+               Guid="A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C56"
+               Bitness="always64">
+      <File Id="qsvgicon" Name="qsvgicon$(var.QtSuffix).dll" Source="$(var.BinDir)\iconengines\qsvgicon$(var.QtSuffix).dll" KeyPath="yes" />
     </Component>
 
     <Component Id="TrayAutostart"
