@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -534,6 +534,10 @@ public:
                 Utils::Logger::Error("DoH: WinHttpOpenRequest failed, error={}", ::GetLastError());
                 return response;
             }
+
+            const DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            ::WinHttpSetOption(hRequest.get(), WINHTTP_OPTION_REDIRECT_POLICY,
+                const_cast<DWORD*>(&redirectPolicy), sizeof(redirectPolicy));
 
             // Request JSON response format for DoH
             ::WinHttpAddRequestHeaders(hRequest.get(),

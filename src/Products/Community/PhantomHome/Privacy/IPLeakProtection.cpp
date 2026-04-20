@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -648,6 +648,10 @@ public:
                     WINHTTP_FLAG_SECURE));
 
                 if (!hRequest) continue;
+
+                const DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+                ::WinHttpSetOption(hRequest.Get(), WINHTTP_OPTION_REDIRECT_POLICY,
+                    const_cast<DWORD*>(&redirectPolicy), sizeof(redirectPolicy));
 
                 // Set all timeouts: resolve, connect, send, receive
                 DWORD timeout = PUBLIC_IP_TIMEOUT_MS;
