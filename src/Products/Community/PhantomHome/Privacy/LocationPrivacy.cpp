@@ -115,6 +115,18 @@ std::mt19937& GetRNG() {
     return gen;
 }
 
+struct RegKeyGuard {
+    RegKeyGuard() = default;
+    HKEY key = nullptr;
+    ~RegKeyGuard() {
+        if (key != nullptr) {
+            ::RegCloseKey(key);
+        }
+    }
+    RegKeyGuard(const RegKeyGuard&) = delete;
+    RegKeyGuard& operator=(const RegKeyGuard&) = delete;
+};
+
 /// @brief Known IP geolocation services
 const std::vector<std::string> IP_GEOLOCATION_DOMAINS = {
     "ip-api.com",
@@ -738,39 +750,39 @@ void LocationPrivacyImpl::SetProtectionMode(LocationProtectionMode mode) {
 bool LocationPrivacyImpl::SetLocationEnabled(bool enabled) {
     try {
         std::unique_lock lock(m_mutex);
-        m_locationEnabled = enabled;
 
-        // Modify Windows location consent via registry
+        // Modify Windows location consent for the current user only.
         constexpr wchar_t LOCATION_CONSENT_KEY[] =
             L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
             L"CapabilityAccessManager\\ConsentStore\\location";
 
-        HKEY hKey = nullptr;
-        LONG regResult = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE, LOCATION_CONSENT_KEY,
-            0, KEY_SET_VALUE, &hKey);
+        RegKeyGuard keyGuard;
+        LONG regResult = ::RegCreateKeyExW(
+            HKEY_CURRENT_USER, LOCATION_CONSENT_KEY,
+            0, nullptr, REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            nullptr, &keyGuard.key, nullptr);
 
-        if (regResult == ERROR_SUCCESS) {
-            const wchar_t* value = enabled ? L"Allow" : L"Deny";
-            DWORD valueSize = static_cast<DWORD>(
-                (wcslen(value) + 1) * sizeof(wchar_t));
-
-            regResult = RegSetValueExW(hKey, L"Value", 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(value), valueSize);
-            RegCloseKey(hKey);
-
-            if (regResult != ERROR_SUCCESS) {
-                Utils::Logger::Warn(
-                    "Failed to write location consent registry value (error={})",
-                    regResult);
-            }
-        } else {
-            Utils::Logger::Warn(
-                "Failed to open location consent registry key (error={})",
+        if (regResult != ERROR_SUCCESS || keyGuard.key == nullptr) {
+            Utils::Logger::Error(
+                "Failed to open HKCU location consent registry key (error={})",
                 regResult);
+            return false;
         }
 
-        Utils::Logger::Info("Location services {}", enabled ? "enabled" : "disabled");
+        const wchar_t* value = enabled ? L"Allow" : L"Deny";
+        const DWORD valueSize = static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t));
+        regResult = ::RegSetValueExW(keyGuard.key, L"Value", 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(value), valueSize);
+        if (regResult != ERROR_SUCCESS) {
+            Utils::Logger::Error(
+                "Failed to write HKCU location consent registry value (error={})",
+                regResult);
+            return false;
+        }
+
+        m_locationEnabled = enabled;
+        Utils::Logger::Info("Location services {} for the current user", enabled ? "enabled" : "disabled");
         return true;
 
     } catch (const std::exception& e) {
@@ -1594,20 +1606,19 @@ void LocationPrivacyImpl::MonitoringThreadFunc() {
     while (!m_stopMonitoring.load(std::memory_order_relaxed)) {
         try {
             // Poll Windows Location Service consent registry key
-            HKEY hKey = nullptr;
-            LONG regResult = RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE, LOCATION_CONSENT_KEY,
-                0, KEY_READ, &hKey);
+            RegKeyGuard keyGuard;
+            LONG regResult = ::RegOpenKeyExW(
+                HKEY_CURRENT_USER, LOCATION_CONSENT_KEY,
+                0, KEY_READ, &keyGuard.key);
 
-            if (regResult == ERROR_SUCCESS) {
+            if (regResult == ERROR_SUCCESS && keyGuard.key != nullptr) {
                 wchar_t valueData[64] = {};
                 DWORD valueSize = sizeof(valueData) - sizeof(wchar_t);
                 DWORD valueType = 0;
 
-                regResult = RegQueryValueExW(hKey, L"Value", nullptr,
+                regResult = ::RegQueryValueExW(keyGuard.key, L"Value", nullptr,
                     &valueType, reinterpret_cast<LPBYTE>(valueData),
                     &valueSize);
-                RegCloseKey(hKey);
 
                 if (regResult == ERROR_SUCCESS && valueType == REG_SZ) {
                     bool isAllowed = (_wcsicmp(valueData, L"Allow") == 0);
