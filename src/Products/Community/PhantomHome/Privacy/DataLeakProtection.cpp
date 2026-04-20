@@ -93,6 +93,7 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
+#include "../Utils/HashUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 
@@ -294,7 +295,39 @@ public:
 private:
     bool m_opened;
 };
+
+class GlobalLockGuard {
+public:
+    explicit GlobalLockGuard(HGLOBAL handle) noexcept
+        : m_handle(handle), m_ptr(handle ? ::GlobalLock(handle) : nullptr) {}
+    ~GlobalLockGuard() {
+        if (m_ptr != nullptr) {
+            ::GlobalUnlock(m_handle);
+        }
+    }
+    GlobalLockGuard(const GlobalLockGuard&) = delete;
+    GlobalLockGuard& operator=(const GlobalLockGuard&) = delete;
+    [[nodiscard]] void* Get() const noexcept { return m_ptr; }
+private:
+    HGLOBAL m_handle = nullptr;
+    void* m_ptr = nullptr;
+};
 #endif
+
+[[nodiscard]] std::string ComputeSensitiveValueFingerprint(std::string_view value) {
+    Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+    if (!hasher.Init()) {
+        return {};
+    }
+    if (!value.empty() && !hasher.Update(value.data(), value.size())) {
+        return {};
+    }
+    std::string digest;
+    if (!hasher.FinalHex(digest, false)) {
+        return {};
+    }
+    return digest;
+}
 
 } // anonymous namespace
 
@@ -794,6 +827,10 @@ bool DataLeakProtectionImpl::HasSensitiveData(const std::string& content) {
         return false;
     }
 
+    const std::string scanContent = (content.size() > DLPConstants::MAX_REGEX_SCAN_SIZE)
+        ? content.substr(0, DLPConstants::MAX_REGEX_SCAN_SIZE)
+        : content;
+
     // Quick check - just look for patterns without full validation
     std::shared_lock lock(m_mutex);
 
@@ -803,7 +840,7 @@ bool DataLeakProtectionImpl::HasSensitiveData(const std::string& content) {
         }
 
         try {
-            if (std::regex_search(content, *pattern.compiledRegex)) {
+            if (std::regex_search(scanContent, *pattern.compiledRegex)) {
                 return true;
             }
         } catch (...) {
@@ -1288,10 +1325,10 @@ std::optional<DLPIncident> DataLeakProtectionImpl::GetIncident(const std::string
 }
 
 void DataLeakProtectionImpl::ReportIncident(const DLPIncident& incident) {
-    // Sanitize: strip raw sensitive values before persisting in memory
+    // Sanitize: retain only non-plaintext metadata before persisting in memory.
     DLPIncident sanitized = incident;
     for (auto& match : sanitized.scanResult.matches) {
-        match.fullValue.clear();
+        match.context.clear();
     }
 
     {
@@ -1438,7 +1475,11 @@ DLPScanResult DataLeakProtectionImpl::PerformScan(const std::string& content) {
 
     DLPScanResult result;
     result.contentSize = content.size();
-    result.contentHash = std::to_string(std::hash<std::string>{}(content));
+    result.contentHash = ComputeSensitiveValueFingerprint(content);
+
+    const std::string scanContent = (content.size() > DLPConstants::MAX_REGEX_SCAN_SIZE)
+        ? content.substr(0, DLPConstants::MAX_REGEX_SCAN_SIZE)
+        : content;
 
     std::shared_lock lock(m_mutex);
 
@@ -1448,7 +1489,7 @@ DLPScanResult DataLeakProtectionImpl::PerformScan(const std::string& content) {
             continue;
         }
 
-        auto matches = ScanWithPattern(pattern, content);
+        auto matches = ScanWithPattern(pattern, scanContent);
 
         if (!matches.empty()) {
             result.hasSensitiveData = true;
@@ -1536,11 +1577,11 @@ std::vector<SensitiveDataMatch> DataLeakProtectionImpl::ScanWithPattern(
 
             SensitiveDataMatch dataMatch;
             dataMatch.pattern = pattern;
-            dataMatch.fullValue = value;
+            dataMatch.fullValue = ComputeSensitiveValueFingerprint(value);
             dataMatch.redactedValue = RedactValue(value, pattern.category);
             dataMatch.offset = static_cast<size_t>(match.position());
             dataMatch.length = value.length();
-            dataMatch.context = ExtractContext(content, dataMatch.offset, dataMatch.length);
+            dataMatch.context.clear();
             dataMatch.confidence = pattern.requiresValidation ? 95 : 85;
             dataMatch.validationPassed = true;
 
@@ -1701,28 +1742,33 @@ std::string DataLeakProtectionImpl::GetClipboardText() {
         return "";
     }
 
-    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+    HGLOBAL hData = static_cast<HGLOBAL>(GetClipboardData(CF_UNICODETEXT));
     if (!hData) {
         return "";
     }
 
-    wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
+    const SIZE_T bufferBytes = ::GlobalSize(hData);
+    if (bufferBytes < sizeof(wchar_t)) {
+        return "";
+    }
+
+    const SIZE_T maxBytes = std::min<SIZE_T>(
+        bufferBytes,
+        static_cast<SIZE_T>(DLPConstants::MAX_CONTENT_SCAN_SIZE) * sizeof(wchar_t));
+    const size_t maxChars = maxBytes / sizeof(wchar_t);
+    if (maxChars == 0) {
+        return "";
+    }
+
+    GlobalLockGuard dataGuard(hData);
+    auto* pszText = static_cast<const wchar_t*>(dataGuard.Get());
     if (!pszText) {
         return "";
     }
 
-    std::string text;
-    try {
-        // Cap clipboard read length to prevent memory exhaustion
-        size_t len = wcsnlen(pszText, DLPConstants::MAX_CONTENT_SCAN_SIZE);
-        text = ::ShadowStrike::Utils::StringUtils::WStringToString(std::wstring_view(pszText, len));
-    } catch (...) {
-        GlobalUnlock(hData);
-        throw;
-    }
-
-    GlobalUnlock(hData);
-    return text;
+    const wchar_t* terminator = std::find(pszText, pszText + maxChars, L'\0');
+    const size_t len = static_cast<size_t>(terminator - pszText);
+    return ::ShadowStrike::Utils::StringUtils::WStringToString(std::wstring_view(pszText, len));
 #else
     return "";
 #endif
