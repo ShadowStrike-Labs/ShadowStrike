@@ -261,33 +261,57 @@ namespace {
     constexpr DISPID DISPID_FOLDERPATH = 0x66B5;
     constexpr DISPID DISPID_FOLDERNAME = 0x3001;
 
-    // Extract URLs from text/HTML content using regex
+    [[nodiscard]] static bool IsUrlDelimiter(char ch) noexcept {
+        switch (ch) {
+            case ' ': case '\t': case '\r': case '\n':
+            case '"': case '\'': case '<': case '>':
+            case ')': case ']': case '}': case '|': case '\\':
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] static std::string TrimExtractedUrl(std::string_view candidate) {
+        while (!candidate.empty()) {
+            const char ch = candidate.back();
+            if (ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == ')' || ch == ']' || ch == '}') {
+                candidate.remove_suffix(1);
+                continue;
+            }
+            break;
+        }
+        return std::string(candidate);
+    }
+
+    // Extract URLs from text/HTML content without regex backtracking
     [[nodiscard]] static std::vector<std::string> ExtractUrlsFromText(const std::string& text) {
         std::vector<std::string> urls;
         if (text.empty()) return urls;
 
-        try {
-            // Match http/https URLs - deliberately broad to catch obfuscated variants
-            static const std::regex urlPattern(
-                R"(https?://[^\s"'<>\)\]\}]{4,2048})",
-                std::regex::optimize | std::regex::icase);
+        size_t cursor = 0;
+        while (cursor < text.size() && urls.size() < MAX_URL_EXTRACT_COUNT) {
+            const size_t httpPos = text.find("http://", cursor);
+            const size_t httpsPos = text.find("https://", cursor);
+            const size_t matchPos =
+                (httpPos == std::string::npos) ? httpsPos :
+                (httpsPos == std::string::npos) ? httpPos : std::min(httpPos, httpsPos);
 
-            auto begin = std::sregex_iterator(text.begin(), text.end(), urlPattern);
-            auto end = std::sregex_iterator();
-
-            for (auto it = begin; it != end && urls.size() < MAX_URL_EXTRACT_COUNT; ++it) {
-                std::string url = it->str();
-                // Trim trailing punctuation that's likely not part of the URL
-                while (!url.empty() && (url.back() == '.' || url.back() == ',' ||
-                       url.back() == ';' || url.back() == ')')) {
-                    url.pop_back();
-                }
-                if (!url.empty()) {
-                    urls.push_back(std::move(url));
-                }
+            if (matchPos == std::string::npos) {
+                break;
             }
-        } catch (const std::regex_error& e) {
-            Logger::Error("ExtractUrlsFromText: regex error: {}", e.what());
+
+            size_t endPos = matchPos;
+            while (endPos < text.size() && !IsUrlDelimiter(text[endPos]) && (endPos - matchPos) < 2048) {
+                ++endPos;
+            }
+
+            std::string normalized = TrimExtractedUrl(std::string_view(text).substr(matchPos, endPos - matchPos));
+            if (!normalized.empty()) {
+                urls.push_back(std::move(normalized));
+            }
+
+            cursor = (endPos > matchPos) ? endPos : matchPos + 1;
         }
 
         return urls;
@@ -954,7 +978,8 @@ public:
                 Logger::Error("OutlookScanner: CoInitializeEx failed: 0x{:X}", hr);
                 return false;
             }
-            m_comInitialized = true;
+            m_comInitialized = SUCCEEDED(hr);
+            m_comApartmentThreadId = m_comInitialized ? GetCurrentThreadId() : 0;
 
             // Create temp directory for attachments
             if (!fs::exists(ATTACHMENT_TEMP_DIR)) {
@@ -1000,8 +1025,15 @@ public:
             }
 
             if (m_comInitialized) {
-                CoUninitialize();
+                if (m_comApartmentThreadId == GetCurrentThreadId()) {
+                    CoUninitialize();
+                } else {
+                    Logger::Warn("OutlookScanner: COM apartment teardown skipped on mismatched thread (init={}, current={})",
+                                 m_comApartmentThreadId,
+                                 GetCurrentThreadId());
+                }
                 m_comInitialized = false;
+                m_comApartmentThreadId = 0;
             }
 
             m_initialized = false;
@@ -1704,9 +1736,25 @@ public:
             // Validate filename — strip any path traversal attempts
             std::wstring wFilename = StringUtils::ToWide(filename);
             wFilename = fs::path(wFilename).filename().wstring();
-            if (wFilename.empty()) {
-                wFilename = L"attachment_" + std::to_wstring(attachmentIndex);
+            std::wstring extension = fs::path(wFilename).extension().wstring();
+            if (extension.size() > 16) {
+                extension.clear();
             }
+            if (!extension.empty()) {
+                std::erase_if(extension, [](wchar_t ch) {
+                    return !(::iswalnum(ch) != 0 || ch == L'.');
+                });
+                if (extension == L".") {
+                    extension.clear();
+                }
+            }
+
+            const auto uniqueToken = static_cast<unsigned long long>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            std::wstring secureName = std::format(L"attachment_{:04}_{:016X}{}",
+                                                  attachmentIndex,
+                                                  uniqueToken,
+                                                  extension);
 
             // Ensure the secure temp directory exists
             if (!fs::exists(ATTACHMENT_TEMP_DIR)) {
@@ -1717,13 +1765,16 @@ public:
                 }
             }
 
-            // Save attachment to the secure temp path
-            fs::path tempPath = ATTACHMENT_TEMP_DIR / wFilename;
+            // Save attachment to the secure temp path using a non-user-controlled name
+            fs::path tempPath = ATTACHMENT_TEMP_DIR / secureName;
 
-            // Avoid overwriting — append index if file exists
-            if (fs::exists(tempPath)) {
-                tempPath = ATTACHMENT_TEMP_DIR /
-                    (std::to_wstring(attachmentIndex) + L"_" + wFilename);
+            std::error_code canonicalEc;
+            const fs::path tempRoot = fs::weakly_canonical(ATTACHMENT_TEMP_DIR, canonicalEc);
+            const fs::path tempCandidate = fs::weakly_canonical(tempPath.parent_path(), canonicalEc) / tempPath.filename();
+            if (canonicalEc || tempRoot.empty() || tempCandidate.empty() ||
+                tempCandidate.native().rfind(tempRoot.native(), 0) != 0) {
+                Logger::Error("ExtractAttachment: Refusing unsafe temp path for '{}'", filename);
+                return std::nullopt;
             }
 
             // Cap at MAX_ATTACHMENT_SIZE — check file after save
@@ -2741,6 +2792,7 @@ private:
     mutable std::shared_mutex m_mutex;
     bool m_initialized{ false };
     bool m_comInitialized{ false };
+    DWORD m_comApartmentThreadId{ 0 };
     ModuleStatus m_status{ ModuleStatus::Uninitialized };
     AddinStatus m_addinStatus{ AddinStatus::Disconnected };
 

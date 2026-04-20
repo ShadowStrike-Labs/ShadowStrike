@@ -229,6 +229,51 @@ namespace {
         }
         return result;
     }
+
+    [[nodiscard]] bool IsUrlDelimiter(char ch) noexcept {
+        switch (ch) {
+            case ' ': case '\t': case '\r': case '\n':
+            case '<': case '>': case '"': case '\'':
+            case '{': case '}': case '[': case ']':
+            case '|': case '\\':
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] std::string TrimUrlCandidate(std::string_view candidate) {
+        while (!candidate.empty()) {
+            const char ch = candidate.back();
+            if (ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == ')' ||
+                ch == ']' || ch == '}' || ch == '"' || ch == '\'') {
+                candidate.remove_suffix(1);
+                continue;
+            }
+            break;
+        }
+        return std::string(candidate);
+    }
+
+    void AppendUrlCandidate(std::vector<std::string>& urls, std::string_view candidate) {
+        if (urls.size() >= PhishingConstants::MAX_URLS_TO_ANALYZE) {
+            return;
+        }
+
+        constexpr size_t kMaxUrlLength = 2048;
+        if (candidate.empty() || candidate.size() > kMaxUrlLength) {
+            return;
+        }
+
+        std::string normalized = TrimUrlCandidate(candidate);
+        if (normalized.empty() || normalized.size() > kMaxUrlLength) {
+            return;
+        }
+
+        if (std::find(urls.begin(), urls.end(), normalized) == urls.end()) {
+            urls.push_back(std::move(normalized));
+        }
+    }
 }
 
 // ============================================================================
@@ -1524,24 +1569,31 @@ std::string_view GetURLVerdictName(URLVerdict verdict) noexcept {
 
 std::vector<std::string> ExtractURLsFromText(const std::string& text) {
     std::vector<std::string> urls;
+    if (text.empty()) {
+        return urls;
+    }
 
-    try {
-        // Regex pattern for URLs
-        std::regex urlRegex(
-            R"((https?://[^\s<>"{}|\\^\[\]`]+))",
-            std::regex::icase
-        );
+    const size_t scanLimit = std::min(text.size(), MAX_BODY_SIZE);
+    size_t cursor = 0;
 
-        auto begin = std::sregex_iterator(text.begin(), text.end(), urlRegex);
-        auto end = std::sregex_iterator();
+    while (cursor < scanLimit && urls.size() < PhishingConstants::MAX_URLS_TO_ANALYZE) {
+        const size_t httpPos = text.find("http://", cursor);
+        const size_t httpsPos = text.find("https://", cursor);
+        const size_t matchPos =
+            (httpPos == std::string::npos) ? httpsPos :
+            (httpsPos == std::string::npos) ? httpPos : std::min(httpPos, httpsPos);
 
-        for (auto it = begin; it != end; ++it) {
-            urls.push_back(it->str());
+        if (matchPos == std::string::npos || matchPos >= scanLimit) {
+            break;
         }
 
-    } catch (const std::exception& e) {
-        Utils::Logger::Error("ExtractURLsFromText failed - {}",
-                           e.what());
+        size_t endPos = matchPos;
+        while (endPos < scanLimit && !IsUrlDelimiter(text[endPos]) && (endPos - matchPos) < 2048) {
+            ++endPos;
+        }
+
+        AppendUrlCandidate(urls, std::string_view(text).substr(matchPos, endPos - matchPos));
+        cursor = (endPos > matchPos) ? endPos : matchPos + 1;
     }
 
     return urls;
@@ -1549,35 +1601,56 @@ std::vector<std::string> ExtractURLsFromText(const std::string& text) {
 
 std::vector<std::string> ExtractURLsFromHTML(const std::string& html) {
     std::vector<std::string> urls;
+    if (html.empty()) {
+        return urls;
+    }
 
-    try {
-        // Extract from href attributes
-        std::regex hrefRegex(
-            R"(href\s*=\s*["']([^"']+)["'])",
-            std::regex::icase
-        );
+    const size_t scanLimit = std::min(html.size(), MAX_BODY_SIZE);
+    std::string lowered = AsciiToLower(std::string_view(html.data(), scanLimit));
+    size_t cursor = 0;
 
-        auto begin = std::sregex_iterator(html.begin(), html.end(), hrefRegex);
-        auto end = std::sregex_iterator();
-
-        for (auto it = begin; it != end; ++it) {
-            std::string url = (*it)[1].str();
-            if (url.find("http://") == 0 || url.find("https://") == 0) {
-                urls.push_back(url);
-            }
+    while (cursor < lowered.size() && urls.size() < PhishingConstants::MAX_URLS_TO_ANALYZE) {
+        size_t hrefPos = lowered.find("href", cursor);
+        if (hrefPos == std::string::npos) {
+            break;
         }
 
-        // Also extract plain URLs from HTML text
-        auto textUrls = ExtractURLsFromText(html);
-        urls.insert(urls.end(), textUrls.begin(), textUrls.end());
+        size_t equalsPos = lowered.find('=', hrefPos + 4);
+        if (equalsPos == std::string::npos || equalsPos >= lowered.size()) {
+            break;
+        }
 
-        // Remove duplicates
-        std::sort(urls.begin(), urls.end());
-        urls.erase(std::unique(urls.begin(), urls.end()), urls.end());
+        size_t valuePos = equalsPos + 1;
+        while (valuePos < lowered.size() && std::isspace(static_cast<unsigned char>(lowered[valuePos])) != 0) {
+            ++valuePos;
+        }
+        if (valuePos >= lowered.size()) {
+            break;
+        }
 
-    } catch (const std::exception& e) {
-        Utils::Logger::Error("ExtractURLsFromHTML failed - {}",
-                           e.what());
+        char quote = html[valuePos];
+        if (quote != '"' && quote != '\'') {
+            cursor = valuePos;
+            continue;
+        }
+
+        const size_t valueStart = valuePos + 1;
+        const size_t valueEnd = html.find(quote, valueStart);
+        if (valueEnd == std::string::npos || valueEnd > scanLimit) {
+            break;
+        }
+
+        const std::string_view candidate(html.data() + valueStart, valueEnd - valueStart);
+        if (candidate.starts_with("http://") || candidate.starts_with("https://")) {
+            AppendUrlCandidate(urls, candidate);
+        }
+
+        cursor = valueEnd + 1;
+    }
+
+    auto textUrls = ExtractURLsFromText(std::string(html.data(), scanLimit));
+    for (const auto& url : textUrls) {
+        AppendUrlCandidate(urls, url);
     }
 
     return urls;
