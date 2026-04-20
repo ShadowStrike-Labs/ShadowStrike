@@ -58,7 +58,8 @@
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>wWinMainCRTStartup</EntryPointSymbol>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>shell32.lib;user32.lib;gdi32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>PhantomCoreLib.lib;libcrypto.lib;libssl.lib;shell32.lib;user32.lib;gdi32.lib;advapi32.lib;ws2_32.lib;crypt32.lib;iphlpapi.lib;ole32.lib;oleaut32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)lib\$(Configuration);$(SolutionDir)vendor;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
 
@@ -92,6 +93,13 @@
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.hpp" />
+  </ItemGroup>
+
+  <!-- Engine dependency (only Logger symbols pulled by linker) -->
+  <ItemGroup>
+    <ProjectReference Include="PhantomCoreLib.vcxproj">
+      <Project>{8A5C6B4D-2E1F-4A3B-9C7D-0E1F2A3B4C5D}</Project>
+    </ProjectReference>
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

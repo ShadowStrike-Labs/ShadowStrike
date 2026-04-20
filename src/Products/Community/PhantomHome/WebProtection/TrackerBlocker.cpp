@@ -149,26 +149,7 @@ std::string_view GetCategoryName(TrackerCategory category) noexcept {
     }
 }
 
-std::string_view GetRequestTypeName(RequestType type) noexcept {
-    switch (type) {
-        case RequestType::Unknown:        return "Unknown";
-        case RequestType::Document:       return "Document";
-        case RequestType::SubDocument:    return "SubDocument";
-        case RequestType::Stylesheet:     return "Stylesheet";
-        case RequestType::Script:         return "Script";
-        case RequestType::Image:          return "Image";
-        case RequestType::Font:           return "Font";
-        case RequestType::Object:         return "Object";
-        case RequestType::XMLHttpRequest: return "XMLHttpRequest";
-        case RequestType::Ping:           return "Ping";
-        case RequestType::CSPReport:      return "CSPReport";
-        case RequestType::Media:          return "Media";
-        case RequestType::WebSocket:      return "WebSocket";
-        case RequestType::WebRTC:         return "WebRTC";
-        case RequestType::Other:          return "Other";
-        default:                          return "Multiple";
-    }
-}
+// GetRequestTypeName is defined in AdBlocker.cpp — shared across WebProtection modules.
 
 std::string_view GetBlockDecisionName(BlockDecision decision) noexcept {
     switch (decision) {

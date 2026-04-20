@@ -92,7 +92,7 @@ g_baselineCPUID         DQ 0            ; Baseline CPUID measurement
 g_calibrationDone       DD 0            ; Calibration flag
 
 ;; Memory test buffer (cache line aligned)
-ALIGN 64
+ALIGN 16
 g_memoryTestBuffer      DB 4096 DUP(0)  ; 4KB buffer for memory tests
 
 .CODE
@@ -308,13 +308,19 @@ MeasureCPUIDOverhead ENDP
 ;;   RCX - Sleep duration in milliseconds
 ;; Returns: Deviation percentage (0 = exact, >50 = likely patched)
 ;; =============================================================================
-MeasureSleepAcceleration PROC
+MeasureSleepAcceleration PROC FRAME
     push    rbx
+    .PUSHREG rbx
     push    rsi
+    .PUSHREG rsi
     push    rdi
+    .PUSHREG rdi
     push    r12
+    .PUSHREG r12
     push    r13
+    .PUSHREG r13
     sub     rsp, 48         ; Shadow space (32) + alignment (16) to maintain 16-byte RSP
+    .ALLOCSTACK 48
     .ENDPROLOG
     
     ;; Save sleep duration

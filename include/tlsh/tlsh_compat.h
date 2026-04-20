@@ -1,25 +1,26 @@
-// tlsh.h içindeki __attribute__ sorununu çözmek için
-// tlsh.h dosyasýnýn EN BAÞINA (ilk include'dan ÖNCE) bunu ekle:
+// tlsh.h iï¿½indeki __attribute__ sorununu ï¿½ï¿½zmek iï¿½in
+// tlsh.h dosyasï¿½nï¿½n EN BAï¿½INA (ilk include'dan ï¿½NCE) bunu ekle:
 
 #ifndef TLSH_COMPAT_H
 #define TLSH_COMPAT_H
 
-// Windows MSVC uyumluluðu
+// Windows MSVC uyumluluï¿½u
 #ifdef _MSC_VER
 #define __attribute__(x)
 #define __extension__
-// Uyarýlarý bastýr - TLSH kodu POSIX fonklarý kullanýyor
+// Uyarï¿½larï¿½ bastï¿½r - TLSH kodu POSIX fonklarï¿½ kullanï¿½yor
 #pragma warning(disable: 4996)  // deprecated function warnings
 #pragma warning(disable: 4267)  // conversion warnings
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-// dirent.h uyumluluðu
+// dirent.h uyumluluï¿½u
 #ifdef _WIN32
 #include <windows.h>
-#include<stdio.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-// Windows için dirent.h replacement
+// Windows iï¿½in dirent.h replacement
 typedef struct {
     HANDLE handle;
     WIN32_FIND_DATAA data;
@@ -65,7 +66,7 @@ inline int closedir(DIR* dir) {
     return 0;
 }
 
-// POSIX string fonksiyonlarý replacement
+// POSIX string fonksiyonlarï¿½ replacement
 #ifndef strdup
 #define strdup _strdup
 #endif
