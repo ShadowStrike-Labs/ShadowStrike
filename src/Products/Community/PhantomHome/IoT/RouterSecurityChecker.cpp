@@ -591,17 +591,19 @@ std::string RouterSecurityReport::ToJson() const {
 }
 
 uint32_t RouterSecurityReport::GetCriticalIssueCount() const {
-    return std::count_if(securityIssues.begin(), securityIssues.end(),
+    const auto count = std::count_if(securityIssues.begin(), securityIssues.end(),
         [](const SecurityIssue& issue) {
             return issue.riskLevel == SecurityRiskLevel::Critical;
         });
+    return static_cast<uint32_t>(std::min<size_t>(count, UINT32_MAX));
 }
 
 uint32_t RouterSecurityReport::GetHighIssueCount() const {
-    return std::count_if(securityIssues.begin(), securityIssues.end(),
+    const auto count = std::count_if(securityIssues.begin(), securityIssues.end(),
         [](const SecurityIssue& issue) {
             return issue.riskLevel == SecurityRiskLevel::High;
         });
+    return static_cast<uint32_t>(std::min<size_t>(count, UINT32_MAX));
 }
 
 bool RouterAssessmentConfig::IsValid() const noexcept {
@@ -1530,7 +1532,7 @@ std::string RouterSecurityCheckerImpl::GetDefaultGatewayInternal() const {
 // ============================================================================
 
 std::vector<WirelessNetworkInfo> RouterSecurityCheckerImpl::GetWirelessNetworks(
-    const std::string& ip)
+    const std::string& /*ip*/)
 {
     std::vector<WirelessNetworkInfo> networks;
 
