@@ -9,58 +9,17 @@
  * ShadowStrike PhantomHome - IoT PROTECTION MODULE WIRING
  * ============================================================================
  *
- * @file IoTWiring.cpp
- * @brief Registers the IoT protection subsystem with HomeProductOrchestrator
- *        via IPLeakProtection, which serves as the IoT integration facade.
- *
- * DESIGN RATIONALE
- * ================
- * The IoT folder contains five individual modules:
- *   - IoTDeviceScanner
- *   - IPLeakProtection  (IoT namespace)
- *   - RouterSecurityChecker
- *   - SmartHomeProtection
- *   - WiFiSecurityAnalyzer
- *
- * Each module header defines its own `ShadowStrike::IoT::ModuleStatus` enum
- * with distinct enumerators and values.  Because the five headers share a
- * namespace but define incompatible enumerations, including more than one of
- * them in the same translation unit causes a C2011 type-redefinition error.
- *
- * `IPLeakProtection` is explicitly documented as "an integration point for
- * IoT security subsystems" and exposes:
- *   - StartIoTModules()  — initializes and starts the full IoT stack
- *   - StopIoTModules()   — stops and tears down the full IoT stack
- *   - RunIoTSecurityScan() / GetIoTStatus()
- *
- * Registering `IPLeakProtection` as the sole wiring entry therefore drives
- * the complete IoT lifecycle through a single, well-defined integration point,
- * matching the "register facade if it exists" contract in the wiring spec.
- *
- * The module is registered as "IoTIPLeakProtection" to disambiguate from the
- * identically-named class in the Privacy folder (ShadowStrike::Privacy).
- *
- * LIFECYCLE MAPPING
- * =================
- *   initialize() → IPLeakProtection::Instance().Initialize()
- *   start()      → IPLeakProtection::Instance().StartIoTModules()
- *   shutdown()   → IPLeakProtection::Instance().StopIoTModules()
- *                  IPLeakProtection::Instance().Shutdown()
- *
- * PHASE / CONFIG KEY
- * ==================
- *   Phase      : ModulePhase::OnDemand
- *   Config key : "Home/IoT/Enabled"
- *
- * @author ShadowStrike Security Team
- * @version 1.0.0
- * @date 2026
- * ============================================================================
+ * Registers each IoT subsystem independently so HomeProductOrchestrator can
+ * initialize, start, and tear down the stack in deterministic order.
  */
 
 #include "pch.h"
 
 #include "../HomeProductOrchestrator.hpp"
+#include "IoTDeviceScanner.hpp"
+#include "RouterSecurityChecker.hpp"
+#include "SmartHomeProtection.hpp"
+#include "WiFiSecurityAnalyzer.hpp"
 #include "IPLeakProtection.hpp"
 
 #include "../../../../PhantomCore/Utils/Logger.hpp"
@@ -69,98 +28,135 @@ namespace {
 
 constexpr const wchar_t* kLogCategory = L"IoTWiring";
 
+using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
+using ::ShadowStrike::Products::Home::ModuleDescriptor;
+using ::ShadowStrike::Products::Home::ModulePhase;
+
 struct IoTModulesRegistrar final {
     IoTModulesRegistrar() noexcept {
         try {
-            using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
-            using ::ShadowStrike::Products::Home::ModuleDescriptor;
-            using ::ShadowStrike::Products::Home::ModulePhase;
-            using ::ShadowStrike::IoT::IPLeakProtection;
-
-            // ----------------------------------------------------------------
-            // IoTIPLeakProtection — IoT integration facade
-            //
-            // IPLeakProtection is the designated integration point for all IoT
-            // subsystems.  Its Initialize() prepares IP-leak detection; its
-            // StartIoTModules() brings up the full IoT stack
-            // (IoTDeviceScanner, RouterSecurityChecker, SmartHomeProtection,
-            //  WiFiSecurityAnalyzer).  StopIoTModules() tears them all down
-            // before Shutdown() releases IPLeakProtection's own resources.
-            // ----------------------------------------------------------------
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
-                .name             = "IoTIPLeakProtection",
+                .name = "IoTDeviceScanner",
                 .enabledConfigKey = "Home/IoT/Enabled",
-                .phase            = ModulePhase::OnDemand,
-
+                .phase = ModulePhase::OnDemand,
                 .initialize = []() -> bool {
-                    try {
-                        if (!IPLeakProtection::Instance().Initialize()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"IoTIPLeakProtection: Initialize() returned false");
-                            return false;
-                        }
-                        return true;
-                    } catch (const std::exception& ex) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: initialize() threw: %hs", ex.what());
-                        return false;
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: initialize() threw unknown exception");
-                        return false;
-                    }
+                    ShadowStrike::IoT::IoTScannerConfiguration config;
+                    config.autoDiscoveryOnStartup = false;
+                    config.continuousMonitoring = false;
+                    config.defaultScanConfig.checkDefaultCredentials = false;
+                    return ShadowStrike::IoT::IoTDeviceScanner::Instance().Initialize(config);
                 },
-
-                // start() activates the full IoT stack via the integration facade.
                 .start = []() -> bool {
-                    try {
-                        if (!IPLeakProtection::Instance().StartIoTModules()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"IoTIPLeakProtection: StartIoTModules() returned false");
-                            return false;
-                        }
-                        return true;
-                    } catch (const std::exception& ex) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: start() threw: %hs", ex.what());
-                        return false;
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: start() threw unknown exception");
-                        return false;
-                    }
+                    return ShadowStrike::IoT::IoTDeviceScanner::Instance().IsInitialized();
                 },
-
-                .shutdown = []() noexcept {
-                    try {
-                        IPLeakProtection::Instance().StopIoTModules();
-                    } catch (const std::exception& ex) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: StopIoTModules() threw: %hs", ex.what());
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: StopIoTModules() threw unknown exception");
-                    }
-                    try {
-                        IPLeakProtection::Instance().Shutdown();
-                    } catch (const std::exception& ex) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: Shutdown() threw: %hs", ex.what());
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"IoTIPLeakProtection: Shutdown() threw unknown exception");
-                    }
+                .shutdown = []() {
+                    ShadowStrike::IoT::IoTDeviceScanner::Instance().StopScan();
+                    ShadowStrike::IoT::IoTDeviceScanner::Instance().Shutdown();
                 }
             });
 
+            HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
+                .name = "WiFiSecurityAnalyzer",
+                .enabledConfigKey = "Home/IoT/Enabled",
+                .phase = ModulePhase::OnDemand,
+                .initialize = []() -> bool {
+                    ShadowStrike::IoT::WiFiAnalyzerConfiguration config;
+                    config.continuousMonitoring = false;
+                    config.allowNearbyNetworkEnumeration = false;
+                    return ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance().Initialize(config);
+                },
+                .start = []() -> bool {
+                    auto& analyzer = ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance();
+                    if (!analyzer.IsInitialized()) {
+                        return false;
+                    }
+                    return analyzer.StartMonitoring();
+                },
+                .shutdown = []() {
+                    ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance().StopMonitoring();
+                    ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance().Shutdown();
+                }
+            });
+
+            HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
+                .name = "RouterSecurityChecker",
+                .enabledConfigKey = "Home/IoT/Enabled",
+                .phase = ModulePhase::OnDemand,
+                .initialize = []() -> bool {
+                    ShadowStrike::IoT::RouterCheckerConfiguration config;
+                    config.autoAssessOnStartup = false;
+                    config.defaultAssessmentConfig.checkDefaultCredentials = false;
+                    config.defaultAssessmentConfig.allowCredentialProbe = false;
+                    return ShadowStrike::IoT::RouterSecurityChecker::Instance().Initialize(config);
+                },
+                .start = []() -> bool {
+                    return ShadowStrike::IoT::RouterSecurityChecker::Instance().IsInitialized();
+                },
+                .shutdown = []() {
+                    ShadowStrike::IoT::RouterSecurityChecker::Instance().Shutdown();
+                }
+            });
+
+            HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
+                .name = "SmartHomeProtection",
+                .enabledConfigKey = "Home/IoT/Enabled",
+                .phase = ModulePhase::OnDemand,
+                .initialize = []() -> bool {
+                    ShadowStrike::IoT::SmartHomeConfiguration config;
+                    return ShadowStrike::IoT::SmartHomeProtection::Instance().Initialize(config);
+                },
+                .start = []() -> bool {
+                    auto& protection = ShadowStrike::IoT::SmartHomeProtection::Instance();
+                    if (!protection.IsInitialized()) {
+                        return false;
+                    }
+                    return protection.StartProtection();
+                },
+                .shutdown = []() {
+                    ShadowStrike::IoT::SmartHomeProtection::Instance().StopProtection();
+                    ShadowStrike::IoT::SmartHomeProtection::Instance().Shutdown();
+                }
+            });
+
+            HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
+                .name = "IoTIPLeakProtection",
+                .enabledConfigKey = "Home/IoT/Enabled",
+                .phase = ModulePhase::OnDemand,
+                .initialize = []() -> bool {
+                    ShadowStrike::IoT::IPLeakProtectionConfiguration config;
+                    config.allowExternalEndpointProbes = false;
+                    return ShadowStrike::IoT::IPLeakProtection::Instance().Initialize(config);
+                },
+                .start = []() -> bool {
+                    auto& protection = ShadowStrike::IoT::IPLeakProtection::Instance();
+                    if (!protection.IsInitialized()) {
+                        return false;
+                    }
+                    if (!protection.StartMonitoring()) {
+                        return false;
+                    }
+                    if (!protection.StartVPNMonitoring()) {
+                        protection.StopMonitoring();
+                        return false;
+                    }
+                    return true;
+                },
+                .shutdown = []() {
+                    auto& protection = ShadowStrike::IoT::IPLeakProtection::Instance();
+                    protection.StopVPNMonitoring();
+                    protection.StopMonitoring();
+                    protection.Shutdown();
+                }
+            });
+
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(kLogCategory, L"IoT wiring registration failed: %hs", ex.what());
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            SS_LOG_ERROR(kLogCategory, L"IoT wiring registration failed with unknown exception");
         }
     }
 };
 
-// Namespace-scope object — constructed before main(), exactly once per
-// PhantomHome binary (unnamed namespace prevents ODR issues in other TUs).
 const IoTModulesRegistrar g_iotModulesRegistrar{};
 
 }  // namespace

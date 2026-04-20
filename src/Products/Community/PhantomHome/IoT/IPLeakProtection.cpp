@@ -34,13 +34,13 @@
 
 #include "pch.h"
 #include "IPLeakProtection.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/RegistryUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/FileUtils.hpp"
+#include "../../../../PhantomCore/Utils/RegistryUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 #include "IoTDeviceScanner.hpp"
 #include "WiFiSecurityAnalyzer.hpp"
 #include "RouterSecurityChecker.hpp"
@@ -671,6 +671,16 @@ bool IPLeakProtectionConfiguration::IsValid() const noexcept {
         return false;
     }
 
+    if (allowedProbeHosts.size() > 16) {
+        return false;
+    }
+
+    for (const auto& host : allowedProbeHosts) {
+        if (host.empty() || host.size() > 253 || host.find("..") != std::string::npos) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -867,69 +877,45 @@ IPLeakProtectionImpl::~IPLeakProtectionImpl() {
 // ============================================================================
 
 bool IPLeakProtectionImpl::Initialize(const IPLeakProtectionConfiguration& config) {
-    bool shouldStartMonitoring = false;
-    bool shouldStartVPNMonitor = false;
-
     try {
-        std::unique_lock lock(m_mutex);
+        {
+            std::unique_lock lock(m_mutex);
 
-        if (m_isActive) {
-            Utils::Logger::Warn("IPLeakProtection already initialized");
-            return false;
+            if (m_isActive) {
+                Utils::Logger::Warn("IPLeakProtection already initialized");
+                return false;
+            }
+
+            m_status = ModuleStatus::Initializing;
+
+            if (!config.IsValid()) {
+                Utils::Logger::Error("Invalid IPLeakProtection configuration");
+                m_status = ModuleStatus::Error;
+                return false;
+            }
+
+            m_config = config;
+
+            WSADATA wsaData;
+            const int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (result != 0) {
+                Utils::Logger::Error("WSAStartup failed: {}", result);
+                m_status = ModuleStatus::Error;
+                return false;
+            }
+
+            m_stats.Reset();
+            m_isActive = true;
+            m_status = ModuleStatus::Running;
         }
 
-        m_status = ModuleStatus::Initializing;
-
-        // Validate configuration
-        if (!config.IsValid()) {
-            Utils::Logger::Error("Invalid IPLeakProtection configuration");
-            m_status = ModuleStatus::Error;
-            return false;
-        }
-
-        m_config = config;
-
-        // Initialize Winsock
-        WSADATA wsaData;
-        int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (result != 0) {
-            Utils::Logger::Error("WSAStartup failed: {}", result);
-            m_status = ModuleStatus::Error;
-            return false;
-        }
-
-        // Initialize statistics
-        m_stats.Reset();
-
-        m_isActive = true;
-        m_status = ModuleStatus::Running;
-
-        shouldStartVPNMonitor = m_config.enableVPNMonitoring;
-        shouldStartMonitoring = m_config.enabled;
-
-        // Release lock before calling methods that also acquire the mutex
-    }
-
-    // Detect initial VPN state (doesn't need m_mutex)
-    DetectVPNState();
-
-    // Start VPN monitoring outside of the lock
-    if (shouldStartVPNMonitor) {
-        StartVPNMonitoring();
-    }
-
-    // Start monitoring outside of the lock
-    if (shouldStartMonitoring) {
-        StartMonitoring();
-    }
-
-    Utils::Logger::Info("IPLeakProtection initialized successfully");
-    return true;
+        DetectVPNState();
+        Utils::Logger::Info("IPLeakProtection initialized successfully");
+        return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Critical("IPLeakProtection initialization failed: {}", e.what());
+        Utils::Logger::Error("IPLeakProtection initialization failed: {}", e.what());
         m_status = ModuleStatus::Error;
-        // Clean up Winsock if we started it
         WSACleanup();
         return false;
     }
@@ -1194,20 +1180,16 @@ IPLeakDetectionResult IPLeakProtectionImpl::CheckDNSLeak() {
             }
         }
 
-        // Perform actual DNS leak test: query a leak-test domain through system resolver
-        // and verify the responding DNS server is expected
-        for (const auto& testDomain : IPLeakConstants::DNS_LEAK_TEST_SERVERS) {
-            std::wstring wDomain = Utils::StringUtils::ToWide(testDomain);
-            std::vector<Utils::NetworkUtils::DnsRecord> records;
-            Utils::NetworkUtils::DnsQueryOptions queryOpts;
-            queryOpts.timeoutMs = IPLeakConstants::DNS_QUERY_TIMEOUT_MS;
-            queryOpts.useSystemDns = true;
+        bool allowExternalProbes = false;
+        {
+            std::shared_lock lock(m_mutex);
+            allowExternalProbes = m_config.allowExternalEndpointProbes;
+        }
 
-            Utils::NetworkUtils::Error netErr;
-            Utils::NetworkUtils::QueryDns(wDomain, Utils::NetworkUtils::DnsRecordType::TXT,
-                records, queryOpts, &netErr);
-            // The response from these services embeds the resolver's IP in the answer,
-            // allowing us to verify which DNS server actually handled the query.
+        if (allowExternalProbes) {
+            for (const auto& testDomain : IPLeakConstants::DNS_LEAK_TEST_SERVERS) {
+                PerformDNSQuery(testDomain, {});
+            }
         }
 
         // If VPN is connected but using ISP DNS — definitive leak
@@ -1512,6 +1494,14 @@ IPAddressInfo IPLeakProtectionImpl::GetPublicIP() {
     IPAddressInfo info;
 
     try {
+        {
+            std::shared_lock lock(m_mutex);
+            if (!m_config.allowExternalEndpointProbes) {
+                Utils::Logger::Info("Public IP lookup skipped because outbound probes are disabled");
+                return info;
+            }
+        }
+
         std::string publicIP = QueryPublicIP();
 
         if (publicIP.empty()) {
@@ -1986,26 +1976,104 @@ bool IPLeakProtectionImpl::StartIoTModules() {
     try {
         std::unique_lock lock(m_mutex);
 
-        // Start IoT sibling modules via their Meyers' singletons
-        bool allOk = true;
+        bool scannerInitialized = false;
+        bool wifiInitialized = false;
+        bool wifiStarted = false;
+        bool routerInitialized = false;
+        bool smartInitialized = false;
+        bool smartStarted = false;
 
-        if (IoTDeviceScanner::HasInstance()) {
-            m_iotStatus.deviceScannerActive = true;
+        auto rollback = [&]() noexcept {
+            if (smartStarted) {
+                SmartHomeProtection::Instance().StopProtection();
+            }
+            if (smartInitialized) {
+                SmartHomeProtection::Instance().Shutdown();
+            }
+            if (routerInitialized) {
+                RouterSecurityChecker::Instance().Shutdown();
+            }
+            if (wifiStarted) {
+                WiFiSecurityAnalyzer::Instance().StopMonitoring();
+            }
+            if (wifiInitialized) {
+                WiFiSecurityAnalyzer::Instance().Shutdown();
+            }
+            if (scannerInitialized) {
+                IoTDeviceScanner::Instance().StopScan();
+                IoTDeviceScanner::Instance().Shutdown();
+            }
+        };
+
+        IoTScannerConfiguration scannerConfig;
+        scannerConfig.autoDiscoveryOnStartup = false;
+        scannerConfig.continuousMonitoring = false;
+        scannerConfig.defaultScanConfig.checkDefaultCredentials = false;
+        if (!IoTDeviceScanner::Instance().IsInitialized()) {
+            if (!IoTDeviceScanner::Instance().Initialize(scannerConfig)) {
+                rollback();
+                return false;
+            }
+            scannerInitialized = true;
         }
-        if (WiFiSecurityAnalyzer::HasInstance()) {
-            m_iotStatus.wifiAnalyzerActive = true;
+
+        WiFiAnalyzerConfiguration wifiConfig;
+        wifiConfig.continuousMonitoring = true;
+        wifiConfig.allowNearbyNetworkEnumeration = false;
+        if (!WiFiSecurityAnalyzer::Instance().IsInitialized()) {
+            if (!WiFiSecurityAnalyzer::Instance().Initialize(wifiConfig)) {
+                rollback();
+                return false;
+            }
+            wifiInitialized = true;
         }
-        if (RouterSecurityChecker::HasInstance()) {
-            m_iotStatus.routerCheckerActive = true;
+        if (!WiFiSecurityAnalyzer::Instance().IsMonitoring()) {
+            if (!WiFiSecurityAnalyzer::Instance().StartMonitoring()) {
+                rollback();
+                return false;
+            }
+            wifiStarted = true;
         }
-        if (SmartHomeProtection::HasInstance()) {
-            m_iotStatus.smartHomeActive = true;
+
+        RouterCheckerConfiguration routerConfig;
+        routerConfig.autoAssessOnStartup = false;
+        routerConfig.defaultAssessmentConfig.checkDefaultCredentials = false;
+        routerConfig.defaultAssessmentConfig.allowCredentialProbe = false;
+        if (!RouterSecurityChecker::Instance().IsInitialized()) {
+            if (!RouterSecurityChecker::Instance().Initialize(routerConfig)) {
+                rollback();
+                return false;
+            }
+            routerInitialized = true;
         }
+
+        SmartHomeConfiguration smartConfig;
+        if (!SmartHomeProtection::Instance().IsInitialized()) {
+            if (!SmartHomeProtection::Instance().Initialize(smartConfig)) {
+                rollback();
+                return false;
+            }
+            smartInitialized = true;
+        }
+        if (!SmartHomeProtection::Instance().IsProtectionActive()) {
+            if (!SmartHomeProtection::Instance().StartProtection()) {
+                rollback();
+                return false;
+            }
+            smartStarted = true;
+        }
+
+        m_iotStatus.deviceScannerActive = IoTDeviceScanner::Instance().IsInitialized();
+        m_iotStatus.wifiAnalyzerActive = WiFiSecurityAnalyzer::Instance().IsInitialized();
+        m_iotStatus.routerCheckerActive = RouterSecurityChecker::Instance().IsInitialized();
+        m_iotStatus.smartHomeActive = SmartHomeProtection::Instance().IsInitialized();
 
         Utils::Logger::Info("IoT subsystem modules started (scanner={}, wifi={}, router={}, smart={})",
-            m_iotStatus.deviceScannerActive, m_iotStatus.wifiAnalyzerActive,
-            m_iotStatus.routerCheckerActive, m_iotStatus.smartHomeActive);
-        return allOk;
+            m_iotStatus.deviceScannerActive,
+            m_iotStatus.wifiAnalyzerActive,
+            m_iotStatus.routerCheckerActive,
+            m_iotStatus.smartHomeActive);
+        return true;
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("StartIoTModules failed: {}", e.what());
@@ -2016,11 +2084,23 @@ bool IPLeakProtectionImpl::StartIoTModules() {
 void IPLeakProtectionImpl::StopIoTModules() {
     try {
         std::unique_lock lock(m_mutex);
-        m_iotStatus.deviceScannerActive = false;
-        m_iotStatus.wifiAnalyzerActive = false;
-        m_iotStatus.routerCheckerActive = false;
-        m_iotStatus.smartHomeActive = false;
+        if (SmartHomeProtection::HasInstance()) {
+            SmartHomeProtection::Instance().StopProtection();
+            SmartHomeProtection::Instance().Shutdown();
+        }
+        if (RouterSecurityChecker::HasInstance()) {
+            RouterSecurityChecker::Instance().Shutdown();
+        }
+        if (WiFiSecurityAnalyzer::HasInstance()) {
+            WiFiSecurityAnalyzer::Instance().StopMonitoring();
+            WiFiSecurityAnalyzer::Instance().Shutdown();
+        }
+        if (IoTDeviceScanner::HasInstance()) {
+            IoTDeviceScanner::Instance().StopScan();
+            IoTDeviceScanner::Instance().Shutdown();
+        }
 
+        m_iotStatus = IoTSubsystemStatus{};
         Utils::Logger::Info("IoT subsystem modules stopped");
 
     } catch (const std::exception& e) {
@@ -2032,18 +2112,32 @@ bool IPLeakProtectionImpl::RunIoTSecurityScan() {
     try {
         Utils::Logger::Info("IoT security scan initiated");
 
-        // Trigger scans on available IoT modules
         if (IoTDeviceScanner::HasInstance()) {
-            // IoTDeviceScanner provides network device discovery
-            Utils::Logger::Debug("Triggering IoT device scan");
+            auto config = IoTDeviceScanner::Instance().GetConfiguration().defaultScanConfig;
+            config.checkDefaultCredentials = false;
+            if (!IoTDeviceScanner::Instance().StartDiscovery(config)) {
+                Utils::Logger::Warn("IoT security scan: device discovery did not start");
+            }
+            m_iotStatus.totalDevicesFound = static_cast<uint32_t>(
+                std::min(IoTDeviceScanner::Instance().GetNetworkMap().size(),
+                    static_cast<size_t>(UINT32_MAX)));
         }
 
         if (WiFiSecurityAnalyzer::HasInstance()) {
-            Utils::Logger::Debug("Triggering WiFi security scan");
+            m_iotStatus.wifiThreatsDetected = static_cast<uint32_t>(
+                std::min(WiFiSecurityAnalyzer::Instance().GetDetectedThreats().size(),
+                    static_cast<size_t>(UINT32_MAX)));
         }
 
         if (RouterSecurityChecker::HasInstance()) {
-            Utils::Logger::Debug("Triggering router security check");
+            const auto report = RouterSecurityChecker::Instance().QuickSecurityCheck();
+            m_iotStatus.routerVulnerabilities = static_cast<uint32_t>(report.securityIssues.size());
+        }
+
+        if (SmartHomeProtection::HasInstance()) {
+            m_iotStatus.smartHomeIssues = static_cast<uint32_t>(
+                std::min(SmartHomeProtection::Instance().GetAlerts().size(),
+                    static_cast<size_t>(UINT32_MAX)));
         }
 
         return true;
@@ -2147,7 +2241,7 @@ bool IPLeakProtectionImpl::SelfTest() {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Critical("Self-test failed with exception: {}", e.what());
+        Utils::Logger::Error("Self-test failed with exception: {}", e.what());
         return false;
     }
 }
