@@ -47,17 +47,22 @@ All six T0 items are finished. The Phantom Home build system is fully operationa
 
 ---
 
-## TIER 1: GLOBAL THREAT INTELLIGENCE — API KEYS & FEED SYSTEM
+## TIER 1: GLOBAL THREAT INTELLIGENCE — API KEYS & FEED SYSTEM ✅ COMPLETE
 
-### Current Status (Post-Survey)
-The `ThreatIntelFeedManager` is **80-90% production-ready**:
-- HTTP client: WinINet (Windows native), HTTPS, TLS cert validation ✅
-- IOC storage: Memory-mapped B+Tree/Radix/Trie, <100ns hash lookup ✅
-- JSON/CSV parsers: Implemented with size/depth caps ✅
-- Feed infrastructure: Concurrent sync, rate limiting, exponential backoff ✅
-- Credential sanitization: secureClear() with volatile overwrite ✅
-- **GAPS**: API key loading from env/config not wired, Feodo CSV parser incomplete,
-  STIX parser minimal. AI inference requires ONNX Runtime SDK (optional dep).
+All T1 items completed (April 2026). 7 commercially-free feed parsers implemented,
+hardened, and fuzz-tested. Paid feeds (VT/OTX/AbuseIPDB) safely deferred with dormancy
+guards. PhishTank API key registration deferred (temporarily disabled by Cisco Talos).
+
+**Fuzzer Validation (108,192 iterations, ZERO crashes):**
+- ThreatIntel Parser Fuzzer: 58,192 iterations, 0 crashes, 7,274 iter/s
+- ThreatIntel Format Fuzzer: 50,000 iterations, 0 crashes, 12,614 iter/s, 100% parse success
+- 14 ParserConfig variants × 3 parsers (JSON/CSV/STIX) exercised
+
+**Code Hardening Applied:**
+- CSV delimiter sentinel (`'\0'`) for line-per-IOC feeds (Feodo, ET Open, Botvrij)
+- Credential redaction (`GetSafeLogUrl()` + `pathContainsCredentials`) for PhishTank
+- Safe dormancy guard in `AddFeed()` — empty API key → log INFO + return true
+- All factories set priority, confidence, reputation, tags, field mappings
 
 ### 1A. Commercial-Use License Audit (VERIFIED — April 2026)
 
@@ -183,14 +188,21 @@ The `ThreatIntelFeedManager` is **80-90% production-ready**:
 
 ---
 
-## TIER 2: STATIC ANALYSIS — PVS-STUDIO & COVERITY SWEEP
+## TIER 2: STATIC ANALYSIS — COVERITY SWEEP (PROJECT-WIDE)
 
-Status: No repo-wide static analysis has been run except a partial sensor
-check. PVS-Studio and Coverity are industry-standard for catching bugs that
-compilers and code review miss.
+> **Decision (2026-04-20):** PVS-Studio dropped. As of April 10, 2026, the free
+> comment-based activation is dead. Their open-source license requires the project
+> to be "non-commercial" — our planned dual-license model (AGPLv3 + Commercial)
+> disqualifies ShadowStrike. Coverity Scan remains fully compatible with our
+> open-core model (AGPLv3 code is publicly registered → free scan).
+>
+> **Coverity workflow expanded:** `.github/workflows/coverity-scan.yml` now builds
+> ALL project modules (PhantomSensor, PhantomCoreLib, PhantomHome, Service, Tray,
+> UI, ShadowStrike engine, PhantomEDR, PhantomXDR) instead of only PhantomSensor.
+> Supports `workflow_dispatch` with scope selection: full / sensor-only / usermode-only.
 
-**Process:** The architect provides PVS-Studio / Coverity scan results
-per-module. Opus triages every finding into (a) false positive — suppress
+**Process:** The architect triggers Coverity scans (push to main, manual dispatch,
+or weekly cron). Opus triages every finding into (a) false positive — suppress
 with comment, or (b) real bug — fix at production-grade quality.
 
 - [ ] **T2-01 · PhantomCore scan**
