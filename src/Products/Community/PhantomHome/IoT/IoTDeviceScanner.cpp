@@ -59,11 +59,11 @@
 // ADDITIONAL INCLUDES
 // ============================================================================
 
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/Timer.hpp"
-#include "../Utils/HashUtils.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/Utils/JSONUtils.hpp"
+#include "../../../../PhantomCore/Utils/Timer.hpp"
+#include "../../../../PhantomCore/Utils/HashUtils.hpp"
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -412,6 +412,38 @@ namespace {
         }
 
         return hosts;
+    }
+
+    [[nodiscard]] std::optional<int> GetCIDRPrefixLength(const std::string& cidr) {
+        const auto slashPos = cidr.find('/');
+        if (slashPos == std::string::npos) {
+            return std::nullopt;
+        }
+
+        int prefixLen = 0;
+        const std::string maskStr = cidr.substr(slashPos + 1);
+        const auto [ptr, ec] = std::from_chars(maskStr.data(), maskStr.data() + maskStr.size(), prefixLen);
+        if (ec != std::errc{} || ptr != maskStr.data() + maskStr.size() || prefixLen < 0 || prefixLen > 32) {
+            return std::nullopt;
+        }
+
+        return prefixLen;
+    }
+
+    [[nodiscard]] bool IsSubnetScopeAllowed(const std::string& cidr, bool allowLargeSubnets) {
+        const auto prefixLen = GetCIDRPrefixLength(cidr);
+        if (!prefixLen.has_value()) {
+            return true;
+        }
+
+        if (*prefixLen <= 16 && !allowLargeSubnets) {
+            ::ShadowStrike::Utils::Logger::Warn(
+                "Rejecting broad subnet {} without explicit consent (minimum supported prefix is /17)",
+                cidr);
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -1369,14 +1401,22 @@ public:
     void ScanThreadFunc(std::vector<std::string> targets) {
         ::ShadowStrike::Utils::Logger::Info("Scan thread started for {} targets", targets.size());
 
-        auto scanStartTime = std::chrono::system_clock::now();
+        const auto scanStartTime = std::chrono::system_clock::now();
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(m_activeScanConfig.scanTimeoutMs);
         UpdateProgress(ScanStatus::Discovering, 0.0f, "");
 
         size_t count = 0;
         bool cancelled = false;
+        bool timedOut = false;
         for (const auto& ip : targets) {
             if (!m_scanActive.load(std::memory_order_acquire)) {
                 cancelled = true;
+                break;
+            }
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                timedOut = true;
                 break;
             }
 
@@ -1413,10 +1453,15 @@ public:
                 m_progress.devicesScanned++;
             }
 
-            count++;
+            ++count;
         }
 
-        if (cancelled) {
+        if (timedOut) {
+            UpdateProgress(ScanStatus::Error,
+                static_cast<float>(count) / static_cast<float>(targets.size()) * 100.0f,
+                "scan-timeout");
+            NotifyError("IoT scan timed out before completing all targets", ERROR_TIMEOUT);
+        } else if (cancelled) {
             UpdateProgress(ScanStatus::Cancelled,
                 static_cast<float>(count) / static_cast<float>(targets.size()) * 100.0f, "");
         } else {
@@ -1424,13 +1469,12 @@ public:
         }
 
         m_scanActive.store(false, std::memory_order_release);
-
-        // Generate summary
         GenerateScanSummary(scanStartTime);
 
         ::ShadowStrike::Utils::Logger::Info("Scan thread {} — {} devices found on {} targets",
-                            cancelled ? "cancelled" : "completed",
-                            m_progress.devicesFound, targets.size());
+                            timedOut ? "timed out" : (cancelled ? "cancelled" : "completed"),
+                            m_progress.devicesFound,
+                            targets.size());
     }
 
     // ========================================================================
@@ -1688,8 +1732,6 @@ void IoTDeviceScanner::Shutdown() {
 
 [[nodiscard]] bool IoTDeviceScanner::StartDiscovery(const IoTScanConfig& config) {
     try {
-        // Atomically claim the scan slot — prevents two concurrent calls from
-        // both passing the "is scan active?" check
         bool expected = false;
         if (!m_impl->m_scanActive.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
@@ -1697,8 +1739,6 @@ void IoTDeviceScanner::Shutdown() {
             return false;
         }
 
-        // From this point we own the scan slot.  Any failure path must
-        // reset m_scanActive to false before returning.
         auto releaseOnFailure = [this]() noexcept {
             m_impl->m_scanActive.store(false, std::memory_order_release);
         };
@@ -1709,10 +1749,29 @@ void IoTDeviceScanner::Shutdown() {
             return false;
         }
 
+        if (!config.IsValid()) {
+            ::ShadowStrike::Utils::Logger::Error("StartDiscovery rejected invalid scan configuration");
+            releaseOnFailure();
+            return false;
+        }
+
         m_impl->m_activeScanConfig = config;
 
-        // Generate target list using proper CIDR parsing
         std::vector<std::string> targets;
+        std::unordered_set<std::string> dedupedTargets;
+
+        auto appendTargets = [&](const std::string& cidr) {
+            if (!IsSubnetScopeAllowed(cidr, config.allowLargeSubnets)) {
+                return;
+            }
+
+            auto hosts = ParseCIDRToHosts(cidr);
+            for (auto& host : hosts) {
+                if (dedupedTargets.insert(host).second) {
+                    targets.push_back(std::move(host));
+                }
+            }
+        };
 
         if (config.targetSubnets.empty()) {
             auto interfaces = m_impl->EnumerateInterfaces();
@@ -1722,23 +1781,19 @@ void IoTDeviceScanner::Shutdown() {
 
                     std::string cidr = DeriveCIDRFromInterface(iface.ipv4Address, iface.subnetMask);
                     if (!cidr.empty()) {
-                        auto hosts = ParseCIDRToHosts(cidr);
-                        targets.insert(targets.end(), hosts.begin(), hosts.end());
-                        ::ShadowStrike::Utils::Logger::Info("Auto-detected subnet: {} ({} hosts)", cidr, hosts.size());
+                        appendTargets(cidr);
                     }
                 }
             }
         } else {
             for (const auto& subnet : config.targetSubnets) {
-                auto hosts = ParseCIDRToHosts(subnet);
-                targets.insert(targets.end(), hosts.begin(), hosts.end());
+                appendTargets(subnet);
             }
         }
 
-        // Remove excluded IPs using a set for O(1) lookup
         if (!config.excludedIPs.empty()) {
             std::unordered_set<std::string> excluded(config.excludedIPs.begin(),
-                                                      config.excludedIPs.end());
+                                                     config.excludedIPs.end());
             targets.erase(
                 std::remove_if(targets.begin(), targets.end(),
                     [&excluded](const std::string& ip) {
@@ -1748,32 +1803,34 @@ void IoTDeviceScanner::Shutdown() {
         }
 
         if (targets.empty()) {
-            ::ShadowStrike::Utils::Logger::Error("No targets to scan");
+            ::ShadowStrike::Utils::Logger::Error("No scan targets remained after scope validation");
             releaseOnFailure();
             return false;
         }
 
+        if (targets.size() > IoTConstants::MAX_TRACKED_DEVICES) {
+            ::ShadowStrike::Utils::Logger::Warn(
+                "Target set exceeded device cap ({}), truncating",
+                IoTConstants::MAX_TRACKED_DEVICES);
+            targets.resize(IoTConstants::MAX_TRACKED_DEVICES);
+        }
+
         ::ShadowStrike::Utils::Logger::Info("Starting IoT scan of {} targets", targets.size());
 
-        // Reset progress
         {
             std::unique_lock lock(m_impl->m_mutex);
             m_impl->m_progress = IoTScanProgress{};
             m_impl->m_progress.status = ScanStatus::Initializing;
         }
 
-        // Ensure previous thread is joined before starting new one
         if (m_impl->m_scanThread.joinable()) {
             m_impl->m_scanThread.join();
         }
 
         m_impl->m_status = ModuleStatus::Scanning;
-
         m_impl->m_scanThread = std::thread(
             &IoTDeviceScannerImpl::ScanThreadFunc, m_impl.get(), std::move(targets));
-
         m_impl->m_stats.totalScans++;
-
         return true;
 
     } catch (const std::exception& e) {
@@ -2275,13 +2332,13 @@ void IoTScanStatistics::Reset() noexcept {
     if (!defaultScanConfig.IsValid()) {
         return false;
     }
-    return true;
+    return enabled || (!autoDiscoveryOnStartup && !continuousMonitoring);
 }
 
 [[nodiscard]] bool IoTScanConfig::IsValid() const noexcept {
     if (scanTimeoutMs == 0) return false;
     if (scanTimeoutMs > 300000) return false; // Max 5 minutes
-    if (maxParallelScans == 0 || maxParallelScans > 100) return false;
+    if (maxParallelScans == 0 || maxParallelScans > IoTConstants::MAX_CONCURRENT_PORT_SCANS) return false;
     if (scanIntervalSeconds > 0 && scanIntervalSeconds < 60) return false; // Min 60s between auto-scans
     return true;
 }
@@ -2299,6 +2356,7 @@ void IoTScanStatistics::Reset() noexcept {
     j["enableMDNSDiscovery"] = enableMDNSDiscovery;
     j["enableARPScanning"] = enableARPScanning;
     j["enableCVEChecking"] = enableCVEChecking;
+    j["allowLargeSubnets"] = allowLargeSubnets;
     j["targetSubnets"] = targetSubnets;
     j["excludedIPs"] = excludedIPs;
     j["scanIntervalSeconds"] = scanIntervalSeconds;
