@@ -62,6 +62,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <atomic>
+#include <future>
 
 #pragma comment(lib, "Setupapi.lib")
 #pragma comment(lib, "Cfgmgr32.lib")
@@ -89,6 +90,47 @@ namespace {
     template<typename T>
     void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
         std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
+    enum class DeviceChangePayloadStatus : uint8_t {
+        Valid,
+        Ignore,
+        Malformed
+    };
+
+    [[nodiscard]] DeviceChangePayloadStatus TryExtractDeviceInterfaceName(
+        DWORD_PTR rawData,
+        const wchar_t*& nameBegin,
+        size_t& nameLength) noexcept {
+        __try {
+            auto* header = reinterpret_cast<PDEV_BROADCAST_HDR>(rawData);
+            if (header->dbch_size < sizeof(DEV_BROADCAST_HDR) ||
+                header->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE) {
+                return DeviceChangePayloadStatus::Ignore;
+            }
+
+            constexpr size_t kDeviceInterfaceNameOffset =
+                offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name);
+            if (header->dbch_size < kDeviceInterfaceNameOffset + sizeof(wchar_t)) {
+                return DeviceChangePayloadStatus::Malformed;
+            }
+
+            auto* interfaceData =
+                reinterpret_cast<PDEV_BROADCAST_DEVICEINTERFACE_W>(header);
+            const auto availableChars =
+                (static_cast<size_t>(header->dbch_size) - kDeviceInterfaceNameOffset) / sizeof(wchar_t);
+            const wchar_t* begin = interfaceData->dbcc_name;
+            const wchar_t* end = std::find(begin, begin + availableChars, L'\0');
+            if (end == begin + availableChars) {
+                return DeviceChangePayloadStatus::Malformed;
+            }
+
+            nameBegin = begin;
+            nameLength = static_cast<size_t>(end - begin);
+            return DeviceChangePayloadStatus::Valid;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return DeviceChangePayloadStatus::Malformed;
+        }
     }
 
     const wchar_t* const CLASS_NAME = L"ShadowStrikeUSBMonitorWindow";
@@ -132,6 +174,44 @@ namespace {
             }
         }
         return o.str();
+    }
+
+    [[nodiscard]] std::string SanitizeUsbField(std::string_view value,
+                                               size_t maxLen = 128) {
+        std::string output;
+        output.reserve(std::min(value.size(), maxLen));
+
+        for (unsigned char ch : value) {
+            if (output.size() >= maxLen) {
+                break;
+            }
+
+            if (ch == '\0') {
+                break;
+            }
+
+            if (ch < 0x20 || ch == 0x7F) {
+                continue;
+            }
+
+            output.push_back(static_cast<char>(ch));
+        }
+
+        return output;
+    }
+
+    [[nodiscard]] std::string RedactDeviceIdentifier(std::string_view value) {
+        if (value.empty()) {
+            return "unknown-device";
+        }
+
+        constexpr size_t kTailChars = 12;
+        const std::string sanitized = SanitizeUsbField(value, 256);
+        if (sanitized.size() <= kTailChars) {
+            return sanitized;
+        }
+
+        return "..." + sanitized.substr(sanitized.size() - kTailChars);
     }
 }
 
@@ -189,9 +269,11 @@ public:
     bool SelfTest();
 
 private:
-    void MonitorThreadProc();
+    void MonitorThreadProc(std::promise<bool> startupSignal);
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     void HandleDeviceChange(UINT nEventType, DWORD_PTR dwData);
+    void QueueNotificationWork(std::function<void()> workItem);
+    void NotificationWorkerProc(std::stop_token stopToken);
     void EnumerateDevices();
     std::optional<USBDeviceInfo> GetDeviceInfoFromPnP(const std::wstring& devicePath);
     void ProcessNewDevice(const USBDeviceInfo& device);
@@ -223,7 +305,10 @@ private:
     std::vector<ErrorCallback> m_errorCallbacks;
 
     mutable USBMonitorStatistics m_stats;
-    std::vector<std::jthread> m_notificationThreads;
+    mutable std::mutex m_notificationQueueMutex;
+    std::condition_variable m_notificationQueueCv;
+    std::deque<std::function<void()>> m_notificationQueue;
+    std::jthread m_notificationWorker;
 };
 
 // ============================================================================
@@ -255,6 +340,11 @@ bool USBDeviceMonitorImpl::Initialize(const USBMonitorConfiguration& config) {
     m_config = config;
     m_status.store(MonitorModuleStatus::Initializing, std::memory_order_release);
     AtomicValueStoreRelaxed(m_stats.startTime, Clock::now());
+    if (!m_notificationWorker.joinable()) {
+        m_notificationWorker = std::jthread([this](std::stop_token stopToken) {
+            NotificationWorkerProc(stopToken);
+        });
+    }
     m_status.store(MonitorModuleStatus::Running, std::memory_order_release);
 
     SS_LOG_INFO(L"USBMonitor", L"Initialized with history size: %zu", m_config.deviceHistorySize);
@@ -264,7 +354,15 @@ bool USBDeviceMonitorImpl::Initialize(const USBMonitorConfiguration& config) {
 void USBDeviceMonitorImpl::Shutdown() {
     StopMonitoring();
 
-    m_notificationThreads.clear();
+    {
+        std::lock_guard lock(m_notificationQueueMutex);
+        m_notificationQueue.clear();
+    }
+    if (m_notificationWorker.joinable()) {
+        m_notificationWorker.request_stop();
+        m_notificationQueueCv.notify_all();
+        m_notificationWorker.join();
+    }
 
     std::unique_lock lock(m_mutex);
     m_status.store(MonitorModuleStatus::Stopped, std::memory_order_release);
@@ -282,7 +380,23 @@ bool USBDeviceMonitorImpl::StartMonitoring() {
         m_stopThread.store(false, std::memory_order_release);
     }
 
-    m_monitorThread = std::jthread([this](std::stop_token st) { MonitorThreadProc(); });
+    std::promise<bool> startupPromise;
+    auto startupFuture = startupPromise.get_future();
+    m_monitorThread = std::jthread(
+        [this, startupSignal = std::move(startupPromise)](std::stop_token) mutable {
+            MonitorThreadProc(std::move(startupSignal));
+        });
+
+    const bool started = startupFuture.get();
+    if (!started) {
+        if (m_monitorThread.joinable()) {
+            m_monitorThread.join();
+        }
+        m_isMonitoring.store(false, std::memory_order_release);
+        m_status.store(MonitorModuleStatus::Error, std::memory_order_release);
+        SS_LOG_ERROR(L"USBMonitor", L"Monitoring startup failed");
+        return false;
+    }
 
     m_isMonitoring.store(true, std::memory_order_release);
     m_status.store(MonitorModuleStatus::Monitoring, std::memory_order_release);
@@ -304,6 +418,7 @@ void USBDeviceMonitorImpl::StopMonitoring() {
     }
 
     if (m_monitorThread.joinable()) {
+        m_monitorThread.request_stop();
         m_monitorThread.join();
     }
 
@@ -318,7 +433,7 @@ void USBDeviceMonitorImpl::StopMonitoring() {
     SS_LOG_INFO(L"USBMonitor", L"Monitoring stopped");
 }
 
-void USBDeviceMonitorImpl::MonitorThreadProc() {
+void USBDeviceMonitorImpl::MonitorThreadProc(std::promise<bool> startupSignal) {
     WNDCLASSEXW wx = {};
     wx.cbSize = sizeof(WNDCLASSEXW);
     wx.lpfnWndProc = USBDeviceMonitorImpl::WndProc;
@@ -329,6 +444,7 @@ void USBDeviceMonitorImpl::MonitorThreadProc() {
         DWORD err = GetLastError();
         if (err != ERROR_CLASS_ALREADY_EXISTS) {
             SS_LOG_ERROR(L"USBMonitor", L"RegisterClassExW failed: %lu", err);
+            startupSignal.set_value(false);
             return;
         }
     }
@@ -336,6 +452,7 @@ void USBDeviceMonitorImpl::MonitorThreadProc() {
     m_hNotifyWnd = CreateWindowExW(0, CLASS_NAME, WINDOW_NAME, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandle(nullptr), this);
     if (!m_hNotifyWnd) {
         SS_LOG_LAST_ERROR(L"USBMonitor", L"Failed to create notification window");
+        startupSignal.set_value(false);
         return;
     }
 
@@ -347,8 +464,13 @@ void USBDeviceMonitorImpl::MonitorThreadProc() {
     m_hDevNotify = RegisterDeviceNotificationW(m_hNotifyWnd, &notificationFilter, DEVICE_NOTIFY_WINDOW_HANDLE);
     if (!m_hDevNotify) {
         SS_LOG_LAST_ERROR(L"USBMonitor", L"Failed to register device notification");
+        DestroyWindow(m_hNotifyWnd);
+        m_hNotifyWnd = nullptr;
+        startupSignal.set_value(false);
+        return;
     }
 
+    startupSignal.set_value(true);
     EnumerateDevices();
 
     MSG msg;
@@ -368,6 +490,48 @@ void USBDeviceMonitorImpl::MonitorThreadProc() {
     }
 
     UnregisterClassW(CLASS_NAME, GetModuleHandle(nullptr));
+}
+
+void USBDeviceMonitorImpl::QueueNotificationWork(std::function<void()> workItem) {
+    constexpr size_t kMaxQueuedDeviceEvents = 128;
+    {
+        std::lock_guard lock(m_notificationQueueMutex);
+        if (m_notificationQueue.size() >= kMaxQueuedDeviceEvents) {
+            SS_LOG_WARN(L"USBMonitor", L"Dropping USB notification because worker queue is saturated");
+            return;
+        }
+
+        m_notificationQueue.emplace_back(std::move(workItem));
+    }
+
+    m_notificationQueueCv.notify_one();
+}
+
+void USBDeviceMonitorImpl::NotificationWorkerProc(std::stop_token stopToken) {
+    while (!stopToken.stop_requested()) {
+        std::function<void()> workItem;
+        {
+            std::unique_lock lock(m_notificationQueueMutex);
+            m_notificationQueueCv.wait(lock, [&]() {
+                return stopToken.stop_requested() || !m_notificationQueue.empty();
+            });
+
+            if (stopToken.stop_requested()) {
+                return;
+            }
+
+            workItem = std::move(m_notificationQueue.front());
+            m_notificationQueue.pop_front();
+        }
+
+        try {
+            workItem();
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(L"USBMonitor", L"USB notification worker exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_WARN(L"USBMonitor", L"USB notification worker exception");
+        }
+    }
 }
 
 LRESULT CALLBACK USBDeviceMonitorImpl::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -391,25 +555,35 @@ LRESULT CALLBACK USBDeviceMonitorImpl::WndProc(HWND hwnd, UINT msg, WPARAM wPara
 void USBDeviceMonitorImpl::HandleDeviceChange(UINT nEventType, DWORD_PTR dwData) {
     if (!dwData) return;
 
-    auto* pHdr = reinterpret_cast<PDEV_BROADCAST_HDR>(dwData);
-    if (pHdr->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE) return;
+    const wchar_t* nameBegin = nullptr;
+    size_t nameLength = 0;
+    const auto payloadStatus =
+        TryExtractDeviceInterfaceName(dwData, nameBegin, nameLength);
+    if (payloadStatus == DeviceChangePayloadStatus::Ignore) {
+        return;
+    }
 
-    auto* pDevInf = reinterpret_cast<PDEV_BROADCAST_DEVICEINTERFACE_W>(pHdr);
-    std::wstring dbcc_name = pDevInf->dbcc_name;
+    if (payloadStatus == DeviceChangePayloadStatus::Malformed) {
+        SS_LOG_WARN(L"USBMonitor", L"Rejected malformed WM_DEVICECHANGE payload");
+        return;
+    }
 
     if (nEventType == DBT_DEVICEARRIVAL) {
-        m_notificationThreads.emplace_back([this, dbcc_name]() {
+        const std::wstring dbccName(nameBegin, nameLength);
+        QueueNotificationWork([this, dbccName]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-            auto deviceOpt = GetDeviceInfoFromPnP(dbcc_name);
+            auto deviceOpt = GetDeviceInfoFromPnP(dbccName);
             if (deviceOpt) {
                 ProcessNewDevice(*deviceOpt);
             }
         });
     } else if (nEventType == DBT_DEVICEREMOVECOMPLETE) {
-        m_notificationThreads.emplace_back([this]() {
+        QueueNotificationWork([this]() {
             EnumerateDevices();
         });
+    } else {
+        return;
     }
 }
 
@@ -476,6 +650,11 @@ void USBDeviceMonitorImpl::EnumerateDevices() {
 }
 
 std::optional<USBDeviceInfo> USBDeviceMonitorImpl::GetDeviceInfoFromPnP(const std::wstring& devicePath) {
+    if (devicePath.empty() || devicePath.size() > 1024) {
+        SS_LOG_WARN(L"USBMonitor", L"Rejected malformed device interface path");
+        return std::nullopt;
+    }
+
     USBDeviceInfo info;
     info.status = DeviceStatus::Connected;
     info.connectionTime = std::chrono::system_clock::now();
@@ -501,7 +680,7 @@ std::optional<USBDeviceInfo> USBDeviceMonitorImpl::GetDeviceInfoFromPnP(const st
         } catch (...) {}
     }
 
-    info.deviceId = "USB\\VID_" + info.vendorId + "&PID_" + info.productId;
+    info.deviceId = SanitizeUsbField("USB\\VID_" + info.vendorId + "&PID_" + info.productId, 128);
     info.classCode = 0x08;
     info.subclassCode = 0x06;
     info.type = ClassifyDeviceType(info.classCode, info.subclassCode);
@@ -522,14 +701,15 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
         auto policyResult = dcm.EvaluateDevice(mutableDevice);
 
         SS_LOG_DEBUG(L"USBMonitor", L"Policy evaluation result: %hs for device %hs",
-            GetEvaluationResultName(policyResult.result).data(), device.deviceId.c_str());
+            GetEvaluationResultName(policyResult.result).data(),
+            RedactDeviceIdentifier(device.deviceId).c_str());
 
         access = policyResult.accessLevel;
         if (policyResult.result == EvaluationResult::Blocked) {
             blocked = true;
             m_stats.devicesBlocked.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_WARN(L"USBMonitor", L"Device blocked by policy: %hs (Rule: %hs)",
-                device.deviceId.c_str(), policyResult.matchingRuleName.c_str());
+                RedactDeviceIdentifier(device.deviceId).c_str(), policyResult.matchingRuleName.c_str());
         } else if (access == AccessLevel::ReadOnly) {
             m_stats.devicesReadOnly.fetch_add(1, std::memory_order_relaxed);
         }
@@ -548,7 +728,7 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
             auto analysisResult = badUsb.AnalyzeDevice(device.vid, device.pid);
             if (analysisResult != DeviceAnalysisResult::Safe) {
                 SS_LOG_WARN(L"USBMonitor", L"BadUSB suspicious device: %hs (Analysis: %hs)",
-                    device.deviceId.c_str(), GetDeviceAnalysisResultName(analysisResult).data());
+                    RedactDeviceIdentifier(device.deviceId).c_str(), GetDeviceAnalysisResultName(analysisResult).data());
 
                 if (analysisResult == DeviceAnalysisResult::KnownBadDevice ||
                     analysisResult == DeviceAnalysisResult::BlacklistedDevice) {
@@ -642,7 +822,7 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
     NotifyCallbacks(evt);
 
     SS_LOG_INFO(L"USBMonitor", L"Device connected: %hs (VID_%04X&PID_%04X) Access: %hs",
-        device.deviceId.c_str(), device.vid, device.pid, GetAccessLevelName(access).data());
+        RedactDeviceIdentifier(device.deviceId).c_str(), device.vid, device.pid, GetAccessLevelName(access).data());
 }
 
 void USBDeviceMonitorImpl::ProcessRemovedDevice(const std::string& deviceId) {
@@ -654,12 +834,12 @@ void USBDeviceMonitorImpl::ProcessRemovedDevice(const std::string& deviceId) {
     USBEvent evt;
     evt.type = DeviceEventType::Disconnected;
     evt.timestamp = std::chrono::system_clock::now();
-    evt.details = "Device disconnected: " + deviceId;
+    evt.details = "Device disconnected: " + RedactDeviceIdentifier(deviceId);
 
     LogEvent(DeviceEventType::Disconnected, USBDeviceInfo{}, AccessLevel::Blocked, evt.details);
     NotifyCallbacks(evt);
 
-    SS_LOG_INFO(L"USBMonitor", L"Device disconnected: %hs", deviceId.c_str());
+    SS_LOG_INFO(L"USBMonitor", L"Device disconnected: %hs", RedactDeviceIdentifier(deviceId).c_str());
 }
 
 AccessLevel USBDeviceMonitorImpl::EvaluatePolicy(const USBDeviceInfo& device) {
@@ -823,7 +1003,7 @@ bool USBDeviceMonitorImpl::SafeEjectDevice(const std::string& driveLetter) {
 
     HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hVolume == INVALID_HANDLE_VALUE) {
-        SS_LOG_LAST_ERROR(L"USBMonitor", L"Failed to open volume %s for eject", volumePath.c_str());
+        SS_LOG_LAST_ERROR(L"USBMonitor", L"Failed to open volume %ls for eject", volumePath.c_str());
         return false;
     }
 
@@ -844,7 +1024,7 @@ bool USBDeviceMonitorImpl::SafeEjectDevice(const std::string& driveLetter) {
 bool USBDeviceMonitorImpl::SafeEjectDeviceById(const std::string& deviceId) {
     std::string driveLetter = GetDriveLetterForDeviceId(deviceId);
     if (driveLetter.empty()) {
-        SS_LOG_ERROR(L"USBMonitor", L"No drive letter found for device %hs", deviceId.c_str());
+        SS_LOG_ERROR(L"USBMonitor", L"No drive letter found for device %hs", RedactDeviceIdentifier(deviceId).c_str());
         return false;
     }
     return SafeEjectDevice(driveLetter);
@@ -866,9 +1046,9 @@ void USBDeviceMonitorImpl::EmergencyBlockDevice(const std::string& deviceId) {
     }
 
     m_stats.emergencyBlocks.fetch_add(1, std::memory_order_relaxed);
-    SS_LOG_WARN(L"USBMonitor", L"EMERGENCY BLOCK triggered for device: %hs", deviceId.c_str());
+    SS_LOG_WARN(L"USBMonitor", L"EMERGENCY BLOCK triggered for device: %hs", RedactDeviceIdentifier(deviceId).c_str());
 
-    LogEvent(DeviceEventType::AccessDeniedPolicy, USBDeviceInfo{}, AccessLevel::Blocked, "Emergency block: " + deviceId);
+    LogEvent(DeviceEventType::AccessDeniedPolicy, USBDeviceInfo{}, AccessLevel::Blocked, "Emergency block: " + RedactDeviceIdentifier(deviceId));
 }
 
 bool USBDeviceMonitorImpl::UnblockDevice(const std::string& deviceId) {
@@ -877,7 +1057,7 @@ bool USBDeviceMonitorImpl::UnblockDevice(const std::string& deviceId) {
     if (it != m_connectedDevices.end()) {
         it->second.accessLevel = AccessLevel::FullAccess;
         it->second.status = DeviceStatus::Ready;
-        SS_LOG_INFO(L"USBMonitor", L"Device unblocked: %hs", deviceId.c_str());
+        SS_LOG_INFO(L"USBMonitor", L"Device unblocked: %hs", RedactDeviceIdentifier(deviceId).c_str());
         return true;
     }
     return false;
@@ -1302,12 +1482,12 @@ std::string FormatCapacity(uint64_t bytes) {
 // ============================================================================
 
 std::string USBDeviceInfo::ToString() const {
-    return deviceId + " (" + friendlyName + ")";
+    return RedactDeviceIdentifier(deviceId) + " (" + SanitizeUsbField(friendlyName) + ")";
 }
 
 std::string USBDeviceInfo::ToJson() const {
     std::ostringstream oss;
-    oss << "{\"deviceId\":\"" << EscapeJson(deviceId) << "\""
+    oss << "{\"deviceId\":\"" << EscapeJson(RedactDeviceIdentifier(deviceId)) << "\""
         << ",\"vid\":\"0x" << std::hex << std::setw(4) << std::setfill('0') << vid << "\""
         << ",\"pid\":\"0x" << std::hex << std::setw(4) << std::setfill('0') << pid << "\""
         << ",\"type\":\"" << GetDeviceTypeName(type) << "\""
