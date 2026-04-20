@@ -48,6 +48,7 @@
 #include "../PerfBudget/PerfBudget.hpp"
 #include "ServiceInstaller.hpp"
 #include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Update/UpdateManager.hpp"
 
 #pragma comment(lib, "wtsapi32.lib")
 
@@ -153,6 +154,36 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
         return;
     }
 
+    // ---- Update subsystem ----
+    // Initialization failure is non-fatal: the service continues to run as a
+    // pure scanner. Update status IPC falls back to safe defaults.
+    try {
+        ::ShadowStrike::Update::UpdateConfiguration uc{};
+        uc.enabled                  = true;
+        uc.autoUpdate               = true;
+        uc.channel                  = ::ShadowStrike::Update::UpdateChannel::Stable;
+        uc.checkIntervalHours       =
+            ::ShadowStrike::Update::UpdateConstants::DEFAULT_CHECK_INTERVAL_HOURS;
+        uc.stagingDirectory         = L"C:\\ProgramData\\ShadowStrike\\Update\\Staging";
+        uc.respectMeteredConnection = true;
+        uc.deferDuringGaming        = true;
+        uc.deferDuringHighCPU       = true;
+
+        if (!::ShadowStrike::Update::UpdateManager::Instance().Initialize(uc)) {
+            ShadowStrike::Utils::Logger::Warn(
+                "ServiceMain: UpdateManager::Initialize returned false; "
+                "service continuing without update subsystem");
+        } else {
+            ShadowStrike::Utils::Logger::Info("ServiceMain: UpdateManager initialized");
+        }
+    } catch (const std::exception& e) {
+        ShadowStrike::Utils::Logger::Warn(
+            "ServiceMain: UpdateManager init exception: {}", e.what());
+    } catch (...) {
+        ShadowStrike::Utils::Logger::Warn(
+            "ServiceMain: UpdateManager init unknown exception");
+    }
+
     // ---- IPC pipe server ----
     using namespace ShadowStrike::PhantomHome::IPC;
 
@@ -192,6 +223,15 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
     IPCRouter::Instance().Shutdown();
     server->Stop();
     server.reset();
+
+    try {
+        if (::ShadowStrike::Update::UpdateManager::HasInstance()) {
+            ::ShadowStrike::Update::UpdateManager::Instance().Shutdown();
+        }
+    } catch (...) {
+        // Shutdown best-effort; never block the service stop path.
+    }
+
     orch.Shutdown();
 
     ::CloseHandle(g_stop_event);
