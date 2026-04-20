@@ -59,12 +59,12 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -218,6 +218,17 @@ std::string NormalizeMacAddress(std::string_view mac) {
         }
     }
     return result;
+}
+
+[[nodiscard]] std::string RedactDeviceIdentifier(std::string_view value) {
+    if (value.empty()) {
+        return "<unknown>";
+    }
+    if (value.size() <= 6) {
+        return "***";
+    }
+    return std::string(value.substr(0, 2)) + "***" +
+           std::string(value.substr(value.size() - 2));
 }
 
 /**
@@ -635,8 +646,8 @@ bool SmartHomeProtectionImpl::MonitorDeviceInternal(const std::string& macAddres
         // Validate and normalize MAC address format
         std::string normalizedMac = NormalizeMacAddress(macAddress);
         if (normalizedMac.empty()) {
-            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Invalid MAC address format: {}",
-                               macAddress);
+            ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Invalid MAC address format for {}",
+                               RedactDeviceIdentifier(macAddress));
             return false;
         }
 
@@ -646,7 +657,7 @@ bool SmartHomeProtectionImpl::MonitorDeviceInternal(const std::string& macAddres
             // Check if already monitoring
             if (m_devices.find(normalizedMac) != m_devices.end()) {
                 ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Device already monitored: {}",
-                                  normalizedMac);
+                                  RedactDeviceIdentifier(normalizedMac));
                 return true;
             }
 
@@ -681,7 +692,7 @@ bool SmartHomeProtectionImpl::MonitorDeviceInternal(const std::string& macAddres
         // if callback re-enters any device method
 
         ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Now monitoring device: {}",
-                          normalizedMac);
+                          RedactDeviceIdentifier(normalizedMac));
 
         InvokeEventCallbacks(normalizedMac, SmartDeviceEvent::DeviceOnline);
 
@@ -707,7 +718,7 @@ bool SmartHomeProtectionImpl::UnmonitorDeviceInternal(const std::string& macAddr
             auto it = m_devices.find(lookupKey);
             if (it == m_devices.end()) {
                 ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Device not found: {}",
-                                  macAddress);
+                                  RedactDeviceIdentifier(macAddress));
                 return false;
             }
 
@@ -721,7 +732,7 @@ bool SmartHomeProtectionImpl::UnmonitorDeviceInternal(const std::string& macAddr
         // Lock released BEFORE callback invocation
 
         ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Stopped monitoring device: {}",
-                          lookupKey);
+                          RedactDeviceIdentifier(lookupKey));
 
         InvokeEventCallbacks(lookupKey, SmartDeviceEvent::DeviceOffline);
 
@@ -1227,7 +1238,7 @@ void SmartHomeProtectionImpl::DetectAnomalies(
             );
 
             ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Traffic anomaly detected for device: {}",
-                              deviceId);
+                              RedactDeviceIdentifier(deviceId));
 
             // On anomaly, run deep traffic analysis
             AnalyzeTraffic(deviceId, currentTraffic);
@@ -1565,7 +1576,7 @@ bool SmartHomeProtection::SetDevicePriority(const std::string& deviceId, bool hi
         it->second.isHighPriority = highPriority;
 
         ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Device {} priority: {}",
-                          deviceId,
+                          RedactDeviceIdentifier(deviceId),
                           highPriority ? "HIGH" : "NORMAL");
 
         return true;
@@ -1590,7 +1601,7 @@ bool SmartHomeProtection::SetPrivacySensitive(const std::string& deviceId, bool 
         it->second.isPrivacySensitive = sensitive;
 
         ::ShadowStrike::Utils::Logger::Info("SmartHomeProtection: Device {} privacy-sensitive: {}",
-                          deviceId,
+                          RedactDeviceIdentifier(deviceId),
                           sensitive ? "YES" : "NO");
 
         return true;
