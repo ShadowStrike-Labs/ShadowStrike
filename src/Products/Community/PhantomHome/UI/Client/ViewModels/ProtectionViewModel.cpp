@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QLocale>
 #include <QMetaObject>
+#include <QPointer>
 #include <QString>
 
 #include <format>
@@ -86,19 +87,21 @@ ProtectionViewModel::~ProtectionViewModel() {
 void ProtectionViewModel::wireClient() {
     if (!m_client) return;
 
-    m_client->SetStateCallback([this](bool connected) {
+    m_client->SetStateCallback([self = QPointer<ProtectionViewModel>(this)](bool connected) {
+        if (!self) return;
         QMetaObject::invokeMethod(
-            this, "onConnectionChanged", Qt::QueuedConnection,
+            self.data(), "onConnectionChanged", Qt::QueuedConnection,
             Q_ARG(bool, connected));
     });
 
-    m_client->SetPushCallback([this](const FrameEnvelope& env) {
+    m_client->SetPushCallback([self = QPointer<ProtectionViewModel>(this)](const FrameEnvelope& env) {
+        if (!self) return;
         switch (env.type) {
         case MessageType::EventStateChanged: {
             auto parsed = ProtectionStateReply::FromJson(env.payload);
             if (!parsed) return;
             QMetaObject::invokeMethod(
-                this, "onStateReply", Qt::QueuedConnection,
+                self.data(), "onStateReply", Qt::QueuedConnection,
                 Q_ARG(QString, OverallStateTag(parsed->state)),
                 Q_ARG(QString, QString::fromStdString(parsed->reason)),
                 Q_ARG(int,     static_cast<int>(parsed->active_threats)),
@@ -110,7 +113,7 @@ void ProtectionViewModel::wireClient() {
             QString module  = QString::fromStdString(env.payload.value("m", ""));
             QString sev     = QString::fromStdString(env.payload.value("sv", ""));
             QMetaObject::invokeMethod(
-                this, "onDetectionPush", Qt::QueuedConnection,
+                self.data(), "onDetectionPush", Qt::QueuedConnection,
                 Q_ARG(QString, title),
                 Q_ARG(QString, module),
                 Q_ARG(QString, sev));
@@ -126,12 +129,13 @@ void ProtectionViewModel::refreshAll() {
     if (!m_client) return;
 
     m_client->RequestAsync(MessageType::GetState, nlohmann::json::object(),
-        [this](std::optional<FrameEnvelope> reply) {
+        [self = QPointer<ProtectionViewModel>(this)](std::optional<FrameEnvelope> reply) {
+            if (!self) return;
             if (!reply) return;
             auto parsed = ProtectionStateReply::FromJson(reply->payload);
             if (!parsed) return;
             QMetaObject::invokeMethod(
-                this, "onStateReply", Qt::QueuedConnection,
+                self.data(), "onStateReply", Qt::QueuedConnection,
                 Q_ARG(QString, OverallStateTag(parsed->state)),
                 Q_ARG(QString, QString::fromStdString(parsed->reason)),
                 Q_ARG(int,     static_cast<int>(parsed->active_threats)),
@@ -139,7 +143,8 @@ void ProtectionViewModel::refreshAll() {
         });
 
     m_client->RequestAsync(MessageType::GetModuleStatus, nlohmann::json::object(),
-        [this](std::optional<FrameEnvelope> reply) {
+        [self = QPointer<ProtectionViewModel>(this)](std::optional<FrameEnvelope> reply) {
+            if (!self) return;
             if (!reply) return;
             auto parsed = GetModuleStatusReply::FromJson(reply->payload);
             if (!parsed) return;
@@ -155,9 +160,10 @@ void ProtectionViewModel::refreshAll() {
                 r.insert(QStringLiteral("group"),       QString::fromStdString(m.group));
                 vl.push_back(std::move(r));
             }
-            QMetaObject::invokeMethod(this, [this, list = std::move(vl)]() {
-                m_modules = list;
-                emit modulesChanged();
+            QMetaObject::invokeMethod(self.data(), [self, list = std::move(vl)]() mutable {
+                if (!self) return;
+                self->m_modules = std::move(list);
+                emit self->modulesChanged();
             }, Qt::QueuedConnection);
         });
 }
@@ -177,7 +183,10 @@ void ProtectionViewModel::setModuleEnabled(const QString& id, bool enabled) {
         {"e",  enabled},
     };
     m_client->RequestAsync(MessageType::SetModuleEnable, payload,
-        [this](std::optional<FrameEnvelope>) { refreshAll(); });
+        [self = QPointer<ProtectionViewModel>(this)](std::optional<FrameEnvelope>) {
+            if (!self) return;
+            self->refreshAll();
+        });
 }
 
 void ProtectionViewModel::onStateReply(QString state,

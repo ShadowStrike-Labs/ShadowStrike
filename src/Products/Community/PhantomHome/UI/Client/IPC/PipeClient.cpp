@@ -12,6 +12,7 @@
 #include "PipeClient.hpp"
 
 #include <algorithm>
+#include <array>
 #include <format>
 #include <span>
 
@@ -20,6 +21,101 @@
 namespace ShadowStrike::PhantomHome::IPC {
 
 namespace {
+
+constexpr const wchar_t* kPhantomServiceName = L"ShadowStrikePhantomService";
+
+class ScopedHandle {
+public:
+    ScopedHandle() = default;
+    explicit ScopedHandle(HANDLE h) : h_(h) {}
+    ~ScopedHandle() {
+        if (h_ != nullptr && h_ != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(h_);
+        }
+    }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    [[nodiscard]] HANDLE get() const noexcept { return h_; }
+    [[nodiscard]] HANDLE* put() noexcept { return &h_; }
+    [[nodiscard]] bool valid() const noexcept {
+        return h_ != nullptr && h_ != INVALID_HANDLE_VALUE;
+    }
+
+private:
+    HANDLE h_{nullptr};
+};
+
+class ScopedServiceHandle {
+public:
+    ScopedServiceHandle() = default;
+    explicit ScopedServiceHandle(SC_HANDLE h) : h_(h) {}
+    ~ScopedServiceHandle() {
+        if (h_ != nullptr) {
+            ::CloseServiceHandle(h_);
+        }
+    }
+
+    ScopedServiceHandle(const ScopedServiceHandle&) = delete;
+    ScopedServiceHandle& operator=(const ScopedServiceHandle&) = delete;
+
+    [[nodiscard]] SC_HANDLE get() const noexcept { return h_; }
+    [[nodiscard]] bool valid() const noexcept { return h_ != nullptr; }
+
+private:
+    SC_HANDLE h_{nullptr};
+};
+
+static bool QueryTokenInformation(HANDLE token,
+                                  TOKEN_INFORMATION_CLASS klass,
+                                  std::vector<std::uint8_t>& out) {
+    DWORD need = 0;
+    ::GetTokenInformation(token, klass, nullptr, 0, &need);
+    if (need == 0 || need > 64 * 1024) return false;
+    out.assign(need, 0);
+    return ::GetTokenInformation(token, klass, out.data(), need, &need) != FALSE;
+}
+
+static bool IsLocalSystemToken(HANDLE token) {
+    std::vector<std::uint8_t> user_buf;
+    if (!QueryTokenInformation(token, TokenUser, user_buf)) return false;
+
+    const auto* user = reinterpret_cast<const TOKEN_USER*>(user_buf.data());
+    if (!user || !user->User.Sid || !::IsValidSid(user->User.Sid)) return false;
+
+    std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> sid_buf{};
+    DWORD sid_size = static_cast<DWORD>(sid_buf.size());
+    if (!::CreateWellKnownSid(WinLocalSystemSid, nullptr, sid_buf.data(), &sid_size)) {
+        return false;
+    }
+
+    return ::EqualSid(user->User.Sid, sid_buf.data()) != FALSE;
+}
+
+static std::optional<DWORD> QueryExpectedServicePid() {
+    ScopedServiceHandle scm(::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm.valid()) return std::nullopt;
+
+    ScopedServiceHandle svc(::OpenServiceW(scm.get(), kPhantomServiceName, SERVICE_QUERY_STATUS));
+    if (!svc.valid()) return std::nullopt;
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytes_needed = 0;
+    if (!::QueryServiceStatusEx(svc.get(),
+                                SC_STATUS_PROCESS_INFO,
+                                reinterpret_cast<LPBYTE>(&status),
+                                sizeof(status),
+                                &bytes_needed)) {
+        return std::nullopt;
+    }
+
+    if (status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId == 0) {
+        return std::nullopt;
+    }
+
+    return status.dwProcessId;
+}
 
 static bool WriteExact(HANDLE pipe, const void* buf, std::uint32_t size) {
     const auto* p = static_cast<const std::uint8_t*>(buf);
@@ -78,6 +174,7 @@ void PipeClient::Start() {
 void PipeClient::Stop() noexcept {
     if (!running_.exchange(false)) return;
     stopping_.store(true);
+    connected_.store(false);
 
     HANDLE h = pipe_;
     if (h != INVALID_HANDLE_VALUE) {
@@ -87,8 +184,8 @@ void PipeClient::Stop() noexcept {
     }
     if (connect_thread_.joinable()) connect_thread_.join();
     if (read_thread_.joinable())    read_thread_.join();
-
     CancelAllPending();
+    JoinAsyncThreads();
 }
 
 void PipeClient::CancelAllPending() {
@@ -100,6 +197,20 @@ void PipeClient::CancelAllPending() {
     }
     for (auto& [id, p] : snapshot) {
         try { p->promise.set_value(std::nullopt); } catch (...) {}
+    }
+}
+
+void PipeClient::JoinAsyncThreads() noexcept {
+    std::vector<std::thread> snapshot;
+    {
+        std::scoped_lock lk(async_threads_mutex_);
+        snapshot.swap(async_threads_);
+    }
+
+    for (auto& t : snapshot) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
 }
 
@@ -133,6 +244,47 @@ bool PipeClient::WriteFrame(std::span<const std::uint8_t> bytes) {
     std::scoped_lock lk(write_mutex_);
     if (!WriteExact(pipe_, &len_le, sizeof(len_le))) return false;
     return WriteExact(pipe_, bytes.data(), len_le);
+}
+
+bool PipeClient::VerifyServerIdentity(HANDLE pipe) const {
+    ULONG server_pid = 0;
+    if (!::GetNamedPipeServerProcessId(pipe, &server_pid) || server_pid == 0) {
+        ShadowStrike::Utils::Logger::Warn(
+            "PipeClient: failed to query pipe server pid gle={}", ::GetLastError());
+        return false;
+    }
+
+    const auto expected_pid = QueryExpectedServicePid();
+    if (!expected_pid || *expected_pid != static_cast<DWORD>(server_pid)) {
+        ShadowStrike::Utils::Logger::Warn(
+            "PipeClient: rejecting pipe server pid={} because it does not match the SCM service instance",
+            server_pid);
+        return false;
+    }
+
+    ScopedHandle process(::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, server_pid));
+    if (!process.valid()) {
+        ShadowStrike::Utils::Logger::Warn(
+            "PipeClient: failed to open pipe server process pid={} gle={}",
+            server_pid, ::GetLastError());
+        return false;
+    }
+
+    ScopedHandle token;
+    if (!::OpenProcessToken(process.get(), TOKEN_QUERY, token.put()) || !token.valid()) {
+        ShadowStrike::Utils::Logger::Warn(
+            "PipeClient: failed to open pipe server token pid={} gle={}",
+            server_pid, ::GetLastError());
+        return false;
+    }
+
+    if (!IsLocalSystemToken(token.get())) {
+        ShadowStrike::Utils::Logger::Warn(
+            "PipeClient: rejecting non-LocalSystem pipe server pid={}", server_pid);
+        return false;
+    }
+
+    return true;
 }
 
 bool PipeClient::PerformHandshake() {
@@ -178,6 +330,14 @@ void PipeClient::ConnectLoop() {
                                  GENERIC_READ | GENERIC_WRITE,
                                  0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
+            if (stopping_.load()) break;
+            std::this_thread::sleep_for(backoff);
+            backoff = std::min(backoff * 2, options_.reconnect_max);
+            continue;
+        }
+
+        if (!VerifyServerIdentity(h)) {
+            ::CloseHandle(h);
             if (stopping_.load()) break;
             std::this_thread::sleep_for(backoff);
             backoff = std::min(backoff * 2, options_.reconnect_max);
@@ -291,10 +451,13 @@ std::optional<FrameEnvelope> PipeClient::Request(MessageType type, const nlohman
 void PipeClient::RequestAsync(MessageType type,
                               const nlohmann::json& payload,
                               RequestCallback callback) {
-    std::thread([this, type, payload, cb = std::move(callback)]() mutable {
+    std::thread worker([this, type, payload, cb = std::move(callback)]() mutable {
         auto r = Request(type, payload);
         try { cb(std::move(r)); } catch (...) {}
-    }).detach();
+    });
+
+    std::scoped_lock lk(async_threads_mutex_);
+    async_threads_.emplace_back(std::move(worker));
 }
 
 }  // namespace ShadowStrike::PhantomHome::IPC

@@ -75,9 +75,9 @@ int main(int argc, char* argv[]) {
 
     const int rc = app.exec();
 
-    // Graceful teardown order: QML (app.exec return) → VM → PipeClient.
-    vm.reset();
+    // Graceful teardown order: QML (app.exec return) → PipeClient → VM.
     client->Stop();
+    vm.reset();
     client.reset();
     return rc;
 }
