@@ -42,10 +42,6 @@
 #include <numeric>
 #include <cctype>
 
-// Windows Headers for SSL/TLS certificate analysis
-#include <winhttp.h>
-#pragma comment(lib, "winhttp.lib")
-
 namespace ShadowStrike {
 namespace WebBrowser {
 
@@ -115,6 +111,16 @@ namespace {
     inline constexpr size_t MAX_FORM_REGEX_ITERS  = 10'000;
     inline constexpr int    TYPOSQUAT_MAX_EDIT_DIST = 3;
     inline constexpr double TYPOSQUAT_SIMILARITY_THRESHOLD = 0.75;
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
 }
 
 // ============================================================================
@@ -875,103 +881,28 @@ public:
     CertificateAnalysis AnalyzeCertificateInternal(const std::string& url) {
         CertificateAnalysis certResult;
 
-        // Parse URL to extract host and port
-        std::regex urlRegex(R"(^https?://([^/:]+)(?::(\d+))?)");
-        std::smatch match;
-        if (!std::regex_search(url, match, urlRegex) || match.size() < 2) {
+        const std::wstring wideUrl = Utils::StringUtils::ToWide(url);
+        if (wideUrl.empty()) {
             return certResult;
         }
 
-        std::string host = match[1].str();
-        int port = 443;
-        if (match.size() >= 3 && match[2].matched) {
-            port = std::stoi(match[2].str());
-        }
-
-        // Only analyze HTTPS URLs
-        if (url.find("https://") != 0) {
+        Utils::NetworkUtils::UrlComponents components;
+        Utils::NetworkUtils::Error parseError;
+        if (!Utils::NetworkUtils::ParseUrl(wideUrl, components, &parseError) ||
+            !Utils::StringUtils::IEquals(components.scheme, L"https") ||
+            components.host.empty()) {
             return certResult;
         }
 
-        std::wstring wHost = Utils::StringUtils::ToWide(host);
-
-        HINTERNET hSession = WinHttpOpen(
-            L"ShadowStrike/3.0 CertAnalyzer",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-
-        if (!hSession) return certResult;
-
-        HINTERNET hConnect = WinHttpConnect(hSession, wHost.c_str(),
-                                            static_cast<INTERNET_PORT>(port), 0);
-        if (!hConnect) {
-            WinHttpCloseHandle(hSession);
-            return certResult;
-        }
-
-        HINTERNET hRequest = WinHttpOpenRequest(
-            hConnect, L"HEAD", L"/",
-            nullptr, WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
-
-        if (!hRequest) {
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            return certResult;
-        }
-
-        // Set timeout (5 seconds)
-        DWORD timeout = 5000;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
-
-        // Allow invalid certificates so we can inspect them
-        DWORD secFlags = SECURITY_FLAG_IGNORE_ALL_CERT_ERRORS;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
-
-        BOOL sendOk = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-        if (sendOk) {
-            WinHttpReceiveResponse(hRequest, nullptr);
-        }
-
-        // Extract certificate info
-        WINHTTP_CERTIFICATE_INFO certInfo{};
-        DWORD certInfoSize = sizeof(certInfo);
-        if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_SECURITY_CERTIFICATE_STRUCT,
-                               &certInfo, &certInfoSize)) {
+        Utils::NetworkUtils::SslCertificateInfo certInfo;
+        const uint16_t port = components.port == 0 ? static_cast<uint16_t>(443) : components.port;
+        if (Utils::NetworkUtils::GetSslCertificate(components.host, port, certInfo, &parseError)) {
             certResult.hasCertificate = true;
-
-            if (certInfo.lpszSubjectInfo) {
-                certResult.subjectCN = Utils::StringUtils::ToNarrow(certInfo.lpszSubjectInfo);
-                LocalFree(certInfo.lpszSubjectInfo);
-            }
-            if (certInfo.lpszIssuerInfo) {
-                certResult.issuer = Utils::StringUtils::ToNarrow(certInfo.lpszIssuerInfo);
-                LocalFree(certInfo.lpszIssuerInfo);
-            }
-
-            // Check validity
-            certResult.isValid = true; // If we got cert info, the handshake succeeded
-
-            // Convert FILETIME to system_clock::time_point
-            auto FTToTP = [](const FILETIME& ft) -> SystemTimePoint {
-                ULARGE_INTEGER uli;
-                uli.LowPart  = ft.dwLowDateTime;
-                uli.HighPart = ft.dwHighDateTime;
-                // Windows FILETIME epoch: Jan 1, 1601
-                // Unix epoch: Jan 1, 1970
-                constexpr uint64_t kEpochDiff = 116444736000000000ULL;
-                if (uli.QuadPart < kEpochDiff) return SystemTimePoint{};
-                auto microseconds = (uli.QuadPart - kEpochDiff) / 10;
-                return SystemTimePoint{std::chrono::microseconds{microseconds}};
-            };
-
-            certResult.validFrom = FTToTP(certInfo.ftStart);
-            certResult.validTo   = FTToTP(certInfo.ftExpiry);
+            certResult.subjectCN = Utils::StringUtils::ToNarrow(certInfo.subject);
+            certResult.issuer = Utils::StringUtils::ToNarrow(certInfo.issuer);
+            certResult.isValid = certInfo.isValid;
+            certResult.validFrom = certInfo.validFrom;
+            certResult.validTo = certInfo.validTo;
 
             // Calculate days until expiry
             auto now = std::chrono::system_clock::now();
@@ -993,19 +924,11 @@ public:
                 certResult.isFreeCert = true;
             }
 
-            // Self-signed detection (subject == issuer)
+            certResult.isSelfSigned = certInfo.isSelfSigned;
             if (certResult.subjectCN == certResult.issuer && !certResult.subjectCN.empty()) {
                 certResult.isSelfSigned = true;
             }
-
-            if (certInfo.lpszProtocolName) LocalFree(certInfo.lpszProtocolName);
-            if (certInfo.lpszSignatureAlgName) LocalFree(certInfo.lpszSignatureAlgName);
-            if (certInfo.lpszEncryptionAlgName) LocalFree(certInfo.lpszEncryptionAlgName);
         }
-
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
 
         return certResult;
     }
@@ -1080,6 +1003,11 @@ bool PhishingDetector::Initialize(const PhishingDetectorConfiguration& config) {
     }
 
     m_impl->m_status = ModuleStatus::Initializing;
+    if (!config.IsValid()) {
+        m_impl->m_status = ModuleStatus::Error;
+        Logger::Error("PhishingDetector: invalid configuration rejected");
+        return false;
+    }
     m_impl->m_config = config;
 
     // Populate brand-to-domain mapping from defaults
@@ -1404,7 +1332,25 @@ void PhishingDetector::UnregisterCallbacks() {
 }
 
 PhishingDetectorStatistics PhishingDetector::GetStatistics() const {
-    return m_impl->m_stats;
+    PhishingDetectorStatistics copy;
+    copy.totalAnalyzed.store(m_impl->m_stats.totalAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.phishingDetected.store(m_impl->m_stats.phishingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.suspiciousDetected.store(m_impl->m_stats.suspiciousDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.safeDetected.store(m_impl->m_stats.safeDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.homographsDetected.store(m_impl->m_stats.homographsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.typosquattingDetected.store(m_impl->m_stats.typosquattingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.brandImpersonationDetected.store(m_impl->m_stats.brandImpersonationDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.loginFormsAnalyzed.store(m_impl->m_stats.loginFormsAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.certificatesChecked.store(m_impl->m_stats.certificatesChecked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy.threatIntelMatches.store(m_impl->m_stats.threatIntelMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    for (size_t i = 0; i < m_impl->m_stats.byVerdict.size(); ++i) {
+        copy.byVerdict[i].store(m_impl->m_stats.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < m_impl->m_stats.byIndicator.size(); ++i) {
+        copy.byIndicator[i].store(m_impl->m_stats.byIndicator[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    AtomicValueStoreRelaxed(copy.startTime, AtomicValueLoadRelaxed(m_impl->m_stats.startTime));
+    return copy;
 }
 
 void PhishingDetector::ResetStatistics() {
@@ -1553,11 +1499,17 @@ std::wstring DecodePunycode(const std::string& domain) {
 
     // Windows IdnToUnicode conversion
     std::wstring wideDomain = Utils::StringUtils::ToWide(domain);
-    int needed = IdnToUnicode(0, wideDomain.c_str(), static_cast<int>(wideDomain.size()), nullptr, 0);
-    if (needed <= 0) return wideDomain;
+    int needed = IdnToUnicode(IDN_USE_STD3_ASCII_RULES,
+                              wideDomain.c_str(),
+                              static_cast<int>(wideDomain.size()),
+                              nullptr,
+                              0);
+    if (needed <= 0 || needed > 512) return wideDomain;
 
     std::wstring decoded(static_cast<size_t>(needed), L'\0');
-    int result = IdnToUnicode(0, wideDomain.c_str(), static_cast<int>(wideDomain.size()),
+    int result = IdnToUnicode(IDN_USE_STD3_ASCII_RULES,
+                              wideDomain.c_str(),
+                              static_cast<int>(wideDomain.size()),
                               decoded.data(), needed);
     if (result <= 0) return wideDomain;
     decoded.resize(static_cast<size_t>(result));
@@ -1683,7 +1635,7 @@ void PhishingDetectorStatistics::Reset() noexcept {
     threatIntelMatches       = 0;
     for (auto& v : byVerdict)   v.store(0, std::memory_order_relaxed);
     for (auto& v : byIndicator) v.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string PhishingDetectorStatistics::ToJson() const {
