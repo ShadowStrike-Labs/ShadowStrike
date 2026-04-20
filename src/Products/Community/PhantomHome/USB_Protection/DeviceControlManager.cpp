@@ -51,6 +51,7 @@
 #include "PhantomCore/Utils/ProcessUtils.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <sstream>
 #include <iomanip>
 #include <regex>
@@ -1012,7 +1013,13 @@ private:
     }
 
     void NotifyError(const std::string& message, int code) {
-        for (const auto& callback : m_errorCallbacks) {
+        std::vector<ErrorCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks = m_errorCallbacks;
+        }
+
+        for (const auto& callback : callbacks) {
             try {
                 callback(message, code);
             } catch (...) {
@@ -1509,7 +1516,6 @@ bool UserCondition::AllowsCurrentUser() const {
                 // Convert group name to SID
                 PSID pSid = NULL;
                 DWORD sidSize = 0;
-                wchar_t* domainName = NULL;
                 DWORD domainSize = 0;
                 SID_NAME_USE sidUse;
                 
@@ -1518,19 +1524,17 @@ bool UserCondition::AllowsCurrentUser() const {
                 
                 if (sidSize > 0) {
                     pSid = (PSID)LocalAlloc(LPTR, sidSize);
-                    domainName = new wchar_t[domainSize];
+                    auto domainBuf = std::make_unique<wchar_t[]>(domainSize);
                     
-                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainName, &domainSize, &sidUse)) {
+                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainBuf.get(), &domainSize, &sidUse)) {
                         BOOL isMember = FALSE;
                         if (CheckTokenMembership(hToken, pSid, &isMember) && isMember) {
-                            delete[] domainName;
                             LocalFree(pSid);
                             CloseHandle(hToken);
                             return false;  // User is in denied group
                         }
                     }
                     
-                    delete[] domainName;
                     LocalFree(pSid);
                 }
             }
@@ -1561,7 +1565,6 @@ bool UserCondition::AllowsCurrentUser() const {
                 
                 PSID pSid = NULL;
                 DWORD sidSize = 0;
-                wchar_t* domainName = NULL;
                 DWORD domainSize = 0;
                 SID_NAME_USE sidUse;
                 
@@ -1570,19 +1573,17 @@ bool UserCondition::AllowsCurrentUser() const {
                 
                 if (sidSize > 0) {
                     pSid = (PSID)LocalAlloc(LPTR, sidSize);
-                    domainName = new wchar_t[domainSize];
+                    auto domainBuf = std::make_unique<wchar_t[]>(domainSize);
                     
-                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainName, &domainSize, &sidUse)) {
+                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainBuf.get(), &domainSize, &sidUse)) {
                         BOOL isMember = FALSE;
                         if (CheckTokenMembership(hToken, pSid, &isMember) && isMember) {
                             foundInGroup = true;
-                            delete[] domainName;
                             LocalFree(pSid);
                             break;
                         }
                     }
                     
-                    delete[] domainName;
                     LocalFree(pSid);
                 }
             }
@@ -1815,20 +1816,6 @@ bool DeviceControlConfiguration::IsValid() const noexcept {
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
-
-std::string_view GetAccessLevelName(AccessLevel level) noexcept {
-    switch (level) {
-        case AccessLevel::FullAccess:     return "FullAccess";
-        case AccessLevel::ReadOnly:       return "ReadOnly";
-        case AccessLevel::WriteOnly:      return "WriteOnly";
-        case AccessLevel::NoExecute:      return "NoExecute";
-        case AccessLevel::Blocked:        return "Blocked";
-        case AccessLevel::QuarantineOnly: return "QuarantineOnly";
-        case AccessLevel::AuditOnly:      return "AuditOnly";
-        case AccessLevel::Custom:         return "Custom";
-        default:                          return "Unknown";
-    }
-}
 
 // H4 FIX: Updated for new DeviceCategory enum values
 std::string_view GetDeviceCategoryName(DeviceCategory cat) noexcept {
