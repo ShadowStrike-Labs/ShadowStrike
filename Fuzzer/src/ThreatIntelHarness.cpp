@@ -199,7 +199,7 @@ void PopulateCommonTypeMapping(ParserConfig& config) {
 
 [[nodiscard]] std::vector<ParserVariant> BuildParserVariants() {
     std::vector<ParserVariant> variants;
-    variants.reserve(6);
+    variants.reserve(14);
 
     {
         ParserConfig config = BuildDefaultConfig();
@@ -261,6 +261,98 @@ void PopulateCommonTypeMapping(ParserConfig& config) {
         config.trimWhitespace = true;
         config.lowercaseValues = true;
         variants.push_back({ "csv-tab-autodetect", std::move(config) });
+    }
+
+    // ---- Feed-specific configs: exercise the exact parser paths used by real feeds ----
+
+    // URLhaus CSV config (comma-delimited, header row, URL in column 2)
+    {
+        ParserConfig config = BuildDefaultConfig();
+        config.csvDelimiter = ',';
+        config.csvQuote = '"';
+        config.csvHasHeader = true;
+        config.csvValueColumn = 2;
+        config.trimWhitespace = true;
+        config.skipInvalid = true;
+        variants.push_back({ "urlhaus-csv", std::move(config) });
+    }
+
+    // MalwareBazaar JSON config
+    {
+        ParserConfig config = BuildDefaultConfig();
+        config.iocPath = "$.data";
+        config.valuePath = "$.sha256_hash";
+        config.firstSeenPath = "$.first_seen";
+        config.lastSeenPath = "$.last_seen";
+        config.categoryPath = "$.file_type";
+        config.tagsPath = "$.tags";
+        variants.push_back({ "malwarebazaar-json", std::move(config) });
+    }
+
+    // ThreatFox JSON config (multi-type IOC, type mapping)
+    {
+        ParserConfig config = BuildDefaultConfig();
+        config.iocPath = "$.data";
+        config.valuePath = "$.ioc";
+        config.typePath = "$.ioc_type";
+        config.categoryPath = "$.threat_type";
+        config.confidencePath = "$.confidence_level";
+        config.firstSeenPath = "$.first_seen_utc";
+        config.lastSeenPath = "$.last_seen_utc";
+        config.tagsPath = "$.tags";
+        config.typeMapping["ip:port"] = IOCType::IPv4;
+        config.typeMapping["domain"] = IOCType::Domain;
+        config.typeMapping["url"] = IOCType::URL;
+        config.typeMapping["md5_hash"] = IOCType::FileHash;
+        config.typeMapping["sha256_hash"] = IOCType::FileHash;
+        config.typeMapping["sha1_hash"] = IOCType::FileHash;
+        variants.push_back({ "threatfox-json", std::move(config) });
+    }
+
+    // Feodo/ET Open/Botvrij: newline-delimited single-column (IP or hash per line)
+    {
+        ParserConfig config = BuildDefaultConfig();
+        config.csvDelimiter = '\n';
+        config.csvHasHeader = false;
+        config.csvValueColumn = 0;
+        config.trimWhitespace = true;
+        config.skipInvalid = true;
+        variants.push_back({ "line-per-ioc", std::move(config) });
+    }
+
+    // PhishTank JSON config (root-level array of objects)
+    {
+        ParserConfig config = BuildDefaultConfig();
+        config.iocPath = "$";
+        config.valuePath = "$.url";
+        config.categoryPath = "$.target";
+        config.firstSeenPath = "$.verification_time";
+        variants.push_back({ "phishtank-json", std::move(config) });
+    }
+
+    // MISP JSON config
+    {
+        ParserConfig config = BuildDefaultConfig();
+        config.iocPath = "$.response.Attribute";
+        config.valuePath = "$.value";
+        config.typePath = "$.type";
+        config.categoryPath = "$.category";
+        config.typeMapping["ip-src"] = IOCType::IPv4;
+        config.typeMapping["ip-dst"] = IOCType::IPv4;
+        config.typeMapping["domain"] = IOCType::Domain;
+        config.typeMapping["hostname"] = IOCType::Domain;
+        config.typeMapping["url"] = IOCType::URL;
+        config.typeMapping["md5"] = IOCType::FileHash;
+        config.typeMapping["sha1"] = IOCType::FileHash;
+        config.typeMapping["sha256"] = IOCType::FileHash;
+        config.typeMapping["email-src"] = IOCType::Email;
+        variants.push_back({ "misp-json", std::move(config) });
+    }
+
+    // Empty/minimal config (edge case)
+    {
+        ParserConfig config{};
+        variants.push_back({ "empty-config", std::move(config) });
     }
 
     return variants;

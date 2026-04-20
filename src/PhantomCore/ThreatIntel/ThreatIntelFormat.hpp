@@ -593,6 +593,7 @@ enum class ThreatIntelSource : uint16_t {
     GreyNoise = 114,
     BotScout = 115,
     HoneyDB = 116,
+    Botvrij = 117,
     
     // Government/CERT Sources (200-299)
     CISA = 200,
@@ -634,6 +635,10 @@ enum class ThreatIntelSource : uint16_t {
         case ThreatIntelSource::GreyNoise:      return "GreyNoise";
         case ThreatIntelSource::Shodan:         return "Shodan";
         case ThreatIntelSource::Spamhaus:       return "Spamhaus";
+        case ThreatIntelSource::Feodo:          return "Feodo Tracker";
+        case ThreatIntelSource::EmergingThreats: return "Emerging Threats";
+        case ThreatIntelSource::PhishTank:      return "PhishTank";
+        case ThreatIntelSource::Botvrij:        return "Botvrij.eu";
         case ThreatIntelSource::CISA:           return "CISA";
         case ThreatIntelSource::MITRE_ATT_CK:   return "MITRE ATT&CK";
         case ThreatIntelSource::InternalAnalysis: return "Internal Analysis";

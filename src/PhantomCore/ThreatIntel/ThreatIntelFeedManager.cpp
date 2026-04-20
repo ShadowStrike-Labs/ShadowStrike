@@ -629,8 +629,9 @@ ThreatFeedConfig ThreatFeedConfig::CreateURLhaus() {
     
     config.feedId = "urlhaus";
     config.name = "URLhaus";
-    config.description = "Malicious URLs from URLhaus";
+    config.description = "Malicious URLs from URLhaus (abuse.ch)";
     config.protocol = FeedProtocol::CSV_HTTP;
+    config.priority = FeedPriority::High;
     
     config.endpoint.baseUrl = "https://urlhaus.abuse.ch";
     config.endpoint.path = "/downloads/csv_online/";
@@ -638,16 +639,20 @@ ThreatFeedConfig ThreatFeedConfig::CreateURLhaus() {
     
     config.auth.method = AuthMethod::None;
     
-    // No rate limit for public feed
     config.rateLimit.requestsPerMinute = 10;
     
     config.parser.csvDelimiter = ',';
     config.parser.csvQuote = '"';
     config.parser.csvHasHeader = true;
     config.parser.csvValueColumn = 2;  // URL column
+    config.parser.trimWhitespace = true;
+    config.parser.skipInvalid = true;
     
     config.syncIntervalSeconds = 300;  // 5 minutes (frequently updated)
+    config.defaultConfidence = ConfidenceLevel::High;
+    config.defaultReputation = ReputationLevel::Malicious;
     config.allowedTypes = { IOCType::URL };
+    config.defaultTags = { "malware-distribution", "urlhaus" };
     
     return config;
 }
@@ -657,8 +662,9 @@ ThreatFeedConfig ThreatFeedConfig::CreateMalwareBazaar() {
     
     config.feedId = "malwarebazaar";
     config.name = "MalwareBazaar";
-    config.description = "Malware samples from MalwareBazaar";
+    config.description = "Malware samples from MalwareBazaar (abuse.ch)";
     config.protocol = FeedProtocol::REST_API;
+    config.priority = FeedPriority::High;
     
     config.endpoint.baseUrl = "https://mb-api.abuse.ch";
     config.endpoint.path = "/api/v1/";
@@ -672,9 +678,16 @@ ThreatFeedConfig ThreatFeedConfig::CreateMalwareBazaar() {
     
     config.parser.iocPath = "$.data";
     config.parser.valuePath = "$.sha256_hash";
+    config.parser.firstSeenPath = "$.first_seen";
+    config.parser.lastSeenPath = "$.last_seen";
+    config.parser.categoryPath = "$.file_type";
+    config.parser.tagsPath = "$.tags";
     
     config.syncIntervalSeconds = 600;  // 10 minutes
+    config.defaultConfidence = ConfidenceLevel::Confirmed;
+    config.defaultReputation = ReputationLevel::Malicious;
     config.allowedTypes = { IOCType::FileHash };
+    config.defaultTags = { "malware", "malwarebazaar" };
     
     return config;
 }
@@ -684,8 +697,9 @@ ThreatFeedConfig ThreatFeedConfig::CreateThreatFox(const std::string& apiKey) {
     
     config.feedId = "threatfox";
     config.name = "ThreatFox";
-    config.description = "IOCs from ThreatFox";
+    config.description = "IOCs from ThreatFox (abuse.ch)";
     config.protocol = FeedProtocol::REST_API;
+    config.priority = FeedPriority::High;
     
     config.endpoint.baseUrl = "https://threatfox-api.abuse.ch";
     config.endpoint.path = "/api/v1/";
@@ -707,14 +721,165 @@ ThreatFeedConfig ThreatFeedConfig::CreateThreatFox(const std::string& apiKey) {
     config.parser.valuePath = "$.ioc";
     config.parser.typePath = "$.ioc_type";
     config.parser.categoryPath = "$.threat_type";
+    config.parser.confidencePath = "$.confidence_level";
+    config.parser.firstSeenPath = "$.first_seen_utc";
+    config.parser.lastSeenPath = "$.last_seen_utc";
+    config.parser.tagsPath = "$.tags";
     
     config.parser.typeMapping["ip:port"] = IOCType::IPv4;
     config.parser.typeMapping["domain"] = IOCType::Domain;
     config.parser.typeMapping["url"] = IOCType::URL;
     config.parser.typeMapping["md5_hash"] = IOCType::FileHash;
     config.parser.typeMapping["sha256_hash"] = IOCType::FileHash;
+    config.parser.typeMapping["sha1_hash"] = IOCType::FileHash;
     
     config.syncIntervalSeconds = 900;  // 15 minutes
+    config.defaultConfidence = ConfidenceLevel::High;
+    config.defaultReputation = ReputationLevel::Malicious;
+    config.defaultTags = { "threatfox" };
+    
+    return config;
+}
+
+ThreatFeedConfig ThreatFeedConfig::CreateFeodoTracker() {
+    ThreatFeedConfig config = CreateDefault(ThreatIntelSource::Feodo);
+    
+    config.feedId = "feodotracker";
+    config.name = "Feodo Tracker";
+    config.description = "C2 botnet IP blocklist from Feodo Tracker (abuse.ch)";
+    config.protocol = FeedProtocol::CSV_HTTP;
+    config.priority = FeedPriority::High;
+    
+    // Feodo recommended blocklist: one IP per line, comment lines start with #
+    config.endpoint.baseUrl = "https://feodotracker.abuse.ch";
+    config.endpoint.path = "/downloads/ipblocklist_recommended.txt";
+    config.endpoint.method = "GET";
+    
+    config.auth.method = AuthMethod::None;
+    
+    config.rateLimit.requestsPerMinute = 30;
+    
+    // Simple one-column format (IP per line), no header, # comments
+    config.parser.csvDelimiter = '\n';
+    config.parser.csvHasHeader = false;
+    config.parser.csvValueColumn = 0;
+    config.parser.trimWhitespace = true;
+    config.parser.skipInvalid = true;
+    
+    config.syncIntervalSeconds = 300;   // 5 minutes (frequently updated)
+    config.defaultConfidence = ConfidenceLevel::High;
+    config.defaultReputation = ReputationLevel::Malicious;
+    config.allowedTypes = { IOCType::IPv4 };
+    config.defaultTags = { "c2", "botnet", "feodo" };
+    
+    return config;
+}
+
+ThreatFeedConfig ThreatFeedConfig::CreateETOpen() {
+    ThreatFeedConfig config = CreateDefault(ThreatIntelSource::EmergingThreats);
+    
+    config.feedId = "etopen-compromised-ips";
+    config.name = "ET Open Compromised IPs";
+    config.description = "Proofpoint Emerging Threats Open compromised IP list";
+    config.protocol = FeedProtocol::CSV_HTTP;
+    config.priority = FeedPriority::Normal;
+    
+    // ET Open publishes plain-text IP lists (one per line, no header)
+    config.endpoint.baseUrl = "https://rules.emergingthreats.net";
+    config.endpoint.path = "/blockrules/compromised-ips.txt";
+    config.endpoint.method = "GET";
+    
+    config.auth.method = AuthMethod::None;
+    
+    config.rateLimit.requestsPerMinute = 10;
+    
+    config.parser.csvDelimiter = '\n';
+    config.parser.csvHasHeader = false;
+    config.parser.csvValueColumn = 0;
+    config.parser.trimWhitespace = true;
+    config.parser.skipInvalid = true;
+    
+    config.syncIntervalSeconds = 3600;  // 1 hour (updated daily)
+    config.defaultConfidence = ConfidenceLevel::Medium;
+    config.defaultReputation = ReputationLevel::Suspicious;
+    config.allowedTypes = { IOCType::IPv4 };
+    config.defaultTags = { "compromised", "emerging-threats" };
+    
+    return config;
+}
+
+ThreatFeedConfig ThreatFeedConfig::CreatePhishTank(const std::string& apiKey) {
+    ThreatFeedConfig config = CreateDefault(ThreatIntelSource::PhishTank);
+    
+    config.feedId = "phishtank";
+    config.name = "PhishTank";
+    config.description = "Verified phishing URLs from PhishTank (Cisco Talos)";
+    config.protocol = FeedProtocol::JSON_HTTP;
+    config.priority = FeedPriority::Normal;
+    
+    // PhishTank JSON download endpoint
+    // With API key: https://data.phishtank.com/data/<KEY>/online-valid.json
+    // Without key: https://data.phishtank.com/data/online-valid.json (rate limited)
+    config.endpoint.baseUrl = "https://data.phishtank.com";
+    if (!apiKey.empty()) {
+        config.endpoint.path = "/data/" + apiKey + "/online-valid.json";
+    } else {
+        config.endpoint.path = "/data/online-valid.json";
+    }
+    config.endpoint.method = "GET";
+    config.endpoint.headers["Accept"] = "application/json";
+    
+    config.auth.method = AuthMethod::None;  // Key embedded in URL path
+    
+    // PhishTank rate limits: with key = faster, without = heavily limited
+    config.rateLimit.requestsPerMinute = apiKey.empty() ? 2 : 10;
+    
+    // PhishTank JSON structure: array of objects with "url", "verified", "target"
+    config.parser.iocPath = "$";          // Root is the array
+    config.parser.valuePath = "$.url";
+    config.parser.categoryPath = "$.target";
+    config.parser.firstSeenPath = "$.verification_time";
+    
+    config.syncIntervalSeconds = 3600;   // 1 hour
+    config.maxIOCsPerSync = 500000;      // PhishTank can be large
+    config.defaultConfidence = ConfidenceLevel::High;
+    config.defaultReputation = ReputationLevel::Malicious;
+    config.allowedTypes = { IOCType::URL };
+    config.defaultTags = { "phishing", "phishtank" };
+    
+    return config;
+}
+
+ThreatFeedConfig ThreatFeedConfig::CreateBotvrij() {
+    ThreatFeedConfig config = CreateDefault(ThreatIntelSource::Botvrij);
+    
+    config.feedId = "botvrij-osint";
+    config.name = "Botvrij.eu OSINT";
+    config.description = "Dutch OSINT threat intel feed (hash blocklist)";
+    config.protocol = FeedProtocol::CSV_HTTP;
+    config.priority = FeedPriority::Low;
+    
+    // Botvrij.eu publishes MISP-format JSON event feeds
+    config.endpoint.baseUrl = "https://www.botvrij.eu";
+    config.endpoint.path = "/data/feed-osint/hashes.txt";
+    config.endpoint.method = "GET";
+    
+    config.auth.method = AuthMethod::None;
+    
+    config.rateLimit.requestsPerMinute = 5;
+    
+    // hashes.txt is a plain-text hash list (one hash per line, SHA256/MD5 mixed)
+    config.parser.csvDelimiter = '\n';
+    config.parser.csvHasHeader = false;
+    config.parser.csvValueColumn = 0;
+    config.parser.trimWhitespace = true;
+    config.parser.skipInvalid = true;
+    
+    config.syncIntervalSeconds = 7200;  // 2 hours (updated periodically)
+    config.defaultConfidence = ConfidenceLevel::Medium;
+    config.defaultReputation = ReputationLevel::Suspicious;
+    config.allowedTypes = { IOCType::FileHash };
+    config.defaultTags = { "osint", "botvrij" };
     
     return config;
 }
@@ -1538,6 +1703,17 @@ void ThreatIntelFeedManager::Shutdown() {
 // ============================================================================
 
 bool ThreatIntelFeedManager::AddFeed(const ThreatFeedConfig& config) {
+    // Safe dormancy: if a feed requires API key auth but key is empty,
+    // log a clear message and silently skip — this is expected for deferred feeds
+    if (config.auth.method == AuthMethod::ApiKey && config.auth.apiKey.empty()) {
+        SS_LOG_INFO(L"ThreatIntelFeedManager",
+            L"Feed '%S' deferred: requires API key (source=%S). "
+            L"Set the corresponding environment variable to activate.",
+            config.feedId.c_str(),
+            ThreatIntelSourceToString(config.source));
+        return true;  // Not an error — intentional dormancy
+    }
+    
     std::string errorMsg;
     if (!config.Validate(&errorMsg)) {
         return false;
