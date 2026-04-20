@@ -37,6 +37,7 @@
 #include <wtsapi32.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <format>
 #include <string>
@@ -44,6 +45,7 @@
 #include "../IPC/PipeServer.hpp"
 #include "../IPC/IPCRouter.hpp"
 #include "../../HomeProductOrchestrator.hpp"
+#include "../PerfBudget/PerfBudget.hpp"
 #include "ServiceInstaller.hpp"
 #include "PhantomCore/Utils/Logger.hpp"
 
@@ -175,6 +177,7 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
     }
 
     ReportStatus(SERVICE_RUNNING);
+    ::ShadowStrike::PhantomHome::UI::PerfBudget::Instance().MarkProcessReady();
     ShadowStrike::Utils::Logger::Info("ServiceMain: running, session={}", po.session_id);
 
     // ---- Main wait loop ----
@@ -197,6 +200,18 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
 }  // namespace
 
 extern "C" int wmain(int argc, wchar_t* argv[]) {
+    using PB  = ::ShadowStrike::PhantomHome::UI::PerfBudget;
+    using PBL = ::ShadowStrike::PhantomHome::UI::PerfBudgetLimits;
+    PB::Instance().MarkProcessStart();
+    {
+        PBL lim{};
+        lim.soft_rss_bytes  =  256ull * 1024ull * 1024ull;
+        lim.hard_rss_bytes  =  512ull * 1024ull * 1024ull;
+        lim.soft_startup_ms = std::chrono::milliseconds{1500};
+        lim.hard_startup_ms = std::chrono::milliseconds{5000};
+        PB::Instance().Start(lim, "PhantomHome.Service");
+    }
+
     // --install / --uninstall must run elevated. They never fall through to
     // SCM dispatch. Any other argv (or no argv) is treated as the service
     // control manager launching the process; StartServiceCtrlDispatcherW

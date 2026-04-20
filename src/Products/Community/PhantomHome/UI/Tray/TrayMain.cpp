@@ -61,6 +61,7 @@
 #include <string>
 
 #include "PhantomCore/Utils/Logger.hpp"
+#include "../PerfBudget/PerfBudget.hpp"
 #include "Products/Community/PhantomHome/UI/IPC/Messages.hpp"
 #include "Products/Community/PhantomHome/UI/Client/IPC/PipeClient.hpp"
 
@@ -445,6 +446,19 @@ extern "C" int WINAPI wWinMain(HINSTANCE inst,
                                HINSTANCE /*prev*/,
                                LPWSTR    /*cmd*/,
                                int       /*show*/) {
+    using ::ShadowStrike::PhantomHome::UI::PerfBudget;
+    using ::ShadowStrike::PhantomHome::UI::PerfBudgetLimits;
+
+    PerfBudget::Instance().MarkProcessStart();
+    {
+        PerfBudgetLimits lim{};
+        lim.soft_rss_bytes  =  48ull * 1024ull * 1024ull;
+        lim.hard_rss_bytes  =  96ull * 1024ull * 1024ull;
+        lim.soft_startup_ms = std::chrono::milliseconds{200};
+        lim.hard_startup_ms = std::chrono::milliseconds{800};
+        PerfBudget::Instance().Start(lim, "PhantomHome.Tray");
+    }
+
     // Per-session single-instance gate.
     HANDLE mutex = ::CreateMutexW(nullptr, TRUE, kMutexName);
     if (!mutex || ::GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -490,6 +504,10 @@ extern "C" int WINAPI wWinMain(HINSTANCE inst,
         ::CloseHandle(mutex);
         return 4;
     }
+
+    // The tray is "ready" the moment the icon is on screen. Recording it
+    // here gives us an honest cold-start latency number against the budget.
+    PerfBudget::Instance().MarkProcessReady();
 
     // Spin up the IPC client. State callbacks marshal to the GUI thread via
     // PostMessage so we never touch GDI / Shell_NotifyIcon off-thread.

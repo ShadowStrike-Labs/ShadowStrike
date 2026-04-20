@@ -19,6 +19,7 @@
 #include <QUrl>
 
 #include <memory>
+#include <chrono>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -27,6 +28,7 @@
 
 #include "IPC/PipeClient.hpp"
 #include "ViewModels/ProtectionViewModel.hpp"
+#include "../PerfBudget/PerfBudget.hpp"
 
 namespace {
 
@@ -41,6 +43,18 @@ std::uint32_t CurrentSessionId() noexcept {
 } // namespace
 
 int main(int argc, char* argv[]) {
+    using PB  = ::ShadowStrike::PhantomHome::UI::PerfBudget;
+    using PBL = ::ShadowStrike::PhantomHome::UI::PerfBudgetLimits;
+    PB::Instance().MarkProcessStart();
+    {
+        PBL lim{};
+        lim.soft_rss_bytes  = 120ull * 1024ull * 1024ull;
+        lim.hard_rss_bytes  = 240ull * 1024ull * 1024ull;
+        lim.soft_startup_ms = std::chrono::milliseconds{500};
+        lim.hard_startup_ms = std::chrono::milliseconds{2000};
+        PB::Instance().Start(lim, "PhantomHome.UI");
+    }
+
     // High-DPI is automatic on Qt 6; just enable crisp scaling for QtSvg.
     QGuiApplication::setOrganizationName(QStringLiteral("ShadowStrike-Labs"));
     QGuiApplication::setOrganizationDomain(QStringLiteral("shadowstrike.dev"));
@@ -72,6 +86,8 @@ int main(int argc, char* argv[]) {
     if (engine.rootObjects().isEmpty()) {
         return 2;
     }
+
+    PB::Instance().MarkProcessReady();
 
     const int rc = app.exec();
 
