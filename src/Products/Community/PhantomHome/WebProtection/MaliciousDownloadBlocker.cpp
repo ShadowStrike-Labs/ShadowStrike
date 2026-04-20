@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <format>
 #include <cctype>
+#include <deque>
 
 // Windows Headers for Trust Verification and Downloads path
 #include <wintrust.h>
@@ -88,6 +89,16 @@ namespace {
     inline constexpr size_t MAGIC_HEADER_SIZE        = 16;
     inline constexpr size_t PE_MAX_IMPORT_CHECK      = 10'000;
     inline constexpr DWORD  DIR_WATCH_BUFFER_SIZE    = 64 * 1024;
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
 }
 
 // ============================================================================
@@ -538,7 +549,32 @@ public:
 
     int GetFileReputation(const fs::path& filePath);
 
-    DownloadBlockerStatistics GetStatistics() const { return m_stats; }
+    DownloadBlockerStatistics GetStatistics() const {
+        DownloadBlockerStatistics copy;
+        copy.totalDownloads.store(m_stats.totalDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.scannedDownloads.store(m_stats.scannedDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.cleanDownloads.store(m_stats.cleanDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.blockedDownloads.store(m_stats.blockedDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.quarantinedDownloads.store(m_stats.quarantinedDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.malwareDetected.store(m_stats.malwareDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.pupDetected.store(m_stats.pupDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.suspiciousDetected.store(m_stats.suspiciousDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.sandboxedFiles.store(m_stats.sandboxedFiles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.signatureMatches.store(m_stats.signatureMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.heuristicMatches.store(m_stats.heuristicMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.reputationBlocks.store(m_stats.reputationBlocks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.policyBlocks.store(m_stats.policyBlocks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.scanErrors.store(m_stats.scanErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.bytesScanned.store(m_stats.bytesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < m_stats.byVerdict.size(); ++i) {
+            copy.byVerdict[i].store(m_stats.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < m_stats.byIndicator.size(); ++i) {
+            copy.byIndicator[i].store(m_stats.byIndicator[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        AtomicValueStoreRelaxed(copy.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
+        return copy;
+    }
     void ResetStatistics() { m_stats.Reset(); }
 
     void RegisterScanCallback(ScanResultCallback callback);
@@ -554,6 +590,7 @@ private:
     void MonitoringLoop();
     DownloadVerdict AnalyzeFile(const fs::path& path, const std::string& hash, FileAnalysisResult& analysis);
     void NotifyCallbacks(const DownloadScanResult& result, const fs::path& filePath, const std::string& sourceUrl);
+    void RememberProcessedFile(const std::string& path);
 
     mutable std::shared_mutex m_mutex;
     DownloadBlockerConfiguration m_config;
@@ -563,8 +600,10 @@ private:
     std::atomic<bool> m_isMonitoring{false};
     std::thread m_monitorThread;
     std::atomic<bool> m_stopThread{false};
+    HANDLE m_stopEvent = nullptr;
     std::vector<fs::path> m_monitoredDirs;
     std::unordered_set<std::string> m_processedFiles;
+    std::deque<std::string> m_processedFileOrder;
 
     // Policy
     std::unordered_set<std::string> m_blockedExtensions;
@@ -595,10 +634,15 @@ private:
 
 MaliciousDownloadBlockerImpl::MaliciousDownloadBlockerImpl() {
     m_stats.Reset();
+    m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 }
 
 MaliciousDownloadBlockerImpl::~MaliciousDownloadBlockerImpl() {
     Shutdown();
+    if (m_stopEvent) {
+        CloseHandle(m_stopEvent);
+        m_stopEvent = nullptr;
+    }
 }
 
 bool MaliciousDownloadBlockerImpl::Initialize(const DownloadBlockerConfiguration& config) {
@@ -609,6 +653,11 @@ bool MaliciousDownloadBlockerImpl::Initialize(const DownloadBlockerConfiguration
     }
 
     m_status.store(ModuleStatus::Initializing, std::memory_order_release);
+    if (!config.IsValid()) {
+        m_status.store(ModuleStatus::Error, std::memory_order_release);
+        Logger::Error("DownloadBlocker: invalid configuration rejected");
+        return false;
+    }
     m_config = config;
 
     // Load extension policy
@@ -1035,6 +1084,9 @@ bool MaliciousDownloadBlockerImpl::StartMonitoring() {
     }
 
     m_stopThread.store(false, std::memory_order_release);
+    if (m_stopEvent) {
+        ResetEvent(m_stopEvent);
+    }
     m_monitorThread = std::thread(&MaliciousDownloadBlockerImpl::MonitoringLoop, this);
     m_isMonitoring.store(true, std::memory_order_release);
 
@@ -1047,6 +1099,9 @@ void MaliciousDownloadBlockerImpl::StopMonitoring() {
         std::unique_lock lock(m_mutex);
         if (!m_isMonitoring.load(std::memory_order_acquire)) return;
         m_stopThread.store(true, std::memory_order_release);
+        if (m_stopEvent) {
+            SetEvent(m_stopEvent);
+        }
     }
 
     if (m_monitorThread.joinable()) {
@@ -1067,7 +1122,7 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
 
         ~WatchEntry() {
             if (hDir != INVALID_HANDLE_VALUE) {
-                CancelIo(hDir);
+                CancelIoEx(hDir, nullptr);
                 CloseHandle(hDir);
             }
         }
@@ -1089,7 +1144,7 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
     {
         std::shared_lock lock(m_mutex);
         for (const auto& dir : m_monitoredDirs) {
-            if (watches.size() >= MAX_MONITORED_DIRS) break;
+            if (watches.size() >= (MAX_MONITORED_DIRS - 1)) break;
             if (!fs::exists(dir) || !fs::is_directory(dir)) continue;
 
             auto entry = std::make_unique<WatchEntry>();
@@ -1159,14 +1214,10 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
                         if (IsTemporaryDownloadFile(p)) continue;
                         std::string pathStr = p.string();
 
-                        if (m_processedFiles.size() >= MAX_PROCESSED_FILES) {
-                            m_processedFiles.clear();
-                        }
-
                         if (m_processedFiles.find(pathStr) == m_processedFiles.end()) {
                             if (WaitForFileReady(p, std::chrono::milliseconds(2000))) {
                                 ScanFileAsync(p, "");
-                                m_processedFiles.insert(pathStr);
+                                RememberProcessedFile(pathStr);
                             }
                         }
                     }
@@ -1181,7 +1232,10 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
 
     // Event-driven monitoring loop
     std::vector<HANDLE> events;
-    events.reserve(watches.size());
+    events.reserve(watches.size() + (m_stopEvent ? 1 : 0));
+    if (m_stopEvent) {
+        events.push_back(m_stopEvent);
+    }
     for (const auto& w : watches) {
         events.push_back(w->overlapped.hEvent);
     }
@@ -1196,7 +1250,11 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
             break;
         }
 
-        DWORD idx = waitResult - WAIT_OBJECT_0;
+        if (m_stopEvent && waitResult == WAIT_OBJECT_0) {
+            break;
+        }
+
+        DWORD idx = waitResult - WAIT_OBJECT_0 - (m_stopEvent ? 1u : 0u);
         if (idx >= watches.size()) continue;
 
         auto& watch = watches[idx];
@@ -1225,14 +1283,10 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
                     if (!IsTemporaryDownloadFile(fullPath) && fs::is_regular_file(fullPath)) {
                         std::string pathStr = fullPath.string();
 
-                        if (m_processedFiles.size() >= MAX_PROCESSED_FILES) {
-                            m_processedFiles.clear();
-                        }
-
                         if (m_processedFiles.find(pathStr) == m_processedFiles.end()) {
                             if (WaitForFileReady(fullPath, std::chrono::milliseconds(3000))) {
                                 ScanFileAsync(fullPath, "");
-                                m_processedFiles.insert(pathStr);
+                                RememberProcessedFile(pathStr);
                             }
                         }
                     }
@@ -1260,6 +1314,18 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
             CloseHandle(w->overlapped.hEvent);
             w->overlapped.hEvent = nullptr;
         }
+    }
+}
+
+void MaliciousDownloadBlockerImpl::RememberProcessedFile(const std::string& path) {
+    if (!m_processedFiles.insert(path).second) {
+        return;
+    }
+
+    m_processedFileOrder.push_back(path);
+    while (m_processedFileOrder.size() > MAX_PROCESSED_FILES) {
+        m_processedFiles.erase(m_processedFileOrder.front());
+        m_processedFileOrder.pop_front();
     }
 }
 
@@ -1908,7 +1974,7 @@ void DownloadBlockerStatistics::Reset() noexcept {
     bytesScanned       = 0;
     for (auto& v : byVerdict)   v.store(0, std::memory_order_relaxed);
     for (auto& v : byIndicator) v.store(0, std::memory_order_relaxed);
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string DownloadBlockerStatistics::ToJson() const {
