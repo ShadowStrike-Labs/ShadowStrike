@@ -51,6 +51,7 @@
 #include "PhantomCore/Utils/ProcessUtils.hpp"
 
 #include <algorithm>
+#include <format>
 #include <sstream>
 #include <iomanip>
 #include <regex>
@@ -68,6 +69,8 @@
 
 
 namespace {
+    constexpr size_t kMaxUsbFieldLength = 256;
+    constexpr size_t kMaxUsbPathLength = 1024;
 
     template<typename T>
     [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
@@ -76,6 +79,43 @@ namespace {
     template<typename T>
     void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
         std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::string SanitizeHostileUsbString(std::string_view input,
+                                                       size_t maxLen = kMaxUsbFieldLength) {
+        std::string output;
+        output.reserve(std::min(input.size(), maxLen));
+
+        for (unsigned char ch : input) {
+            if (output.size() >= maxLen) {
+                break;
+            }
+
+            if (ch == '\0') {
+                break;
+            }
+
+            if (ch < 0x20 || ch == 0x7F) {
+                continue;
+            }
+
+            output.push_back(static_cast<char>(ch));
+        }
+
+        return output;
+    }
+
+    [[nodiscard]] std::string RedactSensitiveBuffer(std::string_view buffer) {
+        return std::format("redacted:{}-bytes", buffer.size());
+    }
+
+    [[nodiscard]] std::string RedactDeviceIdentifier(std::string_view input) {
+        const std::string sanitized = SanitizeHostileUsbString(input, kMaxUsbFieldLength);
+        if (sanitized.size() <= 12) {
+            return sanitized;
+        }
+
+        return "..." + sanitized.substr(sanitized.size() - 12);
     }
 } // namespace
 
@@ -337,8 +377,7 @@ public:
 
         auto descriptor = GetDeviceDescriptorInternal(devicePath);
         if (!descriptor) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Failed to get device descriptor: %hs",
-                devicePath.c_str());
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to get device descriptor for USB HID path");
             return DeviceAnalysisResult::Unknown;
         }
 
@@ -894,12 +933,21 @@ private:
         const std::string& devicePath) const {
 
 #ifdef _WIN32
+        if (devicePath.empty() || devicePath.size() > kMaxUsbPathLength) {
+            return std::nullopt;
+        }
+
         HIDDeviceDescriptor descriptor;
-        descriptor.devicePath = devicePath;
+        descriptor.devicePath = SanitizeHostileUsbString(devicePath, kMaxUsbPathLength);
         descriptor.firstSeen = std::chrono::system_clock::now();
 
-        HANDLE hDevice = CreateFileA(
-            devicePath.c_str(),
+        const std::wstring widePath = Utils::StringUtils::ToWide(devicePath);
+        if (widePath.empty()) {
+            return std::nullopt;
+        }
+
+        HANDLE hDevice = CreateFileW(
+            widePath.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
@@ -920,15 +968,15 @@ private:
 
         wchar_t buffer[256] = {0};
         if (HidD_GetManufacturerString(hDevice, buffer, sizeof(buffer))) {
-            descriptor.manufacturer = Utils::StringUtils::ToNarrow(buffer);
+            descriptor.manufacturer = SanitizeHostileUsbString(Utils::StringUtils::ToNarrow(buffer));
         }
 
         if (HidD_GetProductString(hDevice, buffer, sizeof(buffer))) {
-            descriptor.product = Utils::StringUtils::ToNarrow(buffer);
+            descriptor.product = SanitizeHostileUsbString(Utils::StringUtils::ToNarrow(buffer));
         }
 
         if (HidD_GetSerialNumberString(hDevice, buffer, sizeof(buffer))) {
-            descriptor.serialNumber = Utils::StringUtils::ToNarrow(buffer);
+            descriptor.serialNumber = SanitizeHostileUsbString(Utils::StringUtils::ToNarrow(buffer));
         }
 
         PHIDP_PREPARSED_DATA preparsedData = nullptr;
@@ -1010,7 +1058,8 @@ private:
         SS_LOG_INFO(LOG_CATEGORY,
             L"Device analyzed: VID=%04X PID=%04X Mfg='%hs' Product='%hs' -> %hs",
             desc.vendorId, desc.productId,
-            desc.manufacturer.c_str(), desc.product.c_str(),
+            SanitizeHostileUsbString(desc.manufacturer).c_str(),
+            SanitizeHostileUsbString(desc.product).c_str(),
             std::string(GetDeviceAnalysisResultName(result)).c_str());
     }
 
@@ -1421,7 +1470,7 @@ private:
                                         const HIDInputStatistics& stats) {
 
         SS_LOG_WARN(LOG_CATEGORY, L"BadUSB ATTACK DETECTED on device '%hs': %hs",
-            deviceId.c_str(), reason.c_str());
+            RedactDeviceIdentifier(deviceId).c_str(), reason.c_str());
 
         m_attackInProgress = true;
         devState.attackDetected = true;
@@ -1469,7 +1518,7 @@ private:
                                          const DetectedCommandPattern& pattern) {
         SS_LOG_WARN(LOG_CATEGORY,
             L"Command pattern detected on device '%hs': %hs (MITRE: %hs)",
-            deviceId.c_str(),
+            RedactDeviceIdentifier(deviceId).c_str(),
             std::string(GetInputPatternTypeName(pattern.patternType)).c_str(),
             pattern.mitreAttackId.c_str());
 
@@ -1606,10 +1655,12 @@ private:
     }
 
     void NotifyError(const std::string& message, int code) {
-        // Copy callbacks under lock, invoke outside
-        auto callbacksCopy = m_errorCallbacks;
-        // Release lock not possible here as callers may/may not hold it.
-        // Since error callbacks are rare, invoke inline with exception guard.
+        std::vector<ErrorCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy = m_errorCallbacks;
+        }
+
         for (const auto& callback : callbacksCopy) {
             try {
                 callback(message, code);
@@ -1864,11 +1915,11 @@ std::string HIDDeviceDescriptor::ToJson() const {
     Utils::JSON::Json json;
     json["vendorId"] = vendorId;
     json["productId"] = productId;
-    json["devicePath"] = devicePath;
-    json["instanceId"] = instanceId;
-    json["manufacturer"] = manufacturer;
-    json["product"] = product;
-    json["serialNumber"] = serialNumber;
+    json["devicePath"] = RedactSensitiveBuffer(devicePath);
+    json["instanceId"] = RedactSensitiveBuffer(instanceId);
+    json["manufacturer"] = SanitizeHostileUsbString(manufacturer);
+    json["product"] = SanitizeHostileUsbString(product);
+    json["serialNumber"] = RedactSensitiveBuffer(serialNumber);
     json["classCode"] = classCode;
     json["subclassCode"] = subclassCode;
     json["protocolCode"] = protocolCode;
@@ -1883,7 +1934,7 @@ std::string DetectedCommandPattern::ToJson() const {
     Utils::JSON::Json json;
     json["patternType"] = static_cast<uint8_t>(patternType);
     json["patternTypeName"] = std::string(GetInputPatternTypeName(patternType));
-    json["commandString"] = commandString;
+    json["commandString"] = RedactSensitiveBuffer(commandString);
     json["riskScore"] = riskScore;
     json["mitreAttackId"] = mitreAttackId;
     return json.dump();
@@ -1916,7 +1967,7 @@ std::string BadUSBAttackEvent::ToJson() const {
 
     json["responseTaken"] = static_cast<uint8_t>(responseTaken);
     json["responseName"] = std::string(GetBadUSBResponseName(responseTaken));
-    json["reconstructedBuffer"] = reconstructedBuffer;
+    json["reconstructedBuffer"] = RedactSensitiveBuffer(reconstructedBuffer);
     json["riskScore"] = riskScore;
     json["detectionReason"] = detectionReason;
     json["attackDurationMs"] = attackDuration.count();
