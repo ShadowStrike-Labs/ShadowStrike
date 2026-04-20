@@ -400,6 +400,11 @@ public:
     void Shutdown() noexcept;
     
     /**
+     * @brief Returns whether the monitor has been initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
+
+    /**
      * @brief Starts continuous monitoring.
      */
     void StartMonitoring();
