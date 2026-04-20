@@ -1,51 +1,59 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
-/**
- * ============================================================================
- * ShadowStrike PhantomHome - DNS LEAK PROTECTION MODULE WIRING
- * ============================================================================
- *
- * @file DNSLeakProtectionWiring.cpp
- * @brief Registers the DNSLeakProtection module with the HomeProductOrchestrator
- *        via a static initializer, before main() runs.
- *
- * DNSLeakProtection intercepts DNS queries to detect resolver leaks that
- * expose a user's network activity outside a VPN tunnel. Initialize() loads
- * resolver configuration and baseline policy; MonitorDnsActivity() arms the
- * real-time DNS interception hook. StopMonitoring() quiesces that hook before
- * Shutdown() releases resolver state and OS handles.
- *
- * Phase      : ModulePhase::OnDemand
- * Config key : "Home/Privacy/Enabled"
- *
- * @author ShadowStrike Security Team
- * @version 1.0.0
- * @date 2026
- * ============================================================================
- */
-
 #include "pch.h"
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../DNSLeakProtection.hpp"
-
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
 
 constexpr const wchar_t* kLogCategory = L"DNSLeakProtectionWiring";
+using Module = ::ShadowStrike::Privacy::DNSLeakProtection;
 
-struct DNSLeakProtectionRegistrar final {
-    DNSLeakProtectionRegistrar() noexcept {
+[[nodiscard]] bool ValidateInitialized(const wchar_t* operation) {
+    if (!Module::HasInstance()) {
+        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: %ls called before instance creation", operation);
+        return false;
+    }
+
+    auto& module = Module::Instance();
+    if (!module.IsInitialized()) {
+        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: %ls called while module is not initialized", operation);
+        return false;
+    }
+
+    return true;
+}
+
+void SafeShutdown() noexcept {
+    if (!Module::HasInstance()) {
+        return;
+    }
+
+    try {
+        auto& module = Module::Instance();
+            if (module.IsInitialized()) {
+                module.StopMonitoring();
+                module.Shutdown();
+            }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: shutdown cleanup threw: %hs", e.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: shutdown cleanup threw unknown exception");
+    }
+}
+
+struct Registrar final {
+    Registrar() noexcept {
         try {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
-            using ::ShadowStrike::Privacy::DNSLeakProtection;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "DNSLeakProtection",
@@ -54,61 +62,75 @@ struct DNSLeakProtectionRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        if (!DNSLeakProtection::Instance().Initialize()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"DNSLeakProtection: Initialize() returned false");
+                        if (Module::HasInstance()) {
+                            auto& existingModule = Module::Instance();
+                            if (existingModule.IsInitialized()) {
+                                return true;
+                            }
+                            const auto status = existingModule.GetStatus();
+                            if (status != ::ShadowStrike::Privacy::ModuleStatus::Uninitialized &&
+                                status != ::ShadowStrike::Privacy::ModuleStatus::Stopped) {
+                                SS_LOG_ERROR(kLogCategory,
+                                    L"DNSLeakProtection: initialize() rejected while status is %hs",
+                                    ::ShadowStrike::Privacy::GetModuleStatusName(status).data());
+                                return false;
+                            }
+                        }
+                        auto& module = Module::Instance();
+                        if (!module.Initialize()) {
+                            SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: Initialize() returned false");
+                            SafeShutdown();
+                            return false;
+                        }
+                        if (!module.IsInitialized()) {
+                            SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: Initialize() completed without entering initialized state");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DNSLeakProtection: initialize() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: initialize() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DNSLeakProtection: initialize() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: initialize() threw unknown exception");
                         return false;
                     }
                 },
 
                 .start = []() -> bool {
+                    if (!ValidateInitialized(L"start")) {
+                        return false;
+                    }
                     try {
-                        if (!DNSLeakProtection::Instance().MonitorDnsActivity()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"DNSLeakProtection: MonitorDnsActivity() returned false");
+                        auto& module = Module::Instance();
+                        if (!module.MonitorDnsActivity()) {
+                            SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: MonitorDnsActivity() returned false");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DNSLeakProtection: start() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: start() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DNSLeakProtection: start() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DNSLeakProtection: start() threw unknown exception");
                         return false;
                     }
                 },
-
                 .shutdown = []() noexcept {
-                    try {
-                        DNSLeakProtection::Instance().StopMonitoring();
-                        DNSLeakProtection::Instance().Shutdown();
-                    } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DNSLeakProtection: shutdown threw: %hs", e.what());
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DNSLeakProtection: shutdown threw unknown exception");
-                    }
+                    SafeShutdown();
                 }
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            // Static initializer path: logger may not yet be available.
         }
     }
 };
 
-const DNSLeakProtectionRegistrar g_dnsLeakProtectionRegistrar{};
+const Registrar g_registrar{};
 
 }  // namespace
