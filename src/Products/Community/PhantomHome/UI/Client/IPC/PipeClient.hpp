@@ -98,6 +98,7 @@ private:
 
     void ConnectLoop();
     void ReadLoop();
+    [[nodiscard]] bool VerifyServerIdentity(HANDLE pipe) const;
     [[nodiscard]] bool PerformHandshake();
     [[nodiscard]] bool ReadFrame(std::vector<std::uint8_t>& out);
     [[nodiscard]] bool WriteFrame(std::span<const std::uint8_t> bytes);
@@ -105,6 +106,7 @@ private:
     void DispatchReply(const FrameEnvelope& env);
     void NotifyConnected(bool c);
     void CancelAllPending();
+    void JoinAsyncThreads() noexcept;
 
     Options                                                 options_;
     std::atomic<bool>                                       running_{false};
@@ -115,6 +117,8 @@ private:
     std::mutex                                              write_mutex_;
     std::thread                                             connect_thread_;
     std::thread                                             read_thread_;
+    std::mutex                                              async_threads_mutex_;
+    std::vector<std::thread>                                async_threads_;
     std::mutex                                              pending_mutex_;
     std::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending_;
     PushCallback                                            push_cb_;
