@@ -449,6 +449,296 @@ void HomeProductOrchestrator::SetModuleState(ModuleRecord& rec,
     rec.lastTransition = std::chrono::steady_clock::now();
 }
 
+bool HomeProductOrchestrator::SetModuleEnabled(std::string_view name, bool enabled) noexcept {
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+
+    // Find the module by name.
+    std::size_t idx = SIZE_MAX;
+    ModuleDescriptor desc;
+    ModuleState priorState;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        for (std::size_t i = 0; i < m_modules.size(); ++i) {
+            if (m_modules[i].descriptor.name == name) {
+                idx = i;
+                desc = m_modules[i].descriptor;
+                priorState = m_modules[i].state;
+                break;
+            }
+        }
+    }
+    if (idx == SIZE_MAX) {
+        SS_LOG_WARN(kLogCategory, L"SetModuleEnabled: unknown module '%hs'",
+                    std::string(name).c_str());
+        return false;
+    }
+
+    // Persist the change to ConfigManager so it survives restarts.
+    if (!desc.enabledConfigKey.empty()) {
+        try {
+            auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+            if (!cfg.SetValue(desc.enabledConfigKey, enabled)) {
+                SS_LOG_WARN(kLogCategory,
+                    L"SetModuleEnabled '%hs': ConfigManager::SetValue returned false",
+                    desc.name.c_str());
+            }
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleEnabled '%hs': ConfigManager::SetValue failed",
+                desc.name.c_str());
+        }
+    }
+
+    if (enabled) {
+        // Enable: re-initialize + start if the module is Disabled/Stopped/Failed.
+        if (priorState == ModuleState::Running ||
+            priorState == ModuleState::Initialized) {
+            return true;  // Already running/initialized — nothing to do.
+        }
+
+        bool ok = false;
+        std::string errMsg;
+        try {
+            ok = desc.initialize();
+        } catch (const std::exception& e) {
+            errMsg = e.what();
+        } catch (...) {
+            errMsg = "unknown exception";
+        }
+
+        if (!ok) {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+            }
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleEnabled '%hs': Initialize() failed: %hs",
+                desc.name.c_str(),
+                errMsg.empty() ? "returned false" : errMsg.c_str());
+            return false;
+        }
+
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Initialized);
+            }
+        }
+
+        ok = false;
+        errMsg.clear();
+        try {
+            ok = desc.start();
+        } catch (const std::exception& e) {
+            errMsg = e.what();
+        } catch (...) {
+            errMsg = "unknown exception";
+        }
+
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                if (ok) {
+                    SetModuleState(m_modules[idx], ModuleState::Running);
+                    SS_LOG_INFO(kLogCategory,
+                        L"Module '%hs' enabled and started", desc.name.c_str());
+                } else {
+                    SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+                    SS_LOG_ERROR(kLogCategory,
+                        L"SetModuleEnabled '%hs': Start() failed: %hs",
+                        desc.name.c_str(),
+                        errMsg.empty() ? "returned false" : errMsg.c_str());
+                }
+            }
+        }
+        return ok;
+    } else {
+        // Disable: shutdown if running.
+        if (priorState != ModuleState::Running &&
+            priorState != ModuleState::Initialized) {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Disabled);
+            }
+            return true;  // Already not running.
+        }
+
+        try {
+            desc.shutdown();
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleEnabled '%hs': Shutdown() threw: %hs",
+                desc.name.c_str(), e.what());
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleEnabled '%hs': Shutdown() threw unknown exception",
+                desc.name.c_str());
+        }
+
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Disabled);
+                SS_LOG_INFO(kLogCategory,
+                    L"Module '%hs' disabled and stopped", desc.name.c_str());
+            }
+        }
+        return true;
+    }
+}
+
+void HomeProductOrchestrator::PauseAllModules() noexcept {
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+
+    if (m_paused.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(kLogCategory, L"PauseAllModules: already paused");
+        return;
+    }
+
+    m_pausedModuleNames.clear();
+
+    // Collect Running module names and shut them down in reverse phase order
+    // (same shutdown ordering as Shutdown()).
+    std::vector<std::size_t> indices;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        indices.reserve(m_modules.size());
+        for (auto phaseIt = kPhaseOrder.rbegin(); phaseIt != kPhaseOrder.rend(); ++phaseIt) {
+            for (std::size_t i = m_modules.size(); i-- > 0; ) {
+                if (m_modules[i].descriptor.phase == *phaseIt &&
+                    m_modules[i].state == ModuleState::Running) {
+                    indices.push_back(i);
+                }
+            }
+        }
+    }
+
+    for (std::size_t idx : indices) {
+        ModuleDescriptor desc;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            if (idx >= m_modules.size()) continue;
+            desc = m_modules[idx].descriptor;
+        }
+
+        m_pausedModuleNames.push_back(desc.name);
+
+        try {
+            desc.shutdown();
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCategory,
+                L"PauseAllModules: '%hs' shutdown threw: %hs",
+                desc.name.c_str(), e.what());
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"PauseAllModules: '%hs' shutdown threw unknown exception",
+                desc.name.c_str());
+        }
+
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Stopped);
+            }
+        }
+        SS_LOG_INFO(kLogCategory, L"Paused module '%hs'", desc.name.c_str());
+    }
+
+    m_paused.store(true, std::memory_order_release);
+    SS_LOG_INFO(kLogCategory, L"PhantomHome protection paused (%zu modules quiesced)",
+                m_pausedModuleNames.size());
+}
+
+void HomeProductOrchestrator::ResumeAllModules() noexcept {
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+
+    if (!m_paused.load(std::memory_order_acquire)) {
+        return;  // Not paused.
+    }
+
+    SS_LOG_INFO(kLogCategory, L"Resuming %zu paused modules",
+                m_pausedModuleNames.size());
+
+    for (const auto& name : m_pausedModuleNames) {
+        // Find module by name.
+        std::size_t idx = SIZE_MAX;
+        ModuleDescriptor desc;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            for (std::size_t i = 0; i < m_modules.size(); ++i) {
+                if (m_modules[i].descriptor.name == name) {
+                    idx = i;
+                    desc = m_modules[i].descriptor;
+                    break;
+                }
+            }
+        }
+        if (idx == SIZE_MAX) continue;
+
+        bool ok = false;
+        std::string errMsg;
+        try {
+            ok = desc.initialize();
+        } catch (const std::exception& e) {
+            errMsg = e.what();
+        } catch (...) {
+            errMsg = "unknown exception";
+        }
+
+        if (!ok) {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+            }
+            SS_LOG_ERROR(kLogCategory,
+                L"Resume '%hs': Initialize() failed: %hs",
+                name.c_str(), errMsg.empty() ? "returned false" : errMsg.c_str());
+            continue;
+        }
+
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Initialized);
+            }
+        }
+
+        ok = false;
+        errMsg.clear();
+        try {
+            ok = desc.start();
+        } catch (const std::exception& e) {
+            errMsg = e.what();
+        } catch (...) {
+            errMsg = "unknown exception";
+        }
+
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                if (ok) {
+                    SetModuleState(m_modules[idx], ModuleState::Running);
+                    SS_LOG_INFO(kLogCategory, L"Resumed module '%hs'", name.c_str());
+                } else {
+                    SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Resume '%hs': Start() failed: %hs",
+                        name.c_str(),
+                        errMsg.empty() ? "returned false" : errMsg.c_str());
+                }
+            }
+        }
+    }
+
+    m_pausedModuleNames.clear();
+    m_paused.store(false, std::memory_order_release);
+    SS_LOG_INFO(kLogCategory, L"PhantomHome protection resumed");
+}
+
+bool HomeProductOrchestrator::IsPaused() const noexcept {
+    return m_paused.load(std::memory_order_acquire);
+}
+
 }  // namespace Home
 }  // namespace Products
 }  // namespace ShadowStrike

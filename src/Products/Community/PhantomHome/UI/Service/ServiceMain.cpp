@@ -161,6 +161,7 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
     auto server   = std::make_unique<PipeServer>(po);
 
     IPCRouter::Instance().Bind(orch);
+    IPCRouter::Instance().BindPipeServer(*server);
     server->SetHandler([](ClientContext& ctx,
                           const FrameEnvelope& req,
                           MessageType& reply_type,
@@ -188,6 +189,7 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
     }
 
     ReportStatus(SERVICE_STOP_PENDING, NO_ERROR, 15000);
+    IPCRouter::Instance().Shutdown();
     server->Stop();
     server.reset();
     orch.Shutdown();
