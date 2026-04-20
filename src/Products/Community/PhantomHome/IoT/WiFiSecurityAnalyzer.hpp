@@ -129,12 +129,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../PatternStore/PatternStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/PatternStore/PatternStore.hpp"
 
+
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -305,21 +307,6 @@ enum class NetworkStatus : uint8_t {
     Connecting          = 3,
     Disconnected        = 4,
     Blocked             = 5
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Monitoring      = 4,
-    Paused          = 5,
-    Stopping        = 6,
-    Stopped         = 7,
-    Error           = 8
 };
 
 // ============================================================================
@@ -584,7 +571,10 @@ struct WiFiAnalyzerConfiguration {
     bool enabled = true;
     
     /// @brief Enable continuous monitoring
-    bool continuousMonitoring = true;
+    bool continuousMonitoring = false;
+    
+    /// @brief Allow enumeration of nearby networks beyond the currently connected SSID
+    bool allowNearbyNetworkEnumeration = false;
     
     /// @brief Scan interval (seconds)
     uint32_t scanIntervalSeconds = 60;

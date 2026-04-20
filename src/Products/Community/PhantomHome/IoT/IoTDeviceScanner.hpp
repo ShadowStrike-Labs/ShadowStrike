@@ -137,11 +137,13 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/PatternStore/PatternStore.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -362,21 +364,6 @@ enum class ScanStatus : uint8_t {
     Error           = 7
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Monitoring      = 4,
-    Paused          = 5,
-    Stopping        = 6,
-    Stopped         = 7,
-    Error           = 8
-};
-
 // ============================================================================
 // STRUCTURES
 // ============================================================================
@@ -588,6 +575,9 @@ struct IoTScanConfig {
     /// @brief Enable CVE checking
     bool enableCVEChecking = true;
     
+    /// @brief Require explicit consent before scanning subnets broader than /16
+    bool allowLargeSubnets = false;
+    
     /// @brief Target subnets (empty = auto-detect)
     std::vector<std::string> targetSubnets;
     
@@ -604,7 +594,7 @@ struct IoTScanConfig {
     bool lowBandwidthMode = false;
     
     /// @brief Max parallel scans
-    uint32_t maxParallelScans = 10;
+    uint32_t maxParallelScans = IoTConstants::MAX_CONCURRENT_PORT_SCANS;
     
     [[nodiscard]] bool IsValid() const noexcept;
     [[nodiscard]] std::string ToJson() const;
@@ -733,11 +723,11 @@ struct IoTScannerConfiguration {
     /// @brief Default scan config
     IoTScanConfig defaultScanConfig;
     
-    /// @brief Auto-discovery on startup
-    bool autoDiscoveryOnStartup = true;
+    /// @brief Auto-discovery on startup (default-off until user initiates a scan)
+    bool autoDiscoveryOnStartup = false;
     
-    /// @brief Continuous monitoring
-    bool continuousMonitoring = true;
+    /// @brief Continuous monitoring (default-off to avoid unconsented network collection)
+    bool continuousMonitoring = false;
     
     /// @brief Alert on new devices
     bool alertOnNewDevices = true;

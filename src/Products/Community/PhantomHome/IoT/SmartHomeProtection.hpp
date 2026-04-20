@@ -130,11 +130,13 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Whitelist/WhiteListStore.hpp"
+
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -306,20 +308,6 @@ enum class ProtectionMode : uint8_t {
     Away                = 3,    ///< Away mode (higher alerting)
     Home                = 4,    ///< Home mode (relaxed)
     Sleep               = 5     ///< Sleep mode (no alerts for normal)
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Monitoring      = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
