@@ -1,0 +1,20 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/ShadowStrike/Phantom/qml">
+        <file>App.qml</file>
+        <file>Theming/qmldir</file>
+        <file>Theming/Theme.qml</file>
+        <file>components/Sidebar.qml</file>
+        <file>components/ShieldAnimator.qml</file>
+        <file>components/CardFrame.qml</file>
+        <file>pages/MainPage.qml</file>
+        <file>pages/SecurityPage.qml</file>
+        <file>pages/PerformancePage.qml</file>
+        <file>pages/PrivacyPage.qml</file>
+        <file>pages/ScanPage.qml</file>
+        <file>pages/QuarantinePage.qml</file>
+        <file>pages/ReportsPage.qml</file>
+        <file>pages/SettingsPage.qml</file>
+        <file>assets/logo.svg</file>
+    </qresource>
+</RCC>
