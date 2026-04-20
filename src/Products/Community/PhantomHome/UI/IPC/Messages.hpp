@@ -250,7 +250,7 @@ DecodeEnvelopeCbor(std::span<const std::uint8_t> bytes) noexcept {
         const auto t  = obj["t"].get<std::uint64_t>();
         const auto id = obj["id"].get<std::uint64_t>();
 
-        if (v > (std::numeric_limits<std::uint8_t>::max)())  return std::nullopt;
+        if (v == 0 || v > (std::numeric_limits<std::uint8_t>::max)())  return std::nullopt;
         if (t > (std::numeric_limits<std::uint16_t>::max)()) return std::nullopt;
 
         FrameEnvelope env;
