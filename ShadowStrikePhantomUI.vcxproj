@@ -65,7 +65,7 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <ConformanceMode>true</ConformanceMode>
       <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
@@ -78,8 +78,8 @@
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(QtLib);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Qt6Core$(QtLibSuffix).lib;Qt6Gui$(QtLibSuffix).lib;Qt6Qml$(QtLibSuffix).lib;Qt6Quick$(QtLibSuffix).lib;Qt6QuickControls2$(QtLibSuffix).lib;Qt6Svg$(QtLibSuffix).lib;Qt6Network$(QtLibSuffix).lib;advapi32.lib;ws2_32.lib;userenv.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(QtLib);$(SolutionDir)lib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>PhantomCoreLib.lib;Qt6Core$(QtLibSuffix).lib;Qt6Gui$(QtLibSuffix).lib;Qt6Qml$(QtLibSuffix).lib;Qt6Quick$(QtLibSuffix).lib;Qt6QuickControls2$(QtLibSuffix).lib;Qt6Svg$(QtLibSuffix).lib;Qt6Network$(QtLibSuffix).lib;advapi32.lib;ws2_32.lib;userenv.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -170,6 +170,12 @@
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <ItemGroup>
+    <ProjectReference Include="PhantomCoreLib.vcxproj">
+      <Project>{8A5C6B4D-2E1F-4A3B-9C7D-0E1F2A3B4C5D}</Project>
+    </ProjectReference>
+  </ItemGroup>
 
   <!-- Copy required Qt runtime DLLs next to the executable post-build. -->
   <Target Name="DeployQtRuntime" AfterTargets="Link">
