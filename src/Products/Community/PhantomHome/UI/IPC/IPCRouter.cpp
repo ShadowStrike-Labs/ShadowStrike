@@ -19,12 +19,15 @@
 #include <algorithm>
 #include <chrono>
 #include <future>
+#include <thread>
 
 #include "../../HomeProductOrchestrator.hpp"
+#include "../../Reports/HomeReportsStore.hpp"
 #include "PhantomCore/Utils/Logger.hpp"
 #include "PhantomCore/Core/Engine/ScanEngine.hpp"
 #include "PhantomCore/Core/Engine/QuarantineManager.hpp"
 #include "PhantomCore/Config/ConfigManager.hpp"
+#include "PhantomCore/Update/UpdateManager.hpp"
 
 namespace ShadowStrike::PhantomHome::IPC {
 
@@ -569,6 +572,22 @@ void IPCRouter::HandleScanStart(ClientContext&, const FrameEnvelope& req,
                 }
             }
 
+            try {
+                const auto scan_id_str = std::to_string(sid);
+                const std::uint64_t threats =
+                    result.statistics.filesInfected + result.statistics.filesSuspicious;
+                const std::int64_t duration_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - startTime).count();
+                ::ShadowStrike::PhantomHome::Reports::HomeReportsStore::Instance()
+                    .RecordScanCompleted(scan_id_str,
+                                         result.statistics.filesScanned,
+                                         threats,
+                                         duration_ms);
+            } catch (...) {
+                // Journal failure must not affect scan outcome.
+            }
+
             SS_LOG_INFO(kLogCat,
                 L"Scan %llu completed: %llu files, %llu threats in %llu s",
                 static_cast<unsigned long long>(sid),
@@ -859,8 +878,8 @@ void IPCRouter::HandleGetDetectionAction(ClientContext&, const FrameEnvelope&,
     GetDetectionActionReply r;
     try {
         auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
-        auto val = cfg.GetValue<std::uint8_t>(kCfgDetectionAction,
-            static_cast<std::uint8_t>(DetectionAction::Quarantine));
+        auto val = cfg.GetValue<std::uint32_t>(kCfgDetectionAction,
+            static_cast<std::uint32_t>(DetectionAction::Quarantine));
         r.action = static_cast<DetectionAction>(val);
     } catch (...) {
         r.action = DetectionAction::Quarantine;
@@ -884,8 +903,8 @@ void IPCRouter::HandleSetDetectionAction(ClientContext&, const FrameEnvelope& re
         return;
     }
 
-    auto val = static_cast<std::uint8_t>(parsed->action);
-    if (val > static_cast<std::uint8_t>(DetectionAction::LogOnly)) {
+    auto val = static_cast<std::uint32_t>(parsed->action);
+    if (val > static_cast<std::uint32_t>(DetectionAction::LogOnly)) {
         MakeError(reply_type, reply_payload, ErrorCode::SchemaViolation,
                   "detection action value out of range");
         return;
@@ -893,7 +912,7 @@ void IPCRouter::HandleSetDetectionAction(ClientContext&, const FrameEnvelope& re
 
     try {
         auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
-        bool ok = cfg.SetValue<std::uint8_t>(kCfgDetectionAction, val);
+        bool ok = cfg.SetValue<std::uint32_t>(kCfgDetectionAction, val);
         if (!ok) {
             MakeError(reply_type, reply_payload, ErrorCode::Internal,
                       "ConfigManager::SetValue failed");
@@ -1032,11 +1051,55 @@ void IPCRouter::HandleQuarantineRestore(ClientContext&, const FrameEnvelope& req
 void IPCRouter::HandleGetUpdateStatus(ClientContext&, const FrameEnvelope&,
                                       MessageType& reply_type,
                                       nlohmann::json& reply_payload) noexcept {
-    // Update system is not built yet. Return a safe "up_to_date" response.
     UpdateStatusReply r;
+    r.current_version = "0.0.0";
     r.up_to_date      = true;
-    r.current_version = "1.0.0-preview";
-    r.last_check_unix = 0;
+
+    try {
+        if (::ShadowStrike::Update::UpdateManager::HasInstance()) {
+            auto& um = ::ShadowStrike::Update::UpdateManager::Instance();
+
+            try {
+                auto v = um.GetCurrentVersion(::ShadowStrike::Update::UpdateType::Program);
+                if (!v.versionString.empty()) {
+                    r.current_version = v.versionString;
+                    if (r.current_version.size() > 63) {
+                        r.current_version.resize(63);
+                    }
+                }
+            } catch (...) {
+                // Leave default current_version.
+            }
+
+            try {
+                auto pending        = um.GetAvailableUpdates();
+                r.pending_updates   = static_cast<std::uint32_t>(pending.size());
+                r.up_to_date        = pending.empty();
+            } catch (...) {
+            }
+
+            try {
+                r.status_code     = static_cast<std::uint32_t>(um.GetStatus());
+                r.reboot_required = um.IsRebootRequired();
+                r.in_progress     = um.IsUpdateInProgress();
+            } catch (...) {
+            }
+
+            try {
+                auto last = um.GetLastCheckTime();
+                if (last) {
+                    using namespace std::chrono;
+                    r.last_check_unix = static_cast<std::uint64_t>(
+                        duration_cast<seconds>(last->time_since_epoch()).count());
+                }
+            } catch (...) {
+            }
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCat, L"GetUpdateStatus failed: %hs", e.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCat, L"GetUpdateStatus failed: unknown exception");
+    }
 
     reply_type    = MessageType::GetUpdateStatusReply;
     reply_payload = r.ToJson();
@@ -1049,10 +1112,58 @@ void IPCRouter::HandleGetUpdateStatus(ClientContext&, const FrameEnvelope&,
 void IPCRouter::HandleTriggerUpdate(ClientContext&, const FrameEnvelope&,
                                     MessageType& reply_type,
                                     nlohmann::json& reply_payload) noexcept {
-    // Update system is not built yet. Return "no updates available" safely.
-    reply_type    = MessageType::TriggerUpdateReply;
-    reply_payload = nlohmann::json{{"ok", true},
-                                   {"msg", "no updates available"}};
+    reply_type = MessageType::TriggerUpdateReply;
+
+    try {
+        if (!::ShadowStrike::Update::UpdateManager::HasInstance()) {
+            reply_payload = nlohmann::json{
+                {"ok", false},
+                {"msg", "update subsystem not initialized"}};
+            return;
+        }
+
+        auto& um = ::ShadowStrike::Update::UpdateManager::Instance();
+
+        if (um.IsUpdateInProgress()) {
+            reply_payload = nlohmann::json{
+                {"ok", true},
+                {"msg", "update already in progress"}};
+            return;
+        }
+
+        // Fire-and-forget: dispatch the check on a detached future so the
+        // client is not held while network I/O runs.
+        try {
+            auto fut = um.CheckForUpdatesAsync();
+            std::thread([f = std::move(fut)]() mutable {
+                try {
+                    (void)f.get();
+                } catch (...) {
+                    // Logged by the UpdateManager itself.
+                }
+            }).detach();
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCat, L"TriggerUpdate dispatch failed: %hs", e.what());
+            reply_payload = nlohmann::json{
+                {"ok", false},
+                {"msg", "failed to dispatch update check"}};
+            return;
+        }
+
+        reply_payload = nlohmann::json{
+            {"ok", true},
+            {"msg", "update check started"}};
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCat, L"TriggerUpdate failed: %hs", e.what());
+        reply_payload = nlohmann::json{
+            {"ok", false},
+            {"msg", "internal error"}};
+    } catch (...) {
+        SS_LOG_ERROR(kLogCat, L"TriggerUpdate failed: unknown exception");
+        reply_payload = nlohmann::json{
+            {"ok", false},
+            {"msg", "internal error"}};
+    }
 }
 
 // ============================================================================
@@ -1073,12 +1184,65 @@ void IPCRouter::HandleSubscribePerfMetrics(ClientContext&, const FrameEnvelope&,
 // Handler: GetReports
 // ============================================================================
 
-void IPCRouter::HandleGetReports(ClientContext&, const FrameEnvelope&,
+void IPCRouter::HandleGetReports(ClientContext&, const FrameEnvelope& req,
                                  MessageType& reply_type,
                                  nlohmann::json& reply_payload) noexcept {
-    // Report subsystem is not built yet. Return empty report list.
-    reply_type    = MessageType::GetReportsReply;
-    reply_payload = nlohmann::json{{"reports", nlohmann::json::array()}};
+    reply_type = MessageType::GetReportsReply;
+
+    try {
+        ::ShadowStrike::PhantomHome::Reports::ReportQuery q;
+        q.max_entries = 256;
+
+        auto parsed = GetReportsRequest::FromJson(req.payload);
+        if (parsed) {
+            q.max_entries = (parsed->max_entries == 0)
+                                ? 256
+                                : static_cast<std::size_t>(parsed->max_entries);
+            if (parsed->kind) {
+                q.kind = static_cast<
+                    ::ShadowStrike::PhantomHome::Reports::ReportKind>(*parsed->kind);
+            }
+            if (parsed->min_severity) {
+                q.min_severity = static_cast<
+                    ::ShadowStrike::PhantomHome::Reports::ReportSeverity>(
+                    *parsed->min_severity);
+            }
+            if (parsed->since_id) {
+                q.since_id = *parsed->since_id;
+            }
+        }
+
+        auto entries =
+            ::ShadowStrike::PhantomHome::Reports::HomeReportsStore::Instance().Query(q);
+
+        GetReportsReply out;
+        out.entries.reserve(entries.size());
+        for (const auto& e : entries) {
+            ReportEntry wire;
+            wire.id                = e.id;
+            wire.timestamp_unix_ms = e.timestamp_unix_ms;
+            wire.kind              = static_cast<std::uint32_t>(e.kind);
+            wire.severity          = static_cast<std::uint32_t>(e.severity);
+            wire.module_name       = e.module;
+            wire.title             = e.title;
+            wire.description       = e.description;
+            wire.target            = e.target;
+            wire.action            = e.action;
+            wire.scan_id           = e.scan_id;
+            wire.files_scanned     = e.files_scanned;
+            wire.threats_found     = e.threats_found;
+            wire.duration_ms       = e.duration_ms;
+            out.entries.push_back(std::move(wire));
+        }
+
+        reply_payload = out.ToJson();
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCat, L"GetReports failed: %hs", e.what());
+        reply_payload = nlohmann::json{{"entries", nlohmann::json::array()}};
+    } catch (...) {
+        SS_LOG_ERROR(kLogCat, L"GetReports failed: unknown exception");
+        reply_payload = nlohmann::json{{"entries", nlohmann::json::array()}};
+    }
 }
 
 }  // namespace ShadowStrike::PhantomHome::IPC

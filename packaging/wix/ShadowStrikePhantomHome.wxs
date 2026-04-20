@@ -57,6 +57,7 @@
       <ComponentRef Id="QtImageFormats"    />
       <ComponentRef Id="QtIconEngines"     />
       <ComponentRef Id="TrayAutostart"     />
+      <ComponentRef Id="PhantomSensorDriver" />
     </Feature>
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -65,6 +66,7 @@
           <Directory Id="PlatformsDir"    Name="platforms" />
           <Directory Id="ImageFormatsDir" Name="imageformats" />
           <Directory Id="IconEnginesDir"  Name="iconengines" />
+          <Directory Id="DriversDir"      Name="Drivers" />
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -204,6 +206,34 @@
                      Type="string"
                      Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomTray.exe&quot;"
                      KeyPath="yes" />
+    </Component>
+
+    <!--
+         PhantomSensor minifilter driver payload.
+
+         The MSI stages the driver files on disk but does NOT auto-install the
+         minifilter. Loading a kernel driver is a deliberate act that requires
+         either a production WHQL signature or `bcdedit /set testsigning on` on
+         the target host. The deployment runbook documents the manual
+         `pnputil /add-driver ... /install` + `fltmc load` step.
+    -->
+    <Component Id="PhantomSensorDriver"
+               Directory="DriversDir"
+               Guid="D5E6F708-9112-4B3C-C4D5-6E7F80912233"
+               Bitness="always64">
+      <File Id="PhantomSensorSys"
+            Name="PhantomSensor.sys"
+            Source="$(var.SensorDir)\PhantomSensor.sys"
+            KeyPath="yes" />
+      <File Id="PhantomSensorInf"
+            Name="PhantomSensor.inf"
+            Source="$(var.SensorDir)\PhantomSensor\PhantomSensor.inf" />
+      <File Id="PhantomSensorCat"
+            Name="phantomsensor.cat"
+            Source="$(var.SensorDir)\PhantomSensor\phantomsensor.cat" />
+      <File Id="PhantomSensorCer"
+            Name="PhantomSensor.cer"
+            Source="$(var.SensorDir)\PhantomSensor.cer" />
     </Component>
 
   </Package>

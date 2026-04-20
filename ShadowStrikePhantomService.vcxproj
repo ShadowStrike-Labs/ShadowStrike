@@ -110,6 +110,9 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\Reports\HomeReportsStore.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
 
   <!-- PhantomHome product modules -->
@@ -200,6 +203,7 @@
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\PipeServer.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\IPCRouter.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Reports\HomeReportsStore.hpp" />
   </ItemGroup>
 
   <!-- Engine dependency -->

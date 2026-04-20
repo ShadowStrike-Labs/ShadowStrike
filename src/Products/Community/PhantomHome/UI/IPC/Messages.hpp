@@ -806,9 +806,21 @@ struct UpdateStatusReply {
     bool          up_to_date{true};
     std::string   current_version{};
     std::uint64_t last_check_unix{0};
+    std::uint32_t pending_updates{0};
+    std::uint32_t status_code{0};
+    bool          reboot_required{false};
+    bool          in_progress{false};
 
     [[nodiscard]] nlohmann::json ToJson() const {
-        return {{"ok", up_to_date}, {"v", current_version}, {"lc", last_check_unix}};
+        return {
+            {"ok", up_to_date},
+            {"v",  current_version},
+            {"lc", last_check_unix},
+            {"pu", pending_updates},
+            {"sc", status_code},
+            {"rr", reboot_required},
+            {"ip", in_progress},
+        };
     }
     [[nodiscard]] static std::optional<UpdateStatusReply> FromJson(const nlohmann::json& j) {
         if (!j.is_object()) return std::nullopt;
@@ -816,8 +828,85 @@ struct UpdateStatusReply {
         if (!detail::GetBool(j, "ok", r.up_to_date)) return std::nullopt;
         if (!detail::GetStringBounded(j, "v", r.current_version, 64)) return std::nullopt;
         if (!detail::GetUint(j, "lc", r.last_check_unix)) return std::nullopt;
+        // Forward-compatible optional fields.
+        if (j.contains("pu")) { (void)detail::GetUint(j, "pu", r.pending_updates); }
+        if (j.contains("sc")) { (void)detail::GetUint(j, "sc", r.status_code); }
+        if (j.contains("rr")) { (void)detail::GetBool(j, "rr", r.reboot_required); }
+        if (j.contains("ip")) { (void)detail::GetBool(j, "ip", r.in_progress); }
         return r;
     }
 };
 
+// ---- Reports -------------------------------------------------------------
+
+struct ReportEntry {
+    std::uint64_t id{0};
+    std::int64_t  timestamp_unix_ms{0};
+    std::uint32_t kind{0};
+    std::uint32_t severity{0};
+    std::string   module_name;
+    std::string   title;
+    std::string   description;
+    std::string   target;
+    std::string   action;
+    std::string   scan_id;
+    std::uint64_t files_scanned{0};
+    std::uint64_t threats_found{0};
+    std::int64_t  duration_ms{0};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        return {
+            {"id",  id},
+            {"ts",  timestamp_unix_ms},
+            {"k",   kind},
+            {"sv",  severity},
+            {"m",   module_name},
+            {"t",   title},
+            {"d",   description},
+            {"tg",  target},
+            {"a",   action},
+            {"sid", scan_id},
+            {"fs",  files_scanned},
+            {"tf",  threats_found},
+            {"ds",  duration_ms},
+        };
+    }
+};
+
+struct GetReportsRequest {
+    std::optional<std::uint32_t> kind;
+    std::optional<std::uint32_t> min_severity;
+    std::optional<std::uint64_t> since_id;
+    std::uint32_t                max_entries{256};
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        nlohmann::json j = { {"max", max_entries} };
+        if (kind)         j["k"]   = *kind;
+        if (min_severity) j["sv"]  = *min_severity;
+        if (since_id)     j["sid"] = *since_id;
+        return j;
+    }
+    [[nodiscard]] static std::optional<GetReportsRequest> FromJson(const nlohmann::json& j) {
+        if (!j.is_object()) return std::nullopt;
+        GetReportsRequest r;
+        if (j.contains("max")) { (void)detail::GetUint(j, "max", r.max_entries); }
+        if (j.contains("k"))   { std::uint32_t v{};   if (detail::GetUint(j, "k",   v)) r.kind         = v; }
+        if (j.contains("sv"))  { std::uint32_t v{};   if (detail::GetUint(j, "sv",  v)) r.min_severity = v; }
+        if (j.contains("sid")) { std::uint64_t v{};   if (detail::GetUint(j, "sid", v)) r.since_id     = v; }
+        if (r.max_entries == 0 || r.max_entries > 1024) r.max_entries = 256;
+        return r;
+    }
+};
+
+struct GetReportsReply {
+    std::vector<ReportEntry> entries;
+
+    [[nodiscard]] nlohmann::json ToJson() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& e : entries) arr.push_back(e.ToJson());
+        return { {"entries", std::move(arr)} };
+    }
+};
+
 }  // namespace ShadowStrike::PhantomHome::IPC
+
