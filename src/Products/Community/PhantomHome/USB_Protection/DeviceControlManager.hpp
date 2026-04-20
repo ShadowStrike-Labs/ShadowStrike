@@ -277,21 +277,8 @@ enum class EvaluationResult : uint8_t {
     Error           = 255
 };
 
-/**
- * @brief DeviceControlManager module status.
- *
- * Module-specific name avoids ODR violation with identically-named
- * enums in sibling USB_Protection headers.
- */
-enum class DCModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+/// @brief Canonical lifecycle state reused from USBCommonTypes.hpp.
+using DCModuleStatus = ModuleStatus;
 
 // ============================================================================
 // STRUCTURES

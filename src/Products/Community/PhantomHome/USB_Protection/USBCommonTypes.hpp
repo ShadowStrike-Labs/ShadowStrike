@@ -66,8 +66,36 @@ enum class AccessLevel : uint8_t {
     Custom          = 255   ///< Custom permission set
 };
 
+/**
+ * @brief Shared module lifecycle state.
+ *
+ * Canonical lifecycle state used by USB modules whose state machine does not
+ * require module-specific substates such as Monitoring or Scanning.
+ */
+enum class ModuleStatus : uint8_t {
+    Uninitialized   = 0,
+    Initializing    = 1,
+    Running         = 2,
+    Paused          = 3,
+    Stopping        = 4,
+    Stopped         = 5,
+    Error           = 6
+};
+
 /// @brief Human-readable name for an AccessLevel value.
-[[nodiscard]] std::string_view GetAccessLevelName(AccessLevel level) noexcept;
+[[nodiscard]] inline std::string_view GetAccessLevelName(AccessLevel level) noexcept {
+    switch (level) {
+        case AccessLevel::FullAccess:     return "FullAccess";
+        case AccessLevel::ReadOnly:       return "ReadOnly";
+        case AccessLevel::WriteOnly:      return "WriteOnly";
+        case AccessLevel::NoExecute:      return "NoExecute";
+        case AccessLevel::Blocked:        return "Blocked";
+        case AccessLevel::QuarantineOnly: return "QuarantineOnly";
+        case AccessLevel::AuditOnly:      return "AuditOnly";
+        case AccessLevel::Custom:         return "Custom";
+        default:                          return "Unknown";
+    }
+}
 
 }  // namespace USB
 }  // namespace ShadowStrike
