@@ -333,7 +333,7 @@ void HomeProductOrchestrator::ShutdownLocked() noexcept {
         std::shared_lock regLock(m_registryMutex);
         indices.reserve(m_modules.size());
         for (auto it = kPhaseOrder.rbegin(); it != kPhaseOrder.rend(); ++it) {
-            for (std::size_t i = 0; i < m_modules.size(); ++i) {
+            for (std::size_t i = m_modules.size(); i-- > 0;) {
                 if (m_modules[i].descriptor.phase == *it) {
                     indices.push_back(i);
                 }
