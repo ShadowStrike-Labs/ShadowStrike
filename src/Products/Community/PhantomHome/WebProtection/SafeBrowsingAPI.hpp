@@ -220,8 +220,11 @@ struct SafeBrowsingConfig {
     /// @brief Fail-closed mode (block on error)
     bool failClosed = false;
 
+    /// @brief Allow external cloud reputation lookups (opt-in only, disabled in Community tier)
+    bool enableCloudLookups = false;
+
     /// @brief Enable telemetry
-    bool enableTelemetry = true;
+    bool enableTelemetry = false;
 
     /// @brief Verbose logging
     bool verboseLogging = false;
@@ -402,7 +405,7 @@ struct SafeBrowsingStatistics {
           totalBlocked(other.totalBlocked.load(std::memory_order_relaxed)),
           lookupErrors(other.lookupErrors.load(std::memory_order_relaxed)),
           totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
-          startTime(other.startTime) {}
+          startTime(std::atomic_ref<SteadyTimePoint>(const_cast<SteadyTimePoint&>(other.startTime)).load(std::memory_order_relaxed)) {}
 
     SafeBrowsingStatistics& operator=(const SafeBrowsingStatistics& other) {
         if (this != &other) {
@@ -419,7 +422,7 @@ struct SafeBrowsingStatistics {
             totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
             lookupErrors.store(other.lookupErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
             totalProcessingTimeUs.store(other.totalProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = other.startTime;
+            startTime = std::atomic_ref<SteadyTimePoint>(const_cast<SteadyTimePoint&>(other.startTime)).load(std::memory_order_relaxed);
         }
         return *this;
     }
@@ -438,7 +441,7 @@ struct SafeBrowsingStatistics {
           totalBlocked(other.totalBlocked.load(std::memory_order_relaxed)),
           lookupErrors(other.lookupErrors.load(std::memory_order_relaxed)),
           totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
-          startTime(other.startTime) {}
+          startTime(std::atomic_ref<SteadyTimePoint>(const_cast<SteadyTimePoint&>(other.startTime)).load(std::memory_order_relaxed)) {}
 
     SafeBrowsingStatistics& operator=(SafeBrowsingStatistics&&) = delete;
 
