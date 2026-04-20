@@ -187,6 +187,45 @@ namespace {
         return fs::temp_directory_path() / name;
     }
 
+    [[nodiscard]] fs::path NormalizePathForComparison(const fs::path& path) {
+        std::error_code ec;
+        fs::path normalized = fs::weakly_canonical(path, ec);
+        if (ec) {
+            ec.clear();
+            normalized = path.lexically_normal();
+        }
+        return normalized;
+    }
+
+    [[nodiscard]] bool PathStartsWith(const fs::path& path, const fs::path& prefix) {
+        auto normalizedPath = NormalizePathForComparison(path);
+        auto normalizedPrefix = NormalizePathForComparison(prefix);
+        auto [pathIt, prefixIt] = std::mismatch(
+            normalizedPath.begin(), normalizedPath.end(),
+            normalizedPrefix.begin(), normalizedPrefix.end());
+        return prefixIt == normalizedPrefix.end();
+    }
+
+    [[nodiscard]] bool HasReparsePoint(const fs::path& path) noexcept {
+#ifdef _WIN32
+        const DWORD attributes = ::GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+               (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+        (void)path;
+        return false;
+#endif
+    }
+
+    [[nodiscard]] bool IsPathWithinUserBrowserRoots(const fs::path& path) {
+        const fs::path localPath = GetKnownFolderSafe(CSIDL_LOCAL_APPDATA);
+        const fs::path roamingPath = GetKnownFolderSafe(CSIDL_APPDATA);
+        if (localPath.empty() || roamingPath.empty()) {
+            return false;
+        }
+        return PathStartsWith(path, localPath) || PathStartsWith(path, roamingPath);
+    }
+
     /// @brief RAII guard that deletes a temporary file on scope exit
     struct TempFileGuard {
         fs::path path;
@@ -428,12 +467,18 @@ public:
                     break;
             }
 
-            // Verify paths exist
+            // Verify paths exist and remain inside the expected AppData roots.
             for (const auto& pathStr : pathsToCheck) {
                 fs::path p(pathStr);
-                if (fs::exists(p)) {
-                    profiles.push_back(p);
+                std::error_code ec;
+                if (!fs::exists(p, ec) || ec) {
+                    continue;
                 }
+                if (HasReparsePoint(p) || !IsPathWithinUserBrowserRoots(p)) {
+                    Utils::Logger::Warn("CookieManager: Skipping untrusted browser profile path {}", p.string());
+                    continue;
+                }
+                profiles.push_back(std::move(p));
             }
 
             // Cache the results
@@ -467,6 +512,13 @@ public:
                 if (!fs::exists(cookieDbPath)) {
                     return cookies;
                 }
+            }
+
+            if (HasReparsePoint(profilePath) || HasReparsePoint(cookieDbPath) ||
+                !IsPathWithinUserBrowserRoots(cookieDbPath)) {
+                Utils::Logger::Warn("CookieManager: Refusing to read cookies from untrusted path {}",
+                    cookieDbPath.string());
+                return cookies;
             }
 
             // Copy database to temp (browser may have it locked)
@@ -609,6 +661,13 @@ public:
         try {
             fs::path cookieDbPath = profilePath / "cookies.sqlite";
             if (!fs::exists(cookieDbPath)) {
+                return cookies;
+            }
+
+            if (HasReparsePoint(profilePath) || HasReparsePoint(cookieDbPath) ||
+                !IsPathWithinUserBrowserRoots(cookieDbPath)) {
+                Utils::Logger::Warn("CookieManager: Refusing to read Firefox cookies from untrusted path {}",
+                    cookieDbPath.string());
                 return cookies;
             }
 
@@ -1650,10 +1709,17 @@ bool CookieManager::DeleteCookie(const BrowserCookie& cookie) {
             return false;
         }
 
+        if (HasReparsePoint(fs::path(cookie.profile)) || HasReparsePoint(cookieDbPath) ||
+            !IsPathWithinUserBrowserRoots(fs::path(cookie.profile)) ||
+            !IsPathWithinUserBrowserRoots(cookieDbPath)) {
+            Utils::Logger::Warn("CookieManager: Refusing to delete cookie outside trusted browser roots");
+            return false;
+        }
+
         // Open database for writing (not a temp copy — we modify the original)
         sqlite3* db = nullptr;
         int rc = sqlite3_open_v2(cookieDbPath.string().c_str(), &db,
-                                  SQLITE_OPEN_READWRITE, nullptr);
+                                  SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
         if (rc != SQLITE_OK) {
             Utils::Logger::Debug("CookieManager: Cannot open cookie DB for writing (rc={}): {}",
                                 rc, db ? sqlite3_errmsg(db) : "null handle");
@@ -1661,6 +1727,7 @@ bool CookieManager::DeleteCookie(const BrowserCookie& cookie) {
             return false;
         }
         SqliteDbGuard dbGuard(db);
+        sqlite3_busy_timeout(db, 1000);
 
         // Use parameterized query — prevents SQL injection
         sqlite3_stmt* stmt = nullptr;
@@ -1682,8 +1749,12 @@ bool CookieManager::DeleteCookie(const BrowserCookie& cookie) {
 
         rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
-            Utils::Logger::Error("CookieManager: DELETE failed (rc={}): {}",
-                                rc, sqlite3_errmsg(db));
+            if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+                Utils::Logger::Debug("CookieManager: Cookie DB busy during delete (rc={})", rc);
+            } else {
+                Utils::Logger::Error("CookieManager: DELETE failed (rc={}): {}",
+                                    rc, sqlite3_errmsg(db));
+            }
             return false;
         }
 
