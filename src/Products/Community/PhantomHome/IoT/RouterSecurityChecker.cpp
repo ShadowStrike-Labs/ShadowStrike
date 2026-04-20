@@ -59,12 +59,12 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/Utils/Base64Utils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -607,13 +607,19 @@ uint32_t RouterSecurityReport::GetHighIssueCount() const {
 bool RouterAssessmentConfig::IsValid() const noexcept {
     if (timeoutMs == 0) return false;
     if (timeoutMs > 300000) return false; // Max 5 minutes
+    if (maxCredentialAttempts == 0 || maxCredentialAttempts > 5) return false;
+    if (credentialProbeJitterMs > 5000) return false;
     return true;
 }
 
 std::string RouterAssessmentConfig::ToJson() const {
     nlohmann::json j = {
         {"gatewayIP", gatewayIP},
+        {"requireLocalGateway", requireLocalGateway},
         {"checkDefaultCredentials", checkDefaultCredentials},
+        {"allowCredentialProbe", allowCredentialProbe},
+        {"maxCredentialAttempts", maxCredentialAttempts},
+        {"credentialProbeJitterMs", credentialProbeJitterMs},
         {"checkUPnP", checkUPnP},
         {"checkWireless", checkWireless},
         {"checkDNS", checkDNS},
@@ -649,7 +655,10 @@ std::string RouterStatistics::ToJson() const {
 }
 
 bool RouterCheckerConfiguration::IsValid() const noexcept {
-    return defaultAssessmentConfig.IsValid();
+    if (!defaultAssessmentConfig.IsValid()) {
+        return false;
+    }
+    return periodicAssessmentHours <= 24 * 30;
 }
 
 // ============================================================================
@@ -718,7 +727,9 @@ public:
     [[nodiscard]] RouterSecurityReport QuickSecurityCheckInternal(const std::string& gatewayIP);
 
     // Specific checks
-    [[nodiscard]] bool CheckDefaultCredentialsInternal(const std::string& ip);
+    [[nodiscard]] bool CheckDefaultCredentialsInternal(
+        const std::string& ip,
+        const RouterAssessmentConfig& assessmentConfig);
     [[nodiscard]] UPnPInfo CheckUPnPInternal(const std::string& ip);
     [[nodiscard]] bool CheckDNSHijackingInternal();
     [[nodiscard]] std::string GetDefaultGatewayInternal() const;
@@ -867,13 +878,16 @@ RouterSecurityReport RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
         m_cancelRequested.store(false, std::memory_order_release);
         m_progress.store(0.0f, std::memory_order_release);
 
+        RouterAssessmentConfig effectiveConfig = config;
+
         // Determine gateway IP
+        UpdateProgress(5.0f, "Detecting default gateway");
+        const std::string localGateway = GetDefaultGatewayInternal();
         std::string targetIP = gatewayIP;
         if (targetIP.empty() || targetIP == "0.0.0.0") {
-            UpdateProgress(5.0f, "Detecting default gateway");
-            targetIP = GetDefaultGatewayInternal();
+            targetIP = localGateway;
             if (targetIP.empty()) {
-                ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Failed to detect gateway");
+                ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Failed to detect local default gateway");
                 report.status = AssessmentStatus::Failed;
                 return report;
             }
@@ -886,6 +900,22 @@ RouterSecurityReport RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
             ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Invalid gateway IP format");
             report.status = AssessmentStatus::Failed;
             return report;
+        }
+
+        if (effectiveConfig.requireLocalGateway) {
+            if (localGateway.empty()) {
+                ::ShadowStrike::Utils::Logger::Warn(
+                    "RouterSecurityChecker: Refusing assessment because the local default gateway could not be resolved");
+                report.status = AssessmentStatus::Failed;
+                return report;
+            }
+            if (localGateway != targetIP) {
+                ::ShadowStrike::Utils::Logger::Warn(
+                    "RouterSecurityChecker: Refusing assessment for non-local gateway target {}",
+                    targetIP);
+                report.status = AssessmentStatus::Failed;
+                return report;
+            }
         }
 
         ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Auditing router at {}",
@@ -908,9 +938,9 @@ RouterSecurityReport RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
         }
 
         // Check default credentials
-        if (config.checkDefaultCredentials) {
+        if (effectiveConfig.checkDefaultCredentials && effectiveConfig.allowCredentialProbe) {
             UpdateProgress(20.0f, "Checking default credentials");
-            if (CheckDefaultCredentialsInternal(targetIP)) {
+            if (CheckDefaultCredentialsInternal(targetIP, effectiveConfig)) {
                 report.defaultCredsFound = true;
                 m_statistics.defaultCredsFound.fetch_add(1, std::memory_order_relaxed);
 
@@ -1118,27 +1148,56 @@ RouterSecurityReport RouterSecurityCheckerImpl::QuickSecurityCheckInternal(
 // ============================================================================
 
 bool RouterSecurityCheckerImpl::CheckDefaultCredentialsInternal(
-    const std::string& ip)
+    const std::string& ip,
+    const RouterAssessmentConfig& assessmentConfig)
 {
     try {
+        if (!assessmentConfig.checkDefaultCredentials || !assessmentConfig.allowCredentialProbe) {
+            ::ShadowStrike::Utils::Logger::Info(
+                "RouterSecurityChecker: Credential probing skipped for {} (explicit consent not granted)",
+                ip);
+            return false;
+        }
+
+        const auto localGateway = GetDefaultGatewayInternal();
+        if (assessmentConfig.requireLocalGateway) {
+            if (localGateway.empty()) {
+                ::ShadowStrike::Utils::Logger::Warn(
+                    "RouterSecurityChecker: Refusing credential probe because the local default gateway could not be resolved");
+                return false;
+            }
+            if (localGateway != ip) {
+                ::ShadowStrike::Utils::Logger::Warn(
+                    "RouterSecurityChecker: Refusing credential probe for non-local gateway target {}",
+                    ip);
+                return false;
+            }
+        }
+
         auto credDatabase = GetDefaultCredentialsDatabase();
+        if (!assessmentConfig.customCredentials.empty()) {
+            credDatabase.reserve(credDatabase.size() + assessmentConfig.customCredentials.size());
+            for (const auto& custom : assessmentConfig.customCredentials) {
+                credDatabase.push_back({RouterVendor::Unknown, custom.first, custom.second, "custom"});
+            }
+        }
 
-        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Testing {} default credentials for {}",
-                          credDatabase.size(),
-                          ip);
+        const size_t maxAttempts = std::min<size_t>(assessmentConfig.maxCredentialAttempts, 5);
+        const uint32_t jitterBaseMs = std::min<uint32_t>(assessmentConfig.credentialProbeJitterMs, 5000u);
+        const uint32_t timeoutMs = std::clamp<uint32_t>(assessmentConfig.timeoutMs, 1000u, 5000u);
 
-        // Attempt HTTP Basic Authentication against common admin endpoints
-        constexpr uint16_t adminPorts[] = { 80, 443, 8080, 8443 };
-        constexpr const wchar_t* adminPaths[] = { L"/", L"/login", L"/admin", L"/cgi-bin/luci" };
-        constexpr size_t kMaxAttempts = 50; // Cap total attempts to avoid account lockout
-        constexpr uint32_t kPerAttemptDelayMs = 250; // Rate-limit between attempts
+        ::ShadowStrike::Utils::Logger::Info(
+            "RouterSecurityChecker: Credential probe enabled for local gateway {} with cap {}",
+            ip,
+            maxAttempts);
 
+        constexpr uint16_t adminPorts[] = {80, 443, 8080, 8443};
+        constexpr const wchar_t* adminPaths[] = {L"/", L"/login", L"/admin", L"/cgi-bin/luci"};
         size_t attemptCount = 0;
 
         for (uint16_t port : adminPorts) {
             if (m_cancelRequested.load(std::memory_order_acquire)) return false;
 
-            // Determine protocol
             const bool useTLS = (port == 443 || port == 8443);
             const std::wstring proto = useTLS ? L"https" : L"http";
 
@@ -1150,58 +1209,71 @@ bool RouterSecurityCheckerImpl::CheckDefaultCredentialsInternal(
 
                 for (const auto& cred : credDatabase) {
                     if (m_cancelRequested.load(std::memory_order_acquire)) return false;
-                    if (++attemptCount > kMaxAttempts) {
+                    if (attemptCount >= maxAttempts) {
                         ::ShadowStrike::Utils::Logger::Info(
-                            "RouterSecurityChecker: Reached credential test cap ({} attempts)",
-                            kMaxAttempts);
+                            "RouterSecurityChecker: Reached credential probe cap ({} attempts)",
+                            maxAttempts);
                         return false;
                     }
 
-                    // Build HTTP Basic Auth header: base64(username:password)
+                    ++attemptCount;
+
                     std::string authPlain = cred.username + ":" + cred.password;
-                    std::string authEncoded = ::ShadowStrike::Utils::CryptoUtils::Base64::Encode(
-                        reinterpret_cast<const uint8_t*>(authPlain.data()), authPlain.size());
+                    std::string authEncoded;
+                    if (!::ShadowStrike::Utils::Base64Encode(authPlain, authEncoded)) {
+                        ::ShadowStrike::Utils::Logger::Warn(
+                            "RouterSecurityChecker: Failed to encode credential payload for {}",
+                            ip);
+                        return false;
+                    }
 
                     ::ShadowStrike::Utils::NetworkUtils::HttpRequestOptions opts;
-                    opts.timeoutMs = std::min(m_config.defaultAssessmentConfig.timeoutMs, 5000u);
+                    opts.timeoutMs = timeoutMs;
                     opts.headers.push_back({L"Authorization",
                         std::format(L"Basic {}", ::ShadowStrike::Utils::StringUtils::ToWide(authEncoded))});
-                    opts.allowRedirects = false; // Don't follow redirects (avoid loops)
-                    opts.verifySSL = false; // Router self-signed certs are common
+                    opts.allowRedirects = false;
+                    opts.verifySSL = false;
 
                     ::ShadowStrike::Utils::NetworkUtils::HttpResponse response;
                     ::ShadowStrike::Utils::NetworkUtils::Error netErr;
-                    bool ok = ::ShadowStrike::Utils::NetworkUtils::HttpRequest(baseURL, response, opts, &netErr);
+                    const bool ok = ::ShadowStrike::Utils::NetworkUtils::HttpRequest(baseURL, response, opts, &netErr);
+                    authPlain.assign(authPlain.size(), '\0');
 
                     if (!ok) {
-                        // Connection refused or timeout — try next port
                         break;
                     }
 
-                    // 200 or 301/302 (authenticated redirect) means creds work
+                    if (response.statusCode == 429 || response.statusCode == 503) {
+                        ::ShadowStrike::Utils::Logger::Warn(
+                            "RouterSecurityChecker: Router throttled credential probe on {}:{} (HTTP {})",
+                            ip,
+                            port,
+                            response.statusCode);
+                        return false;
+                    }
+
                     if (response.statusCode == 200 || response.statusCode == 301 || response.statusCode == 302) {
                         ::ShadowStrike::Utils::Logger::Warn(
-                            "RouterSecurityChecker: DEFAULT CREDENTIALS ACCEPTED on {}:{} user={}",
-                            ip, port,
-                            cred.username);
+                            "RouterSecurityChecker: Default credentials accepted on {}:{}",
+                            ip,
+                            port);
                         return true;
                     }
 
-                    // 401/403 means credentials failed — try next credential
                     if (response.statusCode == 401 || response.statusCode == 403) {
-                        // Rate-limit to avoid triggering lockout
-                        Sleep(kPerAttemptDelayMs);
+                        const uint32_t jitterMs = jitterBaseMs + static_cast<uint32_t>((attemptCount * 73U) % 251U);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(jitterMs));
                         continue;
                     }
 
-                    // Other status codes — admin page may not be at this path
                     break;
                 }
             }
         }
 
-        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: No default credentials found for {}",
-                          ip);
+        ::ShadowStrike::Utils::Logger::Info(
+            "RouterSecurityChecker: No default credentials accepted for {}",
+            ip);
         return false;
 
     } catch (const std::exception& e) {
@@ -1427,50 +1499,29 @@ bool RouterSecurityCheckerImpl::CheckDNSHijackingInternal() {
 
 std::string RouterSecurityCheckerImpl::GetDefaultGatewayInternal() const {
     try {
-#ifdef _WIN32
-        ULONG bufferSize = sizeof(IP_ADAPTER_INFO);
-        std::vector<BYTE> buffer(bufferSize);
-
-        PIP_ADAPTER_INFO pAdapterInfo = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
-
-        DWORD result = GetAdaptersInfo(pAdapterInfo, &bufferSize);
-        if (result == ERROR_BUFFER_OVERFLOW) {
-            if (bufferSize > 256 * 1024) {
-                ::ShadowStrike::Utils::Logger::Warn("RouterSecurityChecker: GetAdaptersInfo requested excessive buffer");
-                return "192.168.1.1";
+        ::ShadowStrike::Utils::NetworkUtils::IpAddress gateway;
+        ::ShadowStrike::Utils::NetworkUtils::Error netErr;
+        if (!::ShadowStrike::Utils::NetworkUtils::GetDefaultGateway(gateway, &netErr) ||
+            !gateway.IsValid()) {
+            if (!netErr.message.empty()) {
+                ::ShadowStrike::Utils::Logger::Warn(
+                    "RouterSecurityChecker: Unable to resolve default gateway - {}",
+                    ::ShadowStrike::Utils::StringUtils::ToNarrow(netErr.message));
             }
-            buffer.resize(bufferSize);
-            pAdapterInfo = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
-            result = GetAdaptersInfo(pAdapterInfo, &bufferSize);
+            return {};
         }
 
-        if (result == NO_ERROR) {
-            PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
-            constexpr size_t kMaxAdapters = 64;
-            size_t count = 0;
-            while (pAdapter && count < kMaxAdapters) {
-                if (pAdapter->Type == MIB_IF_TYPE_ETHERNET ||
-                    pAdapter->Type == IF_TYPE_IEEE80211) {
-                    std::string gateway = pAdapter->GatewayList.IpAddress.String;
-                    if (!gateway.empty() && gateway != "0.0.0.0" && IsValidIPv4(gateway)) {
-                        ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Detected gateway: {}",
-                                          gateway);
-                        return gateway;
-                    }
-                }
-                pAdapter = pAdapter->Next;
-                ++count;
-            }
+        const auto gatewayStr = ::ShadowStrike::Utils::StringUtils::ToNarrow(gateway.ToString());
+        if (!IsValidIPv4(gatewayStr) || gatewayStr == "0.0.0.0") {
+            return {};
         }
-#endif
 
-        // Fallback: common gateway
-        return "192.168.1.1";
+        return gatewayStr;
 
     } catch (const std::exception& e) {
         ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Failed to get gateway - {}",
                            e.what());
-        return "192.168.1.1";
+        return {};
     }
 }
 
@@ -2165,7 +2216,14 @@ float RouterSecurityChecker::GetProgress() const noexcept {
 // ============================================================================
 
 bool RouterSecurityChecker::CheckDefaultCredentials(const std::string& ip) {
-    return m_impl ? m_impl->CheckDefaultCredentialsInternal(ip) : false;
+    if (!m_impl) {
+        return false;
+    }
+
+    std::shared_lock lock(m_impl->m_mutex);
+    const auto config = m_impl->m_config.defaultAssessmentConfig;
+    lock.unlock();
+    return m_impl->CheckDefaultCredentialsInternal(ip, config);
 }
 
 UPnPInfo RouterSecurityChecker::CheckUPnP(const std::string& ip) {
