@@ -144,6 +144,25 @@ namespace {
 /// @brief Shared directory iterator options: skip inaccessible directories
 constexpr auto kDirIterOpts = fs::directory_options::skip_permission_denied;
 
+[[nodiscard]] fs::path NormalizeCleanerPath(const fs::path& path) {
+    std::error_code ec;
+    fs::path normalized = fs::weakly_canonical(path, ec);
+    if (ec) {
+        ec.clear();
+        normalized = path.lexically_normal();
+    }
+    return normalized;
+}
+
+[[nodiscard]] bool CleanerPathStartsWith(const fs::path& path, const fs::path& prefix) {
+    const auto normalizedPath = NormalizeCleanerPath(path);
+    const auto normalizedPrefix = NormalizeCleanerPath(prefix);
+    auto [pathIt, prefixIt] = std::mismatch(
+        normalizedPath.begin(), normalizedPath.end(),
+        normalizedPrefix.begin(), normalizedPrefix.end());
+    return prefixIt == normalizedPrefix.end();
+}
+
 /**
  * @brief Browser profile locations
  */
@@ -229,6 +248,57 @@ BrowserPaths GetBrowserPathsInternal(BrowserType browser) {
 #endif
 
     return paths;
+}
+
+[[nodiscard]] std::vector<fs::path> GetAllowedCleanerRoots() {
+    std::vector<fs::path> roots;
+#ifdef _WIN32
+    wchar_t tempPath[MAX_PATH] = {};
+    if (::GetTempPathW(MAX_PATH, tempPath) != 0) {
+        roots.emplace_back(tempPath);
+    }
+
+    wchar_t appDataPath[MAX_PATH] = {};
+    if (SUCCEEDED(::SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath))) {
+        roots.emplace_back(fs::path(appDataPath) / "Microsoft" / "Windows" / "Recent");
+        roots.emplace_back(fs::path(appDataPath) / "Microsoft" / "Windows" / "Recent" / "AutomaticDestinations");
+        roots.emplace_back(fs::path(appDataPath) / "Microsoft" / "Windows" / "Recent" / "CustomDestinations");
+    }
+
+    wchar_t localAppDataPath[MAX_PATH] = {};
+    if (SUCCEEDED(::SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppDataPath))) {
+        roots.emplace_back(fs::path(localAppDataPath) / "Microsoft" / "Windows" / "Explorer");
+    }
+
+    wchar_t winDir[MAX_PATH] = {};
+    if (::GetWindowsDirectoryW(winDir, MAX_PATH) != 0) {
+        roots.emplace_back(fs::path(winDir) / L"Prefetch");
+    }
+#endif
+
+    for (auto browser : {BrowserType::Chrome, BrowserType::Firefox, BrowserType::Edge,
+                         BrowserType::Opera, BrowserType::Brave, BrowserType::Vivaldi,
+                         BrowserType::Chromium}) {
+        auto browserPaths = GetBrowserPathsInternal(browser);
+        roots.insert(roots.end(), browserPaths.profilePaths.begin(), browserPaths.profilePaths.end());
+    }
+
+    return roots;
+}
+
+[[nodiscard]] bool IsAllowedCleanerPath(const fs::path& path) {
+    const auto roots = GetAllowedCleanerRoots();
+    return std::any_of(roots.begin(), roots.end(), [&](const fs::path& root) {
+        return !root.empty() && CleanerPathStartsWith(path, root);
+    });
+}
+
+[[nodiscard]] bool ShouldPreserveCleanerRoot(const fs::path& path) {
+    const auto normalizedPath = NormalizeCleanerPath(path);
+    const auto roots = GetAllowedCleanerRoots();
+    return std::any_of(roots.begin(), roots.end(), [&](const fs::path& root) {
+        return !root.empty() && NormalizeCleanerPath(root) == normalizedPath;
+    });
 }
 
 } // anonymous namespace
@@ -1485,6 +1555,12 @@ CleanTarget PrivacyCleanerImpl::CreateCleanTarget(
 
 bool PrivacyCleanerImpl::DeleteFileSecurely(const fs::path& filePath, SecureEraseMethod method) {
     try {
+        if (!IsAllowedCleanerPath(filePath)) {
+            SS_LOG_WARN(L"PrivacyCleaner", L"Refusing to delete file outside managed roots: %hs",
+                filePath.string().c_str());
+            return false;
+        }
+
         switch (method) {
             case SecureEraseMethod::SinglePass:
                 if (!OverwriteFile(filePath, 0x00)) return false;
@@ -1985,6 +2061,12 @@ bool PrivacyCleanerImpl::DeleteTarget(const CleanTarget& target, SecureEraseMeth
             return false;
         }
 
+        if (!IsAllowedCleanerPath(target.path)) {
+            SS_LOG_WARN(L"PrivacyCleaner", L"Refusing to clean unmanaged path: %hs",
+                target.path.string().c_str());
+            return false;
+        }
+
         if (target.isDirectory) {
             for (const auto& entry : fs::recursive_directory_iterator(target.path, kDirIterOpts, ec)) {
                 if (ec) { ec.clear(); continue; }
@@ -1992,10 +2074,12 @@ bool PrivacyCleanerImpl::DeleteTarget(const CleanTarget& target, SecureEraseMeth
                     DeleteFileSecurely(entry.path(), method);
                 }
             }
-            fs::remove_all(target.path, ec);
-            if (ec) {
-                SS_LOG_WARN(L"PrivacyCleaner", L"DeleteTarget: could not fully remove directory: %hs",
-                    target.path.string().c_str());
+            if (!ShouldPreserveCleanerRoot(target.path)) {
+                fs::remove_all(target.path, ec);
+                if (ec) {
+                    SS_LOG_WARN(L"PrivacyCleaner", L"DeleteTarget: could not fully remove directory: %hs",
+                        target.path.string().c_str());
+                }
             }
         } else {
             DeleteFileSecurely(target.path, method);
@@ -2593,21 +2677,6 @@ bool CleanerConfiguration::IsValid() const noexcept {
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
-
-std::string_view GetBrowserTypeName(BrowserType browser) noexcept {
-    switch (browser) {
-        case BrowserType::Chrome:    return "Chrome";
-        case BrowserType::Firefox:   return "Firefox";
-        case BrowserType::Edge:      return "Edge";
-        case BrowserType::Opera:     return "Opera";
-        case BrowserType::Brave:     return "Brave";
-        case BrowserType::Vivaldi:   return "Vivaldi";
-        case BrowserType::IE:        return "Internet Explorer";
-        case BrowserType::Chromium:  return "Chromium";
-        case BrowserType::All:       return "All";
-        default:                     return "Unknown";
-    }
-}
 
 std::string_view GetEraseMethodName(SecureEraseMethod method) noexcept {
     switch (method) {
