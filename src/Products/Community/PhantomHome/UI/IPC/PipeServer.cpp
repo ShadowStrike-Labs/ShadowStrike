@@ -65,6 +65,11 @@ public:
     [[nodiscard]] bool    valid() const noexcept {
         return h_ != nullptr && h_ != INVALID_HANDLE_VALUE;
     }
+    [[nodiscard]] HANDLE release() noexcept {
+        HANDLE tmp = h_;
+        h_ = nullptr;
+        return tmp;
+    }
     void reset() noexcept {
         if (valid()) ::CloseHandle(h_);
         h_ = nullptr;
@@ -229,6 +234,57 @@ static bool ReadExact(HANDLE pipe, void* buf, std::uint32_t size) {
     return true;
 }
 
+static bool WaitForPipeBytes(HANDLE pipe,
+                             std::uint32_t minimum_bytes,
+                             DWORD timeout_ms,
+                             HANDLE stop_event) {
+    if (minimum_bytes == 0) return true;
+
+    const ULONGLONG deadline =
+        (timeout_ms == INFINITE) ? 0ULL : (::GetTickCount64() + timeout_ms);
+
+    for (;;) {
+        DWORD available = 0;
+        if (::PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+            if (available >= minimum_bytes) {
+                return true;
+            }
+        } else {
+            const DWORD gle = ::GetLastError();
+            if (gle == ERROR_BROKEN_PIPE ||
+                gle == ERROR_PIPE_NOT_CONNECTED ||
+                gle == ERROR_NO_DATA ||
+                gle == ERROR_INVALID_HANDLE ||
+                gle == ERROR_OPERATION_ABORTED) {
+                return false;
+            }
+        }
+
+        DWORD wait_ms = 50;
+        if (timeout_ms != INFINITE) {
+            const ULONGLONG now = ::GetTickCount64();
+            if (now >= deadline) {
+                return false;
+            }
+
+            const ULONGLONG remaining = deadline - now;
+            wait_ms = static_cast<DWORD>((std::min<ULONGLONG>)(remaining, wait_ms));
+        }
+
+        if (stop_event) {
+            const DWORD wait = ::WaitForSingleObject(stop_event, wait_ms);
+            if (wait == WAIT_OBJECT_0) {
+                return false;
+            }
+            if (wait == WAIT_FAILED) {
+                return false;
+            }
+        } else {
+            ::Sleep(wait_ms);
+        }
+    }
+}
+
 }  // namespace
 
 // ==========================================================================
@@ -265,11 +321,13 @@ bool ClientContext::PushMessage(MessageType type, const nlohmann::json& payload)
 
 PipeServer::PipeServer(Options options) : options_(std::move(options)) {
     stop_event_ = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    accept_ready_event_ = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
 }
 
 PipeServer::~PipeServer() {
     Stop();
     if (stop_event_) ::CloseHandle(stop_event_);
+    if (accept_ready_event_) ::CloseHandle(accept_ready_event_);
 }
 
 std::wstring PipeServer::PipeFullName() const {
@@ -284,8 +342,16 @@ void PipeServer::SetHandler(MessageHandler handler) {
 
 bool PipeServer::Start() {
     if (running_.exchange(true)) return true;
+    if (!stop_event_ || !accept_ready_event_) {
+        ShadowStrike::Utils::Logger::Error(
+            "PipeServer: missing synchronization events during startup");
+        running_.store(false);
+        return false;
+    }
     stopping_.store(false);
+    accept_ready_.store(false);
     ::ResetEvent(stop_event_);
+    ::ResetEvent(accept_ready_event_);
 
     try {
         accept_thread_ = std::thread(&PipeServer::AcceptLoop, this);
@@ -295,6 +361,18 @@ bool PipeServer::Start() {
         running_.store(false);
         return false;
     }
+
+    const DWORD ready_wait = ::WaitForSingleObject(accept_ready_event_, 5000);
+    if (ready_wait != WAIT_OBJECT_0 || !accept_ready_.load()) {
+        ShadowStrike::Utils::Logger::Error(
+            "PipeServer: accept loop failed to secure the initial pipe instance");
+        stopping_.store(true);
+        ::SetEvent(stop_event_);
+        if (accept_thread_.joinable()) accept_thread_.join();
+        running_.store(false);
+        return false;
+    }
+
     ShadowStrike::Utils::Logger::Info(
         "PipeServer: started, pipe prefix session={}", options_.session_id);
     return true;
@@ -339,7 +417,7 @@ HANDLE PipeServer::CreatePipeInstance(bool first) {
     }
 
     const auto name = PipeFullName();
-    DWORD open_mode = PIPE_ACCESS_DUPLEX;
+    DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
 
     // Message mode is intentional — we implement our own framing on top, but
@@ -355,8 +433,10 @@ HANDLE PipeServer::CreatePipeInstance(bool first) {
         /*nDefaultTimeOut=*/ 0,
         &sa);
     if (h == INVALID_HANDLE_VALUE) {
+        const DWORD gle = ::GetLastError();
         ShadowStrike::Utils::Logger::Error(
-            "PipeServer: CreateNamedPipeW failed, gle={}", ::GetLastError());
+            "PipeServer: CreateNamedPipeW failed, gle={}", gle);
+        ::SetLastError(gle);
     }
     return h;
 }
@@ -364,30 +444,93 @@ HANDLE PipeServer::CreatePipeInstance(bool first) {
 void PipeServer::AcceptLoop() {
     bool first = true;
     while (!stopping_.load()) {
-        HANDLE pipe = CreatePipeInstance(first);
-        first = false;
-        if (pipe == INVALID_HANDLE_VALUE) {
+        ScopedHandle pipe(CreatePipeInstance(first));
+        if (!pipe.valid()) {
+            const DWORD gle = ::GetLastError();
+            if (first) {
+                accept_ready_.store(false);
+                if (accept_ready_event_) ::SetEvent(accept_ready_event_);
+            }
             if (stopping_.load()) break;
+            if (first &&
+                (gle == ERROR_ACCESS_DENIED ||
+                 gle == ERROR_PIPE_BUSY ||
+                 gle == ERROR_INVALID_HANDLE)) {
+                ShadowStrike::Utils::Logger::Error(
+                    "PipeServer: initial pipe instance could not be secured; refusing to attach to an existing pipe, gle={}",
+                    gle);
+                stopping_.store(true);
+                running_.store(false);
+                if (stop_event_) ::SetEvent(stop_event_);
+                break;
+            }
             ::Sleep(200);
             continue;
         }
 
-        // Blocking ConnectNamedPipe — Stop() closes the handle to unblock.
-        BOOL ok = ::ConnectNamedPipe(pipe, nullptr);
-        if (!ok && ::GetLastError() != ERROR_PIPE_CONNECTED) {
-            ::CloseHandle(pipe);
-            if (stopping_.load()) break;
-            continue;
+        ScopedHandle connect_event(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        if (!connect_event.valid()) {
+            ShadowStrike::Utils::Logger::Error(
+                "PipeServer: CreateEventW failed for accept path, gle={}",
+                ::GetLastError());
+            if (first) {
+                accept_ready_.store(false);
+                if (accept_ready_event_) ::SetEvent(accept_ready_event_);
+            }
+            stopping_.store(true);
+            running_.store(false);
+            if (stop_event_) ::SetEvent(stop_event_);
+            break;
         }
+
+        if (first) {
+            accept_ready_.store(true);
+            if (accept_ready_event_) ::SetEvent(accept_ready_event_);
+        }
+
+        OVERLAPPED ov{};
+        ov.hEvent = connect_event.get();
+
+        BOOL ok = ::ConnectNamedPipe(pipe.get(), &ov);
+        if (!ok) {
+            const DWORD gle = ::GetLastError();
+            if (gle == ERROR_IO_PENDING) {
+                HANDLE waits[2] = {stop_event_, connect_event.get()};
+                const DWORD wait = ::WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+                if (wait == WAIT_OBJECT_0) {
+                    ::CancelIoEx(pipe.get(), &ov);
+                    break;
+                }
+                if (wait != WAIT_OBJECT_0 + 1) {
+                    ::CancelIoEx(pipe.get(), &ov);
+                    if (stopping_.load()) break;
+                    continue;
+                }
+
+                DWORD transferred = 0;
+                if (!::GetOverlappedResult(pipe.get(), &ov, &transferred, FALSE)) {
+                    const DWORD result_gle = ::GetLastError();
+                    if (result_gle == ERROR_OPERATION_ABORTED && stopping_.load()) {
+                        break;
+                    }
+                    if (stopping_.load()) break;
+                    continue;
+                }
+            } else if (gle != ERROR_PIPE_CONNECTED) {
+                if (stopping_.load()) break;
+                continue;
+            }
+        }
+
+        first = false;
 
         ULONG client_pid = 0;
-        if (!::GetNamedPipeClientProcessId(pipe, &client_pid)) {
-            ::DisconnectNamedPipe(pipe);
-            ::CloseHandle(pipe);
+        if (!::GetNamedPipeClientProcessId(pipe.get(), &client_pid)) {
+            ::DisconnectNamedPipe(pipe.get());
             continue;
         }
 
-        auto ctx = std::make_shared<ClientContext>(*this, pipe, client_pid);
+        auto ctx = std::make_shared<ClientContext>(*this, pipe.release(), client_pid);
         {
             std::scoped_lock lk(clients_mutex_);
             if (clients_.size() >= options_.max_concurrent_connections) {
@@ -412,8 +555,14 @@ void PipeServer::AcceptLoop() {
 
 bool PipeServer::ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out) {
     std::uint32_t len_le = 0;
+    if (!WaitForPipeBytes(pipe, sizeof(len_le), options_.read_timeout_ms, stop_event_)) {
+        return false;
+    }
     if (!ReadExact(pipe, &len_le, sizeof(len_le))) return false;
     if (len_le == 0 || len_le > kMaxFrameBytes) return false;
+    if (!WaitForPipeBytes(pipe, len_le, options_.read_timeout_ms, stop_event_)) {
+        return false;
+    }
     out.resize(len_le);
     return ReadExact(pipe, out.data(), len_le);
 }
