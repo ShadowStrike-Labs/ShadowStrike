@@ -32,6 +32,8 @@
 
 #include "pch.h"
 #include "AdBlocker.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY
@@ -62,6 +64,19 @@ std::atomic<bool> AdBlocker::s_instanceCreated{false};
 // HELPER FUNCTIONS
 // ============================================================================
 namespace {
+    inline constexpr uintmax_t MAX_FILTER_LIST_FILE_SIZE = 64ULL * 1024ULL * 1024ULL;
+    inline constexpr size_t MAX_FILTER_RULE_LENGTH = 8192;
+    inline constexpr size_t MAX_REGEX_RULE_LENGTH = 1024;
+
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
 
     bool StartsWith(std::string_view str, std::string_view prefix) noexcept {
         return str.size() >= prefix.size() && str.substr(0, prefix.size()) == prefix;
@@ -79,22 +94,47 @@ namespace {
     }
 
     std::string GetDomainFromUrl(const std::string& url) {
-        std::string_view sv = url;
-        size_t start = 0;
-        if (StartsWith(sv, "http://")) start = 7;
-        else if (StartsWith(sv, "https://")) start = 8;
-        else if (StartsWith(sv, "//")) start = 2;
+        const std::wstring wideUrl = Utils::StringUtils::ToWide(url);
+        if (!wideUrl.empty()) {
+            Utils::NetworkUtils::UrlComponents components;
+            Utils::NetworkUtils::Error parseError;
+            if (Utils::NetworkUtils::ParseUrl(wideUrl, components, &parseError) &&
+                !components.host.empty())
+            {
+                return ToLowerStr(Utils::StringUtils::ToNarrow(components.host));
+            }
+        }
 
-        size_t end = sv.find('/', start);
-        if (end == std::string_view::npos) end = sv.size();
+        if (url.find("://") == std::string::npos &&
+            url.find('/') == std::string::npos &&
+            url.find('?') == std::string::npos &&
+            url.find('#') == std::string::npos)
+        {
+            return ToLowerStr(url);
+        }
 
-        size_t port = sv.find(':', start);
-        if (port != std::string_view::npos && port < end) end = port;
+        return {};
+    }
 
-        size_t at = sv.find('@', start);
-        if (at != std::string_view::npos && at < end) start = at + 1;
+    [[nodiscard]] bool IsStrictUtf8(std::string_view value) noexcept {
+        if (value.empty()) {
+            return true;
+        }
 
-        return ToLowerStr(sv.substr(start, end - start));
+        const int required = MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            nullptr,
+            0);
+        return required > 0;
+    }
+
+    [[nodiscard]] bool ContainsEmbeddedLineBreak(std::string_view value) noexcept {
+        return value.find('\r') != std::string_view::npos ||
+               value.find('\n') != std::string_view::npos ||
+               value.find('\0') != std::string_view::npos;
     }
 
     std::string GetBaseDomain(const std::string& domain) {
@@ -377,10 +417,11 @@ void AdBlockerStatistics::Reset() noexcept {
     cacheMisses = 0;
     bytesBlocked = 0;
     for (auto& count : byRequestType) count = 0;
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string AdBlockerStatistics::ToJson() const {
+    const auto statsStartTime = AtomicValueLoadRelaxed(startTime);
     std::ostringstream oss;
     oss << "{"
         << "\"totalRequests\":" << totalRequests.load() << ","
@@ -395,7 +436,7 @@ std::string AdBlockerStatistics::ToJson() const {
         << "\"cacheHits\":" << cacheHits.load() << ","
         << "\"cacheMisses\":" << cacheMisses.load() << ","
         << "\"bytesBlocked\":" << bytesBlocked.load() << ","
-        << "\"uptimeSeconds\":" << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - startTime).count()
+        << "\"uptimeSeconds\":" << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - statsStartTime).count()
         << "}";
     return oss.str();
 }
@@ -423,6 +464,10 @@ public:
         }
 
         m_status = ModuleStatus::Initializing;
+        if (!config.IsValid()) {
+            m_status = ModuleStatus::Error;
+            return false;
+        }
         m_config = config;
 
         m_networkRules.clear();
@@ -915,7 +960,14 @@ public:
     }
 
     bool LoadFilterListFromFileInternal(const std::string& filePath, const std::string& listId = {}) {
-        std::ifstream file(filePath);
+        std::error_code sizeError;
+        const auto fileSize = fs::file_size(filePath, sizeError);
+        if (!sizeError && fileSize > MAX_FILTER_LIST_FILE_SIZE) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Filter list exceeds maximum size: %hs", filePath.c_str());
+            return false;
+        }
+
+        std::ifstream file(filePath, std::ios::binary);
         if (!file.is_open()) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to open filter list file: %hs", filePath.c_str());
             return false;
@@ -948,6 +1000,14 @@ public:
         listInfo->status = FilterListStatus::Loading;
 
         while (std::getline(file, line)) {
+            if (line.size() > MAX_FILTER_RULE_LENGTH) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Skipping overlong filter rule in %hs", filePath.c_str());
+                continue;
+            }
+            if (ContainsEmbeddedLineBreak(line) || !IsStrictUtf8(line)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Skipping invalid UTF-8 or smuggled filter rule in %hs", filePath.c_str());
+                continue;
+            }
             line = TrimWhitespace(line);
             if (line.empty() || line[0] == '!' || line[0] == '[') continue;
 
@@ -1117,7 +1177,7 @@ public:
         stats.cacheHits = m_stats.cacheHits.load();
         stats.cacheMisses = m_stats.cacheMisses.load();
         stats.bytesBlocked = m_stats.bytesBlocked.load();
-        stats.startTime = m_stats.startTime;
+        AtomicValueStoreRelaxed(stats.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
         return stats;
     }
 
@@ -1611,6 +1671,10 @@ std::optional<NetworkFilterRule> ParseNetworkRule(const std::string& rule) {
     // Handle regex pattern (enclosed in /.../)
     if (patternStr.size() >= 2 && patternStr.front() == '/' && patternStr.back() == '/') {
         std::string regexStr = patternStr.substr(1, patternStr.size() - 2);
+        if (regexStr.size() > MAX_REGEX_RULE_LENGTH) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Rejecting oversized regex rule");
+            return std::nullopt;
+        }
         try {
             r.compiledRegex = std::regex(regexStr, std::regex_constants::ECMAScript |
                                                     std::regex_constants::icase |
