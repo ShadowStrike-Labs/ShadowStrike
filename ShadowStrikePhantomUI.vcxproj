@@ -111,6 +111,7 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\main.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.cpp" />
     <!-- MOC outputs are generated into $(IntDir) and included via CustomBuild. -->
     <ClCompile Include="$(IntDir)moc_ProtectionViewModel.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_ProtectionViewModel.cpp')">true</ExcludedFromBuild>

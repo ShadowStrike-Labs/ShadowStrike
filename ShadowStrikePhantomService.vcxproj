@@ -97,6 +97,7 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Service\ServiceInstaller.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\IPC\PipeServer.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\IPC\IPCRouter.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
