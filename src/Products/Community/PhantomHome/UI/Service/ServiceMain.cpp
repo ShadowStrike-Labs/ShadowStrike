@@ -44,6 +44,7 @@
 #include "../IPC/PipeServer.hpp"
 #include "../IPC/IPCRouter.hpp"
 #include "../../HomeProductOrchestrator.hpp"
+#include "ServiceInstaller.hpp"
 #include "PhantomCore/Utils/Logger.hpp"
 
 #pragma comment(lib, "wtsapi32.lib")
@@ -195,7 +196,56 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
 
 }  // namespace
 
-extern "C" int wmain(int /*argc*/, wchar_t* /*argv*/[]) {
+extern "C" int wmain(int argc, wchar_t* argv[]) {
+    // --install / --uninstall must run elevated. They never fall through to
+    // SCM dispatch. Any other argv (or no argv) is treated as the service
+    // control manager launching the process; StartServiceCtrlDispatcherW
+    // will fail fast with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT if invoked
+    // directly from a console, which is the documented behaviour.
+    if (argc >= 2 && argv != nullptr && argv[1] != nullptr) {
+        const std::wstring arg{argv[1]};
+        if (arg == L"--install" || arg == L"-install" || arg == L"/install") {
+            wchar_t self[MAX_PATH]{};
+            const DWORD n = ::GetModuleFileNameW(nullptr, self, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH) {
+                ShadowStrike::Utils::Logger::Error(
+                    "wmain --install: GetModuleFileNameW failed gle={}", ::GetLastError());
+                return 1;
+            }
+            const std::wstring service_path{self, n};
+
+            // Derive the tray path by replacing the final component.
+            std::wstring tray_path = service_path;
+            const auto slash = tray_path.find_last_of(L"\\/");
+            if (slash == std::wstring::npos) {
+                ShadowStrike::Utils::Logger::Error(
+                    "wmain --install: cannot derive install directory from '{}'",
+                    std::string(service_path.begin(), service_path.end()));
+                return 1;
+            }
+            tray_path.resize(slash + 1);
+            tray_path.append(L"ShadowStrikePhantomTray.exe");
+
+            if (!ShadowStrike::PhantomHome::UI::Service::InstallService(service_path)) {
+                return 2;
+            }
+            if (!ShadowStrike::PhantomHome::UI::Service::InstallTrayAutostart(tray_path)) {
+                // Roll back the service registration so install is all-or-nothing.
+                (void)ShadowStrike::PhantomHome::UI::Service::UninstallService();
+                return 3;
+            }
+            return 0;
+        }
+        if (arg == L"--uninstall" || arg == L"-uninstall" || arg == L"/uninstall") {
+            // Best-effort, in the opposite order of install: remove the tray
+            // entry first so no new tray instances spawn while the service is
+            // being torn down.
+            const bool tray_ok = ShadowStrike::PhantomHome::UI::Service::UninstallTrayAutostart();
+            const bool svc_ok  = ShadowStrike::PhantomHome::UI::Service::UninstallService();
+            return (tray_ok && svc_ok) ? 0 : 4;
+        }
+    }
+
     SERVICE_TABLE_ENTRYW table[] = {
         {const_cast<LPWSTR>(kServiceName), reinterpret_cast<LPSERVICE_MAIN_FUNCTIONW>(ServiceMainW)},
         {nullptr, nullptr}};
