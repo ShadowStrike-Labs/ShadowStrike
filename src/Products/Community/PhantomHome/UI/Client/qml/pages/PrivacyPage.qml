@@ -7,6 +7,9 @@ import "../components"
 Item {
     id: page
 
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Privacy")
+
     property bool webcamBlocked: false
     property bool dnsLeakProtection: true
     property bool ipLeakProtection: true

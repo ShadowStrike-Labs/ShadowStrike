@@ -14,6 +14,9 @@ import "../components"
 Item {
     id: page
 
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Security")
+
     // Backend-driven list of modules. Each element:
     //   { id, displayName, enabled, state ("running"|"degraded"|"disabled") }
     property var modules: []
@@ -72,6 +75,10 @@ Item {
                         Switch {
                             checked: modelData.enabled
                             onToggled: page.setModuleEnabled(modelData.id, checked)
+                            focusPolicy: Qt.StrongFocus
+                            Accessible.role: Accessible.CheckBox
+                            Accessible.name: qsTr("%1 enabled").arg(modelData.displayName)
+                            Accessible.description: qsTr("Toggle the %1 protection module").arg(modelData.displayName)
                         }
                     }
                 }
@@ -91,10 +98,26 @@ Item {
 
                 ButtonGroup { id: actionGroup }
 
-                RadioButton { ButtonGroup.group: actionGroup; text: "Ask me";       checked: true }
-                RadioButton { ButtonGroup.group: actionGroup; text: "Quarantine (recommended)" }
-                RadioButton { ButtonGroup.group: actionGroup; text: "Delete" }
-                RadioButton { ButtonGroup.group: actionGroup; text: "Log only" }
+                RadioButton { ButtonGroup.group: actionGroup; text: "Ask me";       checked: true
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.role: Accessible.RadioButton
+                    Accessible.name: qsTr("Ask me on detection")
+                }
+                RadioButton { ButtonGroup.group: actionGroup; text: "Quarantine (recommended)"
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.role: Accessible.RadioButton
+                    Accessible.name: qsTr("Quarantine on detection")
+                }
+                RadioButton { ButtonGroup.group: actionGroup; text: "Delete"
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.role: Accessible.RadioButton
+                    Accessible.name: qsTr("Delete on detection")
+                }
+                RadioButton { ButtonGroup.group: actionGroup; text: "Log only"
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.role: Accessible.RadioButton
+                    Accessible.name: qsTr("Log only on detection")
+                }
             }
 
             Item { Layout.fillHeight: true }

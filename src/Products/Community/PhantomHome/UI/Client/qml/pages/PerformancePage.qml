@@ -7,6 +7,9 @@ import "../components"
 Item {
     id: page
 
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Performance")
+
     property real cpuPct: 0.0
     property real memPct: 0.0
     property bool gameModeActive: false

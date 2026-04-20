@@ -13,6 +13,9 @@ import "../components"
 Item {
     id: page
 
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Protection status")
+
     // Wired from App.qml -> ProtectionViewModel
     property string protectionState: "green"
     property string stateCopy: "We are protecting you"
@@ -62,6 +65,10 @@ Item {
                     text: "Fast scan"
                     Layout.topMargin: Theme.sp3
                     onClicked: page.startFastScan()
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.role: Accessible.Button
+                    Accessible.name: qsTr("Fast scan")
+                    Accessible.description: qsTr("Run a fast scan of frequently targeted system locations")
                     background: Rectangle {
                         color: Theme.accent
                         radius: Theme.radiusSm
