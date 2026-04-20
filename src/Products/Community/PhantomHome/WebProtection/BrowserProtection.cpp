@@ -37,6 +37,8 @@
 #include "MaliciousDownloadBlocker.hpp"
 #include "SafeBrowsingAPI.hpp"
 #include "TrackerBlocker.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY
@@ -68,11 +70,82 @@ std::atomic<bool> BrowserProtection::s_instanceCreated{false};
 // ============================================================================
 namespace {
 
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     std::string ToLower(std::string_view str) {
         std::string lower(str);
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return lower;
+    }
+
+    [[nodiscard]] bool ContainsUnsafeText(std::string_view value) noexcept {
+        return std::any_of(value.begin(), value.end(), [](unsigned char c) {
+            return c < 0x21 || c == 0x7F;
+        });
+    }
+
+    [[nodiscard]] bool IsValidDomainCharacter(char c) noexcept {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        return std::isalnum(uc) != 0 || c == '.' || c == '-';
+    }
+
+    [[nodiscard]] std::string NormalizeDomainCandidate(std::string_view value) {
+        if (value.empty() || value.size() > 253 || ContainsUnsafeText(value)) {
+            return {};
+        }
+
+        if (value.find("://") != std::string_view::npos ||
+            value.find('/') != std::string_view::npos ||
+            value.find('\\') != std::string_view::npos ||
+            value.find('@') != std::string_view::npos ||
+            value.find(':') != std::string_view::npos ||
+            value.front() == '.' || value.front() == '-' ||
+            value.back() == '-') {
+            return {};
+        }
+
+        std::string normalized = ToLower(value);
+        while (!normalized.empty() && normalized.back() == '.') {
+            normalized.pop_back();
+        }
+
+        if (normalized.empty()) {
+            return {};
+        }
+
+        bool lastWasDot = true;
+        for (char c : normalized) {
+            if (!IsValidDomainCharacter(c)) {
+                return {};
+            }
+
+            if (c == '.') {
+                if (lastWasDot) {
+                    return {};
+                }
+                lastWasDot = true;
+                continue;
+            }
+
+            lastWasDot = false;
+        }
+
+        return lastWasDot ? std::string{} : normalized;
+    }
+
+    [[nodiscard]] bool HasOnlyValidCustomDomains(const std::vector<std::string>& domains) {
+        return std::all_of(domains.begin(), domains.end(), [](const std::string& domain) {
+            return !NormalizeDomainCandidate(domain).empty();
+        });
     }
 
     std::string EscapeJson(const std::string& s) {
@@ -98,21 +171,35 @@ namespace {
     }
 
     std::string GetDomainFromUrl(const std::string& url) {
-        size_t start = 0;
-        if (url.find("http://") == 0) start = 7;
-        else if (url.find("https://") == 0) start = 8;
-        else if (url.find("//") == 0) start = 2;
+        const std::wstring wideUrl = Utils::StringUtils::ToWide(url);
+        if (!wideUrl.empty()) {
+            Utils::NetworkUtils::UrlComponents components;
+            Utils::NetworkUtils::Error parseError;
+            if (Utils::NetworkUtils::ParseUrl(wideUrl, components, &parseError) &&
+                !components.host.empty())
+            {
+                const std::string host = ToLower(Utils::StringUtils::ToNarrow(components.host));
+                if (host.find(':') != std::string::npos) {
+                    // NetworkUtils already canonicalizes IPv6 host extraction; domain-specific
+                    // normalization intentionally does not apply to literals containing ':'.
+                    return host;
+                }
+                const auto normalized = NormalizeDomainCandidate(host);
+                if (!normalized.empty()) {
+                    return normalized;
+                }
+            }
+        }
 
-        size_t end = url.find('/', start);
-        if (end == std::string::npos) end = url.size();
+        if (url.find("://") == std::string::npos &&
+            url.find('/') == std::string::npos &&
+            url.find('?') == std::string::npos &&
+            url.find('#') == std::string::npos)
+        {
+            return NormalizeDomainCandidate(url);
+        }
 
-        size_t port = url.find(':', start);
-        if (port != std::string::npos && port < end) end = port;
-
-        size_t at = url.find('@', start);
-        if (at != std::string::npos && at < end) start = at + 1;
-
-        return ToLower(url.substr(start, end - start));
+        return {};
     }
 
     bool DomainEndsWith(const std::string& domain, const std::string& suffix) {
@@ -318,10 +405,11 @@ void BrowserProtectionStatistics::Reset() noexcept {
     for (auto& count : byCategory) count = 0;
     for (auto& count : byBrowser) count = 0;
 
-    startTime = Clock::now();
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string BrowserProtectionStatistics::ToJson() const {
+    const auto statsStartTime = AtomicValueLoadRelaxed(startTime);
     std::ostringstream oss;
     oss << "{"
         << "\"totalNavigations\":" << totalNavigations.load() << ","
@@ -336,7 +424,7 @@ std::string BrowserProtectionStatistics::ToJson() const {
         << "\"adsBlocked\":" << adsBlocked.load() << ","
         << "\"trackersBlocked\":" << trackersBlocked.load() << ","
         << "\"safeSearchEnforced\":" << safeSearchEnforced.load() << ","
-        << "\"uptimeSeconds\":" << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - startTime).count()
+        << "\"uptimeSeconds\":" << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - statsStartTime).count()
         << "}";
     return oss.str();
 }
@@ -346,6 +434,8 @@ bool BrowserProtectionConfiguration::IsValid() const noexcept {
     if (newDomainThresholdDays < 0 || newDomainThresholdDays > 365) return false;
     if (customBlocklist.size() > 100000) return false;
     if (customAllowlist.size() > 100000) return false;
+    if (!HasOnlyValidCustomDomains(customBlocklist)) return false;
+    if (!HasOnlyValidCustomDomains(customAllowlist)) return false;
     return true;
 }
 
@@ -366,16 +456,27 @@ public:
         }
 
         m_status = ModuleStatus::Initializing;
+
+        if (!config.IsValid()) {
+            m_status = ModuleStatus::Error;
+            SS_LOG_WARN(LOG_CATEGORY, L"Invalid BrowserProtection configuration rejected");
+            return false;
+        }
+
         m_config = config;
 
         m_blocklist.clear();
         m_allowlist.clear();
 
         for (const auto& domain : m_config.customBlocklist) {
-            m_blocklist.insert(ToLower(domain));
+            if (const auto normalizedDomain = NormalizeDomainCandidate(domain); !normalizedDomain.empty()) {
+                m_blocklist.insert(std::move(normalizedDomain));
+            }
         }
         for (const auto& domain : m_config.customAllowlist) {
-            m_allowlist.insert(ToLower(domain));
+            if (const auto normalizedDomain = NormalizeDomainCandidate(domain); !normalizedDomain.empty()) {
+                m_allowlist.insert(std::move(normalizedDomain));
+            }
         }
 
         // Store safe search and parental control settings
@@ -467,7 +568,16 @@ public:
             return result;
         }
 
-        std::string domain = request.domain.empty() ? GetDomainFromUrl(request.url) : ToLower(request.domain);
+        std::string domain = request.domain.empty()
+            ? GetDomainFromUrl(request.url)
+            : NormalizeDomainCandidate(request.domain);
+        if (domain.empty()) {
+            result.action = NavigationAction::Block;
+            result.blockReasons = BlockReason::PolicyViolation;
+            result.threatName = "Malformed domain in navigation request";
+            m_stats.blockedNavigations++;
+            return result;
+        }
 
         // 1. Pre-navigation callback
         if (m_preNavCallback) {
@@ -1065,6 +1175,10 @@ public:
         wchar_t modulePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
         fs::path hostExePath = fs::path(modulePath).parent_path() / L"ShadowStrikeNativeHost.exe";
+        if (!fs::exists(hostExePath) || !fs::is_regular_file(hostExePath)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Native messaging host executable missing: %ls", hostExePath.c_str());
+            return false;
+        }
 
         m_nativeMessagingRunning.store(true);
         SS_LOG_INFO(LOG_CATEGORY, L"Native messaging host started");
@@ -1256,7 +1370,7 @@ public:
         stats.safeSearchEnforced = m_stats.safeSearchEnforced.load();
         stats.cacheHits = m_stats.cacheHits.load();
         stats.cacheMisses = m_stats.cacheMisses.load();
-        stats.startTime = m_stats.startTime;
+        AtomicValueStoreRelaxed(stats.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
         return stats;
     }
 
@@ -1915,3 +2029,4 @@ std::vector<fs::path> GetBrowserProfilePaths(BrowserType browser) {
 
 }  // namespace WebBrowser
 }  // namespace ShadowStrike
+
