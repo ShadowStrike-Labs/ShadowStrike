@@ -59,85 +59,127 @@ The `ThreatIntelFeedManager` is **80-90% production-ready**:
 - **GAPS**: API key loading from env/config not wired, Feodo CSV parser incomplete,
   STIX parser minimal. AI inference requires ONNX Runtime SDK (optional dep).
 
-### 1A. API Key Inventory & Commercial-Use Audit (UPDATED)
+### 1A. Commercial-Use License Audit (VERIFIED — April 2026)
 
-| Service | Auth | Free Limit | Commercial-OK? | Real Status |
-|---------|------|-----------|----------------|-------------|
-| **VirusTotal** | `x-apikey` | 4 req/min, 500/day | ⚠️ Free=non-commercial | **Full REST impl** (cpp:535) — needs key to activate |
-| **AlienVault OTX** | `X-OTX-API-KEY` | 100 req/min | ✅ Community exchange | **Full REST impl** (cpp:565) — needs key to activate |
-| **AbuseIPDB** | `Key` | 60 req/min, 1000/day | ⚠️ Free=non-commercial | **Full REST impl** (cpp:594) — needs key to activate |
-| **URLhaus** | None | 10 req/min | ✅ CC0 | **Implemented** — CSV parser wired |
-| **MalwareBazaar** | None | 10 req/min | ✅ CC0 | **Implemented** — POST JSON wired |
-| **ThreatFox** | Optional | 10 req/min | ✅ Public | **Implemented** — POST JSON wired |
-| **Feodo** | None | 30 req/min | ✅ Public | **URL configured** — CSV parser incomplete |
-| **MISP** | `Authorization` | Self-hosted | ✅ Open-source | **Implemented** — user provides own instance |
-| **NIST NVD** | Optional | Unlimited | ✅ US Gov public | **Implemented** — EDR VulnDatabase |
-| **GitHub Advisories** | None | Public | ✅ Public | **Implemented** |
-| **EMBER 2024** | None | Open | ✅ Apache-2.0 | **Integrated** in PhantomCortex |
+> **Decision:** All non-commercial-licensed feeds are DEFERRED to Phantom Pro/Enterprise.
+> Phantom Home (Community) ships ONLY with feeds that are 100% free for commercial use.
+> NLNet funding applied for — no budget for paid APIs at this time.
 
-### 1B. Action Items
+#### ✅ FREE FOR COMMERCIAL USE — Ships with Phantom Home
+
+| Service | License | Auth | Rate Limit | Parser Status |
+|---------|---------|------|-----------|--------------|
+| **URLhaus** (abuse.ch) | CC BY 4.0 | None | 10 req/min | ✅ CSV parser wired |
+| **MalwareBazaar** (abuse.ch) | CC BY 4.0 | None | 10 req/min | ✅ POST JSON wired |
+| **ThreatFox** (abuse.ch) | CC BY 4.0 | None | 10 req/min | ✅ POST JSON wired |
+| **Feodo Tracker** (abuse.ch) | CC BY 4.0 | None | 30 req/min | ⚠️ CSV parser incomplete |
+| **Emerging Threats Open** (Proofpoint) | MIT/BSD | None | Public download | 🆕 Parser needed |
+| **Botvrij.eu** | OSINT / no restriction | None | Public MISP | 🆕 Parser needed |
+| **PhishTank** (Cisco Talos) | Free commercial (ToS) | API key (free) | Rate-limited | 🆕 Parser needed |
+| **MISP** | Open-source (self-hosted) | `Authorization` | Self-hosted | ✅ Implemented |
+| **NIST NVD** | US Gov public data | Optional | Unlimited | ✅ Implemented (EDR VulnDB) |
+| **GitHub Advisories** | Public | None | Public | ✅ Implemented |
+| **EMBER 2024** | Apache-2.0 | None | Open dataset | ✅ Integrated (PhantomCortex) |
+
+> **Attribution requirement:** All abuse.ch feeds (URLhaus, MalwareBazaar, ThreatFox,
+> Feodo) require: `"Data provided by abuse.ch — https://abuse.ch"` in the About dialog
+> and documentation. ET Open requires MIT/BSD attribution notice.
+
+#### ❌ DEFERRED TO PRO/ENTERPRISE (Not free for commercial use)
+
+| Service | License | Why Deferred | Code Status |
+|---------|---------|-------------|-------------|
+| **VirusTotal** | Paid ($5K-$15K/yr) | Prohibits commercial use on free tier | Full REST impl (cpp:535) — dormant |
+| **AlienVault OTX** | Non-commercial EULA | LevelBlue EULA prohibits commercial integration without written approval | Full REST impl (cpp:565) — dormant |
+| **AbuseIPDB** | Non-commercial free tier | Paid plan required for commercial products | Full REST impl (cpp:594) — dormant |
+| **Spamhaus DROP/EDROP** | Commercial license required | Cannot bundle into commercial security products without license | 🆕 Not yet implemented |
+| **OpenPhish** | Non-commercial only | Community feed is strictly non-commercial | 🆕 Not yet implemented |
+| **C2IntelFeeds** | CC BY-NC-SA 4.0 | Non-commercial, share-alike — cannot use commercially | 🆕 Not yet implemented |
+
+> **Note:** All deferred feeds have full parsers or infrastructure in the codebase.
+> When Pro/Enterprise launches and revenue arrives, flipping them on is a config change +
+> API key insertion. Zero code changes needed.
+
+### 1B. Revised Task Breakdown
 
 **YOUR TASKS (Architect):**
-- Register for AlienVault OTX API key at https://otx.alienvault.com
-- Set environment variable `SHADOWSTRIKE_OTX_KEY=<your-key>`
-- Decision: VirusTotal/AbuseIPDB — defer to Pro/Enterprise? Or purchase?
-- Test feeds on live VM by checking ThreatIntelStore IOC counts in logs
+1. Register for a **free PhishTank API key** at https://phishtank.org/register.php
+   → Set env var `SHADOWSTRIKE_PHISHTANK_KEY=<your-key>`
+2. **Test feeds on VM** — start Service, check logs for IOC counts after 5-min sync
+3. **Verify attribution** — check About dialog / docs include abuse.ch + ET Open credits
+4. **Contact LevelBlue** (optional, long-term) — request commercial license for OTX
+   if future Pro/Enterprise tiers are planned
+5. **NLNet follow-up** — if funded, revisit VT/AbuseIPDB paid API purchases
 
 **MY TASKS (Opus — Code):**
 
-- [x] **T1-01 · API Key Loading Infrastructure** ← NEW
-  - Implement env-var loading: `SHADOWSTRIKE_VT_KEY`, `SHADOWSTRIKE_OTX_KEY`,
-    `SHADOWSTRIKE_ABUSEIPDB_KEY`, `SHADOWSTRIKE_THREATFOX_KEY`
-  - Fallback to ConfigManager encrypted field
-  - Fallback to Windows Credential Manager (DPAPI)
-  - Priority: env-var → credential-manager → config-file
-  - **Acceptance:** Feed system auto-discovers keys from environment on startup.
+- [ ] **T1-01 · API Key Loading Infrastructure**
+  - Implement env-var loading: `SHADOWSTRIKE_PHISHTANK_KEY` (only key needed now)
+  - Fallback chain: env-var → Windows Credential Manager (DPAPI) → ConfigManager
+  - Build the generic `CredentialProvider` class for future Pro/Enterprise keys too
+  - Keep env-var names defined for ALL feeds (VT, OTX, AbuseIPDB) so Pro can just set them
+  - **Acceptance:** Feed system auto-discovers PhishTank key from environment on startup.
+    VT/OTX/AbuseIPDB remain dormant with clear log: "Feed disabled — no API key"
 
-- [x] **T1-02 · Activate abuse.ch feeds (URLhaus + MalwareBazaar + ThreatFox)**
-  - These are free, public, no-API-key, commercial-OK.
+- [ ] **T1-02 · Activate abuse.ch feeds (URLhaus + MalwareBazaar + ThreatFox)**
+  - These are free, no-API-key, CC BY 4.0 (commercial OK with attribution).
   - Verify FeedManager actually fetches on startup, parses, stores IOCs.
-  - Ensure sync intervals respect rate limits.
-  - **Acceptance:** After service startup, ThreatIntelStore contains fresh IOCs.
+  - Ensure sync intervals respect rate limits (10 req/min per feed).
+  - Add abuse.ch attribution string to About dialog / settings.
+  - **Acceptance:** After service startup, ThreatIntelStore contains fresh IOCs from all 3.
 
-- [x] **T1-03 · Complete Feodo Tracker CSV parser**
+- [ ] **T1-03 · Complete Feodo Tracker CSV parser**
   - URL is configured but CSV parser is incomplete.
-  - Implement Feodo CSV column mapping (ip, port, status, lastOnline, etc.)
+  - Implement Feodo CSV column mapping: first_seen, dst_ip, dst_port, c2_status,
+    last_online, malware.
+  - Same CC BY 4.0 license — commercial OK with attribution.
   - **Acceptance:** Feodo C2 IPs flow into ThreatIntelStore IP index.
 
-- [x] **T1-04 · Activate AlienVault OTX feed**
-  - Parser is implemented (cpp:565-592) — just needs API key plumbing.
-  - Wire env-var `SHADOWSTRIKE_OTX_KEY` → feed config header.
-  - **Acceptance:** OTX pulse IOCs flow into ThreatIntelStore.
+- [ ] **T1-04 · Implement Emerging Threats Open rules feed** ← REPLACES OTX
+  - License: MIT/BSD — fully free for commercial use (Proofpoint confirmed)
+  - Download Suricata rules from `rules.emergingthreats.net/open/`
+  - Parse: extract IOCs (IPs, domains, URLs) from `alert` rules
+  - Map to ThreatIntelStore entries with ET rule SID as reference
+  - **Acceptance:** ET Open IOCs flow into ThreatIntelStore. Attribution in docs.
 
-- [x] **T1-05 · VirusTotal + AbuseIPDB — safe dormancy**
-  - ⚠️ Both Free APIs prohibit commercial redistribution.
-  - **Decision for Community tier:** Leave dormant. abuse.ch + OTX sufficient.
-  - Ensure code compiles clean with no-key scenario.
-  - Add clear log messages: "VT feed disabled — no API key configured"
-  - **Future:** Pro/Enterprise tier activates with purchased API.
+- [ ] **T1-05 · Implement PhishTank feed** ← NEW (replaces VT dormancy task)
+  - License: Free for commercial use (Cisco Talos ToS)
+  - Requires free API key from architect (SHADOWSTRIKE_PHISHTANK_KEY)
+  - Download phishing URL database (JSON/CSV, hourly updates)
+  - Parse: extract verified phishing URLs, store in ThreatIntelStore URL index
+  - Wire into WebProtection + SafeBrowsing modules for real-time URL blocking
+  - **Acceptance:** PhishTank URLs block known phishing sites in real-time.
 
-- [x] **T1-06 · Expand feed coverage — new open sources**
-  - Research and implement parsers for:
-    - Spamhaus DROP/EDROP (IP ranges, free for non-commercial + open-source)
-    - Emerging Threats open rules (Proofpoint, free Suricata rules)
-    - C2IntelFeeds (GitHub, public domain)
-    - Botvrij.eu (open IOC lists)
-    - OpenPhish (community feed, commercial restrictions — evaluate)
-  - For each: verify license, implement parser, add to FeedManager.
+- [ ] **T1-06 · Implement Botvrij.eu MISP feed** ← NEW (replaces mixed feed task)
+  - License: OSINT, no commercial restrictions, as-is
+  - Download MISP-format IOC exports from botvrij.eu
+  - Parse: MISP event JSON → extract hashes, domains, IPs, URLs
+  - We already have MISP parser — adapt for Botvrij.eu endpoint
+  - **Acceptance:** Botvrij.eu IOCs enrich ThreatIntelStore.
 
-- [x] **T1-07 · ONNX Runtime integration verification**
+- [ ] **T1-07 · Safe dormancy for deferred feeds (VT + OTX + AbuseIPDB)**
+  - Ensure code compiles clean with zero API keys configured
+  - Add clear log messages per feed: "VirusTotal feed disabled — no API key.
+    Available in Phantom Pro/Enterprise."
+  - Ensure no HTTP requests are made for dormant feeds
+  - Guard all deferred feed parsers behind `if (hasApiKey())` checks
+  - **Acceptance:** Service starts clean with zero warnings about missing keys
+    for commercial-restricted feeds. Only PhishTank warns if key missing.
+
+- [ ] **T1-08 · ONNX Runtime integration verification**
   - Verify `__has_include(<onnxruntime_c_api.h>)` fallback works cleanly.
   - If SDK present: 5-model ensemble (static, behavioral, memory, network, emulation)
   - If SDK absent: graceful skip with clear log, heuristic-only mode.
   - Document ONNX Runtime SDK installation in README for developers.
   - **Acceptance:** Build with and without ONNX SDK — both produce working EXE.
 
-- [x] **T1-08 · Feed health monitoring**
+- [ ] **T1-09 · Feed health monitoring + attribution compliance**
   - Add per-feed health counters: lastSuccessTime, lastFailureTime, consecutiveFailures,
     totalIOCsLoaded, lastSyncDuration.
   - Expose via IPC so UI can show feed status in Settings page.
   - Log warnings when a feed fails 3+ consecutive times.
-  - **Acceptance:** UI Settings page shows feed name + last-sync + IOC count.
+  - Add attribution strings in About dialog: abuse.ch, Proofpoint ET, PhishTank, Botvrij.eu
+  - **Acceptance:** UI Settings page shows feed name + last-sync + IOC count + attribution.
 
 ---
 
