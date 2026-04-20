@@ -73,6 +73,9 @@ std::atomic<bool> USBAutorunBlocker::s_instanceCreated{false};
 // ANONYMOUS HELPER UTILITIES
 // ============================================================================
 namespace {
+    constexpr size_t kMaxAutorunLines = 4096;
+    constexpr size_t kMaxAutorunLineLength = 4096;
+    constexpr size_t kMaxAutorunFieldLength = 1024;
 
     template<typename T>
     [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
@@ -179,6 +182,29 @@ namespace {
     void LowercaseASCII(std::string& s) {
         std::transform(s.begin(), s.end(), s.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
+
+    [[nodiscard]] std::string StripControlCharacters(std::string_view input) {
+        std::string output;
+        output.reserve(std::min(input.size(), kMaxAutorunFieldLength));
+
+        for (unsigned char ch : input) {
+            if (output.size() >= kMaxAutorunFieldLength) {
+                break;
+            }
+
+            if (ch == '\r' || ch == '\n' || ch == '\0') {
+                continue;
+            }
+
+            if (ch < 0x20 && ch != '\t') {
+                continue;
+            }
+
+            output.push_back(static_cast<char>(ch));
+        }
+
+        return output;
     }
 
     /// Returns true if the autorun key typically references a file path.
@@ -761,12 +787,26 @@ public:
 
         while (std::getline(stream, line)) {
             ++lineNum;
-            std::string trimmed = Trim(line);
+            if (lineNum > kMaxAutorunLines) {
+                SS_LOG_WARN(LOG_CAT, L"Autorun parser hit line cap (%zu), truncating analysis", kMaxAutorunLines);
+                break;
+            }
+
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+
+            if (line.size() > kMaxAutorunLineLength) {
+                SS_LOG_WARN(LOG_CAT, L"Autorun parser rejected oversized line %zu", lineNum);
+                continue;
+            }
+
+            std::string trimmed = StripControlCharacters(Trim(line));
             if (trimmed.empty() || trimmed[0] == ';') continue;
 
             // Section header
             if (trimmed.front() == '[' && trimmed.back() == ']') {
-                currentSection = trimmed.substr(1, trimmed.size() - 2);
+                currentSection = StripControlCharacters(trimmed.substr(1, trimmed.size() - 2));
                 LowercaseASCII(currentSection);
                 continue;
             }
@@ -778,8 +818,12 @@ public:
             AutorunEntry entry;
             entry.lineNumber = lineNum;
             entry.section = currentSection;
-            entry.key   = Trim(trimmed.substr(0, eqPos));
-            entry.value = Trim(trimmed.substr(eqPos + 1));
+            entry.key   = StripControlCharacters(Trim(trimmed.substr(0, eqPos)));
+            entry.value = StripControlCharacters(Trim(trimmed.substr(eqPos + 1)));
+
+            if (entry.key.empty()) {
+                continue;
+            }
 
             std::string lowerKey = entry.key;
             LowercaseASCII(lowerKey);
@@ -1242,19 +1286,37 @@ private:
     void InvokeEnforcementCallback(const EnforcementResult& result) {
         EnforcementCallback cb;
         { std::lock_guard lock(m_callbackMutex); cb = m_enforcementCallback; }
-        if (cb) cb(result);
+        if (cb) {
+            try {
+                cb(result);
+            } catch (...) {
+                SS_LOG_WARN(LOG_CAT, L"Enforcement callback threw exception");
+            }
+        }
     }
 
     void InvokeVaccinationCallback(const VaccinationResult& result) {
         VaccinationCallback cb;
         { std::lock_guard lock(m_callbackMutex); cb = m_vaccinationCallback; }
-        if (cb) cb(result);
+        if (cb) {
+            try {
+                cb(result);
+            } catch (...) {
+                SS_LOG_WARN(LOG_CAT, L"Vaccination callback threw exception");
+            }
+        }
     }
 
     void NotifyError(const std::string& message, int code) {
         ErrorCallback cb;
         { std::lock_guard lock(m_callbackMutex); cb = m_errorCallback; }
-        if (cb) cb(message, code);
+        if (cb) {
+            try {
+                cb(message, code);
+            } catch (...) {
+                SS_LOG_WARN(LOG_CAT, L"Error callback threw exception");
+            }
+        }
     }
 
     // ========================================================================
