@@ -429,6 +429,14 @@ std::string FeedEndpoint::GetPaginatedUrl(uint64_t offset, uint32_t limit) const
     return url;
 }
 
+std::string FeedEndpoint::GetSafeLogUrl() const {
+    if (!pathContainsCredentials) {
+        return GetFullUrl();
+    }
+    // Redact path: show only baseUrl + "/<REDACTED>"
+    return baseUrl + "/<REDACTED>";
+}
+
 // ============================================================================
 // FEED CONFIG IMPLEMENTATION
 // ============================================================================
@@ -759,8 +767,9 @@ ThreatFeedConfig ThreatFeedConfig::CreateFeodoTracker() {
     
     config.rateLimit.requestsPerMinute = 30;
     
-    // Simple one-column format (IP per line), no header, # comments
-    config.parser.csvDelimiter = '\n';
+    // Simple one-column format (IP per line), CsvParser with getline already splits
+    // by newline; use '\0' sentinel delimiter so ParseLine returns whole line as field[0]
+    config.parser.csvDelimiter = '\0';
     config.parser.csvHasHeader = false;
     config.parser.csvValueColumn = 0;
     config.parser.trimWhitespace = true;
@@ -793,7 +802,8 @@ ThreatFeedConfig ThreatFeedConfig::CreateETOpen() {
     
     config.rateLimit.requestsPerMinute = 10;
     
-    config.parser.csvDelimiter = '\n';
+    // One IP per line; '\0' sentinel means "no field splitting — whole line is field[0]"
+    config.parser.csvDelimiter = '\0';
     config.parser.csvHasHeader = false;
     config.parser.csvValueColumn = 0;
     config.parser.trimWhitespace = true;
@@ -823,6 +833,7 @@ ThreatFeedConfig ThreatFeedConfig::CreatePhishTank(const std::string& apiKey) {
     config.endpoint.baseUrl = "https://data.phishtank.com";
     if (!apiKey.empty()) {
         config.endpoint.path = "/data/" + apiKey + "/online-valid.json";
+        config.endpoint.pathContainsCredentials = true;  // API key embedded in URL
     } else {
         config.endpoint.path = "/data/online-valid.json";
     }
@@ -869,7 +880,8 @@ ThreatFeedConfig ThreatFeedConfig::CreateBotvrij() {
     config.rateLimit.requestsPerMinute = 5;
     
     // hashes.txt is a plain-text hash list (one hash per line, SHA256/MD5 mixed)
-    config.parser.csvDelimiter = '\n';
+    // '\0' sentinel: no field splitting, whole line is field[0]
+    config.parser.csvDelimiter = '\0';
     config.parser.csvHasHeader = false;
     config.parser.csvValueColumn = 0;
     config.parser.trimWhitespace = true;

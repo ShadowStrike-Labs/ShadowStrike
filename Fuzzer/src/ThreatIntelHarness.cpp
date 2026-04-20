@@ -309,10 +309,10 @@ void PopulateCommonTypeMapping(ParserConfig& config) {
         variants.push_back({ "threatfox-json", std::move(config) });
     }
 
-    // Feodo/ET Open/Botvrij: newline-delimited single-column (IP or hash per line)
+    // Feodo/ET Open/Botvrij: line-per-IOC (whole line = field[0], '\0' = no splitting)
     {
         ParserConfig config = BuildDefaultConfig();
-        config.csvDelimiter = '\n';
+        config.csvDelimiter = '\0';
         config.csvHasHeader = false;
         config.csvValueColumn = 0;
         config.trimWhitespace = true;
