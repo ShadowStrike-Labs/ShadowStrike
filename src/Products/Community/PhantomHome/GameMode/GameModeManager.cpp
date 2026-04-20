@@ -574,10 +574,14 @@ private:
     // Detection thread
     std::unique_ptr<std::thread> m_detectionThread;
     std::atomic<bool> m_stopDetection{false};
+    std::mutex m_detectionWaitMutex;
+    std::condition_variable m_detectionWaitCv;
 
     // Schedule thread
     std::unique_ptr<std::thread> m_scheduleThread;
     std::atomic<bool> m_stopSchedule{false};
+    std::mutex m_scheduleWaitMutex;
+    std::condition_variable m_scheduleWaitCv;
 
     // Resume worker: single managed thread that executes deferred actions
     // after a configured delay. Joined in Shutdown to guarantee lifetime
@@ -687,6 +691,8 @@ bool GameModeManagerImpl::Initialize(const GameModeConfiguration& config) {
         m_stopDetection.store(true, std::memory_order_release);
         m_stopSchedule.store(true, std::memory_order_release);
         m_stopResume.store(true, std::memory_order_release);
+        m_detectionWaitCv.notify_all();
+        m_scheduleWaitCv.notify_all();
         m_resumeCv.notify_all();
 
         // Move threads out before unlocking so we can join outside the lock
@@ -719,6 +725,8 @@ void GameModeManagerImpl::Shutdown() {
     m_stopDetection.store(true, std::memory_order_release);
     m_stopSchedule.store(true, std::memory_order_release);
     m_stopResume.store(true, std::memory_order_release);
+    m_detectionWaitCv.notify_all();
+    m_scheduleWaitCv.notify_all();
     m_resumeCv.notify_all();
 
     // Join threads OUTSIDE the lock to prevent deadlock
@@ -1636,7 +1644,12 @@ void GameModeManagerImpl::DetectionThreadFunc() {
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+            std::unique_lock waitLock(m_detectionWaitMutex);
+            m_detectionWaitCv.wait_for(waitLock,
+                                       std::chrono::milliseconds(intervalMs),
+                                       [this] {
+                                           return m_stopDetection.load(std::memory_order_acquire);
+                                       });
         }
 
     } catch (const std::exception& e) {
@@ -1683,7 +1696,12 @@ void GameModeManagerImpl::ScheduleCheckThreadFunc() {
                 Deactivate();
             }
 
-            std::this_thread::sleep_for(std::chrono::seconds(60));  // Check every minute
+            std::unique_lock waitLock(m_scheduleWaitMutex);
+            m_scheduleWaitCv.wait_for(waitLock,
+                                      std::chrono::seconds(60),
+                                      [this] {
+                                          return m_stopSchedule.load(std::memory_order_acquire);
+                                      });
         }
 
     } catch (const std::exception& e) {
@@ -1792,21 +1810,30 @@ void GameModeManagerImpl::ApplyProfile(const GameModeProfile& profile) {
             break;
     }
 
-    // Apply the performance optimization profile
-    auto result = PerformanceOptimizer::Instance().ApplyProfile(optProfile);
-    if (!result.success) {
-        Utils::Logger::Warn("PerformanceOptimizer failed to apply profile: {}",
-            result.errorMessage);
+    auto& optimizer = PerformanceOptimizer::Instance();
+    if (optimizer.IsInitialized()) {
+        auto result = optimizer.ApplyProfile(optProfile);
+        if (!result.success) {
+            Utils::Logger::Warn("PerformanceOptimizer failed to apply profile: {}",
+                result.errorMessage);
+        } else {
+            Utils::Logger::Info("PerformanceOptimizer applied profile (modified {} processes, "
+                                "freed {} MB, estimated gain {:.1f}%)",
+                result.processesModified, result.memoryFreedMB, result.estimatedGainPercent);
+        }
     } else {
-        Utils::Logger::Info("PerformanceOptimizer applied profile (modified {} processes, "
-                            "freed {} MB, estimated gain {:.1f}%)",
-            result.processesModified, result.memoryFreedMB, result.estimatedGainPercent);
+        Utils::Logger::Warn("PerformanceOptimizer unavailable; applying GameMode profile in degraded mode");
     }
 
     // Start overlay integrity monitoring if enabled in the profile
     if (profile.enableOverlayProtection) {
-        OverlayProtection::Instance().StartIntegrityMonitoring();
-        Utils::Logger::Info("Overlay integrity monitoring started");
+        auto& overlayProtection = OverlayProtection::Instance();
+        if (overlayProtection.IsInitialized()) {
+            overlayProtection.StartIntegrityMonitoring();
+            Utils::Logger::Info("Overlay integrity monitoring started");
+        } else {
+            Utils::Logger::Warn("OverlayProtection unavailable; overlay integrity monitoring skipped");
+        }
     }
 
     Utils::Logger::Info("Protection level: {}",
@@ -1821,19 +1848,23 @@ void GameModeManagerImpl::ApplyProfile(const GameModeProfile& profile) {
 void GameModeManagerImpl::RestoreNormalMode() {
     Utils::Logger::Info("Restoring normal mode");
 
-    // Restore system to normal performance profile
-    auto result = PerformanceOptimizer::Instance().RestoreSystem();
-    if (!result.success) {
-        Utils::Logger::Warn("PerformanceOptimizer restore failed: {}",
-            result.errorMessage);
-    } else {
-        Utils::Logger::Info("PerformanceOptimizer restored system (restored {} processes)",
-            result.processesModified);
+    auto& optimizer = PerformanceOptimizer::Instance();
+    if (optimizer.IsInitialized()) {
+        auto result = optimizer.RestoreSystem();
+        if (!result.success) {
+            Utils::Logger::Warn("PerformanceOptimizer restore failed: {}",
+                result.errorMessage);
+        } else {
+            Utils::Logger::Info("PerformanceOptimizer restored system (restored {} processes)",
+                result.processesModified);
+        }
     }
 
-    // Stop overlay integrity monitoring
-    OverlayProtection::Instance().StopIntegrityMonitoring();
-    Utils::Logger::Info("Overlay integrity monitoring stopped");
+    auto& overlayProtection = OverlayProtection::Instance();
+    if (overlayProtection.IsInitialized()) {
+        overlayProtection.StopIntegrityMonitoring();
+        Utils::Logger::Info("Overlay integrity monitoring stopped");
+    }
 }
 
 // Fix #3: DetectGames delegates to GameProcessDetector
