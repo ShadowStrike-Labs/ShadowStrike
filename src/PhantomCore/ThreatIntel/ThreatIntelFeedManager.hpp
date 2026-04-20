@@ -388,9 +388,13 @@ struct FeedEndpoint {
     std::unordered_map<std::string, std::string> queryParams; ///< Query parameters
     std::string requestBody;                ///< Request body template (for POST)
     std::string contentType = "application/json";
+    bool pathContainsCredentials = false;    ///< True if path embeds API key (redact from logs)
     
     /// @brief Get full URL with parameters
     [[nodiscard]] std::string GetFullUrl() const;
+    
+    /// @brief Get URL safe for logging (credentials redacted if pathContainsCredentials)
+    [[nodiscard]] std::string GetSafeLogUrl() const;
     
     /// @brief Build URL with pagination
     [[nodiscard]] std::string GetPaginatedUrl(uint64_t offset, uint32_t limit) const;
