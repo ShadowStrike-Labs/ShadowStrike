@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -142,6 +142,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -190,22 +191,6 @@ namespace fs = std::filesystem;
 // ============================================================================
 // ENUMERATIONS
 // ============================================================================
-
-/**
- * @brief Browser type
- */
-enum class BrowserType : uint8_t {
-    Unknown         = 0,
-    Chrome          = 1,
-    Firefox         = 2,
-    Edge            = 3,
-    Opera           = 4,
-    Brave           = 5,
-    Vivaldi         = 6,
-    IE              = 7,
-    Chromium        = 8,
-    All             = 255
-};
 
 /**
  * @brief Browser data type
@@ -296,20 +281,6 @@ enum class ScheduleType : uint8_t {
     Daily           = 3,
     Weekly          = 4,
     OnDemand        = 5
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Ready           = 2,
-    Cleaning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
