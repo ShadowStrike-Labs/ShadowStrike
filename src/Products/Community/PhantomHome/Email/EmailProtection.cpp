@@ -165,89 +165,178 @@ namespace EmailParsing {
         return "";
     }
 
+    [[nodiscard]] std::string TrimAsciiWhitespace(std::string_view value) {
+        const size_t begin = value.find_first_not_of(" \t\r\n");
+        if (begin == std::string_view::npos) {
+            return {};
+        }
+
+        const size_t end = value.find_last_not_of(" \t\r\n");
+        return std::string(value.substr(begin, end - begin + 1));
+    }
+
+    [[nodiscard]] bool IsUrlDelimiter(char ch) noexcept {
+        switch (ch) {
+            case ' ': case '\t': case '\r': case '\n':
+            case '<': case '>': case '"': case '\'':
+            case '{': case '}': case '[': case ']':
+            case '|': case '\\':
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] std::string NormalizeUrlCandidate(std::string_view candidate) {
+        while (!candidate.empty()) {
+            const char ch = candidate.back();
+            if (ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == ')' ||
+                ch == ']' || ch == '}' || ch == '"' || ch == '\'') {
+                candidate.remove_suffix(1);
+                continue;
+            }
+            break;
+        }
+        return std::string(candidate);
+    }
+
+    [[nodiscard]] std::string RedactForLog(std::string_view value) {
+        constexpr size_t kMaxLogBytes = 48;
+        std::string redacted = TrimAsciiWhitespace(value.substr(0, std::min(value.size(), kMaxLogBytes)));
+        for (char& ch : redacted) {
+            if (ch == '\r' || ch == '\n' || ch == '\t') {
+                ch = ' ';
+            }
+        }
+        if (value.size() > kMaxLogBytes) {
+            redacted += "…";
+        }
+        return redacted;
+    }
+
     /**
      * @brief Parse header value (unfold, trim)
      */
     std::string ParseHeaderValue(const std::string& value) {
-        // CRITICAL-006 FIX: Validate and limit input size to prevent buffer overflow
-        constexpr size_t MAX_HEADER_VALUE_SIZE = 16384;  // 16KB max per header
+        constexpr size_t MAX_HEADER_VALUE_SIZE = 16384;
+        const std::string_view bounded(value.data(), std::min(value.size(), MAX_HEADER_VALUE_SIZE));
 
-        if (value.length() > MAX_HEADER_VALUE_SIZE) {
-            // Return truncated value for safety
-            std::string result = value.substr(0, MAX_HEADER_VALUE_SIZE);
+        std::string unfolded;
+        unfolded.reserve(bounded.size());
 
-            // Unfold (remove CRLF followed by whitespace)
-            static const std::regex unfoldRegex(R"(\r?\n[ \t]+)");
-            result = std::regex_replace(result, unfoldRegex, " ");
-
-            // Trim
-            result.erase(0, result.find_first_not_of(" \t\r\n"));
-            result.erase(result.find_last_not_of(" \t\r\n") + 1);
-
-            return result;
+        for (size_t i = 0; i < bounded.size(); ++i) {
+            const char ch = bounded[i];
+            if (ch == '\r' || ch == '\n') {
+                size_t j = i;
+                if (bounded[j] == '\r' && (j + 1) < bounded.size() && bounded[j + 1] == '\n') {
+                    ++j;
+                }
+                if ((j + 1) < bounded.size() && (bounded[j + 1] == ' ' || bounded[j + 1] == '\t')) {
+                    unfolded.push_back(' ');
+                    i = j + 1;
+                    while ((i + 1) < bounded.size() && (bounded[i + 1] == ' ' || bounded[i + 1] == '\t')) {
+                        ++i;
+                    }
+                }
+                continue;
+            }
+            unfolded.push_back(ch);
         }
 
-        std::string result = value;
-
-        // Unfold (remove CRLF followed by whitespace)
-        static const std::regex unfoldRegex(R"(\r?\n[ \t]+)");
-        result = std::regex_replace(result, unfoldRegex, " ");
-
-        // Trim
-        result.erase(0, result.find_first_not_of(" \t\r\n"));
-        result.erase(result.find_last_not_of(" \t\r\n") + 1);
-
-        return result;
+        return TrimAsciiWhitespace(unfolded);
     }
 
     /**
-     * @brief Extract URLs from text using regex
+     * @brief Extract URLs from text without regex backtracking.
      */
     std::vector<std::string> ExtractURLsFromText(const std::string& text, size_t maxUrls = EmailProtectionConstants::MAX_URLS_PER_EMAIL) {
         std::vector<std::string> urls;
+        size_t cursor = 0;
 
-        // URL regex pattern (static to avoid recompilation)
-        static const std::regex urlRegex(
-            R"((https?://[^\s<>"{}|\\^`\[\]]+))",
-            std::regex_constants::icase
-        );
+        while (cursor < text.size() && urls.size() < maxUrls) {
+            const size_t httpPos = text.find("http://", cursor);
+            const size_t httpsPos = text.find("https://", cursor);
+            const size_t matchPos =
+                (httpPos == std::string::npos) ? httpsPos :
+                (httpsPos == std::string::npos) ? httpPos : std::min(httpPos, httpsPos);
 
-        auto begin = std::sregex_iterator(text.begin(), text.end(), urlRegex);
-        auto end = std::sregex_iterator();
+            if (matchPos == std::string::npos) {
+                break;
+            }
 
-        for (auto it = begin; it != end && urls.size() < maxUrls; ++it) {
-            urls.push_back(it->str());
+            size_t endPos = matchPos;
+            while (endPos < text.size() && !IsUrlDelimiter(text[endPos]) && (endPos - matchPos) < 2048) {
+                ++endPos;
+            }
+
+            std::string normalized = NormalizeUrlCandidate(std::string_view(text).substr(matchPos, endPos - matchPos));
+            if (!normalized.empty()) {
+                urls.push_back(std::move(normalized));
+            }
+            cursor = (endPos > matchPos) ? endPos : matchPos + 1;
         }
 
+        std::sort(urls.begin(), urls.end());
+        urls.erase(std::unique(urls.begin(), urls.end()), urls.end());
         return urls;
     }
 
     /**
-     * @brief Extract URLs from HTML (href attributes)
+     * @brief Extract URLs from HTML (href attributes).
      */
     std::vector<std::string> ExtractURLsFromHTML(const std::string& html, size_t maxUrls = EmailProtectionConstants::MAX_URLS_PER_EMAIL) {
         std::vector<std::string> urls;
+        std::string lowered(html);
+        std::ranges::transform(lowered, lowered.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        size_t cursor = 0;
 
-        // href= pattern (static to avoid recompilation)
-        static const std::regex hrefRegex(
-            R"(href\s*=\s*["']([^"']+)["'])",
-            std::regex_constants::icase
-        );
-
-        auto begin = std::sregex_iterator(html.begin(), html.end(), hrefRegex);
-        auto end = std::sregex_iterator();
-
-        for (auto it = begin; it != end && urls.size() < maxUrls; ++it) {
-            std::string url = (*it)[1].str();
-            if (url.starts_with("http://") || url.starts_with("https://")) {
-                urls.push_back(url);
+        while (cursor < lowered.size() && urls.size() < maxUrls) {
+            const size_t hrefPos = lowered.find("href", cursor);
+            if (hrefPos == std::string::npos) {
+                break;
             }
+
+            const size_t equalsPos = lowered.find('=', hrefPos + 4);
+            if (equalsPos == std::string::npos) {
+                break;
+            }
+
+            size_t valuePos = equalsPos + 1;
+            while (valuePos < lowered.size() && std::isspace(static_cast<unsigned char>(lowered[valuePos])) != 0) {
+                ++valuePos;
+            }
+            if (valuePos >= lowered.size()) {
+                break;
+            }
+
+            const char quote = html[valuePos];
+            if (quote != '"' && quote != '\'') {
+                cursor = valuePos;
+                continue;
+            }
+
+            const size_t valueStart = valuePos + 1;
+            const size_t valueEnd = html.find(quote, valueStart);
+            if (valueEnd == std::string::npos) {
+                break;
+            }
+
+            const std::string_view candidate(html.data() + valueStart, valueEnd - valueStart);
+            if (candidate.starts_with("http://") || candidate.starts_with("https://")) {
+                urls.push_back(NormalizeUrlCandidate(candidate));
+            }
+
+            cursor = valueEnd + 1;
         }
 
-        // Remove duplicates
+        auto textUrls = ExtractURLsFromText(html, maxUrls);
+        urls.insert(urls.end(), textUrls.begin(), textUrls.end());
         std::sort(urls.begin(), urls.end());
         urls.erase(std::unique(urls.begin(), urls.end()), urls.end());
-
+        if (urls.size() > maxUrls) {
+            urls.resize(maxUrls);
+        }
         return urls;
     }
 
@@ -547,13 +636,49 @@ bool EmailProtectionImpl::Initialize(
 
         m_config = config;
 
-        // Generate quarantine encryption key
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint16_t> dist(0, 255);
-        for (auto& byte : m_quarantineKey) {
-            byte = static_cast<uint8_t>(dist(gen));
+        // Generate a fresh quarantine encryption key for this process lifetime.
+        if (BCryptGenRandom(nullptr,
+                            m_quarantineKey.data(),
+                            static_cast<ULONG>(m_quarantineKey.size()),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            Utils::Logger::Error("EmailProtection: Failed to generate quarantine encryption key");
+            m_status.store(ModuleStatus::Error, std::memory_order_release);
+            return false;
         }
+
+        bool initializedAttachmentScanner = false;
+        bool initializedPhishingDetector = false;
+        bool initializedSpamDetector = false;
+        bool initializedOutlookScanner = false;
+        bool initializedThunderbirdScanner = false;
+
+        const auto rollbackInitializedSubsystems = [&]() noexcept {
+            try {
+                if (initializedThunderbirdScanner && m_thunderbirdScanner != nullptr) {
+                    m_thunderbirdScanner->Shutdown();
+                }
+                if (initializedOutlookScanner && m_outlookScanner != nullptr) {
+                    m_outlookScanner->Shutdown();
+                }
+                if (initializedSpamDetector && m_spamDetector != nullptr) {
+                    m_spamDetector->Shutdown();
+                }
+                if (initializedPhishingDetector && m_phishingDetector != nullptr) {
+                    m_phishingDetector->Shutdown();
+                }
+                if (initializedAttachmentScanner && m_attachmentScanner != nullptr) {
+                    m_attachmentScanner->Shutdown();
+                }
+            } catch (...) {
+                Utils::Logger::Error("EmailProtection: Subsystem rollback encountered an unexpected exception");
+            }
+
+            m_attachmentScanner = nullptr;
+            m_phishingDetector = nullptr;
+            m_spamDetector = nullptr;
+            m_outlookScanner = nullptr;
+            m_thunderbirdScanner = nullptr;
+        };
 
         // Initialize subsystem detectors (checking return values)
         if (m_config.scanAttachments) {
@@ -565,11 +690,13 @@ bool EmailProtectionImpl::Initialize(
                 attachConfig.defaultScanConfig.scanMacros = true;
                 attachConfig.verboseLogging = m_config.verboseLogging;
                 if (!m_attachmentScanner->Initialize(attachConfig)) {
-                    Utils::Logger::Warn("EmailProtection: Attachment scanner initialization failed - disabling");
-                    m_attachmentScanner = nullptr;
-                } else {
-                    Utils::Logger::Info("EmailProtection: Attachment scanner integrated");
+                    Utils::Logger::Error("EmailProtection: Attachment scanner initialization failed");
+                    rollbackInitializedSubsystems();
+                    m_status.store(ModuleStatus::Error, std::memory_order_release);
+                    return false;
                 }
+                initializedAttachmentScanner = true;
+                Utils::Logger::Info("EmailProtection: Attachment scanner integrated");
             } else {
                 Utils::Logger::Info("EmailProtection: Attachment scanner already initialized");
             }
@@ -585,11 +712,13 @@ bool EmailProtectionImpl::Initialize(
                 phishConfig.enableSenderVerification = true;
                 phishConfig.verboseLogging = m_config.verboseLogging;
                 if (!m_phishingDetector->Initialize(phishConfig)) {
-                    Utils::Logger::Warn("EmailProtection: Phishing detector initialization failed - disabling");
-                    m_phishingDetector = nullptr;
-                } else {
-                    Utils::Logger::Info("EmailProtection: Phishing detector integrated");
+                    Utils::Logger::Error("EmailProtection: Phishing detector initialization failed");
+                    rollbackInitializedSubsystems();
+                    m_status.store(ModuleStatus::Error, std::memory_order_release);
+                    return false;
                 }
+                initializedPhishingDetector = true;
+                Utils::Logger::Info("EmailProtection: Phishing detector integrated");
             } else {
                 Utils::Logger::Info("EmailProtection: Phishing detector already initialized");
             }
@@ -603,11 +732,13 @@ bool EmailProtectionImpl::Initialize(
                 spamConfig.spamThreshold = m_config.spamThreshold;
                 spamConfig.verboseLogging = m_config.verboseLogging;
                 if (!m_spamDetector->Initialize(spamConfig)) {
-                    Utils::Logger::Warn("EmailProtection: Spam detector initialization failed - disabling");
-                    m_spamDetector = nullptr;
-                } else {
-                    Utils::Logger::Info("EmailProtection: Spam detector integrated");
+                    Utils::Logger::Error("EmailProtection: Spam detector initialization failed");
+                    rollbackInitializedSubsystems();
+                    m_status.store(ModuleStatus::Error, std::memory_order_release);
+                    return false;
                 }
+                initializedSpamDetector = true;
+                Utils::Logger::Info("EmailProtection: Spam detector integrated");
             } else {
                 Utils::Logger::Info("EmailProtection: Spam detector already initialized");
             }
@@ -619,11 +750,13 @@ bool EmailProtectionImpl::Initialize(
                 OutlookScannerConfiguration outlookConfig;
                 outlookConfig.enabled = true;
                 if (!m_outlookScanner->Initialize(outlookConfig)) {
-                    Utils::Logger::Warn("EmailProtection: Outlook scanner initialization failed - disabling");
-                    m_outlookScanner = nullptr;
-                } else {
-                    Utils::Logger::Info("EmailProtection: Outlook scanner integrated");
+                    Utils::Logger::Error("EmailProtection: Outlook scanner initialization failed");
+                    rollbackInitializedSubsystems();
+                    m_status.store(ModuleStatus::Error, std::memory_order_release);
+                    return false;
                 }
+                initializedOutlookScanner = true;
+                Utils::Logger::Info("EmailProtection: Outlook scanner integrated");
             } else {
                 Utils::Logger::Info("EmailProtection: Outlook scanner already initialized");
             }
@@ -635,11 +768,13 @@ bool EmailProtectionImpl::Initialize(
                 ThunderbirdScannerConfiguration tbConfig;
                 tbConfig.enabled = true;
                 if (!m_thunderbirdScanner->Initialize(tbConfig)) {
-                    Utils::Logger::Warn("EmailProtection: Thunderbird scanner initialization failed - disabling");
-                    m_thunderbirdScanner = nullptr;
-                } else {
-                    Utils::Logger::Info("EmailProtection: Thunderbird scanner integrated");
+                    Utils::Logger::Error("EmailProtection: Thunderbird scanner initialization failed");
+                    rollbackInitializedSubsystems();
+                    m_status.store(ModuleStatus::Error, std::memory_order_release);
+                    return false;
                 }
+                initializedThunderbirdScanner = true;
+                Utils::Logger::Info("EmailProtection: Thunderbird scanner integrated");
             } else {
                 Utils::Logger::Info("EmailProtection: Thunderbird scanner already initialized");
             }
@@ -648,8 +783,15 @@ bool EmailProtectionImpl::Initialize(
         // Initialize quarantine directory
         if (!m_config.quarantinePath.empty()) {
             m_quarantineDir = m_config.quarantinePath;
-            if (!fs::exists(m_quarantineDir)) {
-                fs::create_directories(m_quarantineDir);
+            std::error_code quarantineEc;
+            fs::create_directories(m_quarantineDir, quarantineEc);
+            if (quarantineEc && !fs::exists(m_quarantineDir)) {
+                Utils::Logger::Error("EmailProtection: Failed to create quarantine directory '{}': {}",
+                                     m_quarantineDir.string(),
+                                     quarantineEc.message());
+                rollbackInitializedSubsystems();
+                m_status.store(ModuleStatus::Error, std::memory_order_release);
+                return false;
             }
             
             // Set restrictive permissions on quarantine directory (Windows)
@@ -705,6 +847,26 @@ bool EmailProtectionImpl::Initialize(
         return true;
 
     } catch (const std::exception& e) {
+        if (m_thunderbirdScanner != nullptr && m_thunderbirdScanner->IsInitialized()) {
+            m_thunderbirdScanner->Shutdown();
+            m_thunderbirdScanner = nullptr;
+        }
+        if (m_outlookScanner != nullptr && m_outlookScanner->IsInitialized()) {
+            m_outlookScanner->Shutdown();
+            m_outlookScanner = nullptr;
+        }
+        if (m_spamDetector != nullptr && m_spamDetector->IsInitialized()) {
+            m_spamDetector->Shutdown();
+            m_spamDetector = nullptr;
+        }
+        if (m_phishingDetector != nullptr && m_phishingDetector->IsInitialized()) {
+            m_phishingDetector->Shutdown();
+            m_phishingDetector = nullptr;
+        }
+        if (m_attachmentScanner != nullptr && m_attachmentScanner->IsInitialized()) {
+            m_attachmentScanner->Shutdown();
+            m_attachmentScanner = nullptr;
+        }
         Utils::Logger::Error("EmailProtection: Initialization failed - {}",
                            e.what());
         m_initialized.store(false, std::memory_order_release);
@@ -841,7 +1003,11 @@ EmailScanResult EmailProtectionImpl::ScanMessageInternal(
 
         // 5. Authentication verification (SPF/DKIM/DMARC)
         if (m_config.verifySPF || m_config.verifyDKIM || m_config.verifyDMARC) {
-            VerifyAuthenticationInternal(message, result);
+            const bool authCheckCompleted = VerifyAuthenticationInternal(message, result);
+            if (!authCheckCompleted) {
+                Utils::Logger::Warn("EmailProtection: Authentication verification could not complete for message {}",
+                                    message.messageId);
+            }
         }
 
         // Aggregate result
@@ -852,9 +1018,14 @@ EmailScanResult EmailProtectionImpl::ScanMessageInternal(
 
         // Take action if configured
         if (result.recommendedAction == ScanAction::Quarantine) {
-            QuarantineEmailInternal(message, result);
-            result.actionTaken = "Quarantined";
-            m_statistics.quarantined.fetch_add(1, std::memory_order_relaxed);
+            if (QuarantineEmailInternal(message, result)) {
+                result.actionTaken = "Quarantined";
+                m_statistics.quarantined.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                result.actionTaken = "QuarantineFailed";
+                Utils::Logger::Warn("EmailProtection: Quarantine action failed for message {}",
+                                    message.messageId);
+            }
         } else if (result.recommendedAction == ScanAction::Block) {
             result.actionTaken = "Blocked";
             m_statistics.blocked.fetch_add(1, std::memory_order_relaxed);
@@ -875,8 +1046,8 @@ EmailScanResult EmailProtectionImpl::ScanMessageInternal(
         InvokeScanCallbacks(result);
 
         if (m_config.verboseLogging || !result.isClean) {
-            Utils::Logger::Info("EmailProtection: Email scanned - Subject: {}, Action: {}, Clean: {}",
-                              message.subject,
+            Utils::Logger::Info("EmailProtection: Email scanned - SubjectSnippet: '{}', Action: {}, Clean: {}",
+                              EmailParsing::RedactForLog(message.subject),
                               result.actionTaken,
                               result.isClean);
         }
@@ -1407,9 +1578,11 @@ std::optional<EmailMessage> EmailProtectionImpl::ParseRawEmailInternal(
             {
             std::string hexHash;
             Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
-            hasher.Update(emailContent.data(), emailContent.size());
-            hasher.FinalHex(hexHash);
-            message.messageId = hexHash.substr(0, 16);
+            if (!hasher.Update(emailContent.data(), emailContent.size()) || !hasher.FinalHex(hexHash)) {
+                Utils::Logger::Warn("EmailProtection: Failed to hash raw message for synthetic ID generation");
+            } else {
+                message.messageId = hexHash.substr(0, 16);
+            }
         }
         }
 
@@ -1477,9 +1650,9 @@ bool EmailProtectionImpl::QuarantineEmailInternal(
 
             InvokeQuarantineCallbacks(entry);
 
-            Utils::Logger::Warn("EmailProtection: Quarantined email (encrypted) - ID: {}, Subject: {}, Size: {}",
+            Utils::Logger::Warn("EmailProtection: Quarantined email (encrypted) - ID: {}, SubjectSnippet: '{}', Size: {}",
                               entry.quarantineId,
-                              message.subject,
+                              EmailParsing::RedactForLog(message.subject),
                               encrypted.size());
 
             return true;
@@ -1543,10 +1716,9 @@ bool EmailProtectionImpl::ReleaseFromQuarantineInternal(
 {
     // CRITICAL-001 FIX: Validate authorization token before release
     if (!authorizationToken.empty() && !ValidateReleaseToken(authorizationToken, releasedBy)) {
-        Utils::Logger::Error("EmailProtection: Authorization failed - ID: {}, Token: {}, ReleasedBy: {}",
+        Utils::Logger::Error("EmailProtection: Authorization failed - ID: {}, ReleasedBy: {}",
                               quarantineId,
-                              authorizationToken.substr(0, 8) + "...",
-                              releasedBy);
+                              EmailParsing::RedactForLog(releasedBy));
         return false;
     }
 
@@ -2373,48 +2545,100 @@ std::vector<uint8_t> EmailProtectionImpl::DecryptQuarantineData(
 void EmailProtectionImpl::SecureDeleteFile(const fs::path& filePath)
 {
     try {
-        // HIGH-002 FIX: Implement secure deletion instead of simple fs::remove()
         if (!fs::exists(filePath)) {
             return;
         }
 
-        // Check file size - skip if too large
+        fs::path quarantineRoot;
+        {
+            std::shared_lock lock(m_quarantineMutex);
+            quarantineRoot = m_quarantineDir;
+        }
+
+        const auto isWithinQuarantine = [](const fs::path& base, const fs::path& candidate) {
+            auto baseIt = base.begin();
+            auto candidateIt = candidate.begin();
+            for (; baseIt != base.end() && candidateIt != candidate.end(); ++baseIt, ++candidateIt) {
+                if (*baseIt != *candidateIt) {
+                    return false;
+                }
+            }
+            return baseIt == base.end();
+        };
+
         std::error_code ec;
-        const uintmax_t fileSize = fs::file_size(filePath, ec);
-        if (ec || fileSize > 100 * 1024 * 1024) {  // 100MB max for secure delete
-            Utils::Logger::Warn("EmailProtection: File too large for secure delete - {}",
-                                  filePath.string());
-            fs::remove(filePath);
+        const fs::path canonicalPath = fs::weakly_canonical(filePath, ec);
+        std::error_code rootEc;
+        const fs::path canonicalQuarantineRoot = quarantineRoot.empty()
+            ? fs::path{}
+            : fs::weakly_canonical(quarantineRoot, rootEc);
+        if (ec || rootEc || (!canonicalQuarantineRoot.empty() && !isWithinQuarantine(canonicalQuarantineRoot, canonicalPath))) {
+            Utils::Logger::Error("EmailProtection: Refusing to delete non-quarantine path '{}'",
+                                 filePath.string());
             return;
         }
 
-        // Open file for secure overwrite
-        std::ofstream file(filePath, std::ios::binary | std::ios::in);
+        const uintmax_t fileSize = fs::file_size(canonicalPath, ec);
+        if (ec) {
+            Utils::Logger::Warn("EmailProtection: Failed to query file size for secure delete '{}': {}",
+                                canonicalPath.string(),
+                                ec.message());
+            fs::remove(canonicalPath, ec);
+            return;
+        }
+
+        std::fstream file(canonicalPath, std::ios::binary | std::ios::in | std::ios::out);
         if (!file.is_open()) {
-            // Can't open, try regular delete
-            fs::remove(filePath);
+            Utils::Logger::Warn("EmailProtection: Falling back to direct delete for '{}'",
+                                canonicalPath.string());
+            fs::remove(canonicalPath, ec);
             return;
         }
 
-        // Get file size
-        const uintmax_t size = fileSize;
+        constexpr size_t kSecureDeleteChunkSize = 64 * 1024;
+        std::vector<uint8_t> chunk(kSecureDeleteChunkSize, 0x00);
+        const auto overwritePass = [&](const std::function<void(std::span<uint8_t>)>& filler) -> bool {
+            file.clear();
+            file.seekp(0, std::ios::beg);
+            uintmax_t remaining = fileSize;
+            while (remaining > 0) {
+                const size_t toWrite = static_cast<size_t>(std::min<uintmax_t>(remaining, chunk.size()));
+                filler(std::span<uint8_t>(chunk.data(), toWrite));
+                file.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(toWrite));
+                if (!file.good()) {
+                    return false;
+                }
+                remaining -= toWrite;
+            }
+            file.flush();
+            return file.good();
+        };
 
-        // Perform multiple overwrite passes (DoD 5220.22-M standard: 3 passes)
-        std::vector<uint8_t> pass1(size, 0x00);
-        std::vector<uint8_t> pass2(size, 0xFF);
-        std::vector<uint8_t> pass3(size, static_cast<uint8_t>(rand()));
-
-        file.write(reinterpret_cast<const char*>(pass1.data()), pass1.size());
-        file.write(reinterpret_cast<const char*>(pass2.data()), pass2.size());
-        file.write(reinterpret_cast<const char*>(pass3.data()), pass3.size());
-
-        file.flush();
+        const bool zeroPassOk = overwritePass([](std::span<uint8_t> buffer) {
+            std::fill(buffer.begin(), buffer.end(), 0x00);
+        });
+        const bool ffPassOk = zeroPassOk && overwritePass([](std::span<uint8_t> buffer) {
+            std::fill(buffer.begin(), buffer.end(), 0xFF);
+        });
+        const bool randomPassOk = ffPassOk && overwritePass([](std::span<uint8_t> buffer) {
+            const NTSTATUS status = BCryptGenRandom(nullptr,
+                                                    buffer.data(),
+                                                    static_cast<ULONG>(buffer.size()),
+                                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (status != 0) {
+                std::fill(buffer.begin(), buffer.end(), 0xA5);
+            }
+        });
         file.close();
 
-        // Sync to disk
+        if (!randomPassOk) {
+            Utils::Logger::Warn("EmailProtection: Secure overwrite incomplete for '{}'",
+                                canonicalPath.string());
+        }
+
 #ifdef _WIN32
         HANDLE hFile = CreateFileW(
-            filePath.c_str(),
+            canonicalPath.c_str(),
             GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
@@ -2428,10 +2652,15 @@ void EmailProtectionImpl::SecureDeleteFile(const fs::path& filePath)
         }
 #endif
 
-        // Delete the file
-        fs::remove(filePath);
+        fs::remove(canonicalPath, ec);
+        if (ec) {
+            Utils::Logger::Error("EmailProtection: Failed to remove quarantined file '{}': {}",
+                                 canonicalPath.string(),
+                                 ec.message());
+            return;
+        }
 
-        Utils::Logger::Debug("EmailProtection: Securely deleted - {}", filePath.string());
+        Utils::Logger::Debug("EmailProtection: Securely deleted quarantine payload '{}'", canonicalPath.filename().string());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("EmailProtection: Secure delete exception for {} - {}",
@@ -2800,9 +3029,9 @@ EmailScanResult EmailProtection::ScanMSGFile(const fs::path& path) {
         std::error_code ec;
         message.rawSize = static_cast<size_t>(std::filesystem::file_size(path, ec));
 
-        Utils::Logger::Info("EmailProtection: MSG file parsed via IStorage - subject: '{}', "
+        Utils::Logger::Info("EmailProtection: MSG file parsed via IStorage - subjectSnippet: '{}', "
                            "attachments: {}, headers: {}",
-                           message.subject,
+                           EmailParsing::RedactForLog(message.subject),
                            message.attachments.size(),
                            message.headers.size());
 
