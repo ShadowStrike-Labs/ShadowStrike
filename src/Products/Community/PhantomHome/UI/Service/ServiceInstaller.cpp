@@ -29,6 +29,7 @@
 #include <windows.h>
 
 #include <format>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -49,9 +50,32 @@ struct ScmHandle {
     operator SC_HANDLE() const noexcept { return h; }
 };
 
+[[nodiscard]] std::optional<std::wstring> QuoteServiceBinaryPath(std::wstring_view image_path) {
+    if (image_path.empty()) {
+        return std::nullopt;
+    }
+    if (image_path.find(L'"') != std::wstring_view::npos) {
+        return std::nullopt;
+    }
+
+    std::wstring quoted;
+    quoted.reserve(image_path.size() + 2);
+    quoted.push_back(L'"');
+    quoted.append(image_path);
+    quoted.push_back(L'"');
+    return quoted;
+}
+
 }  // namespace
 
 [[nodiscard]] bool InstallService(const std::wstring& image_path) {
+    const auto quoted_image_path = QuoteServiceBinaryPath(image_path);
+    if (!quoted_image_path) {
+        ShadowStrike::Utils::Logger::Error(
+            "InstallService: refusing to register an invalid service image path");
+        return false;
+    }
+
     ScmHandle mgr{::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE)};
     if (!mgr) {
         ShadowStrike::Utils::Logger::Error("InstallService: OpenSCManagerW failed gle={}", ::GetLastError());
@@ -65,7 +89,7 @@ struct ScmHandle {
                                    SERVICE_WIN32_OWN_PROCESS,
                                    SERVICE_AUTO_START,
                                    SERVICE_ERROR_NORMAL,
-                                   image_path.c_str(),
+                                   quoted_image_path->c_str(),
                                    nullptr, nullptr, nullptr,
                                    /*LocalSystem*/ nullptr,
                                    nullptr)};
