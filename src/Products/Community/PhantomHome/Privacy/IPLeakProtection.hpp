@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -133,6 +133,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -264,21 +265,6 @@ enum class WebRTCBlockMethod : uint8_t {
     NetworkBlock    = 2,    ///< Block STUN/TURN traffic
     ExtensionBased  = 3,    ///< Use browser extension
     Combined        = 4     ///< All methods
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Monitoring      = 3,
-    KillSwitchActive= 4,
-    Paused          = 5,
-    Stopping        = 6,
-    Stopped         = 7,
-    Error           = 8
 };
 
 // ============================================================================

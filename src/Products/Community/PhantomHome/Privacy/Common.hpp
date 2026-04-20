@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <optional>
 #include <chrono>
 #include <filesystem>
 #include <algorithm>
@@ -80,14 +81,18 @@ namespace fs = std::filesystem;
  * violations when linked into the same translation unit.
  */
 enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
+    Uninitialized    = 0,
+    Initializing     = 1,
+    Running          = 2,
+    Monitoring       = 3,
+    Scanning         = 4,
+    Ready            = 5,
+    Cleaning         = 6,
+    KillSwitchActive = 7,
+    Paused           = 8,
+    Stopping         = 9,
+    Stopped          = 10,
+    Error            = 11
 };
 
 /**
@@ -121,14 +126,18 @@ inline constexpr size_t BROWSER_ARRAY_SIZE = static_cast<size_t>(BrowserType::_B
  */
 [[nodiscard]] inline std::string_view GetModuleStatusName(ModuleStatus status) noexcept {
     switch (status) {
-        case ModuleStatus::Uninitialized: return "Uninitialized";
-        case ModuleStatus::Initializing:  return "Initializing";
-        case ModuleStatus::Running:       return "Running";
-        case ModuleStatus::Scanning:      return "Scanning";
-        case ModuleStatus::Paused:        return "Paused";
-        case ModuleStatus::Stopping:      return "Stopping";
-        case ModuleStatus::Stopped:       return "Stopped";
-        case ModuleStatus::Error:         return "Error";
+        case ModuleStatus::Uninitialized:    return "Uninitialized";
+        case ModuleStatus::Initializing:     return "Initializing";
+        case ModuleStatus::Running:          return "Running";
+        case ModuleStatus::Monitoring:       return "Monitoring";
+        case ModuleStatus::Scanning:         return "Scanning";
+        case ModuleStatus::Ready:            return "Ready";
+        case ModuleStatus::Cleaning:         return "Cleaning";
+        case ModuleStatus::KillSwitchActive: return "KillSwitchActive";
+        case ModuleStatus::Paused:           return "Paused";
+        case ModuleStatus::Stopping:         return "Stopping";
+        case ModuleStatus::Stopped:          return "Stopped";
+        case ModuleStatus::Error:            return "Error";
         default:                          return "Unknown";
     }
 }

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -139,6 +139,7 @@
 #include "../Utils/FileUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -163,6 +164,9 @@ namespace DLPConstants {
 
     /// @brief Maximum content size to scan
     inline constexpr size_t MAX_CONTENT_SCAN_SIZE = 100 * 1024 * 1024;  // 100MB
+
+    /// @brief Hard cap for regex evaluation to bound worst-case backtracking
+    inline constexpr size_t MAX_REGEX_SCAN_SIZE = 4 * 1024 * 1024;  // 4MB
     
     /// @brief Clipboard polling interval
     inline constexpr uint32_t CLIPBOARD_POLL_INTERVAL_MS = 500;
@@ -290,20 +294,6 @@ enum class ComplianceFramework : uint8_t {
     Custom          = 8
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
-
 // ============================================================================
 // STRUCTURES
 // ============================================================================
@@ -361,7 +351,7 @@ struct SensitiveDataMatch {
     /// @brief Matched value (partially redacted)
     std::string redactedValue;
     
-    /// @brief Full value (for logging/evidence)
+    /// @brief SHA-256 fingerprint of the matched value (never plaintext)
     std::string fullValue;
     
     /// @brief Context (surrounding text)

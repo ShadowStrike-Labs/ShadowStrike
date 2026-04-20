@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -132,6 +132,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
+#include "Common.hpp"
 #include "../PatternStore/PatternStore.hpp"
 
 // ============================================================================
@@ -269,20 +270,6 @@ enum class PoisoningStatus : uint8_t {
     Suspicious      = 1,
     Poisoned        = 2,
     Verified        = 3
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Monitoring      = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
