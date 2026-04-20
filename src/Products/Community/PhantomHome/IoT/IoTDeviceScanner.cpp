@@ -645,7 +645,8 @@ public:
         }
 
         std::string prefix = mac.substr(0, 8);
-        std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::toupper);
+        std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
 
         for (const auto& entry : MAC_VENDORS) {
             if (prefix == entry.prefix) {
@@ -1641,7 +1642,10 @@ IoTDeviceScanner::~IoTDeviceScanner() {
 
         if (config.autoDiscoveryOnStartup && config.enabled) {
             lock.unlock();
-            StartDiscovery(config.defaultScanConfig);
+            if (!StartDiscovery(config.defaultScanConfig)) {
+                ::ShadowStrike::Utils::Logger::Warn(
+                    "IoTDeviceScanner startup discovery did not start despite autoDiscoveryOnStartup=true");
+            }
         }
 
         return true;

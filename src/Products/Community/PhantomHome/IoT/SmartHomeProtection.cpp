@@ -862,8 +862,10 @@ void SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
             }
         }
 
-        if (needAutoMonitor) {
-            MonitorDeviceInternal(sourceMac);
+        if (needAutoMonitor && !MonitorDeviceInternal(sourceMac)) {
+            ::ShadowStrike::Utils::Logger::Warn(
+                "SmartHomeProtection: Auto-monitor enrollment failed for {}",
+                RedactDeviceIdentifier(sourceMac));
         }
 
         // === UPDATE DEVICE TRAFFIC STATE ===
@@ -1256,7 +1258,7 @@ void SmartHomeProtectionImpl::DetectAnomalies(
 
 void SmartHomeProtectionImpl::AnalyzeTraffic(
     const std::string& deviceId,
-    uint64_t bytes)
+    [[maybe_unused]] uint64_t bytes)
 {
     try {
         // === PHASE 1: Gather connection intelligence (under lock, then release) ===
