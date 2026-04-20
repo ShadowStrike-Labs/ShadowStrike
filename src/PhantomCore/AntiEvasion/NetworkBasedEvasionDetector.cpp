@@ -3293,7 +3293,10 @@ namespace ShadowStrike::AntiEvasion {
                 // static buffers. They must NOT be freed by the caller.
 
                 if (proxyInfo.lpszProxy && proxyInfo.lpszProxy[0] != '\0') {
-                    outProxyAddress = Utils::StringUtils::ToWide(proxyInfo.lpszProxy);
+                    // InternetQueryOptionA writes ANSI strings; lpszProxy is
+                    // typed as LPCTSTR but contains narrow chars in practice.
+                    outProxyAddress = Utils::StringUtils::ToWide(
+                        reinterpret_cast<const char*>(proxyInfo.lpszProxy));
                     return true;
                 }
             }

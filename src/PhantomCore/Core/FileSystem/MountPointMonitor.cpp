@@ -411,7 +411,7 @@ struct MountPointMonitor::Impl {
             DWORD maxComponentLen = 0;
             DWORD fileSystemFlags = 0;
 
-            if (GetVolumeInformationW(
+            if (::GetVolumeInformationW(
                 rootPath,
                 volumeName, MAX_PATH,
                 &serialNumber,

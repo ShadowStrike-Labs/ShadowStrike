@@ -1125,6 +1125,11 @@ public:
         Logger::Info("SpamDetector: Shutdown complete");
     }
 
+    [[nodiscard]] bool IsInitialized() const noexcept {
+        std::shared_lock lock(m_mutex);
+        return m_initialized;
+    }
+
     // ========================================================================
     // ANALYSIS
     // ========================================================================
@@ -1702,6 +1707,10 @@ bool SpamDetector::Initialize(const SpamDetectorConfiguration& config) {
 
 void SpamDetector::Shutdown() noexcept {
     m_impl->Shutdown();
+}
+
+bool SpamDetector::IsInitialized() const noexcept {
+    return m_impl && m_impl->IsInitialized();
 }
 
 bool SpamDetector::IsSpam(const std::string& headers, const std::string& body) {

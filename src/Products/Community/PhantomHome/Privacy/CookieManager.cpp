@@ -80,9 +80,8 @@
 #include <fstream>
 #include <regex>
 
-// SQLite for browser database access
+// SQLite for browser database access (linked via PhantomCoreLib)
 #include <SQLiteCpp/sqlite3.h>
-#pragma comment(lib, "sqlite3.lib")
 
 // Ensure SHGetFolderPathW / CSIDL_* are available (needed by Common.hpp helpers)
 #include <shlobj.h>
