@@ -1674,6 +1674,11 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
     }
 
+    [[nodiscard]] bool IsInitialized() const noexcept {
+        std::shared_lock lock(m_mutex);
+        return m_initialized;
+    }
+
     // ========================================================================
     // MONITORING CONTROL
     // ========================================================================
@@ -2180,6 +2185,10 @@ bool PerformanceMonitor::Initialize(const PerformanceMonitorConfig& config) {
 
 void PerformanceMonitor::Shutdown() noexcept {
     m_impl->Shutdown();
+}
+
+bool PerformanceMonitor::IsInitialized() const noexcept {
+    return m_impl->IsInitialized();
 }
 
 void PerformanceMonitor::StartMonitoring() {

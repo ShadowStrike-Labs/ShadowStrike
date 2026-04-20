@@ -60,7 +60,9 @@
 
 #include "PhantomCore/Utils/StringUtils.hpp"
 #include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/PE_sig_verf.hpp"
 #include "PhantomCore/Utils/Timer.hpp"
+#include "PhantomCore/Core/System/PerformanceMonitor.hpp"
 #include <psapi.h>
 #include <winternl.h>
 #include <powrprof.h>
@@ -73,6 +75,7 @@
 #include <algorithm>
 #include <thread>
 #include <filesystem>
+#include <condition_variable>
 #include <atomic>            // Fix #2: missing include
 
 #if __has_include(<dxgi1_4.h>)
@@ -104,6 +107,8 @@ namespace {
 
     using namespace ShadowStrike::GameMode;
     namespace Utils = ShadowStrike::Utils;
+    namespace CoreSystem = ShadowStrike::Core::System;
+    namespace PESig = ShadowStrike::Utils::pe_sig_utils;
 
     /// @brief Maximum processes to track
     constexpr size_t MAX_TRACKED_PROCESSES = 1024;
@@ -454,6 +459,9 @@ public:
     std::atomic<bool> m_monitoringActive{false};
     std::thread m_monitoringThread;
     uint32_t m_monitoringIntervalMs = MONITORING_INTERVAL_MS;
+    std::mutex m_monitoringStopMutex;
+    std::condition_variable m_monitoringStopCv;
+    std::atomic<bool> m_ownsCorePerformanceMonitor{false};
 
     // PO-C2: Dedicated mutex for performance counter fields below
     mutable std::mutex m_perfCounterMutex;
@@ -641,13 +649,73 @@ public:
     }
 
     /**
-     * @brief Open process with required privileges
-     * Fix #15: Callers should wrap in ScopedHandle.
+     * @brief Open process with required privileges.
+     * Uses least-privilege access sufficient for priority, quota, and affinity updates.
      */
     [[nodiscard]] HANDLE OpenProcessWithPrivileges(uint32_t pid) {
-        DWORD access = PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION |
-                      PROCESS_VM_READ | PROCESS_SET_QUOTA;
-        return ::OpenProcess(access, FALSE, pid);
+        constexpr DWORD kAccess = PROCESS_QUERY_LIMITED_INFORMATION |
+                                  PROCESS_SET_INFORMATION |
+                                  PROCESS_SET_QUOTA;
+        return ::OpenProcess(kAccess, FALSE, pid);
+    }
+
+    [[nodiscard]] static bool IsPriorityIncrease(ProcessPriorityClass priority) noexcept {
+        return priority == ProcessPriorityClass::AboveNormal ||
+               priority == ProcessPriorityClass::High ||
+               priority == ProcessPriorityClass::Realtime;
+    }
+
+    [[nodiscard]] static std::optional<std::wstring> QueryProcessImagePath(HANDLE hProcess) {
+        std::array<wchar_t, 32768> imagePath{};
+        DWORD pathSize = static_cast<DWORD>(imagePath.size());
+        if (!::QueryFullProcessImageNameW(hProcess, 0, imagePath.data(), &pathSize) ||
+            pathSize == 0) {
+            return std::nullopt;
+        }
+
+        return std::wstring(imagePath.data(), pathSize);
+    }
+
+    [[nodiscard]] static bool IsTrustedSignedProcess(HANDLE hProcess,
+                                                     uint32_t pid,
+                                                     std::string* failureReason = nullptr) {
+        const auto imagePath = QueryProcessImagePath(hProcess);
+        if (!imagePath.has_value()) {
+            if (failureReason) {
+                *failureReason = "image path unavailable";
+            }
+            return false;
+        }
+
+        PESig::PEFileSignatureVerifier verifier;
+        verifier.SetRevocationMode(PESig::RevocationMode::OfflineAllowed);
+
+        PESig::SignatureInfo sigInfo;
+        PESig::Error sigError;
+        if (!verifier.VerifyPESignature(*imagePath, sigInfo, &sigError)) {
+            if (failureReason) {
+                *failureReason = sigError.message.empty()
+                    ? "signature verification failed"
+                    : Utils::StringUtils::ToNarrow(sigError.message);
+            }
+            Utils::Logger::Warn("PerformanceOptimizer: rejecting priority increase for PID {} ({}): {}",
+                                pid, Utils::StringUtils::ToNarrow(*imagePath),
+                                failureReason ? *failureReason : "signature verification failed");
+            return false;
+        }
+
+        const bool trusted = sigInfo.isSigned && sigInfo.isVerified && sigInfo.isChainTrusted;
+        if (!trusted) {
+            if (failureReason) {
+                *failureReason = "process is not signed by a trusted publisher";
+            }
+            Utils::Logger::Warn("PerformanceOptimizer: rejecting priority increase for PID {} ({}): {}",
+                                pid, Utils::StringUtils::ToNarrow(*imagePath),
+                                failureReason ? *failureReason : "process is not signed by a trusted publisher");
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -738,30 +806,35 @@ public:
      */
     void MonitoringThreadFunc() {
         Utils::Logger::Info("Resource monitoring thread started");
+        (void)::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
-        // PO-L4: Use sleep_until to prevent drift accumulation
-        auto nextTick = Clock::now() + std::chrono::milliseconds(m_monitoringIntervalMs);
+        auto nextTick = Clock::now();
 
         while (m_monitoringActive.load(std::memory_order_acquire)) {
             try {
-                // Get resource snapshot
                 auto snapshot = CaptureResourceSnapshot();
-
-                // Notify callbacks
                 NotifyResourceUpdate(snapshot);
-
             } catch (const std::exception& e) {
                 Utils::Logger::Error("Monitoring thread error: {}", e.what());
             } catch (...) {
                 Utils::Logger::Error("Unknown monitoring thread error");
             }
 
-            // PO-L4: Sleep until next tick, then advance; reset if we fell behind
-            std::this_thread::sleep_until(nextTick);
-            auto now = Clock::now();
             nextTick += std::chrono::milliseconds(m_monitoringIntervalMs);
+            std::unique_lock waitLock(m_monitoringStopMutex);
+            const bool stopRequested = m_monitoringStopCv.wait_until(
+                waitLock, nextTick, [this] {
+                    return !m_monitoringActive.load(std::memory_order_acquire);
+                });
+            waitLock.unlock();
+
+            if (stopRequested) {
+                break;
+            }
+
+            const auto now = Clock::now();
             if (nextTick < now) {
-                nextTick = now + std::chrono::milliseconds(m_monitoringIntervalMs);
+                nextTick = now;
             }
         }
 
@@ -1013,25 +1086,27 @@ public:
         SystemResourceSnapshot snapshot;
         snapshot.timestamp = std::chrono::system_clock::now();
 
-        // CPU usage
-        snapshot.cpuUsage = GetCPUUsage();
+        const auto& coreMonitor = CoreSystem::PerformanceMonitor::Instance();
+        if (coreMonitor.IsInitialized()) {
+            const auto systemUsage = coreMonitor.GetSystemUsage();
+            snapshot.cpuUsage = std::clamp(systemUsage.totalCpuPercent, 0.0, 100.0);
+            snapshot.memoryUsage = std::clamp(systemUsage.memoryUsagePercent, 0.0, 100.0);
+            snapshot.availableMemoryMB = systemUsage.availablePhysicalBytes / (1024ull * 1024ull);
+            snapshot.diskReadMBps = std::max(0.0, systemUsage.diskReadBytesPerSec / (1024.0 * 1024.0));
+            snapshot.diskWriteMBps = std::max(0.0, systemUsage.diskWriteBytesPerSec / (1024.0 * 1024.0));
+            snapshot.diskQueueLength = std::max(0.0, systemUsage.diskQueueLength);
+            snapshot.networkMbps = std::max(0.0,
+                ((systemUsage.networkSendBytesPerSec + systemUsage.networkRecvBytesPerSec) * 8.0) / 1'000'000.0);
+        } else {
+            snapshot.cpuUsage = GetCPUUsage();
 
-        // Memory
-        uint64_t totalMB = 0;
-        if (GetMemoryInfo(totalMB, snapshot.availableMemoryMB, snapshot.memoryUsage)) {
-            // Success
+            uint64_t totalMB = 0;
+            (void)GetMemoryInfo(totalMB, snapshot.availableMemoryMB, snapshot.memoryUsage);
+            CaptureDiskIO(snapshot.diskReadMBps, snapshot.diskWriteMBps, snapshot.diskQueueLength);
+            snapshot.networkMbps = CaptureNetworkMbps();
         }
 
-        // Power status
         (void)GetPowerStatus(snapshot.onBattery, snapshot.batteryPercent);
-
-        // Disk I/O via NtQuerySystemInformation
-        CaptureDiskIO(snapshot.diskReadMBps, snapshot.diskWriteMBps, snapshot.diskQueueLength);
-
-        // Network I/O via IP Helper GetIfTable2 (delta Mbps over sample interval)
-        snapshot.networkMbps = CaptureNetworkMbps();
-
-        // GPU via DXGI
         snapshot.gpuUsage = CaptureGPUUsage();
 
         return snapshot;
@@ -1041,11 +1116,17 @@ public:
      * @brief Stop monitoring thread
      */
     void StopMonitoring() {
-        if (m_monitoringActive.load(std::memory_order_acquire)) {
-            m_monitoringActive.store(false, std::memory_order_release);
-            if (m_monitoringThread.joinable()) {
-                m_monitoringThread.join();
-            }
+        const bool wasActive = m_monitoringActive.exchange(false, std::memory_order_acq_rel);
+        m_monitoringStopCv.notify_all();
+
+        if (wasActive && m_monitoringThread.joinable()) {
+            m_monitoringThread.join();
+        }
+
+        if (m_ownsCorePerformanceMonitor.exchange(false, std::memory_order_acq_rel)) {
+            auto& coreMonitor = CoreSystem::PerformanceMonitor::Instance();
+            coreMonitor.StopMonitoring();
+            coreMonitor.Shutdown();
         }
     }
 
@@ -1222,11 +1303,8 @@ PerformanceOptimizer::~PerformanceOptimizer() {
 
         m_impl->m_config = config;
 
-        // PO-M3: Enable SeDebugPrivilege for cross-process operations
-        if (!EnablePrivilege(L"SeDebugPrivilege")) {
-            Utils::Logger::Warn("Failed to enable SE_DEBUG_NAME privilege; "
-                                "some cross-process operations may fail");
-        }
+        // Cross-process optimization remains best-effort and must not depend on
+        // admin-only SeDebugPrivilege. Least-privilege opens are used instead.
 
         // Reset statistics
         m_impl->m_stats.Reset();
@@ -1455,14 +1533,26 @@ PerformanceOptimizer::GetConfiguration() const {
                 m_impl->SaveProcessState(pid, hProcess.get());
             }
 
+            bool allowPriorityIncrease = true;
+            if (m_impl->IsPriorityIncrease(settings.processPriority)) {
+                std::string trustReason;
+                allowPriorityIncrease = m_impl->IsTrustedSignedProcess(hProcess.get(), pid, &trustReason);
+                if (!allowPriorityIncrease) {
+                    Utils::Logger::Warn("PerformanceOptimizer: skipping priority increase for PID {} ({}): {}",
+                                        pid, Utils::StringUtils::ToNarrow(processName), trustReason);
+                }
+            }
+
             // Apply priority
-            DWORD winPriority = GetWindowsPriorityClass(settings.processPriority);
-            if (::SetPriorityClass(hProcess.get(), winPriority)) {
-                auto& state = m_impl->m_processStates[pid];
-                state.currentPriority = settings.processPriority;
-                state.isModified = true;
-                processesModified++;
-                m_impl->m_stats.priorityChanges++;
+            if (allowPriorityIncrease) {
+                DWORD winPriority = GetWindowsPriorityClass(settings.processPriority);
+                if (::SetPriorityClass(hProcess.get(), winPriority)) {
+                    auto& state = m_impl->m_processStates[pid];
+                    state.currentPriority = settings.processPriority;
+                    state.isModified = true;
+                    processesModified++;
+                    m_impl->m_stats.priorityChanges++;
+                }
             }
 
             // Fix #5 + #16: Apply I/O priority with proper translation and error check
@@ -1683,6 +1773,14 @@ PerformanceOptimizer::GetConfiguration() const {
         ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
         if (!hProcess) {
             return false;
+        }
+
+        if (m_impl->IsPriorityIncrease(priority)) {
+            std::string reason;
+            if (!m_impl->IsTrustedSignedProcess(hProcess.get(), pid, &reason)) {
+                Utils::Logger::Warn("SetProcessPriority rejected for PID {}: {}", pid, reason);
+                return false;
+            }
         }
 
         DWORD winPriority = GetWindowsPriorityClass(priority);
@@ -2168,6 +2266,28 @@ void PerformanceOptimizer::StartResourceMonitoring(uint32_t intervalMs) {
         if (originalInterval != intervalMs) {
             Utils::Logger::Warn("StartResourceMonitoring: intervalMs {} clamped to {} "
                                 "(valid range: 100-60000)", originalInterval, intervalMs);
+        }
+
+        auto& coreMonitor = CoreSystem::PerformanceMonitor::Instance();
+        if (!coreMonitor.IsInitialized()) {
+            auto monitorConfig = CoreSystem::PerformanceMonitorConfig::CreateLowImpact();
+            monitorConfig.monitorProcesses = false;
+            monitorConfig.monitorSystem = true;
+            monitorConfig.detectAnomalies = false;
+            monitorConfig.autoThrottle = false;
+            monitorConfig.samplingIntervalMs = intervalMs;
+            monitorConfig.historyDepthSeconds = 60;
+
+            if (coreMonitor.Initialize(monitorConfig)) {
+                m_impl->m_ownsCorePerformanceMonitor.store(true, std::memory_order_release);
+            } else {
+                Utils::Logger::Warn("PerformanceOptimizer: PhantomCore PerformanceMonitor initialization failed; using local fallback counters");
+            }
+        }
+
+        if (m_impl->m_ownsCorePerformanceMonitor.load(std::memory_order_acquire) &&
+            coreMonitor.IsInitialized()) {
+            coreMonitor.StartMonitoring();
         }
 
         std::unique_lock lock(m_impl->m_mutex);
