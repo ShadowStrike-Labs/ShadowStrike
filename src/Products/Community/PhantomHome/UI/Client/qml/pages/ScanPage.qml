@@ -7,6 +7,9 @@ import "../components"
 Item {
     id: page
 
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Scan")
+
     property int    scanType: 0              // 0=Quick 1=Full 2=Custom 3=Memory
     property bool   scanning: false
     property real   progress: 0.0            // 0..1

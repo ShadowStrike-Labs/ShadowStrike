@@ -7,6 +7,9 @@ import "../components"
 Item {
     id: page
 
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Settings")
+
     property bool autoStart: true
     property bool telemetryEnabled: false
     property bool notifications: true

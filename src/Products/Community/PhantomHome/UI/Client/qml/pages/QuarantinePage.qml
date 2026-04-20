@@ -6,6 +6,9 @@ import "../components"
 
 Item {
     id: page
+
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Quarantine")
     property var items: []     // [{id, path, sha256, detectionName, quarantinedUnix, severity}]
 
     signal restore(string id)

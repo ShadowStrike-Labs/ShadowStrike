@@ -6,6 +6,9 @@ import "../components"
 
 Item {
     id: page
+
+    Accessible.role: Accessible.Pane
+    Accessible.name: qsTr("Reports")
     property var events: []       // [{timeUnix, module, severity, title, detail}]
 
     ColumnLayout {

@@ -17,6 +17,9 @@ Rectangle {
     radius:      0
     implicitWidth: 196
 
+    Accessible.role: Accessible.PageTabList
+    Accessible.name: qsTr("Navigation")
+
     property int selectedIndex: 0
     signal navigate(int index)
 
@@ -88,6 +91,26 @@ Rectangle {
             color: root.selectedIndex === index ? Theme.bg2 : "transparent"
             border.color: root.selectedIndex === index ? Theme.stroke : "transparent"
             border.width: 1
+
+            activeFocusOnTab: true
+
+            Accessible.role: Accessible.PageTab
+            Accessible.name: label
+            Accessible.description: qsTr("Open %1 page").arg(label)
+            Accessible.focusable: true
+            Accessible.onPressAction: {
+                root.selectedIndex = index
+                root.navigate(index)
+            }
+
+            Keys.onReturnPressed: {
+                root.selectedIndex = index
+                root.navigate(index)
+            }
+            Keys.onSpacePressed: {
+                root.selectedIndex = index
+                root.navigate(index)
+            }
 
             Row {
                 anchors.verticalCenter: parent.verticalCenter

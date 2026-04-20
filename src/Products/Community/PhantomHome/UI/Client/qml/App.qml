@@ -23,6 +23,10 @@ ApplicationWindow {
     color: "transparent"
     title: "ShadowStrike Phantom"
 
+    Accessible.role: Accessible.Window
+    Accessible.name: qsTr("ShadowStrike Phantom Home")
+    Accessible.description: qsTr("ShadowStrike Phantom Home main window. Use Tab to move between controls.")
+
     // Injected from main.cpp
     property var protectionVm: null
 
@@ -65,12 +69,20 @@ ApplicationWindow {
                 flat: true
                 onClicked: root.showMinimized()
                 implicitWidth: 36; implicitHeight: 28
+                focusPolicy: Qt.TabFocus
+                Accessible.role: Accessible.Button
+                Accessible.name: qsTr("Minimize")
+                Accessible.description: qsTr("Minimize the ShadowStrike Phantom window")
             }
             Button {
                 text: "\u2715"                 // ✕ close
                 flat: true
                 onClicked: root.close()
                 implicitWidth: 36; implicitHeight: 28
+                focusPolicy: Qt.TabFocus
+                Accessible.role: Accessible.Button
+                Accessible.name: qsTr("Close")
+                Accessible.description: qsTr("Close the ShadowStrike Phantom window")
             }
         }
     }
