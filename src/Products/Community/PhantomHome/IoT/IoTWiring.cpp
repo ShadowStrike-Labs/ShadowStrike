@@ -61,7 +61,7 @@ struct IoTModulesRegistrar final {
                 .phase = ModulePhase::OnDemand,
                 .initialize = []() -> bool {
                     ShadowStrike::IoT::WiFiAnalyzerConfiguration config;
-                    config.continuousMonitoring = false;
+                    config.continuousMonitoring = true;
                     config.allowNearbyNetworkEnumeration = false;
                     return ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance().Initialize(config);
                 },

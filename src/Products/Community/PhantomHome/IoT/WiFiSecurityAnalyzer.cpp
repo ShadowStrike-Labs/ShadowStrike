@@ -727,6 +727,23 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
             connection.network.vendor = GetVendorFromBSSID(connection.network.bssid);
         }
 
+        {
+            std::unique_lock lock(m_mutex);
+            auto now = std::chrono::system_clock::now();
+            auto& tracked = m_trackedNetworks[connection.network.bssid];
+            if (tracked.firstSeen.time_since_epoch().count() == 0) {
+                connection.network.firstSeen = now;
+            } else {
+                connection.network.firstSeen = tracked.firstSeen;
+            }
+            connection.network.lastSeen = now;
+            m_trackedNetworks[connection.network.bssid] = connection.network;
+            if (m_config.trackBSSIDHistory) {
+                UpdateBSSIDHistory(connection.network);
+            }
+            m_stats.currentNetworksTracked = static_cast<uint32_t>(m_trackedNetworks.size());
+        }
+
         std::vector<WiFiSecurityThreat> threats = CheckNetworkSecurity(connection.network);
         for (const auto& threat : threats) {
             NotifyThreat(threat);

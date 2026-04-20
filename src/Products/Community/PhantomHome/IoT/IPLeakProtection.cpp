@@ -2112,11 +2112,15 @@ bool IPLeakProtectionImpl::RunIoTSecurityScan() {
     try {
         Utils::Logger::Info("IoT security scan initiated");
 
+        bool overallSuccess = true;
+
         if (IoTDeviceScanner::HasInstance()) {
             auto config = IoTDeviceScanner::Instance().GetConfiguration().defaultScanConfig;
             config.checkDefaultCredentials = false;
-            if (!IoTDeviceScanner::Instance().StartDiscovery(config)) {
+            const bool scanStarted = IoTDeviceScanner::Instance().StartDiscovery(config);
+            if (!scanStarted) {
                 Utils::Logger::Warn("IoT security scan: device discovery did not start");
+                overallSuccess = false;
             }
             m_iotStatus.totalDevicesFound = static_cast<uint32_t>(
                 std::min(IoTDeviceScanner::Instance().GetNetworkMap().size(),
@@ -2140,7 +2144,7 @@ bool IPLeakProtectionImpl::RunIoTSecurityScan() {
                     static_cast<size_t>(UINT32_MAX)));
         }
 
-        return true;
+        return overallSuccess;
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("RunIoTSecurityScan failed: {}", e.what());
