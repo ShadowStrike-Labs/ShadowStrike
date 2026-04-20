@@ -1,51 +1,59 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
-/**
- * ============================================================================
- * ShadowStrike PhantomHome - WEBCAM PROTECTOR MODULE WIRING
- * ============================================================================
- *
- * @file WebcamProtectorWiring.cpp
- * @brief Registers the WebcamProtector module with the HomeProductOrchestrator
- *        via a static initializer, before main() runs.
- *
- * WebcamProtector intercepts camera access attempts by processes and enforces
- * allow/deny policy. Initialize() sets up the device enumeration and policy
- * engine; StartMonitoring() arms the kernel-notification callbacks that
- * intercept live camera access. StopMonitoring() quiesces those callbacks
- * cleanly before Shutdown() tears down device handles.
- *
- * Phase      : ModulePhase::OnDemand
- * Config key : "Home/Privacy/Enabled"
- *
- * @author ShadowStrike Security Team
- * @version 1.0.0
- * @date 2026
- * ============================================================================
- */
-
 #include "pch.h"
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../WebcamProtector.hpp"
-
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
 
 constexpr const wchar_t* kLogCategory = L"WebcamProtectorWiring";
+using Module = ::ShadowStrike::Privacy::WebcamProtector;
 
-struct WebcamProtectorRegistrar final {
-    WebcamProtectorRegistrar() noexcept {
+[[nodiscard]] bool ValidateInitialized(const wchar_t* operation) {
+    if (!Module::HasInstance()) {
+        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: %ls called before instance creation", operation);
+        return false;
+    }
+
+    auto& module = Module::Instance();
+    if (!module.IsInitialized()) {
+        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: %ls called while module is not initialized", operation);
+        return false;
+    }
+
+    return true;
+}
+
+void SafeShutdown() noexcept {
+    if (!Module::HasInstance()) {
+        return;
+    }
+
+    try {
+        auto& module = Module::Instance();
+            if (module.IsInitialized()) {
+                module.StopMonitoring();
+                module.Shutdown();
+            }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: shutdown cleanup threw: %hs", e.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: shutdown cleanup threw unknown exception");
+    }
+}
+
+struct Registrar final {
+    Registrar() noexcept {
         try {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
-            using ::ShadowStrike::Privacy::WebcamProtector;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "WebcamProtector",
@@ -54,61 +62,75 @@ struct WebcamProtectorRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        if (!WebcamProtector::Instance().Initialize()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"WebcamProtector: Initialize() returned false");
+                        if (Module::HasInstance()) {
+                            auto& existingModule = Module::Instance();
+                            if (existingModule.IsInitialized()) {
+                                return true;
+                            }
+                            const auto status = existingModule.GetStatus();
+                            if (status != ::ShadowStrike::Privacy::ModuleStatus::Uninitialized &&
+                                status != ::ShadowStrike::Privacy::ModuleStatus::Stopped) {
+                                SS_LOG_ERROR(kLogCategory,
+                                    L"WebcamProtector: initialize() rejected while status is %hs",
+                                    ::ShadowStrike::Privacy::GetModuleStatusName(status).data());
+                                return false;
+                            }
+                        }
+                        auto& module = Module::Instance();
+                        if (!module.Initialize()) {
+                            SS_LOG_ERROR(kLogCategory, L"WebcamProtector: Initialize() returned false");
+                            SafeShutdown();
+                            return false;
+                        }
+                        if (!module.IsInitialized()) {
+                            SS_LOG_ERROR(kLogCategory, L"WebcamProtector: Initialize() completed without entering initialized state");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"WebcamProtector: initialize() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: initialize() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"WebcamProtector: initialize() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: initialize() threw unknown exception");
                         return false;
                     }
                 },
 
                 .start = []() -> bool {
+                    if (!ValidateInitialized(L"start")) {
+                        return false;
+                    }
                     try {
-                        if (!WebcamProtector::Instance().StartMonitoring()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"WebcamProtector: StartMonitoring() returned false");
+                        auto& module = Module::Instance();
+                        if (!module.StartMonitoring()) {
+                            SS_LOG_ERROR(kLogCategory, L"WebcamProtector: StartMonitoring() returned false");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"WebcamProtector: start() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: start() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"WebcamProtector: start() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"WebcamProtector: start() threw unknown exception");
                         return false;
                     }
                 },
-
                 .shutdown = []() noexcept {
-                    try {
-                        WebcamProtector::Instance().StopMonitoring();
-                        WebcamProtector::Instance().Shutdown();
-                    } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"WebcamProtector: shutdown threw: %hs", e.what());
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"WebcamProtector: shutdown threw unknown exception");
-                    }
+                    SafeShutdown();
                 }
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            // Static initializer path: logger may not yet be available.
         }
     }
 };
 
-const WebcamProtectorRegistrar g_webcamProtectorRegistrar{};
+const Registrar g_registrar{};
 
 }  // namespace

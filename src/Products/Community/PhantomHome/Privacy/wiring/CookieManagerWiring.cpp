@@ -1,49 +1,58 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
-/**
- * ============================================================================
- * ShadowStrike PhantomHome - COOKIE MANAGER MODULE WIRING
- * ============================================================================
- *
- * @file CookieManagerWiring.cpp
- * @brief Registers the CookieManager module with the HomeProductOrchestrator
- *        via a static initializer, before main() runs.
- *
- * CookieManager handles browser cookie enumeration, tracker purge, and
- * supercookie detection. It becomes fully operational after Initialize()
- * returns; there is no separate Start() method.
- *
- * Phase      : ModulePhase::OnDemand
- * Config key : "Home/Privacy/Enabled"
- *
- * @author ShadowStrike Security Team
- * @version 1.0.0
- * @date 2026
- * ============================================================================
- */
-
 #include "pch.h"
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../CookieManager.hpp"
-
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
 
 constexpr const wchar_t* kLogCategory = L"CookieManagerWiring";
+using Module = ::ShadowStrike::Privacy::CookieManager;
 
-struct CookieManagerRegistrar final {
-    CookieManagerRegistrar() noexcept {
+[[nodiscard]] bool ValidateInitialized(const wchar_t* operation) {
+    if (!Module::HasInstance()) {
+        SS_LOG_ERROR(kLogCategory, L"CookieManager: %ls called before instance creation", operation);
+        return false;
+    }
+
+    auto& module = Module::Instance();
+    if (!module.IsInitialized()) {
+        SS_LOG_ERROR(kLogCategory, L"CookieManager: %ls called while module is not initialized", operation);
+        return false;
+    }
+
+    return true;
+}
+
+void SafeShutdown() noexcept {
+    if (!Module::HasInstance()) {
+        return;
+    }
+
+    try {
+        auto& module = Module::Instance();
+            if (module.IsInitialized()) {
+                module.Shutdown();
+            }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCategory, L"CookieManager: shutdown cleanup threw: %hs", e.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"CookieManager: shutdown cleanup threw unknown exception");
+    }
+}
+
+struct Registrar final {
+    Registrar() noexcept {
         try {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
-            using ::ShadowStrike::Privacy::CookieManager;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "CookieManager",
@@ -52,47 +61,56 @@ struct CookieManagerRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        if (!CookieManager::Instance().Initialize()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"CookieManager: Initialize() returned false");
+                        if (Module::HasInstance()) {
+                            auto& existingModule = Module::Instance();
+                            if (existingModule.IsInitialized()) {
+                                return true;
+                            }
+                            const auto status = existingModule.GetStatus();
+                            if (status != ::ShadowStrike::Privacy::ModuleStatus::Uninitialized &&
+                                status != ::ShadowStrike::Privacy::ModuleStatus::Stopped) {
+                                SS_LOG_ERROR(kLogCategory,
+                                    L"CookieManager: initialize() rejected while status is %hs",
+                                    ::ShadowStrike::Privacy::GetModuleStatusName(status).data());
+                                return false;
+                            }
+                        }
+                        auto& module = Module::Instance();
+                        if (!module.Initialize()) {
+                            SS_LOG_ERROR(kLogCategory, L"CookieManager: Initialize() returned false");
+                            SafeShutdown();
+                            return false;
+                        }
+                        if (!module.IsInitialized()) {
+                            SS_LOG_ERROR(kLogCategory, L"CookieManager: Initialize() completed without entering initialized state");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"CookieManager: initialize() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"CookieManager: initialize() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"CookieManager: initialize() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"CookieManager: initialize() threw unknown exception");
                         return false;
                     }
                 },
 
-                // CookieManager is fully operational after Initialize(); no
-                // separate background thread or event loop requires arming.
                 .start = []() -> bool {
-                    return true;
+                    return ValidateInitialized(L"start");
                 },
-
                 .shutdown = []() noexcept {
-                    try {
-                        CookieManager::Instance().Shutdown();
-                    } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"CookieManager: Shutdown() threw: %hs", e.what());
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"CookieManager: Shutdown() threw unknown exception");
-                    }
+                    SafeShutdown();
                 }
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            // Static initializer path: logger may not yet be available.
         }
     }
 };
 
-const CookieManagerRegistrar g_cookieManagerRegistrar{};
+const Registrar g_registrar{};
 
 }  // namespace

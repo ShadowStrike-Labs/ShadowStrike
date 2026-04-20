@@ -1,51 +1,59 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
-/**
- * ============================================================================
- * ShadowStrike PhantomHome - DATA LEAK PROTECTION MODULE WIRING
- * ============================================================================
- *
- * @file DataLeakProtectionWiring.cpp
- * @brief Registers the DataLeakProtection module with the HomeProductOrchestrator
- *        via a static initializer, before main() runs.
- *
- * DataLeakProtection (DLP) scans egress channels for sensitive data patterns.
- * Initialize() loads policy definitions and pattern rules; StartClipboardMonitoring()
- * arms the real-time clipboard interception hook that requires a running
- * message loop. StopClipboardMonitoring() quiesces the hook before Shutdown()
- * releases OS handles and policy state.
- *
- * Phase      : ModulePhase::OnDemand
- * Config key : "Home/Privacy/Enabled"
- *
- * @author ShadowStrike Security Team
- * @version 1.0.0
- * @date 2026
- * ============================================================================
- */
-
 #include "pch.h"
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../DataLeakProtection.hpp"
-
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
 
 constexpr const wchar_t* kLogCategory = L"DataLeakProtectionWiring";
+using Module = ::ShadowStrike::Privacy::DataLeakProtection;
 
-struct DataLeakProtectionRegistrar final {
-    DataLeakProtectionRegistrar() noexcept {
+[[nodiscard]] bool ValidateInitialized(const wchar_t* operation) {
+    if (!Module::HasInstance()) {
+        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: %ls called before instance creation", operation);
+        return false;
+    }
+
+    auto& module = Module::Instance();
+    if (!module.IsInitialized()) {
+        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: %ls called while module is not initialized", operation);
+        return false;
+    }
+
+    return true;
+}
+
+void SafeShutdown() noexcept {
+    if (!Module::HasInstance()) {
+        return;
+    }
+
+    try {
+        auto& module = Module::Instance();
+            if (module.IsInitialized()) {
+                module.StopClipboardMonitoring();
+                module.Shutdown();
+            }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: shutdown cleanup threw: %hs", e.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: shutdown cleanup threw unknown exception");
+    }
+}
+
+struct Registrar final {
+    Registrar() noexcept {
         try {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
-            using ::ShadowStrike::Privacy::DataLeakProtection;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "DataLeakProtection",
@@ -54,61 +62,75 @@ struct DataLeakProtectionRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        if (!DataLeakProtection::Instance().Initialize()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"DataLeakProtection: Initialize() returned false");
+                        if (Module::HasInstance()) {
+                            auto& existingModule = Module::Instance();
+                            if (existingModule.IsInitialized()) {
+                                return true;
+                            }
+                            const auto status = existingModule.GetStatus();
+                            if (status != ::ShadowStrike::Privacy::ModuleStatus::Uninitialized &&
+                                status != ::ShadowStrike::Privacy::ModuleStatus::Stopped) {
+                                SS_LOG_ERROR(kLogCategory,
+                                    L"DataLeakProtection: initialize() rejected while status is %hs",
+                                    ::ShadowStrike::Privacy::GetModuleStatusName(status).data());
+                                return false;
+                            }
+                        }
+                        auto& module = Module::Instance();
+                        if (!module.Initialize()) {
+                            SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: Initialize() returned false");
+                            SafeShutdown();
+                            return false;
+                        }
+                        if (!module.IsInitialized()) {
+                            SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: Initialize() completed without entering initialized state");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DataLeakProtection: initialize() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: initialize() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DataLeakProtection: initialize() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: initialize() threw unknown exception");
                         return false;
                     }
                 },
 
                 .start = []() -> bool {
+                    if (!ValidateInitialized(L"start")) {
+                        return false;
+                    }
                     try {
-                        if (!DataLeakProtection::Instance().StartClipboardMonitoring()) {
-                            SS_LOG_ERROR(kLogCategory,
-                                L"DataLeakProtection: StartClipboardMonitoring() returned false");
+                        auto& module = Module::Instance();
+                        if (!module.StartClipboardMonitoring()) {
+                            SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: StartClipboardMonitoring() returned false");
+                            SafeShutdown();
                             return false;
                         }
                         return true;
                     } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DataLeakProtection: start() threw: %hs", e.what());
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: start() threw: %hs", e.what());
                         return false;
                     } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DataLeakProtection: start() threw unknown exception");
+                        SafeShutdown();
+                        SS_LOG_ERROR(kLogCategory, L"DataLeakProtection: start() threw unknown exception");
                         return false;
                     }
                 },
-
                 .shutdown = []() noexcept {
-                    try {
-                        DataLeakProtection::Instance().StopClipboardMonitoring();
-                        DataLeakProtection::Instance().Shutdown();
-                    } catch (const std::exception& e) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DataLeakProtection: shutdown threw: %hs", e.what());
-                    } catch (...) {
-                        SS_LOG_ERROR(kLogCategory,
-                            L"DataLeakProtection: shutdown threw unknown exception");
-                    }
+                    SafeShutdown();
                 }
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            // Static initializer path: logger may not yet be available.
         }
     }
 };
 
-const DataLeakProtectionRegistrar g_dataLeakProtectionRegistrar{};
+const Registrar g_registrar{};
 
 }  // namespace
