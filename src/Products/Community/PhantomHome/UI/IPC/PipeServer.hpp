@@ -53,6 +53,30 @@ namespace ShadowStrike::PhantomHome::IPC {
 class PipeServer;
 
 /**
+ * @brief Windows identity of the connected client, as derived from its access
+ *        token at connect time. Populated by PipeServer during the
+ *        authentication step and thereafter immutable.
+ *
+ * Used for:
+ *   - policy gating (session match, integrity floor, elevation),
+ *   - audit logging (user_name + sid are recorded on connect),
+ *   - per-client telemetry attribution.
+ *
+ * None of the string fields are ever sent back over the wire.
+ */
+struct ClientIdentity {
+    std::wstring  user_sid;              ///< string SID, e.g. S-1-5-21-...
+    std::wstring  user_name;             ///< DOMAIN\\user (bounded, audit only)
+    std::uint32_t session_id{0};         ///< Windows logon session id
+    std::uint32_t integrity_rid{0};      ///< SECURITY_MANDATORY_*_RID
+    bool          is_elevated{false};    ///< TokenElevation reports elevated
+    bool          is_admin_member{false};///< BUILTIN\\Administrators in token
+    bool          is_local_system{false};///< NT AUTHORITY\\SYSTEM
+    bool          is_anonymous{false};   ///< ANONYMOUS LOGON
+    bool          authenticated{false};  ///< token inspection succeeded
+};
+
+/**
  * @brief Per-connection context passed to the message handler.
  */
 class ClientContext {
@@ -63,9 +87,11 @@ public:
     ClientContext(const ClientContext&) = delete;
     ClientContext& operator=(const ClientContext&) = delete;
 
-    [[nodiscard]] std::uint32_t ClientProcessId() const noexcept { return client_pid_; }
-    [[nodiscard]] bool          AuthenticatedPrivileged() const noexcept { return authenticated_privileged_.load(); }
-    void                        SetAuthenticatedPrivileged(bool v) noexcept { authenticated_privileged_.store(v); }
+    [[nodiscard]] std::uint32_t          ClientProcessId() const noexcept { return client_pid_; }
+    [[nodiscard]] bool                   AuthenticatedPrivileged() const noexcept { return authenticated_privileged_.load(); }
+    void                                 SetAuthenticatedPrivileged(bool v) noexcept { authenticated_privileged_.store(v); }
+    [[nodiscard]] const ClientIdentity&  Identity() const noexcept { return identity_; }
+    void                                 SetIdentity(ClientIdentity id) { identity_ = std::move(id); }
 
     /**
      * @brief Send a server-push message (e.g. EventDetection, EventPerfMetrics).
@@ -84,6 +110,7 @@ private:
     HANDLE                    pipe_{INVALID_HANDLE_VALUE};
     std::uint32_t             client_pid_{0};
     std::atomic<bool>         authenticated_privileged_{false};
+    ClientIdentity            identity_{};
     std::mutex                write_mutex_;
 };
 
@@ -143,9 +170,11 @@ private:
     void WorkerLoop(std::shared_ptr<ClientContext> ctx);
 
     [[nodiscard]] HANDLE CreatePipeInstance(bool first);
+    [[nodiscard]] bool   AuthenticateClient(ClientContext& ctx);
     [[nodiscard]] bool   HandshakeFrame(ClientContext& ctx);
     [[nodiscard]] bool   ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out);
     [[nodiscard]] bool   WriteFrame(HANDLE pipe, std::mutex& m, std::span<const std::uint8_t> bytes);
+    void                 SendAuthFailure(ClientContext& ctx, const char* reason);
 
     Options                                     options_;
     std::atomic<bool>                           running_{false};
