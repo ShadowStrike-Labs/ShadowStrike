@@ -180,6 +180,8 @@ private:
     std::atomic<bool>                           running_{false};
     std::atomic<bool>                           stopping_{false};
     HANDLE                                      stop_event_{nullptr};
+    HANDLE                                      accept_ready_event_{nullptr};
+    std::atomic<bool>                           accept_ready_{false};
     std::thread                                 accept_thread_;
     std::mutex                                  clients_mutex_;
     std::vector<std::shared_ptr<ClientContext>> clients_;
