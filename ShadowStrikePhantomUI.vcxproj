@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ShadowStrikePhantomUI.vcxproj
+  =============================
+  Qt 6 / QML desktop client for ShadowStrike Phantom Home.
+
+  Requires:
+    - Qt 6.7 LTS MSVC build (default path: C:\Qt\6.7.3\msvc2019_64)
+      Override via environment variable  Qt6_ROOT  if installed elsewhere.
+
+  MOC + RCC are invoked via <CustomBuild> so this project has no runtime
+  dependency on the Qt VSAddin. Header-based Q_OBJECT emitters must be
+  listed under <QtMoc> below.
+
+  The EXE statically embeds all QML assets through qml.qrc, so the shipped
+  binary has zero loose QML files.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{B2C38F21-7A4D-4B1B-8F7D-0A0B4C1D2E02}</ProjectGuid>
+    <RootNamespace>ShadowStrikePhantomUI</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <Qt6_ROOT Condition="'$(Qt6_ROOT)'==''">C:\Qt\6.7.3\msvc2019_64</Qt6_ROOT>
+    <QtBin>$(Qt6_ROOT)\bin</QtBin>
+    <QtInc>$(Qt6_ROOT)\include</QtInc>
+    <QtLib>$(Qt6_ROOT)\lib</QtLib>
+    <IntDir>$(ProjectDir)build\$(Configuration)\UI\</IntDir>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <TargetName>ShadowStrikePhantomUI</TargetName>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <QtLibSuffix Condition="'$(Configuration)'=='Debug'">d</QtLibSuffix>
+    <QtLibSuffix Condition="'$(Configuration)'=='Release'"></QtLibSuffix>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+      <WarningLevel>Level3</WarningLevel>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalIncludeDirectories>$(SolutionDir)include;$(SolutionDir)include\YARA;$(SolutionDir)src;$(QtInc);$(QtInc)\QtCore;$(QtInc)\QtGui;$(QtInc)\QtQml;$(QtInc)\QtQuick;$(QtInc)\QtQuickControls2;$(QtInc)\QtSvg;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;QT_CORE_LIB;QT_GUI_LIB;QT_QML_LIB;QT_QUICK_LIB;QT_QUICKCONTROLS2_LIB;SHADOWSTRIKE_PRODUCT_HOME=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(QtLib);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Qt6Core$(QtLibSuffix).lib;Qt6Gui$(QtLibSuffix).lib;Qt6Qml$(QtLibSuffix).lib;Qt6Quick$(QtLibSuffix).lib;Qt6QuickControls2$(QtLibSuffix).lib;Qt6Svg$(QtLibSuffix).lib;Qt6Network$(QtLibSuffix).lib;advapi32.lib;ws2_32.lib;userenv.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;QT_NO_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- ====================================================================
+       C++ sources
+       ==================================================================== -->
+  <ItemGroup>
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\main.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp" />
+    <!-- MOC outputs are generated into $(IntDir) and included via CustomBuild. -->
+    <ClCompile Include="$(IntDir)moc_ProtectionViewModel.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_ProtectionViewModel.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)qrc_qml.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)qrc_qml.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
+  </ItemGroup>
+
+  <!-- ====================================================================
+       MOC: run moc.exe on every header that has Q_OBJECT
+       ==================================================================== -->
+  <ItemGroup>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.hpp">
+      <Message>MOC ProtectionViewModel.hpp</Message>
+      <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_ProtectionViewModel.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)moc_ProtectionViewModel.cpp</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+
+  <!-- ====================================================================
+       RCC: embed QML into the binary
+       ==================================================================== -->
+  <ItemGroup>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\qml\qml.qrc">
+      <Message>RCC qml.qrc</Message>
+      <Command>"$(QtBin)\rcc.exe" --name qml --output "$(IntDir)qrc_qml.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)qrc_qml.cpp</Outputs>
+      <AdditionalInputs>src\Products\Community\PhantomHome\UI\Client\qml\App.qml;src\Products\Community\PhantomHome\UI\Client\qml\Theming\Theme.qml;src\Products\Community\PhantomHome\UI\Client\qml\Theming\qmldir;src\Products\Community\PhantomHome\UI\Client\qml\components\Sidebar.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\ShieldAnimator.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\CardFrame.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\MainPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\SecurityPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\PerformancePage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\PrivacyPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\ScanPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\QuarantinePage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\ReportsPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\SettingsPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.svg</AdditionalInputs>
+    </CustomBuild>
+  </ItemGroup>
+
+  <!-- Pure reference items (not built). -->
+  <ItemGroup>
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\App.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Theming\Theme.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Theming\qmldir" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\Sidebar.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\ShieldAnimator.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\CardFrame.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\MainPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\SecurityPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\PerformancePage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\PrivacyPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\ScanPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\QuarantinePage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\ReportsPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\SettingsPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.svg" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- Copy required Qt runtime DLLs next to the executable post-build. -->
+  <Target Name="DeployQtRuntime" AfterTargets="Link">
+    <Exec Command='"$(QtBin)\windeployqt.exe" --qmldir "$(SolutionDir)src\Products\Community\PhantomHome\UI\Client\qml" --no-translations --no-system-d3d-compiler --no-opengl-sw "$(OutDir)$(TargetName).exe"' IgnoreExitCode="true" />
+  </Target>
+</Project>
