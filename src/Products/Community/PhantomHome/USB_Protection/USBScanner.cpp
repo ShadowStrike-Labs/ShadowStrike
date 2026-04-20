@@ -59,6 +59,7 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <sstream>
 #include <iomanip>
@@ -222,6 +223,27 @@ struct ScopedHandle {
            (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
 }
 
+[[nodiscard]] bool IsValidDriveRoot(std::string_view rootPath) noexcept {
+    if (rootPath.size() < 2 || rootPath.size() > 4) {
+        return false;
+    }
+
+    if (!std::isalpha(static_cast<unsigned char>(rootPath[0])) || rootPath[1] != ':') {
+        return false;
+    }
+
+    if (rootPath.size() == 2) {
+        return true;
+    }
+
+    if ((rootPath[2] != '\\' && rootPath[2] != '/') ||
+        (rootPath.size() == 4 && rootPath[3] != '\0')) {
+        return false;
+    }
+
+    return rootPath.size() == 3;
+}
+
 /// Map a SignatureStore ThreatLevel to a 0-100 risk score.
 [[nodiscard]] int ThreatLevelToRiskScore(SignatureStore::ThreatLevel level) noexcept {
     switch (level) {
@@ -273,6 +295,7 @@ public:
 
         m_status = ScannerModuleStatus::Initializing;
         m_config = config;
+        m_activeScanConfig = config.defaultScanConfig;
         m_statistics.Reset();
 
         // Initialize the thread pool for scan workers
@@ -378,6 +401,7 @@ public:
         }
 
         m_config = config;
+        m_activeScanConfig = config.defaultScanConfig;
         SS_LOG_INFO(LOG_CATEGORY, L"Scanner configuration updated");
         return true;
     }
@@ -410,10 +434,16 @@ public:
             return false;
         }
 
+        if (!IsValidDriveRoot(rootPath)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Rejected invalid removable-media root");
+            return false;
+        }
+
         // Store drive root for symlink/junction validation (H2)
         {
             std::wstring wideRoot(rootPath.begin(), rootPath.end());
             m_currentDriveRoot = std::move(wideRoot);
+            m_activeScanConfig = config;
         }
 
         // Reset scan state
@@ -473,6 +503,11 @@ public:
         result.scanTime = std::chrono::system_clock::now();
         auto scanStart = Clock::now();
         const std::wstring widePath = filePath.wstring();
+        USBScanConfig activeConfig;
+        {
+            std::shared_lock lock(m_mutex);
+            activeConfig = m_activeScanConfig;
+        }
 
         // ── Validate file exists ────────────────────────────────────────────
         std::error_code ec;
@@ -547,7 +582,7 @@ public:
         result.fileSize = static_cast<uint64_t>(fileSize.QuadPart);
 
         // Cap — skip files exceeding the configured size limit
-        if (result.fileSize > m_config.defaultScanConfig.maxFileSize) {
+        if (result.fileSize > activeConfig.maxFileSize) {
             result.result = FileScanResult::Skipped;
             m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
             return result;
@@ -655,7 +690,7 @@ public:
         }
 
         // ── Phase 5: Heuristic analysis ─────────────────────────────────────
-        if (m_config.defaultScanConfig.useHeuristics) {
+        if (activeConfig.useHeuristics) {
             PerformHeuristicAnalysis(filePath, result);
         }
 
@@ -730,8 +765,14 @@ public:
     }
 
     [[nodiscard]] USBScanResultSummary WaitForCompletion() {
-        if (m_scanFuture.valid()) {
-            try { m_scanFuture.wait(); } catch (...) {}
+        std::shared_future<void> scanFuture;
+        {
+            std::shared_lock lock(m_mutex);
+            scanFuture = m_scanFuture;
+        }
+
+        if (scanFuture.valid()) {
+            try { scanFuture.wait(); } catch (...) {}
         }
         std::shared_lock lock(m_mutex);
         return m_summary;
@@ -1087,6 +1128,8 @@ private:
                         std::vector<fs::path>& normalFiles) {
 
         const std::wstring wideRoot(rootPath.begin(), rootPath.end());
+        uint64_t enumeratedFiles = 0;
+        uint64_t enumeratedBytes = 0;
 
         try {
             for (auto it = fs::recursive_directory_iterator(
@@ -1139,6 +1182,27 @@ private:
                         continue;
                     }
                 }
+
+                const auto fileSize = it->file_size(ec);
+                if (ec) {
+                    continue;
+                }
+
+                if (enumeratedFiles >= config.maxFilesPerDevice) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"USB scan file cap reached on %hs (%llu files)",
+                        rootPath.c_str(), static_cast<unsigned long long>(config.maxFilesPerDevice));
+                    break;
+                }
+
+                if (fileSize > config.maxFileSize ||
+                    enumeratedBytes > config.maxTotalBytesPerDevice ||
+                    fileSize > (config.maxTotalBytesPerDevice - enumeratedBytes)) {
+                    continue;
+                }
+
+                enumeratedBytes += fileSize;
+                ++enumeratedFiles;
 
                 if (IsPathExcluded(path, config)) {
                     continue;
@@ -1284,21 +1348,36 @@ private:
 
             case DetectionAction::Delete:
             {
-                std::error_code ec;
-                fs::remove(result.filePath, ec);
-                if (!ec) {
-                    result.actionTaken = DetectionAction::Delete;
-                    {
-                        std::unique_lock lock(m_mutex);
-                        m_summary.filesDeleted++;
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Deletion on removable media is disabled; attempting local quarantine for %hs",
+                    pathStr.c_str());
+
+                auto& qm = Core::Engine::QuarantineManager::Instance();
+                if (qm.IsInitialized()) {
+                    std::wstring widePath(result.filePath.wstring());
+                    std::wstring wideThreat(threatNm.begin(), threatNm.end());
+                    auto qResult = qm.QuarantineFile(widePath, wideThreat, 0);
+                    if (qResult.IsSuccess()) {
+                        result.actionTaken = DetectionAction::Quarantine;
+                        result.quarantinePath = std::filesystem::path(qResult.quarantinePath);
+                        {
+                            std::unique_lock lock(m_mutex);
+                            m_summary.filesQuarantined++;
+                        }
+                        m_statistics.totalFilesQuarantined.fetch_add(1, std::memory_order_relaxed);
+                        SS_LOG_INFO(LOG_CATEGORY,
+                            L"Removable-media threat quarantined locally: %hs", pathStr.c_str());
+                    } else {
+                        result.actionTaken = DetectionAction::Report;
+                        SS_LOG_ERROR(LOG_CATEGORY,
+                            L"Fallback quarantine failed for %hs: %ls",
+                            pathStr.c_str(), qResult.message.c_str());
                     }
-                    m_statistics.totalFilesDeleted.fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_WARN(LOG_CATEGORY,
-                        L"Infected file deleted: %hs", pathStr.c_str());
                 } else {
-                    SS_LOG_ERROR(LOG_CATEGORY,
-                        L"Failed to delete infected file: %hs (error: %hs)",
-                        pathStr.c_str(), ec.message().c_str());
+                    result.actionTaken = DetectionAction::Report;
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"QuarantineManager unavailable; threat reported without destructive action: %hs",
+                        pathStr.c_str());
                 }
                 break;
             }
@@ -1397,6 +1476,7 @@ private:
 
     // Drive root for symlink validation (protected by m_mutex)
     std::wstring m_currentDriveRoot;
+    USBScanConfig m_activeScanConfig{};
 
     // Progress and summary (protected by m_mutex)
     USBScanProgress m_progress;
@@ -1565,6 +1645,8 @@ std::string USBScanner::GetVersionString() noexcept {
 bool USBScanConfig::IsValid() const noexcept {
     if (maxFileSize == 0) return false;
     if (scanDepth == 0 || scanDepth > USBScannerConstants::MAX_SCAN_DEPTH) return false;
+    if (maxFilesPerDevice == 0) return false;
+    if (maxTotalBytesPerDevice == 0) return false;
     if (maxArchiveDepth > 20) return false;
     return true;
 }
@@ -1579,6 +1661,8 @@ std::string USBScanConfig::ToJson() const {
     json["checkThreatIntel"]  = checkThreatIntel;
     json["maxFileSize"]       = maxFileSize;
     json["scanDepth"]         = scanDepth;
+    json["maxFilesPerDevice"] = maxFilesPerDevice;
+    json["maxTotalBytesPerDevice"] = maxTotalBytesPerDevice;
     json["maxArchiveDepth"]   = maxArchiveDepth;
     json["priority"]          = static_cast<uint8_t>(priority);
     json["detectionAction"]   = static_cast<uint8_t>(detectionAction);

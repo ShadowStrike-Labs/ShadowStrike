@@ -321,6 +321,12 @@ struct USBScanConfig {
     
     /// @brief Scan depth
     size_t scanDepth = USBScannerConstants::DEFAULT_SCAN_DEPTH;
+
+    /// @brief Maximum regular files scanned per removable device
+    uint64_t maxFilesPerDevice = 50000;
+
+    /// @brief Maximum cumulative bytes scanned per removable device
+    uint64_t maxTotalBytesPerDevice = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     
     /// @brief Maximum archive nesting
     size_t maxArchiveDepth = 5;
