@@ -14,6 +14,12 @@
         <file>components/Iconed.qml</file>
         <file>components/ModuleCard.qml</file>
         <file>components/ModuleSettingsDialog.qml</file>
+        <file>components/SectionHeader.qml</file>
+        <file>components/Banner.qml</file>
+        <file>components/HeroCard.qml</file>
+        <file>components/RecommendationCard.qml</file>
+        <file>components/QuickActionTile.qml</file>
+        <file>components/ActivityTimeline.qml</file>
         <file>pages/MainPage.qml</file>
         <file>pages/SecurityPage.qml</file>
         <file>pages/PerformancePage.qml</file>
@@ -22,6 +28,7 @@
         <file>pages/QuarantinePage.qml</file>
         <file>pages/ReportsPage.qml</file>
         <file>pages/SettingsPage.qml</file>
+        <file>pages/IdentityPage.qml</file>
         <file>pages/detail/GenericModuleDetailPage.qml</file>
         <file>assets/logo.svg</file>
         <file>assets/logo.png</file>

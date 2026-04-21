@@ -94,6 +94,7 @@ Rectangle {
         ListElement { label: qsTr("Scan");        badge: ""   }
         ListElement { label: qsTr("Quarantine");  badge: ""   }
         ListElement { label: qsTr("Reports");     badge: ""   }
+        ListElement { label: qsTr("Identity");    badge: ""   }
     }
 
     // Monochrome geometric glyphs (work in every font).
@@ -106,6 +107,7 @@ Rectangle {
         case 4: return "\u2316"   // target (scan)
         case 5: return "\u26A0"   // warning (quarantine)
         case 6: return "\u2261"   // bars (reports)
+        case 7: return "\u25CE"   // bullseye (identity)
         }
         return "\u25A0"
     }
