@@ -1,0 +1,32 @@
+
+SERVICE_NAME: ShadowStrikePhantomService 
+        TYPE               : 10  WIN32_OWN_PROCESS  
+        STATE              : 4  RUNNING 
+                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+[SC] QueryServiceConfig SUCCESS
+
+SERVICE_NAME: ShadowStrikePhantomService
+        TYPE               : 10  WIN32_OWN_PROCESS 
+        START_TYPE         : 2   AUTO_START
+        ERROR_CONTROL      : 1   NORMAL
+        BINARY_PATH_NAME   : "C:\Program Files\ShadowStrike\Phantom\ShadowStrikePhantomService.exe"
+        LOAD_ORDER_GROUP   : 
+        TAG                : 0
+        DISPLAY_NAME       : ShadowStrike Phantom Service
+        DEPENDENCIES       : 
+        SERVICE_START_NAME : LocalSystem
+
+SERVICE_NAME: ShadowStrikePhantomService 
+        TYPE               : 10  WIN32_OWN_PROCESS  
+        STATE              : 4  RUNNING 
+                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+        PID                : 4584
+        FLAGS              : 

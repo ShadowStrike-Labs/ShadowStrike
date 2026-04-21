@@ -311,13 +311,49 @@ void LaunchDashboard() noexcept {
     sei.lpFile       = path.c_str();
     sei.nShow        = SW_SHOWNORMAL;
     if (!::ShellExecuteExW(&sei)) {
+        const DWORD gle = ::GetLastError();
         ShadowStrike::Utils::Logger::Warn(
             "Tray: ShellExecuteExW '{}' failed gle={}",
-            std::string(path.begin(), path.end()),
-            ::GetLastError());
+            std::string(path.begin(), path.end()), gle);
+        wchar_t msg[512]{};
+        ::StringCchPrintfW(msg, 512,
+            L"ShadowStrike Phantom could not start the dashboard.\n\n"
+            L"Target: %ls\nWindows error: %lu\n\n"
+            L"Please reinstall from the installer.",
+            path.c_str(), gle);
+        ::MessageBoxW(nullptr, msg, L"ShadowStrike Phantom",
+                      MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
         return;
     }
+    // Wait briefly for the UI to survive past initial loader work. If the
+    // process dies inside ~1.5s with an abnormal exit code, the Qt runtime
+    // or a VC++ Redistributable DLL is missing (STATUS_DLL_NOT_FOUND =
+    // 0xC0000135 / STATUS_ENTRYPOINT_NOT_FOUND = 0xC0000139). Users never
+    // see the loader error dialog in a headless session, so surface it
+    // ourselves instead of a silent flicker.
     if (sei.hProcess) {
+        const DWORD wait = ::WaitForSingleObject(sei.hProcess, 1500);
+        if (wait == WAIT_OBJECT_0) {
+            DWORD exit_code = 0;
+            ::GetExitCodeProcess(sei.hProcess, &exit_code);
+            if (exit_code != 0) {
+                ShadowStrike::Utils::Logger::Error(
+                    "Tray: dashboard exited immediately rc=0x{:08x}",
+                    exit_code);
+                wchar_t msg[640]{};
+                ::StringCchPrintfW(msg, 640,
+                    L"ShadowStrike Phantom dashboard failed to start.\n\n"
+                    L"Exit code: 0x%08X\nTarget: %ls\n\n"
+                    L"Common causes:\n"
+                    L"  0xC0000135  Missing Visual C++ Redistributable\n"
+                    L"  0xC0000139  Missing Qt runtime DLL\n"
+                    L"  Other      See install_tree.txt\n\n"
+                    L"Please reinstall or run the VC++ redistributable hotfix.",
+                    exit_code, path.c_str());
+                ::MessageBoxW(nullptr, msg, L"ShadowStrike Phantom",
+                              MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
+            }
+        }
         ::CloseHandle(sei.hProcess);
     }
 }

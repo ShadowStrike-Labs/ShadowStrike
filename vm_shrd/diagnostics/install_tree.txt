@@ -1,0 +1,779 @@
+ Volume in drive C has no label.
+ Volume Serial Number is 6813-1C7A
+
+ Directory of C:\Program Files\ShadowStrike\Phantom
+
+04/21/2026  05:40 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          assets
+04/21/2026  05:37 PM    <DIR>          Drivers
+04/21/2026  05:37 PM    <DIR>          iconengines
+04/21/2026  05:37 PM    <DIR>          imageformats
+10/16/2025  08:06 PM         5,327,872 libcrypto-3-x64.dll
+10/16/2025  08:04 PM         1,949,696 libssl-3-x64.dll
+04/21/2026  05:37 PM    <DIR>          networkinformation
+04/21/2026  05:37 PM    <DIR>          platforms
+04/21/2026  05:37 PM    <DIR>          qml
+09/19/2024  10:18 AM         6,108,816 Qt6Core.dll
+09/19/2024  10:18 AM         9,062,544 Qt6Gui.dll
+09/19/2024  10:18 AM         1,741,456 Qt6Network.dll
+09/19/2024  10:18 AM         1,972,368 Qt6OpenGL.dll
+09/19/2024  07:00 PM         5,123,728 Qt6Qml.dll
+09/19/2024  07:00 PM           733,840 Qt6QmlModels.dll
+09/19/2024  07:00 PM            76,432 Qt6QmlWorkerScript.dll
+09/19/2024  07:01 PM         5,786,768 Qt6Quick.dll
+09/19/2024  07:01 PM            96,400 Qt6QuickControls2.dll
+09/19/2024  07:01 PM         1,099,920 Qt6QuickControls2Basic.dll
+09/19/2024  07:01 PM            62,096 Qt6QuickControls2BasicStyleImpl.dll
+09/19/2024  07:01 PM         1,000,592 Qt6QuickControls2Fusion.dll
+09/19/2024  07:01 PM           157,840 Qt6QuickControls2FusionStyleImpl.dll
+09/19/2024  07:01 PM         2,410,640 Qt6QuickControls2Imagine.dll
+09/19/2024  07:01 PM            49,808 Qt6QuickControls2ImagineStyleImpl.dll
+09/19/2024  07:01 PM           289,936 Qt6QuickControls2Impl.dll
+09/19/2024  07:01 PM         1,261,712 Qt6QuickControls2Material.dll
+09/19/2024  07:01 PM           264,848 Qt6QuickControls2MaterialStyleImpl.dll
+09/19/2024  07:01 PM           991,888 Qt6QuickControls2Universal.dll
+09/19/2024  07:01 PM           108,176 Qt6QuickControls2UniversalStyleImpl.dll
+09/19/2024  07:01 PM            67,728 Qt6QuickControls2WindowsStyleImpl.dll
+09/19/2024  07:02 PM           222,352 Qt6QuickLayouts.dll
+09/19/2024  07:02 PM           256,656 Qt6QuickShapes.dll
+09/19/2024  07:02 PM         1,790,608 Qt6QuickTemplates2.dll
+09/19/2024  05:58 PM           514,192 Qt6Svg.dll
+04/21/2026  05:25 PM         6,856,192 ShadowStrikePhantomService.exe
+04/21/2026  04:57 PM           375,296 ShadowStrikePhantomTray.exe
+04/21/2026  04:57 PM           837,120 ShadowStrikePhantomUI.exe
+04/21/2026  05:37 PM    <DIR>          tls
+              30 File(s)     56,597,520 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\assets
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+03/10/2026  09:53 PM           400,673 ShadowStrike_Logo.png
+               1 File(s)        400,673 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\Drivers
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+04/20/2026  11:14 PM             2,368 phantomsensor.cat
+04/20/2026  11:14 PM               784 PhantomSensor.cer
+04/20/2026  11:14 PM             4,690 PhantomSensor.inf
+04/20/2026  11:14 PM           960,296 PhantomSensor.sys
+               4 File(s)        968,138 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\iconengines
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+09/19/2024  05:58 PM            72,336 qsvgicon.dll
+               1 File(s)         72,336 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\imageformats
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+09/19/2024  10:19 AM            48,784 qgif.dll
+09/19/2024  10:19 AM            47,248 qico.dll
+09/19/2024  10:19 AM           567,952 qjpeg.dll
+09/19/2024  05:58 PM            41,104 qsvg.dll
+               4 File(s)        705,088 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\networkinformation
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+09/19/2024  10:19 AM            72,336 qnetworklistmanager.dll
+               1 File(s)         72,336 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\platforms
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+09/19/2024  10:20 AM           912,528 qwindows.dll
+               1 File(s)        912,528 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          QtQml
+04/21/2026  05:37 PM    <DIR>          QtQuick
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQml
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          Base
+04/21/2026  05:37 PM    <DIR>          Models
+09/19/2024  06:49 PM               240 qmldir
+09/19/2024  07:05 PM            31,376 qmlmetaplugin.dll
+04/21/2026  05:37 PM    <DIR>          WorkerScript
+04/21/2026  05:37 PM    <DIR>          XmlListModel
+               2 File(s)         31,616 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQml\Base
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:50 PM           129,476 plugins.qmltypes
+09/19/2024  06:49 PM               213 qmldir
+09/19/2024  07:04 PM            30,864 qmlplugin.dll
+               3 File(s)        160,553 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQml\Models
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  07:04 PM            30,864 modelsplugin.dll
+09/19/2024  06:50 PM            51,048 plugins.qmltypes
+09/19/2024  06:49 PM               230 qmldir
+               3 File(s)         82,142 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQml\WorkerScript
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:50 PM             1,358 plugins.qmltypes
+09/19/2024  06:49 PM               260 qmldir
+09/19/2024  07:04 PM            30,864 workerscriptplugin.dll
+               3 File(s)         32,482 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQml\XmlListModel
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          Controls
+04/21/2026  05:37 PM    <DIR>          Dialogs
+04/21/2026  05:37 PM    <DIR>          Effects
+04/21/2026  05:37 PM    <DIR>          Layouts
+04/21/2026  05:37 PM    <DIR>          LocalStorage
+04/21/2026  05:37 PM    <DIR>          NativeStyle
+04/21/2026  05:37 PM    <DIR>          Particles
+09/19/2024  06:53 PM           528,462 plugins.qmltypes
+09/19/2024  06:49 PM               215 qmldir
+09/19/2024  07:06 PM            30,864 qtquick2plugin.dll
+04/21/2026  05:37 PM    <DIR>          Shapes
+04/21/2026  05:37 PM    <DIR>          Templates
+04/21/2026  05:37 PM    <DIR>          tooling
+04/21/2026  05:37 PM    <DIR>          Window
+               3 File(s)        559,541 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          Basic
+04/21/2026  05:37 PM    <DIR>          Fusion
+04/21/2026  05:37 PM    <DIR>          Imagine
+04/21/2026  05:37 PM    <DIR>          impl
+04/21/2026  05:37 PM    <DIR>          Material
+09/19/2024  06:56 PM               215 plugins.qmltypes
+09/19/2024  06:49 PM               598 qmldir
+09/19/2024  07:05 PM            41,104 qtquickcontrols2plugin.dll
+04/21/2026  05:37 PM    <DIR>          Universal
+04/21/2026  05:37 PM    <DIR>          Windows
+               3 File(s)         41,917 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Basic
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               561 AbstractButton.qml
+09/19/2024  06:44 PM               211 Action.qml
+09/19/2024  06:44 PM               216 ActionGroup.qml
+09/19/2024  06:44 PM               305 ApplicationWindow.qml
+09/19/2024  06:44 PM               934 BusyIndicator.qml
+09/19/2024  06:44 PM             1,927 Button.qml
+09/19/2024  06:44 PM               216 ButtonGroup.qml
+09/19/2024  06:44 PM               216 Calendar.qml
+09/19/2024  06:44 PM               201 CalendarModel.qml
+09/19/2024  06:44 PM             2,356 CheckBox.qml
+09/19/2024  06:44 PM             2,812 CheckDelegate.qml
+09/19/2024  06:44 PM             4,263 ComboBox.qml
+09/19/2024  06:44 PM               540 Container.qml
+09/19/2024  06:44 PM               554 Control.qml
+09/19/2024  06:44 PM             1,126 DayOfWeekRow.qml
+09/19/2024  06:44 PM             2,493 DelayButton.qml
+09/19/2024  06:44 PM             1,928 Dial.qml
+09/19/2024  06:44 PM             1,640 Dialog.qml
+09/19/2024  06:44 PM             1,341 DialogButtonBox.qml
+09/19/2024  06:44 PM             1,631 Drawer.qml
+09/19/2024  06:44 PM               696 Frame.qml
+09/19/2024  06:44 PM             1,322 GroupBox.qml
+09/19/2024  06:44 PM             1,515 HorizontalHeaderView.qml
+04/21/2026  05:37 PM    <DIR>          impl
+09/19/2024  06:44 PM             1,617 ItemDelegate.qml
+09/19/2024  06:44 PM               336 Label.qml
+09/19/2024  06:44 PM             1,422 Menu.qml
+09/19/2024  06:44 PM               845 MenuBar.qml
+09/19/2024  06:44 PM             1,324 MenuBarItem.qml
+09/19/2024  06:44 PM             2,717 MenuItem.qml
+09/19/2024  06:44 PM               772 MenuSeparator.qml
+09/19/2024  06:44 PM             1,193 MonthGrid.qml
+09/19/2024  06:44 PM               934 Page.qml
+09/19/2024  06:44 PM             1,142 PageIndicator.qml
+09/19/2024  06:44 PM               661 Pane.qml
+09/19/2024  06:56 PM            10,158 plugins.qmltypes
+09/19/2024  06:44 PM               922 Popup.qml
+09/19/2024  06:44 PM             1,071 ProgressBar.qml
+09/19/2024  06:49 PM             4,048 qmldir
+09/19/2024  07:05 PM            32,400 qtquickcontrols2basicstyleplugin.dll
+09/19/2024  06:44 PM             2,043 RadioButton.qml
+09/19/2024  06:44 PM             2,499 RadioDelegate.qml
+09/19/2024  06:44 PM             3,335 RangeSlider.qml
+09/19/2024  06:44 PM             1,963 RoundButton.qml
+09/19/2024  06:44 PM             1,533 ScrollBar.qml
+09/19/2024  06:44 PM             1,302 ScrollIndicator.qml
+09/19/2024  06:44 PM             1,055 ScrollView.qml
+09/19/2024  06:44 PM               815 SelectionRectangle.qml
+09/19/2024  06:44 PM             2,253 Slider.qml
+09/19/2024  06:44 PM             3,504 SpinBox.qml
+09/19/2024  06:44 PM               935 SplitView.qml
+09/19/2024  06:44 PM             1,214 StackView.qml
+09/19/2024  06:44 PM             1,592 SwipeDelegate.qml
+09/19/2024  06:44 PM             1,156 SwipeView.qml
+09/19/2024  06:44 PM             2,277 Switch.qml
+09/19/2024  06:44 PM             2,819 SwitchDelegate.qml
+09/19/2024  06:44 PM             1,138 TabBar.qml
+09/19/2024  06:44 PM             1,317 TabButton.qml
+09/19/2024  06:44 PM             1,637 TextArea.qml
+09/19/2024  06:44 PM             1,895 TextField.qml
+09/19/2024  06:44 PM               673 ToolBar.qml
+09/19/2024  06:44 PM             1,328 ToolButton.qml
+09/19/2024  06:44 PM               838 ToolSeparator.qml
+09/19/2024  06:44 PM             1,093 ToolTip.qml
+09/19/2024  06:44 PM             4,061 TreeViewDelegate.qml
+09/19/2024  06:44 PM             1,803 Tumbler.qml
+09/19/2024  06:44 PM             1,506 VerticalHeaderView.qml
+09/19/2024  06:44 PM             1,132 WeekNumberColumn.qml
+              67 File(s)        139,282 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Basic\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:55 PM             4,205 plugins.qmltypes
+09/19/2024  06:49 PM               305 qmldir
+09/19/2024  07:05 PM            31,376 qtquickcontrols2basicstyleimplplugin.dll
+               3 File(s)         35,886 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Fusion
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               367 ApplicationWindow.qml
+09/19/2024  06:44 PM             1,192 BusyIndicator.qml
+09/19/2024  06:44 PM             1,282 Button.qml
+09/19/2024  06:44 PM             1,572 CheckBox.qml
+09/19/2024  06:44 PM             1,996 CheckDelegate.qml
+09/19/2024  06:44 PM             5,064 ComboBox.qml
+09/19/2024  06:44 PM             2,873 DelayButton.qml
+09/19/2024  06:44 PM             1,500 Dial.qml
+09/19/2024  06:44 PM             1,924 Dialog.qml
+09/19/2024  06:44 PM             1,224 DialogButtonBox.qml
+09/19/2024  06:44 PM             1,993 Drawer.qml
+09/19/2024  06:44 PM               794 Frame.qml
+09/19/2024  06:44 PM             1,461 GroupBox.qml
+09/19/2024  06:44 PM             1,817 HorizontalHeaderView.qml
+04/21/2026  05:37 PM    <DIR>          impl
+09/19/2024  06:44 PM             1,577 ItemDelegate.qml
+09/19/2024  06:44 PM               405 Label.qml
+09/19/2024  06:44 PM             1,694 Menu.qml
+09/19/2024  06:44 PM             1,219 MenuBar.qml
+09/19/2024  06:44 PM             1,396 MenuBarItem.qml
+09/19/2024  06:44 PM             2,630 MenuItem.qml
+09/19/2024  06:44 PM               846 MenuSeparator.qml
+09/19/2024  06:44 PM             1,003 Page.qml
+09/19/2024  06:44 PM             1,206 PageIndicator.qml
+09/19/2024  06:44 PM               729 Pane.qml
+09/19/2024  06:56 PM             5,142 plugins.qmltypes
+09/19/2024  06:44 PM               947 Popup.qml
+09/19/2024  06:44 PM             2,763 ProgressBar.qml
+09/19/2024  06:49 PM             3,440 qmldir
+09/19/2024  07:05 PM            32,400 qtquickcontrols2fusionstyleplugin.dll
+09/19/2024  06:44 PM             1,522 RadioButton.qml
+09/19/2024  06:44 PM             1,996 RadioDelegate.qml
+09/19/2024  06:44 PM             2,175 RangeSlider.qml
+09/19/2024  06:44 PM             2,478 RoundButton.qml
+09/19/2024  06:44 PM             1,602 ScrollBar.qml
+09/19/2024  06:44 PM             1,371 ScrollIndicator.qml
+09/19/2024  06:44 PM             1,055 ScrollView.qml
+09/19/2024  06:44 PM               966 SelectionRectangle.qml
+09/19/2024  06:44 PM             1,351 Slider.qml
+09/19/2024  06:44 PM             5,132 SpinBox.qml
+09/19/2024  06:44 PM               976 SplitView.qml
+09/19/2024  06:44 PM             1,684 SwipeDelegate.qml
+09/19/2024  06:44 PM             1,512 Switch.qml
+09/19/2024  06:44 PM             2,074 SwitchDelegate.qml
+09/19/2024  06:44 PM             1,441 TabBar.qml
+09/19/2024  06:44 PM             2,184 TabButton.qml
+09/19/2024  06:44 PM             1,706 TextArea.qml
+09/19/2024  06:44 PM             2,434 TextField.qml
+09/19/2024  06:44 PM             1,572 ToolBar.qml
+09/19/2024  06:44 PM             1,269 ToolButton.qml
+09/19/2024  06:44 PM             1,093 ToolSeparator.qml
+09/19/2024  06:44 PM             1,383 ToolTip.qml
+09/19/2024  06:44 PM             3,958 TreeViewDelegate.qml
+09/19/2024  06:44 PM             1,653 Tumbler.qml
+09/19/2024  06:44 PM             1,776 VerticalHeaderView.qml
+              54 File(s)        128,819 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Fusion\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM             1,528 ButtonPanel.qml
+09/19/2024  06:44 PM             2,112 CheckIndicator.qml
+09/19/2024  06:55 PM             2,737 plugins.qmltypes
+09/19/2024  06:49 PM               754 qmldir
+09/19/2024  07:05 PM            31,376 qtquickcontrols2fusionstyleimplplugin.dll
+09/19/2024  06:44 PM             1,529 RadioIndicator.qml
+09/19/2024  06:44 PM             2,096 SliderGroove.qml
+09/19/2024  06:44 PM             1,576 SliderHandle.qml
+09/19/2024  06:44 PM             3,585 SwitchIndicator.qml
+               9 File(s)         47,293 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Imagine
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               636 ApplicationWindow.qml
+09/19/2024  06:44 PM             2,130 BusyIndicator.qml
+09/19/2024  06:44 PM             2,711 Button.qml
+09/19/2024  06:44 PM             3,072 CheckBox.qml
+09/19/2024  06:44 PM             3,382 CheckDelegate.qml
+09/19/2024  06:44 PM             5,963 ComboBox.qml
+09/19/2024  06:44 PM             3,961 DelayButton.qml
+09/19/2024  06:44 PM             2,659 Dial.qml
+09/19/2024  06:44 PM             2,707 Dialog.qml
+09/19/2024  06:44 PM             1,860 DialogButtonBox.qml
+09/19/2024  06:44 PM             2,196 Drawer.qml
+09/19/2024  06:44 PM             1,374 Frame.qml
+09/19/2024  06:44 PM             2,353 GroupBox.qml
+09/19/2024  06:44 PM             1,515 HorizontalHeaderView.qml
+04/21/2026  05:37 PM    <DIR>          impl
+09/19/2024  06:44 PM             2,245 ItemDelegate.qml
+09/19/2024  06:44 PM               972 Label.qml
+09/19/2024  06:44 PM             2,482 Menu.qml
+09/19/2024  06:44 PM             4,142 MenuItem.qml
+09/19/2024  06:44 PM             1,697 MenuSeparator.qml
+09/19/2024  06:44 PM             1,664 Page.qml
+09/19/2024  06:44 PM             2,112 PageIndicator.qml
+09/19/2024  06:44 PM             1,372 Pane.qml
+09/19/2024  06:56 PM             1,347 plugins.qmltypes
+09/19/2024  06:44 PM             1,836 Popup.qml
+09/19/2024  06:44 PM             4,386 ProgressBar.qml
+09/19/2024  06:49 PM             3,337 qmldir
+09/19/2024  07:05 PM            32,400 qtquickcontrols2imaginestyleplugin.dll
+09/19/2024  06:44 PM             2,877 RadioButton.qml
+09/19/2024  06:44 PM             3,178 RadioDelegate.qml
+09/19/2024  06:44 PM             5,113 RangeSlider.qml
+09/19/2024  06:44 PM             2,726 RoundButton.qml
+09/19/2024  06:44 PM             3,270 ScrollBar.qml
+09/19/2024  06:44 PM             2,783 ScrollIndicator.qml
+09/19/2024  06:44 PM             1,877 ScrollView.qml
+09/19/2024  06:44 PM             1,216 SelectionRectangle.qml
+09/19/2024  06:44 PM             3,939 Slider.qml
+09/19/2024  06:44 PM             4,505 SpinBox.qml
+09/19/2024  06:44 PM             1,151 SplitView.qml
+09/19/2024  06:44 PM             2,148 StackView.qml
+09/19/2024  06:44 PM             2,353 SwipeDelegate.qml
+09/19/2024  06:44 PM             2,126 SwipeView.qml
+09/19/2024  06:44 PM             4,271 Switch.qml
+09/19/2024  06:44 PM             4,735 SwitchDelegate.qml
+09/19/2024  06:44 PM             2,018 TabBar.qml
+09/19/2024  06:44 PM             2,020 TabButton.qml
+09/19/2024  06:44 PM             2,587 TextArea.qml
+09/19/2024  06:44 PM             2,524 TextField.qml
+09/19/2024  06:44 PM             1,516 ToolBar.qml
+09/19/2024  06:44 PM             2,169 ToolButton.qml
+09/19/2024  06:44 PM             1,901 ToolSeparator.qml
+09/19/2024  06:44 PM             1,975 ToolTip.qml
+09/19/2024  06:44 PM             2,389 Tumbler.qml
+09/19/2024  06:44 PM             1,506 VerticalHeaderView.qml
+              53 File(s)        165,384 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Imagine\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               911 OpacityMask.qml
+09/19/2024  06:49 PM               384 qmldir
+09/19/2024  07:05 PM            31,376 qtquickcontrols2imaginestyleimplplugin.dll
+09/19/2024  06:55 PM               215 QuickControls2ImagineStyleImpl.qmltypes
+               4 File(s)         32,886 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:55 PM            48,440 plugins.qmltypes
+09/19/2024  06:49 PM               295 qmldir
+09/19/2024  07:05 PM            31,376 qtquickcontrols2implplugin.dll
+               3 File(s)         80,111 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Material
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               335 ApplicationWindow.qml
+09/19/2024  06:44 PM               995 BusyIndicator.qml
+09/19/2024  06:44 PM             3,443 Button.qml
+09/19/2024  06:44 PM             2,019 CheckBox.qml
+09/19/2024  06:44 PM             2,398 CheckDelegate.qml
+09/19/2024  06:44 PM             5,022 ComboBox.qml
+09/19/2024  06:44 PM             2,906 DelayButton.qml
+09/19/2024  06:44 PM             1,887 Dial.qml
+09/19/2024  06:44 PM             3,427 Dialog.qml
+09/19/2024  06:44 PM             1,655 DialogButtonBox.qml
+09/19/2024  06:44 PM             2,258 Drawer.qml
+09/19/2024  06:44 PM             1,208 Frame.qml
+09/19/2024  06:44 PM             1,947 GroupBox.qml
+09/19/2024  06:44 PM             1,637 HorizontalHeaderView.qml
+04/21/2026  05:37 PM    <DIR>          impl
+09/19/2024  06:44 PM             1,903 ItemDelegate.qml
+09/19/2024  06:44 PM               368 Label.qml
+09/19/2024  06:44 PM             2,660 Menu.qml
+09/19/2024  06:44 PM               924 MenuBar.qml
+09/19/2024  06:44 PM             1,762 MenuBarItem.qml
+09/19/2024  06:44 PM             3,106 MenuItem.qml
+09/19/2024  06:44 PM               760 MenuSeparator.qml
+09/19/2024  06:44 PM             1,166 Page.qml
+09/19/2024  06:44 PM             1,413 PageIndicator.qml
+09/19/2024  06:44 PM             1,108 Pane.qml
+09/19/2024  06:57 PM            21,644 plugins.qmltypes
+09/19/2024  06:44 PM             2,011 Popup.qml
+09/19/2024  06:44 PM             1,175 ProgressBar.qml
+09/19/2024  06:49 PM             3,566 qmldir
+09/19/2024  07:05 PM            32,400 qtquickcontrols2materialstyleplugin.dll
+09/19/2024  06:44 PM             2,009 RadioButton.qml
+09/19/2024  06:44 PM             2,385 RadioDelegate.qml
+09/19/2024  06:44 PM             5,905 RangeSlider.qml
+09/19/2024  06:44 PM             2,957 RoundButton.qml
+09/19/2024  06:44 PM             2,132 ScrollBar.qml
+09/19/2024  06:44 PM             1,318 ScrollIndicator.qml
+09/19/2024  06:44 PM             1,055 ScrollView.qml
+09/19/2024  06:44 PM               881 SelectionRectangle.qml
+09/19/2024  06:44 PM             4,921 Slider.qml
+09/19/2024  06:44 PM             4,666 SpinBox.qml
+09/19/2024  06:44 PM             1,640 SplitView.qml
+09/19/2024  06:44 PM             1,741 StackView.qml
+09/19/2024  06:44 PM             2,220 SwipeDelegate.qml
+09/19/2024  06:44 PM             1,190 SwipeView.qml
+09/19/2024  06:44 PM             2,422 Switch.qml
+09/19/2024  06:44 PM             2,437 SwitchDelegate.qml
+09/19/2024  06:44 PM             1,792 TabBar.qml
+09/19/2024  06:44 PM             1,541 TabButton.qml
+09/19/2024  06:44 PM             4,339 TextArea.qml
+09/19/2024  06:44 PM             3,803 TextField.qml
+09/19/2024  06:44 PM             1,011 ToolBar.qml
+09/19/2024  06:44 PM             1,922 ToolButton.qml
+09/19/2024  06:44 PM               865 ToolSeparator.qml
+09/19/2024  06:44 PM             1,566 ToolTip.qml
+09/19/2024  06:44 PM             4,564 TreeViewDelegate.qml
+09/19/2024  06:44 PM             1,619 Tumbler.qml
+09/19/2024  06:44 PM             1,628 VerticalHeaderView.qml
+              56 File(s)        171,632 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Material\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM             1,722 BoxShadow.qml
+09/19/2024  06:44 PM             2,512 CheckIndicator.qml
+09/19/2024  06:44 PM               990 CursorDelegate.qml
+09/19/2024  06:44 PM             8,616 ElevationEffect.qml
+09/19/2024  06:55 PM            10,908 plugins.qmltypes
+09/19/2024  06:49 PM             1,074 qmldir
+09/19/2024  07:05 PM            31,376 qtquickcontrols2materialstyleimplplugin.dll
+09/19/2024  06:44 PM             1,523 RadioIndicator.qml
+09/19/2024  06:44 PM             6,681 RectangularGlow.qml
+09/19/2024  06:44 PM             1,763 RoundedElevationEffect.qml
+09/19/2024  06:44 PM             1,234 SliderHandle.qml
+09/19/2024  06:44 PM             4,223 SwitchIndicator.qml
+              12 File(s)         72,622 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Universal
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               615 ApplicationWindow.qml
+09/19/2024  06:44 PM               969 BusyIndicator.qml
+09/19/2024  06:44 PM             1,947 Button.qml
+09/19/2024  06:44 PM             1,586 CheckBox.qml
+09/19/2024  06:44 PM             2,522 CheckDelegate.qml
+09/19/2024  06:44 PM             5,462 ComboBox.qml
+09/19/2024  06:44 PM             1,968 DelayButton.qml
+09/19/2024  06:44 PM             1,997 Dial.qml
+09/19/2024  06:44 PM             1,874 Dialog.qml
+09/19/2024  06:44 PM             1,523 DialogButtonBox.qml
+09/19/2024  06:44 PM             1,632 Drawer.qml
+09/19/2024  06:44 PM               722 Frame.qml
+09/19/2024  06:44 PM             1,391 GroupBox.qml
+09/19/2024  06:44 PM             1,663 HorizontalHeaderView.qml
+04/21/2026  05:37 PM    <DIR>          impl
+09/19/2024  06:44 PM             1,987 ItemDelegate.qml
+09/19/2024  06:44 PM               373 Label.qml
+09/19/2024  06:44 PM             1,501 Menu.qml
+09/19/2024  06:44 PM               893 MenuBar.qml
+09/19/2024  06:44 PM             1,904 MenuBarItem.qml
+09/19/2024  06:44 PM             3,394 MenuItem.qml
+09/19/2024  06:44 PM               893 MenuSeparator.qml
+09/19/2024  06:44 PM               945 Page.qml
+09/19/2024  06:44 PM             1,168 PageIndicator.qml
+09/19/2024  06:44 PM               672 Pane.qml
+09/19/2024  06:57 PM             8,862 plugins.qmltypes
+09/19/2024  06:44 PM               978 Popup.qml
+09/19/2024  06:44 PM             1,138 ProgressBar.qml
+09/19/2024  06:49 PM             3,427 qmldir
+09/19/2024  07:05 PM            32,400 qtquickcontrols2universalstyleplugin.dll
+09/19/2024  06:44 PM             1,589 RadioButton.qml
+09/19/2024  06:44 PM             2,522 RadioDelegate.qml
+09/19/2024  06:44 PM             4,106 RangeSlider.qml
+09/19/2024  06:44 PM             1,986 RoundButton.qml
+09/19/2024  06:44 PM             2,186 ScrollBar.qml
+09/19/2024  06:44 PM             1,430 ScrollIndicator.qml
+09/19/2024  06:44 PM             1,055 ScrollView.qml
+09/19/2024  06:44 PM             1,020 SelectionRectangle.qml
+09/19/2024  06:44 PM             3,029 Slider.qml
+09/19/2024  06:44 PM             4,985 SpinBox.qml
+09/19/2024  06:44 PM             1,018 SplitView.qml
+09/19/2024  06:44 PM             1,748 StackView.qml
+09/19/2024  06:44 PM             2,177 SwipeDelegate.qml
+09/19/2024  06:44 PM             1,585 Switch.qml
+09/19/2024  06:44 PM             2,524 SwitchDelegate.qml
+09/19/2024  06:44 PM             1,219 TabBar.qml
+09/19/2024  06:44 PM             1,431 TabButton.qml
+09/19/2024  06:44 PM             2,661 TextArea.qml
+09/19/2024  06:44 PM             2,644 TextField.qml
+09/19/2024  06:44 PM               719 ToolBar.qml
+09/19/2024  06:44 PM             1,653 ToolButton.qml
+09/19/2024  06:44 PM               940 ToolSeparator.qml
+09/19/2024  06:44 PM             1,279 ToolTip.qml
+09/19/2024  06:44 PM             1,713 Tumbler.qml
+09/19/2024  06:44 PM             1,654 VerticalHeaderView.qml
+              54 File(s)        135,279 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Universal\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM             2,298 CheckIndicator.qml
+09/19/2024  06:56 PM             3,600 plugins.qmltypes
+09/19/2024  06:49 PM               563 qmldir
+09/19/2024  07:05 PM            31,888 qtquickcontrols2universalstyleimplplugin.dll
+09/19/2024  06:44 PM             1,827 RadioIndicator.qml
+09/19/2024  06:44 PM             2,132 SwitchIndicator.qml
+               6 File(s)         42,308 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Windows
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM               262 ApplicationWindow.qml
+09/19/2024  06:44 PM             1,533 Button.qml
+09/19/2024  06:44 PM             3,100 CheckBox.qml
+09/19/2024  06:44 PM             2,868 CheckDelegate.qml
+09/19/2024  06:44 PM             3,935 ComboBox.qml
+09/19/2024  06:44 PM             2,878 DelayButton.qml
+09/19/2024  06:44 PM               240 Frame.qml
+09/19/2024  06:44 PM               243 GroupBox.qml
+04/21/2026  05:37 PM    <DIR>          impl
+09/19/2024  06:44 PM               389 ItemDelegate.qml
+09/19/2024  06:58 PM               215 plugins.qmltypes
+09/19/2024  06:44 PM               246 ProgressBar.qml
+09/19/2024  06:49 PM             1,667 qmldir
+09/19/2024  07:05 PM           370,832 qtquickcontrols2windowsstyleplugin.dll
+09/19/2024  06:44 PM               246 RadioButton.qml
+09/19/2024  06:44 PM               454 RadioDelegate.qml
+09/19/2024  06:44 PM             4,676 RangeSlider.qml
+09/19/2024  06:44 PM             3,752 ScrollBar.qml
+09/19/2024  06:44 PM             1,384 ScrollView.qml
+09/19/2024  06:44 PM               946 SelectionRectangle.qml
+09/19/2024  06:44 PM               241 Slider.qml
+09/19/2024  06:44 PM             3,493 SpinBox.qml
+09/19/2024  06:44 PM             1,412 Switch.qml
+09/19/2024  06:44 PM             1,696 SwitchDelegate.qml
+09/19/2024  06:44 PM               243 TextArea.qml
+09/19/2024  06:44 PM               244 TextField.qml
+              25 File(s)        407,195 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Controls\Windows\impl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:49 PM               420 qmldir
+09/19/2024  07:05 PM            31,376 qtquickcontrols2windowsstyleimplplugin.dll
+09/19/2024  06:56 PM               215 QuickControls2WindowsStyleImpl.qmltypes
+09/19/2024  06:44 PM             2,201 SwitchIndicator.qml
+               4 File(s)         34,212 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          quickimpl
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs\quickimpl
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          qml
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs\quickimpl\qml
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          +Fusion
+04/21/2026  05:37 PM    <DIR>          +Imagine
+04/21/2026  05:37 PM    <DIR>          +Material
+04/21/2026  05:37 PM    <DIR>          +Universal
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs\quickimpl\qml\+Fusion
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs\quickimpl\qml\+Imagine
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs\quickimpl\qml\+Material
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Dialogs\quickimpl\qml\+Universal
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Effects
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Layouts
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:53 PM            19,728 plugins.qmltypes
+09/19/2024  06:49 PM               250 qmldir
+09/19/2024  07:06 PM            30,864 qquicklayoutsplugin.dll
+               3 File(s)         50,842 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\LocalStorage
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\NativeStyle
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+04/21/2026  05:37 PM    <DIR>          controls
+09/19/2024  06:57 PM            10,888 plugins.qmltypes
+09/19/2024  06:49 PM             2,236 qmldir
+09/19/2024  07:06 PM           745,104 qtquickcontrols2nativestyleplugin.dll
+04/21/2026  05:37 PM    <DIR>          util
+               3 File(s)        758,228 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\NativeStyle\controls
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM             1,759 DefaultButton.qml
+09/19/2024  06:44 PM             2,509 DefaultCheckBox.qml
+09/19/2024  06:44 PM             3,929 DefaultComboBox.qml
+09/19/2024  06:44 PM             1,030 DefaultDial.qml
+09/19/2024  06:44 PM             1,282 DefaultFrame.qml
+09/19/2024  06:44 PM             2,337 DefaultGroupBox.qml
+09/19/2024  06:44 PM             1,089 DefaultItemDelegate.qml
+09/19/2024  06:44 PM               857 DefaultItemDelegateIconLabel.qml
+09/19/2024  06:44 PM               981 DefaultProgressBar.qml
+09/19/2024  06:44 PM             2,370 DefaultRadioButton.qml
+09/19/2024  06:44 PM             2,052 DefaultRadioDelegate.qml
+09/19/2024  06:44 PM             1,238 DefaultScrollBar.qml
+09/19/2024  06:44 PM             1,840 DefaultSlider.qml
+09/19/2024  06:44 PM             2,626 DefaultSpinBox.qml
+09/19/2024  06:44 PM             1,976 DefaultTextArea.qml
+09/19/2024  06:44 PM             2,347 DefaultTextField.qml
+09/19/2024  06:44 PM             4,060 DefaultTreeViewDelegate.qml
+              17 File(s)         34,282 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\NativeStyle\util
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:44 PM             1,952 WindowsFocusFrame.qml
+               1 File(s)          1,952 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Particles
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Shapes
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:53 PM            15,567 plugins.qmltypes
+09/19/2024  06:49 PM               207 qmldir
+09/19/2024  07:06 PM            30,864 qmlshapesplugin.dll
+               3 File(s)         46,638 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Templates
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:55 PM           245,581 plugins.qmltypes
+09/19/2024  06:49 PM               237 qmldir
+09/19/2024  07:06 PM            31,888 qtquicktemplates2plugin.dll
+               3 File(s)        277,706 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\tooling
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+               0 File(s)              0 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\qml\QtQuick\Window
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:37 PM    <DIR>          ..
+09/19/2024  06:49 PM               213 qmldir
+09/19/2024  06:50 PM               215 quickwindow.qmltypes
+09/19/2024  07:06 PM            31,888 quickwindowplugin.dll
+               3 File(s)         32,316 bytes
+
+ Directory of C:\Program Files\ShadowStrike\Phantom\tls
+
+04/21/2026  05:37 PM    <DIR>          .
+04/21/2026  05:40 PM    <DIR>          ..
+09/19/2024  10:20 AM           104,592 qcertonlybackend.dll
+09/19/2024  10:20 AM           320,144 qopensslbackend.dll
+09/19/2024  10:20 AM           263,824 qschannelbackend.dll
+               3 File(s)        688,560 bytes
+
+     Total Files Listed:
+             445 File(s)     64,020,303 bytes
+             140 Dir(s)  35,733,876,736 bytes free
