@@ -116,6 +116,17 @@ reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v ShadowStrikePhan
 echo [5/6] Creating Start-menu shortcut ...
 powershell -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%ProgramData%\Microsoft\Windows\Start Menu\Programs\ShadowStrike Phantom.lnk'); $s.TargetPath='%DST%\ShadowStrikePhantomUI.exe'; $s.WorkingDirectory='%DST%'; $s.IconLocation='%DST%\ShadowStrikePhantomUI.exe,0'; $s.Save()" >nul 2>&1
 
+REM ---- PhantomCortex model directory (ProgramData, world-readable) ----
+echo [5b/6] Preparing PhantomCortex model store ...
+set "MODELDIR=%ProgramData%\ShadowStrike\Models"
+if not exist "%MODELDIR%" mkdir "%MODELDIR%" >nul 2>&1
+if exist "%SRC%\Models" (
+    robocopy "%SRC%\Models" "%MODELDIR%" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+)
+REM Register the model directory so the service picks it up even without a
+REM full CortexConfig.json deployment.
+reg add "HKLM\SOFTWARE\ShadowStrike\PhantomCortex" /v ModelDirectory /t REG_SZ /d "%MODELDIR%" /f >nul 2>&1
+
 echo [6/6] Starting service...
 sc start %SVC%
 set TRIES=0

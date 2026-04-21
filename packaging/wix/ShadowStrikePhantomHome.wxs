@@ -58,6 +58,8 @@
       <ComponentRef Id="QtIconEngines"     />
       <ComponentRef Id="TrayAutostart"     />
       <ComponentRef Id="PhantomSensorDriver" />
+      <ComponentRef Id="OnnxRuntime" />
+      <ComponentRef Id="CortexModelRegistry" />
     </Feature>
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -68,6 +70,13 @@
           <Directory Id="IconEnginesDir"  Name="iconengines" />
           <Directory Id="DriversDir"      Name="Drivers" />
         </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- World-readable ProgramData model store for PhantomCortex ONNX models. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="CortexCompanyDataFolder" Name="ShadowStrike">
+        <Directory Id="CortexModelsFolder" Name="Models" />
       </Directory>
     </StandardDirectory>
 
@@ -170,6 +179,35 @@
                Bitness="always64">
       <File Id="libcrypto" Name="libcrypto-3-x64.dll" Source="$(var.BinDir)\libcrypto-3-x64.dll" KeyPath="yes" />
       <File Id="libssl"    Name="libssl-3-x64.dll"    Source="$(var.BinDir)\libssl-3-x64.dll" />
+    </Component>
+
+    <!-- ONNX Runtime (PhantomCortex inference engine) -->
+    <Component Id="OnnxRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="C4A1B2D3-5E6F-4708-9A1B-2C3D4E5F60A1"
+               Bitness="always64">
+      <File Id="OrtDll"
+            Name="onnxruntime.dll"
+            Source="$(var.BinDir)\onnxruntime.dll"
+            KeyPath="yes" />
+      <File Id="OrtProvidersSharedDll"
+            Name="onnxruntime_providers_shared.dll"
+            Source="$(var.BinDir)\onnxruntime_providers_shared.dll" />
+    </Component>
+
+    <!-- Registry pointer so the service can locate the model store without
+         a full CortexConfig.json deployment. -->
+    <Component Id="CortexModelRegistry"
+               Directory="CortexModelsFolder"
+               Guid="C4A1B2D3-5E6F-4708-9A1B-2C3D4E5F60A2"
+               Bitness="always64">
+      <CreateFolder />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\ShadowStrike\PhantomCortex">
+        <RegistryValue Name="ModelDirectory"
+                       Type="string"
+                       Value="[CommonAppDataFolder]ShadowStrike\Models"
+                       KeyPath="yes" />
+      </RegistryKey>
     </Component>
 
     <!-- Qt plugin: platforms -->
