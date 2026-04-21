@@ -38,4 +38,22 @@ void WannaCryDetector_Shutdown() noexcept {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WannaCry has a narrow kernel-hot-path surface — only process create is
+// relevant (SMB events go through a separate network handler that is not
+// yet plumbed into user-mode). File write/rename signals are consumed
+// indirectly through RansomwareDetector's sub-detector chain.
+// ---------------------------------------------------------------------------
+
+void WannaCryDetector_OnProcessCreated(std::uint32_t pid,
+                                       const std::wstring& imagePath,
+                                       const std::wstring& commandLine) noexcept {
+    try {
+        WannaCryDetector::Instance().OnProcessCreated(
+            pid, std::wstring_view{imagePath}, std::wstring_view{commandLine});
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("RansomwareWiring: WannaCry OnProcessCreated exception: {}", e.what());
+    } catch (...) {}
+}
+
 }  // namespace ShadowStrike::Ransomware::Wiring::Internal

@@ -2151,6 +2151,49 @@ public:
             }
         }
 
+        // =====================================================================
+        // 1.6  RANSOMWARE + SCRIPT-SCANNER DISPATCH (Phase 4 kernel fan-out)
+        //
+        // The ransomware subsystem (RansomwareDetector, LockyDetector,
+        // WannaCryDetector, HoneypotManager) and the script scanners are
+        // initialized during Start() but were previously starved of kernel
+        // events. Route the event here — BEFORE the heavier metamorphic /
+        // packer / signature pipeline — so family-specific detectors get the
+        // first look at every touched file.
+        //
+        // The script dispatch is the only one that can short-circuit to Block:
+        // when JS / VBS / Python / Office-macro analyzers return a verdict,
+        // the file is known-bad and no further analysis is warranted.
+        // =====================================================================
+        {
+            const uint8_t accessType = req.AccessType;
+            switch (accessType) {
+                case static_cast<uint8_t>(ShadowStrikeAccessWrite):
+                case static_cast<uint8_t>(ShadowStrikeAccessCreate):
+                    Ransomware::Wiring::DispatchFileWrite(
+                        req.ProcessId, filePath, std::wstring{});
+                    if (Scripts::Wiring::DispatchFileScan(req.ProcessId, filePath)) {
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: Script scanner blocked malicious file: {}",
+                            Utils::StringUtils::ToNarrow(filePath));
+                        m_stats.threatsDetected++;
+                        return Communication::KernelVerdict::Block;
+                    }
+                    break;
+                case static_cast<uint8_t>(ShadowStrikeAccessRename):
+                    // Rename carries only the new path at this layer; LockyDetector
+                    // still scores on the new extension alone.
+                    Ransomware::Wiring::DispatchFileRename(
+                        req.ProcessId, std::wstring{}, filePath);
+                    break;
+                case static_cast<uint8_t>(ShadowStrikeAccessDelete):
+                    Ransomware::Wiring::DispatchFileDelete(req.ProcessId, filePath);
+                    break;
+                default:
+                    break;
+            }
+        }
+
         // 2. Check Verdict Cache
         std::string hashKey;
 
@@ -2809,6 +2852,20 @@ public:
             }
         }
 
+        // =====================================================================
+        // RANSOMWARE SUBSYSTEM PROCESS-NOTIFY DISPATCH (Phase 4 kernel fan-out)
+        //
+        // Fan every process create / terminate notification out to the
+        // RansomwareDetector composite engine, LockyDetector dropper-chain
+        // tracker, WannaCryDetector service-install detector, and
+        // HoneypotManager for attribution.  Each call is noexcept at the
+        // aggregator boundary; a single misbehaving module cannot take the
+        // IPC loop down.
+        // =====================================================================
+        Ransomware::Wiring::DispatchProcessNotify(
+            req.processId, req.parentProcessId,
+            imagePath, commandLine, static_cast<bool>(req.isCreation));
+
         return Communication::KernelVerdict::Allow;
     }
 
@@ -3079,6 +3136,18 @@ public:
                 "RealTimeProtection: ProcessMonitor::OnModuleLoad exception PID {}: {}",
                 req.processId, e.what());
         } catch (...) {}
+
+        // =====================================================================
+        // RANSOMWARE SUBSYSTEM IMAGE-LOAD DISPATCH (Phase 4 kernel fan-out)
+        //
+        // Notifies RansomwareDetector, LockyDetector, and HoneypotManager of
+        // every loaded image so they can correlate DLL fingerprints against
+        // known dropper payloads and update per-process attribution state.
+        // =====================================================================
+        Ransomware::Wiring::DispatchImageLoad(
+            req.processId, imagePath,
+            static_cast<std::uintptr_t>(req.imageBase),
+            static_cast<std::size_t>(req.imageSize));
 
         return Communication::KernelVerdict::Allow;
     }
