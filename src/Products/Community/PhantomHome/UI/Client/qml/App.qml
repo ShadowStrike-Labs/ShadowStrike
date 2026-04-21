@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
-import ShadowStrike.Phantom.Theming
+import "Theming"
 import "components"
 import "pages"
 
