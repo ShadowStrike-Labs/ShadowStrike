@@ -331,8 +331,19 @@ PipeServer::~PipeServer() {
 }
 
 std::wstring PipeServer::PipeFullName() const {
-    std::wstring prefix(kPipeNamePrefix.begin(), kPipeNamePrefix.end());
-    return prefix + std::to_wstring(options_.session_id);
+    // Session-independent pipe name. The previous design suffixed the
+    // interactive session id captured at service-start time via
+    // WTSGetActiveConsoleSessionId(), but that function returns 0xFFFFFFFF
+    // when the service starts before any user logs on - which is the
+    // normal auto-start path for us. The tray client, in its own session,
+    // would then never find a matching pipe and the user would see a
+    // permanent "service offline" tooltip. Authorisation is already
+    // enforced by (a) the pipe SDDL restricting access to Interactive +
+    // Administrators + SYSTEM and (b) per-connection token inspection in
+    // InspectClientIdentity. Session matching at pipe-name level is
+    // redundant and actively harmful.
+    (void)options_.session_id;
+    return std::wstring(kPipeNamePrefix.begin(), kPipeNamePrefix.end());
 }
 
 void PipeServer::SetHandler(MessageHandler handler) {
@@ -676,14 +687,12 @@ bool PipeServer::AuthenticateClient(ClientContext& ctx) {
         ctx.SetIdentity(std::move(id));
         return false;
     }
-    if (!id.is_local_system && id.session_id != options_.session_id) {
-        ShadowStrike::Utils::Logger::Warn(
-            "PipeServer: rejecting cross-session client pid={}, "
-            "client_session={}, pipe_session={}",
-            ctx.ClientProcessId(), id.session_id, options_.session_id);
-        ctx.SetIdentity(std::move(id));
-        return false;
-    }
+    // Session-independent pipe: any authenticated interactive user on this
+    // host may connect (the SDDL ACL is the gate). We previously refused
+    // cross-session clients here, which broke the common auto-start case
+    // where the service binds its pipe in session 0 before any user logs
+    // on - a tray launched later in session 1+ could never connect.
+    (void)options_.session_id;
 
     // Map identity -> privileged flag. Elevation OR admin membership OR
     // LocalSystem grants write-intent access. Interactive standard users
