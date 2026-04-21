@@ -7,7 +7,7 @@
  */
 
 #include "InstructionDecoder.hpp"
-#include "../../Common/Constants.hpp"
+#include "../../../../Common/Constants.hpp"
 #include <cstring>
 
 namespace Phantom {

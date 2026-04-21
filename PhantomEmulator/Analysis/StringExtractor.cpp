@@ -34,7 +34,7 @@ static constexpr uint32_t kMinXORBlockSize         = 32;
 static constexpr uint32_t kMaxXORSampleBytes       = 256;
 static constexpr float    kHighEntropyThreshold    = 5.0f;
 static constexpr float    kPrintableRatioThreshold = 0.6f;
-static constexpr uint32_t kPageSize                = 4096;
+static constexpr uint32_t kSEPageSize                = 4096;
 static constexpr uint32_t kMaxPagesPerScan         = 131072; // 512 MB / 4 KB
 static constexpr GuestAddress kMaxScanAddress      = 512ULL * 1024 * 1024;
 static constexpr uint32_t kMaxDecodedStringLength  = 8192;
@@ -417,7 +417,7 @@ static constexpr std::array<const char*, 20> kC2Keywords = {{
 
 // ---- Known Win32 API names (~100 entries) ---------------------------------
 
-static constexpr std::array<const char*, 106> kKnownAPIs = {{
+static constexpr std::array<const char*, 116> kKnownAPIs = {{
     "VirtualAlloc", "VirtualAllocEx", "VirtualFree", "VirtualProtect",
     "VirtualProtectEx", "VirtualQuery", "VirtualQueryEx",
     "CreateFileA", "CreateFileW", "ReadFile", "WriteFile", "CloseHandle",
@@ -1450,7 +1450,7 @@ void StringExtractor::ScanAll(const VirtualMemory& memory) noexcept {
     // Pages are 4096 bytes, guest space is capped at kMaxScanAddress.
 
     uint32_t pagesScanned = 0;
-    for (GuestAddress addr = 0; addr < kMaxScanAddress; addr += kPageSize) {
+    for (GuestAddress addr = 0; addr < kMaxScanAddress; addr += kSEPageSize) {
         if (pagesScanned >= kMaxPagesPerScan) break;
         if (m_impl->strings.size() >= kMaxStrings) break;
 
@@ -1458,7 +1458,7 @@ void StringExtractor::ScanAll(const VirtualMemory& memory) noexcept {
         if (!hostPtr) continue;
 
         // Scan this page for strings (ASCII, wide, XOR)
-        m_impl->ScanRegionImpl(hostPtr, kPageSize, addr);
+        m_impl->ScanRegionImpl(hostPtr, kSEPageSize, addr);
         ++pagesScanned;
     }
 

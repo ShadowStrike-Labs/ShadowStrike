@@ -10,7 +10,7 @@
 
 #include "Instruction.hpp"
 #include "../../State/CPUState.hpp"
-#include "../../Common/Errors.hpp"
+#include "../../../../Common/Errors.hpp"
 #include <cstdint>
 #include <optional>
 #include <span>

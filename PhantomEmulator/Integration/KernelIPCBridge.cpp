@@ -17,6 +17,8 @@
 #include "../Analysis/BehaviorMonitor.hpp"
 #include "../Analysis/MITREMapper.hpp"
 #include "../Analysis/IOCExtractor.hpp"
+#include "../Analysis/EvasionDetector.hpp"
+#include "../Analysis/NetworkBehaviorAnalyzer.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

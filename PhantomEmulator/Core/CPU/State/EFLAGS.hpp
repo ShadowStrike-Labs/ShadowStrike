@@ -8,8 +8,8 @@
 
 #pragma once
 
-#include "../../Common/Constants.hpp"
-#include "../../Common/Platform.hpp"
+#include "../../../Common/Constants.hpp"
+#include "../../../Common/Platform.hpp"
 #include <cstdint>
 #include <array>
 

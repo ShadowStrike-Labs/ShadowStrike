@@ -26,6 +26,7 @@
 #include <cstring>
 #include <string>
 #include <cctype>
+#include <cwctype>
 
 namespace Phantom::WinAPI::Kernel32 {
 

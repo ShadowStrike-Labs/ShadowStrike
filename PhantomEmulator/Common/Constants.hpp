@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include "WinMacroUndef.hpp"
 
 namespace Phantom {
 

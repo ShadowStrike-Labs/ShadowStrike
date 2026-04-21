@@ -77,19 +77,19 @@ public:
 
     // Read `count` bytes from guest address into host buffer.
     // Returns ErrorCode::Success or an access violation error.
-    [[nodiscard]] ErrorCode Read(GuestAddress addr, void* dst, uint32_t count) noexcept;
+    [[nodiscard]] ErrorCode Read(GuestAddress addr, void* dst, uint32_t count) const noexcept;
 
     // Write `count` bytes from host buffer to guest address.
     [[nodiscard]] ErrorCode Write(GuestAddress addr, const void* src, uint32_t count) noexcept;
 
     // Fetch instruction bytes (requires Execute permission).
     [[nodiscard]] ErrorCode FetchInstruction(
-        GuestAddress addr, uint8_t* dst, uint32_t maxBytes, uint32_t& bytesRead) noexcept;
+        GuestAddress addr, uint8_t* dst, uint32_t maxBytes, uint32_t& bytesRead) const noexcept;
 
     // === Typed access helpers (hot path) ===
 
     template <typename T>
-    [[nodiscard]] ErrorCode ReadValue(GuestAddress addr, T& value) noexcept {
+    [[nodiscard]] ErrorCode ReadValue(GuestAddress addr, T& value) const noexcept {
         return Read(addr, &value, sizeof(T));
     }
 

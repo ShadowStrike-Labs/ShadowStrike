@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <map>
 #include <mutex>
 #include <string>

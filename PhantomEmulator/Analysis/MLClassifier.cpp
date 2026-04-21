@@ -9,8 +9,8 @@
  */
 
 #include "MLClassifier.hpp"
-#include "AI/ModelInference.hpp"
-#include "AI/CortexTypes.hpp"
+#include "PhantomCore/AI/ModelInference.hpp"
+#include "PhantomCore/AI/CortexTypes.hpp"
 
 #include <algorithm>
 #include <cmath>
