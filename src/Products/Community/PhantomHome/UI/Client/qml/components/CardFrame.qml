@@ -6,11 +6,13 @@ import "../Theming"
 /*
  * CardFrame
  * ---------
- * Panel used to group related controls. Provides:
- *   - subtle vertical gradient (reads as lifted surface on dark bg)
- *   - 1 px hairline border
- *   - optional title text
- *   - default property area for children (Column.children, list<Item>).
+ * Panel used to group related controls. Borderless, tone-based - depth
+ * comes from the bg2 -> bg3 step rather than a stroke. Provides:
+ *   - optional title / subtitle block
+ *   - default child area (contentChildren)
+ *   - optional hover elevation (bg2 -> bg3)
+ *   - optional clickable surface with pointer cursor
+ *   - optional left accent bar for emphasis (blue/green/amber)
  *
  * NOTE: Only visual Items may be placed as children. Non-visual QtObjects
  * such as ButtonGroup must live at the enclosing scope, not inside a card.
@@ -20,39 +22,62 @@ Rectangle {
     color: "transparent"
     border.width: 0
     radius: Theme.radiusMd
-    implicitHeight: contentHost.implicitHeight + Theme.sp5 * 2
+    implicitHeight: contentHost.implicitHeight + (root.padded ? Theme.sp5 * 2 : 0)
 
     property string title: ""
     property string subtitle: ""
     property bool   padded: true
 
+    // Light polish extensions (opt-in; default behavior matches the
+    // legacy CardFrame so every existing caller stays pixel-compatible).
+    property bool   hoverable:  false
+    property bool   clickable:  false
+    property color  accentBar:  "transparent"
+    property bool   elevated:   false
+    signal clicked()
+    signal doubleClicked()
+
     default property alias contentChildren: inner.children
 
-    // Gradient fill layer (darker at the bottom for depth).
+    // --- Surface ---------------------------------------------------------
     Rectangle {
+        id: surface
         anchors.fill: parent
         radius: parent.radius
-        gradient: Gradient {
-            GradientStop { position: 0.0; color: Theme.bg2 }
-            GradientStop { position: 1.0; color: Qt.darker(Theme.bg2, 1.10) }
-        }
-        border.color: Theme.stroke
-        border.width: 1
+        color: (root.elevated || ((root.hoverable || root.clickable) && mouse.containsMouse))
+               ? Theme.bg3
+               : Theme.bg2
+        Behavior on color { ColorAnimation { duration: Theme.motionFast } }
     }
 
-    // Thin accent highlight on the top edge (1 px) for definition.
+    // --- Optional accent bar (left edge, 3 px) ---------------------------
     Rectangle {
-        anchors.top: parent.top
+        visible: root.accentBar !== "transparent"
         anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.topMargin: 1
-        anchors.leftMargin: 1
-        anchors.rightMargin: 1
-        height: 1
-        radius: 1
-        color: Qt.rgba(1, 1, 1, 0.04)
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: Theme.sp2
+        anchors.topMargin: Theme.sp3
+        anchors.bottomMargin: Theme.sp3
+        width: 3
+        radius: 1.5
+        color: root.accentBar
     }
 
+    // --- Hover / click surface (sits under content, above background) ----
+    MouseArea {
+        id: mouse
+        anchors.fill: parent
+        hoverEnabled: root.hoverable || root.clickable
+        acceptedButtons: Qt.LeftButton
+        cursorShape: root.clickable ? Qt.PointingHandCursor : Qt.ArrowCursor
+        enabled: root.hoverable || root.clickable
+        onClicked: if (root.clickable) root.clicked()
+        onDoubleClicked: if (root.clickable) root.doubleClicked()
+        propagateComposedEvents: true
+    }
+
+    // --- Content ---------------------------------------------------------
     ColumnLayout {
         id: contentHost
         anchors.fill: parent
@@ -66,7 +91,7 @@ Rectangle {
             spacing: 2
             Text {
                 text: root.title
-                color: Theme.text
+                color: Theme.textStrong
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontHeading
                 font.weight: Font.DemiBold

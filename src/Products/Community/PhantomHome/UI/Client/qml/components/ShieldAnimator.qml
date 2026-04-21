@@ -5,136 +5,180 @@ import "../Theming"
 /*
  * ShieldAnimator
  * --------------
- * The signature protection emblem used on the main page. Pure vector
- * so it scales to any DPI with no assets.
+ * Hero protection-state visual. A large hexagonal shield with a soft
+ * radial halo behind it. The whole thing breathes subtly at rest and
+ * radiates attention when state is amber or red.
  *
- * Visual composition (back -> front):
- *   1. Soft breathing halo (large, low alpha)
- *   2. Rotating conic accent ring (slow)
- *   3. Shield outline (gradient-filled, stroked)
- *   4. Check mark
- *
- * `protectionState` drives the accent hue through Theme status colors,
- * animated via ColorAnimation on `shieldColor`. Note the property is
- * deliberately *not* called currentColor - that name is reserved by
- * Qt Quick's CSS/SVG inheritance and cannot be written to at runtime.
+ * The shape is drawn with a Canvas (deterministic sizing) and the halo
+ * is a stack of concentric transparent circles, which renders fine on
+ * every Qt 6.5+ backend without requiring QtGraphicalEffects or
+ * GraphicsInfo.api checks.
  */
 Item {
     id: root
-    implicitWidth:  220
-    implicitHeight: 240
 
-    property string protectionState: "green"        // green|amber|red|paused
-    property real   pulse: 0.0
-    property real   ringAngle: 0.0
+    // --- API -------------------------------------------------------------
+    // NOTE: uses `protectionState` (not `state`) - `state` is a reserved
+    // Item property that drives the QML state machine and must not be
+    // shadowed by an arbitrary string value.
+    property string protectionState: "green"   // green | amber | red | paused
+    property int    size:    240              // hero size; pages may scale down
+    property bool   breathe: true              // disable when rendering off-screen
 
-    property color shieldColor: {
+    implicitWidth:  size
+    implicitHeight: size
+
+    // Resolve a color for the current state.
+    function _stateColor() {
         switch (protectionState) {
-        case "green":  return Theme.stateGreen
-        case "amber":  return Theme.stateAmber
-        case "red":    return Theme.stateRed
-        case "paused": return Theme.statePause
+        case "green":  return Theme.success
+        case "amber":  return Theme.warning
+        case "red":    return Theme.danger
+        case "paused": return Theme.textMuted
         }
-        return Theme.stateGreen
+        return Theme.accent
     }
 
-    Behavior on shieldColor { ColorAnimation { duration: Theme.motionSlow } }
+    readonly property color currentColor: _stateColor()
 
-    // Continuous gentle breathing used by halo + fill alpha.
-    SequentialAnimation on pulse {
-        loops: Animation.Infinite
-        running: true
-        NumberAnimation { from: 0.0; to: 1.0; duration: Theme.motionBreath; easing.type: Easing.InOutSine }
-        NumberAnimation { from: 1.0; to: 0.0; duration: Theme.motionBreath; easing.type: Easing.InOutSine }
-    }
+    // Pulsation amplitude - larger for attention states.
+    readonly property real _breatheTarget: (protectionState === "green" || protectionState === "paused") ? 1.0 : 1.05
 
-    // Slow rotation for the accent ring.
-    NumberAnimation on ringAngle {
-        from: 0; to: 360
-        duration: 9000
-        loops: Animation.Infinite
-        running: true
-    }
-
-    // --- Outer breathing halo (largest layer) -----------------------------
-    Rectangle {
+    // ---------------------------------------------------------------------
+    // Halo (stack of radial rings). Drawn first so the shield floats on it.
+    // ---------------------------------------------------------------------
+    Item {
+        id: halo
         anchors.centerIn: parent
-        width:  200 + root.pulse * 28
-        height: width
-        radius: width / 2
-        color:  Qt.rgba(root.shieldColor.r, root.shieldColor.g, root.shieldColor.b,
-                        0.06 + root.pulse * 0.08)
-    }
+        width:  root.size * 1.35
+        height: root.size * 1.35
 
-    // --- Middle accent halo (cooler blue, static) -------------------------
-    Rectangle {
-        anchors.centerIn: parent
-        width:  164
-        height: width
-        radius: width / 2
-        color:  "transparent"
-        border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.22)
-        border.width: 1
-    }
+        // Outer soft ring
+        Rectangle {
+            anchors.centerIn: parent
+            width:  parent.width
+            height: parent.height
+            radius: width / 2
+            color:  "transparent"
+            border.color: Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.05)
+            border.width: 1
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width:  parent.width * 0.82
+            height: parent.height * 0.82
+            radius: width / 2
+            color:  Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.06)
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width:  parent.width * 0.64
+            height: parent.height * 0.64
+            radius: width / 2
+            color:  Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.10)
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width:  parent.width * 0.48
+            height: parent.height * 0.48
+            radius: width / 2
+            color:  Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.16)
+        }
 
-    // --- Rotating dashed accent ring --------------------------------------
-    Shape {
-        anchors.centerIn: parent
-        width:  178
-        height: 178
-        rotation: root.ringAngle
-        layer.enabled: true
-        layer.samples: 8
-        ShapePath {
-            strokeColor: Qt.rgba(Theme.accentAlt.r, Theme.accentAlt.g, Theme.accentAlt.b, 0.55)
-            strokeWidth: 2
-            fillColor:   "transparent"
-            strokeStyle: ShapePath.DashLine
-            dashPattern: [3, 6]
-            capStyle:    ShapePath.FlatCap
-            startX: 89; startY: 0
-            PathAngleArc { centerX: 89; centerY: 89; radiusX: 89; radiusY: 89
-                           startAngle: -90; sweepAngle: 360 }
+        // Slow breathing: scales the whole halo.
+        scale: 1.0
+        SequentialAnimation on scale {
+            running: root.breathe
+            loops: Animation.Infinite
+            NumberAnimation { to: root._breatheTarget; duration: Theme.motionBreath; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 1.0;                 duration: Theme.motionBreath; easing.type: Easing.InOutSine }
         }
     }
 
-    // --- Shield body ------------------------------------------------------
-    Shape {
-        id: shield
+    // ---------------------------------------------------------------------
+    // Hexagonal shield body with inner gradient face. Drawn via Canvas so
+    // we don't depend on QtQuick.Shapes availability at runtime (it ships
+    // with Qt 6 Core but is an optional module on some Conan builds).
+    // ---------------------------------------------------------------------
+    Canvas {
+        id: shieldCanvas
         anchors.centerIn: parent
-        width:  138
-        height: 150
-        layer.enabled: true
-        layer.samples: 8
+        width:  root.size
+        height: root.size
+        antialiasing: true
 
-        // Soft inner fill (gradient-looking via two stacked paths)
-        ShapePath {
-            strokeColor: root.shieldColor
-            strokeWidth: 2.5
-            fillColor:   Qt.rgba(root.shieldColor.r, root.shieldColor.g, root.shieldColor.b,
-                                 0.14 + root.pulse * 0.06)
-            joinStyle:   ShapePath.RoundJoin
-            capStyle:    ShapePath.RoundCap
+        property color fillStrong: Qt.lighter(root.currentColor, 1.12)
+        property color fillDeep:   Qt.darker(root.currentColor, 1.35)
 
-            startX: 69; startY: 2
-            PathLine  { x: 134; y: 24 }
-            PathLine  { x: 134; y: 76 }
-            PathCubic { control1X: 134; control1Y: 114; control2X: 104; control2Y: 140; x: 69; y: 148 }
-            PathCubic { control1X: 34;  control1Y: 140; control2X: 4;   control2Y: 114; x: 4;  y: 76 }
-            PathLine  { x: 4;   y: 24 }
-            PathLine  { x: 69;  y: 2 }
+        onPaint: {
+            const ctx = getContext("2d");
+            ctx.reset();
+
+            const w = width;
+            const h = height;
+            const cx = w / 2;
+            const cy = h / 2;
+            const r  = Math.min(w, h) * 0.42;
+
+            // Hexagonal path (flat-top).
+            const pts = [];
+            for (let i = 0; i < 6; ++i) {
+                const a = Math.PI / 3 * i + Math.PI / 6;
+                pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+            }
+
+            // Outer stroke layer (subtle)
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < 6; ++i) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.closePath();
+
+            const grad = ctx.createLinearGradient(cx, cy - r, cx, cy + r);
+            grad.addColorStop(0.0, fillStrong);
+            grad.addColorStop(1.0, fillDeep);
+            ctx.fillStyle = grad;
+            ctx.fill();
+
+            ctx.lineWidth   = 1;
+            ctx.strokeStyle = Qt.rgba(1, 1, 1, 0.08);
+            ctx.stroke();
+
+            // Inner glyph: a smaller concentric hex for depth.
+            ctx.beginPath();
+            for (let i = 0; i < 6; ++i) {
+                const a = Math.PI / 3 * i + Math.PI / 6;
+                const px = cx + (r * 0.70) * Math.cos(a);
+                const py = cy + (r * 0.70) * Math.sin(a);
+                if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+            ctx.fillStyle = Qt.rgba(1, 1, 1, 0.08);
+            ctx.fill();
         }
 
-        // Check mark
-        ShapePath {
-            strokeColor: root.shieldColor
-            strokeWidth: 5
-            fillColor:   "transparent"
-            capStyle:    ShapePath.RoundCap
-            joinStyle:   ShapePath.RoundJoin
-            startX: 38; startY: 76
-            PathLine { x: 62;  y: 100 }
-            PathLine { x: 104; y: 54  }
+        // Repaint when state (color) changes.
+        Connections {
+            target: root
+            function onCurrentColorChanged() { shieldCanvas.requestPaint() }
+        }
+        Component.onCompleted: requestPaint()
+    }
+
+    // State-dependent glyph drawn on top of the shield (check / ! / x).
+    Text {
+        anchors.centerIn: parent
+        color: "#FFFFFF"
+        font.family: Theme.fontFamily
+        font.pixelSize: root.size * 0.28
+        font.weight: Font.DemiBold
+        text: {
+            switch (root.protectionState) {
+            case "green":  return "\u2713"   // check
+            case "amber":  return "!"
+            case "red":    return "\u2715"   // cross
+            case "paused": return "\u25A0"   // square
+            }
+            return "\u2013"
         }
     }
 }
