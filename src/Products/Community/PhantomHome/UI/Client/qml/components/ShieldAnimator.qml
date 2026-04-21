@@ -19,7 +19,8 @@ Item {
     property string protectionState: "green"       // "green"|"amber"|"red"|"paused"
     property real   pulse: 0.0
 
-    readonly property color currentColor: {
+    // shieldColor avoids the reserved CSS 'currentColor' read-only property.
+    property color shieldColor: {
         switch (protectionState) {
         case "green":  return Theme.stateGreen
         case "amber":  return Theme.stateAmber
@@ -29,7 +30,7 @@ Item {
         return Theme.stateGreen
     }
 
-    Behavior on currentColor { ColorAnimation { duration: Theme.motionSlow } }
+    Behavior on shieldColor { ColorAnimation { duration: Theme.motionSlow } }
 
     SequentialAnimation on pulse {
         loops: Animation.Infinite
@@ -44,7 +45,7 @@ Item {
         width:  160 + root.pulse * 18
         height: width
         radius: width / 2
-        color:  Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b,
+        color:  Qt.rgba(root.shieldColor.r, root.shieldColor.g, root.shieldColor.b,
                         0.08 + root.pulse * 0.10)
     }
 
@@ -57,9 +58,9 @@ Item {
         layer.samples: 8
 
         ShapePath {
-            strokeColor: root.currentColor
+            strokeColor: root.shieldColor
             strokeWidth: 2
-            fillColor:   Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.18)
+            fillColor:   Qt.rgba(root.shieldColor.r, root.shieldColor.g, root.shieldColor.b, 0.18)
 
             startX: 65; startY: 2
             PathLine { x: 126; y: 22 }
@@ -71,7 +72,7 @@ Item {
         }
 
         ShapePath {
-            strokeColor: root.currentColor
+            strokeColor: root.shieldColor
             strokeWidth: 4
             fillColor:   "transparent"
             capStyle:    ShapePath.RoundCap
