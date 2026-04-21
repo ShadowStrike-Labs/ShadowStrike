@@ -5,7 +5,7 @@ REM =====================================================================
 setlocal ENABLEDELAYEDEXPANSION
 
 set "STAGE=%LOCALAPPDATA%\ShadowStrike-Install"
-if /I "%~dp0"=="%STAGE%\" goto local
+if /I "%~dp0"=="%STAGE%\" goto staged
 
 REM ---- First invocation: copy to local disk, relaunch from there ------
 echo [stage] Copying installer to %STAGE% ...
@@ -28,24 +28,26 @@ if exist "%~dp0payload\app" (
     pause
     exit /b 1
 )
-echo [stage] Re-launching from local copy ...
-start "ShadowStrike Phantom" cmd /k "\"%STAGE%\%~nx0\""
+echo [stage] Launching local copy in a new window ...
+start "ShadowStrike Phantom" cmd /k ""%STAGE%\%~nx0""
 exit /b 0
 
-:local
+:staged
 net session >nul 2>&1
+if not errorlevel 1 goto body
+
+set "SELF=%~f0"
+echo.
+echo [elevate] Requesting Administrator rights. Click YES on the UAC prompt.
+powershell -NoProfile -Command "try { Start-Process -FilePath cmd -Verb RunAs -ArgumentList ('/k ""' + $env:SELF + '""') -ErrorAction Stop } catch { Write-Host ('[elevate] ' + $_.Exception.Message); exit 1 }"
 if errorlevel 1 (
     echo.
-    echo [elevate] Re-launching with Administrator rights. Click YES on the UAC prompt.
-    powershell -NoProfile -Command "try { Start-Process -FilePath 'cmd.exe' -ArgumentList ('/k','\"%~f0\"') -Verb RunAs -ErrorAction Stop } catch { Write-Host ('[elevate] failed: ' + $_.Exception.Message) ; exit 1 }"
-    if errorlevel 1 (
-        echo.
-        echo [!] UAC was cancelled. Nothing was done.
-        pause
-    )
-    exit /b 0
+    echo [!] UAC cancelled or failed. Nothing was done.
+    pause
 )
+exit /b 0
 
+:body
 set "HERE=%~dp0"
 set "SRC=%HERE%payload\app"
 set "DST=%ProgramFiles%\ShadowStrike\Phantom"
