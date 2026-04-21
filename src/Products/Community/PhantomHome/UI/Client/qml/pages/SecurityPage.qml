@@ -24,6 +24,9 @@ Item {
     signal setModuleEnabled(string moduleId, bool enabled)
     signal setDetectionAction(string moduleId, int action)    // 0=Ask 1=Quarantine 2=Delete 3=LogOnly
 
+    // ButtonGroup is a non-visual QtObject; must live at Item scope, not inside a Column/CardFrame.
+    ButtonGroup { id: actionGroup }
+
     ScrollView {
         anchors.fill: parent
         clip: true
@@ -95,8 +98,6 @@ Item {
             CardFrame {
                 title: "When a threat is detected"
                 Layout.fillWidth: true
-
-                ButtonGroup { id: actionGroup }
 
                 RadioButton { ButtonGroup.group: actionGroup; text: "Ask me";       checked: true
                     focusPolicy: Qt.StrongFocus
