@@ -65,8 +65,8 @@ Item {
             startX: 65; startY: 2
             PathLine { x: 126; y: 22 }
             PathLine { x: 126; y: 72 }
-            PathCubic { x1: 126; y1: 108; x2: 100; y2: 132; x: 65; y: 140 }
-            PathCubic { x1: 30;  y1: 132; x2: 4;   y2: 108; x: 4;  y: 72 }
+            PathCubic { control1X: 126; control1Y: 108; control2X: 100; control2Y: 132; x: 65; y: 140 }
+            PathCubic { control1X: 30;  control1Y: 132; control2X: 4;   control2Y: 108; x: 4;  y: 72 }
             PathLine { x: 4;   y: 22 }
             PathLine { x: 65;  y: 2 }
         }
