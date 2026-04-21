@@ -1,0 +1,6 @@
+
+RealTimeProtectionEnabled AntivirusEnabled AMServiceEnabled TamperProtected
+------------------------- ---------------- ---------------- ---------------
+                    False            False            False                
+
+
