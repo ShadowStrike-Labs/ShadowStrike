@@ -52,8 +52,8 @@ for /f "tokens=2" %%P in ('sc queryex %SVC% 2^>nul ^| findstr /I "PID"') do (
 taskkill /f /im ShadowStrikePhantomService.exe >nul 2>&1
 
 echo [2/6] Unloading minifilter driver ...
-fltmc detach ShadowStrikePhantomSensor >nul 2>&1
-fltmc unload ShadowStrikePhantomSensor >nul 2>&1
+fltmc detach PhantomSensor >nul 2>&1
+fltmc unload PhantomSensor >nul 2>&1
 
 echo [3/6] Removing driver package ...
 for /f "tokens=*" %%P in ('pnputil /enum-drivers ^| findstr /I "PhantomSensor.inf"') do (

@@ -7,8 +7,11 @@ import "../components"
 /*
  * MainPage
  * --------
- * Top-level status view: animated shield, big protection copy, Fast Scan
- * CTA, and a short summary row (last scan / threats blocked / update status).
+ * The "at-a-glance" protection hub the user sees first. Layout:
+ *
+ *   [ Shield emblem ][ State copy + primary CTA          ]
+ *   [ Stat card ][ Stat card ][ Stat card                ]
+ *   [ Quick actions rail (scan shortcuts + updates)      ]
  */
 Item {
     id: page
@@ -16,125 +19,252 @@ Item {
     Accessible.role: Accessible.Pane
     Accessible.name: qsTr("Protection status")
 
-    // Wired from App.qml -> ProtectionViewModel
+    // Wired from App.qml -> ProtectionViewModel.
     property string protectionState: "green"
-    property string stateCopy: "We are protecting you"
-    property string stateSubCopy: "Real-time protection is active."
-    property string lastScan: "—"
+    property string stateCopy:       "You are protected"
+    property string stateSubCopy:    "Real-time protection is active."
+    property string lastScan:        "—"
     property int    threatsBlocked7d: 0
-    property string updateStatus: "Up to date"
+    property string updateStatus:    "Up to date"
 
     signal startFastScan()
+    signal openScanTab()
+    signal openUpdateTab()
 
-    ColumnLayout {
+    function severityFromState(s) {
+        switch (s) {
+        case "green":  return "ok"
+        case "amber":  return "warn"
+        case "red":    return "bad"
+        case "paused": return "muted"
+        }
+        return "info"
+    }
+    function labelFromState(s) {
+        switch (s) {
+        case "green":  return "Protected"
+        case "amber":  return "Attention needed"
+        case "red":    return "At risk"
+        case "paused": return "Paused"
+        }
+        return "Checking"
+    }
+
+    ScrollView {
         anchors.fill: parent
-        anchors.margins: Theme.sp6
-        spacing: Theme.sp6
+        clip: true
 
-        RowLayout {
-            Layout.fillWidth: true
+        ColumnLayout {
+            width: page.width - 2
+            anchors.margins: 0
             spacing: Theme.sp6
 
-            ShieldAnimator {
-                protectionState: page.protectionState
-                Layout.preferredWidth: 180
-                Layout.preferredHeight: 200
+            // ----- Hero row --------------------------------------------------
+            CardFrame {
+                Layout.fillWidth: true
+                Layout.topMargin: Theme.sp6
+                Layout.leftMargin: Theme.sp8
+                Layout.rightMargin: Theme.sp8
+                padded: true
+
+                Item {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 240
+
+                    RowLayout {
+                        anchors.fill: parent
+                        spacing: Theme.sp8
+
+                        ShieldAnimator {
+                            id: shield
+                            protectionState: page.protectionState
+                            Layout.preferredWidth: 220
+                            Layout.preferredHeight: 240
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            spacing: Theme.sp3
+
+                            StatePill {
+                                label: page.labelFromState(page.protectionState)
+                                severity: page.severityFromState(page.protectionState)
+                            }
+
+                            Text {
+                                text: page.stateCopy
+                                color: Theme.textStrong
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontDisplay
+                                font.weight: Font.DemiBold
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                text: page.stateSubCopy
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontBody
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                                Layout.maximumWidth: 640
+                            }
+
+                            RowLayout {
+                                spacing: Theme.sp3
+                                Layout.topMargin: Theme.sp3
+
+                                PrimaryButton {
+                                    text: "Fast scan"
+                                    onClicked: page.startFastScan()
+                                    Accessible.name: qsTr("Fast scan")
+                                    Accessible.description: qsTr("Run a fast scan of frequently targeted system locations")
+                                }
+                                SecondaryButton {
+                                    text: "Full scan"
+                                    onClicked: page.openScanTab()
+                                }
+                                SecondaryButton {
+                                    text: "Check for updates"
+                                    onClicked: page.openUpdateTab()
+                                }
+                            }
+                            Item { Layout.fillHeight: true }
+                        }
+                    }
+                }
             }
 
-            ColumnLayout {
+            // ----- Stat cards row -----------------------------------------
+            RowLayout {
                 Layout.fillWidth: true
-                spacing: Theme.sp2
+                Layout.leftMargin: Theme.sp8
+                Layout.rightMargin: Theme.sp8
+                spacing: Theme.sp4
 
-                Text {
-                    text: page.stateCopy
-                    color: Theme.text
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontTitle + 8
-                    font.weight: Font.DemiBold
-                }
-                Text {
-                    text: page.stateSubCopy
-                    color: Theme.textMuted
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontBody
-                    wrapMode: Text.WordWrap
-                    Layout.maximumWidth: 480
-                }
+                CardFrame {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 118
+                    title: "Last scan"
+                    subtitle: "Most recent detection sweep"
 
-                Button {
-                    text: "Fast scan"
-                    Layout.topMargin: Theme.sp3
-                    onClicked: page.startFastScan()
-                    focusPolicy: Qt.StrongFocus
-                    Accessible.role: Accessible.Button
-                    Accessible.name: qsTr("Fast scan")
-                    Accessible.description: qsTr("Run a fast scan of frequently targeted system locations")
-                    background: Rectangle {
-                        color: Theme.accent
-                        radius: Theme.radiusSm
-                        border.color: Qt.darker(Theme.accent, 1.15)
-                        border.width: 1
-                    }
-                    contentItem: Text {
-                        text: parent.text
-                        color: "#FFFFFF"
+                    Text {
+                        text: page.lastScan
+                        color: Theme.textStrong
                         font.family: Theme.fontFamily
-                        font.pixelSize: Theme.fontBody
-                        font.weight: Font.DemiBold
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment:   Text.AlignVCenter
-                        leftPadding: Theme.sp4
-                        rightPadding: Theme.sp4
-                        topPadding: Theme.sp2
-                        bottomPadding: Theme.sp2
+                        font.pixelSize: Theme.fontHeading
+                        font.weight: Font.Medium
+                    }
+                }
+                CardFrame {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 118
+                    title: "Threats blocked"
+                    subtitle: "Last 7 days"
+
+                    RowLayout {
+                        spacing: Theme.sp2
+                        Text {
+                            text: page.threatsBlocked7d
+                            color: Theme.textStrong
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontDisplay
+                            font.weight: Font.DemiBold
+                        }
+                        Text {
+                            text: "blocked"
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontBody
+                            Layout.alignment: Qt.AlignBottom
+                            bottomPadding: 6
+                        }
+                    }
+                }
+                CardFrame {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 118
+                    title: "Updates"
+                    subtitle: "Signatures and engine"
+
+                    RowLayout {
+                        spacing: Theme.sp2
+                        Rectangle {
+                            width: 10; height: 10; radius: 5
+                            color: Theme.success
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            text: page.updateStatus
+                            color: Theme.textStrong
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontHeading
+                            font.weight: Font.Medium
+                        }
                     }
                 }
             }
+
+            // ----- Quick actions rail -------------------------------------
+            CardFrame {
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.sp8
+                Layout.rightMargin: Theme.sp8
+                Layout.bottomMargin: Theme.sp6
+                title: "Quick actions"
+                subtitle: "Common tasks you can run right now"
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns: 4
+                    columnSpacing: Theme.sp3
+                    rowSpacing: Theme.sp3
+
+                    Repeater {
+                        model: [
+                            { title: "Quick scan",       desc: "Common locations", target: 0 },
+                            { title: "Full system scan", desc: "All drives",       target: 1 },
+                            { title: "Custom scan",      desc: "Pick a path",      target: 2 },
+                            { title: "Memory scan",      desc: "Running processes",target: 3 }
+                        ]
+                        delegate: Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 72
+                            radius: Theme.radiusSm
+                            color: hover.hovered ? Theme.bg3 : Theme.bg2
+                            border.color: hover.hovered ? Theme.accentAlt : Theme.stroke
+                            border.width: 1
+                            Behavior on color        { ColorAnimation { duration: Theme.motionFast } }
+                            Behavior on border.color { ColorAnimation { duration: Theme.motionFast } }
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: Theme.sp3
+                                spacing: 2
+                                Text {
+                                    text: modelData.title
+                                    color: Theme.textStrong
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontBody
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: modelData.desc
+                                    color: Theme.textMuted
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSmall
+                                }
+                            }
+
+                            HoverHandler { id: hover }
+                            TapHandler { onTapped: page.openScanTab() }
+                        }
+                    }
+                }
+            }
+
+            Item { Layout.fillHeight: true }
         }
-
-        // Summary row
-        GridLayout {
-            Layout.fillWidth: true
-            columns: 3
-            columnSpacing: Theme.sp4
-            rowSpacing:    Theme.sp4
-
-            CardFrame {
-                title: "Last scan"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 92
-                Text {
-                    text: page.lastScan
-                    color: Theme.textMuted
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontBody
-                }
-            }
-            CardFrame {
-                title: "Threats blocked (7d)"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 92
-                Text {
-                    text: page.threatsBlocked7d
-                    color: Theme.text
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontTitle
-                    font.weight: Font.DemiBold
-                }
-            }
-            CardFrame {
-                title: "Updates"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 92
-                Text {
-                    text: page.updateStatus
-                    color: Theme.textMuted
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontBody
-                }
-            }
-        }
-
-        Item { Layout.fillHeight: true }
     }
 }
