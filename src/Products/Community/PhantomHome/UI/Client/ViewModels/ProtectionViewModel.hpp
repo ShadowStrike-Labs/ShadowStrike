@@ -43,6 +43,12 @@ class ProtectionViewModel : public QObject {
     Q_PROPERTY(int     threatsBlocked7d   READ threatsBlocked7d   NOTIFY stateChanged)
     Q_PROPERTY(QString updateStatus       READ updateStatus       NOTIFY stateChanged)
 
+    // Engine-health atoms (populated from ProtectionStateReply).
+    Q_PROPERTY(bool    sensorOk           READ sensorOk           NOTIFY stateChanged)
+    Q_PROPERTY(QString sensorReason       READ sensorReason       NOTIFY stateChanged)
+    Q_PROPERTY(int     cortexActive       READ cortexActive       NOTIFY stateChanged)
+    Q_PROPERTY(int     cortexTotal        READ cortexTotal        NOTIFY stateChanged)
+
     Q_PROPERTY(double  cpuPct             READ cpuPct             NOTIFY perfChanged)
     Q_PROPERTY(double  memPct             READ memPct             NOTIFY perfChanged)
     Q_PROPERTY(bool    gameModeActive     READ gameModeActive     NOTIFY perfChanged)
@@ -66,6 +72,11 @@ public:
     QString lastScan()         const { return m_lastScan; }
     int     threatsBlocked7d() const { return m_threatsBlocked7d; }
     QString updateStatus()     const { return m_updateStatus; }
+
+    bool    sensorOk()     const { return m_sensorOk; }
+    QString sensorReason() const { return m_sensorReason; }
+    int     cortexActive() const { return m_cortexActive; }
+    int     cortexTotal()  const { return m_cortexTotal; }
 
     double  cpuPct()             const { return m_cpuPct; }
     double  memPct()             const { return m_memPct; }
@@ -91,7 +102,9 @@ signals:
 private:
     // Inbound wire handlers (invoked on GUI thread via QueuedConnection)
     Q_INVOKABLE void onStateReply(QString state, QString reason,
-                                  int activeThreats, qint64 lastUpdateUnix);
+                                  int activeThreats, qint64 lastUpdateUnix,
+                                  bool sensorOk, QString sensorReason,
+                                  int cortexActive, int cortexTotal);
     Q_INVOKABLE void onDetectionPush(QString title, QString module,
                                      QString severity);
     Q_INVOKABLE void onConnectionChanged(bool connected);
@@ -107,6 +120,11 @@ private:
     QString m_lastScan         = "—";
     int     m_threatsBlocked7d = 0;
     QString m_updateStatus     = "Checking…";
+
+    bool    m_sensorOk     = false;
+    QString m_sensorReason = "probing";
+    int     m_cortexActive = 0;
+    int     m_cortexTotal  = 0;
 
     double  m_cpuPct       = 0.0;
     double  m_memPct       = 0.0;

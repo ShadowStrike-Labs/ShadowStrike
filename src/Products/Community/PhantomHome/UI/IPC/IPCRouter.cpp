@@ -28,6 +28,14 @@
 #include "PhantomCore/Core/Engine/QuarantineManager.hpp"
 #include "PhantomCore/Config/ConfigManager.hpp"
 #include "PhantomCore/Update/UpdateManager.hpp"
+#include "PhantomCore/AI/PhantomCortex.hpp"
+
+// Kernel-sensor / service-controller probes (Win32 only; this file is
+// Windows-only by design so the guard is belt-and-braces).
+#if defined(_WIN32)
+#include <Windows.h>
+#include <winsvc.h>
+#endif
 
 namespace ShadowStrike::PhantomHome::IPC {
 
@@ -55,6 +63,83 @@ constexpr std::size_t kQuarantineListCap = 8192;
         case OS::Registered:    return ModuleState::Disabled;
         case OS::Failed:        return ModuleState::Failed;
         default:                return ModuleState::Disabled;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine-health probes (cheap, called once per GetState reply).
+// ---------------------------------------------------------------------------
+
+/// Probe the PhantomSensor kernel-mode driver via SCM.
+/// Writes @p reason with a short actionable hint when not Running.
+[[nodiscard]] bool ProbeKernelSensor(std::string& reason) noexcept {
+#if defined(_WIN32)
+    reason.clear();
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm == nullptr) {
+        reason = "service manager unavailable";
+        return false;
+    }
+    SC_HANDLE svc = ::OpenServiceW(scm, L"PhantomSensor",
+                                   SERVICE_QUERY_STATUS);
+    if (svc == nullptr) {
+        const DWORD err = ::GetLastError();
+        ::CloseServiceHandle(scm);
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
+            reason = "driver not installed";
+        } else if (err == ERROR_ACCESS_DENIED) {
+            reason = "cannot query driver (access denied)";
+        } else {
+            reason = "driver query failed";
+        }
+        return false;
+    }
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD bytesNeeded = 0;
+    const BOOL ok = ::QueryServiceStatusEx(
+        svc, SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytesNeeded);
+    ::CloseServiceHandle(svc);
+    ::CloseServiceHandle(scm);
+    if (!ok) {
+        reason = "driver status unavailable";
+        return false;
+    }
+    if (ssp.dwCurrentState == SERVICE_RUNNING) {
+        return true;
+    }
+    // Distinguish the two most common "not running" cases so the UI can
+    // give the user an actionable next step.
+    switch (ssp.dwCurrentState) {
+        case SERVICE_STOPPED:         reason = "driver not started"; break;
+        case SERVICE_START_PENDING:   reason = "driver starting";    break;
+        case SERVICE_STOP_PENDING:    reason = "driver stopping";    break;
+        case SERVICE_PAUSED:          reason = "driver paused";      break;
+        default:                      reason = "driver not running"; break;
+    }
+    return false;
+#else
+    reason = "kernel sensor not available on this platform";
+    return false;
+#endif
+}
+
+/// Count the number of active Cortex model slots (graceful if Cortex
+/// hasn't been initialised yet — returns 0/0).
+void ProbeCortex(std::uint32_t& active, std::uint32_t& total) noexcept {
+    active = 0;
+    total  = 0;
+    try {
+        auto& cortex = ::ShadowStrike::AI::PhantomCortex::Instance();
+        auto versions = cortex.GetModelVersions();
+        total = static_cast<std::uint32_t>(versions.size());
+        for (const auto& slot : versions) {
+            if (slot.has_value()) ++active;
+        }
+    } catch (...) {
+        // Cortex singleton not available or threw — treat as "not probed".
+        active = 0;
+        total  = 0;
     }
 }
 
@@ -502,6 +587,22 @@ void IPCRouter::HandleGetState(ClientContext&, const FrameEnvelope&,
     } else {
         r.state  = OverallState::Green;
         r.reason = {};
+    }
+
+    // Populate engine-health atoms (cheap probes, one per reply).
+    r.sensor_ok = ProbeKernelSensor(r.sensor_reason);
+    ProbeCortex(r.cortex_active, r.cortex_total);
+
+    // A missing kernel sensor or zero-model Cortex demotes green to amber
+    // so the user-facing traffic light is honest about pipeline gaps.
+    if (r.state == OverallState::Green &&
+        (!r.sensor_ok || (r.cortex_total > 0 && r.cortex_active == 0))) {
+        r.state = OverallState::Amber;
+        if (r.reason.empty()) {
+            r.reason = !r.sensor_ok
+                ? std::string("kernel sensor not running")
+                : std::string("AI models not loaded");
+        }
     }
 
     reply_type    = MessageType::GetStateReply;
