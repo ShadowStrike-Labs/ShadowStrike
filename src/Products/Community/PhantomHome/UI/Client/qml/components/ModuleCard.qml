@@ -6,29 +6,29 @@ import "../Theming"
 /*
  * ModuleCard
  * ----------
- * Kaspersky-class visual representation of a single protection module.
+ * Kaspersky-class tile for a single protection module.
  *
- *   +---------------------------------------------------------------+
- *   | [icon]  Module display name                    (●) status    |
- *   |         short human description                 [Configure ⚙]|
- *   |                                                  [ toggle ]  |
- *   +---------------------------------------------------------------+
+ *   +-----------------------------------------------------------------+
+ *   | [icon]  Module display name                    (●) Running      |
+ *   |         short human description                 [cog]  [toggle] |
+ *   +-----------------------------------------------------------------+
  *
- * The card is intentionally tall (88 px) so the icon + two-line copy
- * and the status cluster can breathe. Hover lifts the card with a blue
- * rim. Focus lights the same rim in accent for keyboard navigation.
+ * The whole tile body is a click surface that emits detailRequested()
+ * so the parent page can push a detail view onto its StackView. The
+ * cog and toggle stop propagation so they keep their own affordances.
  *
  * Inputs
  *   moduleId     : string  – stable module id (e.g. "RansomwareProtection")
- *   displayName  : string  – human name
+ *   displayName  : string  – human name shipped by the service
  *   description  : string  – one-line explanation ("what this does")
  *   state        : string  – "running" | "degraded" | "disabled"
  *   enabled      : bool    – current on/off
- *   glyph        : string  – icon codepoint (Unicode symbol)
+ *   iconName     : string  – Iconed logical name ("shield", "lock", ...)
  *
  * Signals
- *   toggled(bool enabled)
- *   configureRequested()
+ *   toggled(bool enabled)       – master switch flipped
+ *   configureRequested()        – cog tapped (opens fine-tune dialog)
+ *   detailRequested()           – tile body tapped (drill into detail)
  */
 Rectangle {
     id: root
@@ -38,13 +38,14 @@ Rectangle {
     property string description: ""
     property string state:       "running"
     property bool   enabled:     true
-    property string glyph:       "\u25A0"
+    property string iconName:    "shield"
 
     signal toggled(bool enabled)
     signal configureRequested()
+    signal detailRequested()
 
     Layout.fillWidth: true
-    implicitHeight: 92
+    implicitHeight: 94
 
     radius: Theme.radiusMd
     color: hover.hovered ? Theme.bg3 : Theme.bg2
@@ -56,9 +57,15 @@ Rectangle {
 
     HoverHandler { id: hover }
 
-    Accessible.role: Accessible.Pane
+    // Click the body (but not the gear / toggle) to drill in.
+    TapHandler {
+        acceptedButtons: Qt.LeftButton
+        onTapped: root.detailRequested()
+    }
+
+    Accessible.role: Accessible.Button
     Accessible.name: displayName
-    Accessible.description: description
+    Accessible.description: qsTr("%1. Click to view settings.").arg(description)
 
     // Soft status bar on the left edge — green / amber / grey.
     Rectangle {
@@ -79,32 +86,30 @@ Rectangle {
         anchors.rightMargin: Theme.sp4
         spacing: Theme.sp4
 
-        // ---- Icon tile -----------------------------------------------
+        // ---- Icon chip -----------------------------------------------
         Rectangle {
-            Layout.preferredWidth: 48
-            Layout.preferredHeight: 48
+            Layout.preferredWidth: 50
+            Layout.preferredHeight: 50
             radius: Theme.radiusSm
             gradient: Gradient {
                 GradientStop { position: 0.0; color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.22) }
-                GradientStop { position: 1.0; color: Qt.rgba(Theme.accentDeep.r, Theme.accentDeep.g, Theme.accentDeep.b, 0.25) }
+                GradientStop { position: 1.0; color: Qt.rgba(Theme.accentDeep.r, Theme.accentDeep.g, Theme.accentDeep.b, 0.28) }
             }
             border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.35)
             border.width: 1
 
-            Text {
+            Iconed {
                 anchors.centerIn: parent
-                text: root.glyph
-                color: Theme.accentAlt
-                font.family: Theme.fontFamily
-                font.pixelSize: 22
-                font.bold: true
+                iconName: root.iconName
+                size: 26
+                tint: root.state === "disabled" ? Theme.textMuted : Theme.accentAlt
             }
         }
 
         // ---- Name + description --------------------------------------
         ColumnLayout {
             Layout.fillWidth: true
-            spacing: 2
+            spacing: 3
 
             RowLayout {
                 Layout.fillWidth: true
@@ -120,7 +125,6 @@ Rectangle {
                     Layout.fillWidth: true
                 }
 
-                // Status dot + label cluster.
                 Rectangle {
                     width: 8; height: 8; radius: 4
                     color: root.state === "running"  ? Theme.success
@@ -155,8 +159,8 @@ Rectangle {
         // ---- Configure (gear) ----------------------------------------
         AbstractButton {
             id: gearBtn
-            implicitWidth: 34
-            implicitHeight: 34
+            implicitWidth: 36
+            implicitHeight: 36
             hoverEnabled: true
             focusPolicy: Qt.TabFocus
             onClicked: root.configureRequested()
@@ -179,12 +183,10 @@ Rectangle {
                 border.width: 1
                 Behavior on color { ColorAnimation { duration: Theme.motionFast } }
             }
-            contentItem: Text {
-                text: "\u2699"
-                anchors.centerIn: parent
-                color: gearBtn.hovered ? Theme.accentAlt : Theme.textMuted
-                font.family: Theme.fontFamily
-                font.pixelSize: 18
+            contentItem: Iconed {
+                iconName: "cog"
+                size: 18
+                tint: gearBtn.hovered ? Theme.accentAlt : Theme.textMuted
             }
         }
 
