@@ -16,5 +16,6 @@
         <file>pages/ReportsPage.qml</file>
         <file>pages/SettingsPage.qml</file>
         <file>assets/logo.svg</file>
+        <file>assets/logo.png</file>
     </qresource>
 </RCC>
