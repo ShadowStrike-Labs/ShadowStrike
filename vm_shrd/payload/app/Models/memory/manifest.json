@@ -1,0 +1,8 @@
+{
+    "slot": "memory",
+    "status": "pending-training",
+    "version": { "major": 0, "minor": 0, "patch": 0 },
+    "sha256": null,
+    "trained_at": null,
+    "notes": "Placeholder manifest. Drop a trained current.onnx beside this file and replace sha256/version/trained_at to activate this Cortex slot."
+}

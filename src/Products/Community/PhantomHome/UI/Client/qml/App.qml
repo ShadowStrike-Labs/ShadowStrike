@@ -195,6 +195,12 @@ ApplicationWindow {
             SecurityPage {
                 modules: protectionVm ? protectionVm.modules : []
                 onSetModuleEnabled: (id, on) => { if (protectionVm) protectionVm.setModuleEnabled(id, on) }
+                onSetDetectionAction: (id, action) => {
+                    if (protectionVm && protectionVm.setDetectionAction) protectionVm.setDetectionAction(id, action)
+                }
+                onConfigureModule: (id, payload) => {
+                    if (protectionVm && protectionVm.configureModule) protectionVm.configureModule(id, payload)
+                }
             }
             PerformancePage {
                 cpuPct:             protectionVm ? protectionVm.cpuPct             : 0.0
