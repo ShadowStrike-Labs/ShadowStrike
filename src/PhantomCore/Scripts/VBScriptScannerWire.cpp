@@ -11,6 +11,9 @@
 #include "pch.h"
 #include "VBScriptScanner.hpp"
 #include "../Utils/Logger.hpp"
+#include <filesystem>
+#include <algorithm>
+#include <cwctype>
 
 namespace ShadowStrike::Scripts::Wiring::Internal {
 
@@ -36,6 +39,27 @@ void VBScriptScanner_Shutdown() noexcept {
     } catch (...) {
         Utils::Logger::Error("ScriptsWiring: VBScriptScanner shutdown unknown exception");
     }
+}
+
+bool VBScriptScanner_ScanFile(const std::wstring& filePath,
+                              const std::wstring& lowerExt) noexcept {
+    try {
+        std::filesystem::path p{filePath};
+        VBSScanResult result{};
+        if (lowerExt == L".vbe") {
+            result = VBScriptScanner::Instance().ScanEncodedVBE(p);
+        } else if (lowerExt == L".wsf" || lowerExt == L".wsh") {
+            result = VBScriptScanner::Instance().ScanWSF(p);
+        } else if (lowerExt == L".hta") {
+            result = VBScriptScanner::Instance().ScanHTA(p);
+        } else {
+            result = VBScriptScanner::Instance().ScanFile(p);
+        }
+        return result.isMalicious;
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("ScriptsWiring: VBS ScanFile exception: {}", e.what());
+    } catch (...) {}
+    return false;
 }
 
 }  // namespace ShadowStrike::Scripts::Wiring::Internal

@@ -11,6 +11,7 @@
 #include "pch.h"
 #include "JavaScriptScanner.hpp"
 #include "../Utils/Logger.hpp"
+#include <filesystem>
 
 namespace ShadowStrike::Scripts::Wiring::Internal {
 
@@ -36,6 +37,17 @@ void JavaScriptScanner_Shutdown() noexcept {
     } catch (...) {
         Utils::Logger::Error("ScriptsWiring: JavaScriptScanner shutdown unknown exception");
     }
+}
+
+bool JavaScriptScanner_ScanFile(const std::wstring& filePath) noexcept {
+    try {
+        const auto result = JavaScriptScanner::Instance().ScanFile(
+            std::filesystem::path{filePath});
+        return result.isMalicious;
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("ScriptsWiring: JS ScanFile exception: {}", e.what());
+    } catch (...) {}
+    return false;
 }
 
 }  // namespace ShadowStrike::Scripts::Wiring::Internal

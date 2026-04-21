@@ -42,6 +42,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cstddef>
+#include <string>
+
 namespace ShadowStrike::Ransomware::Wiring {
 
 /**
@@ -61,5 +65,50 @@ namespace ShadowStrike::Ransomware::Wiring {
  *        modules are swallowed and logged.
  */
 void ShutdownRansomwareSubsystem() noexcept;
+
+// ============================================================================
+// KERNEL EVENT DISPATCH  (called from RealTimeProtection's kernel handlers)
+//
+// Each dispatch routes a single kernel-observed event into every ransomware
+// module that has a matching entry point. Signatures use only primitive
+// types and std::wstring so the header can be included from TUs that must
+// not pull in any module header (ODR isolation).
+//
+// All dispatches are noexcept; individual module failures are swallowed and
+// logged. None of them block the caller.
+// ============================================================================
+
+/**
+ * @brief A process just wrote to @p filePath. Runs the behavioral write
+ *        analysis (RansomwareDetector::AnalyzeWrite), the family-specific
+ *        detectors (LockyDetector::OnFileWrite), and the honeypot tripwire
+ *        (HoneypotManager::OnHoneypotAccessed when @p filePath matches a
+ *        registered decoy).
+ */
+void DispatchFileWrite(std::uint32_t pid,
+                       const std::wstring& filePath,
+                       const std::wstring& processName) noexcept;
+
+/// Process @p pid renamed @p oldPath to @p newPath.
+void DispatchFileRename(std::uint32_t pid,
+                        const std::wstring& oldPath,
+                        const std::wstring& newPath) noexcept;
+
+/// Process @p pid deleted @p filePath.
+void DispatchFileDelete(std::uint32_t pid,
+                        const std::wstring& filePath) noexcept;
+
+/// Kernel reported a process creation / termination event.
+void DispatchProcessNotify(std::uint32_t pid,
+                           std::uint32_t parentPid,
+                           const std::wstring& imagePath,
+                           const std::wstring& commandLine,
+                           bool isCreation) noexcept;
+
+/// Kernel reported an image (DLL / driver / exe) load.
+void DispatchImageLoad(std::uint32_t pid,
+                       const std::wstring& imagePath,
+                       std::uintptr_t imageBase,
+                       std::size_t imageSize) noexcept;
 
 }  // namespace ShadowStrike::Ransomware::Wiring
