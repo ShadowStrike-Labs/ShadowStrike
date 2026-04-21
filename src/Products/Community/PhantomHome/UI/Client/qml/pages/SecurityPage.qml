@@ -257,7 +257,7 @@ Item {
                                 settingsDialog.moduleId    = modelData.id
                                 settingsDialog.displayName = modelData.displayName
                                 settingsDialog.description = page.metaFor(modelData.id).desc
-                                settingsDialog.enabled     = modelData.enabled === true
+                                settingsDialog.moduleEnabled = modelData.enabled === true
                                 settingsDialog.sensitivity = 1
                                 settingsDialog.action      = 1
                                 settingsDialog.exclusions  = ""

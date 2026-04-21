@@ -33,7 +33,7 @@ Popup {
     property string moduleId:    ""
     property string displayName: ""
     property string description: ""
-    property bool   enabled:     true
+    property bool   moduleEnabled: true
     property int    sensitivity: 1                    // 0=Low 1=Balanced 2=High
     property int    action:      1                    // 0=Ask 1=Quarantine 2=Delete 3=LogOnly
     property string exclusions:  ""
@@ -192,9 +192,9 @@ Popup {
                             }
                         }
                         Switch {
-                            checked: root.enabled
+                            checked: root.moduleEnabled
                             focusPolicy: Qt.StrongFocus
-                            onToggled: root.enabled = checked
+                            onToggled: root.moduleEnabled = checked
                             Accessible.name: qsTr("%1 enabled").arg(root.displayName)
                         }
                     }
@@ -404,7 +404,7 @@ Popup {
                     onClicked: {
                         root.applied({
                             "id":          root.moduleId,
-                            "enabled":     root.enabled,
+                            "enabled":     root.moduleEnabled,
                             "sensitivity": root.sensitivity,
                             "action":      root.action,
                             "exclusions":  root.exclusions
