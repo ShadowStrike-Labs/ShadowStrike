@@ -5,16 +5,14 @@ import "../Theming"
 /*
  * PrimaryButton
  * -------------
- * The single visual treatment used for "this is the main action on the
- * page" - Fast Scan, Check for Updates, Resolve Now. Uses the primary
- * electric-blue accent with a subtle gradient and press/hover states.
- *
- * Use SecondaryButton for anything that isn't the dominant action.
+ * Flat, pill-ish primary action button. Single-tone fill (blue or red
+ * for destructive), quiet hover/press states. This is the only "loud"
+ * button style in the app - used for the dominant action on a page.
  */
 Button {
     id: root
-    implicitHeight: 40
-    implicitWidth: Math.max(148, contentItem.implicitWidth + Theme.sp8)
+    implicitHeight: 38
+    implicitWidth: Math.max(128, contentItem.implicitWidth + Theme.sp8)
     focusPolicy: Qt.StrongFocus
     hoverEnabled: true
 
@@ -23,23 +21,21 @@ Button {
     background: Rectangle {
         anchors.fill: parent
         radius: Theme.radiusSm
-        gradient: Gradient {
-            GradientStop { position: 0.0
-                color: root.danger
-                       ? (root.pressed ? "#C72D47" : root.hovered ? "#FF5F7C" : "#FF4F6E")
-                       : (root.pressed ? Theme.accentPress : root.hovered ? Theme.accentHover : Theme.accent)
-            }
-            GradientStop { position: 1.0
-                color: root.danger
-                       ? (root.pressed ? "#9B1B32" : "#E0355A")
-                       : (root.pressed ? "#153F91" : root.hovered ? "#2F7BE0" : "#1F5ECC")
-            }
+        color: root.danger
+               ? (root.pressed ? "#B91C1C" : root.hovered ? "#F87171" : Theme.danger)
+               : (root.pressed ? Theme.accentPress : root.hovered ? Theme.accentHover : Theme.accent)
+        Behavior on color { ColorAnimation { duration: Theme.motionFast } }
+
+        // Focus ring - rendered as a soft second outline, not a hard border.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.color: root.activeFocus
+                          ? Qt.rgba(1, 1, 1, 0.45)
+                          : "transparent"
+            border.width: 2
         }
-        border.color: root.activeFocus
-                      ? Qt.lighter(root.danger ? Theme.danger : Theme.accent, 1.35)
-                      : Qt.rgba(1, 1, 1, 0.10)
-        border.width: 1
-        Behavior on border.color { ColorAnimation { duration: Theme.motionFast } }
     }
 
     contentItem: Text {
@@ -51,7 +47,7 @@ Button {
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment:   Text.AlignVCenter
         elide: Text.ElideRight
-        leftPadding:  Theme.sp4
-        rightPadding: Theme.sp4
+        leftPadding:  Theme.sp5
+        rightPadding: Theme.sp5
     }
 }

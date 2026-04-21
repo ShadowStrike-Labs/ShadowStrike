@@ -5,9 +5,9 @@ import "../Theming"
 /*
  * SecondaryButton
  * ---------------
- * Low-emphasis action. Ghost style: transparent with a 1 px border that
- * brightens on hover. Used whenever PrimaryButton would be too loud
- * (Cancel, Restore, Delete in tables, navigation secondaries).
+ * Low-emphasis action. Borderless at rest; hover surfaces a faint tonal
+ * fill. Accent text color on hover to signal interactivity. Used for
+ * Cancel, Restore, View Details, and any non-primary CTA.
  */
 Button {
     id: root
@@ -24,23 +24,20 @@ Button {
         color: root.pressed
                ? (root.danger ? Theme.overlayDanger : Theme.overlayPressed)
                : root.hovered
-                  ? (root.danger ? Qt.rgba(1, 0.31, 0.43, 0.08) : Theme.overlayHover)
+                  ? (root.danger ? Qt.rgba(0.94, 0.27, 0.27, 0.10) : Theme.overlayHover)
                   : "transparent"
         border.color: root.activeFocus
                       ? (root.danger ? Theme.danger : Theme.accent)
-                      : root.hovered
-                         ? (root.danger ? Theme.danger : Theme.accentAlt)
-                         : Theme.stroke
-        border.width: 1
-        Behavior on color        { ColorAnimation { duration: Theme.motionFast } }
-        Behavior on border.color { ColorAnimation { duration: Theme.motionFast } }
+                      : "transparent"
+        border.width: root.activeFocus ? 2 : 0
+        Behavior on color { ColorAnimation { duration: Theme.motionFast } }
     }
 
     contentItem: Text {
         text: root.text
         color: root.danger
                ? (root.hovered ? Theme.danger : Qt.lighter(Theme.danger, 1.1))
-               : root.hovered ? Theme.text : Theme.textMuted
+               : root.hovered ? Theme.accentAlt : Theme.textMuted
         font.family: Theme.fontFamily
         font.pixelSize: Theme.fontBody
         font.weight: Font.Medium

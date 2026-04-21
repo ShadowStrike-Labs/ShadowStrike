@@ -9,14 +9,15 @@ import "pages"
 /*
  * Root application window for ShadowStrike Phantom Home.
  *
- * - Frameless, draggable via the title bar.
- * - Fixed-aspect 1240 x 760 DIP on Community. Not resizable.
- * - All visual styling comes from Theme; nothing hard-codes colors.
+ * Frameless, borderless, tone-driven chrome. The window itself is a
+ * single deep surface with rounded corners; the title bar carries the
+ * search field and window controls, the left rail hosts navigation,
+ * and the page stack fills the rest.
  */
 ApplicationWindow {
     id: root
-    width: 1240
-    height: 760
+    width: 1280
+    height: 800
     minimumWidth: 1240
     minimumHeight: 760
     visible: true
@@ -26,59 +27,43 @@ ApplicationWindow {
 
     Accessible.role: Accessible.Window
     Accessible.name: qsTr("ShadowStrike Phantom Home")
-    Accessible.description: qsTr("ShadowStrike Phantom Home main window. Use Tab to move between controls.")
 
-    // Injected from main.cpp (ProtectionViewModel)
+    // Injected from main.cpp (ProtectionViewModel).
     property var protectionVm: null
+
+    // Currently-visible page index. Drives both Sidebar highlight and
+    // the StackLayout below. Bound both ways via Sidebar's navigate().
+    property int currentPage: 0
 
     // --- Rounded window surface -------------------------------------------
     Rectangle {
         id: surface
         anchors.fill: parent
         radius: Theme.radiusLg
-        border.color: Theme.stroke
-        border.width: 1
-        gradient: Gradient {
-            GradientStop { position: 0.0; color: Theme.bgGradTop }
-            GradientStop { position: 1.0; color: Theme.bgGradBot }
-        }
+        color: Theme.bg0
+        border.width: 0
 
-        // Subtle top accent line (1 px) - helps the chrome read as a window
-        // rather than a flat panel.
+        // Very subtle top accent glow - a whisper of blue, not a line.
         Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
             anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
             anchors.topMargin: 1
-            anchors.leftMargin: Theme.radiusLg
-            anchors.rightMargin: Theme.radiusLg
+            width: parent.width * 0.45
             height: 1
-            color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.35)
+            color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.30)
         }
     }
 
     // --- Title bar --------------------------------------------------------
-    Rectangle {
+    Item {
         id: titleBar
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
+        anchors.leftMargin: Theme.sidebarWidth
         height: Theme.titleBarHeight
-        color: Theme.bgHeader
-        radius: Theme.radiusLg
 
-        // The bottom corners of the title bar must not be rounded - square
-        // them off with a second rectangle matching the title bar color.
-        Rectangle {
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            height: parent.height / 2
-            color: parent.color
-        }
-
-        // Draggable area covers the full bar, but stops short of the window
-        // control buttons on the right so clicks there land on the buttons.
+        // Drag area (stops short of the window controls on the right).
         MouseArea {
             anchors.left: parent.left
             anchors.right: windowControls.left
@@ -86,108 +71,103 @@ ApplicationWindow {
             anchors.bottom: parent.bottom
             acceptedButtons: Qt.LeftButton
             onPressed: root.startSystemMove()
-            onDoubleClicked: {
-                // Ignore double click on Community (non-resizable window).
-            }
         }
 
-        Row {
+        // Search input (centered, narrow, top-of-page).
+        Rectangle {
+            id: search
             anchors.left: parent.left
+            anchors.leftMargin: Theme.sp5
             anchors.verticalCenter: parent.verticalCenter
-            anchors.leftMargin: Theme.sp4
-            spacing: Theme.sp2
+            width: 280
+            height: 30
+            radius: 15
+            color: Theme.bg2
 
-            // Accent mark - a tiny blue square to brand the chrome.
-            Rectangle {
-                width: 10; height: 10
-                radius: 2
-                anchors.verticalCenter: parent.verticalCenter
-                color: Theme.accent
-            }
             Text {
-                text: "ShadowStrike Phantom"
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.sp3
                 anchors.verticalCenter: parent.verticalCenter
+                text: "\uD83D\uDD0D"      // magnifier
+                color: Theme.textMuted
+                font.pixelSize: 12
+            }
+            TextInput {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Theme.sp6 + 6
+                anchors.rightMargin: Theme.sp3
                 color: Theme.text
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontBody
-                font.weight: Font.DemiBold
-            }
-            Rectangle {
-                width: 1; height: 14
-                anchors.verticalCenter: parent.verticalCenter
-                color: Theme.stroke
-            }
-            Text {
-                text: "Home"
-                anchors.verticalCenter: parent.verticalCenter
-                color: Theme.textMuted
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fontSmall
+                selectByMouse: true
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Search (Ctrl+F)")
+                    color: Theme.textDim
+                    font: parent.font
+                    visible: !parent.text && !parent.activeFocus
+                }
             }
         }
 
-        // --- Window controls (visible, hover-highlighted) -----------------
+        // Window controls (min / close). No maximize on Community.
         Row {
             id: windowControls
             anchors.right: parent.right
-            anchors.rightMargin: Theme.sp2
+            anchors.rightMargin: Theme.sp3
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2
 
             IconButton {
-                glyph: "\u2212"               // minus (minimize)
+                glyph: "\u2212"
                 onClicked: root.showMinimized()
                 Accessible.name: qsTr("Minimize")
-                Accessible.description: qsTr("Minimize the ShadowStrike Phantom window")
             }
             IconButton {
-                glyph: "\u2715"               // multiplication X (close)
+                glyph: "\u2715"
                 danger: true
                 onClicked: root.close()
                 Accessible.name: qsTr("Close")
-                Accessible.description: qsTr("Close the ShadowStrike Phantom window")
             }
-        }
-
-        // Bottom hairline between title bar and main body.
-        Rectangle {
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            height: 1
-            color: Theme.stroke
         }
     }
 
     // --- Main body: sidebar + page stack ----------------------------------
     RowLayout {
-        anchors.top: titleBar.bottom
+        anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
+        anchors.topMargin: 1        // keep accent glow visible
         spacing: 0
 
         Sidebar {
             id: sidebar
             Layout.preferredWidth: Theme.sidebarWidth
             Layout.fillHeight: true
-            selectedIndex: 0
-            onNavigate: (i) => stack.currentIndex = i
+            selectedIndex: root.currentPage
+            engineOnline: protectionVm ? protectionVm.sensorOk : true
+            onNavigate: (i) => root.currentPage = i
+            onOpenSettings: root.currentPage = 7
         }
 
+        // Page stack begins below the title bar row.
         StackLayout {
             id: stack
             Layout.fillWidth: true
             Layout.fillHeight: true
-            currentIndex: 0
+            Layout.topMargin: Theme.titleBarHeight
+            currentIndex: root.currentPage
 
             MainPage {
                 protectionState:  protectionVm ? protectionVm.protectionState  : "green"
-                stateCopy:        protectionVm ? protectionVm.stateCopy        : "You are protected"
-                stateSubCopy:     protectionVm ? protectionVm.stateSubCopy     : "Real-time protection is active."
-                lastScan:         protectionVm ? protectionVm.lastScan         : "—"
+                stateCopy:        protectionVm ? protectionVm.stateCopy        : qsTr("You are protected")
+                stateSubCopy:     protectionVm ? protectionVm.stateSubCopy     : qsTr("Real-time protection is active.")
+                lastScan:         protectionVm ? protectionVm.lastScan         : "\u2014"
                 threatsBlocked7d: protectionVm ? protectionVm.threatsBlocked7d : 0
-                updateStatus:     protectionVm ? protectionVm.updateStatus     : "Checking for updates…"
+                updateStatus:     protectionVm ? protectionVm.updateStatus     : qsTr("Checking for updates\u2026")
                 sensorOk:         protectionVm ? protectionVm.sensorOk         : false
                 sensorReason:     protectionVm ? protectionVm.sensorReason     : ""
                 cortexActive:     protectionVm ? protectionVm.cortexActive     : 0
@@ -195,20 +175,16 @@ ApplicationWindow {
                 modules:          protectionVm ? protectionVm.modules          : []
                 recentEvents:     protectionVm ? protectionVm.recentEvents     : []
                 onStartFastScan:    if (protectionVm) protectionVm.startFastScan()
-                onOpenScanTab:      stack.currentIndex = 4
-                onOpenUpdateTab:    stack.currentIndex = 7
-                onOpenSecurityTab:  stack.currentIndex = 1
-                onOpenReportsTab:   stack.currentIndex = 6
+                onOpenScanTab:      root.currentPage = 4
+                onOpenUpdateTab:    root.currentPage = 7
+                onOpenSecurityTab:  root.currentPage = 1
+                onOpenReportsTab:   root.currentPage = 6
             }
             SecurityPage {
                 modules: protectionVm ? protectionVm.modules : []
-                onSetModuleEnabled: (id, on) => { if (protectionVm) protectionVm.setModuleEnabled(id, on) }
-                onSetDetectionAction: (id, action) => {
-                    if (protectionVm && protectionVm.setDetectionAction) protectionVm.setDetectionAction(id, action)
-                }
-                onConfigureModule: (id, payload) => {
-                    if (protectionVm && protectionVm.configureModule) protectionVm.configureModule(id, payload)
-                }
+                onSetModuleEnabled:   (id, on)      => { if (protectionVm) protectionVm.setModuleEnabled(id, on) }
+                onSetDetectionAction: (id, action)  => { if (protectionVm && protectionVm.setDetectionAction) protectionVm.setDetectionAction(id, action) }
+                onConfigureModule:    (id, payload) => { if (protectionVm && protectionVm.configureModule) protectionVm.configureModule(id, payload) }
             }
             PerformancePage {
                 cpuPct:             protectionVm ? protectionVm.cpuPct             : 0.0

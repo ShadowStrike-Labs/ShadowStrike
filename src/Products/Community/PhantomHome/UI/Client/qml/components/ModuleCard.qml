@@ -6,29 +6,18 @@ import "../Theming"
 /*
  * ModuleCard
  * ----------
- * Kaspersky-class tile for a single protection module.
+ * Kaspersky-class tile for a single protection module. Borderless;
+ * depth comes from tonal steps (bg2 -> bg3 on hover). A soft status
+ * bar on the left edge signals running / degraded / disabled.
  *
  *   +-----------------------------------------------------------------+
- *   | [icon]  Module display name                    (●) Running      |
- *   |         short human description                 [cog]  [toggle] |
+ *   |  [icon chip]  Module display name          (dot) Running  [cog] |
+ *   |               short human description                   [toggle]|
  *   +-----------------------------------------------------------------+
  *
- * The whole tile body is a click surface that emits detailRequested()
- * so the parent page can push a detail view onto its StackView. The
- * cog and toggle stop propagation so they keep their own affordances.
- *
- * Inputs
- *   moduleId     : string  – stable module id (e.g. "RansomwareProtection")
- *   displayName  : string  – human name shipped by the service
- *   description  : string  – one-line explanation ("what this does")
- *   state        : string  – "running" | "degraded" | "disabled"
- *   enabled      : bool    – current on/off
- *   iconName     : string  – Iconed logical name ("shield", "lock", ...)
- *
- * Signals
- *   toggled(bool enabled)       – master switch flipped
- *   configureRequested()        – cog tapped (opens fine-tune dialog)
- *   detailRequested()           – tile body tapped (drill into detail)
+ * The tile body is a click surface that emits detailRequested() so the
+ * parent page can push a detail view onto its StackView. The cog and
+ * toggle keep their own affordances and stop propagation.
  */
 Rectangle {
     id: root
@@ -45,19 +34,16 @@ Rectangle {
     signal detailRequested()
 
     Layout.fillWidth: true
-    implicitHeight: 94
+    implicitHeight: 96
 
     radius: Theme.radiusMd
     color: hover.hovered ? Theme.bg3 : Theme.bg2
-    border.color: hover.hovered ? Theme.accentAlt : Theme.stroke
-    border.width: 1
+    border.width: 0
 
-    Behavior on color        { ColorAnimation { duration: Theme.motionFast } }
-    Behavior on border.color { ColorAnimation { duration: Theme.motionFast } }
+    Behavior on color { ColorAnimation { duration: Theme.motionFast } }
 
     HoverHandler { id: hover }
 
-    // Click the body (but not the gear / toggle) to drill in.
     TapHandler {
         acceptedButtons: Qt.LeftButton
         onTapped: root.detailRequested()
@@ -67,12 +53,14 @@ Rectangle {
     Accessible.name: displayName
     Accessible.description: qsTr("%1. Click to view settings.").arg(description)
 
-    // Soft status bar on the left edge — green / amber / grey.
+    // Status bar on the left edge - green / amber / muted.
     Rectangle {
         anchors.left: parent.left
         anchors.top: parent.top
         anchors.bottom: parent.bottom
-        anchors.margins: 2
+        anchors.topMargin: Theme.sp3
+        anchors.bottomMargin: Theme.sp3
+        anchors.leftMargin: Theme.sp2
         width: 3
         radius: 1.5
         color: root.state === "running"  ? Theme.success
@@ -82,26 +70,21 @@ Rectangle {
 
     RowLayout {
         anchors.fill: parent
-        anchors.leftMargin: Theme.sp5
+        anchors.leftMargin: Theme.sp5 + Theme.sp2
         anchors.rightMargin: Theme.sp4
         spacing: Theme.sp4
 
         // ---- Icon chip -----------------------------------------------
         Rectangle {
-            Layout.preferredWidth: 50
-            Layout.preferredHeight: 50
+            Layout.preferredWidth: 46
+            Layout.preferredHeight: 46
             radius: Theme.radiusSm
-            gradient: Gradient {
-                GradientStop { position: 0.0; color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.22) }
-                GradientStop { position: 1.0; color: Qt.rgba(Theme.accentDeep.r, Theme.accentDeep.g, Theme.accentDeep.b, 0.28) }
-            }
-            border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.35)
-            border.width: 1
+            color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.16)
 
             Iconed {
                 anchors.centerIn: parent
                 iconName: root.iconName
-                size: 26
+                size: 22
                 tint: root.state === "disabled" ? Theme.textMuted : Theme.accentAlt
             }
         }
@@ -180,7 +163,7 @@ Rectangle {
                        ? Theme.overlayPressed
                        : gearBtn.hovered ? Theme.overlayHover : "transparent"
                 border.color: gearBtn.activeFocus ? Theme.accent : "transparent"
-                border.width: 1
+                border.width: gearBtn.activeFocus ? 1 : 0
                 Behavior on color { ColorAnimation { duration: Theme.motionFast } }
             }
             contentItem: Iconed {
