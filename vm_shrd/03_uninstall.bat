@@ -42,6 +42,14 @@ taskkill /f /im ShadowStrikePhantomTray.exe >nul 2>&1
 taskkill /f /im ShadowStrikePhantomUI.exe   >nul 2>&1
 sc stop %SVC% >nul 2>&1
 timeout /t 2 /nobreak >nul
+REM Force-kill stuck service (survives START_PENDING / STOP_PENDING wedges).
+for /f "tokens=2" %%P in ('sc queryex %SVC% 2^>nul ^| findstr /I "PID"') do (
+    if not "%%P"=="0" (
+        echo     Force-killing service PID %%P ...
+        taskkill /f /pid %%P >nul 2>&1
+    )
+)
+taskkill /f /im ShadowStrikePhantomService.exe >nul 2>&1
 
 echo [2/6] Unloading minifilter driver ...
 fltmc detach ShadowStrikePhantomSensor >nul 2>&1

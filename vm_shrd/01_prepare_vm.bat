@@ -1,7 +1,15 @@
 @echo off
 REM =====================================================================
-REM ShadowStrike Phantom Home - VM prep: enable TESTSIGNING so the driver
-REM can load. Reboot REQUIRED afterwards.
+REM ShadowStrike Phantom Home - VM prep (USER-MODE ONLY).
+REM
+REM This used to enable kernel TESTSIGNING so the minifilter driver
+REM would load. That also forces Windows 11 to fall back to the generic
+REM display adapter (1024x768, resolution cannot be changed), which
+REM most users do not want. By default we no longer touch test-signing
+REM here - the Home product runs entirely in user mode.
+REM
+REM If you specifically want to test the kernel sensor driver, run
+REM 05_enable_driver_dev.bat instead of this script.
 REM =====================================================================
 setlocal ENABLEDELAYEDEXPANSION
 
@@ -35,23 +43,21 @@ exit /b 0
 :body
 echo === ShadowStrike Phantom Home - VM prep ===
 echo.
-echo [1/2] Enabling kernel TESTSIGNING (required for the test-signed driver)...
-bcdedit /set testsigning on
-if errorlevel 1 (
-    echo [!] bcdedit failed. You may need to disable Secure Boot in the VM firmware.
-    pause
-    exit /b 1
-)
-
-echo [2/2] Relaxing UAC prompt level (optional, makes testing less noisy)...
+echo [1/2] Relaxing UAC prompt level (less noisy during testing) ...
 reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f >nul 2>&1
+
+echo [2/2] Verifying display flags are safe (test-signing should be OFF) ...
+bcdedit /enum {current} | findstr /I "testsigning nointegritychecks"
+echo.
+echo If you see "testsigning Yes" above and your screen is stuck at
+echo 1024x768, run 00a_fix_resolution.bat then reboot.
 
 echo.
 echo ============================================================
-echo Prep done. REBOOT the VM now.
-echo After reboot the desktop will show "Test Mode" watermark.
-echo Then run 00_disable_defender.bat (if Tamper Protection is off),
-echo followed by 02_install.bat.
+echo Prep done. Next steps:
+echo   1) 00_disable_defender.bat    ^(Tamper Protection must be OFF^)
+echo   2) reboot
+echo   3) 02_install.bat
 echo ============================================================
 pause
 exit /b 0
