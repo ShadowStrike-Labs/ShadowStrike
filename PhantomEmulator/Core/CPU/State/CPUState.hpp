@@ -9,8 +9,8 @@
 #pragma once
 
 #include "EFLAGS.hpp"
-#include "../../Common/Types.hpp"
-#include "../../Common/Constants.hpp"
+#include "../../../Common/Types.hpp"
+#include "../../../Common/Constants.hpp"
 #include <array>
 #include <cstdint>
 #include <cstring>

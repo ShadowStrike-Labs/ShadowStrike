@@ -7,7 +7,7 @@
  */
 
 #include "CPUState.hpp"
-#include "../../Common/Constants.hpp"
+#include "../../../Common/Constants.hpp"
 #include <cstring>
 
 namespace Phantom {

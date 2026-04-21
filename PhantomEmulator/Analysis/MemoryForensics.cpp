@@ -1798,6 +1798,7 @@ void MemoryForensics::Impl::ScanBufferForROPChain(
             }
 
             // Check if target address is executable
+            {
             auto prot = memory.GetProtection(target);
             if (!prot.has_value() || !HasProt(*prot, MemProt::Execute)) {
                 if (gadgetRun >= kROPMinGadgets) {
@@ -1855,6 +1856,7 @@ void MemoryForensics::Impl::ScanBufferForROPChain(
                 gadgetRun = 0;
             }
             continue;
+            } // end block scoping prot/gadgetBuf/isGadget
 
         emit_rop:
             {

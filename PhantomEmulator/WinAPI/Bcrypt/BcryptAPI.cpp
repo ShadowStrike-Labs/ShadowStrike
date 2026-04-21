@@ -196,7 +196,7 @@ public:
 private:
     BcryptDeterministicRNG() noexcept = default;
     // Seed chosen for recognizable pattern in forensic dumps
-    std::atomic<uint64_t> m_state{ 0x5BADOW57R1KEULL };
+    std::atomic<uint64_t> m_state{ 0x5BAD5EED5BAD5EEDULL };
 };
 
 // ============================================================================

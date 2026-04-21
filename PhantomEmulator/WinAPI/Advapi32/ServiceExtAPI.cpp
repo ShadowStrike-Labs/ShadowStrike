@@ -2,870 +2,998 @@
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * PhantomEmulator - Custom x86/x64 Emulation Engine
  *
- * ServiceExtAPI.cpp — Advapi32 extended Service Control Manager API implementations
+ * RegistryAPI.cpp — Advapi32 registry API handler implementations
  *
- * Service reconfiguration (T1543.003), security service tampering,
- * service enumeration for target discovery, and malware registering
- * itself as a service are tracked here.
- *
- * All operations run against the VirtualServiceDB singleton from ServiceAPI.cpp.
+ * Virtual registry tree with pre-populated Windows 10 Pro entries.
+ * Anti-evasion: no VM/sandbox artifacts; hardware looks like real Lenovo.
+ * Persistence writes to Run/RunOnce/Services flagged as RegistryPersistence.
  *
  * Copyright (C) 2025-2026 ShadowStrike Labs
  * AGPL-3.0 License
  */
 
-#include "ServiceExtAPI.hpp"
-#include "ServiceAPI.hpp"
+#include "RegistryAPI.hpp"
 #include "../APIDispatcher.hpp"
-#include "../HandleTable.hpp"
-#include "../../Core/Memory/VirtualMemory.hpp"
-#include "../../Core/CPU/State/CPUState.hpp"
-#include "../../Common/Types.hpp"
-#include "../../Common/Config.hpp"
 
 #include <algorithm>
-#include <array>
-#include <cstring>
+#include <cctype>
+#include <cwctype>
+#include <map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace Phantom::WinAPI::Advapi32 {
 
 // ============================================================================
-// Win32 service constants (no windows.h dependency)
+// Win32 registry constants (no windows.h dependency)
 // ============================================================================
 
-static constexpr uint32_t kErrorSuccess             = 0;
-static constexpr uint32_t kErrorInvalidHandle       = 6;
-static constexpr uint32_t kErrorInvalidParameter    = 87;
-static constexpr uint32_t kErrorInsufficientBuffer  = 122;
-static constexpr uint32_t kErrorMoreData            = 234;
-static constexpr uint32_t kErrorServiceDoesNotExist = 1060;
+static constexpr uint32_t ERROR_SUCCESS            = 0;
+static constexpr uint32_t ERROR_FILE_NOT_FOUND     = 2;
+static constexpr uint32_t ERROR_MORE_DATA          = 234;
+static constexpr uint32_t ERROR_NO_MORE_ITEMS      = 259;
+static constexpr uint32_t ERROR_BADKEY             = 1010;
+static constexpr uint32_t ERROR_INVALID_PARAMETER  = 87;
+static constexpr uint32_t ERROR_INSUFFICIENT_BUFFER = 122;
 
-static constexpr uint32_t kMaxStringLen = 4096;
-
-// SERVICE_STATUS field sizes
-static constexpr uint32_t kServiceStatusSize        = 28;
-static constexpr uint32_t kServiceStatusProcessSize = 36;
-static constexpr uint32_t kQueryServiceConfigSize   = 48;
-
-// Service type constants
-static constexpr uint32_t SERVICE_WIN32_OWN_PROCESS  = 0x10;
-static constexpr uint32_t SERVICE_WIN32_SHARE_PROCESS = 0x20;
-
-// Service state constants
-static constexpr uint32_t SERVICE_STOPPED            = 0x01;
-static constexpr uint32_t SERVICE_START_PENDING      = 0x02;
-static constexpr uint32_t SERVICE_STOP_PENDING       = 0x03;
-static constexpr uint32_t SERVICE_RUNNING            = 0x04;
-
-// Service control codes
-static constexpr uint32_t SERVICE_CONTROL_STOP       = 0x01;
-static constexpr uint32_t SERVICE_CONTROL_PAUSE      = 0x02;
-static constexpr uint32_t SERVICE_CONTROL_CONTINUE   = 0x03;
-static constexpr uint32_t SERVICE_CONTROL_INTERROGATE = 0x04;
-
-// Service start type
-static constexpr uint32_t SERVICE_AUTO_START         = 0x02;
-static constexpr uint32_t SERVICE_DEMAND_START       = 0x03;
-static constexpr uint32_t SERVICE_DISABLED           = 0x04;
-
-// Service accepts flags
-static constexpr uint32_t SERVICE_ACCEPT_STOP        = 0x01;
-static constexpr uint32_t SERVICE_ACCEPT_PAUSE_CONTINUE = 0x02;
-static constexpr uint32_t SERVICE_ACCEPT_SHUTDOWN    = 0x04;
-
-// SC_STATUS_TYPE
-static constexpr uint32_t SC_STATUS_PROCESS_INFO     = 0;
+static constexpr GuestHandle HKEY_CLASSES_ROOT   = 0x80000000ULL;
+static constexpr GuestHandle HKEY_CURRENT_USER   = 0x80000001ULL;
+static constexpr GuestHandle HKEY_LOCAL_MACHINE  = 0x80000002ULL;
+static constexpr GuestHandle HKEY_USERS          = 0x80000003ULL;
 
 // ============================================================================
-// Fake well-known service list for enumeration
+// Virtual Registry Value
 // ============================================================================
 
-struct FakeServiceInfo {
-    const wchar_t* keyName;
-    const wchar_t* displayName;
-    uint32_t       serviceType;
-    uint32_t       currentState;
-    uint32_t       pid;
+struct VirtualRegValue {
+    uint32_t             type = NT::REG_SZ;
+    std::vector<uint8_t> data;
 };
 
-static constexpr FakeServiceInfo kFakeServices[] = {
-    { L"Winmgmt",      L"Windows Management Instrumentation",    SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 1084 },
-    { L"WinDefend",    L"Microsoft Defender Antivirus Service",  SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 3412 },
-    { L"Spooler",      L"Print Spooler",                        SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 2240 },
-    { L"BITS",         L"Background Intelligent Transfer Service", SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"wuauserv",     L"Windows Update",                       SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"Dnscache",     L"DNS Client",                           SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1304 },
-    { L"EventLog",     L"Windows Event Log",                    SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1192 },
-    { L"Schedule",     L"Task Scheduler",                       SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1072 },
-    { L"PlugPlay",     L"Plug and Play",                        SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 848 },
-    { L"RpcSs",        L"Remote Procedure Call (RPC)",          SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 824 },
-    { L"LanmanServer", L"Server",                               SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"LanmanWorkstation", L"Workstation",                     SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"CryptSvc",     L"Cryptographic Services",               SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"Dhcp",         L"DHCP Client",                          SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1304 },
-    { L"DcomLaunch",   L"DCOM Server Process Launcher",         SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 824 },
-    { L"Power",        L"Power",                                SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 824 },
-    { L"ProfSvc",      L"User Profile Service",                 SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1072 },
-    { L"Themes",       L"Themes",                               SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"AudioSrv",     L"Windows Audio",                        SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 2876 },
-    { L"netprofm",     L"Network List Service",                 SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1304 },
-    { L"NlaSvc",       L"Network Location Awareness",           SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1304 },
-    { L"mpssvc",       L"Windows Defender Firewall",            SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"BFE",          L"Base Filtering Engine",                SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 968 },
-    { L"SamSs",        L"Security Accounts Manager",            SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 824 },
-    { L"lsass",        L"Local Security Authority",             SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 756 },
-    { L"TrkWks",       L"Distributed Link Tracking Client",     SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 2024 },
-    { L"W32Time",      L"Windows Time",                         SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1072 },
-    { L"WSearch",      L"Windows Search",                       SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING, 3968 },
-    { L"iphlpsvc",     L"IP Helper",                            SERVICE_WIN32_SHARE_PROCESS, SERVICE_RUNNING, 1304 },
-    { L"Netlogon",     L"Netlogon",                             SERVICE_WIN32_OWN_PROCESS, SERVICE_STOPPED, 0 },
+// ============================================================================
+// Virtual Registry Key
+// ============================================================================
+
+struct VirtualRegKey {
+    std::map<std::wstring, VirtualRegValue> values;
+    std::vector<std::wstring>               subKeyNames;
 };
 
-static constexpr uint32_t kFakeServiceCount =
-    static_cast<uint32_t>(sizeof(kFakeServices) / sizeof(kFakeServices[0]));
+// ============================================================================
+// Virtual Registry Tree (static, thread-safe via shared_mutex)
+// ============================================================================
 
-// Security-critical services — stopping these is defense evasion
-static bool IsSecurityService(const std::wstring& name) noexcept {
-    std::wstring lower;
-    lower.reserve(name.size());
-    for (wchar_t c : name) lower.push_back(static_cast<wchar_t>(std::towlower(c)));
+class VirtualRegistry {
+public:
+    static VirtualRegistry& Instance() noexcept {
+        static VirtualRegistry s_instance;
+        return s_instance;
+    }
 
-    if (lower == L"windefend") return true;
-    if (lower == L"mpssvc") return true;
-    if (lower == L"wscsvc") return true;
-    if (lower == L"securityhealthservice") return true;
-    if (lower == L"bfe") return true;
-    if (lower == L"sense") return true;
-    if (lower == L"mbamdervice") return true;
-    return false;
+    void Initialize(const EmulationConfig& config) noexcept {
+        std::unique_lock lock(m_mutex);
+        if (m_initialized) return;
+        PopulateDefaults(config);
+        m_initialized = true;
+    }
+
+    [[nodiscard]] bool KeyExists(const std::wstring& fullPath) const noexcept {
+        std::shared_lock lock(m_mutex);
+        return m_keys.contains(fullPath);
+    }
+
+    [[nodiscard]] bool CreateKey(const std::wstring& fullPath) noexcept {
+        std::unique_lock lock(m_mutex);
+        if (m_keys.contains(fullPath)) return true;
+        if (m_keys.size() >= kMaxKeys) return false;
+        m_keys[fullPath] = {};
+        RegisterAsSubKey(fullPath);
+        return true;
+    }
+
+    [[nodiscard]] bool DeleteKey(const std::wstring& fullPath) noexcept {
+        std::unique_lock lock(m_mutex);
+        auto it = m_keys.find(fullPath);
+        if (it == m_keys.end()) return false;
+        if (!it->second.subKeyNames.empty()) return false;
+        m_keys.erase(it);
+        UnregisterSubKey(fullPath);
+        return true;
+    }
+
+    [[nodiscard]] bool SetValue(const std::wstring& keyPath, const std::wstring& valueName,
+                                uint32_t type, const uint8_t* data, uint32_t dataSize) noexcept {
+        std::unique_lock lock(m_mutex);
+        auto it = m_keys.find(keyPath);
+        if (it == m_keys.end()) return false;
+        if (dataSize > kMaxValueDataSize) return false;
+        VirtualRegValue val;
+        val.type = type;
+        val.data.assign(data, data + dataSize);
+        it->second.values[valueName] = std::move(val);
+        return true;
+    }
+
+    [[nodiscard]] const VirtualRegValue* QueryValue(const std::wstring& keyPath,
+                                                     const std::wstring& valueName) const noexcept {
+        std::shared_lock lock(m_mutex);
+        auto keyIt = m_keys.find(keyPath);
+        if (keyIt == m_keys.end()) return nullptr;
+        auto valIt = keyIt->second.values.find(valueName);
+        if (valIt == keyIt->second.values.end()) return nullptr;
+        return &valIt->second;
+    }
+
+    [[nodiscard]] bool DeleteValue(const std::wstring& keyPath,
+                                    const std::wstring& valueName) noexcept {
+        std::unique_lock lock(m_mutex);
+        auto keyIt = m_keys.find(keyPath);
+        if (keyIt == m_keys.end()) return false;
+        return keyIt->second.values.erase(valueName) > 0;
+    }
+
+    [[nodiscard]] std::optional<std::wstring> EnumSubKey(const std::wstring& keyPath,
+                                                          uint32_t index) const noexcept {
+        std::shared_lock lock(m_mutex);
+        auto it = m_keys.find(keyPath);
+        if (it == m_keys.end()) return std::nullopt;
+        if (index >= it->second.subKeyNames.size()) return std::nullopt;
+        return it->second.subKeyNames[index];
+    }
+
+    struct ValueEnumEntry {
+        std::wstring             name;
+        uint32_t                 type;
+        std::vector<uint8_t>     data;
+    };
+
+    [[nodiscard]] std::optional<ValueEnumEntry> EnumValue(const std::wstring& keyPath,
+                                                           uint32_t index) const noexcept {
+        std::shared_lock lock(m_mutex);
+        auto it = m_keys.find(keyPath);
+        if (it == m_keys.end()) return std::nullopt;
+        if (index >= it->second.values.size()) return std::nullopt;
+        auto valIt = it->second.values.begin();
+        std::advance(valIt, index);
+        return ValueEnumEntry{ valIt->first, valIt->second.type, valIt->second.data };
+    }
+
+private:
+    VirtualRegistry() noexcept = default;
+
+    static constexpr uint32_t kMaxKeys          = 16384;
+    static constexpr uint32_t kMaxValueDataSize  = 1024 * 1024;
+
+    mutable std::shared_mutex                   m_mutex;
+    std::map<std::wstring, VirtualRegKey>       m_keys;
+    bool                                        m_initialized = false;
+
+    // ========================================================================
+    // Helper: pack a REG_SZ from narrow string
+    // ========================================================================
+    static std::vector<uint8_t> PackRegSz(const std::string& s) noexcept {
+        std::vector<uint8_t> buf;
+        buf.reserve((s.size() + 1) * 2);
+        for (char c : s) {
+            buf.push_back(static_cast<uint8_t>(c));
+            buf.push_back(0);
+        }
+        buf.push_back(0);
+        buf.push_back(0);
+        return buf;
+    }
+
+    static std::vector<uint8_t> PackRegDword(uint32_t v) noexcept {
+        std::vector<uint8_t> buf(4);
+        std::memcpy(buf.data(), &v, 4);
+        return buf;
+    }
+
+    // ========================================================================
+    // Register child key name in parent's subKeyNames list
+    // ========================================================================
+    void RegisterAsSubKey(const std::wstring& fullPath) noexcept {
+        auto pos = fullPath.rfind(L'\\');
+        if (pos == std::wstring::npos || pos == 0) return;
+        std::wstring parent = fullPath.substr(0, pos);
+        std::wstring child  = fullPath.substr(pos + 1);
+        auto it = m_keys.find(parent);
+        if (it == m_keys.end()) return;
+        auto& subs = it->second.subKeyNames;
+        if (std::find(subs.begin(), subs.end(), child) == subs.end()) {
+            subs.push_back(child);
+        }
+    }
+
+    void UnregisterSubKey(const std::wstring& fullPath) noexcept {
+        auto pos = fullPath.rfind(L'\\');
+        if (pos == std::wstring::npos || pos == 0) return;
+        std::wstring parent = fullPath.substr(0, pos);
+        std::wstring child  = fullPath.substr(pos + 1);
+        auto it = m_keys.find(parent);
+        if (it == m_keys.end()) return;
+        auto& subs = it->second.subKeyNames;
+        subs.erase(std::remove(subs.begin(), subs.end(), child), subs.end());
+    }
+
+    // ========================================================================
+    // Populate the virtual registry with realistic Windows 10 Pro data
+    // ========================================================================
+    void PopulateDefaults(const EmulationConfig& config) noexcept {
+        auto addKey = [&](const std::wstring& path) {
+            m_keys[path] = {};
+            RegisterAsSubKey(path);
+        };
+
+        auto addSz = [&](const std::wstring& keyPath, const std::wstring& name,
+                          const std::string& value) {
+            m_keys[keyPath].values[name] = { NT::REG_SZ, PackRegSz(value) };
+        };
+
+        auto addDword = [&](const std::wstring& keyPath, const std::wstring& name,
+                             uint32_t value) {
+            m_keys[keyPath].values[name] = { NT::REG_DWORD, PackRegDword(value) };
+        };
+
+        // Root hives
+        addKey(L"HKLM");
+        addKey(L"HKCU");
+        addKey(L"HKCR");
+        addKey(L"HKU");
+
+        // HKLM\SOFTWARE
+        addKey(L"HKLM\\SOFTWARE");
+        addKey(L"HKLM\\SOFTWARE\\Microsoft");
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Windows NT");
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+
+        auto& ntVer = L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        addSz(ntVer, L"ProductName",           "Windows 10 Pro");
+        addSz(ntVer, L"CurrentBuildNumber",     "19045");
+        addSz(ntVer, L"EditionID",             "Professional");
+        addSz(ntVer, L"InstallationType",       "Client");
+        addSz(ntVer, L"CurrentVersion",         "6.3");
+        addSz(ntVer, L"BuildLab",              "19041.vb_release.191206-1406");
+        addSz(ntVer, L"BuildLabEx",            "19041.1.amd64fre.vb_release.191206-1406");
+        addDword(ntVer, L"CurrentMajorVersionNumber", 10);
+        addDword(ntVer, L"CurrentMinorVersionNumber", 0);
+        addDword(ntVer, L"UBR", 3803);
+        // RegisteredOrganization from config
+        {
+            std::string org;
+            for (wchar_t wc : config.domainName) {
+                org.push_back(static_cast<char>(wc & 0x7F));
+            }
+            addSz(ntVer, L"RegisteredOrganization", org);
+            addSz(ntVer, L"RegisteredOwner", "JSmith");
+        }
+
+        // Cryptography MachineGuid
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Cryptography");
+        addSz(L"HKLM\\SOFTWARE\\Microsoft\\Cryptography",
+              L"MachineGuid", "a3b7c912-48d1-4e3a-b8f2-1a2b3c4d5e6f");
+
+        // HARDWARE\DESCRIPTION\System
+        addKey(L"HKLM\\HARDWARE");
+        addKey(L"HKLM\\HARDWARE\\DESCRIPTION");
+        addKey(L"HKLM\\HARDWARE\\DESCRIPTION\\System");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System",
+              L"SystemBiosVersion", "LENOVO - 1380");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System",
+              L"VideoBiosVersion",  "NVIDIA - 1080");
+
+        // BIOS
+        addKey(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"SystemManufacturer", "LENOVO");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"SystemProductName",  "ThinkPad X1 Carbon");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"BIOSVendor",         "LENOVO");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"BIOSVersion",        "N2HET80W (1.53)");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"BIOSReleaseDate",    "11/14/2022");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"BaseBoardManufacturer", "LENOVO");
+        addSz(L"HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+              L"BaseBoardProduct",   "20U9005MUS");
+
+        // HKCU Run key (empty — monitor for persistence additions)
+        addKey(L"HKCU\\SOFTWARE");
+        addKey(L"HKCU\\SOFTWARE\\Microsoft");
+        addKey(L"HKCU\\SOFTWARE\\Microsoft\\Windows");
+        addKey(L"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion");
+        addKey(L"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run");
+        addKey(L"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+
+        // HKLM Run key
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Windows");
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion");
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run");
+        addKey(L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+
+        // Services
+        addKey(L"HKLM\\SYSTEM");
+        addKey(L"HKLM\\SYSTEM\\CurrentControlSet");
+        addKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services");
+    }
+};
+
+// ============================================================================
+// Path normalization: resolve predefined HKEY handles + NT path prefixes
+// ============================================================================
+
+static std::wstring HivePrefix(GuestHandle hKey) noexcept {
+    if (hKey == HKEY_LOCAL_MACHINE)  return L"HKLM";
+    if (hKey == HKEY_CURRENT_USER)   return L"HKCU";
+    if (hKey == HKEY_CLASSES_ROOT)   return L"HKCR";
+    if (hKey == HKEY_USERS)          return L"HKU";
+    return {};
 }
 
-// ============================================================================
-// Wide/narrow helpers
-// ============================================================================
+static bool IsPredefinedHKey(GuestHandle h) noexcept {
+    return h == HKEY_LOCAL_MACHINE || h == HKEY_CURRENT_USER ||
+           h == HKEY_CLASSES_ROOT || h == HKEY_USERS;
+}
 
 static std::wstring NarrowToWide(std::string_view s) noexcept {
     std::wstring w;
     w.reserve(s.size());
-    for (char c : s) w.push_back(static_cast<wchar_t>(static_cast<uint8_t>(c)));
+    for (char c : s) {
+        w.push_back(static_cast<wchar_t>(static_cast<uint8_t>(c)));
+    }
     return w;
 }
 
-static std::string WideToNarrow(const std::wstring& ws) noexcept {
-    std::string s;
-    s.reserve(ws.size());
-    for (wchar_t wc : ws) s.push_back(static_cast<char>(wc & 0x7F));
-    return s;
+static std::wstring NormalizeRegistryPath(const std::wstring& raw) noexcept {
+    std::wstring path = raw;
+
+    // NT native path normalization
+    auto replacePrefix = [&](const std::wstring& from, const std::wstring& to) {
+        if (path.size() >= from.size()) {
+            std::wstring prefix = path.substr(0, from.size());
+            // Case-insensitive compare
+            bool match = true;
+            for (size_t i = 0; i < from.size(); ++i) {
+                if (std::towlower(prefix[i]) != std::towlower(from[i])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                path = to + path.substr(from.size());
+            }
+        }
+    };
+
+    replacePrefix(L"\\Registry\\Machine", L"HKLM");
+    replacePrefix(L"\\Registry\\User",    L"HKU");
+
+    // Strip trailing backslash
+    while (!path.empty() && path.back() == L'\\') {
+        path.pop_back();
+    }
+
+    return path;
 }
 
-// Resolve service name from an SC_HANDLE (stored as SyncObjectData)
-static std::wstring ResolveServiceName(APIContext& ctx, GuestHandle hService) noexcept {
-    auto entry = ctx.Handles().Lookup(hService);
-    if (!entry.has_value()) return {};
-    auto* syncData = std::get_if<SyncObjectData>(&entry->data);
-    if (!syncData) return {};
-    return syncData->name;
+// Build the full registry path from a parent handle and a subkey string
+static std::wstring BuildFullPath(GuestHandle hKey, const std::wstring& subKey,
+                                   HandleTable& handles) noexcept {
+    std::wstring base;
+
+    if (IsPredefinedHKey(hKey)) {
+        base = HivePrefix(hKey);
+    } else {
+        auto entry = handles.Lookup(hKey, HandleType::RegistryKey);
+        if (!entry.has_value()) return {};
+        auto* regData = std::get_if<RegistryKeyHandleData>(&entry->data);
+        if (!regData) return {};
+        base = regData->path;
+    }
+
+    if (subKey.empty()) return NormalizeRegistryPath(base);
+
+    std::wstring full = base + L"\\" + subKey;
+    return NormalizeRegistryPath(full);
+}
+
+// Detect writes to persistence-critical keys
+static bool IsPersistenceKey(const std::wstring& path) noexcept {
+    std::wstring lower;
+    lower.reserve(path.size());
+    for (wchar_t c : path) lower.push_back(static_cast<wchar_t>(std::towlower(c)));
+
+    if (lower.find(L"\\run") != std::wstring::npos) return true;
+    if (lower.find(L"\\runonce") != std::wstring::npos) return true;
+    if (lower.find(L"\\services\\") != std::wstring::npos) return true;
+    return false;
 }
 
 // ============================================================================
-// ChangeServiceConfigA/W — hService(0), dwServiceType(1), dwStartType(2),
-//   dwErrorControl(3), lpBinaryPathName(4), lpLoadOrderGroup(5),
-//   lpdwTagId(6), lpDependencies(7), lpServiceStartName(8),
-//   lpPassword(9), lpDisplayName(10)
-//
-// CRITICAL: Persistence via binary path modification (T1543.003)
+// RegOpenKeyExA/W — common implementation
 // ============================================================================
 
-static bool ChangeServiceConfigImpl(APIContext& ctx, bool isWide) {
-    const auto hService     = ctx.GetArg(0);
-    const auto dwSvcType    = ctx.GetArg32(1);
-    const auto dwStartType  = ctx.GetArg32(2);
-    const auto lpBinaryPath = ctx.GetArgPtr(4);
-    const auto lpDisplayName = ctx.GetArgPtr(10);
+static bool RegOpenKeyExImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
 
-    (void)dwSvcType;
-    (void)dwStartType;
+    GuestHandle hKey    = ctx.GetArg(0);
+    GuestAddress lpSub  = ctx.GetArgPtr(1);
+    // arg2 = ulOptions (ignored)
+    // arg3 = samDesired
+    GuestAddress phkOut = ctx.GetArgPtr(4);
 
-    std::wstring svcName = ResolveServiceName(ctx, hService);
-    if (svcName.empty()) {
-        ctx.FailWithError(kErrorInvalidHandle);
+    if (phkOut == 0) {
+        ctx.SetReturn32(ERROR_INVALID_PARAMETER);
         return true;
     }
 
-    // Track modified binary path — critical persistence IOC
-    if (lpBinaryPath != 0) {
-        if (isWide) {
-            (void)ctx.ReadWideString(lpBinaryPath, kMaxStringLen / 2);
-        } else {
-            (void)ctx.ReadAnsiString(lpBinaryPath, kMaxStringLen);
-        }
+    std::wstring subKey = isWide ? ctx.ReadWideString(lpSub)
+                                 : NarrowToWide(ctx.ReadAnsiString(lpSub));
+
+    std::wstring fullPath = BuildFullPath(hKey, subKey, ctx.Handles());
+    if (fullPath.empty()) {
+        ctx.SetReturn32(ERROR_BADKEY);
+        return true;
     }
 
-    if (lpDisplayName != 0) {
-        if (isWide) {
-            (void)ctx.ReadWideString(lpDisplayName, kMaxStringLen / 2);
-        } else {
-            (void)ctx.ReadAnsiString(lpDisplayName, kMaxStringLen);
-        }
+    if (!VirtualRegistry::Instance().KeyExists(fullPath)) {
+        ctx.SetReturn32(ERROR_FILE_NOT_FOUND);
+        return true;
     }
 
-    // BehaviorFlag::Persistence | BehaviorFlag::ServiceManipulation raised by dispatcher
+    RegistryKeyHandleData data;
+    data.path       = fullPath;
+    data.accessMask = ctx.GetArg32(3);
 
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
+    GuestHandle newHandle = ctx.Handles().Create(HandleType::RegistryKey, std::move(data));
+
+    if (ctx.Is64Bit()) {
+        ctx.Memory().WriteU64(phkOut, newHandle);
+    } else {
+        ctx.Memory().WriteU32(phkOut, static_cast<uint32_t>(newHandle));
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
     return true;
 }
 
-bool HandleChangeServiceConfigA(APIContext& ctx) { return ChangeServiceConfigImpl(ctx, false); }
-bool HandleChangeServiceConfigW(APIContext& ctx) { return ChangeServiceConfigImpl(ctx, true); }
+bool HandleRegOpenKeyExA(APIContext& ctx) { return RegOpenKeyExImpl(ctx, false); }
+bool HandleRegOpenKeyExW(APIContext& ctx) { return RegOpenKeyExImpl(ctx, true); }
 
 // ============================================================================
-// ChangeServiceConfig2A/W — hService(0), dwInfoLevel(1), lpInfo(2)
+// RegCreateKeyExA/W
 // ============================================================================
 
-static bool ChangeServiceConfig2Impl(APIContext& ctx, bool /*isWide*/) {
-    const auto hService    = ctx.GetArg(0);
-    const auto dwInfoLevel = ctx.GetArg32(1);
+static bool RegCreateKeyExImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
 
-    (void)dwInfoLevel;
+    GuestHandle hKey     = ctx.GetArg(0);
+    GuestAddress lpSub   = ctx.GetArgPtr(1);
+    // arg2 = Reserved, arg3 = lpClass, arg4 = dwOptions, arg5 = samDesired
+    GuestAddress phkOut  = ctx.GetArgPtr(6);
+    GuestAddress lpDisp  = ctx.GetArgPtr(7);
 
-    std::wstring svcName = ResolveServiceName(ctx, hService);
-    if (svcName.empty()) {
-        ctx.FailWithError(kErrorInvalidHandle);
+    if (phkOut == 0) {
+        ctx.SetReturn32(ERROR_INVALID_PARAMETER);
         return true;
     }
 
-    // Track extended configuration changes (description, failure actions, etc.)
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
+    std::wstring subKey = isWide ? ctx.ReadWideString(lpSub)
+                                 : NarrowToWide(ctx.ReadAnsiString(lpSub));
 
-bool HandleChangeServiceConfig2A(APIContext& ctx) { return ChangeServiceConfig2Impl(ctx, false); }
-bool HandleChangeServiceConfig2W(APIContext& ctx) { return ChangeServiceConfig2Impl(ctx, true); }
-
-// ============================================================================
-// EnumServicesStatusA/W — hSCManager(0), dwServiceType(1), dwServiceState(2),
-//   lpServices(3), cbBufSize(4), pcbBytesNeeded(5), lpServicesReturned(6),
-//   lpResumeHandle(7)
-//
-// ENUM_SERVICE_STATUSA layout per entry:
-//   char[256]          lpServiceName     (offset 0)
-//   char[256]          lpDisplayName     (offset 256)
-//   SERVICE_STATUS     ServiceStatus     (offset 512, 28 bytes)
-//   Total per entry: 540 bytes
-// ============================================================================
-
-static bool EnumServicesStatusImpl(APIContext& ctx, bool isWide) {
-    const auto lpServices        = ctx.GetArgPtr(3);
-    const auto cbBufSize         = ctx.GetArg32(4);
-    const auto pcbBytesNeeded    = ctx.GetArgPtr(5);
-    const auto lpServicesReturned = ctx.GetArgPtr(6);
-
-    auto& mem = ctx.Memory();
-
-    // Calculate space needed per entry
-    const uint32_t nameFieldSize = isWide ? 512u : 256u;  // chars * sizeof(unit)
-    const uint32_t entrySize     = nameFieldSize + nameFieldSize + kServiceStatusSize;
-    const uint32_t totalNeeded   = kFakeServiceCount * entrySize;
-
-    if (pcbBytesNeeded != 0) {
-        mem.WriteU32(pcbBytesNeeded, totalNeeded);
-    }
-
-    if (lpServices == 0 || cbBufSize < totalNeeded) {
-        if (lpServicesReturned != 0) mem.WriteU32(lpServicesReturned, 0);
-        ctx.FailWithError(kErrorMoreData);
+    std::wstring fullPath = BuildFullPath(hKey, subKey, ctx.Handles());
+    if (fullPath.empty()) {
+        ctx.SetReturn32(ERROR_BADKEY);
         return true;
     }
 
-    // Write service entries
-    uint32_t entriesWritten = 0;
-    GuestAddress offset = lpServices;
-
-    for (uint32_t i = 0; i < kFakeServiceCount; ++i) {
-        if ((offset - lpServices) + entrySize > cbBufSize) break;
-
-        const auto& svc = kFakeServices[i];
-
-        if (isWide) {
-            ctx.WriteWideString(offset, svc.keyName, nameFieldSize / sizeof(wchar_t));
-            ctx.WriteWideString(offset + nameFieldSize, svc.displayName, nameFieldSize / sizeof(wchar_t));
-        } else {
-            ctx.WriteAnsiString(offset, WideToNarrow(svc.keyName), nameFieldSize);
-            ctx.WriteAnsiString(offset + nameFieldSize, WideToNarrow(svc.displayName), nameFieldSize);
-        }
-
-        // SERVICE_STATUS: dwServiceType(4), dwCurrentState(4), dwControlsAccepted(4),
-        //                 dwWin32ExitCode(4), dwServiceSpecificExitCode(4),
-        //                 dwCheckPoint(4), dwWaitHint(4) = 28 bytes
-        GuestAddress statusOffset = offset + nameFieldSize + nameFieldSize;
-        mem.WriteU32(statusOffset,      svc.serviceType);
-        mem.WriteU32(statusOffset + 4,  svc.currentState);
-        uint32_t accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PAUSE_CONTINUE | SERVICE_ACCEPT_SHUTDOWN;
-        mem.WriteU32(statusOffset + 8,  accepted);
-        mem.WriteU32(statusOffset + 12, 0);  // dwWin32ExitCode
-        mem.WriteU32(statusOffset + 16, 0);  // dwServiceSpecificExitCode
-        mem.WriteU32(statusOffset + 20, 0);  // dwCheckPoint
-        mem.WriteU32(statusOffset + 24, 0);  // dwWaitHint
-
-        offset += entrySize;
-        ++entriesWritten;
-    }
-
-    if (lpServicesReturned != 0) {
-        mem.WriteU32(lpServicesReturned, entriesWritten);
-    }
-
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
-
-bool HandleEnumServicesStatusA(APIContext& ctx) { return EnumServicesStatusImpl(ctx, false); }
-bool HandleEnumServicesStatusW(APIContext& ctx) { return EnumServicesStatusImpl(ctx, true); }
-
-// ============================================================================
-// EnumServicesStatusExA/W — hSCManager(0), InfoLevel(1), dwServiceType(2),
-//   dwServiceState(3), lpServices(4), cbBufSize(5), pcbBytesNeeded(6),
-//   lpServicesReturned(7), lpResumeHandle(8), pszGroupName(9)
-//
-// Adds dwProcessId and dwServiceFlags to each entry
-// ============================================================================
-
-static bool EnumServicesStatusExImpl(APIContext& ctx, bool isWide) {
-    const auto lpServices         = ctx.GetArgPtr(4);
-    const auto cbBufSize          = ctx.GetArg32(5);
-    const auto pcbBytesNeeded     = ctx.GetArgPtr(6);
-    const auto lpServicesReturned = ctx.GetArgPtr(7);
-
-    auto& mem = ctx.Memory();
-
-    // Extended entry: name fields + SERVICE_STATUS_PROCESS (36 bytes)
-    const uint32_t nameFieldSize = isWide ? 512u : 256u;
-    const uint32_t entrySize     = nameFieldSize + nameFieldSize + kServiceStatusProcessSize;
-    const uint32_t totalNeeded   = kFakeServiceCount * entrySize;
-
-    if (pcbBytesNeeded != 0) {
-        mem.WriteU32(pcbBytesNeeded, totalNeeded);
-    }
-
-    if (lpServices == 0 || cbBufSize < totalNeeded) {
-        if (lpServicesReturned != 0) mem.WriteU32(lpServicesReturned, 0);
-        ctx.FailWithError(kErrorMoreData);
-        return true;
-    }
-
-    uint32_t entriesWritten = 0;
-    GuestAddress offset = lpServices;
-
-    for (uint32_t i = 0; i < kFakeServiceCount; ++i) {
-        if ((offset - lpServices) + entrySize > cbBufSize) break;
-
-        const auto& svc = kFakeServices[i];
-
-        if (isWide) {
-            ctx.WriteWideString(offset, svc.keyName, nameFieldSize / sizeof(wchar_t));
-            ctx.WriteWideString(offset + nameFieldSize, svc.displayName, nameFieldSize / sizeof(wchar_t));
-        } else {
-            ctx.WriteAnsiString(offset, WideToNarrow(svc.keyName), nameFieldSize);
-            ctx.WriteAnsiString(offset + nameFieldSize, WideToNarrow(svc.displayName), nameFieldSize);
-        }
-
-        // SERVICE_STATUS_PROCESS: SERVICE_STATUS(28) + dwProcessId(4) + dwServiceFlags(4)
-        GuestAddress statusOffset = offset + nameFieldSize + nameFieldSize;
-        mem.WriteU32(statusOffset,      svc.serviceType);
-        mem.WriteU32(statusOffset + 4,  svc.currentState);
-        uint32_t accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PAUSE_CONTINUE | SERVICE_ACCEPT_SHUTDOWN;
-        mem.WriteU32(statusOffset + 8,  accepted);
-        mem.WriteU32(statusOffset + 12, 0);         // dwWin32ExitCode
-        mem.WriteU32(statusOffset + 16, 0);         // dwServiceSpecificExitCode
-        mem.WriteU32(statusOffset + 20, 0);         // dwCheckPoint
-        mem.WriteU32(statusOffset + 24, 0);         // dwWaitHint
-        mem.WriteU32(statusOffset + 28, svc.pid);   // dwProcessId
-        mem.WriteU32(statusOffset + 32, 0);         // dwServiceFlags
-
-        offset += entrySize;
-        ++entriesWritten;
-    }
-
-    if (lpServicesReturned != 0) {
-        mem.WriteU32(lpServicesReturned, entriesWritten);
-    }
-
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
-
-bool HandleEnumServicesStatusExA(APIContext& ctx) { return EnumServicesStatusExImpl(ctx, false); }
-bool HandleEnumServicesStatusExW(APIContext& ctx) { return EnumServicesStatusExImpl(ctx, true); }
-
-// ============================================================================
-// QueryServiceStatusEx — hService(0), InfoLevel(1), lpBuffer(2),
-//                          cbBufSize(3), pcbBytesNeeded(4)
-// ============================================================================
-
-bool HandleQueryServiceStatusEx(APIContext& ctx) {
-    const auto hService       = ctx.GetArg(0);
-    const auto infoLevel      = ctx.GetArg32(1);
-    const auto lpBuffer       = ctx.GetArgPtr(2);
-    const auto cbBufSize      = ctx.GetArg32(3);
-    const auto pcbBytesNeeded = ctx.GetArgPtr(4);
-
-    std::wstring svcName = ResolveServiceName(ctx, hService);
-    if (svcName.empty()) {
-        ctx.FailWithError(kErrorInvalidHandle);
-        return true;
-    }
-
-    auto& mem = ctx.Memory();
-
-    if (infoLevel == SC_STATUS_PROCESS_INFO) {
-        if (pcbBytesNeeded != 0) {
-            mem.WriteU32(pcbBytesNeeded, kServiceStatusProcessSize);
-        }
-
-        if (lpBuffer == 0 || cbBufSize < kServiceStatusProcessSize) {
-            ctx.FailWithError(kErrorInsufficientBuffer);
+    bool existed = VirtualRegistry::Instance().KeyExists(fullPath);
+    if (!existed) {
+        if (!VirtualRegistry::Instance().CreateKey(fullPath)) {
+            ctx.SetReturn32(ERROR_BADKEY);
             return true;
         }
+    }
 
-        // Look up in fake service list for matching data
-        uint32_t svcType    = SERVICE_WIN32_OWN_PROCESS;
-        uint32_t curState   = SERVICE_RUNNING;
-        uint32_t pid        = 2048;
+    RegistryKeyHandleData data;
+    data.path       = fullPath;
+    data.accessMask = ctx.GetArg32(5);
 
-        std::wstring lowerName;
-        lowerName.reserve(svcName.size());
-        for (wchar_t c : svcName) lowerName.push_back(static_cast<wchar_t>(std::towlower(c)));
+    GuestHandle newHandle = ctx.Handles().Create(HandleType::RegistryKey, std::move(data));
 
-        for (uint32_t i = 0; i < kFakeServiceCount; ++i) {
-            std::wstring fkLower;
-            const wchar_t* fk = kFakeServices[i].keyName;
-            while (*fk) {
-                fkLower.push_back(static_cast<wchar_t>(std::towlower(*fk)));
-                ++fk;
-            }
-            if (lowerName == fkLower) {
-                svcType  = kFakeServices[i].serviceType;
-                curState = kFakeServices[i].currentState;
-                pid      = kFakeServices[i].pid;
-                break;
-            }
-        }
-
-        mem.WriteU32(lpBuffer,      svcType);
-        mem.WriteU32(lpBuffer + 4,  curState);
-        uint32_t accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PAUSE_CONTINUE;
-        mem.WriteU32(lpBuffer + 8,  accepted);
-        mem.WriteU32(lpBuffer + 12, 0);     // dwWin32ExitCode
-        mem.WriteU32(lpBuffer + 16, 0);     // dwServiceSpecificExitCode
-        mem.WriteU32(lpBuffer + 20, 0);     // dwCheckPoint
-        mem.WriteU32(lpBuffer + 24, 0);     // dwWaitHint
-        mem.WriteU32(lpBuffer + 28, pid);   // dwProcessId
-        mem.WriteU32(lpBuffer + 32, 0);     // dwServiceFlags
+    if (ctx.Is64Bit()) {
+        ctx.Memory().WriteU64(phkOut, newHandle);
     } else {
-        ctx.FailWithError(kErrorInvalidParameter);
+        ctx.Memory().WriteU32(phkOut, static_cast<uint32_t>(newHandle));
+    }
+
+    // REG_CREATED_NEW_KEY = 1, REG_OPENED_EXISTING_KEY = 2
+    if (lpDisp != 0) {
+        ctx.Memory().WriteU32(lpDisp, existed ? 2u : 1u);
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
+    return true;
+}
+
+bool HandleRegCreateKeyExA(APIContext& ctx) { return RegCreateKeyExImpl(ctx, false); }
+bool HandleRegCreateKeyExW(APIContext& ctx) { return RegCreateKeyExImpl(ctx, true); }
+
+// ============================================================================
+// RegSetValueExA/W
+// ============================================================================
+
+static bool RegSetValueExImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
+
+    GuestHandle hKey       = ctx.GetArg(0);
+    GuestAddress lpName    = ctx.GetArgPtr(1);
+    // arg2 = Reserved
+    uint32_t dwType        = ctx.GetArg32(3);
+    GuestAddress lpData    = ctx.GetArgPtr(4);
+    uint32_t cbData        = ctx.GetArg32(5);
+
+    // Resolve key path from handle
+    std::wstring keyPath;
+    if (IsPredefinedHKey(hKey)) {
+        keyPath = HivePrefix(hKey);
+    } else {
+        auto entry = ctx.Handles().Lookup(hKey, HandleType::RegistryKey);
+        if (!entry.has_value()) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        auto* regData = std::get_if<RegistryKeyHandleData>(&entry->data);
+        if (!regData) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        keyPath = regData->path;
+    }
+
+    std::wstring valueName = isWide ? ctx.ReadWideString(lpName)
+                                     : NarrowToWide(ctx.ReadAnsiString(lpName));
+
+    // Cap data size to prevent resource exhaustion
+    static constexpr uint32_t kMaxRegDataRead = 64 * 1024;
+    if (cbData > kMaxRegDataRead) cbData = kMaxRegDataRead;
+
+    std::vector<uint8_t> buf(cbData);
+    if (cbData > 0 && lpData != 0) {
+        auto err = ctx.Memory().Read(lpData, buf.data(), cbData);
+        if (err != ErrorCode::Success) {
+            ctx.SetReturn32(ERROR_INVALID_PARAMETER);
+            return true;
+        }
+    }
+
+    if (!VirtualRegistry::Instance().SetValue(keyPath, valueName, dwType, buf.data(), cbData)) {
+        ctx.SetReturn32(ERROR_BADKEY);
         return true;
     }
 
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
+    // Flag persistence writes
+    if (IsPersistenceKey(keyPath)) {
+        ctx.SetLastError(0);
+        // Behavior flag is raised by the dispatcher via the BehaviorFlag on the registration entry.
+        // We also explicitly note it here for tracing.
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
+    return true;
+}
+
+bool HandleRegSetValueExA(APIContext& ctx) { return RegSetValueExImpl(ctx, false); }
+bool HandleRegSetValueExW(APIContext& ctx) { return RegSetValueExImpl(ctx, true); }
+
+// ============================================================================
+// RegQueryValueExA/W
+// ============================================================================
+
+static bool RegQueryValueExImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
+
+    GuestHandle hKey       = ctx.GetArg(0);
+    GuestAddress lpName    = ctx.GetArgPtr(1);
+    // arg2 = lpReserved
+    GuestAddress lpType    = ctx.GetArgPtr(3);
+    GuestAddress lpData    = ctx.GetArgPtr(4);
+    GuestAddress lpcbData  = ctx.GetArgPtr(5);
+
+    std::wstring keyPath;
+    if (IsPredefinedHKey(hKey)) {
+        keyPath = HivePrefix(hKey);
+    } else {
+        auto entry = ctx.Handles().Lookup(hKey, HandleType::RegistryKey);
+        if (!entry.has_value()) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        auto* regData = std::get_if<RegistryKeyHandleData>(&entry->data);
+        if (!regData) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        keyPath = regData->path;
+    }
+
+    std::wstring valueName = isWide ? ctx.ReadWideString(lpName)
+                                     : NarrowToWide(ctx.ReadAnsiString(lpName));
+
+    const VirtualRegValue* val = VirtualRegistry::Instance().QueryValue(keyPath, valueName);
+    if (!val) {
+        ctx.SetReturn32(ERROR_FILE_NOT_FOUND);
+        return true;
+    }
+
+    // Write type if requested
+    if (lpType != 0) {
+        ctx.Memory().WriteU32(lpType, val->type);
+    }
+
+    uint32_t dataSize = static_cast<uint32_t>(val->data.size());
+
+    if (lpcbData == 0) {
+        // NULL lpcbData: just return success if no data buffer requested
+        ctx.SetReturn32(ERROR_SUCCESS);
+        return true;
+    }
+
+    uint32_t bufferSize = 0;
+    ctx.Memory().ReadU32(lpcbData, bufferSize);
+
+    // If lpData is NULL, return required size
+    if (lpData == 0) {
+        ctx.Memory().WriteU32(lpcbData, dataSize);
+        ctx.SetReturn32(ERROR_SUCCESS);
+        return true;
+    }
+
+    if (bufferSize < dataSize) {
+        ctx.Memory().WriteU32(lpcbData, dataSize);
+        ctx.SetReturn32(ERROR_MORE_DATA);
+        return true;
+    }
+
+    // Write the data
+    if (dataSize > 0) {
+        auto err = ctx.Memory().Write(lpData, val->data.data(), dataSize);
+        if (err != ErrorCode::Success) {
+            ctx.SetReturn32(ERROR_INVALID_PARAMETER);
+            return true;
+        }
+    }
+
+    ctx.Memory().WriteU32(lpcbData, dataSize);
+
+    // For ANSI variant, convert REG_SZ data from wide to narrow if needed
+    if (!isWide && (val->type == NT::REG_SZ || val->type == NT::REG_EXPAND_SZ) &&
+        dataSize >= 2 && lpData != 0 && bufferSize >= dataSize / 2) {
+        // The stored data is already UTF-16LE packed by PackRegSz.
+        // For the A variant, write a narrow copy instead.
+        std::string narrow;
+        narrow.reserve(dataSize / 2);
+        for (uint32_t i = 0; i + 1 < dataSize; i += 2) {
+            char c = static_cast<char>(val->data[i]);
+            narrow.push_back(c);
+        }
+        uint32_t narrowSize = static_cast<uint32_t>(narrow.size());
+        ctx.Memory().Write(lpData, narrow.data(), narrowSize);
+        ctx.Memory().WriteU32(lpcbData, narrowSize);
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
+    return true;
+}
+
+bool HandleRegQueryValueExA(APIContext& ctx) { return RegQueryValueExImpl(ctx, false); }
+bool HandleRegQueryValueExW(APIContext& ctx) { return RegQueryValueExImpl(ctx, true); }
+
+// ============================================================================
+// RegDeleteKeyA/W
+// ============================================================================
+
+static bool RegDeleteKeyImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
+
+    GuestHandle hKey    = ctx.GetArg(0);
+    GuestAddress lpSub  = ctx.GetArgPtr(1);
+
+    std::wstring subKey = isWide ? ctx.ReadWideString(lpSub)
+                                 : NarrowToWide(ctx.ReadAnsiString(lpSub));
+
+    std::wstring fullPath = BuildFullPath(hKey, subKey, ctx.Handles());
+    if (fullPath.empty()) {
+        ctx.SetReturn32(ERROR_BADKEY);
+        return true;
+    }
+
+    if (!VirtualRegistry::Instance().DeleteKey(fullPath)) {
+        ctx.SetReturn32(ERROR_FILE_NOT_FOUND);
+        return true;
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
+    return true;
+}
+
+bool HandleRegDeleteKeyA(APIContext& ctx) { return RegDeleteKeyImpl(ctx, false); }
+bool HandleRegDeleteKeyW(APIContext& ctx) { return RegDeleteKeyImpl(ctx, true); }
+
+// ============================================================================
+// RegDeleteValueA/W
+// ============================================================================
+
+static bool RegDeleteValueImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
+
+    GuestHandle hKey     = ctx.GetArg(0);
+    GuestAddress lpName  = ctx.GetArgPtr(1);
+
+    std::wstring keyPath;
+    if (IsPredefinedHKey(hKey)) {
+        keyPath = HivePrefix(hKey);
+    } else {
+        auto entry = ctx.Handles().Lookup(hKey, HandleType::RegistryKey);
+        if (!entry.has_value()) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        auto* regData = std::get_if<RegistryKeyHandleData>(&entry->data);
+        if (!regData) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        keyPath = regData->path;
+    }
+
+    std::wstring valueName = isWide ? ctx.ReadWideString(lpName)
+                                     : NarrowToWide(ctx.ReadAnsiString(lpName));
+
+    if (!VirtualRegistry::Instance().DeleteValue(keyPath, valueName)) {
+        ctx.SetReturn32(ERROR_FILE_NOT_FOUND);
+        return true;
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
+    return true;
+}
+
+bool HandleRegDeleteValueA(APIContext& ctx) { return RegDeleteValueImpl(ctx, false); }
+bool HandleRegDeleteValueW(APIContext& ctx) { return RegDeleteValueImpl(ctx, true); }
+
+// ============================================================================
+// RegCloseKey
+// ============================================================================
+
+bool HandleRegCloseKey(APIContext& ctx) {
+    GuestHandle hKey = ctx.GetArg(0);
+
+    // Predefined keys cannot be closed
+    if (IsPredefinedHKey(hKey)) {
+        ctx.SetReturn32(ERROR_SUCCESS);
+        return true;
+    }
+
+    if (!ctx.Handles().Close(hKey)) {
+        ctx.SetReturn32(ERROR_BADKEY);
+        return true;
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
     return true;
 }
 
 // ============================================================================
-// QueryServiceConfigA/W — hService(0), lpServiceConfig(1),
-//                           cbBufSize(2), pcbBytesNeeded(3)
-//
-// QUERY_SERVICE_CONFIG layout (x64):
-//   DWORD  dwServiceType          (offset  0)
-//   DWORD  dwStartType            (offset  4)
-//   DWORD  dwErrorControl         (offset  8)
-//   LPTSTR lpBinaryPathName       (offset 12/16 on x64 — pointer)
-//   ... additional pointer fields
-// We write a simplified flat version with inline strings.
+// RegEnumKeyExA/W
 // ============================================================================
 
-static bool QueryServiceConfigImpl(APIContext& ctx, bool isWide) {
-    const auto hService       = ctx.GetArg(0);
-    const auto lpConfig       = ctx.GetArgPtr(1);
-    const auto cbBufSize      = ctx.GetArg32(2);
-    const auto pcbBytesNeeded = ctx.GetArgPtr(3);
+static bool RegEnumKeyExImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
 
-    std::wstring svcName = ResolveServiceName(ctx, hService);
-    if (svcName.empty()) {
-        ctx.FailWithError(kErrorInvalidHandle);
-        return true;
-    }
+    GuestHandle hKey        = ctx.GetArg(0);
+    uint32_t    dwIndex     = ctx.GetArg32(1);
+    GuestAddress lpName     = ctx.GetArgPtr(2);
+    GuestAddress lpcchName  = ctx.GetArgPtr(3);
+    // arg4 = lpReserved, arg5 = lpClass, arg6 = lpcchClass, arg7 = lpftLastWriteTime
 
-    auto& mem = ctx.Memory();
-
-    // Fixed minimum size for response
-    static constexpr uint32_t kMinConfigSize = 64;
-
-    if (pcbBytesNeeded != 0) {
-        mem.WriteU32(pcbBytesNeeded, kMinConfigSize);
-    }
-
-    if (lpConfig == 0 || cbBufSize < kMinConfigSize) {
-        ctx.FailWithError(kErrorInsufficientBuffer);
-        return true;
-    }
-
-    // Zero the buffer first
-    std::vector<uint8_t> buf(kMinConfigSize, 0);
-
-    uint32_t svcType   = SERVICE_WIN32_OWN_PROCESS;
-    uint32_t startType = SERVICE_AUTO_START;
-
-    // dwServiceType
-    std::memcpy(buf.data() + 0, &svcType, 4);
-    // dwStartType
-    std::memcpy(buf.data() + 4, &startType, 4);
-    // dwErrorControl = SERVICE_ERROR_NORMAL (1)
-    uint32_t errCtl = 1;
-    std::memcpy(buf.data() + 8, &errCtl, 4);
-    // Remaining pointer fields are left as NULL — malware typically checks
-    // dwServiceType and dwStartType, not the string pointers
-
-    mem.Write(lpConfig, buf.data(), kMinConfigSize);
-
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
-
-bool HandleQueryServiceConfigA(APIContext& ctx) { return QueryServiceConfigImpl(ctx, false); }
-bool HandleQueryServiceConfigW(APIContext& ctx) { return QueryServiceConfigImpl(ctx, true); }
-
-// ============================================================================
-// GetServiceDisplayNameA/W — hSCManager(0), lpServiceName(1),
-//                              lpDisplayName(2), lpcchBuffer(3)
-// ============================================================================
-
-static bool GetServiceDisplayNameImpl(APIContext& ctx, bool isWide) {
-    const auto lpServiceName = ctx.GetArgPtr(1);
-    const auto lpDisplayName = ctx.GetArgPtr(2);
-    const auto lpcchBuffer   = ctx.GetArgPtr(3);
-
-    if (lpServiceName == 0 || lpcchBuffer == 0) {
-        ctx.FailWithError(kErrorInvalidParameter);
-        return true;
-    }
-
-    std::wstring svcName;
-    if (isWide) {
-        svcName = ctx.ReadWideString(lpServiceName, kMaxStringLen / 2);
+    std::wstring keyPath;
+    if (IsPredefinedHKey(hKey)) {
+        keyPath = HivePrefix(hKey);
     } else {
-        svcName = NarrowToWide(ctx.ReadAnsiString(lpServiceName, kMaxStringLen));
+        auto entry = ctx.Handles().Lookup(hKey, HandleType::RegistryKey);
+        if (!entry.has_value()) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        auto* regData = std::get_if<RegistryKeyHandleData>(&entry->data);
+        if (!regData) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        keyPath = regData->path;
     }
 
-    auto& mem = ctx.Memory();
-
-    // Search fake service list
-    std::wstring displayName;
-    std::wstring lowerName;
-    lowerName.reserve(svcName.size());
-    for (wchar_t c : svcName) lowerName.push_back(static_cast<wchar_t>(std::towlower(c)));
-
-    for (uint32_t i = 0; i < kFakeServiceCount; ++i) {
-        std::wstring fkLower;
-        const wchar_t* fk = kFakeServices[i].keyName;
-        while (*fk) {
-            fkLower.push_back(static_cast<wchar_t>(std::towlower(*fk)));
-            ++fk;
-        }
-        if (lowerName == fkLower) {
-            displayName = kFakeServices[i].displayName;
-            break;
-        }
+    auto subKey = VirtualRegistry::Instance().EnumSubKey(keyPath, dwIndex);
+    if (!subKey.has_value()) {
+        ctx.SetReturn32(ERROR_NO_MORE_ITEMS);
+        return true;
     }
 
-    if (displayName.empty()) {
-        ctx.FailWithError(kErrorServiceDoesNotExist);
+    if (lpcchName == 0 || lpName == 0) {
+        ctx.SetReturn32(ERROR_INVALID_PARAMETER);
         return true;
     }
 
     uint32_t bufChars = 0;
-    mem.ReadU32(lpcchBuffer, bufChars);
+    ctx.Memory().ReadU32(lpcchName, bufChars);
+
+    const std::wstring& name = subKey.value();
 
     if (isWide) {
-        uint32_t needed = static_cast<uint32_t>(displayName.size());
-        if (lpDisplayName == 0 || bufChars <= needed) {
-            mem.WriteU32(lpcchBuffer, needed + 1);
-            ctx.FailWithError(kErrorInsufficientBuffer);
+        uint32_t needed = static_cast<uint32_t>(name.size());
+        if (bufChars <= needed) {
+            ctx.Memory().WriteU32(lpcchName, needed + 1);
+            ctx.SetReturn32(ERROR_MORE_DATA);
             return true;
         }
-        ctx.WriteWideString(lpDisplayName, displayName, bufChars);
-        mem.WriteU32(lpcchBuffer, needed);
+        ctx.WriteWideString(lpName, name, bufChars);
+        ctx.Memory().WriteU32(lpcchName, needed);
     } else {
-        std::string narrow = WideToNarrow(displayName);
+        std::string narrow;
+        narrow.reserve(name.size());
+        for (wchar_t wc : name) narrow.push_back(static_cast<char>(wc & 0x7F));
         uint32_t needed = static_cast<uint32_t>(narrow.size());
-        if (lpDisplayName == 0 || bufChars <= needed) {
-            mem.WriteU32(lpcchBuffer, needed + 1);
-            ctx.FailWithError(kErrorInsufficientBuffer);
+        if (bufChars <= needed) {
+            ctx.Memory().WriteU32(lpcchName, needed + 1);
+            ctx.SetReturn32(ERROR_MORE_DATA);
             return true;
         }
-        ctx.WriteAnsiString(lpDisplayName, narrow, bufChars);
-        mem.WriteU32(lpcchBuffer, needed);
+        ctx.WriteAnsiString(lpName, narrow, bufChars);
+        ctx.Memory().WriteU32(lpcchName, needed);
     }
 
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
+    // Write zero-filled FILETIME if requested (arg7)
+    GuestAddress lpft = ctx.GetArgPtr(7);
+    if (lpft != 0) {
+        ctx.Memory().WriteU64(lpft, 0);
+    }
+
+    ctx.SetReturn32(ERROR_SUCCESS);
     return true;
 }
 
-bool HandleGetServiceDisplayNameA(APIContext& ctx) { return GetServiceDisplayNameImpl(ctx, false); }
-bool HandleGetServiceDisplayNameW(APIContext& ctx) { return GetServiceDisplayNameImpl(ctx, true); }
+bool HandleRegEnumKeyExA(APIContext& ctx) { return RegEnumKeyExImpl(ctx, false); }
+bool HandleRegEnumKeyExW(APIContext& ctx) { return RegEnumKeyExImpl(ctx, true); }
 
 // ============================================================================
-// GetServiceKeyNameA/W — hSCManager(0), lpDisplayName(1),
-//                          lpServiceName(2), lpcchBuffer(3)
+// RegEnumValueA/W
 // ============================================================================
 
-static bool GetServiceKeyNameImpl(APIContext& ctx, bool isWide) {
-    const auto lpDisplayName = ctx.GetArgPtr(1);
-    const auto lpServiceName = ctx.GetArgPtr(2);
-    const auto lpcchBuffer   = ctx.GetArgPtr(3);
+static bool RegEnumValueImpl(APIContext& ctx, bool isWide) {
+    VirtualRegistry::Instance().Initialize(ctx.Config());
 
-    if (lpDisplayName == 0 || lpcchBuffer == 0) {
-        ctx.FailWithError(kErrorInvalidParameter);
-        return true;
-    }
+    GuestHandle hKey        = ctx.GetArg(0);
+    uint32_t    dwIndex     = ctx.GetArg32(1);
+    GuestAddress lpName     = ctx.GetArgPtr(2);
+    GuestAddress lpcchName  = ctx.GetArgPtr(3);
+    // arg4 = lpReserved
+    GuestAddress lpType     = ctx.GetArgPtr(5);
+    GuestAddress lpData     = ctx.GetArgPtr(6);
+    GuestAddress lpcbData   = ctx.GetArgPtr(7);
 
-    std::wstring dispName;
-    if (isWide) {
-        dispName = ctx.ReadWideString(lpDisplayName, kMaxStringLen / 2);
+    std::wstring keyPath;
+    if (IsPredefinedHKey(hKey)) {
+        keyPath = HivePrefix(hKey);
     } else {
-        dispName = NarrowToWide(ctx.ReadAnsiString(lpDisplayName, kMaxStringLen));
-    }
-
-    auto& mem = ctx.Memory();
-
-    // Search by display name
-    std::wstring keyName;
-    std::wstring lowerDisp;
-    lowerDisp.reserve(dispName.size());
-    for (wchar_t c : dispName) lowerDisp.push_back(static_cast<wchar_t>(std::towlower(c)));
-
-    for (uint32_t i = 0; i < kFakeServiceCount; ++i) {
-        std::wstring fkLower;
-        const wchar_t* fk = kFakeServices[i].displayName;
-        while (*fk) {
-            fkLower.push_back(static_cast<wchar_t>(std::towlower(*fk)));
-            ++fk;
-        }
-        if (lowerDisp == fkLower) {
-            keyName = kFakeServices[i].keyName;
-            break;
-        }
-    }
-
-    if (keyName.empty()) {
-        ctx.FailWithError(kErrorServiceDoesNotExist);
-        return true;
-    }
-
-    uint32_t bufChars = 0;
-    mem.ReadU32(lpcchBuffer, bufChars);
-
-    if (isWide) {
-        uint32_t needed = static_cast<uint32_t>(keyName.size());
-        if (lpServiceName == 0 || bufChars <= needed) {
-            mem.WriteU32(lpcchBuffer, needed + 1);
-            ctx.FailWithError(kErrorInsufficientBuffer);
+        auto entry = ctx.Handles().Lookup(hKey, HandleType::RegistryKey);
+        if (!entry.has_value()) {
+            ctx.SetReturn32(ERROR_BADKEY);
             return true;
         }
-        ctx.WriteWideString(lpServiceName, keyName, bufChars);
-        mem.WriteU32(lpcchBuffer, needed);
+        auto* regData = std::get_if<RegistryKeyHandleData>(&entry->data);
+        if (!regData) {
+            ctx.SetReturn32(ERROR_BADKEY);
+            return true;
+        }
+        keyPath = regData->path;
+    }
+
+    auto valEntry = VirtualRegistry::Instance().EnumValue(keyPath, dwIndex);
+    if (!valEntry.has_value()) {
+        ctx.SetReturn32(ERROR_NO_MORE_ITEMS);
+        return true;
+    }
+
+    if (lpcchName == 0 || lpName == 0) {
+        ctx.SetReturn32(ERROR_INVALID_PARAMETER);
+        return true;
+    }
+
+    // Write value name
+    uint32_t nameBufChars = 0;
+    ctx.Memory().ReadU32(lpcchName, nameBufChars);
+
+    const std::wstring& vName = valEntry->name;
+
+    if (isWide) {
+        uint32_t needed = static_cast<uint32_t>(vName.size());
+        if (nameBufChars <= needed) {
+            ctx.Memory().WriteU32(lpcchName, needed + 1);
+            ctx.SetReturn32(ERROR_MORE_DATA);
+            return true;
+        }
+        ctx.WriteWideString(lpName, vName, nameBufChars);
+        ctx.Memory().WriteU32(lpcchName, needed);
     } else {
-        std::string narrow = WideToNarrow(keyName);
+        std::string narrow;
+        narrow.reserve(vName.size());
+        for (wchar_t wc : vName) narrow.push_back(static_cast<char>(wc & 0x7F));
         uint32_t needed = static_cast<uint32_t>(narrow.size());
-        if (lpServiceName == 0 || bufChars <= needed) {
-            mem.WriteU32(lpcchBuffer, needed + 1);
-            ctx.FailWithError(kErrorInsufficientBuffer);
+        if (nameBufChars <= needed) {
+            ctx.Memory().WriteU32(lpcchName, needed + 1);
+            ctx.SetReturn32(ERROR_MORE_DATA);
             return true;
         }
-        ctx.WriteAnsiString(lpServiceName, narrow, bufChars);
-        mem.WriteU32(lpcchBuffer, needed);
+        ctx.WriteAnsiString(lpName, narrow, nameBufChars);
+        ctx.Memory().WriteU32(lpcchName, needed);
     }
 
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
-
-bool HandleGetServiceKeyNameA(APIContext& ctx) { return GetServiceKeyNameImpl(ctx, false); }
-bool HandleGetServiceKeyNameW(APIContext& ctx) { return GetServiceKeyNameImpl(ctx, true); }
-
-// ============================================================================
-// ControlService — hService(0), dwControl(1), lpServiceStatus(2)
-//
-// Stopping security services is BehaviorFlag::DefenseEvasion
-// ============================================================================
-
-bool HandleControlService(APIContext& ctx) {
-    const auto hService  = ctx.GetArg(0);
-    const auto dwControl = ctx.GetArg32(1);
-    const auto lpStatus  = ctx.GetArgPtr(2);
-
-    std::wstring svcName = ResolveServiceName(ctx, hService);
-    if (svcName.empty()) {
-        ctx.FailWithError(kErrorInvalidHandle);
-        return true;
+    // Write type
+    if (lpType != 0) {
+        ctx.Memory().WriteU32(lpType, valEntry->type);
     }
 
-    // Track control command
-    (void)dwControl;
+    // Write data
+    uint32_t dataSize = static_cast<uint32_t>(valEntry->data.size());
+    if (lpcbData != 0) {
+        uint32_t dataBufSize = 0;
+        ctx.Memory().ReadU32(lpcbData, dataBufSize);
 
-    // Detect security service tampering
-    if (dwControl == SERVICE_CONTROL_STOP && IsSecurityService(svcName)) {
-        // BehaviorFlag::DefenseEvasion raised by dispatcher
-    }
-
-    // Write SERVICE_STATUS to output buffer
-    if (lpStatus != 0) {
-        auto& mem = ctx.Memory();
-        uint32_t state = SERVICE_RUNNING;
-        if (dwControl == SERVICE_CONTROL_STOP) state = SERVICE_STOP_PENDING;
-        else if (dwControl == SERVICE_CONTROL_PAUSE) state = SERVICE_START_PENDING;
-
-        mem.WriteU32(lpStatus,      SERVICE_WIN32_OWN_PROCESS);
-        mem.WriteU32(lpStatus + 4,  state);
-        mem.WriteU32(lpStatus + 8,  SERVICE_ACCEPT_STOP);
-        mem.WriteU32(lpStatus + 12, 0);
-        mem.WriteU32(lpStatus + 16, 0);
-        mem.WriteU32(lpStatus + 20, 0);
-        mem.WriteU32(lpStatus + 24, 0);
-    }
-
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
-
-// ============================================================================
-// StartServiceCtrlDispatcherA/W — lpServiceStartTable(0)
-//
-// Malware registering itself as a service — persistence indicator
-// ============================================================================
-
-static bool StartServiceCtrlDispatcherImpl(APIContext& ctx, bool /*isWide*/) {
-    const auto lpTable = ctx.GetArgPtr(0);
-    (void)lpTable;
-
-    // BehaviorFlag::ServiceManipulation raised by dispatcher
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
-
-bool HandleStartServiceCtrlDispatcherA(APIContext& ctx) { return StartServiceCtrlDispatcherImpl(ctx, false); }
-bool HandleStartServiceCtrlDispatcherW(APIContext& ctx) { return StartServiceCtrlDispatcherImpl(ctx, true); }
-
-// ============================================================================
-// RegisterServiceCtrlHandlerExA/W — lpServiceName(0), lpHandlerProc(1),
-//                                     lpContext(2)
-//
-// Returns a SERVICE_STATUS_HANDLE (fake, non-zero)
-// ============================================================================
-
-static bool RegisterServiceCtrlHandlerExImpl(APIContext& ctx, bool isWide) {
-    const auto lpServiceName = ctx.GetArgPtr(0);
-
-    if (lpServiceName != 0) {
-        if (isWide) {
-            (void)ctx.ReadWideString(lpServiceName, kMaxStringLen / 2);
-        } else {
-            (void)ctx.ReadAnsiString(lpServiceName, kMaxStringLen);
+        if (lpData != 0 && dataBufSize >= dataSize && dataSize > 0) {
+            ctx.Memory().Write(lpData, valEntry->data.data(), dataSize);
+        } else if (lpData != 0 && dataBufSize < dataSize) {
+            ctx.Memory().WriteU32(lpcbData, dataSize);
+            ctx.SetReturn32(ERROR_MORE_DATA);
+            return true;
         }
+        ctx.Memory().WriteU32(lpcbData, dataSize);
     }
 
-    // Return a fake SERVICE_STATUS_HANDLE (non-zero value)
-    ctx.SetLastError(kErrorSuccess);
-    ctx.SetReturn(0x0000CAFE);
+    ctx.SetReturn32(ERROR_SUCCESS);
     return true;
 }
 
-bool HandleRegisterServiceCtrlHandlerExA(APIContext& ctx) { return RegisterServiceCtrlHandlerExImpl(ctx, false); }
-bool HandleRegisterServiceCtrlHandlerExW(APIContext& ctx) { return RegisterServiceCtrlHandlerExImpl(ctx, true); }
-
-// ============================================================================
-// SetServiceStatus — hServiceStatus(0), lpServiceStatus(1)
-// ============================================================================
-
-bool HandleSetServiceStatus(APIContext& ctx) {
-    const auto hServiceStatus = ctx.GetArg(0);
-    const auto lpServiceStatus = ctx.GetArgPtr(1);
-
-    (void)hServiceStatus;
-
-    // Read the current state being set for tracking
-    if (lpServiceStatus != 0) {
-        uint32_t svcType = 0;
-        uint32_t curState = 0;
-        ctx.Memory().ReadU32(lpServiceStatus, svcType);
-        ctx.Memory().ReadU32(lpServiceStatus + 4, curState);
-        (void)svcType;
-        (void)curState;
-    }
-
-    ctx.SetReturnBool(true);
-    ctx.SetLastError(kErrorSuccess);
-    return true;
-}
+bool HandleRegEnumValueA(APIContext& ctx) { return RegEnumValueImpl(ctx, false); }
+bool HandleRegEnumValueW(APIContext& ctx) { return RegEnumValueImpl(ctx, true); }
 
 // ============================================================================
 // Registration
 // ============================================================================
 
-void RegisterServiceExtAPI(APIDispatcher& dispatcher) noexcept {
+void RegisterRegistryAPI(APIDispatcher& dispatcher) noexcept {
     static constexpr APIRegistration kRegs[] = {
-        { "advapi32.dll", "ChangeServiceConfigA",
-          HandleChangeServiceConfigA, 11, false },
-        { "advapi32.dll", "ChangeServiceConfigW",
-          HandleChangeServiceConfigW, 11, false },
-        { "advapi32.dll", "ChangeServiceConfig2A",
-          HandleChangeServiceConfig2A, 3, false },
-        { "advapi32.dll", "ChangeServiceConfig2W",
-          HandleChangeServiceConfig2W, 3, false },
-        { "advapi32.dll", "EnumServicesStatusA",
-          HandleEnumServicesStatusA, 8, false },
-        { "advapi32.dll", "EnumServicesStatusW",
-          HandleEnumServicesStatusW, 8, false },
-        { "advapi32.dll", "EnumServicesStatusExA",
-          HandleEnumServicesStatusExA, 10, false },
-        { "advapi32.dll", "EnumServicesStatusExW",
-          HandleEnumServicesStatusExW, 10, false },
-        { "advapi32.dll", "QueryServiceStatusEx",
-          HandleQueryServiceStatusEx, 5, false },
-        { "advapi32.dll", "QueryServiceConfigA",
-          HandleQueryServiceConfigA, 4, false },
-        { "advapi32.dll", "QueryServiceConfigW",
-          HandleQueryServiceConfigW, 4, false },
-        { "advapi32.dll", "GetServiceDisplayNameA",
-          HandleGetServiceDisplayNameA, 4, false },
-        { "advapi32.dll", "GetServiceDisplayNameW",
-          HandleGetServiceDisplayNameW, 4, false },
-        { "advapi32.dll", "GetServiceKeyNameA",
-          HandleGetServiceKeyNameA, 4, false },
-        { "advapi32.dll", "GetServiceKeyNameW",
-          HandleGetServiceKeyNameW, 4, false },
-        { "advapi32.dll", "ControlService",
-          HandleControlService, 3, false },
-        { "advapi32.dll", "StartServiceCtrlDispatcherA",
-          HandleStartServiceCtrlDispatcherA, 1, false },
-        { "advapi32.dll", "StartServiceCtrlDispatcherW",
-          HandleStartServiceCtrlDispatcherW, 1, false },
-        { "advapi32.dll", "RegisterServiceCtrlHandlerExA",
-          HandleRegisterServiceCtrlHandlerExA, 3, false },
-        { "advapi32.dll", "RegisterServiceCtrlHandlerExW",
-          HandleRegisterServiceCtrlHandlerExW, 3, false },
-        { "advapi32.dll", "SetServiceStatus",
-          HandleSetServiceStatus, 2, false },
+        { "advapi32.dll", "RegOpenKeyExA",    HandleRegOpenKeyExA,    5, false },
+        { "advapi32.dll", "RegOpenKeyExW",    HandleRegOpenKeyExW,    5, false },
+        { "advapi32.dll", "RegCreateKeyExA",  HandleRegCreateKeyExA,  9, false },
+        { "advapi32.dll", "RegCreateKeyExW",  HandleRegCreateKeyExW,  9, false },
+        { "advapi32.dll", "RegSetValueExA",   HandleRegSetValueExA,   6, false },
+        { "advapi32.dll", "RegSetValueExW",   HandleRegSetValueExW,   6, false },
+        { "advapi32.dll", "RegQueryValueExA", HandleRegQueryValueExA, 6, false },
+        { "advapi32.dll", "RegQueryValueExW", HandleRegQueryValueExW, 6, false },
+        { "advapi32.dll", "RegDeleteKeyA",    HandleRegDeleteKeyA,    2, false },
+        { "advapi32.dll", "RegDeleteKeyW",    HandleRegDeleteKeyW,    2, false },
+        { "advapi32.dll", "RegDeleteValueA",  HandleRegDeleteValueA,  2, false },
+        { "advapi32.dll", "RegDeleteValueW",  HandleRegDeleteValueW,  2, false },
+        { "advapi32.dll", "RegCloseKey",      HandleRegCloseKey,      1, false },
+        { "advapi32.dll", "RegEnumKeyExA",    HandleRegEnumKeyExA,    8, false },
+        { "advapi32.dll", "RegEnumKeyExW",    HandleRegEnumKeyExW,    8, false },
+        { "advapi32.dll", "RegEnumValueA",    HandleRegEnumValueA,    8, false },
+        { "advapi32.dll", "RegEnumValueW",    HandleRegEnumValueW,    8, false },
     };
 
     dispatcher.RegisterBatch(kRegs, static_cast<uint32_t>(std::size(kRegs)));

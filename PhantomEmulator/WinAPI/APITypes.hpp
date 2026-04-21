@@ -17,6 +17,7 @@
 #include "../Common/Types.hpp"
 #include "../Common/Errors.hpp"
 #include "../Common/Config.hpp"
+#include "../Common/WinMacroUndef.hpp"
 
 #include <cstdint>
 #include <string>

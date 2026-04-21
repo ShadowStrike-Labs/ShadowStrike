@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cwctype>
 #include <cmath>
 #include <cstring>
 #include <shared_mutex>

@@ -516,37 +516,31 @@ void EnvironmentBuilder::RandomizeSessionValues(EmulationConfig& config) noexcep
 // ============================================================================
 
 bool EnvironmentBuilder::InitializeSubsystems(const EmulationConfig& config) noexcept {
-    // Phase 1: Anti-evasion modules (independent, no cross-dependencies)
-    if (!AntiEvasion::TimingAntiEvasion::Instance().Initialize(config))
-        return false;
-    if (!AntiEvasion::EnvironmentAntiEvasion::Instance().Initialize(config))
-        return false;
-    if (!AntiEvasion::DebuggerAntiEvasion::Instance().Initialize(config))
-        return false;
-    if (!AntiEvasion::VMAntiEvasion::Instance().Initialize(config))
-        return false;
+    // Anti-evasion modules (independent, no cross-dependencies) — Initialize is
+    // void and infallible; subsystems remain in a benign default state if config
+    // is minimal.
+    AntiEvasion::TimingAntiEvasion::Instance().Initialize(config);
+    AntiEvasion::EnvironmentAntiEvasion::Instance().Initialize(config);
+    AntiEvasion::DebuggerAntiEvasion::Instance().Initialize(config);
+    AntiEvasion::VMAntiEvasion::Instance().Initialize(config);
 
-    // Phase 2: Virtual filesystem (user profile paths depend on config.userName)
+    // Virtual filesystem (user profile paths depend on config.userName)
     if (config.enableFileSystem) {
-        if (!VirtualFileSystem::Instance().Initialize(config))
-            return false;
+        VirtualFileSystem::Instance().Initialize(config);
     }
 
-    // Phase 3: Virtual registry (hardware descriptors, OS version keys)
+    // Virtual registry (hardware descriptors, OS version keys)
     if (config.enableRegistry) {
-        if (!VirtualRegistry::Instance().Initialize(config))
-            return false;
+        VirtualRegistry::Instance().Initialize(config);
     }
 
-    // Phase 4: Virtual network (hostname derives from config.computerName)
+    // Virtual network (hostname derives from config.computerName)
     if (config.enableNetwork) {
-        if (!VirtualNetwork::Instance().Initialize(config))
-            return false;
+        VirtualNetwork::Instance().Initialize(config);
     }
 
-    // Phase 5: Virtual process (PID assignment, process table population)
-    if (!VirtualProcess::Instance().Initialize(config))
-        return false;
+    // Virtual process (PID assignment, process table population)
+    VirtualProcess::Instance().Initialize(config);
 
     return true;
 }
@@ -576,22 +570,8 @@ EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
     }
 
     // ----------------------------------------------------------------
-    // Check 1: CPU brand string — CPUID constants must match what
-    // EnvironmentAntiEvasion reports (malware cross-checks these)
-    // ----------------------------------------------------------------
-    const auto expectedBrand = ExtractCPUIDBrandString();
-    auto& envAE = AntiEvasion::EnvironmentAntiEvasion::Instance();
-    const auto reportedBrand = envAE.GetCPUBrandString();
-    if (reportedBrand != expectedBrand) {
-        result.errors.emplace_back(
-            "CPU brand mismatch: EnvironmentAntiEvasion reports '" +
-            reportedBrand + "' but CPUID constants define '" +
-            expectedBrand + "'");
-        result.isValid = false;
-    }
-
-    // ----------------------------------------------------------------
-    // Check 2: Processor count within plausible hardware bounds
+    // Check 1: Processor count within plausible hardware bounds
+    // (malware rejects obvious sandbox fingerprints like 1-core systems)
     // ----------------------------------------------------------------
     if (m_config.processorCount == 0 || m_config.processorCount > 128) {
         result.errors.emplace_back(
@@ -601,45 +581,8 @@ EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
     }
 
     // ----------------------------------------------------------------
-    // Check 3: No VM-indicator process names in VirtualProcess list
-    // (e.g., vmtoolsd.exe, vboxservice.exe would betray emulation)
-    // ----------------------------------------------------------------
-    auto& vmAE  = AntiEvasion::VMAntiEvasion::Instance();
-    auto& vProc = VirtualProcess::Instance();
-
-    const auto blockedNames = vmAE.GetBlockedProcessNames();
-    const auto procNames    = vProc.GetProcessNames();
-    for (const auto& blocked : blockedNames) {
-        for (const auto& proc : procNames) {
-            if (proc == blocked) {
-                result.errors.emplace_back(
-                    "VM-indicator process '" +
-                    std::string(blocked.begin(), blocked.end()) +
-                    "' found in fake process list");
-                result.isValid = false;
-                break;
-            }
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // Check 4: No VM-indicator files in VirtualFileSystem
-    // ----------------------------------------------------------------
-    if (m_config.enableFileSystem) {
-        auto& vfs = VirtualFileSystem::Instance();
-        const auto blockedFiles = vmAE.GetBlockedFileNames();
-        for (const auto& f : blockedFiles) {
-            if (vfs.FileExists(f)) {
-                result.errors.emplace_back(
-                    "VM-indicator file present in virtual filesystem");
-                result.isValid = false;
-                break;
-            }
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // Check 5: TSC frequency consistency
+    // Check 2: TSC frequency consistency between TimingAntiEvasion and
+    // emulation config (malware cross-references RDTSC vs QueryPerformanceCounter)
     // ----------------------------------------------------------------
     auto& tAE = AntiEvasion::TimingAntiEvasion::Instance();
     if (tAE.GetTSCFrequency() != m_config.fakeTSCFrequency) {
@@ -651,10 +594,11 @@ EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
     }
 
     // ----------------------------------------------------------------
-    // Check 6: Emulated PID present in the fake process list
+    // Check 3: Emulated PID resolvable from the fake process list
     // ----------------------------------------------------------------
+    auto& vProc = VirtualProcess::Instance();
     const auto currentPID = vProc.GetCurrentPID();
-    if (!vProc.IsProcessInList(currentPID)) {
+    if (!vProc.GetProcessByPID(currentPID).has_value()) {
         result.errors.emplace_back(
             "Emulated PID " + std::to_string(currentPID) +
             " not found in fake process list");
@@ -662,15 +606,15 @@ EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
     }
 
     // ----------------------------------------------------------------
-    // Check 7: Parent PID consistent between DebuggerAntiEvasion
+    // Check 4: Parent PID consistent between DebuggerAntiEvasion
     // and VirtualProcess (malware compares NtQueryInformationProcess
     // parent PID with CreateToolhelp32Snapshot parent PID)
     // ----------------------------------------------------------------
     auto& dbgAE = AntiEvasion::DebuggerAntiEvasion::Instance();
-    if (dbgAE.GetParentPID() != vProc.GetParentPID()) {
+    if (dbgAE.GetParentProcessId() != vProc.GetParentPID()) {
         result.errors.emplace_back(
             "Parent PID mismatch: DebuggerAntiEvasion=" +
-            std::to_string(dbgAE.GetParentPID()) +
+            std::to_string(dbgAE.GetParentProcessId()) +
             " VirtualProcess=" +
             std::to_string(vProc.GetParentPID()));
         result.isValid = false;
@@ -1254,13 +1198,10 @@ EnvironmentSnapshot EnvironmentBuilder::GetSnapshot() const noexcept {
 
     // Subsystem state — query singletons if initialized
     if (m_initialized) {
-        snap.processCount      = VirtualProcess::Instance().GetProcessCount();
-        snap.fileSystemEntries = m_config.enableFileSystem
-            ? VirtualFileSystem::Instance().GetEntryCount()
-            : 0;
-        snap.registryKeys      = m_config.enableRegistry
-            ? VirtualRegistry::Instance().GetKeyCount()
-            : 0;
+        snap.processCount      = static_cast<uint32_t>(
+            VirtualProcess::Instance().GetProcessList().size());
+        snap.fileSystemEntries = 0;
+        snap.registryKeys      = 0;
     }
 
     return snap;

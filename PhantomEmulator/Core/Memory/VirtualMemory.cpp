@@ -144,7 +144,7 @@ bool VirtualMemory::Protect(GuestAddress base, GuestSize size, MemProt newProt) 
 // Memory Access (Hot Path)
 // ============================================================================
 
-ErrorCode VirtualMemory::Read(GuestAddress addr, void* dst, uint32_t count) noexcept {
+ErrorCode VirtualMemory::Read(GuestAddress addr, void* dst, uint32_t count) const noexcept {
     if (!dst || count == 0) return ErrorCode::InvalidAddress;
 
     std::shared_lock lock(m_mutex);
@@ -218,7 +218,7 @@ ErrorCode VirtualMemory::Write(GuestAddress addr, const void* src, uint32_t coun
 }
 
 ErrorCode VirtualMemory::FetchInstruction(
-    GuestAddress addr, uint8_t* dst, uint32_t maxBytes, uint32_t& bytesRead) noexcept
+    GuestAddress addr, uint8_t* dst, uint32_t maxBytes, uint32_t& bytesRead) const noexcept
 {
     if (!dst || maxBytes == 0) return ErrorCode::InvalidAddress;
 

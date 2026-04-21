@@ -799,117 +799,117 @@ static constexpr uint32_t kAPINameCount =
 // matched as ordered subsequences with configurable gap tolerance.
 
 // --- Process Injection (1–20) ---
-static const APIId kP001[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_CreateRemoteThread };
-static const APIId kP002[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_QueueUserAPC };
-static const APIId kP003[] = { API_NtCreateSection, API_NtMapViewOfSection, API_NtMapViewOfSection };
-static const APIId kP004[] = { API_CreateProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_QueueUserAPC, API_ResumeThread };
-static const APIId kP005[] = { API_OpenThread, API_SuspendThread, API_GetThreadContext, API_SetThreadContext, API_ResumeThread };
-static const APIId kP006[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_RtlCreateUserThread };
-static const APIId kP007[] = { API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_NtCreateThreadEx };
-static const APIId kP008[] = { API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_QueueUserAPC };
-static const APIId kP009[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_CreateRemoteThreadEx };
-static const APIId kP010[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_VirtualProtectEx, API_CreateRemoteThread };
-static const APIId kP011[] = { API_OpenProcess, API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_QueueUserAPC };
-static const APIId kP012[] = { API_LoadLibrary, API_GetProcAddress, API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_CreateRemoteThread };
-static const APIId kP013[] = { API_VirtualAlloc, API_WriteProcessMemory, API_VirtualProtect, API_CreateThread };
-static const APIId kP014[] = { API_NtCreateSection, API_NtMapViewOfSection, API_NtMapViewOfSection, API_NtResumeThread };
-static const APIId kP015[] = { API_OpenProcess, API_WriteProcessMemory, API_NtCreateThreadEx };
-static const APIId kP016[] = { API_OpenProcess, API_VirtualAllocEx, API_NtWriteVirtualMemory, API_CreateRemoteThread };
-static const APIId kP017[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_SetThreadContext };
-static const APIId kP018[] = { API_OpenProcess, API_SuspendThread, API_VirtualAllocEx, API_WriteProcessMemory, API_ResumeThread };
-static const APIId kP019[] = { API_OpenProcess, API_VirtualProtectEx, API_WriteProcessMemory, API_CreateRemoteThread };
-static const APIId kP020[] = { API_NtOpenProcess, API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_NtCreateThreadEx };
+static const APIId kP1[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_CreateRemoteThread };
+static const APIId kP2[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_QueueUserAPC };
+static const APIId kP3[] = { API_NtCreateSection, API_NtMapViewOfSection, API_NtMapViewOfSection };
+static const APIId kP4[] = { API_CreateProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_QueueUserAPC, API_ResumeThread };
+static const APIId kP5[] = { API_OpenThread, API_SuspendThread, API_GetThreadContext, API_SetThreadContext, API_ResumeThread };
+static const APIId kP6[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_RtlCreateUserThread };
+static const APIId kP7[] = { API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_NtCreateThreadEx };
+static const APIId kP8[] = { API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_QueueUserAPC };
+static const APIId kP9[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_CreateRemoteThreadEx };
+static const APIId kP10[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_VirtualProtectEx, API_CreateRemoteThread };
+static const APIId kP11[] = { API_OpenProcess, API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_QueueUserAPC };
+static const APIId kP12[] = { API_LoadLibrary, API_GetProcAddress, API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_CreateRemoteThread };
+static const APIId kP13[] = { API_VirtualAlloc, API_WriteProcessMemory, API_VirtualProtect, API_CreateThread };
+static const APIId kP14[] = { API_NtCreateSection, API_NtMapViewOfSection, API_NtMapViewOfSection, API_NtResumeThread };
+static const APIId kP15[] = { API_OpenProcess, API_WriteProcessMemory, API_NtCreateThreadEx };
+static const APIId kP16[] = { API_OpenProcess, API_VirtualAllocEx, API_NtWriteVirtualMemory, API_CreateRemoteThread };
+static const APIId kP17[] = { API_OpenProcess, API_VirtualAllocEx, API_WriteProcessMemory, API_SetThreadContext };
+static const APIId kP18[] = { API_OpenProcess, API_SuspendThread, API_VirtualAllocEx, API_WriteProcessMemory, API_ResumeThread };
+static const APIId kP19[] = { API_OpenProcess, API_VirtualProtectEx, API_WriteProcessMemory, API_CreateRemoteThread };
+static const APIId kP20[] = { API_NtOpenProcess, API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_NtCreateThreadEx };
 
 // --- Process Hollowing (21–28) ---
-static const APIId kP021[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_SetThreadContext, API_ResumeThread };
-static const APIId kP022[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_SetThreadContext, API_ResumeThread };
-static const APIId kP023[] = { API_NtCreateSection, API_CreateProcess, API_NtUnmapViewOfSection, API_NtMapViewOfSection, API_ResumeThread };
-static const APIId kP024[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_NtResumeThread };
-static const APIId kP025[] = { API_CreateProcess, API_WriteProcessMemory, API_SetThreadContext, API_ResumeThread };
-static const APIId kP026[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_NtCreateSection, API_NtMapViewOfSection, API_SetThreadContext, API_ResumeThread };
-static const APIId kP027[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_GetThreadContext, API_SetThreadContext, API_ResumeThread };
-static const APIId kP028[] = { API_CreateProcess, API_ReadProcessMemory, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_ResumeThread };
+static const APIId kP21[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_SetThreadContext, API_ResumeThread };
+static const APIId kP22[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_NtAllocateVirtualMemory, API_NtWriteVirtualMemory, API_SetThreadContext, API_ResumeThread };
+static const APIId kP23[] = { API_NtCreateSection, API_CreateProcess, API_NtUnmapViewOfSection, API_NtMapViewOfSection, API_ResumeThread };
+static const APIId kP24[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_NtResumeThread };
+static const APIId kP25[] = { API_CreateProcess, API_WriteProcessMemory, API_SetThreadContext, API_ResumeThread };
+static const APIId kP26[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_NtCreateSection, API_NtMapViewOfSection, API_SetThreadContext, API_ResumeThread };
+static const APIId kP27[] = { API_CreateProcess, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_GetThreadContext, API_SetThreadContext, API_ResumeThread };
+static const APIId kP28[] = { API_CreateProcess, API_ReadProcessMemory, API_NtUnmapViewOfSection, API_VirtualAllocEx, API_WriteProcessMemory, API_ResumeThread };
 
 // --- Credential Theft (29–39) ---
-static const APIId kP029[] = { API_OpenProcess, API_ReadProcessMemory, API_ReadProcessMemory };
-static const APIId kP030[] = { API_RegOpenKeyEx, API_RegQueryValueEx, API_RegQueryValueEx };
-static const APIId kP031[] = { API_LsaOpenPolicy, API_LsaRetrievePrivateData };
-static const APIId kP032[] = { API_OpenProcessToken, API_DuplicateTokenEx, API_CreateProcessAsUser };
-static const APIId kP033[] = { API_CredEnumerate };
-static const APIId kP034[] = { API_CredRead };
-static const APIId kP035[] = { API_OpenProcessToken, API_ImpersonateLoggedOnUser };
-static const APIId kP036[] = { API_OpenProcessToken, API_AdjustTokenPrivileges, API_CreateProcess };
-static const APIId kP037[] = { API_NtOpenProcessToken, API_NtQueryInformationToken, API_NtAdjustPrivilegesToken };
-static const APIId kP038[] = { API_OpenProcess, API_ReadProcessMemory, API_ReadProcessMemory, API_ReadProcessMemory };
-static const APIId kP039[] = { API_NtOpenProcess, API_NtReadVirtualMemory, API_NtReadVirtualMemory };
+static const APIId kP29[] = { API_OpenProcess, API_ReadProcessMemory, API_ReadProcessMemory };
+static const APIId kP30[] = { API_RegOpenKeyEx, API_RegQueryValueEx, API_RegQueryValueEx };
+static const APIId kP31[] = { API_LsaOpenPolicy, API_LsaRetrievePrivateData };
+static const APIId kP32[] = { API_OpenProcessToken, API_DuplicateTokenEx, API_CreateProcessAsUser };
+static const APIId kP33[] = { API_CredEnumerate };
+static const APIId kP34[] = { API_CredRead };
+static const APIId kP35[] = { API_OpenProcessToken, API_ImpersonateLoggedOnUser };
+static const APIId kP36[] = { API_OpenProcessToken, API_AdjustTokenPrivileges, API_CreateProcess };
+static const APIId kP37[] = { API_NtOpenProcessToken, API_NtQueryInformationToken, API_NtAdjustPrivilegesToken };
+static const APIId kP38[] = { API_OpenProcess, API_ReadProcessMemory, API_ReadProcessMemory, API_ReadProcessMemory };
+static const APIId kP39[] = { API_NtOpenProcess, API_NtReadVirtualMemory, API_NtReadVirtualMemory };
 
 // --- Ransomware (40–57) ---
-static const APIId kP040[] = { API_FindFirstFile, API_FindNextFile, API_CreateFile, API_ReadFile, API_CryptEncrypt, API_WriteFile, API_CloseHandle };
-static const APIId kP041[] = { API_FindFirstFile, API_FindNextFile, API_CreateFile, API_ReadFile, API_CryptGenRandom, API_WriteFile };
-static const APIId kP042[] = { API_CryptAcquireContext, API_CryptGenKey, API_FindFirstFile, API_FindNextFile, API_CryptEncrypt };
-static const APIId kP043[] = { API_CryptAcquireContext, API_CryptGenKey, API_CryptExportKey };
-static const APIId kP044[] = { API_GetLogicalDrives, API_GetDriveType, API_FindFirstFile };
-static const APIId kP045[] = { API_FindFirstFile, API_FindNextFile, API_MoveFile };
-static const APIId kP046[] = { API_FindFirstFile, API_FindNextFile, API_DeleteFile };
-static const APIId kP047[] = { API_CreateFile, API_WriteFile, API_CloseHandle, API_DeleteFile };
-static const APIId kP048[] = { API_FindFirstFile, API_FindNextFile, API_FindFirstFile };
-static const APIId kP049[] = { API_CreateFile, API_ReadFile, API_CryptEncrypt, API_WriteFile, API_MoveFile };
-static const APIId kP050[] = { API_CryptAcquireContext, API_CryptImportKey, API_CryptEncrypt };
-static const APIId kP051[] = { API_GetLogicalDrives, API_GetDriveType, API_FindFirstFile, API_FindNextFile, API_CreateFile, API_ReadFile, API_CryptEncrypt, API_WriteFile };
-static const APIId kP052[] = { API_FindFirstFile, API_FindNextFile, API_ReadFile, API_WriteFile, API_MoveFile };
-static const APIId kP053[] = { API_CryptAcquireContext, API_CryptGenRandom, API_CreateFile, API_WriteFile };
-static const APIId kP054[] = { API_FindFirstFile, API_FindNextFile, API_CreateFile, API_WriteFile, API_DeleteFile };
-static const APIId kP055[] = { API_CryptAcquireContext, API_CryptGenKey, API_CryptExportKey, API_FindFirstFile, API_CryptEncrypt };
-static const APIId kP056[] = { API_FindFirstFile, API_FindNextFile, API_ReadFile, API_CryptEncrypt, API_WriteFile };
-static const APIId kP057[] = { API_GetLogicalDrives, API_GetDriveType, API_FindFirstFile, API_FindNextFile, API_CryptEncrypt };
+static const APIId kP40[] = { API_FindFirstFile, API_FindNextFile, API_CreateFile, API_ReadFile, API_CryptEncrypt, API_WriteFile, API_CloseHandle };
+static const APIId kP41[] = { API_FindFirstFile, API_FindNextFile, API_CreateFile, API_ReadFile, API_CryptGenRandom, API_WriteFile };
+static const APIId kP42[] = { API_CryptAcquireContext, API_CryptGenKey, API_FindFirstFile, API_FindNextFile, API_CryptEncrypt };
+static const APIId kP43[] = { API_CryptAcquireContext, API_CryptGenKey, API_CryptExportKey };
+static const APIId kP44[] = { API_GetLogicalDrives, API_GetDriveType, API_FindFirstFile };
+static const APIId kP45[] = { API_FindFirstFile, API_FindNextFile, API_MoveFile };
+static const APIId kP46[] = { API_FindFirstFile, API_FindNextFile, API_DeleteFile };
+static const APIId kP47[] = { API_CreateFile, API_WriteFile, API_CloseHandle, API_DeleteFile };
+static const APIId kP48[] = { API_FindFirstFile, API_FindNextFile, API_FindFirstFile };
+static const APIId kP49[] = { API_CreateFile, API_ReadFile, API_CryptEncrypt, API_WriteFile, API_MoveFile };
+static const APIId kP50[] = { API_CryptAcquireContext, API_CryptImportKey, API_CryptEncrypt };
+static const APIId kP51[] = { API_GetLogicalDrives, API_GetDriveType, API_FindFirstFile, API_FindNextFile, API_CreateFile, API_ReadFile, API_CryptEncrypt, API_WriteFile };
+static const APIId kP52[] = { API_FindFirstFile, API_FindNextFile, API_ReadFile, API_WriteFile, API_MoveFile };
+static const APIId kP53[] = { API_CryptAcquireContext, API_CryptGenRandom, API_CreateFile, API_WriteFile };
+static const APIId kP54[] = { API_FindFirstFile, API_FindNextFile, API_CreateFile, API_WriteFile, API_DeleteFile };
+static const APIId kP55[] = { API_CryptAcquireContext, API_CryptGenKey, API_CryptExportKey, API_FindFirstFile, API_CryptEncrypt };
+static const APIId kP56[] = { API_FindFirstFile, API_FindNextFile, API_ReadFile, API_CryptEncrypt, API_WriteFile };
+static const APIId kP57[] = { API_GetLogicalDrives, API_GetDriveType, API_FindFirstFile, API_FindNextFile, API_CryptEncrypt };
 
 // --- Downloader/Dropper (58–72) ---
-static const APIId kP058[] = { API_InternetOpen, API_InternetOpenUrl, API_InternetReadFile, API_CreateFile, API_WriteFile };
-static const APIId kP059[] = { API_URLDownloadToFile, API_CreateProcess };
-static const APIId kP060[] = { API_WinHttpOpen, API_WinHttpConnect, API_WinHttpOpenRequest, API_WinHttpSendRequest, API_WinHttpReceiveResponse };
-static const APIId kP061[] = { API_WSAStartup, API_socket, API_connect, API_send, API_recv, API_CreateFile, API_WriteFile };
-static const APIId kP062[] = { API_CoCreateInstance, API_InternetReadFile, API_CreateFile, API_WriteFile };
-static const APIId kP063[] = { API_LoadLibrary, API_GetProcAddress, API_InternetOpen, API_InternetOpenUrl, API_InternetReadFile };
-static const APIId kP064[] = { API_InternetOpen, API_InternetConnect, API_HttpOpenRequest, API_HttpSendRequest, API_InternetReadFile, API_CreateFile, API_WriteFile };
-static const APIId kP065[] = { API_InternetReadFile, API_CreateFile, API_WriteFile, API_CreateProcess };
-static const APIId kP066[] = { API_WinHttpOpen, API_WinHttpConnect, API_WinHttpOpenRequest, API_WinHttpSendRequest, API_WinHttpReceiveResponse, API_WinHttpReadData, API_CreateFile, API_WriteFile };
-static const APIId kP067[] = { API_gethostbyname, API_socket, API_connect, API_recv, API_CreateFile, API_WriteFile };
-static const APIId kP068[] = { API_URLDownloadToFile, API_ShellExecute };
-static const APIId kP069[] = { API_InternetOpen, API_InternetOpenUrl, API_InternetReadFile, API_CreateFile, API_WriteFile, API_CreateProcess };
-static const APIId kP070[] = { API_WSAStartup, API_socket, API_connect, API_recv, API_CreateProcess };
-static const APIId kP071[] = { API_URLDownloadToFile, API_LoadLibrary };
-static const APIId kP072[] = { API_WinHttpOpen, API_WinHttpConnect, API_WinHttpOpenRequest, API_WinHttpSendRequest, API_WinHttpReceiveResponse, API_WinHttpReadData, API_CreateProcess };
+static const APIId kP58[] = { API_InternetOpen, API_InternetOpenUrl, API_InternetReadFile, API_CreateFile, API_WriteFile };
+static const APIId kP59[] = { API_URLDownloadToFile, API_CreateProcess };
+static const APIId kP60[] = { API_WinHttpOpen, API_WinHttpConnect, API_WinHttpOpenRequest, API_WinHttpSendRequest, API_WinHttpReceiveResponse };
+static const APIId kP61[] = { API_WSAStartup, API_socket, API_connect, API_send, API_recv, API_CreateFile, API_WriteFile };
+static const APIId kP62[] = { API_CoCreateInstance, API_InternetReadFile, API_CreateFile, API_WriteFile };
+static const APIId kP63[] = { API_LoadLibrary, API_GetProcAddress, API_InternetOpen, API_InternetOpenUrl, API_InternetReadFile };
+static const APIId kP64[] = { API_InternetOpen, API_InternetConnect, API_HttpOpenRequest, API_HttpSendRequest, API_InternetReadFile, API_CreateFile, API_WriteFile };
+static const APIId kP65[] = { API_InternetReadFile, API_CreateFile, API_WriteFile, API_CreateProcess };
+static const APIId kP66[] = { API_WinHttpOpen, API_WinHttpConnect, API_WinHttpOpenRequest, API_WinHttpSendRequest, API_WinHttpReceiveResponse, API_WinHttpReadData, API_CreateFile, API_WriteFile };
+static const APIId kP67[] = { API_gethostbyname, API_socket, API_connect, API_recv, API_CreateFile, API_WriteFile };
+static const APIId kP68[] = { API_URLDownloadToFile, API_ShellExecute };
+static const APIId kP69[] = { API_InternetOpen, API_InternetOpenUrl, API_InternetReadFile, API_CreateFile, API_WriteFile, API_CreateProcess };
+static const APIId kP70[] = { API_WSAStartup, API_socket, API_connect, API_recv, API_CreateProcess };
+static const APIId kP71[] = { API_URLDownloadToFile, API_LoadLibrary };
+static const APIId kP72[] = { API_WinHttpOpen, API_WinHttpConnect, API_WinHttpOpenRequest, API_WinHttpSendRequest, API_WinHttpReceiveResponse, API_WinHttpReadData, API_CreateProcess };
 
 // --- Persistence (73–89) ---
-static const APIId kP073[] = { API_RegOpenKeyEx, API_RegSetValueEx };
-static const APIId kP074[] = { API_RegCreateKeyEx, API_RegSetValueEx };
-static const APIId kP075[] = { API_OpenSCManager, API_CreateService };
-static const APIId kP076[] = { API_CopyFile, API_RegOpenKeyEx, API_RegSetValueEx };
-static const APIId kP077[] = { API_SHGetFolderPath, API_CopyFile };
-static const APIId kP078[] = { API_OpenSCManager, API_OpenService, API_StartService };
-static const APIId kP079[] = { API_NtOpenKey, API_NtSetValueKey };
-static const APIId kP080[] = { API_RegCreateKeyEx, API_RegSetValueEx, API_RegCloseKey };
-static const APIId kP081[] = { API_RegOpenKeyEx, API_RegSetValueEx, API_RegSetValueEx };
-static const APIId kP082[] = { API_OpenSCManager, API_CreateService, API_StartService };
-static const APIId kP083[] = { API_NtCreateKey, API_NtSetValueKey };
-static const APIId kP084[] = { API_CreateFile, API_WriteFile, API_RegOpenKeyEx, API_RegSetValueEx };
-static const APIId kP085[] = { API_CopyFile, API_OpenSCManager, API_CreateService, API_StartService };
-static const APIId kP086[] = { API_SHGetFolderPath, API_CreateFile, API_WriteFile };
-static const APIId kP087[] = { API_GetTempPath, API_CreateFile, API_WriteFile, API_CreateProcess };
-static const APIId kP088[] = { API_RegOpenKeyEx, API_RegSetValueEx, API_RegOpenKeyEx, API_RegSetValueEx };
-static const APIId kP089[] = { API_GetModuleFileName, API_CopyFile, API_RegOpenKeyEx, API_RegSetValueEx };
+static const APIId kP73[] = { API_RegOpenKeyEx, API_RegSetValueEx };
+static const APIId kP74[] = { API_RegCreateKeyEx, API_RegSetValueEx };
+static const APIId kP75[] = { API_OpenSCManager, API_CreateService };
+static const APIId kP76[] = { API_CopyFile, API_RegOpenKeyEx, API_RegSetValueEx };
+static const APIId kP77[] = { API_SHGetFolderPath, API_CopyFile };
+static const APIId kP78[] = { API_OpenSCManager, API_OpenService, API_StartService };
+static const APIId kP79[] = { API_NtOpenKey, API_NtSetValueKey };
+static const APIId kP80[] = { API_RegCreateKeyEx, API_RegSetValueEx, API_RegCloseKey };
+static const APIId kP81[] = { API_RegOpenKeyEx, API_RegSetValueEx, API_RegSetValueEx };
+static const APIId kP82[] = { API_OpenSCManager, API_CreateService, API_StartService };
+static const APIId kP83[] = { API_NtCreateKey, API_NtSetValueKey };
+static const APIId kP84[] = { API_CreateFile, API_WriteFile, API_RegOpenKeyEx, API_RegSetValueEx };
+static const APIId kP85[] = { API_CopyFile, API_OpenSCManager, API_CreateService, API_StartService };
+static const APIId kP86[] = { API_SHGetFolderPath, API_CreateFile, API_WriteFile };
+static const APIId kP87[] = { API_GetTempPath, API_CreateFile, API_WriteFile, API_CreateProcess };
+static const APIId kP88[] = { API_RegOpenKeyEx, API_RegSetValueEx, API_RegOpenKeyEx, API_RegSetValueEx };
+static const APIId kP89[] = { API_GetModuleFileName, API_CopyFile, API_RegOpenKeyEx, API_RegSetValueEx };
 
 // --- Evasion (90–109) ---
-static const APIId kP090[] = { API_IsDebuggerPresent };
-static const APIId kP091[] = { API_NtQueryInformationProcess };
-static const APIId kP092[] = { API_GetTickCount, API_GetTickCount };
-static const APIId kP093[] = { API_CreateToolhelp32Snapshot, API_Process32First, API_Process32Next };
-static const APIId kP094[] = { API_NtSetInformationThread };
-static const APIId kP095[] = { API_GetModuleHandle, API_GetProcAddress, API_VirtualProtect };
-static const APIId kP096[] = { API_QueryPerformanceCounter, API_QueryPerformanceCounter };
-static const APIId kP097[] = { API_FindWindow };
-static const APIId kP098[] = { API_NtQuerySystemInformation };
-static const APIId kP099[] = { API_CheckRemoteDebuggerPresent };
+static const APIId kP90[] = { API_IsDebuggerPresent };
+static const APIId kP91[] = { API_NtQueryInformationProcess };
+static const APIId kP92[] = { API_GetTickCount, API_GetTickCount };
+static const APIId kP93[] = { API_CreateToolhelp32Snapshot, API_Process32First, API_Process32Next };
+static const APIId kP94[] = { API_NtSetInformationThread };
+static const APIId kP95[] = { API_GetModuleHandle, API_GetProcAddress, API_VirtualProtect };
+static const APIId kP96[] = { API_QueryPerformanceCounter, API_QueryPerformanceCounter };
+static const APIId kP97[] = { API_FindWindow };
+static const APIId kP98[] = { API_NtQuerySystemInformation };
+static const APIId kP99[] = { API_CheckRemoteDebuggerPresent };
 static const APIId kP100[] = { API_Sleep, API_GetTickCount };
 static const APIId kP101[] = { API_GetComputerName, API_GetUserName, API_GetSystemInfo };
 static const APIId kP102[] = { API_GetDiskFreeSpaceEx };
@@ -1085,117 +1085,117 @@ struct PatternDef {
 
 static const PatternDef kPatterns[] = {
     // --- Process Injection (T1055) ---
-    PDEF(001, "Classic Remote Thread Injection",               "T1055.002", 4, 12),
-    PDEF(002, "APC Queue Injection",                           "T1055.004", 4, 12),
-    PDEF(003, "Section Mapping Injection",                     "T1055.012", 4, 10),
-    PDEF(004, "Early Bird APC Injection",                      "T1055.004", 4, 14),
-    PDEF(005, "Thread Execution Hijacking",                    "T1055.003", 4, 10),
-    PDEF(006, "RtlCreateUserThread Injection",                 "T1055.002", 4, 12),
-    PDEF(007, "Nt* API Process Injection",                     "T1055.002", 4, 10),
-    PDEF(008, "Nt* APC Injection",                             "T1055.004", 4, 10),
-    PDEF(009, "CreateRemoteThreadEx Injection",                "T1055.002", 4, 12),
-    PDEF(010, "VirtualProtectEx + Remote Thread Injection",    "T1055.002", 4, 14),
-    PDEF(011, "Nt* Memory + APC Injection",                    "T1055.004", 4, 12),
-    PDEF(012, "Dynamic API Resolve + Injection",               "T1055.001", 4, 20),
-    PDEF(013, "Self-Injection via VirtualAlloc",               "T1055.002", 3, 10),
-    PDEF(014, "Section Map Double-Map Injection",              "T1055.012", 4, 12),
-    PDEF(015, "WriteProcessMemory + NtCreateThreadEx",         "T1055.002", 4, 10),
-    PDEF(016, "Mixed API Injection (VA + Nt Write)",           "T1055.002", 4, 12),
-    PDEF(017, "Stack Pivot via SetThreadContext",              "T1055.003", 4, 12),
-    PDEF(018, "Suspend-Inject-Resume",                         "T1055.003", 4, 14),
-    PDEF(019, "Module Stomping Injection",                     "T1055.002", 4, 12),
-    PDEF(020, "Full Nt* Injection Chain",                      "T1055.002", 4, 10),
+    PDEF(1, "Classic Remote Thread Injection",               "T1055.002", 4, 12),
+    PDEF(2, "APC Queue Injection",                           "T1055.004", 4, 12),
+    PDEF(3, "Section Mapping Injection",                     "T1055.012", 4, 10),
+    PDEF(4, "Early Bird APC Injection",                      "T1055.004", 4, 14),
+    PDEF(5, "Thread Execution Hijacking",                    "T1055.003", 4, 10),
+    PDEF(6, "RtlCreateUserThread Injection",                 "T1055.002", 4, 12),
+    PDEF(7, "Nt* API Process Injection",                     "T1055.002", 4, 10),
+    PDEF(8, "Nt* APC Injection",                             "T1055.004", 4, 10),
+    PDEF(9, "CreateRemoteThreadEx Injection",                "T1055.002", 4, 12),
+    PDEF(10, "VirtualProtectEx + Remote Thread Injection",    "T1055.002", 4, 14),
+    PDEF(11, "Nt* Memory + APC Injection",                    "T1055.004", 4, 12),
+    PDEF(12, "Dynamic API Resolve + Injection",               "T1055.001", 4, 20),
+    PDEF(13, "Self-Injection via VirtualAlloc",               "T1055.002", 3, 10),
+    PDEF(14, "Section Map Double-Map Injection",              "T1055.012", 4, 12),
+    PDEF(15, "WriteProcessMemory + NtCreateThreadEx",         "T1055.002", 4, 10),
+    PDEF(16, "Mixed API Injection (VA + Nt Write)",           "T1055.002", 4, 12),
+    PDEF(17, "Stack Pivot via SetThreadContext",              "T1055.003", 4, 12),
+    PDEF(18, "Suspend-Inject-Resume",                         "T1055.003", 4, 14),
+    PDEF(19, "Module Stomping Injection",                     "T1055.002", 4, 12),
+    PDEF(20, "Full Nt* Injection Chain",                      "T1055.002", 4, 10),
 
     // --- Process Hollowing (T1055.012) ---
-    PDEF(021, "Classic Process Hollowing",                     "T1055.012", 4, 14),
-    PDEF(022, "Nt* Process Hollowing",                         "T1055.012", 4, 14),
-    PDEF(023, "Transacted Section Hollowing",                  "T1055.013", 4, 14),
-    PDEF(024, "Hollowing + NtResumeThread",                    "T1055.012", 4, 14),
-    PDEF(025, "Minimal Process Hollowing",                     "T1055.012", 4, 12),
-    PDEF(026, "Section-Based Process Hollowing",               "T1055.012", 4, 14),
-    PDEF(027, "Hollowing with Context Manipulation",           "T1055.012", 4, 16),
-    PDEF(028, "Hollowing with Memory Read",                    "T1055.012", 4, 16),
+    PDEF(21, "Classic Process Hollowing",                     "T1055.012", 4, 14),
+    PDEF(22, "Nt* Process Hollowing",                         "T1055.012", 4, 14),
+    PDEF(23, "Transacted Section Hollowing",                  "T1055.013", 4, 14),
+    PDEF(24, "Hollowing + NtResumeThread",                    "T1055.012", 4, 14),
+    PDEF(25, "Minimal Process Hollowing",                     "T1055.012", 4, 12),
+    PDEF(26, "Section-Based Process Hollowing",               "T1055.012", 4, 14),
+    PDEF(27, "Hollowing with Context Manipulation",           "T1055.012", 4, 16),
+    PDEF(28, "Hollowing with Memory Read",                    "T1055.012", 4, 16),
 
     // --- Credential Theft (T1003) ---
-    PDEF(029, "LSASS Memory Dump",                             "T1003.001", 4, 8),
-    PDEF(030, "SAM Registry Credential Dump",                  "T1003.002", 3, 8),
-    PDEF(031, "LSA Secret Retrieval",                          "T1003.004", 4, 6),
-    PDEF(032, "Token Theft + Process Creation",                "T1134.002", 4, 10),
-    PDEF(033, "Credential Vault Enumeration",                  "T1555",     3, 4),
-    PDEF(034, "Credential Vault Read",                         "T1555",     3, 4),
-    PDEF(035, "Token Impersonation",                           "T1134.001", 3, 8),
-    PDEF(036, "Privilege Token + Process Spawn",               "T1134.002", 4, 12),
-    PDEF(037, "Nt* Token Privilege Manipulation",              "T1134.001", 3, 8),
-    PDEF(038, "Repeated LSASS Memory Read",                    "T1003.001", 4, 10),
-    PDEF(039, "Nt* Remote Memory Dump",                        "T1003.001", 4, 8),
+    PDEF(29, "LSASS Memory Dump",                             "T1003.001", 4, 8),
+    PDEF(30, "SAM Registry Credential Dump",                  "T1003.002", 3, 8),
+    PDEF(31, "LSA Secret Retrieval",                          "T1003.004", 4, 6),
+    PDEF(32, "Token Theft + Process Creation",                "T1134.002", 4, 10),
+    PDEF(33, "Credential Vault Enumeration",                  "T1555",     3, 4),
+    PDEF(34, "Credential Vault Read",                         "T1555",     3, 4),
+    PDEF(35, "Token Impersonation",                           "T1134.001", 3, 8),
+    PDEF(36, "Privilege Token + Process Spawn",               "T1134.002", 4, 12),
+    PDEF(37, "Nt* Token Privilege Manipulation",              "T1134.001", 3, 8),
+    PDEF(38, "Repeated LSASS Memory Read",                    "T1003.001", 4, 10),
+    PDEF(39, "Nt* Remote Memory Dump",                        "T1003.001", 4, 8),
 
     // --- Ransomware (T1486) ---
-    PDEF(040, "File Encryption Loop (CryptEncrypt)",           "T1486",     4, 12),
-    PDEF(041, "File Encryption Loop (CryptGenRandom)",         "T1486",     4, 12),
-    PDEF(042, "Ransomware Key Gen + Encrypt",                  "T1486",     4, 16),
-    PDEF(043, "Crypto Key Generation + Export",                "T1486",     3, 8),
-    PDEF(044, "Drive Enumeration for Encryption",              "T1486",     3, 8),
-    PDEF(045, "Mass File Rename",                              "T1486",     3, 8),
-    PDEF(046, "Mass File Deletion",                            "T1485",     4, 8),
-    PDEF(047, "File Overwrite + Delete",                       "T1485",     3, 6),
-    PDEF(048, "Recursive Directory Enumeration",               "T1083",     2, 10),
-    PDEF(049, "Encrypt-then-Rename",                           "T1486",     4, 10),
-    PDEF(050, "Key Import + Encrypt",                          "T1486",     4, 8),
-    PDEF(051, "Full Drive Ransomware Chain",                   "T1486",     4, 20),
-    PDEF(052, "File Enum + Read/Write/Rename",                 "T1486",     3, 12),
-    PDEF(053, "Random Data File Write",                        "T1486",     3, 8),
-    PDEF(054, "File Enum + Overwrite + Delete",                "T1485",     4, 10),
-    PDEF(055, "Full Key Gen + Encrypt Chain",                  "T1486",     4, 18),
-    PDEF(056, "File Read + Encrypt + Write",                   "T1486",     4, 10),
-    PDEF(057, "Drive Enum + Encrypt",                          "T1486",     4, 14),
+    PDEF(40, "File Encryption Loop (CryptEncrypt)",           "T1486",     4, 12),
+    PDEF(41, "File Encryption Loop (CryptGenRandom)",         "T1486",     4, 12),
+    PDEF(42, "Ransomware Key Gen + Encrypt",                  "T1486",     4, 16),
+    PDEF(43, "Crypto Key Generation + Export",                "T1486",     3, 8),
+    PDEF(44, "Drive Enumeration for Encryption",              "T1486",     3, 8),
+    PDEF(45, "Mass File Rename",                              "T1486",     3, 8),
+    PDEF(46, "Mass File Deletion",                            "T1485",     4, 8),
+    PDEF(47, "File Overwrite + Delete",                       "T1485",     3, 6),
+    PDEF(48, "Recursive Directory Enumeration",               "T1083",     2, 10),
+    PDEF(49, "Encrypt-then-Rename",                           "T1486",     4, 10),
+    PDEF(50, "Key Import + Encrypt",                          "T1486",     4, 8),
+    PDEF(51, "Full Drive Ransomware Chain",                   "T1486",     4, 20),
+    PDEF(52, "File Enum + Read/Write/Rename",                 "T1486",     3, 12),
+    PDEF(53, "Random Data File Write",                        "T1486",     3, 8),
+    PDEF(54, "File Enum + Overwrite + Delete",                "T1485",     4, 10),
+    PDEF(55, "Full Key Gen + Encrypt Chain",                  "T1486",     4, 18),
+    PDEF(56, "File Read + Encrypt + Write",                   "T1486",     4, 10),
+    PDEF(57, "Drive Enum + Encrypt",                          "T1486",     4, 14),
 
     // --- Downloader/Dropper (T1105) ---
-    PDEF(058, "WinINet URL Download",                          "T1105",     3, 10),
-    PDEF(059, "URLDownloadToFile + Execute",                   "T1105",     4, 8),
-    PDEF(060, "WinHTTP Download",                              "T1071.001", 3, 10),
-    PDEF(061, "Winsock Raw Download to File",                  "T1105",     3, 14),
-    PDEF(062, "COM-based HTTP Download",                       "T1105",     3, 12),
-    PDEF(063, "Dynamic API Resolve Download",                  "T1105",     3, 16),
-    PDEF(064, "WinINet Full HTTP Download Chain",              "T1105",     3, 14),
-    PDEF(065, "Download + Execute Chain",                      "T1105",     4, 10),
-    PDEF(066, "WinHTTP Full Download to File",                 "T1105",     3, 18),
-    PDEF(067, "DNS Resolve + Socket Download",                 "T1105",     3, 14),
-    PDEF(068, "URLDownloadToFile + ShellExecute",              "T1105",     4, 8),
-    PDEF(069, "WinINet Download + Execute",                    "T1105",     4, 14),
-    PDEF(070, "Socket Download + Execute",                     "T1105",     4, 12),
-    PDEF(071, "URLDownloadToFile + LoadLibrary",               "T1105",     4, 8),
-    PDEF(072, "WinHTTP Download + Execute",                    "T1105",     4, 18),
+    PDEF(58, "WinINet URL Download",                          "T1105",     3, 10),
+    PDEF(59, "URLDownloadToFile + Execute",                   "T1105",     4, 8),
+    PDEF(60, "WinHTTP Download",                              "T1071.001", 3, 10),
+    PDEF(61, "Winsock Raw Download to File",                  "T1105",     3, 14),
+    PDEF(62, "COM-based HTTP Download",                       "T1105",     3, 12),
+    PDEF(63, "Dynamic API Resolve Download",                  "T1105",     3, 16),
+    PDEF(64, "WinINet Full HTTP Download Chain",              "T1105",     3, 14),
+    PDEF(65, "Download + Execute Chain",                      "T1105",     4, 10),
+    PDEF(66, "WinHTTP Full Download to File",                 "T1105",     3, 18),
+    PDEF(67, "DNS Resolve + Socket Download",                 "T1105",     3, 14),
+    PDEF(68, "URLDownloadToFile + ShellExecute",              "T1105",     4, 8),
+    PDEF(69, "WinINet Download + Execute",                    "T1105",     4, 14),
+    PDEF(70, "Socket Download + Execute",                     "T1105",     4, 12),
+    PDEF(71, "URLDownloadToFile + LoadLibrary",               "T1105",     4, 8),
+    PDEF(72, "WinHTTP Download + Execute",                    "T1105",     4, 18),
 
     // --- Persistence (T1547, T1543, T1053) ---
-    PDEF(073, "Registry Run Key Persistence",                  "T1547.001", 3, 8),
-    PDEF(074, "Registry Create + Run Key",                     "T1547.001", 3, 8),
-    PDEF(075, "Service Creation Persistence",                  "T1543.003", 3, 8),
-    PDEF(076, "File Copy + Registry Persistence",              "T1547.001", 4, 12),
-    PDEF(077, "Startup Folder File Drop",                      "T1547.009", 3, 8),
-    PDEF(078, "Service Open + Start",                          "T1569.002", 2, 8),
-    PDEF(079, "Nt Registry Persistence",                       "T1547.001", 3, 8),
-    PDEF(080, "Registry Create + Set + Close",                 "T1547.001", 3, 8),
-    PDEF(081, "Multiple Registry Value Writes",                "T1547.001", 3, 10),
-    PDEF(082, "Service Create + Start",                        "T1543.003", 3, 8),
-    PDEF(083, "Nt Registry Key Create + Set",                  "T1547.001", 3, 8),
-    PDEF(084, "File Drop + Registry Persistence",              "T1547.001", 4, 12),
-    PDEF(085, "File Copy + Service Persistence",               "T1543.003", 4, 14),
-    PDEF(086, "Startup Folder Direct Write",                   "T1547.009", 3, 10),
-    PDEF(087, "Temp File Drop + Execute",                      "T1105",     3, 10),
-    PDEF(088, "Multi-Key Registry Persistence",                "T1547.001", 3, 14),
-    PDEF(089, "Self-Copy + Registry Persistence",              "T1547.001", 4, 14),
+    PDEF(73, "Registry Run Key Persistence",                  "T1547.001", 3, 8),
+    PDEF(74, "Registry Create + Run Key",                     "T1547.001", 3, 8),
+    PDEF(75, "Service Creation Persistence",                  "T1543.003", 3, 8),
+    PDEF(76, "File Copy + Registry Persistence",              "T1547.001", 4, 12),
+    PDEF(77, "Startup Folder File Drop",                      "T1547.009", 3, 8),
+    PDEF(78, "Service Open + Start",                          "T1569.002", 2, 8),
+    PDEF(79, "Nt Registry Persistence",                       "T1547.001", 3, 8),
+    PDEF(80, "Registry Create + Set + Close",                 "T1547.001", 3, 8),
+    PDEF(81, "Multiple Registry Value Writes",                "T1547.001", 3, 10),
+    PDEF(82, "Service Create + Start",                        "T1543.003", 3, 8),
+    PDEF(83, "Nt Registry Key Create + Set",                  "T1547.001", 3, 8),
+    PDEF(84, "File Drop + Registry Persistence",              "T1547.001", 4, 12),
+    PDEF(85, "File Copy + Service Persistence",               "T1543.003", 4, 14),
+    PDEF(86, "Startup Folder Direct Write",                   "T1547.009", 3, 10),
+    PDEF(87, "Temp File Drop + Execute",                      "T1105",     3, 10),
+    PDEF(88, "Multi-Key Registry Persistence",                "T1547.001", 3, 14),
+    PDEF(89, "Self-Copy + Registry Persistence",              "T1547.001", 4, 14),
 
     // --- Evasion (T1622, T1497) ---
-    PDEF(090, "IsDebuggerPresent Check",                       "T1622",     2, 4),
-    PDEF(091, "NtQueryInformationProcess Debug Check",         "T1622",     2, 4),
-    PDEF(092, "GetTickCount Timing Check",                     "T1497.003", 2, 6),
-    PDEF(093, "Process Enumeration (Sandbox Check)",           "T1057",     2, 8),
-    PDEF(094, "ThreadHideFromDebugger",                        "T1622",     3, 4),
-    PDEF(095, "AMSI/ETW Bypass Setup",                         "T1562.001", 4, 10),
-    PDEF(096, "QPC Timing Check",                              "T1497.003", 2, 6),
-    PDEF(097, "FindWindow Anti-Debug",                         "T1622",     2, 4),
-    PDEF(098, "NtQuerySystemInformation Evasion",              "T1082",     2, 4),
-    PDEF(099, "CheckRemoteDebuggerPresent",                    "T1622",     2, 4),
+    PDEF(90, "IsDebuggerPresent Check",                       "T1622",     2, 4),
+    PDEF(91, "NtQueryInformationProcess Debug Check",         "T1622",     2, 4),
+    PDEF(92, "GetTickCount Timing Check",                     "T1497.003", 2, 6),
+    PDEF(93, "Process Enumeration (Sandbox Check)",           "T1057",     2, 8),
+    PDEF(94, "ThreadHideFromDebugger",                        "T1622",     3, 4),
+    PDEF(95, "AMSI/ETW Bypass Setup",                         "T1562.001", 4, 10),
+    PDEF(96, "QPC Timing Check",                              "T1497.003", 2, 6),
+    PDEF(97, "FindWindow Anti-Debug",                         "T1622",     2, 4),
+    PDEF(98, "NtQuerySystemInformation Evasion",              "T1082",     2, 4),
+    PDEF(99, "CheckRemoteDebuggerPresent",                    "T1622",     2, 4),
     PDEF(100, "Sleep + Timing Validation",                     "T1497.003", 2, 6),
     PDEF(101, "Environment Fingerprinting",                    "T1497.001", 2, 10),
     PDEF(102, "Disk Size Sandbox Check",                       "T1497.001", 2, 4),
