@@ -7,6 +7,10 @@
         <file>components/Sidebar.qml</file>
         <file>components/ShieldAnimator.qml</file>
         <file>components/CardFrame.qml</file>
+        <file>components/IconButton.qml</file>
+        <file>components/PrimaryButton.qml</file>
+        <file>components/SecondaryButton.qml</file>
+        <file>components/StatePill.qml</file>
         <file>pages/MainPage.qml</file>
         <file>pages/SecurityPage.qml</file>
         <file>pages/PerformancePage.qml</file>

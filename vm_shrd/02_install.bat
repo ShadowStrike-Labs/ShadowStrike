@@ -81,8 +81,8 @@ taskkill /f /im ShadowStrikePhantomService.exe >nul 2>&1
 taskkill /f /im ShadowStrikePhantomTray.exe    >nul 2>&1
 taskkill /f /im ShadowStrikePhantomUI.exe      >nul 2>&1
 taskkill /f /im msiexec.exe                    >nul 2>&1
-fltmc detach ShadowStrikePhantomSensor >nul 2>&1
-fltmc unload ShadowStrikePhantomSensor >nul 2>&1
+fltmc detach PhantomSensor >nul 2>&1
+fltmc unload PhantomSensor >nul 2>&1
 sc query %SVC% >nul 2>&1
 if not errorlevel 1 sc delete %SVC% >nul 2>&1
 REM SCM can take a moment to truly release the binary after delete.
@@ -141,8 +141,19 @@ if exist "%DST%\Drivers\PhantomSensor.inf" (
     bcdedit /enum {current} 2>nul | findstr /I "testsigning" | findstr /I "Yes" >nul 2>&1
     if not errorlevel 1 (
         echo [*] test-signing is on, attempting to load PhantomSensor minifilter ...
+        REM Trust the test-signing cert so pnputil accepts the driver package.
+        if exist "%DST%\Drivers\PhantomSensor.cer" (
+            certutil -addstore -f Root            "%DST%\Drivers\PhantomSensor.cer" >nul 2>&1
+            certutil -addstore -f TrustedPublisher "%DST%\Drivers\PhantomSensor.cer" >nul 2>&1
+        )
         pnputil /add-driver "%DST%\Drivers\PhantomSensor.inf" /install >nul 2>&1
-        fltmc load ShadowStrikePhantomSensor   >nul 2>&1
+        fltmc load PhantomSensor               >nul 2>&1
+        fltmc filters 2>nul | findstr /I PhantomSensor >nul 2>&1
+        if not errorlevel 1 (
+            echo     OK: PhantomSensor minifilter is loaded.
+        ) else (
+            echo     [!] PhantomSensor did not load. Check fltmc output and 04_collect_diagnostics.bat.
+        )
     ) else (
         echo [*] driver skipped ^(user-mode only install; run 05_enable_driver_dev.bat to enable^)
     )
@@ -160,7 +171,7 @@ echo   Tray     : autostart + just launched
 echo   UI       : %DST%\ShadowStrikePhantomUI.exe
 echo ============================================================
 echo.
-echo Right-click the tray icon - "Open Dashboard" to launch the UI.
+echo Right-click the tray icon - "Show ShadowStrike Phantom" to launch the UI.
 echo If the UI does not open, run 04_collect_diagnostics.bat.
 echo.
 pause

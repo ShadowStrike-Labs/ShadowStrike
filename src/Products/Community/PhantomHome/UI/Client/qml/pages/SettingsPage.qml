@@ -4,59 +4,175 @@ import QtQuick.Layouts
 import "../Theming"
 import "../components"
 
+/*
+ * SettingsPage
+ * ------------
+ * General application settings and update preferences.
+ */
 Item {
     id: page
 
     Accessible.role: Accessible.Pane
     Accessible.name: qsTr("Settings")
 
-    property bool autoStart: true
-    property bool telemetryEnabled: false
-    property bool notifications: true
-    property string updateChannel: "stable"
+    property bool  launchOnStartup:    true
+    property bool  showNotifications:  true
+    property int   logLevelIndex:      1   // 0=Error 1=Info 2=Debug
+    property bool  automaticUpdates:   true
+    property string lastUpdateCheck:   "Never"
 
-    signal setAutoStart(bool on)
-    signal setTelemetry(bool on)
-    signal setNotifications(bool on)
-    signal setUpdateChannel(string channel)
+    signal setLaunchOnStartup(bool on)
+    signal setShowNotifications(bool on)
+    signal setLogLevel(int index)
+    signal setAutomaticUpdates(bool on)
     signal checkForUpdates()
 
-    ColumnLayout {
+    readonly property var logLevelModel: ["Error", "Info", "Debug"]
+
+    ScrollView {
         anchors.fill: parent
-        anchors.margins: Theme.sp6
-        spacing: Theme.sp4
+        clip: true
 
-        Text { text: "Settings"; color: Theme.text
-               font.family: Theme.fontFamily
-               font.pixelSize: Theme.fontTitle; font.weight: Font.DemiBold }
+        ColumnLayout {
+            width: page.width - 2
+            spacing: Theme.sp5
 
-        CardFrame {
-            title: "General"
-            Layout.fillWidth: true
-            RowLayout { Text { text: "Start at login"; color: Theme.text; Layout.fillWidth: true }
-                        Switch { checked: page.autoStart
-                                 onToggled: page.setAutoStart(checked) } }
-            RowLayout { Text { text: "Show desktop notifications"; color: Theme.text; Layout.fillWidth: true }
-                        Switch { checked: page.notifications
-                                 onToggled: page.setNotifications(checked) } }
-            RowLayout { Text { text: "Share anonymous telemetry"; color: Theme.text; Layout.fillWidth: true }
-                        Switch { checked: page.telemetryEnabled
-                                 onToggled: page.setTelemetry(checked) } }
-        }
-
-        CardFrame {
-            title: "Updates"
-            Layout.fillWidth: true
-            RowLayout {
-                ComboBox {
-                    model: ["stable","beta","insider"]
-                    currentIndex: model.indexOf(page.updateChannel)
-                    onActivated: page.setUpdateChannel(currentText)
-                }
-                Button { text: "Check for updates"; onClicked: page.checkForUpdates() }
+            Column {
+                Layout.fillWidth: true
+                Layout.topMargin: Theme.sp6
+                Layout.leftMargin: Theme.sp8
+                Layout.rightMargin: Theme.sp8
+                spacing: 4
+                Text { text: "Settings"; color: Theme.textStrong
+                       font.family: Theme.fontFamily
+                       font.pixelSize: Theme.fontTitle
+                       font.weight: Font.DemiBold }
+                Text { text: "Application behaviour and update policy."
+                       color: Theme.textMuted
+                       font.family: Theme.fontFamily
+                       font.pixelSize: Theme.fontBody }
             }
-        }
 
-        Item { Layout.fillHeight: true }
+            CardFrame {
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.sp8
+                Layout.rightMargin: Theme.sp8
+                title: "General"
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 56
+                    radius: Theme.radiusSm
+                    color: Theme.bg1
+                    border.color: Theme.stroke
+                    border.width: 1
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.sp4
+                        anchors.rightMargin: Theme.sp3
+                        spacing: Theme.sp3
+                        Text { Layout.fillWidth: true
+                               text: "Launch at startup"
+                               color: Theme.textStrong
+                               font.family: Theme.fontFamily
+                               font.pixelSize: Theme.fontBody }
+                        Switch { checked: page.launchOnStartup
+                                 onToggled: page.setLaunchOnStartup(checked) }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 56
+                    radius: Theme.radiusSm
+                    color: Theme.bg1
+                    border.color: Theme.stroke
+                    border.width: 1
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.sp4
+                        anchors.rightMargin: Theme.sp3
+                        spacing: Theme.sp3
+                        Text { Layout.fillWidth: true
+                               text: "Show notifications"
+                               color: Theme.textStrong
+                               font.family: Theme.fontFamily
+                               font.pixelSize: Theme.fontBody }
+                        Switch { checked: page.showNotifications
+                                 onToggled: page.setShowNotifications(checked) }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 56
+                    radius: Theme.radiusSm
+                    color: Theme.bg1
+                    border.color: Theme.stroke
+                    border.width: 1
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.sp4
+                        anchors.rightMargin: Theme.sp3
+                        spacing: Theme.sp3
+                        Text { Layout.fillWidth: true
+                               text: "Log verbosity"
+                               color: Theme.textStrong
+                               font.family: Theme.fontFamily
+                               font.pixelSize: Theme.fontBody }
+                        ComboBox {
+                            implicitWidth: 160
+                            model: page.logLevelModel
+                            currentIndex: page.logLevelIndex
+                            onActivated: page.setLogLevel(currentIndex)
+                        }
+                    }
+                }
+            }
+
+            CardFrame {
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.sp8
+                Layout.rightMargin: Theme.sp8
+                Layout.bottomMargin: Theme.sp6
+                title: "Updates"
+                subtitle: "Last check: " + page.lastUpdateCheck
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 56
+                    radius: Theme.radiusSm
+                    color: Theme.bg1
+                    border.color: Theme.stroke
+                    border.width: 1
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.sp4
+                        anchors.rightMargin: Theme.sp3
+                        spacing: Theme.sp3
+                        Text { Layout.fillWidth: true
+                               text: "Install signature updates automatically"
+                               color: Theme.textStrong
+                               font.family: Theme.fontFamily
+                               font.pixelSize: Theme.fontBody }
+                        Switch { checked: page.automaticUpdates
+                                 onToggled: page.setAutomaticUpdates(checked) }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: Theme.sp3
+                    spacing: Theme.sp3
+                    Item { Layout.fillWidth: true }
+                    PrimaryButton {
+                        text: "Check for updates now"
+                        onClicked: page.checkForUpdates()
+                    }
+                }
+            }
+
+            Item { Layout.fillHeight: true }
+        }
     }
 }

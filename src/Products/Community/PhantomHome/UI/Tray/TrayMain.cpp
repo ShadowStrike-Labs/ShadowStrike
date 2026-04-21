@@ -411,8 +411,8 @@ void ShowContextMenu(HWND hwnd) noexcept {
     const bool connected = g_state.connected.load();
     const UINT disabled  = connected ? 0u : static_cast<UINT>(MF_GRAYED);
 
-    ::AppendMenuW(menu, MF_STRING, ID_MENU_OPEN_DASHBOARD, L"Open &Dashboard");
-    ::SetMenuDefaultItem(menu, ID_MENU_OPEN_DASHBOARD, FALSE);
+    ::AppendMenuW(menu, MF_STRING, ID_MENU_OPEN_UI,                L"&Show ShadowStrike Phantom");
+    ::SetMenuDefaultItem(menu, ID_MENU_OPEN_UI, FALSE);
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING | disabled, ID_MENU_QUICK_SCAN,  L"&Quick scan");
     ::AppendMenuW(menu, MF_STRING | disabled, ID_MENU_FULL_SCAN,   L"&Full scan");
@@ -421,7 +421,6 @@ void ShowContextMenu(HWND hwnd) noexcept {
     ::AppendMenuW(menu, MF_STRING | disabled, ID_MENU_PAUSE_1H,    L"Pause protection &1 hour");
     ::AppendMenuW(menu, MF_STRING | disabled, ID_MENU_RESUME,      L"&Resume protection");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    ::AppendMenuW(menu, MF_STRING, ID_MENU_OPEN_UI,                L"Open &UI window");
     ::AppendMenuW(menu, MF_STRING, ID_MENU_EXIT,                   L"E&xit");
 
     POINT pt{};
@@ -437,7 +436,6 @@ void ShowContextMenu(HWND hwnd) noexcept {
     ::PostMessageW(hwnd, WM_NULL, 0, 0);
 
     switch (cmd) {
-        case ID_MENU_OPEN_DASHBOARD:
         case ID_MENU_OPEN_UI:
             LaunchDashboard();
             break;
