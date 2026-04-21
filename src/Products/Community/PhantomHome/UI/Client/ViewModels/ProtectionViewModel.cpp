@@ -8,6 +8,7 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QString>
+#include <QTimer>
 
 #include <format>
 
@@ -75,6 +76,30 @@ ProtectionViewModel::ProtectionViewModel(std::shared_ptr<PipeClient> client,
     : QObject(parent)
     , m_client(std::move(client)) {
     wireClient();
+
+    // -----------------------------------------------------------------
+    // First-fetch robustness:
+    //
+    //  (a) If PipeClient established its connection *before* QML finished
+    //      constructing this view-model, the SetStateCallback edge has
+    //      already fired and onConnectionChanged(true) will never be
+    //      delivered. In that case the UI spins on "Loading protection
+    //      modules…" forever. Ask immediately if we're already up.
+    //
+    //  (b) As a belt-and-braces guarantee against any future transport
+    //      race (slow connect, reconnect in-flight at ctor time, etc.),
+    //      arm a single-shot 1.5s timer that fires an unconditional
+    //      refreshAll() on the GUI thread. refreshAll() is idempotent —
+    //      two back-to-back calls just cause two replies, which
+    //      modulesChanged() coalesces naturally.
+    // -----------------------------------------------------------------
+    if (m_client && m_client->IsConnected()) {
+        QMetaObject::invokeMethod(this, "refreshAll", Qt::QueuedConnection);
+    }
+    QTimer::singleShot(1500, this, [self = QPointer<ProtectionViewModel>(this)]() {
+        if (!self) return;
+        self->refreshAll();
+    });
 }
 
 ProtectionViewModel::~ProtectionViewModel() {

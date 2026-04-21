@@ -58,6 +58,128 @@ constexpr std::size_t kQuarantineListCap = 8192;
     }
 }
 
+/// Derive a default UI group tag from ModulePhase for modules that do not
+/// provide an explicit `group`. The UI can over-bucket in its own metadata
+/// table, but the server must ship *something* or the client ends up with
+/// an empty string and buckets every module into "Other".
+[[nodiscard]] std::string DefaultGroupForPhase(
+    ::ShadowStrike::Products::Home::ModulePhase p) noexcept
+{
+    using PH = ::ShadowStrike::Products::Home::ModulePhase;
+    switch (p) {
+        case PH::Foundation:      return "Platform";
+        case PH::CoreProtections: return "Realtime";
+        case PH::OnDemand:        return "OnDemand";
+        case PH::UserExperience:  return "Experience";
+        case PH::Background:      return "Background";
+        default:                  return "Other";
+    }
+}
+
+/// Curated group tag for well-known modules. Keeps SecurityPage grouping
+/// coherent even before every descriptor gets an explicit `group` field.
+/// Kept as an unordered_map so lookup is O(1) during the module-list hot
+/// path. Unknown names fall back to DefaultGroupForPhase().
+[[nodiscard]] std::string_view WellKnownGroup(std::string_view name) noexcept {
+    // Realtime on-access scanning + PUA + heuristics.
+    if (name == "RealTimeProtection" || name == "OnAccessScanner"
+        || name == "HeuristicEngine" || name == "SignatureEngine")
+        return "Realtime";
+
+    // Ransomware + backup/rollback.
+    if (name == "RansomwareProtection" || name == "RansomwareDetector"
+        || name == "LockyDetector" || name == "BackupManager"
+        || name == "RollbackEngine")
+        return "Ransomware";
+
+    // Web + URL + phishing.
+    if (name == "WebProtection" || name == "UrlScanner"
+        || name == "PhishingDetector" || name == "SafeBrowsing"
+        || name == "TlsInspector")
+        return "Web";
+
+    // Network-layer: firewall, IDS, DNS.
+    if (name == "FirewallManager" || name == "NetworkMonitor"
+        || name == "NetworkIntrusionDetector" || name == "DnsGuard"
+        || name == "ArpSpoofDetector")
+        return "Network";
+
+    // Privacy suite.
+    if (name == "WebcamProtector" || name == "MicrophoneGuard"
+        || name == "PrivacyCleaner" || name == "DataLeakProtection"
+        || name == "DNSLeakProtection" || name == "IPLeakProtection"
+        || name == "CookieManager"   || name == "LocationPrivacy")
+        return "Privacy";
+
+    // Exploit / memory.
+    if (name == "ExploitDetector" || name == "MemoryProtection"
+        || name == "DllInjectionDetector" || name == "HollowingDetector")
+        return "Exploit";
+
+    // Script / fileless.
+    if (name == "ScriptAnalyzer" || name == "AmsiBridge"
+        || name == "PowerShellGuard" || name == "MacroGuard")
+        return "Script";
+
+    // Removable media.
+    if (name == "USBProtection" || name == "UsbDeviceGuard"
+        || name == "AutorunBlocker")
+        return "USB";
+
+    // IoT / smart-home.
+    if (name == "IoTScanner" || name == "SmartHomeMonitor"
+        || name == "RouterSecurity")
+        return "IoT";
+
+    // Financial.
+    if (name == "BankingProtection" || name == "BankingTrojanDetector"
+        || name == "SecureBrowser")
+        return "Banking";
+
+    // Mail clients.
+    if (name == "EmailProtection" || name == "EmailScanner"
+        || name == "AttachmentGuard")
+        return "Email";
+
+    // Identity / credentials.
+    if (name == "IdentityProtection" || name == "CredentialGuard"
+        || name == "PasswordStealerDetector" || name == "KeyloggerDetector")
+        return "Identity";
+
+    return {};  // not well-known; caller falls back to phase-derived group.
+}
+
+/// Convert a CamelCase internal module name into a presentable user-facing
+/// label. "RansomwareProtection" -> "Ransomware Protection",
+/// "DNSLeakProtection" -> "DNS Leak Protection", "IoTScanner" -> "IoT Scanner".
+/// Safe for empty input.
+[[nodiscard]] std::string HumanizeModuleName(std::string_view name) {
+    std::string out;
+    out.reserve(name.size() + 4);
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const char c = name[i];
+        if (i > 0) {
+            const char prev = name[i - 1];
+            // Word boundary: lower-to-upper (aB), or letter-to-digit,
+            // or acronym-exit (XMLParser → XML Parser).
+            const bool lowerToUpper =
+                (prev >= 'a' && prev <= 'z') && (c >= 'A' && c <= 'Z');
+            const bool letterToDigit =
+                ((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z'))
+                && (c >= '0' && c <= '9');
+            const bool acronymExit =
+                (prev >= 'A' && prev <= 'Z') && (c >= 'A' && c <= 'Z')
+                && (i + 1 < name.size())
+                && (name[i + 1] >= 'a' && name[i + 1] <= 'z');
+            if (lowerToUpper || letterToDigit || acronymExit) {
+                out.push_back(' ');
+            }
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
 /// Widen a narrow string for scan targets.
 [[nodiscard]] std::wstring ToWide(const std::string& s) {
     if (s.empty()) return {};
@@ -402,11 +524,20 @@ void IPCRouter::HandleGetModuleStatus(ClientContext&, const FrameEnvelope&,
         for (const auto& ms : statuses) {
             ModuleStatusEntry e;
             e.id           = ms.name;
-            e.display_name = ms.name;
+            e.display_name = !ms.displayName.empty()
+                                 ? ms.displayName
+                                 : HumanizeModuleName(ms.name);
             e.state   = MapOrchestratorState(ms.state);
             e.enabled = (ms.state != ::ShadowStrike::Products::Home::ModuleState::Disabled &&
                          ms.state != ::ShadowStrike::Products::Home::ModuleState::Stopped &&
                          ms.state != ::ShadowStrike::Products::Home::ModuleState::Unregistered);
+            if (!ms.group.empty()) {
+                e.group = ms.group;
+            } else if (auto wk = WellKnownGroup(ms.name); !wk.empty()) {
+                e.group.assign(wk.begin(), wk.end());
+            } else {
+                e.group = DefaultGroupForPhase(ms.phase);
+            }
             r.modules.push_back(std::move(e));
         }
     }

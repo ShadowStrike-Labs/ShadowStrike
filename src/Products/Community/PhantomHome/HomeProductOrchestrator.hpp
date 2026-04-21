@@ -88,6 +88,19 @@ struct ModuleDescriptor {
     /// "EmailProtection", "BankingTrojanDetector". Must be unique.
     std::string name;
 
+    /// Optional user-facing label (e.g. "Ransomware protection"). When left
+    /// empty the UI/IPC layer will derive a presentable title from `name`
+    /// via a CamelCase-to-spaces humanizer. Populate this whenever the
+    /// internal code id is ambiguous or not properly title-cased.
+    std::string displayName;
+
+    /// Optional UI grouping tag (e.g. "Realtime", "Ransomware", "Web",
+    /// "Network", "Privacy", "Exploit", "Script", "USB", "IoT", "Banking",
+    /// "Email", "Identity"). When empty, the IPC layer derives a default
+    /// bucket from `phase` so UI keeps working for legacy modules that have
+    /// not yet been retagged.
+    std::string group;
+
     /// ConfigManager key (e.g. "Home/Email/Enabled"). Empty string means
     /// "always enabled" (used by Config/Policy bootstrap modules).
     std::string enabledConfigKey;
@@ -112,10 +125,12 @@ struct ModuleDescriptor {
 
 /// @brief Runtime status snapshot for diagnostics / IPC /status endpoint.
 struct ModuleStatus {
-    std::string name;
+    std::string name;           ///< Stable internal id (e.g. "RansomwareProtection").
+    std::string displayName;    ///< Presentable title; falls back to humanized name.
+    std::string group;          ///< UI grouping tag; falls back to derived-from-phase.
     ModulePhase phase{ModulePhase::CoreProtections};
     ModuleState state{ModuleState::Unregistered};
-    std::string lastError;  ///< Populated when state == Failed.
+    std::string lastError;      ///< Populated when state == Failed.
     std::chrono::steady_clock::time_point lastTransition{};
 };
 

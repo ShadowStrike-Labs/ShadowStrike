@@ -399,6 +399,8 @@ std::vector<ModuleStatus> HomeProductOrchestrator::GetStatus() const {
     for (const auto& rec : m_modules) {
         out.push_back({
             rec.descriptor.name,
+            rec.descriptor.displayName,
+            rec.descriptor.group,
             rec.descriptor.phase,
             rec.state,
             rec.lastError,
@@ -415,6 +417,8 @@ std::optional<ModuleStatus> HomeProductOrchestrator::GetModuleStatus(std::string
     if (it == m_modules.end()) return std::nullopt;
     return ModuleStatus{
         it->descriptor.name,
+        it->descriptor.displayName,
+        it->descriptor.group,
         it->descriptor.phase,
         it->state,
         it->lastError,
