@@ -59,7 +59,7 @@ inline constexpr std::uint32_t kMaxPipeInstances     = 16u;             // per i
 inline constexpr std::uint32_t kPipeReadTimeoutMs    = 10u * 1000u;     // 10 s
 inline constexpr std::uint32_t kPipeWriteTimeoutMs   = 5u  * 1000u;     // 5  s
 
-inline constexpr std::string_view kPipeNamePrefix = R"(\\.\pipe\ShadowStrike.Phantom.UI.)";
+inline constexpr std::string_view kPipeNamePrefix = R"(\\.\pipe\ShadowStrike.Phantom.UI)";
 
 // SDDL: SYSTEM + Administrators + INTERACTIVE users have Read+Write; all others denied.
 inline constexpr std::wstring_view kPipeSddl =

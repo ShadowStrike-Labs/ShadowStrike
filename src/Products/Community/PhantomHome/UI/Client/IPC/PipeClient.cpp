@@ -139,9 +139,9 @@ static bool ReadExact(HANDLE pipe, void* buf, std::uint32_t size) {
     return true;
 }
 
-static std::wstring BuildPipeName(std::uint32_t session_id) {
-    std::wstring prefix(kPipeNamePrefix.begin(), kPipeNamePrefix.end());
-    return prefix + std::to_wstring(session_id);
+static std::wstring BuildPipeName(std::uint32_t /*session_id*/) {
+    // Session-independent; see PipeServer::PipeFullName for rationale.
+    return std::wstring(kPipeNamePrefix.begin(), kPipeNamePrefix.end());
 }
 
 }  // namespace

@@ -4,6 +4,44 @@ REM ShadowStrike Phantom Home - VM installer (XCOPY + SCM; no MSI).
 REM =====================================================================
 setlocal ENABLEDELAYEDEXPANSION
 
+REM --- Always work off a LOCAL copy of the payload ---------------------
+REM Rationale: users frequently launch this script from a VMware / VirtualBox
+REM shared folder that Windows exposes as a mapped drive letter (Z:, \\vmware-host\...).
+REM When we elevate via UAC, the elevated token does NOT inherit that mapping,
+REM so `%~f0` resolves to a drive the elevated cmd cannot see - which shows up
+REM as "The system cannot find the drive specified." We avoid the whole class
+REM of bugs by copying the installer + payload into C:\ProgramData first and
+REM relaunching from there.
+
+set "STAGE=%ProgramData%\ShadowStrike\Install"
+
+REM Detect if we are already running from the local stage.
+set "LOCAL_COPY=0"
+if /I "%~dp0"=="%STAGE%\" set "LOCAL_COPY=1"
+
+if "%LOCAL_COPY%"=="0" (
+    echo [stage] Copying installer + payload to %STAGE% ...
+    if not exist "%STAGE%" mkdir "%STAGE%" >nul 2>&1
+    robocopy "%~dp0" "%STAGE%" *.bat README.txt /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+    if not exist "%~dp0payload\app" (
+        echo [!] payload\app not found next to this script.
+        echo     Expected: %~dp0payload\app
+        pause
+        exit /b 1
+    )
+    robocopy "%~dp0payload" "%STAGE%\payload" /E /MT:8 /R:2 /W:2 /NFL /NDL /NJH /NJS /NC /NS /NP
+    set RC=!ERRORLEVEL!
+    if !RC! geq 8 (
+        echo [!] robocopy failed copying payload to %STAGE% exit=!RC!
+        pause
+        exit /b 1
+    )
+    echo [stage] Re-launching from local copy ...
+    start "" /wait cmd.exe /c "\"%STAGE%\02_install.bat\""
+    exit /b !ERRORLEVEL!
+)
+
+REM ----------------- Running from local stage here on ------------------
 net session >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -25,8 +63,7 @@ set "DST=%ProgramFiles%\ShadowStrike\Phantom"
 set "SVC=ShadowStrikePhantomService"
 
 if not exist "%SRC%\ShadowStrikePhantomService.exe" (
-    echo [!] payload\app not found next to this script.
-    echo     Expected: %SRC%
+    echo [!] payload\app not found at %SRC%
     pause
     exit /b 1
 )
@@ -61,9 +98,9 @@ taskkill /f /im msiexec.exe                    >nul 2>&1
 echo [2/7] Deploying files to %DST% ...
 if not exist "%DST%" mkdir "%DST%" >nul 2>&1
 robocopy "%SRC%" "%DST%" /E /MT:8 /R:2 /W:2 /NFL /NDL /NJH /NJS /NC /NS /NP
-set RC=%ERRORLEVEL%
-if %RC% geq 8 (
-    echo [!] robocopy reported errors exit=%RC%. Aborting.
+set RC=!ERRORLEVEL!
+if !RC! geq 8 (
+    echo [!] robocopy reported errors exit=!RC!. Aborting.
     pause
     exit /b 2
 )
