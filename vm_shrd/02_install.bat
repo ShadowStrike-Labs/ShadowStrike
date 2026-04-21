@@ -14,7 +14,7 @@ for %%F in ("%~dp0*.bat" "%~dp0README.txt") do (
     if exist %%F copy /y %%F "%STAGE%\" >nul 2>&1
 )
 if exist "%~dp0payload\app" (
-    echo [stage] Copying 60 MB payload to %STAGE%\payload ^(first run only, please wait^) ...
+    echo [stage] Copying payload to %STAGE%\payload ^(first run only, please wait^) ...
     robocopy "%~dp0payload" "%STAGE%\payload" /E /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP
     set RC=!ERRORLEVEL!
     if !RC! geq 8 (
@@ -66,36 +66,41 @@ echo Source : %SRC%
 echo Target : %DST%
 echo.
 
-bcdedit /enum {current} | findstr /I "testsigning" | findstr /I "Yes" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Kernel TESTSIGNING is OFF. Run 01_prepare_vm.bat, reboot, then try again.
-    pause
-    exit /b 1
-)
-
-echo [1/7] Tearing down any previous install...
-fltmc detach ShadowStrikePhantomSensor >nul 2>&1
-fltmc unload ShadowStrikePhantomSensor >nul 2>&1
+echo [1/6] Tearing down any previous install...
+REM Stop service gracefully first, then force-kill if it is stuck in
+REM START_PENDING (our previous builds could wedge there for minutes).
 sc stop %SVC% >nul 2>&1
 timeout /t 2 /nobreak >nul
-sc query %SVC% >nul 2>&1
-if not errorlevel 1 sc delete %SVC% >nul 2>&1
+for /f "tokens=2" %%P in ('sc queryex %SVC% 2^>nul ^| findstr /I "PID"') do (
+    if not "%%P"=="0" (
+        echo     Force-killing stuck service PID %%P ...
+        taskkill /f /pid %%P >nul 2>&1
+    )
+)
 taskkill /f /im ShadowStrikePhantomService.exe >nul 2>&1
 taskkill /f /im ShadowStrikePhantomTray.exe    >nul 2>&1
 taskkill /f /im ShadowStrikePhantomUI.exe      >nul 2>&1
 taskkill /f /im msiexec.exe                    >nul 2>&1
+fltmc detach ShadowStrikePhantomSensor >nul 2>&1
+fltmc unload ShadowStrikePhantomSensor >nul 2>&1
+sc query %SVC% >nul 2>&1
+if not errorlevel 1 sc delete %SVC% >nul 2>&1
+REM SCM can take a moment to truly release the binary after delete.
+timeout /t 2 /nobreak >nul
 
-echo [2/7] Deploying files to %DST% ...
+echo [2/6] Deploying files to %DST% ...
 if not exist "%DST%" mkdir "%DST%" >nul 2>&1
 robocopy "%SRC%" "%DST%" /E /MT:8 /R:2 /W:2 /NFL /NDL /NJH /NJS /NC /NS /NP
 set RC=!ERRORLEVEL!
 if !RC! geq 8 (
     echo [!] robocopy reported errors exit=!RC!. Aborting.
+    echo     Most common cause: Defender quarantined the service EXE.
+    echo     Fix: run 00_disable_defender.bat, reboot, then retry.
     pause
     exit /b 2
 )
 
-echo [3/7] Registering Windows service %SVC% ...
+echo [3/6] Registering Windows service %SVC% ...
 sc create %SVC% binPath= "\"%DST%\ShadowStrikePhantomService.exe\"" start= auto type= own DisplayName= "ShadowStrike Phantom Service"
 if errorlevel 1 (
     echo [!] sc create failed. gle=%errorlevel%
@@ -105,13 +110,13 @@ if errorlevel 1 (
 sc description %SVC% "Provides ShadowStrike Phantom Home real-time protection, scanning, and telemetry." >nul
 sc failure     %SVC% reset= 86400 actions= restart/60000/restart/60000/run/0 >nul
 
-echo [4/7] Registering tray autostart (HKLM Run) ...
+echo [4/6] Registering tray autostart (HKLM Run) ...
 reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v ShadowStrikePhantomTray /t REG_SZ /d "\"%DST%\ShadowStrikePhantomTray.exe\"" /f >nul
 
-echo [5/7] Creating Start-menu shortcut ...
+echo [5/6] Creating Start-menu shortcut ...
 powershell -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%ProgramData%\Microsoft\Windows\Start Menu\Programs\ShadowStrike Phantom.lnk'); $s.TargetPath='%DST%\ShadowStrikePhantomUI.exe'; $s.WorkingDirectory='%DST%'; $s.IconLocation='%DST%\ShadowStrikePhantomUI.exe,0'; $s.Save()" >nul 2>&1
 
-echo [6/7] Starting service...
+echo [6/6] Starting service...
 sc start %SVC%
 set TRIES=0
 :wait_running
@@ -119,22 +124,28 @@ timeout /t 1 /nobreak >nul
 sc query %SVC% | findstr /I "RUNNING" >nul
 if not errorlevel 1 goto running
 set /a TRIES+=1
-if !TRIES! lss 20 goto wait_running
-echo [!] Service did not reach RUNNING within 20 s. Current state:
+if !TRIES! lss 15 goto wait_running
+echo [!] Service did not reach RUNNING within 15 s. Current state:
 sc query %SVC%
 echo     Run 04_collect_diagnostics.bat for details.
-goto driver
+goto skip_driver
 :running
 echo     OK: service is RUNNING.
 
-:driver
-echo [7/7] Installing minifilter driver...
+:skip_driver
+REM ---- Minifilter driver is OPTIONAL on Home.
+REM The user-mode product works fully without it; loading it requires
+REM test-signing which breaks Windows 11 display. Use 05_enable_driver_dev.bat
+REM if you specifically want to exercise the kernel sensor.
 if exist "%DST%\Drivers\PhantomSensor.inf" (
-    pnputil /add-driver "%DST%\Drivers\PhantomSensor.inf" /install
-    fltmc load ShadowStrikePhantomSensor
-    fltmc filters | findstr /I "ShadowStrikePhantomSensor"
-) else (
-    echo     ^(no driver payload at %DST%\Drivers; skipping^)
+    bcdedit /enum {current} 2>nul | findstr /I "testsigning" | findstr /I "Yes" >nul 2>&1
+    if not errorlevel 1 (
+        echo [*] test-signing is on, attempting to load PhantomSensor minifilter ...
+        pnputil /add-driver "%DST%\Drivers\PhantomSensor.inf" /install >nul 2>&1
+        fltmc load ShadowStrikePhantomSensor   >nul 2>&1
+    ) else (
+        echo [*] driver skipped ^(user-mode only install; run 05_enable_driver_dev.bat to enable^)
+    )
 )
 
 echo.
@@ -147,7 +158,6 @@ echo Install complete.
 echo   Service  : %SVC% - %DST%\ShadowStrikePhantomService.exe
 echo   Tray     : autostart + just launched
 echo   UI       : %DST%\ShadowStrikePhantomUI.exe
-echo   Driver   : ShadowStrikePhantomSensor
 echo ============================================================
 echo.
 echo Right-click the tray icon - "Open Dashboard" to launch the UI.
