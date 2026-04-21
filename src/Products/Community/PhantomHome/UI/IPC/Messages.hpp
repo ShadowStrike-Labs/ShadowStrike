@@ -367,11 +367,22 @@ struct ProtectionStateReply {
     std::uint32_t active_threats{0};
     std::uint64_t last_update_unix{0};
 
+    // Engine health atoms (v2 additive, backward-compatible). When absent
+    // from the JSON (older service) the UI renders as "unknown / ok".
+    bool          sensor_ok{true};         // kernel-mode PhantomSensor driver reachable
+    std::string   sensor_reason{};         // why it is not reachable (empty when ok)
+    std::uint32_t cortex_active{0};        // number of loaded AI model slots
+    std::uint32_t cortex_total{0};         // total model slot count (0 = not probed yet)
+
     [[nodiscard]] nlohmann::json ToJson() const {
         return {{"s", static_cast<std::uint8_t>(state)},
                 {"r", reason},
                 {"at", active_threats},
-                {"lu", last_update_unix}};
+                {"lu", last_update_unix},
+                {"ks", sensor_ok},
+                {"kr", sensor_reason},
+                {"ca", cortex_active},
+                {"ct", cortex_total}};
     }
     [[nodiscard]] static std::optional<ProtectionStateReply> FromJson(const nlohmann::json& j) {
         if (!j.is_object()) return std::nullopt;
@@ -382,6 +393,12 @@ struct ProtectionStateReply {
         if (!detail::GetUint(j, "at", r.active_threats)) return std::nullopt;
         if (!detail::GetUint(j, "lu", r.last_update_unix)) return std::nullopt;
         r.state = static_cast<OverallState>(s);
+
+        // Engine-health fields are optional (back-compat with older service).
+        (void)detail::GetBool(j, "ks", r.sensor_ok);
+        (void)detail::GetStringBounded(j, "kr", r.sensor_reason, 256);
+        (void)detail::GetUint(j, "ca", r.cortex_active);
+        (void)detail::GetUint(j, "ct", r.cortex_total);
         return r;
     }
 };

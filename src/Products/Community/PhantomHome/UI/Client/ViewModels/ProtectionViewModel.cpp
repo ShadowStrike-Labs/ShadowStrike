@@ -130,7 +130,11 @@ void ProtectionViewModel::wireClient() {
                 Q_ARG(QString, OverallStateTag(parsed->state)),
                 Q_ARG(QString, QString::fromStdString(parsed->reason)),
                 Q_ARG(int,     static_cast<int>(parsed->active_threats)),
-                Q_ARG(qint64,  static_cast<qint64>(parsed->last_update_unix)));
+                Q_ARG(qint64,  static_cast<qint64>(parsed->last_update_unix)),
+                Q_ARG(bool,    parsed->sensor_ok),
+                Q_ARG(QString, QString::fromStdString(parsed->sensor_reason)),
+                Q_ARG(int,     static_cast<int>(parsed->cortex_active)),
+                Q_ARG(int,     static_cast<int>(parsed->cortex_total)));
             break;
         }
         case MessageType::EventDetection: {
@@ -164,7 +168,11 @@ void ProtectionViewModel::refreshAll() {
                 Q_ARG(QString, OverallStateTag(parsed->state)),
                 Q_ARG(QString, QString::fromStdString(parsed->reason)),
                 Q_ARG(int,     static_cast<int>(parsed->active_threats)),
-                Q_ARG(qint64,  static_cast<qint64>(parsed->last_update_unix)));
+                Q_ARG(qint64,  static_cast<qint64>(parsed->last_update_unix)),
+                Q_ARG(bool,    parsed->sensor_ok),
+                Q_ARG(QString, QString::fromStdString(parsed->sensor_reason)),
+                Q_ARG(int,     static_cast<int>(parsed->cortex_active)),
+                Q_ARG(int,     static_cast<int>(parsed->cortex_total)));
         });
 
     m_client->RequestAsync(MessageType::GetModuleStatus, nlohmann::json::object(),
@@ -217,7 +225,11 @@ void ProtectionViewModel::setModuleEnabled(const QString& id, bool enabled) {
 void ProtectionViewModel::onStateReply(QString state,
                                        QString reason,
                                        int activeThreats,
-                                       qint64 lastUpdateUnix) {
+                                       qint64 lastUpdateUnix,
+                                       bool sensorOk,
+                                       QString sensorReason,
+                                       int cortexActive,
+                                       int cortexTotal) {
     m_protectionState  = std::move(state);
     const bool risky   = m_protectionState != QStringLiteral("green");
     m_stateCopy        = risky
@@ -231,6 +243,12 @@ void ProtectionViewModel::onStateReply(QString state,
         : std::move(reason);
     m_threatsBlocked7d = activeThreats;
     m_lastScan         = FormatUnix(static_cast<std::uint64_t>(lastUpdateUnix));
+
+    m_sensorOk     = sensorOk;
+    m_sensorReason = std::move(sensorReason);
+    m_cortexActive = cortexActive;
+    m_cortexTotal  = cortexTotal;
+
     emit stateChanged();
 }
 

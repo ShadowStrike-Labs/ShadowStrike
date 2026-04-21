@@ -36,6 +36,15 @@ Item {
     property int    threatsBlocked7d: 0
     property string updateStatus:     "Up to date"
 
+    // Engine-health atoms — surfaced as amber banners when the pipeline is
+    // degraded. Kernel sensor and Cortex are optional layers; when either
+    // is missing the user-mode engines still run, but we must be honest
+    // about the gap so users can fix it.
+    property bool   sensorOk:         true
+    property string sensorReason:     ""
+    property int    cortexActive:     0
+    property int    cortexTotal:      0
+
     // Optional: when App.qml wires these, banners light up honestly.
     property var    modules:          []
     property var    recentEvents:     []
@@ -231,7 +240,10 @@ Item {
                 Layout.fillWidth: true
                 Layout.leftMargin: Theme.sp8
                 Layout.rightMargin: Theme.sp8
-                visible: page.counts.degraded + page.counts.disabled > 0 || page.updateStatus.indexOf("fail") >= 0
+                visible: page.counts.degraded + page.counts.disabled > 0
+                         || page.updateStatus.indexOf("fail") >= 0
+                         || !page.sensorOk
+                         || (page.cortexTotal > 0 && page.cortexActive === 0)
 
                 implicitHeight: recRow.implicitHeight
 
@@ -324,6 +336,90 @@ Item {
                             PrimaryButton {
                                 text: qsTr("Inspect")
                                 onClicked: page.openSecurityTab()
+                            }
+                        }
+                    }
+
+                    // -------- Kernel sensor not running ---------------------
+                    Rectangle {
+                        visible: !page.sensorOk
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 82
+                        radius: Theme.radiusMd
+                        color: Theme.bg2
+                        border.color: Qt.rgba(1.0, 0.76, 0.28, 0.35)
+                        border.width: 1
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: Theme.sp4
+                            spacing: Theme.sp4
+
+                            Rectangle {
+                                Layout.preferredWidth: 40; Layout.preferredHeight: 40
+                                radius: Theme.radiusSm
+                                color: Qt.rgba(1.0, 0.76, 0.28, 0.14)
+                                Iconed { anchors.centerIn: parent; iconName: "shield"; size: 22; tint: Theme.warning }
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 2
+                                Text {
+                                    text: qsTr("Kernel sensor offline")
+                                    color: Theme.textStrong
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontBody
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: page.sensorReason.length > 0
+                                          ? qsTr("%1 — external-feed detections disabled. User-mode protection remains active.").arg(page.sensorReason)
+                                          : qsTr("External-feed detections disabled. User-mode protection remains active.")
+                                    color: Theme.textMuted
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+                            }
+                        }
+                    }
+
+                    // -------- Cortex models not provisioned ------------------
+                    Rectangle {
+                        visible: page.cortexTotal > 0 && page.cortexActive === 0
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 82
+                        radius: Theme.radiusMd
+                        color: Theme.bg2
+                        border.color: Qt.rgba(1.0, 0.76, 0.28, 0.35)
+                        border.width: 1
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: Theme.sp4
+                            spacing: Theme.sp4
+
+                            Rectangle {
+                                Layout.preferredWidth: 40; Layout.preferredHeight: 40
+                                radius: Theme.radiusSm
+                                color: Qt.rgba(1.0, 0.76, 0.28, 0.14)
+                                Iconed { anchors.centerIn: parent; iconName: "bolt"; size: 22; tint: Theme.warning }
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 2
+                                Text {
+                                    text: qsTr("AI models not provisioned")
+                                    color: Theme.textStrong
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontBody
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: qsTr("Heuristic and signature layers active. Deploy Cortex models to enable ML-assisted detection.")
+                                    color: Theme.textMuted
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
                             }
                         }
                     }

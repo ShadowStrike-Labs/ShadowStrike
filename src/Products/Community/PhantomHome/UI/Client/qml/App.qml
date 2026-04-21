@@ -188,6 +188,10 @@ ApplicationWindow {
                 lastScan:         protectionVm ? protectionVm.lastScan         : "—"
                 threatsBlocked7d: protectionVm ? protectionVm.threatsBlocked7d : 0
                 updateStatus:     protectionVm ? protectionVm.updateStatus     : "Checking for updates…"
+                sensorOk:         protectionVm ? protectionVm.sensorOk         : false
+                sensorReason:     protectionVm ? protectionVm.sensorReason     : ""
+                cortexActive:     protectionVm ? protectionVm.cortexActive     : 0
+                cortexTotal:      protectionVm ? protectionVm.cortexTotal      : 0
                 modules:          protectionVm ? protectionVm.modules          : []
                 recentEvents:     protectionVm ? protectionVm.recentEvents     : []
                 onStartFastScan:    if (protectionVm) protectionVm.startFastScan()
