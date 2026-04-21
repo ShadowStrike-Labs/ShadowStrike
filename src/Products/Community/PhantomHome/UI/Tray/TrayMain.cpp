@@ -52,6 +52,8 @@
 #include <shellapi.h>
 #include <strsafe.h>
 #include <wtsapi32.h>
+#include <objbase.h>
+#include <gdiplus.h>
 
 #include <atomic>
 #include <cstdint>
@@ -66,6 +68,7 @@
 #include "Products/Community/PhantomHome/UI/Client/IPC/PipeClient.hpp"
 
 #pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 namespace {
 
@@ -114,6 +117,11 @@ struct TrayState {
     HICON                            icon_red{nullptr};
     HICON                            icon_paused{nullptr};
     HICON                            icon_offline{nullptr};
+    // Brand icon loaded from disk (ShadowStrike_Logo.png next to the exe).
+    // Unlike the shared system icons above, this one is owned by us and
+    // must be released with DestroyIcon on shutdown.
+    HICON                            icon_brand{nullptr};
+    ULONG_PTR                        gdiplus_token{0};
     bool                             icon_installed{false};
 
     std::unique_ptr<ipc::PipeClient> client;
@@ -134,6 +142,62 @@ TrayState g_state;
         LR_DEFAULTSIZE | LR_SHARED));
 }
 
+// Load the brand PNG that ships next to the tray exe and convert it to an
+// HICON sized for the notification area. Caller owns the returned HICON and
+// must release it with DestroyIcon. Returns nullptr on any failure - the
+// caller is expected to fall back to the system shield icon in that case.
+[[nodiscard]] HICON LoadBrandIconFromModuleDir() noexcept {
+    wchar_t module_path[MAX_PATH] = {};
+    const DWORD len = ::GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return nullptr;
+    }
+    // Strip the exe filename, leaving a trailing backslash.
+    for (DWORD i = len; i > 0; --i) {
+        if (module_path[i - 1] == L'\\' || module_path[i - 1] == L'/') {
+            module_path[i] = L'\0';
+            break;
+        }
+    }
+    wchar_t png_path[MAX_PATH] = {};
+    if (FAILED(::StringCchPrintfW(png_path, MAX_PATH,
+                                  L"%sassets\\ShadowStrike_Logo.png",
+                                  module_path))) {
+        return nullptr;
+    }
+    if (::GetFileAttributesW(png_path) == INVALID_FILE_ATTRIBUTES) {
+        return nullptr;  // Not deployed - fine, we fall back.
+    }
+
+    // GDI+ is already initialised in wWinMain; creating a Bitmap here is
+    // safe. Scope the Bitmap so GetHICON is called before destruction.
+    HICON hicon = nullptr;
+    {
+        Gdiplus::Bitmap bitmap(png_path, FALSE);
+        if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+            return nullptr;
+        }
+        // Rescale to the small-icon metric so the tray doesn't downsample a
+        // 512x512 PNG every paint.
+        const int cx = ::GetSystemMetrics(SM_CXSMICON);
+        const int cy = ::GetSystemMetrics(SM_CYSMICON);
+        Gdiplus::Bitmap scaled(cx > 0 ? cx : 16, cy > 0 ? cy : 16,
+                               PixelFormat32bppARGB);
+        Gdiplus::Graphics g(&scaled);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        if (g.DrawImage(&bitmap, 0, 0, scaled.GetWidth(), scaled.GetHeight())
+                != Gdiplus::Ok) {
+            return nullptr;
+        }
+        if (scaled.GetHICON(&hicon) != Gdiplus::Ok) {
+            return nullptr;
+        }
+    }
+    return hicon;
+}
+
 [[nodiscard]] std::uint32_t CurrentSessionId() noexcept {
     DWORD sid = 0;
     if (::ProcessIdToSessionId(::GetCurrentProcessId(), &sid)) {
@@ -143,14 +207,23 @@ TrayState g_state;
 }
 
 [[nodiscard]] HICON PickIconFor(ipc::OverallState s, bool connected) noexcept {
-    if (!connected) return g_state.icon_offline;
+    // Use the brand icon for healthy / informational states so the user
+    // visually identifies our product in the tray. Keep the loud system
+    // warning / error glyphs for Amber and Red because alert states MUST
+    // be distinguishable at a glance even by colourblind users.
+    if (!connected) {
+        return g_state.icon_brand ? g_state.icon_brand : g_state.icon_offline;
+    }
     switch (s) {
-        case ipc::OverallState::Green:  return g_state.icon_green;
+        case ipc::OverallState::Green:
+            return g_state.icon_brand ? g_state.icon_brand : g_state.icon_green;
         case ipc::OverallState::Amber:  return g_state.icon_amber;
         case ipc::OverallState::Red:    return g_state.icon_red;
-        case ipc::OverallState::Paused: return g_state.icon_paused;
+        case ipc::OverallState::Paused:
+            return g_state.icon_brand ? g_state.icon_brand : g_state.icon_paused;
         case ipc::OverallState::Unknown:
-        default:                        return g_state.icon_offline;
+        default:
+            return g_state.icon_brand ? g_state.icon_brand : g_state.icon_offline;
     }
 }
 
@@ -466,7 +539,21 @@ extern "C" int WINAPI wWinMain(HINSTANCE inst,
         return 0;
     }
 
+    // GDI+ is required to decode the brand PNG. Initialise once for the
+    // whole process; a failure here is non-fatal (we simply fall back to
+    // the system shield).
+    {
+        Gdiplus::GdiplusStartupInput gdip_in;
+        if (Gdiplus::GdiplusStartup(&g_state.gdiplus_token, &gdip_in, nullptr)
+                != Gdiplus::Ok) {
+            g_state.gdiplus_token = 0;
+        }
+    }
+
     // Load icons up front so state-change paths never allocate.
+    if (g_state.gdiplus_token) {
+        g_state.icon_brand = LoadBrandIconFromModuleDir();
+    }
     g_state.icon_green   = LoadSystemIcon(IDI_SHIELD);
     g_state.icon_amber   = LoadSystemIcon(IDI_WARNING);
     g_state.icon_red     = LoadSystemIcon(IDI_ERROR);
@@ -475,6 +562,8 @@ extern "C" int WINAPI wWinMain(HINSTANCE inst,
     if (!g_state.icon_green || !g_state.icon_offline) {
         ShadowStrike::Utils::Logger::Error(
             "Tray: LoadImageW for system icons failed gle={}", ::GetLastError());
+        if (g_state.icon_brand) { ::DestroyIcon(g_state.icon_brand); g_state.icon_brand = nullptr; }
+        if (g_state.gdiplus_token) { Gdiplus::GdiplusShutdown(g_state.gdiplus_token); g_state.gdiplus_token = 0; }
         ::CloseHandle(mutex);
         return 1;
     }
@@ -541,6 +630,14 @@ extern "C" int WINAPI wWinMain(HINSTANCE inst,
     if (g_state.client) {
         g_state.client->Stop();
         g_state.client.reset();
+    }
+    if (g_state.icon_brand) {
+        ::DestroyIcon(g_state.icon_brand);
+        g_state.icon_brand = nullptr;
+    }
+    if (g_state.gdiplus_token) {
+        Gdiplus::GdiplusShutdown(g_state.gdiplus_token);
+        g_state.gdiplus_token = 0;
     }
     ::CloseHandle(mutex);
     return static_cast<int>(msg.wParam);

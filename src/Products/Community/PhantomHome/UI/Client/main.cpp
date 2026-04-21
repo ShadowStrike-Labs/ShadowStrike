@@ -62,7 +62,16 @@ int main(int argc, char* argv[]) {
     QGuiApplication::setApplicationVersion(QStringLiteral("0.1.0"));
 
     QGuiApplication app(argc, argv);
-    app.setWindowIcon(QIcon(QStringLiteral(":/ShadowStrike/Phantom/qml/assets/logo.svg")));
+    // Brand icon for the window / taskbar / alt-tab list. Prefer the high-
+    // resolution PNG shipped in the qrc; fall back to the SVG if the PNG is
+    // missing (e.g. old resource builds) so the window is never iconless.
+    {
+        QIcon brand(QStringLiteral(":/ShadowStrike/Phantom/qml/assets/logo.png"));
+        if (brand.isNull()) {
+            brand = QIcon(QStringLiteral(":/ShadowStrike/Phantom/qml/assets/logo.svg"));
+        }
+        app.setWindowIcon(brand);
+    }
 
     using namespace ShadowStrike::PhantomHome;
 
