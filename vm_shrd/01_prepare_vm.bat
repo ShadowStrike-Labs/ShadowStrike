@@ -1,39 +1,55 @@
 @echo off
-REM ShadowStrike Phantom Home - VM preparation (run ONCE per clean snapshot).
-REM Auto-elevates to Administrator.
+REM =====================================================================
+REM ShadowStrike Phantom Home - VM prep: enable TESTSIGNING so the driver
+REM can load. Reboot REQUIRED afterwards.
+REM =====================================================================
+setlocal ENABLEDELAYEDEXPANSION
 
+set "STAGE=%LOCALAPPDATA%\ShadowStrike-Install"
+if /I "%~dp0"=="%STAGE%\" goto local
+
+echo [stage] Copying to %STAGE% ...
+if not exist "%STAGE%" mkdir "%STAGE%" 2>nul
+for %%F in ("%~dp0*.bat" "%~dp0README.txt") do (
+    if exist %%F copy /y %%F "%STAGE%\" >nul 2>&1
+)
+echo [stage] Re-launching from local copy ...
+start "ShadowStrike Phantom" cmd /k "\"%STAGE%\%~nx0\""
+exit /b 0
+
+:local
 net session >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo This script needs Administrator rights.
-    echo A UAC prompt will appear; click YES.
-    echo.
-    powershell -NoProfile -Command "$p='%~f0'; if ($p -match '^([A-Za-z]):') { $d = Get-PSDrive $matches[1] -ErrorAction SilentlyContinue; if ($d -and $d.DisplayRoot) { $p = $d.DisplayRoot + $p.Substring(2) } }; try { Start-Process -FilePath 'cmd.exe' -ArgumentList ('/k','\"' + $p + '\"') -Verb RunAs -ErrorAction Stop } catch { Write-Host ('[elevate] failed: ' + $_.Exception.Message); exit 1 }"
+    echo [elevate] Re-launching with Administrator rights. Click YES on the UAC prompt.
+    powershell -NoProfile -Command "try { Start-Process -FilePath 'cmd.exe' -ArgumentList ('/k','\"%~f0\"') -Verb RunAs -ErrorAction Stop } catch { Write-Host ('[elevate] failed: ' + $_.Exception.Message) ; exit 1 }"
     if errorlevel 1 (
         echo.
-        echo [!] Elevation was cancelled or denied. Nothing was done.
-        echo     Close this window and try again, clicking YES on the UAC prompt.
-        echo.
+        echo [!] UAC was cancelled. Nothing was done.
         pause
     )
     exit /b 0
 )
 
-echo === Installing PhantomSensor test-signing cert into Root + TrustedPublisher ===
-certutil -addstore Root            "%~dp0PhantomSensor.cer" || goto :err
-certutil -addstore TrustedPublisher "%~dp0PhantomSensor.cer" || goto :err
+echo === ShadowStrike Phantom Home - VM prep ===
+echo.
+echo [1/2] Enabling kernel TESTSIGNING (required for the test-signed driver)...
+bcdedit /set testsigning on
+if errorlevel 1 (
+    echo [!] bcdedit failed. You may need to disable Secure Boot in the VM firmware.
+    pause
+    exit /b 1
+)
+
+echo [2/2] Relaxing UAC prompt level (optional, makes testing less noisy)...
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f >nul 2>&1
 
 echo.
-echo === Enabling kernel test-signing mode (required for WDK-signed driver) ===
-bcdedit /set testsigning on || goto :err
-
-echo.
-echo [OK] Preparation complete.
-echo [!] REBOOT THE VM NOW, then run 02_install.bat.
+echo ============================================================
+echo Prep done. REBOOT the VM now.
+echo After reboot the desktop will show "Test Mode" watermark.
+echo Then run 00_disable_defender.bat (if Tamper Protection is off),
+echo followed by 02_install.bat.
+echo ============================================================
 pause
 exit /b 0
-
-:err
-echo [X] Preparation step failed. Aborting.
-pause
-exit /b 1
