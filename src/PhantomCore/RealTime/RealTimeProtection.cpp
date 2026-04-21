@@ -84,6 +84,20 @@
 #include "../Exploits/PrivilegeEscalationDetector.hpp"
 
 // ============================================================================
+// SUBSYSTEM WIRING (ransomware + script-scanner + ROP bring-up)
+//
+// NOTE: ROPProtection.hpp is DELIBERATELY NOT included here. It lives in
+//       the same ShadowStrike::Exploits namespace as KernelExploitDetector
+//       and redefines DetectionConfidence / BlockCallback with incompatible
+//       signatures (pre-existing ODR violation across module headers). The
+//       ROP engine is driven through the RopWiring shim, which includes
+//       ROPProtection.hpp in its own isolated TU.
+// ============================================================================
+#include "../RansomwareProtection/RansomwareWiring.hpp"
+#include "../Scripts/ScriptsWiring.hpp"
+#include "../Exploits/RopWiring.hpp"
+
+// ============================================================================
 // ANTI-EVASION DETECTOR INCLUDES
 // ============================================================================
 #include "../AntiEvasion/DebuggerEvasionDetector.hpp"
@@ -724,6 +738,38 @@ public:
 
             SetState(ProtectionState::ACTIVE);
             Utils::Logger::Info("RealTimeProtection: Started successfully");
+
+            // =================================================================
+            // SUBSYSTEM WIRING - Phase 3 orphan bring-up
+            // =================================================================
+            //
+            // The ransomware protection stack (9 modules) and script-scanner
+            // stack (4 scanners) are initialized here, after all their
+            // dependencies (IPCManager, ScanEngine, Cortex, CacheManager) are
+            // already up. Failures are isolated inside each subsystem; this
+            // block never propagates an exception out of Start().
+            //
+            // Ordering rationale: ransomware modules register file-write
+            // callbacks that scan engines and detection callbacks eventually
+            // consume, so they must come up AFTER the detection/IPC layer
+            // but BEFORE Start() returns so subsequent traffic is covered.
+            //
+            try {
+                (void)::ShadowStrike::Ransomware::Wiring::
+                    InitializeRansomwareSubsystem();
+            } catch (...) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: ransomware wiring threw - continuing");
+            }
+
+            try {
+                (void)::ShadowStrike::Scripts::Wiring::
+                    InitializeScriptsSubsystem();
+            } catch (...) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: scripts wiring threw - continuing");
+            }
+
             return true;
 
         } catch (const std::exception& e) {
@@ -1857,6 +1903,21 @@ public:
             Utils::Logger::Error("RealTimeProtection: StackPivotDetector unknown exception");
         }
 
+        // ROPProtection (return-oriented programming / gadget-chain detection).
+        // Driven through the RopWiring shim to keep ROPProtection.hpp out of
+        // this TU (it redefines DetectionConfidence in ShadowStrike::Exploits,
+        // which would collide with KernelExploitDetector.hpp already included
+        // above - a pre-existing ODR issue in the module headers).
+        try {
+            if (!::ShadowStrike::Exploits::RopWiring::InitROPProtection()) {
+                Utils::Logger::Warn("RealTimeProtection: ROPProtection init returned false");
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("RealTimeProtection: ROPProtection exception: {}", e.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: ROPProtection unknown exception");
+        }
+
         // KernelExploitDetector (singleton — BYOVD / vulnerable driver / IOCTL abuse detection)
         try {
             auto& ked = Exploits::KernelExploitDetector::Instance();
@@ -2026,11 +2087,26 @@ public:
         } catch (...) {}
 
         try { Exploits::StackPivotDetector::Instance().Shutdown(); } catch (...) {}
+        try { ::ShadowStrike::Exploits::RopWiring::ShutdownROPProtection(); } catch (...) {}
         try { Exploits::BufferOverflowProtection::Instance().Shutdown(); } catch (...) {}
         try { Exploits::JITSprayDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::HeapSprayDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::KernelExploitDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::PrivilegeEscalationDetector::Instance().Shutdown(); } catch (...) {}
+
+        // =====================================================================
+        // Subsystem wiring teardown (Phase 3)
+        //
+        // Both helpers are `noexcept` and log their own failures; the wrapping
+        // try/catch below is belt-and-suspenders in case someone replaces the
+        // implementation with something looser in future.
+        // =====================================================================
+        try {
+            ::ShadowStrike::Scripts::Wiring::ShutdownScriptsSubsystem();
+        } catch (...) {}
+        try {
+            ::ShadowStrike::Ransomware::Wiring::ShutdownRansomwareSubsystem();
+        } catch (...) {}
 
         Utils::Logger::Info("RealTimeProtection: Components stopped");
     }
