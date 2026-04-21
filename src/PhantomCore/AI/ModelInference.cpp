@@ -522,12 +522,9 @@ bool ModelInference::Initialize(const CortexConfig& config) noexcept {
             return false;
         }
 
-        // Disable per-session thread-pool spinning to reduce idle CPU
-        if (!CheckOrtStatus(api,
-                api->DisablePerSessionThreads(m_impl->env),
-                L"DisablePerSessionThreads")) {
-            // Non-fatal — continue
-        }
+        // Per-session thread-pool spinning is disabled on each SessionOptions
+        // in LoadModel() below.  The env-level DisablePerSessionThreads API
+        // takes OrtThreadingOptions, which we do not configure here.
 
         // -----------------------------------------------------------
         // 3. Detect hardware capabilities

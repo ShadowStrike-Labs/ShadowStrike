@@ -67,8 +67,8 @@
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;$(ProjectDir)PhantomEmulator;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;SHADOWSTRIKE_HAS_YARA;PHANTOM_EMULATOR_AVAILABLE;GTEST_LINKED_AS_SHARED_LIBRARY=1;GMOCK_LINKED_AS_SHARED_LIBRARY=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;$(ProjectDir)PhantomEmulator;$(ProjectDir)vendor\onnxruntime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;SHADOWSTRIKE_HAS_YARA;PHANTOM_EMULATOR_AVAILABLE;SHADOWSTRIKE_HAS_ONNXRUNTIME=1;GTEST_LINKED_AS_SHARED_LIBRARY=1;GMOCK_LINKED_AS_SHARED_LIBRARY=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Lib>
       <AdditionalOptions>/IGNORE:4006 %(AdditionalOptions)</AdditionalOptions>
@@ -432,6 +432,7 @@
     </ClCompile>
     <ClCompile Include="PhantomEmulator\Analysis\PerformanceProfiler.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)PhantomEmulator\Analysis_PerformanceProfiler.obj</ObjectFileName>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\Analysis\StringExtractor.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
@@ -568,8 +569,12 @@
     <ClCompile Include="PhantomEmulator\Core\Loader\PELoader.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="PhantomEmulator\Common\Platform.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="PhantomEmulator\Core\Loader\PEParser.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)PhantomEmulator\Loader_PEParser.obj</ObjectFileName>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\Core\Loader\RelocApplier.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

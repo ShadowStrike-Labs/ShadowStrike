@@ -405,3 +405,10 @@ docs/book/
 PhantomCortex/training/output/
 PhantomCortex/training/data/raw/
 PhantomCortex/training/data/*_combined.npz
+
+# ONNX Runtime vendored SDK binaries
+vendor/onnxruntime/**/*.pdb
+
+# Local GUI workbench
+/GUI_WORK/
+
