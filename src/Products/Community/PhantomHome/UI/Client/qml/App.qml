@@ -188,9 +188,13 @@ ApplicationWindow {
                 lastScan:         protectionVm ? protectionVm.lastScan         : "—"
                 threatsBlocked7d: protectionVm ? protectionVm.threatsBlocked7d : 0
                 updateStatus:     protectionVm ? protectionVm.updateStatus     : "Checking for updates…"
-                onStartFastScan:  if (protectionVm) protectionVm.startFastScan()
-                onOpenScanTab:    stack.currentIndex = 4
-                onOpenUpdateTab:  stack.currentIndex = 7
+                modules:          protectionVm ? protectionVm.modules          : []
+                recentEvents:     protectionVm ? protectionVm.recentEvents     : []
+                onStartFastScan:    if (protectionVm) protectionVm.startFastScan()
+                onOpenScanTab:      stack.currentIndex = 4
+                onOpenUpdateTab:    stack.currentIndex = 7
+                onOpenSecurityTab:  stack.currentIndex = 1
+                onOpenReportsTab:   stack.currentIndex = 6
             }
             SecurityPage {
                 modules: protectionVm ? protectionVm.modules : []
