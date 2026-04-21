@@ -3291,7 +3291,71 @@ public:
             }
 
             case FilterMessageType_RansomwareAlert: {
-                Utils::Logger::Error("RealTimeProtection: RANSOMWARE ALERT from kernel (payload {} bytes)", size);
+                // Kernel minifilter has independently detected ransomware-like behaviour
+                // (rapid rename/encryption storm, shadow-copy wipe, backup deletion).
+                // This is a HIGH-confidence signal from kernel-side heuristics.
+                Utils::Logger::Error(
+                    "RealTimeProtection: RANSOMWARE ALERT from kernel (payload {} bytes)", size);
+                m_stats.threatsDetected++;
+
+                // Forward raw alert payload to BehaviorBlocker for cross-correlation
+                // with user-mode behavioural score + optional runtime kill / rollback.
+                if (data && size > 0) {
+                    try {
+                        auto& bb = BehaviorBlocker::Instance();
+                        if (bb.IsRunning()) {
+                            auto payload = std::span<const std::byte>(
+                                static_cast<const std::byte*>(data), size);
+                            bb.OnKernelBehavioralAlert(
+                                static_cast<uint32_t>(FilterMessageType_RansomwareAlert),
+                                payload);
+                        }
+                    } catch (const std::exception& ex) {
+                        Utils::Logger::Error(
+                            "RealTimeProtection: RansomwareAlert BehaviorBlocker dispatch failed: {}",
+                            ex.what());
+                    } catch (...) {}
+                }
+                break;
+            }
+
+            case FilterMessageType_NamedPipeEvent: {
+                // Named-pipe create / connect — relevant for C2 tunnels and lateral
+                // movement (MITRE T1570 / T1021.002). Route to BehaviorBlocker so
+                // the behavioural engine can correlate with process + network data.
+                m_stats.threatsDetected++;
+                if (data && size > 0) {
+                    try {
+                        auto& bb = BehaviorBlocker::Instance();
+                        if (bb.IsRunning()) {
+                            auto payload = std::span<const std::byte>(
+                                static_cast<const std::byte*>(data), size);
+                            bb.OnKernelBehavioralAlert(
+                                static_cast<uint32_t>(FilterMessageType_NamedPipeEvent),
+                                payload);
+                        }
+                    } catch (...) {}
+                }
+                Utils::Logger::Warn(
+                    "RealTimeProtection: Named-pipe kernel event (payload {} bytes)", size);
+                break;
+            }
+
+            case FilterMessageType_FileBackupEvent: {
+                // Kernel BackupProtector has snapshotted a file before a write /
+                // rename / delete so a subsequent ransomware attempt can be rolled
+                // back. This is an informational telemetry signal, not a detection.
+                Utils::Logger::Info(
+                    "RealTimeProtection: Kernel file-backup checkpoint ({} bytes)", size);
+                break;
+            }
+
+            case FilterMessageType_FileRollbackEvent: {
+                // Kernel has rolled a file back from a pre-write snapshot after
+                // ransomware behaviour was confirmed. Surface as a recovery event
+                // (user-facing in the Timeline panel).
+                Utils::Logger::Warn(
+                    "RealTimeProtection: Kernel file-rollback recovery ({} bytes)", size);
                 m_stats.threatsDetected++;
                 break;
             }

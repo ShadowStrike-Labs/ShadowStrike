@@ -11,6 +11,8 @@
         <file>components/PrimaryButton.qml</file>
         <file>components/SecondaryButton.qml</file>
         <file>components/StatePill.qml</file>
+        <file>components/ModuleCard.qml</file>
+        <file>components/ModuleSettingsDialog.qml</file>
         <file>pages/MainPage.qml</file>
         <file>pages/SecurityPage.qml</file>
         <file>pages/PerformancePage.qml</file>

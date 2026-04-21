@@ -146,7 +146,7 @@
       <Message>RCC qml.qrc</Message>
       <Command>"$(QtBin)\rcc.exe" --name qml --output "$(IntDir)qrc_qml.cpp" "%(FullPath)"</Command>
       <Outputs>$(IntDir)qrc_qml.cpp</Outputs>
-      <AdditionalInputs>src\Products\Community\PhantomHome\UI\Client\qml\App.qml;src\Products\Community\PhantomHome\UI\Client\qml\Theming\Theme.qml;src\Products\Community\PhantomHome\UI\Client\qml\Theming\qmldir;src\Products\Community\PhantomHome\UI\Client\qml\components\Sidebar.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\ShieldAnimator.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\CardFrame.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\MainPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\SecurityPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\PerformancePage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\PrivacyPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\ScanPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\QuarantinePage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\ReportsPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\SettingsPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.svg</AdditionalInputs>
+      <AdditionalInputs>src\Products\Community\PhantomHome\UI\Client\qml\App.qml;src\Products\Community\PhantomHome\UI\Client\qml\Theming\Theme.qml;src\Products\Community\PhantomHome\UI\Client\qml\Theming\qmldir;src\Products\Community\PhantomHome\UI\Client\qml\components\Sidebar.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\ShieldAnimator.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\CardFrame.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\ModuleCard.qml;src\Products\Community\PhantomHome\UI\Client\qml\components\ModuleSettingsDialog.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\MainPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\SecurityPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\PerformancePage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\PrivacyPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\ScanPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\QuarantinePage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\ReportsPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\pages\SettingsPage.qml;src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.svg</AdditionalInputs>
     </CustomBuild>
   </ItemGroup>
 
@@ -158,6 +158,8 @@
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\Sidebar.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\ShieldAnimator.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\CardFrame.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\ModuleCard.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\components\ModuleSettingsDialog.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\MainPage.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\SecurityPage.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\PerformancePage.qml" />

@@ -123,6 +123,11 @@ if not exist "%MODELDIR%" mkdir "%MODELDIR%" >nul 2>&1
 if exist "%SRC%\Models" (
     robocopy "%SRC%\Models" "%MODELDIR%" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP >nul
 )
+REM Harden ACLs so only SYSTEM / Administrators can write; Users read-only.
+REM This prevents a non-admin user from dropping a malicious .onnx into the
+REM model store to be loaded by the service at next start.
+icacls "%MODELDIR%" /inheritance:r >nul 2>&1
+icacls "%MODELDIR%" /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "BUILTIN\Users:(OI)(CI)RX" >nul 2>&1
 REM Register the model directory so the service picks it up even without a
 REM full CortexConfig.json deployment.
 reg add "HKLM\SOFTWARE\ShadowStrike\PhantomCortex" /v ModelDirectory /t REG_SZ /d "%MODELDIR%" /f >nul 2>&1
