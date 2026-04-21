@@ -4,6 +4,7 @@
 #include "ProtectionViewModel.hpp"
 
 #include <QDateTime>
+#include <QDebug>
 #include <QLocale>
 #include <QMetaObject>
 #include <QPointer>
@@ -220,6 +221,52 @@ void ProtectionViewModel::setModuleEnabled(const QString& id, bool enabled) {
             if (!self) return;
             self->refreshAll();
         });
+}
+
+void ProtectionViewModel::setDetectionAction(const QString& id, int action) {
+    if (!m_client) return;
+    nlohmann::json payload = {
+        {"id", id.toStdString()},
+        {"a",  action},
+    };
+    m_client->RequestAsync(MessageType::SetDetectionAction, payload,
+        [self = QPointer<ProtectionViewModel>(this)](std::optional<FrameEnvelope>) {
+            if (!self) return;
+            self->refreshAll();
+        });
+}
+
+void ProtectionViewModel::configureModule(const QString& id, const QVariantMap& payload) {
+    Q_UNUSED(payload);
+    qDebug() << "[ProtectionViewModel] configureModule: TODO service-side stub — id=" << id;
+}
+
+void ProtectionViewModel::runTuneUp(const QString& name) {
+    qDebug() << "[ProtectionViewModel] runTuneUp: TODO service-side stub —" << name;
+}
+
+void ProtectionViewModel::runPasswordAudit() {
+    qDebug() << "[ProtectionViewModel] runPasswordAudit: TODO service-side stub";
+}
+
+void ProtectionViewModel::refreshQuarantine() {
+    qDebug() << "[ProtectionViewModel] refreshQuarantine: TODO wire QuarantineList IPC verb";
+}
+
+void ProtectionViewModel::restoreQuarantineItem(const QString& id) {
+    qDebug() << "[ProtectionViewModel] restoreQuarantineItem: TODO service-side stub — id=" << id;
+}
+
+void ProtectionViewModel::deleteQuarantineItem(const QString& id) {
+    qDebug() << "[ProtectionViewModel] deleteQuarantineItem: TODO service-side stub — id=" << id;
+}
+
+void ProtectionViewModel::exportReportCsv() {
+    qDebug() << "[ProtectionViewModel] exportReportCsv: TODO service-side stub";
+}
+
+void ProtectionViewModel::installUpdate() {
+    qDebug() << "[ProtectionViewModel] installUpdate: TODO service-side stub";
 }
 
 void ProtectionViewModel::onStateReply(QString state,

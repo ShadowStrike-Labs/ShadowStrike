@@ -54,8 +54,9 @@ class ProtectionViewModel : public QObject {
     Q_PROPERTY(bool    gameModeActive     READ gameModeActive     NOTIFY perfChanged)
     Q_PROPERTY(bool    batterySaverActive READ batterySaverActive NOTIFY perfChanged)
 
-    Q_PROPERTY(QVariantList modules       READ modules       NOTIFY modulesChanged)
-    Q_PROPERTY(QVariantList recentEvents  READ recentEvents  NOTIFY eventsChanged)
+    Q_PROPERTY(QVariantList modules         READ modules         NOTIFY modulesChanged)
+    Q_PROPERTY(QVariantList recentEvents    READ recentEvents    NOTIFY eventsChanged)
+    Q_PROPERTY(QVariantList quarantineItems READ quarantineItems NOTIFY quarantineChanged)
 
 public:
     explicit ProtectionViewModel(std::shared_ptr<PipeClient> client,
@@ -83,13 +84,23 @@ public:
     bool    gameModeActive()     const { return m_gameMode; }
     bool    batterySaverActive() const { return m_batterySaver; }
 
-    QVariantList modules()      const { return m_modules; }
-    QVariantList recentEvents() const { return m_recentEvents; }
+    QVariantList modules()         const { return m_modules; }
+    QVariantList recentEvents()    const { return m_recentEvents; }
+    QVariantList quarantineItems() const { return m_quarantineItems; }
 
 public slots:
     // ---- User intents, callable from QML -----------------------------------
     Q_INVOKABLE void startFastScan();
     Q_INVOKABLE void setModuleEnabled(const QString& id, bool enabled);
+    Q_INVOKABLE void setDetectionAction(const QString& id, int action);
+    Q_INVOKABLE void configureModule(const QString& id, const QVariantMap& payload);
+    Q_INVOKABLE void runTuneUp(const QString& name);
+    Q_INVOKABLE void runPasswordAudit();
+    Q_INVOKABLE void refreshQuarantine();
+    Q_INVOKABLE void restoreQuarantineItem(const QString& id);
+    Q_INVOKABLE void deleteQuarantineItem(const QString& id);
+    Q_INVOKABLE void exportReportCsv();
+    Q_INVOKABLE void installUpdate();
     Q_INVOKABLE void refreshAll();
 
 signals:
@@ -97,6 +108,7 @@ signals:
     void perfChanged();
     void modulesChanged();
     void eventsChanged();
+    void quarantineChanged();
     void connectionChanged(bool connected);
 
 private:
@@ -133,6 +145,7 @@ private:
 
     QVariantList m_modules;
     QVariantList m_recentEvents;
+    QVariantList m_quarantineItems;
 };
 
 } // namespace ShadowStrike::PhantomHome::UI::Client
