@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <format>
 #include <string>
+#include <thread>
 
 #include "../IPC/PipeServer.hpp"
 #include "../IPC/IPCRouter.hpp"
@@ -60,6 +61,7 @@ SERVICE_STATUS_HANDLE g_status_handle{nullptr};
 SERVICE_STATUS        g_status{};
 HANDLE                g_stop_event{nullptr};
 std::atomic<bool>     g_stop_requested{false};
+std::atomic<bool>     g_init_done{false};
 
 void ReportStatus(DWORD current_state,
                   DWORD exit_code       = NO_ERROR,
@@ -136,57 +138,18 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
         return;
     }
 
-    // ---- Orchestrator init ----
+    // ---- Bind orchestrator singleton + start pipe server BEFORE any heavy
+    // module init. IPCRouter handlers tolerate an unbound/uninitialized
+    // orchestrator (they return "engine not initialized" Red state), so the
+    // UI can connect and render a "starting up" dashboard immediately.
+    // Heavy module Initialize()/Start() runs on a background thread so the
+    // SCM transition to SERVICE_RUNNING is not gated by it; otherwise any
+    // single slow module (YARA rule compile, ThreatIntel feed load, first
+    // DB open) can starve the SCM 30 s budget and leave us stuck in
+    // START_PENDING as observed in field diagnostics.
     auto& orch = ::ShadowStrike::Products::Home::HomeProductOrchestrator::Instance();
-    if (!orch.Initialize()) {
-        ShadowStrike::Utils::Logger::Error("ServiceMain: orchestrator Initialize() failed");
-        ReportStatus(SERVICE_STOPPED, 0, 0, /*specific=*/2);
-        ::CloseHandle(g_stop_event);
-        return;
-    }
-    ReportStatus(SERVICE_START_PENDING, NO_ERROR, 10000);
 
-    if (!orch.Start()) {
-        ShadowStrike::Utils::Logger::Error("ServiceMain: orchestrator Start() failed");
-        orch.Shutdown();
-        ReportStatus(SERVICE_STOPPED, 0, 0, /*specific=*/3);
-        ::CloseHandle(g_stop_event);
-        return;
-    }
-
-    // ---- Update subsystem ----
-    // Initialization failure is non-fatal: the service continues to run as a
-    // pure scanner. Update status IPC falls back to safe defaults.
-    try {
-        ::ShadowStrike::Update::UpdateConfiguration uc{};
-        uc.enabled                  = true;
-        uc.autoUpdate               = true;
-        uc.channel                  = ::ShadowStrike::Update::UpdateChannel::Stable;
-        uc.checkIntervalHours       =
-            ::ShadowStrike::Update::UpdateConstants::DEFAULT_CHECK_INTERVAL_HOURS;
-        uc.stagingDirectory         = L"C:\\ProgramData\\ShadowStrike\\Update\\Staging";
-        uc.respectMeteredConnection = true;
-        uc.deferDuringGaming        = true;
-        uc.deferDuringHighCPU       = true;
-
-        if (!::ShadowStrike::Update::UpdateManager::Instance().Initialize(uc)) {
-            ShadowStrike::Utils::Logger::Warn(
-                "ServiceMain: UpdateManager::Initialize returned false; "
-                "service continuing without update subsystem");
-        } else {
-            ShadowStrike::Utils::Logger::Info("ServiceMain: UpdateManager initialized");
-        }
-    } catch (const std::exception& e) {
-        ShadowStrike::Utils::Logger::Warn(
-            "ServiceMain: UpdateManager init exception: {}", e.what());
-    } catch (...) {
-        ShadowStrike::Utils::Logger::Warn(
-            "ServiceMain: UpdateManager init unknown exception");
-    }
-
-    // ---- IPC pipe server ----
     using namespace ShadowStrike::PhantomHome::IPC;
-
     PipeServer::Options po{};
     po.session_id = CurrentInteractiveSessionId();
     auto server   = std::make_unique<PipeServer>(po);
@@ -202,7 +165,6 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
 
     if (!server->Start()) {
         ShadowStrike::Utils::Logger::Error("ServiceMain: PipeServer::Start failed");
-        orch.Shutdown();
         ReportStatus(SERVICE_STOPPED, 0, 0, /*specific=*/4);
         ::CloseHandle(g_stop_event);
         return;
@@ -210,7 +172,62 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
 
     ReportStatus(SERVICE_RUNNING);
     ::ShadowStrike::PhantomHome::UI::PerfBudget::Instance().MarkProcessReady();
-    ShadowStrike::Utils::Logger::Info("ServiceMain: running, session={}", po.session_id);
+    ShadowStrike::Utils::Logger::Info(
+        "ServiceMain: running (pipe up, orchestrator initializing async), session={}",
+        po.session_id);
+
+    // ---- Background orchestrator + update subsystem init ----
+    std::thread init_thread([&orch]() {
+        try {
+            if (!orch.Initialize()) {
+                ShadowStrike::Utils::Logger::Error(
+                    "ServiceMain[bg]: orchestrator Initialize() returned false; "
+                    "service stays online as scanner-less shell");
+            } else if (!orch.Start()) {
+                ShadowStrike::Utils::Logger::Error(
+                    "ServiceMain[bg]: orchestrator Start() returned false; "
+                    "one or more modules failed but service remains online");
+            } else {
+                ShadowStrike::Utils::Logger::Info(
+                    "ServiceMain[bg]: orchestrator fully running");
+            }
+        } catch (const std::exception& e) {
+            ShadowStrike::Utils::Logger::Error(
+                "ServiceMain[bg]: orchestrator init threw: {}", e.what());
+        } catch (...) {
+            ShadowStrike::Utils::Logger::Error(
+                "ServiceMain[bg]: orchestrator init threw unknown exception");
+        }
+
+        try {
+            ::ShadowStrike::Update::UpdateConfiguration uc{};
+            uc.enabled                  = true;
+            uc.autoUpdate               = true;
+            uc.channel                  = ::ShadowStrike::Update::UpdateChannel::Stable;
+            uc.checkIntervalHours       =
+                ::ShadowStrike::Update::UpdateConstants::DEFAULT_CHECK_INTERVAL_HOURS;
+            uc.stagingDirectory         = L"C:\\ProgramData\\ShadowStrike\\Update\\Staging";
+            uc.respectMeteredConnection = true;
+            uc.deferDuringGaming        = true;
+            uc.deferDuringHighCPU       = true;
+
+            if (!::ShadowStrike::Update::UpdateManager::Instance().Initialize(uc)) {
+                ShadowStrike::Utils::Logger::Warn(
+                    "ServiceMain[bg]: UpdateManager::Initialize returned false");
+            } else {
+                ShadowStrike::Utils::Logger::Info(
+                    "ServiceMain[bg]: UpdateManager initialized");
+            }
+        } catch (const std::exception& e) {
+            ShadowStrike::Utils::Logger::Warn(
+                "ServiceMain[bg]: UpdateManager init exception: {}", e.what());
+        } catch (...) {
+            ShadowStrike::Utils::Logger::Warn(
+                "ServiceMain[bg]: UpdateManager init unknown exception");
+        }
+
+        g_init_done.store(true, std::memory_order_release);
+    });
 
     // ---- Main wait loop ----
     while (!g_stop_requested.load()) {
@@ -219,10 +236,18 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
         if (wait == WAIT_FAILED)   break;
     }
 
-    ReportStatus(SERVICE_STOP_PENDING, NO_ERROR, 15000);
+    ReportStatus(SERVICE_STOP_PENDING, NO_ERROR, 30000);
     IPCRouter::Instance().Shutdown();
     server->Stop();
     server.reset();
+
+    // Join the async init thread before we tear down singletons it touches.
+    // If init is still in flight (e.g. service stopped within the first
+    // seconds), we must wait for it to finish before Shutdown() is called,
+    // otherwise Initialize() and Shutdown() race on the same module registry.
+    if (init_thread.joinable()) {
+        init_thread.join();
+    }
 
     try {
         if (::ShadowStrike::Update::UpdateManager::HasInstance()) {
