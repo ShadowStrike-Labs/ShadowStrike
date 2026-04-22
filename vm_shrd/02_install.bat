@@ -8,13 +8,14 @@ set "STAGE=%LOCALAPPDATA%\ShadowStrike-Install"
 if /I "%~dp0"=="%STAGE%\" goto staged
 
 REM ---- First invocation: copy to local disk, relaunch from there ------
-echo [stage] Copying installer to %STAGE% ...
+REM Always sync the full payload so re-runs after updates pick up new binaries.
+echo [stage] Syncing installer to %STAGE% ...
 if not exist "%STAGE%" mkdir "%STAGE%" 2>nul
 for %%F in ("%~dp0*.bat" "%~dp0README.txt") do (
     if exist %%F copy /y %%F "%STAGE%\" >nul 2>&1
 )
 if exist "%~dp0payload\app" (
-    echo [stage] Copying payload to %STAGE%\payload ^(first run only, please wait^) ...
+    echo [stage] Syncing payload to %STAGE%\payload (please wait^) ...
     robocopy "%~dp0payload" "%STAGE%\payload" /E /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP
     set RC=!ERRORLEVEL!
     if !RC! geq 8 (
