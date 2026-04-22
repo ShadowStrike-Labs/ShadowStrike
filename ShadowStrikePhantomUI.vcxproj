@@ -111,13 +111,27 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\main.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\IPC\Messages.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Accessibility\HighContrastContext.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\I18n\Translator.cpp" />
     <!-- MOC outputs are generated into $(IntDir) and included via CustomBuild. -->
     <ClCompile Include="$(IntDir)moc_ProtectionViewModel.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_ProtectionViewModel.cpp')">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="$(IntDir)moc_PerfBudget.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_PerfBudget.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)moc_HighContrastContext.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_HighContrastContext.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="$(IntDir)qrc_qml.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)qrc_qml.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)qrc_translations.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)qrc_translations.cpp')">true</ExcludedFromBuild>
     </ClCompile>
   </ItemGroup>
 
@@ -125,6 +139,9 @@
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Accessibility\HighContrastContext.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\I18n\Translator.hpp" />
   </ItemGroup>
 
   <!-- ====================================================================
@@ -135,6 +152,16 @@
       <Message>MOC ProtectionViewModel.hpp</Message>
       <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_ProtectionViewModel.cpp" "%(FullPath)"</Command>
       <Outputs>$(IntDir)moc_ProtectionViewModel.cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.hpp">
+      <Message>MOC PerfBudget.hpp</Message>
+      <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_PerfBudget.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)moc_PerfBudget.cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Accessibility\HighContrastContext.hpp">
+      <Message>MOC HighContrastContext.hpp</Message>
+      <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_HighContrastContext.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)moc_HighContrastContext.cpp</Outputs>
     </CustomBuild>
   </ItemGroup>
 
@@ -171,6 +198,11 @@
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\SettingsPage.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\detail\GenericModuleDetailPage.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.svg" />
+    <!-- Accessibility QML module -->
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Accessibility\FocusRing.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Accessibility\HighContrast.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Accessibility\_HOWTO_A11Y.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Accessibility\qmldir" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
@@ -185,4 +217,73 @@
   <Target Name="DeployQtRuntime" AfterTargets="Link">
     <Exec Command='"$(QtBin)\windeployqt.exe" --qmldir "$(SolutionDir)src\Products\Community\PhantomHome\UI\Client\qml" --no-translations --no-system-d3d-compiler --no-opengl-sw "$(OutDir)$(TargetName).exe"' IgnoreExitCode="true" />
   </Target>
+
+  <!-- ====================================================================
+       lrelease: compile .ts → .qm for each supported locale
+       ==================================================================== -->
+  <ItemGroup>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_en_US.ts">
+      <Message>lrelease en_US</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_en_US.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_en_US.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_de_DE.ts">
+      <Message>lrelease de_DE</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_de_DE.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_de_DE.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_tr_TR.ts">
+      <Message>lrelease tr_TR</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_tr_TR.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_tr_TR.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_ja_JP.ts">
+      <Message>lrelease ja_JP</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_ja_JP.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_ja_JP.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_es_ES.ts">
+      <Message>lrelease es_ES</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_es_ES.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_es_ES.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_fr_FR.ts">
+      <Message>lrelease fr_FR</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_fr_FR.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_fr_FR.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_pt_BR.ts">
+      <Message>lrelease pt_BR</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_pt_BR.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_pt_BR.qm</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\phantomhome_ru_RU.ts">
+      <Message>lrelease ru_RU</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+"$(QtBin)\lrelease.exe" "%(FullPath)" -qm "$(IntDir)translations\phantomhome_ru_RU.qm"</Command>
+      <Outputs>$(IntDir)translations\phantomhome_ru_RU.qm</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+
+  <!-- ====================================================================
+       RCC: embed compiled translation resources into the binary
+       ==================================================================== -->
+  <ItemGroup>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\translations.qrc">
+      <Message>RCC translations.qrc</Message>
+      <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"
+copy /Y "%(FullPath)" "$(IntDir)translations\translations.qrc"
+"$(QtBin)\rcc.exe" --name translations --output "$(IntDir)qrc_translations.cpp" "$(IntDir)translations\translations.qrc"</Command>
+      <Outputs>$(IntDir)qrc_translations.cpp</Outputs>
+      <AdditionalInputs>$(IntDir)translations\phantomhome_en_US.qm;$(IntDir)translations\phantomhome_de_DE.qm;$(IntDir)translations\phantomhome_tr_TR.qm;$(IntDir)translations\phantomhome_ja_JP.qm;$(IntDir)translations\phantomhome_es_ES.qm;$(IntDir)translations\phantomhome_fr_FR.qm;$(IntDir)translations\phantomhome_pt_BR.qm;$(IntDir)translations\phantomhome_ru_RU.qm</AdditionalInputs>
+    </CustomBuild>
+  </ItemGroup>
+
 </Project>

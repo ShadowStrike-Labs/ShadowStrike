@@ -953,9 +953,16 @@ bool HomeProductOrchestrator::SetModuleMode(std::string_view name,
                 SetModuleState(m_modules[idx], ModuleState::Initialized);
             }
         }
+        priorState = ModuleState::Initialized;  // Fall through to the Start block below.
+    }
 
-        ok = false;
-        errMsg.clear();
+    // If the module is Initialized but not yet Running, start it now.
+    // This covers two cases: the enable block above just initialized it,
+    // and the rare case where the module arrived here already Initialized
+    // (e.g. Initialize() ran but Start() was not yet called).
+    if (priorState == ModuleState::Initialized) {
+        bool ok = false;
+        std::string errMsg;
         try {
             ok = desc.start();
         } catch (const std::exception& e) {
@@ -983,7 +990,7 @@ bool HomeProductOrchestrator::SetModuleMode(std::string_view name,
             }
         }
         SS_LOG_INFO(kLogCategory,
-            L"Module '%hs' enabled for mode transition to %hs",
+            L"Module '%hs' started for mode transition to %hs",
             desc.name.c_str(), std::string(ToString(mode)).c_str());
     }
 
