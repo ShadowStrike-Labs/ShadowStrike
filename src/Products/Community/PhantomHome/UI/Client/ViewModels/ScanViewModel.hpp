@@ -33,6 +33,7 @@
 #pragma once
 
 #include <QObject>
+#include <QJsonObject>
 #include <QString>
 #include <QStringList>
 #include <memory>
@@ -105,7 +106,8 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 
-    void startScan(const QJsonObject& payload);
+    // Implementation helpers defined in the .cpp (not part of the public ABI).
+    void doStartScan(const QJsonObject& payload);
     void applyProgressUpdate(const QJsonObject& ev);
     void pollProgress();
 };
