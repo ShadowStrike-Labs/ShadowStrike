@@ -50,6 +50,7 @@
 #include <QCoreApplication>
 #include <QJsonDocument>
 #include <QMetaObject>
+#include <QPointer>
 
 // Standard library
 #include <algorithm>
@@ -490,9 +491,11 @@ void PipeClient::Impl::TransitionState(PipeClientState newState, const wchar_t* 
     const int to       = static_cast<int>(newState);
     const QString qReason = QString::fromWCharArray(reason);
 
-    PostToMain([this, from, to, qReason]() {
-        emit m_q->stateChanged();
-        emit m_q->stateTransition(from, to, qReason);
+    PostToMain([qObj = QPointer<PipeClient>(m_q), from, to, qReason]() {
+        if (qObj) {
+            emit qObj->stateChanged();
+            emit qObj->stateTransition(from, to, qReason);
+        }
     });
 }
 
@@ -754,8 +757,8 @@ bool PipeClient::Impl::PerformAuth(HANDLE hPipe, std::stop_token stoken)
         DWORD tmp = 0; GetOverlappedResult(hPipe, &readOvlp, &tmp, TRUE);
         SS_LOG_ERROR(kLog, L"Auth handshake timed out after %lu ms.", kAuthTimeoutMs);
         TransitionState(PipeClientState::Fatal, L"Auth handshake timed out");
-        PostToMain([this]() {
-            emit m_q->authRejected(QStringLiteral("AUTH_TIMEOUT"));
+        PostToMain([qObj = QPointer<PipeClient>(m_q)]() {
+            if (qObj) emit qObj->authRejected(QStringLiteral("AUTH_TIMEOUT"));
         });
         return false;
     }
@@ -788,8 +791,8 @@ bool PipeClient::Impl::PerformAuth(HANDLE hPipe, std::stop_token stoken)
         SS_LOG_ERROR(kLog, L"Service rejected authentication: %hs", reason.c_str());
         TransitionState(PipeClientState::Fatal, L"Auth rejected by service");
         const QString qReason = QString::fromStdString(reason);
-        PostToMain([this, qReason]() {
-            emit m_q->authRejected(qReason);
+        PostToMain([qObj = QPointer<PipeClient>(m_q), qReason]() {
+            if (qObj) emit qObj->authRejected(qReason);
         });
         return false;
     }
@@ -805,8 +808,8 @@ bool PipeClient::Impl::PerformAuth(HANDLE hPipe, std::stop_token stoken)
         SS_LOG_ERROR(kLog, L"Auth handshake response: ok=false — %hs", reason.c_str());
         TransitionState(PipeClientState::Fatal, L"Auth rejected — ok=false");
         const QString qReason = QString::fromStdString(reason);
-        PostToMain([this, qReason]() {
-            emit m_q->authRejected(qReason);
+        PostToMain([qObj = QPointer<PipeClient>(m_q), qReason]() {
+            if (qObj) emit qObj->authRejected(qReason);
         });
         return false;
     }
@@ -1110,8 +1113,8 @@ void PipeClient::Impl::OnEnvelopeReceived(const Envelope& env)
                      reason.c_str());
         TransitionState(PipeClientState::Fatal, L"AuthFailed push received from service");
         const QString qReason = QString::fromStdString(reason);
-        PostToMain([this, qReason]() {
-            emit m_q->authRejected(qReason);
+        PostToMain([qObj = QPointer<PipeClient>(m_q), qReason]() {
+            if (qObj) emit qObj->authRejected(qReason);
         });
         return;
     }

@@ -188,13 +188,19 @@ BuildScanProgressEvent(std::uint64_t scanId,
                     percent, clampedPct);
     }
 
-    // nlohmann stores integers as signed int64 by default; cast uint64 explicitly
-    // so the JSON "scanId" field round-trips correctly on the UI side.
+    // Cast uint64_t → int64_t for nlohmann storage; clamp to INT64_MAX to
+    // avoid signed overflow on pathological values (> 9.2 × 10^18 items).
+    static constexpr auto kI64Max = static_cast<std::uint64_t>(INT64_MAX);
+
+    auto safeI64 = [](std::uint64_t v) noexcept -> std::int64_t {
+        return static_cast<std::int64_t>(v <= kI64Max ? v : kI64Max);
+    };
+
     nlohmann::json payload = {
-        { "scanId",       static_cast<std::int64_t>(scanId)       },
-        { "percent",      clampedPct                               },
-        { "itemsScanned", static_cast<std::int64_t>(itemsScanned) },
-        { "threatsFound", static_cast<std::int64_t>(threatsFound) }
+        { "scanId",       safeI64(scanId)       },
+        { "percent",      clampedPct            },
+        { "itemsScanned", safeI64(itemsScanned) },
+        { "threatsFound", safeI64(threatsFound) }
     };
 
     return SerializeEnvelope(CommandType::ScanProgressEvent, payload);
