@@ -34,6 +34,7 @@
  */
 #pragma once
 
+#include <QJsonObject>
 #include <QObject>
 #include <QString>
 #include <memory>
@@ -69,7 +70,7 @@ public:
      *
      * Sends UpdateConfig (30) with {key:"globalMode", value:<mode>}.
      * Property update is deferred until the service confirms; on failure
-     * requestError is emitted and the property rolls back.
+     * requestError is emitted and the property is not changed.
      */
     Q_INVOKABLE void setGlobalMode(int mode);
 
@@ -94,6 +95,10 @@ signals:
     void requestError(QString code, QString message);
 
 private:
+    // Called from member-function context (lambdas + push handlers).
+    void applyProtectionStateUpdate(const QJsonObject& payload) noexcept;
+    void applyHeadlineStateUpdate(const QJsonObject& payload) noexcept;
+
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
