@@ -37,6 +37,9 @@
 #include <winsvc.h>
 #endif
 
+#include <memory>
+#include <vector>
+
 namespace ShadowStrike::PhantomHome::IPC {
 
 namespace {
@@ -70,11 +73,176 @@ constexpr std::size_t kQuarantineListCap = 8192;
 // Engine-health probes (cheap, called once per GetState reply).
 // ---------------------------------------------------------------------------
 
-/// Probe the PhantomSensor kernel-mode driver via SCM.
-/// Writes @p reason with a short actionable hint when not Running.
+/// Probe the PhantomSensor kernel-mode driver.
+///
+/// Primary path: enumerate loaded minifilters via fltlib.dll (dynamically
+/// loaded to avoid adding fltlib.lib to AdditionalDependencies). If an entry
+/// named "PhantomSensor" is present the driver is active regardless of SCM
+/// state — this covers the case where the filter was attached via
+/// `fltmc load` or `sc start` without SCM promoting the state to RUNNING.
+///
+/// Fallback path: SCM SERVICE_RUNNING query, preserved verbatim from the
+/// original implementation. Produces an actionable @p reason string when the
+/// driver is absent or stopped.
+///
+/// Thread-safe: no mutable shared state; dynamic-load handle is stack-local.
 [[nodiscard]] bool ProbeKernelSensor(std::string& reason) noexcept {
 #if defined(_WIN32)
     reason.clear();
+
+    // -----------------------------------------------------------------------
+    // Primary path — fltlib.dll minifilter enumeration.
+    //
+    // FILTER_FULL_INFORMATION layout (fltUser.h / MSDN):
+    //   https://docs.microsoft.com/en-us/windows/win32/api/fltuser/
+    //           ns-fltuser-filter_full_information
+    // Fields:
+    //   ULONG  NextEntryOffset   — byte offset to next entry, 0 if last.
+    //   ULONG  FrameID           — filter manager frame index.
+    //   ULONG  NumberOfInstances — number of attached instances.
+    //   USHORT FilterNameLength  — name length in BYTES (not null-terminated).
+    //   WCHAR  FilterNameBuffer[1] — inline name buffer.
+    // FilterFullInformation == 1 per FILTER_INFORMATION_CLASS (fltUser.h).
+    // -----------------------------------------------------------------------
+    struct FilterFullInfo {
+        ULONG  NextEntryOffset;
+        ULONG  FrameID;
+        ULONG  NumberOfInstances;
+        USHORT FilterNameLength;
+        WCHAR  FilterNameBuffer[1];
+    };
+    constexpr DWORD kFilterFullInformation = 1u;
+
+    using PfnFilterFindFirst = HRESULT (WINAPI*)(
+        DWORD, LPVOID, DWORD, LPDWORD, LPHANDLE);
+    using PfnFilterFindNext  = HRESULT (WINAPI*)(
+        HANDLE, DWORD, LPVOID, DWORD, LPDWORD);
+    using PfnFilterFindClose = HRESULT (WINAPI*)(HANDLE);
+
+    // RAII wrapper for HMODULE — no std::unique_ptr<incomplete_type> concerns.
+    struct AutoModule {
+        HMODULE h{nullptr};
+        ~AutoModule() noexcept { if (h) ::FreeLibrary(h); }
+        explicit operator bool() const noexcept { return h != nullptr; }
+    };
+
+    // RAII wrapper for the filter-find enumeration handle.
+    struct FilterFindGuard {
+        HANDLE             h{INVALID_HANDLE_VALUE};
+        PfnFilterFindClose closeFn{nullptr};
+        FilterFindGuard() noexcept = default;
+        FilterFindGuard(const FilterFindGuard&)            = delete;
+        FilterFindGuard& operator=(const FilterFindGuard&) = delete;
+        ~FilterFindGuard() noexcept {
+            if (h != INVALID_HANDLE_VALUE && closeFn) {
+                closeFn(h);
+                h = INVALID_HANDLE_VALUE;
+            }
+        }
+    };
+
+    // Target filter name — ordinal comparison by the kernel, but _wcsnicmp is
+    // safer for user-mode UI purposes (per task specification).
+    constexpr wchar_t  kTarget[]    = L"PhantomSensor";
+    constexpr USHORT   kTargetChars = static_cast<USHORT>(
+        sizeof(kTarget) / sizeof(wchar_t) - 1u);  // excludes null terminator
+
+    try {
+        AutoModule fltLib{ ::LoadLibraryW(L"fltlib.dll") };
+        if (fltLib) {
+            auto pfnFirst = reinterpret_cast<PfnFilterFindFirst>(
+                ::GetProcAddress(fltLib.h, "FilterFindFirst"));
+            auto pfnNext  = reinterpret_cast<PfnFilterFindNext>(
+                ::GetProcAddress(fltLib.h, "FilterFindNext"));
+            auto pfnClose = reinterpret_cast<PfnFilterFindClose>(
+                ::GetProcAddress(fltLib.h, "FilterFindClose"));
+
+            if (pfnFirst && pfnNext && pfnClose) {
+                constexpr DWORD kInitBufBytes = 4096u;
+                std::vector<BYTE> buf(kInitBufBytes);
+                DWORD    returned  = 0;
+                FilterFindGuard hFind{};
+                hFind.closeFn = pfnClose;
+
+                HRESULT hr = pfnFirst(kFilterFullInformation,
+                    buf.data(), static_cast<DWORD>(buf.size()),
+                    &returned, &hFind.h);
+
+                if (hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA)) {
+                    // `returned` holds the minimum required buffer size.
+                    const DWORD newSize = (returned > 0) ? returned * 2u
+                                                         : static_cast<DWORD>(buf.size()) * 2u;
+                    buf.resize(newSize);
+                    returned = 0;
+                    hr = pfnFirst(kFilterFullInformation,
+                        buf.data(), static_cast<DWORD>(buf.size()),
+                        &returned, &hFind.h);
+                }
+
+                // Scan a buffer of packed FILTER_FULL_INFORMATION entries.
+                // Returns true if PhantomSensor is found.
+                auto scanBuf = [&]() noexcept -> bool {
+                    if (returned == 0) return false;
+                    const auto* entry = reinterpret_cast<const FilterFullInfo*>(
+                        buf.data());
+                    while (entry != nullptr) {
+                        const USHORT charCount =
+                            entry->FilterNameLength / sizeof(WCHAR);
+                        if (charCount == kTargetChars &&
+                            _wcsnicmp(entry->FilterNameBuffer,
+                                      kTarget,
+                                      static_cast<std::size_t>(kTargetChars)) == 0)
+                        {
+                            return true;
+                        }
+                        if (entry->NextEntryOffset == 0) break;
+                        entry = reinterpret_cast<const FilterFullInfo*>(
+                            reinterpret_cast<const BYTE*>(entry)
+                            + entry->NextEntryOffset);
+                    }
+                    return false;
+                };
+
+                if (SUCCEEDED(hr)) {
+                    if (scanBuf()) { reason.clear(); return true; }
+
+                    // Iterate subsequent entries.
+                    for (;;) {
+                        returned = 0;
+                        hr = pfnNext(hFind.h, kFilterFullInformation,
+                            buf.data(), static_cast<DWORD>(buf.size()),
+                            &returned);
+
+                        if (hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA)) {
+                            const DWORD newSize =
+                                (returned > 0) ? returned * 2u
+                                               : static_cast<DWORD>(buf.size()) * 2u;
+                            buf.resize(newSize);
+                            returned = 0;
+                            hr = pfnNext(hFind.h, kFilterFullInformation,
+                                buf.data(), static_cast<DWORD>(buf.size()),
+                                &returned);
+                        }
+
+                        if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)) break;
+                        if (FAILED(hr)) break;
+                        if (scanBuf()) { reason.clear(); return true; }
+                    }
+                }
+                // fltlib enumeration completed: PhantomSensor not among loaded
+                // filters. Fall through to SCM for the actionable reason string.
+            }
+            // GetProcAddress failed — fall through to SCM path.
+        }
+        // LoadLibrary failed or fltlib unavailable — fall through to SCM path.
+    } catch (...) {
+        // Allocation or any unexpected failure — fall through to SCM path.
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback path — SCM SERVICE_RUNNING query.
+    // Preserved verbatim; produces an actionable reason string.
+    // -----------------------------------------------------------------------
     SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (scm == nullptr) {
         reason = "service manager unavailable";

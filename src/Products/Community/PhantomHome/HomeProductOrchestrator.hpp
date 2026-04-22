@@ -284,6 +284,10 @@ private:
     std::vector<std::string> m_pausedModuleNames;  // guarded by m_lifecycleMutex
 };
 
+/// @brief Force-link every *Wiring.cpp TU. Call at the start of Initialize()
+///        to prevent MSVC /OPT:REF + LTCG from stripping registrar globals.
+void EnsureAllModulesWired() noexcept;
+
 }  // namespace Home
 }  // namespace Products
 }  // namespace ShadowStrike

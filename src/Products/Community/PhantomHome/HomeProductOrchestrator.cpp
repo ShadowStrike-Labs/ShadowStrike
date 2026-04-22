@@ -123,6 +123,11 @@ bool HomeProductOrchestrator::Initialize() noexcept {
 }
 
 bool HomeProductOrchestrator::InitializeLocked() noexcept {
+    // Pull every *Wiring.cpp TU into the reference graph before we iterate
+    // modules. This is a no-op at runtime but defeats MSVC /OPT:REF + LTCG
+    // elision of the internal-linkage registrar globals in Release builds.
+    EnsureAllModulesWired();
+
     // Config defaults and profile presets are registered by the HomeConfig
     // Foundation-phase module (ConfigWiring.cpp). Because Foundation runs
     // first in phase order, all keys are available before any feature module
