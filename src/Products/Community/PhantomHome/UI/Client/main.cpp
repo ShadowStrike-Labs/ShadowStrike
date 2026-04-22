@@ -26,6 +26,7 @@
 
 #include <memory>
 #include <chrono>
+#include <exception>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -93,6 +94,102 @@ void SsQtMessageHandler(QtMsgType type, const QMessageLogContext& ctx, const QSt
     }
 }
 
+// ---------------------------------------------------------------------------
+// Top-level unhandled-exception filter. When the UI dies on an access
+// violation, stack overflow, pure virtual call, etc. this filter writes a
+// compact crash header (exception code + faulting address + first frames)
+// to ui_errors.log *before* the process disappears. Without this hook a
+// crash leaves zero forensic trace — the pipe silently closes and the
+// user sees a permanently "Loading…" dashboard on the next start.
+// ---------------------------------------------------------------------------
+LONG WINAPI SsTopLevelCrashFilter(EXCEPTION_POINTERS* info) noexcept {
+    if (s_logPath.isEmpty() || info == nullptr || info->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    QFile f(s_logPath);
+    if (!f.open(QIODevice::Append | QIODevice::Text)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    QTextStream ts(&f);
+
+    const EXCEPTION_RECORD* rec = info->ExceptionRecord;
+    ts << "[CRASH] UI process faulted: code=0x"
+       << QString::number(static_cast<quint32>(rec->ExceptionCode), 16).toUpper()
+       << " flags=0x"
+       << QString::number(static_cast<quint32>(rec->ExceptionFlags), 16).toUpper()
+       << " addr=0x"
+       << QString::number(reinterpret_cast<quintptr>(rec->ExceptionAddress), 16).toUpper();
+
+    // Access-violation extra info: [0] = read/write/dep, [1] = va.
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+        const ULONG_PTR kind = rec->ExceptionInformation[0];
+        const ULONG_PTR va   = rec->ExceptionInformation[1];
+        const char* op = (kind == 0) ? "read" : (kind == 1) ? "write" : (kind == 8) ? "dep" : "?";
+        ts << " av_op=" << op
+           << " av_va=0x" << QString::number(static_cast<quint64>(va), 16).toUpper();
+    }
+    ts << "\n";
+
+    // Dump a few return addresses from the context so we at least know
+    // which module faulted even without symbols. CaptureStackBackTrace runs
+    // from the exception thread context.
+    void* frames[16]{};
+    const USHORT n = ::CaptureStackBackTrace(0, 16, frames, nullptr);
+    ts << "[CRASH] frames(" << n << "):";
+    for (USHORT i = 0; i < n; ++i) {
+        ts << " 0x"
+           << QString::number(reinterpret_cast<quintptr>(frames[i]), 16).toUpper();
+    }
+    ts << "\n";
+    ts.flush();
+    f.flush();
+    f.close();
+
+    // Let Windows Error Reporting continue so the process terminates cleanly
+    // (and any WER minidump machinery still fires).
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Vectored handler runs *before* the top-level filter, which matters when a
+// debugger or WER takes over the unhandled-exception path. We install it as
+// a belt-and-braces so the log line always lands regardless of who wins the
+// exception race.
+LONG WINAPI SsVectoredCrashLogger(EXCEPTION_POINTERS* info) noexcept {
+    if (info == nullptr || info->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    // Only log genuinely fatal / uncaught categories. C++ exceptions
+    // (0xE06D7363) and DLL-load probes generate a lot of false positives.
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+        (void)SsTopLevelCrashFilter(info);
+        break;
+    default:
+        break;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void SsTerminateHandler() noexcept {
+    if (!s_logPath.isEmpty()) {
+        QFile f(s_logPath);
+        if (f.open(QIODevice::Append | QIODevice::Text)) {
+            QTextStream ts(&f);
+            ts << "[CRASH] std::terminate invoked (unhandled C++ exception or noexcept violation)\n";
+        }
+    }
+    std::abort();
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -112,6 +209,13 @@ int main(int argc, char* argv[]) {
         }
     }
     qInstallMessageHandler(SsQtMessageHandler);
+
+    // Install crash handlers *before* anything else runs so any fault during
+    // QGuiApplication ctor, QML plugin load, PipeClient thread spawn, etc.
+    // gets forensic breadcrumbs on disk.
+    ::SetUnhandledExceptionFilter(&SsTopLevelCrashFilter);
+    ::AddVectoredExceptionHandler(/*FirstHandler=*/0, &SsVectoredCrashLogger);
+    std::set_terminate(&SsTerminateHandler);
 
     // -----------------------------------------------------------------------
     // Performance budget

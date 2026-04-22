@@ -75,6 +75,24 @@ if exist "%LOGDIR%" (
     echo Check that ShadowStrikePhantomService.exe is the build from 2026-04-23 or later. >> "%OUT%\service_logs_missing.txt"
 )
 
+REM --- UI error logs live in each interactive user's LOCALAPPDATA. The elevated
+REM     console's %LOCALAPPDATA% points at the admin profile, not the user that
+REM     actually saw the "Loading protection modules..." UI, so we walk every
+REM     user profile on the box and collect whatever is there.
+echo [7b/10] UI error logs (per-user) ...
+mkdir "%OUT%\ui_logs" >nul 2>&1
+for /d %%U in ("%SystemDrive%\Users\*") do (
+    if exist "%%U\AppData\Local\ShadowStrike\Phantom\ui_errors.log" (
+        copy /y "%%U\AppData\Local\ShadowStrike\Phantom\ui_errors.log" ^
+            "%OUT%\ui_logs\%%~nU_ui_errors.log" >nul 2>&1
+        echo Collected UI log from user %%~nU >> "%OUT%\ui_logs\collection_note.txt"
+    )
+)
+if not exist "%OUT%\ui_logs\collection_note.txt" (
+    echo No ui_errors.log found in any user profile. > "%OUT%\ui_logs\collection_note.txt"
+    echo Either the UI has not been launched yet, or the log handler did not initialise. >> "%OUT%\ui_logs\collection_note.txt"
+)
+
 echo [8/10] Defender state ...
 powershell -NoProfile -Command "Get-MpComputerStatus | Select RealTimeProtectionEnabled,AntivirusEnabled,AMServiceEnabled,TamperProtected" > "%OUT%\defender.txt" 2>&1
 
@@ -100,6 +118,7 @@ echo === Diagnostics collected in: %OUT% ===
 echo Copy that folder back out of the VM and send it over.
 echo Key files to check:
 echo   service_logs\PhantomHome.Service*.log  --  service startup + module init log
+echo   ui_logs\*_ui_errors.log                 --  UI-side crash / QML / IPC warnings
 echo   ui_startup_stdout.txt                   --  UI connection probe output
 echo   pipes.txt                               --  IPC pipe presence
 echo   service_state.txt                       --  SCM service state
