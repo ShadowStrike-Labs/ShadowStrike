@@ -95,11 +95,44 @@ ProtectionViewModel::ProtectionViewModel(std::shared_ptr<PipeClient> client,
     //      modulesChanged() coalesces naturally.
     // -----------------------------------------------------------------
     if (m_client && m_client->IsConnected()) {
+        qWarning() << "[ProtectionViewModel] ctor: client already connected, queuing immediate refreshAll()";
         QMetaObject::invokeMethod(this, "refreshAll", Qt::QueuedConnection);
+    } else {
+        qWarning() << "[ProtectionViewModel] ctor: client not yet connected, awaiting state callback";
     }
     QTimer::singleShot(1500, this, [self = QPointer<ProtectionViewModel>(this)]() {
         if (!self) return;
+        qWarning() << "[ProtectionViewModel] 1.5s safety timer fired -> refreshAll()";
         self->refreshAll();
+    });
+
+    // Empty-modules retry watchdog: if after 4 seconds the UI still has 0 modules,
+    // re-issue refreshAll() up to 8 times at 3-second intervals. This defends
+    // against (a) a transient pipe race where the first reply is dropped, and
+    // (b) the orchestrator still mid-init when the UI first asks. GetStatus() is
+    // safe to poll — it uses a shared_lock and is cheap.
+    QTimer::singleShot(4000, this, [self = QPointer<ProtectionViewModel>(this)]() {
+        if (!self) return;
+        self->scheduleEmptyRetry(0);
+    });
+}
+
+void ProtectionViewModel::scheduleEmptyRetry(int attempt) {
+    if (attempt >= 8) {
+        qWarning() << "[ProtectionViewModel] empty-retry watchdog exhausted after" << attempt << "attempts";
+        return;
+    }
+    if (!m_modules.isEmpty()) {
+        qWarning() << "[ProtectionViewModel] empty-retry watchdog: modules populated ("
+                   << m_modules.size() << ") — stopping";
+        return;
+    }
+    qWarning() << "[ProtectionViewModel] empty-retry watchdog attempt" << (attempt + 1)
+               << "— modules still empty, re-issuing refreshAll()";
+    refreshAll();
+    QTimer::singleShot(3000, this, [self = QPointer<ProtectionViewModel>(this), attempt]() {
+        if (!self) return;
+        self->scheduleEmptyRetry(attempt + 1);
     });
 }
 
@@ -157,6 +190,12 @@ void ProtectionViewModel::wireClient() {
 
 void ProtectionViewModel::refreshAll() {
     if (!m_client) return;
+    const bool connected = m_client->IsConnected();
+    qWarning() << "[ProtectionViewModel] refreshAll() entered; client.connected=" << connected;
+    if (!connected) {
+        qWarning() << "[ProtectionViewModel] refreshAll(): client NOT connected — skipping (will retry on state-change)";
+        return;
+    }
 
     m_client->RequestAsync(MessageType::GetState, nlohmann::json::object(),
         [self = QPointer<ProtectionViewModel>(this)](std::optional<FrameEnvelope> reply) {
@@ -179,9 +218,18 @@ void ProtectionViewModel::refreshAll() {
     m_client->RequestAsync(MessageType::GetModuleStatus, nlohmann::json::object(),
         [self = QPointer<ProtectionViewModel>(this)](std::optional<FrameEnvelope> reply) {
             if (!self) return;
-            if (!reply) return;
+            if (!reply) {
+                qWarning() << "[ProtectionViewModel] GetModuleStatus: reply=nullopt (timeout/transport-drop)";
+                return;
+            }
             auto parsed = GetModuleStatusReply::FromJson(reply->payload);
-            if (!parsed) return;
+            if (!parsed) {
+                qWarning() << "[ProtectionViewModel] GetModuleStatus: reply parse FAILED; payload keys="
+                           << QString::fromStdString(reply->payload.dump().substr(0, 300));
+                return;
+            }
+            qWarning() << "[ProtectionViewModel] GetModuleStatus: parsed OK, modules.size="
+                       << static_cast<int>(parsed->modules.size());
 
             QVariantList vl;
             vl.reserve(static_cast<int>(parsed->modules.size()));
