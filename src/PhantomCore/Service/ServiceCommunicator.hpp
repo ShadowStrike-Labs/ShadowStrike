@@ -335,6 +335,40 @@ public:
      */
     [[nodiscard]] size_t Broadcast(CommandType type, const std::vector<uint8_t>& payload);
 
+    /**
+     * @brief Broadcast a pre-serialised 24-byte Envelope to all authenticated clients.
+     *
+     * The serialised envelope is written as-is (caller must use EventPush::Build*
+     * or Envelope::Serialize to produce it). Each client is subject to an
+     * independent per-event-type token-bucket rate limit (20 events/sec, burst 20).
+     * Unauthenticated clients are silently skipped.
+     *
+     * @param eventType           Command type (used for rate-bucket keying only).
+     * @param serializedEnvelope  Pre-built wire bytes including 24-byte header.
+     * @return Number of clients that received the message.
+     */
+    [[nodiscard]] size_t BroadcastEvent(CommandType                       eventType,
+                                        const std::vector<std::uint8_t>& serializedEnvelope);
+
+    /**
+     * @brief Mark a client as authenticated so it receives BroadcastEvent messages.
+     *
+     * Called by the AuthHandshake command handler after successful token
+     * verification. Safe to call from any thread.
+     *
+     * @param clientId  The client identifier assigned during connection.
+     */
+    void MarkClientAuthenticated(std::uint64_t clientId);
+
+    /**
+     * @brief Revoke a client's authenticated status.
+     *
+     * Idempotent. Called automatically when the client disconnects.
+     *
+     * @param clientId  The client identifier to revoke.
+     */
+    void RevokeClientAuthentication(std::uint64_t clientId);
+
     // ========================================================================
     // DIAGNOSTICS & MANAGEMENT
     // ========================================================================

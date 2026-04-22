@@ -303,6 +303,9 @@
     <ClCompile Include="src\PhantomCore\SelfProtection\SelfDefense.cpp" />
     <ClCompile Include="src\PhantomCore\SelfProtection\TamperProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Service\AntivirusService.cpp" />
+    <ClCompile Include="src\PhantomCore\Service\EventPush.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Service\IpcAuthToken.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ProductExtensions.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceCommunicator.cpp" />
@@ -395,9 +398,12 @@
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\ModeThresholds.cpp" />
     <!-- Zero-Trust Execution Guard — PhantomHome product module -->
-    <ClCompile Include="src\PhantomCore\RealTime\ZeroTrust\ZeroTrustGuard.cpp" />
+    <ClCompile Include="src\PhantomCore\RealTime\ZeroTrust\ZeroTrustGuard.cpp">
+      <ObjectFileName>$(IntDir)PhantomCore_ZeroTrustGuard.obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustGuard.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)PhantomHome_ZeroTrustGuard.obj</ObjectFileName>
     </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustPromptQueue.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
