@@ -69,6 +69,16 @@ std::atomic<bool> ChromeExtensionScanner::s_instanceCreated{false};
 
 namespace {
 
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     // JSON string escaping for manual serialization paths
     std::string EscapeJson(const std::string& s) {
         std::ostringstream o;
@@ -243,7 +253,7 @@ public:
             copy.byVerdict[i] = m_stats.byVerdict[i].load();
         for (size_t i = 0; i < m_stats.byBrowser.size(); ++i)
             copy.byBrowser[i] = m_stats.byBrowser[i].load();
-        copy.startTime = m_stats.startTime;
+        AtomicValueStoreRelaxed(copy.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
         return copy;
     }
     void ResetStatistics() { m_stats.Reset(); }
@@ -1590,9 +1600,9 @@ void ChromeExtensionScannerStatistics::Reset() noexcept {
     jsFilesAnalyzed = 0;
     obfuscatedFound = 0;
     cryptominersFound = 0;
-    for (auto& v : byVerdict) v = 0;
-    for (auto& b : byBrowser) b = 0;
-    startTime = Clock::now();
+    for (auto& v : byVerdict) v.store(0, std::memory_order_relaxed);
+    for (auto& b : byBrowser) b.store(0, std::memory_order_relaxed);
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string ChromeExtensionScannerStatistics::ToJson() const {

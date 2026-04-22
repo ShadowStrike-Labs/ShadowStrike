@@ -615,7 +615,7 @@ struct DownloadBlockerStatistics {
           policyBlocks(o.policyBlocks.load(std::memory_order_relaxed)),
           scanErrors(o.scanErrors.load(std::memory_order_relaxed)),
           bytesScanned(o.bytesScanned.load(std::memory_order_relaxed)),
-          startTime(o.startTime) {
+          startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < byVerdict.size(); ++i) {
             byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed),
                                std::memory_order_relaxed);
@@ -651,7 +651,7 @@ struct DownloadBlockerStatistics {
             byIndicator[i].store(o.byIndicator[i].load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
         }
-        startTime = o.startTime;
+        startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed);
         return *this;
     }
 

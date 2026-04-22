@@ -596,7 +596,7 @@ struct PhishingDetectorStatistics {
           loginFormsAnalyzed(o.loginFormsAnalyzed.load(std::memory_order_relaxed)),
           certificatesChecked(o.certificatesChecked.load(std::memory_order_relaxed)),
           threatIntelMatches(o.threatIntelMatches.load(std::memory_order_relaxed)),
-          startTime(o.startTime) {
+          startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < byVerdict.size(); ++i) {
             byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed),
                                std::memory_order_relaxed);
@@ -627,7 +627,7 @@ struct PhishingDetectorStatistics {
             byIndicator[i].store(o.byIndicator[i].load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
         }
-        startTime = o.startTime;
+        startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed);
         return *this;
     }
 

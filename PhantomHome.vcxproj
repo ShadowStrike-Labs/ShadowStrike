@@ -159,6 +159,7 @@
     <ClCompile Include="src\PhantomCore\AntiEvasion\TimeBasedEvasionDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\ModeThresholds.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\SystemTray.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductEntry.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupWiring.cpp" />

@@ -545,7 +545,7 @@ struct ChromeExtensionScannerStatistics {
     ChromeExtensionScannerStatistics() noexcept = default;
 
     ChromeExtensionScannerStatistics(const ChromeExtensionScannerStatistics& o) noexcept
-        : startTime(o.startTime) {
+        : startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
         totalScanned.store(o.totalScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
         safeFound.store(o.safeFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
         suspiciousFound.store(o.suspiciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -578,7 +578,7 @@ struct ChromeExtensionScannerStatistics {
                 byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
             for (size_t i = 0; i < byBrowser.size(); ++i)
                 byBrowser[i].store(o.byBrowser[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = o.startTime;
+            startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed);
         }
         return *this;
     }

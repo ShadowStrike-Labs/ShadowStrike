@@ -596,7 +596,7 @@ struct FirefoxAddonScannerStatistics {
     FirefoxAddonScannerStatistics() noexcept = default;
 
     FirefoxAddonScannerStatistics(const FirefoxAddonScannerStatistics& o) noexcept
-        : startTime(o.startTime) {
+        : startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
         totalScanned.store(o.totalScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
         safeFound.store(o.safeFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
         suspiciousFound.store(o.suspiciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -631,7 +631,7 @@ struct FirefoxAddonScannerStatistics {
                 byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
             for (size_t i = 0; i < byType.size(); ++i)
                 byType[i].store(o.byType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = o.startTime;
+            startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed);
         }
         return *this;
     }

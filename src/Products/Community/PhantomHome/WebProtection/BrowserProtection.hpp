@@ -618,7 +618,7 @@ struct BrowserProtectionStatistics {
           safeSearchEnforced(o.safeSearchEnforced.load(std::memory_order_relaxed)),
           cacheHits(o.cacheHits.load(std::memory_order_relaxed)),
           cacheMisses(o.cacheMisses.load(std::memory_order_relaxed)),
-          startTime(o.startTime) {
+          startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < byBlockReason.size(); ++i) {
             byBlockReason[i].store(o.byBlockReason[i].load(std::memory_order_relaxed),
                                    std::memory_order_relaxed);
@@ -661,7 +661,7 @@ struct BrowserProtectionStatistics {
             byBrowser[i].store(o.byBrowser[i].load(std::memory_order_relaxed),
                                std::memory_order_relaxed);
         }
-        startTime = o.startTime;
+        startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed);
         return *this;
     }
 
