@@ -428,7 +428,12 @@ HANDLE PipeServer::CreatePipeInstance(bool first) {
     }
 
     const auto name = PipeFullName();
-    DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    // NOTE: All I/O on these handles is synchronous (blocking ReadFile /
+    // WriteFile with lpOverlapped = nullptr). Do NOT set FILE_FLAG_OVERLAPPED
+    // here — mixing sync calls with async-opened handles is undefined on
+    // Windows and manifests as spurious WriteFile failures once a pipe has
+    // served more than the initial handshake frame.
+    DWORD open_mode = PIPE_ACCESS_DUPLEX;
     if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
 
     // Message mode is intentional — we implement our own framing on top, but
@@ -829,9 +834,10 @@ void PipeServer::WorkerLoop(std::shared_ptr<ClientContext> ctx) {
                 static_cast<std::size_t>(b.size()));
             if (!WriteFrame(ctx->PipeHandle(), ctx->write_mutex_,
                             std::span<const std::uint8_t>(b))) {
+                const DWORD gle = ::GetLastError();
                 ShadowStrike::Utils::Logger::Warn(
-                    "PipeServer: WriteFrame failed for pid={} corr={}; closing worker",
-                    ctx->ClientProcessId(), env->correlation_id);
+                    "PipeServer: WriteFrame failed for pid={} corr={} gle={}; closing worker",
+                    ctx->ClientProcessId(), env->correlation_id, gle);
                 break;
             }
         }
