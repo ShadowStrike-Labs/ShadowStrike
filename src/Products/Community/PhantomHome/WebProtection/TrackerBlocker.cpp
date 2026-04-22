@@ -449,7 +449,8 @@ public:
         // Load configured blocklist files
         for (const auto& path : m_config.blocklistPaths) {
             if (std::filesystem::exists(path)) {
-                LoadBlocklistFromFile(path, BlocklistSource::Custom, path.filename().string());
+                (void)LoadBlocklistFromFileLocked(path, BlocklistSource::Custom,
+                                                  path.filename().string());
             }
         }
 
@@ -930,9 +931,10 @@ public:
     // CUSTOM RULES
     // ========================================================================
 
-    [[nodiscard]] bool AddRule(const BlockRule& rule) {
-        std::unique_lock lock(m_mutex);
-
+    // Internal: caller MUST hold m_mutex exclusively (std::shared_mutex is
+    // non-recursive on Windows — re-acquiring it from the same thread is
+    // undefined behaviour and in practice deadlocks via SRWLock).
+    [[nodiscard]] bool AddRuleLocked(const BlockRule& rule) {
         if (rule.pattern.empty()) {
             TB_LOG_WARN("Cannot add rule with empty pattern");
             return false;
@@ -958,6 +960,11 @@ public:
 
         m_stats.activeRuleCount = m_rules.size();
         return true;
+    }
+
+    [[nodiscard]] bool AddRule(const BlockRule& rule) {
+        std::unique_lock lock(m_mutex);
+        return AddRuleLocked(rule);
     }
 
     [[nodiscard]] bool BlockDomain(std::string_view domain, TrackerCategory category) {
@@ -1606,6 +1613,7 @@ private:
         return result;
     }
 
+    // Precondition: m_mutex held exclusively by caller (called from Initialize).
     void LoadBuiltInRules() {
         // Add some well-known tracker domains
         const std::vector<std::pair<std::string, TrackerCategory>> builtInTrackers = {
@@ -1634,7 +1642,7 @@ private:
             rule.type = RuleType::DomainSuffix;
             rule.category = category;
             rule.source = BlocklistSource::BuiltIn;
-            AddRule(rule);
+            (void)AddRuleLocked(rule);
             m_domainCategories[domain] = category;
         }
 
@@ -1653,7 +1661,13 @@ private:
                                               BlocklistSource source,
                                               const std::string& name) {
         std::unique_lock lock(m_mutex);
+        return LoadBlocklistFromFileLocked(path, source, name);
+    }
 
+    // Precondition: m_mutex held exclusively by caller.
+    [[nodiscard]] bool LoadBlocklistFromFileLocked(const std::filesystem::path& path,
+                                                    BlocklistSource source,
+                                                    const std::string& name) {
         try {
             std::error_code fileSizeError;
             const auto fileSize = fs::file_size(path, fileSizeError);
@@ -1691,7 +1705,7 @@ private:
                         TB_LOG_WARN("Reached maximum blocklist rule count; stopping parse");
                         break;
                     }
-                    AddRule(rule);
+                    AddRuleLocked(rule);
                     ruleCount++;
                 }
             }
