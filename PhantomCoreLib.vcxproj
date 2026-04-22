@@ -394,6 +394,34 @@
     <!-- Additional PhantomCore modules not in original PhantomHome.vcxproj -->
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\ModeThresholds.cpp" />
+    <!-- Zero-Trust Execution Guard — PhantomHome product module -->
+    <ClCompile Include="src\PhantomCore\RealTime\ZeroTrust\ZeroTrustGuard.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustGuard.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustPromptQueue.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\ZeroTrustGuard\wiring\ZeroTrustWiring.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <!-- AmsiProvider module -->
+    <ClCompile Include="src\Products\Community\PhantomHome\AmsiProvider\AmsiProvider.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\AmsiProvider\AmsiProviderRegistration.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\AmsiProvider\wiring\AmsiWiring.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <!-- NetworkAttackBlocker module -->
+    <ClCompile Include="src\Products\Community\PhantomHome\NetworkAttackBlocker\NetworkAttackBlocker.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\NetworkAttackBlocker\wiring\NabWiring.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\AI\CortexConfig.cpp" />
     <ClCompile Include="src\PhantomCore\AI\FeatureExtractor.cpp" />
     <ClCompile Include="src\PhantomCore\AI\ModelCache.cpp" />
@@ -839,6 +867,16 @@
     <MASM Include="src\PhantomCore\AntiEvasion\DebuggerEvasionDetector_x64.asm">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </MASM>
+  </ItemGroup>
+
+  <!-- Zero-Trust Execution Guard header files -->
+  <ItemGroup>
+    <ClInclude Include="src\PhantomCore\RealTime\ZeroTrust\ZeroTrustGuard.hpp" />
+    <ClInclude Include="src\PhantomCore\RealTime\ZeroTrust\ZeroTrustPromptQueue.hpp" />
+    <ClInclude Include="src\PhantomCore\RealTime\ZeroTrust\ZeroTrustWiring.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustGuard.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustPromptQueue.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\ZeroTrustGuard\wiring\ZeroTrustWiring.hpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

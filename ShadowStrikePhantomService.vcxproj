@@ -64,7 +64,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>PhantomCoreLib.lib;libyara.lib;libcrypto.lib;libssl.lib;onnxruntime.lib;normaliz.lib;advapi32.lib;ws2_32.lib;userenv.lib;wtsapi32.lib;crypt32.lib;iphlpapi.lib;shell32.lib;ole32.lib;oleaut32.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>PhantomCoreLib.lib;libyara.lib;libcrypto.lib;libssl.lib;onnxruntime.lib;normaliz.lib;advapi32.lib;ws2_32.lib;userenv.lib;wtsapi32.lib;crypt32.lib;iphlpapi.lib;shell32.lib;ole32.lib;oleaut32.lib;wininet.lib;amsi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)lib\$(Configuration);$(SolutionDir)vendor;$(SolutionDir)vendor\yara_lib;$(SolutionDir)vendor\onnxruntime\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
