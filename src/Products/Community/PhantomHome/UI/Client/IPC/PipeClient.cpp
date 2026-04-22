@@ -326,9 +326,16 @@ void PipeClient::ConnectLoop() {
             continue;
         }
 
+        // SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION: required so the
+        // service-side AuthenticateClient can call ImpersonateNamedPipeClient
+        // to inspect the caller's token. Without SECURITY_SQOS_PRESENT the
+        // OS defaults to SecurityAnonymous and ImpersonateNamedPipeClient
+        // returns ERROR_NO_IMPERSONATION_TOKEN (1368), causing auth failure.
         HANDLE h = ::CreateFileW(name.c_str(),
                                  GENERIC_READ | GENERIC_WRITE,
-                                 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                                 0, nullptr, OPEN_EXISTING,
+                                 SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
+                                 nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             if (stopping_.load()) break;
             std::this_thread::sleep_for(backoff);
