@@ -564,9 +564,17 @@ void PipeServer::AcceptLoop() {
     }
 }
 
-bool PipeServer::ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out) {
+bool PipeServer::ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out,
+                           std::uint32_t first_byte_timeout_ms) {
     std::uint32_t len_le = 0;
-    if (!WaitForPipeBytes(pipe, sizeof(len_le), options_.read_timeout_ms, stop_event_)) {
+    // The first-byte wait uses the caller-supplied timeout so the worker loop
+    // can pass INFINITE for an authenticated, established connection (idle
+    // client should not be force-disconnected) while HandshakeFrame still
+    // uses a short timeout to reject stalled handshakes. Once the first byte
+    // arrives, the rest of the frame must complete within read_timeout_ms —
+    // that is a legitimate per-request timeout protecting against slow-write
+    // DoS, not an idle-connection timeout.
+    if (!WaitForPipeBytes(pipe, sizeof(len_le), first_byte_timeout_ms, stop_event_)) {
         return false;
     }
     if (!ReadExact(pipe, &len_le, sizeof(len_le))) return false;
@@ -722,7 +730,7 @@ bool PipeServer::AuthenticateClient(ClientContext& ctx) {
 
 bool PipeServer::HandshakeFrame(ClientContext& ctx) {
     std::vector<std::uint8_t> buf;
-    if (!ReadFrame(ctx.PipeHandle(), buf)) return false;
+    if (!ReadFrame(ctx.PipeHandle(), buf, options_.read_timeout_ms)) return false;
 
     auto env = DecodeEnvelopeCbor(std::span<const std::uint8_t>(buf));
     if (!env || env->type != MessageType::Hello || env->version != kProtocolVersion) {
@@ -758,7 +766,14 @@ void PipeServer::WorkerLoop(std::shared_ptr<ClientContext> ctx) {
     } else {
         while (!stopping_.load()) {
             std::vector<std::uint8_t> buf;
-            if (!ReadFrame(ctx->PipeHandle(), buf)) break;
+            // INFINITE first-byte wait: an authenticated, trusted client may
+            // legitimately sit idle between user-driven requests. The pipe
+            // breakage (client close / process exit) is detected by
+            // PeekNamedPipe returning ERROR_BROKEN_PIPE inside
+            // WaitForPipeBytes, which closes the connection cleanly. The
+            // stop_event_ handle still breaks the wait on service shutdown,
+            // so this does not leak a thread.
+            if (!ReadFrame(ctx->PipeHandle(), buf, INFINITE)) break;
 
             auto env = DecodeEnvelopeCbor(std::span<const std::uint8_t>(buf));
             if (!env) {

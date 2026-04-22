@@ -172,7 +172,8 @@ private:
     [[nodiscard]] HANDLE CreatePipeInstance(bool first);
     [[nodiscard]] bool   AuthenticateClient(ClientContext& ctx);
     [[nodiscard]] bool   HandshakeFrame(ClientContext& ctx);
-    [[nodiscard]] bool   ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out);
+    [[nodiscard]] bool   ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out,
+                                   std::uint32_t first_byte_timeout_ms);
     [[nodiscard]] bool   WriteFrame(HANDLE pipe, std::mutex& m, std::span<const std::uint8_t> bytes);
     void                 SendAuthFailure(ClientContext& ctx, const char* reason);
 
