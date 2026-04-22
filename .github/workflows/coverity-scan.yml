@@ -1,4 +1,4 @@
-name: Coverity Scan
+﻿name: Coverity Scan
 
 on:
   push:
@@ -21,7 +21,7 @@ on:
 jobs:
   coverity:
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 450
 
     steps:
       - name: Checkout code
