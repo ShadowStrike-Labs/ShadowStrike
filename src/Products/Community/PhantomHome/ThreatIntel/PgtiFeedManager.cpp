@@ -389,7 +389,7 @@ void PgtiFeedManager::SetFeedEnabled(std::string_view feedId, bool enabled)
     m_impl->PersistEnabledFlag(feedId, enabled);
 
     if (enabled && m_impl->running.load(std::memory_order_acquire)) {
-        RefreshNow(feedId);
+        (void)RefreshNow(feedId);
     }
 
     const auto health = enabled ? PgtiFeedStatus::Health::Degraded
