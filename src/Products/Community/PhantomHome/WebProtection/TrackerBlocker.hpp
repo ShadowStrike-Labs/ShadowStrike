@@ -774,7 +774,7 @@ struct TrackerBlockerStatistics {
           totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
           activeRuleCount(other.activeRuleCount.load(std::memory_order_relaxed)),
           whitelistExceptions(other.whitelistExceptions.load(std::memory_order_relaxed)),
-          startTime(other.startTime), lastEventTime(other.lastEventTime) {
+          startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(other.startTime)).load(std::memory_order_relaxed)), lastEventTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(other.lastEventTime)).load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < 16; ++i) {
             blocksByCategory[i].store(other.blocksByCategory[i].load(std::memory_order_relaxed),
                                       std::memory_order_relaxed);
@@ -797,8 +797,8 @@ struct TrackerBlockerStatistics {
             }
             activeRuleCount.store(other.activeRuleCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
             whitelistExceptions.store(other.whitelistExceptions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = other.startTime;
-            lastEventTime = other.lastEventTime;
+            startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(other.startTime)).load(std::memory_order_relaxed);
+            lastEventTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(other.lastEventTime)).load(std::memory_order_relaxed);
         }
         return *this;
     }
@@ -814,7 +814,7 @@ struct TrackerBlockerStatistics {
           totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
           activeRuleCount(other.activeRuleCount.load(std::memory_order_relaxed)),
           whitelistExceptions(other.whitelistExceptions.load(std::memory_order_relaxed)),
-          startTime(other.startTime), lastEventTime(other.lastEventTime) {
+          startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(other.startTime)).load(std::memory_order_relaxed)), lastEventTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(other.lastEventTime)).load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < 16; ++i) {
             blocksByCategory[i].store(other.blocksByCategory[i].load(std::memory_order_relaxed),
                                       std::memory_order_relaxed);

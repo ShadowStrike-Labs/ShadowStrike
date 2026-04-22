@@ -1,4 +1,0 @@
-ShadowStrikePhantomServic     4584 Services                   0     21,488 K Unknown         NT AUTHORITY\SYSTEM                                     0:00:00 N/A                                                                     
-ShadowStrikePhantomTray.e    10408 Console                    1     22,716 K Running         WMYC\shado                                              0:00:00 GDI+ Window (ShadowStrikePhantomTray.exe)                               
-WindowsTerminal.exe          10416 Console                    1     81,092 K Running         WMYC\shado                                              0:00:00 ShadowStrike Phantom                                                    
-cmd.exe                       8464 Console                    1      8,772 K Running         WMYC\shado                                              0:00:00 C:\WINDOWS\system32\cmd.exe - C:\Users\shado\AppData\Local\ShadowStrike-

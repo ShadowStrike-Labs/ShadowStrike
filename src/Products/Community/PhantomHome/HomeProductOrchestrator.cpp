@@ -12,6 +12,7 @@
 #include "pch.h"
 
 #include "HomeProductOrchestrator.hpp"
+#include "ModeThresholds.hpp"
 
 #include "../../../PhantomCore/Config/ConfigManager.hpp"
 #include "../../../PhantomCore/Utils/Logger.hpp"
@@ -339,6 +340,11 @@ bool HomeProductOrchestrator::StartLocked() noexcept {
                 allOk = false;
             }
         }
+
+        // Restore persisted protection mode for modules that just reached Running.
+        if (ok) {
+            ApplyPersistedModeUnlocked(idx);
+        }
     }
 
     // Only report running if at least one module reached Running state.
@@ -447,6 +453,7 @@ std::vector<ModuleStatus> HomeProductOrchestrator::GetStatus() const {
             rec.state,
             rec.lastError,
             rec.lastTransition,
+            rec.currentMode,
         });
     }
     return out;
@@ -465,6 +472,7 @@ std::optional<ModuleStatus> HomeProductOrchestrator::GetModuleStatus(std::string
         it->state,
         it->lastError,
         it->lastTransition,
+        it->currentMode,
     };
 }
 
@@ -783,6 +791,361 @@ void HomeProductOrchestrator::ResumeAllModules() noexcept {
 
 bool HomeProductOrchestrator::IsPaused() const noexcept {
     return m_paused.load(std::memory_order_acquire);
+}
+
+// ============================================================================
+// Protection Mode Management
+// ============================================================================
+
+bool HomeProductOrchestrator::SetModuleMode(std::string_view name,
+                                            ProtectionMode mode) noexcept {
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+
+    // Find module under a shared registry lock; copy what we need.
+    std::size_t idx = SIZE_MAX;
+    ModuleDescriptor desc;
+    ModuleState priorState = ModuleState::Unregistered;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        for (std::size_t i = 0; i < m_modules.size(); ++i) {
+            if (m_modules[i].descriptor.name == name) {
+                idx = i;
+                desc = m_modules[i].descriptor;
+                priorState = m_modules[i].state;
+                break;
+            }
+        }
+    }
+
+    if (idx == SIZE_MAX) {
+        SS_LOG_ERROR(kLogCategory, L"SetModuleMode: unknown module '%hs'",
+                     std::string(name).c_str());
+        return false;
+    }
+
+    // Validate the requested mode against the descriptor's supported mask.
+    const std::uint8_t modeBit = ProtectionModeMask(mode);
+    if ((desc.supportedModesMask & modeBit) == 0) {
+        SS_LOG_ERROR(kLogCategory,
+            L"SetModuleMode '%hs': mode '%hs' not in supported mask 0x%02X",
+            desc.name.c_str(),
+            std::string(ToString(mode)).c_str(),
+            static_cast<unsigned>(desc.supportedModesMask));
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Off — delegate to the disable path (no setMode call).
+    // -------------------------------------------------------------------------
+    if (mode == ProtectionMode::Off) {
+        if (priorState == ModuleState::Running ||
+            priorState == ModuleState::Initialized) {
+            // Persist the enabled-state change.
+            if (!desc.enabledConfigKey.empty()) {
+                try {
+                    if (!::ShadowStrike::Config::ConfigManager::Instance()
+                            .SetValue<bool>(desc.enabledConfigKey, false)) {
+                        SS_LOG_WARN(kLogCategory,
+                            L"SetModuleMode '%hs' Off: ConfigManager SetValue(enabled=false) returned false",
+                            desc.name.c_str());
+                    }
+                } catch (...) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"SetModuleMode '%hs' Off: failed to persist enabled=false",
+                        desc.name.c_str());
+                }
+            }
+            // Quiesce the module.
+            try {
+                desc.shutdown();
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"SetModuleMode '%hs' Off: shutdown() threw: %hs",
+                    desc.name.c_str(), e.what());
+            } catch (...) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"SetModuleMode '%hs' Off: shutdown() threw unknown exception",
+                    desc.name.c_str());
+            }
+            {
+                std::unique_lock regLock(m_registryMutex);
+                if (idx < m_modules.size()) {
+                    SetModuleState(m_modules[idx], ModuleState::Disabled);
+                    m_modules[idx].currentMode = ProtectionMode::Off;
+                }
+            }
+        } else {
+            // Already not running — just record the mode.
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                m_modules[idx].currentMode = ProtectionMode::Off;
+            }
+        }
+
+        // Persist the mode.
+        try {
+            if (!::ShadowStrike::Config::ConfigManager::Instance()
+                    .SetValue<int32_t>("Home/" + desc.name + "/Mode", 0)) {
+                SS_LOG_WARN(kLogCategory,
+                    L"SetModuleMode '%hs' Off: ConfigManager SetValue(Mode=0) returned false",
+                    desc.name.c_str());
+            }
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs' Off: failed to persist mode",
+                desc.name.c_str());
+        }
+
+        SS_LOG_INFO(kLogCategory,
+            L"Module '%hs' set to Off (disabled and quiesced)", desc.name.c_str());
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-Off mode — ensure the module is Running before applying thresholds.
+    // -------------------------------------------------------------------------
+    if (priorState == ModuleState::Disabled  ||
+        priorState == ModuleState::Stopped   ||
+        priorState == ModuleState::Failed    ||
+        priorState == ModuleState::Registered) {
+
+        // Enable: persist enabled key, then initialize + start.
+        if (!desc.enabledConfigKey.empty()) {
+            try {
+                if (!::ShadowStrike::Config::ConfigManager::Instance()
+                        .SetValue<bool>(desc.enabledConfigKey, true)) {
+                    SS_LOG_WARN(kLogCategory,
+                        L"SetModuleMode '%hs': ConfigManager SetValue(enabled=true) returned false",
+                        desc.name.c_str());
+                }
+            } catch (...) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"SetModuleMode '%hs': failed to persist enabled=true",
+                    desc.name.c_str());
+            }
+        }
+
+        bool ok = false;
+        std::string errMsg;
+        try {
+            ok = desc.initialize();
+        } catch (const std::exception& e) {
+            errMsg = e.what();
+        } catch (...) {
+            errMsg = "unknown exception";
+        }
+
+        if (!ok) {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+            }
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs': Initialize() failed while enabling for mode %hs: %hs",
+                desc.name.c_str(),
+                std::string(ToString(mode)).c_str(),
+                errMsg.empty() ? "returned false" : errMsg.c_str());
+            return false;
+        }
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Initialized);
+            }
+        }
+
+        ok = false;
+        errMsg.clear();
+        try {
+            ok = desc.start();
+        } catch (const std::exception& e) {
+            errMsg = e.what();
+        } catch (...) {
+            errMsg = "unknown exception";
+        }
+
+        if (!ok) {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+            }
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs': Start() failed while enabling for mode %hs: %hs",
+                desc.name.c_str(),
+                std::string(ToString(mode)).c_str(),
+                errMsg.empty() ? "returned false" : errMsg.c_str());
+            return false;
+        }
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (idx < m_modules.size()) {
+                SetModuleState(m_modules[idx], ModuleState::Running);
+            }
+        }
+        SS_LOG_INFO(kLogCategory,
+            L"Module '%hs' enabled for mode transition to %hs",
+            desc.name.c_str(), std::string(ToString(mode)).c_str());
+    }
+
+    // -------------------------------------------------------------------------
+    // Apply the mode: prefer descriptor.setMode, fall back to ApplyModeThresholds.
+    // -------------------------------------------------------------------------
+    bool modeApplied = false;
+    if (desc.setMode) {
+        try {
+            modeApplied = desc.setMode(mode);
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs': setMode(%hs) threw: %hs",
+                desc.name.c_str(), std::string(ToString(mode)).c_str(), e.what());
+            return false;
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs': setMode(%hs) threw unknown exception",
+                desc.name.c_str(), std::string(ToString(mode)).c_str());
+            return false;
+        }
+        if (!modeApplied) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs': setMode(%hs) returned false",
+                desc.name.c_str(), std::string(ToString(mode)).c_str());
+            return false;
+        }
+    } else {
+        modeApplied = ApplyModeThresholds(desc.name, mode);
+        if (!modeApplied) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SetModuleMode '%hs': ApplyModeThresholds(%hs) failed",
+                desc.name.c_str(), std::string(ToString(mode)).c_str());
+            return false;
+        }
+    }
+
+    // Persist the mode to ConfigManager.
+    try {
+        if (!::ShadowStrike::Config::ConfigManager::Instance()
+                .SetValue<int32_t>("Home/" + desc.name + "/Mode",
+                                   static_cast<int32_t>(mode))) {
+            SS_LOG_WARN(kLogCategory,
+                L"SetModuleMode '%hs': ConfigManager SetValue(Mode=%hs) returned false",
+                desc.name.c_str(), std::string(ToString(mode)).c_str());
+        }
+    } catch (...) {
+        // Non-fatal: mode already applied; log and continue.
+        SS_LOG_ERROR(kLogCategory,
+            L"SetModuleMode '%hs': failed to persist mode %hs (mode is active)",
+            desc.name.c_str(), std::string(ToString(mode)).c_str());
+    }
+
+    // Update the live status record.
+    {
+        std::unique_lock regLock(m_registryMutex);
+        if (idx < m_modules.size()) {
+            m_modules[idx].currentMode = mode;
+        }
+    }
+
+    SS_LOG_INFO(kLogCategory,
+        L"Module '%hs' protection mode set to %hs",
+        desc.name.c_str(), std::string(ToString(mode)).c_str());
+    return true;
+}
+
+std::optional<ProtectionMode>
+HomeProductOrchestrator::GetModuleMode(std::string_view name) const {
+    std::shared_lock regLock(m_registryMutex);
+    const auto it = std::find_if(m_modules.begin(), m_modules.end(),
+        [&](const ModuleRecord& r) { return r.descriptor.name == name; });
+    if (it == m_modules.end()) return std::nullopt;
+    return it->currentMode;
+}
+
+void HomeProductOrchestrator::ApplyPersistedModeUnlocked(
+    std::size_t moduleIdx) noexcept {
+    // Called under m_lifecycleMutex. The module at moduleIdx is Running.
+    ModuleDescriptor desc;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        if (moduleIdx >= m_modules.size()) return;
+        desc = m_modules[moduleIdx].descriptor;
+    }
+
+    const std::string modeKey = "Home/" + desc.name + "/Mode";
+    int32_t storedRaw = -1;
+    try {
+        auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+        if (!cfg.HasKey(modeKey)) return;  // No persisted mode — leave default.
+        storedRaw = cfg.GetValue<int32_t>(modeKey, -1);
+    } catch (...) {
+        SS_LOG_WARN(kLogCategory,
+            L"ApplyPersistedMode '%hs': ConfigManager read failed; using default mode",
+            desc.name.c_str());
+        return;
+    }
+
+    // Validate range (0..3 correspond to ProtectionMode enumerators).
+    if (storedRaw < 0 || storedRaw > 3) {
+        SS_LOG_WARN(kLogCategory,
+            L"ApplyPersistedMode '%hs': stored mode value %d is out of range [0,3]; ignoring",
+            desc.name.c_str(), storedRaw);
+        return;
+    }
+
+    const auto mode = static_cast<ProtectionMode>(storedRaw);
+
+    // Off means disabled — but the module just started, so this is inconsistent.
+    // The enabled-key check in InitializeLocked already gates on Off. Skip.
+    if (mode == ProtectionMode::Off) return;
+
+    // Confirm the module supports this mode.
+    {
+        std::shared_lock regLock(m_registryMutex);
+        if (moduleIdx >= m_modules.size()) return;
+        const std::uint8_t mask = m_modules[moduleIdx].descriptor.supportedModesMask;
+        if ((mask & ProtectionModeMask(mode)) == 0) {
+            SS_LOG_WARN(kLogCategory,
+                L"ApplyPersistedMode '%hs': persisted mode %hs not in supported mask 0x%02X; ignoring",
+                desc.name.c_str(),
+                std::string(ToString(mode)).c_str(),
+                static_cast<unsigned>(mask));
+            return;
+        }
+    }
+
+    // Apply: prefer the module's own setMode, fall back to threshold helper.
+    bool ok = false;
+    if (desc.setMode) {
+        try {
+            ok = desc.setMode(mode);
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(kLogCategory,
+                L"ApplyPersistedMode '%hs': setMode(%hs) threw: %hs",
+                desc.name.c_str(), std::string(ToString(mode)).c_str(), e.what());
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"ApplyPersistedMode '%hs': setMode(%hs) threw unknown exception",
+                desc.name.c_str(), std::string(ToString(mode)).c_str());
+        }
+    } else {
+        ok = ApplyModeThresholds(desc.name, mode);
+    }
+
+    if (!ok) {
+        SS_LOG_WARN(kLogCategory,
+            L"ApplyPersistedMode '%hs': failed to restore mode %hs; module runs at default",
+            desc.name.c_str(), std::string(ToString(mode)).c_str());
+        return;
+    }
+
+    {
+        std::unique_lock regLock(m_registryMutex);
+        if (moduleIdx < m_modules.size()) {
+            m_modules[moduleIdx].currentMode = mode;
+        }
+    }
+    SS_LOG_INFO(kLogCategory,
+        L"Module '%hs' restored to persisted protection mode %hs",
+        desc.name.c_str(), std::string(ToString(mode)).c_str());
 }
 
 }  // namespace Home

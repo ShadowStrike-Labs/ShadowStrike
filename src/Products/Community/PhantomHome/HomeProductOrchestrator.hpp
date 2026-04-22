@@ -82,6 +82,27 @@ enum class ModulePhase : uint8_t {
     Background      = 4,  ///< BackupManager snapshot-on-threat.
 };
 
+/// @brief Per-module protection intensity level.
+///
+/// Determines how aggressively a subsystem monitors and blocks threats.
+/// Ordered from least to most aggressive; cast to uint8_t gives a stable
+/// numeric representation suitable for ConfigManager persistence.
+enum class ProtectionMode : std::uint8_t {
+    Off        = 0,  ///< Module disabled; no detection activity.
+    Passive    = 1,  ///< Detect-only; no blocking; lowest CPU overhead.
+    Balanced   = 2,  ///< Block on suspicion at moderate sensitivity (default).
+    Aggressive = 3,  ///< Maximum sensitivity; block at low confidence threshold.
+};
+
+/// @brief Returns the bitmask bit for a given ProtectionMode.
+///
+/// Bit i is set when mode i is in the mask. Combined masks declare which
+/// modes a ModuleDescriptor supports.
+/// @example ProtectionModeMask(ProtectionMode::Balanced) == 0b0100 == 4
+[[nodiscard]] constexpr std::uint8_t ProtectionModeMask(ProtectionMode m) noexcept {
+    return static_cast<std::uint8_t>(1u << static_cast<std::uint8_t>(m));
+}
+
 /// @brief Descriptor supplied by each subsystem at registration time.
 struct ModuleDescriptor {
     /// Human-readable module name, used in logs and status queries. E.g.
@@ -121,6 +142,19 @@ struct ModuleDescriptor {
     /// Must not throw. Contract: quiesce threads, unregister callbacks,
     /// release OS handles. Called in reverse phase order during teardown.
     std::function<void()> shutdown;
+
+    /// Optional: transitions the module to a new active ProtectionMode.
+    /// Called only when the module is already Running and mode != Off.
+    /// If null, the orchestrator falls back to ApplyModeThresholds().
+    /// Must not throw. Return true on success.
+    std::function<bool(ProtectionMode)> setMode;
+
+    /// Bitmask of ProtectionMode values this module supports.
+    /// Bit i set means ProtectionMode(i) is accepted by SetModuleMode.
+    /// Default: Off | Balanced (bits 0 and 2, mask = 0b0101 = 5).
+    std::uint8_t supportedModesMask =
+        ProtectionModeMask(ProtectionMode::Off) |
+        ProtectionModeMask(ProtectionMode::Balanced);
 };
 
 /// @brief Runtime status snapshot for diagnostics / IPC /status endpoint.
@@ -132,6 +166,7 @@ struct ModuleStatus {
     ModuleState state{ModuleState::Unregistered};
     std::string lastError;      ///< Populated when state == Failed.
     std::chrono::steady_clock::time_point lastTransition{};
+    ProtectionMode currentMode = ProtectionMode::Off;  ///< Active protection intensity.
 };
 
 /**
@@ -225,6 +260,45 @@ public:
     [[nodiscard]] bool SetModuleEnabled(std::string_view name, bool enabled) noexcept;
 
     /**
+     * @brief Transition a named module to the given ProtectionMode.
+     *
+     * Behavior:
+     *   - Mode::Off  → disabled via the existing SetModuleEnabled(false) path;
+     *                  setMode() is NOT invoked.
+     *   - Any other  → ensures the module is Running (enables if needed),
+     *                  then calls descriptor.setMode(mode) if set, otherwise
+     *                  falls back to ApplyModeThresholds(name, mode).
+     * The new mode is persisted to ConfigManager key "Home/<Name>/Mode".
+     * ModuleStatus::currentMode is updated on success.
+     *
+     * @param name  Stable internal module name (e.g. "BankingTrojanDetector").
+     * @param mode  Target protection intensity.
+     * @return true on success; false if the module was not found, the mode is
+     *         not in its supportedModesMask, or the transition callback failed.
+     */
+    [[nodiscard]] bool SetModuleMode(std::string_view name, ProtectionMode mode) noexcept;
+
+    /**
+     * @brief Return the current ProtectionMode for a named module.
+     * @return The active mode, or nullopt if the module does not exist.
+     */
+    [[nodiscard]] std::optional<ProtectionMode> GetModuleMode(std::string_view name) const;
+
+    /**
+     * @brief Convert a ProtectionMode enumerator to its string representation.
+     * @return "Off" | "Passive" | "Balanced" | "Aggressive" | "Unknown"
+     */
+    [[nodiscard]] static constexpr std::string_view ToString(ProtectionMode mode) noexcept {
+        switch (mode) {
+            case ProtectionMode::Off:        return "Off";
+            case ProtectionMode::Passive:    return "Passive";
+            case ProtectionMode::Balanced:   return "Balanced";
+            case ProtectionMode::Aggressive: return "Aggressive";
+        }
+        return "Unknown";
+    }
+
+    /**
      * @brief Pause all currently Running modules.
      *
      * Calls shutdown() on every Running module and records their names so
@@ -261,12 +335,18 @@ private:
         ModuleState state{ModuleState::Registered};
         std::string lastError;
         std::chrono::steady_clock::time_point lastTransition{};
+        ProtectionMode currentMode{ProtectionMode::Off};  ///< Active protection intensity.
     };
 
     // Lifecycle helpers - called under m_lifecycleMutex.
     [[nodiscard]] bool InitializeLocked() noexcept;
     [[nodiscard]] bool StartLocked() noexcept;
     void ShutdownLocked() noexcept;
+
+    /// @brief Reads "Home/<name>/Mode" from ConfigManager and applies it.
+    ///        Must be called under m_lifecycleMutex with the module Running.
+    ///        No-op if the key is absent or the mode equals the current one.
+    void ApplyPersistedModeUnlocked(std::size_t moduleIdx) noexcept;
 
     [[nodiscard]] bool IsModuleEnabled(const ModuleDescriptor& desc) const noexcept;
     void SetModuleState(ModuleRecord& rec, ModuleState state, std::string_view err = {}) noexcept;

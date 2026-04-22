@@ -303,6 +303,7 @@
     <ClCompile Include="src\PhantomCore\SelfProtection\SelfDefense.cpp" />
     <ClCompile Include="src\PhantomCore\SelfProtection\TamperProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Service\AntivirusService.cpp" />
+    <ClCompile Include="src\PhantomCore\Service\IpcAuthToken.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ProductExtensions.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceCommunicator.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceController.cpp" />
@@ -391,6 +392,8 @@
     <ClCompile Include="src\PhantomCore\Whitelist\WhiteListStore.cpp" />
     <ClCompile Include="src\PhantomCore\Whitelist\WhiteListStringPool.cpp" />
     <!-- Additional PhantomCore modules not in original PhantomHome.vcxproj -->
+    <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\ModeThresholds.cpp" />
     <ClCompile Include="src\PhantomCore\AI\CortexConfig.cpp" />
     <ClCompile Include="src\PhantomCore\AI\FeatureExtractor.cpp" />
     <ClCompile Include="src\PhantomCore\AI\ModelCache.cpp" />

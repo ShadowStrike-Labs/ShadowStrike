@@ -68,6 +68,16 @@ std::atomic<bool> FirefoxAddonScanner::s_instanceCreated{false};
 
 namespace {
 
+    template<typename T>
+    [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
+        return std::atomic_ref<T>(const_cast<T&>(value)).load(std::memory_order_relaxed);
+    }
+
+    template<typename T>
+    void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
+        std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
+    }
+
     constexpr uint32_t kZipEndCentralDirSig  = 0x06054b50;
     constexpr uint32_t kZipCentralDirSig     = 0x02014b50;
     constexpr uint32_t kZipLocalFileHeaderSig = 0x04034b50;
@@ -1344,7 +1354,26 @@ private:
 
 public:
     FirefoxAddonScannerStatistics GetStatisticsCopy() const {
-        return m_stats;
+        FirefoxAddonScannerStatistics copy;
+        copy.totalScanned.store(m_stats.totalScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.safeFound.store(m_stats.safeFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.suspiciousFound.store(m_stats.suspiciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.maliciousFound.store(m_stats.maliciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.unsignedFound.store(m_stats.unsignedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.sideloadedFound.store(m_stats.sideloadedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.overPrivilegedFound.store(m_stats.overPrivilegedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.profilesScanned.store(m_stats.profilesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.xpisExtracted.store(m_stats.xpisExtracted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.jsFilesAnalyzed.store(m_stats.jsFilesAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy.obfuscatedFound.store(m_stats.obfuscatedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < m_stats.byVerdict.size(); ++i) {
+            copy.byVerdict[i].store(m_stats.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < m_stats.byType.size(); ++i) {
+            copy.byType[i].store(m_stats.byType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        AtomicValueStoreRelaxed(copy.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
+        return copy;
     }
 
     void ResetStatistics() { m_stats.Reset(); }
@@ -1964,9 +1993,9 @@ void FirefoxAddonScannerStatistics::Reset() noexcept {
     xpisExtracted = 0;
     jsFilesAnalyzed = 0;
     obfuscatedFound = 0;
-    for (auto& v : byVerdict) v = 0;
-    for (auto& t : byType) t = 0;
-    startTime = Clock::now();
+    for (auto& v : byVerdict) v.store(0, std::memory_order_relaxed);
+    for (auto& t : byType) t.store(0, std::memory_order_relaxed);
+    AtomicValueStoreRelaxed(startTime, Clock::now());
 }
 
 std::string FirefoxAddonScannerStatistics::ToJson() const {

@@ -424,7 +424,7 @@ struct AdBlockerStatistics {
           cacheHits(o.cacheHits.load(std::memory_order_relaxed)),
           cacheMisses(o.cacheMisses.load(std::memory_order_relaxed)),
           bytesBlocked(o.bytesBlocked.load(std::memory_order_relaxed)),
-          startTime(o.startTime) {
+          startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < byRequestType.size(); ++i) {
             byRequestType[i].store(o.byRequestType[i].load(std::memory_order_relaxed),
                                    std::memory_order_relaxed);
@@ -449,7 +449,7 @@ struct AdBlockerStatistics {
             byRequestType[i].store(o.byRequestType[i].load(std::memory_order_relaxed),
                                    std::memory_order_relaxed);
         }
-        startTime = o.startTime;
+        startTime = std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed);
         return *this;
     }
 
