@@ -44,6 +44,8 @@
 #include "GPUMiningDetector.hpp"
 #include "PoolConnectionDetector.hpp"
 
+#include "../ModeThresholds.hpp"
+
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
@@ -56,6 +58,9 @@ struct CryptoMinersModuleRegistrar final {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             auto& orch = HomeProductOrchestrator::Instance();
 
@@ -108,7 +113,17 @@ struct CryptoMinersModuleRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"CryptoMinerDetector: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("CryptoMinerDetector", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             // ----------------------------------------------------------------
@@ -151,7 +166,17 @@ struct CryptoMinersModuleRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"BrowserMinerDetector: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("BrowserMinerDetector", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             // ----------------------------------------------------------------
@@ -203,7 +228,17 @@ struct CryptoMinersModuleRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"CPUUsageAnalyzer: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("CPUUsageAnalyzer", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             // ----------------------------------------------------------------
@@ -255,7 +290,17 @@ struct CryptoMinersModuleRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"GPUMiningDetector: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("GPUMiningDetector", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             // ----------------------------------------------------------------
@@ -307,7 +352,17 @@ struct CryptoMinersModuleRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"PoolConnectionDetector: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("PoolConnectionDetector", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
         } catch (...) {

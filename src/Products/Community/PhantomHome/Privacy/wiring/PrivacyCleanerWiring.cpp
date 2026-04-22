@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -8,6 +8,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../PrivacyCleaner.hpp"
+#include "../../ModeThresholds.hpp"
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
@@ -53,6 +54,8 @@ struct Registrar final {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "PrivacyCleaner",
@@ -103,7 +106,24 @@ struct Registrar final {
                 },
                 .shutdown = []() noexcept {
                     SafeShutdown();
-                }
+                },
+
+                // PrivacyCleaner is a scheduled on-demand cleaner with no detection
+                // thresholds or intensity concept; Passive/Aggressive are not
+                // meaningful and map to the sole operational (Balanced) state.
+                .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Passive || mode == ProtectionMode::Aggressive) {
+                        SS_LOG_WARN(kLogCategory,
+                            L"PrivacyCleaner: ProtectionMode::%hs is not supported "
+                            L"(cleaner has no intensity concept); treating as Balanced",
+                            std::string(HomeProductOrchestrator::ToString(mode)).c_str());
+                    }
+                    return true;
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)     |
+                    ProtectionModeMask(ProtectionMode::Balanced)
             });
         } catch (...) {
             // Static initializer path: logger may not yet be available.

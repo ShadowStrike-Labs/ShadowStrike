@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -8,6 +8,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../IPLeakProtection.hpp"
+#include "../../ModeThresholds.hpp"
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
@@ -54,6 +55,9 @@ struct Registrar final {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "PrivacyIPLeakProtection",
@@ -123,7 +127,17 @@ struct Registrar final {
                 },
                 .shutdown = []() noexcept {
                     SafeShutdown();
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("PrivacyIPLeakProtection", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static initializer path: logger may not yet be available.

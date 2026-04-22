@@ -29,6 +29,7 @@
 #include "pch.h"
 
 #include "../HomeProductOrchestrator.hpp"
+#include "../ModeThresholds.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
 #include "DeviceControlManager.hpp"
@@ -73,6 +74,9 @@ struct USBRegistrar final {
     USBRegistrar() noexcept {
         using ::ShadowStrike::Products::Home::ModuleDescriptor;
         using ::ShadowStrike::Products::Home::ModulePhase;
+        using ::ShadowStrike::Products::Home::ProtectionMode;
+        using ::ShadowStrike::Products::Home::ProtectionModeMask;
+        using ::ShadowStrike::Products::Home::ApplyModeThresholds;
         using namespace ::ShadowStrike::USB;
 
         // ------------------------------------------------------------------
@@ -111,7 +115,15 @@ struct USBRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"DeviceControlManager::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("DeviceControlManager", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -148,7 +160,15 @@ struct USBRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"BadUSBDetector::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("BadUSBDetector", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -185,7 +205,15 @@ struct USBRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"USBAutorunBlocker::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("USBAutorunBlocker", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -242,7 +270,15 @@ struct USBRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"USBDeviceMonitor::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("USBDeviceMonitor", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -279,7 +315,15 @@ struct USBRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"USBScanner::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("USBScanner", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
     }
 };

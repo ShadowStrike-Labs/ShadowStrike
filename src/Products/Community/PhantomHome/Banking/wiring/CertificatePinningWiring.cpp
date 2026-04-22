@@ -32,6 +32,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../CertificatePinning.hpp"
+#include "../../ModeThresholds.hpp"
 
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -46,6 +47,9 @@ struct CertificatePinningRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Banking::CertificatePinning;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "CertificatePinning",
@@ -87,7 +91,33 @@ struct CertificatePinningRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"CertificatePinning: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    using ::ShadowStrike::Banking::PinningMode;
+                    PinningMode pinMode = PinningMode::Enforce;
+                    switch (mode) {
+                        case ProtectionMode::Passive:
+                            pinMode = PinningMode::ReportOnly;
+                            break;
+                        case ProtectionMode::Balanced:
+                            pinMode = PinningMode::Enforce;
+                            break;
+                        case ProtectionMode::Aggressive:
+                            pinMode = PinningMode::Strict;
+                            break;
+                        default:
+                            break;
+                    }
+                    CertificatePinning::Instance().SetMode(pinMode);
+                    return ApplyModeThresholds("CertificatePinning", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.

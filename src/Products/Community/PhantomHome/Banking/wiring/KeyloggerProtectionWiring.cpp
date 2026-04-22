@@ -32,6 +32,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../KeyloggerProtection.hpp"
+#include "../../ModeThresholds.hpp"
 
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -46,6 +47,9 @@ struct KeyloggerProtectionRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Banking::KeyloggerProtection;
+            using HomeProtectionMode = ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "KeyloggerProtection",
@@ -100,7 +104,33 @@ struct KeyloggerProtectionRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"KeyloggerProtection: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](HomeProtectionMode mode) -> bool {
+                    using KLMode = ::ShadowStrike::Banking::ProtectionMode;
+                    KLMode klMode = KLMode::Protect;
+                    switch (mode) {
+                        case HomeProtectionMode::Passive:
+                            klMode = KLMode::Monitor;
+                            break;
+                        case HomeProtectionMode::Balanced:
+                            klMode = KLMode::Protect;
+                            break;
+                        case HomeProtectionMode::Aggressive:
+                            klMode = KLMode::Aggressive;
+                            break;
+                        default:
+                            break;
+                    }
+                    KeyloggerProtection::Instance().SetProtectionMode(klMode);
+                    return ApplyModeThresholds("KeyloggerProtection", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(HomeProtectionMode::Off)        |
+                    ProtectionModeMask(HomeProtectionMode::Passive)    |
+                    ProtectionModeMask(HomeProtectionMode::Balanced)   |
+                    ProtectionModeMask(HomeProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.
