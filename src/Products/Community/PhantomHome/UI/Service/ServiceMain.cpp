@@ -31,8 +31,12 @@
  *     silently so Windows Error Reporting can kick in.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
 #include <windows.h>
 #include <wtsapi32.h>
 
@@ -266,7 +270,75 @@ VOID WINAPI ServiceMainW(DWORD /*argc*/, LPWSTR* /*argv*/) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Resolve %ProgramData%\ShadowStrike\Logs as an absolute wide path.
+// Falls back to the module-directory relative "logs" on any failure.
+// ---------------------------------------------------------------------------
+static std::wstring ResolveLogDirectory() noexcept {
+    wchar_t expanded[MAX_PATH]{};
+    if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike\\Logs",
+                                    expanded, MAX_PATH) == 0) {
+        return L"logs";
+    }
+
+    // Ensure parent dir first.
+    wchar_t parent[MAX_PATH]{};
+    if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike",
+                                    parent, MAX_PATH) != 0) {
+        ::CreateDirectoryW(parent, nullptr);  // Ignore ERROR_ALREADY_EXISTS.
+    }
+
+    // Create the Logs subdirectory.
+    if (!::CreateDirectoryW(expanded, nullptr)) {
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_ALREADY_EXISTS) {
+            return L"logs";  // Unexpected failure; fall back.
+        }
+    }
+    return std::wstring{expanded};
+}
+
+// ---------------------------------------------------------------------------
+// Configure the Logger before any other subsystem uses it.
+// Must be called as early as possible in wmain() so that failures in static
+// initializers (from wiring TUs) and early-startup errors are captured.
+// ---------------------------------------------------------------------------
+static void InitialiseLogger() noexcept {
+    try {
+        using ::ShadowStrike::Utils::Logger;
+        using ::ShadowStrike::Utils::LoggerConfig;
+        using ::ShadowStrike::Utils::LogLevel;
+
+        LoggerConfig cfg{};
+        cfg.async               = true;
+        cfg.toConsole           = false;   // Service has no console.
+        cfg.toFile              = true;
+        cfg.toEventLog          = true;    // Also write critical events to App log.
+        cfg.logDirectory        = ResolveLogDirectory();
+        cfg.baseFileName        = L"PhantomHome.Service";
+        cfg.maxFileSizeBytes    = 20ULL * 1024ULL * 1024ULL;  // 20 MB per file
+        cfg.maxFileCount        = 10;
+        cfg.minimalLevel        = LogLevel::Info;
+        cfg.flushLevel          = LogLevel::Error;
+        cfg.eventLogSource      = L"ShadowStrike Phantom Service";
+        cfg.useUtcTime          = true;
+        cfg.includeSrcLocation  = true;
+        cfg.includeProcThreadId = true;
+
+        Logger::Instance().Initialize(cfg);
+    } catch (...) {
+        // If Logger init throws, we silently continue: subsequent Log calls
+        // will auto-init with console-only defaults, which is still useful
+        // when the service is run interactively for debugging.
+    }
+}
+
 extern "C" int wmain(int argc, wchar_t* argv[]) {
+    // Logger must be up before anything else — including the wiring static
+    // initialisers (which already ran before wmain but may have queued
+    // deferred diagnostic output) and the PerfBudget singleton.
+    InitialiseLogger();
+
     using PB  = ::ShadowStrike::PhantomHome::UI::PerfBudget;
     using PBL = ::ShadowStrike::PhantomHome::UI::PerfBudgetLimits;
     PB::Instance().MarkProcessStart();
