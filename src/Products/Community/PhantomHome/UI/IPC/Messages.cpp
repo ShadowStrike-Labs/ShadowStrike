@@ -154,8 +154,10 @@ Envelope::Deserialize(std::span<const std::uint8_t> data) noexcept
     // --- Field extraction ---
     const auto magic       = ReadLe<std::uint32_t>(hdr +  0);
     const auto version     = ReadLe<std::uint16_t>(hdr +  4);
-    // reserved 2 bytes at offset 6 — accepted regardless of value for
-    // forward-compatibility, but we verify it is zero for protocol v1.
+    // reserved 2 bytes at offset 6 — must be zero for protocol v1.
+    // NOTE: Future protocol versions that use these bits MUST bump kProtocolVersion
+    // so that v1 parsers fail on version mismatch rather than reserved-field mismatch,
+    // preserving orderly forward-compatibility.
     const auto reserved    = ReadLe<std::uint16_t>(hdr +  6);
     const auto typeRaw     = ReadLe<std::uint32_t>(hdr +  8);
     const auto requestId   = ReadLe<std::uint64_t>(hdr + 12);
@@ -223,13 +225,24 @@ MakeErrorResponse(std::string_view code, std::string_view message)
 }
 
 // ============================================================================
-// ValidateJson
+// ValidateJson (internal recursive helper + public entry)
 // ============================================================================
 
-bool ValidateJson(const nlohmann::json& j, std::uint32_t maxDepth) noexcept
+namespace {
+
+/// Internal recursive validator.
+/// @param nodeCount  Running total of nodes visited.  Rejected when it
+///                   exceeds kMaxJsonNodes to prevent O(N) DoS on wide trees.
+[[nodiscard]] bool ValidateJsonImpl(
+    const nlohmann::json& j,
+    std::uint32_t         maxDepth,
+    std::uint32_t&        nodeCount) noexcept
 {
-    // Depth limit: if we've exhausted the budget and the value is a container,
-    // reject it; primitives at depth == 0 are fine.
+    if (nodeCount >= kMaxJsonNodes) {
+        return false;   // Algorithmic complexity / DoS guard.
+    }
+    ++nodeCount;
+
     if (j.is_binary()) {
         // Binary blobs are a nlohmann extension not part of the JSON standard.
         // Reject them unconditionally to prevent binary-injection attacks.
@@ -239,17 +252,25 @@ bool ValidateJson(const nlohmann::json& j, std::uint32_t maxDepth) noexcept
     if (j.is_object()) {
         if (maxDepth == 0) return false; // Container at limit — too deep.
         for (const auto& [/*key*/_, val] : j.items()) {
-            if (!ValidateJson(val, maxDepth - 1u)) return false;
+            if (!ValidateJsonImpl(val, maxDepth - 1u, nodeCount)) return false;
         }
     } else if (j.is_array()) {
         if (maxDepth == 0) return false;
         for (const auto& elem : j) {
-            if (!ValidateJson(elem, maxDepth - 1u)) return false;
+            if (!ValidateJsonImpl(elem, maxDepth - 1u, nodeCount)) return false;
         }
     }
     // Primitives (null, boolean, number, string) consume no additional depth.
 
     return true;
+}
+
+} // anonymous namespace (inner — appended to the existing one above)
+
+bool ValidateJson(const nlohmann::json& j, std::uint32_t maxDepth) noexcept
+{
+    std::uint32_t nodeCount = 0;
+    return ValidateJsonImpl(j, maxDepth, nodeCount);
 }
 
 } // namespace ShadowStrike::PhantomHome::IPC

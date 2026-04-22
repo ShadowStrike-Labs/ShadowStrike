@@ -1,4 +1,4 @@
-#include "pch.h"
+﻿#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -42,6 +42,7 @@
 
 // STL
 #include <array>
+#include <functional>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -161,20 +162,51 @@ public:
         return s_inst;
     }
 
-    void Store(std::uint32_t sessionId, std::string&& token) {
-        std::unique_lock lock(m_mtx);
-        m_map[sessionId] = std::move(token);
-    }
-
+    /// Fast read path — concurrent readers allowed.
     [[nodiscard]] std::string Get(std::uint32_t sessionId) const {
         std::shared_lock lock(m_mtx);
         auto it = m_map.find(sessionId);
         return (it != m_map.end()) ? it->second : std::string{};
     }
 
-    [[nodiscard]] bool Contains(std::uint32_t sessionId) const noexcept {
-        std::shared_lock lock(m_mtx);
-        return m_map.count(sessionId) != 0;
+    /// Atomic check-then-generate-then-store.
+    ///
+    /// Holds an exclusive lock for the entire duration of `generator()` so that
+    /// concurrent calls for the same session ID will block, then re-use the token
+    /// that the first caller stored (double-checked locking under the exclusive
+    /// lock prevents duplicate nonce generation and conflicting file writes).
+    ///
+    /// @param sessionId  Session to fetch or generate a token for.
+    /// @param generator  Callable returning the new token string (empty on error).
+    ///                   Called at most once per session per service lifetime.
+    /// @return The token for sessionId (from cache or freshly generated).
+    [[nodiscard]] std::string GetOrGenerate(
+        std::uint32_t           sessionId,
+        std::function<std::string()> generator)
+    {
+        // Fast path — shared lock.
+        {
+            std::shared_lock slock(m_mtx);
+            auto it = m_map.find(sessionId);
+            if (it != m_map.end()) return it->second;
+        }
+
+        // Slow path — exclusive lock prevents concurrent generation for the same
+        // session from producing two different nonces / file writes.
+        {
+            std::unique_lock ulock(m_mtx);
+
+            // Double-check: another thread may have stored the token while we
+            // were waiting for the exclusive lock.
+            auto it = m_map.find(sessionId);
+            if (it != m_map.end()) return it->second;
+
+            std::string token = generator();
+            if (!token.empty()) {
+                m_map.emplace(sessionId, token);
+            }
+            return token;
+        }
     }
 
 private:
@@ -195,6 +227,15 @@ private:
 /// Compare two string_views in constant time.  Length differences short-circuit
 /// (length is NOT secret — the expected token length is fixed at 44 chars for
 /// base64 of 32 bytes, and the attacker can observe that without timing).
+///
+/// Security implementation notes:
+///   - `volatile unsigned char acc` forces the compiler to materialise every
+///     store to `acc`; it cannot collapse or hoist the XOR loop.
+///   - `_ReadWriteBarrier()` is an MSVC full compiler fence that prevents the
+///     read of `acc` from being scheduled before the loop completes.
+///   - Together these provide defence-in-depth against compiler timing
+///     side-channels under /O2.  Hardware-level constant-time guarantees
+///     are architecture-dependent; x64 conditional moves ensure no branch.
 [[nodiscard]] bool ConstantTimeEqual(std::string_view a, std::string_view b) noexcept
 {
     if (a.size() != b.size()) return false;
@@ -206,6 +247,9 @@ private:
     for (std::size_t i = 0; i < a.size(); ++i) {
         acc |= pa[i] ^ pb[i];   // Bitwise OR accumulates any difference.
     }
+
+    // Compiler memory fence: prevents reordering the `acc` read before the loop.
+    _ReadWriteBarrier();
 
     return acc == 0;
 }
@@ -441,80 +485,67 @@ private:
 
 std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
 {
-    TokenCache& cache = TokenCache::Instance();
-
-    // Fast path: token already cached for this session.
+    // GetOrGenerate atomically checks the cache and, if empty, invokes the
+    // generator lambda under an exclusive lock.  Concurrent callers for the
+    // same sessionId block until the first caller stores the result; they then
+    // receive that cached value — preventing duplicate nonce generation and
+    // conflicting file writes (TOCTOU fix).
+    return TokenCache::Instance().GetOrGenerate(sessionId, [sessionId]() -> std::string
     {
-        std::string cached = cache.Get(sessionId);
-        if (!cached.empty()) {
-            return cached;
+        std::array<std::uint8_t, kNonceBytes> nonce{};
+        if (!GenerateNonce(nonce)) {
+            SS_LOG_ERROR(kLogCat,
+                L"EnsureForSession: nonce generation failed for session %u", sessionId);
+            return {};
         }
-    }
 
-    // ── Generate nonce ────────────────────────────────────────────────────────
-    std::array<std::uint8_t, kNonceBytes> nonce{};
-    if (!GenerateNonce(nonce)) {
-        SS_LOG_ERROR(kLogCat,
-            L"EnsureForSession: nonce generation failed for session %u", sessionId);
-        return {};
-    }
-
-    // ── Base64-encode nonce ───────────────────────────────────────────────────
-    std::string tokenB64;
-    if (!ShadowStrike::Utils::Base64Encode(nonce.data(), nonce.size(), tokenB64)) {
-        SS_LOG_ERROR(kLogCat,
-            L"EnsureForSession: Base64Encode failed for session %u", sessionId);
+        std::string tokenB64;
+        if (!ShadowStrike::Utils::Base64Encode(nonce.data(), nonce.size(), tokenB64)) {
+            SS_LOG_ERROR(kLogCat,
+                L"EnsureForSession: Base64Encode failed for session %u", sessionId);
+            RtlSecureZeroMemory(nonce.data(), nonce.size());
+            return {};
+        }
         RtlSecureZeroMemory(nonce.data(), nonce.size());
-        return {};
-    }
-    // Clear the raw nonce from the stack immediately.
-    RtlSecureZeroMemory(nonce.data(), nonce.size());
 
-    // ── Obtain the interactive user's primary token ───────────────────────────
-    HANDLE rawUserToken = nullptr;
-    if (!::WTSQueryUserToken(sessionId, &rawUserToken)) {
-        DWORD err = ::GetLastError();
-        SS_LOG_ERROR(kLogCat,
-            L"WTSQueryUserToken failed for session %u: error=%lu",
-            sessionId, static_cast<unsigned long>(err));
-        return {};
-    }
-    ScopedHandle hUserToken(rawUserToken);
+        HANDLE rawUserToken = nullptr;
+        if (!::WTSQueryUserToken(sessionId, &rawUserToken)) {
+            DWORD err = ::GetLastError();
+            SS_LOG_ERROR(kLogCat,
+                L"WTSQueryUserToken failed for session %u: error=%lu",
+                sessionId, static_cast<unsigned long>(err));
+            return {};
+        }
+        ScopedHandle hUserToken(rawUserToken);
 
-    // ── Resolve the token file path ───────────────────────────────────────────
-    std::wstring tokenPath = ResolveTokenPathForSession(hUserToken.Get());
-    if (tokenPath.empty()) {
-        SS_LOG_ERROR(kLogCat,
-            L"EnsureForSession: failed to resolve token path for session %u", sessionId);
-        return {};
-    }
+        std::wstring tokenPath = ResolveTokenPathForSession(hUserToken.Get());
+        if (tokenPath.empty()) {
+            SS_LOG_ERROR(kLogCat,
+                L"EnsureForSession: failed to resolve token path for session %u", sessionId);
+            return {};
+        }
 
-    // ── Extract user SID for ACL ──────────────────────────────────────────────
-    std::vector<BYTE> tokenUserBuf;
-    PSID userSid = ExtractUserSid(hUserToken.Get(), tokenUserBuf);
-    if (userSid == nullptr) {
-        SS_LOG_ERROR(kLogCat,
-            L"EnsureForSession: failed to extract user SID for session %u", sessionId);
-        return {};
-    }
+        std::vector<BYTE> tokenUserBuf;
+        PSID userSid = ExtractUserSid(hUserToken.Get(), tokenUserBuf);
+        if (userSid == nullptr) {
+            SS_LOG_ERROR(kLogCat,
+                L"EnsureForSession: failed to extract user SID for session %u", sessionId);
+            return {};
+        }
 
-    // ── Write the token file with restrictive ACL ─────────────────────────────
-    if (!WriteTokenFile(tokenPath, tokenB64, userSid)) {
-        SS_LOG_ERROR(kLogCat,
-            L"EnsureForSession: WriteTokenFile failed for session %u", sessionId);
-        return {};
-    }
+        if (!WriteTokenFile(tokenPath, tokenB64, userSid)) {
+            SS_LOG_ERROR(kLogCat,
+                L"EnsureForSession: WriteTokenFile failed for session %u", sessionId);
+            return {};
+        }
 
-    // ── Cache and return ──────────────────────────────────────────────────────
-    cache.Store(sessionId, std::string(tokenB64));
+        SS_LOG_INFO(kLogCat,
+            L"IPC auth token issued for session %u at '%ls'",
+            sessionId, tokenPath.c_str());
 
-    SS_LOG_INFO(kLogCat,
-        L"IPC auth token issued for session %u at '%ls'",
-        sessionId, tokenPath.c_str());
-
-    return tokenB64;
+        return tokenB64;
+    });
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Verify  (service-side)
 // ─────────────────────────────────────────────────────────────────────────────
