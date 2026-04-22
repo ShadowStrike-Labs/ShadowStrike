@@ -113,3 +113,11 @@ struct BankingTrojanDetectorRegistrar final {
 const BankingTrojanDetectorRegistrar g_bankingTrojanDetectorRegistrar{};
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Keep-alive anchor — prevents MSVC /OPT:REF + LTCG from dropping this TU in
+// Release builds. The global registrar has internal linkage, so without an
+// external-linkage symbol referenced from another TU the linker can elide the
+// whole object. WiringAnchor.cpp takes the address of this function.
+// ---------------------------------------------------------------------------
+extern "C" void PhantomHome_KeepAlive_BankingTrojanDetector() noexcept {}

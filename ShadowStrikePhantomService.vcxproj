@@ -156,6 +156,7 @@
     <ClCompile Include="src\Products\Community\PhantomHome\GameMode\PerformanceOptimizer.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductEntry.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WiringAnchor.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\IoT\IoTDeviceScanner.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\IoT\IoTWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\IoT\IPLeakProtection.cpp" />
