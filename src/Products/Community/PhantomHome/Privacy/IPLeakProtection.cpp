@@ -1679,8 +1679,15 @@ IPLeakProtection::~IPLeakProtection() {
         m_impl->m_stats.Reset();
         AtomicValueStoreRelaxed(m_impl->m_stats.startTime, Clock::now());
 
-        // Detect initial VPN status
-        m_impl->m_vpnStatus.store(m_impl->DetectVPNStatus(), std::memory_order_release);
+        // Initial VPN status is deferred to the monitoring thread / first
+        // GetVPNStatus() call. Performing a synchronous network-adapter
+        // enumeration under the init lock has been observed to block for
+        // tens of seconds on freshly-booted Windows hosts whose NDIS stack
+        // is still settling, which in turn stalls the orchestrator's
+        // sequential initialization phase and starves every downstream
+        // module. The status stays Unknown until StartVPNMonitoring()
+        // performs its first poll cycle.
+        m_impl->m_vpnStatus.store(VPNStatus::Unknown, std::memory_order_release);
 
         m_impl->m_status = ModuleStatus::Running;
 

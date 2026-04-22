@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <future>
 
 namespace ShadowStrike {
 namespace Products {
@@ -183,9 +185,43 @@ bool HomeProductOrchestrator::InitializeLocked() noexcept {
             desc.name.c_str(), PhaseName(desc.phase));
 
         bool ok = false;
+        bool timedOut = false;
         std::string errMsg;
+
+        // Run each module's Initialize() on a worker thread with a hard
+        // wall-clock budget. A single module that blocks on a slow syscall
+        // (NDIS/WFP warm-up, DNS resolution, filesystem stall, RPC timeout)
+        // must not be able to freeze the orchestrator's sequential phase
+        // loop — that leaves every subsequent module un-registered and the
+        // UI stuck on "Loading protection modules...". On timeout we mark
+        // the module Failed, log forensically, and continue. The detached
+        // future keeps the worker thread alive so the slow call can finish
+        // in the background without leaking a handle into our scope.
+        constexpr auto kInitBudget = std::chrono::seconds(15);
         try {
-            ok = desc.initialize();
+            auto fut = std::async(std::launch::async, [fn = desc.initialize]() -> bool {
+                try {
+                    return fn ? fn() : false;
+                } catch (...) {
+                    return false;
+                }
+            });
+
+            if (fut.wait_for(kInitBudget) == std::future_status::ready) {
+                ok = fut.get();
+            } else {
+                timedOut = true;
+                ok = false;
+                errMsg = "initialize() exceeded 15s budget";
+                SS_LOG_ERROR(kLogCategory,
+                    L"Module '%hs' Initialize() timed out after 15s; continuing without it",
+                    desc.name.c_str());
+                // Detach — let the blocked call finish in the background.
+                // Its result is discarded. We deliberately never touch the
+                // future again to avoid blocking in ~future().
+                auto* leaked = new std::future<bool>(std::move(fut));
+                (void)leaked;
+            }
         } catch (const std::exception& e) {
             ok = false;
             errMsg = e.what();
@@ -207,7 +243,8 @@ bool HomeProductOrchestrator::InitializeLocked() noexcept {
                 SetModuleState(m_modules[idx], ModuleState::Initialized);
                 SS_LOG_INFO(kLogCategory, L"Module '%hs' initialized", desc.name.c_str());
             } else {
-                SetModuleState(m_modules[idx], ModuleState::Failed, errMsg);
+                SetModuleState(m_modules[idx], ModuleState::Failed,
+                    timedOut ? std::string("init timeout") : errMsg);
                 SS_LOG_ERROR(kLogCategory,
                     L"Module '%hs' Initialize() reported failure: %hs",
                     desc.name.c_str(),
