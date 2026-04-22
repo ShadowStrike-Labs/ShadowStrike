@@ -22,6 +22,8 @@
 #include "WiFiSecurityAnalyzer.hpp"
 #include "IPLeakProtection.hpp"
 
+#include "../ModeThresholds.hpp"
+
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
@@ -31,6 +33,9 @@ constexpr const wchar_t* kLogCategory = L"IoTWiring";
 using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
 using ::ShadowStrike::Products::Home::ModuleDescriptor;
 using ::ShadowStrike::Products::Home::ModulePhase;
+using ::ShadowStrike::Products::Home::ProtectionMode;
+using ::ShadowStrike::Products::Home::ProtectionModeMask;
+using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
 struct IoTModulesRegistrar final {
     IoTModulesRegistrar() noexcept {
@@ -52,7 +57,25 @@ struct IoTModulesRegistrar final {
                 .shutdown = []() {
                     ShadowStrike::IoT::IoTDeviceScanner::Instance().StopScan();
                     ShadowStrike::IoT::IoTDeviceScanner::Instance().Shutdown();
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    // IoTDeviceScanner provides passive network monitoring and
+                    // active discovery; ApplyModeThresholds propagates sensitivity
+                    // settings that IoTDeviceScanner reads on the next scan cycle.
+                    if (mode == ProtectionMode::Passive) {
+                        if (ShadowStrike::IoT::IoTDeviceScanner::Instance().IsInitialized()) {
+                            (void)ShadowStrike::IoT::IoTDeviceScanner::Instance().StartPassiveMonitoring();
+                        }
+                    }
+                    return ApplyModeThresholds("IoTDeviceScanner", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
@@ -75,7 +98,17 @@ struct IoTModulesRegistrar final {
                 .shutdown = []() {
                     ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance().StopMonitoring();
                     ShadowStrike::IoT::WiFiSecurityAnalyzer::Instance().Shutdown();
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("WiFiSecurityAnalyzer", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
@@ -94,7 +127,17 @@ struct IoTModulesRegistrar final {
                 },
                 .shutdown = []() {
                     ShadowStrike::IoT::RouterSecurityChecker::Instance().Shutdown();
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("RouterSecurityChecker", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
@@ -115,7 +158,28 @@ struct IoTModulesRegistrar final {
                 .shutdown = []() {
                     ShadowStrike::IoT::SmartHomeProtection::Instance().StopProtection();
                     ShadowStrike::IoT::SmartHomeProtection::Instance().Shutdown();
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    // SmartHomeProtection exposes SetProtectionMode() with its own enum.
+                    // Map: Passive → Monitor (log only), Balanced → Protect, Aggressive → Lockdown.
+                    using SHMode = ::ShadowStrike::IoT::ProtectionMode;
+                    SHMode shMode = SHMode::Protect;
+                    switch (mode) {
+                        case ProtectionMode::Passive:    shMode = SHMode::Monitor;   break;
+                        case ProtectionMode::Balanced:   shMode = SHMode::Protect;   break;
+                        case ProtectionMode::Aggressive: shMode = SHMode::Lockdown;  break;
+                        default: break;
+                    }
+                    ShadowStrike::IoT::SmartHomeProtection::Instance().SetProtectionMode(shMode);
+                    return ApplyModeThresholds("SmartHomeProtection", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
@@ -146,7 +210,17 @@ struct IoTModulesRegistrar final {
                     protection.StopVPNMonitoring();
                     protection.StopMonitoring();
                     protection.Shutdown();
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("IoTIPLeakProtection", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
 
         } catch (const std::exception& ex) {

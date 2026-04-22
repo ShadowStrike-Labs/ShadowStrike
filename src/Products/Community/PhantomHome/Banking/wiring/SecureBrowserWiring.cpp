@@ -32,6 +32,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../SecureBrowser.hpp"
+#include "../../ModeThresholds.hpp"
 
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -46,6 +47,9 @@ struct SecureBrowserRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Banking::SecureBrowser;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "SecureBrowser",
@@ -87,7 +91,17 @@ struct SecureBrowserRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"SecureBrowser: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("SecureBrowser", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.

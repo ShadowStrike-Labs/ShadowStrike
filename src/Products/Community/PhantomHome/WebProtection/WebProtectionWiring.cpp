@@ -32,6 +32,7 @@
 #include "pch.h"
 
 #include "../HomeProductOrchestrator.hpp"
+#include "../ModeThresholds.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
 #include "SafeBrowsingAPI.hpp"
@@ -79,6 +80,9 @@ struct WebProtectionRegistrar final {
     WebProtectionRegistrar() noexcept {
         using ::ShadowStrike::Products::Home::ModuleDescriptor;
         using ::ShadowStrike::Products::Home::ModulePhase;
+        using ::ShadowStrike::Products::Home::ProtectionMode;
+        using ::ShadowStrike::Products::Home::ProtectionModeMask;
+        using ::ShadowStrike::Products::Home::ApplyModeThresholds;
         using namespace ::ShadowStrike::WebBrowser;
 
         // ------------------------------------------------------------------
@@ -119,7 +123,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"SafeBrowsingAPI::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("SafeBrowsingAPI", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -155,7 +167,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"PhishingDetector::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("PhishingDetector", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -191,7 +211,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"AdBlocker::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("AdBlocker", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -227,7 +255,23 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"TrackerBlocker::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                BlockerMode bm = BlockerMode::Standard;
+                switch (mode) {
+                    case ProtectionMode::Passive:    bm = BlockerMode::Monitor;  break;
+                    case ProtectionMode::Balanced:   bm = BlockerMode::Standard; break;
+                    case ProtectionMode::Aggressive: bm = BlockerMode::Strict;   break;
+                    default: break;
+                }
+                TrackerBlocker::Instance().SetMode(bm);
+                return ApplyModeThresholds("TrackerBlocker", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -286,7 +330,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"BrowserProtection::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("BrowserProtection", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -346,7 +398,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"MaliciousDownloadBlocker::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("MaliciousDownloadBlocker", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -382,7 +442,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"ChromeExtensionScanner::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("ChromeExtensionScanner", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
 
         // ------------------------------------------------------------------
@@ -418,7 +486,15 @@ struct WebProtectionRegistrar final {
                     SS_LOG_ERROR(kCat,
                         L"FirefoxAddonScanner::Shutdown threw unknown exception");
                 }
-            }
+            },
+            .setMode = [](ProtectionMode mode) -> bool {
+                return ApplyModeThresholds("FirefoxAddonScanner", mode);
+            },
+            .supportedModesMask =
+                ProtectionModeMask(ProtectionMode::Off)        |
+                ProtectionModeMask(ProtectionMode::Passive)    |
+                ProtectionModeMask(ProtectionMode::Balanced)   |
+                ProtectionModeMask(ProtectionMode::Aggressive)
         });
     }
 };

@@ -38,6 +38,7 @@
 
 #include "../HomeProductOrchestrator.hpp"
 #include "EmailProtection.hpp"
+#include "../ModeThresholds.hpp"
 
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -52,6 +53,9 @@ struct EmailProtectionRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Email::EmailProtection;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "EmailProtection",
@@ -98,7 +102,17 @@ struct EmailProtectionRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"EmailProtection: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("EmailProtection", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.

@@ -39,6 +39,7 @@
 #include "PerformanceOptimizer.hpp"
 
 #include "../HomeProductOrchestrator.hpp"
+#include "../ModeThresholds.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
@@ -51,6 +52,8 @@ struct GameModeWiringRegistrar final {
             using ::ShadowStrike::Products::Home::HomeProductOrchestrator;
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
 
             // ----------------------------------------------------------------
             // GameProcessDetector - game/launcher/VR process and fullscreen
@@ -99,7 +102,23 @@ struct GameModeWiringRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"GameProcessDetector::Shutdown threw unknown exception");
                     }
-                }
+                },
+
+                // GameProcessDetector monitors for active game processes; it is an
+                // on/off module with no detection-intensity concept.
+                .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Passive || mode == ProtectionMode::Aggressive) {
+                        SS_LOG_INFO(kLogCategory,
+                            L"GameProcessDetector: ProtectionMode::%hs is not supported "
+                            L"(GameMode modules are on/off only); treating as Balanced",
+                            std::string(HomeProductOrchestrator::ToString(mode)).c_str());
+                    }
+                    return true;
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)     |
+                    ProtectionModeMask(ProtectionMode::Balanced)
             });
 
             // ----------------------------------------------------------------
@@ -155,7 +174,23 @@ struct GameModeWiringRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"PerformanceOptimizer shutdown threw unknown exception");
                     }
-                }
+                },
+
+                // PerformanceOptimizer adjusts process priorities while a game is
+                // active; it is an on/off module with no detection-intensity concept.
+                .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Passive || mode == ProtectionMode::Aggressive) {
+                        SS_LOG_INFO(kLogCategory,
+                            L"PerformanceOptimizer: ProtectionMode::%hs is not supported "
+                            L"(GameMode modules are on/off only); treating as Balanced",
+                            std::string(HomeProductOrchestrator::ToString(mode)).c_str());
+                    }
+                    return true;
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)     |
+                    ProtectionModeMask(ProtectionMode::Balanced)
             });
 
             // ----------------------------------------------------------------
@@ -206,7 +241,23 @@ struct GameModeWiringRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"OverlayProtection::Shutdown threw unknown exception");
                     }
-                }
+                },
+
+                // OverlayProtection secures game overlay windows; it is an on/off
+                // module with no detection-intensity concept.
+                .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Passive || mode == ProtectionMode::Aggressive) {
+                        SS_LOG_INFO(kLogCategory,
+                            L"OverlayProtection: ProtectionMode::%hs is not supported "
+                            L"(GameMode modules are on/off only); treating as Balanced",
+                            std::string(HomeProductOrchestrator::ToString(mode)).c_str());
+                    }
+                    return true;
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)     |
+                    ProtectionModeMask(ProtectionMode::Balanced)
             });
 
             // ----------------------------------------------------------------
@@ -256,7 +307,23 @@ struct GameModeWiringRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"GameModeManager::Shutdown threw unknown exception");
                     }
-                }
+                },
+
+                // GameModeManager orchestrates the GameMode facade; it is an on/off
+                // module with no detection-intensity concept.
+                .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Passive || mode == ProtectionMode::Aggressive) {
+                        SS_LOG_INFO(kLogCategory,
+                            L"GameModeManager: ProtectionMode::%hs is not supported "
+                            L"(GameMode modules are on/off only); treating as Balanced",
+                            std::string(HomeProductOrchestrator::ToString(mode)).c_str());
+                    }
+                    return true;
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)     |
+                    ProtectionModeMask(ProtectionMode::Balanced)
             });
 
         } catch (...) {

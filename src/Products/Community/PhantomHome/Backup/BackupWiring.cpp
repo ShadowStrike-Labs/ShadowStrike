@@ -49,6 +49,7 @@
 
 #include "../HomeProductOrchestrator.hpp"
 #include "BackupManager.hpp"
+#include "../ModeThresholds.hpp"
 
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -91,6 +92,9 @@ struct BackupWiringRegistrar final {
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Backup::BackupManager;
             using ::ShadowStrike::Backup::BackupConfiguration;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "BackupManager",
@@ -158,7 +162,27 @@ struct BackupWiringRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"BackupManager: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                // BackupManager is a binary (on/off) module. It has no detection
+                // thresholds, sensitivity knobs, or blocking concept. Passive and
+                // Aggressive are therefore not meaningful; they fall back to Balanced
+                // operation with a one-time informational log.
+                .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Passive || mode == ProtectionMode::Aggressive) {
+                        SS_LOG_INFO(kLogCategory,
+                            L"BackupManager: ProtectionMode::%hs is not supported "
+                            L"(Backup is an on/off module with no intensity concept); "
+                            L"operating in Balanced mode",
+                            std::string(HomeProductOrchestrator::ToString(mode)).c_str());
+                    }
+                    // Backup is already running in its sole operational state.
+                    return true;
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)     |
+                    ProtectionModeMask(ProtectionMode::Balanced)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.

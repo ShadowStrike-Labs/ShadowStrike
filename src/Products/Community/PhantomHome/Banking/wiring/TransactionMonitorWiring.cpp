@@ -33,6 +33,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../TransactionMonitor.hpp"
+#include "../../ModeThresholds.hpp"
 
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -47,6 +48,9 @@ struct TransactionMonitorRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Banking::TransactionMonitor;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "TransactionMonitor",
@@ -101,7 +105,17 @@ struct TransactionMonitorRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"TransactionMonitor: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("TransactionMonitor", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.

@@ -34,6 +34,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../BankingTrojanDetector.hpp"
+#include "../../ModeThresholds.hpp"
 
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -48,6 +49,9 @@ struct BankingTrojanDetectorRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Banking::BankingTrojanDetector;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "BankingTrojanDetector",
@@ -102,7 +106,17 @@ struct BankingTrojanDetectorRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"BankingTrojanDetector: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("BankingTrojanDetector", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.

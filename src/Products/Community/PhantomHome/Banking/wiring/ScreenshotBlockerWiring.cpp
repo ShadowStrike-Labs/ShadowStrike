@@ -32,6 +32,7 @@
 
 #include "../../HomeProductOrchestrator.hpp"
 #include "../ScreenshotBlocker.hpp"
+#include "../../ModeThresholds.hpp"
 
 #include "../../../../../PhantomCore/Utils/Logger.hpp"
 
@@ -46,6 +47,9 @@ struct ScreenshotBlockerRegistrar final {
             using ::ShadowStrike::Products::Home::ModuleDescriptor;
             using ::ShadowStrike::Products::Home::ModulePhase;
             using ::ShadowStrike::Banking::ScreenshotBlocker;
+            using ::ShadowStrike::Products::Home::ProtectionMode;
+            using ::ShadowStrike::Products::Home::ProtectionModeMask;
+            using ::ShadowStrike::Products::Home::ApplyModeThresholds;
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "ScreenshotBlocker",
@@ -100,7 +104,17 @@ struct ScreenshotBlockerRegistrar final {
                         SS_LOG_ERROR(kLogCategory,
                             L"ScreenshotBlocker: Shutdown() threw unknown exception");
                     }
-                }
+                },
+
+                .setMode = [](ProtectionMode mode) -> bool {
+                    return ApplyModeThresholds("ScreenshotBlocker", mode);
+                },
+
+                .supportedModesMask =
+                    ProtectionModeMask(ProtectionMode::Off)        |
+                    ProtectionModeMask(ProtectionMode::Passive)    |
+                    ProtectionModeMask(ProtectionMode::Balanced)   |
+                    ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
             // Static-init-time: logger may not be available. Swallow silently.
