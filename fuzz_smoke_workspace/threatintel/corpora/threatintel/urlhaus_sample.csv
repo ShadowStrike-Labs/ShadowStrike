@@ -1,0 +1,4 @@
+# URLhaus Online
+"id","dateadded","url","url_status","threat","tags"
+"1","2024-01-01","http://malware.example.com/payload.exe","online","malware_distribution","elf"
+"2","2024-01-01","http://evil.test/dropper.dll","offline","malware_distribution","dll"

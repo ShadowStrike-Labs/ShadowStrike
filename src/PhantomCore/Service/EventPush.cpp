@@ -206,4 +206,32 @@ BuildScanProgressEvent(std::uint64_t scanId,
     return SerializeEnvelope(CommandType::ScanProgressEvent, payload);
 }
 
+std::vector<std::uint8_t>
+BuildPgtiFeedUpdated(std::string_view feedId, std::string_view health)
+{
+    if (feedId.empty()) {
+        SS_LOG_WARN(kLog, L"BuildPgtiFeedUpdated called with empty feedId.");
+    }
+    if (health.empty()) {
+        SS_LOG_WARN(kLog, L"BuildPgtiFeedUpdated called with empty health.");
+    }
+
+    nlohmann::json payload = {
+        { "feedId",  std::string(feedId) },
+        { "health",  std::string(health) }
+    };
+
+    return SerializeEnvelope(CommandType::PgtiFeedUpdated, payload);
+}
+
+std::vector<std::uint8_t>
+BuildRecommendationsChanged(std::uint32_t activeCount)
+{
+    nlohmann::json payload = {
+        { "activeCount", activeCount }
+    };
+
+    return SerializeEnvelope(CommandType::RecommendationsChanged, payload);
+}
+
 } // namespace ShadowStrike::Service::Events

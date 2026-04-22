@@ -1,0 +1,12 @@
+<RCC>
+  <qresource prefix="/i18n">
+    <file>phantomhome_en_US.qm</file>
+    <file>phantomhome_de_DE.qm</file>
+    <file>phantomhome_tr_TR.qm</file>
+    <file>phantomhome_ja_JP.qm</file>
+    <file>phantomhome_es_ES.qm</file>
+    <file>phantomhome_fr_FR.qm</file>
+    <file>phantomhome_pt_BR.qm</file>
+    <file>phantomhome_ru_RU.qm</file>
+  </qresource>
+</RCC>

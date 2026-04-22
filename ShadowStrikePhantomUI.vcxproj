@@ -118,6 +118,10 @@
     </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Accessibility\HighContrastContext.cpp" />
+    <!-- RCC generated output for assets.qrc -->
+    <ClCompile Include="$(IntDir)qrc_assets.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\I18n\Translator.cpp" />
     <!-- MOC outputs are generated into $(IntDir) and included via CustomBuild. -->
     <ClCompile Include="$(IntDir)moc_ProtectionViewModel.cpp">
@@ -208,6 +212,11 @@
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\SettingsPage.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\pages\detail\GenericModuleDetailPage.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.svg" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.png" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Pages\PerformancePage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Pages\PrivacyPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Pages\ZeroTrustDetailPage.qml" />
+    <None Include="src\Products\Community\PhantomHome\UI\Client\assets.qrc" />
     <!-- Accessibility QML module -->
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Accessibility\FocusRing.qml" />
     <None Include="src\Products\Community\PhantomHome\UI\Client\qml\Accessibility\HighContrast.qml" />
@@ -286,6 +295,12 @@
        RCC: embed compiled translation resources into the binary
        ==================================================================== -->
   <ItemGroup>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\assets.qrc">
+      <Message>RCC assets.qrc</Message>
+      <Command>"$(QtBin)\rcc.exe" --name assets --output "$(IntDir)qrc_assets.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)qrc_assets.cpp</Outputs>
+      <AdditionalInputs>src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.png</AdditionalInputs>
+    </CustomBuild>
     <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\translations.qrc">
       <Message>RCC translations.qrc</Message>
       <Command>if not exist "$(IntDir)translations" mkdir "$(IntDir)translations"

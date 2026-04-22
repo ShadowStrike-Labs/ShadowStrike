@@ -1,0 +1,1 @@
+{"type":"bundle","id":"bundle--1","objects":[{"type":"indicator","id":"indicator--1","pattern":"[ipv4-addr:value = '10.0.0.1']","valid_from":"2024-01-01","labels":["malicious-activity"]},{"type":"indicator","id":"indicator--2","pattern":"[domain-name:value = 'evil.test']","valid_from":"2024-01-01","labels":["anomalous-activity"]}]}

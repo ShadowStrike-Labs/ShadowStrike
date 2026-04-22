@@ -1,0 +1,18 @@
+{
+  "target": "scan-engine",
+  "timestamp": "2026-04-17T07:27:53Z",
+  "statistics": {
+    "totalIterations": 1,
+    "crashesFound": 0,
+    "uniqueCrashes": 0,
+    "corpusSize": 4,
+    "corpusAdditions": 0,
+    "totalBytesProcessed": 3,
+    "parseSuccesses": 1,
+    "parseFailures": 0,
+    "iterationsPerSecond": 333.33,
+    "durationMs": 3
+  },
+  "crashes": [
+  ]
+}

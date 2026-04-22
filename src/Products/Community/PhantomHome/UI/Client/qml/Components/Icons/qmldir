@@ -1,0 +1,13 @@
+module ShadowStrike.Components.Icons
+ShieldIcon 1.0 ShieldIcon.qml
+LockIcon 1.0 LockIcon.qml
+GaugeIcon 1.0 GaugeIcon.qml
+EyeIcon 1.0 EyeIcon.qml
+GearIcon 1.0 GearIcon.qml
+BackIcon 1.0 BackIcon.qml
+CloseIcon 1.0 CloseIcon.qml
+RefreshIcon 1.0 RefreshIcon.qml
+SearchIcon 1.0 SearchIcon.qml
+CheckIcon 1.0 CheckIcon.qml
+AlertIcon 1.0 AlertIcon.qml
+InfoIcon 1.0 InfoIcon.qml

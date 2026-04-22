@@ -107,4 +107,31 @@ BuildScanProgressEvent(std::uint64_t scanId,
                        std::uint64_t itemsScanned,
                        std::uint64_t threatsFound);
 
+/**
+ * @brief Serialise a PgtiFeedUpdated push-event envelope.
+ *
+ * JSON payload: { "feedId": "<feedId>", "health": "<health>" }
+ * CommandType:  PgtiFeedUpdated (106)
+ * requestId:    0
+ *
+ * @param feedId   Canonical PGTI feed identifier (e.g. "malware_ip").
+ * @param health   Health state string: "healthy" | "degraded" | "failed" | "disabled".
+ * @return Serialised wire buffer, or empty on internal failure.
+ */
+[[nodiscard]] std::vector<std::uint8_t>
+BuildPgtiFeedUpdated(std::string_view feedId, std::string_view health);
+
+/**
+ * @brief Serialise a RecommendationsChanged push-event envelope.
+ *
+ * JSON payload: { "activeCount": <uint32> }
+ * CommandType:  RecommendationsChanged (107)
+ * requestId:    0
+ *
+ * @param activeCount  Number of currently active (non-dismissed) recommendations.
+ * @return Serialised wire buffer, or empty on internal failure.
+ */
+[[nodiscard]] std::vector<std::uint8_t>
+BuildRecommendationsChanged(std::uint32_t activeCount);
+
 } // namespace ShadowStrike::Service::Events
