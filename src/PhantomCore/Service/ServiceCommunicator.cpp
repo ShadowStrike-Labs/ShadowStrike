@@ -52,6 +52,7 @@
 #include <atomic>
 #include <future>
 #include <algorithm>
+#include <unordered_map>
 
 // Windows SDK
 #include <sddl.h>
@@ -180,6 +181,9 @@ public:
 
     void RegisterHandler(CommandType type, CommandHandler handler);
     size_t Broadcast(CommandType type, const std::vector<uint8_t>& payload);
+    size_t BroadcastEvent(CommandType eventType, const std::vector<uint8_t>& serializedEnvelope);
+    void MarkClientAuthenticatedById(uint64_t clientId);
+    void RevokeClientAuthenticationById(uint64_t clientId);
 
     CommunicatorStats GetStats() const;
     void ResetStats();
@@ -225,9 +229,39 @@ private:
     std::map<CommandType, CommandHandler> m_handlers;
 
     // Clients
+    struct TokenBucket {
+        std::chrono::steady_clock::time_point lastRefill{ std::chrono::steady_clock::now() };
+        double tokens{ 20.0 }; // Start full.
+
+        static constexpr double kRate     = 20.0; // events / second
+        static constexpr double kCapacity = 20.0; // burst cap
+
+        // Returns true if a token was consumed (event allowed).
+        [[nodiscard]] bool TryConsume() noexcept {
+            const auto   now = std::chrono::steady_clock::now();
+            const double dt  = std::chrono::duration<double>(now - lastRefill).count();
+            tokens    = std::min(kCapacity, tokens + dt * kRate);
+            lastRefill = now;
+            if (tokens >= 1.0) { tokens -= 1.0; return true; }
+            return false;
+        }
+    };
+
     struct ActiveClient {
-        ScopedHandle pipe;
-        uint64_t id;
+        ScopedHandle         pipe;
+        uint64_t             id{ 0 };
+        std::atomic<bool>    authenticated{ false };
+        // Per-event-type token buckets; keyed by CommandType raw uint32.
+        // Protected by bucketMutex (separate from m_clientsMutex).
+        std::mutex                              bucketMutex;
+        std::unordered_map<uint32_t, TokenBucket> rateBuckets;
+
+        // Non-copyable, non-movable (atomic + mutex members).
+        ActiveClient() = default;
+        ActiveClient(const ActiveClient&) = delete;
+        ActiveClient& operator=(const ActiveClient&) = delete;
+        ActiveClient(ActiveClient&&) = delete;
+        ActiveClient& operator=(ActiveClient&&) = delete;
     };
     std::vector<std::shared_ptr<ActiveClient>> m_activeClients;
     std::mutex m_clientsMutex; // Protects m_activeClients
@@ -493,6 +527,31 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                     m_stats.messagesReceived++;
 
                     if (ProcessMessage(cmd, payload, response)) {
+                        // If this was an AuthHandshake and the response indicates success,
+                        // mark the client as authenticated for BroadcastEvent delivery.
+                        if (cmd == CommandType::AuthHandshake && !response.empty()) {
+                            // The handler encodes the response as JSON; check for "ok":true.
+                            // We parse here without nlohmann (service tier) using a simple search.
+                            // A proper JSON parse would require pulling in nlohmann — acceptable
+                            // since it is already a project dependency.
+                            bool authOk = false;
+                            try {
+                                // response is raw JSON bytes from the handler.
+                                const std::string respStr(response.begin(), response.end());
+                                if (respStr.find("\"ok\":true") != std::string::npos ||
+                                    respStr.find("\"ok\": true") != std::string::npos) {
+                                    authOk = true;
+                                }
+                            } catch (...) {}
+                            if (authOk) {
+                                MarkClientAuthenticatedById(client->clientId);
+                            } else {
+                                m_stats.authFailures++;
+                                SS_LOG_WARN(L"IPC",
+                                    L"AuthHandshake for client %llu returned ok=false.",
+                                    client->clientId);
+                            }
+                        }
                         // Send response
                         // Construct response header
                         WireHeader respHeader;
@@ -526,7 +585,7 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
 
 disconnect:
     CloseHandle(hEvent);
-    // Remove from active clients
+    // Remove from active clients; auth is revoked implicitly by removal.
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
         m_activeClients.erase(
@@ -536,7 +595,7 @@ disconnect:
         );
     }
     m_stats.activeConnections--;
-    SS_LOG_INFO(L"IPC", L"Client disconnected.");
+    SS_LOG_INFO(L"IPC", L"Client %llu disconnected.", client->clientId);
 }
 
 bool ServiceCommunicatorImpl::ProcessMessage(CommandType cmd, const std::vector<uint8_t>& data, std::vector<uint8_t>& response) {
@@ -593,6 +652,79 @@ size_t ServiceCommunicatorImpl::Broadcast(CommandType type, const std::vector<ui
         }
     }
     return count;
+}
+
+size_t ServiceCommunicatorImpl::BroadcastEvent(CommandType                       eventType,
+                                               const std::vector<uint8_t>&       serializedEnvelope)
+{
+    if (serializedEnvelope.empty()) {
+        SS_LOG_WARN(L"IPC", L"BroadcastEvent called with empty serializedEnvelope for type %u",
+                    static_cast<uint32_t>(eventType));
+        return 0;
+    }
+
+    const uint32_t typeKey = static_cast<uint32_t>(eventType);
+    size_t count = 0;
+
+    std::lock_guard<std::mutex> lk(m_clientsMutex);
+    for (auto& client : m_activeClients) {
+        // Auth filter — skip unauthenticated clients.
+        if (!client->authenticated.load(std::memory_order_acquire)) {
+            continue;
+        }
+
+        // Per-client per-event-type token-bucket rate limit (20 events/sec).
+        {
+            std::lock_guard<std::mutex> bl(client->bucketMutex);
+            auto& bucket = client->rateBuckets[typeKey];
+            if (!bucket.TryConsume()) {
+                m_stats.droppedPackets++;
+                SS_LOG_WARN(L"IPC",
+                    L"BroadcastEvent rate-limited client %llu for event type %u",
+                    client->id, typeKey);
+                continue;
+            }
+        }
+
+        DWORD written = 0;
+        if (WriteFile(client->pipe,
+                      serializedEnvelope.data(),
+                      static_cast<DWORD>(serializedEnvelope.size()),
+                      &written, nullptr)) {
+            count++;
+            m_stats.messagesSent++;
+            m_stats.bytesSent += written;
+        } else {
+            SS_LOG_WARN(L"IPC",
+                L"BroadcastEvent WriteFile failed for client %llu: %lu",
+                client->id, GetLastError());
+        }
+    }
+    return count;
+}
+
+void ServiceCommunicatorImpl::MarkClientAuthenticatedById(uint64_t clientId)
+{
+    std::lock_guard<std::mutex> lk(m_clientsMutex);
+    for (auto& client : m_activeClients) {
+        if (client->id == clientId) {
+            client->authenticated.store(true, std::memory_order_release);
+            SS_LOG_INFO(L"IPC", L"Client %llu marked as authenticated.", clientId);
+            return;
+        }
+    }
+    SS_LOG_WARN(L"IPC", L"MarkClientAuthenticatedById: client %llu not found.", clientId);
+}
+
+void ServiceCommunicatorImpl::RevokeClientAuthenticationById(uint64_t clientId)
+{
+    std::lock_guard<std::mutex> lk(m_clientsMutex);
+    for (auto& client : m_activeClients) {
+        if (client->id == clientId) {
+            client->authenticated.store(false, std::memory_order_release);
+            return;
+        }
+    }
 }
 
 void ServiceCommunicatorImpl::CleanupDisconnectedClients() {
@@ -663,6 +795,19 @@ size_t ServiceCommunicator::Broadcast(CommandType type, const std::string& paylo
 
 size_t ServiceCommunicator::Broadcast(CommandType type, const std::vector<uint8_t>& payload) {
     return m_impl->Broadcast(type, payload);
+}
+
+size_t ServiceCommunicator::BroadcastEvent(CommandType                      eventType,
+                                            const std::vector<std::uint8_t>& serializedEnvelope) {
+    return m_impl->BroadcastEvent(eventType, serializedEnvelope);
+}
+
+void ServiceCommunicator::MarkClientAuthenticated(std::uint64_t clientId) {
+    m_impl->MarkClientAuthenticatedById(clientId);
+}
+
+void ServiceCommunicator::RevokeClientAuthentication(std::uint64_t clientId) {
+    m_impl->RevokeClientAuthenticationById(clientId);
 }
 
 CommunicatorStats ServiceCommunicator::GetStats() const {

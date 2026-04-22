@@ -110,7 +110,9 @@
   <ItemGroup>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\main.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ProtectionViewModel.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\IPC\Messages.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -126,6 +128,9 @@
     </ClCompile>
     <ClCompile Include="$(IntDir)moc_HighContrastContext.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_HighContrastContext.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)moc_PipeClient.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_PipeClient.cpp')">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="$(IntDir)qrc_qml.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)qrc_qml.cpp')">true</ExcludedFromBuild>
@@ -162,6 +167,11 @@
       <Message>MOC HighContrastContext.hpp</Message>
       <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_HighContrastContext.cpp" "%(FullPath)"</Command>
       <Outputs>$(IntDir)moc_HighContrastContext.cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp">
+      <Message>MOC PipeClient.hpp</Message>
+      <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_PipeClient.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)moc_PipeClient.cpp</Outputs>
     </CustomBuild>
   </ItemGroup>
 
