@@ -1,0 +1,18 @@
+{
+  "target": "threatintel",
+  "timestamp": "2026-04-20T17:32:41Z",
+  "statistics": {
+    "totalIterations": 50000,
+    "crashesFound": 0,
+    "uniqueCrashes": 0,
+    "corpusSize": 1,
+    "corpusAdditions": 0,
+    "totalBytesProcessed": 11482009,
+    "parseSuccesses": 234,
+    "parseFailures": 49766,
+    "iterationsPerSecond": 7273.79,
+    "durationMs": 6874
+  },
+  "crashes": [
+  ]
+}

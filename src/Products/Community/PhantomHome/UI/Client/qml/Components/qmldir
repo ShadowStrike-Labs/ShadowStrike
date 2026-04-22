@@ -1,0 +1,23 @@
+module ShadowStrike.Components
+StatusChip 1.0 StatusChip.qml
+ToggleSwitch 1.0 ToggleSwitch.qml
+PrimaryButton 1.0 PrimaryButton.qml
+GhostButton 1.0 GhostButton.qml
+IconButton 1.0 IconButton.qml
+Card 1.0 Card.qml
+SectionTitle 1.0 SectionTitle.qml
+ModuleCard 1.0 ModuleCard.qml
+ModePillRow 1.0 ModePillRow.qml
+HeroShield 1.0 HeroShield.qml
+HeadlineTicker 1.0 HeadlineTicker.qml
+RecommendationCard 1.0 RecommendationCard.qml
+ThreatRow 1.0 ThreatRow.qml
+FastScanTile 1.0 FastScanTile.qml
+PGTIFeedRow 1.0 PGTIFeedRow.qml
+SidebarItem 1.0 SidebarItem.qml
+Sidebar 1.0 Sidebar.qml
+TopBar 1.0 TopBar.qml
+TrustSlider 1.0 TrustSlider.qml
+SearchBar 1.0 SearchBar.qml
+PageHost 1.0 PageHost.qml
+EmptyState 1.0 EmptyState.qml

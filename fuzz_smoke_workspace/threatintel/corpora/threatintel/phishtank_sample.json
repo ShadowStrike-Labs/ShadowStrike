@@ -1,0 +1,1 @@
+[{"phish_id":1,"url":"http://phish.example.com/login","verified":"yes","target":"PayPal","verification_time":"2024-01-01"},{"phish_id":2,"url":"http://fake.test/signin","verified":"yes","target":"Google","verification_time":"2024-01-02"}]

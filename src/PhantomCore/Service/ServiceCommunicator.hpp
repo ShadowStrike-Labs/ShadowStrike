@@ -140,6 +140,8 @@ enum class CommandType : uint32_t {
     ScanProgressEvent       = 103,  ///< Async scan progress update
     HeadlineStateChanged    = 104,  ///< Headline protection indicator changed
     AuthFailed              = 105,  ///< Service rejected a client auth attempt
+    PgtiFeedUpdated         = 106,  ///< PGTI feed health or status changed
+    RecommendationsChanged  = 107,  ///< Active recommendation set changed
 
     // ── Extended UI command set (v2 protocol) ──────────────────────────────
     AuthHandshake           = 199,  ///< Client presents session auth token

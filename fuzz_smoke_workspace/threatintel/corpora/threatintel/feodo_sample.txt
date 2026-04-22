@@ -1,0 +1,7 @@
+# Feodo Tracker Recommended Blocklist
+# Updated: 2024-01-01
+192.168.1.1
+10.0.0.1
+172.16.0.1
+8.8.8.8
+1.2.3.4

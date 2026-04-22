@@ -1,0 +1,15 @@
+<RCC>
+    <!--
+        assets.qrc — ShadowStrike PhantomHome UI brand asset bundle.
+        Registers the product logo for use in QML via:
+            source: "qrc:/qml/assets/logo.png"
+
+        NOTE (packaging): tray_logo.png is the source for the tray .ico.
+        A proper multi-resolution .ico must be generated from logo.png by the
+        packaging pipeline (e.g. ImageMagick: convert logo.png -define icon:auto-resize
+        tray_logo.ico) and then embedded via the tray's .rc file.
+    -->
+    <qresource prefix="/qml/assets">
+        <file alias="logo.png">qml/assets/logo.png</file>
+    </qresource>
+</RCC>

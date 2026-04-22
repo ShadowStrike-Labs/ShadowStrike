@@ -1,0 +1,18 @@
+{
+  "target": "behavior",
+  "timestamp": "2026-04-17T05:55:53Z",
+  "statistics": {
+    "totalIterations": 8,
+    "crashesFound": 0,
+    "uniqueCrashes": 0,
+    "corpusSize": 5,
+    "corpusAdditions": 0,
+    "totalBytesProcessed": 278,
+    "parseSuccesses": 8,
+    "parseFailures": 0,
+    "iterationsPerSecond": 2000.00,
+    "durationMs": 4
+  },
+  "crashes": [
+  ]
+}

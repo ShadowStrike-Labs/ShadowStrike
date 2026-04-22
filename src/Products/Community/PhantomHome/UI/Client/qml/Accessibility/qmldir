@@ -1,0 +1,3 @@
+module ShadowStrike.Accessibility
+FocusRing 1.0 FocusRing.qml
+singleton HighContrast 1.0 HighContrast.qml

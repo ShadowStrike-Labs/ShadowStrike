@@ -446,6 +446,19 @@
     <ClCompile Include="src\PhantomCore\Performance\dev\PerformanceProfiler.cpp" />
     <ClCompile Include="src\PhantomCore\RealTime\RealTimeProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Update\LocalFolderTransport.cpp" />
+    <!-- PhantomHome new service-layer components (module-catalog, pgti-feed-manager, recommendations-engine, headline-state-service) -->
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Shared\ModuleCatalog.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\ThreatIntel\PgtiFeedManager.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\Recommendations\RecommendationsEngine.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\HeadlineState\HeadlineStateService.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
 
   <!-- PhantomEmulator static analysis engine (134 files) -->
@@ -883,6 +896,13 @@
     <ClInclude Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustGuard.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\ZeroTrustGuard\ZeroTrustPromptQueue.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\ZeroTrustGuard\wiring\ZeroTrustWiring.hpp" />
+  </ItemGroup>
+  <!-- PhantomHome new service-layer component headers -->
+  <ItemGroup>
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Shared\ModuleCatalog.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\ThreatIntel\PgtiFeedManager.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Recommendations\RecommendationsEngine.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\HeadlineState\HeadlineStateService.hpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

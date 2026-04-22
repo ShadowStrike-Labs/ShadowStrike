@@ -1,0 +1,18 @@
+{
+  "target": "ransomware-analysis",
+  "timestamp": "2026-04-18T18:11:09Z",
+  "statistics": {
+    "totalIterations": 100,
+    "crashesFound": 0,
+    "uniqueCrashes": 0,
+    "corpusSize": 8,
+    "corpusAdditions": 0,
+    "totalBytesProcessed": 725337,
+    "parseSuccesses": 100,
+    "parseFailures": 0,
+    "iterationsPerSecond": 20000.00,
+    "durationMs": 5
+  },
+  "crashes": [
+  ]
+}
