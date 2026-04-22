@@ -133,7 +133,61 @@ enum class CommandType : uint32_t {
     UpdateSignatures    = 40,   ///< Trigger update
     QuarantineAction    = 50,   ///< Restore/Delete quarantined items
     ThreatAlert         = 100,  ///< Server->Client: Threat detected
-    LogMessage          = 101   ///< Server->Client: Log stream
+    LogMessage          = 101,  ///< Server->Client: Log stream
+
+    // ── Server -> Client push events (v2 protocol) ─────────────────────────
+    ProtectionStateChanged  = 102,  ///< Real-time protection state flipped
+    ScanProgressEvent       = 103,  ///< Async scan progress update
+    HeadlineStateChanged    = 104,  ///< Headline protection indicator changed
+    AuthFailed              = 105,  ///< Service rejected a client auth attempt
+
+    // ── Extended UI command set (v2 protocol) ──────────────────────────────
+    AuthHandshake           = 199,  ///< Client presents session auth token
+
+    // Module management
+    ListModules             = 200,  ///< Enumerate available protection modules
+    SetModuleEnabled        = 201,  ///< Enable / disable a named module
+    SetModuleMode           = 202,  ///< Change a module's operating mode
+    GetModuleConfig         = 203,  ///< Retrieve module configuration blob
+    SetModuleConfig         = 204,  ///< Update module configuration blob
+
+    // Protection control
+    PauseProtection         = 210,  ///< Temporarily suspend real-time protection
+    ResumeProtection        = 211,  ///< Resume real-time protection
+
+    // Scan control — new high-range codes distinct from legacy StartScan=20/StopScan=21
+    // NOTE: StartScan=20 and StopScan=21 remain the canonical scan verbs for
+    // the existing wire protocol; these codes expose scan control via the v2
+    // UI channel and intentionally use different integer values.
+    // Because C++ enum member names must be unique within their enum, the names
+    // StartScan and StopScan already occupy values 20 and 21 above; therefore
+    // the v2 integer codes 220/221 are reachable only via static_cast<uint32_t>
+    // or by the dispatcher numeric routing table — not as named enum members.
+    GetScanProgress         = 222,  ///< Poll in-progress scan completion %
+
+    // Quarantine — see also QuarantineAction=50 (legacy restore/delete verb)
+    ListQuarantine          = 230,  ///< List all quarantined items
+
+    // Reporting
+    GetReports              = 240,  ///< Retrieve historical detection reports
+    GetDashboard            = 250,  ///< Dashboard summary (threats, scans, modules)
+
+    // Event subscription
+    SubscribeEvents         = 260,  ///< Register for real-time push events
+
+    // PGTI feed management
+    ListPGTIFeeds           = 270,  ///< Enumerate configured threat-intel feeds
+    SetPGTIFeedEnabled      = 271,  ///< Enable / disable a specific feed
+    RefreshPGTIFeeds        = 272,  ///< Force-refresh all enabled feeds
+
+    // Zero-Trust
+    GetZeroTrustState       = 280,  ///< Query current Zero-Trust posture
+    SetZeroTrustConfig      = 281,  ///< Update Zero-Trust policy
+    AnswerZeroTrustPrompt   = 282,  ///< User response to a Zero-Trust prompt
+
+    // Recommendations
+    GetRecommendations      = 290,  ///< List pending security recommendations
+    DismissRecommendation   = 291,  ///< Dismiss a specific recommendation
 };
 
 /**
