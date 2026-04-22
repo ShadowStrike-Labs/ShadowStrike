@@ -797,6 +797,11 @@ void PipeServer::WorkerLoop(std::shared_ptr<ClientContext> ctx) {
             }
             if (handler_copy) {
                 try {
+                    ShadowStrike::Utils::Logger::Info(
+                        "PipeServer: dispatch pid={} type={} corr={}",
+                        ctx->ClientProcessId(),
+                        static_cast<int>(env->type),
+                        env->correlation_id);
                     handler_copy(*ctx, *env, reply_type, reply_payload);
                 } catch (const std::exception& e) {
                     reply_type    = MessageType::Error;
@@ -816,8 +821,17 @@ void PipeServer::WorkerLoop(std::shared_ptr<ClientContext> ctx) {
             reply.correlation_id = env->correlation_id;
             reply.payload        = std::move(reply_payload);
             const auto b = EncodeEnvelopeCbor(reply);
+            ShadowStrike::Utils::Logger::Info(
+                "PipeServer: reply pid={} corr={} replyType={} bytes={}",
+                ctx->ClientProcessId(),
+                env->correlation_id,
+                static_cast<int>(reply_type),
+                static_cast<std::size_t>(b.size()));
             if (!WriteFrame(ctx->PipeHandle(), ctx->write_mutex_,
                             std::span<const std::uint8_t>(b))) {
+                ShadowStrike::Utils::Logger::Warn(
+                    "PipeServer: WriteFrame failed for pid={} corr={}; closing worker",
+                    ctx->ClientProcessId(), env->correlation_id);
                 break;
             }
         }

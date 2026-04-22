@@ -789,6 +789,9 @@ void IPCRouter::HandleGetModuleStatus(ClientContext&, const FrameEnvelope&,
     std::scoped_lock lk(mutex_);
     if (orch_) {
         auto statuses = orch_->GetStatus();
+        ShadowStrike::Utils::Logger::Info(
+            "IPCRouter: GetModuleStatus -> orchestrator returned {} module(s)",
+            static_cast<std::size_t>(statuses.size()));
         r.modules.reserve(statuses.size());
         for (const auto& ms : statuses) {
             ModuleStatusEntry e;
@@ -809,10 +812,16 @@ void IPCRouter::HandleGetModuleStatus(ClientContext&, const FrameEnvelope&,
             }
             r.modules.push_back(std::move(e));
         }
+    } else {
+        ShadowStrike::Utils::Logger::Warn(
+            "IPCRouter: GetModuleStatus -> orch_ is NULL; replying with empty list");
     }
 
     reply_type    = MessageType::GetModuleStatusReply;
     reply_payload = r.ToJson();
+    ShadowStrike::Utils::Logger::Info(
+        "IPCRouter: GetModuleStatus reply built; modules={}",
+        static_cast<std::size_t>(r.modules.size()));
 }
 
 // ============================================================================

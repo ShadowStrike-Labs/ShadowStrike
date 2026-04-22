@@ -122,6 +122,7 @@ private:
     Q_INVOKABLE void onConnectionChanged(bool connected);
 
     void wireClient();
+    void scheduleEmptyRetry(int attempt);
 
     std::shared_ptr<PipeClient> m_client;
 
