@@ -87,6 +87,40 @@
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <!--
+        Force-include every *Wiring.cpp keep-alive symbol so that MSVC
+        /GL + /LTCG + /OPT:REF cannot silently drop the TU that owns the
+        static registrar object.  With whole-program optimisation the linker
+        may inline the empty keep-alive body at every call site in
+        EnsureAllModulesWired() and subsequently elide the originating TU,
+        which would remove the .CRT$XCU entry and prevent the module from
+        registering.  /INCLUDE is evaluated before whole-program code-gen,
+        guaranteeing the TU (and its static initialiser) is retained.
+      -->
+      <ForceSymbolReferences>
+        PhantomHome_KeepAlive_Config;
+        PhantomHome_KeepAlive_EmailProtection;
+        PhantomHome_KeepAlive_USBProtection;
+        PhantomHome_KeepAlive_WebProtection;
+        PhantomHome_KeepAlive_IoT;
+        PhantomHome_KeepAlive_GameMode;
+        PhantomHome_KeepAlive_CryptoMiners;
+        PhantomHome_KeepAlive_BankingTrojanDetector;
+        PhantomHome_KeepAlive_CertificatePinning;
+        PhantomHome_KeepAlive_KeyloggerProtection;
+        PhantomHome_KeepAlive_ScreenshotBlocker;
+        PhantomHome_KeepAlive_SecureBrowser;
+        PhantomHome_KeepAlive_TransactionMonitor;
+        PhantomHome_KeepAlive_Backup;
+        PhantomHome_KeepAlive_CookieManager;
+        PhantomHome_KeepAlive_DataLeakProtection;
+        PhantomHome_KeepAlive_DNSLeakProtection;
+        PhantomHome_KeepAlive_IPLeakProtection;
+        PhantomHome_KeepAlive_LocationPrivacy;
+        PhantomHome_KeepAlive_MicrophoneGuard;
+        PhantomHome_KeepAlive_PrivacyCleaner;
+        PhantomHome_KeepAlive_WebcamProtector
+      </ForceSymbolReferences>
     </Link>
   </ItemDefinitionGroup>
 
