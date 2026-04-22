@@ -54,6 +54,10 @@
 #include <algorithm>
 #include <unordered_map>
 
+// Third-party
+// nlohmann/json is used for proper JSON parsing in the AuthHandshake handler.
+#include <nlohmann/json.hpp>
+
 // Windows SDK
 #include <sddl.h>
 #include <aclapi.h>
@@ -530,19 +534,26 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                         // If this was an AuthHandshake and the response indicates success,
                         // mark the client as authenticated for BroadcastEvent delivery.
                         if (cmd == CommandType::AuthHandshake && !response.empty()) {
-                            // The handler encodes the response as JSON; check for "ok":true.
-                            // We parse here without nlohmann (service tier) using a simple search.
-                            // A proper JSON parse would require pulling in nlohmann — acceptable
-                            // since it is already a project dependency.
+                            // Parse the response JSON properly to extract the root-level "ok"
+                            // boolean. String-search is unsafe — a malicious error message
+                            // or nested field could contain the substring and bypass auth.
                             bool authOk = false;
                             try {
-                                // response is raw JSON bytes from the handler.
-                                const std::string respStr(response.begin(), response.end());
-                                if (respStr.find("\"ok\":true") != std::string::npos ||
-                                    respStr.find("\"ok\": true") != std::string::npos) {
-                                    authOk = true;
+                                auto j = nlohmann::json::parse(
+                                    response.begin(), response.end(),
+                                    /*callback=*/nullptr,
+                                    /*allow_exceptions=*/false);
+                                if (!j.is_discarded() && j.is_object()) {
+                                    const auto it = j.find("ok");
+                                    if (it != j.end() &&
+                                        it->is_boolean() &&
+                                        it->get<bool>()) {
+                                        authOk = true;
+                                    }
                                 }
-                            } catch (...) {}
+                            } catch (...) {
+                                authOk = false;
+                            }
                             if (authOk) {
                                 MarkClientAuthenticatedById(client->clientId);
                             } else {
@@ -664,40 +675,54 @@ size_t ServiceCommunicatorImpl::BroadcastEvent(CommandType                      
     }
 
     const uint32_t typeKey = static_cast<uint32_t>(eventType);
-    size_t count = 0;
 
-    std::lock_guard<std::mutex> lk(m_clientsMutex);
-    for (auto& client : m_activeClients) {
-        // Auth filter — skip unauthenticated clients.
-        if (!client->authenticated.load(std::memory_order_acquire)) {
-            continue;
-        }
+    // Snapshot eligible targets under lock, then release before doing blocking
+    // I/O.  Holding m_clientsMutex across WriteFile would allow a slow or
+    // malicious client to stall client connection/disconnection globally.
+    struct WriteTarget {
+        std::shared_ptr<ActiveClient> client; // keeps the ActiveClient alive
+        HANDLE                        pipe;
+    };
+    std::vector<WriteTarget> targets;
 
-        // Per-client per-event-type token-bucket rate limit (20 events/sec).
-        {
-            std::lock_guard<std::mutex> bl(client->bucketMutex);
-            auto& bucket = client->rateBuckets[typeKey];
-            if (!bucket.TryConsume()) {
-                m_stats.droppedPackets++;
-                SS_LOG_WARN(L"IPC",
-                    L"BroadcastEvent rate-limited client %llu for event type %u",
-                    client->id, typeKey);
+    {
+        std::lock_guard<std::mutex> lk(m_clientsMutex);
+        targets.reserve(m_activeClients.size());
+        for (auto& client : m_activeClients) {
+            if (!client->authenticated.load(std::memory_order_acquire))
                 continue;
-            }
-        }
 
+            // Apply rate limit under its own lock — separate from m_clientsMutex.
+            {
+                std::lock_guard<std::mutex> bl(client->bucketMutex);
+                auto& bucket = client->rateBuckets[typeKey];
+                if (!bucket.TryConsume()) {
+                    m_stats.droppedPackets++;
+                    SS_LOG_WARN(L"IPC",
+                        L"BroadcastEvent rate-limited client %llu for event type %u",
+                        client->id, typeKey);
+                    continue;
+                }
+            }
+
+            targets.push_back({ client, static_cast<HANDLE>(client->pipe) });
+        }
+    } // m_clientsMutex released here — WriteFile runs lock-free
+
+    size_t count = 0;
+    for (auto& tgt : targets) {
         DWORD written = 0;
-        if (WriteFile(client->pipe,
+        if (WriteFile(tgt.pipe,
                       serializedEnvelope.data(),
                       static_cast<DWORD>(serializedEnvelope.size()),
                       &written, nullptr)) {
-            count++;
+            ++count;
             m_stats.messagesSent++;
             m_stats.bytesSent += written;
         } else {
             SS_LOG_WARN(L"IPC",
                 L"BroadcastEvent WriteFile failed for client %llu: %lu",
-                client->id, GetLastError());
+                tgt.client->id, GetLastError());
         }
     }
     return count;
