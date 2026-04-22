@@ -45,6 +45,9 @@ extern "C" {
     void PhantomHome_KeepAlive_MicrophoneGuard()      noexcept;
     void PhantomHome_KeepAlive_PrivacyCleaner()       noexcept;
     void PhantomHome_KeepAlive_WebcamProtector()      noexcept;
+    void PhantomHome_KeepAlive_ZeroTrust()            noexcept;
+    void PhantomHome_KeepAlive_AmsiProvider()         noexcept;
+    void PhantomHome_KeepAlive_NetworkAttackBlocker() noexcept;
 }
 
 namespace ShadowStrike {
@@ -78,6 +81,9 @@ void EnsureAllModulesWired() noexcept {
     sink = reinterpret_cast<void*>(&PhantomHome_KeepAlive_MicrophoneGuard);
     sink = reinterpret_cast<void*>(&PhantomHome_KeepAlive_PrivacyCleaner);
     sink = reinterpret_cast<void*>(&PhantomHome_KeepAlive_WebcamProtector);
+    sink = reinterpret_cast<void*>(&PhantomHome_KeepAlive_ZeroTrust);
+    sink = reinterpret_cast<void*>(&PhantomHome_KeepAlive_AmsiProvider);
+    sink = reinterpret_cast<void*>(&PhantomHome_KeepAlive_NetworkAttackBlocker);
     (void)sink;
 }
 
