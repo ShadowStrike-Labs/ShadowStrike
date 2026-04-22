@@ -84,6 +84,12 @@ inline constexpr std::uint32_t kMaxPayloadBytes  = 1u << 20;   // 1 MiB
 /// Maximum permitted JSON nesting depth. Checked recursively after parse.
 inline constexpr std::uint32_t kMaxJsonDepth     = 8u;
 
+/// Maximum total number of JSON nodes (values) allowed across the entire tree.
+/// Prevents algorithmic complexity DoS: an attacker cannot send a shallow (≤8
+/// levels) but enormously wide JSON array/object that triggers O(N) traversal.
+/// 4096 nodes comfortably covers all legitimate UI payloads.
+inline constexpr std::uint32_t kMaxJsonNodes     = 4096u;
+
 /// Bump this when the wire format changes in a backward-incompatible way.
 inline constexpr std::uint32_t kProtocolVersion  = 1u;
 

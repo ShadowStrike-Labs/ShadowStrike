@@ -155,14 +155,15 @@ enum class CommandType : uint32_t {
     PauseProtection         = 210,  ///< Temporarily suspend real-time protection
     ResumeProtection        = 211,  ///< Resume real-time protection
 
-    // Scan control — new high-range codes distinct from legacy StartScan=20/StopScan=21
-    // NOTE: StartScan=20 and StopScan=21 remain the canonical scan verbs for
-    // the existing wire protocol; these codes expose scan control via the v2
-    // UI channel and intentionally use different integer values.
-    // Because C++ enum member names must be unique within their enum, the names
-    // StartScan and StopScan already occupy values 20 and 21 above; therefore
-    // the v2 integer codes 220/221 are reachable only via static_cast<uint32_t>
-    // or by the dispatcher numeric routing table — not as named enum members.
+    // Scan control
+    // NOTE: Enum member names StartScan and StopScan are already used at values 20
+    // and 21 above (existing wire protocol).  In the v2 UI protocol, the dispatcher
+    // routes these commands by CommandType value; numeric codes 220 and 221 are
+    // reserved in the v2 spec as wire-level routing values but are NOT represented
+    // as named C++ enum members to avoid duplicate-name ODR issues.  Dispatcher
+    // implementations must use static_cast<CommandType>(220) and (221) or their
+    // own routing tables when handling those v2 codes.
+    // Similarly, QuarantineAction is at 50 (legacy); 231 is the v2 dispatch code.
     GetScanProgress         = 222,  ///< Poll in-progress scan completion %
 
     // Quarantine — see also QuarantineAction=50 (legacy restore/delete verb)
