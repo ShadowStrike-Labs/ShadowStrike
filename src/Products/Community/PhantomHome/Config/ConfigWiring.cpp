@@ -33,6 +33,7 @@
 #include "../HomeProductOrchestrator.hpp"
 #include "HomeConfigRegistration.hpp"
 
+#include "../../../../PhantomCore/Config/ProfileManager.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
 namespace {
@@ -54,6 +55,29 @@ struct HomeConfigRegistrar final {
                 .initialize = []() -> bool {
                     try {
                         namespace Cfg = ShadowStrike::Products::PhantomHome::Config;
+
+                        // ProfileManager must be running before any
+                        // CreateCustomProfile() call inside
+                        // RegisterProfilePresets(). The manager is a
+                        // process-wide Meyers singleton and has no other
+                        // bootstrap entry point in the service host, so the
+                        // Foundation phase owns its one-shot initialization.
+                        // Idempotent: a second Initialize() is a warning NOP.
+                        auto& profile_mgr = ::ShadowStrike::Config::ProfileManager::Instance();
+                        if (!profile_mgr.IsInitialized()) {
+                            ::ShadowStrike::Config::ProfileManagerConfiguration pmc{};
+                            // Home product is user-interactive: keep
+                            // auto-detection/scheduling enabled (defaults),
+                            // but zero the cooldown so the first runtime
+                            // profile switch from the UI is not rejected
+                            // by the per-process cooldown gate.
+                            pmc.switchCooldownSeconds = 0;
+                            if (!profile_mgr.Initialize(pmc)) {
+                                SS_LOG_ERROR(kLogCategory,
+                                    L"HomeConfig: ProfileManager::Initialize() returned false");
+                                return false;
+                            }
+                        }
 
                         if (!Cfg::RegisterProductDefaults()) {
                             SS_LOG_ERROR(kLogCategory,
