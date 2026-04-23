@@ -201,7 +201,15 @@ public:
             memConfig.enableCodeIntegrity = true;
             memConfig.enableHeapProtection = true;
             memConfig.enableStackProtection = true;
-            memConfig.enableAntiDump = true;
+            // NOTE: enableAntiDump performs PE header obfuscation (wipes DOS
+            // stub and mutates OptionalHeader) on the running image. This
+            // collides with AntiDebug's code-integrity monitor, which has
+            // already registered the entire image (headers included) as a
+            // CRC-checked region — the mutation trips AntiDebug and
+            // terminates the service before Initialize() can return. Disable
+            // here until AntiDebug gains a header-exclusion token; it is a
+            // defense-in-depth feature, not a core protection.
+            memConfig.enableAntiDump = false;
             if (!Security::MemoryProtection::Instance().Initialize(memConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize MemoryProtection");
                 // Non-fatal: memory protection degrades
