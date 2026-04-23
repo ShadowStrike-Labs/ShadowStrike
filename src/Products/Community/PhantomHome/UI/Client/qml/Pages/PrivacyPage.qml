@@ -175,6 +175,7 @@ PageHost {
                 id:    modulesRepeater
                 model: root.staticPrivacyModules
                 delegate: ModuleCard {
+                    required property var modelData
                     width:              parent.width - Theme.spacingL * 2
                     moduleName:         modelData.name
                     displayName:        modelData.display
@@ -215,6 +216,7 @@ PageHost {
             Repeater {
                 model: root.recentPrivacyEvents
                 delegate: ThreatRow {
+                    required property var modelData
                     width:            parent.width - Theme.spacingL * 2
                     threatName:       modelData.threatName   || ""
                     filePath:         modelData.filePath     || ""
