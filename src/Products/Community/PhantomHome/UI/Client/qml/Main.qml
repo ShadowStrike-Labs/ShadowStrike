@@ -47,7 +47,10 @@ ApplicationWindow {
     }
 
     // ── Window active ↔ animation budget ──────────────────────────────────
-    onActiveChanged: perfBudget.onWindowActiveChanged(active)
+    // PerfBudgetContext exposes only the read-only `animationsPaused` property;
+    // the PerfBudget::OnWindowActiveChanged static is called from the C++ side
+    // (wired into ApplicationWindow::activeChanged after engine.load in main.cpp).
+    // No-op here — kept as a hook point for future QML-side reaction.
 
     // ── Root layout ────────────────────────────────────────────────────────
     RowLayout {

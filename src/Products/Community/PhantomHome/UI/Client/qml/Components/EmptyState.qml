@@ -16,7 +16,7 @@ Item {
         id: col
         anchors.centerIn: parent
         spacing:          Theme.spacingM
-        horizontalItemAlignment: Qt.AlignHCenter
+        width:            Math.min(parent.width, 320)
 
         Image {
             visible:  root.iconSource.toString().length > 0
@@ -29,6 +29,7 @@ Item {
         }
 
         Text {
+            width:               parent.width
             horizontalAlignment: Text.AlignHCenter
             text:   root.title
             color:  Theme.textSecondary
@@ -38,13 +39,13 @@ Item {
         }
 
         Text {
+            width:               parent.width
             horizontalAlignment: Text.AlignHCenter
             text:    root.message
             color:   Theme.textMuted
             font.family:    Theme.fontFamily
             font.pixelSize: Theme.fontSizeBody
             wrapMode: Text.WordWrap
-            width:   Math.min(parent.width, 260)
         }
     }
 

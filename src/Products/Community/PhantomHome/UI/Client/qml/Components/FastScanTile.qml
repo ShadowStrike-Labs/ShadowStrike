@@ -27,13 +27,12 @@ Item {
         Column {
             anchors.centerIn: parent
             spacing:          Theme.spacingM
-            horizontalItemAlignment: Qt.AlignHCenter
 
             // Idle state
             Column {
                 visible:  root.scanState === "idle"
                 spacing:  Theme.spacingS
-                horizontalItemAlignment: Qt.AlignHCenter
+                anchors.horizontalCenter: parent.horizontalCenter
 
                 Text {
                     horizontalAlignment: Text.AlignHCenter
@@ -118,7 +117,7 @@ Item {
             Column {
                 visible:  root.scanState === "complete"
                 spacing:  Theme.spacingS
-                horizontalItemAlignment: Qt.AlignHCenter
+                anchors.horizontalCenter: parent.horizontalCenter
 
                 Text {
                     horizontalAlignment: Text.AlignHCenter
