@@ -9,7 +9,25 @@ Item {
 
     property bool collapsed:      false
     property int  selectedIndex:  0
+
+    // Ordered route keys aligned 1:1 with the nav model below.  Kept as a
+    // property so Main.qml's route map and this file remain in sync without
+    // duplicating the strings in two places.
+    readonly property var navRoutes: [
+        "dashboard",
+        "security",
+        "performance",
+        "privacy"
+    ]
+
+    // Legacy numeric signal — retained so any existing listeners keep working.
     signal selectionChanged(int index)
+
+    // High-level navigation signal consumed by Main.qml.  Emitted whenever the
+    // user picks a sidebar item or the settings button; carries the route key
+    // that Main.qml's routeMap understands.
+    signal navigate(string route)
+
     signal settingsClicked()
 
     width: root.collapsed ? Theme.sidebarWidthCollapsed : Theme.sidebarWidthExpanded
@@ -130,6 +148,9 @@ Item {
                     onActivated: {
                         root.selectedIndex = index
                         root.selectionChanged(index)
+                        if (index >= 0 && index < root.navRoutes.length) {
+                            root.navigate(root.navRoutes[index])
+                        }
                     }
                 }
             }
@@ -145,7 +166,10 @@ Item {
             }
             iconSource: "qrc:/icons/gear.svg"
             tooltip:    qsTr("Settings")
-            onClicked:  root.settingsClicked()
+            onClicked: {
+                root.settingsClicked()
+                root.navigate("settings")
+            }
         }
     }
 
