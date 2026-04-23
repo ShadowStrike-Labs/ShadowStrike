@@ -548,12 +548,16 @@ public:
 
             // Enable anti-dump if configured
             if (config.enableAntiDump) {
+                SS_LOG_INFO(LOG_CATEGORY, L"Enabling anti-dump protection...");
                 enableAntiDumpInternal();
+                SS_LOG_INFO(LOG_CATEGORY, L"Anti-dump protection enabled");
             }
 
             // Start integrity monitoring if enabled
             if (config.enableCodeIntegrity) {
+                SS_LOG_INFO(LOG_CATEGORY, L"Starting code integrity monitoring...");
                 startIntegrityMonitoring();
+                SS_LOG_INFO(LOG_CATEGORY, L"Code integrity monitoring started");
             }
 
             m_initialized = true;
