@@ -261,6 +261,25 @@ using CommandHandler = std::function<bool(CommandType cmd,
                                           std::vector<uint8_t>& responsePayload)>;
 
 /**
+ * @brief Callback for v2 Envelope command handlers (verbs >= 100).
+ *
+ * Invoked by the ServiceCommunicator when it parses a v2 (24-byte Envelope)
+ * frame from a connected client.  The handler is responsible for calling
+ * SendResponseEnvelope() to send its reply.
+ *
+ * @param clientId    Opaque client identifier assigned at connection time.
+ * @param sessionId   Windows logon session ID of the connecting process
+ *                    (obtained via GetNamedPipeClientSessionId at accept time).
+ *                    Used to verify IpcAuthToken per-session tokens.
+ * @param requestId   Caller-side correlation ID echoed in the response envelope.
+ * @param jsonPayload Raw UTF-8 JSON string extracted from the Envelope frame.
+ */
+using V2CommandHandler = std::function<void(std::uint64_t clientId,
+                                             std::uint32_t sessionId,
+                                             std::uint64_t requestId,
+                                             std::string_view jsonPayload)>;
+
+/**
  * @brief Callback for connection events
  */
 using ConnectionCallback = std::function<void(uint64_t clientId, bool connected)>;
@@ -323,6 +342,51 @@ public:
      * @param handler Function to execute
      */
     void RegisterHandler(CommandType type, CommandHandler handler);
+
+    /**
+     * @brief Register a v2 Envelope handler for a specific command type.
+     *
+     * When the ServiceCommunicator receives a 24-byte Envelope frame whose
+     * type field equals @p type, it invokes @p handler with the parsed client
+     * context.  Replaces any previously registered handler for @p type.
+     * Thread-safe; may be called before or after Start().
+     *
+     * @param type    CommandType value identifying this verb.
+     * @param handler Callback that processes the request and sends a reply via
+     *                SendResponseEnvelope().
+     */
+    void RegisterV2Handler(CommandType type, V2CommandHandler handler);
+
+    /**
+     * @brief Return whether a client has been authenticated via AuthHandshake.
+     *
+     * Thread-safe.
+     *
+     * @param clientId  Client identifier from the V2CommandHandler argument.
+     * @return true if MarkClientAuthenticated() has been called for this client
+     *         and the client has not yet disconnected.
+     */
+    [[nodiscard]] bool IsClientAuthenticated(std::uint64_t clientId) const;
+
+    /**
+     * @brief Send a v2 Envelope response to a specific connected client.
+     *
+     * Builds the 24-byte wire header, appends @p jsonPayload, and writes the
+     * frame to the client's pipe handle.  If the client has already
+     * disconnected, the write fails silently (WriteFile error is logged).
+     *
+     * Thread-safe; may be called from any thread (including a V2CommandHandler
+     * invoked on a thread-pool task).
+     *
+     * @param clientId    Client to send to (from V2CommandHandler argument).
+     * @param type        CommandType echoed in the response Envelope header.
+     * @param requestId   Correlation ID echoed from the request Envelope.
+     * @param jsonPayload UTF-8 JSON body (must be <= MAX_MESSAGE_SIZE bytes).
+     */
+    void SendResponseEnvelope(std::uint64_t    clientId,
+                              CommandType      type,
+                              std::uint64_t    requestId,
+                              std::string_view jsonPayload);
 
     /**
      * @brief Broadcast a message to all connected and authenticated clients
