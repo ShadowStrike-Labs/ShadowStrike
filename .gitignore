@@ -372,6 +372,17 @@ CLAUDE.md
 DAILY_MODULE_ROADMAP.md
 SHADOWSTRIKE_3_YEAR_ROADMAP.md
 
+# vm_shrd is a workspace output directory; the binaries inside are NOT committed.
+# The directory itself is gitignored; only the README and hashes are excluded
+# because they are transient outputs of each build drop.
+vm_shrd/
+
+# Dev signing cert exception: the dev PFX and CER are intentionally tracked.
+# The password (ShadowStrikeDev!) is documented in Sign-PhantomHome.ps1 -- it is
+# NOT a secret; the cert is valueless outside local smoke testing.
+!packaging/signing/ShadowStrike-Dev.pfx
+!packaging/signing/ShadowStrike-Dev.cer
+
 # --- Commercial / Private (NEVER push to public repo) ---
 # Phantom Pro and Enterprise contain proprietary commercial code.
 # Only Community/ is open-source and tracked by git.
