@@ -52,14 +52,14 @@ void ProtectionViewModel::applyProtectionStateUpdate(const QJsonObject& payload)
     const int  newMode   = payload.value(QLatin1String("globalMode")).toInt(m_impl->globalMode);
     const bool newPaused = payload.value(QLatin1String("paused")).toBool(m_impl->paused);
 
-    const bool modeChanged   = (newMode   != m_impl->globalMode);
-    const bool pausedChanged = (newPaused != m_impl->paused);
+    const bool modeChanged       = (newMode   != m_impl->globalMode);
+    const bool pauseStateChanged = (newPaused != m_impl->paused);
 
     m_impl->globalMode = newMode;
     m_impl->paused     = newPaused;
 
-    if (modeChanged)   emit globalModeChanged();
-    if (pausedChanged) emit pausedChanged();
+    if (modeChanged)       emit globalModeChanged();
+    if (pauseStateChanged) emit pausedChanged();
 }
 
 void ProtectionViewModel::applyHeadlineStateUpdate(const QJsonObject& payload) noexcept
