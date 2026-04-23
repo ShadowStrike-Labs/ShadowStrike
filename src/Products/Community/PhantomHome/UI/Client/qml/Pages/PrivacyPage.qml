@@ -28,14 +28,14 @@ PageHost {
     // Active privacy modules (if modulesListModel is not available, show static)
     // -------------------------------------------------------------------------
     readonly property var staticPrivacyModules: [
-        { name: qsTr("WebcamProtector"),       description: qsTr("Blocks unauthorized webcam access"), enabled: true  },
-        { name: qsTr("MicrophoneGuard"),        description: qsTr("Prevents silent microphone capture"),  enabled: true  },
-        { name: qsTr("LocationPrivacy"),        description: qsTr("Masks precise location from apps"),    enabled: true  },
-        { name: qsTr("CookieManager"),          description: qsTr("Cleans tracking cookies on close"),    enabled: false },
-        { name: qsTr("DNSLeakProtection"),      description: qsTr("Routes DNS through secure resolver"),  enabled: true  },
-        { name: qsTr("IPLeakProtection"),       description: qsTr("Prevents real IP exposure via WebRTC"),enabled: true  },
-        { name: qsTr("DataLeakProtection"),     description: qsTr("Monitors clipboard and file transfers"),enabled: false },
-        { name: qsTr("PrivacyCleaner"),         description: qsTr("Erases browsing artifacts on demand"), enabled: true  },
+        { name: "WebcamProtector",    display: qsTr("Webcam Protector"),    description: qsTr("Blocks unauthorized webcam access"),        icon: "qrc:/icons/shield.svg",  enabled: true  },
+        { name: "MicrophoneGuard",    display: qsTr("Microphone Guard"),    description: qsTr("Prevents silent microphone capture"),       icon: "qrc:/icons/shield.svg",  enabled: true  },
+        { name: "LocationPrivacy",    display: qsTr("Location Privacy"),    description: qsTr("Masks precise location from apps"),         icon: "qrc:/icons/shield.svg",  enabled: true  },
+        { name: "CookieManager",      display: qsTr("Cookie Manager"),      description: qsTr("Cleans tracking cookies on close"),         icon: "qrc:/icons/shield.svg",  enabled: false },
+        { name: "DNSLeakProtection",  display: qsTr("DNS Leak Protection"), description: qsTr("Routes DNS through secure resolver"),       icon: "qrc:/icons/shield.svg",  enabled: true  },
+        { name: "IPLeakProtection",   display: qsTr("IP Leak Protection"),  description: qsTr("Prevents real IP exposure via WebRTC"),     icon: "qrc:/icons/shield.svg",  enabled: true  },
+        { name: "DataLeakProtection", display: qsTr("Data Leak Protection"),description: qsTr("Monitors clipboard and file transfers"),    icon: "qrc:/icons/shield.svg",  enabled: false },
+        { name: "PrivacyCleaner",     display: qsTr("Privacy Cleaner"),     description: qsTr("Erases browsing artifacts on demand"),      icon: "qrc:/icons/shield.svg",  enabled: true  },
     ]
 
     // -------------------------------------------------------------------------
@@ -175,15 +175,19 @@ PageHost {
                 id:    modulesRepeater
                 model: root.staticPrivacyModules
                 delegate: ModuleCard {
-                    width:            parent.width - Theme.spacingL * 2
-                    moduleName:       modelData.name
-                    moduleDescription: modelData.description
-                    enabled:          modelData.enabled
+                    width:              parent.width - Theme.spacingL * 2
+                    moduleName:         modelData.name
+                    displayName:        modelData.display
+                    description:        modelData.description
+                    iconSource:         modelData.icon
+                    state:              modelData.enabled ? "on" : "off"
+                    enabled:            modelData.enabled
+                    currentMode:        1
+                    supportedModesMask: 0x3
                     onToggled: function(nowEnabled) {
                         if (typeof modulesListModel !== 'undefined') {
                             modulesListModel.setEnabled(modelData.name, nowEnabled);
                         } else {
-                            // TODO: wire to modulesListModel.setEnabled once the VM is authored.
                             console.log("[PrivacyPage] toggle", modelData.name, "→", nowEnabled,
                                         "— modulesListModel not yet registered.");
                         }
