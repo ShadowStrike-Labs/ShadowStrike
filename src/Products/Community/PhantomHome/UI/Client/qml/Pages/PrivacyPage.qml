@@ -207,7 +207,6 @@ PageHost {
                 width:  parent.width - Theme.spacingL * 2
                 active: root.recentPrivacyEvents.length === 0
                 sourceComponent: EmptyState {
-                    icon:    "shield"
                     title:   qsTr("No recent events")
                     message: qsTr("All privacy sensors are quiet. No suspicious access attempts detected.")
                 }
@@ -221,7 +220,6 @@ PageHost {
                     filePath:         modelData.filePath     || ""
                     action:           modelData.action       || "blocked"
                     timestampDisplay: modelData.timestamp    || ""
-                    severity:         modelData.severity     || "warning"
                 }
             }
 
