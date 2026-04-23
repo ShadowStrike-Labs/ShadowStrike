@@ -74,6 +74,18 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <!--
+      Post-build: stage driver artifacts to the installer staging directory.
+      The .cat copy is best-effort (inf2cat runs after the build, not during it;
+      the file will be present if signing was already performed).
+    -->
+    <PostBuildEvent>
+      if not exist "$(SolutionDir)build\installer\staging\drivers" mkdir "$(SolutionDir)build\installer\staging\drivers"
+      copy /Y "$(OutDir)PhantomSensor.sys" "$(SolutionDir)build\installer\staging\drivers\"
+      copy /Y "$(ProjectDir)PhantomSensor.inf" "$(SolutionDir)build\installer\staging\drivers\"
+      if exist "$(OutDir)PhantomSensor\phantomsensor.cat" copy /Y "$(OutDir)PhantomSensor\phantomsensor.cat" "$(SolutionDir)build\installer\staging\drivers\PhantomSensor.cat"
+      echo [OK] PhantomSensor artifacts staged to $(SolutionDir)build\installer\staging\drivers\
+    </PostBuildEvent>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>

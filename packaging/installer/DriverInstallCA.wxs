@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DriverInstallCA.wxs
+  ===================
+  MSI custom action to invoke ShadowStrikeDriverResume.exe stage1 mode
+  immediately after InstallFinalize on fresh installs.
+
+  Design:
+    Deferred-no-impersonation CA: runs as SYSTEM with elevated SCM access.
+    Return asyncWait: MSI waits for exit code but does NOT interpret
+    3010 (reboot required) as an MSI failure; the helper owns reboot UX.
+    REBOOT=ReallySuppress: prevents Windows Installer from prompting a
+    second restart dialog (the DriverResume EXE owns the reboot UX).
+    Condition: NOT Installed (skip on upgrades where testsigning already handled).
+
+  Sequence (relative to InstallFinalize = 6600):
+    SetDriverInstallPath   6601 - Set property for deferred CA
+    ExecDriverInstallStg1  6602 - Invoke DriverResume stage1 mode
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Fragment>
+
+    <!--
+      Suppress the Windows Installer reboot prompt.
+      The DriverResume helper manages the reboot countdown UX via
+      InitiateSystemShutdownExW (60-second countdown with a visible message).
+    -->
+    <Property Id="REBOOT" Value="ReallySuppress"/>
+
+    <!--
+      Immediate CA: stores the stage1 command into the ExecDriverInstallStg1
+      property so the deferred CA can read it as CustomActionData.
+    -->
+    <CustomAction Id="SetDriverInstallPath"
+                  Property="ExecDriverInstallStg1"
+                  Value="[INSTALLFOLDER]ShadowStrikeDriverResume.exe --stage1"/>
+
+    <!--
+      Deferred-no-impersonation CA: runs as SYSTEM.
+      Execute deferred: runs after files are copied to disk.
+      Impersonate no: keeps SYSTEM token, required for SCM and bcdedit access.
+      Return asyncWait: MSI waits for helper to exit; exit code 3010 is treated
+      as a soft restart request by the Burn bootstrapper, not as a fatal error.
+    -->
+    <CustomAction Id="ExecDriverInstallStg1"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="ShadowStrikeDriverResume.exe --stage1"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="asyncWait"/>
+
+    <InstallExecuteSequence>
+      <!--
+        Set the property immediately before the deferred CA fires.
+        Condition: NOT Installed means this only runs on first install, not repair/upgrade.
+      -->
+      <Custom Action="SetDriverInstallPath"
+              Before="ExecDriverInstallStg1"
+              Condition="NOT Installed"/>
+
+      <!--
+        Invoke the driver install helper after InstallFinalize (sequence 6600)
+        so all MSI-managed files are guaranteed to be on disk.
+        Condition: NOT Installed (skip upgrades where driver was already installed).
+      -->
+      <Custom Action="ExecDriverInstallStg1"
+              After="InstallFinalize"
+              Condition="NOT Installed"/>
+    </InstallExecuteSequence>
+
+  </Fragment>
+
+</Wix>

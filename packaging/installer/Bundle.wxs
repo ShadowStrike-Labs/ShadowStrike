@@ -37,6 +37,10 @@
       The EULA text (RTF) is also embedded in the MSI's WixUI_Minimal dialog;
       including it here means the user sees it regardless of how the bundle
       is invoked.
+
+      ShowVersion="yes"      – display the product version in the bundle UI.
+      ShowRestartButton="yes" – if the MSI CA returns 3010, the bundle UI
+                                shows a "Restart" button rather than "Finish".
     -->
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
@@ -97,6 +101,22 @@
                          Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
                          Value="Installed"
                          Variable="VcRedistInstalled"
+                         Result="value"/>
+  </Fragment>
+
+  <!--
+    Registry search: driver installation complete flag.
+    Written by ShadowStrikeDriverResume.exe (stage2 mode) on successful driver load.
+    Used by the bundle to determine whether the driver has already been installed
+    (idempotency guard; the DriverResume EXE is also internally idempotent,
+    so the bundle condition is informational / UI polish only).
+  -->
+  <Fragment>
+    <util:RegistrySearch Id="DriverCompleteSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\ShadowStrike\PhantomHome\Driver"
+                         Value="InstallComplete"
+                         Variable="DriverInstallComplete"
                          Result="value"/>
   </Fragment>
 
