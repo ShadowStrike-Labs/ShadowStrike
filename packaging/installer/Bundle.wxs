@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ShadowStrike Phantom Home – Burn bootstrapper bundle.
+
+  Bundle UpgradeCode: {CCD11E3C-E8D9-461C-A8CC-BEE40AF19402}
+  IMMUTABLE across all future bootstrapper releases.
+
+  Chain (in order):
+    1. vc_redist.x64.exe  – Microsoft Visual C++ Redistributable (x64)
+    2. ShadowStrikePhantom-Home-Setup.msi – the product MSI
+
+  Build (from repo root):
+    wix build -arch x64 ^
+      -d ProductVersion=1.0.0.0 ^
+      -d BinDir=bin\Release ^
+      -d InstallerDir=packaging\installer ^
+      -d MsiPath=build\installer\ShadowStrikePhantom-Home-Setup.msi ^
+      -ext WixToolset.BootstrapperApplications.wixext ^
+      -ext WixToolset.Util.wixext ^
+      packaging\installer\Bundle.wxs ^
+      -o build\installer\ShadowStrikePhantom-Home-Setup.exe
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Bundle Name="ShadowStrike Phantom Home"
+          Manufacturer="ShadowStrike-Labs"
+          Version="$(var.ProductVersion)"
+          UpgradeCode="{CCD11E3C-E8D9-461C-A8CC-BEE40AF19402}"
+          IconSourceFile="$(var.InstallerDir)\icons\ShadowStrike.ico"
+          AboutUrl="https://shadowstrike.dev">
+
+    <!--
+      WixStandardBootstrapperApplication with the rtfLicense theme displays a
+      full-page licence agreement before the user can proceed with installation.
+      The EULA text (RTF) is also embedded in the MSI's WixUI_Minimal dialog;
+      including it here means the user sees it regardless of how the bundle
+      is invoked.
+    -->
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="rtfLicense"
+          LicenseFile="$(var.InstallerDir)\License.rtf"
+          LogoFile="$(var.InstallerDir)\icons\ShadowStrike.ico"
+          SuppressOptionsUI="yes"
+          SuppressRepair="yes"
+          ShowVersion="yes"/>
+    </BootstrapperApplication>
+
+    <Chain>
+
+      <!--
+        VC++ Redistributable – must install before the MSI because
+        ShadowStrikePhantomService.exe links the MSVC 2022 runtime.
+
+        Permanent="yes" prevents uninstall: VC++ may be shared by other
+        applications and must not be removed with this product.
+
+        DetectCondition: the VC 2022 x64 installer sets Installed=1
+        under HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64.
+      -->
+      <ExePackage Id="VcRedist"
+                  DisplayName="Microsoft Visual C++ 2015-2022 Redistributable (x64)"
+                  Description="Visual C++ runtime required by ShadowStrike Phantom components."
+                  SourceFile="$(var.BinDir)\vc_redist.x64.exe"
+                  InstallArguments="/install /quiet /norestart"
+                  RepairArguments="/repair /quiet /norestart"
+                  UninstallArguments="/uninstall /quiet /norestart"
+                  DetectCondition="VcRedistInstalled"
+                  Permanent="yes"
+                  Vital="yes"/>
+
+      <!--
+        Product MSI – installed after the VC++ runtime is confirmed present.
+        ForcePerMachine ensures the MSI cannot be deployed per-user even if
+        the current user lacks elevation.
+      -->
+      <MsiPackage Id="PhantomHomeMsi"
+                  DisplayName="ShadowStrike Phantom Home"
+                  Description="Installs the ShadowStrike Phantom Home NGAV platform."
+                  SourceFile="$(var.MsiPath)"
+                  ForcePerMachine="yes"
+                  Vital="yes"/>
+
+    </Chain>
+
+  </Bundle>
+
+  <!--
+    Registry search: populate VcRedistInstalled so the ExePackage's
+    DetectCondition can skip VC++ if it is already present.
+  -->
+  <Fragment>
+    <util:RegistrySearch Id="VcRedistSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                         Value="Installed"
+                         Variable="VcRedistInstalled"
+                         Result="value"/>
+  </Fragment>
+
+</Wix>

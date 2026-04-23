@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ShadowStrike Phantom Home – WiX v4 MSI (wix.exe 5.x)
+
+  UpgradeCode: {C8F5D9A3-7E4B-4D28-9C1F-5A2E6B4D8F01}
+  IMMUTABLE – changing this breaks the upgrade chain for every existing endpoint.
+
+  Build (from repo root):
+    wix build -arch x64 ^
+      -d ProductVersion=1.0.0.0 ^
+      -d BinDir=bin\Release ^
+      -d StagingDir=build\installer\staging ^
+      -d InstallerDir=packaging\installer ^
+      -ext WixToolset.Util.wixext ^
+      -ext WixToolset.UI.wixext ^
+      packaging\installer\Product.wxs ^
+      packaging\installer\Components.wxs ^
+      build\installer\QtHarvest.wxs ^
+      -o build\installer\ShadowStrikePhantom-Home-Setup.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="ShadowStrike Phantom Home"
+           Manufacturer="ShadowStrike-Labs"
+           Version="$(var.ProductVersion)"
+           Language="1033"
+           UpgradeCode="{C8F5D9A3-7E4B-4D28-9C1F-5A2E6B4D8F01}"
+           InstallerVersion="500"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <!--
+      MajorUpgrade: any older ProductCode is removed before this version installs.
+      DowngradeErrorMessage prevents rolling back to an older release accidentally.
+    -->
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed. Downgrade is not supported."
+        Schedule="afterInstallInitialize"/>
+
+    <!-- Single embedded cabinet with maximum compression. -->
+    <Media Id="1" Cabinet="Phantom.cab" EmbedCab="yes" CompressionLevel="high"/>
+
+    <!-- ──────────────── ARP / Add-Remove Programs entries ──────────────── -->
+    <Property Id="ARPPRODUCTICON" Value="ShadowStrikeIcon"/>
+    <Property Id="ARPHELPLINK"    Value="https://shadowstrike.dev/support"/>
+    <Property Id="ARPURLINFOABOUT" Value="https://shadowstrike.dev"/>
+    <!-- Suppress Repair to keep the end-user experience clean.
+         Full re-install is the supported update path via MajorUpgrade. -->
+    <Property Id="ARPNOREPAIR"   Value="1"/>
+    <!-- Note: ARPNOMODIFY is set by WixUI_Minimal automatically. -->
+
+    <!-- Product icon (used in ARP list and MSI dialog title bar). -->
+    <Icon Id="ShadowStrikeIcon" SourceFile="$(var.InstallerDir)\icons\ShadowStrike.ico"/>
+
+    <!-- WixUI license variable – must point to an RTF file. -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\License.rtf"/>
+    <WixVariable Id="WixUIBannerBmp" Overridable="yes" Value="$(var.InstallerDir)\icons\ShadowStrike.ico"/>
+
+    <!--
+      WixUI_Minimal: shows a licence agreement dialog, then installs silently.
+      This is appropriate for a per-machine security product where the admin
+      deploying the software must accept the EULA on behalf of end-users.
+    -->
+    <ui:WixUI Id="WixUI_Minimal"/>
+
+    <!-- ──────────────── Launch conditions ──────────────── -->
+    <!-- Require 64-bit Windows 8.1 (6.3) or later. -->
+    <Launch Condition="Installed OR (VersionNT64 &gt;= 603)"
+            Message="ShadowStrike Phantom Home requires a 64-bit Windows 10 or later operating system."/>
+    <!-- Require administrative context. -->
+    <Launch Condition="Installed OR Privileged"
+            Message="ShadowStrike Phantom Home must be installed with administrator privileges."/>
+
+    <!-- ──────────────── Directory tree ──────────────── -->
+    <!--
+      Qt subdirectories (platforms, qml, styles, …) are declared inside
+      QtHarvest.wxs so they coexist cleanly with the harvested components.
+    -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ShadowStrikeFolder" Name="ShadowStrike">
+        <Directory Id="INSTALLFOLDER" Name="Phantom"/>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- All-users Start Menu programs folder. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ShadowStrikeMenuFolder" Name="ShadowStrike"/>
+    </StandardDirectory>
+
+    <!-- Public desktop folder for the optional desktop shortcut. -->
+    <StandardDirectory Id="DesktopFolder"/>
+
+    <!-- ProgramData directories for logs and quarantine store. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataSS" Name="ShadowStrike">
+        <Directory Id="ProgramDataLogs"       Name="Logs"/>
+        <Directory Id="ProgramDataQuarantine" Name="Quarantine"/>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- ──────────────── Feature tree ──────────────── -->
+    <Feature Id="FeatureMain"
+             Title="ShadowStrike Phantom Home"
+             Description="Core protection engine, service, system-tray companion and management UI."
+             Level="1"
+             AllowAdvertise="no"
+             InstallDefault="local">
+
+      <!-- Three hand-authored executables. -->
+      <ComponentRef Id="CmpServiceExe"/>
+      <ComponentRef Id="CmpTrayExe"/>
+      <ComponentRef Id="CmpUIExe"/>
+
+      <!-- ONNX inference engine and DirectX shader compiler runtime. -->
+      <ComponentRef Id="CmpOnnxRuntime"/>
+      <ComponentRef Id="CmpDxRuntime"/>
+
+      <!-- Machine-wide Run-key entry that starts the tray on every logon. -->
+      <ComponentRef Id="CmpTrayAutostart"/>
+
+      <!-- Start Menu shortcut for the UI. -->
+      <ComponentRef Id="CmpStartMenuShortcut"/>
+
+      <!-- ProgramData directories with correct ACLs. -->
+      <ComponentRef Id="CmpProgramDataLogs"/>
+      <ComponentRef Id="CmpProgramDataQuarantine"/>
+
+      <!-- Qt 6 runtime DLLs and plugins (auto-harvested from windeployqt staging). -->
+      <ComponentGroupRef Id="QtRuntimeComponents"/>
+    </Feature>
+
+    <!-- Optional desktop shortcut – default Level=10 means not selected by default. -->
+    <Feature Id="FeatureDesktopShortcut"
+             Title="Desktop Shortcut"
+             Description="Place a shortcut to ShadowStrike Phantom Home on the desktop."
+             Level="10"
+             AllowAdvertise="no">
+      <ComponentRef Id="CmpDesktopShortcut"/>
+    </Feature>
+
+  </Package>
+</Wix>

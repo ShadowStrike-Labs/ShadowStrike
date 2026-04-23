@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ShadowStrike Phantom Home – hand-authored components.
+
+  Covers:
+    • ShadowStrikePhantomService.exe  (LocalSystem service, delayed auto-start)
+    • ShadowStrikePhantomTray.exe     (tray companion; started via HKLM Run key)
+    • ShadowStrikePhantomUI.exe       (Qt QML desktop client)
+    • ONNX Runtime DLLs               (onnxruntime.dll + onnxruntime_providers_shared.dll)
+    • DirectX Runtime DLLs            (dxcompiler.dll + dxil.dll)
+    • HKLM Run key for tray autostart
+    • All-users Start Menu shortcut
+    • Public desktop shortcut (optional feature)
+    • ProgramData\ShadowStrike\Logs       (SYSTEM/Admins=Full, Users=Read)
+    • ProgramData\ShadowStrike\Quarantine (SYSTEM/Admins=Full, Users=Read)
+
+  Qt runtime DLLs and plugins are NOT here – they live in QtHarvest.wxs which
+  is auto-generated from the windeployqt staging directory.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Fragment>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SERVICE EXECUTABLE
+         Component GUID is permanent – Windows Installer uses it to track
+         the installed component across upgrades and repairs.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpServiceExe"
+               Directory="INSTALLFOLDER"
+               Guid="{8A1B0C7E-4F3A-4D1E-AC2D-9F6E2A1B3C41}"
+               Bitness="always64">
+
+      <File Id="ServiceExe"
+            Name="ShadowStrikePhantomService.exe"
+            Source="$(var.BinDir)\ShadowStrikePhantomService.exe"
+            KeyPath="yes"/>
+
+      <!--
+        ServiceInstall creates the SCM entry.  The service account is
+        LocalSystem; the binary already imposes its own privilege-dropping
+        logic for sandboxed worker threads.
+      -->
+      <ServiceInstall Id="SvcInstall"
+                      Name="ShadowStrikePhantomService"
+                      DisplayName="ShadowStrike Phantom Service"
+                      Description="Provides ShadowStrike Phantom Home real-time threat detection, behavioural analysis, and telemetry collection."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Vital="yes"
+                      Account="LocalSystem">
+        <!-- Ensure RPC subsystem is up before the service starts. -->
+        <ServiceDependency Id="RpcSs"/>
+      </ServiceInstall>
+
+      <!--
+        util:ServiceConfig sets failure recovery actions.
+        DelayedAutoStart is enabled via a direct registry write to
+        HKLM\SYSTEM\CurrentControlSet\Services\<name>\DelayedAutostart (DWORD=1),
+        which is the canonical mechanism supported on all target OS versions.
+      -->
+      <util:ServiceConfig
+          ServiceName="ShadowStrikePhantomService"
+          FirstFailureActionType="restart"
+          SecondFailureActionType="restart"
+          ThirdFailureActionType="none"
+          RestartServiceDelayInSeconds="60"
+          ResetPeriodInDays="1"/>
+
+      <!--
+        Delayed auto-start flag: prevents the service from extending boot time
+        on machines with many auto-start services.  The SCM honours this after
+        the boot sequence has completed and the system enters idle.
+      -->
+      <RegistryValue Root="HKLM"
+                     Key="SYSTEM\CurrentControlSet\Services\ShadowStrikePhantomService"
+                     Name="DelayedAutostart"
+                     Type="integer"
+                     Value="1"/>
+
+      <!--
+        ServiceControl: start on install, stop on both install (upgrade) and
+        uninstall, remove entry on uninstall.  Wait="yes" ensures the MSI
+        engine does not proceed until the SCM reports the service has stopped.
+      -->
+      <ServiceControl Id="SvcControl"
+                      Name="ShadowStrikePhantomService"
+                      Start="install"
+                      Stop="both"
+                      Remove="uninstall"
+                      Wait="yes"/>
+
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         TRAY EXECUTABLE
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpTrayExe"
+               Directory="INSTALLFOLDER"
+               Guid="{71C7E2F4-2E9A-4B1D-8D5A-5A0F6C3E2D22}"
+               Bitness="always64">
+      <File Id="TrayExe"
+            Name="ShadowStrikePhantomTray.exe"
+            Source="$(var.BinDir)\ShadowStrikePhantomTray.exe"
+            KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         UI EXECUTABLE  (Qt QML desktop client)
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpUIExe"
+               Directory="INSTALLFOLDER"
+               Guid="{B3F4A5E6-7C8D-4E9F-A0B1-2C3D4E5F6071}"
+               Bitness="always64">
+      <File Id="UIExe"
+            Name="ShadowStrikePhantomUI.exe"
+            Source="$(var.BinDir)\ShadowStrikePhantomUI.exe"
+            KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         ONNX RUNTIME  (PhantomCortex ML inference engine)
+         Not staged by windeployqt – must be deployed alongside the service.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpOnnxRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="{F787E93D-D63B-428A-96A7-1706956B4017}"
+               Bitness="always64">
+      <File Id="OrtDll"
+            Name="onnxruntime.dll"
+            Source="$(var.BinDir)\onnxruntime.dll"
+            KeyPath="yes"/>
+      <File Id="OrtProvidersSharedDll"
+            Name="onnxruntime_providers_shared.dll"
+            Source="$(var.BinDir)\onnxruntime_providers_shared.dll"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         DIRECTX SHADER COMPILER RUNTIME  (required by ONNX/DX backend)
+         dxcompiler.dll + dxil.dll are not Qt dependencies; windeployqt does
+         not stage them.  D3Dcompiler_47.dll IS staged by windeployqt.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpDxRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="{39E08603-89CE-47F3-8C3B-CF38AE07D290}"
+               Bitness="always64">
+      <File Id="DxCompilerDll"
+            Name="dxcompiler.dll"
+            Source="$(var.BinDir)\dxcompiler.dll"
+            KeyPath="yes"/>
+      <File Id="DxilDll"
+            Name="dxil.dll"
+            Source="$(var.BinDir)\dxil.dll"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         TRAY AUTOSTART  (HKLM Run key – launches for every interactive user)
+         Using HKLM so the tray starts regardless of which user logs in,
+         consistent with a per-machine security product deployment.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpTrayAutostart"
+               Directory="INSTALLFOLDER"
+               Guid="{C4D5E6F7-8091-4A2B-B3C4-5D6E7F809102}"
+               Bitness="always64">
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+                     Name="ShadowStrikePhantomTray"
+                     Type="string"
+                     Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomTray.exe&quot;"
+                     KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         START MENU SHORTCUT  (all-users, per-machine install)
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpStartMenuShortcut"
+               Directory="ShadowStrikeMenuFolder"
+               Guid="{2B805F0A-F462-4E7B-8423-12D2980AD947}"
+               Bitness="always64">
+      <Shortcut Id="ShortcutStartMenuUI"
+                Name="ShadowStrike Phantom Home"
+                Description="Open the ShadowStrike Phantom Home security dashboard"
+                Target="[INSTALLFOLDER]ShadowStrikePhantomUI.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="ShadowStrikeIcon"/>
+      <!--
+        RemoveFolder: clean up the ShadowStrike subfolder in the Start Menu
+        on uninstall so no orphan folder is left behind.
+      -->
+      <RemoveFolder Id="RemoveShadowStrikeMenuFolder"
+                    Directory="ShadowStrikeMenuFolder"
+                    On="uninstall"/>
+      <!-- Registry KeyPath required for non-file components. -->
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                     Name="StartMenuShortcut"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         DESKTOP SHORTCUT  (optional feature; not selected by default)
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpDesktopShortcut"
+               Directory="DesktopFolder"
+               Guid="{1D7EF776-81C2-47A6-9C01-636C112A9707}"
+               Bitness="always64">
+      <Shortcut Id="ShortcutDesktopUI"
+                Name="ShadowStrike Phantom Home"
+                Description="Open the ShadowStrike Phantom Home security dashboard"
+                Target="[INSTALLFOLDER]ShadowStrikePhantomUI.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="ShadowStrikeIcon"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                     Name="DesktopShortcut"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PROGRAMDATA – LOGS DIRECTORY
+         ACL: SYSTEM + Administrators → Full Control; Users → Read + Traverse
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpProgramDataLogs"
+               Directory="ProgramDataLogs"
+               Guid="{B353239A-99D0-49A5-9AFE-9AF64CF450EA}"
+               Bitness="always64">
+      <CreateFolder>
+        <util:PermissionEx User="System"
+                           Domain="NT AUTHORITY"
+                           GenericAll="yes"/>
+        <util:PermissionEx User="Administrators"
+                           GenericAll="yes"/>
+        <util:PermissionEx User="Users"
+                           GenericRead="yes"
+                           GenericExecute="yes"/>
+      </CreateFolder>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Dirs"
+                     Name="Logs"
+                     Type="string"
+                     Value="[ProgramDataLogs]"
+                     KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PROGRAMDATA – QUARANTINE DIRECTORY
+         Same ACL policy as Logs; the service writes here under SYSTEM.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpProgramDataQuarantine"
+               Directory="ProgramDataQuarantine"
+               Guid="{FF63BCCB-E04E-4F02-AAD6-A0A292C3A133}"
+               Bitness="always64">
+      <CreateFolder>
+        <util:PermissionEx User="System"
+                           Domain="NT AUTHORITY"
+                           GenericAll="yes"/>
+        <util:PermissionEx User="Administrators"
+                           GenericAll="yes"/>
+        <util:PermissionEx User="Users"
+                           GenericRead="yes"
+                           GenericExecute="yes"/>
+      </CreateFolder>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Dirs"
+                     Name="Quarantine"
+                     Type="string"
+                     Value="[ProgramDataQuarantine]"
+                     KeyPath="yes"/>
+    </Component>
+
+  </Fragment>
+</Wix>
