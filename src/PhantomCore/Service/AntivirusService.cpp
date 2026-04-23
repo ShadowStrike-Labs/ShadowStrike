@@ -256,9 +256,11 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize RegistryProtection");
                 // Non-fatal: registry tamper detection degrades
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"RegistryProtection init returned");
 
             // File Protection (protect installation directory and databases
             // before Real-Time Protection opens its signature/pattern files)
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing FileProtection...");
             Security::FileProtectionConfiguration fpConfig;
             fpConfig.mode = Security::FileProtectionMode::Protect;
             fpConfig.enableIntegrityMonitoring = true;
@@ -268,9 +270,11 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize FileProtection");
                 // Non-fatal: file tamper detection degrades
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"FileProtection init returned");
 
             // Digital Signature Validator (used by RealTimeProtection and
             // ProcessCreationMonitor for Authenticode verification)
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing DigitalSignatureValidator...");
             Security::SignatureValidatorConfiguration dsvConfig;
             dsvConfig.enableCaching = true;
             dsvConfig.allowCatalogSignatures = true;
@@ -279,16 +283,20 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize DigitalSignatureValidator");
                 // Non-fatal: signature validation degrades
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"DigitalSignatureValidator init returned");
 
             // Certificate Validator
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing CertificateValidator...");
             Security::CertificateValidatorConfiguration certConfig;
             if (!Security::CertificateValidator::Instance().Initialize(certConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize CertificateValidator");
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"CertificateValidator init returned");
 
             // SelfDefense (central orchestrator — coordinates all protection
             // modules, starts watchdog/heartbeat monitoring. Must be last in
             // the self-protection chain so all subsystems are ready.)
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing SelfDefense...");
             Security::SelfDefenseConfiguration sdConfig;
             sdConfig.level = Security::SelfDefenseLevel::Enhanced;
             sdConfig.enableWatchdog = true;
@@ -298,18 +306,23 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize SelfDefense orchestrator");
                 // Non-fatal: watchdog/heartbeat monitoring degrades
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense init returned");
 
             // AMSI Integration
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing AMSIIntegration...");
             if (!Scripts::AMSIIntegration::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AMSIIntegration");
                 // Warning only, service can run without AMSI
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"AMSIIntegration init returned");
 
             // 4. Initialize Communication
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing IPCManager...");
             if (!Communication::IPCManager::Instance().Initialize()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize IPCManager");
                 return false;
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"IPCManager init returned");
 
             // Initialize Communication subsystems (singletons — all depend on IPCManager)
             if (!Communication::AlertSystem::Instance().Initialize(Communication::AlertConfiguration{})) {
