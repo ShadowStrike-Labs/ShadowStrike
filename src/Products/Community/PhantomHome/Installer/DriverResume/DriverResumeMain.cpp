@@ -264,13 +264,18 @@ static int RunStage2()
     // 6. Load the driver: FilterLoad → StartServiceW fallback.
     err = LoadDriver(scm.get());
     if (err != ERROR_SUCCESS) {
-        LOG_ERROR(L"LoadDriver failed (0x%08X). Driver is installed but not running.", err);
-        // Fall through: still write marker so bundle doesn't re-run on next launch.
-    } else {
-        LOG_INFO(L"Driver loaded and running.");
+        LOG_ERROR(L"LoadDriver failed (0x%08X). Rolling back SCM entry and driver binary.", err);
+        // Rollback: remove service and binary so the next install attempt starts clean.
+        // Leaving an SCM entry pointing to a non-running driver is a dangerous orphan.
+        (void)StopAndDeleteExistingService(scm.get());
+        DeleteFileW(dstPath.c_str());
+        return kExitGenericFailure;
     }
+    LOG_INFO(L"Driver loaded and running.");
 
-    // 7. Write InstallComplete registry marker.
+    // 7. Write InstallComplete registry marker ONLY on full success.
+    //    If this is skipped (LoadDriver failed above, we returned), the bundle
+    //    will attempt the full install again on next launch, which is correct.
     DWORD markerErr = SetInstallCompleteMarker();
     if (markerErr != ERROR_SUCCESS) {
         LOG_WARN(L"SetInstallCompleteMarker failed (0x%08X) — bundle detection may re-run.",
@@ -280,9 +285,8 @@ static int RunStage2()
     // 8. Clean up RunOnce entry (idempotent).
     (void)ClearRunOnceEntry();
 
-    LOG_INFO(L"=== Stage 2 complete. Exit code: %d ===",
-             (err == ERROR_SUCCESS) ? kExitSuccess : kExitGenericFailure);
-    return (err == ERROR_SUCCESS) ? kExitSuccess : kExitGenericFailure;
+    LOG_INFO(L"=== Stage 2 complete. ===");
+    return kExitSuccess;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

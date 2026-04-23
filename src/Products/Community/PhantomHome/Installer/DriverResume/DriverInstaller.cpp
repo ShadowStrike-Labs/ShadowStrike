@@ -100,19 +100,19 @@ static std::wstring BuildSystemDriverPath()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  VerifyDriverSignature
-//  Uses WinVerifyTrust to confirm Authenticode structure of the staged .sys.
-//  For dev-signed binaries, the root cert is not in Trusted Publishers; we
-//  verify the structural signature only (WTD_REVOKE_NONE, no UI, no chain
-//  trust check). This stops an attacker from substituting an UNSIGNED binary
-//  while still allowing dev-cert-signed binaries through.
+//  VerifyDriverSignatureByHandle
+//  Uses WinVerifyTrust with an already-open HANDLE so the file cannot be
+//  swapped between verification and copy.  pcwszFilePath is still required by
+//  the SIP (Subject Interface Package) to locate the Authenticode data in the
+//  file's security directory; setting hFile prevents WinVerifyTrust from
+//  opening a second file handle (which would reintroduce the TOCTOU window).
 // ────────────────────────────────────────────────────────────────────────────
-static DWORD VerifyDriverSignature(const std::wstring& filePath)
+static DWORD VerifyDriverSignatureByHandle(HANDLE hFile, const std::wstring& filePath)
 {
     WINTRUST_FILE_INFO fileInfo{};
-    fileInfo.cbStruct    = sizeof(fileInfo);
-    fileInfo.pcwszFilePath = filePath.c_str();
-    fileInfo.hFile       = nullptr;
+    fileInfo.cbStruct       = sizeof(fileInfo);
+    fileInfo.pcwszFilePath  = filePath.c_str();
+    fileInfo.hFile          = hFile;    // Use caller's handle — no second open.
     fileInfo.pgKnownSubject = nullptr;
 
     GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
@@ -121,35 +121,35 @@ static DWORD VerifyDriverSignature(const std::wstring& filePath)
     wtd.cbStruct            = sizeof(wtd);
     wtd.pPolicyCallbackData = nullptr;
     wtd.pSIPClientData      = nullptr;
-    wtd.dwUIChoice          = WTD_UI_NONE;       // No UI dialogs
+    wtd.dwUIChoice          = WTD_UI_NONE;
     wtd.fdwRevocationChecks = WTD_REVOKE_NONE;   // Skip CRL (offline-friendly)
     wtd.dwUnionChoice       = WTD_CHOICE_FILE;
     wtd.pFile               = &fileInfo;
     wtd.dwStateAction       = WTD_STATEACTION_VERIFY;
     wtd.hWVTStateData       = nullptr;
     wtd.pwszURLReference    = nullptr;
-    // WTD_SAFER_FLAG: skip SAFER check (we don't need full policy here).
     wtd.dwProvFlags         = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
     wtd.dwUIContext         = 0;
 
     LONG status = WinVerifyTrust(nullptr, &policyGuid, &wtd);
 
-    // Always close the state data to prevent resource leak.
+    // Always close the state data to prevent WinVerifyTrust resource leak.
     wtd.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(nullptr, &policyGuid, &wtd);
 
     // Acceptable results:
     //   ERROR_SUCCESS (0)                   - trusted chain
     //   CERT_E_UNTRUSTEDROOT (0x800B0109)   - self-signed / dev cert root
-    //   CERT_E_CHAINING (0x800B010A)        - chain build failed (also dev cert)
-    //   TRUST_E_EXPLICIT_DISTRUST           - explicitly distrusted (REJECT)
-    //   TRUST_E_NOSIGNATURE (0x800B0100)    - no signature at all (REJECT)
+    //   CERT_E_CHAINING (0x800B010A)        - chain build failure (also dev cert)
+    // Rejected:
+    //   TRUST_E_NOSIGNATURE (0x800B0100)    - no signature at all
+    //   TRUST_E_EXPLICIT_DISTRUST           - explicitly distrusted
+    //   Any other HRESULT failure
 
     if (status == static_cast<LONG>(CERT_E_UNTRUSTEDROOT) ||
         status == static_cast<LONG>(CERT_E_CHAINING))
     {
-        // Dev-cert signed: structurally valid but root not in Trusted Publishers.
-        LOG_WARN(L"Driver binary has a dev-cert signature (root not trusted by CA store). "
+        LOG_WARN(L"Driver binary has a dev-cert signature (root not in CA store). "
                  L"Acceptable for dev/test builds. HRESULT=0x%08X", status);
         return ERROR_SUCCESS;
     }
@@ -159,59 +159,33 @@ static DWORD VerifyDriverSignature(const std::wstring& filePath)
         return ERROR_SUCCESS;
     }
 
-    // Any other failure means the file has no valid Authenticode signature.
-    LOG_ERROR(L"WinVerifyTrust REJECTED driver binary '%ls': HRESULT=0x%08X. "
+    LOG_ERROR(L"WinVerifyTrust REJECTED '%ls': HRESULT=0x%08X. "
               L"Refusing to copy unsigned or tampered driver to System32.",
               filePath.c_str(), static_cast<DWORD>(status));
-    return ERROR_INVALID_DATA; // Signature absent or structurally invalid.
+    return ERROR_INVALID_DATA;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  SecureCopyFile
-//  Opens the source file with FILE_SHARE_READ (no write sharing) to prevent
-//  TOCTOU replacement between verification and copy. Manually reads and writes
-//  the content using the open handle so the file cannot be swapped under us.
+//  StreamCopyFromHandle
+//  Copies srcSize bytes from an already-open source handle to tmpDstPath.
+//  The caller must set the source file position to the desired read offset
+//  before calling (typically 0 after VerifyDriverSignatureByHandle).
 // ────────────────────────────────────────────────────────────────────────────
-static DWORD SecureCopyFile(const std::wstring& srcPath,
-                             const std::wstring& tmpDstPath)
+static DWORD StreamCopyFromHandle(HANDLE hSrc,
+                                   LONGLONG srcSize,
+                                   const std::wstring& tmpDstPath)
 {
-    // Open source: GENERIC_READ, FILE_SHARE_READ only.
-    // Any concurrent open for WRITE or DELETE will fail with ERROR_SHARING_VIOLATION.
-    HandleGuard srcHandle(
-        CreateFileW(srcPath.c_str(),
-                    GENERIC_READ,
-                    FILE_SHARE_READ,     // deny write + delete sharing
-                    nullptr,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    nullptr));
-
-    if (!srcHandle.valid()) {
-        DWORD err = GetLastError();
-        LOG_ERROR(L"SecureCopyFile: cannot open source '%ls' (0x%08X)", srcPath.c_str(), err);
-        return err;
-    }
-
-    LARGE_INTEGER srcSize{};
-    if (!GetFileSizeEx(srcHandle.get(), &srcSize)) {
-        DWORD err = GetLastError();
-        LOG_ERROR(L"SecureCopyFile: GetFileSizeEx failed (0x%08X)", err);
-        return err;
-    }
-
     // Sanity cap: no legitimate kernel driver is > 64 MB.
     constexpr LONGLONG kMaxDriverBytes = 64LL * 1024 * 1024;
-    if (srcSize.QuadPart > kMaxDriverBytes) {
-        LOG_ERROR(L"SecureCopyFile: source size %lld B exceeds 64 MB cap. Refusing.",
-                  srcSize.QuadPart);
+    if (srcSize > kMaxDriverBytes) {
+        LOG_ERROR(L"Source size %lld B exceeds 64 MB cap. Refusing.", srcSize);
         return ERROR_FILE_TOO_LARGE;
     }
 
-    // Open temp destination (create new; overwrite if prior .tmp exists).
     HandleGuard dstHandle(
         CreateFileW(tmpDstPath.c_str(),
                     GENERIC_WRITE,
-                    0,                   // exclusive: no sharing
+                    0,               // exclusive access — no sharing
                     nullptr,
                     CREATE_ALWAYS,
                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
@@ -219,26 +193,24 @@ static DWORD SecureCopyFile(const std::wstring& srcPath,
 
     if (!dstHandle.valid()) {
         DWORD err = GetLastError();
-        LOG_ERROR(L"SecureCopyFile: cannot create temp dest '%ls' (0x%08X)",
+        LOG_ERROR(L"StreamCopyFromHandle: cannot create '%ls' (0x%08X)",
                   tmpDstPath.c_str(), err);
         return err;
     }
 
-    // Stream copy via 1 MB chunks.
     constexpr DWORD kChunk = 1024 * 1024;
     std::vector<BYTE> buf(kChunk);
-    LONGLONG remaining = srcSize.QuadPart;
+    LONGLONG remaining = srcSize;
 
     while (remaining > 0) {
         DWORD toRead = static_cast<DWORD>(
             remaining < static_cast<LONGLONG>(kChunk) ? remaining : kChunk);
         DWORD bytesRead = 0;
-        if (!ReadFile(srcHandle.get(), buf.data(), toRead, &bytesRead, nullptr) ||
+        if (!ReadFile(hSrc, buf.data(), toRead, &bytesRead, nullptr) ||
             bytesRead != toRead)
         {
             DWORD err = GetLastError();
-            LOG_ERROR(L"SecureCopyFile: ReadFile failed (0x%08X)", err);
-            // Destroy partial destination.
+            LOG_ERROR(L"StreamCopyFromHandle: ReadFile failed (0x%08X)", err);
             dstHandle = HandleGuard{};
             DeleteFileW(tmpDstPath.c_str());
             return err;
@@ -249,7 +221,7 @@ static DWORD SecureCopyFile(const std::wstring& srcPath,
             bytesWritten != bytesRead)
         {
             DWORD err = GetLastError();
-            LOG_ERROR(L"SecureCopyFile: WriteFile failed (0x%08X)", err);
+            LOG_ERROR(L"StreamCopyFromHandle: WriteFile failed (0x%08X)", err);
             dstHandle = HandleGuard{};
             DeleteFileW(tmpDstPath.c_str());
             return err;
@@ -258,14 +230,12 @@ static DWORD SecureCopyFile(const std::wstring& srcPath,
         remaining -= bytesRead;
     }
 
-    // Flush to disk before rename.
     if (!FlushFileBuffers(dstHandle.get())) {
-        LOG_WARN(L"SecureCopyFile: FlushFileBuffers failed (0x%08X) – non-fatal.",
+        LOG_WARN(L"StreamCopyFromHandle: FlushFileBuffers failed (0x%08X) -- non-fatal.",
                  GetLastError());
     }
 
     return ERROR_SUCCESS;
-    // dstHandle closes here; srcHandle closes here (still deny-write during entire copy).
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -310,11 +280,16 @@ DWORD ResolveInstalledDriverPath(std::wstring& outPath)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  CopyDriverBinary
-//  Security design:
-//   1. Verify Authenticode signature of source binary.
-//   2. Open source with exclusive-write denial to prevent TOCTOU replacement.
-//   3. Manual stream-copy (SecureCopyFile) while holding the locked handle.
-//   4. Atomic rename .tmp → final path.
+//  Security design (post-review hardening):
+//   1. Open source file ONCE with FILE_SHARE_READ (exclusive write denial).
+//      This single handle is used for BOTH signature verification and stream
+//      copy — there is no window where the file can be swapped between them.
+//   2. WinVerifyTrust receives the pre-opened HANDLE (fileInfo.hFile) so it
+//      does not open the file a second time.
+//   3. After WinVerifyTrust, seek source to offset 0 and stream-copy while
+//      still holding the locked handle.
+//   4. Atomic rename .tmp → final using MoveFileExW; same-volume check
+//      ensures rename is truly atomic on NTFS (not a copy-then-delete).
 // ────────────────────────────────────────────────────────────────────────────
 DWORD CopyDriverBinary(const std::wstring& srcPath, std::wstring& dstPath)
 {
@@ -324,25 +299,82 @@ DWORD CopyDriverBinary(const std::wstring& srcPath, std::wstring& dstPath)
         return GetLastError() ? GetLastError() : ERROR_FUNCTION_FAILED;
     }
 
-    // --- Step 1: Verify Authenticode signature BEFORE touching the destination.
-    DWORD err = VerifyDriverSignature(srcPath);
+    // --- Step 1: Open source with write-denial (TOCTOU prevention).
+    //     FILE_SHARE_READ only — any concurrent WRITE or DELETE open fails.
+    HandleGuard srcHandle(
+        CreateFileW(srcPath.c_str(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    nullptr));
+
+    if (!srcHandle.valid()) {
+        DWORD err = GetLastError();
+        LOG_ERROR(L"CopyDriverBinary: cannot open source '%ls' (0x%08X)",
+                  srcPath.c_str(), err);
+        return err;
+    }
+
+    // Get size while we have the handle (size is fixed once we deny writes).
+    LARGE_INTEGER srcSize{};
+    if (!GetFileSizeEx(srcHandle.get(), &srcSize)) {
+        DWORD err = GetLastError();
+        LOG_ERROR(L"CopyDriverBinary: GetFileSizeEx failed (0x%08X)", err);
+        return err;
+    }
+
+    // --- Step 2: Verify Authenticode signature using the already-open handle.
+    //     WinVerifyTrust receives hFile so it does not open a second handle.
+    //     The write-denial on srcHandle is still in effect during verification.
+    DWORD err = VerifyDriverSignatureByHandle(srcHandle.get(), srcPath);
     if (err != ERROR_SUCCESS) {
-        LOG_ERROR(L"Signature verification FAILED for '%ls'. Driver copy aborted.", srcPath.c_str());
+        LOG_ERROR(L"Signature verification FAILED. Driver copy aborted.");
         return err;
     }
     LOG_INFO(L"Authenticode signature verified for: %ls", srcPath.c_str());
 
-    // --- Step 2 + 3: Locked copy (SecureCopyFile denies write-share on src).
+    // --- Step 3: Verify source and destination are on the same volume.
+    //     MoveFileExW is only atomic (kernel rename) on NTFS within one volume.
+    //     Across volumes it degrades to copy+delete, which is not atomic.
+    {
+        wchar_t srcVol[MAX_PATH + 1]  = {};
+        wchar_t dstVol[MAX_PATH + 1]  = {};
+        bool samePath = GetVolumePathNameW(srcPath.c_str(), srcVol, MAX_PATH) &&
+                        GetVolumePathNameW(dstPath.c_str(), dstVol, MAX_PATH);
+        if (!samePath || _wcsicmp(srcVol, dstVol) != 0) {
+            // Source and destination are on different volumes.
+            // MoveFileExW would perform a non-atomic copy+delete, which is unsafe.
+            // This configuration is not expected in any standard Windows install;
+            // fail loudly so the condition is visible rather than silently unsafe.
+            LOG_ERROR(L"Source volume '%ls' != destination volume '%ls'. "
+                      L"Cross-volume rename is not atomic. Aborting.",
+                      srcVol, dstVol);
+            return ERROR_NOT_SAME_DEVICE;
+        }
+    }
+
+    // --- Step 4: Seek source back to 0 and stream-copy while holding locked handle.
+    {
+        LARGE_INTEGER zero{};
+        if (!SetFilePointerEx(srcHandle.get(), zero, nullptr, FILE_BEGIN)) {
+            DWORD e = GetLastError();
+            LOG_ERROR(L"CopyDriverBinary: SetFilePointerEx failed (0x%08X)", e);
+            return e;
+        }
+    }
+
     std::wstring tmpDst = dstPath + L".tmp";
     LOG_INFO(L"Secure-copying driver to temp: %ls", tmpDst.c_str());
 
-    err = SecureCopyFile(srcPath, tmpDst);
+    err = StreamCopyFromHandle(srcHandle.get(), srcSize.QuadPart, tmpDst);
     if (err != ERROR_SUCCESS) {
-        LOG_ERROR(L"SecureCopyFile failed (0x%08X).", err);
+        LOG_ERROR(L"StreamCopyFromHandle failed (0x%08X).", err);
         return err;
     }
 
-    // --- Step 4: Atomic rename .tmp → final destination.
+    // --- Step 5: Atomic rename .tmp → final destination (NTFS rename = atomic).
     if (!MoveFileExW(tmpDst.c_str(), dstPath.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         err = GetLastError();
@@ -354,6 +386,7 @@ DWORD CopyDriverBinary(const std::wstring& srcPath, std::wstring& dstPath)
 
     LOG_INFO(L"Driver staged atomically to: %ls", dstPath.c_str());
     return ERROR_SUCCESS;
+    // srcHandle closes here — write-denial was maintained for the full operation.
 }
 
 // ────────────────────────────────────────────────────────────────────────────
