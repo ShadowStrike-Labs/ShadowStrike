@@ -77,8 +77,13 @@
         <file alias="ShadowStrike/Accessibility/_HOWTO_A11Y.qml">Accessibility/_HOWTO_A11Y.qml</file>
 
         <!-- ── Pages (no QML module — referenced directly by URL) ───────── -->
+        <file>Pages/MainPage.qml</file>
         <file>Pages/PerformancePage.qml</file>
+        <file>Pages/PgtiDetailPage.qml</file>
         <file>Pages/PrivacyPage.qml</file>
+        <file>Pages/QuarantineSubroute.qml</file>
+        <file>Pages/ReportsSubroute.qml</file>
+        <file>Pages/SecurityPage.qml</file>
         <file>Pages/ZeroTrustDetailPage.qml</file>
 
     </qresource>
