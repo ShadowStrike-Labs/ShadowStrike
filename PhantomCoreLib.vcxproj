@@ -306,6 +306,9 @@
     <ClCompile Include="src\PhantomCore\Service\EventPush.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\Service\HomeIpcDispatcher.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Service\IpcAuthToken.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ProductExtensions.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceCommunicator.cpp" />
@@ -899,6 +902,7 @@
   </ItemGroup>
   <!-- PhantomHome new service-layer component headers -->
   <ItemGroup>
+    <ClInclude Include="src\PhantomCore\Service\HomeIpcDispatcher.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Shared\ModuleCatalog.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\ThreatIntel\PgtiFeedManager.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Recommendations\RecommendationsEngine.hpp" />
