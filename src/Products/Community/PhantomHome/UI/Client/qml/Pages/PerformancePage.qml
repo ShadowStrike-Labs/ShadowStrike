@@ -410,7 +410,6 @@ PageHost {
                 width: parent.width - Theme.spacingL * 2
                 active: root.recentOptimizations.length === 0
                 sourceComponent: EmptyState {
-                    icon:    "gauge"
                     title:   qsTr("No recent optimizations")
                     message: qsTr("ShadowStrike has not made any performance adjustments yet.")
                 }
