@@ -92,9 +92,14 @@ ApplicationWindow {
 
         // Maps route string → QML component URL.
         readonly property var routeMap: ({
+            "dashboard":     "qrc:/qml/Pages/MainPage.qml",
+            "security":      "qrc:/qml/Pages/SecurityPage.qml",
             "performance":   "qrc:/qml/Pages/PerformancePage.qml",
             "privacy":       "qrc:/qml/Pages/PrivacyPage.qml",
-            "zerotrust":     "qrc:/qml/Pages/ZeroTrustDetailPage.qml"
+            "zerotrust":     "qrc:/qml/Pages/ZeroTrustDetailPage.qml",
+            "pgti":          "qrc:/qml/Pages/PgtiDetailPage.qml",
+            "quarantine":    "qrc:/qml/Pages/QuarantineSubroute.qml",
+            "reports":       "qrc:/qml/Pages/ReportsSubroute.qml"
         })
 
         function navigateTo(route) {
