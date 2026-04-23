@@ -228,13 +228,38 @@ void SignalFirstInstance() noexcept
 // ---------------------------------------------------------------------------
 void InitLogger() noexcept
 {
+    // Resolve per-user log directory so the UI works under the read-only
+    // Program Files install location.  Fallback chain:
+    //   1. %LOCALAPPDATA%\ShadowStrike\Logs           (preferred)
+    //   2. %TEMP%\ShadowStrike\Logs                   (service-like fallback)
+    //   3. "logs"                                     (dev runs from bin\Release)
+    std::wstring logDir;
+    {
+        wchar_t localAppData[MAX_PATH]{};
+        DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            logDir.assign(localAppData, n);
+            logDir += L"\\ShadowStrike\\Logs";
+        } else {
+            wchar_t tempPath[MAX_PATH]{};
+            DWORD t = ::GetTempPathW(MAX_PATH, tempPath);
+            if (t > 0 && t < MAX_PATH) {
+                logDir.assign(tempPath, t);
+                if (!logDir.empty() && logDir.back() != L'\\') logDir.push_back(L'\\');
+                logDir += L"ShadowStrike\\Logs";
+            } else {
+                logDir = L"logs";
+            }
+        }
+    }
+
     LoggerConfig cfg{};
     cfg.async             = true;
     cfg.toConsole         = false;  // GUI application — no console window
     cfg.toFile            = true;
     cfg.toEventLog        = false;
     cfg.jsonLines         = false;
-    cfg.logDirectory      = L"logs";
+    cfg.logDirectory      = logDir;
     cfg.baseFileName      = L"PhantomHomeUI";
     cfg.maxFileSizeBytes  = 10ULL * 1024ULL * 1024ULL;  // 10 MiB
     cfg.maxFileCount      = 5;
@@ -385,6 +410,19 @@ int main(int argc, char* argv[])
     if (engine.rootObjects().isEmpty()) {
         SS_LOG_ERROR(L"PhantomHome.Main",
                      L"Fatal: QML engine produced no root objects after loading Main.qml");
+        // Surface the failure to the user so a silent install-time regression
+        // (e.g. missing Qt QML module, broken qrc) is immediately visible
+        // instead of the UI appearing to do nothing when launched from the tray.
+        ::MessageBoxW(
+            nullptr,
+            L"ShadowStrike Phantom could not start its user interface.\n\n"
+            L"The QML engine failed to load the main view. This usually means a "
+            L"required Qt runtime component is missing or damaged.\n\n"
+            L"Please reinstall from the signed bundle (ShadowStrikePhantom-Home-Setup.exe) "
+            L"and, if the problem persists, send the log file found under:\n"
+            L"    %LOCALAPPDATA%\\ShadowStrike\\Logs\\PhantomHomeUI*.log",
+            L"ShadowStrike Phantom Home — startup failure",
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
         pipeClient.Stop();
         windowActivator.Stop();
         if (hMutex) ::CloseHandle(hMutex);
