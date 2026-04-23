@@ -6,7 +6,11 @@ import ShadowStrike.Accessibility
 Item {
     id: root
 
-    required property string pageTitle
+    // Title of the current page.  Optional — defaults to empty so TopBar
+    // can be instantiated without a route context (e.g. in previews or on
+    // boot before Main.qml's navigation model has settled).  Consumers that
+    // need a specific value should assign pageTitle: "…" at the binding site.
+    property string pageTitle: ""
     property bool showBack: false
     signal backClicked()
 

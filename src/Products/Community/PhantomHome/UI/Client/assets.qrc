@@ -12,4 +12,24 @@
     <qresource prefix="/qml/assets">
         <file alias="logo.png">qml/assets/logo.png</file>
     </qresource>
+    <!--
+        Icon set — minimalist feather-style monoline SVGs shared by the
+        entire PhantomHome UI.  Stroke colour is baked in (Theme.textPrimary
+        ≈ #EAF2FF) so Qt's QQuickImage renders them correctly without needing
+        a tint pipeline.  Referenced via:
+            source: "qrc:/icons/<name>.svg"
+    -->
+    <qresource prefix="/icons">
+        <file alias="back.svg">qml/icons/back.svg</file>
+        <file alias="chevron_left.svg">qml/icons/chevron_left.svg</file>
+        <file alias="chevron_right.svg">qml/icons/chevron_right.svg</file>
+        <file alias="close.svg">qml/icons/close.svg</file>
+        <file alias="eye.svg">qml/icons/eye.svg</file>
+        <file alias="gauge.svg">qml/icons/gauge.svg</file>
+        <file alias="gear.svg">qml/icons/gear.svg</file>
+        <file alias="lock.svg">qml/icons/lock.svg</file>
+        <file alias="refresh.svg">qml/icons/refresh.svg</file>
+        <file alias="search.svg">qml/icons/search.svg</file>
+        <file alias="shield.svg">qml/icons/shield.svg</file>
+    </qresource>
 </RCC>

@@ -411,7 +411,7 @@
       <Message>RCC assets.qrc</Message>
       <Command>"$(QtBin)\rcc.exe" --name assets --output "$(IntDir)qrc_assets.cpp" "%(FullPath)"</Command>
       <Outputs>$(IntDir)qrc_assets.cpp</Outputs>
-      <AdditionalInputs>src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.png</AdditionalInputs>
+      <AdditionalInputs>src\Products\Community\PhantomHome\UI\Client\qml\assets\logo.png;src\Products\Community\PhantomHome\UI\Client\qml\icons\back.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\chevron_left.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\chevron_right.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\close.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\eye.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\gauge.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\gear.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\lock.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\refresh.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\search.svg;src\Products\Community\PhantomHome\UI\Client\qml\icons\shield.svg</AdditionalInputs>
     </CustomBuild>
     <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\translations\translations.qrc">
       <Message>RCC translations.qrc</Message>

@@ -75,6 +75,7 @@ ApplicationWindow {
                 id:     topBar
                 Layout.fillWidth: true
                 Layout.preferredHeight: Theme.topBarHeight
+                pageTitle: d.currentTitle
             }
 
             // Page host — holds the StackView
@@ -89,6 +90,25 @@ ApplicationWindow {
     // ── Private navigation logic ───────────────────────────────────────────
     QtObject {
         id: d
+
+        // Current route key (mirrors what was last requested via navigateTo).
+        property string currentRoute: "dashboard"
+
+        // Human-readable title for the TopBar.  Derived from currentRoute via
+        // a small lookup so TopBar and the routeMap stay in sync in one place.
+        readonly property var titleMap: ({
+            "dashboard":   qsTr("Dashboard"),
+            "security":    qsTr("Security"),
+            "performance": qsTr("Performance"),
+            "privacy":     qsTr("Privacy"),
+            "zerotrust":   qsTr("Zero Trust"),
+            "pgti":        qsTr("Threat Intelligence"),
+            "quarantine":  qsTr("Quarantine"),
+            "reports":     qsTr("Reports"),
+            "settings":    qsTr("Settings")
+        })
+        readonly property string currentTitle:
+            (titleMap[currentRoute] !== undefined) ? titleMap[currentRoute] : ""
 
         // Maps route string → QML component URL.
         readonly property var routeMap: ({
@@ -105,6 +125,7 @@ ApplicationWindow {
         function navigateTo(route) {
             const url = routeMap[route];
             if (url !== undefined) {
+                currentRoute = route;
                 pageHost.navigateTo(url);
             }
         }
