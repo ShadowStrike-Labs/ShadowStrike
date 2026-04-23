@@ -39,6 +39,26 @@ namespace {
 
 constexpr const wchar_t* kLogSource = L"ShadowStrike Phantom Service";
 
+// ---------------------------------------------------------------------------
+// Unhandled SEH filter — writes a synchronous crash marker to the log so a
+// silent access-violation or stack-overflow in a module's Initialize path is
+// visible in the next run's triage instead of a truncated log.
+// ---------------------------------------------------------------------------
+LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
+    try {
+        DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+        void* addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+        ShadowStrike::Utils::Logger::Instance().Flush();
+        ::ShadowStrike::Utils::Logger::Error(
+            "FATAL unhandled SEH exception: code=0x{:08X} address={:p}",
+            static_cast<unsigned>(code), addr);
+        ShadowStrike::Utils::Logger::Instance().Flush();
+    } catch (...) {
+        // Best effort only; process is about to die.
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 std::wstring ResolveLogDirectory() noexcept {
     wchar_t expanded[MAX_PATH]{};
     if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike\\Logs",
@@ -92,6 +112,7 @@ void InitialiseLogger() noexcept {
 }  // namespace
 
 extern "C" int wmain(int argc, wchar_t* argv[]) {
+    ::SetUnhandledExceptionFilter(ShadowStrikeUnhandledFilter);
     InitialiseLogger();
 
     if (argc >= 2 && argv != nullptr && argv[1] != nullptr) {

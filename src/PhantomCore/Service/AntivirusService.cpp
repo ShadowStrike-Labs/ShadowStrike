@@ -121,6 +121,12 @@ public:
             Utils::LoggerConfig loggerConfig{};
             loggerConfig.baseFileName = ServiceConstants::SERVICE_NAME;
             loggerConfig.eventLogSource = ServiceConstants::SERVICE_NAME;
+            // Synchronous logging during Initialize so every line is durably
+            // flushed before the next Initialize() call — critical for
+            // diagnosing crashes in downstream modules. Async mode is
+            // re-enabled after the service reaches steady state (see Run()).
+            loggerConfig.async = false;
+            loggerConfig.flushLevel = Utils::LogLevel::Trace;
             Utils::Logger::Instance().Initialize(loggerConfig);
             SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service initializing...");
 
@@ -202,16 +208,20 @@ public:
             }
 
             // Tamper Protection (Critical - protect self first)
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing TamperProtection...");
             Security::TamperProtectionConfiguration tamperConfig;
             tamperConfig.mode = Security::TamperProtectionMode::Enforce;
             if (!Security::TamperProtection::Instance().Initialize(tamperConfig)) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize TamperProtection");
                 return false;
             }
+            SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection initialized — calling ProtectSelf");
             Security::TamperProtection::Instance().ProtectSelf();
+            SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection ProtectSelf completed");
 
             // Process Protection (must be initialized before RealTimeProtection
             // so the kernel HandleAlert bridge is ready when IPC starts)
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing ProcessProtection...");
             Security::ProcessProtectionConfiguration ppConfig;
             if (!Security::ProcessProtection::Instance().Initialize(ppConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize ProcessProtection");
@@ -219,11 +229,14 @@ public:
             } else {
                 // Initialize() already protects our own PID internally.
                 // Attempt PPL elevation via kernel driver for maximum protection.
+                SS_LOG_INFO(LOG_CATEGORY, L"ProcessProtection initialized — attempting PPL elevation");
                 (void)Security::ProcessProtection::Instance().ElevateToPPL();
+                SS_LOG_INFO(LOG_CATEGORY, L"ProcessProtection PPL elevation attempt completed");
             }
 
             // Registry Protection (initializes kernel registry callback handler
             // and starts integrity monitoring before RealTimeProtection activates)
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing RegistryProtection...");
             Security::RegistryProtectionConfiguration rpConfig;
             rpConfig.mode = Security::RegistryProtectionMode::Rollback;
             rpConfig.enableAutoRollback = true;

@@ -765,12 +765,12 @@ PageHost {
             Repeater {
                 model: root.recentDecisions
                 delegate: ThreatRow {
+                    required property var modelData
                     width:            parent.width - Theme.spacingL * 2
                     threatName:       modelData.fileName     || ""
                     filePath:         modelData.filePath     || ""
                     action:           modelData.decision     || "blocked"
                     timestampDisplay: modelData.timestamp    || ""
-                    severity:         modelData.severity     || "warning"
                 }
             }
 
