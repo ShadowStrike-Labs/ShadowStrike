@@ -6,16 +6,28 @@
   immediately after InstallFinalize on fresh installs.
 
   Design:
-    Deferred-no-impersonation CA: runs as SYSTEM with elevated SCM access.
-    Return asyncWait: MSI waits for exit code but does NOT interpret
-    3010 (reboot required) as an MSI failure; the helper owns reboot UX.
-    REBOOT=ReallySuppress: prevents Windows Installer from prompting a
-    second restart dialog (the DriverResume EXE owns the reboot UX).
-    Condition: NOT Installed (skip on upgrades where testsigning already handled).
+    SetDriverStage1Cmd (immediate) expands [INSTALLFOLDER] into the
+    ExecDriverInstallStg1 property so the deferred CA receives the full
+    absolute path as CustomActionData.
 
-  Sequence (relative to InstallFinalize = 6600):
-    SetDriverInstallPath   6601 - Set property for deferred CA
-    ExecDriverInstallStg1  6602 - Invoke DriverResume stage1 mode
+    ExecDriverInstallStg1 (deferred, no-impersonation) reads CustomActionData
+    and executes the stage1 helper as SYSTEM. Return=asyncWait means MSI waits
+    for exit but treats exit 3010 as a non-fatal restart request (the Burn
+    bootstrapper engine interprets that exit code and shows a restart button).
+
+    REBOOT=ReallySuppress prevents Windows Installer from prompting its own
+    restart dialog. The DriverResume EXE owns restart UX via
+    InitiateSystemShutdownExW (60-second countdown with user-visible message).
+
+    Condition: NOT Installed (first install only; skip upgrades/repairs where
+    testsigning was already configured on initial install).
+
+  WiX v4 Directory+ExeCommand CA pattern:
+    The Directory attribute on a CustomAction sets the MSI working directory
+    for the spawned process. MSI resolves Directory table entries in both
+    immediate and deferred phases, so INSTALLFOLDER resolves to the full
+    absolute path. The ExeCommand basename is found in that working directory.
+    This is the correct WiX v4 approach for single-EXE deferred CAs.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
@@ -23,25 +35,26 @@
 
     <!--
       Suppress the Windows Installer reboot prompt.
-      The DriverResume helper manages the reboot countdown UX via
-      InitiateSystemShutdownExW (60-second countdown with a visible message).
+      DriverResume manages the reboot UX (60-second countdown via
+      InitiateSystemShutdownExW with SE_SHUTDOWN_NAME privilege).
     -->
     <Property Id="REBOOT" Value="ReallySuppress"/>
 
     <!--
-      Immediate CA: stores the stage1 command into the ExecDriverInstallStg1
-      property so the deferred CA can read it as CustomActionData.
+      Immediate CA: stores the full expanded stage1 command into the property
+      whose name matches the deferred CA. MSI passes this to the deferred CA
+      as CustomActionData, giving it the absolute install path.
     -->
-    <CustomAction Id="SetDriverInstallPath"
+    <CustomAction Id="SetDriverStage1Cmd"
                   Property="ExecDriverInstallStg1"
-                  Value="[INSTALLFOLDER]ShadowStrikeDriverResume.exe --stage1"/>
+                  Value="&quot;[INSTALLFOLDER]ShadowStrikeDriverResume.exe&quot; --stage1"/>
 
     <!--
-      Deferred-no-impersonation CA: runs as SYSTEM.
-      Execute deferred: runs after files are copied to disk.
-      Impersonate no: keeps SYSTEM token, required for SCM and bcdedit access.
-      Return asyncWait: MSI waits for helper to exit; exit code 3010 is treated
-      as a soft restart request by the Burn bootstrapper, not as a fatal error.
+      Deferred-no-impersonation CA: spawns DriverResume as SYSTEM.
+      Directory resolves to the absolute INSTALLFOLDER path in the deferred
+      phase via the MSI Directory table (NOT a live property lookup).
+      ExeCommand is the process command line relative to that directory.
+      Return asyncWait: waits for exit; exit 3010 is non-fatal (bundle handles it).
     -->
     <CustomAction Id="ExecDriverInstallStg1"
                   Directory="INSTALLFOLDER"
@@ -52,17 +65,17 @@
 
     <InstallExecuteSequence>
       <!--
-        Set the property immediately before the deferred CA fires.
-        Condition: NOT Installed means this only runs on first install, not repair/upgrade.
+        Set CustomActionData before the deferred CA fires.
+        Condition: NOT Installed (first install only).
       -->
-      <Custom Action="SetDriverInstallPath"
+      <Custom Action="SetDriverStage1Cmd"
               Before="ExecDriverInstallStg1"
               Condition="NOT Installed"/>
 
       <!--
-        Invoke the driver install helper after InstallFinalize (sequence 6600)
-        so all MSI-managed files are guaranteed to be on disk.
-        Condition: NOT Installed (skip upgrades where driver was already installed).
+        Fire deferred CA after InstallFinalize (sequence 6600) so all
+        MSI-managed files are guaranteed to be on disk.
+        Condition: NOT Installed (same guard as the setter).
       -->
       <Custom Action="ExecDriverInstallStg1"
               After="InstallFinalize"

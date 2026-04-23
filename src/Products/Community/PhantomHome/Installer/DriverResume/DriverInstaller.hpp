@@ -75,6 +75,30 @@ inline constexpr wchar_t kRunOnceValName[]     = L"PhantomSensorDriverInstall";
 //  RAII handle wrappers
 // ────────────────────────────────────────────────────────────────────────────
 
+/** RAII wrapper for Win32 HANDLE. */
+struct HandleGuard {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    explicit HandleGuard(HANDLE handle = INVALID_HANDLE_VALUE) noexcept : h(handle) {}
+    ~HandleGuard() noexcept { if (h != INVALID_HANDLE_VALUE && h != nullptr) CloseHandle(h); }
+
+    HandleGuard(const HandleGuard&)            = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    HandleGuard(HandleGuard&& o) noexcept : h(o.h) { o.h = INVALID_HANDLE_VALUE; }
+    HandleGuard& operator=(HandleGuard&& o) noexcept {
+        if (this != &o) {
+            if (h != INVALID_HANDLE_VALUE && h != nullptr) CloseHandle(h);
+            h = o.h; o.h = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return h != INVALID_HANDLE_VALUE && h != nullptr;
+    }
+    [[nodiscard]] HANDLE get() const noexcept { return h; }
+    HANDLE release() noexcept { HANDLE r = h; h = INVALID_HANDLE_VALUE; return r; }
+};
+
 /** RAII wrapper for SC_HANDLE (SCM or service). */
 struct ScHandleGuard {
     SC_HANDLE h = nullptr;
