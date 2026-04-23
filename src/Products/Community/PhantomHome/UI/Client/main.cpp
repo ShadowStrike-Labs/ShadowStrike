@@ -494,6 +494,23 @@ int main(int argc, char* argv[])
     }
 
     // ── Step 14: Post-load actions ─────────────────────────────────────────
+    // Wire ApplicationWindow::activeChanged → PerfBudget::OnWindowActiveChanged
+    // now that the root window object exists.  Previously this was bound
+    // inline in Main.qml but PerfBudgetContext has no invokable entry point,
+    // so the call lives C++-side where the static can be invoked directly.
+    {
+        const auto& roots = engine.rootObjects();
+        for (QObject* obj : roots) {
+            if (auto* win = qobject_cast<QQuickWindow*>(obj)) {
+                QObject::connect(win, &QWindow::activeChanged, &app,
+                                 [win]() noexcept {
+                                     PerfBudget::OnWindowActiveChanged(win->isActive());
+                                 });
+                break;
+            }
+        }
+    }
+
     // Apply minimized state and action args via a single-shot timer so the
     // window has completed its first paint before we manipulate it.
     QTimer::singleShot(0, [&]() {

@@ -347,7 +347,8 @@ PageHost {
                     Accessible.role:        Accessible.ListItem
                     Accessible.name:        qRow.name
                     Accessible.description: qsTr("%1 — %2 — quarantined %3").arg(qRow.threat).arg(qRow.path).arg(root.relativeTime(qRow.quarantinedAt))
-                    Accessible.checkState:  qRow._selected ? Qt.Checked : Qt.Unchecked
+                    Accessible.checkable:   true
+                    Accessible.checked:     qRow._selected
                 }
 
                 ScrollBar.vertical: ScrollBar {

@@ -97,5 +97,6 @@ Item {
     Accessible.role:        Accessible.CheckBox
     Accessible.name:        root.labelText.length > 0 ? root.labelText : qsTr("Toggle")
     Accessible.description: root.checked ? qsTr("Enabled") : qsTr("Disabled")
-    Accessible.checkState:  root.checked ? Qt.Checked : Qt.Unchecked
+    Accessible.checkable:   true
+    Accessible.checked:     root.checked
 }
