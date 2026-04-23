@@ -184,10 +184,14 @@ public:
     bool IsRunning() const noexcept;
 
     void RegisterHandler(CommandType type, CommandHandler handler);
+    void RegisterV2Handler(CommandType type, V2CommandHandler handler);
     size_t Broadcast(CommandType type, const std::vector<uint8_t>& payload);
     size_t BroadcastEvent(CommandType eventType, const std::vector<uint8_t>& serializedEnvelope);
     void MarkClientAuthenticatedById(uint64_t clientId);
     void RevokeClientAuthenticationById(uint64_t clientId);
+    [[nodiscard]] bool IsClientAuthenticatedById(uint64_t clientId) const;
+    [[nodiscard]] uint32_t GetClientSessionIdById(uint64_t clientId) const;
+    void SendResponseEnvelopeToClient(uint64_t clientId, CommandType type, uint64_t requestId, std::string_view jsonPayload);
 
     CommunicatorStats GetStats() const;
     void ResetStats();
@@ -213,6 +217,7 @@ private:
     void ListenLoop();
     void HandleClient(std::shared_ptr<ClientContext> client);
     bool ProcessMessage(CommandType cmd, const std::vector<uint8_t>& data, std::vector<uint8_t>& response);
+    void ProcessV2Message(uint64_t clientId, uint32_t sessionId, CommandType cmd, uint64_t requestId, std::string_view json);
     bool CreatePipeSecurityDescriptor();
     void CleanupDisconnectedClients();
 
@@ -231,6 +236,7 @@ private:
 
     // Handlers
     std::map<CommandType, CommandHandler> m_handlers;
+    std::map<CommandType, V2CommandHandler> m_v2Handlers;
 
     // Clients
     struct TokenBucket {
@@ -255,6 +261,10 @@ private:
         ScopedHandle         pipe;
         uint64_t             id{ 0 };
         std::atomic<bool>    authenticated{ false };
+        // Windows session ID of the connecting process, recorded at accept time
+        // via GetNamedPipeClientSessionId. Used by the AuthHandshake handler to
+        // verify per-session IpcAuthToken without needing impersonation mid-call.
+        std::uint32_t        sessionId{ 0 };
         // Per-event-type token buckets; keyed by CommandType raw uint32.
         // Protected by bucketMutex (separate from m_clientsMutex).
         std::mutex                              bucketMutex;
@@ -268,7 +278,7 @@ private:
         ActiveClient& operator=(ActiveClient&&) = delete;
     };
     std::vector<std::shared_ptr<ActiveClient>> m_activeClients;
-    std::mutex m_clientsMutex; // Protects m_activeClients
+    mutable std::mutex m_clientsMutex; // Protects m_activeClients
 
     // Stats
     CommunicatorStats m_stats;
@@ -443,6 +453,16 @@ void ServiceCommunicatorImpl::ListenLoop() {
                 DuplicateHandle(GetCurrentProcess(), hPipe, GetCurrentProcess(), &hDup, 0, FALSE, DUPLICATE_SAME_ACCESS);
                 activeClient->pipe = hDup;
                 activeClient->id = clientCtx->clientId;
+
+                // Record the Windows session ID of the connecting client for use by
+                // the AuthHandshake v2 handler (IpcAuthToken::Verify requires sessionId).
+                ULONG sessionId = 0;
+                if (!GetNamedPipeClientSessionId(hPipe, &sessionId)) {
+                    SS_LOG_WARN(L"IPC", L"GetNamedPipeClientSessionId failed for client %llu (err=%lu); sessionId=0 assumed",
+                        clientCtx->clientId, GetLastError());
+                }
+                activeClient->sessionId = static_cast<std::uint32_t>(sessionId);
+
                 m_activeClients.push_back(activeClient);
             }
             m_stats.activeConnections++;
@@ -501,15 +521,83 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
             memcpy(accumulator.data() + oldSize, client->buffer.data(), bytesRead);
 
             // Try to process message(s)
-            // Wire format: [Magic:4][Command:4][Size:4][Timestamp:8][Payload:Size]
+            // Wire format v1: [Magic:4][Command:4][Size:4][Timestamp:8][Payload:Size]
+            // Wire format v2: [Magic:4][Version:2][Reserved:2][Type:4][RequestId:8][PayloadSize:4][JSON:PayloadSize]
             while (accumulator.size() >= sizeof(WireHeader)) {
-                WireHeader* header = reinterpret_cast<WireHeader*>(accumulator.data());
+                const auto* headerPtr = reinterpret_cast<const WireHeader*>(accumulator.data());
 
-                if (header->magic != CommunicationConstants::PROTOCOL_MAGIC) {
-                    SS_LOG_WARN(L"IPC", L"Invalid protocol magic. Dropping client.");
+                if (headerPtr->magic != CommunicationConstants::PROTOCOL_MAGIC) {
+                    SS_LOG_WARN(L"IPC", L"Invalid protocol magic from client %llu. Dropping.", client->clientId);
                     m_stats.droppedPackets++;
                     goto disconnect;
                 }
+
+                // ── V2 detection ─────────────────────────────────────────────────────────
+                // V2 Envelope overlaps the v1 WireHeader:
+                //   bytes [4-5] = Envelope::version  (uint16, expected == 1)
+                //   bytes [6-7] = Envelope::reserved (uint16, expected == 0)
+                //   bytes [8-11]= Envelope::type     (CommandType, v2 range >= 100)
+                //   bytes [20-23]= Envelope::payloadSize (uint32, real JSON length)
+                // We need at least 24 bytes before committing to the v2 path.
+                if (accumulator.size() >= 24u) {
+                    const uint16_t v2ver  = *reinterpret_cast<const uint16_t*>(accumulator.data() + 4);
+                    const uint16_t v2res  = *reinterpret_cast<const uint16_t*>(accumulator.data() + 6);
+                    const uint32_t v2type = *reinterpret_cast<const uint32_t*>(accumulator.data() + 8);
+
+                    constexpr uint32_t kV2CommandMin = 100u;
+                    constexpr uint32_t kV2CommandMax = 400u;
+
+                    if (v2ver == 1u && v2res == 0u &&
+                        v2type >= kV2CommandMin && v2type <= kV2CommandMax)
+                    {
+                        const uint32_t realPayloadSize = *reinterpret_cast<const uint32_t*>(
+                            accumulator.data() + 20);
+
+                        if (realPayloadSize > CommunicationConstants::MAX_MESSAGE_SIZE) {
+                            SS_LOG_WARN(L"IPC", L"V2 payload too large (%u) from client %llu. Dropping.",
+                                realPayloadSize, client->clientId);
+                            m_stats.droppedPackets++;
+                            goto disconnect;
+                        }
+
+                        const size_t totalV2Size = 24u + realPayloadSize;
+                        if (accumulator.size() < totalV2Size) {
+                            break; // Wait for more data
+                        }
+
+                        const uint64_t requestId = *reinterpret_cast<const uint64_t*>(
+                            accumulator.data() + 12);
+                        const CommandType v2cmd  = static_cast<CommandType>(v2type);
+
+                        const std::string_view jsonView(
+                            reinterpret_cast<const char*>(accumulator.data() + 24),
+                            realPayloadSize);
+
+                        m_stats.messagesReceived++;
+
+                        // Resolve session ID once under lock to avoid repeated contention.
+                        uint32_t sessionId = GetClientSessionIdById(client->clientId);
+                        ProcessV2Message(client->clientId, sessionId, v2cmd, requestId, jsonView);
+
+                        accumulator.erase(accumulator.begin(),
+                                          accumulator.begin() + static_cast<std::ptrdiff_t>(totalV2Size));
+                        continue;
+                    }
+                } else {
+                    // Have 20-23 bytes: can't determine v2 vs v1 definitively yet; wait.
+                    // (In PIPE_TYPE_MESSAGE mode each ReadFile delivers one full frame,
+                    //  so this branch is reachable only for very short v1 messages like
+                    //  a bare 20-byte Heartbeat.)
+                    // Check if v1 payloadSize = 0 to disambiguate:
+                    if (headerPtr->command == 1u && headerPtr->payloadSize > 0u) {
+                        // Could be partial v2 frame; wait for rest.
+                        break;
+                    }
+                    // Fall through to v1 path.
+                }
+
+                // ── V1 path (existing code) ───────────────────────────────────────────────
+                WireHeader* header = reinterpret_cast<WireHeader*>(accumulator.data());
 
                 if (header->payloadSize > CommunicationConstants::MAX_MESSAGE_SIZE) {
                     SS_LOG_WARN(L"IPC", L"Message too large (%u). Dropping client.", header->payloadSize);
@@ -633,6 +721,119 @@ bool ServiceCommunicatorImpl::ProcessMessage(CommandType cmd, const std::vector<
 void ServiceCommunicatorImpl::RegisterHandler(CommandType type, CommandHandler handler) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_handlers[type] = handler;
+}
+
+void ServiceCommunicatorImpl::RegisterV2Handler(CommandType type, V2CommandHandler handler) {
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    m_v2Handlers[type] = std::move(handler);
+}
+
+bool ServiceCommunicatorImpl::IsClientAuthenticatedById(uint64_t clientId) const {
+    std::lock_guard<std::mutex> lk(m_clientsMutex);
+    for (const auto& c : m_activeClients) {
+        if (c->id == clientId)
+            return c->authenticated.load(std::memory_order_acquire);
+    }
+    return false;
+}
+
+uint32_t ServiceCommunicatorImpl::GetClientSessionIdById(uint64_t clientId) const {
+    std::lock_guard<std::mutex> lk(m_clientsMutex);
+    for (const auto& c : m_activeClients) {
+        if (c->id == clientId)
+            return c->sessionId;
+    }
+    return 0u;
+}
+
+void ServiceCommunicatorImpl::SendResponseEnvelopeToClient(
+    uint64_t clientId, CommandType type, uint64_t requestId, std::string_view jsonPayload)
+{
+    if (jsonPayload.size() > CommunicationConstants::MAX_MESSAGE_SIZE) {
+        SS_LOG_WARN(L"IPC",
+            L"SendResponseEnvelope: payload too large (%zu) for client %llu, type %u",
+            jsonPayload.size(), clientId, static_cast<uint32_t>(type));
+        return;
+    }
+
+    // Build the 24-byte v2 Envelope header.
+    constexpr size_t kHeaderSize = 24u;
+    const uint32_t payloadSize = static_cast<uint32_t>(jsonPayload.size());
+
+    std::vector<uint8_t> buf;
+    buf.reserve(kHeaderSize + payloadSize);
+
+    // [0-3]  magic
+    const uint32_t magic = CommunicationConstants::PROTOCOL_MAGIC;
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(&magic),
+                           reinterpret_cast<const uint8_t*>(&magic) + 4);
+    // [4-5]  version = 1; [6-7] reserved = 0
+    const uint16_t version = 1u, reserved = 0u;
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(&version),
+                           reinterpret_cast<const uint8_t*>(&version) + 2);
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(&reserved),
+                           reinterpret_cast<const uint8_t*>(&reserved) + 2);
+    // [8-11]  type
+    const uint32_t typeVal = static_cast<uint32_t>(type);
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(&typeVal),
+                           reinterpret_cast<const uint8_t*>(&typeVal) + 4);
+    // [12-19] requestId
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(&requestId),
+                           reinterpret_cast<const uint8_t*>(&requestId) + 8);
+    // [20-23] payloadSize
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(&payloadSize),
+                           reinterpret_cast<const uint8_t*>(&payloadSize) + 4);
+    // [24+]  JSON body
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(jsonPayload.data()),
+                           reinterpret_cast<const uint8_t*>(jsonPayload.data()) + payloadSize);
+
+    // Snapshot the target pipe handle under lock, then write without holding it.
+    std::shared_ptr<ActiveClient> target;
+    {
+        std::lock_guard<std::mutex> lk(m_clientsMutex);
+        for (auto& c : m_activeClients) {
+            if (c->id == clientId) { target = c; break; }
+        }
+    }
+    if (!target) {
+        SS_LOG_WARN(L"IPC", L"SendResponseEnvelope: client %llu not found", clientId);
+        return;
+    }
+
+    DWORD written = 0;
+    if (!WriteFile(target->pipe, buf.data(), static_cast<DWORD>(buf.size()), &written, nullptr)) {
+        SS_LOG_WARN(L"IPC", L"SendResponseEnvelope: WriteFile failed (err=%lu) for client %llu",
+            GetLastError(), clientId);
+    } else {
+        m_stats.bytesSent  += written;
+        m_stats.messagesSent++;
+    }
+}
+
+void ServiceCommunicatorImpl::ProcessV2Message(
+    uint64_t clientId, uint32_t sessionId, CommandType cmd, uint64_t requestId, std::string_view json)
+{
+    V2CommandHandler handler;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        const auto it = m_v2Handlers.find(cmd);
+        if (it == m_v2Handlers.end()) {
+            SS_LOG_WARN(L"IPC", L"No v2 handler for command %u from client %llu",
+                static_cast<uint32_t>(cmd), clientId);
+            return;
+        }
+        handler = it->second;
+    }
+
+    try {
+        handler(clientId, sessionId, requestId, json);
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"IPC", L"Exception in v2 handler for command %u: %hs",
+            static_cast<uint32_t>(cmd), ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(L"IPC", L"Unknown exception in v2 handler for command %u",
+            static_cast<uint32_t>(cmd));
+    }
 }
 
 size_t ServiceCommunicatorImpl::Broadcast(CommandType type, const std::vector<uint8_t>& payload) {
@@ -811,6 +1012,21 @@ bool ServiceCommunicator::IsRunning() const noexcept {
 
 void ServiceCommunicator::RegisterHandler(CommandType type, CommandHandler handler) {
     m_impl->RegisterHandler(type, handler);
+}
+
+void ServiceCommunicator::RegisterV2Handler(CommandType type, V2CommandHandler handler) {
+    m_impl->RegisterV2Handler(type, std::move(handler));
+}
+
+bool ServiceCommunicator::IsClientAuthenticated(std::uint64_t clientId) const {
+    return m_impl->IsClientAuthenticatedById(clientId);
+}
+
+void ServiceCommunicator::SendResponseEnvelope(std::uint64_t    clientId,
+                                               CommandType      type,
+                                               std::uint64_t    requestId,
+                                               std::string_view jsonPayload) {
+    m_impl->SendResponseEnvelopeToClient(clientId, type, requestId, jsonPayload);
 }
 
 size_t ServiceCommunicator::Broadcast(CommandType type, const std::string& payload) {

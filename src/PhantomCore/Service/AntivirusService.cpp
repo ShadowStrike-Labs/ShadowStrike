@@ -71,6 +71,8 @@
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Config/ConfigManager.hpp"
 #include "ProductExtensions.hpp"
+#include "HomeIpcDispatcher.hpp"
+#include "ServiceCommunicator.hpp"
 
 // ============================================================================
 // WINDOWS SDK
@@ -403,6 +405,19 @@ public:
 
         // Start Communication subsystems
         Communication::ServiceCommunication::Instance().Start(true);
+
+        // Initialize and start the v2 IPC pipe server, then wire all PhantomHome
+        // UI command handlers before any client can connect and send a verb.
+        {
+            auto& ipcSvc = ServiceCommunicator::Instance();
+            if (!ipcSvc.Initialize()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunicator::Initialize() failed — HomeIpcDispatcher not installed");
+            } else if (!ipcSvc.Start()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — HomeIpcDispatcher not installed");
+            } else {
+                HomeIpcDispatcher::Instance().Install(ipcSvc);
+            }
+        }
 
         // Register AMSI provider
         Scripts::AMSIIntegration::Instance().RegisterProvider();
