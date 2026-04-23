@@ -132,6 +132,7 @@
       <!-- ONNX inference engine and DirectX shader compiler runtime. -->
       <ComponentRef Id="CmpOnnxRuntime"/>
       <ComponentRef Id="CmpDxRuntime"/>
+      <ComponentRef Id="CmpOpenSslRuntime"/>
 
       <!-- Machine-wide Run-key entry that starts the tray on every logon. -->
       <ComponentRef Id="CmpTrayAutostart"/>

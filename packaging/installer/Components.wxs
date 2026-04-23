@@ -145,6 +145,27 @@
     </Component>
 
     <!-- ═══════════════════════════════════════════════════════════════════
+         OPENSSL 3 RUNTIME  (libcrypto-3-x64 + libssl-3-x64)
+         The service links libcrypto-3-x64.dll as a static import (TLS/X.509
+         for ThreatIntel feed fetch, certificate pinning, telemetry POST).
+         Without this component the service process FAILS TO LOAD at
+         CreateProcess time — SCM reports "service failed to start".
+         libssl-3-x64 is loaded by libcrypto at runtime for TLS sockets.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpOpenSslRuntime"
+               Directory="INSTALLFOLDER"
+               Guid="{4A5E7B8C-2D1F-4E6A-9B3C-0D5F7A1E6C28}"
+               Bitness="always64">
+      <File Id="LibCryptoDll"
+            Name="libcrypto-3-x64.dll"
+            Source="$(var.BinDir)\libcrypto-3-x64.dll"
+            KeyPath="yes"/>
+      <File Id="LibSslDll"
+            Name="libssl-3-x64.dll"
+            Source="$(var.BinDir)\libssl-3-x64.dll"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
          DIRECTX SHADER COMPILER RUNTIME  (required by ONNX/DX backend)
          dxcompiler.dll + dxil.dll are not Qt dependencies; windeployqt does
          not stage them.  D3Dcompiler_47.dll IS staged by windeployqt.
