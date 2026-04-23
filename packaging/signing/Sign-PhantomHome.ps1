@@ -87,7 +87,15 @@ $Targets = [ordered]@{
     "ShadowStrikePhantomService.exe"     = Join-Path $RepoRoot "bin\Release\ShadowStrikePhantomService.exe"
     "ShadowStrikePhantomUI.exe"          = Join-Path $RepoRoot "bin\Release\ShadowStrikePhantomUI.exe"
     "ShadowStrikePhantomTray.exe"        = Join-Path $RepoRoot "bin\Release\ShadowStrikePhantomTray.exe"
+    "ShadowStrikeDriverResume.exe"       = Join-Path $RepoRoot "bin\Release\ShadowStrikeDriverResume.exe"
     "ShadowStrikePhantom-Home-Setup.msi" = Join-Path $RepoRoot "build\installer\ShadowStrikePhantom-Home-Setup.msi"
+}
+
+# Driver-specific artifacts: sign separately after the main EXE/MSI loop.
+# These require /ph (page hash) for kernel-mode components.
+$DriverTargets = [ordered]@{
+    "PhantomSensor.sys" = Join-Path $RepoRoot "build\installer\staging\drivers\PhantomSensor.sys"
+    "PhantomSensor.cat" = Join-Path $RepoRoot "build\installer\staging\drivers\PhantomSensor.cat"
 }
 
 $BundlePath  = Join-Path $RepoRoot "build\installer\ShadowStrikePhantom-Home-Setup.exe"
@@ -102,6 +110,20 @@ foreach ($name in $Targets.Keys) {
     $sizeMB = [math]::Round((Get-Item $path).Length / 1MB, 2)
     Write-Host "[INFO] Found: $path  ($sizeMB MB)"
 }
+
+# Validate driver targets – skip gracefully with a warning if not built yet.
+$missingDrivers = @()
+foreach ($name in @($DriverTargets.Keys)) {
+    $path = $DriverTargets[$name]
+    if (-not (Test-Path $path)) {
+        Write-Host "[WARN] Driver artifact not found (may not have been built): $path" -ForegroundColor Yellow
+        $missingDrivers += $name
+    } else {
+        $sizeMB = [math]::Round((Get-Item $path).Length / 1MB, 2)
+        Write-Host "[INFO] Found driver artifact: $path  ($sizeMB MB)"
+    }
+}
+foreach ($name in $missingDrivers) { $DriverTargets.Remove($name) }
 if (-not (Test-Path $BundlePath)) { throw "Bundle not found: $BundlePath" }
 Write-Host "[INFO] Found bundle: $BundlePath  ($([math]::Round((Get-Item $BundlePath).Length/1MB,2)) MB)"
 
@@ -243,7 +265,63 @@ try {
 }
 Write-Host ""
 
-Write-Host "=== SIGN PHASE COMPLETE -- beginning verification ==="
+# ---------------------------------------------------------------------------
+# 5c. Sign kernel driver artifacts (PhantomSensor.sys + .cat)
+#
+#     Driver and catalog require /ph (page hash embedding) for kernel-mode
+#     integrity verification.  Without /ph, CI enforcement can reject the load.
+#     We use a dedicated signing loop that adds /ph to the signtool arguments.
+# ---------------------------------------------------------------------------
+function Invoke-SignDriver {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [bool]$WithTimestamp = $true
+    )
+
+    $argList = @(
+        "sign",
+        "/fd",  "sha256",
+        "/ph",                   # Embed page hashes (required for kernel drivers)
+        "/f",   $PfxPath,
+        "/p",   $PfxPass,
+        "/d",   "ShadowStrike PhantomSensor"
+    )
+
+    if ($WithTimestamp) {
+        $argList += @("/tr", $TimestampUrl, "/td", "sha256")
+    }
+
+    $argList += $File
+
+    Write-Host "[SIGN-DRV$(if ($WithTimestamp) {'+TS'} else {'     '})] $File"
+    & $SignTool @argList | Out-Host
+    $ec = $LASTEXITCODE
+    return [int]$ec
+}
+
+if ($DriverTargets.Count -gt 0) {
+    Write-Host "[DRIVER] Signing kernel driver artifacts..."
+    foreach ($name in $DriverTargets.Keys) {
+        $file = $DriverTargets[$name]
+
+        $rc = Invoke-SignDriver -File $file -WithTimestamp $timestampReachable
+        if ($rc -ne 0 -and $timestampReachable) {
+            Write-Host "[WARN] TS sign failed for driver artifact (exit $rc). Retrying without timestamp..." -ForegroundColor Yellow
+            $rc = Invoke-SignDriver -File $file -WithTimestamp $false
+        }
+
+        if ($rc -ne 0) {
+            Write-Host "[ERROR] SIGN FAILED: $file (exit $rc)" -ForegroundColor Red
+            exit 1
+        }
+        $signStatus[$name] = "OK"
+        Write-Host ""
+    }
+} else {
+    Write-Host "[WARN] No driver artifacts to sign (PhantomSensor.sys/.cat not present in staging)." -ForegroundColor Yellow
+}
+
+Write-Host ""
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -268,6 +346,8 @@ $anyFailed = $false
 
 $AllTargets = [ordered]@{}
 foreach ($k in $Targets.Keys) { $AllTargets[$k] = $Targets[$k] }
+# Add driver artifacts if they were signed.
+foreach ($k in $DriverTargets.Keys) { $AllTargets[$k] = $DriverTargets[$k] }
 # NOTE: The bundle EXE is verified differently — its engine is signed internally.
 # Get-AuthenticodeSignature on the outer bundle returns "NotSigned" by design;
 # Burn uses the embedded engine's PE signature for authenticity, not the outer file.

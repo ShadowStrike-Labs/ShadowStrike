@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DriverComponent.wxs
+  ===================
+  PhantomSensor kernel minifilter driver components for the PhantomHome MSI.
+
+  Contents:
+    CmpPhantomSensorDriver   - Stages PhantomSensor.sys / .inf / .cat into
+                               [INSTALLFOLDER]\Drivers\.
+    CmpDriverResumeExe       - ShadowStrikeDriverResume.exe (driver installer
+                               helper, runs post-install and post-reboot).
+
+  IMPORTANT:
+    The .sys file is NOT registered as a service here.  Service creation,
+    minifilter instance configuration, and driver loading are performed by
+    ShadowStrikeDriverResume.exe (stage2 mode) via the post-install custom action
+    (DriverInstallCA.wxs) and/or RunOnce after a reboot.  MSI ServiceInstall
+    is unsuitable for FILE_SYSTEM_DRIVER types that require testsigning enablement
+    before the kernel will accept the load request.
+
+  GUIDs are permanent across product releases.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Fragment>
+
+    <!--
+      Driver Staging Directory: [INSTALLFOLDER]\Drivers\
+      INSTALLFOLDER is declared in Product.wxs; this Fragment extends it.
+      Files are staged here during MSI install. The DriverResume helper
+      copies PhantomSensor.sys from this location into System32\drivers\
+      when it runs post-reboot.
+    -->
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Directory Id="DriversDir" Name="Drivers"/>
+    </DirectoryRef>
+
+    <!--
+      PhantomSensor driver files component.
+      Component GUID permanent across upgrades for correct Windows Installer tracking.
+      Bitness always64: driver is x64-only.
+    -->
+    <Component Id="CmpPhantomSensorDriver"
+               Directory="DriversDir"
+               Guid="{F1A2B3C4-D5E6-47F8-9A0B-1C2D3E4F5061}"
+               Bitness="always64">
+
+      <!--
+        KeyPath on the .sys ensures Windows Installer tracks the driver file.
+        The file is NOT loaded by MSI itself; DriverResume stage2 does that.
+      -->
+      <File Id="PhantomSensorSys"
+            Name="PhantomSensor.sys"
+            Source="$(var.StagingDir)\drivers\PhantomSensor.sys"
+            KeyPath="yes"/>
+
+      <File Id="PhantomSensorInf"
+            Name="PhantomSensor.inf"
+            Source="$(var.StagingDir)\drivers\PhantomSensor.inf"/>
+
+      <File Id="PhantomSensorCat"
+            Name="PhantomSensor.cat"
+            Source="$(var.StagingDir)\drivers\PhantomSensor.cat"/>
+
+      <!--
+        Registry marker: staging path for DriverResume to locate at runtime.
+      -->
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Driver"
+                     Name="StagingPath"
+                     Type="string"
+                     Value="[DriversDir]"
+                     KeyPath="no"/>
+
+    </Component>
+
+    <!--
+      Driver resume helper executable.
+      ShadowStrikeDriverResume.exe drives the test-signing pivot,
+      post-reboot RunOnce resume, and SCM driver service creation.
+      Installed next to the service executable in [INSTALLFOLDER].
+    -->
+    <Component Id="CmpDriverResumeExe"
+               Directory="INSTALLFOLDER"
+               Guid="{F1A2B3C4-D5E6-47F8-9A0B-1C2D3E4F5062}"
+               Bitness="always64">
+
+      <File Id="DriverResumeExe"
+            Name="ShadowStrikeDriverResume.exe"
+            Source="$(var.BinDir)\ShadowStrikeDriverResume.exe"
+            KeyPath="yes"/>
+
+    </Component>
+
+  </Fragment>
+
+</Wix>

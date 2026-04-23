@@ -423,3 +423,5 @@ vendor/onnxruntime/**/*.pdb
 # Local GUI workbench
 /GUI_WORK/
 
+
+build/wix-intermediate/

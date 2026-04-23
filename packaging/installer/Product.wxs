@@ -116,6 +116,12 @@
       </Directory>
     </StandardDirectory>
 
+    <!--
+      DriversDir ([INSTALLFOLDER]\Drivers\) is declared in DriverComponent.wxs.
+      This comment documents the relationship — the StandardDirectory Id="INSTALLFOLDER"
+      extension is handled there to avoid duplicate directory declarations.
+    -->
+
     <!-- ──────────────── Feature tree ──────────────── -->
     <Feature Id="FeatureMain"
              Title="ShadowStrike Phantom Home"
@@ -146,6 +152,11 @@
 
       <!-- Qt 6 runtime DLLs and plugins (auto-harvested from windeployqt staging). -->
       <ComponentGroupRef Id="QtRuntimeComponents"/>
+
+      <!-- PhantomSensor minifilter driver files (staged; loaded post-reboot). -->
+      <ComponentRef Id="CmpPhantomSensorDriver"/>
+      <!-- Driver resume helper executable (invoked by MSI CA and RunOnce). -->
+      <ComponentRef Id="CmpDriverResumeExe"/>
     </Feature>
 
     <!-- Optional desktop shortcut – default Level=10 means not selected by default. -->
