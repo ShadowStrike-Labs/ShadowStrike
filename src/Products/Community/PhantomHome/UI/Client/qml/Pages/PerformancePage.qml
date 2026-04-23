@@ -226,11 +226,9 @@ PageHost {
                                     font.family:        Theme.fontFamily
                                     font.pixelSize:     Theme.fontSizeBody
                                     elide:              Text.ElideRight
-                                    width:              parent.width - 80 - Theme.spacingS * 3 - 8
+                                    width:              parent.width - 8 - 72 - Theme.spacingS * 2
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
-
-                                Item { width: 1; height: 1; Layout.fillWidth: true }
 
                                 Text {
                                     text:               modelData.time

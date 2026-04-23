@@ -44,6 +44,8 @@ Item {
                 fill:    parent
                 margins: root.padding
             }
+            implicitWidth:  childrenRect.width
+            implicitHeight: childrenRect.height
         }
 
         MouseArea {
