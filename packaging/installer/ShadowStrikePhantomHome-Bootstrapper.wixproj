@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX v5 SDK-style project for the ShadowStrike Phantom Home Bootstrapper.
+
+  Build with:
+    wix build -arch x64 ^
+      -d ProductVersion=1.0.0.0 ^
+      -d BinDir=bin\Release ^
+      -d InstallerDir=packaging\installer ^
+      -d MsiPath=build\installer\ShadowStrikePhantom-Home-Setup.msi ^
+      -ext WixToolset.Bal.wixext ^
+      packaging\installer\Bundle.wxs ^
+      -o build\installer\ShadowStrikePhantom-Home-Setup.exe
+
+  The MSI must be built before the bootstrapper.
+-->
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputName>ShadowStrikePhantom-Home-Setup</OutputName>
+    <OutputType>Bundle</OutputType>
+    <Platform>x64</Platform>
+    <OutputPath>..\..\build\installer\</OutputPath>
+    <IntermediateOutputPath>..\..\build\installer\obj\bundle\</IntermediateOutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.0.0</ProductVersion>
+    <BinDir Condition="'$(BinDir)' == ''">..\..\bin\Release</BinDir>
+    <InstallerDir Condition="'$(InstallerDir)' == ''">.</InstallerDir>
+    <MsiPath Condition="'$(MsiPath)' == ''">..\..\build\installer\ShadowStrikePhantom-Home-Setup.msi</MsiPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <WixExtension Include="WixToolset.Util.wixext"/>
+    <WixExtension Include="WixToolset.BootstrapperApplications.wixext"/>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Bundle.wxs"/>
+  </ItemGroup>
+
+</Project>

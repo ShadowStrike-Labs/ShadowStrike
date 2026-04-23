@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX v5 SDK-style project for the ShadowStrike Phantom Home MSI.
+
+  Build with Visual Studio or:
+    dotnet build packaging\installer\ShadowStrikePhantomHome.wixproj -c Release
+
+  Or directly via wix.exe (preferred for CI):
+    wix build -arch x64 ^
+      -d ProductVersion=1.0.0.0 ^
+      -d BinDir=bin\Release ^
+      -d StagingDir=build\installer\staging ^
+      -d InstallerDir=packaging\installer ^
+      -ext WixToolset.Util.wixext ^
+      -ext WixToolset.UI.wixext ^
+      packaging\installer\Product.wxs ^
+      packaging\installer\Components.wxs ^
+      build\installer\QtHarvest.wxs ^
+      -o build\installer\ShadowStrikePhantom-Home-Setup.msi
+-->
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputName>ShadowStrikePhantom-Home-Setup</OutputName>
+    <OutputType>Package</OutputType>
+    <Platform>x64</Platform>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputPath>..\..\build\installer\</OutputPath>
+    <IntermediateOutputPath>..\..\build\installer\obj\msi\</IntermediateOutputPath>
+    <SuppressIces>ICE57</SuppressIces>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.0.0</ProductVersion>
+    <BinDir Condition="'$(BinDir)' == ''">..\..\bin\Release</BinDir>
+    <StagingDir Condition="'$(StagingDir)' == ''">..\..\build\installer\staging</StagingDir>
+    <InstallerDir Condition="'$(InstallerDir)' == ''">.</InstallerDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <WixExtension Include="WixToolset.Util.wixext"/>
+    <WixExtension Include="WixToolset.UI.wixext"/>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Product.wxs"/>
+    <Compile Include="Components.wxs"/>
+    <Compile Include="..\..\build\installer\QtHarvest.wxs"/>
+  </ItemGroup>
+
+</Project>
