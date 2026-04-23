@@ -118,21 +118,50 @@ namespace ShadowStrike::Service {
         }
 
         void Run() {
-            // 1. Report START_PENDING
-            ReportStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+            // 1. Report START_PENDING with generous initial wait hint. A
+            //    dedicated heartbeat thread will keep pumping further
+            //    checkpoint updates to SCM while InitializeComponents() runs.
+            //    SCM kills the service if wait hint expires without an
+            //    updated checkpoint, so this pump is mandatory for enterprise
+            //    init sequences (signature loads, kernel IPC handshake,
+            //    self-defense hash baselines, etc.).
+            constexpr DWORD kInitWaitHintMs   = 30000; // Per-update hint
+            constexpr DWORD kPumpIntervalMs   = 5000;  // Update every 5s
 
-            // 2. Initialize Components
+            ReportStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
+
+            std::atomic<bool> initDone{false};
+            std::thread pendingPump([this, &initDone]() {
+                while (!initDone.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(kPumpIntervalMs));
+                    if (initDone.load(std::memory_order_acquire)) break;
+                    ReportStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
+                }
+            });
+
+            // 2. Initialize Components (can take tens of seconds on first run
+            //    while signature DBs decompress, SHA-256 baselines compute,
+            //    and driver IPC handshakes negotiate — the pump above keeps
+            //    SCM from killing us).
+            bool initOk = false;
             try {
                 InitializeComponents();
-                ReportStatus(SERVICE_RUNNING);
-
-                // Log start
-                // Logger::Info("ShadowStrike Service Started Successfully");
+                initOk = true;
             }
             catch (...) {
+                initOk = false;
+            }
+
+            // Signal pump to exit, then join before any further status changes
+            initDone.store(true, std::memory_order_release);
+            if (pendingPump.joinable()) pendingPump.join();
+
+            if (!initOk) {
                 ReportStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
                 return;
             }
+            ReportStatus(SERVICE_RUNNING);
 
             // 3. Main Service Loop (Waits for stop signal)
             while (m_running.load()) {

@@ -81,6 +81,8 @@
 #include <strsafe.h>
 #include <sddl.h>
 #include <thread>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <sstream>
 #include <iomanip>
@@ -939,10 +941,40 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
 
     if (!m_statusHandle) return;
 
-    SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+    // SCM kills a service if its wait-hint expires without a checkpoint bump.
+    // Initialization touches signature DBs, kernel IPC, SHA-256 baselines and
+    // per-process/registry protection snapshots — easily tens of seconds on
+    // first start (cold disk cache, slow VMs, no AES-NI). Spin a dedicated
+    // heartbeat pump that keeps bumping the checkpoint every 5s with a
+    // generous 30s wait hint until initialization completes.
+    constexpr DWORD kInitWaitHintMs = 30000;
+    constexpr DWORD kPumpIntervalMs = 5000;
 
-    // Initialize subsystems
-    if (!m_impl->Initialize()) {
+    SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
+
+    std::atomic<bool> initDone{false};
+    std::thread pendingPump([this, &initDone]() {
+        while (!initDone.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPumpIntervalMs));
+            if (initDone.load(std::memory_order_acquire)) break;
+            SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
+        }
+    });
+
+    // Initialize subsystems (potentially long-running)
+    bool initOk = false;
+    try {
+        initOk = m_impl->Initialize();
+    } catch (...) {
+        initOk = false;
+    }
+
+    // Stop pump before transitioning to RUNNING / STOPPED so we don't race on
+    // SetServiceStatus with the pump thread.
+    initDone.store(true, std::memory_order_release);
+    if (pendingPump.joinable()) pendingPump.join();
+
+    if (!initOk) {
         SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
         return;
     }
