@@ -129,19 +129,7 @@
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\Service\ServiceMain.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\Service\ServiceInstaller.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\IPC\PipeServer.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\IPC\IPCRouter.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.cpp">
+    <ClCompile Include="src\PhantomCore\Service\ServiceMain.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\Reports\HomeReportsStore.cpp">
@@ -216,7 +204,6 @@
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\MicrophoneGuardWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\PrivacyCleanerWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\WebcamProtectorWiring.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\SystemTray.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\BadUSBDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\DeviceControlManager.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBAutorunBlocker.cpp" />
@@ -236,8 +223,6 @@
 
   <ItemGroup>
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
-    <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\PipeServer.hpp" />
-    <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\IPCRouter.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Reports\HomeReportsStore.hpp" />
   </ItemGroup>
