@@ -8,7 +8,7 @@
 <strong>Open-Source Next-Generation Endpoint Protection Platform for Windows</strong>
 
 <br/>
-<em>Custom kernel sensor · On-device AI/ML · Full-system emulation engine · 1.5M+ lines of C/C++/ASM</em>
+<em>Custom kernel sensor · On-device analysis · Full-system emulation engine · 2.3M+ lines of C/C++/ASM</em>
 
 <br/><br/>
 
@@ -63,13 +63,12 @@ This is not a wrapper around existing tools. This is not a PoC. This is a produc
 
 | Subsystem | What It Is | Scale |
 |-----------|-----------|-------|
-| **[PhantomSensor](#-phantomsensor--kernel-driver)** | WDM minifilter kernel driver with 20 detection subsystems | 380K LoC · 241 source files |
-| **[Shared Modules](#-shared-modules--user-mode-detection-infrastructure)** | User-mode detection, protection, and intelligence infrastructure | 500K+ LoC · 461 source files · 23 modules |
-| **[PhantomEmulator](#-phantomemulator--malware-emulation-engine)** | Custom x86/x64 CPU emulation engine for safe malware detonation | 300K+ LoC · 195 source files |
-| **[PhantomCortex](#-phantomcortex--ondevice-aiml)** | On-device AI/ML threat classification — 5 neural network models | 23K LoC · 56 Python files |
-| **[PhantomDisassembler](#-phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 disassembler replacing third-party dependencies | In development |
+| **[PhantomSensor](#-phantomsensor--kernel-driver)** | WDM minifilter kernel driver with 20 detection subsystems |
+| **[Shared Modules](#-shared-modules--user-mode-detection-infrastructure)** | User-mode detection, protection, and intelligence infrastructure |
+| **[PhantomEmulator](#-phantomemulator--malware-emulation-engine)** | Custom x86/x64 CPU emulation engine for safe malware detonation |
+| **[PhantomCortex](#-phantomcortex--ondevice-aiml)** | On-device threat classification — 5 neural network models |
+| **[PhantomDisassembler](#-phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 disassembler replacing third-party dependencies |
 
-> **1.5 million lines** of C, C++20, x86 Assembly, and Python.
 
 > **Current state:** Alpha. Kernel driver is complete and Coverity-verified. PhantomCore is ready. AI models trained on 3.5M+ real PE samples (EMBER 2018 + EMBER 2024). Emulation engine operational. On track for public beta early 2027.
 
@@ -95,7 +94,7 @@ ShadowStrike Phantom is the alternative:
 | PhantomSensor.sys | ✅ Complete | 20 subsystems · Coverity 0.25 defect/KLoC · Driver Verifier passed |
 | PhantomCore | ✅ Complete | 23 modules — security audit phase |
 | PhantomEmulator | ✅ Complete | CPU emulation · 10 DLL stubs · Analysis suite |
-| PhantomCortex AI/ML | 🔧 85% | 5 models trained · ONNX inference · Nightly retraining pipeline |
+| PhantomCortex | 🔧 85% | 4 models trained + 1 model will be retrained with the comprehensive datasets + synthetic datas · ONNX inference · Nightly retraining pipeline |
 | PhantomDisassembler | ✅ Complete | Custom x86/x64 decoder — replacing Zydis dependency |
 | Kernel ↔ User-Mode Wiring | ✅ Complete | Encrypted IPC · Module-by-module integration in progress |
 | Product Tiers (Home/EDR/XDR) | 🔧 58% | After shared infrastructure |
@@ -147,7 +146,7 @@ ShadowStrike Phantom is the alternative:
 │              ┌─────────────┴─────────────┐                                               │
 │              │    PhantomSensor.sys       │                                               │
 │              │  WDM Minifilter · Alt 385210                                              │
-│              │  380K LoC · 20 Subsystems │                                               │
+│              │     · 20 Subsystems        │                                               │
 │              └─────────────┬─────────────┘                                               │
 │   ┌────────────────────────┼────────────────────────┐                                    │
 │   ▼                        ▼                        ▼                                    │
@@ -207,7 +206,7 @@ A **From scratch WDM minifilter** kernel driver that intercepts, analyzes, and b
 
 ---
 
-## 🧠 PhantomCortex — On-Device AI/ML
+## 🧠 PhantomCortex — On-Device Analysis
 
 Five purpose-built neural network models running inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on **3.5-3.6M real PE samples** from the EMBER 2018-2024 datasets plus synthetic behavioral, memory, network, and emulation data.
 
