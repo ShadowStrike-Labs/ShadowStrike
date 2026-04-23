@@ -78,11 +78,36 @@ ApplicationWindow {
                 pageTitle: d.currentTitle
             }
 
-            // Page host — holds the StackView
-            PageHost {
-                id:     pageHost
+            // Page host — Loader that swaps the current page QML on navigate.
+            // Wrapped in an Item so the outer sizing is governed by the
+            // RowLayout attached properties (Layout.fill*), while the Loader
+            // inside uses anchors to fill that Item; the loaded page (whose
+            // root is a PageHost) then fills the Loader via its own
+            // anchors.fill: parent.  This keeps the layout contract clean:
+            // no anchors on a Layout-managed item, no Layout.* on anchored
+            // children.
+            Item {
+                id: pageHostContainer
                 Layout.fillWidth:  true
                 Layout.fillHeight: true
+
+                Loader {
+                    id: pageLoader
+                    anchors.fill: parent
+                    asynchronous: false
+                    onStatusChanged: {
+                        if (status === Loader.Error) {
+                            console.warn("PageLoader failed to load source: " +
+                                         source + " — " + sourceComponent);
+                        }
+                    }
+                }
+
+                function navigateTo(url) {
+                    if (pageLoader.source !== url) {
+                        pageLoader.source = url;
+                    }
+                }
             }
         }
     }
@@ -126,16 +151,14 @@ ApplicationWindow {
             const url = routeMap[route];
             if (url !== undefined) {
                 currentRoute = route;
-                pageHost.navigateTo(url);
+                pageHostContainer.navigateTo(url);
             }
         }
     }
 
     // ── Apply initial route from C++ ───────────────────────────────────────
     Component.onCompleted: {
-        const route = initialRoute;
-        if (route && route !== "") {
-            d.navigateTo(route);
-        }
+        const route = (initialRoute && initialRoute !== "") ? initialRoute : "dashboard";
+        d.navigateTo(route);
     }
 }
