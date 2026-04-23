@@ -70,6 +70,9 @@
 
 // Qt — utilities
 #include <QLoggingCategory>
+#include <QtGlobal>
+#include <QQmlError>
+#include <QList>
 
 // ShadowStrike — logger (must come after windows.h)
 #include <PhantomCore/Utils/Logger.hpp>
@@ -271,6 +274,43 @@ void InitLogger() noexcept
     Logger::Instance().Initialize(cfg);
 }
 
+// ---------------------------------------------------------------------------
+// Qt → ShadowStrike Logger bridge.
+//
+// Qt emits QML errors, property binding loops, and module-import failures via
+// qWarning/qCritical routed through QtMessageHandler. Without a handler these
+// messages go to stderr / OutputDebugString and are invisible in a GUI install,
+// which turns "QML failed to load" into a silent exit.  We route everything
+// into our structured logger so post-mortem analysis of customer installs has
+// actionable diagnostics.
+// ---------------------------------------------------------------------------
+void QtMessageToLogger(QtMsgType type,
+                       const QMessageLogContext& ctx,
+                       const QString& msg) noexcept
+{
+    const std::wstring wmsg = msg.toStdWString();
+    const char* category = (ctx.category && *ctx.category) ? ctx.category : "Qt";
+    const std::wstring wcat(category, category + std::strlen(category));
+
+    switch (type) {
+    case QtDebugMsg:
+        SS_LOG_DEBUG(L"PhantomHome.Qt", L"[%ls] %ls", wcat.c_str(), wmsg.c_str());
+        break;
+    case QtInfoMsg:
+        SS_LOG_INFO(L"PhantomHome.Qt", L"[%ls] %ls", wcat.c_str(), wmsg.c_str());
+        break;
+    case QtWarningMsg:
+        SS_LOG_WARN(L"PhantomHome.Qt", L"[%ls] %ls", wcat.c_str(), wmsg.c_str());
+        break;
+    case QtCriticalMsg:
+        SS_LOG_ERROR(L"PhantomHome.Qt", L"[%ls] %ls", wcat.c_str(), wmsg.c_str());
+        break;
+    case QtFatalMsg:
+        SS_LOG_ERROR(L"PhantomHome.Qt", L"[FATAL][%ls] %ls", wcat.c_str(), wmsg.c_str());
+        break;
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -292,6 +332,11 @@ int main(int argc, char* argv[])
 
     // ── Step 2: Logger ─────────────────────────────────────────────────────
     InitLogger();
+
+    // Route Qt's own diagnostics (qWarning/qCritical, QML errors, binding
+    // loops, plugin load failures) into our logger so production installs can
+    // be diagnosed post-mortem without attaching a debugger.
+    qInstallMessageHandler(&QtMessageToLogger);
 
     SS_LOG_INFO(L"PhantomHome.Main",
                 L"ShadowStrike PhantomHome UI starting — version %ls",
@@ -365,6 +410,24 @@ int main(int argc, char* argv[])
 
     // ── Step 12: QML engine ────────────────────────────────────────────────
     QQmlApplicationEngine engine;
+
+    // Route QML parser / type-compile warnings into our logger.  This gives
+    // us the concrete filename:line:column and diagnostic string (e.g.
+    // "module 'ShadowStrike.Foo' is not installed") that would otherwise
+    // only appear on stderr which GUI apps do not surface.
+    QObject::connect(&engine, &QQmlApplicationEngine::warnings, &app,
+        [](const QList<QQmlError>& errors) {
+            for (const QQmlError& err : errors) {
+                const std::wstring url  = err.url().toString().toStdWString();
+                const std::wstring desc = err.description().toStdWString();
+                SS_LOG_ERROR(L"PhantomHome.Qml",
+                             L"QML error at %ls:%d:%d — %ls",
+                             url.c_str(),
+                             err.line(),
+                             err.column(),
+                             desc.c_str());
+            }
+        });
 
     // Tell the import machinery where to find ShadowStrike.* QML modules.
     engine.addImportPath(QStringLiteral("qrc:/qml"));
