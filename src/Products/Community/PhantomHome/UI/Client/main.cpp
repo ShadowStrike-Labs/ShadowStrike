@@ -1,0 +1,452 @@
+/*
+ * ShadowStrike - Enterprise NGAV/EDR Platform
+ * Copyright (C) 2026 ShadowStrike Security
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+/**
+ * ============================================================================
+ * ShadowStrike NGAV — PHANTOM HOME UI — ENTRY POINT
+ * ============================================================================
+ *
+ * @file main.cpp
+ * @brief Process entry point for ShadowStrikePhantomUI.exe.
+ *
+ * Startup sequence:
+ *   1. PerfBudget::ApplyEngineTuning()    — env vars before QApplication
+ *   2. Logger initialisation
+ *   3. Single-instance mutex guard        — second instance signals first and exits
+ *   4. QApplication construction (DPI, style)
+ *   5. Translator::LoadFromConfigOrSystem()
+ *   6. HighContrastContext, PerfBudgetContext, WindowActivator
+ *   7. PipeClient::Start()
+ *   8. ViewModel construction
+ *   9. QQmlApplicationEngine + context properties
+ *  10. Load qrc:/qml/Main.qml
+ *  11. PerfBudget::EndStartupAndValidate()
+ *  12. QApplication::exec()
+ *  13. Shutdown: PipeClient::Stop(), Logger::ShutDown()
+ *
+ * Threading model:
+ *   All context properties are QObjects owned by the Qt main thread.
+ *   PipeClient and WindowActivator own their own std::jthreads internally
+ *   and marshal callbacks to the main thread via QMetaObject::invokeMethod.
+ *
+ * @author ShadowStrike Security Team
+ * @version 1.0.0
+ * @date 2026
+ * ============================================================================
+ */
+
+// Windows headers must precede Qt headers to avoid macro collisions.
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <Windows.h>
+#include <shellapi.h>  // CommandLineToArgvW
+
+// Qt — application
+#include <QApplication>
+#include <QGuiApplication>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickWindow>
+#include <QTimer>
+#include <QStringList>
+
+// Qt — utilities
+#include <QLoggingCategory>
+
+// ShadowStrike — logger (must come after windows.h)
+#include <PhantomCore/Utils/Logger.hpp>
+
+// ShadowStrike — startup budget
+#include <Products/Community/PhantomHome/UI/PerfBudget/PerfBudget.hpp>
+
+// ShadowStrike — localisation
+#include <Products/Community/PhantomHome/UI/I18n/Translator.hpp>
+
+// ShadowStrike — HCM bridge
+#include <Products/Community/PhantomHome/UI/Accessibility/HighContrastContext.hpp>
+
+// ShadowStrike — service IPC
+#include <Products/Community/PhantomHome/UI/Client/IPC/PipeClient.hpp>
+
+// ShadowStrike — view models
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/ProtectionViewModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/ScanViewModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/QuarantineModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/ReportsModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/SettingsViewModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/ModulesListModel.hpp>
+
+// ShadowStrike — single-instance activation bridge
+#include <Products/Community/PhantomHome/UI/Client/WindowActivator.hpp>
+
+// ShadowStrike — CLI argument constants (tray ↔ UI contract)
+#include <Products/Community/PhantomHome/UI/Shared/TrayUiArgs.hpp>
+
+// ShadowStrike — version
+#include <Products/Community/PhantomHome/UI/Tray/Version.hpp>
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+static constexpr wchar_t kSingleInstanceMutex[] =
+    L"Global\\ShadowStrike.PhantomHome.UI";
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+namespace {
+
+using namespace ShadowStrike::Utils;
+using namespace ShadowStrike::PhantomHome::UI;
+using namespace ShadowStrike::PhantomHome::UI::IPC;
+using namespace ShadowStrike::PhantomHome::UI::ViewModels;
+using namespace ShadowStrike::PhantomHome::Tray::Version;
+
+// ---------------------------------------------------------------------------
+// Parsed startup arguments
+// ---------------------------------------------------------------------------
+struct StartupArgs {
+    bool    minimized   = false;
+    bool    fromTray    = false;
+    QString initialRoute;       ///< e.g. "settings", "reports", "quarantine"
+
+    // Action flags — forwarded to the appropriate ViewModel after startup.
+    bool    quickScan         = false;
+    bool    fullScan          = false;
+    bool    pauseProtection   = false;
+    bool    resumeProtection  = false;
+    bool    checkForUpdates   = false;
+};
+
+// ---------------------------------------------------------------------------
+// Parse argv using the TrayUiArgs contract.
+// ---------------------------------------------------------------------------
+[[nodiscard]] StartupArgs ParseArgs() noexcept
+{
+    StartupArgs args{};
+
+    int    argc  = 0;
+    LPWSTR*wargv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
+    if (!wargv) {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"CommandLineToArgvW failed (error=%lu); using defaults",
+                    ::GetLastError());
+        return args;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring_view arg{wargv[i]};
+
+        if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kOpenDashboard) {
+            args.initialRoute = QStringLiteral("dashboard");
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kOpenSettings) {
+            args.initialRoute = QStringLiteral("settings");
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kOpenReports) {
+            args.initialRoute = QStringLiteral("reports");
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kOpenQuarantine) {
+            args.initialRoute = QStringLiteral("quarantine");
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kQuickScan) {
+            args.quickScan = true;
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kFullScan) {
+            args.fullScan = true;
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kPauseProtection) {
+            args.pauseProtection = true;
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kResumeProtection) {
+            args.resumeProtection = true;
+        } else if (arg == ShadowStrike::PhantomHome::UI::TrayArgs::kCheckForUpdates) {
+            args.checkForUpdates = true;
+        } else if (arg == L"--minimized") {
+            args.minimized = true;
+        } else if (arg == L"--from-tray") {
+            args.fromTray = true;
+        }
+    }
+
+    ::LocalFree(wargv);
+    return args;
+}
+
+// ---------------------------------------------------------------------------
+// Attempt to signal the first instance to show its window.
+// Best-effort: any failure is logged at WARN and ignored.
+// ---------------------------------------------------------------------------
+void SignalFirstInstance() noexcept
+{
+    HANDLE pipe = ::CreateFileW(
+        WindowActivator::kPipeName,
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr);
+
+    if (pipe == INVALID_HANDLE_VALUE) {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"Could not open activation pipe to first instance (error=%lu)",
+                    ::GetLastError());
+        return;
+    }
+
+    DWORD written = 0;
+    const bool ok = ::WriteFile(pipe,
+                                WindowActivator::kActivateToken,
+                                static_cast<DWORD>(sizeof(WindowActivator::kActivateToken)),
+                                &written,
+                                nullptr) != FALSE;
+    if (!ok) {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"WriteFile to activation pipe failed (error=%lu)",
+                    ::GetLastError());
+    }
+
+    ::CloseHandle(pipe);
+}
+
+// ---------------------------------------------------------------------------
+// Logger initialisation
+// ---------------------------------------------------------------------------
+void InitLogger() noexcept
+{
+    LoggerConfig cfg{};
+    cfg.async             = true;
+    cfg.toConsole         = false;  // GUI application — no console window
+    cfg.toFile            = true;
+    cfg.toEventLog        = false;
+    cfg.jsonLines         = false;
+    cfg.logDirectory      = L"logs";
+    cfg.baseFileName      = L"PhantomHomeUI";
+    cfg.maxFileSizeBytes  = 10ULL * 1024ULL * 1024ULL;  // 10 MiB
+    cfg.maxFileCount      = 5;
+    cfg.minimalLevel      = LogLevel::Info;
+    cfg.flushLevel        = LogLevel::Error;
+    cfg.includeSrcLocation = true;
+    cfg.includeProcThreadId = true;
+
+    Logger::Instance().Initialize(cfg);
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
+
+int main(int argc, char* argv[])
+{
+    // ── Step 1: Engine tuning (before QApplication) ────────────────────────
+    PerfBudget::ApplyEngineTuning();
+
+    // Force Basic style — we own all visual styling through Theme.qml.
+    qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
+
+    // Pass-through DPI scale so the OS compositor handles fractional scales
+    // without Qt rounding errors on mixed-DPI setups.
+    QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
+        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+
+    // ── Step 2: Logger ─────────────────────────────────────────────────────
+    InitLogger();
+
+    SS_LOG_INFO(L"PhantomHome.Main",
+                L"ShadowStrike PhantomHome UI starting — version %ls",
+                kVersion);
+
+    // ── Step 3: Single-instance guard ──────────────────────────────────────
+    HANDLE hMutex = ::CreateMutexW(nullptr, FALSE, kSingleInstanceMutex);
+    const DWORD mutexErr = ::GetLastError();
+
+    if (hMutex == nullptr) {
+        SS_LOG_ERROR(L"PhantomHome.Main",
+                     L"CreateMutexW failed — cannot guarantee single-instance (error=%lu)",
+                     ::GetLastError());
+        // Proceed anyway; this is a non-fatal degraded state.
+    } else if (mutexErr == ERROR_ALREADY_EXISTS) {
+        SS_LOG_INFO(L"PhantomHome.Main",
+                    L"Another instance is already running — signalling activation and exiting");
+        SignalFirstInstance();
+        ::CloseHandle(hMutex);
+        return 0;
+    }
+
+    // ── Step 4: QApplication ───────────────────────────────────────────────
+    QApplication app(argc, argv);
+
+    QCoreApplication::setOrganizationName(QStringLiteral("ShadowStrike Labs"));
+    QCoreApplication::setOrganizationDomain(QStringLiteral("ShadowStrike.dev"));
+    QCoreApplication::setApplicationName(QStringLiteral("ShadowStrike Phantom Home"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("1.0.0-dev"));
+
+    // ── Step 5: CLI args ───────────────────────────────────────────────────
+    const StartupArgs startArgs = ParseArgs();
+
+    SS_LOG_INFO(L"PhantomHome.Main",
+                L"Startup args: minimized=%d fromTray=%d route=%ls quickScan=%d",
+                startArgs.minimized,
+                startArgs.fromTray,
+                startArgs.initialRoute.toStdWString().c_str(),
+                startArgs.quickScan);
+
+    // ── Step 6: Localisation ───────────────────────────────────────────────
+    const QString effectiveLocale = Translator::LoadFromConfigOrSystem();
+    SS_LOG_INFO(L"PhantomHome.Main", L"Active locale: %ls",
+                effectiveLocale.toStdWString().c_str());
+
+    // ── Step 7: High Contrast context ──────────────────────────────────────
+    HighContrastContext& hcmCtx = HighContrastContext::Instance();
+
+    // ── Step 8: Perf budget context ────────────────────────────────────────
+    PerfBudgetContext& perfCtx = PerfBudget::Context();
+    PerfBudget::BeginStartup();
+
+    // ── Step 9: WindowActivator (single-instance pipe server) ──────────────
+    WindowActivator windowActivator;
+    windowActivator.Start();
+
+    // ── Step 10: Service pipe client ───────────────────────────────────────
+    PipeClient& pipeClient = PipeClient::Instance();
+    if (!pipeClient.Start()) {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"PipeClient::Start() failed — UI will operate in disconnected mode");
+    }
+
+    // ── Step 11: ViewModels ────────────────────────────────────────────────
+    ProtectionViewModel protectionViewModel;
+    ScanViewModel       scanViewModel;
+    QuarantineModel     quarantineModel;
+    ReportsModel        reportsModel;
+    SettingsViewModel   settingsViewModel;
+    ModulesListModel    modulesListModel;
+
+    // ── Step 12: QML engine ────────────────────────────────────────────────
+    QQmlApplicationEngine engine;
+
+    // Tell the import machinery where to find ShadowStrike.* QML modules.
+    engine.addImportPath(QStringLiteral("qrc:/qml"));
+
+    // Expose all context properties before load so QML bindings resolve.
+    QQmlContext* ctx = engine.rootContext();
+
+    ctx->setContextProperty(QStringLiteral("hcmCtx"),              &hcmCtx);
+    ctx->setContextProperty(QStringLiteral("perfBudget"),          &perfCtx);
+    ctx->setContextProperty(QStringLiteral("windowActivator"),     &windowActivator);
+    ctx->setContextProperty(QStringLiteral("pipeClient"),          &pipeClient);
+
+    ctx->setContextProperty(QStringLiteral("protectionViewModel"), &protectionViewModel);
+    ctx->setContextProperty(QStringLiteral("scanViewModel"),       &scanViewModel);
+    ctx->setContextProperty(QStringLiteral("quarantineModel"),     &quarantineModel);
+    ctx->setContextProperty(QStringLiteral("reportsModel"),        &reportsModel);
+    ctx->setContextProperty(QStringLiteral("settingsViewModel"),   &settingsViewModel);
+    ctx->setContextProperty(QStringLiteral("modulesListModel"),    &modulesListModel);
+
+    // initialRoute is a plain string — read once by Main.qml at Component.onCompleted.
+    ctx->setContextProperty(QStringLiteral("initialRoute"),
+                            startArgs.initialRoute);
+
+    // ── Step 13: Load Main.qml ─────────────────────────────────────────────
+    const QUrl mainUrl(QStringLiteral("qrc:/qml/Main.qml"));
+
+    // Fatal guard: if Main.qml fails to load we cannot continue.
+    QObject::connect(
+        &engine,
+        &QQmlApplicationEngine::objectCreationFailed,
+        &app,
+        [&mainUrl](const QUrl& url) {
+            if (url == mainUrl) {
+                SS_LOG_ERROR(L"PhantomHome.Main",
+                             L"Fatal: QML engine failed to create root object from Main.qml");
+                QCoreApplication::exit(1);
+            }
+        },
+        Qt::QueuedConnection);
+
+    engine.load(mainUrl);
+
+    if (engine.rootObjects().isEmpty()) {
+        SS_LOG_ERROR(L"PhantomHome.Main",
+                     L"Fatal: QML engine produced no root objects after loading Main.qml");
+        pipeClient.Stop();
+        windowActivator.Stop();
+        if (hMutex) ::CloseHandle(hMutex);
+        Logger::Instance().ShutDown();
+        return 1;
+    }
+
+    // ── Step 14: Post-load actions ─────────────────────────────────────────
+    // Apply minimized state and action args via a single-shot timer so the
+    // window has completed its first paint before we manipulate it.
+    QTimer::singleShot(0, [&]() {
+        // Minimized: hide the window immediately after the first frame.
+        if (startArgs.minimized) {
+            const auto& roots = engine.rootObjects();
+            for (QObject* obj : roots) {
+                if (auto* win = qobject_cast<QQuickWindow*>(obj)) {
+                    win->showMinimized();
+                    break;
+                }
+            }
+        }
+
+        // Forward action args to the appropriate ViewModel.
+        if (startArgs.quickScan) {
+            QMetaObject::invokeMethod(&scanViewModel,
+                                      "startQuickScan",
+                                      Qt::QueuedConnection);
+        } else if (startArgs.fullScan) {
+            QMetaObject::invokeMethod(&scanViewModel,
+                                      "startFullScan",
+                                      Qt::QueuedConnection);
+        }
+
+        if (startArgs.pauseProtection) {
+            QMetaObject::invokeMethod(&protectionViewModel,
+                                      "pauseProtection",
+                                      Qt::QueuedConnection);
+        } else if (startArgs.resumeProtection) {
+            QMetaObject::invokeMethod(&protectionViewModel,
+                                      "resumeProtection",
+                                      Qt::QueuedConnection);
+        }
+    });
+
+    PerfBudget::EndStartupAndValidate();
+
+    // ── Step 15: Event loop ────────────────────────────────────────────────
+    const int exitCode = QApplication::exec();
+
+    // ── Step 16: Shutdown ──────────────────────────────────────────────────
+    SS_LOG_INFO(L"PhantomHome.Main",
+                L"Event loop exited with code %d — shutting down", exitCode);
+
+    pipeClient.Stop();
+    windowActivator.Stop();
+
+    if (hMutex) {
+        ::CloseHandle(hMutex);
+        hMutex = nullptr;
+    }
+
+    Logger::Instance().ShutDown();
+
+    return exitCode;
+}

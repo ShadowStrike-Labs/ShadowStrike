@@ -1,0 +1,85 @@
+<!--
+    qml.qrc — ShadowStrike PhantomHome UI QML resource bundle.
+
+    All QML, qmldir, and related assets required by the Qt Quick engine are
+    embedded here under prefix /qml so the shipped binary carries zero loose
+    QML files.
+
+    Module path aliases:
+      The qmldir files declare module names of the form "ShadowStrike.Foo".
+      With engine.addImportPath("qrc:/qml"), the Qt import machinery resolves
+      "ShadowStrike.Foo" by looking for "qrc:/qml/ShadowStrike/Foo/qmldir".
+      The alias= attributes below map the on-disk layout to that expectation.
+
+    Prefix: /qml
+      Entry point:          qrc:/qml/Main.qml
+      Theming module:       qrc:/qml/ShadowStrike/Theming/Theme.qml
+      Components module:    qrc:/qml/ShadowStrike/Components/<Component>.qml
+      Icons sub-module:     qrc:/qml/ShadowStrike/Components/Icons/<Icon>.qml
+      Accessibility module: qrc:/qml/ShadowStrike/Accessibility/<File>.qml
+      Pages (no module):    qrc:/qml/Pages/<Page>.qml
+-->
+<RCC>
+    <qresource prefix="/qml">
+
+        <!-- ── Entry point ──────────────────────────────────────────────── -->
+        <file>Main.qml</file>
+
+        <!-- ── ShadowStrike.Theming module ─────────────────────────────── -->
+        <file alias="ShadowStrike/Theming/qmldir">Theming/qmldir</file>
+        <file alias="ShadowStrike/Theming/Theme.qml">Theming/Theme.qml</file>
+
+        <!-- ── ShadowStrike.Components module ──────────────────────────── -->
+        <file alias="ShadowStrike/Components/qmldir">Components/qmldir</file>
+        <file alias="ShadowStrike/Components/Card.qml">Components/Card.qml</file>
+        <file alias="ShadowStrike/Components/EmptyState.qml">Components/EmptyState.qml</file>
+        <file alias="ShadowStrike/Components/FastScanTile.qml">Components/FastScanTile.qml</file>
+        <file alias="ShadowStrike/Components/GhostButton.qml">Components/GhostButton.qml</file>
+        <file alias="ShadowStrike/Components/HeadlineTicker.qml">Components/HeadlineTicker.qml</file>
+        <file alias="ShadowStrike/Components/HeroShield.qml">Components/HeroShield.qml</file>
+        <file alias="ShadowStrike/Components/IconButton.qml">Components/IconButton.qml</file>
+        <file alias="ShadowStrike/Components/ModePillRow.qml">Components/ModePillRow.qml</file>
+        <file alias="ShadowStrike/Components/ModuleCard.qml">Components/ModuleCard.qml</file>
+        <file alias="ShadowStrike/Components/PageHost.qml">Components/PageHost.qml</file>
+        <file alias="ShadowStrike/Components/PGTIFeedRow.qml">Components/PGTIFeedRow.qml</file>
+        <file alias="ShadowStrike/Components/PrimaryButton.qml">Components/PrimaryButton.qml</file>
+        <file alias="ShadowStrike/Components/RecommendationCard.qml">Components/RecommendationCard.qml</file>
+        <file alias="ShadowStrike/Components/SearchBar.qml">Components/SearchBar.qml</file>
+        <file alias="ShadowStrike/Components/SectionTitle.qml">Components/SectionTitle.qml</file>
+        <file alias="ShadowStrike/Components/Sidebar.qml">Components/Sidebar.qml</file>
+        <file alias="ShadowStrike/Components/SidebarItem.qml">Components/SidebarItem.qml</file>
+        <file alias="ShadowStrike/Components/StatusChip.qml">Components/StatusChip.qml</file>
+        <file alias="ShadowStrike/Components/ThreatRow.qml">Components/ThreatRow.qml</file>
+        <file alias="ShadowStrike/Components/ToggleSwitch.qml">Components/ToggleSwitch.qml</file>
+        <file alias="ShadowStrike/Components/TopBar.qml">Components/TopBar.qml</file>
+        <file alias="ShadowStrike/Components/TrustSlider.qml">Components/TrustSlider.qml</file>
+
+        <!-- ── ShadowStrike.Components.Icons sub-module ─────────────────── -->
+        <file alias="ShadowStrike/Components/Icons/qmldir">Components/Icons/qmldir</file>
+        <file alias="ShadowStrike/Components/Icons/AlertIcon.qml">Components/Icons/AlertIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/BackIcon.qml">Components/Icons/BackIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/CheckIcon.qml">Components/Icons/CheckIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/CloseIcon.qml">Components/Icons/CloseIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/EyeIcon.qml">Components/Icons/EyeIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/GaugeIcon.qml">Components/Icons/GaugeIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/GearIcon.qml">Components/Icons/GearIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/InfoIcon.qml">Components/Icons/InfoIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/LockIcon.qml">Components/Icons/LockIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/RefreshIcon.qml">Components/Icons/RefreshIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/SearchIcon.qml">Components/Icons/SearchIcon.qml</file>
+        <file alias="ShadowStrike/Components/Icons/ShieldIcon.qml">Components/Icons/ShieldIcon.qml</file>
+
+        <!-- ── ShadowStrike.Accessibility module ────────────────────────── -->
+        <file alias="ShadowStrike/Accessibility/qmldir">Accessibility/qmldir</file>
+        <file alias="ShadowStrike/Accessibility/FocusRing.qml">Accessibility/FocusRing.qml</file>
+        <file alias="ShadowStrike/Accessibility/HighContrast.qml">Accessibility/HighContrast.qml</file>
+        <!-- _HOWTO_A11Y.qml is documentation only; not exposed as a module type -->
+        <file alias="ShadowStrike/Accessibility/_HOWTO_A11Y.qml">Accessibility/_HOWTO_A11Y.qml</file>
+
+        <!-- ── Pages (no QML module — referenced directly by URL) ───────── -->
+        <file>Pages/PerformancePage.qml</file>
+        <file>Pages/PrivacyPage.qml</file>
+        <file>Pages/ZeroTrustDetailPage.qml</file>
+
+    </qresource>
+</RCC>
