@@ -849,7 +849,9 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
     // Protect current process
     uint32_t selfPid = ::GetCurrentProcessId();
     lock.unlock();
+    SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectProcess(self)...");
     bool selfProtected = ProtectProcess(selfPid);
+    SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: RegisterShadowStrikeComponent...");
     RegisterShadowStrikeComponent(selfPid, "ShadowStrikeService");
 
     // Track any critical protection failures
@@ -871,18 +873,22 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
     }
 
     // Protect installation directory
+    SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectInstallationDirectory...");
     ProtectInstallationDirectory();
 
     // Protect service registry keys
+    SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectServiceRegistryKeys...");
     ProtectServiceRegistryKeys();
 
     // Start watchdog if enabled
     if (config.enableWatchdog) {
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: StartWatchdog...");
         if (!StartWatchdog()) degraded = true;
     }
 
     // Protect code section if integrity monitoring enabled
     if (config.enableIntegrityMonitoring) {
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectCodeSection...");
         if (!ProtectCodeSection()) degraded = true;
     }
 
@@ -895,7 +901,9 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
 
     // Kernel bridge: sync protected processes and register alert handler
     if (config.enableKernelProtection) {
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: SyncProtectedProcessesToKernel...");
         SyncProtectedProcessesToKernel();
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: RegisterKernelHandler...");
         RegisterKernelHandler();
     }
 
