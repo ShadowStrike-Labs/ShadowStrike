@@ -81,16 +81,23 @@
                      Value="1"/>
 
       <!--
-        ServiceControl: start on install, stop on both install (upgrade) and
-        uninstall, remove entry on uninstall.  Wait="yes" ensures the MSI
-        engine does not proceed until the SCM reports the service has stopped.
+        ServiceControl:
+        * Stop on both install (upgrade path) and uninstall.
+        * Remove on uninstall.
+        * Start on install with Wait="no" so that a missing prerequisite
+          (e.g. VC++ 2015-2022 x64 runtime if the user launched the plain
+          .msi instead of the bundled .exe) does NOT roll back the whole
+          install.  Start="auto" + DelayedAutoStart=yes guarantees the
+          service still comes up on the next reboot, and the WixUI final
+          dialog directs the user to re-run the bundle if the initial
+          start attempt fails.
       -->
       <ServiceControl Id="SvcControl"
                       Name="ShadowStrikePhantomService"
                       Start="install"
                       Stop="both"
                       Remove="uninstall"
-                      Wait="yes"/>
+                      Wait="no"/>
 
     </Component>
 
