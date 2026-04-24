@@ -24,6 +24,12 @@
 #include <algorithm>
 #include <cstring>
 
+// DESIGN: Guest-memory writebacks (WSABUF scatter reads, byte-count
+// writeback) are [[nodiscard]]; guest-side faults do not affect
+// emulator correctness.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ws2_32 {
 
 // ============================================================================
@@ -82,6 +88,13 @@ bool HandleWSASocketA(APIContext& ctx) {
         return true;
     }
 
+    // T1071 Application Layer Protocol. WSASocket is missing from
+    // APIDatabase.hpp — advanced malware (Cobalt Strike, Meterpreter
+    // reverse_https) deliberately uses the "WSA-" primitives to evade
+    // EDRs that only hook the legacy BSD API. Wire explicitly.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetReturn(h);
     return true;
 }
@@ -138,6 +151,13 @@ bool HandleWSASend(APIContext& ctx) {
         mem.WriteU32(lpBytesSent, totalBytes);
     }
 
+    // T1071.001 / T1041 — WSASend is the scatter-gather transmission
+    // primitive heavily used by async C2 frameworks (overlapped I/O
+    // + completion routines). APIDatabase.hpp has no entry for it;
+    // wire NetworkC2 + SuspiciousAPI directly.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturn32(0);
     return true;
@@ -156,6 +176,11 @@ bool HandleWSARecv(APIContext& ctx) {
     if (lpBytesRecvd != 0) {
         ctx.Memory().WriteU32(lpBytesRecvd, 0);
     }
+
+    // T1071.001 — async scatter-gather receive primitive. APIDatabase
+    // has no entry; wire NetworkC2 so the incoming C2 traffic is
+    // observable even when the sample uses only WSA-variants.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturn32(0);
@@ -186,3 +211,6 @@ void RegisterWSAAsyncAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ws2_32
+
+#pragma warning(pop)
+
