@@ -28,6 +28,11 @@
 #include <string>
 #include <unordered_map>
 
+// DESIGN: Guest-memory writebacks (WriteU32) are [[nodiscard]]; guest-side
+// faults do not affect emulator correctness.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Wininet {
 
 // ============================================================================
@@ -123,17 +128,8 @@ private:
 // Wide-to-narrow helper (ASCII truncation for IOC storage)
 // ============================================================================
 
-static std::string WideToNarrow(const std::wstring& ws) noexcept {
-    std::string narrow;
-    narrow.reserve(ws.size());
-    for (wchar_t wc : ws) {
-        narrow.push_back(static_cast<char>(wc & 0x7F));
-    }
-    return narrow;
-}
-
 // ============================================================================
-// HttpSendRequestExA — hRequest(0), lpBuffersIn(1), lpBuffersOut(2),
+// HttpSendRequestExA— hRequest(0), lpBuffersIn(1), lpBuffersOut(2),
 //                       dwFlags(3), dwContext(4)
 // ============================================================================
 
@@ -148,14 +144,18 @@ bool HandleHttpSendRequestExA(APIContext& ctx) {
         return true;
     }
 
-    // Track streaming request initiation — network activity IOC
+    // T1071.001 Application Layer Protocol (Web). HttpSendRequestEx is the
+    // streaming-C2 transmission primitive — every beacon flows through here.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
     return true;
 }
 
 // ============================================================================
-// HttpSendRequestExW — wide-string variant
+// HttpSendRequestExW— wide-string variant
 // ============================================================================
 
 bool HandleHttpSendRequestExW(APIContext& ctx) {
@@ -216,17 +216,22 @@ bool HandleInternetSetOptionA(APIContext& ctx) {
     (void)lpBuffer;
     (void)dwBufferLen;
 
-    // Detect proxy configuration — C2 proxy setup IOC
+    // T1090 Proxy. Programmatic proxy reconfiguration is a classic C2
+    // pivot (tunneling over attacker-controlled proxy).
     if (dwOption == INTERNET_OPTION_PROXY) {
-        // Proxy set is flagged; dispatcher raises NetworkC2
+        ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
-    // Detect SSL validation bypass — defense evasion IOC
+    // T1553 Subvert Trust Controls — disabling SSL validation to allow MitM
+    // or self-signed C2 certificates.
     if (dwOption == INTERNET_OPTION_SECURITY_FLAGS && lpBuffer != 0 && dwBufferLen >= 4) {
         uint32_t flags = 0;
         ctx.Memory().ReadU32(lpBuffer, flags);
         if ((flags & SECURITY_FLAG_IGNORE_ALL_MASK) != 0) {
-            // SSL bypass detected; dispatcher raises DefenseEvasion
+            ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         }
     }
 
@@ -342,6 +347,11 @@ bool HandleInternetWriteFile(APIContext& ctx) {
                                         static_cast<uint32_t>(16ULL * 1024 * 1024));
 
     ConnectionTracker::Instance().AddUploaded(hFile, safeBytes);
+
+    // T1041 Exfiltration Over C2 Channel. InternetWriteFile is the explicit
+    // upload primitive — any invocation is a strong network-C2 signal.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     // Report all bytes written successfully
     if (lpdwBytesWritten != 0) {
@@ -504,3 +514,6 @@ void RegisterHttpStreamAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Wininet
+
+#pragma warning(pop)
+
