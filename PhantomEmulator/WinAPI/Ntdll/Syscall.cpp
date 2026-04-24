@@ -41,6 +41,11 @@
 #include <algorithm>
 #include <cstring>
 
+// DESIGN: Syscall dispatch & stub writer emit many guest-memory writes;
+// guest AV on writeback is a guest fault, not our bug.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -233,12 +238,14 @@ bool SyscallDispatcher::Dispatch(CPUState& cpu, VirtualMemory& mem,
         returnAddr = static_cast<GuestAddress>(retAddr32);
     }
 
-    if (!IsFromNtdll(returnAddr)) {
+    const bool directSyscall = !IsFromNtdll(returnAddr);
+    if (directSyscall) {
         ++m_directCalls;
 
         // Flag: direct syscall is a defense-evasion + suspicious-API indicator.
         // The caller will aggregate these flags through the APIDispatcher's
-        // behavior-flag accumulator.
+        // behavior-flag accumulator (flag emission happens after APIContext
+        // construction below — see ctx.AddBehaviorFlag calls).
         //
         // We don't block execution — we want to observe what the malware does
         // after the syscall.  Blocking would alter execution flow and cause
@@ -284,6 +291,16 @@ bool SyscallDispatcher::Dispatch(CPUState& cpu, VirtualMemory& mem,
 
     // ---- Build APIContext and invoke the handler -------------------------
     APIContext ctx(cpu, mem, handles, config, tls, m_dispatcher);
+
+    // IOC: direct syscall from outside ntdll image (T1106 Native API via
+    // HellsGate/SysWhispers/FreshyCalls/Tartarus direct-syscall techniques
+    // bypassing usermode API hooks). Emit on every hit so aggregated
+    // behavior scoring weights it; the handler itself may add further flags.
+    if (directSyscall) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     const bool continueExec = m_handlers[syscallNum](ctx);
 
     // ---- Simulate SYSRET / IRET -----------------------------------------
@@ -368,7 +385,7 @@ uint32_t SyscallDispatcher::WriteSyscallStubs(VirtualMemory& mem,
         // Determine argument byte count for x86 ret N.
         // Look up the function in the known-API table.
         const KnownAPIEntry* known = FindBySyscallNumber(num);
-        const uint16_t argBytes = known
+        [[maybe_unused]] const uint16_t argBytes = known
             ? static_cast<uint16_t>(known->argCount * 4)
             : 0;
 
@@ -431,3 +448,6 @@ void RegisterSyscall(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
+
