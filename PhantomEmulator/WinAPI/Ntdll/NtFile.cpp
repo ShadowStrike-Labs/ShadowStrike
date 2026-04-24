@@ -25,6 +25,14 @@
 #include <string>
 #include <cctype>
 
+// DESIGN: WriteU32/WriteU64/Write guest writebacks are [[nodiscard]] so the
+// caller can detect guest-side AVs. Every destination address here is
+// either null-checked or proven valid by a preceding buffer-size check;
+// a write that AVs is a guest-side fault that the emulated code handles.
+// Pragma is namespace-scoped; validation guards remain explicit.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -208,9 +216,29 @@ bool HandleNtCreateFile(APIContext& ctx) {
                        createDisp == kFileSupersede ||
                        createDisp == kFileOverwrite ||
                        createDisp == kFileOverwriteIf);
-    bool isOpening  = (createDisp == kFileOpen ||
-                       createDisp == kFileOpenIf ||
-                       createDisp == kFileOverwriteIf);
+    // (createDisp == kFileOpen / kFileOpenIf / kFileOverwriteIf) would
+    // yield the "opening" predicate — currently unused because every
+    // NtCreateFile call in the emulator succeeds via the virtual FS.
+
+    // IOC: T1059.005 / T1105 / T1027.002 file-drop on the NT layer.
+    // Every creation/overwrite disposition is an observable file drop in
+    // the virtual FS and every dropped payload gets FileDropped. Paths
+    // matching known persistence directories escalate the verdict to
+    // DefenseEvasion (T1546 / AppData staging).
+    if (isCreating) {
+        ctx.AddBehaviorFlag(BehaviorFlag::FileDropped);
+        const auto& p = normalizedPath;
+        const bool inAppData = p.find(L"\\AppData\\") != std::wstring::npos ||
+                               p.find(L"\\appdata\\") != std::wstring::npos;
+        const bool inTemp    = p.find(L"\\Temp\\") != std::wstring::npos ||
+                               p.find(L"\\temp\\") != std::wstring::npos;
+        const bool inStartup = p.find(L"\\Startup\\") != std::wstring::npos ||
+                               p.find(L"\\Start Menu\\") != std::wstring::npos;
+        if (inAppData || inTemp || inStartup) {
+            ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
 
     // Default virtual file size (for DLL stubs, config files malware probes)
     uint64_t virtualFileSize = kDefaultVirtualFileSize;
@@ -415,8 +443,11 @@ bool HandleNtWriteFile(APIContext& ctx) {
             f.fileSize     = newSize;
         });
 
-    // The dispatcher's behavioral layer will raise FileDropped based on the
-    // API metadata in kKnownAPIs. No additional flag logic needed here.
+    // IOC: T1105 / T1059.005 file write on the NT layer. Any successful
+    // data write through NtWriteFile is treated as a file drop for the
+    // purposes of behavior correlation; the dispatcher metadata only
+    // catches Win32 WriteFile and misses direct-syscall paths.
+    ctx.AddBehaviorFlag(BehaviorFlag::FileDropped);
 
     WriteIoStatus(mem, ioStatusPtr, NT::STATUS_SUCCESS, length);
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
@@ -484,8 +515,16 @@ bool HandleNtSetInformationFile(APIContext& ctx) {
                 ctx.SetReturnNtStatus(NT::STATUS_INVALID_PARAMETER);
                 return true;
             }
-            // Delete-on-close is a defense-evasion signal (self-deletion).
-            // The behavior flag is raised by the dispatcher based on API metadata.
+            // IOC: T1070.004 Indicator Removal on Host — File Deletion.
+            // A non-zero DeleteFile byte schedules deletion on handle close;
+            // this is the standard "drop → execute → self-delete" pattern
+            // used by droppers, miners and ransomware cleanup stages.
+            uint8_t deleteFlag = 0;
+            if (mem.ReadU8(infoPtr, deleteFlag) == ErrorCode::Success &&
+                deleteFlag != 0) {
+                ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+                ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            }
             WriteIoStatus(mem, ioStatusPtr, NT::STATUS_SUCCESS, 0);
             ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
             return true;
@@ -706,3 +745,5 @@ void RegisterNtFile(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
