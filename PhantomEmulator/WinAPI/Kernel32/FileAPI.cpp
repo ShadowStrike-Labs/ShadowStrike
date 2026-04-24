@@ -26,6 +26,13 @@
 #include <string>
 #include <cctype>
 
+// DESIGN: VirtualMemory::Write* returns [[nodiscard]] ErrorCode. Kernel32 file
+// APIs ignore output-buffer write failures on caller-supplied pointers — the
+// guest Win32 contract surfaces the status via GetLastError/return value, not
+// the paging outcome. Scope: this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -120,6 +127,24 @@ static bool CreateFileCore(APIContext& ctx, const std::wstring& rawPath,
     }
 
     std::wstring normalizedPath = NormalizePath(rawPath);
+
+    // Win32 creation disposition values: CREATE_NEW(1), CREATE_ALWAYS(2),
+    // OPEN_EXISTING(3), OPEN_ALWAYS(4), TRUNCATE_EXISTING(5).
+    // 1/2/4 can materialize new file content; pair that with a write-capable
+    // access mask + executable-looking target to flag T1105 (Ingress Tool
+    // Transfer) / file-drop behaviour.
+    constexpr uint32_t kCreateNew       = 1;
+    constexpr uint32_t kCreateAlways    = 2;
+    constexpr uint32_t kOpenAlways      = 4;
+    constexpr uint32_t kTruncateExisting = 5;
+    const bool willCreate =
+        (creationDisp == kCreateNew || creationDisp == kCreateAlways ||
+         creationDisp == kOpenAlways || creationDisp == kTruncateExisting);
+    const bool writeAccess =
+        (access & NT::GENERIC_WRITE) || (access & NT::FILE_WRITE_DATA);
+    if (willCreate && writeAccess && IsExecutablePath(normalizedPath)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::FileDropped);
+    }
 
     // Determine default file size based on creation disposition
     uint64_t fileSize = kDefaultVirtualFileSize;
@@ -381,6 +406,12 @@ bool HandleDeleteFileA(APIContext& ctx) {
         return true;
     }
 
+    // Deleting an executable artifact is a classic self-delete / anti-forensic
+    // evasion pattern (T1070.004 — File Deletion).
+    if (IsExecutablePath(AnsiToWide(ansiPath))) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+    }
+
     // File deletion always succeeds in our virtual FS
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -403,6 +434,10 @@ bool HandleDeleteFileW(APIContext& ctx) {
     if (widePath.empty()) {
         ctx.FailWithError(Win32::ERROR_INVALID_NAME);
         return true;
+    }
+
+    if (IsExecutablePath(widePath)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
     }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
@@ -1013,3 +1048,5 @@ void RegisterFileAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
