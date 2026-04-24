@@ -30,6 +30,9 @@
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom::VirtualOS {
 
@@ -40,6 +43,9 @@ namespace Phantom::VirtualOS {
 namespace {
 
 static constexpr size_t kPageSize = 4096;
+static constexpr uint32_t kMaxExportsPerProfile = 512;
+static constexpr size_t kMaxExportNameBytes = 256;
+static constexpr uint32_t kMaxSyntheticImageSize = 128U * 1024U * 1024U;
 
 // Windows 10 22H2 build timestamp (approx. Oct 2023 update)
 static constexpr uint32_t kWin10_22H2_Timestamp = 0x6500E6DB;
@@ -87,8 +93,16 @@ void WriteWideString(std::vector<uint8_t>& b, size_t off,
 }
 
 size_t WideLen(const wchar_t* s) noexcept {
+    if (!s) return 0;
     size_t len = 0;
     while (s[len]) ++len;
+    return len;
+}
+
+size_t BoundedAsciiLen(const char* s, size_t maxLen) noexcept {
+    if (!s) return 0;
+    size_t len = 0;
+    while (len < maxLen && s[len] != '\0') ++len;
     return len;
 }
 
@@ -393,8 +407,15 @@ static constexpr char kWinIniContent[] =
 
 /// Extract filename component from a path (after last backslash)
 [[nodiscard]] std::wstring_view ExtractFilename(std::wstring_view path) noexcept {
-    auto pos = path.rfind(L'\\');
-    if (pos == std::wstring_view::npos) return path;
+    const auto slash = path.rfind(L'/');
+    const auto backslash = path.rfind(L'\\');
+    if (slash == std::wstring_view::npos &&
+        backslash == std::wstring_view::npos) {
+        return path;
+    }
+    const auto pos = std::max(
+        slash == std::wstring_view::npos ? 0 : slash,
+        backslash == std::wstring_view::npos ? 0 : backslash);
     return path.substr(pos + 1);
 }
 
@@ -403,6 +424,33 @@ static constexpr char kWinIniContent[] =
                              std::wstring_view suffix) noexcept {
     if (path.size() < suffix.size()) return false;
     return IEqualW(path.substr(path.size() - suffix.size()), suffix);
+}
+
+[[nodiscard]] bool ValidateProfile(
+    const DLLContentProfile& profile,
+    bool is64bit) noexcept
+{
+    if (!profile.dllName || WideLen(profile.dllName) == 0) return false;
+    if (profile.realFileSize < kPageSize) return false;
+    if (profile.sizeOfImage < 0x5000 || profile.sizeOfImage > kMaxSyntheticImageSize) {
+        return false;
+    }
+    if ((profile.sizeOfImage & 0xFFFu) != 0) return false;
+    if (!is64bit && profile.imageBase > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    if (profile.exportCount > kMaxExportsPerProfile) return false;
+    if (profile.exportCount > 0 && !profile.exports) return false;
+
+    for (uint32_t i = 0; i < profile.exportCount; ++i) {
+        const auto& exp = profile.exports[i];
+        const size_t nameLen = BoundedAsciiLen(exp.name, kMaxExportNameBytes);
+        if (nameLen == 0 || nameLen >= kMaxExportNameBytes) return false;
+        if (exp.ordinal == 0) return false;
+        if (exp.rva >= profile.sizeOfImage) return false;
+    }
+
+    return true;
 }
 
 } // anonymous namespace
@@ -444,6 +492,11 @@ std::vector<uint8_t> GenerateRealisticContent(
     const DLLContentProfile& profile,
     bool is64bit) noexcept
 {
+    if (!ValidateProfile(profile, is64bit)) {
+        return {};
+    }
+
+    try {
     std::vector<uint8_t> pe(kPageSize, 0);
 
     // ========================================================================
@@ -648,7 +701,6 @@ std::vector<uint8_t> GenerateRealisticContent(
     //   - Name strings after that
 
     if (profile.exportCount > 0) {
-        static constexpr size_t kExportBase = 0x0400;
         // The RVA base for exports is rdataVA (virtual address of .rdata)
         // File offset 0x0600 maps to rdataVA in the virtual address space
         // But since our raw pointer for .rdata is 0x0600, and our actual
@@ -661,7 +713,7 @@ std::vector<uint8_t> GenerateRealisticContent(
         // Recalculate: put exports at 0x0600 (start of .rdata raw data)
         static constexpr size_t kExpFileOff = 0x0600;
 
-        uint32_t numExports = profile.exportCount;
+        const uint32_t numExports = profile.exportCount;
 
         // IMAGE_EXPORT_DIRECTORY at kExpFileOff
         size_t dirOff = kExpFileOff;
@@ -690,19 +742,33 @@ std::vector<uint8_t> GenerateRealisticContent(
         //   DLL name string
         //   Export name strings
 
-        size_t eatOff  = dirOff + 40;
-        size_t nptOff  = eatOff + numExports * 4;
-        size_t ordOff  = nptOff + numExports * 4;
-        size_t strOff  = ordOff + numExports * 2;
+        const size_t eatOff  = dirOff + 40;
+        const size_t nptOff  = eatOff + static_cast<size_t>(numExports) * 4;
+        const size_t ordOff  = nptOff + static_cast<size_t>(numExports) * 4;
+        size_t strOff  = ordOff + static_cast<size_t>(numExports) * 2;
 
         // Align strOff to 2-byte boundary
         if (strOff & 1) strOff++;
+
+        size_t requiredStringBytes = WideLen(profile.dllName) + 1;
+        for (uint32_t i = 0; i < numExports; ++i) {
+            const size_t nameLen = BoundedAsciiLen(profile.exports[i].name, kMaxExportNameBytes);
+            if (nameLen == 0 || nameLen >= kMaxExportNameBytes ||
+                requiredStringBytes > kPageSize - (nameLen + 1)) {
+                return {};
+            }
+            requiredStringBytes += nameLen + 1;
+        }
+
+        if (strOff > kPageSize || requiredStringBytes > kPageSize - strOff) {
+            return {};
+        }
 
         // DLL name string
         size_t dllNameOff = strOff;
         const wchar_t* dllNameW = profile.dllName;
         for (size_t i = 0; dllNameW[i]; ++i) {
-            if (dllNameOff + i >= kPageSize) break;
+            if (dllNameOff + i >= kPageSize) return {};
             pe[dllNameOff + i] = static_cast<uint8_t>(dllNameW[i] & 0x7F);
         }
         size_t dllNameLen = WideLen(dllNameW);
@@ -727,28 +793,34 @@ std::vector<uint8_t> GenerateRealisticContent(
 
         for (uint32_t i = 0; i < numExports; ++i) {
             // Safety: bail if we'd overflow our page
-            if (eatOff + i * 4 + 3 >= kPageSize) break;
-            if (nptOff + i * 4 + 3 >= kPageSize) break;
-            if (ordOff + i * 2 + 1 >= kPageSize) break;
+            if (eatOff + static_cast<size_t>(i) * 4 + 3 >= kPageSize) return {};
+            if (nptOff + static_cast<size_t>(i) * 4 + 3 >= kPageSize) return {};
+            if (ordOff + static_cast<size_t>(i) * 2 + 1 >= kPageSize) return {};
 
             // Export Address Table — use the fake RVA from the profile
-            W32(pe, eatOff + i * 4, profile.exports[i].rva);
+            W32(pe, eatOff + static_cast<size_t>(i) * 4, profile.exports[i].rva);
 
             // Name Pointer Table — RVA of the name string
             if (curStrOff < kPageSize) {
-                W32(pe, nptOff + i * 4, FileToRVA(curStrOff));
+                W32(pe, nptOff + static_cast<size_t>(i) * 4, FileToRVA(curStrOff));
 
                 // Write the name string
                 const char* name = profile.exports[i].name;
-                size_t nameLen = std::strlen(name);
-                size_t copyLen = std::min(nameLen, kPageSize - curStrOff - 1);
+                const size_t nameLen = BoundedAsciiLen(name, kMaxExportNameBytes);
+                if (nameLen == 0 || nameLen >= kMaxExportNameBytes ||
+                    curStrOff > kPageSize || nameLen + 1 > kPageSize - curStrOff) {
+                    return {};
+                }
+                const size_t copyLen = nameLen;
                 std::memcpy(pe.data() + curStrOff, name, copyLen);
                 pe[curStrOff + copyLen] = 0; // null terminator
                 curStrOff += copyLen + 1;
+            } else {
+                return {};
             }
 
             // Ordinal Table — index into EAT (0-based)
-            W16(pe, ordOff + i * 2, static_cast<uint16_t>(i));
+            W16(pe, ordOff + static_cast<size_t>(i) * 2, static_cast<uint16_t>(i));
         }
 
         // Set DataDirectory[0] = Export Table
@@ -921,8 +993,6 @@ std::vector<uint8_t> GenerateRealisticContent(
                 // ProductName after CompanyName
                 size_t pnOff = csOff + cnTotalBytes;
                 static constexpr wchar_t kPNKey[] = L"ProductName";
-                static constexpr wchar_t kPNVal[] =
-                    L"Microsoft\x00ae Windows\x00ae Operating System";
                 // Use a simpler version without registered mark for safety
                 static constexpr wchar_t kPNValSafe[] =
                     L"Microsoft Windows Operating System";
@@ -955,6 +1025,11 @@ std::vector<uint8_t> GenerateRealisticContent(
     }
 
     return pe;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 
@@ -963,24 +1038,7 @@ std::vector<uint8_t> GenerateRealisticContent(
 // ============================================================================
 
 std::vector<uint8_t> GetStaticFileContent(std::wstring_view path) noexcept {
-    // Case-insensitive substring search without allocation
-    auto containsI = [](std::wstring_view haystack,
-                        std::wstring_view needle) noexcept -> bool {
-        if (needle.size() > haystack.size()) return false;
-        for (size_t i = 0; i <= haystack.size() - needle.size(); ++i) {
-            bool match = true;
-            for (size_t j = 0; j < needle.size(); ++j) {
-                if (std::towlower(static_cast<wint_t>(haystack[i + j])) !=
-                    std::towlower(static_cast<wint_t>(needle[j]))) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) return true;
-        }
-        return false;
-    };
-
+    try {
     // Check for hosts file
     if (EndsWithI(path, L"\\drivers\\etc\\hosts")) {
         return std::vector<uint8_t>(
@@ -990,7 +1048,8 @@ std::vector<uint8_t> GetStaticFileContent(std::wstring_view path) noexcept {
     }
 
     // Check for system.ini (must be under a "windows" directory)
-    if (EndsWithI(path, L"\\system.ini") && containsI(path, L"windows")) {
+    if (EndsWithI(path, L"\\windows\\system.ini") ||
+        EndsWithI(path, L"/windows/system.ini")) {
         return std::vector<uint8_t>(
             reinterpret_cast<const uint8_t*>(kSystemIniContent),
             reinterpret_cast<const uint8_t*>(kSystemIniContent) +
@@ -998,7 +1057,8 @@ std::vector<uint8_t> GetStaticFileContent(std::wstring_view path) noexcept {
     }
 
     // Check for win.ini (must be under a "windows" directory)
-    if (EndsWithI(path, L"\\win.ini") && containsI(path, L"windows")) {
+    if (EndsWithI(path, L"\\windows\\win.ini") ||
+        EndsWithI(path, L"/windows/win.ini")) {
         return std::vector<uint8_t>(
             reinterpret_cast<const uint8_t*>(kWinIniContent),
             reinterpret_cast<const uint8_t*>(kWinIniContent) +
@@ -1006,6 +1066,11 @@ std::vector<uint8_t> GetStaticFileContent(std::wstring_view path) noexcept {
     }
 
     return {};
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 } // namespace Phantom::VirtualOS
