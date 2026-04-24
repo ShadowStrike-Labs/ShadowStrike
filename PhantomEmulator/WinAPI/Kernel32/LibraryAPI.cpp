@@ -338,6 +338,45 @@ bool HandleGetProcAddress(APIContext& ctx) {
         }
     }
 
+    // T1027.007 — Dynamic API Resolution. Resolving injection / anti-analysis
+    // primitives by string at runtime is a strong packed-malware IOC. Benign
+    // apps either link statically or pre-resolve at startup; only obfuscated
+    // loaders reach for these names dynamically from inside running code.
+    if (!isOrdinal && !funcName.empty()) {
+        static constexpr const char* kInjectionPrimitives[] = {
+            "VirtualAllocEx",       "VirtualProtectEx",
+            "WriteProcessMemory",   "ReadProcessMemory",
+            "CreateRemoteThread",   "CreateRemoteThreadEx",
+            "NtCreateThreadEx",     "RtlCreateUserThread",
+            "QueueUserAPC",         "NtQueueApcThread",
+            "NtMapViewOfSection",   "ZwUnmapViewOfSection",
+            "SetThreadContext",     "NtSetContextThread",
+            "SetWindowsHookExA",    "SetWindowsHookExW",
+            "NtAllocateVirtualMemory","NtProtectVirtualMemory",
+            "NtWriteVirtualMemory", "NtReadVirtualMemory",
+        };
+        static constexpr const char* kAntiAnalysisPrimitives[] = {
+            "NtQueryInformationProcess", "NtSetInformationThread",
+            "DbgBreakPoint",             "DbgUiRemoteBreakin",
+            "OutputDebugStringA",        "OutputDebugStringW",
+        };
+        bool hitInjection = false;
+        for (const char* name : kInjectionPrimitives) {
+            if (funcName == name) { hitInjection = true; break; }
+        }
+        if (hitInjection) {
+            ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        } else {
+            for (const char* name : kAntiAnalysisPrimitives) {
+                if (funcName == name) {
+                    ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+                    break;
+                }
+            }
+        }
+    }
+
     // Look up in the dispatcher's registered hook map
     // APIDispatcher::GetHookAddress queries by "dllname!funcname"
     // We need to access the dispatcher through a known path.
