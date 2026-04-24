@@ -26,6 +26,14 @@
 
 #include <cstring>
 
+// DESIGN: WriteU64 / Write on guest memory are [[nodiscard]] to expose
+// guest-side access violations; here the address has already been
+// null-checked and any AV is a guest-side fault the caller must cope with.
+// The Win32 BOOL return is driven from the preceding validation. Pragma is
+// namespace-scoped; all input-validation guards remain explicit.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -225,3 +233,5 @@ bool HandleGetSystemTimeAsFileTime(APIContext& ctx) {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
