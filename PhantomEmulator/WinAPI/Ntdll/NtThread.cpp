@@ -36,6 +36,12 @@ static_assert(sizeof(wchar_t) == 2,
     "PhantomEmulator requires sizeof(wchar_t)==2 (UTF-16). "
     "Build with MSVC on Windows.");
 
+// DESIGN: Guest writebacks via WriteU32/U64/Write are [[nodiscard]]; the
+// targets here are null-checked or size-validated. A guest AV on writeback
+// is a guest fault. Pragma is namespace-scoped.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom {
 namespace WinAPI::Ntdll {
 
@@ -138,7 +144,7 @@ static uint32_t GetProcessHandlePID(APIContext& ctx,
 // Helper: Get TID from a thread handle (kCurrentThread returns main TID)
 // ============================================================================
 
-static uint32_t GetThreadTID(APIContext& ctx, GuestHandle handle) noexcept {
+[[maybe_unused]] static uint32_t GetThreadTID(APIContext& ctx, GuestHandle handle) noexcept {
     if (handle == kCurrentThread) {
         return kMainThreadTID;
     }
@@ -318,13 +324,13 @@ static void ApplyApcBehaviorFlags(APIContext& ctx, GuestHandle threadHandle,
 // for the behavioral analysis engine.
 
 bool HandleNtCreateThreadEx(APIContext& ctx) {
-    const bool is64 = ctx.Is64Bit();
+    [[maybe_unused]] const bool is64 = ctx.Is64Bit();
     auto& mem       = ctx.Memory();
 
     const GuestAddress handleOutPtr = ctx.GetArgPtr(0);
     const uint32_t desiredAccess    = ctx.GetArg32(1);
     const GuestHandle processHandle = static_cast<GuestHandle>(ctx.GetArg(3));
-    const GuestAddress startRoutine = ctx.GetArgPtr(4);
+    [[maybe_unused]] const GuestAddress startRoutine = ctx.GetArgPtr(4);
     const uint32_t createFlags      = ctx.GetArg32(6);
 
     // Validate mandatory output pointer
@@ -362,6 +368,15 @@ bool HandleNtCreateThreadEx(APIContext& ctx) {
 
     GuestHandle handle = ctx.Handles().Create(HandleType::Thread, std::move(td));
 
+    // IOC: cross-process thread creation is the canonical remote-thread
+    // injection primitive (T1055.002 / T1055.001). Emit explicit flags
+    // alongside the dispatcher metadata so detection is deterministic.
+    if (!isSelfProcess && processHandle != kNullHandle) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     // Write the handle to the caller's output pointer
     auto err = WriteGuestPtr(mem, handleOutPtr, handle, is64);
     if (err != ErrorCode::Success) {
@@ -388,7 +403,7 @@ bool HandleNtCreateThreadEx(APIContext& ctx) {
 // );
 
 bool HandleNtResumeThread(APIContext& ctx) {
-    const bool is64 = ctx.Is64Bit();
+    [[maybe_unused]] const bool is64 = ctx.Is64Bit();
     auto& mem       = ctx.Memory();
 
     const GuestHandle handle        = static_cast<GuestHandle>(ctx.GetArg(0));
@@ -431,7 +446,7 @@ bool HandleNtResumeThread(APIContext& ctx) {
 // );
 
 bool HandleNtSuspendThread(APIContext& ctx) {
-    const bool is64 = ctx.Is64Bit();
+    [[maybe_unused]] const bool is64 = ctx.Is64Bit();
     auto& mem       = ctx.Memory();
 
     const GuestHandle handle        = static_cast<GuestHandle>(ctx.GetArg(0));
@@ -740,11 +755,13 @@ bool HandleNtQueueApcThreadEx(APIContext& ctx) {
 bool HandleNtSetInformationThread(APIContext& ctx) {
     const uint32_t infoClass = ctx.GetArg32(1);
 
-    // ThreadHideFromDebugger (0x11): CRITICAL ANTI-DEBUG
-    // The behavioral flag AntiAnalysis is automatically set by the
-    // dispatcher's DetectBehaviors engine when it sees this info class
-    // in the captured args. We return success to let the malware proceed.
+    // IOC: T1622 Debugger Evasion — ThreadHideFromDebugger (0x11) is the
+    // single most specific anti-debug syscall. Emit explicit flags instead
+    // of relying on dispatcher metadata, because the class only hits here.
     if (infoClass == kThreadHideFromDebugger) {
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
         return true;
     }
@@ -785,3 +802,6 @@ void RegisterNtThread(APIDispatcher& dispatcher) noexcept {
 
 } // namespace WinAPI::Ntdll
 } // namespace Phantom
+
+#pragma warning(pop)
+
