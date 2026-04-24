@@ -25,6 +25,10 @@
 #include <cstring>
 #include <vector>
 
+// DESIGN: Guest writeback helpers are [[nodiscard]]; targets are checked.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -154,11 +158,24 @@ static bool WriteSidAndAttributes(APIContext& ctx, GuestAddress infoAddr,
 bool HandleNtOpenProcessToken(APIContext& ctx) {
     // Arg0: HANDLE ProcessHandle (typically -1 for current process)
     // Arg1: ACCESS_MASK DesiredAccess
+    auto processHandle   = ctx.GetArg(0);
     auto tokenHandleAddr = ctx.GetArgPtr(2);
 
     if (tokenHandleAddr == 0) {
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_PARAMETER);
         return true;
+    }
+
+    // IOC: T1134.001 Access Token Manipulation — Token Impersonation/Theft.
+    // Opening a token on a foreign process handle is the canonical primitive.
+    // Real Windows self-reference uses the kCurrentProcess pseudo-handle (-1).
+    if (processHandle != kCurrentProcess && processHandle != 0 &&
+        processHandle != kCurrentThread) {
+        auto entry = ctx.Handles().Lookup(processHandle, HandleType::Process);
+        if (entry) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CredentialAccess);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
     }
 
     // Create a token handle. We use std::monostate for the handle data
@@ -283,6 +300,8 @@ bool HandleNtAdjustPrivilegesToken(APIContext& ctx) {
     // Arg5: PULONG ReturnLength (output, optional)
 
     auto tokenHandle     = ctx.GetArg(0);
+    auto newStateAddr    = ctx.GetArgPtr(2);
+    auto bufferLength    = ctx.GetArg32(3);
     auto prevStateAddr   = ctx.GetArgPtr(4);
     auto retLenAddr      = ctx.GetArgPtr(5);
 
@@ -295,9 +314,62 @@ bool HandleNtAdjustPrivilegesToken(APIContext& ctx) {
         }
     }
 
+    // IOC: parse NewState and look for dangerous privilege LUIDs. Windows
+    // well-known privilege LUIDs are stable (LowPart in LUID; HighPart=0):
+    //   SeDebugPrivilege        = 20  (T1134.002 / kernel read-write)
+    //   SeTcbPrivilege          = 7   (act as part of OS)
+    //   SeLoadDriverPrivilege   = 10  (T1068 driver loading)
+    //   SeTakeOwnershipPrivilege= 9   (file tamper)
+    //   SeBackupPrivilege       = 17  (bypass ACLs)
+    //   SeRestorePrivilege      = 18  (bypass ACLs)
+    //   SeShutdownPrivilege     = 19
+    //   SeSecurityPrivilege     = 8   (audit log clear — T1070.001)
+    //   SeImpersonatePrivilege  = 29
+    // The NewState layout: DWORD PrivilegeCount; LUID_AND_ATTRIBUTES[];
+    //   LUID_AND_ATTRIBUTES = 12 bytes ({ DWORD Low; DWORD High; DWORD Attr }).
+    // SE_PRIVILEGE_ENABLED = 0x00000002.
+    if (newStateAddr != 0 && bufferLength >= 4) {
+        uint32_t count = 0;
+        if (ctx.Memory().ReadU32(newStateAddr, count) == ErrorCode::Success &&
+            count > 0 && count <= 64) {           // cap to defend against
+                                                  // malformed input
+            const GuestAddress arrAddr = newStateAddr + 4;
+            const uint32_t maxEntries =
+                (bufferLength >= 4) ? ((bufferLength - 4) / 12) : 0;
+            const uint32_t nEntries = (count < maxEntries) ? count : maxEntries;
+            bool dangerousEnable = false;
+            for (uint32_t i = 0; i < nEntries; ++i) {
+                uint32_t low = 0, high = 0, attrs = 0;
+                ctx.Memory().ReadU32(arrAddr + i * 12 + 0, low);
+                ctx.Memory().ReadU32(arrAddr + i * 12 + 4, high);
+                ctx.Memory().ReadU32(arrAddr + i * 12 + 8, attrs);
+                if (high != 0) continue;
+                const bool enabling = (attrs & 0x2u) != 0;   // SE_PRIVILEGE_ENABLED
+                if (!enabling) continue;
+                switch (low) {
+                case 7:   // SeTcbPrivilege
+                case 8:   // SeSecurityPrivilege
+                case 9:   // SeTakeOwnershipPrivilege
+                case 10:  // SeLoadDriverPrivilege
+                case 17:  // SeBackupPrivilege
+                case 18:  // SeRestorePrivilege
+                case 20:  // SeDebugPrivilege
+                case 29:  // SeImpersonatePrivilege
+                    dangerousEnable = true;
+                    break;
+                default:
+                    break;
+                }
+                if (dangerousEnable) break;
+            }
+            if (dangerousEnable) {
+                ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
+                ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            }
+        }
+    }
+
     // Always succeed — we want malware to think it has the requested privileges.
-    // The dispatcher's behavioral analysis flags this call automatically via
-    // BehaviorFlag::PrivilegeEscalation in the KnownAPIEntry metadata.
 
     // If PreviousState is requested, write an empty TOKEN_PRIVILEGES
     // (PrivilegeCount = 0) to indicate no changes were needed.
@@ -329,3 +401,6 @@ void RegisterNtToken(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
+
