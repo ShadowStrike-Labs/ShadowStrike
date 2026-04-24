@@ -25,6 +25,9 @@
 #include <cstring>
 #include <cwchar>
 #include <cctype>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <string>
 
 namespace Phantom::VirtualOS {
@@ -35,13 +38,48 @@ namespace Phantom::VirtualOS {
 
 namespace {
 
+static constexpr size_t kMaxRegistryPathChars = 32767;
+static constexpr size_t kMaxRegistryValueNameChars = 16383;
+static constexpr size_t kMaxRegistryStringChars = 32767;
+static constexpr size_t kMaxMultiSzStrings = 4096;
+
 // Case-insensitive ASCII-range wide-char to uppercase
 [[nodiscard]] static wchar_t WideToUpper(wchar_t c) noexcept {
     return (c >= L'a' && c <= L'z') ? static_cast<wchar_t>(c - L'a' + L'A') : c;
 }
 
 // Full string uppercase (case-folding for comparison keys)
-[[nodiscard]] static std::wstring ToUpper(std::wstring_view sv) noexcept {
+[[nodiscard]] static bool IsValidRegistryText(std::wstring_view text, size_t maxChars) noexcept {
+    if (text.size() > maxChars) return false;
+    for (const wchar_t ch : text) {
+        if (ch == L'\0') return false;
+    }
+    return true;
+}
+
+[[nodiscard]] static bool IsSupportedRootPath(std::wstring_view path) noexcept {
+    return path == L"HKCR" || path.starts_with(L"HKCR\\") ||
+           path == L"HKCU" || path.starts_with(L"HKCU\\") ||
+           path == L"HKLM" || path.starts_with(L"HKLM\\") ||
+           path == L"HKU"  || path.starts_with(L"HKU\\")  ||
+           path == L"HKCC" || path.starts_with(L"HKCC\\");
+}
+
+[[nodiscard]] static bool IsRegistryRoot(std::wstring_view path) noexcept {
+    return path == L"HKCR" || path == L"HKCU" || path == L"HKLM" ||
+           path == L"HKU" || path == L"HKCC";
+}
+
+[[nodiscard]] static bool IsValidValueType(uint32_t type) noexcept {
+    return type == RegType::None || type == RegType::SZ || type == RegType::ExpandSZ ||
+           type == RegType::Binary || type == RegType::DWord || type == RegType::DWordBE ||
+           type == RegType::Link || type == RegType::MultiSZ || type == RegType::QWord;
+}
+
+[[nodiscard]] static std::wstring ToUpper(std::wstring_view sv) {
+    if (!IsValidRegistryText(sv, kMaxRegistryPathChars)) {
+        throw std::length_error("registry text exceeds supported length");
+    }
     std::wstring result;
     result.reserve(sv.size());
     for (const auto c : sv) {
@@ -85,7 +123,11 @@ namespace {
 }
 
 // Encode a wide string as REG_SZ byte data (UTF-16LE with null terminator)
-[[nodiscard]] static std::vector<uint8_t> EncodeRegSz(std::wstring_view str) noexcept {
+[[nodiscard]] static std::vector<uint8_t> EncodeRegSz(std::wstring_view str) {
+    if (!IsValidRegistryText(str, kMaxRegistryStringChars) ||
+        str.size() >= (std::numeric_limits<size_t>::max() / sizeof(wchar_t)) - 1) {
+        throw std::length_error("REG_SZ data exceeds supported length");
+    }
     const size_t charCount = str.size() + 1;  // include null terminator
     std::vector<uint8_t> data(charCount * sizeof(wchar_t));
     std::memcpy(data.data(), str.data(), str.size() * sizeof(wchar_t));
@@ -94,14 +136,14 @@ namespace {
 }
 
 // Encode DWORD as 4-byte little-endian
-[[nodiscard]] static std::vector<uint8_t> EncodeDword(uint32_t val) noexcept {
+[[nodiscard]] static std::vector<uint8_t> EncodeDword(uint32_t val) {
     std::vector<uint8_t> data(sizeof(uint32_t));
     std::memcpy(data.data(), &val, sizeof(uint32_t));
     return data;
 }
 
 // Encode QWORD as 8-byte little-endian
-[[nodiscard]] static std::vector<uint8_t> EncodeQword(uint64_t val) noexcept {
+[[nodiscard]] static std::vector<uint8_t> EncodeQword(uint64_t val) {
     std::vector<uint8_t> data(sizeof(uint64_t));
     std::memcpy(data.data(), &val, sizeof(uint64_t));
     return data;
@@ -109,10 +151,20 @@ namespace {
 
 // Encode MULTI_SZ: concatenated null-terminated wide strings with double-null terminator
 [[nodiscard]] static std::vector<uint8_t> EncodeMultiSz(
-        const std::vector<std::wstring>& strings) noexcept {
+        const std::vector<std::wstring>& strings) {
+    if (strings.size() > kMaxMultiSzStrings) {
+        throw std::length_error("REG_MULTI_SZ string count exceeds supported limit");
+    }
     size_t totalChars = 0;
     for (const auto& s : strings) {
+        if (!IsValidRegistryText(s, kMaxRegistryStringChars) ||
+            s.size() > std::numeric_limits<size_t>::max() - totalChars - 2) {
+            throw std::length_error("REG_MULTI_SZ data exceeds supported length");
+        }
         totalChars += s.size() + 1;  // each string + null
+    }
+    if (totalChars >= (std::numeric_limits<size_t>::max() / sizeof(wchar_t)) - 1) {
+        throw std::length_error("REG_MULTI_SZ byte size exceeds supported length");
     }
     totalChars += 1;  // final double-null terminator
 
@@ -149,10 +201,16 @@ VirtualRegistry& VirtualRegistry::Instance() noexcept {
 // ============================================================================
 
 void VirtualRegistry::Initialize(const EmulationConfig& config) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
     if (m_initialized) return;
     PopulateDefaults(config);
     m_initialized = true;
+    } catch (const std::bad_alloc&) {
+        Reset();
+    } catch (const std::length_error&) {
+        Reset();
+    }
 }
 
 void VirtualRegistry::Reset() noexcept {
@@ -167,6 +225,9 @@ void VirtualRegistry::Reset() noexcept {
 // ============================================================================
 
 std::wstring VirtualRegistry::NormalizePath(std::wstring_view path) noexcept {
+    try {
+    if (!IsValidRegistryText(path, kMaxRegistryPathChars)) return {};
+
     std::wstring result;
     result.reserve(path.size());
 
@@ -250,18 +311,27 @@ std::wstring VirtualRegistry::NormalizePath(std::wstring_view path) noexcept {
     }
     // Map HKU\.DEFAULT → HKCU
     else if (result == L"HKU\\.DEFAULT" || result.starts_with(L"HKU\\.DEFAULT\\")) {
-        if (result.size() > 13) {
-            result = L"HKCU\\" + result.substr(14);
+        constexpr size_t kDefaultUserPrefixWithSlash = 13; // "HKU\\.DEFAULT\\"
+        if (result.size() > kDefaultUserPrefixWithSlash) {
+            result = L"HKCU\\" + result.substr(kDefaultUserPrefixWithSlash);
         } else {
             result = L"HKCU";
         }
     }
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 std::wstring VirtualRegistry::ResolveRootHandle(uint64_t rootHandle,
                                                  std::wstring_view subKey) noexcept {
+    try {
+    if (!IsValidRegistryText(subKey, kMaxRegistryPathChars)) return {};
+
     std::wstring prefix;
     switch (rootHandle) {
         case RootKey::HKCR:  prefix = L"HKCR";  break;
@@ -278,6 +348,11 @@ std::wstring VirtualRegistry::ResolveRootHandle(uint64_t rootHandle,
     full.push_back(L'\\');
     full.append(subKey);
     return NormalizePath(full);
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 bool VirtualRegistry::IsRootHandle(uint64_t handle) noexcept {
@@ -293,14 +368,22 @@ bool VirtualRegistry::IsRootHandle(uint64_t handle) noexcept {
 // ============================================================================
 
 bool VirtualRegistry::KeyExists(std::wstring_view fullPath) const noexcept {
+    try {
     const auto normalized = NormalizePath(fullPath);
+    if (normalized.empty()) return false;
     std::shared_lock lock(m_mutex);
     return m_keys.contains(normalized);
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 bool VirtualRegistry::CreateKey(std::wstring_view fullPath) noexcept {
+    try {
     const auto normalized = NormalizePath(fullPath);
-    if (normalized.empty()) return false;
+    if (normalized.empty() || !IsSupportedRootPath(normalized)) return false;
 
     std::unique_lock lock(m_mutex);
 
@@ -341,10 +424,17 @@ bool VirtualRegistry::CreateKey(std::wstring_view fullPath) noexcept {
     }
 
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 bool VirtualRegistry::DeleteKey(std::wstring_view fullPath) noexcept {
+    try {
     const auto normalized = NormalizePath(fullPath);
+    if (normalized.empty() || IsRegistryRoot(normalized)) return false;
     std::unique_lock lock(m_mutex);
 
     auto it = m_keys.find(normalized);
@@ -367,24 +457,43 @@ bool VirtualRegistry::DeleteKey(std::wstring_view fullPath) noexcept {
 
     m_keys.erase(it);
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 std::vector<std::wstring> VirtualRegistry::GetSubkeys(std::wstring_view fullPath) const noexcept {
+    try {
     const auto normalized = NormalizePath(fullPath);
+    if (normalized.empty()) return {};
     std::shared_lock lock(m_mutex);
     auto it = m_keys.find(normalized);
     if (it == m_keys.end()) return {};
     return it->second.subKeyNames;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 std::optional<std::wstring> VirtualRegistry::EnumSubKey(std::wstring_view fullPath,
                                                          uint32_t index) const noexcept {
+    try {
     const auto normalized = NormalizePath(fullPath);
+    if (normalized.empty()) return std::nullopt;
     std::shared_lock lock(m_mutex);
     auto it = m_keys.find(normalized);
     if (it == m_keys.end()) return std::nullopt;
     if (index >= it->second.subKeyNames.size()) return std::nullopt;
     return it->second.subKeyNames[index];
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -394,10 +503,14 @@ std::optional<std::wstring> VirtualRegistry::EnumSubKey(std::wstring_view fullPa
 bool VirtualRegistry::SetValue(std::wstring_view keyPath, std::wstring_view valueName,
                                 uint32_t type, const uint8_t* data,
                                 uint32_t dataSize) noexcept {
+    try {
     if (dataSize > kMaxValueData) return false;
     if (data == nullptr && dataSize > 0) return false;
+    if (!IsValidValueType(type)) return false;
+    if (!IsValidRegistryText(valueName, kMaxRegistryValueNameChars)) return false;
 
     const auto normalizedKey = NormalizePath(keyPath);
+    if (normalizedKey.empty()) return false;
     const auto upperName = ToUpper(valueName);
 
     std::unique_lock lock(m_mutex);
@@ -440,9 +553,9 @@ bool VirtualRegistry::SetValue(std::wstring_view keyPath, std::wstring_view valu
 
     // Track IOC
     const bool persistence = IsPersistencePath(normalizedKey);
-    const bool autoStart = IsAutoStartService(normalizedKey, target->data);
+    const bool autoStart = IsAutoStartService(normalizedKey, valueName, target->data);
 
-    if (persistence || autoStart) {
+    if ((persistence || autoStart) && m_writeIOCs.size() < kMaxWriteIOCs) {
         RegistryWriteIOC ioc;
         ioc.keyPath = normalizedKey;
         ioc.valueName = std::wstring(valueName);
@@ -456,29 +569,45 @@ bool VirtualRegistry::SetValue(std::wstring_view keyPath, std::wstring_view valu
     }
 
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
-const RegValue* VirtualRegistry::QueryValue(std::wstring_view keyPath,
-                                             std::wstring_view valueName) const noexcept {
+std::optional<RegValue> VirtualRegistry::QueryValue(std::wstring_view keyPath,
+                                                     std::wstring_view valueName) const noexcept {
+    try {
+    if (!IsValidRegistryText(valueName, kMaxRegistryValueNameChars)) return std::nullopt;
     const auto normalizedKey = NormalizePath(keyPath);
+    if (normalizedKey.empty()) return std::nullopt;
     const auto upperName = ToUpper(valueName);
 
     std::shared_lock lock(m_mutex);
 
     auto it = m_keys.find(normalizedKey);
-    if (it == m_keys.end()) return nullptr;
+    if (it == m_keys.end()) return std::nullopt;
 
     for (const auto& v : it->second.values) {
         if (ToUpper(v.name) == upperName) {
-            return &v;
+            return v;
         }
     }
-    return nullptr;
+    return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 bool VirtualRegistry::DeleteValue(std::wstring_view keyPath,
                                    std::wstring_view valueName) noexcept {
+    try {
+    if (!IsValidRegistryText(valueName, kMaxRegistryValueNameChars)) return false;
     const auto normalizedKey = NormalizePath(keyPath);
+    if (normalizedKey.empty()) return false;
     const auto upperName = ToUpper(valueName);
 
     std::unique_lock lock(m_mutex);
@@ -493,26 +622,45 @@ bool VirtualRegistry::DeleteValue(std::wstring_view keyPath,
     if (vit == vals.end()) return false;
     vals.erase(vit, vals.end());
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 std::vector<RegValue> VirtualRegistry::GetValues(std::wstring_view keyPath) const noexcept {
+    try {
     const auto normalizedKey = NormalizePath(keyPath);
+    if (normalizedKey.empty()) return {};
     std::shared_lock lock(m_mutex);
 
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return {};
     return it->second.values;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 std::optional<RegValue> VirtualRegistry::EnumValue(std::wstring_view keyPath,
                                                     uint32_t index) const noexcept {
+    try {
     const auto normalizedKey = NormalizePath(keyPath);
+    if (normalizedKey.empty()) return std::nullopt;
     std::shared_lock lock(m_mutex);
 
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return std::nullopt;
     if (index >= it->second.values.size()) return std::nullopt;
     return it->second.values[index];
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -520,23 +668,39 @@ std::optional<RegValue> VirtualRegistry::EnumValue(std::wstring_view keyPath,
 // ============================================================================
 
 uint32_t VirtualRegistry::GetSubkeyCount(std::wstring_view keyPath) const noexcept {
+    try {
     const auto normalized = NormalizePath(keyPath);
+    if (normalized.empty()) return 0;
     std::shared_lock lock(m_mutex);
     auto it = m_keys.find(normalized);
     if (it == m_keys.end()) return 0;
     return static_cast<uint32_t>(it->second.subKeyNames.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 uint32_t VirtualRegistry::GetValueCount(std::wstring_view keyPath) const noexcept {
+    try {
     const auto normalized = NormalizePath(keyPath);
+    if (normalized.empty()) return 0;
     std::shared_lock lock(m_mutex);
     auto it = m_keys.find(normalized);
     if (it == m_keys.end()) return 0;
     return static_cast<uint32_t>(it->second.values.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 uint32_t VirtualRegistry::GetMaxValueNameLen(std::wstring_view keyPath) const noexcept {
+    try {
     const auto normalized = NormalizePath(keyPath);
+    if (normalized.empty()) return 0;
     std::shared_lock lock(m_mutex);
     auto it = m_keys.find(normalized);
     if (it == m_keys.end()) return 0;
@@ -547,10 +711,17 @@ uint32_t VirtualRegistry::GetMaxValueNameLen(std::wstring_view keyPath) const no
         if (len > maxLen) maxLen = len;
     }
     return maxLen;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 uint32_t VirtualRegistry::GetMaxValueDataLen(std::wstring_view keyPath) const noexcept {
+    try {
     const auto normalized = NormalizePath(keyPath);
+    if (normalized.empty()) return 0;
     std::shared_lock lock(m_mutex);
     auto it = m_keys.find(normalized);
     if (it == m_keys.end()) return 0;
@@ -561,6 +732,11 @@ uint32_t VirtualRegistry::GetMaxValueDataLen(std::wstring_view keyPath) const no
         if (len > maxLen) maxLen = len;
     }
     return maxLen;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 // ============================================================================
@@ -568,8 +744,14 @@ uint32_t VirtualRegistry::GetMaxValueDataLen(std::wstring_view keyPath) const no
 // ============================================================================
 
 std::vector<RegistryWriteIOC> VirtualRegistry::GetWriteIOCs() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_writeIOCs;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 bool VirtualRegistry::HasPersistenceWrites() const noexcept {
@@ -585,6 +767,7 @@ bool VirtualRegistry::HasPersistenceWrites() const noexcept {
 // ============================================================================
 
 bool VirtualRegistry::IsPersistencePath(std::wstring_view path) noexcept {
+    try {
     const auto upper = ToUpper(path);
 
     // Run / RunOnce / RunOnceEx keys
@@ -620,14 +803,23 @@ bool VirtualRegistry::IsPersistencePath(std::wstring_view path) noexcept {
     if (WideContainsCI(upper, L"\\POLICIES\\EXPLORER\\RUN")) return true;
 
     return false;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 bool VirtualRegistry::IsAutoStartService(std::wstring_view path,
+                                          std::wstring_view valueName,
                                           const std::vector<uint8_t>& data) noexcept {
+    try {
     const auto upper = ToUpper(path);
+    const auto upperName = ToUpper(valueName);
 
     // Only applies to service keys where "Start" value is being set
     if (!WideContainsCI(upper, L"\\SERVICES\\")) return false;
+    if (upperName != L"START") return false;
 
     // Check if the data represents auto-start (Start type 0=Boot, 1=System, 2=Auto)
     if (data.size() >= sizeof(uint32_t)) {
@@ -637,15 +829,20 @@ bool VirtualRegistry::IsAutoStartService(std::wstring_view path,
     }
 
     return false;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
 // Private: Population helpers (called under write lock during Initialize)
 // ============================================================================
 
-void VirtualRegistry::AddKey(std::wstring_view path) noexcept {
+void VirtualRegistry::AddKey(std::wstring_view path) {
     const auto normalized = NormalizePath(path);
-    if (normalized.empty()) return;
+    if (normalized.empty() || !IsSupportedRootPath(normalized)) return;
     if (m_keys.size() >= kMaxKeys) return;
 
     // Create all intermediate keys
@@ -657,7 +854,9 @@ void VirtualRegistry::AddKey(std::wstring_view path) noexcept {
             : normalized.substr(0, pos);
 
         if (!m_keys.contains(segment)) {
-            RegKeyInfo& newKey = m_keys[segment];
+            if (m_keys.size() >= kMaxKeys) return;
+            auto insertResult = m_keys.try_emplace(segment);
+            RegKeyInfo& newKey = insertResult.first->second;
             newKey.fullPath = segment;
             newKey.lastWriteTime = FakeLastWriteTime();
             newKey.isPrePopulated = true;
@@ -682,10 +881,12 @@ void VirtualRegistry::AddKey(std::wstring_view path) noexcept {
 }
 
 void VirtualRegistry::AddStrValue(std::wstring_view keyPath, std::wstring_view name,
-                                   std::wstring_view value) noexcept {
+                                   std::wstring_view value) {
+    if (!IsValidRegistryText(name, kMaxRegistryValueNameChars)) return;
     const auto normalizedKey = NormalizePath(keyPath);
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return;
+    if (it->second.values.size() >= kMaxValuesPerKey) return;
 
     RegValue rv;
     rv.name = std::wstring(name);
@@ -695,10 +896,12 @@ void VirtualRegistry::AddStrValue(std::wstring_view keyPath, std::wstring_view n
 }
 
 void VirtualRegistry::AddExpandSzValue(std::wstring_view keyPath, std::wstring_view name,
-                                        std::wstring_view value) noexcept {
+                                        std::wstring_view value) {
+    if (!IsValidRegistryText(name, kMaxRegistryValueNameChars)) return;
     const auto normalizedKey = NormalizePath(keyPath);
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return;
+    if (it->second.values.size() >= kMaxValuesPerKey) return;
 
     RegValue rv;
     rv.name = std::wstring(name);
@@ -708,10 +911,12 @@ void VirtualRegistry::AddExpandSzValue(std::wstring_view keyPath, std::wstring_v
 }
 
 void VirtualRegistry::AddDwordValue(std::wstring_view keyPath, std::wstring_view name,
-                                     uint32_t value) noexcept {
+                                     uint32_t value) {
+    if (!IsValidRegistryText(name, kMaxRegistryValueNameChars)) return;
     const auto normalizedKey = NormalizePath(keyPath);
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return;
+    if (it->second.values.size() >= kMaxValuesPerKey) return;
 
     RegValue rv;
     rv.name = std::wstring(name);
@@ -721,10 +926,12 @@ void VirtualRegistry::AddDwordValue(std::wstring_view keyPath, std::wstring_view
 }
 
 void VirtualRegistry::AddQwordValue(std::wstring_view keyPath, std::wstring_view name,
-                                     uint64_t value) noexcept {
+                                     uint64_t value) {
+    if (!IsValidRegistryText(name, kMaxRegistryValueNameChars)) return;
     const auto normalizedKey = NormalizePath(keyPath);
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return;
+    if (it->second.values.size() >= kMaxValuesPerKey) return;
 
     RegValue rv;
     rv.name = std::wstring(name);
@@ -734,10 +941,13 @@ void VirtualRegistry::AddQwordValue(std::wstring_view keyPath, std::wstring_view
 }
 
 void VirtualRegistry::AddBinaryValue(std::wstring_view keyPath, std::wstring_view name,
-                                      const std::vector<uint8_t>& data) noexcept {
+                                      const std::vector<uint8_t>& data) {
+    if (!IsValidRegistryText(name, kMaxRegistryValueNameChars)) return;
+    if (data.size() > kMaxValueData) return;
     const auto normalizedKey = NormalizePath(keyPath);
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return;
+    if (it->second.values.size() >= kMaxValuesPerKey) return;
 
     RegValue rv;
     rv.name = std::wstring(name);
@@ -747,10 +957,12 @@ void VirtualRegistry::AddBinaryValue(std::wstring_view keyPath, std::wstring_vie
 }
 
 void VirtualRegistry::AddMultiSzValue(std::wstring_view keyPath, std::wstring_view name,
-                                       const std::vector<std::wstring>& strings) noexcept {
+                                       const std::vector<std::wstring>& strings) {
+    if (!IsValidRegistryText(name, kMaxRegistryValueNameChars)) return;
     const auto normalizedKey = NormalizePath(keyPath);
     auto it = m_keys.find(normalizedKey);
     if (it == m_keys.end()) return;
+    if (it->second.values.size() >= kMaxValuesPerKey) return;
 
     RegValue rv;
     rv.name = std::wstring(name);
@@ -766,7 +978,7 @@ void VirtualRegistry::AddMultiSzValue(std::wstring_view keyPath, std::wstring_vi
 // NO VM/sandbox/analysis-tool artifacts permitted.
 // ============================================================================
 
-void VirtualRegistry::PopulateDefaults(const EmulationConfig& config) noexcept {
+void VirtualRegistry::PopulateDefaults(const EmulationConfig& config) {
 
     // =======================================================================
     // Root keys
@@ -1485,8 +1697,8 @@ void VirtualRegistry::PopulateDefaults(const EmulationConfig& config) noexcept {
     AddKey(L"HKLM\\SOFTWARE\\MICROSOFT\\DIRECTX");
     AddStrValue(L"HKLM\\SOFTWARE\\MICROSOFT\\DIRECTX",
                 L"Version", L"4.09.00.0904");
-    AddDwordValue(L"HKLM\\SOFTWARE\\MICROSOFT\\DIRECTX",
-                  L"InstalledVersion", 0x0004000900000904);
+    AddBinaryValue(L"HKLM\\SOFTWARE\\MICROSOFT\\DIRECTX",
+                   L"InstalledVersion", { 0x04, 0x09, 0x00, 0x00, 0x04, 0x09, 0x00, 0x00 });
 
     // =======================================================================
     // HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths
