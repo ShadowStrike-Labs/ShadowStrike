@@ -24,6 +24,11 @@
 #include <mutex>
 #include <string>
 
+// DESIGN: Guest-memory writebacks (Read/Write/WriteU32/WriteU64) are
+// [[nodiscard]] — a guest AV on writeback is a guest fault.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ole32 {
 
 // ============================================================================
@@ -758,3 +763,6 @@ void RegisterOleAutAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ole32
+
+#pragma warning(pop)
+
