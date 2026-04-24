@@ -30,6 +30,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -64,6 +67,15 @@ static constexpr GuestSize    kEnvBlockSize         = kPageSize;
 
 // ProcessHeaps pointer array (PEB.ProcessHeaps points here)
 static constexpr GuestAddress kProcessHeapArrayBase = 0x0000000020030000ULL;
+
+// Identity strings flow into fixed-size guest PEB/process-parameter regions.
+// Keep them comfortably below Windows' USHORT-backed UNICODE_STRING limit and
+// below realistic endpoint identity lengths to avoid partial guest writes.
+static constexpr size_t kMaxIdentityChars = 64;
+static constexpr size_t kMaxUnicodeStringChars = 0x7FFE / sizeof(wchar_t);
+static constexpr uint64_t kMinTscFrequencyHz = 1'000'000'000ULL;
+static constexpr uint64_t kMaxTscFrequencyHz = 10'000'000'000ULL;
+static constexpr uint64_t kMaxPhysicalMemoryBytes = 1ULL << 50; // 1 PiB
 
 // ============================================================================
 // PEB Field Offsets — x64 Windows 10 22H2
@@ -196,6 +208,16 @@ struct ModuleDescriptor {
     bool         inInitOrder; // Main exe is NOT in InInitializationOrder
 };
 
+[[nodiscard]] constexpr bool FitsGuestRange(
+    GuestAddress start,
+    GuestSize size,
+    GuestAddress exclusiveLimit) noexcept
+{
+    if (start > exclusiveLimit) return false;
+    const GuestSize available = exclusiveLimit - start;
+    return size <= available;
+}
+
 // ============================================================================
 // Helper: Write wide string as UTF-16LE to guest memory
 // ============================================================================
@@ -203,17 +225,26 @@ struct ModuleDescriptor {
 static bool WriteWideString(
     VirtualMemory& memory,
     GuestAddress   addr,
-    const std::wstring& str) noexcept
+    const std::wstring& str,
+    GuestAddress   exclusiveLimit) noexcept
 {
+    if (str.size() > kMaxUnicodeStringChars) return false;
+
+    const GuestSize byteLen = static_cast<GuestSize>(str.size()) * sizeof(wchar_t);
+    const GuestSize totalBytes = byteLen + sizeof(wchar_t);
+    if (totalBytes < byteLen || !FitsGuestRange(addr, totalBytes, exclusiveLimit)) {
+        return false;
+    }
+
     for (size_t i = 0; i < str.size(); ++i) {
         const auto ch = static_cast<uint16_t>(str[i]);
-        if (memory.WriteU16(addr + static_cast<GuestAddress>(i * 2), ch)
+        if (memory.WriteU16(addr + static_cast<GuestAddress>(i * sizeof(wchar_t)), ch)
             != ErrorCode::Success)
             return false;
     }
     // Null terminator
     return memory.WriteU16(
-        addr + static_cast<GuestAddress>(str.size() * 2), 0
+        addr + static_cast<GuestAddress>(str.size() * sizeof(wchar_t)), 0
     ) == ErrorCode::Success;
 }
 
@@ -226,12 +257,26 @@ static bool WriteUnicodeString(
     VirtualMemory& memory,
     GuestAddress   structAddr,
     GuestAddress&  cursor,
-    const std::wstring& str) noexcept
+    const std::wstring& str,
+    GuestAddress   stringLimit) noexcept
 {
-    if (str.size() > 0x7FFF) return false; // Sanity cap
+    if (str.size() > kMaxUnicodeStringChars) return false;
 
-    const auto byteLen = static_cast<uint16_t>(str.size() * 2);
-    const auto maxLen  = static_cast<uint16_t>(byteLen + 2);
+    const GuestSize byteLen64 = static_cast<GuestSize>(str.size()) * sizeof(wchar_t);
+    const GuestSize maxLen64 = byteLen64 + sizeof(wchar_t);
+    if (maxLen64 < byteLen64 ||
+        maxLen64 > std::numeric_limits<uint16_t>::max() ||
+        !FitsGuestRange(cursor, maxLen64, stringLimit)) {
+        return false;
+    }
+
+    const GuestAddress nextCursor = AlignUp(cursor + maxLen64, 8);
+    if (nextCursor < cursor || nextCursor > stringLimit) {
+        return false;
+    }
+
+    const auto byteLen = static_cast<uint16_t>(byteLen64);
+    const auto maxLen  = static_cast<uint16_t>(maxLen64);
 
     // UNICODE_STRING layout: Length(2) + MaximumLength(2) + pad(4) + Buffer(8)
     if (memory.WriteU16(structAddr + 0, byteLen) != ErrorCode::Success) return false;
@@ -239,9 +284,9 @@ static bool WriteUnicodeString(
     if (memory.WriteU32(structAddr + 4, 0)       != ErrorCode::Success) return false;
     if (memory.WriteU64(structAddr + 8, cursor)  != ErrorCode::Success) return false;
 
-    if (!WriteWideString(memory, cursor, str)) return false;
+    if (!WriteWideString(memory, cursor, str, stringLimit)) return false;
 
-    cursor = AlignUp(cursor + maxLen, 8);
+    cursor = nextCursor;
     return true;
 }
 
@@ -257,26 +302,6 @@ static bool WriteListEntry(
 {
     if (memory.WriteU64(addr + 0, flink) != ErrorCode::Success) return false;
     return memory.WriteU64(addr + 8, blink) == ErrorCode::Success;
-}
-
-// ============================================================================
-// Helper: Derive deterministic session-specific PIDs/TIDs
-// Windows PIDs are multiples of 4, realistic range 1000–9000
-// ============================================================================
-
-static uint32_t DeriveEmulatedPID(uint64_t seed) noexcept {
-    auto raw = static_cast<uint32_t>((seed * 2654435761ULL) >> 16);
-    return (1000 + (raw % 8000)) & ~3u;
-}
-
-static uint32_t DeriveParentPID(uint64_t seed) noexcept {
-    auto raw = static_cast<uint32_t>((seed * 6364136223846793005ULL) >> 20);
-    return (500 + (raw % 4000)) & ~3u;
-}
-
-static uint32_t DeriveInitialTID(uint64_t seed) noexcept {
-    auto raw = static_cast<uint32_t>((seed * 1103515245ULL + 12345) >> 16);
-    return (2000 + (raw % 8000)) & ~3u;
 }
 
 // ============================================================================
@@ -380,14 +405,16 @@ static bool WriteEnvironmentBlock(
     };
 
     GuestAddress cursor = base;
-    const GuestAddress limit = base + kEnvBlockSize - 4;
 
     for (const auto& var : vars) {
         const std::wstring entry = var.name + L"=" + var.value;
-        const auto byteSize = static_cast<GuestSize>((entry.size() + 1) * 2);
-        if (cursor + byteSize > limit) break; // Safety cap
+        if (entry.size() > kMaxUnicodeStringChars) return false;
+        const auto byteSize = static_cast<GuestSize>((entry.size() + 1) * sizeof(wchar_t));
+        if (!FitsGuestRange(cursor, byteSize + sizeof(wchar_t), base + kEnvBlockSize)) {
+            return false;
+        }
 
-        if (!WriteWideString(memory, cursor, entry)) return false;
+        if (!WriteWideString(memory, cursor, entry, base + kEnvBlockSize)) return false;
         cursor += byteSize;
     }
 
@@ -411,21 +438,30 @@ EnvironmentBuilder& EnvironmentBuilder::Instance() noexcept {
 // ============================================================================
 
 bool EnvironmentBuilder::Build(const EmulationConfig& config) noexcept {
-    if (m_initialized) {
-        Reset();
-    }
+    std::unique_lock lock(m_mutex);
+
+    ResetUnlocked();
 
     // 1. Copy config and randomize session-specific values
     m_config = config;
     RandomizeSessionValues(m_config);
 
-    // 2. Initialize all subsystems in dependency order
-    if (!InitializeSubsystems(m_config))
+    if (!ValidateConfigInput(m_config, nullptr)) {
+        ResetUnlocked();
         return false;
+    }
+
+    // 2. Initialize all subsystems in dependency order
+    if (!InitializeSubsystems(m_config)) {
+        ResetUnlocked();
+        return false;
+    }
 
     // 3. Validate cross-system consistency
-    if (!ValidateConsistency())
+    if (!ValidateConsistency()) {
+        ResetUnlocked();
         return false;
+    }
 
     // 4. Set fixed guest addresses from codebase constants
     m_pebAddress           = WinConst::kPEBAddress64;
@@ -443,8 +479,11 @@ bool EnvironmentBuilder::Build(const EmulationConfig& config) noexcept {
 // ============================================================================
 
 void EnvironmentBuilder::Reset() noexcept {
-    if (!m_initialized) return;
+    std::unique_lock lock(m_mutex);
+    ResetUnlocked();
+}
 
+void EnvironmentBuilder::ResetUnlocked() noexcept {
     // Reverse of InitializeSubsystems order
     VirtualProcess::Instance().Reset();
     VirtualNetwork::Instance().Reset();
@@ -461,6 +500,7 @@ void EnvironmentBuilder::Reset() noexcept {
     m_processParamsAddress = 0;
     m_ldrDataAddress       = 0;
     m_processHeapAddress   = 0;
+    m_config               = {};
 }
 
 // ============================================================================
@@ -551,7 +591,7 @@ bool EnvironmentBuilder::InitializeSubsystems(const EmulationConfig& config) noe
 // ============================================================================
 
 bool EnvironmentBuilder::ValidateConsistency() noexcept {
-    auto result = Validate();
+    auto result = ValidateUnlocked();
     return result.errors.empty();
 }
 
@@ -560,6 +600,11 @@ bool EnvironmentBuilder::ValidateConsistency() noexcept {
 // ============================================================================
 
 EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
+    std::shared_lock lock(m_mutex);
+    return ValidateUnlocked();
+}
+
+EnvironmentValidation EnvironmentBuilder::ValidateUnlocked() const noexcept {
     EnvironmentValidation result;
     result.isValid = true;
 
@@ -567,6 +612,10 @@ EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
         result.warnings.emplace_back(
             "Validation called before Build(); limited checks available");
         return result;
+    }
+
+    if (!ValidateConfigInput(m_config, &result)) {
+        // Continue collecting cross-subsystem drift so callers get a complete report.
     }
 
     // ----------------------------------------------------------------
@@ -623,12 +672,57 @@ EnvironmentValidation EnvironmentBuilder::Validate() const noexcept {
     return result;
 }
 
+bool EnvironmentBuilder::ValidateConfigInput(
+    const EmulationConfig& config,
+    EnvironmentValidation* validation) const noexcept
+{
+    auto fail = [validation](std::string message) noexcept {
+        if (validation) {
+            validation->errors.emplace_back(std::move(message));
+            validation->isValid = false;
+        }
+        return false;
+    };
+
+    bool ok = true;
+
+    if (config.computerName.size() > kMaxIdentityChars) {
+        ok = fail("Computer name exceeds virtual environment identity limit");
+    }
+    if (config.userName.size() > kMaxIdentityChars) {
+        ok = fail("User name exceeds virtual environment identity limit");
+    }
+    if (config.domainName.size() > kMaxIdentityChars) {
+        ok = fail("Domain name exceeds virtual environment identity limit");
+    }
+    if (config.windowsVersion.size() > kMaxIdentityChars) {
+        ok = fail("Windows version string exceeds virtual environment identity limit");
+    }
+    if (config.processorCount == 0 || config.processorCount > 128) {
+        ok = fail("Processor count must be in range 1..128 after session randomization");
+    }
+    if (config.osBuildNumber > std::numeric_limits<uint16_t>::max()) {
+        ok = fail("OS build number exceeds PEB.OSBuildNumber USHORT range");
+    }
+    if (config.fakeTSCFrequency < kMinTscFrequencyHz ||
+        config.fakeTSCFrequency > kMaxTscFrequencyHz) {
+        ok = fail("TSC frequency is outside plausible endpoint CPU bounds");
+    }
+    if (config.totalPhysicalMem == 0 ||
+        config.totalPhysicalMem > kMaxPhysicalMemoryBytes) {
+        ok = fail("Total physical memory is outside supported endpoint bounds");
+    }
+
+    return ok;
+}
+
 // ============================================================================
 // BuildPEBTEB — Write PEB, TEB, and ProcessParameters to Guest Memory
 // Must be called AFTER Build() and AFTER VirtualMemory is initialized
 // ============================================================================
 
 bool EnvironmentBuilder::BuildPEBTEB(VirtualMemory& memory) noexcept {
+    std::shared_lock lock(m_mutex);
     if (!m_initialized) return false;
 
     // Write structures in dependency order:
@@ -648,6 +742,7 @@ bool EnvironmentBuilder::BuildPEBTEB(VirtualMemory& memory) noexcept {
 // ============================================================================
 
 bool EnvironmentBuilder::BuildLdrData(VirtualMemory& memory) noexcept {
+    std::shared_lock lock(m_mutex);
     if (!m_initialized) return false;
     return WriteLdrData(memory);
 }
@@ -804,9 +899,10 @@ bool EnvironmentBuilder::WriteTEB(VirtualMemory& memory) noexcept {
         return memory.WriteU64(a, v) == ErrorCode::Success;
     };
 
-    // Derive session-specific process/thread IDs from tick count seed
-    const uint32_t pid = DeriveEmulatedPID(m_config.fakeTickCount);
-    const uint32_t tid = DeriveInitialTID(m_config.fakeTickCount);
+    const auto& vProc = VirtualProcess::Instance();
+    const uint32_t pid = vProc.GetCurrentPID();
+    const uint32_t tid = vProc.GetCurrentTID();
+    if (pid == 0 || tid == 0) return false;
 
     // 0x000: NtTib.ExceptionList = -1 (no SEH chain in x64 — uses unwind tables)
     if (!w64(teb + TEBOff::ExceptionList, 0xFFFFFFFFFFFFFFFFULL)) return false;
@@ -916,22 +1012,22 @@ bool EnvironmentBuilder::WriteProcessParameters(VirtualMemory& memory) noexcept 
 
     // 0x020: CurrentDirectory.DosPath (UNICODE_STRING)
     if (!WriteUnicodeString(memory, ppBase + PPOff::CurrentDirectoryPath,
-                            strCursor, desktop))
+                            strCursor, desktop, ppBase + kProcessParamsSize))
         return false;
 
     // 0x040: DllPath (UNICODE_STRING) — empty
     if (!WriteUnicodeString(memory, ppBase + PPOff::DllPath,
-                            strCursor, dllPath))
+                            strCursor, dllPath, ppBase + kProcessParamsSize))
         return false;
 
     // 0x050: ImagePathName (UNICODE_STRING)
     if (!WriteUnicodeString(memory, ppBase + PPOff::ImagePathName,
-                            strCursor, imgPath))
+                            strCursor, imgPath, ppBase + kProcessParamsSize))
         return false;
 
     // 0x060: CommandLine (UNICODE_STRING)
     if (!WriteUnicodeString(memory, ppBase + PPOff::CommandLine,
-                            strCursor, cmdLine))
+                            strCursor, cmdLine, ppBase + kProcessParamsSize))
         return false;
 
     // 0x070: Environment → environment variable block
@@ -1118,12 +1214,12 @@ bool EnvironmentBuilder::WriteLdrData(VirtualMemory& memory) noexcept {
 
         // 0x048: FullDllName (UNICODE_STRING + string data)
         if (!WriteUnicodeString(memory, entry + LDREntOff::FullDllName,
-                                strCursor, mod.fullPath))
+                                strCursor, mod.fullPath, ldrBase + kLdrRegionSize))
             return false;
 
         // 0x058: BaseDllName (UNICODE_STRING + string data)
         if (!WriteUnicodeString(memory, entry + LDREntOff::BaseDllName,
-                                strCursor, mod.baseName))
+                                strCursor, mod.baseName, ldrBase + kLdrRegionSize))
             return false;
 
         // 0x068: Flags — LDRP_IMAGE_DLL | LDRP_ENTRY_PROCESSED | LDRP_LOAD_NOTIFICATIONS_SENT
@@ -1161,6 +1257,7 @@ bool EnvironmentBuilder::WriteLdrData(VirtualMemory& memory) noexcept {
 // ============================================================================
 
 EnvironmentSnapshot EnvironmentBuilder::GetSnapshot() const noexcept {
+    std::shared_lock lock(m_mutex);
     EnvironmentSnapshot snap{};
 
     // Identity — directly from config
@@ -1191,15 +1288,15 @@ EnvironmentSnapshot EnvironmentBuilder::GetSnapshot() const noexcept {
     snap.startFileTime  = kBaseFileTime +
                           (m_config.fakeTickCount * 10000ULL);
 
-    // Process — derived from tick count seed (same derivation as WriteTEB)
-    snap.emulatedPID    = DeriveEmulatedPID(m_config.fakeTickCount);
-    snap.parentPID      = DeriveParentPID(m_config.fakeTickCount);
-    snap.initialTID     = DeriveInitialTID(m_config.fakeTickCount);
-
-    // Subsystem state — query singletons if initialized
+    // Process — authoritative values come from VirtualProcess so PEB/TEB,
+    // snapshots, and process-query APIs cannot drift apart.
     if (m_initialized) {
+        const auto& vProc = VirtualProcess::Instance();
+        snap.emulatedPID        = vProc.GetCurrentPID();
+        snap.parentPID          = vProc.GetParentPID();
+        snap.initialTID         = vProc.GetCurrentTID();
         snap.processCount      = static_cast<uint32_t>(
-            VirtualProcess::Instance().GetProcessList().size());
+            vProc.GetProcessList().size());
         snap.fileSystemEntries = 0;
         snap.registryKeys      = 0;
     }
@@ -1211,23 +1308,28 @@ EnvironmentSnapshot EnvironmentBuilder::GetSnapshot() const noexcept {
 // Accessor Methods
 // ============================================================================
 
-const EmulationConfig& EnvironmentBuilder::GetConfig() const noexcept {
+EmulationConfig EnvironmentBuilder::GetConfig() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_config;
 }
 
 bool EnvironmentBuilder::IsInitialized() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_initialized;
 }
 
 GuestAddress EnvironmentBuilder::GetPEBAddress() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_pebAddress;
 }
 
 GuestAddress EnvironmentBuilder::GetTEBAddress() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_tebAddress;
 }
 
 GuestAddress EnvironmentBuilder::GetPEBLdrDataAddress() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_ldrDataAddress;
 }
 
