@@ -29,6 +29,11 @@
 #include <cstring>
 #include <string>
 
+// DESIGN: Guest-memory writebacks (WriteU32) are [[nodiscard]]; guest-side
+// faults do not affect emulator correctness.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Wininet {
 
 // ============================================================================
@@ -286,6 +291,12 @@ bool HandleHttpSendRequestA(APIContext& ctx) {
         (void)safeLen;
     }
 
+    // T1071.001 reinforcement. APIDatabase already raises NetworkC2 for
+    // HttpSendRequest; SuspiciousAPI adds a dedicated "hot primitive"
+    // signal for the correlator to weight beacon transmission above
+    // ambient web traffic.
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true); // TRUE
     return true;
@@ -296,7 +307,7 @@ bool HandleHttpSendRequestA(APIContext& ctx) {
 // ============================================================================
 
 bool HandleHttpSendRequestW(APIContext& ctx) {
-    // Same behavioral result — headers logged via args
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
     return true;
@@ -476,3 +487,6 @@ void RegisterInternetAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Wininet
+
+#pragma warning(pop)
+
