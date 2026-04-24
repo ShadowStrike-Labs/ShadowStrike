@@ -27,9 +27,49 @@
 #include <array>
 #include <cctype>
 #include <cwctype>
+#include <limits>
+#include <new>
 #include <string>
 
 namespace Phantom::VirtualOS {
+
+namespace {
+
+static constexpr size_t kMaxProcessTextChars = 4096;
+static constexpr size_t kMaxProcessIOCChars = 8192;
+
+[[nodiscard]] bool IsReasonableWideText(std::wstring_view text, size_t maxLen) noexcept {
+    if (text.size() > maxLen) return false;
+    for (const wchar_t ch : text) {
+        if (ch == L'\0') return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::wstring SanitizedUserName(std::wstring_view userName) {
+    if (userName.empty()) return L"JSmith";
+    const size_t len = std::min<size_t>(userName.size(), 64);
+    std::wstring result;
+    result.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+        const wchar_t ch = userName[i];
+        result.push_back((ch >= L' ' && ch != L'\\' && ch != L'/' && ch != L':' &&
+                          ch != L'*' && ch != L'?' && ch != L'"' && ch != L'<' &&
+                          ch != L'>' && ch != L'|')
+                             ? ch
+                             : L'_');
+    }
+    return result.empty() ? std::wstring(L"JSmith") : result;
+}
+
+[[nodiscard]] int32_t ClampThreadPriority(int32_t priority) noexcept {
+    if (priority == 0) return 8;
+    if (priority < -15) return -15;
+    if (priority > 15) return 15;
+    return priority;
+}
+
+} // namespace
 
 // ============================================================================
 // Meyers' Singleton
@@ -45,6 +85,7 @@ VirtualProcess& VirtualProcess::Instance() noexcept {
 // ============================================================================
 
 void VirtualProcess::Initialize(const EmulationConfig& config) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
     if (m_initialized) return;
 
@@ -54,7 +95,7 @@ void VirtualProcess::Initialize(const EmulationConfig& config) noexcept {
     m_createIOCs.clear();
     m_nextTID = kEmulatedPID + 1; // TIDs start above the emulated PID
 
-    PopulateProcessList();
+    PopulateProcessList(config);
     PopulateModuleList();
 
     // Locate the emulated process entry we just inserted
@@ -66,6 +107,17 @@ void VirtualProcess::Initialize(const EmulationConfig& config) noexcept {
     }
 
     // Create the main thread for the emulated process
+    if (m_currentProcess.pid != kEmulatedPID) {
+        m_processList.clear();
+        m_threads.clear();
+        m_modules.clear();
+        m_createIOCs.clear();
+        m_currentProcess = {};
+        m_nextTID = 1;
+        m_initialized = false;
+        return;
+    }
+
     ThreadInfo mainThread{};
     mainThread.tid          = m_nextTID++;
     mainThread.ownerPid     = kEmulatedPID;
@@ -80,6 +132,11 @@ void VirtualProcess::Initialize(const EmulationConfig& config) noexcept {
     m_threads.push_back(mainThread);
 
     m_initialized = true;
+    } catch (const std::bad_alloc&) {
+        Reset();
+    } catch (const std::length_error&) {
+        Reset();
+    }
 }
 
 void VirtualProcess::Reset() noexcept {
@@ -97,21 +154,34 @@ void VirtualProcess::Reset() noexcept {
 // Process Table — Public Queries
 // ============================================================================
 
-const std::vector<ProcessInfo>& VirtualProcess::GetProcessList() const noexcept {
-    // Caller holds no lock — this is fine because the list is immutable
-    // after Initialize().  Shared lock for safety.
-    return m_processList;
+std::vector<ProcessInfo> VirtualProcess::GetProcessList() const noexcept {
+    try {
+        std::shared_lock lock(m_mutex);
+        return m_processList;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 std::optional<ProcessInfo> VirtualProcess::GetProcessByPID(uint32_t pid) const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     for (const auto& p : m_processList) {
         if (p.pid == pid) return p;
     }
     return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 std::optional<ProcessInfo> VirtualProcess::GetProcessByName(std::wstring_view name) const noexcept {
+    if (!IsReasonableWideText(name, kMaxProcessTextChars)) return std::nullopt;
+    try {
     std::shared_lock lock(m_mutex);
     for (const auto& p : m_processList) {
         if (p.name.size() != name.size()) continue;
@@ -126,10 +196,22 @@ std::optional<ProcessInfo> VirtualProcess::GetProcessByName(std::wstring_view na
         if (match) return p;
     }
     return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
-const ProcessInfo& VirtualProcess::GetCurrentProcess() const noexcept {
-    return m_currentProcess;
+ProcessInfo VirtualProcess::GetCurrentProcess() const noexcept {
+    try {
+        std::shared_lock lock(m_mutex);
+        return m_currentProcess;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 uint32_t VirtualProcess::GetCurrentPID() const noexcept {
@@ -145,14 +227,16 @@ uint32_t VirtualProcess::GetParentPID() const noexcept {
 // ============================================================================
 
 uint32_t VirtualProcess::CreateThread(GuestAddress startAddress, int32_t priority) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
     if (m_threads.size() >= kMaxThreads) return 0;
+    if (m_nextTID == 0 || m_nextTID == std::numeric_limits<uint32_t>::max()) return 0;
 
     ThreadInfo ti{};
     ti.tid          = m_nextTID++;
     ti.ownerPid     = kEmulatedPID;
     ti.startAddress = startAddress;
-    ti.priority     = (priority != 0) ? priority : 8;
+    ti.priority     = ClampThreadPriority(priority);
     ti.state        = 0; // KTHREAD_STATE: Initialized
     ti.createTime   = m_currentProcess.createTime + static_cast<uint64_t>(m_threads.size()) * 100'000;
     ti.kernelTime   = 0;
@@ -161,15 +245,27 @@ uint32_t VirtualProcess::CreateThread(GuestAddress startAddress, int32_t priorit
     ti.isSuspended  = false;
     m_threads.push_back(ti);
     return ti.tid;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 std::vector<ThreadInfo> VirtualProcess::GetThreadList(uint32_t pid) const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     std::vector<ThreadInfo> result;
+    result.reserve(std::min(m_threads.size(), static_cast<size_t>(kMaxThreads)));
     for (const auto& t : m_threads) {
         if (t.ownerPid == pid) result.push_back(t);
     }
     return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 std::optional<ThreadInfo> VirtualProcess::GetThreadByTID(uint32_t tid) const noexcept {
@@ -214,6 +310,7 @@ bool VirtualProcess::ResumeThread(uint32_t tid) noexcept {
 
 bool VirtualProcess::TerminateThread(uint32_t tid) noexcept {
     std::unique_lock lock(m_mutex);
+    if (!m_threads.empty() && m_threads.front().tid == tid) return false;
     auto it = std::find_if(m_threads.begin(), m_threads.end(),
                            [tid](const ThreadInfo& t) { return t.tid == tid; });
     if (it == m_threads.end()) return false;
@@ -225,11 +322,20 @@ bool VirtualProcess::TerminateThread(uint32_t tid) noexcept {
 // Module List
 // ============================================================================
 
-const std::vector<ModuleInfo>& VirtualProcess::GetModuleList() const noexcept {
-    return m_modules;
+std::vector<ModuleInfo> VirtualProcess::GetModuleList() const noexcept {
+    try {
+        std::shared_lock lock(m_mutex);
+        return m_modules;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 std::optional<ModuleInfo> VirtualProcess::GetModuleByName(std::wstring_view name) const noexcept {
+    if (!IsReasonableWideText(name, kMaxProcessTextChars)) return std::nullopt;
+    try {
     std::shared_lock lock(m_mutex);
     for (const auto& m : m_modules) {
         if (m.name.size() != name.size()) continue;
@@ -244,16 +350,27 @@ std::optional<ModuleInfo> VirtualProcess::GetModuleByName(std::wstring_view name
         if (match) return m;
     }
     return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 std::optional<ModuleInfo> VirtualProcess::GetModuleByAddress(GuestAddress addr) const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     for (const auto& m : m_modules) {
-        if (addr >= m.baseAddress && addr < m.baseAddress + m.imageSize) {
+        if (addr >= m.baseAddress && (addr - m.baseAddress) < m.imageSize) {
             return m;
         }
     }
     return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -366,6 +483,7 @@ static constexpr const wchar_t* kSandboxTools[] = {
 } // anonymous namespace
 
 bool VirtualProcess::IsAnalysisTool(std::wstring_view processName) const noexcept {
+    if (!IsReasonableWideText(processName, kMaxProcessTextChars)) return false;
     return IsInBlocklist(processName, kDebuggerTools,    std::size(kDebuggerTools))
         || IsInBlocklist(processName, kNetworkTools,     std::size(kNetworkTools))
         || IsInBlocklist(processName, kMonitoringTools,  std::size(kMonitoringTools))
@@ -374,6 +492,7 @@ bool VirtualProcess::IsAnalysisTool(std::wstring_view processName) const noexcep
 }
 
 bool VirtualProcess::IsDebuggerProcess(std::wstring_view processName) const noexcept {
+    if (!IsReasonableWideText(processName, kMaxProcessTextChars)) return false;
     return IsInBlocklist(processName, kDebuggerTools, std::size(kDebuggerTools));
 }
 
@@ -382,15 +501,34 @@ bool VirtualProcess::IsDebuggerProcess(std::wstring_view processName) const noex
 // ============================================================================
 
 void VirtualProcess::RecordProcessCreation(const ProcessCreateIOC& ioc) noexcept {
+    if (!IsReasonableWideText(ioc.commandLine, kMaxProcessIOCChars) ||
+        !IsReasonableWideText(ioc.imagePath, kMaxProcessTextChars)) {
+        return;
+    }
+    try {
     std::unique_lock lock(m_mutex);
     if (m_createIOCs.size() < kMaxIOCs) {
-        m_createIOCs.push_back(ioc);
+        ProcessCreateIOC sanitized = ioc;
+        sanitized.isSuspended = (ioc.creationFlags & 0x00000004UL) != 0; // CREATE_SUSPENDED
+        sanitized.isHidden = (ioc.creationFlags & 0x08000000UL) != 0;    // CREATE_NO_WINDOW
+        m_createIOCs.push_back(std::move(sanitized));
+    }
+    } catch (const std::bad_alloc&) {
+        return;
+    } catch (const std::length_error&) {
+        return;
     }
 }
 
 std::vector<ProcessCreateIOC> VirtualProcess::GetProcessCreationIOCs() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_createIOCs;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -415,7 +553,7 @@ GuestAddress VirtualProcess::GetProcessHeapAddress() const noexcept {
 // FILETIME base: 2025-01-15 09:00:00 UTC ≈ 133_507_800_000_000_000
 // Each subsequent process is created a few seconds after boot.
 
-void VirtualProcess::PopulateProcessList() noexcept {
+void VirtualProcess::PopulateProcessList(const EmulationConfig& config) {
     m_processList.clear();
     m_processList.reserve(64);
 
@@ -447,6 +585,8 @@ void VirtualProcess::PopulateProcessList() noexcept {
     // Helper: KB/MB constants for readability
     constexpr uint64_t KB = 1024ULL;
     constexpr uint64_t MB = 1024ULL * 1024ULL;
+    const std::wstring userName = SanitizedUserName(config.userName);
+    const std::wstring emulatedImagePath = L"C:\\Users\\" + userName + L"\\Downloads\\sample.exe";
 
     // ----- Session 0 — Kernel / System -----
     add(0,    0,   L"[System Idle Process]", L"",
@@ -613,7 +753,7 @@ void VirtualProcess::PopulateProcessList() noexcept {
 
     // *** THE EMULATED PROCESS (PID 4444) ***
     add(kEmulatedPID, kEmulatedParentPID, L"sample.exe",
-        L"C:\\Users\\JSmith\\Downloads\\sample.exe",
+        emulatedImagePath.c_str(),
         1,   42,  8 * MB,   2 * MB, 8, 1, false);
 
     // Conhost for the emulated process
@@ -670,7 +810,7 @@ void VirtualProcess::PopulateProcessList() noexcept {
 // Base addresses MUST match LibraryAPI.cpp kKnownDLLs for cross-module
 // consistency.  Diverging bases will trip anti-sandbox checks.
 
-void VirtualProcess::PopulateModuleList() noexcept {
+void VirtualProcess::PopulateModuleList() {
     m_modules.clear();
     m_modules.reserve(16);
 
