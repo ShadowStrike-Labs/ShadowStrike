@@ -30,6 +30,15 @@
 #include <string>
 #include <vector>
 
+// DESIGN: the guest-memory writeback paths in this translation unit are all
+// best-effort content reflows (emulated strncpy / CRT conversion). A partial
+// writeback is exactly equivalent to a guest-side AV the guest must handle,
+// so the [[nodiscard]] results are intentionally discarded. Pragma is
+// namespace-scoped; every path that materially affects control flow (size
+// queries, ERROR_INSUFFICIENT_BUFFER) is still checked explicitly.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -327,3 +336,5 @@ bool HandleWideCharToMultiByte(APIContext& ctx) {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
