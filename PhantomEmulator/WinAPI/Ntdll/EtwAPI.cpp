@@ -37,6 +37,14 @@
 #include <algorithm>
 #include <iterator>
 
+// DESIGN: WriteU32/Write on guest memory is [[nodiscard]] so the caller can
+// detect guest-side AVs. In ETW handlers the caller-supplied out-pointer is
+// always null-checked before use; a guest AV on write is a guest-side fault
+// that the emulated application must cope with, so discarding the outcome
+// is semantically correct here.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -401,6 +409,7 @@ bool HandleEtwEventWrite(APIContext& ctx) {
     GuestAddress pEvtDesc  = ctx.GetArgPtr(1);
     uint32_t     dataCount = ctx.GetArg32(2);
     // arg3 = user data array (not deeply parsed in emulation)
+    (void)dataCount;  // DESIGN: reserved for future rate-limit heuristic
 
     // Malware emitting ETW events is unusual — log it
     EtwState::Instance().IncrementEventWriteCount(regHandle);
@@ -468,6 +477,7 @@ bool HandleEtwEventWriteFull(APIContext& ctx) {
 bool HandleNtTraceEvent(APIContext& ctx) {
     uint64_t traceHandle = ctx.GetArg(0);
     uint32_t flags       = ctx.GetArg32(1);
+    (void)flags;  // DESIGN: reserved for future NT flag-bit correlation
 
     // Direct syscall usage of NtTraceEvent is suspicious — most legitimate
     // code goes through EtwEventWrite. Direct syscalls suggest evasion.
@@ -597,3 +607,5 @@ void RegisterEtwAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
