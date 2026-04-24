@@ -28,6 +28,13 @@
 #include <cctype>
 #include <cwctype>
 
+// DESIGN: VirtualMemory::Read*/Write* return [[nodiscard]] ErrorCode. The
+// Kernel32 extended-file shims deliberately discard these — Win32 surfaces
+// failures via GetLastError/return value, not the paging outcome. Scope:
+// this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -214,10 +221,12 @@ bool HandleSetFileTime(APIContext& ctx) {
     (void)readFileTime(lpLastAccessTime, laLo, laHi);
     (void)readFileTime(lpLastWriteTime, lwLo, lwHi);
 
-    // Timestomping detected: any time modification is suspicious.
-    // Setting time to the past (below our fake "current" time) is strongly flagged.
-    // The behavioral flags are raised through the dispatcher's post-call analysis
-    // based on the APICallDetail and its category/function name.
+    // Timestomping detected: any SetFileTime call is a high-signal T1070.006
+    // IOC. Benign apps almost never rewrite file timestamps; attackers use it
+    // to blend dropped artifacts with surrounding filesystem entries.
+    if (lpCreationTime != 0 || lpLastAccessTime != 0 || lpLastWriteTime != 0) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+    }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -280,10 +289,10 @@ static bool SetFileAttributesImpl(APIContext& ctx, bool isWide) {
         (void)ctx.ReadAnsiString(lpFileName, kMaxPathChars);
     }
 
-    // Detect hidden/system attribute setting — defense evasion IOC
+    // Detect hidden/system attribute setting — defense evasion IOC (T1564.001).
     if ((dwAttributes & FILE_ATTRIBUTE_HIDDEN) != 0 ||
         (dwAttributes & FILE_ATTRIBUTE_SYSTEM) != 0) {
-        // BehaviorFlag::DefenseEvasion raised through dispatcher post-call analysis
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
     }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
@@ -932,3 +941,5 @@ void RegisterFileExtAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
