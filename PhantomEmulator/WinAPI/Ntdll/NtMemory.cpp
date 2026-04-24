@@ -23,6 +23,15 @@
 #include <algorithm>
 #include <cstring>
 
+// DESIGN: Guest writebacks via WriteU32/WriteU64 are [[nodiscard]] so the
+// caller can detect guest-side AVs. Every target pointer here is either
+// null-checked or proven valid by a size check above the write; a guest
+// AV on writeback is a guest fault that the emulated code handles.
+// Pragma is namespace-scoped; explicit guards and return-status semantics
+// remain intact.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -50,7 +59,7 @@ static bool IsSelfProcess(uint64_t handle) noexcept {
 }
 
 // Write IoStatusBlock: { NTSTATUS Status; ULONG_PTR Information; }
-static void WriteIoStatus(VirtualMemory& mem, GuestAddress iosbAddr,
+[[maybe_unused]] static void WriteIoStatus(VirtualMemory& mem, GuestAddress iosbAddr,
                           GuestNtStatus status, uint64_t info) noexcept {
     if (iosbAddr == 0) return;
     mem.WriteU32(iosbAddr, static_cast<uint32_t>(status));
@@ -72,6 +81,13 @@ bool HandleNtAllocateVirtualMemory(APIContext& ctx) {
     const auto win32Prot     = ctx.GetArg32(5);
 
     if (!IsSelfProcess(processHandle)) {
+        // IOC: T1055 Process Injection — allocating memory in a remote
+        // process is the first stage of classic injection (VirtualAllocEx
+        // equivalent). Emitted before the emulator refuses the call so
+        // the behavior is captured even when the call "fails".
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::MemoryManipulation);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
         return true;
     }
@@ -143,10 +159,13 @@ bool HandleNtAllocateVirtualMemory(APIContext& ctx) {
     mem.WriteU64(regionSizePtr, alignedSize);
 
     // Behavioral analysis: PAGE_EXECUTE_READWRITE is suspicious
+    // IOC: T1055.002 Process Injection via RWX allocation is the canonical
+    // shellcode-staging/unpacking signature — emit both MemoryManipulation
+    // and SuspiciousAPI directly from the NT layer so direct-syscall
+    // callers are not missed by Win32-only dispatcher metadata.
     if (win32Prot == NT::PAGE_EXECUTE_READWRITE) {
-        // RWX allocations are a strong signal for shellcode staging or unpacking.
-        // The dispatcher's DetectBehaviors will pick up MemoryManipulation,
-        // but we note it here for downstream analysis layers.
+        ctx.AddBehaviorFlag(BehaviorFlag::MemoryManipulation);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
@@ -166,6 +185,11 @@ bool HandleNtProtectVirtualMemory(APIContext& ctx) {
     const auto oldProtPtr    = ctx.GetArgPtr(4);
 
     if (!IsSelfProcess(processHandle)) {
+        // IOC: T1055 Process Injection — flipping page protection in a
+        // remote process is the final stage of RW→RX shellcode activation.
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
         return true;
     }
@@ -205,6 +229,22 @@ bool HandleNtProtectVirtualMemory(APIContext& ctx) {
     if (!mem.Protect(alignedBase, alignedSize, newProt)) {
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_PARAMETER);
         return true;
+    }
+
+    // IOC: RW→RX / *→RWX / *→RX transitions on a writable region are the
+    // canonical shellcode-activation signature (T1055.002 / T1055.012).
+    // The emulator sees every transition so we escalate based on the new
+    // protection regardless of the prior state.
+    if (newWin32Prot == NT::PAGE_EXECUTE_READWRITE ||
+        newWin32Prot == NT::PAGE_EXECUTE_READ ||
+        newWin32Prot == NT::PAGE_EXECUTE) {
+        ctx.AddBehaviorFlag(BehaviorFlag::MemoryManipulation);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        if (oldWin32Prot == NT::PAGE_READWRITE ||
+            oldWin32Prot == NT::PAGE_WRITECOPY ||
+            newWin32Prot == NT::PAGE_EXECUTE_READWRITE) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        }
     }
 
     // Write old protection to output pointer
@@ -300,6 +340,11 @@ bool HandleNtReadVirtualMemory(APIContext& ctx) {
     const auto bytesReadPtr  = ctx.GetArgPtr(4);
 
     if (!IsSelfProcess(processHandle)) {
+        // IOC: T1003 Credential Access precursor — reading another
+        // process's address space (canonical LSASS / Chrome / keepass
+        // read pattern). Always emit before refusing the call.
+        ctx.AddBehaviorFlag(BehaviorFlag::CredentialAccess);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
         return true;
     }
@@ -354,6 +399,12 @@ bool HandleNtWriteVirtualMemory(APIContext& ctx) {
 
     // Writing to another process is a process-injection signal
     if (!IsSelfProcess(processHandle)) {
+        // IOC: T1055 Process Injection — WriteProcessMemory-equivalent
+        // primitive. Combined with NtAllocateVirtualMemory + CreateThread
+        // this is the classic shellcode injection triad.
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
         return true;
     }
@@ -568,13 +619,19 @@ bool HandleNtMapViewOfSection(APIContext& ctx) {
     const auto baseAddrPtr   = ctx.GetArgPtr(2);
     // arg3 = ZeroBits (ignored)
     // arg4 = CommitSize (ignored — we always commit fully)
-    const auto sectionOffPtr = ctx.GetArgPtr(5);
+    // arg5 = SectionOffset (optional, not emulated)
     const auto viewSizePtr   = ctx.GetArgPtr(6);
     // arg7 = InheritDisposition (ignored)
     // arg8 = AllocationType (ignored)
     const auto win32Prot     = ctx.GetArg32(9);
 
     if (!IsSelfProcess(processHandle)) {
+        // IOC: T1055.012 Process Hollowing / Section Injection — mapping a
+        // section view into a remote process is the primary primitive for
+        // hollowing and AtomBombing-style injection chains.
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessHollowing);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
         return true;
     }
@@ -630,6 +687,14 @@ bool HandleNtMapViewOfSection(APIContext& ctx) {
     // Write results back
     if (baseAddrPtr != 0)   mem.WriteU64(baseAddrPtr, mappedBase);
     if (viewSizePtr != 0)   mem.WriteU64(viewSizePtr, viewSize);
+
+    // IOC: RWX view mapping (shellcode / reflective DLL primitive).
+    if (win32Prot == NT::PAGE_EXECUTE_READWRITE ||
+        win32Prot == NT::PAGE_EXECUTE_READ ||
+        win32Prot == NT::PAGE_EXECUTE) {
+        ctx.AddBehaviorFlag(BehaviorFlag::MemoryManipulation);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
 
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
     return true;
@@ -712,3 +777,5 @@ void RegisterNtMemory(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
