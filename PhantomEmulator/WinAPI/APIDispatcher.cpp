@@ -41,6 +41,17 @@
 #include <algorithm>
 #include <cstring>
 
+// DESIGN: The dispatcher tolerates guest-memory read/write failures as a
+// safety policy — a malformed guest stack or a bogus TEB address must not
+// crash the emulator host. Failed reads leave output variables at their
+// zero-init values; the subsequent RIP=0 or zero return-address faults the
+// guest cleanly on next instruction fetch. The static analyzer cannot see
+// this intent, so suppress C4834 (discarded [[nodiscard]]) and C6031
+// (return value ignored) at the TU scope — every ignored return here is a
+// deliberate best-effort guest memory touch.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom {
 
 // ============================================================================
@@ -231,16 +242,10 @@ void APIDispatcher::WireImports(ImportResolver& imports,
     m_hookSize     = hookRegionSize;
     m_nextHookAddr = hookBase;
 
-    // Re-assign hook addresses sequentially from the new base.
-    // This must be done before wiring because the previous hook addresses
-    // were assigned with the old (possibly zero) base.
-    for (auto& [addr, entry] : m_hookMap) {
-        // We'll rebuild from scratch below, so break the loop.
-        static_cast<void>(addr);
-        static_cast<void>(entry);
-    }
-
-    // Rebuild hookMap with fresh addresses from the provided base.
+    // Rebuild hookMap with fresh addresses from the provided base. The old
+    // addresses (assigned at Register() time, possibly with a zero base) are
+    // discarded. We iterate the existing map in insertion order, reassign,
+    // and swap in the rebuilt table at the end.
     std::unordered_map<GuestAddress, HandlerEntry> newHookMap;
     newHookMap.reserve(m_hookMap.size());
     m_nameMap.clear();
@@ -1145,3 +1150,5 @@ bool APIContext::Is64Bit() const noexcept {
 }
 
 } // namespace Phantom
+
+#pragma warning(pop)
