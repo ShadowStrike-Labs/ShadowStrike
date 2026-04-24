@@ -28,6 +28,11 @@
 #include <cstring>
 #include <string>
 
+// DESIGN: Guest-memory writebacks (sockaddr read-backs, WSAData struct emit)
+// are [[nodiscard]]; guest-side faults do not affect emulator correctness.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ws2_32 {
 
 // ============================================================================
@@ -182,8 +187,10 @@ bool HandleConnect(APIContext& ctx) {
         sd.connected  = true;
     });
 
-    // IOC: log C2 connection target — this is a CRITICAL behavioral indicator
-    // (logged via the API call record mechanism in APIDispatcher)
+    // T1071 Application Layer Protocol. APIDatabase.hpp:397 raises
+    // NetworkC2; SuspiciousAPI flags the raw-socket connect primitive
+    // (reverse shells, custom C2, port-scan egress).
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturn32(0);
@@ -211,6 +218,11 @@ bool HandleSend(APIContext& ctx) {
     if (len > kMaxBufferSize) {
         len = kMaxBufferSize;
     }
+
+    // T1071 / T1041 reinforcement. APIDatabase.hpp:398 raises NetworkC2;
+    // SuspiciousAPI weights the transmission primitive for data-exfil /
+    // C2-beacon correlation.
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     // Return success: malware thinks data was sent — reveals payload size
     ctx.SetLastError(Win32::ERROR_SUCCESS);
@@ -301,6 +313,12 @@ bool HandleListen(APIContext& ctx) {
     ctx.Handles().Modify<SocketData>(s, [](SocketData& sd) {
         sd.listening = true;
     });
+
+    // T1205 Traffic Signaling / T1021 Remote Services. A process that
+    // opens a listening socket is typically a backdoor / reverse-shell
+    // server. APIDatabase.hpp:401 raises NetworkC2; SuspiciousAPI
+    // distinguishes the listener primitive from ambient traffic.
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     ctx.SetReturn32(0);
     return true;
@@ -442,3 +460,6 @@ void RegisterSocketAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ws2_32
+
+#pragma warning(pop)
+
