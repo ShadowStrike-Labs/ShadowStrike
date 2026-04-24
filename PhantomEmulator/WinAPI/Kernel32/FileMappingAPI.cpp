@@ -34,6 +34,12 @@
 #include <string>
 #include <unordered_map>
 
+// DESIGN: VirtualMemory::Free returns [[nodiscard]] ErrorCode. In Kernel32
+// section-mapping shims we discard it — UnmapViewOfFile's Win32 contract
+// surfaces failure via GetLastError / BOOL only. Scope: this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -64,13 +70,6 @@ static std::unordered_map<GuestAddress, GuestSize> s_mappedViews;
 // ============================================================================
 // Helpers
 // ============================================================================
-
-static std::string WideToNarrow(const std::wstring& ws) noexcept {
-    std::string s;
-    s.reserve(ws.size());
-    for (wchar_t wc : ws) s.push_back(static_cast<char>(wc & 0x7F));
-    return s;
-}
 
 static bool IsExecutableProtection(uint32_t protect) noexcept {
     uint32_t base = protect & 0xFF;
@@ -132,6 +131,22 @@ static bool CreateFileMappingImpl(APIContext& ctx, bool isWide) {
 
     // Extract base protection (strip section attributes)
     uint32_t baseProt = flProtect & 0x00FFFFFF;
+
+    // SEC_IMAGE maps a PE as an image — the exact primitive used for
+    // process hollowing / module stomping (T1055.012).
+    if ((flProtect & SEC_IMAGE) != 0) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessHollowing);
+    }
+    // Executable section protection is a DEP-bypass / shellcode-loader
+    // pattern when combined with writable protections (RWX).
+    if (IsExecutableProtection(baseProt)) {
+        if (baseProt == NT::PAGE_EXECUTE_READWRITE ||
+            baseProt == NT::PAGE_EXECUTE_WRITECOPY) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        } else {
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
 
     // Create section handle
     SectionData secData{};
@@ -256,6 +271,16 @@ bool HandleMapViewOfFile(APIContext& ctx) {
     // Determine memory protection from desired access
     MemProt prot = MapAccessToMemProt(dwDesiredAccess);
 
+    // Mapping with execute permission outside the PE loader path is a classic
+    // DEP-bypass / shellcode-loader primitive. RWX is the strongest signal.
+    if ((dwDesiredAccess & FILE_MAP_EXECUTE) != 0) {
+        if ((dwDesiredAccess & FILE_MAP_WRITE) != 0) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        } else {
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
+
     // Allocate guest memory for the mapped view
     GuestSize alignedSize = AlignUp(dwNumBytes, kPageSize);
     auto result = ctx.Memory().Allocate(0, alignedSize, prot);
@@ -320,6 +345,16 @@ bool HandleMapViewOfFileEx(APIContext& ctx) {
 
     MemProt prot = MapAccessToMemProt(dwDesiredAccess);
     GuestSize alignedSize = AlignUp(dwNumBytes, kPageSize);
+
+    // Same CodeInjection / SuspiciousAPI wiring as MapViewOfFile — RWX or
+    // executable mapping is the DEP-bypass primitive.
+    if ((dwDesiredAccess & FILE_MAP_EXECUTE) != 0) {
+        if ((dwDesiredAccess & FILE_MAP_WRITE) != 0) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        } else {
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
 
     // Try preferred base address first, fall back to any address
     auto result = ctx.Memory().Allocate(lpBaseAddress, alignedSize, prot);
@@ -417,3 +452,5 @@ void RegisterFileMappingAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
