@@ -22,13 +22,98 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 namespace Phantom::VirtualOS {
+
+namespace {
+
+static constexpr size_t kMaxHostnameLength = 253;
+static constexpr size_t kMaxEndpointLength = 255;
+static constexpr size_t kMaxUserAgentLength = 512;
+static constexpr size_t kMaxHttpMethodLength = 16;
+static constexpr size_t kMaxHttpPathLength = 2048;
+static constexpr size_t kMaxHttpHeadersLength = 8192;
+static constexpr uint32_t kMaxSendEventsPerSocket = 4096;
+static constexpr uint32_t kMaxDnsCacheEntries = 10000;
+static constexpr uint32_t kMaxSyntheticBodySize = 64U * 1024U * 1024U;
+
+[[nodiscard]] uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) noexcept {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return lhs + rhs;
+}
+
+[[nodiscard]] bool IsReasonableNetworkText(
+    std::string_view text,
+    size_t maxLen,
+    bool allowEmpty = false) noexcept
+{
+    if (text.empty()) return allowEmpty;
+    if (text.size() > maxLen) return false;
+    for (const unsigned char ch : text) {
+        if (ch < 0x20 || ch == 0x7F) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::string NarrowHostName(std::wstring_view host) {
+    if (host.empty()) return "DESKTOP-A7B3CF9";
+    const size_t len = std::min(host.size(), kMaxHostnameLength);
+    std::string result;
+    result.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+        const wchar_t ch = host[i];
+        result.push_back((ch >= 0x20 && ch <= 0x7E) ? static_cast<char>(ch) : '-');
+    }
+    return result.empty() ? std::string("DESKTOP-A7B3CF9") : result;
+}
+
+[[nodiscard]] std::string NormalizeHostname(std::string_view hostname) {
+    if (!IsReasonableNetworkText(hostname, kMaxHostnameLength)) return {};
+
+    std::string normalized;
+    normalized.reserve(hostname.size());
+    bool previousDot = false;
+    for (const unsigned char raw : hostname) {
+        const char ch = static_cast<char>(std::tolower(raw));
+        if (!((ch >= 'a' && ch <= 'z') ||
+              (ch >= '0' && ch <= '9') ||
+              ch == '-' || ch == '.')) {
+            return {};
+        }
+        if (ch == '.') {
+            if (previousDot || normalized.empty()) return {};
+            previousDot = true;
+        } else {
+            previousDot = false;
+        }
+        normalized.push_back(ch);
+    }
+    if (normalized.empty() || normalized.back() == '.') return {};
+    return normalized;
+}
+
+[[nodiscard]] bool IsValidHttpRecord(const HttpRequestRecord& record) noexcept {
+    return IsReasonableNetworkText(record.method, kMaxHttpMethodLength) &&
+           IsReasonableNetworkText(record.host, kMaxHostnameLength) &&
+           IsReasonableNetworkText(record.path, kMaxHttpPathLength) &&
+           IsReasonableNetworkText(record.userAgent, kMaxUserAgentLength, true) &&
+           IsReasonableNetworkText(record.headers, kMaxHttpHeadersLength, true) &&
+           record.bodySize <= kMaxSyntheticBodySize;
+}
+
+} // namespace
 
 // ============================================================================
 // Meyers' Singleton
@@ -44,6 +129,7 @@ VirtualNetwork& VirtualNetwork::Instance() noexcept {
 // ============================================================================
 
 void VirtualNetwork::Initialize(const EmulationConfig& config) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
     if (m_initialized) return;
 
@@ -55,9 +141,14 @@ void VirtualNetwork::Initialize(const EmulationConfig& config) noexcept {
 
     m_nextSocketId = 1;
     m_nextDnsIP    = 1;
-    m_hostname     = "DESKTOP-A7B3CF9";
+    m_hostname     = NarrowHostName(config.computerName);
 
     m_initialized = true;
+    } catch (const std::bad_alloc&) {
+        Reset();
+    } catch (const std::length_error&) {
+        Reset();
+    }
 }
 
 void VirtualNetwork::Reset() noexcept {
@@ -78,6 +169,7 @@ void VirtualNetwork::Reset() noexcept {
 // ============================================================================
 
 uint32_t VirtualNetwork::CreateSocket(uint16_t af, uint16_t type, uint16_t protocol) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
     if (m_sockets.size() >= kMaxSockets) return 0;
 
@@ -93,6 +185,11 @@ uint32_t VirtualNetwork::CreateSocket(uint16_t af, uint16_t type, uint16_t proto
     uint32_t id = si.id;
     m_sockets.emplace(id, std::move(si));
     return id;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 bool VirtualNetwork::CloseSocket(uint32_t socketId) noexcept {
@@ -105,6 +202,9 @@ bool VirtualNetwork::CloseSocket(uint32_t socketId) noexcept {
 }
 
 bool VirtualNetwork::Connect(uint32_t socketId, std::string_view ip, uint16_t port) noexcept {
+    if (port == 0 || !IsReasonableNetworkText(ip, kMaxEndpointLength)) return false;
+
+    try {
     std::unique_lock lock(m_mutex);
     auto it = m_sockets.find(socketId);
     if (it == m_sockets.end()) return false;
@@ -122,9 +222,17 @@ bool VirtualNetwork::Connect(uint32_t socketId, std::string_view ip, uint16_t po
         sock.localPort = static_cast<uint16_t>(49152 + (socketId % 16384));
     }
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 bool VirtualNetwork::Bind(uint32_t socketId, std::string_view ip, uint16_t port) noexcept {
+    if (!IsReasonableNetworkText(ip, kMaxEndpointLength)) return false;
+
+    try {
     std::unique_lock lock(m_mutex);
     auto it = m_sockets.find(socketId);
     if (it == m_sockets.end()) return false;
@@ -136,6 +244,11 @@ bool VirtualNetwork::Bind(uint32_t socketId, std::string_view ip, uint16_t port)
     sock.localPort = port;
     sock.state     = SocketState::Bound;
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 bool VirtualNetwork::Listen(uint32_t socketId) noexcept {
@@ -151,6 +264,7 @@ bool VirtualNetwork::Listen(uint32_t socketId) noexcept {
 }
 
 std::optional<uint32_t> VirtualNetwork::Accept(uint32_t socketId) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
     auto it = m_sockets.find(socketId);
     if (it == m_sockets.end()) return std::nullopt;
@@ -174,6 +288,11 @@ std::optional<uint32_t> VirtualNetwork::Accept(uint32_t socketId) noexcept {
     uint32_t newId = accepted.id;
     m_sockets.emplace(newId, std::move(accepted));
     return newId;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 uint32_t VirtualNetwork::Send(uint32_t socketId, uint32_t size) noexcept {
@@ -186,9 +305,19 @@ uint32_t VirtualNetwork::Send(uint32_t socketId, uint32_t size) noexcept {
 
     // Cap single send to 64 KB to prevent unbounded tracking
     uint32_t actual = std::min(size, static_cast<uint32_t>(64 * 1024));
-    sock.bytesSent += actual;
-    sock.sendCount++;
-    sock.sendTimestamps.push_back(sock.sendCount); // ordinal as proxy timestamp
+    sock.bytesSent = SaturatingAdd(sock.bytesSent, actual);
+    if (sock.sendCount < std::numeric_limits<uint32_t>::max()) {
+        sock.sendCount++;
+    }
+    if (sock.sendTimestamps.size() < kMaxSendEventsPerSocket) {
+        try {
+            sock.sendTimestamps.push_back(sock.sendCount); // ordinal as proxy timestamp
+        } catch (const std::bad_alloc&) {
+            return actual;
+        } catch (const std::length_error&) {
+            return actual;
+        }
+    }
     return actual;
 }
 
@@ -201,7 +330,9 @@ uint32_t VirtualNetwork::Recv(uint32_t socketId, uint32_t /*requestedSize*/) noe
     if (sock.state != SocketState::Connected) return 0;
 
     // Simulate "connection closed / no response" — return 0 bytes
-    sock.recvCount++;
+    if (sock.recvCount < std::numeric_limits<uint32_t>::max()) {
+        sock.recvCount++;
+    }
     return 0;
 }
 
@@ -212,18 +343,11 @@ uint32_t VirtualNetwork::Recv(uint32_t socketId, uint32_t /*requestedSize*/) noe
 // Cached so repeated lookups return the same address.
 
 std::string VirtualNetwork::ResolveDns(std::string_view hostname) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
 
-    if (hostname.empty()) return "";
-
-    // Hostname normalization: lower-case copy, capped at 255 chars
-    std::string normalized;
-    const size_t len = std::min(hostname.size(), static_cast<size_t>(255));
-    normalized.reserve(len);
-    for (size_t i = 0; i < len; ++i) {
-        normalized.push_back(static_cast<char>(
-            std::tolower(static_cast<unsigned char>(hostname[i]))));
-    }
+    std::string normalized = NormalizeHostname(hostname);
+    if (normalized.empty()) return "";
 
     // Check cache
     auto cacheIt = m_dnsCache.find(normalized);
@@ -237,6 +361,10 @@ std::string VirtualNetwork::ResolveDns(std::string_view hostname) noexcept {
             m_dnsQueries.push_back(std::move(rec));
         }
         return cacheIt->second;
+    }
+
+    if (m_dnsCache.size() >= kMaxDnsCacheEntries) {
+        return "10.255.255.254";
     }
 
     // Allocate new IP: 10.0.0.x  →  10.x.y.z for > 254 entries
@@ -261,11 +389,20 @@ std::string VirtualNetwork::ResolveDns(std::string_view hostname) noexcept {
     }
 
     return ip;
+    } catch (const std::bad_alloc&) {
+        return "";
+    } catch (const std::length_error&) {
+        return "";
+    }
 }
 
 std::string VirtualNetwork::GetHostname() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_hostname;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -273,15 +410,25 @@ std::string VirtualNetwork::GetHostname() const noexcept {
 // ============================================================================
 
 void VirtualNetwork::LogHttpRequest(const HttpRequestRecord& record) noexcept {
+    if (!IsValidHttpRecord(record)) return;
+
+    try {
     std::unique_lock lock(m_mutex);
     if (m_httpRequests.size() < kMaxHttpRequests) {
         m_httpRequests.push_back(record);
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    } catch (const std::length_error&) {
+        return;
+    }
 }
 
 void VirtualNetwork::LogUserAgent(std::string_view userAgent) noexcept {
+    if (!IsReasonableNetworkText(userAgent, kMaxUserAgentLength)) return;
+
+    try {
     std::unique_lock lock(m_mutex);
-    if (userAgent.empty()) return;
     if (m_userAgents.size() >= kMaxUserAgents) return;
 
     // Deduplicate
@@ -290,6 +437,11 @@ void VirtualNetwork::LogUserAgent(std::string_view userAgent) noexcept {
         if (existing == ua) return;
     }
     m_userAgents.push_back(std::move(ua));
+    } catch (const std::bad_alloc&) {
+        return;
+    } catch (const std::length_error&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -297,16 +449,25 @@ void VirtualNetwork::LogUserAgent(std::string_view userAgent) noexcept {
 // ============================================================================
 
 std::vector<DnsQueryRecord> VirtualNetwork::GetDnsQueries() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_dnsQueries;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 std::vector<HttpRequestRecord> VirtualNetwork::GetHttpRequests() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_httpRequests;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 std::vector<SocketInfo> VirtualNetwork::GetConnections() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     std::vector<SocketInfo> result;
     result.reserve(m_sockets.size());
@@ -314,9 +475,15 @@ std::vector<SocketInfo> VirtualNetwork::GetConnections() const noexcept {
         result.push_back(sock);
     }
     return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 NetworkIOC VirtualNetwork::GetNetworkIOCs() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
 
     NetworkIOC ioc{};
@@ -327,8 +494,8 @@ NetworkIOC VirtualNetwork::GetNetworkIOCs() const noexcept {
         if (!sock.remoteIP.empty()) {
             ips.insert(sock.remoteIP);
         }
-        ioc.totalBytesSent     += sock.bytesSent;
-        ioc.totalBytesReceived += sock.bytesReceived;
+        ioc.totalBytesSent     = SaturatingAdd(ioc.totalBytesSent, sock.bytesSent);
+        ioc.totalBytesReceived = SaturatingAdd(ioc.totalBytesReceived, sock.bytesReceived);
         if (sock.state == SocketState::Connected ||
             sock.state == SocketState::Closed) {
             ioc.totalConnections++;
@@ -368,6 +535,11 @@ NetworkIOC VirtualNetwork::GetNetworkIOCs() const noexcept {
     ioc.hasDataExfiltration = DetectExfiltrationInternal();
 
     return ioc;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -380,7 +552,7 @@ NetworkIOC VirtualNetwork::GetNetworkIOCs() const noexcept {
 
 namespace {
 
-[[nodiscard]] bool HasRegularInterval(const std::vector<uint64_t>& timestamps) noexcept {
+[[nodiscard]] bool HasRegularInterval(const std::vector<uint64_t>& timestamps) {
     if (timestamps.size() < 4) return false;
 
     // Compute inter-arrival deltas
@@ -419,6 +591,7 @@ bool VirtualNetwork::DetectBeaconing() const noexcept {
 
 // Private: caller must already hold lock
 bool VirtualNetwork::DetectBeaconingInternal() const noexcept {
+    try {
     // Group send timestamps by remote IP:port
     std::unordered_map<std::string, std::vector<uint64_t>> groups;
     for (const auto& [id, sock] : m_sockets) {
@@ -433,6 +606,11 @@ bool VirtualNetwork::DetectBeaconingInternal() const noexcept {
         if (HasRegularInterval(ts)) return true;
     }
     return false;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -449,6 +627,7 @@ bool VirtualNetwork::DetectExfiltration() const noexcept {
 }
 
 bool VirtualNetwork::DetectExfiltrationInternal() const noexcept {
+    try {
     constexpr uint64_t kSingleIPThreshold = 10ULL * 1024 * 1024; // 10 MB
     constexpr uint64_t kFanOutThreshold   = 1ULL  * 1024 * 1024; // 1 MB
     constexpr uint32_t kFanOutMinIPs      = 3;
@@ -460,8 +639,8 @@ bool VirtualNetwork::DetectExfiltrationInternal() const noexcept {
 
     for (const auto& [id, sock] : m_sockets) {
         if (sock.remoteIP.empty()) continue;
-        sentPerIP[sock.remoteIP] += sock.bytesSent;
-        recvPerIP[sock.remoteIP] += sock.bytesReceived;
+        sentPerIP[sock.remoteIP] = SaturatingAdd(sentPerIP[sock.remoteIP], sock.bytesSent);
+        recvPerIP[sock.remoteIP] = SaturatingAdd(recvPerIP[sock.remoteIP], sock.bytesReceived);
     }
 
     uint32_t highVolumeTargets = 0;
@@ -485,6 +664,11 @@ bool VirtualNetwork::DetectExfiltrationInternal() const noexcept {
     if (highVolumeTargets >= kFanOutMinIPs) return true;
 
     return false;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -494,8 +678,10 @@ bool VirtualNetwork::DetectExfiltrationInternal() const noexcept {
 
 bool VirtualNetwork::IsSuspiciousDomain(std::string_view hostname) const noexcept {
     if (hostname.empty()) return false;
+    if (!IsReasonableNetworkText(hostname, kMaxHostnameLength)) return true;
 
     // Normalize to lower case for comparison
+    try {
     std::string h;
     h.reserve(hostname.size());
     for (char c : hostname) {
@@ -557,6 +743,11 @@ bool VirtualNetwork::IsSuspiciousDomain(std::string_view hostname) const noexcep
     }
 
     return false;
+    } catch (const std::bad_alloc&) {
+        return true;
+    } catch (const std::length_error&) {
+        return true;
+    }
 }
 
 double VirtualNetwork::ComputeDomainEntropy(std::string_view label) const noexcept {
