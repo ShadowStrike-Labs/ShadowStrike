@@ -300,6 +300,19 @@ bool HandleNtWaitForSingleObject(APIContext& ctx) {
     const bool isZeroTimeout = hasTimeout && (timeout == 0);
     const bool isInfinite    = !hasTimeout; // NULL timeout = infinite wait
 
+    // IOC: T1497.003 Time Based Evasion — long relative waits on a waitable
+    // object are a common sandbox-bypass pattern (wait on a never-signaled
+    // event for >=5s to defeat analysis sandboxes that give up quickly).
+    // Relative waits are negative in NT ticks (100ns units); -50_000_000
+    // corresponds to 5000 ms.
+    if (hasTimeout && timeout < 0) {
+        int64_t absTicks = -timeout;
+        if (absTicks >= 50'000'000LL) {
+            ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
+
     // Check signaled state
     if (CheckAndConsumeSignal(ctx.Handles(), handle, type)) {
         ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
@@ -389,6 +402,13 @@ bool HandleNtWaitForMultipleObjects(APIContext& ctx) {
     }
     const bool isZeroTimeout = hasTimeout && (timeout == 0);
     const bool isInfinite    = !hasTimeout;
+
+    // IOC: T1497.003 — long relative multi-object waits also count as
+    // potential sandbox evasion. Threshold matches NtWaitForSingleObject.
+    if (hasTimeout && timeout < 0 && (-timeout) >= 50'000'000LL) {
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
 
     // Check signaled states
     if (waitType == kWaitAny) {
