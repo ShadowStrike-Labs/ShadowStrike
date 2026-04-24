@@ -117,8 +117,10 @@ public:
     bool SetValue(std::wstring_view keyPath, std::wstring_view valueName,
                   uint32_t type, const uint8_t* data, uint32_t dataSize) noexcept;
 
-    [[nodiscard]] const RegValue* QueryValue(std::wstring_view keyPath,
-                                              std::wstring_view valueName) const noexcept;
+    /// Returns a locked snapshot of a value. The returned object never aliases
+    /// internal registry storage and remains valid after concurrent mutation.
+    [[nodiscard]] std::optional<RegValue> QueryValue(std::wstring_view keyPath,
+                                                     std::wstring_view valueName) const noexcept;
 
     bool DeleteValue(std::wstring_view keyPath, std::wstring_view valueName) noexcept;
 
@@ -147,23 +149,24 @@ private:
     VirtualRegistry(const VirtualRegistry&) = delete;
     VirtualRegistry& operator=(const VirtualRegistry&) = delete;
 
-    void PopulateDefaults(const EmulationConfig& config) noexcept;
-    void AddKey(std::wstring_view path) noexcept;
+    void PopulateDefaults(const EmulationConfig& config);
+    void AddKey(std::wstring_view path);
     void AddStrValue(std::wstring_view keyPath, std::wstring_view name,
-                     std::wstring_view value) noexcept;
+                     std::wstring_view value);
     void AddExpandSzValue(std::wstring_view keyPath, std::wstring_view name,
-                          std::wstring_view value) noexcept;
+                          std::wstring_view value);
     void AddDwordValue(std::wstring_view keyPath, std::wstring_view name,
-                       uint32_t value) noexcept;
+                       uint32_t value);
     void AddQwordValue(std::wstring_view keyPath, std::wstring_view name,
-                       uint64_t value) noexcept;
+                       uint64_t value);
     void AddBinaryValue(std::wstring_view keyPath, std::wstring_view name,
-                        const std::vector<uint8_t>& data) noexcept;
+                        const std::vector<uint8_t>& data);
     void AddMultiSzValue(std::wstring_view keyPath, std::wstring_view name,
-                         const std::vector<std::wstring>& strings) noexcept;
+                         const std::vector<std::wstring>& strings);
 
     [[nodiscard]] static bool IsPersistencePath(std::wstring_view path) noexcept;
     [[nodiscard]] static bool IsAutoStartService(std::wstring_view path,
+                                                  std::wstring_view valueName,
                                                   const std::vector<uint8_t>& data) noexcept;
 
     mutable std::shared_mutex           m_mutex;
@@ -174,6 +177,7 @@ private:
     static constexpr size_t kMaxKeys            = 50000;
     static constexpr size_t kMaxValuesPerKey     = 1000;
     static constexpr size_t kMaxValueData        = 1 * 1024 * 1024;  // 1 MB per value
+    static constexpr size_t kMaxWriteIOCs        = 10000;
 };
 
 } // namespace Phantom::VirtualOS
