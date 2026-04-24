@@ -29,6 +29,11 @@
 #include <cstring>
 #include <string>
 
+// DESIGN: Guest writebacks in WinHttpQueryHeaders / WinHttpReadData are
+// [[nodiscard]] but guest-side faults don't affect our correctness.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Winhttp {
 
 // ============================================================================
@@ -122,6 +127,12 @@ bool HandleWinHttpConnect(APIContext& ctx) {
         return true;
     }
 
+    // T1071.001 Application Layer Protocol (Web). WinHttpConnect binds a
+    // WinHTTP session to a specific remote server:port — this is the
+    // canonical C2-beaconing setup step (APT28/APT29/Emotet/IcedID).
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnHandle(h);
     return true;
@@ -173,7 +184,11 @@ bool HandleWinHttpOpenRequest(APIContext& ctx) {
 
 bool HandleWinHttpSendRequest(APIContext& ctx) {
     // Headers and optional data are captured via APICallDetail args.
-    // For behavioral analysis, the fact that a request was sent is the key signal.
+    // T1071.001 beaconing — WinHttpSendRequest is THE transmission primitive
+    // and deserves the strong NetworkC2 flag on every invocation.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
     return true;
@@ -300,3 +315,6 @@ void RegisterWinHttpAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Winhttp
+
+#pragma warning(pop)
+
