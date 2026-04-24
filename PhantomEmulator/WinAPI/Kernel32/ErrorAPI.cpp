@@ -28,6 +28,12 @@
 #include "../../Core/CPU/State/CPUState.hpp"
 #include "../../Core/Memory/VirtualMemory.hpp"
 
+// DESIGN: VirtualMemory::WriteValue returns [[nodiscard]] ErrorCode. Kernel32
+// anti-debug APIs ignore write failures on output BOOLs — the guest contract
+// only exposes GetLastError. Scope: this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -68,6 +74,9 @@ bool HandleGetLastError(APIContext& ctx) {
 // explicit API call path.
 
 bool HandleIsDebuggerPresent(APIContext& ctx) {
+    // High-signal anti-analysis probe — the call itself is the IOC, independent
+    // of the (always-FALSE) answer we return.
+    ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
     ctx.SetReturnBool(false);
     return true;
 }
@@ -90,6 +99,9 @@ bool HandleCheckRemoteDebuggerPresent(APIContext& ctx) {
         return true;
     }
 
+    // High-signal anti-analysis probe — record it.
+    ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+
     // Write FALSE (0) — no debugger present
     GuestBool falseValue = 0;
     ctx.Memory().WriteValue(pbDebuggerPresent, falseValue);
@@ -100,3 +112,5 @@ bool HandleCheckRemoteDebuggerPresent(APIContext& ctx) {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
