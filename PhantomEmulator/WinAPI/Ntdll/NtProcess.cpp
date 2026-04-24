@@ -24,6 +24,14 @@
 #include <string>
 #include <iterator>
 
+// DESIGN: Guest writebacks (WriteU16/U32/U64/WriteGuestPtr) are [[nodiscard]]
+// so the caller can detect guest-side AVs. Every target is null-checked or
+// proven valid by a length check above; a guest AV on writeback is a guest
+// fault. Pragma is namespace-scoped; validation guards and return-status
+// semantics remain intact.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 // Guest wide characters are always UTF-16LE (2 bytes), regardless of host.
 static_assert(sizeof(wchar_t) == 2,
     "PhantomEmulator requires sizeof(wchar_t)==2 (UTF-16). "
@@ -252,6 +260,46 @@ bool HandleNtOpenProcess(APIContext& ctx) {
 
     const bool isSelf = (static_cast<uint32_t>(targetPid) == kEmulatedPID);
 
+    // IOC: classify the open based on the requested access mask.
+    // Win32 PROCESS_* access constants:
+    //   PROCESS_CREATE_THREAD   = 0x0002  (remote-thread injection primitive)
+    //   PROCESS_VM_OPERATION    = 0x0008  (required for VirtualAllocEx/ProtectEx)
+    //   PROCESS_VM_READ         = 0x0010  (LSASS/secrets read — T1003)
+    //   PROCESS_VM_WRITE        = 0x0020  (WriteProcessMemory injection)
+    //   PROCESS_TERMINATE       = 0x0001  (T1562.001 impair defenses)
+    //   PROCESS_ALL_ACCESS      = 0x001FFFFF
+    if (!isSelf) {
+        constexpr uint32_t kProcCreateThread  = 0x0002;
+        constexpr uint32_t kProcVmOperation   = 0x0008;
+        constexpr uint32_t kProcVmRead        = 0x0010;
+        constexpr uint32_t kProcVmWrite       = 0x0020;
+        constexpr uint32_t kProcTerminate     = 0x0001;
+        constexpr uint32_t kProcAllAccess     = 0x001FFFFFu;
+
+        const bool injectSet =
+            (desiredAccess & (kProcCreateThread | kProcVmOperation |
+                              kProcVmWrite)) != 0;
+        const bool readSet =
+            (desiredAccess & kProcVmRead) != 0;
+        const bool terminateSet =
+            (desiredAccess & kProcTerminate) != 0;
+        const bool allSet =
+            (desiredAccess & kProcAllAccess) == kProcAllAccess;
+
+        if (injectSet || allSet) {
+            ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+        if (readSet || allSet) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CredentialAccess);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+        if (terminateSet && !(injectSet || readSet)) {
+            ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
+
     ProcessHandleData pd{};
     pd.pid        = static_cast<uint32_t>(targetPid);
     pd.accessMask = desiredAccess;
@@ -309,7 +357,11 @@ bool HandleNtTerminateProcess(APIContext& ctx) {
     }
 
     // External process: emulator cannot actually terminate it.
-    // Return success (the call is logged for behavioral analysis).
+    // IOC: T1562.001 Impair Defenses — terminating another process is
+    // the canonical AV/EDR-kill primitive (e.g. avkiller, bring-your-
+    // own-driver chains ending in userland NtTerminateProcess).
+    ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
     return true;
 }
@@ -422,6 +474,13 @@ bool HandleNtQueryInformationProcess(APIContext& ctx) {
     // Returns 0 (no debugger port). Malware checks: if (port != 0) exit;
     // ==================================================================
     case kProcessDebugPort: {
+        // IOC: T1622 Debugger Evasion — every query of these info-classes
+        // is a live anti-analysis signal. We still return the benign
+        // answer so the sample proceeds past the check and reveals the
+        // next stage; the flag is emitted so downstream correlation sees
+        // the evasion attempt regardless of the spoofed result.
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         const uint32_t ptrSz = PtrSize(is64);
 
         if (infoLength < ptrSz) {
@@ -512,6 +571,9 @@ bool HandleNtQueryInformationProcess(APIContext& ctx) {
     // Malware checks: if (NT_SUCCESS(status)) exit;
     // ==================================================================
     case kProcessDebugObjectHandle: {
+        // IOC: T1622 Debugger Evasion (see ProcessDebugPort above).
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         // Do NOT write any data — just return the error status.
         // Windows returns STATUS_PORT_NOT_SET when no debug object is attached.
         ctx.SetReturnNtStatus(NT::STATUS_PORT_NOT_SET);
@@ -524,6 +586,9 @@ bool HandleNtQueryInformationProcess(APIContext& ctx) {
     // Malware checks: if (flags == 0) exit;  (0 means debugger IS present)
     // ==================================================================
     case kProcessDebugFlags: {
+        // IOC: T1622 Debugger Evasion (see ProcessDebugPort above).
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         if (infoLength < 4) {
             WriteReturnLength(mem, returnLenPtr, 4);
             ctx.SetReturnNtStatus(NT::STATUS_INFO_LENGTH_MISMATCH);
@@ -595,3 +660,5 @@ void RegisterNtProcess(APIDispatcher& dispatcher) noexcept {
 
 } // namespace WinAPI::Ntdll
 } // namespace Phantom
+
+#pragma warning(pop)
