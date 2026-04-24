@@ -35,6 +35,12 @@
 #include <cstring>
 #include <string>
 
+// DESIGN: Guest-memory writebacks (Read/Write/WriteU32/WriteU64) are
+// [[nodiscard]] — a guest AV on writeback is a guest fault, not our bug,
+// and the emulator logs it through VirtualMemory telemetry anyway.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ole32 {
 
 // ============================================================================
@@ -214,11 +220,17 @@ bool HandleCoCreateInstance(APIContext& ctx) {
         mem.Read(rclsidAddr, clsid, kGuidSize);
     }
 
-    // Check against known-bad CLSIDs (result used for logging by dispatcher)
+    // Check against known-bad CLSIDs. Hitting any entry in the table is a
+    // strong IOC — malware uses CoCreateInstance to drive ShellLink
+    // (T1547.009 LNK), WScript.Shell / MSXML2.XMLHTTP (T1059.005 VBA/JS
+    // scripting & T1071.001 C2), or IE.Application for COM hijacking
+    // (T1546.015). We emit SuspiciousAPI + DefenseEvasion so behavioral
+    // scoring sees the signal; the dispatcher records the human-readable
+    // CLSID description via APIDatabase metadata.
     const auto* badMatch = MatchBadCLSID(clsid);
     if (badMatch != nullptr) {
-        // SuspiciousAPI flag raised via APIDatabase entry
-        (void)badMatch;
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
     }
 
     // ----------------------------------------------------------------
@@ -414,3 +426,6 @@ void RegisterCOMAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ole32
+
+#pragma warning(pop)
+
