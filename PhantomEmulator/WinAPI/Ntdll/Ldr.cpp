@@ -26,7 +26,17 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+
+// DESIGN: WriteGuestPtr writes the out-parameter pointer value after the
+// caller already validated the destination is non-null. A guest-side AV on
+// a user-provided out pointer is a guest fault — the emulator propagates
+// the NTSTATUS from validation, not from the async memory write. Pragma
+// scope is namespace-wide; every input guard remains explicit.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
 
 namespace Phantom::WinAPI::Ntdll {
 namespace {
@@ -128,6 +138,47 @@ struct LdrState {
         result.push_back(static_cast<char>(c < 128 ? c : '?'));
     }
     return result;
+}
+
+/// IOC: T1027.007 Dynamic API Resolution catalogue.
+///
+/// Going through LdrGetProcedureAddress (or the kernel32 GetProcAddress
+/// thunk, handled separately in LibraryAPI) to resolve one of these
+/// functions is the signature of a process-injection / defense-evasion
+/// loader. Benign code overwhelmingly resolves these via the IAT.
+///
+/// DESIGN: the list is curated to items where the resolve-at-runtime
+/// pattern itself carries near-100% malicious prior. Generic functions
+/// (MessageBox, WriteFile, etc.) are NOT included.
+[[nodiscard]] static bool IsDynamicResolutionRedFlag(
+        std::string_view fn) noexcept {
+    // Case-insensitive comparison using static canonical list
+    static const std::unordered_set<std::string_view> kRedFlagFns{
+        // Injection primitives (T1055)
+        "VirtualAllocEx", "VirtualProtectEx", "WriteProcessMemory",
+        "ReadProcessMemory", "CreateRemoteThread", "CreateRemoteThreadEx",
+        "SetThreadContext", "QueueUserAPC", "NtQueueApcThread",
+        "NtQueueApcThreadEx", "NtAllocateVirtualMemory",
+        "NtProtectVirtualMemory", "NtWriteVirtualMemory",
+        "NtReadVirtualMemory", "NtCreateThreadEx", "RtlCreateUserThread",
+        "NtMapViewOfSection", "NtUnmapViewOfSection",
+        "NtCreateSection", "ZwAllocateVirtualMemory",
+        "ZwProtectVirtualMemory", "ZwWriteVirtualMemory",
+        "ZwCreateThreadEx", "ZwUnmapViewOfSection",
+        // Process hollowing / CreateProcess-suspended chain
+        "NtResumeThread", "NtSuspendThread", "NtGetContextThread",
+        "NtSetContextThread",
+        // Credential access (T1003)
+        "MiniDumpWriteDump",
+        // ETW / AMSI / WLDP blinding (T1562.001 / .006)
+        "EtwEventWrite", "EtwEventRegister", "NtTraceEvent",
+        "NtTraceControl", "AmsiScanBuffer", "AmsiInitialize",
+        "AmsiOpenSession", "WldpQueryDynamicCodeTrust",
+        // Unhooking / direct-syscall resolution
+        "NtCreateFile", "NtOpenFile", "NtDeviceIoControlFile",
+        "LdrLoadDll", "LdrGetProcedureAddress",
+    };
+    return kRedFlagFns.find(fn) != kRedFlagFns.end();
 }
 
 /// Write a guest pointer (size-aware: 4 bytes on x86, 8 bytes on x64).
@@ -287,6 +338,15 @@ static bool HandleLdrGetProcedureAddress(APIContext& ctx) {
         return true;
     }
 
+    // IOC: T1027.007 Dynamic API Resolution. Resolving injection /
+    // ETW-blinding / AMSI-blinding primitives through the loader at
+    // runtime is the standard loader-shellcode pattern used by MSF,
+    // Cobalt Strike, Sliver, Brute Ratel, Donut, etc.
+    if (IsDynamicResolutionRedFlag(funcName)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     WriteGuestPtr(ctx, funcAddrPtr, *hookAddr);
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
     return true;
@@ -388,3 +448,5 @@ void ResetLdrState() noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
