@@ -24,6 +24,12 @@
 #include <unordered_map>
 #include <vector>
 
+// DESIGN: RTL handlers perform many guest memory writebacks; targets are
+// validated by explicit bounds/null checks or by the guest allocator.
+// A guest AV on writeback is a guest fault.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 namespace {
 
@@ -743,6 +749,11 @@ static bool HandleRtlDecompressBuffer(APIContext& ctx) {
     // Calling RtlDecompressBuffer is strong evidence of runtime unpacking.
     // We do not implement actual decompression; the behavioral analysis
     // engine records the call and raises DefenseEvasion via the APIDatabase.
+    //
+    // IOC: T1027.002 Software Packing — in-memory decompression of embedded
+    // payloads is a hallmark of packed/obfuscated malware stages.
+    ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     // Write 0 to *FinalUncompressedSize (arg5) so the caller sees no data
     const GuestAddress finalSizePtr = ctx.GetArgPtr(5);
@@ -804,3 +815,6 @@ void ResetRtlState() noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
+
