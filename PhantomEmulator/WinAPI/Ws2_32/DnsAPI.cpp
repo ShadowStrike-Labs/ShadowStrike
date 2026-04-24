@@ -27,6 +27,11 @@
 #include <cstring>
 #include <string>
 
+// DESIGN: Guest writebacks (WriteU8/16/32/64/Write) are [[nodiscard]];
+// guest-side faults do not affect emulator correctness.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ws2_32 {
 
 // ============================================================================
@@ -100,6 +105,11 @@ bool HandleGethostbyname(APIContext& ctx) {
         return true;
     }
 
+    // T1071.004 Application Layer Protocol (DNS). APIDatabase.hpp:406
+    // already raises NetworkC2; SuspiciousAPI flags the resolution
+    // primitive for DGA / DNS-tunneling correlation.
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     auto& mem = ctx.Memory();
     const bool is64 = ctx.Is64Bit();
     const uint32_t ptrSize = is64 ? 8 : 4;
@@ -112,11 +122,12 @@ bool HandleGethostbyname(APIContext& ctx) {
     const uint32_t addrListSize  = ptrSize * 2; // one addr ptr + null terminator
     const uint32_t aliasListSize = ptrSize;     // null terminator only
     const uint32_t hostentSize   = ptrSize * 3 + 4; // h_name, h_aliases, h_addr_list + addrtype/length
-    const uint32_t totalSize     = AlignUp(hostnameAlloc, 8)
-                                 + AlignUp(aliasListSize, 8)
-                                 + AlignUp(addrSize, 8)
-                                 + AlignUp(addrListSize, 8)
-                                 + AlignUp(hostentSize, 8);
+    const uint32_t totalSize     = static_cast<uint32_t>(
+                                     AlignUp(hostnameAlloc, 8)
+                                   + AlignUp(aliasListSize, 8)
+                                   + AlignUp(addrSize, 8)
+                                   + AlignUp(addrListSize, 8)
+                                   + AlignUp(hostentSize, 8));
 
     GuestAddress base = AllocScratch(mem, totalSize);
     if (base == 0) {
@@ -234,17 +245,21 @@ bool HandleGetaddrinfo(APIContext& ctx) {
         hostname = ctx.ReadAnsiString(pNodeName, kMaxHostnameLen);
     }
 
+    // T1071.004 reinforcement. APIDatabase.hpp:404 raises NetworkC2;
+    // SuspiciousAPI marks the IPv4/IPv6 resolution primitive for the
+    // correlator.
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     (void)pServiceName;
 
     auto& mem = ctx.Memory();
     const bool is64 = ctx.Is64Bit();
-    const uint32_t ptrSize = is64 ? 8 : 4;
 
     // Layout: [sockaddr_in(16)] [addrinfo struct]
     // addrinfo x64: 4+4+4+4 + 8(addrlen) + 8(canonname) + 8(addr) + 8(next) = 48
     // addrinfo x86: 4+4+4+4 + 4(addrlen) + 4(canonname) + 4(addr) + 4(next) = 32
     const uint32_t addrinfoSize = is64 ? 48 : 32;
-    const uint32_t totalSize = AlignUp(16, 8) + AlignUp(addrinfoSize, 8);
+    const uint32_t totalSize = static_cast<uint32_t>(AlignUp(16, 8) + AlignUp(addrinfoSize, 8));
 
     GuestAddress base = AllocScratch(mem, totalSize);
     if (base == 0) {
@@ -466,3 +481,6 @@ void RegisterDnsAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ws2_32
+
+#pragma warning(pop)
+
