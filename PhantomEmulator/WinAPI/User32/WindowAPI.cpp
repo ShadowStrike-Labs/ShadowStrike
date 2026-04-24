@@ -32,6 +32,11 @@
 #include <string>
 #include <string_view>
 
+// DESIGN: Guest-memory writebacks on GetWindowText/GetClassName are
+// [[nodiscard]] but a failed write is a guest-side fault, not ours.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::User32 {
 
 // ============================================================================
@@ -146,10 +151,12 @@ bool HandleMessageBoxA(APIContext& ctx) {
         caption = ctx.ReadAnsiString(lpCaption, kMaxStringLen);
     }
 
-    // Check for ransom-note indicators in the message text
+    // Check for ransom-note indicators in the message text.
+    // Wire SuspiciousAPI explicitly — the APIDatabase entry for MessageBoxA
+    // is BehaviorFlag::None, so without this call the ransom-note heuristic
+    // was dead (the old comment claimed the dispatcher raised it; it did not).
     if (!text.empty() && ContainsRansomKeyword(text)) {
-        // Ransom note detected — no explicit flag exists, mark as suspicious
-        (void)0; // Behavioral flag raised by APIDispatcher via kKnownAPIs table
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
@@ -183,7 +190,7 @@ bool HandleMessageBoxW(APIContext& ctx) {
             narrow.push_back(static_cast<char>(wc < 128 ? wc : '?'));
         }
         if (ContainsRansomKeyword(narrow)) {
-            (void)0; // Behavioral flagging handled by dispatcher
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
         }
     }
 
@@ -553,3 +560,6 @@ void RegisterWindowAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::User32
+
+#pragma warning(pop)
+
