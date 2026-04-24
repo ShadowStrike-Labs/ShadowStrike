@@ -23,6 +23,13 @@
 #include <shared_mutex>
 #include <vector>
 
+// DESIGN: Guest writebacks via WriteU32/U64/Write are [[nodiscard]]; target
+// pointers here are either null-checked or proven valid by a size check
+// above. A guest AV on writeback is a guest fault. Pragma is namespace-
+// scoped; explicit guards remain intact.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -66,8 +73,8 @@ static std::vector<uint8_t> MakeRegDword(uint32_t val) {
     return data;
 }
 
-// Encode a QWORD as REG_QWORD byte data
-static std::vector<uint8_t> MakeRegQword(uint64_t val) {
+// Encode a QWORD as REG_QWORD byte data (kept for future value seeding)
+[[maybe_unused]] static std::vector<uint8_t> MakeRegQword(uint64_t val) {
     std::vector<uint8_t> data(8);
     std::memcpy(data.data(), &val, 8);
     return data;
@@ -356,9 +363,60 @@ static std::wstring NormalizeRegistryPath(const std::wstring& raw) {
 
 static bool IsPersistencePath(const std::wstring& path) {
     auto upper = ToUpper(path);
-    return upper.find(L"\\RUN") != std::wstring::npos ||
-           upper.find(L"\\RUNONCE") != std::wstring::npos ||
-           upper.find(L"\\SERVICES\\") != std::wstring::npos;
+    // T1547.001 Run/RunOnce (per-user + per-machine)
+    if (upper.find(L"\\RUN") != std::wstring::npos ||
+        upper.find(L"\\RUNONCE") != std::wstring::npos) {
+        return true;
+    }
+    // T1543.003 Services
+    if (upper.find(L"\\SERVICES\\") != std::wstring::npos) {
+        return true;
+    }
+    // T1547.004 Winlogon Helper DLL (Userinit / Shell / AppInit_DLLs)
+    if (upper.find(L"\\WINLOGON") != std::wstring::npos ||
+        upper.find(L"APPINIT_DLLS") != std::wstring::npos) {
+        return true;
+    }
+    // T1547.005 Security Support Provider, T1547.014 Active Setup
+    if (upper.find(L"\\LSA\\") != std::wstring::npos ||
+        upper.find(L"\\ACTIVE SETUP\\") != std::wstring::npos) {
+        return true;
+    }
+    // T1546.012 Image File Execution Options debugger hijack
+    if (upper.find(L"IMAGE FILE EXECUTION OPTIONS") != std::wstring::npos) {
+        return true;
+    }
+    // T1546.001 Shell Open / COM hijack patterns
+    if (upper.find(L"\\SHELL\\OPEN\\COMMAND") != std::wstring::npos) {
+        return true;
+    }
+    return false;
+}
+
+// Detect paths that indicate EDR / AV / Windows-Defender tampering
+// (T1562.001 Impair Defenses).
+static bool IsDefenseTamperingPath(const std::wstring& path) {
+    auto upper = ToUpper(path);
+    return upper.find(L"\\WINDOWS DEFENDER") != std::wstring::npos ||
+           upper.find(L"\\MICROSOFT\\AMSI") != std::wstring::npos ||
+           upper.find(L"\\SECURITYHEALTHSERVICE") != std::wstring::npos ||
+           upper.find(L"\\WSCSVC") != std::wstring::npos ||
+           upper.find(L"\\WINDEFEND") != std::wstring::npos ||
+           upper.find(L"\\POLICIES\\MICROSOFT\\WINDOWS DEFENDER")
+               != std::wstring::npos ||
+           upper.find(L"\\SENSE\\") != std::wstring::npos ||      // Defender ATP
+           upper.find(L"\\SYSTEM\\CURRENTCONTROLSET\\SERVICES\\MPS")
+               != std::wstring::npos ||                          // Firewall
+           upper.find(L"\\SYSTEM\\CURRENTCONTROLSET\\CONTROL\\LSA\\DISABLERESTRICTEDADMIN")
+               != std::wstring::npos;
+}
+
+// Detect paths that indicate UAC / security-policy tampering
+static bool IsSecurityPolicyPath(const std::wstring& path) {
+    auto upper = ToUpper(path);
+    return upper.find(L"\\POLICIES\\SYSTEM") != std::wstring::npos ||
+           upper.find(L"\\FIREWALLPOLICY") != std::wstring::npos ||
+           upper.find(L"\\UACDISABLENOTIFY") != std::wstring::npos;
 }
 
 // ============================================================================
@@ -485,6 +543,19 @@ bool HandleNtCreateKey(APIContext& ctx) {
     GuestHandle handle = ctx.Handles().Create(HandleType::RegistryKey, keyData);
     ctx.Memory().WriteU64(keyHandleAddr, handle);
 
+    // IOC: T1547 / T1543 persistence-key creation. Dispatcher metadata sets
+    // a generic RegistryPersistence on NtSetValueKey only; a bare NtCreateKey
+    // into a persistence root (e.g. creating a brand-new service key) is
+    // itself a high-confidence persistence signal.
+    if (IsPersistencePath(keyPath)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::RegistryPersistence);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+    if (IsDefenseTamperingPath(keyPath)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     // Persistence detection is handled automatically by the dispatcher
     // via BehaviorFlag::RegistryPersistence in the KnownAPIEntry metadata.
 
@@ -540,6 +611,65 @@ bool HandleNtSetValueKey(APIContext& ctx) {
 
     VirtualRegistry::Instance().SetValue(keyData->path, valueName,
                                          valueType, data.data(), dataSize);
+
+    // IOC: classify the write target.
+    // Persistence (T1547/T1546/T1543/T1037) always emits RegistryPersistence.
+    // The dispatcher only catches the Win32 RegSetValueEx variant generically;
+    // here we add specific technique-level flags so DefenseEvasion fires when
+    // the target is a known EDR-tamper key — critical for NGAV correlation.
+    if (IsPersistencePath(keyData->path)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::RegistryPersistence);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
+        // T1546.012 IFEO Debugger hijack is BOTH persistence AND
+        // privilege escalation / execution hijack.
+        auto upperPath = ToUpper(keyData->path);
+        auto upperName = ToUpper(valueName);
+        if (upperPath.find(L"IMAGE FILE EXECUTION OPTIONS")
+                != std::wstring::npos &&
+            upperName == L"DEBUGGER") {
+            ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+            ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
+        }
+    }
+
+    if (IsDefenseTamperingPath(keyData->path)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
+    // Value-level tamper detection: well-known kill-switch DWORDs.
+    // REG_DWORD (type 4) with data == 0 into these names is the canonical
+    // Defender/AMSI disable pattern (T1562.001).
+    if (valueType == NT::REG_DWORD && dataSize == 4 && !data.empty()) {
+        uint32_t v = 0;
+        std::memcpy(&v, data.data(), 4);
+        auto upperName = ToUpper(valueName);
+        const bool killSwitch =
+            (upperName == L"DISABLEANTISPYWARE" ||
+             upperName == L"DISABLEREALTIMEMONITORING" ||
+             upperName == L"DISABLEBEHAVIORMONITORING" ||
+             upperName == L"DISABLEONACCESSPROTECTION" ||
+             upperName == L"DISABLESCANONREALTIMEENABLE" ||
+             upperName == L"DISABLEIOAVPROTECTION" ||
+             upperName == L"DISABLEBLOCKATFIRSTSEEN" ||
+             upperName == L"SPYNETREPORTING" ||
+             upperName == L"SUBMITSAMPLESCONSENT" ||
+             upperName == L"AMSIENABLE" ||
+             upperName == L"ENABLELUA" ||
+             upperName == L"CONSENTPROMPTBEHAVIORADMIN" ||
+             upperName == L"ENABLEVIRTUALIZATION" ||
+             upperName == L"ENABLEFIREWALL" ||
+             upperName == L"ENABLELOGFILE");
+        if (killSwitch && v == 0) {
+            ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
+
+    if (IsSecurityPolicyPath(keyData->path)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+    }
 
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
     return true;
@@ -668,6 +798,15 @@ bool HandleNtDeleteKey(APIContext& ctx) {
     }
 
     VirtualRegistry::Instance().DeleteKey(keyData->path);
+
+    // IOC: T1070.009 Indicator Removal — Clear Persistence, or T1562.001
+    // deleting a defender/EDR key.
+    if (IsPersistencePath(keyData->path) ||
+        IsDefenseTamperingPath(keyData->path)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
     return true;
 }
@@ -697,6 +836,15 @@ bool HandleNtDeleteValueKey(APIContext& ctx) {
         valueName = ctx.ReadUnicodeString(valueNameAddr);
 
     bool removed = VirtualRegistry::Instance().DeleteValue(keyData->path, valueName);
+
+    // IOC: deleting a persistence/defense value is an evasion signal.
+    if (removed &&
+        (IsPersistencePath(keyData->path) ||
+         IsDefenseTamperingPath(keyData->path))) {
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     ctx.SetReturnNtStatus(removed ? NT::STATUS_SUCCESS : NT::STATUS_OBJECT_NAME_NOT_FOUND);
     return true;
 }
@@ -898,3 +1046,5 @@ void RegisterNtRegistry(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
