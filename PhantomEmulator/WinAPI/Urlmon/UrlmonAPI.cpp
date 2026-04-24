@@ -32,6 +32,11 @@
 #include <string>
 #include <string_view>
 
+// DESIGN: Guest-memory writebacks are [[nodiscard]]; guest AV on writeback
+// is a guest fault, not our bug.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Urlmon {
 
 // ============================================================================
@@ -69,10 +74,13 @@ bool HandleURLDownloadToFileA(APIContext& ctx) {
         fileName = ctx.ReadAnsiString(szFileName, kMaxStringLen);
     }
 
-    // URL and filename are captured in the API call log by the dispatcher.
-    // The NetworkC2 behavioral flag is raised via the APIDatabase entry.
-    // No actual file is created in the virtual filesystem — we simulate
-    // success so the malware reveals subsequent stages.
+    // CRITICAL IOC — T1105 Ingress Tool Transfer / T1071.001 Application
+    // Layer Protocol. URLDownloadToFile is a textbook dropper primitive.
+    // Every invocation raises NetworkC2 + SuspiciousAPI regardless of URL
+    // content; downstream correlation can refine by URL/reputation later.
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    ctx.AddBehaviorFlag(BehaviorFlag::FileDropped);
 
     ctx.SetReturn32(static_cast<uint32_t>(kS_OK));
     return true;
@@ -96,6 +104,10 @@ bool HandleURLDownloadToFileW(APIContext& ctx) {
     if (szFileName != 0) {
         fileName = ctx.ReadWideString(szFileName, kMaxWideChars);
     }
+
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    ctx.AddBehaviorFlag(BehaviorFlag::FileDropped);
 
     ctx.SetReturn32(static_cast<uint32_t>(kS_OK));
     return true;
@@ -130,12 +142,15 @@ bool HandleURLDownloadToCacheFileA(APIContext& ctx) {
         mem.WriteU8(szFileName + writeLen, 0);
     }
 
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetReturn32(static_cast<uint32_t>(kS_OK));
     return true;
 }
 
 // ============================================================================
-// URLDownloadToCacheFileW — pCaller(0), szURL(1), szFileName(2),
+// URLDownloadToCacheFileW— pCaller(0), szURL(1), szFileName(2),
 //                           cchFileName(3), dwReserved(4), lpfnCB(5)
 // ============================================================================
 
@@ -161,12 +176,15 @@ bool HandleURLDownloadToCacheFileW(APIContext& ctx) {
         mem.WriteU16(szFileName + writeChars * sizeof(wchar_t), 0);
     }
 
+    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
     ctx.SetReturn32(static_cast<uint32_t>(kS_OK));
     return true;
 }
 
 // ============================================================================
-// IsValidURL — pBC(0), szURL(1), dwReserved(2) → S_OK
+// IsValidURL— pBC(0), szURL(1), dwReserved(2) → S_OK
 // ============================================================================
 // Always return S_OK — all URLs are "valid" in emulation.
 
@@ -218,3 +236,6 @@ void RegisterUrlmonAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Urlmon
+
+#pragma warning(pop)
+
