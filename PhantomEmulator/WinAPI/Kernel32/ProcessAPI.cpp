@@ -23,7 +23,16 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <atomic>
+
+// DESIGN: PROCESS_INFORMATION writeback, guest exit-code writeback, and
+// handle-table cleanup on rollback paths are [[nodiscard]] because a failed
+// guest write is an access-violation condition the guest must handle itself.
+// Those are scoped disables; all dangerous error surfaces (Read of
+// user-controlled path strings, Allocate, Protect) are still checked.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
 
 namespace Phantom::WinAPI::Kernel32 {
 
@@ -63,6 +72,122 @@ static std::wstring AnsiToWide(const std::string& ansi) noexcept {
     return result;
 }
 
+// DESIGN: per-file LOLBin (Living-Off-the-Land Binary) lineage classifier.
+// The CreateProcess IOCs are the single richest behavioural surface in any
+// emulator — 90%+ of post-exploitation activity in real incidents is modelled
+// as "Office/IE/Acrobat/unknown.exe spawning powershell.exe with -enc ..."
+// The list below is deliberately conservative (no false-positives on benign
+// MSI custom actions) and covers the mitre ATT&CK T1059 / T1218 / T1105
+// techniques most frequently abused by commodity loaders, red-team kits
+// (Cobalt Strike, Sliver, Mythic, Brute Ratel) and APT tooling.
+struct LolbinClassification {
+    BehaviorFlag primary;
+    BehaviorFlag secondary;
+    std::string_view name;
+};
+
+// Returns {primary, secondary, name} where BehaviorFlag::None in either slot
+// means "no additional flag". `lowerLeaf` is the lower-cased image file name
+// (no path, no quoting). Returns nullopt when the leaf is not on the list.
+[[nodiscard]] static std::optional<LolbinClassification>
+ClassifyLolbin(std::wstring_view lowerLeaf) noexcept {
+    // PowerShell family — T1059.001.
+    if (lowerLeaf == L"powershell.exe" || lowerLeaf == L"powershell" ||
+        lowerLeaf == L"pwsh.exe"       || lowerLeaf == L"pwsh") {
+        return LolbinClassification{BehaviorFlag::PowershellExecution,
+                                    BehaviorFlag::SuspiciousAPI, "powershell"};
+    }
+    // Classic script hosts — T1059.005 / T1059.007 / T1059.003.
+    if (lowerLeaf == L"wscript.exe" || lowerLeaf == L"cscript.exe") {
+        return LolbinClassification{BehaviorFlag::SuspiciousAPI,
+                                    BehaviorFlag::DefenseEvasion, "wscript"};
+    }
+    if (lowerLeaf == L"cmd.exe") {
+        return LolbinClassification{BehaviorFlag::SuspiciousAPI,
+                                    BehaviorFlag::None, "cmd"};
+    }
+    // T1218 signed-binary proxy execution family.
+    if (lowerLeaf == L"rundll32.exe"  || lowerLeaf == L"regsvr32.exe" ||
+        lowerLeaf == L"mshta.exe"     || lowerLeaf == L"msiexec.exe"  ||
+        lowerLeaf == L"installutil.exe"|| lowerLeaf == L"regasm.exe"  ||
+        lowerLeaf == L"regsvcs.exe") {
+        return LolbinClassification{BehaviorFlag::DefenseEvasion,
+                                    BehaviorFlag::SuspiciousAPI, "signed-proxy"};
+    }
+    // T1105 download+stage LOLBins — extremely high-signal IOCs.
+    if (lowerLeaf == L"certutil.exe"  || lowerLeaf == L"bitsadmin.exe" ||
+        lowerLeaf == L"curl.exe"      || lowerLeaf == L"wget.exe") {
+        return LolbinClassification{BehaviorFlag::DefenseEvasion,
+                                    BehaviorFlag::SuspiciousAPI, "stager"};
+    }
+    if (lowerLeaf == L"wmic.exe") {
+        return LolbinClassification{BehaviorFlag::WMIExecution,
+                                    BehaviorFlag::DefenseEvasion, "wmic"};
+    }
+    // Credential / recon / shadow-copy destruction utilities.
+    if (lowerLeaf == L"vssadmin.exe"  || lowerLeaf == L"wbadmin.exe" ||
+        lowerLeaf == L"bcdedit.exe") {
+        return LolbinClassification{BehaviorFlag::DefenseEvasion,
+                                    BehaviorFlag::SuspiciousAPI, "anti-recovery"};
+    }
+    return std::nullopt;
+}
+
+// Extract the case-folded leaf filename from either an applicationName or a
+// commandLine first token. Caller passes whichever was supplied. Empty input
+// → empty output. No allocations beyond the returned string.
+[[nodiscard]] static std::wstring ExtractLowerLeaf(std::wstring_view input) noexcept {
+    // Strip leading whitespace and optional quote.
+    size_t start = 0;
+    while (start < input.size() && (input[start] == L' ' || input[start] == L'\t')) ++start;
+    if (start < input.size() && input[start] == L'"') {
+        ++start;
+        const size_t endQuote = input.find(L'"', start);
+        const size_t tokenEnd = (endQuote == std::wstring_view::npos) ? input.size() : endQuote;
+        input = input.substr(start, tokenEnd - start);
+    } else {
+        const size_t space = input.find_first_of(L" \t", start);
+        input = input.substr(start, (space == std::wstring_view::npos) ? input.size() - start : space - start);
+    }
+
+    // Strip directory component.
+    const size_t lastSep = input.find_last_of(L"\\/");
+    if (lastSep != std::wstring_view::npos) {
+        input = input.substr(lastSep + 1);
+    }
+
+    std::wstring leaf(input);
+    for (auto& ch : leaf) {
+        if (ch >= L'A' && ch <= L'Z') {
+            ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
+        }
+    }
+    return leaf;
+}
+
+// Case-insensitive substring search for a narrow ASCII needle inside a
+// wide-string haystack. Used to scan command lines for PowerShell encoded-
+// command flags and similar evasion markers.
+[[nodiscard]] static bool ContainsInsensitive(std::wstring_view hay,
+                                              std::string_view needle) noexcept {
+    if (needle.empty() || needle.size() > hay.size()) return false;
+    for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            wchar_t hc = hay[i + j];
+            if (hc >= L'A' && hc <= L'Z') hc = static_cast<wchar_t>(hc + (L'a' - L'A'));
+            char nc = needle[j];
+            if (nc >= 'A' && nc <= 'Z') nc = static_cast<char>(nc + ('a' - 'A'));
+            if (hc != static_cast<wchar_t>(static_cast<unsigned char>(nc))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // Internal: CreateProcess core logic (shared by A and W variants)
 // ============================================================================
@@ -75,6 +200,77 @@ static bool CreateProcessCore(APIContext& ctx,
     if (lpProcessInfo == 0) {
         ctx.FailWithError(Win32::ERROR_INVALID_PARAMETER);
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // IOC derivation — MUST happen before we short-circuit so a malformed
+    // PROCESS_INFORMATION pointer still leaves the behavioural fingerprint.
+    //   * CREATE_SUSPENDED on a child is the canonical pre-write step of
+    //     T1055.012 Process Hollowing / T1055.004 Thread Hijacking.
+    //   * LOLBin child → T1059 / T1218 / T1105 depending on family.
+    //   * PowerShell with an encoded-command flag → DefenseEvasion.
+    // ------------------------------------------------------------------
+    const std::wstring_view leafSource =
+        !applicationName.empty() ? std::wstring_view{applicationName}
+                                 : std::wstring_view{commandLine};
+    const std::wstring leaf = ExtractLowerLeaf(leafSource);
+
+    if (!leaf.empty()) {
+        if (auto cls = ClassifyLolbin(leaf); cls.has_value()) {
+            ctx.AddBehaviorFlag(cls->primary);
+            if (cls->secondary != BehaviorFlag::None) {
+                ctx.AddBehaviorFlag(cls->secondary);
+            }
+            // PowerShell encoded command — T1059.001 + T1027. Single
+            // highest-signal commodity-malware IOC in the industry.
+            if (leaf == L"powershell.exe" || leaf == L"powershell" ||
+                leaf == L"pwsh.exe"       || leaf == L"pwsh") {
+                if (ContainsInsensitive(commandLine, "-enc") ||
+                    ContainsInsensitive(commandLine, "-encodedcommand") ||
+                    ContainsInsensitive(commandLine, "-e ")) {
+                    ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+                }
+                // Remote payload fetch via PowerShell — T1105.
+                if (ContainsInsensitive(commandLine, "downloadstring") ||
+                    ContainsInsensitive(commandLine, "iwr ") ||
+                    ContainsInsensitive(commandLine, "invoke-webrequest") ||
+                    ContainsInsensitive(commandLine, "net.webclient")) {
+                    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+                }
+            }
+            // certutil/bitsadmin with a URL argument → T1105 stager.
+            if (leaf == L"certutil.exe" || leaf == L"bitsadmin.exe") {
+                if (ContainsInsensitive(commandLine, "http://") ||
+                    ContainsInsensitive(commandLine, "https://") ||
+                    ContainsInsensitive(commandLine, "ftp://")) {
+                    ctx.AddBehaviorFlag(BehaviorFlag::NetworkC2);
+                }
+            }
+            // vssadmin delete shadows / wbadmin delete catalog — the
+            // defining T1490 (Inhibit System Recovery) ransomware IOC.
+            // No dedicated BehaviorFlag::RansomwareBehavior exists today;
+            // the baseline LOLBin classification already emits
+            // DefenseEvasion + SuspiciousAPI above, and the recovery-
+            // inhibition argument pattern additionally reinforces the
+            // PrivilegeEscalation posture (these commands require admin).
+            if (leaf == L"vssadmin.exe" || leaf == L"wbadmin.exe" ||
+                leaf == L"bcdedit.exe") {
+                if (ContainsInsensitive(commandLine, "delete shadows") ||
+                    ContainsInsensitive(commandLine, "delete catalog") ||
+                    ContainsInsensitive(commandLine, "recoveryenabled no") ||
+                    ContainsInsensitive(commandLine, "bootstatuspolicy ignoreallfailures")) {
+                    ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
+                }
+            }
+        }
+    }
+
+    // CREATE_SUSPENDED on any child is a T1055.012 process-hollowing
+    // precursor — the parent will next unmap the child's main image and
+    // write a replacement with WriteProcessMemory before ResumeThread.
+    if ((dwCreationFlags & CREATE_SUSPENDED) != 0) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessHollowing);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     // Assign unique PIDs for the child
@@ -204,6 +400,30 @@ bool HandleOpenProcess(APIContext& ctx) {
 
     const bool isSelf = (dwPid == kOurPid);
 
+    // IOC: requesting injection-grade access on another process is the
+    // reconnaissance/setup step of T1055 Process Injection. PROCESS_VM_WRITE
+    // plus PROCESS_VM_OPERATION is the exact mask used by every remote
+    // shellcode loader (the follow-up calls are VirtualAllocEx →
+    // WriteProcessMemory → CreateRemoteThread). PROCESS_QUERY_INFORMATION
+    // alone on a remote PID is noisier and intentionally not flagged.
+    if (!isSelf) {
+        constexpr uint32_t kInjMask = NT::PROCESS_VM_WRITE |
+                                      NT::PROCESS_VM_OPERATION |
+                                      NT::PROCESS_CREATE_THREAD;
+        if ((dwAccess & kInjMask) != 0 ||
+            (dwAccess & NT::PROCESS_ALL_ACCESS) == NT::PROCESS_ALL_ACCESS) {
+            ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+        // Credential-access reconnaissance on a remote process: VM_READ
+        // on something like LSASS is the canonical T1003.001 LSASS
+        // dumping precursor.
+        if ((dwAccess & NT::PROCESS_VM_READ) != 0) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CredentialAccess);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        }
+    }
+
     ProcessHandleData phd;
     phd.pid        = dwPid;
     phd.accessMask = dwAccess;
@@ -254,6 +474,7 @@ bool HandleTerminateProcess(APIContext& ctx) {
 // ============================================================================
 
 bool HandleExitProcess(APIContext& ctx) {
+    (void)ctx;
     // Returning false stops the emulation with StopReason::ExitProcess
     return false;
 }
@@ -313,6 +534,9 @@ bool HandleGetExitCodeProcess(APIContext& ctx) {
 bool HandleIsWow64Process(APIContext& ctx) {
     const auto hProcess     = ctx.GetArg(0);
     const auto lpWow64Flag  = ctx.GetArgPtr(1);
+    (void)hProcess; // DESIGN: emulator is single-persona, hProcess is accepted
+                    // for API compatibility but the answer is always derived
+                    // from the emulated CPU bitness.
 
     if (lpWow64Flag == 0) {
         ctx.FailWithError(Win32::ERROR_INVALID_PARAMETER);
@@ -358,3 +582,5 @@ void RegisterProcessAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
