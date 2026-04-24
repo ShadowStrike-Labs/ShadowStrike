@@ -99,12 +99,15 @@ public:
     void Reset() noexcept;
 
     // === Process Table ===
-    [[nodiscard]] const std::vector<ProcessInfo>& GetProcessList() const noexcept;
+    /// Returns a locked snapshot of the virtual process table. On allocation
+    /// failure the snapshot is empty and internal state remains unchanged.
+    [[nodiscard]] std::vector<ProcessInfo> GetProcessList() const noexcept;
     [[nodiscard]] std::optional<ProcessInfo> GetProcessByPID(uint32_t pid) const noexcept;
     [[nodiscard]] std::optional<ProcessInfo> GetProcessByName(std::wstring_view name) const noexcept;
 
     // Current emulated process info
-    [[nodiscard]] const ProcessInfo& GetCurrentProcess() const noexcept;
+    /// Returns a locked snapshot of the emulated process descriptor.
+    [[nodiscard]] ProcessInfo GetCurrentProcess() const noexcept;
     [[nodiscard]] uint32_t GetCurrentPID() const noexcept;
     [[nodiscard]] uint32_t GetParentPID() const noexcept;
 
@@ -118,7 +121,8 @@ public:
     bool TerminateThread(uint32_t tid) noexcept;
 
     // === Module List ===
-    [[nodiscard]] const std::vector<ModuleInfo>& GetModuleList() const noexcept;
+    /// Returns a locked snapshot of modules mapped into the emulated process.
+    [[nodiscard]] std::vector<ModuleInfo> GetModuleList() const noexcept;
     [[nodiscard]] std::optional<ModuleInfo> GetModuleByName(std::wstring_view name) const noexcept;
     [[nodiscard]] std::optional<ModuleInfo> GetModuleByAddress(GuestAddress addr) const noexcept;
 
@@ -141,8 +145,8 @@ private:
     VirtualProcess(const VirtualProcess&) = delete;
     VirtualProcess& operator=(const VirtualProcess&) = delete;
 
-    void PopulateProcessList() noexcept;
-    void PopulateModuleList() noexcept;
+    void PopulateProcessList(const EmulationConfig& config);
+    void PopulateModuleList();
 
     mutable std::shared_mutex m_mutex;
     std::vector<ProcessInfo>      m_processList;
