@@ -41,6 +41,10 @@
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom::VirtualOS {
 
@@ -59,6 +63,8 @@ static constexpr uint32_t kPETimestamp = 0x65A5C8A0;
 static constexpr uint64_t KB = 1024;
 static constexpr uint64_t MB = 1024 * 1024;
 static constexpr uint64_t GB = 1024 * 1024 * 1024;
+static constexpr size_t kMaxNormalizedPathChars = 4096;
+static constexpr size_t kMaxTrackedIOCs = 10000;
 
 // ============================================================================
 // Little-Endian Write Helpers (for PE stub generation)
@@ -104,6 +110,39 @@ void WriteU64LE(std::vector<uint8_t>& buf, size_t offset, uint64_t value) noexce
     return std::wstring(path.substr(sep + 1));
 }
 
+[[nodiscard]] bool IsSafePathInput(std::wstring_view path) noexcept {
+    if (path.empty() || path.size() > kMaxNormalizedPathChars) return false;
+    return path.find(L'\0') == std::wstring_view::npos;
+}
+
+[[nodiscard]] bool CheckedAdd(uint64_t lhs, uint64_t rhs, uint64_t& out) noexcept {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
+    out = lhs + rhs;
+    return true;
+}
+
+[[nodiscard]] bool CheckedTotalGrowth(
+    uint64_t total,
+    uint64_t growth,
+    uint64_t cap) noexcept
+{
+    return growth <= cap && total <= cap - growth;
+}
+
+[[nodiscard]] std::wstring ParentPathOf(std::wstring_view normalized) {
+    const auto lastSep = normalized.rfind(L'\\');
+    if (lastSep == std::wstring_view::npos) return {};
+    if (lastSep <= 2) return std::wstring(normalized.substr(0, 2));
+    return std::wstring(normalized.substr(0, lastSep));
+}
+
+void TrackUniquePath(std::vector<std::wstring>& sink, const std::wstring& path) {
+    if (sink.size() >= kMaxTrackedIOCs) return;
+    if (std::find(sink.begin(), sink.end(), path) == sink.end()) {
+        sink.push_back(path);
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -129,7 +168,9 @@ void WriteU64LE(std::vector<uint8_t>& buf, size_t offset, uint64_t value) noexce
 //   - Trailing backslashes removed (root "c:" preserved)
 
 std::wstring VirtualFileSystem::NormalizePath(std::wstring_view path) noexcept {
-    if (path.empty()) return {};
+    if (!IsSafePathInput(path)) return {};
+
+    try {
 
     std::wstring result(path);
 
@@ -270,6 +311,11 @@ std::wstring VirtualFileSystem::NormalizePath(std::wstring_view path) noexcept {
     }
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -355,6 +401,7 @@ std::vector<uint8_t> VirtualFileSystem::GeneratePEStub(
     bool isDll,
     bool is64bit) noexcept
 {
+    try {
     constexpr size_t kStubSize = 512;
     std::vector<uint8_t> stub(kStubSize, 0);
 
@@ -455,6 +502,11 @@ std::vector<uint8_t> VirtualFileSystem::GeneratePEStub(
     }
 
     return stub;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -481,6 +533,7 @@ VirtualFileSystem& VirtualFileSystem::Instance() noexcept {
 // at session end before the VFS singleton is reused for the next sample.
 
 void VirtualFileSystem::Initialize(const EmulationConfig& config) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized) return;
@@ -492,6 +545,11 @@ void VirtualFileSystem::Initialize(const EmulationConfig& config) noexcept {
 
     PopulateDefaultFileSystem(config);
     m_initialized = true;
+    } catch (const std::bad_alloc&) {
+        Reset();
+    } catch (const std::length_error&) {
+        Reset();
+    }
 }
 
 void VirtualFileSystem::Reset() noexcept {
@@ -516,6 +574,7 @@ void VirtualFileSystem::Reset() noexcept {
 // ============================================================================
 
 void VirtualFileSystem::AddSystemDirectory(std::wstring_view path) noexcept {
+    try {
     if (m_files.size() >= kMaxFileCount) return;
 
     std::wstring normalized(path);
@@ -533,6 +592,11 @@ void VirtualFileSystem::AddSystemDirectory(std::wstring_view path) noexcept {
     entry.isPrePopulated = true;
 
     m_files.emplace(std::move(normalized), std::move(entry));
+    } catch (const std::bad_alloc&) {
+        return;
+    } catch (const std::length_error&) {
+        return;
+    }
 }
 
 void VirtualFileSystem::AddSystemFile(
@@ -540,6 +604,7 @@ void VirtualFileSystem::AddSystemFile(
     uint64_t size,
     uint32_t attrs) noexcept
 {
+    try {
     if (m_files.size() >= kMaxFileCount) return;
 
     std::wstring normalized(path);
@@ -558,6 +623,11 @@ void VirtualFileSystem::AddSystemFile(
     entry.isPrePopulated = true;
 
     m_files.emplace(std::move(normalized), std::move(entry));
+    } catch (const std::bad_alloc&) {
+        return;
+    } catch (const std::length_error&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -588,6 +658,7 @@ void VirtualFileSystem::AddSystemFile(
 void VirtualFileSystem::PopulateDefaultFileSystem(
     const EmulationConfig& config) noexcept
 {
+    static_cast<void>(config);
     // ----------------------------------------------------------------
     // Drive root
     // ----------------------------------------------------------------
@@ -1236,6 +1307,7 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
     uint32_t /*shareMode*/,
     uint32_t disposition) noexcept
 {
+    try {
     std::unique_lock lock(m_mutex);
 
     // Parse ADS stream name if present (e.g., "C:\path\file.exe:Zone.Identifier")
@@ -1253,11 +1325,21 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
     auto it = m_files.find(normalized);
     bool exists = (it != m_files.end());
 
+    auto parentExists = [this](const std::wstring& normalizedPath) {
+        const std::wstring parent = ParentPathOf(normalizedPath);
+        if (parent.empty()) return false;
+        const auto parentIt = m_files.find(parent);
+        return parentIt != m_files.end() &&
+               (parentIt->second.attributes & FileAttr::Directory) != 0;
+    };
+
     switch (disposition) {
         case CreateDisposition::CreateNew: {
-            if (exists) return std::nullopt;
+            if (exists && !isADS) return std::nullopt;
+            if (exists && isADS) break;
 
             if (m_files.size() >= kMaxFileCount) return std::nullopt;
+            if (!parentExists(normalized)) return std::nullopt;
 
             VirtualFileEntry entry;
             entry.name           = ExtractFileName(normalized);
@@ -1269,12 +1351,13 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
             entry.isPrePopulated = false;
 
             it = m_files.emplace(normalized, std::move(entry)).first;
-            m_malwareCreatedFiles.push_back(normalized);
+            TrackUniquePath(m_malwareCreatedFiles, normalized);
             break;
         }
 
         case CreateDisposition::CreateAlways: {
-            if (exists) {
+            if (exists && isADS) break;
+            if (exists && !isADS) {
                 // Truncate existing content
                 auto& entry = it->second;
                 m_totalContentSize -= entry.content.size();
@@ -1282,9 +1365,10 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
                 entry.fileSize       = 0;
                 entry.lastWriteTime  = kSystemFileTime;
                 entry.isPrePopulated = false;
-                m_malwareCreatedFiles.push_back(normalized);
+                TrackUniquePath(m_malwareCreatedFiles, normalized);
             } else {
                 if (m_files.size() >= kMaxFileCount) return std::nullopt;
+                if (!exists && !parentExists(normalized)) return std::nullopt;
 
                 VirtualFileEntry entry;
                 entry.name           = ExtractFileName(normalized);
@@ -1296,7 +1380,7 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
                 entry.isPrePopulated = false;
 
                 it = m_files.emplace(normalized, std::move(entry)).first;
-                m_malwareCreatedFiles.push_back(normalized);
+                TrackUniquePath(m_malwareCreatedFiles, normalized);
             }
             break;
         }
@@ -1309,6 +1393,7 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
         case CreateDisposition::OpenAlways: {
             if (!exists) {
                 if (m_files.size() >= kMaxFileCount) return std::nullopt;
+                if (!parentExists(normalized)) return std::nullopt;
 
                 VirtualFileEntry entry;
                 entry.name           = ExtractFileName(normalized);
@@ -1320,7 +1405,7 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
                 entry.isPrePopulated = false;
 
                 it = m_files.emplace(normalized, std::move(entry)).first;
-                m_malwareCreatedFiles.push_back(normalized);
+                TrackUniquePath(m_malwareCreatedFiles, normalized);
             }
             break;
         }
@@ -1328,11 +1413,13 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
         case CreateDisposition::TruncateExisting: {
             if (!exists) return std::nullopt;
 
-            auto& entry = it->second;
-            m_totalContentSize -= entry.content.size();
-            entry.content.clear();
-            entry.fileSize       = 0;
-            entry.lastWriteTime  = kSystemFileTime;
+            if (!isADS) {
+                auto& entry = it->second;
+                m_totalContentSize -= entry.content.size();
+                entry.content.clear();
+                entry.fileSize       = 0;
+                entry.lastWriteTime  = kSystemFileTime;
+            }
             break;
         }
 
@@ -1357,7 +1444,8 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
         // Create the stream if disposition allows creation
         auto streamIt = entry.alternateStreams.find(streamName);
         if (streamIt == entry.alternateStreams.end()) {
-            if (disposition == CreateDisposition::OpenExisting) {
+            if (disposition == CreateDisposition::OpenExisting ||
+                disposition == CreateDisposition::TruncateExisting) {
                 return std::nullopt;
             }
             AlternateDataStream ads;
@@ -1368,8 +1456,10 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
 
             // IOC: record ADS creation event
             std::wstring adsEvent = normalized + L":" + streamName;
-            m_adsWriteEvents.push_back(adsEvent);
-            m_malwareCreatedFiles.push_back(adsEvent);
+            TrackUniquePath(m_adsWriteEvents, adsEvent);
+            TrackUniquePath(m_malwareCreatedFiles, adsEvent);
+        } else if (disposition == CreateDisposition::CreateNew) {
+            return std::nullopt;
         } else if (disposition == CreateDisposition::CreateAlways ||
                    disposition == CreateDisposition::TruncateExisting) {
             auto& ads = streamIt->second;
@@ -1380,6 +1470,10 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
     }
 
     // Create open-file state
+    if (m_openFiles.size() >= kMaxOpenFiles ||
+        m_nextFileId == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
     uint32_t fileId = m_nextFileId++;
     OpenFileState state;
     state.path        = normalized;
@@ -1391,6 +1485,11 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
 
     m_openFiles.emplace(fileId, std::move(state));
     return fileId;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -1439,12 +1538,18 @@ uint32_t VirtualFileSystem::ReadFile(
 {
     if (!buffer || bytesToRead == 0) return 0;
 
+    try {
     std::unique_lock lock(m_mutex);
 
     auto stateIt = m_openFiles.find(fileId);
     if (stateIt == m_openFiles.end()) return 0;
 
     auto& state = stateIt->second;
+
+    if (!(state.access & FileAccess::Read) &&
+        !(state.access & FileAccess::All)) {
+        return 0;
+    }
 
     auto fileIt = m_files.find(state.path);
     if (fileIt == m_files.end()) return 0;
@@ -1549,6 +1654,11 @@ uint32_t VirtualFileSystem::ReadFile(
 
     state.position += toRead;
     return toRead;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 // ============================================================================
@@ -1579,6 +1689,7 @@ uint32_t VirtualFileSystem::WriteFile(
 {
     if (!buffer || bytesToWrite == 0) return 0;
 
+    try {
     std::unique_lock lock(m_mutex);
 
     auto stateIt = m_openFiles.find(fileId);
@@ -1605,7 +1716,8 @@ uint32_t VirtualFileSystem::WriteFile(
 
         auto& ads = streamIt->second;
 
-        uint64_t endPos = state.position + bytesToWrite;
+        uint64_t endPos = 0;
+        if (!CheckedAdd(state.position, bytesToWrite, endPos)) return 0;
 
         // Per-stream content cap
         if (endPos > kMaxStreamContentSize) {
@@ -1619,7 +1731,7 @@ uint32_t VirtualFileSystem::WriteFile(
         uint64_t newSize     = std::max<uint64_t>(currentSize, endPos);
         uint64_t growth      = newSize - currentSize;
 
-        if (growth > 0 && m_totalContentSize + growth > kMaxTotalContent) {
+        if (growth > 0 && !CheckedTotalGrowth(m_totalContentSize, growth, kMaxTotalContent)) {
             uint64_t allowable = kMaxTotalContent - m_totalContentSize;
             if (allowable == 0) return 0;
             uint64_t maxEnd = currentSize + allowable;
@@ -1638,15 +1750,12 @@ uint32_t VirtualFileSystem::WriteFile(
         }
 
         std::memcpy(ads.content.data() + state.position, buffer, bytesToWrite);
-        state.position += bytesToWrite;
+        state.position = endPos;
         ads.lastWriteTime = kSystemFileTime;
 
         // IOC: record ADS write event
         std::wstring adsEvent = state.path + L":" + state.streamName;
-        if (std::find(m_adsWriteEvents.begin(), m_adsWriteEvents.end(), adsEvent)
-            == m_adsWriteEvents.end()) {
-            m_adsWriteEvents.push_back(adsEvent);
-        }
+        TrackUniquePath(m_adsWriteEvents, adsEvent);
 
         return bytesToWrite;
     }
@@ -1654,7 +1763,8 @@ uint32_t VirtualFileSystem::WriteFile(
     // === Default stream write path ===
 
     // Determine the required content size after this write
-    uint64_t endPos = state.position + bytesToWrite;
+    uint64_t endPos = 0;
+    if (!CheckedAdd(state.position, bytesToWrite, endPos)) return 0;
 
     // Per-file content cap
     if (endPos > kMaxPerFileContent) {
@@ -1668,7 +1778,7 @@ uint32_t VirtualFileSystem::WriteFile(
     uint64_t newEntrySize     = std::max<uint64_t>(currentEntrySize, endPos);
     uint64_t growth           = newEntrySize - currentEntrySize;
 
-    if (growth > 0 && m_totalContentSize + growth > kMaxTotalContent) {
+    if (growth > 0 && !CheckedTotalGrowth(m_totalContentSize, growth, kMaxTotalContent)) {
         // Clamp the write to what fits within the global cap
         uint64_t allowable = kMaxTotalContent - m_totalContentSize;
         if (allowable == 0) return 0;
@@ -1696,7 +1806,7 @@ uint32_t VirtualFileSystem::WriteFile(
     // Write data
     std::memcpy(entry.content.data() + state.position, buffer, bytesToWrite);
 
-    state.position = state.position + bytesToWrite;
+    state.position = endPos;
 
     // Update file size metadata if the write extended the file
     if (endPos > entry.fileSize) {
@@ -1705,12 +1815,14 @@ uint32_t VirtualFileSystem::WriteFile(
     entry.lastWriteTime = kSystemFileTime;
 
     // Track as malware-modified if not already tracked
-    auto& created = m_malwareCreatedFiles;
-    if (std::find(created.begin(), created.end(), state.path) == created.end()) {
-        created.push_back(state.path);
-    }
+    TrackUniquePath(m_malwareCreatedFiles, state.path);
 
     return bytesToWrite;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 
 // ============================================================================
@@ -1747,13 +1859,31 @@ int64_t VirtualFileSystem::SetFilePointer(
             newPos = distance;
             break;
 
-        case SeekOrigin::Current:
-            newPos = static_cast<int64_t>(state.position) + distance;
+        case SeekOrigin::Current: {
+            if (state.position > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                return -1;
+            }
+            const int64_t current = static_cast<int64_t>(state.position);
+            if ((distance > 0 && current > std::numeric_limits<int64_t>::max() - distance) ||
+                (distance < 0 && current < std::numeric_limits<int64_t>::min() - distance)) {
+                return -1;
+            }
+            newPos = current + distance;
             break;
+        }
 
-        case SeekOrigin::End:
-            newPos = static_cast<int64_t>(fileIt->second.fileSize) + distance;
+        case SeekOrigin::End: {
+            if (fileIt->second.fileSize > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                return -1;
+            }
+            const int64_t end = static_cast<int64_t>(fileIt->second.fileSize);
+            if ((distance > 0 && end > std::numeric_limits<int64_t>::max() - distance) ||
+                (distance < 0 && end < std::numeric_limits<int64_t>::min() - distance)) {
+                return -1;
+            }
+            newPos = end + distance;
             break;
+        }
 
         default:
             return -1;
@@ -1797,6 +1927,7 @@ std::optional<uint64_t> VirtualFileSystem::GetFileSize(uint32_t fileId) const no
 //   - Content memory is reclaimed from the total content budget.
 
 bool VirtualFileSystem::DeleteFile(std::wstring_view path) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(path);
@@ -1812,13 +1943,21 @@ bool VirtualFileSystem::DeleteFile(std::wstring_view path) noexcept {
     if (it->second.attributes & FileAttr::Directory) return false;
 
     // Track for IOC
-    m_malwareDeletedFiles.push_back(normalized);
+    TrackUniquePath(m_malwareDeletedFiles, normalized);
 
     // Reclaim content memory
     m_totalContentSize -= it->second.content.size();
+    for (const auto& [_, stream] : it->second.alternateStreams) {
+        m_totalContentSize -= stream.content.size();
+    }
 
     m_files.erase(it);
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -1835,6 +1974,7 @@ bool VirtualFileSystem::MoveFile(
     std::wstring_view oldPath,
     std::wstring_view newPath) noexcept
 {
+    try {
     std::unique_lock lock(m_mutex);
 
     std::wstring oldNorm = NormalizePath(oldPath);
@@ -1850,7 +1990,21 @@ bool VirtualFileSystem::MoveFile(
     // Destination must not exist
     if (m_files.count(newNorm) > 0) return false;
 
-    if (m_files.size() >= kMaxFileCount) return false;
+    const std::wstring parent = ParentPathOf(newNorm);
+    auto parentIt = m_files.find(parent);
+    if (parentIt == m_files.end() ||
+        (parentIt->second.attributes & FileAttr::Directory) == 0) {
+        return false;
+    }
+
+    if ((srcIt->second.attributes & FileAttr::Directory) != 0) {
+        const std::wstring prefix = oldNorm + L"\\";
+        auto childIt = m_files.lower_bound(prefix);
+        if (childIt != m_files.end() &&
+            childIt->first.compare(0, prefix.size(), prefix) == 0) {
+            return false;
+        }
+    }
 
     // Move the entry
     VirtualFileEntry entry = std::move(srcIt->second);
@@ -1862,10 +2016,21 @@ bool VirtualFileSystem::MoveFile(
 
     m_files.emplace(newNorm, std::move(entry));
 
+    for (auto& [_, openState] : m_openFiles) {
+        if (openState.path == oldNorm) {
+            openState.path = newNorm;
+        }
+    }
+
     // Track for IOC
-    m_malwareCreatedFiles.push_back(newNorm);
+    TrackUniquePath(m_malwareCreatedFiles, newNorm);
 
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -1881,6 +2046,7 @@ bool VirtualFileSystem::CopyFile(
     std::wstring_view srcPath,
     std::wstring_view dstPath) noexcept
 {
+    try {
     std::unique_lock lock(m_mutex);
 
     std::wstring srcNorm = NormalizePath(srcPath);
@@ -1889,14 +2055,23 @@ bool VirtualFileSystem::CopyFile(
 
     auto srcIt = m_files.find(srcNorm);
     if (srcIt == m_files.end()) return false;
+    if ((srcIt->second.attributes & FileAttr::Directory) != 0) return false;
 
     if (m_files.count(dstNorm) > 0) return false;
 
     if (m_files.size() >= kMaxFileCount) return false;
 
+    const std::wstring parent = ParentPathOf(dstNorm);
+    auto parentIt = m_files.find(parent);
+    if (parentIt == m_files.end() ||
+        (parentIt->second.attributes & FileAttr::Directory) == 0) {
+        return false;
+    }
+
     // Check total content cap for the copy
     uint64_t contentBytes = srcIt->second.content.size();
-    if (contentBytes > 0 && m_totalContentSize + contentBytes > kMaxTotalContent) {
+    if (contentBytes > 0 &&
+        !CheckedTotalGrowth(m_totalContentSize, contentBytes, kMaxTotalContent)) {
         return false;
     }
 
@@ -1910,9 +2085,14 @@ bool VirtualFileSystem::CopyFile(
     m_files.emplace(dstNorm, std::move(entry));
 
     // Track for IOC
-    m_malwareCreatedFiles.push_back(dstNorm);
+    TrackUniquePath(m_malwareCreatedFiles, dstNorm);
 
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -1923,12 +2103,18 @@ bool VirtualFileSystem::CopyFile(
 // Returns true for both files and directories.
 
 bool VirtualFileSystem::Exists(std::wstring_view path) const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(path);
     if (normalized.empty()) return false;
 
     return m_files.count(normalized) > 0;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -1941,6 +2127,7 @@ bool VirtualFileSystem::Exists(std::wstring_view path) const noexcept {
 std::optional<uint32_t> VirtualFileSystem::GetAttributes(
     std::wstring_view path) const noexcept
 {
+    try {
     std::shared_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(path);
@@ -1950,6 +2137,11 @@ std::optional<uint32_t> VirtualFileSystem::GetAttributes(
     if (it == m_files.end()) return std::nullopt;
 
     return it->second.attributes;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -1963,6 +2155,7 @@ std::optional<uint32_t> VirtualFileSystem::GetAttributes(
 std::optional<VirtualFileEntry> VirtualFileSystem::GetFileInfo(
     std::wstring_view path) const noexcept
 {
+    try {
     std::shared_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(path);
@@ -1984,6 +2177,11 @@ std::optional<VirtualFileEntry> VirtualFileSystem::GetFileInfo(
     // content intentionally left empty for performance
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -1995,6 +2193,7 @@ std::optional<VirtualFileEntry> VirtualFileSystem::GetFileInfo(
 // are NOT marked as pre-populated, allowing them to be deleted/renamed.
 
 bool VirtualFileSystem::CreateDirectory(std::wstring_view path) noexcept {
+    try {
     std::unique_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(path);
@@ -2026,6 +2225,11 @@ bool VirtualFileSystem::CreateDirectory(std::wstring_view path) noexcept {
     m_files.emplace(std::move(normalized), std::move(entry));
 
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -2053,6 +2257,7 @@ std::optional<uint32_t> VirtualFileSystem::FindFirst(
     std::wstring_view pattern,
     DirectoryEntry& firstEntry) noexcept
 {
+    try {
     std::unique_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(pattern);
@@ -2112,6 +2317,10 @@ std::optional<uint32_t> VirtualFileSystem::FindFirst(
     }
 
     if (results.empty()) return std::nullopt;
+    if (m_findHandles.size() >= kMaxFindHandles ||
+        m_nextFindId == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
 
     // Snapshot the first entry for the caller
     firstEntry = results[0];
@@ -2124,6 +2333,11 @@ std::optional<uint32_t> VirtualFileSystem::FindFirst(
 
     m_findHandles.emplace(findId, std::move(fs));
     return findId;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        return std::nullopt;
+    }
 }
 
 bool VirtualFileSystem::FindNext(
@@ -2157,6 +2371,7 @@ void VirtualFileSystem::FindClose(uint32_t findId) noexcept {
 // Malware commonly calls this to determine a drop location.
 
 std::wstring VirtualFileSystem::GetTempPath() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
 
     if (m_userName.empty()) {
@@ -2164,6 +2379,11 @@ std::wstring VirtualFileSystem::GetTempPath() const noexcept {
     }
     // Return mixed-case path (as Windows would)
     return L"C:\\Users\\" + m_userName + L"\\AppData\\Local\\Temp\\";
+    } catch (const std::bad_alloc&) {
+        return L"C:\\Users\\Default\\AppData\\Local\\Temp\\";
+    } catch (const std::length_error&) {
+        return L"C:\\Users\\Default\\AppData\\Local\\Temp\\";
+    }
 }
 
 // ============================================================================
@@ -2178,13 +2398,21 @@ std::wstring VirtualFileSystem::GetTempPath() const noexcept {
 // Both return copies under a shared_lock for thread safety.
 
 std::vector<std::wstring> VirtualFileSystem::GetMalwareCreatedFiles() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_malwareCreatedFiles;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 std::vector<std::wstring> VirtualFileSystem::GetMalwareDeletedFiles() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_malwareDeletedFiles;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -2204,6 +2432,9 @@ std::vector<std::wstring> VirtualFileSystem::GetMalwareDeletedFiles() const noex
 std::pair<std::wstring, std::wstring>
 VirtualFileSystem::ParseStreamPath(std::wstring_view fullPath) noexcept
 {
+    if (!IsSafePathInput(fullPath)) return {};
+
+    try {
     // Find the last path separator to avoid splitting on drive letter colons.
     // E.g., "C:\dir\file.exe:ads" — the colon after "C" is a drive letter.
     auto lastSep = fullPath.rfind(L'\\');
@@ -2221,9 +2452,14 @@ VirtualFileSystem::ParseStreamPath(std::wstring_view fullPath) noexcept
     std::wstring streamPart(fullPath.substr(colonPos + 1));
 
     // Strip $DATA type suffix if present (e.g., "Zone.Identifier:$DATA")
-    auto dataPos = streamPart.find(L":$DATA");
-    if (dataPos != std::wstring::npos) {
-        streamPart.erase(dataPos);
+    auto streamTypePos = streamPart.find(L':');
+    if (streamTypePos != std::wstring::npos) {
+        std::wstring_view streamType(streamPart.data() + streamTypePos + 1,
+                                     streamPart.size() - streamTypePos - 1);
+        if (!WildcardMatch(L"$data", streamType)) {
+            return { std::wstring(fullPath), std::wstring() };
+        }
+        streamPart.erase(streamTypePos);
     }
 
     // Empty stream name after stripping (e.g., "::$DATA") → default stream
@@ -2247,6 +2483,11 @@ VirtualFileSystem::ParseStreamPath(std::wstring_view fullPath) noexcept
     }
 
     return { std::move(basePath), std::move(streamPart) };
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -2256,6 +2497,7 @@ VirtualFileSystem::ParseStreamPath(std::wstring_view fullPath) noexcept
 std::vector<std::wstring> VirtualFileSystem::EnumerateStreams(
     std::wstring_view filePath) const noexcept
 {
+    try {
     std::shared_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(filePath);
@@ -2268,6 +2510,11 @@ std::vector<std::wstring> VirtualFileSystem::EnumerateStreams(
         names.push_back(name);
     }
     return names;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -2278,6 +2525,7 @@ bool VirtualFileSystem::DeleteStream(
     std::wstring_view filePath,
     std::wstring_view streamName) noexcept
 {
+    try {
     std::unique_lock lock(m_mutex);
 
     std::wstring normalized = NormalizePath(filePath);
@@ -2295,6 +2543,11 @@ bool VirtualFileSystem::DeleteStream(
     m_totalContentSize -= streamIt->second.content.size();
     fileIt->second.alternateStreams.erase(streamIt);
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -2302,8 +2555,12 @@ bool VirtualFileSystem::DeleteStream(
 // ============================================================================
 
 std::vector<std::wstring> VirtualFileSystem::GetADSWriteEvents() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_adsWriteEvents;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 } // namespace Phantom::VirtualOS

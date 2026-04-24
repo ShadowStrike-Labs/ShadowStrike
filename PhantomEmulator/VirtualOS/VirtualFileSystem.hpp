@@ -263,6 +263,9 @@ private:
     static constexpr uint64_t kMaxTotalContent     = 256ULL * 1024 * 1024;
     static constexpr uint32_t kMaxStreamsPerFile    = 64;
     static constexpr uint64_t kMaxStreamContentSize = 16ULL * 1024 * 1024;
+    static constexpr uint32_t kMaxOpenFiles         = 4096;
+    static constexpr uint32_t kMaxFindHandles       = 1024;
+    static constexpr uint32_t kMaxIOCHistory        = 10000;
 
     mutable std::shared_mutex m_mutex;
 
