@@ -43,6 +43,13 @@
 #include <cctype>
 #include <bit>
 
+// DESIGN: Guest writebacks and the AnalyzeComCreation probe both return
+// [[nodiscard]] bools we intentionally ignore. Guest writeback failure is
+// a guest-side fault; the probe's return is surfaced via the detector
+// singleton instead of the call site.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Vss {
 
 // ============================================================================
@@ -459,7 +466,11 @@ bool HandleCreateVssBackupComponents(APIContext& ctx) {
         }
     }
 
+    // T1490 Inhibit System Recovery — dropping the T1490 MITRE flag
+    // equivalents we have: SuspiciousAPI always, DefenseEvasion because
+    // shadow-copy destruction is the canonical forensic-erasure primitive.
     ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
 
     // Record this as a direct COM VSS access via the known CLSID.
     // Pass the real IVssBackupComponents CLSID bytes so AnalyzeComCreation
@@ -485,3 +496,6 @@ void RegisterVssAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Vss
+
+#pragma warning(pop)
+
