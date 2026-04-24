@@ -33,6 +33,13 @@
 #include <cstring>
 #include <unordered_set>
 
+// DESIGN: The emulator deliberately discards the [[nodiscard]] ErrorCode from
+// VirtualMemory::Write* calls inside these handlers. A write failure on an
+// output pointer is never actionable — the sample supplied a bad pointer and
+// we simply return the appropriate Win32 error. Scope: this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -74,14 +81,6 @@ static bool IsCallbackInWritableMemory(VirtualMemory& mem,
     auto prot = mem.GetProtection(callbackAddr);
     if (!prot.has_value()) return false;
     return HasProt(*prot, MemProt::Write);
-}
-
-static bool IsCallbackInExecutableMemory(VirtualMemory& mem,
-                                         GuestAddress callbackAddr) noexcept {
-    if (callbackAddr == 0) return false;
-    auto prot = mem.GetProtection(callbackAddr);
-    if (!prot.has_value()) return false;
-    return HasProt(*prot, MemProt::Execute);
 }
 
 static bool IsCallbackInWXMemory(VirtualMemory& mem,
@@ -131,15 +130,19 @@ bool HandleQueueUserAPC(APIContext& ctx) {
         }
     }
 
-    // Behavioral analysis: is this a cross-process or cross-thread APC?
-    // The dispatcher records flags, but the handler sets them on the context
-    // through the call detail. For self-thread APC (e.g., shellcode staging),
-    // we still flag CodeInjection if the callback is in writable memory.
-    // For cross-process APC, we flag ProcessInjection.
-    //
-    // Note: The behavioral flags here are informational — they are accumulated
-    // by the dispatcher's RecordCall / DetectBehaviors path. The handler just
-    // needs to return plausible values.
+    // Behavioral attribution — this is the entire point of intercepting
+    // QueueUserAPC. Cross-thread or cross-process APC queueing is
+    // MITRE T1055.004 (APC injection); shellcode callbacks in writable
+    // memory indicate staged-payload execution.
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    if (!IsSelfThread(hThread, ctx.Handles())) {
+        // Cross-thread / cross-process APC — stealth injection primitive.
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+    }
+    if (IsCallbackInWritableMemory(ctx.Memory(), pfnAPC)) {
+        // APC routine sits in writable memory — shellcode staging.
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+    }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -216,6 +219,16 @@ bool HandleCreateTimerQueueTimer(APIContext& ctx) {
     if (timerHandle == kNullHandle) {
         ctx.FailWithError(Win32::ERROR_NOT_ENOUGH_MEMORY);
         return true;
+    }
+
+    // Behavioral attribution — timer-queue callbacks pointing to writable
+    // memory are a well-documented deferred-execution vector for shellcode
+    // (see MITRE T1053.005 / ATT&CK timer-queue persistence patterns).
+    if (IsCallbackInWXMemory(ctx.Memory(), pfnCallback)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    } else if (IsCallbackInWritableMemory(ctx.Memory(), pfnCallback)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     // Write the new timer handle to the output pointer
@@ -295,8 +308,13 @@ bool HandleSetTimer(APIContext& ctx) {
     // Return a timer ID. If hWnd is NULL and nIDEvent is 0, Windows assigns one.
     uint64_t timerId = (nIDEvent != 0) ? nIDEvent : s_nextSetTimerId++;
 
-    // Suspicious callback detection is handled by the dispatcher's behavioral
-    // analysis. The handler returns a plausible timer ID.
+    // Behavioral attribution — a WM_TIMER callback pointing into writable
+    // or W+X memory indicates shellcode execution via the user32 message
+    // pump (T1056 / callback abuse).
+    if (lpTimerFunc != 0 && IsCallbackInWritableMemory(ctx.Memory(), lpTimerFunc)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturn(timerId);
@@ -341,6 +359,17 @@ bool HandleRegisterWaitForSingleObject(APIContext& ctx) {
     if (waitHandle == kNullHandle) {
         ctx.FailWithError(Win32::ERROR_NOT_ENOUGH_MEMORY);
         return true;
+    }
+
+    // Behavioral attribution — RegisterWaitForSingleObject with the
+    // callback sitting in W+X memory is a textbook shellcode primitive:
+    // the thread-pool worker jumps straight into attacker-controlled bytes
+    // when the wait object signals.
+    if (IsCallbackInWXMemory(ctx.Memory(), pfnCallback)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    } else if (IsCallbackInWritableMemory(ctx.Memory(), pfnCallback)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     // Write the wait handle to the output pointer
@@ -401,3 +430,5 @@ void RegisterAPCInjectionAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
