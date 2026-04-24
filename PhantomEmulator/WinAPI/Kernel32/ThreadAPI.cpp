@@ -28,6 +28,14 @@
 #include <algorithm>
 #include <cstring>
 
+// DESIGN: CONTEXT writeback, thread-id writeback and HandleTable::Modify are
+// all best-effort side effects. A partial guest-memory write is a guest-side
+// access violation the caller must cope with; the Win32 BOOL result is
+// driven off the preceding validated Lookup. Pragma is namespace-scoped and
+// every handle-lookup / input-validation return is still checked explicitly.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -51,6 +59,60 @@ static bool IsSelfProcess(GuestHandle handle) noexcept {
     return handle == kCurrentProcess || handle == kNullHandle;
 }
 
+// DESIGN: classify a thread start address. Shellcode / reflective loaders
+// land RIP on anonymous RWX private memory; legitimate threads land on
+// image-backed executable-readonly pages. We cannot perfectly distinguish
+// "image section" vs "private" here without walking the VAD tree, but the
+// single most reliable cross-cutting heuristic is "start address sits on a
+// writable-executable page", which no compiler toolchain emits in 2026.
+enum class StartAddrClass {
+    ImageBacked,     // executable but not writable — benign pattern
+    WritableExec,    // RWX private memory — shellcode signature
+    NonExecutable,   // start address has no X bit — will fault on first
+                     // fetch; still an IOC of a bad / hollowed RIP target
+    Unbacked         // address has no mapping at all — deliberate-AV tricks
+};
+
+[[nodiscard]] static StartAddrClass
+ClassifyStartAddress(const VirtualMemory& mem, GuestAddress startAddr) noexcept {
+    auto protOpt = mem.GetProtection(startAddr);
+    if (!protOpt.has_value()) {
+        return StartAddrClass::Unbacked;
+    }
+    const MemProt prot = protOpt.value();
+    const bool hasExec  = HasProt(prot, MemProt::Execute);
+    const bool hasWrite = HasProt(prot, MemProt::Write);
+    if (!hasExec)        return StartAddrClass::NonExecutable;
+    if (hasWrite)        return StartAddrClass::WritableExec;
+    return StartAddrClass::ImageBacked;
+}
+
+// Emit the behaviour flags associated with a CreateThread-family start
+// address. `remote` tightens the verdict — a RWX private destination in
+// another process is the unambiguous T1055.002 shellcode pattern.
+static void EmitStartAddrIOCs(APIContext& ctx, StartAddrClass c, bool remote) noexcept {
+    switch (c) {
+        case StartAddrClass::WritableExec:
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            if (remote) {
+                ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+            }
+            break;
+        case StartAddrClass::Unbacked:
+        case StartAddrClass::NonExecutable:
+            // A thread whose start address isn't executable will fault on
+            // first fetch; this is occasionally seen in packers that pre-
+            // allocate a stub page and expect VirtualProtect to be called
+            // externally, but it is never a benign code path.
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            break;
+        case StartAddrClass::ImageBacked:
+            // Benign pattern — do not flag.
+            break;
+    }
+}
+
 // ============================================================================
 // CreateThread
 // ============================================================================
@@ -68,6 +130,12 @@ bool HandleCreateThread(APIContext& ctx) {
     (void)dwStackSize;
     (void)lpParameter;
 
+    // IOC: classify the start address before doing anything else. A RWX
+    // private start address — even in-process — is the shellcode pattern
+    // every packer / MSF / Cobalt Strike loader eventually executes.
+    const auto startClass = ClassifyStartAddress(ctx.Memory(), lpStartAddress);
+    EmitStartAddrIOCs(ctx, startClass, /*remote=*/false);
+
     const uint32_t newTid = s_nextThreadId++;
 
     ThreadHandleData threadData{};
@@ -82,7 +150,6 @@ bool HandleCreateThread(APIContext& ctx) {
         return true;
     }
 
-    // Write thread ID to output pointer if non-null
     if (lpThreadId != 0) {
         ctx.Memory().WriteU32(lpThreadId, newTid);
     }
@@ -115,6 +182,17 @@ bool HandleCreateRemoteThread(APIContext& ctx) {
     (void)lpParameter;
 
     const bool isRemote = !IsSelfProcess(hProcess);
+
+    // IOC: remote thread creation — baseline T1055 ProcessInjection +
+    // RemoteThreadCreation; when the start address is RWX/unbacked the
+    // verdict escalates through EmitStartAddrIOCs().
+    if (isRemote) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::RemoteThreadCreation);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+    const auto startClass = ClassifyStartAddress(ctx.Memory(), lpStartAddress);
+    EmitStartAddrIOCs(ctx, startClass, isRemote);
 
     const uint32_t newTid = s_nextThreadId++;
     const uint32_t ownerPid = isRemote ? kFakeRemoteProcessId : kFakeProcessId;
@@ -161,6 +239,16 @@ bool HandleCreateRemoteThreadEx(APIContext& ctx) {
 
     const bool isRemote = !IsSelfProcess(hProcess);
 
+    // IOC: remote thread creation via the Ex variant carries the same
+    // semantic load as CreateRemoteThread.
+    if (isRemote) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::RemoteThreadCreation);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+    const auto startClassEx = ClassifyStartAddress(ctx.Memory(), lpStartAddress);
+    EmitStartAddrIOCs(ctx, startClassEx, isRemote);
+
     const uint32_t newTid = s_nextThreadId++;
     const uint32_t ownerPid = isRemote ? kFakeRemoteProcessId : kFakeProcessId;
 
@@ -203,6 +291,16 @@ bool HandleResumeThread(APIContext& ctx) {
 
     // Mark unsuspended; return previous suspend count (1 if was suspended, 0 otherwise)
     const auto* td = std::get_if<ThreadHandleData>(&entry->data);
+
+    // IOC: resuming a thread that belongs to another process is the final
+    // step of process hollowing / thread-hijack chains (CreateProcess
+    // SUSPENDED → unmap → alloc → write → SetThreadContext → ResumeThread).
+    if (td && td->ownerPid != kFakeProcessId) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessHollowing);
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     uint32_t previousCount = (td && td->suspended) ? 1u : 0u;
 
     ctx.Handles().Modify<ThreadHandleData>(hThread, [](ThreadHandleData& data) {
@@ -231,6 +329,14 @@ bool HandleSuspendThread(APIContext& ctx) {
     }
 
     const auto* td = std::get_if<ThreadHandleData>(&entry->data);
+
+    // IOC: suspending a thread in another process precedes
+    // SetThreadContext-based thread execution hijack (T1055.003).
+    if (td && td->ownerPid != kFakeProcessId) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     uint32_t previousCount = (td && td->suspended) ? 1u : 0u;
 
     ctx.Handles().Modify<ThreadHandleData>(hThread, [](ThreadHandleData& data) {
@@ -328,9 +434,21 @@ bool HandleSetThreadContext(APIContext& ctx) {
         return true;
     }
 
+    // IOC: SetThreadContext is the second half of T1055.012 process
+    // hollowing (redirects RIP/EIP to injected code); when the target
+    // belongs to another process the verdict escalates to ProcessHollowing.
+    ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    if (entry.has_value()) {
+        const auto* td = std::get_if<ThreadHandleData>(&entry->data);
+        if (td && td->ownerPid != kFakeProcessId) {
+            ctx.AddBehaviorFlag(BehaviorFlag::ProcessHollowing);
+            ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        }
+    }
+
     // No actual context modification in emulation — the behavioral flag
-    // (CodeInjection) is raised by the dispatcher's DetectBehaviors via
-    // the registration metadata.
+    // (CodeInjection) is raised above.
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -453,3 +571,5 @@ void RegisterThreadAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
