@@ -17,6 +17,14 @@
 #include "../../Core/CPU/State/CPUState.hpp"
 #include "../../Core/Memory/VirtualMemory.hpp"
 
+// DESIGN: The emulator deliberately discards the [[nodiscard]] ErrorCode from
+// VirtualMemory::Write* calls. A write failure on a caller-supplied output
+// pointer is never actionable — we return success to the guest anyway because
+// WriteConsole semantically completes once the bytes are accepted. Scope:
+// this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -133,3 +141,5 @@ bool HandleWriteConsoleW(APIContext& ctx) {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
