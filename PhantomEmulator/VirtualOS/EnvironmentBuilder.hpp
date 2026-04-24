@@ -16,6 +16,7 @@
 #include <optional>
 #include <memory>
 #include <array>
+#include <shared_mutex>
 
 // Forward declarations for VirtualOS subsystems
 namespace Phantom {
@@ -115,7 +116,7 @@ public:
 
     // === Convenience Accessors ===
 
-    [[nodiscard]] const EmulationConfig& GetConfig() const noexcept;
+    [[nodiscard]] EmulationConfig GetConfig() const noexcept;
     [[nodiscard]] bool IsInitialized() const noexcept;
 
     // PEB/TEB addresses (set during BuildPEBTEB)
@@ -129,9 +130,13 @@ private:
     EnvironmentBuilder& operator=(const EnvironmentBuilder&) = delete;
 
     // Initialization phases (called by Build in order)
+    void ResetUnlocked() noexcept;
     void RandomizeSessionValues(EmulationConfig& config) noexcept;
     bool InitializeSubsystems(const EmulationConfig& config) noexcept;
     bool ValidateConsistency() noexcept;
+    [[nodiscard]] EnvironmentValidation ValidateUnlocked() const noexcept;
+    [[nodiscard]] bool ValidateConfigInput(const EmulationConfig& config,
+                                           EnvironmentValidation* validation) const noexcept;
 
     // PEB/TEB building helpers
     bool WritePEB(VirtualMemory& memory) noexcept;
@@ -141,6 +146,7 @@ private:
 
     EmulationConfig m_config;
     bool m_initialized = false;
+    mutable std::shared_mutex m_mutex;
 
     // PEB/TEB guest addresses
     GuestAddress m_pebAddress = 0;
