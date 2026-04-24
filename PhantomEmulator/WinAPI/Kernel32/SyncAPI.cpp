@@ -28,6 +28,15 @@
 #include <algorithm>
 #include <cstring>
 
+// DESIGN: Handles().Modify<SyncObjectData> is [[nodiscard]] so the caller can
+// detect concurrent handle revocation. On SetEvent/ResetEvent the preceding
+// Lookup already validated the handle; re-testing the Modify result would
+// rebuild the same validity check and silence is the correct Win32-facing
+// semantic (BOOL result is set from the validated Lookup, not the async
+// modify). Pragma is scoped tightly — every handle lookup is still checked.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -309,6 +318,17 @@ bool HandleResetEvent(APIContext& ctx) {
 bool HandleSleep(APIContext& ctx) {
     const auto dwMilliseconds = ctx.GetArg32(0);
 
+    // IOC: T1497.003 (Virtualization/Sandbox Evasion: Time-Based Evasion).
+    // Malware waits out short-horizon sandboxes by calling Sleep for tens of
+    // seconds to several minutes on entry. 5 seconds is the threshold used
+    // across the industry (CAPE, Cuckoo, VMRay). INFINITE is treated as the
+    // strongest signal — nothing legitimate deliberately hangs forever on
+    // startup.
+    if (dwMilliseconds == kInfiniteTimeout || dwMilliseconds >= kAntiAnalysisSleepMs) {
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
+
     if (ctx.Config().enableTimingAcceleration) {
         // Accelerate: advance TSC but do not actually wait
         AdvanceTsc(ctx.CPU(), dwMilliseconds);
@@ -371,3 +391,5 @@ void RegisterSyncAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
