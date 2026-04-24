@@ -22,6 +22,13 @@
 #include <optional>
 #include <string>
 
+// DESIGN: VirtualMemory::Write* returns a [[nodiscard]] ErrorCode. Environment
+// query APIs deliberately ignore write failures on caller-supplied output
+// buffers — the guest's Win32 contract only exposes GetLastError / required
+// size, not the underlying paging outcome. Scope: this TU only.
+#pragma warning(push)
+#pragma warning(disable: 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -685,3 +692,5 @@ bool HandleGetDiskFreeSpaceExA(APIContext& ctx) {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
