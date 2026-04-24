@@ -20,6 +20,14 @@
 #include <cstring>
 #include <vector>
 
+// DESIGN: Guest-memory writeback helpers (WriteU32/U64/Write) are
+// [[nodiscard]]; in these handlers the target pointers are either null-
+// checked or validated by an earlier size check. A guest AV on writeback
+// is a guest fault, not a host fault. Pragma is file-scoped so handlers
+// remain readable.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Ntdll {
 
 // ============================================================================
@@ -660,6 +668,31 @@ bool HandleNtQuerySystemInformation(APIContext& ctx) {
             ctx.Memory().WriteU32(retLenAddr, len);
     };
 
+    // IOC: classify the query intent up front. Only flag on classes that
+    // are actually reached by malware for discovery/evasion — generic calls
+    // to class 0/2/3 are legitimate.
+    switch (infoClass) {
+    case 5:   // SystemProcessInformation — T1057 Process Discovery
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        break;
+    case 11:  // SystemModuleInformation — T1518.001 Security Software Discovery
+    case 103: // SystemCodeIntegrityInformation — DSE/HVCI probe
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        break;
+    case 35:  // SystemKernelDebuggerInformation — T1622 Debugger Evasion
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::DefenseEvasion);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        break;
+    case 76:  // SystemFirmwareTableInformation — T1497.001 VM / sandbox fingerprint
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        break;
+    default:
+        break;
+    }
+
     switch (infoClass) {
     // ------------------------------------------------------------------
     case 0: { // SystemBasicInformation
@@ -893,10 +926,13 @@ bool HandleNtDelayExecution(APIContext& ctx) {
         }
     }
 
-    // Sandbox evasion detection: Sleep > 5 seconds is suspicious.
-    // The dispatcher's behavioral analysis flags this via
-    // BehaviorFlag::AntiAnalysis in the KnownAPIEntry metadata.
-    // We don't need to set the flag here — it's automatic.
+    // IOC: T1497.003 Time Based Evasion — long Sleep (via NtDelayExecution)
+    // is the canonical sandbox-bypass technique. Threshold mirrors the
+    // Kernel32 Sleep handler: 5000 ms.
+    if (delay100ns >= 50'000'000LL) {
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    }
 
     ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
     return true;
@@ -915,12 +951,27 @@ bool HandleNtDuplicateObject(APIContext& ctx) {
     // Arg5: ULONG HandleAttributes
     // Arg6: ULONG Options
 
+    auto sourceProcess = ctx.GetArg(0);
     auto sourceHandle  = ctx.GetArg(1);
+    auto targetProcess = ctx.GetArg(2);
     auto targetHndAddr = ctx.GetArgPtr(3);
 
     if (targetHndAddr == 0) {
         ctx.SetReturnNtStatus(NT::STATUS_INVALID_PARAMETER);
         return true;
+    }
+
+    // IOC: cross-process handle duplication is a classic DLL/code-injection
+    // or token-theft primitive (e.g. duplicating a high-privilege process
+    // token). Current-process pseudo-handle is 0xFFFFFFFFFFFFFFFF (-1).
+    constexpr uint64_t kCurrentProcessHandle = 0xFFFFFFFFFFFFFFFFULL;
+    const bool sourceIsRemote = (sourceProcess != kCurrentProcessHandle &&
+                                  sourceProcess != 0);
+    const bool targetIsRemote = (targetProcess != kCurrentProcessHandle &&
+                                  targetProcess != 0);
+    if (sourceIsRemote || targetIsRemote) {
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     auto newHandle = ctx.Handles().Duplicate(sourceHandle);
@@ -1048,3 +1099,6 @@ void RegisterNtSystem(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Ntdll
+
+#pragma warning(pop)
+
