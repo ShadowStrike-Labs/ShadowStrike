@@ -35,11 +35,21 @@ struct KnownAPIEntry {
 };
 
 // ============================================================================
-// Ntdll Syscall Numbers (Windows 10 22H2 x64)
+// Ntdll Syscall Numbers (Windows 10 22H2 x64 — reference snapshot)
 // ============================================================================
 // These are the syscall numbers for the most commonly emulated Nt* functions.
 // Malware that uses direct syscalls bypasses kernel32/ntdll wrappers, so we
 // need to intercept at the syscall level too.
+//
+// DESIGN / ARCH-BLOCKER: These numbers are build-specific. They rotate
+// between every Windows feature update (1809 / 1903 / 20H2 / 21H2 / 22H2 /
+// Win11 21H2 / 22H2 / 23H2 / 24H2 all differ). A hard-coded snapshot is
+// therefore a *hint* for human readers and a default for the canonical 22H2
+// table only. Production emulation must resolve SSNs dynamically by parsing
+// the guest-mounted ntdll export table at emulator init (the "Hell's Gate"
+// technique). A value of 0 here means "unresolved / resolve dynamically";
+// FindKnownBySyscall() deliberately treats 0 as a non-match to avoid false
+// positives for APIs whose real SSN we have not pinned.
 
 namespace Syscall {
     static constexpr uint16_t NtAllocateVirtualMemory      = 0x0018;
@@ -83,7 +93,7 @@ namespace Syscall {
     static constexpr uint16_t NtOpenKeyEx                  = 0x010F;
     static constexpr uint16_t NtOpenSection                = 0x0037;
     static constexpr uint16_t NtCreateMutant               = 0x004E;
-    static constexpr uint16_t NtOpenMutant                 = 0x0012;
+    static constexpr uint16_t NtOpenMutant                 = 0;      // collided with NtOpenKey on the 22H2 snapshot; resolve dynamically (see DESIGN note above)
     static constexpr uint16_t NtQueryObject                = 0x0010;
     static constexpr uint16_t NtSetInformationFile         = 0x0027;
     static constexpr uint16_t NtQueryInformationFile       = 0x0011;
@@ -94,7 +104,7 @@ namespace Syscall {
     static constexpr uint16_t NtOpenProcessToken           = 0x012A;
     static constexpr uint16_t NtOpenThreadToken            = 0x0024;
     static constexpr uint16_t NtQueryInformationToken      = 0x0021;
-    static constexpr uint16_t NtAdjustPrivilegesToken      = 0x0041;
+    static constexpr uint16_t NtAdjustPrivilegesToken      = 0;      // collided with NtDeleteValueKey on the 22H2 snapshot; resolve dynamically (see DESIGN note above)
 } // namespace Syscall
 
 // ============================================================================
@@ -471,6 +481,31 @@ static constexpr KnownAPIEntry kKnownAPIs[] = {
 
 static constexpr uint32_t kKnownAPICount = static_cast<uint32_t>(
     sizeof(kKnownAPIs) / sizeof(kKnownAPIs[0]));
+
+// ============================================================================
+// Compile-time integrity guard: no two entries may share a non-zero SSN.
+// ============================================================================
+// A stale or guessed SSN that silently collides with a real one causes the
+// classifier to mislabel the call (e.g., NtDeleteValueKey treated as
+// NtAdjustPrivilegesToken and emitting PrivilegeEscalation on a registry
+// write). Detect this at compile time so future edits to the Syscall::
+// block cannot reintroduce it.
+namespace detail {
+    [[nodiscard]] constexpr bool AllSyscallNumbersUnique() noexcept {
+        for (uint32_t i = 0; i < kKnownAPICount; ++i) {
+            const uint16_t a = kKnownAPIs[i].syscallNumber;
+            if (a == 0) continue;
+            for (uint32_t j = i + 1; j < kKnownAPICount; ++j) {
+                if (kKnownAPIs[j].syscallNumber == a) return false;
+            }
+        }
+        return true;
+    }
+} // namespace detail
+static_assert(detail::AllSyscallNumbersUnique(),
+              "APIDatabase: two KnownAPIEntry records share the same non-zero "
+              "syscallNumber. Set one to 0 (unresolved) or pick the correct "
+              "build-specific SSN — see the DESIGN note in Syscall namespace.");
 
 // ============================================================================
 // Lookup Helpers
