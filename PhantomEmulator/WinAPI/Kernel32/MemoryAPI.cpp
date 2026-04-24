@@ -25,6 +25,16 @@
 #include <unordered_map>
 #include <mutex>
 
+// DESIGN: the VirtualMemory / APIContext write helpers are [[nodiscard]] because
+// a partial write almost always means guest corruption. In MemoryAPI the guest
+// has already been told the operation succeeded (we set the return/last-error
+// before the MBI or byte-count writeback), and a failed output write is a
+// non-fatal guest-side access violation the guest's own code must cope with.
+// We therefore intentionally discard these return codes and scope the warning
+// suppression tightly to this translation unit.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Kernel32 {
 
 // ============================================================================
@@ -81,6 +91,24 @@ static bool IsSelfProcess(GuestHandle handle, const HandleTable& handles) noexce
     return false;
 }
 
+// DESIGN: centralised "is this win32 protection mask executable" predicate.
+// Any handler that accepts a PAGE_* mask and could stage shellcode must use
+// this to decide whether to raise CodeInjection. Strips reserved modifier
+// bits (SEC_IMAGE/GUARD/NOCACHE/WRITECOMBINE) before comparing.
+[[nodiscard]] static bool IsExecutableWin32Prot(uint32_t flProtect) noexcept {
+    const uint32_t base = flProtect & 0x000000FFu;
+    return base == NT::PAGE_EXECUTE ||
+           base == NT::PAGE_EXECUTE_READ ||
+           base == NT::PAGE_EXECUTE_READWRITE ||
+           base == NT::PAGE_EXECUTE_WRITECOPY;
+}
+
+[[nodiscard]] static bool IsRWXWin32Prot(uint32_t flProtect) noexcept {
+    const uint32_t base = flProtect & 0x000000FFu;
+    return base == NT::PAGE_EXECUTE_READWRITE ||
+           base == NT::PAGE_EXECUTE_WRITECOPY;
+}
+
 // ============================================================================
 // VirtualAlloc — lpAddress(0), dwSize(1), flAllocationType(2), flProtect(3)
 // ============================================================================
@@ -130,6 +158,18 @@ bool HandleVirtualAlloc(APIContext& ctx) {
     if (!result.has_value()) {
         ctx.FailWithError(Win32::ERROR_NOT_ENOUGH_MEMORY);
         return true;
+    }
+
+    // IOC: private RWX / executable page allocation — T1055.002 shellcode
+    // staging primitive used by virtually every loader. Committed executable
+    // private memory (no image/section backing) is not something normal
+    // applications do; even JITs go through dedicated CreateFileMapping
+    // flows or have gone to RX-only pages since CET shadow stacks shipped.
+    if (doCommit && IsExecutableWin32Prot(flProtect)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        if (IsRWXWin32Prot(flProtect)) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        }
     }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
@@ -191,9 +231,29 @@ bool HandleVirtualAllocEx(APIContext& ctx) {
             return true;
         }
 
+        // IOC mirrors VirtualAlloc self-path: executable private allocation.
+        if (doCommit && IsExecutableWin32Prot(flProtect)) {
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            if (IsRWXWin32Prot(flProtect)) {
+                ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+            }
+        }
+
         ctx.SetLastError(Win32::ERROR_SUCCESS);
         ctx.SetReturn(result.value());
         return true;
+    }
+
+    // Remote process allocation — defining T1055.002 (Process Injection:
+    // Portable Executable Injection) / T1055 primitive used by every remote
+    // injector from CreateRemoteThread-shellcode to process hollowing. Raise
+    // ProcessInjection unconditionally on the remote path, and CodeInjection
+    // when the allocation is requested with executable rights (shellcode
+    // destination) — benign inter-process helpers use RW-only shared memory.
+    ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+    if (IsExecutableWin32Prot(flProtect)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
     }
 
     // Remote process allocation — strong code injection signal
@@ -332,6 +392,22 @@ bool HandleVirtualProtect(APIContext& ctx) {
     // Write old protection to output pointer
     mem.WriteU32(lpflOldProt, oldWin32Prot);
 
+    // IOC: transition to an executable mapping — T1055.009 (Proc Memory)
+    // "AddressOfNtdllLdrLoadDll-style" JIT loader, shellcode unpacker,
+    // or Cobalt Strike BeaconDLL flip of a PAGE_READWRITE staging area to
+    // PAGE_EXECUTE_READ(/WRITE) once the payload is decoded in place.
+    // Benign code paths (JIT, .NET ReadyToRun) use dedicated memory APIs
+    // (CreateFileMapping SEC_IMAGE / VirtualAlloc2 with MEM_EXECUTE_OPTIONS)
+    // rather than post-hoc protection flips on anonymous private memory.
+    if (IsExecutableWin32Prot(flNewProtect)) {
+        const bool wasNonExec = oldProtOpt.has_value() &&
+                                !HasProt(oldProtOpt.value(), MemProt::Execute);
+        if (wasNonExec || IsRWXWin32Prot(flNewProtect)) {
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        }
+    }
+
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
     return true;
@@ -350,7 +426,16 @@ bool HandleVirtualProtectEx(APIContext& ctx) {
     const auto lpflOldProt   = ctx.GetArgPtr(4);
 
     if (!IsSelfProcess(hProcess, ctx.Handles())) {
-        // Remote process protection change — suspicious
+        // Remote process protection change — T1055 (Process Injection):
+        // the "flip staging buffer to RX" step of every hollowing / PE-
+        // injection chain (the sequence is typically VirtualAllocEx →
+        // WriteProcessMemory → VirtualProtectEx → CreateRemoteThread).
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+        if (IsExecutableWin32Prot(flNewProtect)) {
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        }
+
         if (lpflOldProt != 0) {
             ctx.Memory().WriteU32(lpflOldProt, NT::PAGE_READWRITE);
         }
@@ -386,6 +471,16 @@ bool HandleVirtualProtectEx(APIContext& ctx) {
     }
 
     mem.WriteU32(lpflOldProt, oldWin32Prot);
+
+    // Same IOC logic as VirtualProtect for the self-process path.
+    if (IsExecutableWin32Prot(flNewProtect)) {
+        const bool wasNonExec = oldProtOpt.has_value() &&
+                                !HasProt(oldProtOpt.value(), MemProt::Execute);
+        if (wasNonExec || IsRWXWin32Prot(flNewProtect)) {
+            ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+            ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        }
+    }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -549,6 +644,14 @@ bool HandleReadProcessMemory(APIContext& ctx) {
     const auto lpBytesReadPtr  = ctx.GetArgPtr(4);
 
     if (!IsSelfProcess(hProcess, ctx.Handles())) {
+        // Remote process read — T1003 (OS Credential Dumping) when the
+        // caller attempts to read from LSASS-like contexts, or the readout
+        // half of a process-hollowing reconnaissance pass. Flag as
+        // CredentialAccess + AntiAnalysis and deny the read.
+        ctx.AddBehaviorFlag(BehaviorFlag::CredentialAccess);
+        ctx.AddBehaviorFlag(BehaviorFlag::AntiAnalysis);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
         // Remote process read — flag and fail
         if (lpBytesReadPtr != 0) {
             ctx.Memory().WriteU64(lpBytesReadPtr, 0);
@@ -609,6 +712,15 @@ bool HandleWriteProcessMemory(APIContext& ctx) {
     const auto lpBytesWrittenPtr  = ctx.GetArgPtr(4);
 
     if (!IsSelfProcess(hProcess, ctx.Handles())) {
+        // Remote process write — canonical T1055.002 (Process Injection:
+        // PE Injection) / T1055 write-half primitive. This is the step
+        // that actually copies shellcode or an unpacked PE image into the
+        // victim's address space. Raise ProcessInjection+CodeInjection
+        // unconditionally on the remote path.
+        ctx.AddBehaviorFlag(BehaviorFlag::ProcessInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::CodeInjection);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
+
         // Remote process write — code injection signal
         if (lpBytesWrittenPtr != 0) {
             ctx.Memory().WriteU64(lpBytesWrittenPtr, nSize);
@@ -920,6 +1032,15 @@ bool HandleGlobalAlloc(APIContext& ctx) {
     const auto uFlags  = ctx.GetArg32(0);
     auto       dwBytes = ctx.GetArg(1);
 
+    // DESIGN: GMEM_MOVEABLE (0x0002) returns a movable handle on real
+    // Windows; the emulator models every allocation as FIXED — the guest
+    // would have to call GlobalLock to dereference a moveable handle and
+    // our shim already hands back a direct address. GMEM_ZEROINIT (0x0040)
+    // is implicit because VirtualMemory::Allocate zero-fills. We still
+    // consume uFlags here so /W4 does not flag it as unreferenced and so
+    // future behavior wiring has a handle to attach to.
+    (void)uFlags;
+
     if (dwBytes == 0) {
         dwBytes = 1;
     }
@@ -1050,3 +1171,5 @@ void RegisterMemoryAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Kernel32
+
+#pragma warning(pop)
