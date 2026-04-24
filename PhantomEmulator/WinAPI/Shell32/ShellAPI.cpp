@@ -32,6 +32,11 @@
 #include <string>
 #include <string_view>
 
+// DESIGN: Guest-memory writebacks (Read/Write/WriteU*) are [[nodiscard]];
+// guest AV on writeback is a guest fault, not our bug.
+#pragma warning(push)
+#pragma warning(disable : 4834 6031)
+
 namespace Phantom::WinAPI::Shell32 {
 
 // ============================================================================
@@ -193,13 +198,15 @@ bool HandleShellExecuteA(APIContext& ctx) {
         directory = ctx.ReadAnsiString(lpDirectory, kMaxStringLen);
     }
 
-    // "runas" verb indicates privilege escalation
-    if (!operation.empty() && IsRunAsVerb(operation)) {
-        // PrivilegeEscalation flag raised via dispatcher behavioral detection
-        (void)0;
-    }
+    // IOC: ShellExecute is a primary process-creation vector (T1059 Command
+    // and Scripting Interpreter / T1204 User Execution).
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
-    // ProcessCreation flagged via APIDatabase entry (BehaviorFlag::ProcessInjection)
+    // "runas" verb == UAC elevation request (T1548.002 Bypass UAC / T1134
+    // access-token abuse). Emit PrivilegeEscalation on hit.
+    if (!operation.empty() && IsRunAsVerb(operation)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
+    }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturn(kShellExecuteSuccess);
@@ -235,8 +242,9 @@ bool HandleShellExecuteW(APIContext& ctx) {
         directory = ctx.ReadWideString(lpDirectory, kMaxWideChars);
     }
 
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     if (!operation.empty() && IsRunAsVerbW(operation)) {
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
     }
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
@@ -302,8 +310,9 @@ bool HandleShellExecuteExA(APIContext& ctx) {
     }
 
     if (!verb.empty() && IsRunAsVerb(verb)) {
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
     }
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -355,8 +364,9 @@ bool HandleShellExecuteExW(APIContext& ctx) {
     }
 
     if (!verb.empty() && IsRunAsVerbW(verb)) {
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::PrivilegeEscalation);
     }
+    ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
 
     ctx.SetLastError(Win32::ERROR_SUCCESS);
     ctx.SetReturnBool(true);
@@ -394,10 +404,11 @@ bool HandleSHGetFolderPathA(APIContext& ctx) {
     }
     mem.WriteU8(pszPath + writeLen, 0); // Null terminator
 
-    // Startup folder access indicates persistence
+    // IOC: resolving the Startup folder is a strong persistence signal
+    // (T1547.001 Registry Run Keys / Startup Folder).
     if (IsStartupFolder(csidl)) {
-        // RegistryPersistence flagged via dispatcher
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::RegistryPersistence);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     ctx.SetReturn32(static_cast<uint32_t>(kSOK));
@@ -429,7 +440,8 @@ bool HandleSHGetFolderPathW(APIContext& ctx) {
     mem.WriteU16(pszPath + writeChars * sizeof(wchar_t), 0); // Null terminator
 
     if (IsStartupFolder(csidl)) {
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::RegistryPersistence);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     ctx.SetReturn32(static_cast<uint32_t>(kSOK));
@@ -462,7 +474,8 @@ bool HandleSHGetSpecialFolderPathA(APIContext& ctx) {
     mem.WriteU8(pszPath + writeLen, 0);
 
     if (IsStartupFolder(csidl)) {
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::RegistryPersistence);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     ctx.SetReturnBool(true);
@@ -494,7 +507,8 @@ bool HandleSHGetSpecialFolderPathW(APIContext& ctx) {
     mem.WriteU16(pszPath + writeChars * sizeof(wchar_t), 0);
 
     if (IsStartupFolder(csidl)) {
-        (void)0;
+        ctx.AddBehaviorFlag(BehaviorFlag::RegistryPersistence);
+        ctx.AddBehaviorFlag(BehaviorFlag::SuspiciousAPI);
     }
 
     ctx.SetReturnBool(true);
@@ -542,12 +556,14 @@ bool HandleCommandLineToArgvW(APIContext& ctx) {
     // Cap argc to prevent allocation abuse
     if (argc > 256) argc = 256;
 
-    // Allocate guest memory: array of pointers + the string data
-    const uint32_t ptrSize = ctx.Is64Bit() ? 8 : 4;
-    const uint32_t arraySize = argc * ptrSize;
-    const uint32_t stringBytes = static_cast<uint32_t>(
+    // Allocate guest memory: array of pointers + the string data.
+    // Use GuestSize for the allocation size — AlignUp returns GuestSize
+    // (64-bit) and the sum could exceed 32 bits in pathological inputs.
+    const uint32_t  ptrSize = ctx.Is64Bit() ? 8u : 4u;
+    const GuestSize arraySize  = static_cast<GuestSize>(argc) * ptrSize;
+    const GuestSize stringBytes = static_cast<GuestSize>(
         (cmdLine.size() + 1) * sizeof(wchar_t));
-    const uint32_t totalSize = AlignUp(arraySize + stringBytes, kPageSize);
+    const GuestSize totalSize = AlignUp(arraySize + stringBytes, kPageSize);
 
     auto& mem = ctx.Memory();
     auto alloc = mem.Allocate(0, totalSize, MemProt::RW);
@@ -612,3 +628,6 @@ void RegisterShellAPI(APIDispatcher& dispatcher) noexcept {
 }
 
 } // namespace Phantom::WinAPI::Shell32
+
+#pragma warning(pop)
+
