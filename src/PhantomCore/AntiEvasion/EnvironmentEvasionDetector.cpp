@@ -87,6 +87,8 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
+#pragma warning(disable: 6553) // Windows SDK winreg SAL false positive on RegOpenKeyExW under /analyze.
+
 // ============================================================================
 // SHADOWSTRIKE INTERNAL INCLUDES
 // ============================================================================
@@ -94,17 +96,22 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
+#pragma warning(push)
+#pragma warning(disable: 6101) // Windows SDK ws2tcpip SAL false positive under /analyze.
 #include "../Utils/NetworkUtils.hpp"
+#pragma warning(pop)
 #include "../Utils/HashUtils.hpp"
-#include "../ThreatIntel/ThreatIntelStore.hpp"
 
 // ============================================================================
 // PEPARSER AND DISASSEMBLER INTEGRATION
 // Enterprise-grade PE analysis and disassembly for hook detection
 // ============================================================================
 
+#pragma warning(push)
+#pragma warning(disable: 4201) // Windows/PE structures intentionally expose anonymous unions.
 #include "../PEParser/PEParser.hpp"
 #include <PhantomDisassembler/PhantomDisasm.hpp>
+#pragma warning(pop)
 
 // ============================================================================
 // EXTERNAL ASSEMBLY FUNCTIONS
@@ -294,6 +301,14 @@ extern "C" {
 #include <intrin.h>
 
 namespace AsmFallback {
+
+    [[nodiscard]] constexpr int HandleAccessViolation(unsigned int code) noexcept {
+        return (code == EXCEPTION_ACCESS_VIOLATION ||
+                code == EXCEPTION_IN_PAGE_ERROR ||
+                code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+            ? EXCEPTION_EXECUTE_HANDLER
+            : EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // Fallback: CheckCPUIDHypervisorBit
     extern "C" uint64_t Fallback_CheckCPUIDHypervisorBit() noexcept {
@@ -557,7 +572,7 @@ namespace AsmFallback {
             }
 #endif
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        __except (HandleAccessViolation(GetExceptionCode())) {
             // SEH caught access violation - return 0 (no flags)
             return 0;
         }
@@ -589,7 +604,7 @@ namespace AsmFallback {
             }
 #endif
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        __except (HandleAccessViolation(GetExceptionCode())) {
             // SEH caught access violation - heap structure changed or corrupted
             return 0;
         }
@@ -2433,6 +2448,7 @@ namespace ShadowStrike::AntiEvasion {
         const EnvironmentKernelContext& ctx,
         EnvironmentEvasionResult& result
     ) noexcept {
+        (void)processId;
         try {
             // ----------------------------------------------------------------
             // A.  Parent–child relationship anomaly (kernel-verified parentPid)
@@ -3461,7 +3477,7 @@ namespace ShadowStrike::AntiEvasion {
             LASTINPUTINFO lii = {};
             lii.cbSize = sizeof(lii);
             if (GetLastInputInfo(&lii)) {
-                const DWORD currentTick = GetTickCount();
+                const DWORD currentTick = static_cast<DWORD>(GetTickCount64() & 0xFFFFFFFFu);
                 const DWORD idleTimeMs = currentTick - lii.dwTime;
                 
                 // If system has been idle for more than 10 minutes but uptime is high
@@ -5060,6 +5076,7 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
+        (void)err;
         try {
             if (!fs::exists(filePath)) return false;
 
@@ -5108,6 +5125,7 @@ namespace ShadowStrike::AntiEvasion {
         EnvironmentProgressCallback progressCallback,
         EnvironmentError* err
     ) noexcept {
+        (void)progressCallback;
         EnvironmentBatchResult batchResult;
         batchResult.startTime = std::chrono::system_clock::now();
         batchResult.totalProcesses = static_cast<uint32_t>(processIds.size());
