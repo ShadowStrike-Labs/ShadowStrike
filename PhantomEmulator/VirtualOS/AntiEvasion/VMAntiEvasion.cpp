@@ -18,6 +18,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cwctype>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom::VirtualOS::AntiEvasion {
 
@@ -26,6 +30,9 @@ namespace Phantom::VirtualOS::AntiEvasion {
 // ============================================================================
 
 namespace {
+
+constexpr size_t kMaxTrackedTechniqueChars = 256;
+constexpr size_t kMaxMatcherInputChars = 32768;
 
 // ---- VM File Blocklist (~40 entries) ----
 constexpr const wchar_t* kVMFiles[] = {
@@ -187,6 +194,33 @@ constexpr const wchar_t* kVMDeviceNames[] = {
     return true;
 }
 
+[[nodiscard]] bool IsReasonableWideText(std::wstring_view text) noexcept {
+    if (text.size() > kMaxMatcherInputChars) return false;
+    for (const wchar_t ch : text) {
+        if (ch == L'\0') return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool IsReasonableTechnique(std::string_view text) noexcept {
+    if (text.empty() || text.size() > kMaxTrackedTechniqueChars) return false;
+    for (const char ch : text) {
+        const auto value = static_cast<unsigned char>(ch);
+        if (value < 0x20 || value == 0x7F) return false;
+    }
+    return true;
+}
+
+void SaturatingIncrement(std::atomic<uint32_t>& counter) noexcept {
+    uint32_t current = counter.load(std::memory_order_relaxed);
+    while (current != std::numeric_limits<uint32_t>::max()) {
+        if (counter.compare_exchange_weak(
+                current, current + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -227,22 +261,23 @@ VMAntiEvasion& VMAntiEvasion::Instance() noexcept {
 // ============================================================================
 
 void VMAntiEvasion::Initialize(const EmulationConfig& /*config*/) noexcept {
-    if (m_initialized) return;
-
-    {
+    try {
         std::unique_lock lock(m_mutex);
+        if (m_initialized) return;
         m_detectedTechniques.clear();
         m_detectedTechniques.reserve(64);
+        m_vmCheckCount.store(0, std::memory_order_relaxed);
+        m_initialized = true;
+    } catch (const std::bad_alloc&) {
+        Reset();
+    } catch (const std::length_error&) {
+        Reset();
     }
-    m_vmCheckCount.store(0, std::memory_order_relaxed);
-    m_initialized = true;
 }
 
 void VMAntiEvasion::Reset() noexcept {
-    {
-        std::unique_lock lock(m_mutex);
-        m_detectedTechniques.clear();
-    }
+    std::unique_lock lock(m_mutex);
+    m_detectedTechniques.clear();
     m_vmCheckCount.store(0, std::memory_order_relaxed);
     m_initialized = false;
 }
@@ -252,11 +287,18 @@ void VMAntiEvasion::Reset() noexcept {
 // ============================================================================
 
 void VMAntiEvasion::RecordVMCheckAttempt(std::string_view technique) noexcept {
-    m_vmCheckCount.fetch_add(1, std::memory_order_relaxed);
+    if (!IsReasonableTechnique(technique)) return;
+    SaturatingIncrement(m_vmCheckCount);
 
+    try {
     std::unique_lock lock(m_mutex);
     if (m_detectedTechniques.size() < kMaxTrackedTechniques) {
         m_detectedTechniques.emplace_back(technique);
+    }
+    } catch (const std::bad_alloc&) {
+        return;
+    } catch (const std::length_error&) {
+        return;
     }
 }
 
@@ -265,8 +307,14 @@ uint32_t VMAntiEvasion::GetVMCheckCount() const noexcept {
 }
 
 std::vector<std::string> VMAntiEvasion::GetDetectedTechniques() const noexcept {
+    try {
     std::shared_lock lock(m_mutex);
     return m_detectedTechniques;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -307,6 +355,7 @@ std::vector<std::wstring> VMAntiEvasion::GetSafeRegistryKeys() const noexcept {
     const_cast<VMAntiEvasion*>(this)->RecordVMCheckAttempt(
         "Registry.SafeKeys");
 
+    try {
     return {
         L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
@@ -316,6 +365,11 @@ std::vector<std::wstring> VMAntiEvasion::GetSafeRegistryKeys() const noexcept {
         L"SYSTEM\\CurrentControlSet\\Services\\disk",
         L"SYSTEM\\CurrentControlSet\\Services\\intelppm",
     };
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -345,12 +399,18 @@ bool VMAntiEvasion::HasVMProcesses() const noexcept {
 }
 
 std::vector<std::wstring> VMAntiEvasion::GetVMProcessBlocklist() const noexcept {
+    try {
     std::vector<std::wstring> result;
     result.reserve(std::size(kVMProcesses));
     for (const auto* name : kVMProcesses) {
         result.emplace_back(name);
     }
     return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -480,6 +540,7 @@ uint32_t VMAntiEvasion::GetBrowserHistoryCount() const noexcept {
 // ============================================================================
 
 bool VMAntiEvasion::IsVMFileName(std::wstring_view filename) noexcept {
+    if (!IsReasonableWideText(filename)) return false;
     // Extract just the filename from a potential full path
     const auto lastSlash = filename.find_last_of(L"\\/");
     const auto baseName = (lastSlash != std::wstring_view::npos)
@@ -495,6 +556,7 @@ bool VMAntiEvasion::IsVMFileName(std::wstring_view filename) noexcept {
 }
 
 bool VMAntiEvasion::IsVMRegistryKey(std::wstring_view keyPath) noexcept {
+    if (!IsReasonableWideText(keyPath)) return false;
     for (const auto* vmKey : kVMRegistryKeys) {
         if (WideStringContainsCaseInsensitive(keyPath, vmKey)) {
             return true;
@@ -518,6 +580,7 @@ bool VMAntiEvasion::IsVMRegistryKey(std::wstring_view keyPath) noexcept {
 }
 
 bool VMAntiEvasion::IsVMProcessName(std::wstring_view processName) noexcept {
+    if (!IsReasonableWideText(processName)) return false;
     // Extract just the process name from a potential full path
     const auto lastSlash = processName.find_last_of(L"\\/");
     const auto baseName = (lastSlash != std::wstring_view::npos)
@@ -533,6 +596,7 @@ bool VMAntiEvasion::IsVMProcessName(std::wstring_view processName) noexcept {
 }
 
 bool VMAntiEvasion::IsVMDriverName(std::wstring_view driverName) noexcept {
+    if (!IsReasonableWideText(driverName)) return false;
     // Extract just the driver name
     const auto lastSlash = driverName.find_last_of(L"\\/");
     auto baseName = (lastSlash != std::wstring_view::npos)
@@ -570,6 +634,7 @@ bool VMAntiEvasion::IsVMMACPrefix(const uint8_t mac[6]) noexcept {
 }
 
 bool VMAntiEvasion::IsVMDeviceName(std::wstring_view deviceName) noexcept {
+    if (!IsReasonableWideText(deviceName)) return false;
     for (const auto* vmDevice : kVMDeviceNames) {
         if (WideStringEqualsCaseInsensitive(deviceName, vmDevice)) {
             return true;
