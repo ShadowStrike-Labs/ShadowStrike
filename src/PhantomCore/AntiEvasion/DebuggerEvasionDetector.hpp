@@ -238,7 +238,7 @@ namespace ShadowStrike {
             inline constexpr uint8_t OPCODE_INT2D_SUFFIX = 0x2D;
 
             /// @brief CPUID hypervisor bit position
-            inline constexpr uint32_t CPUID_HYPERVISOR_BIT = (1 << 31);
+            inline constexpr uint32_t CPUID_HYPERVISOR_BIT = (uint32_t{1} << 31);
 
         } // namespace Constants
 
