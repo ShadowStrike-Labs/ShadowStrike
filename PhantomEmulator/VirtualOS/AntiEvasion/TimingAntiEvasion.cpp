@@ -16,6 +16,7 @@
 #include "TimingAntiEvasion.hpp"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace Phantom::VirtualOS::AntiEvasion {
 
@@ -79,6 +80,42 @@ constexpr uint64_t kMaxBaseTickCount = 900'000ULL;  // ~15 min uptime
     return seed ^ (seed >> 31);
 }
 
+[[nodiscard]] constexpr uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) noexcept {
+    return (lhs > std::numeric_limits<uint64_t>::max() - rhs)
+        ? std::numeric_limits<uint64_t>::max()
+        : lhs + rhs;
+}
+
+[[nodiscard]] constexpr uint64_t SaturatingMul(uint64_t lhs, uint64_t rhs) noexcept {
+    if (lhs == 0 || rhs == 0) return 0;
+    return (lhs > std::numeric_limits<uint64_t>::max() / rhs)
+        ? std::numeric_limits<uint64_t>::max()
+        : lhs * rhs;
+}
+
+[[nodiscard]] constexpr uint64_t SaturatingScaleDiv(
+    uint64_t value,
+    uint64_t multiplier,
+    uint64_t divisor) noexcept {
+    if (divisor == 0) return 0;
+    const uint64_t quotient = value / divisor;
+    const uint64_t remainder = value % divisor;
+    return SaturatingAdd(
+        SaturatingMul(quotient, multiplier),
+        SaturatingMul(remainder, multiplier) / divisor);
+}
+
+void SaturatingAtomicAdd(std::atomic<uint64_t>& target, uint64_t delta) noexcept {
+    uint64_t current = target.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint64_t desired = SaturatingAdd(current, delta);
+        if (target.compare_exchange_weak(
+                current, desired, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -95,9 +132,10 @@ TimingAntiEvasion& TimingAntiEvasion::Instance() noexcept {
 // ============================================================================
 
 void TimingAntiEvasion::Initialize(const EmulationConfig& config) noexcept {
+    std::unique_lock lock(m_mutex);
     if (m_initialized) return;
 
-    m_tscFrequency       = config.fakeTSCFrequency;
+    m_tscFrequency       = (config.fakeTSCFrequency == 0) ? 3'800'000'000ULL : config.fakeTSCFrequency;
     m_qpcFrequency       = 10'000'000ULL; // Windows default: 10 MHz
     m_tscPerInstruction   = 25;
     m_accelerationFactor  = config.enableTimingAcceleration ? 1000 : 1;
@@ -127,6 +165,7 @@ void TimingAntiEvasion::Initialize(const EmulationConfig& config) noexcept {
 // ============================================================================
 
 void TimingAntiEvasion::Reset() noexcept {
+    std::unique_lock lock(m_mutex);
     m_instructionCount.store(0, std::memory_order_relaxed);
     m_baseTSC         = 0;
     m_baseTickCount   = 0;
@@ -144,7 +183,7 @@ void TimingAntiEvasion::Reset() noexcept {
 // ============================================================================
 
 void TimingAntiEvasion::AdvanceTick(uint32_t instructionCount) noexcept {
-    m_instructionCount.fetch_add(instructionCount, std::memory_order_relaxed);
+    SaturatingAtomicAdd(m_instructionCount, instructionCount);
 }
 
 // ============================================================================
@@ -157,6 +196,7 @@ void TimingAntiEvasion::AdvanceTick(uint32_t instructionCount) noexcept {
 // shows ~5 ms more, and TSC/QPC agree.
 
 void TimingAntiEvasion::SimulateSleep(uint64_t milliseconds) noexcept {
+    std::shared_lock lock(m_mutex);
     if (milliseconds == 0 || m_tscPerInstruction == 0) return;
 
     // Cap to prevent overflow (max ~49 days of simulated sleep)
@@ -165,11 +205,11 @@ void TimingAntiEvasion::SimulateSleep(uint64_t milliseconds) noexcept {
 
     // TSC ticks that would elapse in the real duration
     // Then divide by acceleration to compress time
-    const uint64_t realTscTicks = (milliseconds * m_tscFrequency) / 1000ULL;
+    const uint64_t realTscTicks = SaturatingScaleDiv(milliseconds, m_tscFrequency, 1000ULL);
     const uint64_t acceleratedTscTicks = realTscTicks / m_accelerationFactor;
     const uint64_t instructionsToAdd = acceleratedTscTicks / m_tscPerInstruction;
 
-    m_instructionCount.fetch_add(instructionsToAdd, std::memory_order_relaxed);
+    SaturatingAtomicAdd(m_instructionCount, instructionsToAdd);
 }
 
 // ============================================================================
@@ -177,8 +217,9 @@ void TimingAntiEvasion::SimulateSleep(uint64_t milliseconds) noexcept {
 // ============================================================================
 
 uint64_t TimingAntiEvasion::GetElapsedNanoseconds() const noexcept {
-    const uint64_t tscDelta = static_cast<uint64_t>(m_instructionCount.load(
-        std::memory_order_relaxed)) * m_tscPerInstruction;
+    const uint64_t tscDelta = SaturatingMul(
+        m_instructionCount.load(std::memory_order_relaxed),
+        m_tscPerInstruction);
 
     // elapsed_ns = (tscDelta * 1,000,000,000) / m_tscFrequency
     // Use 128-bit-safe computation to avoid overflow:
@@ -188,8 +229,9 @@ uint64_t TimingAntiEvasion::GetElapsedNanoseconds() const noexcept {
     const uint64_t wholeSeconds = tscDelta / m_tscFrequency;
     const uint64_t remainder    = tscDelta % m_tscFrequency;
 
-    return wholeSeconds * 1'000'000'000ULL +
-           (remainder * 1'000'000'000ULL) / m_tscFrequency;
+    return SaturatingAdd(
+        SaturatingMul(wholeSeconds, 1'000'000'000ULL),
+        SaturatingScaleDiv(remainder, 1'000'000'000ULL, m_tscFrequency));
 }
 
 // ============================================================================
@@ -198,8 +240,9 @@ uint64_t TimingAntiEvasion::GetElapsedNanoseconds() const noexcept {
 // TSC = baseTSC + (instructionCount * tscPerInstruction)
 
 uint64_t TimingAntiEvasion::GetTSC() const noexcept {
+    std::shared_lock lock(m_mutex);
     const uint64_t count = m_instructionCount.load(std::memory_order_relaxed);
-    return m_baseTSC + (count * m_tscPerInstruction);
+    return SaturatingAdd(m_baseTSC, SaturatingMul(count, m_tscPerInstruction));
 }
 
 // ============================================================================
@@ -211,9 +254,10 @@ uint32_t TimingAntiEvasion::GetTickCount32() const noexcept {
 }
 
 uint64_t TimingAntiEvasion::GetTickCount64() const noexcept {
+    std::shared_lock lock(m_mutex);
     const uint64_t elapsedNs = GetElapsedNanoseconds();
     const uint64_t elapsedMs = elapsedNs / 1'000'000ULL;
-    return m_baseTickCount + elapsedMs;
+    return SaturatingAdd(m_baseTickCount, elapsedMs);
 }
 
 // ============================================================================
@@ -221,19 +265,24 @@ uint64_t TimingAntiEvasion::GetTickCount64() const noexcept {
 // ============================================================================
 
 int64_t TimingAntiEvasion::GetQPC() const noexcept {
+    std::shared_lock lock(m_mutex);
     const uint64_t elapsedNs = GetElapsedNanoseconds();
     // QPC = elapsed_seconds * qpcFrequency
     // = (elapsedNs * qpcFrequency) / 1,000,000,000
     const uint64_t wholeSeconds = elapsedNs / 1'000'000'000ULL;
     const uint64_t remainder    = elapsedNs % 1'000'000'000ULL;
 
-    const uint64_t qpc = wholeSeconds * m_qpcFrequency +
-                          (remainder * m_qpcFrequency) / 1'000'000'000ULL;
-    return static_cast<int64_t>(qpc);
+    const uint64_t qpc = SaturatingAdd(
+        SaturatingMul(wholeSeconds, m_qpcFrequency),
+        SaturatingScaleDiv(remainder, m_qpcFrequency, 1'000'000'000ULL));
+    return static_cast<int64_t>(std::min<uint64_t>(qpc, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
 }
 
 int64_t TimingAntiEvasion::GetQPF() const noexcept {
-    return static_cast<int64_t>(m_qpcFrequency);
+    std::shared_lock lock(m_mutex);
+    return static_cast<int64_t>(std::min<uint64_t>(
+        m_qpcFrequency,
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
 }
 
 // ============================================================================
@@ -241,10 +290,11 @@ int64_t TimingAntiEvasion::GetQPF() const noexcept {
 // ============================================================================
 
 uint64_t TimingAntiEvasion::GetSystemTimeAsFileTime() const noexcept {
+    std::shared_lock lock(m_mutex);
     const uint64_t elapsedNs = GetElapsedNanoseconds();
     // Convert nanoseconds to 100-ns intervals
     const uint64_t elapsed100ns = elapsedNs / 100ULL;
-    return m_baseFileTime + elapsed100ns;
+    return SaturatingAdd(m_baseFileTime, elapsed100ns);
 }
 
 // ============================================================================
@@ -337,7 +387,9 @@ TimingAntiEvasion::SystemTime TimingAntiEvasion::GetSystemTime() const noexcept 
 // ============================================================================
 
 TimingAntiEvasion::SystemTime TimingAntiEvasion::GetLocalTime() const noexcept {
-    const uint64_t utcFileTime = GetSystemTimeAsFileTime();
+    std::shared_lock lock(m_mutex);
+    const uint64_t elapsedNs = GetElapsedNanoseconds();
+    const uint64_t utcFileTime = SaturatingAdd(m_baseFileTime, elapsedNs / 100ULL);
 
     // Apply timezone offset (may be negative — convert minutes to 100-ns)
     const int64_t offsetHundredNs =
@@ -359,10 +411,12 @@ TimingAntiEvasion::SystemTime TimingAntiEvasion::GetLocalTime() const noexcept {
 // ============================================================================
 
 uint64_t TimingAntiEvasion::GetTSCFrequency() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_tscFrequency;
 }
 
 uint32_t TimingAntiEvasion::GetTimingAcceleration() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_accelerationFactor;
 }
 

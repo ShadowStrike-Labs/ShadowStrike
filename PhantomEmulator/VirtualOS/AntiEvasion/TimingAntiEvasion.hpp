@@ -19,6 +19,7 @@
 #include "../../Common/Config.hpp"
 #include <cstdint>
 #include <atomic>
+#include <mutex>
 #include <shared_mutex>
 
 namespace Phantom::VirtualOS::AntiEvasion {
@@ -82,6 +83,7 @@ private:
 
     // Single monotonic source — everything derives from this
     std::atomic<uint64_t> m_instructionCount{0};
+    mutable std::shared_mutex m_mutex;
 
     // Base values (set at initialization)
     uint64_t m_baseTSC         = 0;
