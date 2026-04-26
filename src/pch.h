@@ -50,7 +50,9 @@
 #include <span>
 #include <optional>
 #include <variant>
-#include <expected> // C++23 style or equivalent
+#if defined(_HAS_CXX23) && _HAS_CXX23
+#include <expected>
+#endif
 #include <cstdint>
 #include <algorithm>
 #include <iterator>
@@ -71,9 +73,8 @@
 #include <bit>
 #include <ranges>
 
-// Testing Framework (Commonly used in ShadowStrike)
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+// Test translation units include GoogleTest/GoogleMock explicitly. Keeping
+// production PCH free of test framework headers avoids /analyze noise under /WX.
 
 
 #endif // PCH_H

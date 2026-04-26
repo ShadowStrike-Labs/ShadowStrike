@@ -106,7 +106,12 @@
 
 #include "pch.h"
 #include "DebuggerEvasionDetector.hpp"
+#pragma warning(push)
+#pragma warning(disable: 4201) // Windows/PE headers intentionally expose anonymous unions.
 #include <PhantomDisassembler/PhantomDisasm.hpp>
+#include "../PEParser/PEParser.hpp"
+#include "../PEParser/PETypes.hpp"
+#pragma warning(pop)
 #include <format>
 #include <algorithm>
 #include <execution>
@@ -119,8 +124,6 @@
 // PEPARSER INTEGRATION
 // ============================================================================
 
-#include "../PEParser/PEParser.hpp"
-#include "../PEParser/PETypes.hpp"
 #include "../Utils/StringUtils.hpp"
 
 // ============================================================================
@@ -296,6 +299,14 @@ typedef struct _KUSER_SHARED_DATA_PARTIAL {
 } KUSER_SHARED_DATA_PARTIAL;
 
 namespace ShadowStrike::AntiEvasion {
+
+    [[nodiscard]] constexpr int HandleAccessViolation(unsigned int code) noexcept {
+        return (code == EXCEPTION_ACCESS_VIOLATION ||
+                code == EXCEPTION_IN_PAGE_ERROR ||
+                code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+            ? EXCEPTION_EXECUTE_HANDLER
+            : EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // ========================================================================
     // RAII HANDLE WRAPPER (avoids resource leaks in exception paths)
@@ -596,7 +607,7 @@ namespace AsmFallback {
                 }
             }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        __except (ShadowStrike::AntiEvasion::HandleAccessViolation(GetExceptionCode())) {
             // Memory access failed
             return count;
         }
@@ -625,7 +636,7 @@ namespace AsmFallback {
                 total += (endTime - startTime);
             }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        __except (ShadowStrike::AntiEvasion::HandleAccessViolation(GetExceptionCode())) {
             return 0;
         }
         
@@ -1142,8 +1153,8 @@ namespace ShadowStrike::AntiEvasion {
                                 }
                             }
                         }
-                        __except (EXCEPTION_EXECUTE_HANDLER) {
-                            // Target memory not readable
+                        __except (HandleAccessViolation(GetExceptionCode())) {
+                            return std::nullopt;
                         }
                     }
                 }
@@ -1182,7 +1193,7 @@ namespace ShadowStrike::AntiEvasion {
                 // Return nullopt and let caller handle gracefully
 
             }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
+            __except (HandleAccessViolation(GetExceptionCode())) {
                 // Memory access violation - stub is unmapped or protected
                 SS_LOG_DEBUG(LOG_CATEGORY, L"ExtractSyscallNumberFromStub: Memory access violation");
             }
@@ -1496,7 +1507,8 @@ namespace ShadowStrike::AntiEvasion {
                 // Build instruction trace for diagnostics
                 if (m_formatterInitialized) {
                     char asmBuf[64] = {};
-                    m_formatter.FormatInstruction(instr, ops, instr.operand_count, asmBuf, sizeof(asmBuf), offset);
+                    static_cast<void>(m_formatter.FormatInstruction(
+                        instr, ops, instr.operand_count, asmBuf, sizeof(asmBuf), offset));
                     instructionTrace += std::format(L"  +0x{:02X}: {}\n", offset, Utils::StringUtils::ToWide(asmBuf));
                 }
 
@@ -1725,9 +1737,10 @@ namespace ShadowStrike::AntiEvasion {
             const uint8_t* code,
             size_t size,
             bool is64Bit,
-            uintptr_t baseAddress
-        ) const noexcept {
-            std::vector<std::pair<size_t, Phantom::Disasm::Mnemonic>> found;
+        uintptr_t baseAddress
+    ) const noexcept {
+        (void)baseAddress;
+        std::vector<std::pair<size_t, Phantom::Disasm::Mnemonic>> found;
 
             const auto* decoder = GetDecoder(is64Bit);
             if (!decoder || !code || size == 0) {
@@ -1955,6 +1968,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         try {
             PROCESS_BASIC_INFORMATION pbi = {};
             ULONG len = 0;
@@ -2080,6 +2094,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         try {
             // 1. CheckRemoteDebuggerPresent
             BOOL isDebugged = FALSE;
@@ -2424,6 +2439,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         const auto* decoder = m_impl->GetDecoder(result.is64Bit);
         if (!decoder) return;
 
@@ -2522,6 +2538,8 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<DetectedTechnique>& outDetections,
         Error* err
     ) noexcept {
+        (void)processId;
+        (void)err;
         if (!hProcess) return false;
         bool detected = false;
 
@@ -2661,6 +2679,8 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<DetectedTechnique>& outDetections,
         Error* err
     ) noexcept {
+        (void)processId;
+        (void)err;
         if (!hProcess) return false;
         bool detected = false;
 
@@ -2824,6 +2844,7 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<DetectedTechnique>& outDetections,
         Error* err
     ) noexcept {
+        (void)err;
         if (!hProcess || !m_impl->m_NtQuerySystemInformation) return false;
         bool hiddenFound = false;
 
@@ -2922,6 +2943,8 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<DetectedTechnique>& outDetections,
         Error* err
     ) noexcept {
+        (void)processId;
+        (void)err;
         if (!hProcess) return false;
         bool detected = false;
 
@@ -2998,6 +3021,8 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<DetectedTechnique>& outDetections,
         Error* err
     ) noexcept {
+        (void)processId;
+        (void)err;
         if (!hProcess) return false;
         bool detected = false;
 
@@ -3084,6 +3109,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         if (!hProcess) return;
 
         try {
@@ -3403,6 +3429,7 @@ namespace ShadowStrike::AntiEvasion {
         const BYTE sectionName[8],
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)sectionName;
         if (!decoder || !code || size == 0) return;
 
         // Track RDTSC locations to detect paired timing checks
@@ -3479,9 +3506,7 @@ namespace ShadowStrike::AntiEvasion {
             timingApiMap[api.functionName] = &api;
         }
 
-        // Track which timing APIs are imported for pattern analysis
         std::vector<const TimingAPIInfo*> importedTimingAPIs;
-        size_t totalTimingImports = 0;
 
         try {
             // Read Import Directory
@@ -3608,7 +3633,8 @@ namespace ShadowStrike::AntiEvasion {
 
         // Convert DLL name to lowercase for comparison
         std::string dllNameLower(dllName);
-        std::transform(dllNameLower.begin(), dllNameLower.end(), dllNameLower.begin(), ::tolower);
+        std::transform(dllNameLower.begin(), dllNameLower.end(), dllNameLower.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
         try {
             // Read thunk array (limited to reasonable size)
@@ -3664,7 +3690,8 @@ namespace ShadowStrike::AntiEvasion {
 
                             // Verify DLL name matches (case-insensitive)
                             std::string expectedDll(apiInfo->dllName);
-                            std::transform(expectedDll.begin(), expectedDll.end(), expectedDll.begin(), ::tolower);
+                            std::transform(expectedDll.begin(), expectedDll.end(), expectedDll.begin(),
+                                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
                             if (dllNameLower.find(expectedDll) != std::string::npos ||
                                 expectedDll.find(dllNameLower) != std::string::npos) {
@@ -3813,6 +3840,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         if (!hProcess) return;
 
         try {
@@ -4245,6 +4273,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         if (!hProcess) return;
 
         try {
@@ -4461,6 +4490,7 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         try {
             // Phase 1: Check if target imports NtQuerySystemInformation
             HMODULE hMods[512] = {};
@@ -4589,7 +4619,7 @@ namespace ShadowStrike::AntiEvasion {
                     // mov ecx/edx/r8d, 0x23 (SystemKernelDebuggerInformation)
                     // near a call to NtQuerySystemInformation
                     Phantom::Disasm::Decoder decoder;
-                    decoder.Init(Phantom::Disasm::MachineMode::Long64);
+                    static_cast<void>(decoder.Init(Phantom::Disasm::MachineMode::Long64));
 
                     Phantom::Disasm::DecodedInstruction instruction;
                     Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
@@ -4653,6 +4683,7 @@ namespace ShadowStrike::AntiEvasion {
         const KernelProcessContext& ctx,
         DebuggerEvasionResult& result
     ) noexcept {
+        (void)processId;
         // ----------------------------------------------------------------
         // A.  Parent–child relationship anomaly (kernel-verified parentPid)
         // ----------------------------------------------------------------
@@ -5059,12 +5090,14 @@ namespace ShadowStrike::AntiEvasion {
     // ========================================================================
 
     bool DebuggerEvasionDetector::CheckPEBFlags(uint32_t processId, PEBAnalysisInfo& outPebInfo, Error* err) noexcept {
+        (void)err;
         DebuggerEvasionResult result = AnalyzeProcess(processId);
         outPebInfo = result.pebInfo;
         return result.HasCategory(EvasionCategory::PEBBased);
     }
 
     bool DebuggerEvasionDetector::CheckHardwareBreakpoints(uint32_t processId, std::vector<HardwareBreakpointInfo>& outBreakpoints, Error* err) noexcept {
+        (void)err;
         DebuggerEvasionResult result = AnalyzeProcess(processId);
         outBreakpoints = result.hardwareBreakpoints;
         return result.HasCategory(EvasionCategory::HardwareDebugRegisters);
@@ -5077,6 +5110,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckAPITechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        (void)err;
         DebuggerEvasionResult result = AnalyzeProcess(processId);
         if (result.HasCategory(EvasionCategory::APIBased)) {
             for (const auto& det : result.detectedTechniques) {
@@ -5096,18 +5130,21 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckParentProcess(uint32_t processId, ParentProcessInfo& outParentInfo, Error* err) noexcept {
+        (void)err;
         DebuggerEvasionResult result = AnalyzeProcess(processId);
         outParentInfo = result.parentInfo;
         return result.HasCategory(EvasionCategory::ProcessRelationship);
     }
 
     bool DebuggerEvasionDetector::ScanMemoryArtifacts(uint32_t processId, std::vector<MemoryRegionInfo>& outRegions, Error* err) noexcept {
+        (void)err;
         DebuggerEvasionResult result = AnalyzeProcess(processId);
         outRegions = result.memoryRegions;
         return result.HasCategory(EvasionCategory::MemoryArtifacts);
     }
 
     bool DebuggerEvasionDetector::CheckDebugObjectHandles(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        (void)err;
         ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
         bool detected = false;
@@ -5131,6 +5168,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckSelfDebugging(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        (void)err;
         ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
         bool detected = false;
@@ -5166,15 +5204,14 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckKernelDebugInfo(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) {
             if (err) *err = Error::FromWin32(GetLastError());
             return false;
         }
 
         DebuggerEvasionResult tempResult;
-        QueryKernelDebugInfo(hProcess, processId, tempResult);
-        CloseHandle(hProcess);
+        QueryKernelDebugInfo(hProcess.Get(), processId, tempResult);
 
         for (auto& det : tempResult.detectedTechniques) {
             outDetections.push_back(std::move(det));
@@ -5189,6 +5226,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckCodeIntegrity(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        (void)err;
         ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
 
@@ -5224,6 +5262,7 @@ namespace ShadowStrike::AntiEvasion {
         AnalysisProgressCallback progressCallback,
         Error* err
     ) noexcept {
+        (void)err;
         BatchAnalysisResult batchResult;
         batchResult.startTime = std::chrono::system_clock::now();
 
