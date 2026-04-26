@@ -150,7 +150,10 @@
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#pragma warning(push)
+#pragma warning(disable: 6553) // Windows SDK winreg SAL annotation false positive under /analyze.
 #include "../Utils/RegistryUtils.hpp"
+#pragma warning(pop)
 #include "../Utils/Logger.hpp"
 
 // Forward declarations
