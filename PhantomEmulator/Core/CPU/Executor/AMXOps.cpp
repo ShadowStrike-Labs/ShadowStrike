@@ -22,8 +22,11 @@
  */
 
 #include "../CPU.hpp"
+#include <array>
+#include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <limits>
 
 namespace Phantom {
 
@@ -31,8 +34,75 @@ namespace Phantom {
 // Helpers
 // ============================================================================
 
-static inline bool ValidateTileIndex(uint8_t idx) noexcept {
-    return idx < 8;
+static constexpr uint8_t kAMXTileCount = 8;
+static constexpr uint32_t kTileCfgBytes = 64;
+
+[[nodiscard]] static inline bool ValidateTileIndex(uint8_t idx) noexcept {
+    return idx < kAMXTileCount;
+}
+
+[[nodiscard]] bool CanAddGuestOffset(GuestAddress base, uint64_t offset, GuestAddress& out) noexcept {
+    if (base > (std::numeric_limits<GuestAddress>::max)() - offset) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
+
+[[nodiscard]] bool ValidateTileShape(
+    const CPUState::TileConfig::TileDim& dim) noexcept
+{
+    return dim.rows <= CPUState::kMaxTileRows &&
+           dim.colsb <= CPUState::kMaxTileCols &&
+           static_cast<uint32_t>(dim.rows) * dim.colsb <= CPUState::kTileBytes;
+}
+
+[[nodiscard]] bool ValidateTileMemoryOperand(const DecodedInstruction& inst) noexcept {
+    return inst.operandCount >= 1 && inst.Op(0).IsMemory();
+}
+
+[[nodiscard]] bool ValidateTileRegisterOperand(const DecodedInstruction& inst) noexcept {
+    return inst.operandCount >= 1 && inst.Op(0).IsRegister() &&
+           ValidateTileIndex(inst.Op(0).reg.regIndex);
+}
+
+[[nodiscard]] float FP16ToFloat(uint16_t h) noexcept {
+    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000U)) << 16;
+    uint32_t exp = (h >> 10) & 0x1FU;
+    uint32_t mant = h & 0x03FFU;
+
+    uint32_t bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            int32_t e = -14;
+            while ((mant & 0x0400U) == 0) {
+                mant <<= 1;
+                --e;
+            }
+            mant &= 0x03FFU;
+            bits = sign |
+                   (static_cast<uint32_t>(e + 127) << 23) |
+                   (mant << 13);
+        }
+    } else if (exp == 0x1FU) {
+        bits = sign | 0x7F800000U | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112U) << 23) | (mant << 13);
+    }
+
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void AddWrapI32(CPUState::TileData& dst, uint32_t row, uint32_t col, int32_t product) noexcept {
+    const uint32_t off = row * CPUState::kMaxTileCols + col * sizeof(int32_t);
+    uint32_t accBits = 0;
+    std::memcpy(&accBits, dst.data + off, sizeof(accBits));
+    accBits += static_cast<uint32_t>(product);
+    std::memcpy(dst.data + off, &accBits, sizeof(accBits));
 }
 
 // TILECFG layout (64 bytes, per Intel AMX spec):
@@ -63,29 +133,40 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
     // LDTILECFG: VEX.NP.0F38.W0 49 /0 (memory) — load tile configuration
     // ========================================================================
     if (op == 0x49 && pp == 0 && (inst.modrm >> 6) != 3) {
+        if (!ValidateTileMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
         GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
 
-        uint8_t cfgBuf[64]{};
-        auto err = mem.Read(addr, cfgBuf, 64);
+        std::array<uint8_t, kTileCfgBytes> cfgBuf{};
+        auto err = mem.Read(addr, cfgBuf.data(), static_cast<uint32_t>(cfgBuf.size()));
         if (err != ErrorCode::Success) return err;
+
+        const bool reservedZero =
+            std::all_of(cfgBuf.begin() + 2, cfgBuf.begin() + 16, [](uint8_t b) { return b == 0; }) &&
+            std::all_of(cfgBuf.begin() + 32, cfgBuf.begin() + 48, [](uint8_t b) { return b == 0; }) &&
+            std::all_of(cfgBuf.begin() + 56, cfgBuf.end(), [](uint8_t b) { return b == 0; });
+        if (!reservedZero) {
+            tc.Reset();
+            return ErrorCode::InvalidOperandSize;
+        }
 
         // Parse TILECFG
         tc.paletteId = cfgBuf[0];
         tc.startRow  = cfgBuf[1];
 
         // Validate palette (must be 1 for AMX-INT8/BF16)
-        if (tc.paletteId != 1) {
+        if (tc.paletteId != 1 || tc.startRow >= CPUState::kMaxTileRows) {
             tc.Reset();
             return ErrorCode::InvalidOperandSize;
         }
 
-        for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t i = 0; i < kAMXTileCount; ++i) {
             uint16_t colsb = 0;
-            std::memcpy(&colsb, cfgBuf + 16 + i * 2, sizeof(uint16_t));
+            std::memcpy(&colsb, cfgBuf.data() + 16 + i * 2, sizeof(uint16_t));
             uint8_t rows = cfgBuf[48 + i];
 
             // Validate dimensions
-            if (colsb > CPUState::kMaxTileCols || rows > CPUState::kMaxTileRows) {
+            CPUState::TileConfig::TileDim candidate{colsb, rows};
+            if (!ValidateTileShape(candidate)) {
                 tc.Reset();
                 return ErrorCode::InvalidOperandSize;
             }
@@ -102,16 +183,17 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
     // STTILECFG: VEX.66.0F38.W0 49 /0 (memory) — store tile configuration
     // ========================================================================
     if (op == 0x49 && pp == 1 && (inst.modrm >> 6) != 3) {
+        if (!ValidateTileMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
         GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
 
-        uint8_t cfgBuf[64]{};
+        std::array<uint8_t, kTileCfgBytes> cfgBuf{};
         cfgBuf[0] = tc.paletteId;
         cfgBuf[1] = tc.startRow;
-        for (uint32_t i = 0; i < 8; ++i) {
-            std::memcpy(cfgBuf + 16 + i * 2, &tc.tiles[i].colsb, sizeof(uint16_t));
+        for (uint32_t i = 0; i < kAMXTileCount; ++i) {
+            std::memcpy(cfgBuf.data() + 16 + i * 2, &tc.tiles[i].colsb, sizeof(uint16_t));
             cfgBuf[48 + i] = tc.tiles[i].rows;
         }
-        return mem.Write(addr, cfgBuf, 64);
+        return mem.Write(addr, cfgBuf.data(), static_cast<uint32_t>(cfgBuf.size()));
     }
 
     // ========================================================================
@@ -132,9 +214,10 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
         if (!tc.configured) return ErrorCode::InvalidOperandSize;
         uint8_t tileIdx = inst.opcodeExt;
         if (!ValidateTileIndex(tileIdx)) return ErrorCode::InvalidOperandSize;
+        if (!ValidateTileMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
 
         auto& dim = tc.tiles[tileIdx];
-        if (dim.rows == 0 || dim.colsb == 0) return ErrorCode::InvalidOperandSize;
+        if (dim.rows == 0 || dim.colsb == 0 || !ValidateTileShape(dim)) return ErrorCode::InvalidOperandSize;
 
         GuestAddress baseAddr = CalculateEffectiveAddress(inst.Op(0), inst);
         // The stride comes from the SIB index register × scale.
@@ -143,7 +226,10 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
 
         m_state.tiles[tileIdx].Clear();
         for (uint8_t row = 0; row < dim.rows; ++row) {
-            GuestAddress rowAddr = baseAddr + static_cast<uint64_t>(row) * stride;
+            GuestAddress rowAddr = 0;
+            if (!CanAddGuestOffset(baseAddr, static_cast<uint64_t>(row) * stride, rowAddr)) {
+                return ErrorCode::AddressOverflow;
+            }
             auto err = mem.Read(rowAddr, m_state.tiles[tileIdx].data +
                                 row * CPUState::kMaxTileCols, dim.colsb);
             if (err != ErrorCode::Success) return err;
@@ -158,15 +244,19 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
         if (!tc.configured) return ErrorCode::InvalidOperandSize;
         uint8_t tileIdx = inst.opcodeExt;
         if (!ValidateTileIndex(tileIdx)) return ErrorCode::InvalidOperandSize;
+        if (!ValidateTileMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
 
         auto& dim = tc.tiles[tileIdx];
-        if (dim.rows == 0 || dim.colsb == 0) return ErrorCode::InvalidOperandSize;
+        if (dim.rows == 0 || dim.colsb == 0 || !ValidateTileShape(dim)) return ErrorCode::InvalidOperandSize;
 
         GuestAddress baseAddr = CalculateEffectiveAddress(inst.Op(0), inst);
         uint32_t stride = dim.colsb;
 
         for (uint8_t row = 0; row < dim.rows; ++row) {
-            GuestAddress rowAddr = baseAddr + static_cast<uint64_t>(row) * stride;
+            GuestAddress rowAddr = 0;
+            if (!CanAddGuestOffset(baseAddr, static_cast<uint64_t>(row) * stride, rowAddr)) {
+                return ErrorCode::AddressOverflow;
+            }
             auto err = mem.Write(rowAddr, m_state.tiles[tileIdx].data +
                                  row * CPUState::kMaxTileCols, dim.colsb);
             if (err != ErrorCode::Success) return err;
@@ -188,6 +278,7 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
         // Operand encoding: dst=reg, src1=vvvv, src2=r/m (all tile registers)
         uint8_t dstIdx = inst.opcodeExt;
         uint8_t src1Idx = static_cast<uint8_t>(15 - inst.prefixes.vexVVVV);
+        if (!ValidateTileRegisterOperand(inst)) return ErrorCode::InvalidOperandSize;
         uint8_t src2Idx = inst.Op(0).reg.regIndex;
 
         if (!ValidateTileIndex(dstIdx) || !ValidateTileIndex(src1Idx) ||
@@ -204,7 +295,11 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
         uint16_t N_bytes = dstDim.colsb;
         uint16_t K_bytes = src1Dim.colsb;
 
-        if (M == 0 || N_bytes == 0 || K_bytes == 0)
+        if (M == 0 || N_bytes == 0 || K_bytes == 0 ||
+            !ValidateTileShape(dstDim) || !ValidateTileShape(src1Dim) || !ValidateTileShape(src2Dim) ||
+            (N_bytes % sizeof(int32_t)) != 0 || (K_bytes % sizeof(int32_t)) != 0 ||
+            src1Dim.rows != M || src2Dim.rows != (K_bytes / sizeof(int32_t)) ||
+            src2Dim.colsb != N_bytes)
             return ErrorCode::InvalidOperandSize;
 
         uint32_t N = N_bytes / sizeof(int32_t);  // Number of int32 columns in dst
@@ -216,11 +311,9 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
 
         for (uint32_t m = 0; m < M; ++m) {
             for (uint32_t n = 0; n < N; ++n) {
-                int32_t acc = dst.GetI32(m, n);
                 for (uint32_t k = 0; k < K; ++k) {
                     // Each k-group: 4 byte-pairs dot-product
                     for (uint32_t b = 0; b < 4; ++b) {
-                        uint32_t s1Off = m * CPUState::kMaxTileCols + k * 4 + b;
                         uint32_t s2Off = n * CPUState::kMaxTileCols + k * 4 + b;
                         // Careful: s2 is accessed with n as row for column-major
                         // Actually: src2[k_row][n_col], so off = k*maxCols + n*4 + b
@@ -252,10 +345,9 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
                             b_val = static_cast<uint8_t>(b_byte);
                             break;
                         }
-                        acc += a_val * b_val;
+                        AddWrapI32(dst, m, n, a_val * b_val);
                     }
                 }
-                dst.SetI32(m, n, acc);
             }
         }
         return ErrorCode::Success;
@@ -272,6 +364,7 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
 
         uint8_t dstIdx = inst.opcodeExt;
         uint8_t src1Idx = static_cast<uint8_t>(15 - inst.prefixes.vexVVVV);
+        if (!ValidateTileRegisterOperand(inst)) return ErrorCode::InvalidOperandSize;
         uint8_t src2Idx = inst.Op(0).reg.regIndex;
 
         if (!ValidateTileIndex(dstIdx) || !ValidateTileIndex(src1Idx) ||
@@ -279,11 +372,17 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
             return ErrorCode::InvalidOperandSize;
 
         auto& dstDim = tc.tiles[dstIdx];
+        auto& src1Dim = tc.tiles[src1Idx];
+        auto& src2Dim = tc.tiles[src2Idx];
         uint8_t M = dstDim.rows;
         uint16_t N_bytes = dstDim.colsb;
-        uint16_t K_bytes = tc.tiles[src1Idx].colsb;
+        uint16_t K_bytes = src1Dim.colsb;
 
-        if (M == 0 || N_bytes == 0 || K_bytes == 0)
+        if (M == 0 || N_bytes == 0 || K_bytes == 0 ||
+            !ValidateTileShape(dstDim) || !ValidateTileShape(src1Dim) || !ValidateTileShape(src2Dim) ||
+            (N_bytes % sizeof(float)) != 0 || (K_bytes % sizeof(uint32_t)) != 0 ||
+            src1Dim.rows != M || src2Dim.rows != (K_bytes / sizeof(uint32_t)) ||
+            src2Dim.colsb != N_bytes)
             return ErrorCode::InvalidOperandSize;
 
         uint32_t N = N_bytes / sizeof(float);     // FP32 columns in dst
@@ -318,39 +417,9 @@ ErrorCode CPU::ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) no
                             std::memcpy(&a_f, &a32, sizeof(float));
                             std::memcpy(&b_f, &b32, sizeof(float));
                         } else {
-                            // TDPFP16PS: IEEE FP16 → float
-                            // Manual FP16 decode: sign(1) | exp(5) | mant(10)
-                            auto fp16ToFloat = [](uint16_t h) -> float {
-                                uint32_t sign = (h >> 15) & 1;
-                                uint32_t exp  = (h >> 10) & 0x1F;
-                                uint32_t mant = h & 0x3FF;
-                                if (exp == 0) {
-                                    if (mant == 0) {
-                                        uint32_t f = sign << 31;
-                                        float result = 0.0f;
-                                        std::memcpy(&result, &f, sizeof(float));
-                                        return result;
-                                    }
-                                    // Denormal: normalize
-                                    while (!(mant & 0x400)) { mant <<= 1; exp--; }
-                                    exp++;
-                                    mant &= 0x3FF;
-                                }
-                                if (exp == 31) {
-                                    uint32_t f = (sign << 31) | 0x7F800000 | (mant << 13);
-                                    float result = 0.0f;
-                                    std::memcpy(&result, &f, sizeof(float));
-                                    return result;
-                                }
-                                uint32_t f = (sign << 31) |
-                                             ((exp + 112) << 23) |
-                                             (mant << 13);
-                                float result = 0.0f;
-                                std::memcpy(&result, &f, sizeof(float));
-                                return result;
-                            };
-                            a_f = fp16ToFloat(a_raw);
-                            b_f = fp16ToFloat(b_raw);
+                            // TDPFP16PS: IEEE FP16 -> float.
+                            a_f = FP16ToFloat(a_raw);
+                            b_f = FP16ToFloat(b_raw);
                         }
                         acc += a_f * b_f;
                     }
