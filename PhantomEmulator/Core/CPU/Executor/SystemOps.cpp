@@ -11,8 +11,57 @@
 
 #include "../CPU.hpp"
 #include "../../../Common/Constants.hpp"
+#include <cstring>
 
 namespace Phantom {
+
+namespace {
+
+constexpr uint64_t kSupportedXStateMask = 0x07; // x87, SSE, AVX upper halves
+constexpr uint32_t kMxcsrWritableMask = 0x0000FFBF;
+
+[[nodiscard]] bool CanAddGuestOffset(GuestAddress base, uint64_t offset, GuestAddress& result) noexcept {
+    if (base > (std::numeric_limits<GuestAddress>::max)() - offset) return false;
+    result = base + offset;
+    return true;
+}
+
+[[nodiscard]] ErrorCode WriteGuestOffset(
+    VirtualMemory& mem,
+    GuestAddress base,
+    uint64_t offset,
+    const void* src,
+    uint32_t bytes) noexcept
+{
+    GuestAddress target = 0;
+    if (!CanAddGuestOffset(base, offset, target)) return ErrorCode::AddressOverflow;
+    return mem.Write(target, src, bytes);
+}
+
+[[nodiscard]] ErrorCode ReadGuestOffset(
+    VirtualMemory& mem,
+    GuestAddress base,
+    uint64_t offset,
+    void* dst,
+    uint32_t bytes) noexcept
+{
+    GuestAddress target = 0;
+    if (!CanAddGuestOffset(base, offset, target)) return ErrorCode::AddressOverflow;
+    return mem.Read(target, dst, bytes);
+}
+
+[[nodiscard]] bool HasMemoryOperand0(const DecodedInstruction& inst) noexcept {
+    return inst.HasOperand(0) && inst.Op(0).IsMemory();
+}
+
+[[nodiscard]] uint64_t DeterministicEntropySample(uint64_t seed) noexcept {
+    seed ^= seed >> 12;
+    seed ^= seed << 25;
+    seed ^= seed >> 27;
+    return seed * 0x2545F4914F6CDD1DULL;
+}
+
+} // namespace
 
 ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     if (inst.opcodeMap == OpcodeMap::TwoByte) {
@@ -115,8 +164,7 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
         }
 
         // === RDTSCP (0F 01 F9) — returns TSC + processor ID ===
-        if (inst.opcode == 0x01 && inst.opcodeExt == 7) {
-            // Distinguish RDTSCP (modrm F9) from other 0F 01 /7 forms
+        if (inst.opcode == 0x01 && inst.modrm == 0xF9) {
             m_state.SetReg32(GPR::RAX, static_cast<uint32_t>(m_state.tsc));
             m_state.SetReg32(GPR::RDX, static_cast<uint32_t>(m_state.tsc >> 32));
             m_state.SetReg32(GPR::RCX, 0); // IA32_TSC_AUX = 0 (processor 0)
@@ -219,16 +267,20 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
             if (ext == 7 && mod == 3) return ErrorCode::Success;
 
             // CLFLUSH (ext=7, memory operand) — no-op in emulator
-            if (ext == 7 && mod != 3) return ErrorCode::Success;
+            if (ext == 7 && mod != 3) {
+                return HasMemoryOperand0(inst) ? ErrorCode::Success : ErrorCode::InvalidOperandSize;
+            }
 
             // XSAVE (0F AE /4, memory operand)
             // XSAVEOPT (0F AE /6, memory operand) — same format, hint optimization only
             if ((ext == 4 || ext == 6) && mod != 3) {
+                if (!HasMemoryOperand0(inst)) return ErrorCode::InvalidOperandSize;
                 GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
 
                 // EDX:EAX = requested-feature bitmap (RFBM)
                 uint64_t rfbm = (static_cast<uint64_t>(m_state.GetReg32(GPR::RDX)) << 32)
                               | m_state.GetReg32(GPR::RAX);
+                rfbm &= kSupportedXStateMask;
 
                 // Component 0: x87 FPU state (bytes 0-159 of legacy region)
                 if (rfbm & 1) {
@@ -259,7 +311,7 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                     uint32_t mxcsrMask = 0x0000FFBF;
                     std::memcpy(legacyHdr + 28, &mxcsrMask, 4);
 
-                    auto err = mem.Write(addr, legacyHdr, 32);
+                    auto err = WriteGuestOffset(mem, addr, 0, legacyHdr, 32);
                     if (err != ErrorCode::Success) return err;
 
                     // x87 data registers: 8 × 16 bytes at offset 32 (within legacy 160-byte area)
@@ -267,7 +319,7 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                         uint8_t fpuBuf[16]{};
                         auto ld = m_state.fpuStack[i].value;
                         std::memcpy(fpuBuf, &ld, sizeof(ld) <= 16 ? sizeof(ld) : 16);
-                        err = mem.Write(addr + 32 + static_cast<uint32_t>(i) * 16, fpuBuf, 16);
+                        err = WriteGuestOffset(mem, addr, 32 + static_cast<uint32_t>(i) * 16, fpuBuf, 16);
                         if (err != ErrorCode::Success) return err;
                     }
                 }
@@ -275,8 +327,8 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                 // Component 1: SSE state (XMM registers at bytes 160-415 of legacy region)
                 if (rfbm & 2) {
                     for (uint8_t i = 0; i < 16; ++i) {
-                        auto err = mem.Write(addr + 160 + static_cast<uint32_t>(i) * 16,
-                                             m_state.xmm[i].u8, 16);
+                        auto err = WriteGuestOffset(mem, addr, 160 + static_cast<uint32_t>(i) * 16,
+                                                    m_state.xmm[i].u8, 16);
                         if (err != ErrorCode::Success) return err;
                     }
                 }
@@ -284,16 +336,16 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                 // XSAVE header (bytes 512-575)
                 uint8_t header[64]{};
                 // XSTATE_BV at [512..519] = which components are saved
-                uint64_t xstateBv = rfbm & 0x07; // x87 + SSE + AVX
+                uint64_t xstateBv = rfbm & kSupportedXStateMask;
                 std::memcpy(header, &xstateBv, 8);
-                auto err = mem.Write(addr + 512, header, 64);
+                auto err = WriteGuestOffset(mem, addr, 512, header, 64);
                 if (err != ErrorCode::Success) return err;
 
                 // Component 2: AVX upper YMM (bytes 576-831, 16 × 16 bytes)
                 if (rfbm & 4) {
                     for (uint8_t i = 0; i < 16; ++i) {
-                        err = mem.Write(addr + 576 + static_cast<uint32_t>(i) * 16,
-                                        m_state.ymmHigh[i].u8, 16);
+                        err = WriteGuestOffset(mem, addr, 576 + static_cast<uint32_t>(i) * 16,
+                                               m_state.ymmHigh[i].u8, 16);
                         if (err != ErrorCode::Success) return err;
                     }
                 }
@@ -303,18 +355,21 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
 
             // XRSTOR (0F AE /5, memory operand)
             if (ext == 5 && mod != 3) {
+                if (!HasMemoryOperand0(inst)) return ErrorCode::InvalidOperandSize;
                 GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
 
                 // EDX:EAX = requested-feature bitmap (RFBM)
                 uint64_t rfbm = (static_cast<uint64_t>(m_state.GetReg32(GPR::RDX)) << 32)
                               | m_state.GetReg32(GPR::RAX);
+                rfbm &= kSupportedXStateMask;
 
                 // Read XSAVE header to determine which components are present
                 uint8_t header[64]{};
-                auto err = mem.Read(addr + 512, header, 64);
+                auto err = ReadGuestOffset(mem, addr, 512, header, 64);
                 if (err != ErrorCode::Success) return err;
                 uint64_t xstateBv = 0;
                 std::memcpy(&xstateBv, header, 8);
+                xstateBv &= kSupportedXStateMask;
 
                 // Only restore components in both RFBM and XSTATE_BV
                 uint64_t restoreMask = rfbm & xstateBv;
@@ -322,7 +377,7 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                 // Component 0: x87 FPU state
                 if (restoreMask & 1) {
                     uint8_t legacyHdr[32]{};
-                    err = mem.Read(addr, legacyHdr, 32);
+                    err = ReadGuestOffset(mem, addr, 0, legacyHdr, 32);
                     if (err != ErrorCode::Success) return err;
 
                     std::memcpy(&m_state.fpuControl, legacyHdr, 2);
@@ -337,10 +392,11 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                     std::memcpy(&m_state.fpuIP, legacyHdr + 8, 8);
                     std::memcpy(&m_state.fpuDP, legacyHdr + 16, 8);
                     std::memcpy(&m_state.mxcsr, legacyHdr + 24, 4);
+                    m_state.mxcsr &= kMxcsrWritableMask;
 
                     for (int i = 0; i < 8; ++i) {
                         uint8_t fpuBuf[16]{};
-                        err = mem.Read(addr + 32 + static_cast<uint32_t>(i) * 16, fpuBuf, 16);
+                        err = ReadGuestOffset(mem, addr, 32 + static_cast<uint32_t>(i) * 16, fpuBuf, 16);
                         if (err != ErrorCode::Success) return err;
                         std::memcpy(&m_state.fpuStack[i].value, fpuBuf,
                                     sizeof(m_state.fpuStack[i].value) <= 16
@@ -357,8 +413,8 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                 // Component 1: SSE state
                 if (restoreMask & 2) {
                     for (uint8_t i = 0; i < 16; ++i) {
-                        err = mem.Read(addr + 160 + static_cast<uint32_t>(i) * 16,
-                                       m_state.xmm[i].u8, 16);
+                        err = ReadGuestOffset(mem, addr, 160 + static_cast<uint32_t>(i) * 16,
+                                              m_state.xmm[i].u8, 16);
                         if (err != ErrorCode::Success) return err;
                     }
                 } else if (rfbm & 2) {
@@ -369,8 +425,8 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
                 // Component 2: AVX upper YMM
                 if (restoreMask & 4) {
                     for (uint8_t i = 0; i < 16; ++i) {
-                        err = mem.Read(addr + 576 + static_cast<uint32_t>(i) * 16,
-                                       m_state.ymmHigh[i].u8, 16);
+                        err = ReadGuestOffset(mem, addr, 576 + static_cast<uint32_t>(i) * 16,
+                                              m_state.ymmHigh[i].u8, 16);
                         if (err != ErrorCode::Success) return err;
                     }
                 } else if (rfbm & 4) {
@@ -386,7 +442,8 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
         // === PREFETCH hints (0F 18 /0-3) — no-op in emulator ===
         if (inst.opcode == 0x18) {
             uint8_t ext = inst.opcodeExt;
-            if (ext <= 3) return ErrorCode::Success;
+            uint8_t mod = (inst.modrm >> 6) & 3;
+            if (ext <= 3) return (mod != 3 && HasMemoryOperand0(inst)) ? ErrorCode::Success : ErrorCode::InvalidOperandSize;
             return ErrorCode::UnimplementedOpcode;
         }
     }
@@ -456,19 +513,12 @@ ErrorCode CPU::ExecuteRdRandSeed(const DecodedInstruction& inst, VirtualMemory& 
     if ((ext != 6 && ext != 7) || mod != 3)
         return ErrorCode::UnimplementedOpcode;
 
-    // Xorshift64* PRNG — fast, non-cryptographic, sufficient for emulation.
-    // Seed from TSC on first call; subsequent calls advance the state.
-    static thread_local uint64_t s_prngState = 0;
-    if (s_prngState == 0) {
-        s_prngState = m_state.tsc ^ 0x5DEECE66DULL;
-        if (s_prngState == 0) s_prngState = 1; // Avoid zero state
-    }
-
-    // Xorshift64* step
-    s_prngState ^= s_prngState >> 12;
-    s_prngState ^= s_prngState << 25;
-    s_prngState ^= s_prngState >> 27;
-    uint64_t value = s_prngState * 0x2545F4914F6CDD1DULL;
+    uint64_t seed = m_state.tsc ^
+                    (m_state.instructionCount * 0x9E3779B97F4A7C15ULL) ^
+                    (static_cast<uint64_t>(ext) << 56) ^
+                    0x5DEECE66DULL;
+    if (seed == 0) seed = 1;
+    uint64_t value = DeterministicEntropySample(seed);
 
     // Destination is the register encoded in ModRM.rm (bits 2:0 + REX.B)
     uint8_t regIdx = (inst.modrm & 7) | (inst.prefixes.rexB ? 8 : 0);
