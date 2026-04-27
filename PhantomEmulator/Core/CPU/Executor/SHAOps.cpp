@@ -63,7 +63,60 @@ namespace {
 }
 
 [[nodiscard]] constexpr uint32_t RotateLeft32(uint32_t val, unsigned n) noexcept {
-    return (val << n) | (val >> (32 - n));
+    const unsigned shift = n & 31u;
+    return shift == 0 ? val : ((val << shift) | (val >> (32u - shift)));
+}
+
+[[nodiscard]] bool HasOperands(const DecodedInstruction& inst, uint8_t count) noexcept {
+    return inst.operandCount >= count;
+}
+
+[[nodiscard]] bool IsShaOpcode(OpcodeMap map, uint8_t opcode) noexcept {
+    if (map == OpcodeMap::ThreeByte38) {
+        return opcode >= 0xC8 && opcode <= 0xCD;
+    }
+    return map == OpcodeMap::ThreeByte3A && opcode == 0xCC;
+}
+
+[[nodiscard]] bool HasInvalidShaPrefix(const DecodedInstruction& inst) noexcept {
+    return inst.prefixes.hasLock ||
+           inst.prefixes.hasRep ||
+           inst.prefixes.hasRepNE ||
+           inst.prefixes.hasOpSizeOverride ||
+           inst.prefixes.hasVEX ||
+           inst.prefixes.hasEVEX;
+}
+
+[[nodiscard]] bool IsXmmRegisterOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsRegister() &&
+           operand.reg.regType == RegType::XMM &&
+           !operand.reg.isHighByte &&
+           operand.reg.regIndex < 16;
+}
+
+[[nodiscard]] ErrorCode ValidateShaOperands(const DecodedInstruction& inst) noexcept {
+    if (!IsShaOpcode(inst.opcodeMap, inst.opcode) || HasInvalidShaPrefix(inst)) {
+        return ErrorCode::UnimplementedOpcode;
+    }
+
+    const uint8_t requiredOperands = (inst.opcodeMap == OpcodeMap::ThreeByte3A) ? 3u : 2u;
+    if (!HasOperands(inst, requiredOperands) || !IsXmmRegisterOperand(inst.Op(0))) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
+    if (!IsXmmRegisterOperand(inst.Op(1)) && !inst.Op(1).IsMemory()) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
+    if (inst.Op(1).IsRegister() && !IsXmmRegisterOperand(inst.Op(1))) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
+    if (inst.opcodeMap == OpcodeMap::ThreeByte3A && !inst.Op(2).IsImmediate()) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
+    return ErrorCode::Success;
 }
 
 // ============================================================================
@@ -107,9 +160,11 @@ namespace {
 ErrorCode CPU::ExecuteSHA(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     const uint8_t op = inst.opcode;
 
+    auto validation = ValidateShaOperands(inst);
+    if (validation != ErrorCode::Success) return validation;
+
     // Read destination XMM (operand 0 — always xmm register)
     alignas(16) uint32_t dst[4]{};
-    if (!inst.Op(0).IsRegister()) return ErrorCode::InvalidOperandSize;
     const uint8_t dstIdx = inst.Op(0).reg.regIndex;
     std::memcpy(dst, m_state.XMM(dstIdx).u8, 16);
 
