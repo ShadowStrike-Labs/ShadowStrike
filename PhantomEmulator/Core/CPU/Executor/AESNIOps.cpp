@@ -21,6 +21,7 @@
  */
 
 #include "../CPU.hpp"
+#include <array>
 #include <cstring>
 
 namespace Phantom {
@@ -30,6 +31,16 @@ namespace Phantom {
 // ============================================================================
 
 namespace {
+
+static constexpr size_t kAESBlockBytes = 16;
+static constexpr uint8_t kXmmRegisterCount = 16;
+
+[[nodiscard]] bool IsValidXmmOperand(const DecodedOperand& op) noexcept {
+    // DESIGN: the generic decoder tags SIMD ModRM.reg operands as Register and
+    // carries the physical index in regIndex. Existing vector executors depend
+    // on that representation, so validate shape/index without requiring RegType::XMM.
+    return op.IsRegister() && op.reg.regIndex < kXmmRegisterCount;
+}
 
 alignas(64) constexpr uint8_t kSBox[256] = {
     0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5,
@@ -337,9 +348,19 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
     // All AES-NI instructions require the 66 prefix
     if (!has66) return ErrorCode::UnimplementedOpcode;
 
+    if (inst.operandCount < 2 || !IsValidXmmOperand(inst.Op(0))) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
     // Helper: read 128-bit source from Op(1)
     auto ReadSrc128 = [&](uint8_t* out) -> ErrorCode {
+        if (out == nullptr || inst.operandCount < 2) {
+            return ErrorCode::InvalidOperandSize;
+        }
         if (inst.Op(1).IsRegister()) {
+            if (inst.Op(1).reg.regIndex >= kXmmRegisterCount) {
+                return ErrorCode::InvalidOperandSize;
+            }
             std::memcpy(out, m_state.XMM(inst.Op(1).reg.regIndex).u8, 16);
             return ErrorCode::Success;
         }
@@ -365,14 +386,14 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // Used during equivalent-inverse cipher key expansion.
         // ================================================================
         if (op == 0xDB) {
-            uint8_t src[16]{};
-            auto err = ReadSrc128(src);
+            std::array<uint8_t, kAESBlockBytes> src{};
+            auto err = ReadSrc128(src.data());
             if (err != ErrorCode::Success) return err;
 
-            InvMixColumns(src);
+            InvMixColumns(src.data());
 
             uint8_t dstIdx = inst.Op(0).reg.regIndex;
-            std::memcpy(m_state.XMM(dstIdx).u8, src, 16);
+            std::memcpy(m_state.XMM(dstIdx).u8, src.data(), kAESBlockBytes);
             return ErrorCode::Success;
         }
 
@@ -387,22 +408,22 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // xmm1 = tmp XOR xmm2/m128 (round key)
         // ================================================================
         if (op == 0xDC) {
-            uint8_t roundKey[16]{};
-            auto err = ReadSrc128(roundKey);
+            std::array<uint8_t, kAESBlockBytes> roundKey{};
+            auto err = ReadSrc128(roundKey.data());
             if (err != ErrorCode::Success) return err;
 
             uint8_t dstIdx = inst.Op(0).reg.regIndex;
-            uint8_t state[16];
-            std::memcpy(state, m_state.XMM(dstIdx).u8, 16);
+            std::array<uint8_t, kAESBlockBytes> state{};
+            std::memcpy(state.data(), m_state.XMM(dstIdx).u8, kAESBlockBytes);
 
-            ShiftRows(state);
-            SubBytes(state);
-            MixColumns(state);
+            ShiftRows(state.data());
+            SubBytes(state.data());
+            MixColumns(state.data());
 
-            for (int i = 0; i < 16; i++)
+            for (size_t i = 0; i < state.size(); i++)
                 state[i] ^= roundKey[i];
 
-            std::memcpy(m_state.XMM(dstIdx).u8, state, 16);
+            std::memcpy(m_state.XMM(dstIdx).u8, state.data(), kAESBlockBytes);
             return ErrorCode::Success;
         }
 
@@ -413,21 +434,21 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // Same as AESENC but without MixColumns.
         // ================================================================
         if (op == 0xDD) {
-            uint8_t roundKey[16]{};
-            auto err = ReadSrc128(roundKey);
+            std::array<uint8_t, kAESBlockBytes> roundKey{};
+            auto err = ReadSrc128(roundKey.data());
             if (err != ErrorCode::Success) return err;
 
             uint8_t dstIdx = inst.Op(0).reg.regIndex;
-            uint8_t state[16];
-            std::memcpy(state, m_state.XMM(dstIdx).u8, 16);
+            std::array<uint8_t, kAESBlockBytes> state{};
+            std::memcpy(state.data(), m_state.XMM(dstIdx).u8, kAESBlockBytes);
 
-            ShiftRows(state);
-            SubBytes(state);
+            ShiftRows(state.data());
+            SubBytes(state.data());
 
-            for (int i = 0; i < 16; i++)
+            for (size_t i = 0; i < state.size(); i++)
                 state[i] ^= roundKey[i];
 
-            std::memcpy(m_state.XMM(dstIdx).u8, state, 16);
+            std::memcpy(m_state.XMM(dstIdx).u8, state.data(), kAESBlockBytes);
             return ErrorCode::Success;
         }
 
@@ -442,22 +463,22 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // xmm1 = tmp XOR xmm2/m128 (round key)
         // ================================================================
         if (op == 0xDE) {
-            uint8_t roundKey[16]{};
-            auto err = ReadSrc128(roundKey);
+            std::array<uint8_t, kAESBlockBytes> roundKey{};
+            auto err = ReadSrc128(roundKey.data());
             if (err != ErrorCode::Success) return err;
 
             uint8_t dstIdx = inst.Op(0).reg.regIndex;
-            uint8_t state[16];
-            std::memcpy(state, m_state.XMM(dstIdx).u8, 16);
+            std::array<uint8_t, kAESBlockBytes> state{};
+            std::memcpy(state.data(), m_state.XMM(dstIdx).u8, kAESBlockBytes);
 
-            InvShiftRows(state);
-            InvSubBytes(state);
-            InvMixColumns(state);
+            InvShiftRows(state.data());
+            InvSubBytes(state.data());
+            InvMixColumns(state.data());
 
-            for (int i = 0; i < 16; i++)
+            for (size_t i = 0; i < state.size(); i++)
                 state[i] ^= roundKey[i];
 
-            std::memcpy(m_state.XMM(dstIdx).u8, state, 16);
+            std::memcpy(m_state.XMM(dstIdx).u8, state.data(), kAESBlockBytes);
             return ErrorCode::Success;
         }
 
@@ -468,21 +489,21 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // Same as AESDEC but without InvMixColumns.
         // ================================================================
         if (op == 0xDF) {
-            uint8_t roundKey[16]{};
-            auto err = ReadSrc128(roundKey);
+            std::array<uint8_t, kAESBlockBytes> roundKey{};
+            auto err = ReadSrc128(roundKey.data());
             if (err != ErrorCode::Success) return err;
 
             uint8_t dstIdx = inst.Op(0).reg.regIndex;
-            uint8_t state[16];
-            std::memcpy(state, m_state.XMM(dstIdx).u8, 16);
+            std::array<uint8_t, kAESBlockBytes> state{};
+            std::memcpy(state.data(), m_state.XMM(dstIdx).u8, kAESBlockBytes);
 
-            InvShiftRows(state);
-            InvSubBytes(state);
+            InvShiftRows(state.data());
+            InvSubBytes(state.data());
 
-            for (int i = 0; i < 16; i++)
+            for (size_t i = 0; i < state.size(); i++)
                 state[i] ^= roundKey[i];
 
-            std::memcpy(m_state.XMM(dstIdx).u8, state, 16);
+            std::memcpy(m_state.XMM(dstIdx).u8, state.data(), kAESBlockBytes);
             return ErrorCode::Success;
         }
     }
@@ -505,8 +526,8 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // polynomial arithmetic in GF(2^n).
         // ================================================================
         if (op == 0x44) {
-            uint8_t src128[16]{};
-            auto err = ReadSrc128(src128);
+            std::array<uint8_t, kAESBlockBytes> src128{};
+            auto err = ReadSrc128(src128.data());
             if (err != ErrorCode::Success) return err;
 
             uint8_t imm = 0;
@@ -522,7 +543,7 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
             // Select 64-bit quadwords based on imm8 selector bits
             uint64_t a = (imm & 0x01) ? dst.u64[1] : dst.u64[0];
             uint64_t b;
-            std::memcpy(&b, (imm & 0x10) ? &src128[8] : &src128[0], 8);
+            std::memcpy(&b, (imm & 0x10) ? &src128[8] : &src128[0], sizeof(b));
 
             uint64_t lo = 0, hi = 0;
             CarrylessMultiply64(a, b, lo, hi);
@@ -550,8 +571,8 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
         // xmm1[127:96]  = RotWord(SubWord(X3)) XOR RCON
         // ================================================================
         if (op == 0xDF) {
-            uint8_t src128[16]{};
-            auto err = ReadSrc128(src128);
+            std::array<uint8_t, kAESBlockBytes> src128{};
+            auto err = ReadSrc128(src128.data());
             if (err != ErrorCode::Success) return err;
 
             uint8_t imm = 0;
@@ -564,11 +585,10 @@ ErrorCode CPU::ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) 
             uint32_t rcon = static_cast<uint32_t>(imm);
 
             // Extract 32-bit dwords from source
-            uint32_t x0, x1, x2, x3;
-            std::memcpy(&x0, &src128[0], 4);
-            std::memcpy(&x1, &src128[4], 4);
-            std::memcpy(&x2, &src128[8], 4);
-            std::memcpy(&x3, &src128[12], 4);
+            uint32_t x1 = 0;
+            uint32_t x3 = 0;
+            std::memcpy(&x1, &src128[4], sizeof(x1));
+            std::memcpy(&x3, &src128[12], sizeof(x3));
 
             uint32_t sub1 = SubWord(x1);
             uint32_t sub3 = SubWord(x3);
