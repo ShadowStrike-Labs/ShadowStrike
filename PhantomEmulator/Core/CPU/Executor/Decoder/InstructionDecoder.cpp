@@ -12,6 +12,23 @@
 
 namespace Phantom {
 
+namespace {
+
+[[nodiscard]] bool CanReadInstructionBytes(
+    std::span<const uint8_t> bytes,
+    uint32_t offset,
+    uint32_t width) noexcept
+{
+    if (width == 0) return true;
+    if (offset > Encoding::kMaxInstructionLength) return false;
+    if (width > Encoding::kMaxInstructionLength - offset) return false;
+    const auto available = bytes.size();
+    return static_cast<size_t>(offset) <= available &&
+           static_cast<size_t>(width) <= available - static_cast<size_t>(offset);
+}
+
+} // namespace
+
 // ============================================================================
 // Main Decode Entry Point
 // ============================================================================
@@ -34,12 +51,15 @@ ErrorCode InstructionDecoder::Decode(
     // Phase 1: Prefixes
     auto err = DecodePrefixes(bytes, mode, out.prefixes, offset);
     if (err != ErrorCode::Success) return err;
+    if (offset == Encoding::kMaxInstructionLength && bytes.size() > offset) {
+        return ErrorCode::InstructionTooLong;
+    }
 
     // Phase 1b: VEX prefix (C4/C5)
     // In 64-bit mode: C4/C5 are always VEX prefixes.
     // In 32-bit mode: C4/C5 are VEX only if the next byte has bits [7:6] = 11b.
     // Must check after legacy prefixes but before opcode decoding.
-    if (offset < bytes.size()) {
+    if (CanReadInstructionBytes(bytes, offset, 1)) {
         uint8_t b = bytes[offset];
         if (b == Encoding::kVEX2Byte || b == Encoding::kVEX3Byte) {
             err = DecodeVEX(bytes, mode, out.prefixes, offset);
@@ -47,7 +67,7 @@ ErrorCode InstructionDecoder::Decode(
 
             if (out.prefixes.hasVEX) {
                 // VEX encodes the opcode map implicitly — read the opcode byte directly
-                if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+                if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
                 out.opcode = bytes[offset++];
 
                 switch (out.prefixes.vexMMMMM) {
@@ -65,12 +85,12 @@ ErrorCode InstructionDecoder::Decode(
     }
 
     // Phase 1c: EVEX prefix (0x62)
-    if (offset < bytes.size() && bytes[offset] == 0x62) {
+    if (CanReadInstructionBytes(bytes, offset, 1) && bytes[offset] == 0x62) {
         err = DecodeEVEX(bytes, mode, out.prefixes, offset);
         if (err != ErrorCode::Success) return err;
 
         if (out.prefixes.hasEVEX) {
-            if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+            if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
             out.opcode = bytes[offset++];
 
             switch (out.prefixes.vexMMMMM) {
@@ -143,7 +163,13 @@ vex_opcode_done:
     }
 
     // Phase 6: Immediate
-    uint8_t immSize = OpcodeImmediateSize(out.opcodeMap, out.opcode, out.operandSize);
+    if (out.opcodeMap == OpcodeMap::OneByte &&
+        out.opcode >= 0xA0 && out.opcode <= 0xA3) {
+        err = DecodeMemoryOffset(bytes, offset, out);
+        if (err != ErrorCode::Success) return err;
+    }
+
+    uint8_t immSize = OpcodeImmediateSize(out.opcodeMap, out.opcode, out.opcodeExt, out.operandSize);
     if (immSize > 0) {
         err = DecodeImmediate(bytes, offset, immSize, out);
         if (err != ErrorCode::Success) return err;
@@ -267,13 +293,13 @@ ErrorCode InstructionDecoder::DecodeVEX(
     InstructionPrefixes& prefixes,
     uint32_t& offset) noexcept
 {
-    if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+    if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
 
     uint8_t lead = bytes[offset];
 
     if (lead == Encoding::kVEX2Byte) {
         // Need at least 1 more byte (payload byte)
-        if (offset + 1 >= bytes.size()) return ErrorCode::TruncatedInstruction;
+        if (!CanReadInstructionBytes(bytes, offset, 2)) return ErrorCode::TruncatedInstruction;
 
         uint8_t byte1 = bytes[offset + 1];
 
@@ -317,7 +343,7 @@ ErrorCode InstructionDecoder::DecodeVEX(
 
     } else if (lead == Encoding::kVEX3Byte) {
         // Need at least 2 more bytes (payload bytes)
-        if (offset + 2 >= bytes.size()) return ErrorCode::TruncatedInstruction;
+        if (!CanReadInstructionBytes(bytes, offset, 3)) return ErrorCode::TruncatedInstruction;
 
         uint8_t byte1 = bytes[offset + 1];
         uint8_t byte2 = bytes[offset + 2];
@@ -381,20 +407,15 @@ ErrorCode InstructionDecoder::DecodeEVEX(
     uint32_t& offset) noexcept
 {
     // EVEX needs 4 bytes total (0x62 + 3 payload bytes)
-    if (offset + 3 >= bytes.size()) return ErrorCode::TruncatedInstruction;
+    if (!CanReadInstructionBytes(bytes, offset, 4)) return ErrorCode::TruncatedInstruction;
 
     uint8_t p1 = bytes[offset + 1]; // R|X|B|R'|00|mm
     uint8_t p2 = bytes[offset + 2]; // W|vvvv|1|pp
     uint8_t p3 = bytes[offset + 3]; // z|L'L|b|V'|aaa
 
-    if (mode != CPUMode::Long64) {
-        // In 32-bit mode, distinguish EVEX from BOUND via the EVEX fixed bits.
-        if ((p1 & 0x0C) != 0x00) {
-            return ErrorCode::Success; // Not EVEX, treat as BOUND
-        }
-        if ((p2 & 0x04) == 0) {
-            return ErrorCode::Success;
-        }
+    const bool fixedBitsValid = ((p1 & 0x0C) == 0x00) && ((p2 & 0x04) != 0);
+    if (!fixedBitsValid) {
+        return (mode == CPUMode::Long64) ? ErrorCode::InvalidPrefix : ErrorCode::Success;
     }
 
     // Consume 4 bytes
@@ -449,7 +470,7 @@ ErrorCode InstructionDecoder::DecodeOpcode(
     OpcodeMap& map,
     uint8_t& opcode) noexcept
 {
-    if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+    if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
 
     uint8_t b = bytes[offset++];
 
@@ -461,13 +482,13 @@ ErrorCode InstructionDecoder::DecodeOpcode(
     }
 
     // 0x0F escape — need at least one more byte
-    if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+    if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
 
     b = bytes[offset];
 
     if (b == Encoding::kThreeByteEscape38) {
         offset++;
-        if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+        if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
         map = OpcodeMap::ThreeByte38;
         opcode = bytes[offset++];
         return ErrorCode::Success;
@@ -475,7 +496,7 @@ ErrorCode InstructionDecoder::DecodeOpcode(
 
     if (b == Encoding::kThreeByteEscape3A) {
         offset++;
-        if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+        if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
         map = OpcodeMap::ThreeByte3A;
         opcode = bytes[offset++];
         return ErrorCode::Success;
@@ -499,7 +520,10 @@ ErrorCode InstructionDecoder::DecodeModRM(
     const InstructionPrefixes& prefixes,
     DecodedInstruction& inst) noexcept
 {
-    if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+    (void)mode;
+    (void)prefixes;
+
+    if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
 
     inst.modrm = bytes[offset++];
     inst.hasModRM = true;
@@ -521,7 +545,7 @@ ErrorCode InstructionDecoder::DecodeSIB(
     [[maybe_unused]] const InstructionPrefixes& prefixes,
     DecodedInstruction& inst) noexcept
 {
-    if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+    if (!CanReadInstructionBytes(bytes, offset, 1)) return ErrorCode::TruncatedInstruction;
 
     inst.sib = bytes[offset++];
     inst.hasSIB = true;
@@ -618,6 +642,41 @@ ErrorCode InstructionDecoder::DecodeImmediate(
     return ErrorCode::Success;
 }
 
+ErrorCode InstructionDecoder::DecodeMemoryOffset(
+    std::span<const uint8_t> bytes,
+    uint32_t& offset,
+    DecodedInstruction& inst) noexcept
+{
+    switch (inst.addressSize) {
+        case AddressSize::Addr16: {
+            uint16_t val = 0;
+            if (!ReadWord(bytes, offset, val)) return ErrorCode::TruncatedInstruction;
+            inst.displacement = static_cast<int64_t>(val);
+            inst.dispSize = 2;
+            offset += 2;
+            return ErrorCode::Success;
+        }
+        case AddressSize::Addr32: {
+            uint32_t val = 0;
+            if (!ReadDword(bytes, offset, val)) return ErrorCode::TruncatedInstruction;
+            inst.displacement = static_cast<int64_t>(val);
+            inst.dispSize = 4;
+            offset += 4;
+            return ErrorCode::Success;
+        }
+        case AddressSize::Addr64: {
+            uint64_t val = 0;
+            if (!ReadQword(bytes, offset, val)) return ErrorCode::TruncatedInstruction;
+            inst.displacement = static_cast<int64_t>(val);
+            inst.dispSize = 8;
+            offset += 8;
+            return ErrorCode::Success;
+        }
+        default:
+            return ErrorCode::InvalidOperandSize;
+    }
+}
+
 // ============================================================================
 // Operand Builders
 // ============================================================================
@@ -645,8 +704,8 @@ void InstructionDecoder::BuildMemOperand(
     op.type = OperandType::Memory;
     op.mem.hasBase = false;
     op.mem.hasIndex = false;
-    op.mem.baseReg = 0xFF;
-    op.mem.indexReg = 0xFF;
+    op.mem.baseReg = kInvalidRegisterIndex;
+    op.mem.indexReg = kInvalidRegisterIndex;
     op.mem.scale = 1;
     op.mem.displacement = inst.displacement;
     op.mem.ripRelative = false;
@@ -659,7 +718,21 @@ void InstructionDecoder::BuildMemOperand(
         rm |= 0x08;
     }
 
-    if (mode == CPUMode::Long64 || mode == CPUMode::Protected32) {
+    if (mode == CPUMode::Real16 || inst.addressSize == AddressSize::Addr16) {
+        static constexpr uint8_t kBaseByRM[8] = {3, 3, 5, 5, 6, 7, 5, 3};
+        static constexpr uint8_t kIndexByRM[8] = {6, 7, 6, 7, kInvalidRegisterIndex, kInvalidRegisterIndex, kInvalidRegisterIndex, kInvalidRegisterIndex};
+        const uint8_t rm16 = static_cast<uint8_t>(rm & 0x07);
+
+        if (!(mod == Encoding::kMod_Indirect && rm16 == 6)) {
+            op.mem.hasBase = true;
+            op.mem.baseReg = kBaseByRM[rm16];
+            if (kIndexByRM[rm16] != kInvalidRegisterIndex) {
+                op.mem.hasIndex = true;
+                op.mem.indexReg = kIndexByRM[rm16];
+                op.mem.scale = 1;
+            }
+        }
+    } else if (mode == CPUMode::Long64 || mode == CPUMode::Protected32) {
         if (inst.hasSIB) {
             // SIB addressing
             uint8_t base  = Encoding::SIB_Base(inst.sib);
@@ -863,6 +936,7 @@ bool InstructionDecoder::OpcodeRequiresModRM(OpcodeMap map, uint8_t opcode) cons
 uint8_t InstructionDecoder::OpcodeImmediateSize(
     OpcodeMap map,
     uint8_t opcode,
+    uint8_t opcodeExt,
     OperandSize opSize) const noexcept
 {
     if (map == OpcodeMap::ThreeByte3A) {
@@ -958,9 +1032,9 @@ uint8_t InstructionDecoder::OpcodeImmediateSize(
         // IN/OUT imm8
         case 0xE4: case 0xE5: case 0xE6: case 0xE7: return 1;
 
-        // TEST/NOT/NEG/MUL/DIV group — F6 has imm8 for TEST only (ext=0)
-        case 0xF6: return 0; // Handled specially: only TEST has immediate
-        case 0xF7: return 0; // Same: only TEST has immediate
+        // TEST/NOT/NEG/MUL/DIV group — only /0 TEST has an immediate.
+        case 0xF6: return (opcodeExt == 0) ? 1 : 0;
+        case 0xF7: return (opcodeExt == 0) ? ((opSizeBytes == 8) ? 4 : opSizeBytes) : 0;
 
         default:
             return 0;
@@ -981,6 +1055,7 @@ SegReg InstructionDecoder::DefaultSegment(uint8_t baseReg) const noexcept {
 
 void InstructionDecoder::DecodeModRMOperands(
     DecodedInstruction& inst,
+    CPUMode mode,
     OperandSize regSize,
     OperandSize rmSize,
     bool regIsDst) noexcept
@@ -1007,7 +1082,7 @@ void InstructionDecoder::DecodeModRMOperands(
     } else {
         // Memory
         inst.operands[srcIdx].size = rmSize;
-        BuildMemOperand(inst.operands[srcIdx], inst, inst.prefixes.EffectiveAddressSize(CPUMode::Long64) == AddressSize::Addr64 ? CPUMode::Long64 : CPUMode::Protected32, inst.prefixes);
+        BuildMemOperand(inst.operands[srcIdx], inst, mode, inst.prefixes);
     }
 
     inst.operandCount = 2;
@@ -1041,7 +1116,7 @@ void InstructionDecoder::DecodeOpcodeReg(
 bool InstructionDecoder::ReadByte(
     std::span<const uint8_t> bytes, uint32_t offset, uint8_t& out) const noexcept
 {
-    if (offset >= bytes.size()) return false;
+    if (!CanReadInstructionBytes(bytes, offset, 1)) return false;
     out = bytes[offset];
     return true;
 }
@@ -1049,7 +1124,7 @@ bool InstructionDecoder::ReadByte(
 bool InstructionDecoder::ReadWord(
     std::span<const uint8_t> bytes, uint32_t offset, uint16_t& out) const noexcept
 {
-    if (offset + 1 >= bytes.size()) return false;
+    if (!CanReadInstructionBytes(bytes, offset, 2)) return false;
     std::memcpy(&out, &bytes[offset], 2);
     return true;
 }
@@ -1057,7 +1132,7 @@ bool InstructionDecoder::ReadWord(
 bool InstructionDecoder::ReadDword(
     std::span<const uint8_t> bytes, uint32_t offset, uint32_t& out) const noexcept
 {
-    if (offset + 3 >= bytes.size()) return false;
+    if (!CanReadInstructionBytes(bytes, offset, 4)) return false;
     std::memcpy(&out, &bytes[offset], 4);
     return true;
 }
@@ -1065,7 +1140,7 @@ bool InstructionDecoder::ReadDword(
 bool InstructionDecoder::ReadQword(
     std::span<const uint8_t> bytes, uint32_t offset, uint64_t& out) const noexcept
 {
-    if (offset + 7 >= bytes.size()) return false;
+    if (!CanReadInstructionBytes(bytes, offset, 8)) return false;
     std::memcpy(&out, &bytes[offset], 8);
     return true;
 }
@@ -1131,10 +1206,10 @@ void InstructionDecoder::ResolveOperands(
             uint8_t form = op & 0x07;
             if (form <= 5) {
                 switch (form) {
-                    case 0: DecodeModRMOperands(inst, sz8, sz8, false); return;
-                    case 1: DecodeModRMOperands(inst, sz, sz, false);  return;
-                    case 2: DecodeModRMOperands(inst, sz8, sz8, true); return;
-                    case 3: DecodeModRMOperands(inst, sz, sz, true);   return;
+                    case 0: DecodeModRMOperands(inst, mode, sz8, sz8, false); return;
+                    case 1: DecodeModRMOperands(inst, mode, sz, sz, false);  return;
+                    case 2: DecodeModRMOperands(inst, mode, sz8, sz8, true); return;
+                    case 3: DecodeModRMOperands(inst, mode, sz, sz, true);   return;
                     case 4: DecodeAccumImm(inst, sz8); return;
                     case 5: DecodeAccumImm(inst, sz);  return;
                 }
@@ -1178,14 +1253,14 @@ void InstructionDecoder::ResolveOperands(
         // TEST r/m, r (0x84 byte, 0x85 word/dword/qword)
         if (op == 0x84 || op == 0x85) {
             OperandSize testSz = (op == 0x84) ? sz8 : sz;
-            DecodeModRMOperands(inst, testSz, testSz, false);
+            DecodeModRMOperands(inst, mode, testSz, testSz, false);
             return;
         }
 
         // XCHG r, r/m (0x86 byte, 0x87 word/dword/qword)
         if (op == 0x86 || op == 0x87) {
             OperandSize xchgSz = (op == 0x86) ? sz8 : sz;
-            DecodeModRMOperands(inst, xchgSz, xchgSz, true);
+            DecodeModRMOperands(inst, mode, xchgSz, xchgSz, true);
             return;
         }
 
@@ -1194,7 +1269,7 @@ void InstructionDecoder::ResolveOperands(
             bool isByte = (op == 0x88 || op == 0x8A);
             bool regIsDst = (op == 0x8A || op == 0x8B);
             OperandSize movSz = isByte ? sz8 : sz;
-            DecodeModRMOperands(inst, movSz, movSz, regIsDst);
+            DecodeModRMOperands(inst, mode, movSz, movSz, regIsDst);
             return;
         }
 
@@ -1243,18 +1318,18 @@ void InstructionDecoder::ResolveOperands(
                 inst.operands[1].type = OperandType::Memory;
                 inst.operands[1].size = mSz;
                 inst.operands[1].mem = {};
-                inst.operands[1].mem.displacement = inst.immediate;
-                inst.operands[1].mem.baseReg = 0xFF;
-                inst.operands[1].mem.indexReg = 0xFF;
+                inst.operands[1].mem.displacement = inst.displacement;
+                inst.operands[1].mem.baseReg = kInvalidRegisterIndex;
+                inst.operands[1].mem.indexReg = kInvalidRegisterIndex;
                 inst.operands[1].mem.scale = 1;
                 inst.operands[1].mem.segment = SegReg::DS;
             } else {
                 inst.operands[0].type = OperandType::Memory;
                 inst.operands[0].size = mSz;
                 inst.operands[0].mem = {};
-                inst.operands[0].mem.displacement = inst.immediate;
-                inst.operands[0].mem.baseReg = 0xFF;
-                inst.operands[0].mem.indexReg = 0xFF;
+                inst.operands[0].mem.displacement = inst.displacement;
+                inst.operands[0].mem.baseReg = kInvalidRegisterIndex;
+                inst.operands[0].mem.indexReg = kInvalidRegisterIndex;
                 inst.operands[0].mem.scale = 1;
                 inst.operands[0].mem.segment = SegReg::DS;
                 BuildRegOperand(inst.operands[1], RegType::GPR, 0, mSz);
@@ -1442,19 +1517,19 @@ void InstructionDecoder::ResolveOperands(
 
         // IMUL r, r/m (0xAF)
         if (op == 0xAF) {
-            DecodeModRMOperands(inst, sz, sz, true);
+            DecodeModRMOperands(inst, mode, sz, sz, true);
             return;
         }
 
         // CMOVcc (0x40-0x4F)
         if (op >= 0x40 && op <= 0x4F) {
-            DecodeModRMOperands(inst, sz, sz, true);
+            DecodeModRMOperands(inst, mode, sz, sz, true);
             return;
         }
 
         // BT/BTS/BTR/BTC register form (0xA3/0xAB/0xB3/0xBB)
         if (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB) {
-            DecodeModRMOperands(inst, sz, sz, false);
+            DecodeModRMOperands(inst, mode, sz, sz, false);
             return;
         }
 
@@ -1478,14 +1553,14 @@ void InstructionDecoder::ResolveOperands(
         // XADD (0xC0/0xC1)
         if (op == 0xC0 || op == 0xC1) {
             OperandSize xSz = (op == 0xC0) ? sz8 : sz;
-            DecodeModRMOperands(inst, xSz, xSz, false);
+            DecodeModRMOperands(inst, mode, xSz, xSz, false);
             return;
         }
 
         // CMPXCHG (0xB0/0xB1)
         if (op == 0xB0 || op == 0xB1) {
             OperandSize cSz = (op == 0xB0) ? sz8 : sz;
-            DecodeModRMOperands(inst, cSz, cSz, false);
+            DecodeModRMOperands(inst, mode, cSz, cSz, false);
             return;
         }
 
@@ -1504,7 +1579,7 @@ void InstructionDecoder::ResolveOperands(
 
         // Generic two-byte with ModRM fallback (SSE, etc.)
         if (inst.hasModRM) {
-            DecodeModRMOperands(inst, sz, sz, true);
+            DecodeModRMOperands(inst, mode, sz, sz, true);
             return;
         }
 
@@ -1523,7 +1598,7 @@ void InstructionDecoder::ResolveOperands(
                 BuildImmOperand(inst.operands[2], inst.immediate, OperandSize::Size8, false);
                 inst.operandCount = 3;
             } else {
-                DecodeModRMOperands(inst, sz, sz, true);
+                DecodeModRMOperands(inst, mode, sz, sz, true);
             }
             return;
         }
@@ -1534,7 +1609,7 @@ void InstructionDecoder::ResolveOperands(
     // cases; for critical paths resolve the standard reg,r/m form here.
     if (inst.prefixes.hasVEX || inst.prefixes.hasEVEX) {
         if (inst.hasModRM) {
-            DecodeModRMOperands(inst, sz, sz, true);
+            DecodeModRMOperands(inst, mode, sz, sz, true);
         }
         return;
     }
