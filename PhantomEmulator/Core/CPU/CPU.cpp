@@ -13,8 +13,90 @@
 #include "../../Common/Platform.hpp"
 #include <chrono>
 #include <cstring>
+#include <limits>
+#include <new>
 
 namespace Phantom {
+
+namespace {
+
+[[nodiscard]] bool IsSupportedOperandSize(OperandSize size) noexcept {
+    switch (size) {
+        case OperandSize::Size8:
+        case OperandSize::Size16:
+        case OperandSize::Size32:
+        case OperandSize::Size64:
+            return true;
+    }
+    return false;
+}
+
+[[nodiscard]] uint32_t OperandByteWidth(OperandSize size) noexcept {
+    switch (size) {
+        case OperandSize::Size8:  return 1;
+        case OperandSize::Size16: return 2;
+        case OperandSize::Size32: return 4;
+        case OperandSize::Size64: return 8;
+    }
+    return 0;
+}
+
+[[nodiscard]] bool IsValidGprIndex(uint8_t index) noexcept {
+    return index < static_cast<uint8_t>(GPR::Count);
+}
+
+[[nodiscard]] bool IsValidSegmentIndex(uint8_t index) noexcept {
+    return index < static_cast<uint8_t>(SegReg::Count);
+}
+
+[[nodiscard]] bool AddUnsigned(uint64_t lhs, uint64_t rhs, uint64_t& result) noexcept {
+    if ((std::numeric_limits<uint64_t>::max)() - lhs < rhs) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+[[nodiscard]] bool AddSigned(uint64_t lhs, int64_t rhs, uint64_t& result) noexcept {
+    if (rhs >= 0) {
+        return AddUnsigned(lhs, static_cast<uint64_t>(rhs), result);
+    }
+
+    const uint64_t magnitude = static_cast<uint64_t>(-(rhs + 1)) + 1;
+    if (lhs < magnitude) {
+        return false;
+    }
+    result = lhs - magnitude;
+    return true;
+}
+
+[[nodiscard]] bool ScaleIndex(uint64_t value, uint8_t scale, uint64_t& result) noexcept {
+    if (scale != 1 && scale != 2 && scale != 4 && scale != 8) {
+        return false;
+    }
+    if (value > (std::numeric_limits<uint64_t>::max)() / scale) {
+        return false;
+    }
+    result = value * scale;
+    return true;
+}
+
+void AddSaturating(uint64_t& target, uint64_t increment) noexcept {
+    if ((std::numeric_limits<uint64_t>::max)() - target < increment) {
+        target = (std::numeric_limits<uint64_t>::max)();
+        return;
+    }
+    target += increment;
+}
+
+[[nodiscard]] uint64_t MulSaturating(uint64_t lhs, uint64_t rhs) noexcept {
+    if (lhs != 0 && rhs > (std::numeric_limits<uint64_t>::max)() / lhs) {
+        return (std::numeric_limits<uint64_t>::max)();
+    }
+    return lhs * rhs;
+}
+
+} // namespace
 
 // ============================================================================
 // Constructor / Reset
@@ -179,31 +261,46 @@ ExecutionResult CPU::Execute(
         // abort checks above are always evaluated first — compiled blocks
         // are only reachable for addresses that passed all those guards.
         if (m_jitEnabled) {
+            bool profileCurrentRip = true;
             CompiledBlock* block = m_jit.Lookup(m_state.rip);
             if (block && block->isValid) {
                 uint32_t instrExecuted = m_jit.Execute(*block, m_state, memory);
+                if (instrExecuted == 0) {
+                    // Failed-closed JIT blocks are invalidated by JITCompiler;
+                    // interpret the same RIP in this iteration to preserve
+                    // precise fault reporting and avoid zero-progress loops.
+                    profileCurrentRip = false;
+                } else {
+                    AddSaturating(m_state.instructionCount, instrExecuted);
+                    AddSaturating(m_state.tsc, MulSaturating(instrExecuted, m_state.tscIncrement));
+                    result.instructionsExecuted = m_state.instructionCount;
+                    result.lastRIP = m_state.rip;
 
-                m_state.instructionCount += instrExecuted;
-                m_state.tsc += static_cast<uint64_t>(instrExecuted) * m_state.tscIncrement;
-                result.instructionsExecuted = m_state.instructionCount;
-                result.lastRIP = m_state.rip;
+                    if (PHANTOM_UNLIKELY(m_state.instructionCount >= maxInstr)) {
+                        result.reason = StopReason::InstructionLimit;
+                        break;
+                    }
 
-                if (PHANTOM_UNLIKELY(m_state.instructionCount >= maxInstr)) {
-                    result.reason = StopReason::InstructionLimit;
-                    break;
+                    continue; // Skip interpreter for this block
                 }
-
-                continue; // Skip interpreter for this block
             }
 
             // Track block execution count for profiling.
             // Only allocate a new entry if the map hasn't hit the cap —
             // this prevents unbounded growth from polymorphic code.
-            auto profileIt = m_blockProfile.find(m_state.rip);
-            if (profileIt != m_blockProfile.end()) {
-                ++profileIt->second;
-            } else if (m_blockProfile.size() < kMaxBlockProfileEntries) {
-                m_blockProfile.emplace(m_state.rip, 1u);
+            if (profileCurrentRip) {
+                auto profileIt = m_blockProfile.find(m_state.rip);
+                if (profileIt != m_blockProfile.end()) {
+                    if (profileIt->second < (std::numeric_limits<uint32_t>::max)()) {
+                        ++profileIt->second;
+                    }
+                } else if (m_blockProfile.size() < kMaxBlockProfileEntries) {
+                    try {
+                        m_blockProfile.emplace(m_state.rip, 1u);
+                    } catch (const std::bad_alloc&) {
+                        DisableJIT();
+                    }
+                }
             }
         }
 
@@ -215,6 +312,12 @@ ExecutionResult CPU::Execute(
         if (fetchErr != ErrorCode::Success) {
             result.reason = StopReason::AccessViolation;
             result.errorCode = fetchErr;
+            result.faultAddress = m_state.rip;
+            break;
+        }
+        if (bytesRead == 0) {
+            result.reason = StopReason::InvalidInstruction;
+            result.errorCode = ErrorCode::TruncatedInstruction;
             result.faultAddress = m_state.rip;
             break;
         }
@@ -377,8 +480,12 @@ ErrorCode CPU::DispatchInstruction(
     VirtualMemory& memory,
     MemoryTracker* tracker) noexcept
 {
+    (void)tracker;
     // Track memory writes for W→X
     // (individual instruction handlers call WriteOperand which calls memory.Write)
+    if (inst.length == 0 || inst.NextRIP() == kGuestInvalid) {
+        return ErrorCode::TruncatedInstruction;
+    }
 
     const bool isEVEX = inst.prefixes.hasEVEX;
 
@@ -1048,24 +1155,43 @@ ErrorCode CPU::ReadOperand(
     VirtualMemory& mem,
     uint64_t& value) noexcept
 {
+    value = 0;
+    if (!IsSupportedOperandSize(op.size)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
     switch (op.type) {
         case OperandType::Register: {
             if (op.reg.regType == RegType::GPR) {
                 if (op.reg.isHighByte) {
+                    if (op.size != OperandSize::Size8 || op.reg.regIndex < 4 || op.reg.regIndex > 7) {
+                        return ErrorCode::InvalidOperandSize;
+                    }
                     value = m_state.GetReg8High(op.reg.regIndex);
                 } else {
+                    if (!IsValidGprIndex(op.reg.regIndex)) {
+                        return ErrorCode::InvalidOperandSize;
+                    }
                     value = m_state.GetRegBySize(
                         static_cast<GPR>(op.reg.regIndex), op.size);
                 }
             } else if (op.reg.regType == RegType::Segment) {
+                if (!IsValidSegmentIndex(op.reg.regIndex)) {
+                    return ErrorCode::InvalidOperandSize;
+                }
                 value = m_state.GetSegment(static_cast<SegReg>(op.reg.regIndex)).selector;
+            } else {
+                return ErrorCode::InvalidOperandSize;
             }
             return ErrorCode::Success;
         }
 
         case OperandType::Memory: {
             GuestAddress addr = CalculateEffectiveAddress(op, inst);
-            uint32_t size = static_cast<uint32_t>(op.size);
+            if (addr == kGuestInvalid) {
+                return ErrorCode::InvalidAddress;
+            }
+            uint32_t size = OperandByteWidth(op.size);
             return mem.Read(addr, &value, size);
         }
 
@@ -1090,25 +1216,43 @@ ErrorCode CPU::WriteOperand(
     VirtualMemory& mem,
     uint64_t value) noexcept
 {
+    if (!IsSupportedOperandSize(op.size)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
     switch (op.type) {
         case OperandType::Register: {
             if (op.reg.regType == RegType::GPR) {
                 if (op.reg.isHighByte) {
+                    if (op.size != OperandSize::Size8 || op.reg.regIndex < 4 || op.reg.regIndex > 7) {
+                        return ErrorCode::InvalidOperandSize;
+                    }
                     m_state.SetReg8High(op.reg.regIndex, static_cast<uint8_t>(value));
                 } else {
+                    if (!IsValidGprIndex(op.reg.regIndex)) {
+                        return ErrorCode::InvalidOperandSize;
+                    }
                     m_state.SetRegBySize(
                         static_cast<GPR>(op.reg.regIndex), value, op.size);
                 }
             } else if (op.reg.regType == RegType::Segment) {
+                if (!IsValidSegmentIndex(op.reg.regIndex)) {
+                    return ErrorCode::InvalidOperandSize;
+                }
                 m_state.SetSegmentSelector(static_cast<SegReg>(op.reg.regIndex),
                                            static_cast<uint16_t>(value));
+            } else {
+                return ErrorCode::InvalidOperandSize;
             }
             return ErrorCode::Success;
         }
 
         case OperandType::Memory: {
             GuestAddress addr = CalculateEffectiveAddress(op, inst);
-            uint32_t size = static_cast<uint32_t>(op.size);
+            if (addr == kGuestInvalid) {
+                return ErrorCode::InvalidAddress;
+            }
+            uint32_t size = OperandByteWidth(op.size);
             return mem.Write(addr, &value, size);
         }
 
@@ -1127,26 +1271,48 @@ GuestAddress CPU::CalculateEffectiveAddress(
 
     if (op.mem.ripRelative) {
         // RIP-relative: addr = RIP_next + displacement
-        addr = inst.NextRIP() + static_cast<uint64_t>(op.mem.displacement);
+        const GuestAddress nextRip = inst.NextRIP();
+        if (nextRip == kGuestInvalid || !AddSigned(nextRip, op.mem.displacement, addr)) {
+            return kGuestInvalid;
+        }
     } else {
         // base + index*scale + displacement
         if (op.mem.hasBase) {
+            if (!IsValidGprIndex(op.mem.baseReg)) {
+                return kGuestInvalid;
+            }
             addr = m_state.GetReg64(static_cast<GPR>(op.mem.baseReg));
         }
         if (op.mem.hasIndex) {
-            addr += m_state.GetReg64(static_cast<GPR>(op.mem.indexReg)) * op.mem.scale;
+            if (!IsValidGprIndex(op.mem.indexReg)) {
+                return kGuestInvalid;
+            }
+            uint64_t scaledIndex = 0;
+            if (!ScaleIndex(m_state.GetReg64(static_cast<GPR>(op.mem.indexReg)), op.mem.scale, scaledIndex)
+                || !AddUnsigned(addr, scaledIndex, addr)) {
+                return kGuestInvalid;
+            }
         }
-        addr += static_cast<uint64_t>(op.mem.displacement);
+        if (!AddSigned(addr, op.mem.displacement, addr)) {
+            return kGuestInvalid;
+        }
     }
 
-    // In 32-bit mode, truncate to 32 bits
     if (inst.addressSize == AddressSize::Addr32) {
         addr &= 0xFFFFFFFF;
+    } else if (inst.addressSize == AddressSize::Addr16) {
+        addr &= 0xFFFF;
+    } else if (inst.addressSize != AddressSize::Addr64) {
+        return kGuestInvalid;
     }
 
     // Add segment base (significant for FS/GS in user mode)
     if (op.mem.segment == SegReg::FS || op.mem.segment == SegReg::GS) {
-        addr += m_state.GetSegment(op.mem.segment).base;
+        if (!AddUnsigned(addr, m_state.GetSegment(op.mem.segment).base, addr)) {
+            return kGuestInvalid;
+        }
+    } else if (!CPUState::IsValidSegment(op.mem.segment)) {
+        return kGuestInvalid;
     }
 
     return addr;
@@ -1157,18 +1323,35 @@ GuestAddress CPU::CalculateEffectiveAddress(
 // ============================================================================
 
 ErrorCode CPU::StackPush(VirtualMemory& mem, uint64_t value, OperandSize size) noexcept {
-    uint32_t bytes = static_cast<uint32_t>(size);
+    if (!IsSupportedOperandSize(size)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+    uint32_t bytes = OperandByteWidth(size);
+    if (m_state.RSP() < bytes) {
+        return ErrorCode::StackOverflow;
+    }
     uint64_t rsp = m_state.RSP() - bytes;
+    const auto err = mem.Write(rsp, &value, bytes);
+    if (err != ErrorCode::Success) {
+        return err;
+    }
     m_state.SetReg64(GPR::RSP, rsp);
-    return mem.Write(rsp, &value, bytes);
+    return ErrorCode::Success;
 }
 
 ErrorCode CPU::StackPop(VirtualMemory& mem, uint64_t& value, OperandSize size) noexcept {
-    uint32_t bytes = static_cast<uint32_t>(size);
+    if (!IsSupportedOperandSize(size)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+    uint32_t bytes = OperandByteWidth(size);
     value = 0;
     auto err = mem.Read(m_state.RSP(), &value, bytes);
     if (err != ErrorCode::Success) return err;
-    m_state.SetReg64(GPR::RSP, m_state.RSP() + bytes);
+    uint64_t nextRsp = 0;
+    if (!AddUnsigned(m_state.RSP(), bytes, nextRsp)) {
+        return ErrorCode::StackUnderflow;
+    }
+    m_state.SetReg64(GPR::RSP, nextRsp);
     return ErrorCode::Success;
 }
 
