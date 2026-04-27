@@ -20,8 +20,68 @@
 #include "AVX2Ops.hpp"
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 namespace Phantom {
+
+namespace {
+
+constexpr uint8_t kVectorRegisterCount = 16;
+constexpr uint8_t kGprRegisterCount = 16;
+
+[[nodiscard]] bool IsValidVectorRegisterIndex(uint8_t index) noexcept {
+    return index < kVectorRegisterCount;
+}
+
+[[nodiscard]] bool IsValidVectorRegisterOperand(const DecodedOperand& op) noexcept {
+    return op.IsRegister() && IsValidVectorRegisterIndex(op.reg.regIndex);
+}
+
+[[nodiscard]] bool CanAddGuestOffset(GuestAddress base, int64_t offset, GuestAddress& result) noexcept {
+    if (offset >= 0) {
+        const auto add = static_cast<GuestAddress>(offset);
+        if (base > (std::numeric_limits<GuestAddress>::max)() - add) {
+            return false;
+        }
+        result = base + add;
+        return true;
+    }
+
+    const auto subtract = static_cast<GuestAddress>(uint64_t{0} - static_cast<uint64_t>(offset));
+    if (base < subtract) {
+        return false;
+    }
+    result = base - subtract;
+    return true;
+}
+
+[[nodiscard]] uint32_t HalfToFloatBits(uint16_t half) noexcept {
+    const uint32_t sign = (static_cast<uint32_t>(half >> 15) & 1u) << 31;
+    uint32_t exp = (half >> 10) & 0x1Fu;
+    uint32_t mant = half & 0x3FFu;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            return sign;
+        }
+
+        int32_t unbiasedExp = -14;
+        while ((mant & 0x400u) == 0) {
+            mant <<= 1;
+            --unbiasedExp;
+        }
+        mant &= 0x3FFu;
+        return sign | (static_cast<uint32_t>(unbiasedExp + 127) << 23) | (mant << 13);
+    }
+
+    if (exp == 0x1Fu) {
+        return sign | 0x7F800000u | (mant << 13);
+    }
+
+    return sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+}
+
+} // namespace
 
 // ============================================================================
 // AVX2 Instruction Handler
@@ -29,6 +89,8 @@ namespace Phantom {
 
 ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     if (!inst.prefixes.hasVEX) return ErrorCode::UnimplementedOpcode;
+    if (inst.prefixes.vexL > 1 || inst.prefixes.vexVVVV > 15) return ErrorCode::InvalidOperandSize;
+    if (!inst.HasOperand(0) || !inst.HasOperand(1)) return ErrorCode::InvalidOperandSize;
 
     const uint8_t op      = inst.opcode;
     const uint8_t vexL    = inst.prefixes.vexL;
@@ -37,13 +99,22 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
     const uint8_t vvvv    = static_cast<uint8_t>(15 - inst.prefixes.vexVVVV);
     const bool    is256   = (vexL == 1);
     const uint32_t vecLen = is256 ? 32u : 16u;
+    const bool allowsMemoryDestination =
+        (vexMap == 1 && (op == 0x7F || op == 0x11)) ||
+        (vexMap == 2 && op == 0x8E) ||
+        (vexMap == 3 && (op == 0x1D || op == 0x39));
+    if (inst.Op(0).IsRegister() && !IsValidVectorRegisterOperand(inst.Op(0))) return ErrorCode::InvalidOperandSize;
+    if (inst.Op(1).IsRegister() && !IsValidVectorRegisterOperand(inst.Op(1))) return ErrorCode::InvalidOperandSize;
+    if (!allowsMemoryDestination && !IsValidVectorRegisterOperand(inst.Op(0))) return ErrorCode::InvalidOperandSize;
 
     // ====================================================================
     // Helper: Read a YMM/XMM source from an operand (register or memory)
     // ====================================================================
     auto ReadSrc = [&](uint8_t opIdx, YMMValue& out) -> ErrorCode {
+        if (!inst.HasOperand(opIdx)) return ErrorCode::InvalidOperandSize;
         out.Clear();
         if (inst.Op(opIdx).IsRegister()) {
+            if (!IsValidVectorRegisterOperand(inst.Op(opIdx))) return ErrorCode::InvalidOperandSize;
             if (is256) {
                 m_state.GetYMM(inst.Op(opIdx).reg.regIndex, out.u8);
             } else {
@@ -59,6 +130,9 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
     };
 
     // Helper: Read source from vexVVVV register
+    // DESIGN: the decoder models SIMD operands as generic Register operands; validate
+    // indices here because CPUState masks YMM/XMM indices and would otherwise alias
+    // malformed byte streams onto a different architectural register.
     auto ReadVvvv = [&](YMMValue& out) noexcept {
         out.Clear();
         if (is256) {
@@ -70,6 +144,7 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
 
     // Helper: Write result to destination Op(0)
     auto WriteDst = [&](const YMMValue& val) noexcept {
+        if (!IsValidVectorRegisterOperand(inst.Op(0))) return;
         uint8_t dstIdx = inst.Op(0).reg.regIndex;
         if (is256) {
             m_state.SetYMM(dstIdx, val.u8);
@@ -106,9 +181,7 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             auto err = ReadSrc(1, src2);
             if (err != ErrorCode::Success) return err;
             for (uint32_t i = 0; i < vecLen / 8; ++i)
-                reinterpret_cast<uint64_t*>(dst.u8)[i] =
-                    reinterpret_cast<const uint64_t*>(src1.u8)[i] ^
-                    reinterpret_cast<const uint64_t*>(src2.u8)[i];
+                dst.u64[i] = src1.u64[i] ^ src2.u64[i];
             WriteDst(dst);
             return ErrorCode::Success;
         }
@@ -122,9 +195,7 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             auto err = ReadSrc(1, src2);
             if (err != ErrorCode::Success) return err;
             for (uint32_t i = 0; i < vecLen / 8; ++i)
-                reinterpret_cast<uint64_t*>(dst.u8)[i] =
-                    reinterpret_cast<const uint64_t*>(src1.u8)[i] &
-                    reinterpret_cast<const uint64_t*>(src2.u8)[i];
+                dst.u64[i] = src1.u64[i] & src2.u64[i];
             WriteDst(dst);
             return ErrorCode::Success;
         }
@@ -138,9 +209,7 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             auto err = ReadSrc(1, src2);
             if (err != ErrorCode::Success) return err;
             for (uint32_t i = 0; i < vecLen / 8; ++i)
-                reinterpret_cast<uint64_t*>(dst.u8)[i] =
-                    ~reinterpret_cast<const uint64_t*>(src1.u8)[i] &
-                     reinterpret_cast<const uint64_t*>(src2.u8)[i];
+                dst.u64[i] = ~src1.u64[i] & src2.u64[i];
             WriteDst(dst);
             return ErrorCode::Success;
         }
@@ -154,9 +223,7 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             auto err = ReadSrc(1, src2);
             if (err != ErrorCode::Success) return err;
             for (uint32_t i = 0; i < vecLen / 8; ++i)
-                reinterpret_cast<uint64_t*>(dst.u8)[i] =
-                    reinterpret_cast<const uint64_t*>(src1.u8)[i] |
-                    reinterpret_cast<const uint64_t*>(src2.u8)[i];
+                dst.u64[i] = src1.u64[i] | src2.u64[i];
             WriteDst(dst);
             return ErrorCode::Success;
         }
@@ -989,30 +1056,7 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
 
             YMMValue dst{};
             for (uint32_t i = 0; i < halfCount; ++i) {
-                uint16_t h = halfVals[i];
-                uint32_t sign = (h >> 15) & 1;
-                uint32_t exp  = (h >> 10) & 0x1F;
-                uint32_t mant = h & 0x3FF;
-
-                uint32_t f;
-                if (exp == 0) {
-                    if (mant == 0) {
-                        f = sign << 31; // ±0
-                    } else {
-                        // Denormalized: normalize it
-                        exp = 1;
-                        while (!(mant & 0x400)) { mant <<= 1; exp--; }
-                        mant &= 0x3FF;
-                        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-                    }
-                } else if (exp == 0x1F) {
-                    // Inf or NaN
-                    f = (sign << 31) | 0x7F800000u | (mant << 13);
-                } else {
-                    // Normalized
-                    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-                }
-
+                const uint32_t f = HalfToFloatBits(halfVals[i]);
                 std::memcpy(&dst.f32[i], &f, 4);
             }
 
@@ -1515,7 +1559,10 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
             for (uint32_t i = 0; i < vecLen / 4; ++i) {
                 if (mask.i32[i] < 0) { // bit 31 set
-                    auto err = mem.Read(addr + i * 4, &dst.u32[i], 4);
+                    GuestAddress laneAddr = 0;
+                    if (!CanAddGuestOffset(addr, static_cast<int64_t>(i * 4), laneAddr))
+                        return ErrorCode::AddressOverflow;
+                    auto err = mem.Read(laneAddr, &dst.u32[i], 4);
                     if (err != ErrorCode::Success) return err;
                 } else {
                     dst.u32[i] = 0;
@@ -1541,7 +1588,10 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             for (uint32_t i = 0; i < vecLen / 4; ++i) {
                 if (mask.i32[i] < 0) { // bit 31 set
-                    auto err = mem.Write(addr + i * 4, &src.u32[i], 4);
+                    GuestAddress laneAddr = 0;
+                    if (!CanAddGuestOffset(addr, static_cast<int64_t>(i * 4), laneAddr))
+                        return ErrorCode::AddressOverflow;
+                    auto err = mem.Write(laneAddr, &src.u32[i], 4);
                     if (err != ErrorCode::Success) return err;
                 }
             }
@@ -1577,6 +1627,11 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             // The index register is encoded in the SIB.index field of Op(1)
             uint8_t idxReg = inst.Op(1).mem.indexReg;
             uint8_t scale  = inst.Op(1).mem.scale;
+            if (!IsValidVectorRegisterIndex(idxReg) ||
+                (inst.Op(1).mem.hasBase && inst.Op(1).mem.baseReg >= kGprRegisterCount) ||
+                (scale != 1 && scale != 2 && scale != 4 && scale != 8)) {
+                return ErrorCode::InvalidOperandSize;
+            }
             if (is256)
                 m_state.GetYMM(idxReg, indices.u8);
             else
@@ -1585,14 +1640,17 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             // Base address (without index*scale — that's per-element)
             GuestAddress base = 0;
             if (inst.Op(1).mem.hasBase)
-                base = m_state.gpr[inst.Op(1).mem.baseReg & 0x0F];
-            base += inst.Op(1).mem.displacement;
+                base = m_state.gpr[inst.Op(1).mem.baseReg];
+            if (!CanAddGuestOffset(base, inst.Op(1).mem.displacement, base))
+                return ErrorCode::AddressOverflow;
 
             uint32_t elems = vecLen / 4;
             for (uint32_t i = 0; i < elems; ++i) {
                 if (mask.i32[i] < 0) { // bit 31 set
                     int64_t offset = static_cast<int64_t>(indices.i32[i]) * scale;
-                    GuestAddress elemAddr = base + static_cast<GuestAddress>(offset);
+                    GuestAddress elemAddr = 0;
+                    if (!CanAddGuestOffset(base, offset, elemAddr))
+                        return ErrorCode::AddressOverflow;
                     auto err = mem.Read(elemAddr, &dst.u32[i], 4);
                     if (err != ErrorCode::Success) return err;
                 }
