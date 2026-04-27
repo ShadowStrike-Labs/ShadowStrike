@@ -8,6 +8,8 @@
 
 #include "HardwareBreakpoints.hpp"
 #include <algorithm>
+#include <limits>
+#include <new>
 
 namespace Phantom {
 
@@ -68,6 +70,40 @@ namespace DR6Bits {
     static constexpr uint64_t kClearableMask = kB0 | kB1 | kB2 | kB3 | kBD | kBS | kBT;
 }
 
+namespace {
+
+[[nodiscard]] bool IsValidCondition(HWBPCondition condition) noexcept {
+    switch (condition) {
+        case HWBPCondition::Execute:
+        case HWBPCondition::WriteOnly:
+        case HWBPCondition::IOReadWrite:
+        case HWBPCondition::ReadWrite:
+            return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool IsValidLength(HWBPLength length) noexcept {
+    switch (length) {
+        case HWBPLength::Byte:
+        case HWBPLength::Word:
+        case HWBPLength::Dword:
+        case HWBPLength::Qword:
+            return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool AddRangeEnd(GuestAddress start, uint32_t size, GuestAddress& end) noexcept {
+    if (size == 0 || (std::numeric_limits<GuestAddress>::max)() - start < size) {
+        return false;
+    }
+    end = start + size;
+    return true;
+}
+
+} // namespace
+
 // ============================================================================
 // Static sentinel for out-of-range GetSlot() calls
 // ============================================================================
@@ -79,7 +115,11 @@ const HWBreakpoint HardwareBreakpoints::s_nullSlot{};
 // ============================================================================
 
 HardwareBreakpoints::HardwareBreakpoints() noexcept {
-    m_detections.reserve(256);
+    try {
+        m_detections.reserve(kMaxDetections);
+    } catch (const std::bad_alloc&) {
+        m_detections.clear();
+    }
 }
 
 HardwareBreakpoints::~HardwareBreakpoints() noexcept = default;
@@ -93,6 +133,17 @@ bool HardwareBreakpoints::SetBreakpoint(uint8_t slot, GuestAddress address,
                                          HWBPLength length) noexcept {
     if (slot >= kMaxSlots) {
         return false;
+    }
+    if (!IsValidCondition(condition) || !IsValidLength(length)) {
+        return false;
+    }
+    if (condition == HWBPCondition::Execute) {
+        length = HWBPLength::Byte;
+    } else {
+        const uint64_t alignMask = ~LengthToAlignMask(length);
+        if ((address & alignMask) != 0) {
+            return false;
+        }
     }
 
     auto& bp = m_slots[slot];
@@ -225,6 +276,7 @@ void HardwareBreakpoints::WriteDR(CPUState& cpu, uint8_t drIndex, uint64_t value
         case 0: case 1: case 2: case 3:
             cpu.dr[drIndex] = value;
             m_slots[drIndex].address = value;
+            DecodeDR7(cpu.dr7);
             break;
 
         case 4:
@@ -391,16 +443,10 @@ bool HardwareBreakpoints::RangesOverlap(GuestAddress bpAddr, uint32_t bpLen,
     // Overflow-safe overlap check:
     // [bpAddr, bpAddr + bpLen) overlaps [accessAddr, accessAddr + accessSize)
     // iff bpAddr < accessAddr + accessSize AND accessAddr < bpAddr + bpLen
-    //
-    // Using subtraction form to avoid overflow on 64-bit addresses:
-    // Since we're dealing with small lengths (1/2/4/8), overflow of the sum is
-    // only possible at the very top of the 64-bit address space.
-    const uint64_t bpEnd     = bpAddr + bpLen;
-    const uint64_t accessEnd = accessAddr + static_cast<uint64_t>(accessSize);
-
-    // Overflow detection: if bpEnd wrapped or accessEnd wrapped, handle conservatively
-    if (bpEnd < bpAddr || accessEnd < accessAddr) {
-        return true;  // Conservative: wrapped addresses — assume overlap
+    GuestAddress bpEnd = 0;
+    GuestAddress accessEnd = 0;
+    if (!AddRangeEnd(bpAddr, bpLen, bpEnd) || !AddRangeEnd(accessAddr, accessSize, accessEnd)) {
+        return false;
     }
 
     return (bpAddr < accessEnd) && (accessAddr < bpEnd);
@@ -422,6 +468,15 @@ void HardwareBreakpoints::DecodeDR7(uint64_t dr7) noexcept {
         const uint8_t len = static_cast<uint8_t>(
             (dr7 >> DR7Bits::kLenShift[i]) & 0x3);
         m_slots[i].length = static_cast<HWBPLength>(len);
+
+        if (m_slots[i].condition == HWBPCondition::Execute) {
+            m_slots[i].length = HWBPLength::Byte;
+        } else {
+            const uint64_t alignMask = ~LengthToAlignMask(m_slots[i].length);
+            if ((m_slots[i].address & alignMask) != 0) {
+                m_slots[i].enabled = false;
+            }
+        }
     }
 }
 
@@ -452,11 +507,15 @@ void HardwareBreakpoints::AddDetection(DebugDetectionEvent::Type type,
         return;
     }
 
-    m_detections.push_back(DebugDetectionEvent{
-        .type    = type,
-        .rip     = rip,
-        .details = details,
-    });
+    try {
+        m_detections.push_back(DebugDetectionEvent{
+            .type    = type,
+            .rip     = rip,
+            .details = details,
+        });
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 } // namespace Phantom
