@@ -16,6 +16,72 @@
 
 namespace Phantom {
 
+namespace {
+
+constexpr uint16_t kFpuCompareMask = 0x4500; // C3, C2, C0
+constexpr uint16_t kFpuInvalidOperation = 1u << 0;
+constexpr uint16_t kFpuIntegerIndefinite16 = 0x8000u;
+constexpr uint32_t kFpuIntegerIndefinite32 = 0x80000000u;
+constexpr uint64_t kFpuIntegerIndefinite64 = 0x8000000000000000ull;
+
+[[nodiscard]] bool HasMemoryOperand(const DecodedInstruction& inst) noexcept {
+    return inst.HasOperand(0) && inst.Op(0).IsMemory();
+}
+
+void DiscardFpuPop(CPUState& state) noexcept {
+    static_cast<void>(state.FPUPop());
+}
+
+void SetFpuCompareStatus(CPUState& state, long double lhs, long double rhs) noexcept {
+    state.fpuStatus &= ~kFpuCompareMask;
+    if (std::isunordered(lhs, rhs)) {
+        state.fpuStatus |= kFpuCompareMask; // C3=C2=C0=1 for unordered
+    } else if (lhs < rhs) {
+        state.fpuStatus |= 0x0100;          // C0=1
+    } else if (lhs == rhs) {
+        state.fpuStatus |= 0x4000;          // C3=1
+    }
+}
+
+[[nodiscard]] int32_t ConvertFpuToInt32(CPUState& state, long double value) noexcept {
+    if (!std::isfinite(value) ||
+        value > static_cast<long double>((std::numeric_limits<int32_t>::max)()) ||
+        value < static_cast<long double>((std::numeric_limits<int32_t>::min)())) {
+        state.fpuStatus |= kFpuInvalidOperation;
+        return static_cast<int32_t>(kFpuIntegerIndefinite32);
+    }
+    return static_cast<int32_t>(std::truncl(value));
+}
+
+[[nodiscard]] int64_t ConvertFpuToInt64(CPUState& state, long double value) noexcept {
+    if (!std::isfinite(value) ||
+        value > static_cast<long double>((std::numeric_limits<int64_t>::max)()) ||
+        value < static_cast<long double>((std::numeric_limits<int64_t>::min)())) {
+        state.fpuStatus |= kFpuInvalidOperation;
+        return static_cast<int64_t>(kFpuIntegerIndefinite64);
+    }
+    return static_cast<int64_t>(std::truncl(value));
+}
+
+[[nodiscard]] int ClampScaleExponent(CPUState& state, long double value) noexcept {
+    if (!std::isfinite(value)) {
+        state.fpuStatus |= kFpuInvalidOperation;
+        return 0;
+    }
+    const long double truncated = std::truncl(value);
+    if (truncated > static_cast<long double>((std::numeric_limits<int>::max)())) {
+        state.fpuStatus |= kFpuInvalidOperation;
+        return (std::numeric_limits<int>::max)();
+    }
+    if (truncated < static_cast<long double>((std::numeric_limits<int>::min)())) {
+        state.fpuStatus |= kFpuInvalidOperation;
+        return (std::numeric_limits<int>::min)();
+    }
+    return static_cast<int>(truncated);
+}
+
+} // namespace
+
 ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     if (inst.opcodeMap != OpcodeMap::OneByte) return ErrorCode::UnimplementedOpcode;
 
@@ -28,6 +94,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
     // === D9 opcodes ===
     if (op == 0xD9) {
         if (mod != 3) {
+            if (!HasMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
             // Memory operands
             switch (ext) {
                 case 0: { // FLD m32fp
@@ -48,7 +115,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     float val = static_cast<float>(m_state.FPU_ST(0).value);
                     auto err = mem.Write(addr, &val, 4);
                     if (err != ErrorCode::Success) return err;
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 case 5: { // FLDCW m16
@@ -84,13 +151,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     m_state.FPU_ST(0).value = std::fabsl(m_state.FPU_ST(0).value);
                     return ErrorCode::Success;
                 case 0xE4: // FTST: compare ST(0) with 0.0
-                    if (m_state.FPU_ST(0).value == 0.0L) {
-                        m_state.fpuStatus = (m_state.fpuStatus & ~0x4500) | 0x4000; // C3=1, C0=C2=0 → equal
-                    } else if (m_state.FPU_ST(0).value > 0.0L) {
-                        m_state.fpuStatus = (m_state.fpuStatus & ~0x4500); // C3=C0=C2=0 → greater
-                    } else {
-                        m_state.fpuStatus = (m_state.fpuStatus & ~0x4500) | 0x0100; // C0=1 → less
-                    }
+                    SetFpuCompareStatus(m_state, m_state.FPU_ST(0).value, 0.0L);
                     return ErrorCode::Success;
                 case 0xE8: // FLD1: push 1.0
                     m_state.FPUPush(1.0L);
@@ -131,11 +192,11 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     long double y = m_state.FPU_ST(1).value;
                     if (x <= 0.0L) {
                         m_state.fpuStatus |= (1 << 0); // Invalid operation
-                        m_state.FPUPop();
+                        DiscardFpuPop(m_state);
                         return ErrorCode::Success;
                     }
                     m_state.FPU_ST(1).value = y * std::log2l(x);
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 case 0xF2: { // FPTAN: ST(0) = tan(ST(0)), push 1.0
@@ -148,7 +209,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     long double x = m_state.FPU_ST(0).value;
                     long double y = m_state.FPU_ST(1).value;
                     m_state.FPU_ST(1).value = std::atan2l(y, x);
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 case 0xF4: { // FXTRACT: extract exponent and significand
@@ -193,7 +254,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     long double x = m_state.FPU_ST(0).value;
                     long double y = m_state.FPU_ST(1).value;
                     m_state.FPU_ST(1).value = y * std::log2l(x + 1.0L);
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 case 0xFA: { // FSQRT: ST(0) = sqrt(ST(0))
@@ -227,7 +288,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 case 0xFD: { // FSCALE: ST(0) = ST(0) * 2^trunc(ST(1))
                     long double sig = m_state.FPU_ST(0).value;
                     long double exp = m_state.FPU_ST(1).value;
-                    m_state.FPU_ST(0).value = std::ldexpl(sig, static_cast<int>(std::truncl(exp)));
+                    m_state.FPU_ST(0).value = std::ldexpl(sig, ClampScaleExponent(m_state, exp));
                     return ErrorCode::Success;
                 }
                 case 0xFE: { // FSIN: ST(0) = sin(ST(0))
@@ -251,6 +312,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
         long double b = 0;
 
         if (mod != 3) {
+            if (!HasMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             float fval = 0;
             auto err = mem.Read(addr, &fval, 4);
@@ -277,10 +339,8 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
             }
             case 2: // FCOM
             case 3: { // FCOMP
-                if (a > b)       m_state.fpuStatus = (m_state.fpuStatus & ~0x4500);
-                else if (a < b)  m_state.fpuStatus = (m_state.fpuStatus & ~0x4500) | 0x0100;
-                else             m_state.fpuStatus = (m_state.fpuStatus & ~0x4500) | 0x4000;
-                if (ext == 3) m_state.FPUPop();
+                SetFpuCompareStatus(m_state, a, b);
+                if (ext == 3) DiscardFpuPop(m_state);
                 return ErrorCode::Success;
             }
             default: return ErrorCode::UnimplementedOpcode;
@@ -290,6 +350,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
     // === DD opcodes (FLD m64fp, FST/FSTP m64fp, FUCOM, etc.) ===
     if (op == 0xDD) {
         if (mod != 3) {
+            if (!HasMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
             switch (ext) {
                 case 0: { // FLD m64fp
                     GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
@@ -309,7 +370,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     double val = static_cast<double>(m_state.FPU_ST(0).value);
                     auto err = mem.Write(addr, &val, 8);
                     if (err != ErrorCode::Success) return err;
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 default: return ErrorCode::UnimplementedOpcode;
@@ -329,7 +390,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
             if (modrm >= 0xD8 && modrm <= 0xDF) {
                 // FSTP ST(i)
                 m_state.FPU_ST(rm).value = m_state.FPU_ST(0).value;
-                m_state.FPUPop();
+                DiscardFpuPop(m_state);
                 return ErrorCode::Success;
             }
             return ErrorCode::UnimplementedOpcode;
@@ -339,6 +400,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
     // === DB opcodes (FILD m32int, FIST m32int, etc.) ===
     if (op == 0xDB) {
         if (mod != 3) {
+            if (!HasMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
             switch (ext) {
                 case 0: { // FILD m32int
                     GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
@@ -350,15 +412,15 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 }
                 case 2: { // FIST m32int
                     GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
-                    int32_t val = static_cast<int32_t>(m_state.FPU_ST(0).value);
+                    int32_t val = ConvertFpuToInt32(m_state, m_state.FPU_ST(0).value);
                     return mem.Write(addr, &val, 4);
                 }
                 case 3: { // FISTP m32int
                     GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
-                    int32_t val = static_cast<int32_t>(m_state.FPU_ST(0).value);
+                    int32_t val = ConvertFpuToInt32(m_state, m_state.FPU_ST(0).value);
                     auto err = mem.Write(addr, &val, 4);
                     if (err != ErrorCode::Success) return err;
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 default: return ErrorCode::UnimplementedOpcode;
@@ -383,11 +445,9 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 // FCOMPP: compare ST(0), ST(1) and pop both
                 long double a = m_state.FPU_ST(0).value;
                 long double b = m_state.FPU_ST(1).value;
-                if (a > b)       m_state.fpuStatus = (m_state.fpuStatus & ~0x4500);
-                else if (a < b)  m_state.fpuStatus = (m_state.fpuStatus & ~0x4500) | 0x0100;
-                else             m_state.fpuStatus = (m_state.fpuStatus & ~0x4500) | 0x4000;
-                m_state.FPUPop();
-                m_state.FPUPop();
+                SetFpuCompareStatus(m_state, a, b);
+                DiscardFpuPop(m_state);
+                DiscardFpuPop(m_state);
                 return ErrorCode::Success;
             }
 
@@ -408,7 +468,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 }
                 default: return ErrorCode::UnimplementedOpcode;
             }
-            m_state.FPUPop();
+            DiscardFpuPop(m_state);
             return ErrorCode::Success;
         }
         return ErrorCode::UnimplementedOpcode;
@@ -417,6 +477,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
     // === DF opcodes (FILD m16int, FILD m64int, FNSTSW AX) ===
     if (op == 0xDF) {
         if (mod != 3) {
+            if (!HasMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
             switch (ext) {
                 case 0: { // FILD m16int
                     GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
@@ -436,10 +497,10 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 }
                 case 7: { // FISTP m64int
                     GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
-                    int64_t val = static_cast<int64_t>(m_state.FPU_ST(0).value);
+                    int64_t val = ConvertFpuToInt64(m_state, m_state.FPU_ST(0).value);
                     auto err = mem.Write(addr, &val, 8);
                     if (err != ErrorCode::Success) return err;
-                    m_state.FPUPop();
+                    DiscardFpuPop(m_state);
                     return ErrorCode::Success;
                 }
                 default: return ErrorCode::UnimplementedOpcode;
@@ -460,6 +521,7 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
         long double b = 0;
 
         if (mod != 3) {
+            if (!HasMemoryOperand(inst)) return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             double dval = 0;
             auto err = mem.Read(addr, &dval, 8);
