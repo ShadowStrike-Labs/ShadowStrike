@@ -19,6 +19,9 @@
 #include <cmath>
 #include <cstring>
 #include <intrin.h>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom {
 
@@ -36,6 +39,8 @@ static constexpr uint32_t kEntropyWindowSize         = 256;
 static constexpr uint32_t kEntropyStride             = 128;
 static constexpr double   kEncryptedThreshold        = 7.5;
 static constexpr double   kCompressedThreshold       = 7.0;
+static constexpr size_t   kSHA256BlockSize           = 64;
+static constexpr uint32_t kMaxRSAKeyBits             = 16'384;
 
 // ============================================================================
 // AES S-box (FIPS-197 Table)
@@ -108,12 +113,12 @@ static constexpr std::array<uint32_t, 64> kSHA256K = {
 // CRC32 lookup table (polynomial 0xEDB88320)
 static constexpr std::array<uint32_t, 256> BuildCRC32Table() noexcept {
     std::array<uint32_t, 256> table{};
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
+    for (size_t i = 0; i < table.size(); ++i) {
+        uint32_t crc = static_cast<uint32_t>(i);
         for (int j = 0; j < 8; ++j) {
             crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
         }
-        table[i] = crc;
+        table.at(i) = crc;
     }
     return table;
 }
@@ -165,9 +170,15 @@ struct CryptoAccelerator::Impl {
 // ============================================================================
 
 CryptoAccelerator::CryptoAccelerator() noexcept
-    : m_impl(std::make_unique<Impl>())
 {
-    m_impl->DetectFeatures();
+    try {
+        m_impl = std::make_unique<Impl>();
+        m_impl->DetectFeatures();
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    } catch (const std::length_error&) {
+        m_impl.reset();
+    }
 }
 
 CryptoAccelerator::~CryptoAccelerator() noexcept = default;
@@ -179,10 +190,10 @@ CryptoAccelerator& CryptoAccelerator::operator=(CryptoAccelerator&&) noexcept = 
 // Feature Queries
 // ============================================================================
 
-bool CryptoAccelerator::HasAESNI() const noexcept  { return m_impl->hasAESNI; }
-bool CryptoAccelerator::HasSHANI() const noexcept  { return m_impl->hasSHANI; }
-bool CryptoAccelerator::HasPCLMUL() const noexcept { return m_impl->hasPCLMUL; }
-bool CryptoAccelerator::HasSSE42() const noexcept  { return m_impl->hasSSE42; }
+bool CryptoAccelerator::HasAESNI() const noexcept  { return m_impl && m_impl->hasAESNI; }
+bool CryptoAccelerator::HasSHANI() const noexcept  { return m_impl && m_impl->hasSHANI; }
+bool CryptoAccelerator::HasPCLMUL() const noexcept { return m_impl && m_impl->hasPCLMUL; }
+bool CryptoAccelerator::HasSSE42() const noexcept  { return m_impl && m_impl->hasSSE42; }
 
 // ============================================================================
 // Internal Helpers
@@ -195,6 +206,21 @@ namespace {
     uint32_t v;
     std::memcpy(&v, p, sizeof(v));
     return v;
+}
+
+[[nodiscard]] constexpr GuestAddress SaturatingGuestAdd(
+    GuestAddress base,
+    GuestAddress delta) noexcept {
+    return (base > std::numeric_limits<GuestAddress>::max() - delta)
+        ? std::numeric_limits<GuestAddress>::max()
+        : base + delta;
+}
+
+[[nodiscard]] constexpr bool HasReadableBytes(
+    size_t offset,
+    size_t required,
+    size_t size) noexcept {
+    return offset <= size && required <= size - offset;
 }
 
 // Safe read of a big-endian uint32_t from a byte pointer
@@ -497,6 +523,9 @@ void SHA256TransformHardware(uint32_t state[8], const uint8_t block[64]) noexcep
 
 SHA256Hash CryptoAccelerator::SHA256(ByteSpan data) const noexcept {
     SHA256Hash result{};
+    if (!data.empty() && data.data() == nullptr) {
+        return result;
+    }
 
     // Initial hash values (FIPS-180-4 §5.3.3)
     uint32_t state[8] = {
@@ -508,23 +537,27 @@ SHA256Hash CryptoAccelerator::SHA256(ByteSpan data) const noexcept {
     const uint8_t* ptr = data.data();
     size_t remaining = dataLen;
 
-    // Select transform function based on hardware support
-    const bool useHW = m_impl->hasSHANI;
+    // DESIGN: SHA-NI dispatch remains disabled until the hardware transform has
+    // dedicated cross-vendor known-answer coverage. Hash correctness is security-
+    // critical; the software FIPS-180-4 path is deterministic on every host.
+    constexpr bool useHW = false;
 
     // Process full 64-byte blocks
-    while (remaining >= 64) {
+    while (remaining >= kSHA256BlockSize) {
         if (useHW) {
             SHA256TransformHardware(state, ptr);
         } else {
             SHA256TransformSoftware(state, ptr);
         }
-        ptr += 64;
-        remaining -= 64;
+        ptr += kSHA256BlockSize;
+        remaining -= kSHA256BlockSize;
     }
 
     // Final block with padding (FIPS-180-4 §5.1.1)
     alignas(16) uint8_t finalBlock[128]{};
-    std::memcpy(finalBlock, ptr, remaining);
+    if (remaining != 0) {
+        std::memcpy(finalBlock, ptr, remaining);
+    }
     finalBlock[remaining] = 0x80;
 
     // Determine if we need one or two final blocks
@@ -555,40 +588,14 @@ SHA256Hash CryptoAccelerator::SHA256(ByteSpan data) const noexcept {
 
 uint32_t CryptoAccelerator::CRC32(ByteSpan data) const noexcept {
     if (data.empty()) return 0;
+    if (data.data() == nullptr) return 0;
 
     const uint8_t* ptr = data.data();
-    size_t len = data.size();
     uint32_t crc = 0xFFFFFFFFu;
 
-    // SSE4.2 path: use hardware CRC32 instruction
-    if (m_impl->hasSSE42) {
-        // Process 8 bytes at a time using _mm_crc32_u64
-        while (len >= 8) {
-            uint64_t val;
-            std::memcpy(&val, ptr, sizeof(val));
-            crc = static_cast<uint32_t>(_mm_crc32_u64(crc, val));
-            ptr += 8;
-            len -= 8;
-        }
-        // Process remaining 4 bytes
-        if (len >= 4) {
-            uint32_t val;
-            std::memcpy(&val, ptr, sizeof(val));
-            crc = _mm_crc32_u32(crc, val);
-            ptr += 4;
-            len -= 4;
-        }
-        // Process remaining bytes
-        while (len > 0) {
-            crc = _mm_crc32_u8(crc, *ptr);
-            ++ptr;
-            --len;
-        }
-        return crc ^ 0xFFFFFFFFu;
-    }
-
-    // Scalar table-based fallback
-    for (size_t i = 0; i < len; ++i) {
+    // DESIGN: SSE4.2 CRC intrinsics implement CRC32C (Castagnoli), not IEEE CRC32.
+    // Keep this API CPU-stable by using the IEEE table path on every host.
+    for (size_t i = 0; i < data.size(); ++i) {
         crc = kCRC32Table[(crc ^ ptr[i]) & 0xFF] ^ (crc >> 8);
     }
     return crc ^ 0xFFFFFFFFu;
@@ -603,9 +610,19 @@ AESDetectionResult CryptoAccelerator::DetectAESContent(
 {
     AESDetectionResult result{};
     if (data.empty()) return result;
+    if (data.data() == nullptr) return result;
 
     const size_t scanSize = std::min(data.size(), kMaxScanSize);
     const uint8_t* ptr = data.data();
+    try {
+        result.keyCandidates.reserve(kMaxKeyCandidates);
+        result.sboxLocations.reserve(kMaxSboxLocations);
+        result.roundConstantLocations.reserve(kMaxRoundConstLocations);
+    } catch (const std::bad_alloc&) {
+        return result;
+    } catch (const std::length_error&) {
+        return result;
+    }
 
     // --- Pass 1: Scan for AES S-box tables ---
     if (scanSize >= 256) {
@@ -616,7 +633,8 @@ AESDetectionResult CryptoAccelerator::DetectAESContent(
             if (MatchesSbox(ptr + offset, kAESSbox) ||
                 MatchesSbox(ptr + offset, kAESInvSbox))
             {
-                result.sboxLocations.push_back(baseAddr + static_cast<GuestAddress>(offset));
+                result.sboxLocations.push_back(
+                    SaturatingGuestAdd(baseAddr, static_cast<GuestAddress>(offset)));
                 result.hasAESPatterns = true;
                 // Skip past this S-box to avoid duplicate detections
                 offset += 255;
@@ -646,7 +664,7 @@ AESDetectionResult CryptoAccelerator::DetectAESContent(
             // If we find >=6 distinct RCON values nearby, it's likely key schedule data
             if (rconMatchCount >= 6) {
                 result.roundConstantLocations.push_back(
-                    baseAddr + static_cast<GuestAddress>(offset));
+                    SaturatingGuestAdd(baseAddr, static_cast<GuestAddress>(offset)));
                 result.hasAESPatterns = true;
                 offset += 63;
             }
@@ -717,7 +735,7 @@ AESDetectionResult CryptoAccelerator::DetectAESContent(
 
             if (validRounds >= 3) {
                 AESKeyCandidate candidate;
-                candidate.address = baseAddr + static_cast<GuestAddress>(offset);
+                candidate.address = SaturatingGuestAdd(baseAddr, static_cast<GuestAddress>(offset));
                 candidate.keySize = 128;
                 candidate.confidence = static_cast<float>(validRounds) / 10.0f;
                 std::memcpy(candidate.keyBytes.data(), keyData, 16);
@@ -755,20 +773,29 @@ EncryptionAnalysis CryptoAccelerator::AnalyzeEncryption(
 {
     EncryptionAnalysis result{};
     if (data.empty()) return result;
+    if (data.data() == nullptr) return result;
 
     const size_t scanSize = std::min(data.size(), kMaxScanSize);
     const uint8_t* ptr = data.data();
+    try {
+        result.regions.reserve(kMaxEncryptedRegions);
+    } catch (const std::bad_alloc&) {
+        return result;
+    } catch (const std::length_error&) {
+        return result;
+    }
 
     result.totalBytes = static_cast<uint32_t>(scanSize);
     result.overallEntropy = ComputeEntropy(ptr, scanSize);
 
     // Sliding window entropy analysis
     EncryptedRegion currentRegion{};
+    size_t currentRegionStartOffset = 0;
     bool inRegion = false;
 
     for (size_t offset = 0;
-         offset + kEntropyWindowSize <= scanSize
-             && result.regions.size() < kMaxEncryptedRegions;
+         HasReadableBytes(offset, kEntropyWindowSize, scanSize)
+              && result.regions.size() < kMaxEncryptedRegions;
          offset += kEntropyStride)
     {
         const double windowEntropy = ComputeEntropy(ptr + offset, kEntropyWindowSize);
@@ -776,7 +803,8 @@ EncryptionAnalysis CryptoAccelerator::AnalyzeEncryption(
         if (windowEntropy > kCompressedThreshold) {
             if (!inRegion) {
                 currentRegion = {};
-                currentRegion.start = baseAddr + static_cast<GuestAddress>(offset);
+                currentRegionStartOffset = offset;
+                currentRegion.start = SaturatingGuestAdd(baseAddr, static_cast<GuestAddress>(offset));
                 currentRegion.entropy = windowEntropy;
                 inRegion = true;
             } else {
@@ -796,8 +824,7 @@ EncryptionAnalysis CryptoAccelerator::AnalyzeEncryption(
             }
         } else {
             if (inRegion) {
-                GuestAddress regionEnd = baseAddr + static_cast<GuestAddress>(offset);
-                currentRegion.size = regionEnd - currentRegion.start;
+                currentRegion.size = static_cast<GuestSize>(offset - currentRegionStartOffset);
                 if (currentRegion.size >= kEntropyWindowSize) {
                     result.regions.push_back(currentRegion);
                 }
@@ -808,7 +835,7 @@ EncryptionAnalysis CryptoAccelerator::AnalyzeEncryption(
 
     // Close final region if still open
     if (inRegion) {
-        currentRegion.size = (baseAddr + static_cast<GuestAddress>(scanSize)) - currentRegion.start;
+        currentRegion.size = static_cast<GuestSize>(scanSize - currentRegionStartOffset);
         if (currentRegion.size >= kEntropyWindowSize) {
             result.regions.push_back(currentRegion);
         }
@@ -828,9 +855,12 @@ EncryptionAnalysis CryptoAccelerator::AnalyzeEncryption(
     for (auto& region : result.regions) {
         if (region.type == EncryptedRegion::Type::AES && region.start >= baseAddr) {
             const size_t regionOffset = static_cast<size_t>(region.start - baseAddr);
-            const size_t regionSize = static_cast<size_t>(
-                std::min(region.size, static_cast<GuestSize>(scanSize - regionOffset)));
-            if (regionOffset < scanSize && regionSize > 0) {
+            if (regionOffset < scanSize) {
+                const size_t regionSize = static_cast<size_t>(
+                    std::min(region.size, static_cast<GuestSize>(scanSize - regionOffset)));
+                if (regionSize == 0) {
+                    continue;
+                }
                 ByteSpan regionSpan(ptr + regionOffset, regionSize);
                 if (DetectChaChaPattern(regionSpan)) {
                     region.type = EncryptedRegion::Type::ChaCha;
@@ -848,12 +878,13 @@ EncryptionAnalysis CryptoAccelerator::AnalyzeEncryption(
 
 bool CryptoAccelerator::DetectChaChaPattern(ByteSpan data) const noexcept {
     if (data.size() < 16) return false;
+    if (data.data() == nullptr) return false;
 
     const size_t scanSize = std::min(data.size(), kMaxScanSize);
     const uint8_t* ptr = data.data();
 
     // Scan for "expand 32-byte k" constant (ChaCha20/Salsa20)
-    for (size_t offset = 0; offset + 3 < scanSize; offset += 4) {
+    for (size_t offset = 0; HasReadableBytes(offset, sizeof(uint32_t), scanSize); offset += 4) {
         const uint32_t word = ReadLE32(ptr + offset);
 
         // Check for the first magic constant — if found, verify the others
@@ -861,7 +892,7 @@ bool CryptoAccelerator::DetectChaChaPattern(ByteSpan data) const noexcept {
             // "expand 32-byte k": constants at offsets 0, 4*4=16, 8*4=32, 12*4=48 (in state matrix)
             // But they may also appear consecutively in embedded constant tables
             // Check for adjacent constants (common in lookup tables and code)
-            if (offset + 16 <= scanSize) {
+            if (HasReadableBytes(offset, 16, scanSize)) {
                 const uint32_t w1 = ReadLE32(ptr + offset + 4);
                 const uint32_t w2 = ReadLE32(ptr + offset + 8);
                 const uint32_t w3 = ReadLE32(ptr + offset + 12);
@@ -870,7 +901,7 @@ bool CryptoAccelerator::DetectChaChaPattern(ByteSpan data) const noexcept {
                 }
             }
             // Check for Salsa20 state layout: constants at [0], [5*4], [10*4], [15*4]
-            if (offset + 60 < scanSize) {
+            if (HasReadableBytes(offset, 64, scanSize)) {
                 const uint32_t s1 = ReadLE32(ptr + offset + 20);
                 const uint32_t s2 = ReadLE32(ptr + offset + 40);
                 const uint32_t s3 = ReadLE32(ptr + offset + 60);
@@ -879,7 +910,7 @@ bool CryptoAccelerator::DetectChaChaPattern(ByteSpan data) const noexcept {
                 }
             }
             // ChaCha20 state layout: constants at [0], [4], [8], [12] (dword indices)
-            if (offset + 48 < scanSize) {
+            if (HasReadableBytes(offset, 52, scanSize)) {
                 const uint32_t c1 = ReadLE32(ptr + offset + 16);
                 const uint32_t c2 = ReadLE32(ptr + offset + 32);
                 const uint32_t c3 = ReadLE32(ptr + offset + 48);
@@ -890,7 +921,7 @@ bool CryptoAccelerator::DetectChaChaPattern(ByteSpan data) const noexcept {
         }
 
         // Check for "expand 16-byte k" (128-bit key variant)
-        if (word == kChaCha16ByteKey_0 && offset + 16 <= scanSize) {
+        if (word == kChaCha16ByteKey_0 && HasReadableBytes(offset, 16, scanSize)) {
             const uint32_t w1 = ReadLE32(ptr + offset + 4);
             const uint32_t w2 = ReadLE32(ptr + offset + 8);
             const uint32_t w3 = ReadLE32(ptr + offset + 12);
@@ -926,12 +957,20 @@ std::vector<GuestAddress> CryptoAccelerator::FindRSAPublicKeys(
 {
     std::vector<GuestAddress> results;
     if (data.size() < 4) return results;
+    if (data.data() == nullptr) return results;
+    try {
+        results.reserve(kMaxRSAKeys);
+    } catch (const std::bad_alloc&) {
+        return results;
+    } catch (const std::length_error&) {
+        return results;
+    }
 
     const size_t scanSize = std::min(data.size(), kMaxScanSize);
     const uint8_t* ptr = data.data();
 
     for (size_t offset = 0;
-         offset + 4 <= scanSize && results.size() < kMaxRSAKeys;
+         HasReadableBytes(offset, 4, scanSize) && results.size() < kMaxRSAKeys;
          ++offset)
     {
         // --- ASN.1 DER-encoded RSA public key ---
@@ -942,7 +981,7 @@ std::vector<GuestAddress> CryptoAccelerator::FindRSAPublicKeys(
             const uint32_t seqLen = (static_cast<uint32_t>(ptr[offset + 2]) << 8) |
                                      static_cast<uint32_t>(ptr[offset + 3]);
             // Sanity: RSA key sequence should be 128–8192 bytes
-            if (seqLen >= 128 && seqLen <= 8192 && offset + 4 + seqLen <= scanSize) {
+            if (seqLen >= 128 && seqLen <= 8192 && HasReadableBytes(offset, 4 + seqLen, scanSize)) {
                 // Scan inside for 0x02 0x82 (INTEGER with 2-byte length = large modulus)
                 bool foundModulus = false;
                 const size_t innerEnd = std::min(offset + 4 + seqLen, scanSize - 1);
@@ -958,7 +997,7 @@ std::vector<GuestAddress> CryptoAccelerator::FindRSAPublicKeys(
                     }
                 }
                 if (foundModulus) {
-                    results.push_back(base + static_cast<GuestAddress>(offset));
+                    results.push_back(SaturatingGuestAdd(base, static_cast<GuestAddress>(offset)));
                     offset += 4 + seqLen - 1;
                     continue;
                 }
@@ -968,20 +1007,26 @@ std::vector<GuestAddress> CryptoAccelerator::FindRSAPublicKeys(
         // --- CryptoAPI PUBLICKEYSTRUC + RSAPUBKEY ---
         // PUBLICKEYSTRUC: bType=0x06(PUBLICKEYBLOB), bVersion=0x02, reserved=0x0000, aiKeyAlg
         // RSAPUBKEY:      magic='RSA1' (0x31415352), bitlen, pubexp
-        if (offset + 20 <= scanSize &&
+        if (HasReadableBytes(offset, 20, scanSize) &&
             ptr[offset] == 0x06 &&          // bType = PUBLICKEYBLOB
             ptr[offset + 1] == 0x02 &&      // bVersion = 2
             ptr[offset + 2] == 0x00 &&      // reserved
             ptr[offset + 3] == 0x00)
         {
             // Check for RSA1 magic at offset + 8
-            if (offset + 12 <= scanSize) {
+            if (HasReadableBytes(offset, 16, scanSize)) {
                 const uint32_t magic = ReadLE32(ptr + offset + 8);
                 if (magic == 0x31415352) {   // 'RSA1'
-                    results.push_back(base + static_cast<GuestAddress>(offset));
                     // Skip past the header
                     const uint32_t bitLen = ReadLE32(ptr + offset + 12);
-                    const size_t keyBytes = bitLen / 8;
+                    if (bitLen < 512 || bitLen > kMaxRSAKeyBits || (bitLen % 8) != 0) {
+                        continue;
+                    }
+                    const size_t keyBytes = static_cast<size_t>(bitLen / 8);
+                    if (!HasReadableBytes(offset, 20 + keyBytes, scanSize)) {
+                        continue;
+                    }
+                    results.push_back(SaturatingGuestAdd(base, static_cast<GuestAddress>(offset)));
                     offset += 20 + keyBytes - 1;
                     continue;
                 }
@@ -989,16 +1034,16 @@ std::vector<GuestAddress> CryptoAccelerator::FindRSAPublicKeys(
         }
 
         // Also detect RSA2 (private key blob) headers — often found alongside public keys
-        if (offset + 20 <= scanSize &&
+        if (HasReadableBytes(offset, 20, scanSize) &&
             ptr[offset] == 0x07 &&          // bType = PRIVATEKEYBLOB
             ptr[offset + 1] == 0x02 &&
             ptr[offset + 2] == 0x00 &&
             ptr[offset + 3] == 0x00)
         {
-            if (offset + 12 <= scanSize) {
+            if (HasReadableBytes(offset, 12, scanSize)) {
                 const uint32_t magic = ReadLE32(ptr + offset + 8);
                 if (magic == 0x32415352) {   // 'RSA2'
-                    results.push_back(base + static_cast<GuestAddress>(offset));
+                    results.push_back(SaturatingGuestAdd(base, static_cast<GuestAddress>(offset)));
                     offset += 19;
                     continue;
                 }
