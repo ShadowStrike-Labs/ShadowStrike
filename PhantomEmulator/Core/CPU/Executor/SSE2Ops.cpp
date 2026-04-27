@@ -23,6 +23,10 @@ namespace Phantom {
 
 namespace {
 
+constexpr uint32_t kMxcsrInvalidOperation = 1u << 0;
+constexpr uint32_t kIntegerIndefinite32 = 0x80000000u;
+constexpr uint64_t kIntegerIndefinite64 = 0x8000000000000000ull;
+
 [[nodiscard]] inline int8_t SatI8(int16_t v) noexcept {
     if (v > 127) return 127;
     if (v < -128) return -128;
@@ -47,6 +51,199 @@ namespace {
     return static_cast<uint16_t>(v);
 }
 
+[[nodiscard]] bool HasOperands(const DecodedInstruction& inst, uint8_t count) noexcept {
+    return inst.operandCount >= count;
+}
+
+[[nodiscard]] bool IsXmmRegisterOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsRegister() &&
+           operand.reg.regType == RegType::XMM &&
+           !operand.reg.isHighByte &&
+           operand.reg.regIndex < 16;
+}
+
+[[nodiscard]] bool IsGprRegisterOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsRegister() &&
+           operand.reg.regType == RegType::GPR &&
+           operand.reg.regIndex < 16;
+}
+
+[[nodiscard]] bool IsXmmOrMemoryOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsMemory() || IsXmmRegisterOperand(operand);
+}
+
+[[nodiscard]] bool IsGprOrMemoryOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsMemory() || IsGprRegisterOperand(operand);
+}
+
+[[nodiscard]] bool HasConflictingMandatoryPrefixes(const DecodedInstruction& inst) noexcept {
+    const uint8_t count = static_cast<uint8_t>(inst.prefixes.hasOpSizeOverride ? 1u : 0u) +
+                          static_cast<uint8_t>(inst.prefixes.hasRep ? 1u : 0u) +
+                          static_cast<uint8_t>(inst.prefixes.hasRepNE ? 1u : 0u);
+    return count > 1u;
+}
+
+[[nodiscard]] ErrorCode RequireXmmDstAndXmmOrMemSrc(const DecodedInstruction& inst) noexcept {
+    if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+    return IsXmmRegisterOperand(inst.Op(0)) && IsXmmOrMemoryOperand(inst.Op(1))
+        ? ErrorCode::Success
+        : ErrorCode::InvalidOperandSize;
+}
+
+[[nodiscard]] ErrorCode RequireXmmOrMemDstAndXmmSrc(const DecodedInstruction& inst) noexcept {
+    if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+    return (inst.Op(0).IsMemory() || IsXmmRegisterOperand(inst.Op(0))) &&
+           IsXmmRegisterOperand(inst.Op(1))
+        ? ErrorCode::Success
+        : ErrorCode::InvalidOperandSize;
+}
+
+[[nodiscard]] ErrorCode ValidateSSE2Operands(const DecodedInstruction& inst) noexcept {
+    if (inst.prefixes.hasLock || inst.prefixes.hasVEX || inst.prefixes.hasEVEX) {
+        return ErrorCode::UnimplementedOpcode;
+    }
+    if (HasConflictingMandatoryPrefixes(inst)) {
+        return ErrorCode::UnimplementedOpcode;
+    }
+
+    const uint8_t op = inst.opcode;
+    const bool has66 = inst.prefixes.hasOpSizeOverride;
+    const bool hasF2 = inst.prefixes.hasRepNE;
+    const bool hasF3 = inst.prefixes.hasRep;
+
+    if (op == 0x28 || op == 0x10 || op == 0x6F || op == 0x57 ||
+        op == 0xEF || op == 0x70 || op == 0xC6 || op == 0x14 ||
+        op == 0x15 || op == 0x5A || op == 0x58 || op == 0x5C ||
+        op == 0x59 || op == 0x5E || op == 0x51 || op == 0x5D ||
+        op == 0x5F || op == 0x2E || op == 0x2F ||
+        (op >= 0x60 && op <= 0x6D) ||
+        (op >= 0x74 && op <= 0x76) ||
+        (op >= 0x64 && op <= 0x67) ||
+        (op >= 0xD1 && op <= 0xD5) ||
+        (op >= 0xD8 && op <= 0xDF) ||
+        (op >= 0xE0 && op <= 0xE5) ||
+        (op >= 0xE8 && op <= 0xEF) ||
+        (op >= 0xF1 && op <= 0xF6) ||
+        (op >= 0xF8 && op <= 0xFE)) {
+        return RequireXmmDstAndXmmOrMemSrc(inst);
+    }
+
+    if (op == 0x29 || op == 0x11 || op == 0x7F) {
+        return RequireXmmOrMemDstAndXmmSrc(inst);
+    }
+
+    if (op == 0x71 || op == 0x72 || op == 0x73) {
+        if (!HasOperands(inst, 1)) return ErrorCode::InvalidOperandSize;
+        return IsXmmRegisterOperand(inst.Op(0)) ? ErrorCode::Success : ErrorCode::InvalidOperandSize;
+    }
+
+    if (op == 0x6E && has66) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return IsXmmRegisterOperand(inst.Op(0)) && IsGprOrMemoryOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if (op == 0x7E && has66) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return (IsGprRegisterOperand(inst.Op(0)) || inst.Op(0).IsMemory()) &&
+               IsXmmRegisterOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if (op == 0x7E && hasF3) {
+        return RequireXmmDstAndXmmOrMemSrc(inst);
+    }
+
+    if (op == 0x12 || op == 0x16) {
+        return RequireXmmDstAndXmmOrMemSrc(inst);
+    }
+
+    if (op == 0x13 || op == 0x17) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return inst.Op(0).IsMemory() && IsXmmRegisterOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if ((op == 0xD7 && has66) || op == 0x50 || (op == 0xC5 && has66)) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return IsGprRegisterOperand(inst.Op(0)) && IsXmmRegisterOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if (op == 0xC4 && has66) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return IsXmmRegisterOperand(inst.Op(0)) && IsGprOrMemoryOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if ((op == 0xE7 && has66) || op == 0x2B) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return inst.Op(0).IsMemory() && IsXmmRegisterOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if (op == 0x2A && (hasF2 || hasF3)) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return IsXmmRegisterOperand(inst.Op(0)) && IsGprOrMemoryOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    if ((op == 0x2C || op == 0x2D) && (hasF2 || hasF3)) {
+        if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+        return IsGprRegisterOperand(inst.Op(0)) && IsXmmOrMemoryOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    return ErrorCode::Success;
+}
+
+[[nodiscard]] uint32_t AddI32Wrap(int32_t lhs, int32_t rhs) noexcept {
+    return static_cast<uint32_t>(lhs) + static_cast<uint32_t>(rhs);
+}
+
+[[nodiscard]] double ApplySseRounding(double value, uint32_t mxcsr) noexcept {
+    switch ((mxcsr >> 13) & 0x3u) {
+        case 1: return std::floor(value);
+        case 2: return std::ceil(value);
+        case 3: return std::trunc(value);
+        default: return std::nearbyint(value);
+    }
+}
+
+[[nodiscard]] float ApplySseRounding(float value, uint32_t mxcsr) noexcept {
+    return static_cast<float>(ApplySseRounding(static_cast<double>(value), mxcsr));
+}
+
+[[nodiscard]] int32_t ConvertSseToI32(CPUState& state, double value, bool truncate) noexcept {
+    const double converted = truncate ? std::trunc(value) : ApplySseRounding(value, state.mxcsr);
+    if (!std::isfinite(converted) ||
+        converted > static_cast<double>((std::numeric_limits<int32_t>::max)()) ||
+        converted < static_cast<double>((std::numeric_limits<int32_t>::min)())) {
+        state.mxcsr |= kMxcsrInvalidOperation;
+        return static_cast<int32_t>(kIntegerIndefinite32);
+    }
+    return static_cast<int32_t>(converted);
+}
+
+[[nodiscard]] int64_t ConvertSseToI64(CPUState& state, double value, bool truncate) noexcept {
+    const double converted = truncate ? std::trunc(value) : ApplySseRounding(value, state.mxcsr);
+    if (!std::isfinite(converted) ||
+        converted > static_cast<double>((std::numeric_limits<int64_t>::max)()) ||
+        converted < static_cast<double>((std::numeric_limits<int64_t>::min)())) {
+        state.mxcsr |= kMxcsrInvalidOperation;
+        return static_cast<int64_t>(kIntegerIndefinite64);
+    }
+    return static_cast<int64_t>(converted);
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -55,6 +252,9 @@ namespace {
 
 ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     if (inst.opcodeMap != OpcodeMap::TwoByte) return ErrorCode::UnimplementedOpcode;
+
+    const auto operandValidation = ValidateSSE2Operands(inst);
+    if (operandValidation != ErrorCode::Success) return operandValidation;
 
     uint8_t op = inst.opcode;
     bool has66 = inst.prefixes.hasOpSizeOverride;
@@ -344,7 +544,7 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
         for (int i = 0; i < 4; i++) {
             int32_t a = static_cast<int32_t>(dst.i16[i*2]) * src.i16[i*2];
             int32_t b = static_cast<int32_t>(dst.i16[i*2+1]) * src.i16[i*2+1];
-            dst.i32[i] = a + b;
+            dst.u32[i] = AddI32Wrap(a, b);
         }
         return ErrorCode::Success;
     }
@@ -639,8 +839,8 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
         double v = 0;
         if (inst.Op(1).IsRegister()) v = m_state.XMM(inst.Op(1).reg.regIndex).f64[0];
         else { GuestAddress a = CalculateEffectiveAddress(inst.Op(1), inst); auto e = mem.Read(a, &v, 8); if (e != ErrorCode::Success) return e; }
-        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(static_cast<int64_t>(std::llrint(v))));
-        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(static_cast<int32_t>(std::lrint(v))));
+        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(ConvertSseToI64(m_state, v, false)));
+        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(ConvertSseToI32(m_state, v, false)));
         return ErrorCode::Success;
     }
     // CVTSS2SI (F3 0F 2D)
@@ -648,8 +848,8 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
         float v = 0;
         if (inst.Op(1).IsRegister()) v = m_state.XMM(inst.Op(1).reg.regIndex).f32[0];
         else { GuestAddress a = CalculateEffectiveAddress(inst.Op(1), inst); auto e = mem.Read(a, &v, 4); if (e != ErrorCode::Success) return e; }
-        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(static_cast<int64_t>(std::llrintf(v))));
-        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(static_cast<int32_t>(std::lrintf(v))));
+        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(ConvertSseToI64(m_state, static_cast<double>(v), false)));
+        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(ConvertSseToI32(m_state, static_cast<double>(v), false)));
         return ErrorCode::Success;
     }
     // CVTTSD2SI (F2 0F 2C)
@@ -657,8 +857,8 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
         double v = 0;
         if (inst.Op(1).IsRegister()) v = m_state.XMM(inst.Op(1).reg.regIndex).f64[0];
         else { GuestAddress a = CalculateEffectiveAddress(inst.Op(1), inst); auto e = mem.Read(a, &v, 8); if (e != ErrorCode::Success) return e; }
-        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(static_cast<int64_t>(v)));
-        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(static_cast<int32_t>(v)));
+        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(ConvertSseToI64(m_state, v, true)));
+        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(ConvertSseToI32(m_state, v, true)));
         return ErrorCode::Success;
     }
     // CVTTSS2SI (F3 0F 2C)
@@ -666,8 +866,8 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
         float v = 0;
         if (inst.Op(1).IsRegister()) v = m_state.XMM(inst.Op(1).reg.regIndex).f32[0];
         else { GuestAddress a = CalculateEffectiveAddress(inst.Op(1), inst); auto e = mem.Read(a, &v, 4); if (e != ErrorCode::Success) return e; }
-        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(static_cast<int64_t>(v)));
-        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(static_cast<int32_t>(v)));
+        if (inst.prefixes.rexW) m_state.SetReg64(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint64_t>(ConvertSseToI64(m_state, static_cast<double>(v), true)));
+        else m_state.SetReg32(static_cast<GPR>(inst.Op(0).reg.regIndex), static_cast<uint32_t>(ConvertSseToI32(m_state, static_cast<double>(v), true)));
         return ErrorCode::Success;
     }
     // CVTSD2SS (F2 0F 5A) / CVTSS2SD (F3 0F 5A) / CVTPS2PD / CVTPD2PS
