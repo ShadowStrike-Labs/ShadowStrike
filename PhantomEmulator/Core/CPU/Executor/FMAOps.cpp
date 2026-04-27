@@ -28,6 +28,31 @@
 
 namespace Phantom {
 
+namespace {
+
+constexpr uint8_t kVectorRegisterCount = 16;
+
+[[nodiscard]] bool IsValidVectorRegisterIndex(uint8_t index) noexcept {
+    return index < kVectorRegisterCount;
+}
+
+[[nodiscard]] bool IsValidVectorRegisterOperand(const DecodedOperand& operand) noexcept {
+    if (!operand.IsRegister()) {
+        return false;
+    }
+
+    switch (operand.reg.regType) {
+        case RegType::XMM:
+        case RegType::YMM:
+        case RegType::ZMM:
+            return IsValidVectorRegisterIndex(operand.reg.regIndex);
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
 // FMA operation type decoded from opcode bits [3:1]
 enum class FMAOp : uint8_t {
     FMADDSUB = 0, // x6/x7: Alternating add/sub
@@ -54,10 +79,12 @@ ErrorCode CPU::ExecuteFMA(const DecodedInstruction& inst, VirtualMemory& mem) no
 
     if (inst.opcodeMap != OpcodeMap::ThreeByte38)
         return ErrorCode::UnimplementedOpcode;
+    if (!inst.HasOperand(0) || !inst.HasOperand(1)) return ErrorCode::InvalidOperandSize;
 
     const uint8_t op    = inst.opcode;
     const bool    isW1  = inst.prefixes.vexW;    // W=1: double, W=0: float
     const uint8_t vexL  = inst.prefixes.vexL;
+    if (vexL > 1 || inst.prefixes.vexVVVV > 15) return ErrorCode::InvalidOperandSize;
     const bool    is256 = (vexL == 1);
     const uint32_t vecLen = is256 ? 32u : 16u;
     const uint8_t vvvv  = static_cast<uint8_t>(15 - inst.prefixes.vexVVVV);
@@ -94,6 +121,11 @@ ErrorCode CPU::ExecuteFMA(const DecodedInstruction& inst, VirtualMemory& mem) no
             default: return ErrorCode::UnimplementedOpcode;
         }
     }
+    if (isScalar && is256) return ErrorCode::InvalidOperandSize;
+    if (!IsValidVectorRegisterOperand(inst.Op(0))) return ErrorCode::InvalidOperandSize;
+    if (inst.Op(1).IsRegister() && !IsValidVectorRegisterOperand(inst.Op(1)))
+        return ErrorCode::InvalidOperandSize;
+    if (!IsValidVectorRegisterIndex(vvvv)) return ErrorCode::InvalidOperandSize;
 
     // Read three operand values: dest (Op0), vvvv, and r/m (Op1)
     YMMValue src1{}, src2{}, src3{};
