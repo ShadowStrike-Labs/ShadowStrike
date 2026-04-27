@@ -10,7 +10,8 @@
  *
  * Design notes:
  *   - Only compiles basic blocks (single entry, single exit)
- *   - Compiled code runs in an RWX region managed by VirtualAlloc
+ *   - Compiled code is emitted into a bounded writeable cache and then
+ *     protected executable; the cache is never intentionally left RWX
  *   - Each compiled block has an entry stub that checks guest state
  *   - Compiled code calls back into the emulator for memory access
  *     and API dispatch (no full native execution)
@@ -68,6 +69,7 @@ public:
 
     [[nodiscard]] uint32_t GetOffset() const noexcept;
     [[nodiscard]] uint8_t* GetBuffer() const noexcept;
+    [[nodiscard]] bool Failed() const noexcept;
 
 private:
     void EmitRex(bool w, uint8_t r, uint8_t x, uint8_t b) noexcept;
@@ -76,6 +78,7 @@ private:
     uint8_t* m_buffer = nullptr;
     uint32_t m_capacity = 0;
     uint32_t m_offset = 0;
+    bool m_failed = false;
 };
 
 enum class JITStrategy : uint8_t {

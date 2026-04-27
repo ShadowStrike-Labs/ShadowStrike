@@ -37,6 +37,8 @@ namespace {
 static constexpr uint32_t kLookupTableSize = 8192;
 static constexpr uint32_t kLookupMask = kLookupTableSize - 1;
 static constexpr uint32_t kMaxCompiledInstrPerBlock = 64;
+static constexpr uint32_t kMinJitSlotSize = 128;
+static constexpr uint32_t kMaxJitCodeCacheSize = 64u * 1024u * 1024u;
 
 [[nodiscard]] uint64_t MaskToSize(uint64_t value, OperandSize size) noexcept {
     switch (size) {
@@ -46,6 +48,67 @@ static constexpr uint32_t kMaxCompiledInstrPerBlock = 64;
         case OperandSize::Size64: return value;
     }
     return value;
+}
+
+[[nodiscard]] bool IsSupportedOperandSize(OperandSize size) noexcept {
+    switch (size) {
+        case OperandSize::Size8:
+        case OperandSize::Size16:
+        case OperandSize::Size32:
+        case OperandSize::Size64:
+            return true;
+    }
+    return false;
+}
+
+[[nodiscard]] uint32_t OperandByteWidth(OperandSize size) noexcept {
+    switch (size) {
+        case OperandSize::Size8:  return 1;
+        case OperandSize::Size16: return 2;
+        case OperandSize::Size32: return 4;
+        case OperandSize::Size64: return 8;
+    }
+    return 0;
+}
+
+[[nodiscard]] bool IsValidGprIndex(uint8_t index) noexcept {
+    return index < static_cast<uint8_t>(GPR::Count);
+}
+
+[[nodiscard]] bool IsValidSegmentRegister(SegReg segment) noexcept {
+    return CPUState::IsValidSegment(segment);
+}
+
+[[nodiscard]] bool AddUnsigned(uint64_t lhs, uint64_t rhs, uint64_t& result) noexcept {
+    if ((std::numeric_limits<uint64_t>::max)() - lhs < rhs) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+[[nodiscard]] bool AddSigned(uint64_t lhs, int64_t rhs, uint64_t& result) noexcept {
+    if (rhs >= 0) {
+        return AddUnsigned(lhs, static_cast<uint64_t>(rhs), result);
+    }
+
+    const uint64_t magnitude = static_cast<uint64_t>(-(rhs + 1)) + 1;
+    if (lhs < magnitude) {
+        return false;
+    }
+    result = lhs - magnitude;
+    return true;
+}
+
+[[nodiscard]] bool ScaleIndex(uint64_t value, uint8_t scale, uint64_t& result) noexcept {
+    if (scale != 1 && scale != 2 && scale != 4 && scale != 8) {
+        return false;
+    }
+    if (value > (std::numeric_limits<uint64_t>::max)() / scale) {
+        return false;
+    }
+    result = value * scale;
+    return true;
 }
 
 void UpdateAddFlags(EFlags& flags, uint64_t lhs, uint64_t rhs, uint64_t result, OperandSize size) noexcept {
@@ -110,26 +173,73 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
 
     uint64_t addr = 0;
     if (op.mem.ripRelative) {
-        addr = inst.NextRIP() + static_cast<uint64_t>(op.mem.displacement);
+        const GuestAddress nextRip = inst.NextRIP();
+        if (nextRip == kGuestInvalid || !AddSigned(nextRip, op.mem.displacement, addr)) {
+            return kGuestInvalid;
+        }
     } else {
         if (op.mem.hasBase) {
+            if (!IsValidGprIndex(op.mem.baseReg)) {
+                return kGuestInvalid;
+            }
             addr = cpu.GetReg64(static_cast<GPR>(op.mem.baseReg));
         }
         if (op.mem.hasIndex) {
-            addr += cpu.GetReg64(static_cast<GPR>(op.mem.indexReg)) * op.mem.scale;
+            if (!IsValidGprIndex(op.mem.indexReg)) {
+                return kGuestInvalid;
+            }
+            uint64_t scaledIndex = 0;
+            if (!ScaleIndex(cpu.GetReg64(static_cast<GPR>(op.mem.indexReg)), op.mem.scale, scaledIndex)
+                || !AddUnsigned(addr, scaledIndex, addr)) {
+                return kGuestInvalid;
+            }
         }
-        addr += static_cast<uint64_t>(op.mem.displacement);
+        if (!AddSigned(addr, op.mem.displacement, addr)) {
+            return kGuestInvalid;
+        }
     }
 
     if (inst.addressSize == AddressSize::Addr32) {
         addr &= 0xFFFFFFFFULL;
+    } else if (inst.addressSize == AddressSize::Addr16) {
+        addr &= 0xFFFFULL;
+    } else if (inst.addressSize != AddressSize::Addr64) {
+        return kGuestInvalid;
     }
 
     if (op.mem.segment == SegReg::FS || op.mem.segment == SegReg::GS) {
-        addr += cpu.GetSegment(op.mem.segment).base;
+        if (!AddUnsigned(addr, cpu.GetSegment(op.mem.segment).base, addr)) {
+            return kGuestInvalid;
+        }
+    } else if (!IsValidSegmentRegister(op.mem.segment)) {
+        return kGuestInvalid;
     }
 
     return addr;
+}
+
+[[nodiscard]] bool IsValidRegisterOperand(const DecodedOperand& op) noexcept {
+    if (op.type != OperandType::Register || op.reg.regType != RegType::GPR || !IsSupportedOperandSize(op.size)) {
+        return false;
+    }
+    if (op.reg.isHighByte) {
+        return op.size == OperandSize::Size8 && op.reg.regIndex >= 4 && op.reg.regIndex <= 7;
+    }
+    return IsValidGprIndex(op.reg.regIndex);
+}
+
+[[nodiscard]] bool IsReadableCompiledOperand(const DecodedOperand& op) noexcept {
+    if (!IsSupportedOperandSize(op.size)) {
+        return false;
+    }
+    if (op.type == OperandType::Register) {
+        return IsValidRegisterOperand(op);
+    }
+    return op.type == OperandType::Immediate || op.type == OperandType::RelativeOffset;
+}
+
+[[nodiscard]] bool IsWritableCompiledOperand(const DecodedOperand& op) noexcept {
+    return IsValidRegisterOperand(op);
 }
 
 [[nodiscard]] ErrorCode ReadOperandValue(
@@ -140,11 +250,14 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
     uint64_t& value) noexcept
 {
     value = 0;
+    if (!IsSupportedOperandSize(op.size)) {
+        return ErrorCode::InvalidOperandSize;
+    }
 
     switch (op.type) {
         case OperandType::Register:
-            if (op.reg.regType != RegType::GPR) {
-                return ErrorCode::UnsupportedOpcode;
+            if (!IsValidRegisterOperand(op)) {
+                return ErrorCode::InvalidOperandSize;
             }
             if (op.reg.isHighByte) {
                 value = cpu.GetReg8High(op.reg.regIndex);
@@ -155,7 +268,10 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
 
         case OperandType::Memory: {
             const auto address = CalculateEffectiveAddress(cpu, op, inst);
-            return memory.Read(address, &value, static_cast<uint32_t>(op.size));
+            if (address == kGuestInvalid) {
+                return ErrorCode::InvalidAddress;
+            }
+            return memory.Read(address, &value, OperandByteWidth(op.size));
         }
 
         case OperandType::Immediate:
@@ -178,12 +294,16 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
     const DecodedInstruction& inst,
     uint64_t value) noexcept
 {
+    if (!IsSupportedOperandSize(op.size)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+
     value = MaskToSize(value, op.size);
 
     switch (op.type) {
         case OperandType::Register:
-            if (op.reg.regType != RegType::GPR) {
-                return ErrorCode::UnsupportedOpcode;
+            if (!IsValidRegisterOperand(op)) {
+                return ErrorCode::InvalidOperandSize;
             }
             if (op.reg.isHighByte) {
                 cpu.SetReg8High(op.reg.regIndex, static_cast<uint8_t>(value));
@@ -194,7 +314,10 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
 
         case OperandType::Memory: {
             const auto address = CalculateEffectiveAddress(cpu, op, inst);
-            return memory.Write(address, &value, static_cast<uint32_t>(op.size));
+            if (address == kGuestInvalid) {
+                return ErrorCode::InvalidAddress;
+            }
+            return memory.Write(address, &value, OperandByteWidth(op.size));
         }
 
         default:
@@ -223,12 +346,23 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
 }
 
 [[nodiscard]] bool SupportsCompiledInstruction(const DecodedInstruction& inst) noexcept {
+    if (inst.length == 0 || inst.NextRIP() == kGuestInvalid || inst.prefixes.hasLock) {
+        return false;
+    }
+
     if (IsControlFlowInstruction(inst)) {
         return false;
     }
 
     if (inst.opcodeMap == OpcodeMap::TwoByte) {
-        return inst.operandCount == 2 && (inst.opcode == 0xB6 || inst.opcode == 0xB7);
+        return inst.operandCount == 2
+            && (inst.opcode == 0xB6 || inst.opcode == 0xB7)
+            && inst.HasOperand(0)
+            && inst.HasOperand(1)
+            && IsWritableCompiledOperand(inst.operands[0])
+            && IsValidRegisterOperand(inst.operands[1])
+            && ((inst.opcode == 0xB6 && inst.operands[1].size == OperandSize::Size8)
+                || (inst.opcode == 0xB7 && inst.operands[1].size == OperandSize::Size16));
     }
 
     if (inst.opcodeMap != OpcodeMap::OneByte) {
@@ -237,18 +371,26 @@ void UpdateLogicFlags(EFlags& flags, uint64_t result, OperandSize size) noexcept
 
     const uint8_t op = inst.opcode;
     if (op == 0x90 || op == 0x9B) {
-        return true;
+        return inst.operandCount == 0;
     }
 
     if ((op >= 0xB0 && op <= 0xBF) || op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B
-        || op == 0x8D || op == 0xC6 || op == 0xC7
+        || op == 0xC6 || op == 0xC7
         || op == 0x01 || op == 0x03 || op == 0x05 || op == 0x29 || op == 0x2B
         || op == 0x2D || op == 0x31 || op == 0x33 || op == 0x35) {
-        return inst.operandCount >= 2;
+        return inst.operandCount == 2
+            && inst.HasOperand(0)
+            && inst.HasOperand(1)
+            && IsWritableCompiledOperand(inst.operands[0])
+            && IsReadableCompiledOperand(inst.operands[1]);
     }
 
-    if ((op == 0x81 || op == 0x83) && inst.operandCount >= 2) {
-        return inst.opcodeExt == 0;
+    if ((op == 0x81 || op == 0x83) && inst.operandCount == 2) {
+        return inst.opcodeExt == 0
+            && inst.HasOperand(0)
+            && inst.HasOperand(1)
+            && IsWritableCompiledOperand(inst.operands[0])
+            && IsReadableCompiledOperand(inst.operands[1]);
     }
 
     return false;
@@ -392,7 +534,7 @@ X64Emitter::X64Emitter(uint8_t* buffer, uint32_t capacity) noexcept
 {}
 
 bool X64Emitter::CanEmit(uint32_t bytes) const noexcept {
-    return m_buffer != nullptr && m_offset + bytes <= m_capacity;
+    return m_buffer != nullptr && m_offset <= m_capacity && bytes <= (m_capacity - m_offset);
 }
 
 void X64Emitter::EmitRex(bool w, uint8_t r, uint8_t x, uint8_t b) noexcept {
@@ -408,6 +550,7 @@ void X64Emitter::EmitRex(bool w, uint8_t r, uint8_t x, uint8_t b) noexcept {
 
 void X64Emitter::EmitByte(uint8_t b) noexcept {
     if (!CanEmit(1)) {
+        m_failed = true;
         return;
     }
     m_buffer[m_offset++] = b;
@@ -415,6 +558,7 @@ void X64Emitter::EmitByte(uint8_t b) noexcept {
 
 void X64Emitter::EmitDword(uint32_t v) noexcept {
     if (!CanEmit(4)) {
+        m_failed = true;
         return;
     }
     std::memcpy(m_buffer + m_offset, &v, sizeof(v));
@@ -423,6 +567,7 @@ void X64Emitter::EmitDword(uint32_t v) noexcept {
 
 void X64Emitter::EmitQword(uint64_t v) noexcept {
     if (!CanEmit(8)) {
+        m_failed = true;
         return;
     }
     std::memcpy(m_buffer + m_offset, &v, sizeof(v));
@@ -512,6 +657,10 @@ uint8_t* X64Emitter::GetBuffer() const noexcept {
     return m_buffer;
 }
 
+bool X64Emitter::Failed() const noexcept {
+    return m_failed;
+}
+
 struct JITCompiler::Impl {
     struct RuntimeBlock {
         CompiledBlock compiled{};
@@ -539,6 +688,28 @@ struct JITCompiler::Impl {
         lookupTable.fill(-1);
     }
 
+    [[nodiscard]] static bool IsValidBlockIndex(int32_t blockIndex) noexcept {
+        return blockIndex >= 0 && static_cast<uint32_t>(blockIndex) < kMaxCompiledBlocks;
+    }
+
+#if defined(_WIN32) || defined(_WIN64)
+    [[nodiscard]] static bool ProtectNativeCode(void* address, size_t size, DWORD protection) noexcept {
+        if (address == nullptr || size == 0) {
+            return false;
+        }
+        DWORD previousProtection = 0;
+        return ::VirtualProtect(address, size, protection, &previousProtection) != 0;
+    }
+#endif
+
+    void ResetRuntimeSlot(uint32_t slot) noexcept {
+        if (slot >= kMaxCompiledBlocks) {
+            return;
+        }
+        runtimeBlocks[slot] = RuntimeBlock{};
+        runtimeBlocks[slot].slotIndex = slot;
+    }
+
     [[nodiscard]] int32_t FindLookupIndex(GuestAddress address) const noexcept {
         if (address == 0) {
             return -1;
@@ -550,8 +721,12 @@ struct JITCompiler::Impl {
             if (blockIndex < 0) {
                 return -1;
             }
-            if (runtimeBlocks[static_cast<size_t>(blockIndex)].compiled.isValid
-                && runtimeBlocks[static_cast<size_t>(blockIndex)].compiled.guestAddress == address) {
+            if (!IsValidBlockIndex(blockIndex)) {
+                return -1;
+            }
+            const auto blockSlot = static_cast<size_t>(blockIndex);
+            if (runtimeBlocks[blockSlot].compiled.isValid
+                && runtimeBlocks[blockSlot].compiled.guestAddress == address) {
                 return blockIndex;
             }
         }
@@ -572,15 +747,21 @@ struct JITCompiler::Impl {
             }
 
             const auto blockIndex = static_cast<size_t>(slot);
+            if (blockIndex >= runtimeBlocks.size()) {
+                slot = -1;
+                return;
+            }
             if (runtimeBlocks[blockIndex].compiled.guestAddress == address) {
                 slot = -1;
                 uint32_t next = (index + probe + 1) & kLookupMask;
                 while (lookupTable[next] >= 0) {
                     const int32_t displaced = lookupTable[next];
                     lookupTable[next] = -1;
-                    InsertLookup(
-                        runtimeBlocks[static_cast<size_t>(displaced)].compiled.guestAddress,
-                        displaced);
+                    if (IsValidBlockIndex(displaced)) {
+                        InsertLookup(
+                            runtimeBlocks[static_cast<size_t>(displaced)].compiled.guestAddress,
+                            displaced);
+                    }
                     next = (next + 1) & kLookupMask;
                 }
                 return;
@@ -589,10 +770,15 @@ struct JITCompiler::Impl {
     }
 
     void InsertLookup(GuestAddress address, int32_t blockIndex) noexcept {
+        if (address == 0 || !IsValidBlockIndex(blockIndex)) {
+            return;
+        }
         uint32_t index = static_cast<uint32_t>((address >> 2) & kLookupMask);
         for (uint32_t probe = 0; probe < kLookupTableSize; ++probe) {
             auto& slot = lookupTable[(index + probe) & kLookupMask];
-            if (slot < 0 || runtimeBlocks[static_cast<size_t>(slot)].compiled.guestAddress == address) {
+            if (slot < 0
+                || !IsValidBlockIndex(slot)
+                || runtimeBlocks[static_cast<size_t>(slot)].compiled.guestAddress == address) {
                 slot = blockIndex;
                 return;
             }
@@ -601,7 +787,7 @@ struct JITCompiler::Impl {
 
     [[nodiscard]] RuntimeBlock* FindRuntimeBlock(GuestAddress address) noexcept {
         const int32_t index = FindLookupIndex(address);
-        return index >= 0 ? &runtimeBlocks[static_cast<size_t>(index)] : nullptr;
+        return IsValidBlockIndex(index) ? &runtimeBlocks[static_cast<size_t>(index)] : nullptr;
     }
 
     [[nodiscard]] const RuntimeBlock* FindRuntimeBlock(GuestAddress address) const noexcept {
@@ -616,24 +802,52 @@ struct JITCompiler::Impl {
         }
 
         uint32_t victim = 0;
+        RuntimeBlock* victimBlock = &runtimeBlocks[0];
         uint64_t oldest = std::numeric_limits<uint64_t>::max();
         for (uint32_t i = 0; i < kMaxCompiledBlocks; ++i) {
             if (runtimeBlocks[i].compiled.lastUsed < oldest) {
                 oldest = runtimeBlocks[i].compiled.lastUsed;
                 victim = i;
+                victimBlock = &runtimeBlocks[i];
             }
         }
 
-        RemoveLookup(runtimeBlocks[victim].compiled.guestAddress);
+        RemoveLookup(victimBlock->compiled.guestAddress);
         if (compiledBlockCount > 0) {
             --compiledBlockCount;
         }
-        if (codeCacheUsed >= runtimeBlocks[victim].compiled.nativeSize) {
-            codeCacheUsed -= runtimeBlocks[victim].compiled.nativeSize;
+        if (codeCacheUsed >= victimBlock->compiled.nativeSize) {
+            codeCacheUsed -= victimBlock->compiled.nativeSize;
         }
-        runtimeBlocks[victim] = RuntimeBlock{};
-        runtimeBlocks[victim].slotIndex = victim;
+        ResetRuntimeSlot(victim);
         return victim;
+    }
+
+    [[nodiscard]] GuestAddress RuntimeBlockEnd(const RuntimeBlock& runtime) const noexcept {
+        if (!runtime.compiled.isValid || runtime.compiledInstrCount == 0) {
+            return runtime.compiled.guestAddress;
+        }
+        const GuestAddress blockStart = runtime.compiled.guestAddress;
+        const GuestAddress nextRip = runtime.instructions[runtime.compiledInstrCount - 1].NextRIP();
+        if (nextRip == kGuestInvalid || nextRip < blockStart) {
+            return blockStart;
+        }
+        return nextRip;
+    }
+
+    void InvalidateRuntimeBlock(RuntimeBlock& runtime) noexcept {
+        if (!runtime.compiled.isValid) {
+            return;
+        }
+        RemoveLookup(runtime.compiled.guestAddress);
+        if (compiledBlockCount > 0) {
+            --compiledBlockCount;
+        }
+        if (codeCacheUsed >= runtime.compiled.nativeSize) {
+            codeCacheUsed -= runtime.compiled.nativeSize;
+        }
+        const uint32_t slot = runtime.slotIndex;
+        ResetRuntimeSlot(slot);
     }
 
     [[nodiscard]] static uint32_t ExecuteRuntimeBlock(
@@ -674,7 +888,7 @@ JITCompiler::JITCompiler(JITCompiler&&) noexcept = default;
 JITCompiler& JITCompiler::operator=(JITCompiler&&) noexcept = default;
 
 bool JITCompiler::Initialize(uint32_t cacheSizeBytes) noexcept {
-    if (!m_impl || cacheSizeBytes == 0) {
+    if (!m_impl || cacheSizeBytes == 0 || cacheSizeBytes > kMaxJitCodeCacheSize) {
         return false;
     }
 
@@ -687,13 +901,13 @@ bool JITCompiler::Initialize(uint32_t cacheSizeBytes) noexcept {
     const uint32_t slotCount = kMaxCompiledBlocks;
     const uint32_t roundedSize = std::max(cacheSizeBytes, slotCount * 256u);
     const uint32_t slotSize = roundedSize / slotCount;
-    if (slotSize < 128) {
+    if (slotSize < kMinJitSlotSize) {
         return false;
     }
 
 #if defined(_WIN32) || defined(_WIN64)
     auto* cache = static_cast<uint8_t*>(
-        ::VirtualAlloc(nullptr, roundedSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+        ::VirtualAlloc(nullptr, roundedSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (cache == nullptr) {
         return false;
     }
@@ -814,8 +1028,14 @@ bool JITCompiler::CompileBlock(
     }
 
     auto& runtime = m_impl->runtimeBlocks[slot];
-    runtime = Impl::RuntimeBlock{};
-    runtime.slotIndex = slot;
+    m_impl->ResetRuntimeSlot(slot);
+    auto* buffer = m_impl->codeCache + (static_cast<size_t>(slot) * m_impl->slotSize);
+#if defined(_WIN32) || defined(_WIN64)
+    if (!Impl::ProtectNativeCode(buffer, m_impl->slotSize, PAGE_READWRITE)) {
+        return false;
+    }
+#endif
+
     runtime.compiledInstrCount = compiledInstrCount;
     runtime.compiled.guestAddress = address;
     runtime.compiled.guestInstrCount = instrCount;
@@ -827,7 +1047,6 @@ bool JITCompiler::CompileBlock(
         instructions,
         static_cast<size_t>(compiledInstrCount) * sizeof(DecodedInstruction));
 
-    uint8_t* buffer = m_impl->codeCache + (static_cast<size_t>(slot) * m_impl->slotSize);
     X64Emitter emitter(buffer, m_impl->slotSize);
     emitter.EmitSubRegImm32(4, 0x28);
     emitter.EmitMovRegImm64(8, reinterpret_cast<uint64_t>(&runtime));
@@ -837,18 +1056,32 @@ bool JITCompiler::CompileBlock(
 
     runtime.compiled.nativeCode = buffer;
     runtime.compiled.nativeSize = emitter.GetOffset();
-    if (runtime.compiled.nativeSize == 0 || runtime.compiled.nativeSize > m_impl->slotSize) {
-        runtime = Impl::RuntimeBlock{};
-        runtime.slotIndex = slot;
+    if (emitter.Failed() || runtime.compiled.nativeSize == 0 || runtime.compiled.nativeSize > m_impl->slotSize) {
+        m_impl->ResetRuntimeSlot(slot);
+#if defined(_WIN32) || defined(_WIN64)
+        (void)Impl::ProtectNativeCode(buffer, m_impl->slotSize, PAGE_EXECUTE_READ);
+#endif
         return false;
     }
 
     m_impl->InsertLookup(address, static_cast<int32_t>(slot));
     ++m_impl->compiledBlockCount;
+    if ((std::numeric_limits<uint32_t>::max)() - m_impl->codeCacheUsed < runtime.compiled.nativeSize) {
+        m_impl->InvalidateRuntimeBlock(runtime);
+#if defined(_WIN32) || defined(_WIN64)
+        (void)Impl::ProtectNativeCode(buffer, m_impl->slotSize, PAGE_EXECUTE_READ);
+#endif
+        return false;
+    }
     m_impl->codeCacheUsed += runtime.compiled.nativeSize;
 
 #if defined(_WIN32) || defined(_WIN64)
-    ::FlushInstructionCache(::GetCurrentProcess(), buffer, runtime.compiled.nativeSize);
+    if (::FlushInstructionCache(::GetCurrentProcess(), buffer, runtime.compiled.nativeSize) == 0
+        || !Impl::ProtectNativeCode(buffer, m_impl->slotSize, PAGE_EXECUTE_READ)) {
+        m_impl->InvalidateRuntimeBlock(runtime);
+        (void)Impl::ProtectNativeCode(buffer, m_impl->slotSize, PAGE_EXECUTE_READ);
+        return false;
+    }
 #endif
 
     return true;
@@ -871,22 +1104,10 @@ void JITCompiler::Invalidate(GuestAddress start, GuestSize size) noexcept {
         }
 
         const GuestAddress blockStart = runtime.compiled.guestAddress;
-        const GuestAddress blockEnd =
-            blockStart + (runtime.compiledInstrCount != 0
-                ? runtime.instructions[runtime.compiledInstrCount - 1].NextRIP() - blockStart
-                : 0);
+        const GuestAddress blockEnd = m_impl->RuntimeBlockEnd(runtime);
 
         if (blockStart < end && start < blockEnd) {
-            m_impl->RemoveLookup(runtime.compiled.guestAddress);
-            if (m_impl->compiledBlockCount > 0) {
-                --m_impl->compiledBlockCount;
-            }
-            if (m_impl->codeCacheUsed >= runtime.compiled.nativeSize) {
-                m_impl->codeCacheUsed -= runtime.compiled.nativeSize;
-            }
-            const uint32_t slot = runtime.slotIndex;
-            runtime = Impl::RuntimeBlock{};
-            runtime.slotIndex = slot;
+            m_impl->InvalidateRuntimeBlock(runtime);
         }
     }
 }
@@ -906,9 +1127,13 @@ uint32_t JITCompiler::Execute(
 
     std::unique_lock lock(m_impl->mutex);
     if (auto* runtime = m_impl->FindRuntimeBlock(block.guestAddress); runtime != nullptr) {
-        runtime->compiled.lastUsed = m_impl->usageClock++;
-        runtime->compiled.executionCount += executed;
-        block = runtime->compiled;
+        if (executed == 0) {
+            m_impl->InvalidateRuntimeBlock(*runtime);
+        } else {
+            runtime->compiled.lastUsed = m_impl->usageClock++;
+            runtime->compiled.executionCount += executed;
+            block = runtime->compiled;
+        }
     }
 
     return executed;
