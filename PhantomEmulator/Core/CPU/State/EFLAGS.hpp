@@ -26,10 +26,10 @@ namespace Phantom {
 class EFlags {
 public:
     EFlags() noexcept : m_flags(0x202) {} // IF=1, reserved bit 1 always set
-    explicit EFlags(uint64_t raw) noexcept : m_flags(raw | 0x2) {} // bit 1 always set
+    explicit EFlags(uint64_t raw) noexcept : m_flags(NormalizeRaw(raw)) {}
 
     [[nodiscard]] uint64_t Raw() const noexcept { return m_flags; }
-    void SetRaw(uint64_t val) noexcept { m_flags = (val & kWritableMask) | 0x2; }
+    void SetRaw(uint64_t val) noexcept { m_flags = NormalizeRaw(val); }
 
     // === Individual flag accessors ===
     [[nodiscard]] bool CF() const noexcept { return (m_flags & Flags::CF) != 0; }
@@ -236,6 +236,11 @@ private:
     void SetBit(uint64_t mask, bool value) noexcept {
         if (value) m_flags |= mask;
         else       m_flags &= ~mask;
+        m_flags |= 0x2;
+    }
+
+    [[nodiscard]] static constexpr uint64_t NormalizeRaw(uint64_t value) noexcept {
+        return (value & kWritableMask) | 0x2;
     }
 };
 
