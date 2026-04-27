@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom::CLR {
 
@@ -354,7 +357,8 @@ namespace {
 
 template <typename T>
 [[nodiscard]] bool SafeRead(const uint8_t* buf, uint32_t bufSize, uint32_t offset, T& out) noexcept {
-    if (offset + sizeof(T) > bufSize) return false;
+    if (buf == nullptr) return false;
+    if (offset > bufSize || sizeof(T) > static_cast<size_t>(bufSize - offset)) return false;
     std::memcpy(&out, buf + offset, sizeof(T));
     return true;
 }
@@ -363,6 +367,28 @@ template <typename T>
     if (offset >= bufSize) return false;
     out = buf[offset];
     return true;
+}
+
+[[nodiscard]] bool CanReadRange(uint32_t size, uint32_t offset, uint32_t count) noexcept {
+    return offset <= size && count <= size - offset;
+}
+
+[[nodiscard]] bool CheckedAddU32(uint32_t a, uint32_t b, uint32_t& out) noexcept {
+    if (a > std::numeric_limits<uint32_t>::max() - b) return false;
+    out = a + b;
+    return true;
+}
+
+template <typename T>
+[[nodiscard]] bool ReserveNoThrow(std::vector<T>& values, size_t capacity) noexcept {
+    try {
+        values.reserve(capacity);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 } // anonymous namespace
@@ -390,7 +416,7 @@ std::optional<MSILDisassembler::MethodBodyInfo> MSILDisassembler::ParseMethodHea
         info.hasMoreSections  = false;
         info.initLocals       = false;
 
-        if (info.codeOffset + info.codeSize > bodySize) return std::nullopt;
+        if (!CanReadRange(bodySize, info.codeOffset, info.codeSize)) return std::nullopt;
         return info;
     }
 
@@ -417,7 +443,7 @@ std::optional<MSILDisassembler::MethodBodyInfo> MSILDisassembler::ParseMethodHea
         info.codeOffset = headerSizeBytes;
 
         if (info.codeSize > kMaxILMethodBodySize) return std::nullopt;
-        if (static_cast<uint64_t>(info.codeOffset) + info.codeSize > bodySize) return std::nullopt;
+        if (!CanReadRange(bodySize, info.codeOffset, info.codeSize)) return std::nullopt;
 
         return info;
     }
@@ -438,14 +464,18 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
     uint32_t codeOffset, uint32_t codeSize) noexcept
 {
     std::vector<ExceptionClause> clauses;
+    if (!ReserveNoThrow(clauses, kMaxExceptionClauses)) return clauses;
 
     // Exception sections start after IL code, aligned to 4-byte boundary.
-    uint32_t pos = codeOffset + codeSize;
-    pos = (pos + 3) & ~3u;
+    uint32_t pos = 0;
+    if (!CheckedAddU32(codeOffset, codeSize, pos)) return clauses;
+    if (pos > bodySize) return clauses;
+    if (pos > std::numeric_limits<uint32_t>::max() - 3u) return clauses;
+    pos = (pos + 3u) & ~3u;
 
     bool moreSections = true;
     while (moreSections && pos < bodySize && clauses.size() < kMaxExceptionClauses) {
-        if (pos + 4 > bodySize) break;
+        if (!CanReadRange(bodySize, pos, 4)) break;
 
         const uint8_t kind = body[pos];
         moreSections = (kind & kSectMoreSections) != 0;
@@ -456,7 +486,7 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
 
         if (isFat) {
             // Fat section: 4-byte header (kind:1 + dataSize:3)
-            if (pos + 4 > bodySize) break;
+            if (!CanReadRange(bodySize, pos, 4)) break;
 
             uint32_t dataSize = 0;
             std::memcpy(&dataSize, body + pos, sizeof(uint32_t));
@@ -465,6 +495,7 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
             pos += 4;
             if (dataSize < 4) break;
             const uint32_t payloadSize = dataSize - 4;
+            if (!CanReadRange(bodySize, pos, payloadSize)) break;
 
             if (!isExceptionSection) {
                 pos += payloadSize;
@@ -475,7 +506,7 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
             const uint32_t clauseCount = payloadSize / 24;
             for (uint32_t i = 0; i < clauseCount && clauses.size() < kMaxExceptionClauses; ++i) {
                 const uint32_t clauseStart = pos + i * 24;
-                if (clauseStart + 24 > bodySize) break;
+                if (!CanReadRange(bodySize, clauseStart, 24)) break;
 
                 ExceptionClause c{};
                 uint32_t rawFlags = 0;
@@ -489,20 +520,25 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
                 c.flags = static_cast<ExceptionClauseType>(rawFlags);
 
                 // Validate offsets are within IL bounds.
-                if (c.tryOffset + c.tryLength <= codeSize &&
-                    c.handlerOffset + c.handlerLength <= codeSize) {
+                uint32_t tryEnd = 0;
+                uint32_t handlerEnd = 0;
+                if (CheckedAddU32(c.tryOffset, c.tryLength, tryEnd) &&
+                    CheckedAddU32(c.handlerOffset, c.handlerLength, handlerEnd) &&
+                    tryEnd <= codeSize &&
+                    handlerEnd <= codeSize) {
                     clauses.push_back(c);
                 }
             }
             pos += payloadSize;
         } else {
             // Small section: 4-byte header (kind:1 + dataSize:1 + padding:2)
-            if (pos + 4 > bodySize) break;
+            if (!CanReadRange(bodySize, pos, 4)) break;
 
             const uint32_t dataSize = body[pos + 1];
             pos += 4;
             if (dataSize < 4) break;
             const uint32_t payloadSize = dataSize - 4;
+            if (!CanReadRange(bodySize, pos, payloadSize)) break;
 
             if (!isExceptionSection) {
                 pos += payloadSize;
@@ -513,7 +549,7 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
             const uint32_t clauseCount = payloadSize / 12;
             for (uint32_t i = 0; i < clauseCount && clauses.size() < kMaxExceptionClauses; ++i) {
                 const uint32_t clauseStart = pos + i * 12;
-                if (clauseStart + 12 > bodySize) break;
+                if (!CanReadRange(bodySize, clauseStart, 12)) break;
 
                 ExceptionClause c{};
                 uint16_t smallFlags = 0, tryOff16 = 0, handlerOff16 = 0;
@@ -532,8 +568,12 @@ std::vector<ExceptionClause> MSILDisassembler::ParseExceptionClauses(
                 c.handlerOffset = handlerOff16;
                 c.handlerLength = handlerLen8;
 
-                if (c.tryOffset + c.tryLength <= codeSize &&
-                    c.handlerOffset + c.handlerLength <= codeSize) {
+                uint32_t tryEnd = 0;
+                uint32_t handlerEnd = 0;
+                if (CheckedAddU32(c.tryOffset, c.tryLength, tryEnd) &&
+                    CheckedAddU32(c.handlerOffset, c.handlerLength, handlerEnd) &&
+                    tryEnd <= codeSize &&
+                    handlerEnd <= codeSize) {
                     clauses.push_back(c);
                 }
             }
@@ -585,7 +625,10 @@ std::vector<MSILInstruction> MSILDisassembler::Disassemble(
     std::vector<MSILInstruction> instructions;
     if (!ilBytes || ilSize == 0) return instructions;
 
-    instructions.reserve(std::min<uint32_t>(ilSize, 8192));
+    try {
+    if (!ReserveNoThrow(instructions, std::min<uint32_t>(ilSize, 8192))) {
+        return instructions;
+    }
 
     uint32_t offset = 0;
 
@@ -616,7 +659,7 @@ std::vector<MSILInstruction> MSILDisassembler::Disassemble(
         }
 
         const auto& info = LookupOpcode(opcode);
-        const bool isKnown = (info.name[0] != 'I'); // "INVALID" starts with 'I', all real opcodes are lowercase
+        const bool isKnown = (info.name != kInvalidOpcodeInfo.name);
 
         if (!isKnown) {
             // Unknown opcode — emit as invalid, advance one byte.
@@ -651,15 +694,20 @@ std::vector<MSILInstruction> MSILDisassembler::Disassemble(
                 break;
             }
 
-            const uint32_t switchPayloadSize = 4 + targetCount * 4;
-            if (operandOffset + switchPayloadSize > ilSize) {
+            const uint32_t switchPayloadSize = 4u + targetCount * 4u;
+            if (!CanReadRange(ilSize, operandOffset, switchPayloadSize)) {
                 instr.opcode = MSILOpcode::INVALID;
                 instr.size = opcodeSize + 4;
                 instructions.push_back(std::move(instr));
                 break;
             }
 
-            instr.switchTargets.reserve(targetCount);
+            if (!ReserveNoThrow(instr.switchTargets, targetCount)) {
+                instr.opcode = MSILOpcode::INVALID;
+                instr.size = opcodeSize + 4;
+                instructions.push_back(std::move(instr));
+                break;
+            }
             for (uint32_t i = 0; i < targetCount; ++i) {
                 int32_t target = 0;
                 (void)SafeRead(ilBytes, ilSize, operandOffset + 4 + i * 4, target);
@@ -670,7 +718,7 @@ std::vector<MSILInstruction> MSILDisassembler::Disassemble(
         } else {
             const uint32_t operandSize = OperandFixedSize(info.operandType);
 
-            if (operandOffset + operandSize > ilSize) {
+            if (!CanReadRange(ilSize, operandOffset, operandSize)) {
                 // Truncated operand
                 instr.opcode = MSILOpcode::INVALID;
                 instr.size = opcodeSize;
@@ -739,11 +787,16 @@ std::vector<MSILInstruction> MSILDisassembler::Disassemble(
             instr.size = opcodeSize + operandSize;
         }
 
-        offset += instr.size;
+        if (!CheckedAddU32(offset, instr.size, offset)) break;
         instructions.push_back(std::move(instr));
     }
 
     return instructions;
+    } catch (const std::bad_alloc&) {
+        return instructions;
+    } catch (const std::length_error&) {
+        return instructions;
+    }
 }
 
 // ============================================================================
@@ -754,6 +807,7 @@ MSILDisassembler::DisassemblyResult MSILDisassembler::DisassembleMethod(
     const uint8_t* body, uint32_t bodySize) noexcept
 {
     DisassemblyResult result{};
+    try {
 
     auto headerOpt = ParseMethodHeader(body, bodySize);
     if (!headerOpt.has_value()) return result;
@@ -770,6 +824,11 @@ MSILDisassembler::DisassemblyResult MSILDisassembler::DisassembleMethod(
 
     result.valid = true;
     return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
+        return {};
+    }
 }
 
 } // namespace Phantom::CLR
