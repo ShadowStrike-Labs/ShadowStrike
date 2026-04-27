@@ -82,8 +82,10 @@ void CPUState::Reset32() noexcept {
 
     // SSE: clear all XMM registers
     for (auto& x : xmm) { x.Clear(); }
+    invalidXmmScratch.Clear();
     for (auto& y : ymmHigh) { y.Clear(); }
     for (auto& z : zmmHigh) { z.Clear(); }
+    for (auto& z : zmm16High) { z.Clear(); }
     opmask.fill(0);
     mxcsr = 0x1F80;
     xcr0 = 0xE7;
@@ -124,13 +126,42 @@ void CPUState::Reset64() noexcept {
 // Snapshot/Restore
 // ============================================================================
 
-CPUState::Snapshot CPUState::TakeSnapshot() const noexcept {
+CPUState::Snapshot CPUState::TakeSnapshot() const {
     Snapshot snap{};
     snap.gpr = gpr;
     snap.rip = rip;
     snap.rflags = eflags.Raw();
+    snap.segments = segments;
+    snap.cr0 = cr0;
+    snap.cr2 = cr2;
+    snap.cr3 = cr3;
+    snap.cr4 = cr4;
+    snap.xcr0 = xcr0;
+    snap.dr = dr;
+    snap.dr6 = dr6;
+    snap.dr7 = dr7;
+    snap.fpuStack = fpuStack;
+    snap.fpuControl = fpuControl;
+    snap.fpuStatus = fpuStatus;
+    snap.fpuTag = fpuTag;
+    snap.fpuOpcode = fpuOpcode;
+    snap.fpuIP = fpuIP;
+    snap.fpuDP = fpuDP;
+    snap.fpuTop = fpuTop;
+    snap.xmm = xmm;
+    snap.invalidXmmScratch = invalidXmmScratch;
+    snap.mxcsr = mxcsr;
+    snap.ymmHigh = ymmHigh;
+    snap.zmmHigh = zmmHigh;
+    snap.zmm16High = zmm16High;
+    snap.opmask = opmask;
     snap.mode = mode;
+    snap.tileConfig = tileConfig;
+    snap.tiles = tiles;
+    snap.shadowStackState = std::make_shared<ShadowStackState>(shadowStack);
     snap.instructionCount = instructionCount;
+    snap.tsc = tsc;
+    snap.tscIncrement = tscIncrement;
     return snap;
 }
 
@@ -138,8 +169,42 @@ void CPUState::RestoreSnapshot(const Snapshot& snap) noexcept {
     gpr = snap.gpr;
     rip = snap.rip;
     eflags.SetRaw(snap.rflags);
+    segments = snap.segments;
+    cr0 = snap.cr0;
+    cr2 = snap.cr2;
+    cr3 = snap.cr3;
+    cr4 = snap.cr4;
+    xcr0 = snap.xcr0;
+    dr = snap.dr;
+    dr6 = snap.dr6;
+    dr7 = snap.dr7;
+    fpuStack = snap.fpuStack;
+    fpuControl = snap.fpuControl;
+    fpuStatus = snap.fpuStatus;
+    fpuTag = snap.fpuTag;
+    fpuOpcode = snap.fpuOpcode;
+    fpuIP = snap.fpuIP;
+    fpuDP = snap.fpuDP;
+    fpuTop = snap.fpuTop;
+    xmm = snap.xmm;
+    invalidXmmScratch = snap.invalidXmmScratch;
+    mxcsr = snap.mxcsr;
+    ymmHigh = snap.ymmHigh;
+    zmmHigh = snap.zmmHigh;
+    zmm16High = snap.zmm16High;
+    opmask = snap.opmask;
     mode = snap.mode;
+    tileConfig = snap.tileConfig;
+    tiles = snap.tiles;
+    if (snap.shadowStackState) {
+        shadowStack = *snap.shadowStackState;
+    } else {
+        shadowStack.entries.fill(0);
+        shadowStack.Reset();
+    }
     instructionCount = snap.instructionCount;
+    tsc = snap.tsc;
+    tscIncrement = snap.tscIncrement;
 }
 
 } // namespace Phantom
