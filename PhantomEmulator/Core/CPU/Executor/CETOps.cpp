@@ -25,8 +25,34 @@
 
 namespace Phantom {
 
+namespace {
+
+constexpr uint8_t kGprRegisterCount = 16;
+
+[[nodiscard]] bool IsValidGprRegisterOperand(const DecodedInstruction& inst, uint8_t operandIndex) noexcept {
+    if (!inst.HasOperand(operandIndex) || !inst.Op(operandIndex).IsRegister()) {
+        return false;
+    }
+    const auto& reg = inst.Op(operandIndex).reg;
+    return reg.regType == RegType::GPR && reg.regIndex < kGprRegisterCount;
+}
+
+[[nodiscard]] bool IsValidMemoryOperand(const DecodedInstruction& inst, uint8_t operandIndex) noexcept {
+    return inst.HasOperand(operandIndex) && inst.Op(operandIndex).IsMemory();
+}
+
+[[nodiscard]] bool IsShadowStackPointerValid(const CPUState::ShadowStackState& shadowStack) noexcept {
+    return shadowStack.pointer <= CPUState::kShadowStackMaxDepth;
+}
+
+} // namespace
+
 ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     auto& ss = m_state.shadowStack;
+    if (!IsShadowStackPointerValid(ss)) {
+        ++ss.violations;
+        return ErrorCode::ControlProtectionFault;
+    }
 
     // ========================================================================
     // TwoByte map: 0F 1E — ENDBR32/64, RDSSPD/Q
@@ -45,6 +71,7 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
         // RDSSPD/Q: F3 0F 1E /1 (mod=3)
         if (inst.opcodeExt == 1 && (inst.modrm >> 6) == 3) {
             if (!ss.enabled) return ErrorCode::Success;
+            if (!IsValidGprRegisterOperand(inst, 0)) return ErrorCode::InvalidOperandSize;
             uint8_t reg = inst.Op(0).reg.regIndex;
             if (inst.prefixes.rexW) {
                 uint64_t sspVal = static_cast<uint64_t>(ss.pointer) * sizeof(uint64_t);
@@ -67,6 +94,7 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
         // INCSSPD/Q: F3 0F AE /5 (mod=3, register form)
         if (ext == 5 && (inst.modrm >> 6) == 3) {
             if (!ss.enabled) return ErrorCode::Success;
+            if (!IsValidGprRegisterOperand(inst, 0)) return ErrorCode::InvalidOperandSize;
             uint8_t reg = inst.Op(0).reg.regIndex;
             uint64_t count = 0;
             if (inst.prefixes.rexW) {
@@ -84,6 +112,7 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
         // CLRSSBSY: F3 0F AE /6 (mod!=3, memory form)
         if (ext == 6 && (inst.modrm >> 6) != 3) {
             if (!ss.enabled) return ErrorCode::Success;
+            if (!IsValidMemoryOperand(inst, 0)) return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             uint64_t token = 0;
             auto err = mem.ReadValue<uint64_t>(addr, token);
@@ -128,6 +157,7 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
         // RSTORSSP: F3 0F 01 /5 (memory form — mod!=3)
         if (inst.opcodeExt == 5 && (inst.modrm >> 6) != 3) {
             if (!ss.enabled) return ErrorCode::Success;
+            if (!IsValidMemoryOperand(inst, 0)) return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             uint64_t token = 0;
             auto err = mem.ReadValue<uint64_t>(addr, token);
@@ -145,10 +175,12 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
             if (err != ErrorCode::Success) return err;
 
             // Restore SSP
-            uint32_t newPointer = static_cast<uint32_t>((token >> 1) & 0xFFFFFFFF);
-            if (newPointer > CPUState::kShadowStackMaxDepth)
-                newPointer = CPUState::kShadowStackMaxDepth;
-            ss.pointer = newPointer;
+            const uint64_t newPointer = token >> 1;
+            if (newPointer > CPUState::kShadowStackMaxDepth) {
+                ++ss.violations;
+                return ErrorCode::ControlProtectionFault;
+            }
+            ss.pointer = static_cast<uint32_t>(newPointer);
             return ErrorCode::Success;
         }
         return ErrorCode::UnimplementedOpcode;
@@ -162,6 +194,8 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
         // WRSSD/WRSSQ: NP 0F 38 F6 /r (memory destination, register source)
         if (inst.opcode == 0xF6) {
             if (!ss.enabled) return ErrorCode::Success;
+            if (!IsValidMemoryOperand(inst, 0) || !IsValidGprRegisterOperand(inst, 1))
+                return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             uint8_t srcReg = inst.Op(1).reg.regIndex;
             if (inst.prefixes.rexW) {
@@ -176,6 +210,8 @@ ErrorCode CPU::ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) no
         // WRUSSD/WRUSSQ: 66 0F 38 F5 /r (memory destination, register source)
         if (inst.opcode == 0xF5) {
             if (!ss.enabled) return ErrorCode::Success;
+            if (!IsValidMemoryOperand(inst, 0) || !IsValidGprRegisterOperand(inst, 1))
+                return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             uint8_t srcReg = inst.Op(1).reg.regIndex;
             if (inst.prefixes.rexW) {
