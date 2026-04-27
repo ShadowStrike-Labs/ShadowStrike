@@ -82,7 +82,18 @@ void CPUState::Reset32() noexcept {
 
     // SSE: clear all XMM registers
     for (auto& x : xmm) { x.Clear(); }
+    for (auto& y : ymmHigh) { y.Clear(); }
+    for (auto& z : zmmHigh) { z.Clear(); }
+    opmask.fill(0);
     mxcsr = 0x1F80;
+    xcr0 = 0xE7;
+
+    // AMX/CET state must not survive Reset(); stale tile or shadow-stack
+    // metadata changes control-flow and SIMD behavior in later emulations.
+    tileConfig.Reset();
+    for (auto& tile : tiles) { tile.Clear(); }
+    shadowStack.entries.fill(0);
+    shadowStack.Reset();
 
     instructionCount = 0;
     tsc = 0x00000389A7C21E40ULL;  // ~3.9 trillion — realistic for a system booted ~17 minutes ago at 3.8GHz
