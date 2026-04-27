@@ -36,6 +36,7 @@ class MetadataParser;
 // Evaluation Stack Value Representation
 // ============================================================================
 
+/// Runtime type tag for values stored on the bounded MSIL evaluation stack.
 enum class ILValueType : uint8_t {
     Null,
     Int32,
@@ -46,6 +47,11 @@ enum class ILValueType : uint8_t {
     ArrayRef,
 };
 
+/// Lightweight value used by the interpreter for stack, local, and argument slots.
+///
+/// The active union member is selected by `type`. Factory helpers initialize the
+/// correct member and all query helpers are noexcept so malformed IL cannot
+/// propagate exceptions across the emulator boundary.
 struct ILValue {
     ILValueType type = ILValueType::Null;
     union {
@@ -98,6 +104,9 @@ struct ILValue {
         return v;
     }
 
+    /// Return the signed integer representation used by arithmetic opcodes.
+    /// Non-integer values intentionally coerce to zero for resilient best-effort
+    /// extraction from hostile or incomplete IL.
     [[nodiscard]] int64_t AsInteger() const noexcept {
         switch (type) {
             case ILValueType::Int32: return static_cast<int64_t>(i32);
@@ -106,6 +115,7 @@ struct ILValue {
         }
     }
 
+    /// Return whether the value is false/null for conditional branch opcodes.
     [[nodiscard]] bool IsZero() const noexcept {
         switch (type) {
             case ILValueType::Null:    return true;
@@ -121,11 +131,19 @@ struct ILValue {
 // Callback & Result Types
 // ============================================================================
 
-/// Returns (pointer-to-IL-bytes, size) for a method body given its token.
-/// Returns (nullptr, 0) when the body is unavailable.
+/// Returns `(pointer-to-IL-bytes, size)` for a method body token.
+///
+/// Implementations may be backed by an in-memory PE image, cache, or test
+/// fixture. Throwing providers are treated as untrusted plugin boundaries by
+/// the interpreter and abort the current run without escaping noexcept APIs.
 using MethodBodyProvider =
     std::function<std::pair<const uint8_t*, uint32_t>(uint32_t methodToken)>;
 
+/// Result of a bounded interpreter run.
+///
+/// Vectors are best-effort: under memory pressure they may be empty while the
+/// counters and limit flags still describe the execution. All data is derived
+/// from emulated IL and must be treated as attacker-controlled by callers.
 struct InterpretationResult {
     std::vector<std::u16string>          decryptedStrings;
     std::vector<DotNetAPICall>           apiCalls;
@@ -147,6 +165,12 @@ struct InterpretationResult {
 
 class MSILInterpreter {
 public:
+    /// Construct an interpreter bound to immutable metadata.
+    ///
+    /// Allocation failure leaves the object in an inert state; subsequent calls
+    /// return empty results rather than throwing. The referenced MetadataParser
+    /// must outlive the interpreter. Not thread-safe; create one interpreter per
+    /// concurrent analysis task.
     explicit MSILInterpreter(const MetadataParser& metadata) noexcept;
     ~MSILInterpreter() noexcept;
 
@@ -157,26 +181,44 @@ public:
     MSILInterpreter& operator=(MSILInterpreter&&) noexcept;
 
     /// Provide a callback that fetches IL bytes for a MethodDef token.
+    ///
+    /// The callback is stored by value and may be cleared if allocation fails.
+    /// Callback exceptions are contained at the interpreter boundary.
     void SetMethodBodyProvider(MethodBodyProvider provider) noexcept;
 
     /// Execute a single method body from pre-disassembled instructions.
+    ///
+    /// Preconditions: `instructions` must come from `MSILDisassembler` for the
+    /// same module metadata. Execution is bounded by instruction, stack, call,
+    /// string, array, and API-call caps. On malformed IL or resource pressure,
+    /// the returned limit flags/counters indicate the best-effort outcome.
     [[nodiscard]] InterpretationResult Execute(
         const std::vector<MSILInstruction>& instructions,
         MetadataToken                       methodToken,
         const std::vector<ILValue>&         args = {}) noexcept;
 
-    /// Execute every .cctor in the assembly (primary use case: string decryption).
+    /// Execute every static constructor discovered in metadata.
+    ///
+    /// This helper is intentionally conservative: body-provider failures or
+    /// unavailable raw IL bodies are skipped, and partial aggregate results are
+    /// returned without throwing.
     [[nodiscard]] InterpretationResult ExecuteStaticConstructors(
         MethodBodyProvider bodyProvider) noexcept;
 
-    // --- Configuration (safe defaults from CLRTypes.hpp) ---
+    // --- Configuration (safe defaults and hard caps from CLRTypes.hpp) ---
+    /// Set the maximum number of IL instructions executed per call. Values are clamped.
     void SetMaxInstructions(uint64_t max) noexcept;
+    /// Set the maximum evaluation-stack depth. Values are clamped.
     void SetMaxStackDepth(uint32_t max) noexcept;
+    /// Set the maximum recursive method-call depth. Values are clamped.
     void SetMaxCallDepth(uint32_t max) noexcept;
+    /// Set the maximum tracked array allocation size. Values are clamped.
     void SetMaxArraySize(uint32_t max) noexcept;
 
     // --- Query ---
+    /// Return the cumulative decrypted-string table owned by this interpreter.
     [[nodiscard]] const std::vector<std::u16string>& GetDecryptedStrings() const noexcept;
+    /// Return the cumulative API-call table owned by this interpreter.
     [[nodiscard]] const std::vector<DotNetAPICall>&  GetAPICalls() const noexcept;
 
 private:
