@@ -23,6 +23,130 @@ namespace Phantom {
 
 namespace {
 
+[[nodiscard]] bool HasOperands(const DecodedInstruction& inst, uint8_t count) noexcept {
+    return inst.operandCount >= count;
+}
+
+[[nodiscard]] bool IsXmmRegisterOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsRegister() &&
+           operand.reg.regType == RegType::XMM &&
+           !operand.reg.isHighByte &&
+           operand.reg.regIndex < 16;
+}
+
+[[nodiscard]] bool IsGprRegisterOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsRegister() &&
+           operand.reg.regType == RegType::GPR &&
+           operand.reg.regIndex < 16;
+}
+
+[[nodiscard]] bool IsXmmOrMemoryOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsMemory() || IsXmmRegisterOperand(operand);
+}
+
+[[nodiscard]] bool IsGprOrMemoryOperand(const DecodedOperand& operand) noexcept {
+    return operand.IsMemory() || IsGprRegisterOperand(operand);
+}
+
+[[nodiscard]] bool HasConflictingMandatoryPrefixes(const DecodedInstruction& inst) noexcept {
+    const uint8_t count = static_cast<uint8_t>(inst.prefixes.hasOpSizeOverride ? 1u : 0u) +
+                          static_cast<uint8_t>(inst.prefixes.hasRep ? 1u : 0u) +
+                          static_cast<uint8_t>(inst.prefixes.hasRepNE ? 1u : 0u);
+    return count > 1u;
+}
+
+[[nodiscard]] uint32_t Sse4SourceReadBytes(const DecodedInstruction& inst) noexcept {
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38) {
+        switch (inst.opcode) {
+            case 0x20: // PMOVSXBW
+            case 0x23: // PMOVSXWD
+            case 0x25: // PMOVSXDQ
+            case 0x30: // PMOVZXBW
+            case 0x33: // PMOVZXWD
+            case 0x35: // PMOVZXDQ
+                return 8;
+            default:
+                return 16;
+        }
+    }
+    if (inst.opcodeMap == OpcodeMap::ThreeByte3A && (inst.opcode == 0x0A || inst.opcode == 0x21)) {
+        return 4;
+    }
+    if (inst.opcodeMap == OpcodeMap::ThreeByte3A && inst.opcode == 0x0B) {
+        return 8;
+    }
+    return 16;
+}
+
+[[nodiscard]] bool IsSupportedCrcSize(const DecodedInstruction& inst) noexcept {
+    if (!HasOperands(inst, 2)) return false;
+    if (inst.opcode == 0xF0) return inst.Op(1).size == OperandSize::Size8;
+    if (inst.opcode != 0xF1) return false;
+    if (inst.prefixes.rexW) return inst.Op(1).size == OperandSize::Size64;
+    return inst.Op(1).size == OperandSize::Size16 || inst.Op(1).size == OperandSize::Size32;
+}
+
+[[nodiscard]] ErrorCode RequireXmmDstAndXmmOrMemSrc(const DecodedInstruction& inst) noexcept {
+    if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+    return IsXmmRegisterOperand(inst.Op(0)) && IsXmmOrMemoryOperand(inst.Op(1))
+        ? ErrorCode::Success
+        : ErrorCode::InvalidOperandSize;
+}
+
+[[nodiscard]] ErrorCode RequireGprOrMemDstAndXmmSrc(const DecodedInstruction& inst) noexcept {
+    if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+    return (IsGprRegisterOperand(inst.Op(0)) || inst.Op(0).IsMemory()) &&
+           IsXmmRegisterOperand(inst.Op(1))
+        ? ErrorCode::Success
+        : ErrorCode::InvalidOperandSize;
+}
+
+[[nodiscard]] ErrorCode ValidateSSE4Operands(const DecodedInstruction& inst) noexcept {
+    if (inst.prefixes.hasLock || inst.prefixes.hasVEX || inst.prefixes.hasEVEX ||
+        HasConflictingMandatoryPrefixes(inst)) {
+        return ErrorCode::UnimplementedOpcode;
+    }
+
+    const uint8_t op = inst.opcode;
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38 && inst.prefixes.hasOpSizeOverride) {
+        if (op == 0x2A) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+            return IsXmmRegisterOperand(inst.Op(0)) && inst.Op(1).IsMemory()
+                ? ErrorCode::Success
+                : ErrorCode::InvalidOperandSize;
+        }
+        return RequireXmmDstAndXmmOrMemSrc(inst);
+    }
+
+    if (inst.opcodeMap == OpcodeMap::ThreeByte3A && inst.prefixes.hasOpSizeOverride) {
+        if (op == 0x14 || op == 0x16 || op == 0x17) {
+            return RequireGprOrMemDstAndXmmSrc(inst);
+        }
+        if (op == 0x20 || op == 0x22) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
+            return IsXmmRegisterOperand(inst.Op(0)) && IsGprOrMemoryOperand(inst.Op(1))
+                ? ErrorCode::Success
+                : ErrorCode::InvalidOperandSize;
+        }
+        return RequireXmmDstAndXmmOrMemSrc(inst);
+    }
+
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38 && inst.prefixes.hasRepNE &&
+        (op == 0xF0 || op == 0xF1)) {
+        if (!IsSupportedCrcSize(inst)) return ErrorCode::InvalidOperandSize;
+        return IsGprRegisterOperand(inst.Op(0)) && IsGprOrMemoryOperand(inst.Op(1))
+            ? ErrorCode::Success
+            : ErrorCode::InvalidOperandSize;
+    }
+
+    return ErrorCode::Success;
+}
+
+[[nodiscard]] uint32_t LowDwordProduct(int32_t lhs, int32_t rhs) noexcept {
+    const int64_t product = static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs);
+    return static_cast<uint32_t>(static_cast<uint64_t>(product));
+}
+
 [[nodiscard]] inline uint32_t CRC32C_Byte(uint32_t crc, uint8_t data) noexcept {
     crc ^= data;
     for (int i = 0; i < 8; i++) {
@@ -129,15 +253,17 @@ struct SSE42StringResult {
             break;
         case 3: { // Equal Ordered (substring)
             for (int j = 0; j < elemCount; j++) {
+                if (len1 == 0 || j + len1 > len2 || j + len1 > elemCount) {
+                    continue;
+                }
                 bool match = true;
-                for (int i = 0; i < len1 && (j + i) < elemCount; i++) {
-                    if (j + i >= len2) break;
+                for (int i = 0; i < len1; i++) {
                     if (GetElem(xmm1, i) != GetElem(xmm2, j + i)) {
                         match = false;
                         break;
                     }
                 }
-                if (match && len1 > 0) intRes1 |= (1u << j);
+                if (match) intRes1 |= (1u << j);
             }
             break;
         }
@@ -182,6 +308,9 @@ struct SSE42StringResult {
 // ============================================================================
 
 ErrorCode CPU::ExecuteSSE4(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
+    const auto operandValidation = ValidateSSE4Operands(inst);
+    if (operandValidation != ErrorCode::Success) return operandValidation;
+
     bool has66 = inst.prefixes.hasOpSizeOverride;
     bool hasF2 = inst.prefixes.hasRepNE;
     uint8_t op = inst.opcode;
@@ -194,7 +323,7 @@ ErrorCode CPU::ExecuteSSE4(const DecodedInstruction& inst, VirtualMemory& mem) n
         }
         if (inst.Op(1).IsMemory()) {
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
-            return mem.Read(addr, out.u8, 16);
+            return mem.Read(addr, out.u8, Sse4SourceReadBytes(inst));
         }
         return ErrorCode::InvalidOperandSize;
     };
@@ -319,8 +448,7 @@ ErrorCode CPU::ExecuteSSE4(const DecodedInstruction& inst, VirtualMemory& mem) n
             uint8_t di = inst.Op(0).reg.regIndex; XMMReg& d = m_state.XMM(di);
             XMMReg s{}; auto e = ReadSrcXMM(s); if (e != ErrorCode::Success) return e;
             for (int i = 0; i < 4; i++) {
-                int64_t p = static_cast<int64_t>(d.i32[i]) * s.i32[i];
-                d.i32[i] = static_cast<int32_t>(p);
+                d.u32[i] = LowDwordProduct(d.i32[i], s.i32[i]);
             }
             return ErrorCode::Success;
         }
