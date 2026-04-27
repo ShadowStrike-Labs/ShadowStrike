@@ -14,6 +14,27 @@
 
 namespace Phantom {
 
+namespace {
+
+[[nodiscard]] bool HasOperands(const DecodedInstruction& inst, uint8_t count) noexcept {
+    return inst.operandCount >= count;
+}
+
+[[nodiscard]] ErrorCode OperandSizeBytes(OperandSize size, uint32_t& bytes) noexcept {
+    switch (size) {
+        case OperandSize::Size16: bytes = 2; return ErrorCode::Success;
+        case OperandSize::Size32: bytes = 4; return ErrorCode::Success;
+        case OperandSize::Size64: bytes = 8; return ErrorCode::Success;
+        default: return ErrorCode::InvalidOperandSize;
+    }
+}
+
+[[nodiscard]] uint64_t ZeroExtendMoveSource(uint64_t value, uint8_t opcode) noexcept {
+    return (opcode == 0xB6) ? (value & 0xFFu) : (value & 0xFFFFu);
+}
+
+} // namespace
+
 ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     uint8_t op = inst.opcode;
     OperandSize size = inst.operandSize;
@@ -33,6 +54,7 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
         }
 
         if (isMOV) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             uint64_t val = 0;
             auto err = ReadOperand(inst.Op(1), inst, mem, val);
             if (err != ErrorCode::Success) return err;
@@ -41,6 +63,7 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
         // === LEA r, m (0x8D) ===
         if (op == 0x8D) {
+            if (!HasOperands(inst, 2) || !inst.Op(1).IsMemory()) return ErrorCode::InvalidOperandSize;
             // LEA does NOT access memory — just computes effective address
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
             // In 32-bit operand size, truncate to 32 bits
@@ -51,6 +74,7 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
         // === XCHG r, r/m (0x86, 0x87) or XCHG eAX, r (0x91-0x97) ===
         if (op == 0x86 || op == 0x87 || (op >= 0x91 && op <= 0x97)) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             uint64_t a = 0, b = 0;
             auto err = ReadOperand(inst.Op(0), inst, mem, a);
             if (err != ErrorCode::Success) return err;
@@ -110,6 +134,7 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
         // === MOVSXD (0x63 in 64-bit mode) ===
         if (op == 0x63 && m_state.Is64Bit()) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             uint64_t val = 0;
             auto err = ReadOperand(inst.Op(1), inst, mem, val);
             if (err != ErrorCode::Success) return err;
@@ -125,15 +150,16 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
         // === MOVZX (0F B6: r, r/m8; 0F B7: r, r/m16) ===
         if (op == 0xB6 || op == 0xB7) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             uint64_t val = 0;
             auto err = ReadOperand(inst.Op(1), inst, mem, val);
             if (err != ErrorCode::Success) return err;
-            // Zero-extension happens naturally since val is already zero-extended
-            return WriteOperand(inst.Op(0), inst, mem, val);
+            return WriteOperand(inst.Op(0), inst, mem, ZeroExtendMoveSource(val, op));
         }
 
         // === MOVSX (0F BE: r, r/m8; 0F BF: r, r/m16) ===
         if (op == 0xBE || op == 0xBF) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             uint64_t val = 0;
             auto err = ReadOperand(inst.Op(1), inst, mem, val);
             if (err != ErrorCode::Success) return err;
@@ -145,11 +171,12 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
         // === CMOVcc (0F 40 - 0F 4F) ===
         if (op >= 0x40 && op <= 0x4F) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             uint8_t cc = op & 0x0F;
+            uint64_t val = 0;
+            auto err = ReadOperand(inst.Op(1), inst, mem, val);
+            if (err != ErrorCode::Success) return err;
             if (m_state.eflags.EvaluateCondition(cc)) {
-                uint64_t val = 0;
-                auto err = ReadOperand(inst.Op(1), inst, mem, val);
-                if (err != ErrorCode::Success) return err;
                 return WriteOperand(inst.Op(0), inst, mem, val);
             }
             // Condition not met — no change to destination
@@ -184,16 +211,13 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
     if (inst.opcodeMap == OpcodeMap::ThreeByte38) {
         // === MOVBE r, m (0F 38 F0) — Load with byte swap ===
         if (op == 0xF0) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             if (!inst.Op(1).IsMemory()) return ErrorCode::InvalidOperandSize;
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
             uint64_t val = 0;
             uint32_t bytes = 0;
-            switch (size) {
-                case OperandSize::Size16: bytes = 2; break;
-                case OperandSize::Size32: bytes = 4; break;
-                case OperandSize::Size64: bytes = 8; break;
-                default: return ErrorCode::InvalidOperandSize;
-            }
+            auto sizeErr = OperandSizeBytes(size, bytes);
+            if (sizeErr != ErrorCode::Success) return sizeErr;
             auto err = mem.Read(addr, reinterpret_cast<uint8_t*>(&val), bytes);
             if (err != ErrorCode::Success) return err;
             switch (size) {
@@ -213,6 +237,7 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
         // === MOVBE m, r (0F 38 F1) — Store with byte swap ===
         if (op == 0xF1) {
+            if (!HasOperands(inst, 2)) return ErrorCode::InvalidOperandSize;
             if (!inst.Op(0).IsMemory()) return ErrorCode::InvalidOperandSize;
             uint64_t val = 0;
             auto err = ReadOperand(inst.Op(1), inst, mem, val);
@@ -231,12 +256,8 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
             }
             GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
             uint32_t bytes = 0;
-            switch (size) {
-                case OperandSize::Size16: bytes = 2; break;
-                case OperandSize::Size32: bytes = 4; break;
-                case OperandSize::Size64: bytes = 8; break;
-                default: break;
-            }
+            auto sizeErr = OperandSizeBytes(size, bytes);
+            if (sizeErr != ErrorCode::Success) return sizeErr;
             return mem.Write(addr, reinterpret_cast<const uint8_t*>(&val), bytes);
         }
     }
