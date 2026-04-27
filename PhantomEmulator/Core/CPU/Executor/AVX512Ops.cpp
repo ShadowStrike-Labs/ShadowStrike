@@ -33,8 +33,72 @@
 #include <cmath>
 #include <cstring>
 #include <bit>
+#include <limits>
 
 namespace Phantom {
+
+namespace {
+
+constexpr uint8_t kZmmRegisterCount = 32;
+constexpr uint8_t kOpmaskRegisterCount = 8;
+constexpr uint8_t kGprRegisterCount = 16;
+
+[[nodiscard]] bool IsValidZmmRegisterIndex(uint8_t index) noexcept {
+    return index < kZmmRegisterCount;
+}
+
+[[nodiscard]] bool IsValidOpmaskIndex(uint8_t index) noexcept {
+    return index < kOpmaskRegisterCount;
+}
+
+[[nodiscard]] bool IsValidGprRegisterIndex(uint8_t index) noexcept {
+    return index < kGprRegisterCount;
+}
+
+[[nodiscard]] bool IsValidVectorRegisterOperand(const DecodedOperand& op) noexcept {
+    if (!op.IsRegister()) {
+        return false;
+    }
+
+    switch (op.reg.regType) {
+        case RegType::XMM:
+        case RegType::YMM:
+        case RegType::ZMM:
+            return IsValidZmmRegisterIndex(op.reg.regIndex);
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] bool IsValidRegisterOperand(const DecodedOperand& op) noexcept {
+    if (!op.IsRegister()) {
+        return true;
+    }
+
+    switch (op.reg.regType) {
+        case RegType::GPR:
+            return IsValidGprRegisterIndex(op.reg.regIndex);
+        case RegType::XMM:
+        case RegType::YMM:
+        case RegType::ZMM:
+            return IsValidZmmRegisterIndex(op.reg.regIndex);
+        case RegType::KMask:
+            return IsValidOpmaskIndex(op.reg.regIndex);
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] bool IsValidElementBytes(uint8_t elementBytes) noexcept {
+    return elementBytes == 1 || elementBytes == 2 || elementBytes == 4 || elementBytes == 8;
+}
+
+[[nodiscard]] int32_t AddWrapI32(int32_t lhs, int32_t rhs) noexcept {
+    const uint32_t sum = static_cast<uint32_t>(lhs) + static_cast<uint32_t>(rhs);
+    return std::bit_cast<int32_t>(sum);
+}
+
+} // namespace
 
 // ============================================================================
 // EVEX Masking — Apply opmask with merge or zeroing semantics
@@ -45,9 +109,14 @@ static void ApplyMask(
     const ZMMValue& original,
     uint64_t mask,
     uint8_t elementBytes,
-    bool zeroing) noexcept
+    bool zeroing,
+    uint32_t vecLen = 64) noexcept
 {
-    const uint32_t numElements = 64 / elementBytes;
+    if (!IsValidElementBytes(elementBytes) || vecLen > 64 || (vecLen % elementBytes) != 0) {
+        return;
+    }
+
+    const uint32_t numElements = vecLen / elementBytes;
     for (uint32_t i = 0; i < numElements; ++i) {
         if (!((mask >> i) & 1)) {
             if (zeroing) {
@@ -62,6 +131,10 @@ static void ApplyMask(
 
 // Broadcast a scalar element across the entire ZMM register
 static void Broadcast(ZMMValue& dst, const void* scalar, uint8_t elementBytes, uint32_t vecLen) noexcept {
+    if (!IsValidElementBytes(elementBytes) || vecLen > 64 || (vecLen % elementBytes) != 0) {
+        return;
+    }
+
     const uint32_t numElements = vecLen / elementBytes;
     for (uint32_t i = 0; i < numElements; ++i) {
         std::memcpy(dst.u8 + i * elementBytes, scalar, elementBytes);
@@ -80,6 +153,17 @@ ErrorCode CPU::ExecuteAVX512(
     const uint8_t op   = inst.opcode;
     const uint8_t pp   = pf.vexPP;
     const bool    wBit = pf.vexW;
+    if (pf.evexLL > 2 || pf.vexVVVV > 15 || !IsValidOpmaskIndex(pf.evexAAA)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+    if (!inst.HasOperand(0) || !inst.HasOperand(1)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+    for (uint8_t i = 0; i < kMaxDecodedOperands; ++i) {
+        if (inst.HasOperand(i) && !IsValidRegisterOperand(inst.Op(i))) {
+            return ErrorCode::InvalidOperandSize;
+        }
+    }
 
     // Vector length from EVEX.LL: 0=128(16), 1=256(32), 2=512(64)
     const uint32_t vecLen = (pf.evexLL == 2) ? 64 :
@@ -96,25 +180,35 @@ ErrorCode CPU::ExecuteAVX512(
 
     // Element size depends on W-bit (typically: W=0 → dword, W=1 → qword)
     const uint8_t elemBytes = wBit ? 8 : 4;
+    if (!IsValidElementBytes(elemBytes)) return ErrorCode::InvalidOperandSize;
 
     // Active mask: k0 always means "all ones" (no masking)
     uint64_t activeMask = (maskIdx == 0) ? ~0ULL
                           : m_state.opmask[maskIdx];
 
     // --- Helper lambdas for ZMM read/write ---
-    auto ReadZMM = [&](uint8_t idx, ZMMValue& out) {
+    auto ReadZMM = [&](uint8_t idx, ZMMValue& out) -> ErrorCode {
+        if (!IsValidZmmRegisterIndex(idx)) return ErrorCode::InvalidOperandSize;
         out.Clear();
         m_state.GetZMM(idx, out.u8);
+        return ErrorCode::Success;
     };
 
-    auto WriteZMM = [&](uint8_t idx, const ZMMValue& val) {
-        m_state.SetZMM(idx, val.u8);
+    auto WriteZMM = [&](uint8_t idx, const ZMMValue& val) -> ErrorCode {
+        if (!IsValidZmmRegisterIndex(idx)) return ErrorCode::InvalidOperandSize;
+        ZMMValue full{};
+        full.Clear();
+        std::memcpy(full.u8, val.u8, vecLen);
+        m_state.SetZMM(idx, full.u8);
+        return ErrorCode::Success;
     };
 
     auto ReadSrc = [&](uint8_t opIdx, ZMMValue& out) -> ErrorCode {
+        if (!inst.HasOperand(opIdx)) return ErrorCode::InvalidOperandSize;
         out.Clear();
         const auto& operand = inst.Op(opIdx);
         if (operand.IsRegister()) {
+            if (!IsValidVectorRegisterOperand(operand)) return ErrorCode::InvalidOperandSize;
             uint8_t regIdx = operand.reg.regIndex;
             m_state.GetZMM(regIdx, out.u8);
             return ErrorCode::Success;
@@ -136,14 +230,14 @@ ErrorCode CPU::ExecuteAVX512(
 
     auto WriteDst = [&](const ZMMValue& result, const ZMMValue& origDst) -> ErrorCode {
         ZMMValue final_result;
-        std::memcpy(final_result.u8, result.u8, 64);
+        final_result.Clear();
+        std::memcpy(final_result.u8, result.u8, vecLen);
         if (maskIdx != 0) {
-            ApplyMask(final_result, origDst, activeMask, elemBytes, zeroing);
+            ApplyMask(final_result, origDst, activeMask, elemBytes, zeroing, vecLen);
         }
         const auto& dstOp = inst.Op(0);
         if (dstOp.IsRegister()) {
-            WriteZMM(dstOp.reg.regIndex, final_result);
-            return ErrorCode::Success;
+            return WriteZMM(dstOp.reg.regIndex, final_result);
         }
         if (dstOp.IsMemory()) {
             GuestAddress addr = CalculateEffectiveAddress(dstOp, inst);
@@ -156,7 +250,8 @@ ErrorCode CPU::ExecuteAVX512(
     ZMMValue origDst;
     origDst.Clear();
     if (inst.Op(0).IsRegister() && maskIdx != 0 && !zeroing) {
-        ReadZMM(inst.Op(0).reg.regIndex, origDst);
+        auto err = ReadZMM(inst.Op(0).reg.regIndex, origDst);
+        if (err != ErrorCode::Success) return err;
     }
 
     // ========================================================================
@@ -323,8 +418,7 @@ ErrorCode CPU::ExecuteAVX512(
                 return mem.Write(addr, src.u8, vecLen);
             }
             if (dstOp.IsRegister()) {
-                WriteZMM(dstOp.reg.regIndex, src);
-                return ErrorCode::Success;
+                return WriteZMM(dstOp.reg.regIndex, src);
             }
             return ErrorCode::InvalidOperandSize;
         }
@@ -343,7 +437,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origB.Clear();
             if (maskIdx != 0) ApplyMask(result, origB, activeMask, 1, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
         case 0xFD: { // VPADDW
@@ -359,7 +453,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origW.Clear();
             if (maskIdx != 0) ApplyMask(result, origW, activeMask, 2, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
         case 0xFE: { // VPADDD
@@ -395,7 +489,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origB.Clear();
             if (maskIdx != 0) ApplyMask(result, origB, activeMask, 1, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
         case 0xF9: { // VPSUBW
@@ -411,7 +505,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origW.Clear();
             if (maskIdx != 0) ApplyMask(result, origW, activeMask, 2, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
         case 0xFA: { // VPSUBD
@@ -494,22 +588,18 @@ ErrorCode CPU::ExecuteAVX512(
             result.Clear();
             if (!wBit) { // PS — dword shuffle within 128-bit lanes
                 for (uint32_t lane = 0; lane < vecLen; lane += 16) {
-                    auto* r = reinterpret_cast<uint32_t*>(result.u8 + lane);
-                    auto* s1 = reinterpret_cast<const uint32_t*>(src1.u8 + lane);
-                    auto* s2 = reinterpret_cast<const uint32_t*>(src2.u8 + lane);
-                    r[0] = s1[(imm >> 0) & 3];
-                    r[1] = s1[(imm >> 2) & 3];
-                    r[2] = s2[(imm >> 4) & 3];
-                    r[3] = s2[(imm >> 6) & 3];
+                    const uint32_t base = lane / 4;
+                    result.u32[base + 0] = src1.u32[base + ((imm >> 0) & 3)];
+                    result.u32[base + 1] = src1.u32[base + ((imm >> 2) & 3)];
+                    result.u32[base + 2] = src2.u32[base + ((imm >> 4) & 3)];
+                    result.u32[base + 3] = src2.u32[base + ((imm >> 6) & 3)];
                 }
             } else { // PD — qword shuffle within 128-bit lanes
                 for (uint32_t lane = 0; lane < vecLen; lane += 16) {
-                    auto* r = reinterpret_cast<uint64_t*>(result.u8 + lane);
-                    auto* s1 = reinterpret_cast<const uint64_t*>(src1.u8 + lane);
-                    auto* s2 = reinterpret_cast<const uint64_t*>(src2.u8 + lane);
+                    const uint32_t base = lane / 8;
                     uint32_t laneIdx = lane / 16;
-                    r[0] = s1[(imm >> (laneIdx * 2)) & 1];
-                    r[1] = s2[(imm >> (laneIdx * 2 + 1)) & 1];
+                    result.u64[base + 0] = src1.u64[base + ((imm >> (laneIdx * 2)) & 1)];
+                    result.u64[base + 1] = src2.u64[base + ((imm >> (laneIdx * 2 + 1)) & 1)];
                 }
             }
             return WriteDst(result, origDst);
@@ -533,7 +623,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origB.Clear();
             if (maskIdx != 0) ApplyMask(result, origB, activeMask, 1, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
 
@@ -549,7 +639,8 @@ ErrorCode CPU::ExecuteAVX512(
             } else { // pp=1 → VCVTPS2DQ
                 for (uint32_t i = 0; i < vecLen / 4; ++i) {
                     float v = src.f32[i];
-                    if (v >= 2147483648.0f) result.i32[i] = 0x7FFFFFFF;
+                    if (!std::isfinite(v)) result.i32[i] = (std::numeric_limits<int32_t>::min)();
+                    else if (v >= 2147483648.0f) result.i32[i] = (std::numeric_limits<int32_t>::max)();
                     else if (v < -2147483648.0f) result.i32[i] = static_cast<int32_t>(0x80000000u);
                     else result.i32[i] = static_cast<int32_t>(std::nearbyintf(v));
                 }
@@ -630,7 +721,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origB.Clear();
             if (maskIdx != 0) ApplyMask(result, origB, activeMask, 1, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
         case 0x79: { // VPBROADCASTW
@@ -651,7 +742,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origW.Clear();
             if (maskIdx != 0) ApplyMask(result, origW, activeMask, 2, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
         case 0x58: { // VPBROADCASTD
@@ -850,7 +941,7 @@ ErrorCode CPU::ExecuteAVX512(
             else origB.Clear();
             if (maskIdx != 0) ApplyMask(result, origB, activeMask, 1, zeroing);
             const auto& d = inst.Op(0);
-            if (d.IsRegister()) { WriteZMM(d.reg.regIndex, result); return ErrorCode::Success; }
+            if (d.IsRegister()) return WriteZMM(d.reg.regIndex, result);
             return ErrorCode::InvalidOperandSize;
         }
 
@@ -887,7 +978,7 @@ ErrorCode CPU::ExecuteAVX512(
                 for (int j = 0; j < 4; ++j) {
                     uint8_t a = src1.u8[i * 4 + j];    // unsigned
                     int8_t  b = src2.i8[i * 4 + j];    // signed
-                    sum += static_cast<int32_t>(a) * static_cast<int32_t>(b);
+                    sum = AddWrapI32(sum, static_cast<int32_t>(a) * static_cast<int32_t>(b));
                 }
                 acc.i32[i] = sum;
             }
@@ -923,7 +1014,7 @@ ErrorCode CPU::ExecuteAVX512(
                 for (int j = 0; j < 2; ++j) {
                     int16_t a = src1.i16[i * 2 + j];
                     int16_t b = src2.i16[i * 2 + j];
-                    sum += static_cast<int32_t>(a) * static_cast<int32_t>(b);
+                    sum = AddWrapI32(sum, static_cast<int32_t>(a) * static_cast<int32_t>(b));
                 }
                 acc.i32[i] = sum;
             }
@@ -1190,7 +1281,9 @@ ErrorCode CPU::ExecuteAVX512(
             if (err != ErrorCode::Success) return err;
             result.Clear();
             for (uint32_t i = 0; i < vecLen / 4; ++i)
-                result.i32[i] = (src.i32[i] < 0) ? -src.i32[i] : src.i32[i];
+                result.u32[i] = (src.i32[i] < 0)
+                    ? (uint32_t{0} - static_cast<uint32_t>(src.i32[i]))
+                    : static_cast<uint32_t>(src.i32[i]);
             return WriteDst(result, origDst);
         }
         case 0x1F: {
@@ -1199,7 +1292,9 @@ ErrorCode CPU::ExecuteAVX512(
             if (err != ErrorCode::Success) return err;
             result.Clear();
             for (uint32_t i = 0; i < vecLen / 8; ++i)
-                result.i64[i] = (src.i64[i] < 0) ? -src.i64[i] : src.i64[i];
+                result.u64[i] = (src.i64[i] < 0)
+                    ? (uint64_t{0} - static_cast<uint64_t>(src.i64[i]))
+                    : static_cast<uint64_t>(src.i64[i]);
             return WriteDst(result, origDst);
         }
 
@@ -1288,8 +1383,7 @@ ErrorCode CPU::ExecuteAVX512(
             // Compress doesn't use standard WriteDst masking
             const auto& dstOp = inst.Op(0);
             if (dstOp.IsRegister()) {
-                WriteZMM(dstOp.reg.regIndex, result);
-                return ErrorCode::Success;
+                return WriteZMM(dstOp.reg.regIndex, result);
             }
             if (dstOp.IsMemory()) {
                 GuestAddress addr = CalculateEffectiveAddress(dstOp, inst);
@@ -1324,8 +1418,7 @@ ErrorCode CPU::ExecuteAVX512(
             }
             const auto& dstOp = inst.Op(0);
             if (dstOp.IsRegister()) {
-                WriteZMM(dstOp.reg.regIndex, result);
-                return ErrorCode::Success;
+                return WriteZMM(dstOp.reg.regIndex, result);
             }
             return ErrorCode::InvalidOperandSize;
         }
@@ -1399,12 +1492,11 @@ ErrorCode CPU::ExecuteAVX512(
             uint8_t imm = static_cast<uint8_t>(inst.Op(2).imm.value);
             result.Clear();
             for (uint32_t lane = 0; lane < vecLen; lane += 16) {
-                auto* r = reinterpret_cast<uint32_t*>(result.u8 + lane);
-                auto* s = reinterpret_cast<const uint32_t*>(src.u8 + lane);
-                r[0] = s[(imm >> 0) & 3];
-                r[1] = s[(imm >> 2) & 3];
-                r[2] = s[(imm >> 4) & 3];
-                r[3] = s[(imm >> 6) & 3];
+                const uint32_t base = lane / 4;
+                result.u32[base + 0] = src.u32[base + ((imm >> 0) & 3)];
+                result.u32[base + 1] = src.u32[base + ((imm >> 2) & 3)];
+                result.u32[base + 2] = src.u32[base + ((imm >> 4) & 3)];
+                result.u32[base + 3] = src.u32[base + ((imm >> 6) & 3)];
             }
             return WriteDst(result, origDst);
         }
