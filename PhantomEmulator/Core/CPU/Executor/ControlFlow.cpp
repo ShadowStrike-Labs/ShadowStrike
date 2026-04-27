@@ -13,19 +13,79 @@
  */
 
 #include "../CPU.hpp"
+#include <limits>
 
 namespace Phantom {
+
+namespace {
+
+[[nodiscard]] bool CanAddSignedGuestOffset(
+    GuestAddress base,
+    int64_t offset,
+    GuestAddress& result) noexcept
+{
+    if (offset >= 0) {
+        const auto add = static_cast<GuestAddress>(offset);
+        if (base > (std::numeric_limits<GuestAddress>::max)() - add) {
+            return false;
+        }
+        result = base + add;
+        return true;
+    }
+
+    const auto subtract = static_cast<GuestAddress>(uint64_t{0} - static_cast<uint64_t>(offset));
+    if (base < subtract) {
+        return false;
+    }
+    result = base - subtract;
+    return true;
+}
+
+[[nodiscard]] ErrorCode ResolveRelativeTarget(
+    const DecodedInstruction& inst,
+    GuestAddress& target) noexcept
+{
+    if (!inst.HasOperand(0)) {
+        return ErrorCode::InvalidOperandSize;
+    }
+    if (!CanAddSignedGuestOffset(inst.NextRIP(), inst.Op(0).rel.offset, target)) {
+        return ErrorCode::AddressOverflow;
+    }
+    return ErrorCode::Success;
+}
+
+[[nodiscard]] ErrorCode AdjustStackPointerAfterRet(CPUState& state, uint16_t stackAdj) noexcept {
+    if (state.Is64Bit()) {
+        const uint64_t rsp = state.RSP();
+        if (rsp > (std::numeric_limits<uint64_t>::max)() - stackAdj) {
+            return ErrorCode::AddressOverflow;
+        }
+        state.SetReg64(GPR::RSP, rsp + stackAdj);
+        return ErrorCode::Success;
+    }
+
+    const uint32_t esp = state.GetReg32(GPR::RSP);
+    if (esp > (std::numeric_limits<uint32_t>::max)() - stackAdj) {
+        return ErrorCode::AddressOverflow;
+    }
+    state.SetReg32(GPR::RSP, esp + stackAdj);
+    return ErrorCode::Success;
+}
+
+} // namespace
 
 // ============================================================================
 // Shadow Stack Helpers (inlined for hot-path performance)
 // ============================================================================
 
-static inline void ShadowStackPush(CPUState& state, uint64_t returnAddr) noexcept {
+static inline ErrorCode ShadowStackPush(CPUState& state, uint64_t returnAddr) noexcept {
     auto& ss = state.shadowStack;
-    if (!ss.enabled) return;
-    // Silently wrap on overflow — real hardware would #CP, but for
-    // emulation analysis we keep running to observe full behavior.
-    [[maybe_unused]] bool ok = ss.Push(returnAddr);
+    if (!ss.enabled) return ErrorCode::Success;
+    if (!ss.Push(returnAddr)) {
+        ++ss.violations;
+        return ErrorCode::StackOverflow;
+    }
+    return ErrorCode::Success;
 }
 
 static inline ErrorCode ShadowStackValidateReturn(CPUState& state, uint64_t retAddr) noexcept {
@@ -34,10 +94,8 @@ static inline ErrorCode ShadowStackValidateReturn(CPUState& state, uint64_t retA
 
     uint64_t expectedAddr = 0;
     if (!ss.Pop(expectedAddr)) {
-        // Shadow stack underflow — suspicious but not necessarily malicious
-        // (could be entry-point return). Record the violation for analysis.
         ++ss.violations;
-        return ErrorCode::Success;
+        return ErrorCode::ControlProtectionFault;
     }
 
     if (expectedAddr != retAddr) {
@@ -56,7 +114,6 @@ static inline void SetWaitForEndBranch(CPUState& state) noexcept {
 
 ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     uint8_t op = inst.opcode;
-    OperandSize size = inst.operandSize;
     OperandSize pushSize = m_state.Is64Bit() ? OperandSize::Size64 : OperandSize::Size32;
 
     if (inst.opcodeMap == OpcodeMap::OneByte) {
@@ -65,7 +122,10 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
         if (op >= 0x70 && op <= 0x7F) {
             uint8_t cc = op & 0x0F;
             if (m_state.eflags.EvaluateCondition(cc)) {
-                m_state.SetRIP(inst.NextRIP() + inst.Op(0).rel.offset);
+                GuestAddress target = 0;
+                auto err = ResolveRelativeTarget(inst, target);
+                if (err != ErrorCode::Success) return err;
+                m_state.SetRIP(target);
             } else {
                 m_state.AdvanceRIP(inst.length);
             }
@@ -74,13 +134,19 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
 
         // === JMP rel8 (0xEB) ===
         if (op == 0xEB) {
-            m_state.SetRIP(inst.NextRIP() + inst.Op(0).rel.offset);
+            GuestAddress target = 0;
+            auto err = ResolveRelativeTarget(inst, target);
+            if (err != ErrorCode::Success) return err;
+            m_state.SetRIP(target);
             return ErrorCode::Success;
         }
 
         // === JMP rel32 (0xE9) ===
         if (op == 0xE9) {
-            m_state.SetRIP(inst.NextRIP() + inst.Op(0).rel.offset);
+            GuestAddress target = 0;
+            auto err = ResolveRelativeTarget(inst, target);
+            if (err != ErrorCode::Success) return err;
+            m_state.SetRIP(target);
             return ErrorCode::Success;
         }
 
@@ -89,8 +155,12 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
             GuestAddress returnAddr = inst.NextRIP();
             auto err = StackPush(mem, returnAddr, pushSize);
             if (err != ErrorCode::Success) return err;
-            ShadowStackPush(m_state, returnAddr);
-            m_state.SetRIP(inst.NextRIP() + inst.Op(0).rel.offset);
+            err = ShadowStackPush(m_state, returnAddr);
+            if (err != ErrorCode::Success) return err;
+            GuestAddress target = 0;
+            err = ResolveRelativeTarget(inst, target);
+            if (err != ErrorCode::Success) return err;
+            m_state.SetRIP(target);
             return ErrorCode::Success;
         }
 
@@ -113,15 +183,17 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
             err = ShadowStackValidateReturn(m_state, retAddr);
             if (err != ErrorCode::Success) return err;
             uint16_t stackAdj = static_cast<uint16_t>(inst.immediate & 0xFFFF);
-            m_state.SetReg64(GPR::RSP, m_state.RSP() + stackAdj);
+            err = AdjustStackPointerAfterRet(m_state, stackAdj);
+            if (err != ErrorCode::Success) return err;
             m_state.SetRIP(retAddr);
             return ErrorCode::Success;
         }
 
         // === LOOP/LOOPcc/JCXZ (0xE0-0xE3) ===
         if (op >= 0xE0 && op <= 0xE3) {
-            int64_t offset = inst.Op(0).rel.offset;
-            GuestAddress target = inst.NextRIP() + offset;
+            GuestAddress target = 0;
+            auto err = ResolveRelativeTarget(inst, target);
+            if (err != ErrorCode::Success) return err;
             GuestAddress fallthrough = inst.NextRIP();
 
             if (op == 0xE3) {
@@ -183,7 +255,8 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
                 GuestAddress returnAddr = inst.NextRIP();
                 err = StackPush(mem, returnAddr, pushSize);
                 if (err != ErrorCode::Success) return err;
-                ShadowStackPush(m_state, returnAddr);
+                err = ShadowStackPush(m_state, returnAddr);
+                if (err != ErrorCode::Success) return err;
                 SetWaitForEndBranch(m_state);
                 m_state.SetRIP(target);
                 return ErrorCode::Success;
@@ -198,7 +271,10 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
         if (op >= 0x80 && op <= 0x8F) {
             uint8_t cc = op & 0x0F;
             if (m_state.eflags.EvaluateCondition(cc)) {
-                m_state.SetRIP(inst.NextRIP() + inst.Op(0).rel.offset);
+                GuestAddress target = 0;
+                auto err = ResolveRelativeTarget(inst, target);
+                if (err != ErrorCode::Success) return err;
+                m_state.SetRIP(target);
             } else {
                 m_state.AdvanceRIP(inst.length);
             }
