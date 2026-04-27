@@ -150,23 +150,49 @@ enum class MetadataTableId : uint8_t {
 };
 
 static constexpr uint32_t kMaxMetadataTables = static_cast<uint32_t>(MetadataTableId::MaxTable);
+static constexpr uint32_t kMetadataTokenRowMask = 0x00FFFFFFu;
+static constexpr uint32_t kMaxMetadataTokenRow = kMetadataTokenRowMask;
+
+/**
+ * @brief Validates an ECMA-335 metadata table identifier.
+ *
+ * Thread safety: pure value helper. Failure contract: returns false for
+ * out-of-range table bytes decoded from hostile or malformed metadata tokens.
+ */
+[[nodiscard]] constexpr bool IsValidMetadataTableId(MetadataTableId table) noexcept {
+    return static_cast<uint32_t>(table) < kMaxMetadataTables;
+}
 
 // ============================================================================
 // Metadata Token Encoding (ECMA-335 §II.22)
 // ============================================================================
 
-/// A metadata token is a 32-bit value: upper 8 bits = table ID, lower 24 bits = row index (1-based).
+/**
+ * @brief ECMA-335 metadata token: upper 8 bits table ID, lower 24 bits 1-based row index.
+ *
+ * Tokens are commonly attacker-controlled when parsing managed malware. The
+ * helpers below never truncate row IDs silently and map invalid table bytes to
+ * MetadataTableId::MaxTable so switch statements can reject them explicitly.
+ * Thread safety: immutable value type.
+ */
 struct MetadataToken {
     uint32_t raw = 0;
 
     [[nodiscard]] MetadataTableId Table() const noexcept {
-        return static_cast<MetadataTableId>((raw >> 24) & 0xFF);
+        const auto table = static_cast<MetadataTableId>((raw >> 24) & 0xFFu);
+        return IsValidMetadataTableId(table) ? table : MetadataTableId::MaxTable;
     }
-    [[nodiscard]] uint32_t Row() const noexcept { return raw & 0x00FFFFFF; }
+    [[nodiscard]] uint32_t Row() const noexcept { return raw & kMetadataTokenRowMask; }
     [[nodiscard]] bool IsNull() const noexcept { return raw == 0; }
+    [[nodiscard]] bool IsValid() const noexcept {
+        return !IsNull() && IsValidMetadataTableId(Table()) && Row() != 0;
+    }
 
     static MetadataToken Make(MetadataTableId table, uint32_t row) noexcept {
-        return { (static_cast<uint32_t>(table) << 24) | (row & 0x00FFFFFF) };
+        if (!IsValidMetadataTableId(table) || row == 0 || row > kMaxMetadataTokenRow) {
+            return {};
+        }
+        return { (static_cast<uint32_t>(table) << 24) | row };
     }
 };
 
@@ -175,52 +201,52 @@ struct MetadataToken {
 // ============================================================================
 
 struct TypeDefRow {
-    uint32_t    flags;
+    uint32_t    flags = 0;
     std::string typeName;
     std::string typeNamespace;
-    uint32_t    extendsCodedIndex;    // TypeDefOrRef coded index
-    uint32_t    fieldList;            // Index into Field table
-    uint32_t    methodList;           // Index into MethodDef table
+    uint32_t    extendsCodedIndex = 0; // TypeDefOrRef coded index
+    uint32_t    fieldList = 0;         // Index into Field table
+    uint32_t    methodList = 0;        // Index into MethodDef table
 };
 
 struct MethodDefRow {
-    uint32_t    rva;                  // RVA of IL method body
-    uint16_t    implFlags;
-    uint16_t    flags;
+    uint32_t    rva = 0;              // RVA of IL method body
+    uint16_t    implFlags = 0;
+    uint16_t    flags = 0;
     std::string name;
-    uint32_t    signatureIndex;       // Index into #Blob heap
-    uint32_t    paramList;            // Index into Param table
+    uint32_t    signatureIndex = 0;   // Index into #Blob heap
+    uint32_t    paramList = 0;        // Index into Param table
 };
 
 struct MemberRefRow {
-    uint32_t    classCodedIndex;      // MemberRefParent coded index
+    uint32_t    classCodedIndex = 0;  // MemberRefParent coded index
     std::string name;
-    uint32_t    signatureIndex;
+    uint32_t    signatureIndex = 0;
 };
 
 struct TypeRefRow {
-    uint32_t    resolutionScope;      // ResolutionScope coded index
+    uint32_t    resolutionScope = 0;  // ResolutionScope coded index
     std::string typeName;
     std::string typeNamespace;
 };
 
 struct AssemblyRefRow {
-    uint16_t    majorVersion;
-    uint16_t    minorVersion;
-    uint16_t    buildNumber;
-    uint16_t    revisionNumber;
-    uint32_t    flags;
-    uint32_t    publicKeyOrTokenIndex;
+    uint16_t    majorVersion = 0;
+    uint16_t    minorVersion = 0;
+    uint16_t    buildNumber = 0;
+    uint16_t    revisionNumber = 0;
+    uint32_t    flags = 0;
+    uint32_t    publicKeyOrTokenIndex = 0;
     std::string name;
     std::string culture;
-    uint32_t    hashValueIndex;
+    uint32_t    hashValueIndex = 0;
 };
 
 struct ImplMapRow {
-    uint16_t    mappingFlags;
-    uint32_t    memberForwardedIndex; // MemberForwarded coded index
+    uint16_t    mappingFlags = 0;
+    uint32_t    memberForwardedIndex = 0; // MemberForwarded coded index
     std::string importName;
-    uint32_t    importScopeIndex;     // Index into ModuleRef table
+    uint32_t    importScopeIndex = 0;     // Index into ModuleRef table
 };
 
 struct ModuleRefRow {
@@ -228,20 +254,20 @@ struct ModuleRefRow {
 };
 
 struct AssemblyRow {
-    uint32_t    hashAlgId;
-    uint16_t    majorVersion;
-    uint16_t    minorVersion;
-    uint16_t    buildNumber;
-    uint16_t    revisionNumber;
-    uint32_t    flags;
-    uint32_t    publicKeyIndex;
+    uint32_t    hashAlgId = 0;
+    uint16_t    majorVersion = 0;
+    uint16_t    minorVersion = 0;
+    uint16_t    buildNumber = 0;
+    uint16_t    revisionNumber = 0;
+    uint32_t    flags = 0;
+    uint32_t    publicKeyIndex = 0;
     std::string name;
     std::string culture;
 };
 
 struct FieldRVARow {
-    uint32_t rva;
-    uint32_t fieldIndex;              // Index into Field table
+    uint32_t rva = 0;
+    uint32_t fieldIndex = 0;          // Index into Field table
 };
 
 // ============================================================================
@@ -537,10 +563,10 @@ enum class MSILOperandType : uint8_t {
 // ============================================================================
 
 struct MSILInstruction {
-    uint32_t        offset;          // Byte offset from method start
-    MSILOpcode      opcode;          // Decoded opcode
-    MSILOperandType operandType;     // Operand type
-    uint32_t        size;            // Total instruction size in bytes
+    uint32_t        offset = 0;                    // Byte offset from method start
+    MSILOpcode      opcode = MSILOpcode::INVALID;  // Decoded opcode
+    MSILOperandType operandType = MSILOperandType::None;
+    uint32_t        size = 0;                      // Total instruction size in bytes
 
     // Operand value (depends on operandType)
     union {
@@ -612,11 +638,11 @@ enum class DotNetAPICategory : uint8_t {
 
 /// A detected .NET API call during MSIL analysis
 struct DotNetAPICall {
-    DotNetAPICategory category;
+    DotNetAPICategory category = DotNetAPICategory::Unknown;
     std::string       className;      // e.g., "System.Reflection.Assembly"
     std::string       methodName;     // e.g., "Load"
     MetadataToken     token;
-    uint32_t          ilOffset;       // IL offset where the call occurs
+    uint32_t          ilOffset = 0;   // IL offset where the call occurs
     std::string       resolvedTarget; // Fully resolved "Namespace.Class::Method"
 };
 
@@ -640,16 +666,16 @@ struct DotNetPInvoke {
     std::string moduleName;   // DLL name (e.g., "kernel32.dll")
     std::string importName;   // Function name (e.g., "VirtualAlloc")
     std::string managedName;  // .NET method name that wraps it
-    MetadataToken methodToken;
+    MetadataToken methodToken{};
 };
 
 /// Embedded resource in .NET assembly
 struct DotNetResource {
     std::string name;
-    uint32_t    offset;
-    uint32_t    size;
-    double      entropy;       // Shannon entropy of resource data
-    bool        isEncrypted;   // entropy > 7.0 threshold
+    uint32_t    offset = 0;
+    uint32_t    size = 0;
+    double      entropy = 0.0;  // Shannon entropy of resource data
+    bool        isEncrypted = false; // entropy > 7.0 threshold
 };
 
 // ============================================================================
