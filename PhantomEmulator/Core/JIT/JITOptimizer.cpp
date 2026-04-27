@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <unordered_set>
 
@@ -36,6 +37,7 @@ static constexpr uint32_t kMaxWriteTrackEntries  = 4096;
 static constexpr uint32_t kMaxIRInstructions     = 2048;
 static constexpr float    kColdBranchThreshold   = 0.20f;
 static constexpr uint32_t kMaxGuestGPR           = 16;
+static constexpr uint32_t kMaxCompiledRangeEntries = 4096;
 
 // Host callee-saved registers available for allocation: R12, R13, R14, R15, RBX, RBP
 static constexpr std::array<uint8_t, 6> kHostAllocRegs = {
@@ -118,16 +120,61 @@ static constexpr std::array<uint8_t, 6> kHostAllocRegs = {
            IsRetInstruction(inst) || IsSyscallOrInterrupt(inst);
 }
 
+[[nodiscard]] bool AddUnsigned(GuestAddress lhs, GuestSize rhs, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - lhs < rhs) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+[[nodiscard]] bool AddSigned(GuestAddress lhs, int64_t rhs, GuestAddress& result) noexcept {
+    if (rhs >= 0) {
+        return AddUnsigned(lhs, static_cast<GuestSize>(rhs), result);
+    }
+
+    const auto magnitude = static_cast<GuestSize>(-(rhs + 1)) + 1;
+    if (lhs < magnitude) {
+        return false;
+    }
+    result = lhs - magnitude;
+    return true;
+}
+
+[[nodiscard]] bool RangeEnd(GuestAddress start, GuestSize size, GuestAddress& end) noexcept {
+    return size != 0 && AddUnsigned(start, size, end);
+}
+
+[[nodiscard]] bool RangesOverlap(
+    GuestAddress firstStart,
+    GuestSize firstSize,
+    GuestAddress secondStart,
+    GuestSize secondSize) noexcept
+{
+    GuestAddress firstEnd = 0;
+    GuestAddress secondEnd = 0;
+    if (!RangeEnd(firstStart, firstSize, firstEnd) || !RangeEnd(secondStart, secondSize, secondEnd)) {
+        return false;
+    }
+    return firstStart < secondEnd && secondStart < firstEnd;
+}
+
 [[nodiscard]] GuestAddress ComputeBranchTarget(const DecodedInstruction& inst) noexcept {
     if (inst.operandCount == 0) {
         return 0;
     }
+    const GuestAddress nextRip = inst.NextRIP();
+    if (nextRip == kGuestInvalid) {
+        return 0;
+    }
     const auto& op0 = inst.operands[0];
     if (op0.type == OperandType::RelativeOffset) {
-        return inst.NextRIP() + static_cast<uint64_t>(op0.rel.offset);
+        GuestAddress target = 0;
+        return AddSigned(nextRip, op0.rel.offset, target) ? target : 0;
     }
     if (op0.type == OperandType::Immediate) {
-        return inst.NextRIP() + op0.imm.value;
+        GuestAddress target = 0;
+        return AddUnsigned(nextRip, op0.imm.value, target) ? target : 0;
     }
     return 0;
 }
@@ -137,14 +184,16 @@ static constexpr std::array<uint8_t, 6> kHostAllocRegs = {
 // ============================================================================
 
 [[nodiscard]] uint8_t ExtractGPRIndex(const DecodedOperand& op) noexcept {
-    if (op.type == OperandType::Register && op.reg.regType == RegType::GPR) {
+    if (op.type == OperandType::Register
+        && op.reg.regType == RegType::GPR
+        && op.reg.regIndex < static_cast<uint8_t>(GPR::Count)) {
         return op.reg.regIndex;
     }
     return 0xFF;
 }
 
 [[nodiscard]] bool OperandIsGPR(const DecodedOperand& op) noexcept {
-    return op.type == OperandType::Register && op.reg.regType == RegType::GPR;
+    return ExtractGPRIndex(op) != 0xFF;
 }
 
 [[nodiscard]] bool OperandIsImmediate(const DecodedOperand& op) noexcept {
@@ -156,37 +205,76 @@ static constexpr std::array<uint8_t, 6> kHostAllocRegs = {
 }
 
 // Compute an ALU result for constant folding
+[[nodiscard]] uint32_t OperandBitWidth(OperandSize size) noexcept {
+    switch (size) {
+        case OperandSize::Size8:  return 8;
+        case OperandSize::Size16: return 16;
+        case OperandSize::Size32: return 32;
+        case OperandSize::Size64: return 64;
+    }
+    return 64;
+}
+
+[[nodiscard]] uint64_t OperandMask(OperandSize size) noexcept {
+    switch (size) {
+        case OperandSize::Size8:  return 0xFFULL;
+        case OperandSize::Size16: return 0xFFFFULL;
+        case OperandSize::Size32: return 0xFFFFFFFFULL;
+        case OperandSize::Size64: return (std::numeric_limits<uint64_t>::max)();
+    }
+    return (std::numeric_limits<uint64_t>::max)();
+}
+
+[[nodiscard]] uint64_t MaskToOperand(uint64_t value, OperandSize size) noexcept {
+    return value & OperandMask(size);
+}
+
+[[nodiscard]] uint64_t ArithmeticShiftRight(uint64_t value, uint64_t count, OperandSize size) noexcept {
+    const uint32_t width = OperandBitWidth(size);
+    const uint64_t masked = MaskToOperand(value, size);
+    if (count >= width) {
+        return (masked & (1ULL << (width - 1))) != 0 ? OperandMask(size) : 0;
+    }
+    if (count == 0) {
+        return masked;
+    }
+
+    const uint64_t shifted = masked >> count;
+    if ((masked & (1ULL << (width - 1))) == 0) {
+        return shifted;
+    }
+    const uint64_t signFill = OperandMask(size) << (width - count);
+    return MaskToOperand(shifted | signFill, size);
+}
+
 [[nodiscard]] uint64_t EvaluateALU(IRInstruction::Op op, uint64_t a, uint64_t b, OperandSize sz) noexcept {
     uint64_t result = 0;
+    const uint32_t width = OperandBitWidth(sz);
+    const uint64_t shiftCount = b;
+    const uint64_t lhs = MaskToOperand(a, sz);
+    const uint64_t rhs = MaskToOperand(b, sz);
+
     switch (op) {
-        case IRInstruction::Op::Add: result = a + b; break;
-        case IRInstruction::Op::Sub: result = a - b; break;
-        case IRInstruction::Op::And: result = a & b; break;
-        case IRInstruction::Op::Or:  result = a | b; break;
-        case IRInstruction::Op::Xor: result = a ^ b; break;
+        case IRInstruction::Op::Add: result = lhs + rhs; break;
+        case IRInstruction::Op::Sub: result = lhs - rhs; break;
+        case IRInstruction::Op::And: result = lhs & rhs; break;
+        case IRInstruction::Op::Or:  result = lhs | rhs; break;
+        case IRInstruction::Op::Xor: result = lhs ^ rhs; break;
         case IRInstruction::Op::Shl:
-            result = (b < 64) ? (a << b) : 0;
+            result = (shiftCount < width) ? (lhs << shiftCount) : 0;
             break;
         case IRInstruction::Op::Shr:
-            result = (b < 64) ? (a >> b) : 0;
+            result = (shiftCount < width) ? (lhs >> shiftCount) : 0;
             break;
-        case IRInstruction::Op::Sar: {
-            int64_t sa = static_cast<int64_t>(a);
-            result = (b < 64) ? static_cast<uint64_t>(sa >> b) : static_cast<uint64_t>(sa >> 63);
+        case IRInstruction::Op::Sar:
+            result = ArithmeticShiftRight(lhs, shiftCount, sz);
             break;
-        }
-        case IRInstruction::Op::Not: result = ~a; break;
-        case IRInstruction::Op::Neg: result = static_cast<uint64_t>(-static_cast<int64_t>(a)); break;
+        case IRInstruction::Op::Not: result = ~lhs; break;
+        case IRInstruction::Op::Neg: result = 0ULL - lhs; break;
         default: result = 0; break;
     }
 
-    switch (sz) {
-        case OperandSize::Size8:  return result & 0xFFULL;
-        case OperandSize::Size16: return result & 0xFFFFULL;
-        case OperandSize::Size32: return result & 0xFFFFFFFFULL;
-        case OperandSize::Size64: return result;
-    }
-    return result;
+    return MaskToOperand(result, sz);
 }
 
 [[nodiscard]] bool IsALUOp(IRInstruction::Op op) noexcept {
@@ -251,6 +339,84 @@ static constexpr std::array<uint8_t, 6> kHostAllocRegs = {
     return false;
 }
 
+[[nodiscard]] bool IsValidGuestGpr(uint8_t reg) noexcept {
+    return reg < kMaxGuestGPR;
+}
+
+void ConvertToSideEffect(IRInstruction& ir) noexcept {
+    ir.op = IRInstruction::Op::SideEffect;
+    ir.dst = 0xFF;
+    ir.src1 = 0xFF;
+    ir.src2 = 0xFF;
+    ir.immediate = 0;
+    ir.hasSideEffects = true;
+    ir.isDeadStore = false;
+    ir.isFolded = false;
+}
+
+void SanitizeIR(std::vector<IRInstruction>& ir) noexcept {
+    for (auto& inst : ir) {
+        switch (inst.op) {
+            case IRInstruction::Op::Nop:
+            case IRInstruction::Op::SideEffect:
+            case IRInstruction::Op::FlagUpdate:
+            case IRInstruction::Op::Jcc:
+            case IRInstruction::Op::Jmp:
+            case IRInstruction::Op::Call:
+            case IRInstruction::Op::Ret:
+                break;
+
+            case IRInstruction::Op::MovImm:
+                if (!IsValidGuestGpr(inst.dst)) { ConvertToSideEffect(inst); }
+                break;
+
+            case IRInstruction::Op::MovReg:
+                if (!IsValidGuestGpr(inst.dst) || !IsValidGuestGpr(inst.src1)) { ConvertToSideEffect(inst); }
+                break;
+
+            case IRInstruction::Op::Load:
+                if (!IsValidGuestGpr(inst.dst)) { ConvertToSideEffect(inst); }
+                break;
+
+            case IRInstruction::Op::Store:
+                if (!IsValidGuestGpr(inst.dst)) { ConvertToSideEffect(inst); }
+                break;
+
+            case IRInstruction::Op::Add:
+            case IRInstruction::Op::Sub:
+            case IRInstruction::Op::And:
+            case IRInstruction::Op::Or:
+            case IRInstruction::Op::Xor:
+            case IRInstruction::Op::Shl:
+            case IRInstruction::Op::Shr:
+            case IRInstruction::Op::Sar:
+            case IRInstruction::Op::Rol:
+            case IRInstruction::Op::Ror:
+            case IRInstruction::Op::Mul:
+            case IRInstruction::Op::Div:
+                if (!IsValidGuestGpr(inst.dst)
+                    || !IsValidGuestGpr(inst.src1)
+                    || (inst.src2 != 0xFF && !IsValidGuestGpr(inst.src2))) {
+                    ConvertToSideEffect(inst);
+                }
+                break;
+
+            case IRInstruction::Op::Not:
+            case IRInstruction::Op::Neg:
+                if (!IsValidGuestGpr(inst.dst) || !IsValidGuestGpr(inst.src1)) { ConvertToSideEffect(inst); }
+                break;
+
+            case IRInstruction::Op::Cmp:
+            case IRInstruction::Op::Test:
+                if (!IsValidGuestGpr(inst.src1)
+                    || (inst.src2 != 0xFF && !IsValidGuestGpr(inst.src2))) {
+                    ConvertToSideEffect(inst);
+                }
+                break;
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -287,9 +453,9 @@ struct JITOptimizer::Impl {
     // Statistics
     OptimizationStats stats{};
 
-    Impl() noexcept {
-        writeRanges.reserve(256);
-        compiledRanges.reserve(256);
+    Impl() {
+        writeRanges.reserve(kMaxWriteTrackEntries);
+        compiledRanges.reserve(kMaxCompiledRangeEntries);
     }
 };
 
@@ -325,13 +491,18 @@ std::optional<TraceInfo> JITOptimizer::BuildTrace(
         return std::nullopt;
     }
 
+    try {
     // Cap trace length to prevent unbounded growth
     const uint32_t effectiveMaxLength = std::min(maxTraceLength, kMaxIRInstructions);
+    if (effectiveMaxLength == 0) {
+        return std::nullopt;
+    }
+    const uint32_t cappedInstrCount = std::min(instrCount, kMaxIRInstructions);
 
     // Build an index from guest address to instruction array position for O(1) lookup
     std::unordered_map<GuestAddress, uint32_t> addrToIndex;
-    addrToIndex.reserve(instrCount);
-    for (uint32_t i = 0; i < instrCount; ++i) {
+    addrToIndex.reserve(cappedInstrCount);
+    for (uint32_t i = 0; i < cappedInstrCount; ++i) {
         addrToIndex.emplace(instructions[i].address, i);
     }
 
@@ -372,11 +543,11 @@ std::optional<TraceInfo> JITOptimizer::BuildTrace(
         GuestAddress lastAddr = currentBlockStart;
         bool terminated = false;
 
-        while (idx < instrCount && totalInstr + blockInstrCount < effectiveMaxLength) {
+        while (idx < cappedInstrCount && totalInstr + blockInstrCount < effectiveMaxLength) {
             const auto& inst = instructions[idx];
             if (inst.address != lastAddr && blockInstrCount > 0) {
                 // Instructions are not contiguous — end of this block's coverage
-                if (inst.address != lastAddr + instructions[idx - 1].length) {
+                if (inst.address != instructions[idx - 1].NextRIP()) {
                     break;
                 }
             }
@@ -385,7 +556,11 @@ std::optional<TraceInfo> JITOptimizer::BuildTrace(
             ++blockInstrCount;
 
             if (IsBlockTerminator(inst)) {
-                block.endAddress = inst.address + inst.length;
+                block.endAddress = inst.NextRIP();
+                if (block.endAddress == kGuestInvalid) {
+                    terminated = true;
+                    break;
+                }
 
                 if (IsSyscallOrInterrupt(inst) || IsIndirectBranch(inst) || IsRetInstruction(inst)) {
                     // Hard terminator — cannot continue trace
@@ -404,9 +579,9 @@ std::optional<TraceInfo> JITOptimizer::BuildTrace(
                     auto targetIt = blockProfile.find(target);
                     auto fallIt   = blockProfile.find(fallthrough);
 
-                    uint32_t targetCount = (targetIt != blockProfile.end()) ? targetIt->second : 0;
-                    uint32_t fallCount   = (fallIt != blockProfile.end())   ? fallIt->second   : 0;
-                    uint32_t totalCount  = targetCount + fallCount;
+                    const uint64_t targetCount = (targetIt != blockProfile.end()) ? targetIt->second : 0;
+                    const uint64_t fallCount   = (fallIt != blockProfile.end())   ? fallIt->second   : 0;
+                    const uint64_t totalCount  = targetCount + fallCount;
 
                     if (totalCount > 0) {
                         block.branchTakenRate = static_cast<float>(targetCount) /
@@ -453,9 +628,12 @@ std::optional<TraceInfo> JITOptimizer::BuildTrace(
 
         if (block.endAddress == 0) {
             // Block didn't hit a terminator — ended naturally
-            if (idx > 0 && idx <= instrCount) {
+            if (idx > 0 && idx <= cappedInstrCount) {
                 const auto& lastInst = instructions[idx - 1];
-                block.endAddress = lastInst.address + lastInst.length;
+                block.endAddress = lastInst.NextRIP();
+                if (block.endAddress == kGuestInvalid) {
+                    break;
+                }
                 block.fallthroughTarget = block.endAddress;
             } else {
                 block.endAddress = lastAddr;
@@ -509,6 +687,9 @@ std::optional<TraceInfo> JITOptimizer::BuildTrace(
     }
 
     return trace;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -524,6 +705,7 @@ std::vector<IRInstruction> JITOptimizer::GenerateIR(
         return ir;
     }
 
+    try {
     const uint32_t cappedCount = std::min(count, kMaxIRInstructions);
     ir.reserve(cappedCount * 2); // Some instructions expand to multiple IR ops
 
@@ -549,7 +731,7 @@ std::vector<IRInstruction> JITOptimizer::GenerateIR(
             call.size = inst.operandSize;
             call.hasSideEffects = true;
             if (inst.operandCount > 0 && inst.operands[0].type == OperandType::RelativeOffset) {
-                call.immediate = static_cast<uint64_t>(inst.operands[0].rel.offset) + inst.NextRIP();
+                call.immediate = ComputeBranchTarget(inst);
             }
             ir.push_back(call);
             continue;
@@ -1137,7 +1319,11 @@ std::vector<IRInstruction> JITOptimizer::GenerateIR(
         ir.push_back(side);
     }
 
+    SanitizeIR(ir);
     return ir;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -1472,7 +1658,9 @@ std::vector<RegisterMapping> JITOptimizer::AllocateRegisters(
         return mappings;
     }
 
+    try {
     const uint32_t maxAlloc = std::min(availableHostRegs, static_cast<uint32_t>(kHostAllocRegs.size()));
+    mappings.reserve(maxAlloc);
 
     // Count register usage frequency across the trace
     std::array<uint32_t, kMaxGuestGPR> useCount{};
@@ -1539,14 +1727,58 @@ std::vector<RegisterMapping> JITOptimizer::AllocateRegisters(
     }
 
     return mappings;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
 // Self-Modifying Code Detection
 // ============================================================================
 
+void JITOptimizer::TrackCompiledBlock(GuestAddress start, GuestSize size) noexcept {
+    GuestAddress ignoredEnd = 0;
+    if (!m_impl || !RangeEnd(start, size, ignoredEnd)) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->mutex);
+
+    for (auto& range : m_impl->compiledRanges) {
+        if (range.start == start) {
+            range.size = size;
+            return;
+        }
+    }
+
+    if (m_impl->compiledRanges.size() >= kMaxCompiledRangeEntries) {
+        const size_t halfSize = m_impl->compiledRanges.size() / 2;
+        m_impl->compiledRanges.erase(
+            m_impl->compiledRanges.begin(),
+            m_impl->compiledRanges.begin() + static_cast<ptrdiff_t>(halfSize));
+    }
+
+    m_impl->compiledRanges.push_back({ start, size });
+}
+
+void JITOptimizer::ForgetCompiledBlock(GuestAddress start) noexcept {
+    if (!m_impl || start == 0) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->mutex);
+    const auto removeBegin = std::remove_if(
+        m_impl->compiledRanges.begin(),
+        m_impl->compiledRanges.end(),
+        [start](const BlockRange& range) noexcept {
+            return range.start == start;
+        });
+    m_impl->compiledRanges.erase(removeBegin, m_impl->compiledRanges.end());
+}
+
 void JITOptimizer::OnMemoryWrite(GuestAddress addr, GuestSize size) noexcept {
-    if (!m_impl || size == 0) {
+    GuestAddress writeEnd = 0;
+    if (!m_impl || !RangeEnd(addr, size, writeEnd)) {
         return;
     }
 
@@ -1564,10 +1796,10 @@ void JITOptimizer::OnMemoryWrite(GuestAddress addr, GuestSize size) noexcept {
     // Coalesce with last entry if adjacent or overlapping
     if (!m_impl->writeRanges.empty()) {
         auto& last = m_impl->writeRanges.back();
-        const GuestAddress lastEnd = last.start + last.size;
-        if (addr >= last.start && addr <= lastEnd) {
+        GuestAddress lastEnd = 0;
+        if (RangeEnd(last.start, last.size, lastEnd) && addr >= last.start && addr <= lastEnd) {
             // Overlapping or adjacent — extend
-            const GuestAddress newEnd = std::max(lastEnd, addr + size);
+            const GuestAddress newEnd = std::max(lastEnd, writeEnd);
             last.size = newEnd - last.start;
             return;
         }
@@ -1588,20 +1820,22 @@ std::vector<GuestAddress> JITOptimizer::GetInvalidatedBlocks() const noexcept {
         return result;
     }
 
+    try {
+    result.reserve(std::min(m_impl->compiledRanges.size(), m_impl->writeRanges.size()));
+
     // Check each compiled block against all write ranges
     for (const auto& block : m_impl->compiledRanges) {
-        const GuestAddress blockEnd = block.start + block.size;
-
         for (const auto& wr : m_impl->writeRanges) {
-            const GuestAddress writeEnd = wr.start + wr.size;
-
             // Overlap check: two ranges [a, a+sa) and [b, b+sb) overlap iff
             // a < b+sb && b < a+sa
-            if (block.start < writeEnd && wr.start < blockEnd) {
+            if (RangesOverlap(block.start, block.size, wr.start, wr.size)) {
                 result.push_back(block.start);
                 break; // No need to check more write ranges for this block
             }
         }
+    }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
 
     return result;
