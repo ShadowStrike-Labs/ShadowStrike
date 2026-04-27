@@ -11,8 +11,46 @@
 #include "../CPU.hpp"
 #include "../../../Common/Platform.hpp"
 #include <bit>
+#include <limits>
 
 namespace Phantom {
+
+namespace {
+
+constexpr uint8_t kGprRegisterCount = 16;
+
+[[nodiscard]] bool IsValidGprIndex(uint8_t index) noexcept {
+    return index < kGprRegisterCount;
+}
+
+[[nodiscard]] bool CanAddSignedGuestOffset(
+    GuestAddress base,
+    int64_t offset,
+    GuestAddress& result) noexcept
+{
+    if (offset >= 0) {
+        const auto add = static_cast<GuestAddress>(offset);
+        if (base > (std::numeric_limits<GuestAddress>::max)() - add) {
+            return false;
+        }
+        result = base + add;
+        return true;
+    }
+
+    const auto subtract = static_cast<GuestAddress>(uint64_t{0} - static_cast<uint64_t>(offset));
+    if (base < subtract) {
+        return false;
+    }
+    result = base - subtract;
+    return true;
+}
+
+[[nodiscard]] bool IsValidGprOperand(const DecodedOperand& operand) noexcept {
+    return !operand.IsRegister() ||
+        (operand.reg.regType == RegType::GPR && IsValidGprIndex(operand.reg.regIndex));
+}
+
+} // namespace
 
 ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     uint8_t op = inst.opcode;
@@ -25,6 +63,10 @@ ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& me
     }
 
     if (inst.opcodeMap != OpcodeMap::TwoByte) return ErrorCode::UnimplementedOpcode;
+    if (!inst.HasOperand(0) || !inst.HasOperand(1)) return ErrorCode::InvalidOperandSize;
+    if (!IsValidGprOperand(inst.Op(0)) || !IsValidGprOperand(inst.Op(1))) {
+        return ErrorCode::InvalidOperandSize;
+    }
 
     // === BSF (0F BC) — Bit Scan Forward ===
     if (op == 0xBC && !inst.prefixes.hasRep) {
@@ -100,6 +142,7 @@ ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& me
         uint64_t src = 0;
         auto err = ReadOperand(inst.Op(1), inst, mem, src);
         if (err != ErrorCode::Success) return err;
+        src = MaskToSize(src, size);
 
         uint32_t cnt = 0;
         switch (size) {
@@ -119,6 +162,7 @@ ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& me
         uint64_t src = 0;
         auto err = ReadOperand(inst.Op(1), inst, mem, src);
         if (err != ErrorCode::Success) return err;
+        src = MaskToSize(src, size);
 
         uint32_t cnt = 0;
         switch (size) {
@@ -179,9 +223,11 @@ ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& me
             GuestAddress baseAddr = CalculateEffectiveAddress(inst.Op(0), inst);
             int64_t byteOffset = signedBitIdx >> 3;        // Divide by 8 (arithmetic shift)
             uint8_t bitInByte = static_cast<uint8_t>(signedBitIdx & 7);
-            if (bitInByte < 0) { bitInByte += 8; byteOffset--; }
 
-            GuestAddress effectiveAddr = baseAddr + static_cast<uint64_t>(byteOffset);
+            GuestAddress effectiveAddr = 0;
+            if (!CanAddSignedGuestOffset(baseAddr, byteOffset, effectiveAddr)) {
+                return ErrorCode::AddressOverflow;
+            }
             uint8_t byte = 0;
             err = mem.Read(effectiveAddr, &byte, 1);
             if (err != ErrorCode::Success) return err;
@@ -236,6 +282,10 @@ ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& me
 
 ErrorCode CPU::ExecuteBMI(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     if (!inst.prefixes.hasVEX) return ErrorCode::UnimplementedOpcode;
+    if (!inst.HasOperand(0) || !inst.HasOperand(1)) return ErrorCode::InvalidOperandSize;
+    if (!IsValidGprOperand(inst.Op(0)) || !IsValidGprOperand(inst.Op(1))) {
+        return ErrorCode::InvalidOperandSize;
+    }
 
     const uint8_t op   = inst.opcode;
     const uint8_t pp   = inst.prefixes.vexPP;
@@ -245,6 +295,7 @@ ErrorCode CPU::ExecuteBMI(const DecodedInstruction& inst, VirtualMemory& mem) no
 
     // VEX.vvvv: additional register operand (decoder stores 0-15 directly)
     const uint8_t vvvv = static_cast<uint8_t>(15 - inst.prefixes.vexVVVV);
+    if (!IsValidGprIndex(vvvv)) return ErrorCode::InvalidOperandSize;
 
     // Helper: read GPR source from operand or ModRM r/m
     auto ReadSrc = [&](uint8_t opIdx, uint64_t& val) -> ErrorCode {
@@ -368,7 +419,7 @@ ErrorCode CPU::ExecuteBMI(const DecodedInstruction& inst, VirtualMemory& mem) no
                             is64 ? OperandSize::Size64 : OperandSize::Size32));
 
             uint64_t result = 0;
-            uint64_t k = 0; // Source bit index
+            uint8_t k = 0; // Source bit index
             for (uint8_t i = 0; i < bits && mask != 0; ++i) {
                 if (mask & 1) {
                     if (src & (1ULL << k)) result |= (1ULL << i);
@@ -393,7 +444,7 @@ ErrorCode CPU::ExecuteBMI(const DecodedInstruction& inst, VirtualMemory& mem) no
                             is64 ? OperandSize::Size64 : OperandSize::Size32));
 
             uint64_t result = 0;
-            uint64_t k = 0; // Destination bit index
+            uint8_t k = 0; // Destination bit index
             for (uint8_t i = 0; i < bits && mask != 0; ++i) {
                 if (mask & 1) {
                     if (src & (1ULL << i)) result |= (1ULL << k);
