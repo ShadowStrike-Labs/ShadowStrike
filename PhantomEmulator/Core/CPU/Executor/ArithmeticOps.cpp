@@ -12,12 +12,96 @@
 #include "../CPU.hpp"
 #include "../../../Common/Constants.hpp"
 #include <bit>
+#include <limits>
 
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
 
 namespace Phantom {
+
+namespace {
+
+[[nodiscard]] uint64_t AbsI64ToU64(int64_t value) noexcept {
+    const uint64_t bits = std::bit_cast<uint64_t>(value);
+    return value < 0 ? (uint64_t{0} - bits) : bits;
+}
+
+void AbsSigned128(int64_t high, uint64_t low, uint64_t& magHigh, uint64_t& magLow) noexcept {
+    magHigh = static_cast<uint64_t>(high);
+    magLow = low;
+    if (high < 0) {
+        magHigh = ~magHigh;
+        magLow = ~magLow + 1;
+        if (magLow == 0) {
+            ++magHigh;
+        }
+    }
+}
+
+[[nodiscard]] bool DivUnsigned128By64(
+    uint64_t high,
+    uint64_t low,
+    uint64_t divisor,
+    uint64_t& quotient,
+    uint64_t& remainder) noexcept
+{
+    if (divisor == 0 || high >= divisor) {
+        return false;
+    }
+#ifdef _MSC_VER
+    quotient = _udiv128(high, low, divisor, &remainder);
+#else
+    const auto dividend = (static_cast<__uint128_t>(high) << 64) | low;
+    quotient = static_cast<uint64_t>(dividend / divisor);
+    remainder = static_cast<uint64_t>(dividend % divisor);
+#endif
+    return true;
+}
+
+[[nodiscard]] bool DivSigned128By64(
+    int64_t high,
+    uint64_t low,
+    int64_t divisor,
+    int64_t& quotient,
+    int64_t& remainder) noexcept
+{
+    if (divisor == 0) {
+        return false;
+    }
+
+    uint64_t magHigh = 0;
+    uint64_t magLow = 0;
+    AbsSigned128(high, low, magHigh, magLow);
+
+    const uint64_t divisorMag = AbsI64ToU64(divisor);
+    uint64_t quotientMag = 0;
+    uint64_t remainderMag = 0;
+    if (!DivUnsigned128By64(magHigh, magLow, divisorMag, quotientMag, remainderMag)) {
+        return false;
+    }
+
+    const bool quotientNegative = (high < 0) != (divisor < 0);
+    const uint64_t quotientLimit = quotientNegative
+        ? (uint64_t{1} << 63)
+        : static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
+    if (quotientMag > quotientLimit) {
+        return false;
+    }
+
+    const uint64_t quotientBits = quotientNegative ? (uint64_t{0} - quotientMag) : quotientMag;
+    const uint64_t remainderBits = (high < 0) ? (uint64_t{0} - remainderMag) : remainderMag;
+    quotient = std::bit_cast<int64_t>(quotientBits);
+    remainder = std::bit_cast<int64_t>(remainderBits);
+    return true;
+}
+
+[[nodiscard]] bool SignedMul64Overflow(int64_t low, int64_t high) noexcept {
+    const int64_t expectedHigh = (low < 0) ? int64_t{-1} : int64_t{0};
+    return high != expectedHigh;
+}
+
+} // namespace
 
 // Internal ALU operation identifier
 enum class ALUOp : uint8_t {
@@ -172,7 +256,7 @@ static uint64_t DoALU(ALUOp op, uint64_t a, uint64_t b, OperandSize size,
                 }
                 case OperandSize::Size64: {
                     flags.UpdateSZP64(result);
-                    flags.SetCF(b + carry > a || (carry && b == 0xFFFFFFFFFFFFFFFFULL));
+                    flags.SetCF(b > a || (carry && b == a));
                     flags.SetOF(((a ^ b) & (a ^ result) & 0x8000000000000000ULL) != 0);
                     flags.SetAF(((a ^ b ^ result) & 0x10) != 0);
                     break;
@@ -460,7 +544,7 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                         m_state.SetReg64(GPR::RAX, static_cast<uint64_t>(low));
                         m_state.SetReg64(GPR::RDX, static_cast<uint64_t>(high));
                         // Overflow if high part != sign extension of low
-                        bool overflow = high != (low >> 63);
+                        bool overflow = SignedMul64Overflow(low, high);
 #else
                         __int128_t product = static_cast<__int128_t>(static_cast<int64_t>(m_state.GetReg64(GPR::RAX))) *
                                              static_cast<int64_t>(val);
@@ -541,6 +625,7 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                     case OperandSize::Size8: {
                         int16_t dividend = static_cast<int16_t>(m_state.GetReg16(GPR::RAX));
                         int8_t divisor = static_cast<int8_t>(val);
+                        if (divisor == 0) return ErrorCode::DivideByZero;
                         int16_t quotient = dividend / divisor;
                         if (quotient > 127 || quotient < -128) return ErrorCode::DivideOverflow;
                         m_state.SetReg8(GPR::RAX, static_cast<uint8_t>(quotient));
@@ -552,6 +637,9 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                             (static_cast<uint32_t>(m_state.GetReg16(GPR::RDX)) << 16) |
                             m_state.GetReg16(GPR::RAX));
                         int16_t divisor = static_cast<int16_t>(val);
+                        if (divisor == 0) return ErrorCode::DivideByZero;
+                        if (dividend == (std::numeric_limits<int32_t>::min)() && divisor == -1)
+                            return ErrorCode::DivideOverflow;
                         int32_t quotient = dividend / divisor;
                         if (quotient > 32767 || quotient < -32768) return ErrorCode::DivideOverflow;
                         m_state.SetReg16(GPR::RAX, static_cast<uint16_t>(quotient));
@@ -563,6 +651,9 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                             (static_cast<uint64_t>(m_state.GetReg32(GPR::RDX)) << 32) |
                             m_state.GetReg32(GPR::RAX));
                         int32_t divisor = static_cast<int32_t>(val);
+                        if (divisor == 0) return ErrorCode::DivideByZero;
+                        if (dividend == (std::numeric_limits<int64_t>::min)() && divisor == -1)
+                            return ErrorCode::DivideOverflow;
                         int64_t quotient = dividend / divisor;
                         if (quotient > 2147483647LL || quotient < -2147483648LL)
                             return ErrorCode::DivideOverflow;
@@ -571,28 +662,15 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                         break;
                     }
                     case OperandSize::Size64: {
-#ifdef _MSC_VER
                         int64_t high = static_cast<int64_t>(m_state.GetReg64(GPR::RDX));
                         uint64_t low = m_state.GetReg64(GPR::RAX);
                         int64_t divisor = static_cast<int64_t>(val);
                         int64_t remainder = 0;
-                        int64_t quotient = _div128(high, static_cast<int64_t>(low), divisor, &remainder);
-                        // Overflow check: hardware would #DE, _div128 returns undefined on overflow
-                        // We detect via: if high is not sign extension of low, likely overflow
-                        m_state.SetReg64(GPR::RAX, static_cast<uint64_t>(quotient));
-                        m_state.SetReg64(GPR::RDX, static_cast<uint64_t>(remainder));
-#else
-                        __int128_t dividend = (static_cast<__int128_t>(
-                            static_cast<int64_t>(m_state.GetReg64(GPR::RDX))) << 64) |
-                            m_state.GetReg64(GPR::RAX);
-                        int64_t divisor = static_cast<int64_t>(val);
-                        __int128_t quotient = dividend / divisor;
-                        if (quotient > static_cast<__int128_t>(INT64_MAX) ||
-                            quotient < static_cast<__int128_t>(INT64_MIN))
+                        int64_t quotient = 0;
+                        if (!DivSigned128By64(high, low, divisor, quotient, remainder))
                             return ErrorCode::DivideOverflow;
                         m_state.SetReg64(GPR::RAX, static_cast<uint64_t>(quotient));
-                        m_state.SetReg64(GPR::RDX, static_cast<uint64_t>(dividend % divisor));
-#endif
+                        m_state.SetReg64(GPR::RDX, static_cast<uint64_t>(remainder));
                         break;
                     }
                 }
@@ -644,7 +722,7 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 sImm = static_cast<int64_t>(imm);
                 int64_t low = _mul128(sSrc, sImm, &high);
                 result = static_cast<uint64_t>(low);
-                overflow = high != (low >> 63);
+                overflow = SignedMul64Overflow(low, high);
 #else
                 sSrc = static_cast<int64_t>(src);
                 sImm = static_cast<int64_t>(imm);
@@ -694,7 +772,7 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 int64_t high = 0;
                 int64_t low = _mul128(static_cast<int64_t>(dst), static_cast<int64_t>(src), &high);
                 result = static_cast<uint64_t>(low);
-                overflow = high != (low >> 63);
+                overflow = SignedMul64Overflow(low, high);
 #else
                 __int128_t product = static_cast<__int128_t>(static_cast<int64_t>(dst)) *
                                      static_cast<__int128_t>(static_cast<int64_t>(src));
