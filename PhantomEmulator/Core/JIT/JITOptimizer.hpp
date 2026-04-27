@@ -154,6 +154,8 @@ public:
 
     // === Self-Modifying Code Detection ===
 
+    void TrackCompiledBlock(GuestAddress start, GuestSize size) noexcept;
+    void ForgetCompiledBlock(GuestAddress start) noexcept;
     void OnMemoryWrite(GuestAddress addr, GuestSize size) noexcept;
 
     [[nodiscard]] std::vector<GuestAddress> GetInvalidatedBlocks() const noexcept;
