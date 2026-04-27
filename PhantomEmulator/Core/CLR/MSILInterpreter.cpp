@@ -19,6 +19,7 @@
 
 #include "MSILInterpreter.hpp"
 #include "MetadataParser.hpp"
+#include "MSILDisassembler.hpp"
 #include "CLRTypes.hpp"
 
 #include <algorithm>
@@ -1949,13 +1950,9 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
                 auto [ilBytes, ilSize] = body;
                 if (ilBytes == nullptr || ilSize == 0) continue;
 
-                // We need the disassembler to turn raw bytes into MSILInstruction
-                // vector.  Since MSILDisassembler is a sibling module, the caller
-                // should wrap the body provider to return pre-disassembled instructions.
-                // For raw bytes we cannot proceed — skip silently.
-                // The primary intended call path is Execute() with pre-disassembled
-                // instructions; ExecuteStaticConstructors is a convenience that
-                // requires the caller to wire in a disassembler.
+                const auto instructions = MSILDisassembler::Disassemble(ilBytes, ilSize);
+                if (instructions.empty()) continue;
+                (void)m_impl->Run(instructions, mToken, {});
             }
         }
     } catch (const std::bad_alloc&) {
