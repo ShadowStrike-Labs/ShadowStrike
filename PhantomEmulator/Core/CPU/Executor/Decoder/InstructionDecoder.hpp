@@ -109,6 +109,12 @@ private:
         uint8_t immSize,
         DecodedInstruction& inst) noexcept;
 
+    // Phase 6b: Read address-sized moffs operand for A0-A3.
+    ErrorCode DecodeMemoryOffset(
+        std::span<const uint8_t> bytes,
+        uint32_t& offset,
+        DecodedInstruction& inst) noexcept;
+
     // === Operand decode helpers ===
 
     // Build register operand
@@ -148,6 +154,7 @@ private:
     [[nodiscard]] uint8_t OpcodeImmediateSize(
         OpcodeMap map,
         uint8_t opcode,
+        uint8_t opcodeExt,
         OperandSize opSize) const noexcept;
 
     // Determine the default segment for a memory operand
@@ -163,6 +170,7 @@ private:
     // Standard ModRM r/m, reg encoding (most ALU ops)
     void DecodeModRMOperands(
         DecodedInstruction& inst,
+        CPUMode mode,
         OperandSize regSize,
         OperandSize rmSize,
         bool regIsDst) noexcept;
