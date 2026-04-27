@@ -35,6 +35,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <shared_mutex>
 
 namespace Phantom {
@@ -138,6 +140,14 @@ constexpr uint32_t kFrameCtxOff          = 0x0A0;
 constexpr uint32_t kFrameExPtrsOff       = 0x1A0;
 constexpr uint32_t kTotalFrameSize       = 0x1B0;
 
+[[nodiscard]] bool AddGuestOffset(GuestAddress base, uint64_t offset, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - base < offset) {
+        return false;
+    }
+    result = base + offset;
+    return true;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -226,6 +236,11 @@ struct ExceptionDispatcher::Impl {
         uint32_t numParams,
         const uint64_t* params) noexcept
     {
+        GuestAddress tmp = 0;
+        if (!AddGuestOffset(base, kExRecSize - 1, tmp)) {
+            return ErrorCode::AddressOverflow;
+        }
+
         // Zero the entire record first
         uint8_t zeroes[kExRecSize]{};
         auto ec = mem.Write(base, zeroes, kExRecSize);
@@ -243,14 +258,19 @@ struct ExceptionDispatcher::Impl {
         ec = mem.WriteU64(base + kExRecAddressOff, exceptionAddress);
         if (ec != ErrorCode::Success) return ec;
 
-        const uint32_t safeCount = (numParams > kMaxExceptionParams)
-                                    ? kMaxExceptionParams : numParams;
+        const uint32_t safeCount = (params == nullptr)
+            ? 0
+            : ((numParams > kMaxExceptionParams) ? kMaxExceptionParams : numParams);
 
         ec = mem.WriteU32(base + kExRecNumParamsOff, safeCount);
         if (ec != ErrorCode::Success) return ec;
 
         for (uint32_t i = 0; i < safeCount && params != nullptr; ++i) {
-            ec = mem.WriteU64(base + kExRecInfoOff + i * 8, params[i]);
+            GuestAddress paramAddress = 0;
+            if (!AddGuestOffset(base, kExRecInfoOff + static_cast<uint64_t>(i) * 8, paramAddress)) {
+                return ErrorCode::AddressOverflow;
+            }
+            ec = mem.WriteU64(paramAddress, params[i]);
             if (ec != ErrorCode::Success) return ec;
         }
 
@@ -263,6 +283,11 @@ struct ExceptionDispatcher::Impl {
         GuestAddress base,
         const CPUState& cpu) noexcept
     {
+        GuestAddress tmp = 0;
+        if (!AddGuestOffset(base, kCtxSize - 1, tmp)) {
+            return ErrorCode::AddressOverflow;
+        }
+
         // Zero the context area
         uint8_t zeroes[kCtxSize]{};
         auto ec = mem.Write(base, zeroes, kCtxSize);
@@ -279,15 +304,21 @@ struct ExceptionDispatcher::Impl {
 
         // RAX through RDI (GPR indices 0–7)
         for (uint8_t i = 0; i < 8; ++i) {
-            ec = mem.WriteU64(base + kCtxRaxOff + i * 8,
-                              cpu.GetReg64(static_cast<GPR>(i)));
+            GuestAddress regAddress = 0;
+            if (!AddGuestOffset(base, kCtxRaxOff + static_cast<uint64_t>(i) * 8, regAddress)) {
+                return ErrorCode::AddressOverflow;
+            }
+            ec = mem.WriteU64(regAddress, cpu.GetReg64(static_cast<GPR>(i)));
             if (ec != ErrorCode::Success) return ec;
         }
 
         // R8 through R15 (GPR indices 8–15)
         for (uint8_t i = 0; i < 8; ++i) {
-            ec = mem.WriteU64(base + kCtxR8Off + i * 8,
-                              cpu.GetReg64(static_cast<GPR>(8 + i)));
+            GuestAddress regAddress = 0;
+            if (!AddGuestOffset(base, kCtxR8Off + static_cast<uint64_t>(i) * 8, regAddress)) {
+                return ErrorCode::AddressOverflow;
+            }
+            ec = mem.WriteU64(regAddress, cpu.GetReg64(static_cast<GPR>(8 + i)));
             if (ec != ErrorCode::Success) return ec;
         }
 
@@ -302,6 +333,11 @@ struct ExceptionDispatcher::Impl {
         GuestAddress base,
         CPUState& cpu) noexcept
     {
+        GuestAddress tmp = 0;
+        if (!AddGuestOffset(base, kCtxSize - 1, tmp)) {
+            return ErrorCode::AddressOverflow;
+        }
+
         uint32_t eflags = 0;
         auto ec = mem.ReadU32(base + kCtxEFlagsOff, eflags);
         if (ec != ErrorCode::Success) return ec;
@@ -309,14 +345,22 @@ struct ExceptionDispatcher::Impl {
 
         for (uint8_t i = 0; i < 8; ++i) {
             uint64_t val = 0;
-            ec = mem.ReadU64(base + kCtxRaxOff + i * 8, val);
+            GuestAddress regAddress = 0;
+            if (!AddGuestOffset(base, kCtxRaxOff + static_cast<uint64_t>(i) * 8, regAddress)) {
+                return ErrorCode::AddressOverflow;
+            }
+            ec = mem.ReadU64(regAddress, val);
             if (ec != ErrorCode::Success) return ec;
             cpu.SetReg64(static_cast<GPR>(i), val);
         }
 
         for (uint8_t i = 0; i < 8; ++i) {
             uint64_t val = 0;
-            ec = mem.ReadU64(base + kCtxR8Off + i * 8, val);
+            GuestAddress regAddress = 0;
+            if (!AddGuestOffset(base, kCtxR8Off + static_cast<uint64_t>(i) * 8, regAddress)) {
+                return ErrorCode::AddressOverflow;
+            }
+            ec = mem.ReadU64(regAddress, val);
             if (ec != ErrorCode::Success) return ec;
             cpu.SetReg64(static_cast<GPR>(8 + i), val);
         }
@@ -400,14 +444,24 @@ struct ExceptionDispatcher::Impl {
 
             if (is64) {
                 uint64_t nextVal = 0, handlerVal = 0;
+                GuestAddress handlerAddress = 0;
+                if (!AddGuestOffset(current, 8, handlerAddress)) {
+                    if (recordAbuse) abuse.sehChainCorruption = true;
+                    break;
+                }
                 if (mem.ReadU64(current, nextVal) != ErrorCode::Success) break;
-                if (mem.ReadU64(current + 8, handlerVal) != ErrorCode::Success) break;
+                if (mem.ReadU64(handlerAddress, handlerVal) != ErrorCode::Success) break;
                 next    = nextVal;
                 handler = handlerVal;
             } else {
                 uint32_t nextVal = 0, handlerVal = 0;
+                GuestAddress handlerAddress = 0;
+                if (!AddGuestOffset(current, 4, handlerAddress)) {
+                    if (recordAbuse) abuse.sehChainCorruption = true;
+                    break;
+                }
                 if (mem.ReadU32(current, nextVal) != ErrorCode::Success) break;
-                if (mem.ReadU32(current + 4, handlerVal) != ErrorCode::Success) break;
+                if (mem.ReadU32(handlerAddress, handlerVal) != ErrorCode::Success) break;
                 next    = nextVal;
                 handler = handlerVal;
             }
@@ -445,7 +499,9 @@ struct ExceptionDispatcher::Impl {
             case ExceptionDispatcher::EXCEPTION_SINGLE_STEP:
             case ExceptionDispatcher::EXCEPTION_GUARD_PAGE:
             case ExceptionDispatcher::EXCEPTION_INT_DIVIDE_BY_ZERO:
-                ++abuse.deliberateExceptions;
+                if (abuse.deliberateExceptions < (std::numeric_limits<uint32_t>::max)()) {
+                    ++abuse.deliberateExceptions;
+                }
                 break;
             default:
                 break;
@@ -458,9 +514,13 @@ struct ExceptionDispatcher::Impl {
 // ============================================================================
 
 ExceptionDispatcher::ExceptionDispatcher() noexcept
-    : m_impl(std::make_unique<Impl>())
 {
-    m_impl->vehHandlers.reserve(16);
+    try {
+        m_impl = std::make_unique<Impl>();
+        m_impl->vehHandlers.reserve(Impl::kMaxVEHHandlers);
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    }
 }
 
 ExceptionDispatcher::~ExceptionDispatcher() noexcept = default;
@@ -473,7 +533,7 @@ ExceptionDispatcher& ExceptionDispatcher::operator=(ExceptionDispatcher&&) noexc
 // ============================================================================
 
 void ExceptionDispatcher::AddVEH(GuestAddress handler, bool first) noexcept {
-    if (handler < kMinValidAddress) return;
+    if (!m_impl || handler < kMinValidAddress) return;
 
     std::unique_lock lock(m_impl->mutex);
 
@@ -485,13 +545,22 @@ void ExceptionDispatcher::AddVEH(GuestAddress handler, bool first) noexcept {
     if (it != m_impl->vehHandlers.end()) return;
 
     if (first) {
-        m_impl->vehHandlers.insert(m_impl->vehHandlers.begin(), handler);
+        try {
+            m_impl->vehHandlers.insert(m_impl->vehHandlers.begin(), handler);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     } else {
-        m_impl->vehHandlers.push_back(handler);
+        try {
+            m_impl->vehHandlers.push_back(handler);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     }
 }
 
 void ExceptionDispatcher::RemoveVEH(GuestAddress handler) noexcept {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
 
     auto it = std::find(m_impl->vehHandlers.begin(),
@@ -514,6 +583,9 @@ bool ExceptionDispatcher::DispatchException(
     uint32_t numParams,
     const uint64_t* params) noexcept
 {
+    if (!m_impl) {
+        return false;
+    }
     (void)faultAddress; // Used only indirectly via params for AV exceptions
     m_impl->exceptionsDispatched.fetch_add(1, std::memory_order_relaxed);
 
@@ -529,12 +601,18 @@ bool ExceptionDispatcher::DispatchException(
     const GuestAddress originalRsp = cpu.RSP();
 
     // Align new RSP down to 16-byte boundary after subtracting the frame
-    const GuestAddress newRsp =
-        AlignDown(originalRsp - kTotalFrameSize, 16);
+    if (originalRsp < kTotalFrameSize) {
+        return false;
+    }
+    const GuestAddress newRsp = AlignDown(originalRsp - kTotalFrameSize, 16);
 
     // Validate the guest stack region is writable before committing
+    GuestAddress frameEnd = 0;
+    if (!AddGuestOffset(newRsp, kTotalFrameSize - 1, frameEnd)) {
+        return false;
+    }
     if (!mem.IsAccessible(newRsp, MemProt::Write) ||
-        !mem.IsAccessible(newRsp + kTotalFrameSize - 1, MemProt::Write))
+        !mem.IsAccessible(frameEnd, MemProt::Write))
     {
         // Stack is not writable — cannot build frame.
         // This is itself noteworthy (possible stack overflow or corruption).
@@ -562,7 +640,9 @@ bool ExceptionDispatcher::DispatchException(
     // Write EXCEPTION_POINTERS { &ExceptionRecord, &Context }
     ec = mem.WriteU64(exPtrsAddr, exRecAddr);
     if (ec != ErrorCode::Success) return false;
-    ec = mem.WriteU64(exPtrsAddr + 8, ctxAddr);
+    GuestAddress contextPointerAddress = 0;
+    if (!AddGuestOffset(exPtrsAddr, 8, contextPointerAddress)) return false;
+    ec = mem.WriteU64(contextPointerAddress, ctxAddr);
     if (ec != ErrorCode::Success) return false;
 
     // Commit the new stack pointer so the frame is visible to analysis
@@ -624,6 +704,9 @@ bool ExceptionDispatcher::DispatchFromError(
     ErrorCode error,
     GuestAddress faultAddress) noexcept
 {
+    if (!m_impl) {
+        return false;
+    }
     uint32_t exCode = 0;
     bool continuable = true;
     uint64_t infoParams[2]{};
@@ -694,12 +777,18 @@ bool ExceptionDispatcher::DispatchFromError(
 // ============================================================================
 
 uint32_t ExceptionDispatcher::GetExceptionsDispatched() const noexcept {
+    if (!m_impl) {
+        return 0;
+    }
     return m_impl->exceptionsDispatched.load(std::memory_order_relaxed);
 }
 
 uint32_t ExceptionDispatcher::GetSEHChainDepth(
     CPUState& cpu, VirtualMemory& mem) const noexcept
 {
+    if (!m_impl) {
+        return 0;
+    }
     // Read-only walk (no abuse recording to avoid mutating const-qualified path)
     const bool is64 = cpu.Is64Bit();
     const uint64_t endSentinel = is64 ? kSEHEndOfChain64
@@ -738,6 +827,9 @@ uint32_t ExceptionDispatcher::GetSEHChainDepth(
 }
 
 bool ExceptionDispatcher::DetectedSEHAbuse() const noexcept {
+    if (!m_impl) {
+        return false;
+    }
     return m_impl->HasAnyAbuse();
 }
 
@@ -746,6 +838,9 @@ bool ExceptionDispatcher::DetectedSEHAbuse() const noexcept {
 // ============================================================================
 
 void ExceptionDispatcher::Reset() noexcept {
+    if (!m_impl) {
+        return;
+    }
     std::unique_lock lock(m_impl->mutex);
 
     m_impl->vehHandlers.clear();
