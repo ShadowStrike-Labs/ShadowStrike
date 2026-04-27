@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 namespace Phantom {
 
@@ -82,18 +83,6 @@ public:
     void Reset32() noexcept;
     void Reset64() noexcept;
 
-    // === Snapshot/Restore for analysis ===
-    struct Snapshot {
-        std::array<uint64_t, 16> gpr;
-        uint64_t rip;
-        uint64_t rflags;
-        CPUMode mode;
-        uint64_t instructionCount;
-    };
-
-    [[nodiscard]] Snapshot TakeSnapshot() const noexcept;
-    void RestoreSnapshot(const Snapshot& snap) noexcept;
-
     // ========================================================================
     // General Purpose Registers (GPR)
     // ========================================================================
@@ -101,37 +90,47 @@ public:
     // 16-bit and 8-bit writes preserve upper bits.
     std::array<uint64_t, 16> gpr{};
 
+    [[nodiscard]] static constexpr bool IsValidGpr(GPR reg) noexcept {
+        return static_cast<uint8_t>(reg) < static_cast<uint8_t>(GPR::Count);
+    }
+
+    [[nodiscard]] static constexpr uint8_t GprIndex(GPR reg) noexcept {
+        return static_cast<uint8_t>(reg);
+    }
+
     // Full 64-bit access
     [[nodiscard]] uint64_t GetReg64(GPR reg) const noexcept {
-        return gpr[static_cast<uint8_t>(reg)];
+        return IsValidGpr(reg) ? gpr[GprIndex(reg)] : 0;
     }
     void SetReg64(GPR reg, uint64_t value) noexcept {
-        gpr[static_cast<uint8_t>(reg)] = value;
+        if (IsValidGpr(reg)) { gpr[GprIndex(reg)] = value; }
     }
 
     // 32-bit access (read: truncate; write: zero-extend to 64)
     [[nodiscard]] uint32_t GetReg32(GPR reg) const noexcept {
-        return static_cast<uint32_t>(gpr[static_cast<uint8_t>(reg)]);
+        return static_cast<uint32_t>(GetReg64(reg));
     }
     void SetReg32(GPR reg, uint32_t value) noexcept {
-        gpr[static_cast<uint8_t>(reg)] = value; // zero-extends in 64-bit mode
+        if (IsValidGpr(reg)) { gpr[GprIndex(reg)] = value; } // zero-extends in 64-bit mode
     }
 
     // 16-bit access (read: truncate; write: preserve upper bits)
     [[nodiscard]] uint16_t GetReg16(GPR reg) const noexcept {
-        return static_cast<uint16_t>(gpr[static_cast<uint8_t>(reg)]);
+        return static_cast<uint16_t>(GetReg64(reg));
     }
     void SetReg16(GPR reg, uint16_t value) noexcept {
-        auto& r = gpr[static_cast<uint8_t>(reg)];
+        if (!IsValidGpr(reg)) { return; }
+        auto& r = gpr[GprIndex(reg)];
         r = (r & ~0xFFFFULL) | value;
     }
 
     // 8-bit low access (AL, CL, DL, BL, SPL, BPL, SIL, DIL, R8B-R15B)
     [[nodiscard]] uint8_t GetReg8(GPR reg) const noexcept {
-        return static_cast<uint8_t>(gpr[static_cast<uint8_t>(reg)]);
+        return static_cast<uint8_t>(GetReg64(reg));
     }
     void SetReg8(GPR reg, uint8_t value) noexcept {
-        auto& r = gpr[static_cast<uint8_t>(reg)];
+        if (!IsValidGpr(reg)) { return; }
+        auto& r = gpr[GprIndex(reg)];
         r = (r & ~0xFFULL) | value;
     }
 
@@ -183,7 +182,10 @@ public:
 
     [[nodiscard]] GuestAddress GetRIP() const noexcept { return rip; }
     void SetRIP(GuestAddress addr) noexcept { rip = addr; }
-    void AdvanceRIP(uint32_t bytes) noexcept { rip += bytes; }
+    void AdvanceRIP(uint32_t bytes) noexcept {
+        const uint64_t next = rip + bytes;
+        rip = (next < rip) ? kGuestInvalid : next;
+    }
 
     // ========================================================================
     // EFLAGS / RFLAGS
@@ -195,14 +197,18 @@ public:
     // ========================================================================
     std::array<SegmentDescriptor, 6> segments{};
 
+    [[nodiscard]] static constexpr bool IsValidSegment(SegReg seg) noexcept {
+        return static_cast<uint8_t>(seg) < static_cast<uint8_t>(SegReg::Count);
+    }
+
     [[nodiscard]] const SegmentDescriptor& GetSegment(SegReg seg) const noexcept {
-        return segments[static_cast<uint8_t>(seg)];
+        return segments[IsValidSegment(seg) ? static_cast<uint8_t>(seg) : 0];
     }
     void SetSegmentSelector(SegReg seg, uint16_t selector) noexcept {
-        segments[static_cast<uint8_t>(seg)].selector = selector;
+        if (IsValidSegment(seg)) { segments[static_cast<uint8_t>(seg)].selector = selector; }
     }
     void SetSegmentBase(SegReg seg, uint64_t base) noexcept {
-        segments[static_cast<uint8_t>(seg)].base = base;
+        if (IsValidSegment(seg)) { segments[static_cast<uint8_t>(seg)].base = base; }
     }
 
     // ========================================================================
@@ -276,13 +282,18 @@ public:
     // SSE State (XMM registers + MXCSR)
     // ========================================================================
     std::array<XMMReg, 16> xmm{};
+    XMMReg invalidXmmScratch{};
     uint32_t mxcsr = 0x1F80;   // Default: all exceptions masked
 
+    [[nodiscard]] static constexpr bool IsValidXmmIndex(uint8_t index) noexcept {
+        return index < 16;
+    }
+
     [[nodiscard]] XMMReg& XMM(uint8_t index) noexcept {
-        return xmm[index & 0x0F];
+        return IsValidXmmIndex(index) ? xmm[index] : invalidXmmScratch;
     }
     [[nodiscard]] const XMMReg& XMM(uint8_t index) const noexcept {
-        return xmm[index & 0x0F];
+        return IsValidXmmIndex(index) ? xmm[index] : invalidXmmScratch;
     }
 
     // ========================================================================
@@ -302,49 +313,64 @@ public:
         void Clear() noexcept { std::memset(u8, 0, sizeof(u8)); }
     };
     std::array<ZMMHighReg, 32> zmmHigh{};    // Upper 256 bits of ZMM0-ZMM31
+    std::array<ZMMHighReg, 16> zmm16High{};  // Upper 256 bits for ZMM16-ZMM31
 
     // Opmask registers k0-k7 (64-bit each, width depends on element size)
     std::array<uint64_t, 8> opmask{};
 
+    [[nodiscard]] static constexpr bool IsValidYmmIndex(uint8_t index) noexcept {
+        return index < 16;
+    }
+
+    [[nodiscard]] static constexpr bool IsValidZmmIndex(uint8_t index) noexcept {
+        return index < 32;
+    }
+
     // Get full 512-bit ZMM value (caller provides 64-byte aligned buffer)
     void GetZMM(uint8_t index, void* dst64) const noexcept {
+        if (dst64 == nullptr) { return; }
+        auto* d = static_cast<uint8_t*>(dst64);
         if (index < 16) {
             // ZMM0-15: composed from xmm + ymmHigh + zmmHigh
-            auto* d = static_cast<uint8_t*>(dst64);
             std::memcpy(d, xmm[index].u8, 16);
             std::memcpy(d + 16, ymmHigh[index].u8, 16);
             std::memcpy(d + 32, zmmHigh[index].u8, 32);
         } else if (index < 32) {
-            // ZMM16-31: stored entirely in zmmHigh (no XMM/YMM alias)
-            // Use first 32 bytes from a dedicated slot + zmmHigh upper
-            // For simplicity we store ZMM16-31 entirely in zmmHigh pairs
-            auto* d = static_cast<uint8_t*>(dst64);
+            // ZMM16-31 do not alias XMM/YMM; keep a complete 512-bit image.
             std::memcpy(d, zmmHigh[index].u8, 32);
-            // Upper 256 bits are always zero for ZMM16-31 in this model
-            // (Real APX would extend further — adequate for AVX-512 emulation)
-            std::memset(d + 32, 0, 32);
+            std::memcpy(d + 32, zmm16High[index - 16].u8, 32);
+        } else {
+            std::memset(d, 0, 64);
         }
     }
 
     void SetZMM(uint8_t index, const void* src64) noexcept {
+        if (src64 == nullptr || !IsValidZmmIndex(index)) { return; }
         const auto* s = static_cast<const uint8_t*>(src64);
         if (index < 16) {
             std::memcpy(xmm[index].u8, s, 16);
             std::memcpy(ymmHigh[index].u8, s + 16, 16);
             std::memcpy(zmmHigh[index].u8, s + 32, 32);
-        } else if (index < 32) {
+        } else {
             std::memcpy(zmmHigh[index].u8, s, 32);
+            std::memcpy(zmm16High[index - 16].u8, s + 32, 32);
         }
     }
 
     // Get pointer to full 256-bit YMM value (caller provides 32-byte aligned buffer)
     void GetYMM(uint8_t index, void* dst32) const noexcept {
-        auto idx = index & 0x0F;
+        if (dst32 == nullptr) { return; }
+        if (!IsValidYmmIndex(index)) {
+            std::memset(dst32, 0, 32);
+            return;
+        }
+        const auto idx = index;
         std::memcpy(dst32, xmm[idx].u8, 16);
         std::memcpy(static_cast<uint8_t*>(dst32) + 16, ymmHigh[idx].u8, 16);
     }
     void SetYMM(uint8_t index, const void* src32) noexcept {
-        auto idx = index & 0x0F;
+        if (src32 == nullptr || !IsValidYmmIndex(index)) { return; }
+        const auto idx = index;
         std::memcpy(xmm[idx].u8, src32, 16);
         std::memcpy(ymmHigh[idx].u8, static_cast<const uint8_t*>(src32) + 16, 16);
         // AVX (VEX) zeroes upper ZMM bits
@@ -353,7 +379,9 @@ public:
 
     // Clear upper halves (VEX-encoded 128-bit ops zero the upper YMM bits)
     void ClearYMMHigh(uint8_t index) noexcept {
-        ymmHigh[index & 0x0F].Clear();
+        if (!IsValidYmmIndex(index)) { return; }
+        ymmHigh[index].Clear();
+        zmmHigh[index].Clear();
     }
 
     // ========================================================================
@@ -481,6 +509,47 @@ public:
     // ========================================================================
     uint64_t tsc = 0;
     uint64_t tscIncrement = 25;   // ~25 cycles per instruction at 3.8 GHz
+
+    // === Snapshot/Restore for analysis ===
+    struct Snapshot {
+        std::array<uint64_t, 16> gpr;
+        uint64_t rip;
+        uint64_t rflags;
+        std::array<SegmentDescriptor, 6> segments;
+        uint64_t cr0;
+        uint64_t cr2;
+        uint64_t cr3;
+        uint64_t cr4;
+        uint64_t xcr0;
+        std::array<uint64_t, 4> dr;
+        uint64_t dr6;
+        uint64_t dr7;
+        std::array<FPUReg, 8> fpuStack;
+        uint16_t fpuControl;
+        uint16_t fpuStatus;
+        uint16_t fpuTag;
+        uint16_t fpuOpcode;
+        uint64_t fpuIP;
+        uint64_t fpuDP;
+        int8_t fpuTop;
+        std::array<XMMReg, 16> xmm;
+        XMMReg invalidXmmScratch;
+        uint32_t mxcsr;
+        std::array<XMMReg, 16> ymmHigh;
+        std::array<ZMMHighReg, 32> zmmHigh;
+        std::array<ZMMHighReg, 16> zmm16High;
+        std::array<uint64_t, 8> opmask;
+        CPUMode mode;
+        TileConfig tileConfig;
+        std::array<TileData, 8> tiles;
+        std::shared_ptr<ShadowStackState> shadowStackState;
+        uint64_t instructionCount;
+        uint64_t tsc;
+        uint64_t tscIncrement;
+    };
+
+    [[nodiscard]] Snapshot TakeSnapshot() const;
+    void RestoreSnapshot(const Snapshot& snap) noexcept;
 };
 
 } // namespace Phantom
