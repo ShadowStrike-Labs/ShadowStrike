@@ -37,19 +37,34 @@ enum class ExceptionClauseType : uint32_t {
     Fault     = 0x0004,
 };
 
+/**
+ * @brief ECMA-335 exception handling clause decoded from a method body.
+ *
+ * Offsets and lengths are relative to the IL code stream and are validated to
+ * remain within the decoded method body. Thread safety: immutable value type.
+ */
 struct ExceptionClause {
-    ExceptionClauseType flags;
-    uint32_t tryOffset;
-    uint32_t tryLength;
-    uint32_t handlerOffset;
-    uint32_t handlerLength;
-    uint32_t classTokenOrFilterOffset;
+    ExceptionClauseType flags = ExceptionClauseType::Exception;
+    uint32_t tryOffset = 0;
+    uint32_t tryLength = 0;
+    uint32_t handlerOffset = 0;
+    uint32_t handlerLength = 0;
+    uint32_t classTokenOrFilterOffset = 0;
 };
 
 // ============================================================================
 // MSILDisassembler — Stateless MSIL bytecode decoder
 // ============================================================================
 
+/**
+ * @brief Stateless defensive decoder for ECMA-335 CIL/MSIL method bodies.
+ *
+ * All public functions accept caller-owned byte buffers and validate every
+ * offset, operand size, switch target array, and exception section before
+ * reading. Failure contract: malformed/truncated input returns nullopt, invalid
+ * placeholder instructions, or a result with valid=false; public APIs never
+ * throw. Thread safety: all methods are static and reentrant. IRQL: user-mode.
+ */
 class MSILDisassembler {
 public:
     // Maximum decoded instructions per method body
@@ -58,23 +73,34 @@ public:
     // ---- Method Header Parsing ----
 
     struct MethodBodyInfo {
-        MethodHeaderType headerType;  // Defined in CLRTypes.hpp
-        uint32_t         codeSize;
-        uint16_t         maxStack;
-        uint32_t         localVarSigToken;
-        uint32_t         codeOffset;
-        bool             hasMoreSections;
-        bool             initLocals;
+        MethodHeaderType headerType = MethodHeaderType::TinyFormat;
+        uint32_t         codeSize = 0;
+        uint16_t         maxStack = 0;
+        uint32_t         localVarSigToken = 0;
+        uint32_t         codeOffset = 0;
+        bool             hasMoreSections = false;
+        bool             initLocals = false;
     };
 
+    /**
+     * @brief Parses tiny/fat method body headers.
+     * @return Header info when the body is complete and code bounds are valid.
+     */
     [[nodiscard]] static std::optional<MethodBodyInfo> ParseMethodHeader(
         const uint8_t* body, uint32_t bodySize) noexcept;
 
     // ---- Disassembly ----
 
+    /**
+     * @brief Decodes a raw IL byte stream into bounded MSILInstruction records.
+     * @return Partial decoded stream with invalid sentinel on truncation.
+     */
     [[nodiscard]] static std::vector<MSILInstruction> Disassemble(
         const uint8_t* ilBytes, uint32_t ilSize) noexcept;
 
+    /**
+     * @brief Complete method body disassembly result.
+     */
     struct DisassemblyResult {
         MethodBodyInfo                   header;
         std::vector<MSILInstruction>     instructions;
@@ -82,6 +108,10 @@ public:
         bool                             valid = false;
     };
 
+    /**
+     * @brief Parses a method header, disassembles IL, and extracts EH clauses.
+     * @return valid=false on malformed input or allocation failure.
+     */
     [[nodiscard]] static DisassemblyResult DisassembleMethod(
         const uint8_t* body, uint32_t bodySize) noexcept;
 
