@@ -28,6 +28,9 @@ namespace Phantom {
 // CPU Feature Flags
 // ============================================================================
 
+/**
+ * @brief Immutable host CPU feature snapshot used for SIMD dispatch.
+ */
 struct CPUFeatures {
     bool sse2       = false;
     bool sse41      = false;
@@ -44,14 +47,27 @@ struct CPUFeatures {
 // ============================================================================
 // SIMDEngine — SIMD-Accelerated Analysis Primitives
 // ============================================================================
-// Instantiated per emulation session. Detects host CPU features at construction
-// and dispatches to the best available SIMD path at runtime.
-//
-// Thread safety: all const methods are safe to call concurrently. The object
-// itself is immutable after construction (feature flags are set once).
-
+/**
+ * @brief Host-CPU SIMD accelerated primitives for emulator analysis.
+ *
+ * The engine detects CPU/OS feature support at construction and dispatches to
+ * AVX2/SSE/scalar implementations at runtime. All byte-span inputs must point
+ * to readable memory for their declared length; invalid non-empty null spans
+ * return empty/default results. Expensive heuristic scans are capped internally
+ * to prevent hostile buffers from driving unbounded CPU or allocation work.
+ *
+ * Thread safety: const methods are safe to call concurrently. The object is
+ * immutable after construction. IRQL: user-mode only. Failure contract: public
+ * noexcept APIs do not throw; allocation failure returns empty/default results.
+ */
 class SIMDEngine {
 public:
+    /**
+     * @brief Constructs the engine and records host SIMD feature flags.
+     *
+     * Failure contract: allocation failure leaves the engine feature-disabled;
+     * public APIs continue to return safe empty/default results.
+     */
     SIMDEngine() noexcept;
     ~SIMDEngine() noexcept;
 
@@ -60,79 +76,84 @@ public:
     SIMDEngine(SIMDEngine&&) noexcept;
     SIMDEngine& operator=(SIMDEngine&&) noexcept;
 
-    // ========================================================================
-    // Feature Queries
-    // ========================================================================
-
+    /** @return true when SSE2 is available. */
     [[nodiscard]] bool HasSSE2()       const noexcept;
+    /** @return true when SSE4.1 is available. */
     [[nodiscard]] bool HasSSE41()      const noexcept;
+    /** @return true when SSE4.2 is available. */
     [[nodiscard]] bool HasSSE42()      const noexcept;
+    /** @return true when AVX and OS XSAVE support are available. */
     [[nodiscard]] bool HasAVX()        const noexcept;
+    /** @return true when AVX2 and required OS state support are available. */
     [[nodiscard]] bool HasAVX2()       const noexcept;
+    /** @return true when AES-NI is available. */
     [[nodiscard]] bool HasAESNI()      const noexcept;
+    /** @return true when SHA-NI is available. */
     [[nodiscard]] bool HasSHANI()      const noexcept;
+    /** @return true when PCLMULQDQ is available. */
     [[nodiscard]] bool HasPCLMULQDQ()  const noexcept;
+    /** @return true when BMI1 is available. */
     [[nodiscard]] bool HasBMI1()       const noexcept;
+    /** @return true when BMI2 is available. */
     [[nodiscard]] bool HasBMI2()       const noexcept;
 
+    /** @return Immutable feature snapshot; all false if construction failed. */
     [[nodiscard]] const CPUFeatures& GetFeatures() const noexcept;
 
-    // ========================================================================
-    // Entropy Calculation
-    // ========================================================================
-    // Shannon entropy of the data buffer, in bits per byte [0.0, 8.0].
-    // Uses BuildHistogram internally; SIMD dispatch for the histogram phase.
-
+    /**
+     * @brief Calculates Shannon entropy in bits per byte.
+     * @param data Readable bytes; empty input returns 0.
+     * @return Entropy in [0, 8], or 0 for invalid input.
+     */
     [[nodiscard]] double CalculateEntropy(ByteSpan data) const noexcept;
 
-    // ========================================================================
-    // Byte Frequency Histogram
-    // ========================================================================
-    // Populates a 256-bin histogram from the input data.
-
+    /**
+     * @brief Builds a 256-bin byte-frequency histogram.
+     * @param data Readable bytes; internally capped for uint32_t bin safety.
+     * @param histogram Output bins; reset to zero before population.
+     */
     void BuildHistogram(ByteSpan data,
                         std::array<uint32_t, 256>& histogram) const noexcept;
 
-    // ========================================================================
-    // CRC32C Checksum
-    // ========================================================================
-    // Uses hardware CRC32C (SSE4.2) when available, otherwise a software LUT.
-
+    /**
+     * @brief Computes CRC32C/Castagnoli checksum.
+     * @param data Readable bytes; empty or invalid input returns 0.
+     * @return CRC32C checksum with hardware SSE4.2 dispatch when available.
+     */
     [[nodiscard]] uint32_t CRC32C(ByteSpan data) const noexcept;
 
-    // ========================================================================
-    // Pattern Search (single pattern)
-    // ========================================================================
-    // Returns the offset of the first occurrence of needle in haystack,
-    // or std::nullopt if not found. AVX2 → SSE2 → scalar dispatch.
-
+    /**
+     * @brief Finds the first occurrence of a byte pattern.
+     * @param haystack Readable search bytes; internally capped.
+     * @param needle Readable pattern bytes; empty needle matches offset 0.
+     * @return Offset, or nullopt when not found/invalid.
+     */
     [[nodiscard]] std::optional<size_t> FindPattern(
         ByteSpan haystack, ByteSpan needle) const noexcept;
 
-    // ========================================================================
-    // Multi-Pattern Search
-    // ========================================================================
-    // Returns (offset, pattern_index) pairs for every match of every pattern.
-    // Uses first-byte SIMD filtering then scalar verification.
-
+    /**
+     * @brief Finds bounded occurrences for multiple byte patterns.
+     * @param data Readable search bytes; internally capped.
+     * @param patterns Readable pattern span; invalid/empty patterns are skipped.
+     * @return Bounded (offset, pattern_index) pairs.
+     */
     [[nodiscard]] std::vector<std::pair<size_t, uint32_t>> FindPatterns(
         ByteSpan data,
         std::span<const ByteSpan> patterns) const noexcept;
 
-    // ========================================================================
-    // Memory Compare
-    // ========================================================================
-    // Returns true iff the two spans are identical (same length and content).
-
+    /**
+     * @brief Constant-result memory equality check with SIMD dispatch.
+     * @param a First readable byte span.
+     * @param b Second readable byte span.
+     * @return true when lengths and bytes match; false for invalid non-empty spans.
+     */
     [[nodiscard]] bool MemoryEqual(ByteSpan a, ByteSpan b) const noexcept;
 
-    // ========================================================================
-    // Single-Byte XOR Key Detection
-    // ========================================================================
-    // Tries all 256 XOR keys and returns the most likely one if the decoded
-    // result has a strong printable-ASCII bias. Returns std::nullopt if no
-    // convincing key is found.
-
+    /**
+     * @brief Detects likely single-byte XOR key for ASCII-oriented decoder stubs.
+     * @param data Encoded bytes; internally capped for CPU bounds.
+     * @return Best key when printable/text score is convincing, otherwise nullopt.
+     */
     [[nodiscard]] std::optional<uint8_t> DetectSingleByteXOR(
         ByteSpan data) const noexcept;
 

@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <stdexcept>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -44,7 +46,7 @@ constexpr std::array<uint32_t, 256> BuildCRC32CTable() noexcept {
                 crc >>= 1;
             }
         }
-        table[i] = crc;
+        table.at(i) = crc;
     }
     return table;
 }
@@ -57,6 +59,18 @@ constexpr size_t kMinXORDetectLength    = 16;
 constexpr double kMinPrintableRatio     = 0.70;
 // Minimum ratio advantage over the next-best key
 constexpr double kMinKeyAdvantage       = 0.05;
+constexpr size_t kMaxDirectScanBytes    = 64ULL * 1024ULL * 1024ULL;
+constexpr size_t kMaxXORDetectBytes     = 1ULL * 1024ULL * 1024ULL;
+constexpr size_t kMaxPatternCount       = 65536;
+constexpr size_t kMaxPatternMatches     = 65536;
+
+[[nodiscard]] bool IsValidSpan(ByteSpan data) noexcept {
+    return data.empty() || data.data() != nullptr;
+}
+
+[[nodiscard]] ByteSpan CappedSpan(ByteSpan data) noexcept {
+    return ByteSpan(data.data(), std::min(data.size(), kMaxDirectScanBytes));
+}
 
 } // anonymous namespace
 
@@ -239,7 +253,9 @@ struct SIMDEngine::Impl {
             uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
 
             while (mask != 0) {
-                const uint32_t bit = _tzcnt_u32(mask);
+                unsigned long bitPos = 0;
+                _BitScanForward(&bitPos, mask);
+                const uint32_t bit = static_cast<uint32_t>(bitPos);
                 const size_t candidatePos = i + bit;
 
                 if (candidatePos + needleLen <= haystack.size()) {
@@ -504,8 +520,15 @@ struct SIMDEngine::Impl {
 // ============================================================================
 
 SIMDEngine::SIMDEngine() noexcept
-    : m_impl(std::make_unique<Impl>()) {
-    m_impl->DetectFeatures();
+{
+    try {
+        m_impl = std::make_unique<Impl>();
+        m_impl->DetectFeatures();
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    } catch (const std::length_error&) {
+        m_impl.reset();
+    }
 }
 
 SIMDEngine::~SIMDEngine() noexcept = default;
@@ -517,19 +540,20 @@ SIMDEngine& SIMDEngine::operator=(SIMDEngine&&) noexcept = default;
 // Feature queries
 // ----------------------------------------------------------------------------
 
-bool SIMDEngine::HasSSE2()      const noexcept { return m_impl->features.sse2; }
-bool SIMDEngine::HasSSE41()     const noexcept { return m_impl->features.sse41; }
-bool SIMDEngine::HasSSE42()     const noexcept { return m_impl->features.sse42; }
-bool SIMDEngine::HasAVX()       const noexcept { return m_impl->features.avx; }
-bool SIMDEngine::HasAVX2()      const noexcept { return m_impl->features.avx2; }
-bool SIMDEngine::HasAESNI()     const noexcept { return m_impl->features.aesni; }
-bool SIMDEngine::HasSHANI()     const noexcept { return m_impl->features.shani; }
-bool SIMDEngine::HasPCLMULQDQ() const noexcept { return m_impl->features.pclmulqdq; }
-bool SIMDEngine::HasBMI1()      const noexcept { return m_impl->features.bmi1; }
-bool SIMDEngine::HasBMI2()      const noexcept { return m_impl->features.bmi2; }
+bool SIMDEngine::HasSSE2()      const noexcept { return m_impl && m_impl->features.sse2; }
+bool SIMDEngine::HasSSE41()     const noexcept { return m_impl && m_impl->features.sse41; }
+bool SIMDEngine::HasSSE42()     const noexcept { return m_impl && m_impl->features.sse42; }
+bool SIMDEngine::HasAVX()       const noexcept { return m_impl && m_impl->features.avx; }
+bool SIMDEngine::HasAVX2()      const noexcept { return m_impl && m_impl->features.avx2; }
+bool SIMDEngine::HasAESNI()     const noexcept { return m_impl && m_impl->features.aesni; }
+bool SIMDEngine::HasSHANI()     const noexcept { return m_impl && m_impl->features.shani; }
+bool SIMDEngine::HasPCLMULQDQ() const noexcept { return m_impl && m_impl->features.pclmulqdq; }
+bool SIMDEngine::HasBMI1()      const noexcept { return m_impl && m_impl->features.bmi1; }
+bool SIMDEngine::HasBMI2()      const noexcept { return m_impl && m_impl->features.bmi2; }
 
 const CPUFeatures& SIMDEngine::GetFeatures() const noexcept {
-    return m_impl->features;
+    static constexpr CPUFeatures kNoFeatures{};
+    return m_impl ? m_impl->features : kNoFeatures;
 }
 
 // ----------------------------------------------------------------------------
@@ -538,6 +562,8 @@ const CPUFeatures& SIMDEngine::GetFeatures() const noexcept {
 
 double SIMDEngine::CalculateEntropy(ByteSpan data) const noexcept {
     if (data.empty()) return 0.0;
+    if (!m_impl || !IsValidSpan(data)) return 0.0;
+    data = CappedSpan(data);
 
     std::array<uint32_t, 256> histogram{};
     BuildHistogram(data, histogram);
@@ -550,6 +576,11 @@ double SIMDEngine::CalculateEntropy(ByteSpan data) const noexcept {
 
 void SIMDEngine::BuildHistogram(ByteSpan data,
                                 std::array<uint32_t, 256>& histogram) const noexcept {
+    if (!m_impl || !IsValidSpan(data)) {
+        histogram.fill(0);
+        return;
+    }
+    data = CappedSpan(data);
     m_impl->BuildHistogramScalar(data, histogram);
 }
 
@@ -559,6 +590,7 @@ void SIMDEngine::BuildHistogram(ByteSpan data,
 
 uint32_t SIMDEngine::CRC32C(ByteSpan data) const noexcept {
     if (data.empty()) return 0u;
+    if (!m_impl || !IsValidSpan(data)) return 0u;
 
     if (m_impl->features.sse42) {
         return m_impl->CRC32CHardware(data);
@@ -571,8 +603,10 @@ uint32_t SIMDEngine::CRC32C(ByteSpan data) const noexcept {
 // ----------------------------------------------------------------------------
 
 std::optional<size_t> SIMDEngine::FindPattern(ByteSpan haystack,
-                                              ByteSpan needle) const noexcept {
+                                               ByteSpan needle) const noexcept {
     if (needle.empty()) return 0;
+    if (!m_impl || !IsValidSpan(haystack) || !IsValidSpan(needle)) return std::nullopt;
+    haystack = CappedSpan(haystack);
     if (haystack.size() < needle.size()) return std::nullopt;
 
     if (m_impl->features.avx2) {
@@ -595,24 +629,39 @@ std::vector<std::pair<size_t, uint32_t>> SIMDEngine::FindPatterns(
     std::vector<std::pair<size_t, uint32_t>> results;
 
     if (data.empty() || patterns.empty()) return results;
+    if (!m_impl || !IsValidSpan(data) || patterns.data() == nullptr) return results;
+    data = CappedSpan(data);
+    try {
+        results.reserve(kMaxPatternMatches);
+    } catch (const std::bad_alloc&) {
+        return results;
+    } catch (const std::length_error&) {
+        return results;
+    }
 
     // Guard against pathological inputs
-    constexpr uint32_t kMaxPatterns = 65536;
     const size_t patternCount = (std::min)(patterns.size(),
-                                           static_cast<size_t>(kMaxPatterns));
+                                           kMaxPatternCount);
 
     // Build first-byte lookup: for each possible byte value, which patterns
     // start with it? This avoids O(patterns × data) first-byte checks.
     std::array<std::vector<uint32_t>, 256> firstByteBuckets{};
-    for (size_t pi = 0; pi < patternCount; ++pi) {
-        if (patterns[pi].empty()) continue;
-        firstByteBuckets[patterns[pi][0]].push_back(static_cast<uint32_t>(pi));
+    try {
+        for (size_t pi = 0; pi < patternCount; ++pi) {
+            if (patterns[pi].empty() || !IsValidSpan(patterns[pi])) continue;
+            if (patterns[pi].size() > data.size()) continue;
+            firstByteBuckets[patterns[pi][0]].push_back(static_cast<uint32_t>(pi));
+        }
+    } catch (const std::bad_alloc&) {
+        return results;
+    } catch (const std::length_error&) {
+        return results;
     }
 
     // Determine minimum pattern length for SIMD scanning
     size_t minPatternLen = (std::numeric_limits<size_t>::max)();
     for (size_t pi = 0; pi < patternCount; ++pi) {
-        if (!patterns[pi].empty()) {
+        if (!patterns[pi].empty() && IsValidSpan(patterns[pi]) && patterns[pi].size() <= data.size()) {
             minPatternLen = (std::min)(minPatternLen, patterns[pi].size());
         }
     }
@@ -638,7 +687,9 @@ std::vector<std::pair<size_t, uint32_t>> SIMDEngine::FindPatterns(
                     _mm256_movemask_epi8(cmp));
 
                 while (mask != 0) {
-                    const uint32_t bit = _tzcnt_u32(mask);
+                    unsigned long bitPos = 0;
+                    _BitScanForward(&bitPos, mask);
+                    const uint32_t bit = static_cast<uint32_t>(bitPos);
                     const size_t pos = i + bit;
 
                     for (uint32_t pi : firstByteBuckets[fb]) {
@@ -647,6 +698,7 @@ std::vector<std::pair<size_t, uint32_t>> SIMDEngine::FindPatterns(
                             std::memcmp(&data[pos], pat.data(),
                                         pat.size()) == 0) {
                             results.emplace_back(pos, pi);
+                            if (results.size() >= kMaxPatternMatches) return results;
                         }
                     }
 
@@ -663,6 +715,7 @@ std::vector<std::pair<size_t, uint32_t>> SIMDEngine::FindPatterns(
                 if (i + pat.size() <= data.size() &&
                     std::memcmp(&data[i], pat.data(), pat.size()) == 0) {
                     results.emplace_back(i, pi);
+                    if (results.size() >= kMaxPatternMatches) return results;
                 }
             }
         }
@@ -679,6 +732,7 @@ std::vector<std::pair<size_t, uint32_t>> SIMDEngine::FindPatterns(
             if (i + pat.size() <= data.size() &&
                 std::memcmp(&data[i], pat.data(), pat.size()) == 0) {
                 results.emplace_back(i, pi);
+                if (results.size() >= kMaxPatternMatches) return results;
             }
         }
     }
@@ -693,6 +747,7 @@ std::vector<std::pair<size_t, uint32_t>> SIMDEngine::FindPatterns(
 bool SIMDEngine::MemoryEqual(ByteSpan a, ByteSpan b) const noexcept {
     if (a.size() != b.size()) return false;
     if (a.empty()) return true;
+    if (!m_impl || !IsValidSpan(a) || !IsValidSpan(b)) return false;
 
     if (m_impl->features.avx2) {
         return m_impl->MemoryEqualAVX2(a, b);
@@ -711,29 +766,60 @@ std::optional<uint8_t> SIMDEngine::DetectSingleByteXOR(
     ByteSpan data) const noexcept {
 
     if (data.size() < kMinXORDetectLength) return std::nullopt;
-
-    const auto countPrintable = [&](uint8_t key) -> uint32_t {
-#if defined(_MSC_VER)
-        if (m_impl->features.avx2) {
-            return m_impl->CountPrintableAVX2(data, key);
-        }
-#endif
-        return m_impl->CountPrintableScalar(data, key);
-    };
+    if (!m_impl || !IsValidSpan(data)) return std::nullopt;
+    data = CappedSpan(data);
+    data = ByteSpan(data.data(), std::min(data.size(), kMaxXORDetectBytes));
 
     uint8_t  bestKey       = 0;
     uint32_t bestCount     = 0;
     uint32_t secondBest    = 0;
+    double   bestScore     = -std::numeric_limits<double>::infinity();
+    double   secondScore   = -std::numeric_limits<double>::infinity();
+
+    const auto scoreDecoded = [](uint8_t ch) noexcept -> double {
+        if (ch >= 'a' && ch <= 'z') {
+            switch (ch) {
+            case 'e': case 't': case 'a': case 'o': case 'i': case 'n':
+            case 's': case 'h': case 'r':
+                return 1.55;
+            default:
+                return 1.25;
+            }
+        }
+        if (ch >= 'A' && ch <= 'Z') return 1.15;
+        if (ch >= '0' && ch <= '9') return 0.95;
+        if (ch == ' ') return 1.75;
+        if (ch == '.' || ch == ',' || ch == '-' || ch == '_' || ch == ':' ||
+            ch == ';' || ch == '/' || ch == '\\' || ch == '\'' || ch == '"') {
+            return 0.75;
+        }
+        if (ch == '\r' || ch == '\n' || ch == '\t') return 0.35;
+        if (ch >= 0x20 && ch <= 0x7E) return 0.25;
+        return -2.5;
+    };
 
     // Key 0x00 is identity XOR — skip it (no encoding)
     for (uint32_t key = 1; key < 256; ++key) {
-        const uint32_t count = countPrintable(static_cast<uint8_t>(key));
-        if (count > bestCount) {
+        uint32_t count = 0;
+        double score = 0.0;
+        for (uint8_t byte : data) {
+            const uint8_t decoded = static_cast<uint8_t>(byte ^ static_cast<uint8_t>(key));
+            if ((decoded >= 0x20 && decoded <= 0x7E) ||
+                decoded == '\r' || decoded == '\n' || decoded == '\t') {
+                ++count;
+            }
+            score += scoreDecoded(decoded);
+        }
+
+        if (score > bestScore) {
             secondBest = bestCount;
+            secondScore = bestScore;
             bestCount  = count;
             bestKey    = static_cast<uint8_t>(key);
-        } else if (count > secondBest) {
+            bestScore  = score;
+        } else if (score > secondScore) {
             secondBest = count;
+            secondScore = score;
         }
     }
 
@@ -747,7 +833,13 @@ std::optional<uint8_t> SIMDEngine::DetectSingleByteXOR(
     const double secondRatio = static_cast<double>(secondBest) /
                                static_cast<double>(data.size());
 
-    if (bestRatio - secondRatio < kMinKeyAdvantage) return std::nullopt;
+    const double scoreAdvantage =
+        (bestScore - secondScore) / static_cast<double>(data.size());
+
+    if ((bestRatio - secondRatio < kMinKeyAdvantage) &&
+        scoreAdvantage < kMinKeyAdvantage) {
+        return std::nullopt;
+    }
 
     return bestKey;
 }
