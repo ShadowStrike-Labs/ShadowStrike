@@ -25,6 +25,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -39,8 +42,11 @@ static constexpr uint32_t kDefaultMaxStackDepth    = kMaxEvalStackDepth;    // 1
 static constexpr uint32_t kDefaultMaxCallDepth     = 16;
 static constexpr uint32_t kDefaultMaxArraySize     = 16u * 1024 * 1024;    // 16 MB
 static constexpr uint32_t kDefaultMaxStrings       = kMaxExtractedStrings; // 10 000
+static constexpr uint32_t kDefaultMaxAPICalls      = 50'000;
 static constexpr uint32_t kDefaultMaxArrays        = 1000;
+static constexpr uint32_t kHardMaxArraySize        = 16 * 1024 * 1024;
 static constexpr uint32_t kMinPayloadArraySize     = 16;
+static constexpr uint32_t kMaxTrackedStringLength  = 64 * 1024;
 
 // ============================================================================
 // Forward-declared MetadataParser stub
@@ -62,6 +68,50 @@ static constexpr uint32_t kMinPayloadArraySize     = 16;
 // ============================================================================
 
 namespace {
+
+template <typename T>
+[[nodiscard]] bool ReserveNoThrow(std::vector<T>& values, size_t capacity) noexcept {
+    try {
+        values.reserve(capacity);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+template <typename K, typename V>
+[[nodiscard]] bool ReserveNoThrow(std::unordered_map<K, V>& values, size_t capacity) noexcept {
+    try {
+        values.reserve(capacity);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+[[nodiscard]] uint32_t CheckedNextPc(uint32_t pc) noexcept {
+    return (pc == std::numeric_limits<uint32_t>::max()) ? UINT32_MAX : pc + 1;
+}
+
+[[nodiscard]] bool CheckedAddSignedOffset(
+    uint32_t base,
+    int32_t delta,
+    uint32_t& out) noexcept {
+    if (delta >= 0) {
+        const auto udelta = static_cast<uint32_t>(delta);
+        if (base > std::numeric_limits<uint32_t>::max() - udelta) return false;
+        out = base + udelta;
+        return true;
+    }
+    const auto magnitude = static_cast<uint32_t>(-(static_cast<int64_t>(delta)));
+    if (base < magnitude) return false;
+    out = base - magnitude;
+    return true;
+}
 
 struct TrackedArray {
     std::vector<uint8_t> data;
@@ -228,16 +278,6 @@ struct ResolvedMethod {
            method == "Format";
 }
 
-/// Check if the method/class name appears heavily obfuscated.
-[[nodiscard]] bool LooksObfuscated(std::string_view name) noexcept {
-    if (name.empty()) return false;
-    uint32_t nonAscii = 0;
-    for (char c : name) {
-        if (static_cast<unsigned char>(c) > 127) ++nonAscii;
-    }
-    return nonAscii > name.size() / 2;
-}
-
 } // anonymous namespace
 
 // ============================================================================
@@ -273,6 +313,7 @@ struct MSILInterpreter::Impl {
     uint64_t instrCount     = 0;
     uint32_t currentCallDepth = 0;
     uint32_t peakStackDepth = 0;
+    MetadataToken currentMethodToken{};
     bool     aborted        = false;
     bool     threw          = false;
 
@@ -289,7 +330,15 @@ struct MSILInterpreter::Impl {
             aborted = true;
             return false;
         }
-        evalStack.push_back(val);
+        try {
+            evalStack.push_back(val);
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+            return false;
+        } catch (const std::length_error&) {
+            aborted = true;
+            return false;
+        }
         if (evalStack.size() > peakStackDepth)
             peakStackDepth = static_cast<uint32_t>(evalStack.size());
         return true;
@@ -323,8 +372,19 @@ struct MSILInterpreter::Impl {
     uint32_t TrackString(const std::u16string& s) noexcept {
         if (collectedStrings.size() >= kDefaultMaxStrings)
             return static_cast<uint32_t>(collectedStrings.size() - 1);
+        if (s.size() > kMaxTrackedStringLength) {
+            return static_cast<uint32_t>(collectedStrings.empty() ? 0 : collectedStrings.size() - 1);
+        }
         uint32_t idx = static_cast<uint32_t>(collectedStrings.size());
-        collectedStrings.push_back(s);
+        try {
+            collectedStrings.push_back(s);
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+            return static_cast<uint32_t>(collectedStrings.empty() ? 0 : collectedStrings.size() - 1);
+        } catch (const std::length_error&) {
+            aborted = true;
+            return static_cast<uint32_t>(collectedStrings.empty() ? 0 : collectedStrings.size() - 1);
+        }
         return idx;
     }
 
@@ -341,12 +401,20 @@ struct MSILInterpreter::Impl {
         if (length > maxArraySize) length = maxArraySize;
         if (arrays.size() >= kDefaultMaxArrays)
             return static_cast<uint32_t>(arrays.size() - 1);
-        TrackedArray ta;
-        ta.data.resize(length, 0);
-        ta.elementType = elemType;
-        uint32_t idx = static_cast<uint32_t>(arrays.size());
-        arrays.push_back(std::move(ta));
-        return idx;
+        try {
+            TrackedArray ta;
+            ta.data.resize(length, 0);
+            ta.elementType = elemType;
+            uint32_t idx = static_cast<uint32_t>(arrays.size());
+            arrays.push_back(std::move(ta));
+            return idx;
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+            return static_cast<uint32_t>(arrays.empty() ? 0 : arrays.size() - 1);
+        } catch (const std::length_error&) {
+            aborted = true;
+            return static_cast<uint32_t>(arrays.empty() ? 0 : arrays.size() - 1);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -356,6 +424,8 @@ struct MSILInterpreter::Impl {
                        MetadataToken token,
                        uint32_t ilOffset) noexcept
     {
+        if (collectedAPICalls.size() >= kDefaultMaxAPICalls) return;
+        try {
         DotNetAPICall call{};
         call.category       = ClassifyAPI(rm.nameSpace, rm.className, rm.methodName);
         call.className      = rm.nameSpace.empty()
@@ -367,6 +437,11 @@ struct MSILInterpreter::Impl {
         call.resolvedTarget = call.className + "::" + rm.methodName;
 
         collectedAPICalls.push_back(std::move(call));
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+        } catch (const std::length_error&) {
+            aborted = true;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -407,7 +482,17 @@ struct MSILInterpreter::Impl {
                     const auto& ref = memberRefs[row - 1];
                     rm.methodName = ref.name;
                     // Resolve the class via the coded index token
-                    MetadataToken parentTok{ ref.classCodedIndex };
+                    const uint32_t tag = ref.classCodedIndex & 0x07u;
+                    const uint32_t parentRow = ref.classCodedIndex >> 3;
+                    MetadataToken parentTok{};
+                    switch (tag) {
+                    case 0: parentTok = MetadataToken::Make(MetadataTableId::TypeDef, parentRow); break;
+                    case 1: parentTok = MetadataToken::Make(MetadataTableId::TypeRef, parentRow); break;
+                    case 2: parentTok = MetadataToken::Make(MetadataTableId::ModuleRef, parentRow); break;
+                    case 3: parentTok = MetadataToken::Make(MetadataTableId::MethodDef, parentRow); break;
+                    case 4: parentTok = MetadataToken::Make(MetadataTableId::TypeSpec, parentRow); break;
+                    default: break;
+                    }
                     std::string resolved = metadata.ResolveToken(parentTok);
                     // Split "Namespace.ClassName" into parts
                     auto lastDot = resolved.rfind('.');
@@ -426,8 +511,10 @@ struct MSILInterpreter::Impl {
                 }
             }
 
-        } catch (...) {
-            // Never propagate — hostile IL is expected.
+        } catch (const std::bad_alloc&) {
+            return {};
+        } catch (const std::length_error&) {
+            return {};
         }
         return rm;
     }
@@ -437,9 +524,18 @@ struct MSILInterpreter::Impl {
     // ------------------------------------------------------------------
     void BuildOffsetMap(const std::vector<MSILInstruction>& instructions) noexcept {
         offsetToIndex.clear();
-        offsetToIndex.reserve(instructions.size());
-        for (uint32_t i = 0; i < static_cast<uint32_t>(instructions.size()); ++i) {
-            offsetToIndex[instructions[i].offset] = i;
+        if (!ReserveNoThrow(offsetToIndex, instructions.size())) {
+            aborted = true;
+            return;
+        }
+        try {
+            for (uint32_t i = 0; i < static_cast<uint32_t>(instructions.size()); ++i) {
+                offsetToIndex[instructions[i].offset] = i;
+            }
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+        } catch (const std::length_error&) {
+            aborted = true;
         }
     }
 
@@ -449,15 +545,30 @@ struct MSILInterpreter::Impl {
         return UINT32_MAX;
     }
 
+    [[nodiscard]] bool EnsureVectorSize(std::vector<ILValue>& values, uint32_t count) noexcept {
+        try {
+            values.resize(count);
+            return true;
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+            return false;
+        } catch (const std::length_error&) {
+            aborted = true;
+            return false;
+        }
+    }
+
     // ------------------------------------------------------------------
     // Compute absolute branch target
     // ------------------------------------------------------------------
     [[nodiscard]] uint32_t ComputeBranchTarget(
         const MSILInstruction& instr) const noexcept
     {
-        // Target = (offset + size) + branchOffset
-        return instr.offset + instr.size +
-               static_cast<uint32_t>(instr.operand.branchOffset);
+        uint32_t base = 0;
+        if (instr.offset > std::numeric_limits<uint32_t>::max() - instr.size) return UINT32_MAX;
+        base = instr.offset + instr.size;
+        uint32_t target = 0;
+        return CheckedAddSignedOffset(base, instr.operand.branchOffset, target) ? target : UINT32_MAX;
     }
 
     // ------------------------------------------------------------------
@@ -467,12 +578,18 @@ struct MSILInterpreter::Impl {
         std::string_view method,
         const std::vector<ILValue>& methodArgs) noexcept
     {
+        try {
         // We simulate basic operations on tracked strings.
         if (method == "Concat") {
             std::u16string result;
             for (const auto& a : methodArgs) {
-                if (a.type == ILValueType::String)
-                    result += GetTrackedString(a.ref);
+                if (a.type == ILValueType::String) {
+                    const auto& piece = GetTrackedString(a.ref);
+                    if (piece.size() > kMaxTrackedStringLength - std::min(result.size(), static_cast<size_t>(kMaxTrackedStringLength))) {
+                        return {};
+                    }
+                    result += piece;
+                }
             }
             return result;
         }
@@ -486,6 +603,10 @@ struct MSILInterpreter::Impl {
                 if (!old_s.empty()) {
                     std::u16string::size_type pos = 0;
                     while ((pos = s.find(old_s, pos)) != std::u16string::npos) {
+                        if (new_s.size() > old_s.size() &&
+                            s.size() > kMaxTrackedStringLength - (new_s.size() - old_s.size())) {
+                            return {};
+                        }
                         s.replace(pos, old_s.size(), new_s);
                         pos += new_s.size();
                     }
@@ -497,9 +618,11 @@ struct MSILInterpreter::Impl {
             if (methodArgs[0].type == ILValueType::String &&
                 methodArgs[1].type == ILValueType::Int32) {
                 const auto& base = GetTrackedString(methodArgs[0].ref);
+                if (methodArgs[1].i32 < 0) return {};
                 auto start = static_cast<size_t>(methodArgs[1].i32);
                 if (start < base.size()) {
                     if (methodArgs.size() >= 3 && methodArgs[2].type == ILValueType::Int32) {
+                        if (methodArgs[2].i32 < 0) return {};
                         auto len = static_cast<size_t>(methodArgs[2].i32);
                         return base.substr(start, len);
                     }
@@ -532,6 +655,13 @@ struct MSILInterpreter::Impl {
             return s.substr(l, r - l + 1);
         }
         return {};
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+            return {};
+        } catch (const std::length_error&) {
+            aborted = true;
+            return {};
+        }
     }
 
     // ------------------------------------------------------------------
@@ -665,7 +795,7 @@ struct MSILInterpreter::Impl {
             ILValue val;
             if (!Pop(val)) return UINT32_MAX;
             uint32_t idx = static_cast<uint32_t>(op) - static_cast<uint32_t>(MSILOpcode::Stloc_0);
-            if (idx >= locals.size()) locals.resize(idx + 1);
+            if (idx >= locals.size() && !EnsureVectorSize(locals, idx + 1)) return UINT32_MAX;
             locals[idx] = val;
             return pc + 1;
         }
@@ -674,7 +804,7 @@ struct MSILInterpreter::Impl {
             ILValue val;
             if (!Pop(val)) return UINT32_MAX;
             uint32_t idx = instr.operand.varIndex8;
-            if (idx >= locals.size()) locals.resize(idx + 1);
+            if (idx >= locals.size() && !EnsureVectorSize(locals, idx + 1)) return UINT32_MAX;
             locals[idx] = val;
             return pc + 1;
         }
@@ -683,7 +813,7 @@ struct MSILInterpreter::Impl {
             ILValue val;
             if (!Pop(val)) return UINT32_MAX;
             uint32_t idx = instr.operand.varIndex16;
-            if (idx >= locals.size()) locals.resize(idx + 1);
+            if (idx >= locals.size() && !EnsureVectorSize(locals, idx + 1)) return UINT32_MAX;
             locals[idx] = val;
             return pc + 1;
         }
@@ -746,7 +876,7 @@ struct MSILInterpreter::Impl {
             ILValue val;
             if (!Pop(val)) return UINT32_MAX;
             uint32_t idx = instr.operand.varIndex8;
-            if (idx >= args.size()) args.resize(idx + 1);
+            if (idx >= args.size() && !EnsureVectorSize(args, idx + 1)) return UINT32_MAX;
             args[idx] = val;
             return pc + 1;
         }
@@ -755,7 +885,7 @@ struct MSILInterpreter::Impl {
             ILValue val;
             if (!Pop(val)) return UINT32_MAX;
             uint32_t idx = instr.operand.varIndex16;
-            if (idx >= args.size()) args.resize(idx + 1);
+            if (idx >= args.size() && !EnsureVectorSize(args, idx + 1)) return UINT32_MAX;
             args[idx] = val;
             return pc + 1;
         }
@@ -797,9 +927,9 @@ struct MSILInterpreter::Impl {
             ILValue v;
             if (!Pop(v)) return UINT32_MAX;
             if (v.type == ILValueType::Int32)
-                v.i32 = -v.i32;
+                v.i32 = static_cast<int32_t>(0u - static_cast<uint32_t>(v.i32));
             else if (v.type == ILValueType::Int64)
-                v.i64 = -v.i64;
+                v.i64 = static_cast<int64_t>(0ull - static_cast<uint64_t>(v.i64));
             else if (v.type == ILValueType::Float64)
                 v.f64 = -v.f64;
             if (!Push(v)) return UINT32_MAX;
@@ -1038,9 +1168,16 @@ struct MSILInterpreter::Impl {
             auto idx = static_cast<uint32_t>(v.AsInteger());
             if (idx < static_cast<uint32_t>(instr.switchTargets.size())) {
                 // Switch target offsets are relative to the end of the switch instruction
+                if (instr.offset > std::numeric_limits<uint32_t>::max() - instr.size) {
+                    aborted = true;
+                    return UINT32_MAX;
+                }
                 uint32_t baseOffset = instr.offset + instr.size;
-                uint32_t target     = baseOffset +
-                                      static_cast<uint32_t>(instr.switchTargets[idx]);
+                uint32_t target = 0;
+                if (!CheckedAddSignedOffset(baseOffset, instr.switchTargets[idx], target)) {
+                    aborted = true;
+                    return UINT32_MAX;
+                }
                 uint32_t tgtIdx     = FindInstructionIndex(target);
                 if (tgtIdx == UINT32_MAX) { aborted = true; return UINT32_MAX; }
                 return tgtIdx;
@@ -1059,8 +1196,12 @@ struct MSILInterpreter::Impl {
                 // MetadataParser::ReadUserString returns std::u16string.
                 // We rely on a const-reference method.
                 s = ReadUserStringFromMetadata(usToken);
-            } catch (...) {
-                // Hostile IL — swallow.
+            } catch (const std::bad_alloc&) {
+                aborted = true;
+                return UINT32_MAX;
+            } catch (const std::length_error&) {
+                aborted = true;
+                return UINT32_MAX;
             }
             uint32_t sIdx = TrackString(s);
             if (!Push(ILValue::MakeString(sIdx))) return UINT32_MAX;
@@ -1150,12 +1291,18 @@ struct MSILInterpreter::Impl {
                     // Sign-extend for signed variants
                     if (op == MSILOpcode::Ldelem_I1)
                         elem = static_cast<int32_t>(static_cast<int8_t>(arr.data[idx]));
-                    else if (op == MSILOpcode::Ldelem_I2)
-                        elem = static_cast<int32_t>(static_cast<int16_t>(
-                            idx + 1 < arr.data.size()
-                                ? static_cast<uint16_t>(arr.data[idx]) |
-                                  (static_cast<uint16_t>(arr.data[idx + 1]) << 8)
-                                : arr.data[idx]));
+                    else if (op == MSILOpcode::Ldelem_I2) {
+                        uint16_t word = static_cast<uint16_t>(arr.data[idx]);
+                        if (idx + 1 < arr.data.size()) {
+                            word = static_cast<uint16_t>(
+                                word | (static_cast<uint16_t>(arr.data[idx + 1]) << 8));
+                        }
+                        elem = static_cast<int32_t>(static_cast<int16_t>(word));
+                    } else if (op == MSILOpcode::Ldelem_U2 && idx + 1 < arr.data.size()) {
+                        elem = static_cast<int32_t>(
+                            static_cast<uint16_t>(arr.data[idx]) |
+                            (static_cast<uint16_t>(arr.data[idx + 1]) << 8));
+                    }
                 }
             }
             if (op == MSILOpcode::Ldelem_I8) {
@@ -1410,50 +1557,54 @@ struct MSILInterpreter::Impl {
         int64_t ia = a.AsInteger();
         int64_t ib = b.AsInteger();
         int64_t result = 0;
-
-        bool isUnsigned =
-            (op == MSILOpcode::Div_Un || op == MSILOpcode::Rem_Un ||
-             op == MSILOpcode::Shr_Un || op == MSILOpcode::Add_Ovf_Un ||
-             op == MSILOpcode::Sub_Ovf_Un || op == MSILOpcode::Mul_Ovf_Un);
+        const auto ua = static_cast<uint64_t>(ia);
+        const auto ub = static_cast<uint64_t>(ib);
+        const auto shift = static_cast<unsigned>(ub & 63u);
 
         switch (op) {
             case MSILOpcode::Add: case MSILOpcode::Add_Ovf: case MSILOpcode::Add_Ovf_Un:
-                result = ia + ib; break;
+                result = static_cast<int64_t>(ua + ub); break;
             case MSILOpcode::Sub: case MSILOpcode::Sub_Ovf: case MSILOpcode::Sub_Ovf_Un:
-                result = ia - ib; break;
+                result = static_cast<int64_t>(ua - ub); break;
             case MSILOpcode::Mul: case MSILOpcode::Mul_Ovf: case MSILOpcode::Mul_Ovf_Un:
-                result = ia * ib; break;
+                result = static_cast<int64_t>(ua * ub); break;
             case MSILOpcode::Div:
                 if (ib == 0) { result = 0; }
+                else if (ia == std::numeric_limits<int64_t>::min() && ib == -1) {
+                    result = std::numeric_limits<int64_t>::min();
+                }
                 else { result = ia / ib; }
                 break;
             case MSILOpcode::Div_Un:
                 if (ib == 0) { result = 0; }
-                else { result = static_cast<int64_t>(
-                           static_cast<uint64_t>(ia) / static_cast<uint64_t>(ib)); }
+                else { result = static_cast<int64_t>(ua / ub); }
                 break;
             case MSILOpcode::Rem:
                 if (ib == 0) { result = 0; }
+                else if (ia == std::numeric_limits<int64_t>::min() && ib == -1) {
+                    result = 0;
+                }
                 else { result = ia % ib; }
                 break;
             case MSILOpcode::Rem_Un:
                 if (ib == 0) { result = 0; }
-                else { result = static_cast<int64_t>(
-                           static_cast<uint64_t>(ia) % static_cast<uint64_t>(ib)); }
+                else { result = static_cast<int64_t>(ua % ub); }
                 break;
             case MSILOpcode::And:
-                result = ia & ib; break;
+                result = static_cast<int64_t>(ua & ub); break;
             case MSILOpcode::Or:
-                result = ia | ib; break;
+                result = static_cast<int64_t>(ua | ub); break;
             case MSILOpcode::Xor:
-                result = ia ^ ib; break;
+                result = static_cast<int64_t>(ua ^ ub); break;
             case MSILOpcode::Shl:
-                result = ia << (ib & 63); break;
+                result = static_cast<int64_t>(ua << shift); break;
             case MSILOpcode::Shr:
-                result = ia >> (ib & 63); break;
+                result = ia >= 0
+                    ? static_cast<int64_t>(ua >> shift)
+                    : static_cast<int64_t>(~((~ua) >> shift));
+                break;
             case MSILOpcode::Shr_Un:
-                result = static_cast<int64_t>(
-                    static_cast<uint64_t>(ia) >> (ib & 63)); break;
+                result = static_cast<int64_t>(ua >> shift); break;
             default: break;
         }
 
@@ -1501,7 +1652,9 @@ struct MSILInterpreter::Impl {
         // We invoke it through the const reference.
         try {
             return metadata.ReadUserString(usToken);
-        } catch (...) {
+        } catch (const std::bad_alloc&) {
+            return {};
+        } catch (const std::length_error&) {
             return {};
         }
     }
@@ -1518,41 +1671,39 @@ struct MSILInterpreter::Impl {
         // Record API call
         RecordAPICall(rm, tok, instr.offset);
 
-        // Check for obfuscated names
-        if (LooksObfuscated(rm.className) || LooksObfuscated(rm.methodName)) {
-            DotNetAPICall obfCall{};
-            obfCall.category       = DotNetAPICategory::Unknown;
-            obfCall.className      = rm.className;
-            obfCall.methodName     = rm.methodName;
-            obfCall.token          = tok;
-            obfCall.ilOffset       = instr.offset;
-            obfCall.resolvedTarget = rm.className + "::" + rm.methodName;
-            // Classified separately for obfuscation tracking
-        }
-
         // Determine argument count (approximate: pop based on what's available)
         // For string methods, we collect args for simulation
         bool isStrMethod = IsStringMethod(rm.className, rm.methodName);
 
         // Attempt recursive interpretation for local MethodDef calls
         if (rm.isLocal && bodyProvider && currentCallDepth < maxCallDepth) {
-            auto [ilBytes, ilSize] = bodyProvider(tok.raw);
-            if (ilBytes != nullptr && ilSize > 0) {
-                // This requires disassembling the IL first.
-                // Since MSILDisassembler is a sibling module, we skip recursive
-                // interpretation here unless pre-disassembled instructions are
-                // cached.  In practice the Execute() entry point is called with
-                // pre-disassembled instructions, so recursion would require the
-                // caller to wire in a disassembler callback too.
-                // For now: pop args and push Null.
+            try {
+                auto [ilBytes, ilSize] = bodyProvider(tok.raw);
+                if (ilBytes != nullptr && ilSize > 0) {
+                    // This requires disassembling the IL first.
+                    // Since MSILDisassembler is a sibling module, we skip recursive
+                    // interpretation here unless pre-disassembled instructions are
+                    // cached.  In practice the Execute() entry point is called with
+                    // pre-disassembled instructions, so recursion would require the
+                    // caller to wire in a disassembler callback too.
+                    // For now: pop args and push Null.
+                }
+            } catch (...) {
+                // DESIGN: MethodBodyProvider is caller-owned plugin code. It is an
+                // exception boundary, so arbitrary callback failures abort this run
+                // instead of escaping a noexcept interpreter path.
+                aborted = true;
+                return UINT32_MAX;
             }
         }
 
         // Handle string methods specially
         if (isStrMethod) {
+            try {
             // Collect arguments from stack for simulation
             // String.Concat can have 2-4 args; we pop until non-string or stack empty
             std::vector<ILValue> strArgs;
+            strArgs.reserve(4);
             if (rm.methodName == "Concat") {
                 // Pop all consecutive string values (up to 4)
                 for (int i = 0; i < 4 && !evalStack.empty(); ++i) {
@@ -1605,6 +1756,13 @@ struct MSILInterpreter::Impl {
                 }
             }
             return pc + 1;
+            } catch (const std::bad_alloc&) {
+                aborted = true;
+                return UINT32_MAX;
+            } catch (const std::length_error&) {
+                aborted = true;
+                return UINT32_MAX;
+            }
         }
 
         // For newobj: push an ObjectRef
@@ -1631,12 +1789,23 @@ struct MSILInterpreter::Impl {
         // Reset per-execution state
         evalStack.clear();
         locals.clear();
-        locals.resize(256); // Pre-allocate generous local space
-        args = methodArgs;
+        args.clear();
+        arrays.clear();
+        stringTable.clear();
+        aborted = false;
+        try {
+            locals.resize(256); // Pre-allocate generous local space
+            args = methodArgs;
+        } catch (const std::bad_alloc&) {
+            aborted = true;
+        } catch (const std::length_error&) {
+            aborted = true;
+        }
         instrCount     = 0;
+        currentCallDepth = 0;
         peakStackDepth = 0;
-        aborted        = false;
         threw          = false;
+        currentMethodToken = methodToken;
 
         BuildOffsetMap(instructions);
 
@@ -1649,15 +1818,33 @@ struct MSILInterpreter::Impl {
         for (auto& arr : arrays) {
             if (arr.modified && arr.data.size() >= kMinPayloadArraySize) {
                 if (collectedArrays.size() < kDefaultMaxArrays) {
-                    collectedArrays.push_back(arr.data);
+                    try {
+                        collectedArrays.push_back(arr.data);
+                    } catch (const std::bad_alloc&) {
+                        aborted = true;
+                        break;
+                    } catch (const std::length_error&) {
+                        aborted = true;
+                        break;
+                    }
                 }
             }
         }
 
         InterpretationResult result;
-        result.decryptedStrings      = collectedStrings;
-        result.apiCalls              = collectedAPICalls;
-        result.extractedArrays       = collectedArrays;
+        try {
+            result.decryptedStrings      = collectedStrings;
+            result.apiCalls              = collectedAPICalls;
+            result.extractedArrays       = collectedArrays;
+        } catch (const std::bad_alloc&) {
+            result.decryptedStrings.clear();
+            result.apiCalls.clear();
+            result.extractedArrays.clear();
+        } catch (const std::length_error&) {
+            result.decryptedStrings.clear();
+            result.apiCalls.clear();
+            result.extractedArrays.clear();
+        }
         result.instructionsExecuted  = instrCount;
         result.maxStackDepthReached  = peakStackDepth;
         result.callDepthReached      = currentCallDepth;
@@ -1674,8 +1861,12 @@ struct MSILInterpreter::Impl {
 // ============================================================================
 
 MSILInterpreter::MSILInterpreter(const MetadataParser& metadata) noexcept
-    : m_impl(std::make_unique<Impl>(metadata))
 {
+    try {
+        m_impl = std::make_unique<Impl>(metadata);
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    }
 }
 
 MSILInterpreter::~MSILInterpreter() noexcept = default;
@@ -1684,7 +1875,12 @@ MSILInterpreter::MSILInterpreter(MSILInterpreter&&) noexcept = default;
 MSILInterpreter& MSILInterpreter::operator=(MSILInterpreter&&) noexcept = default;
 
 void MSILInterpreter::SetMethodBodyProvider(MethodBodyProvider provider) noexcept {
-    if (m_impl) m_impl->bodyProvider = std::move(provider);
+    if (!m_impl) return;
+    try {
+        m_impl->bodyProvider = std::move(provider);
+    } catch (const std::bad_alloc&) {
+        m_impl->bodyProvider = {};
+    }
 }
 
 InterpretationResult MSILInterpreter::Execute(
@@ -1703,7 +1899,12 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
 {
     if (!m_impl) return {};
 
-    m_impl->bodyProvider = std::move(bodyProvider);
+    try {
+        m_impl->bodyProvider = std::move(bodyProvider);
+    } catch (const std::bad_alloc&) {
+        m_impl->bodyProvider = {};
+        return {};
+    }
 
     // Iterate all TypeDef rows in the assembly, find methods named ".cctor",
     // fetch their IL bytes via the body provider, and execute them.
@@ -1737,7 +1938,15 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
                 // Fetch IL body
                 MetadataToken mToken = MetadataToken::Make(MetadataTableId::MethodDef, mRow);
                 if (!m_impl->bodyProvider) continue;
-                auto [ilBytes, ilSize] = m_impl->bodyProvider(mToken.raw);
+                std::pair<const uint8_t*, uint32_t> body{};
+                try {
+                    body = m_impl->bodyProvider(mToken.raw);
+                } catch (...) {
+                    // DESIGN: caller-supplied body providers are an exception
+                    // boundary; one bad provider result must not escape noexcept.
+                    continue;
+                }
+                auto [ilBytes, ilSize] = body;
                 if (ilBytes == nullptr || ilSize == 0) continue;
 
                 // We need the disassembler to turn raw bytes into MSILInstruction
@@ -1749,13 +1958,25 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
                 // requires the caller to wire in a disassembler.
             }
         }
-    } catch (...) {
-        // Hostile metadata — return partial results
+    } catch (const std::bad_alloc&) {
+        // Allocation pressure is reported as a partial result rather than crossing noexcept.
+    } catch (const std::length_error&) {
+        // Hostile metadata can expose impossible row ranges; return partial results.
     }
 
-    aggregated.decryptedStrings     = m_impl->collectedStrings;
-    aggregated.apiCalls             = m_impl->collectedAPICalls;
-    aggregated.extractedArrays      = m_impl->collectedArrays;
+    try {
+        aggregated.decryptedStrings     = m_impl->collectedStrings;
+        aggregated.apiCalls             = m_impl->collectedAPICalls;
+        aggregated.extractedArrays      = m_impl->collectedArrays;
+    } catch (const std::bad_alloc&) {
+        aggregated.decryptedStrings.clear();
+        aggregated.apiCalls.clear();
+        aggregated.extractedArrays.clear();
+    } catch (const std::length_error&) {
+        aggregated.decryptedStrings.clear();
+        aggregated.apiCalls.clear();
+        aggregated.extractedArrays.clear();
+    }
     aggregated.instructionsExecuted = m_impl->instrCount;
     aggregated.maxStackDepthReached = m_impl->peakStackDepth;
     aggregated.callDepthReached     = m_impl->currentCallDepth;
@@ -1763,16 +1984,16 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
 }
 
 void MSILInterpreter::SetMaxInstructions(uint64_t max) noexcept {
-    if (m_impl) m_impl->maxInstructions = max;
+    if (m_impl) m_impl->maxInstructions = std::clamp<uint64_t>(max, 1, kMaxInterpretedInstr);
 }
 void MSILInterpreter::SetMaxStackDepth(uint32_t max) noexcept {
-    if (m_impl) m_impl->maxStackDepth = max;
+    if (m_impl) m_impl->maxStackDepth = std::clamp<uint32_t>(max, 1, kMaxEvalStackDepth);
 }
 void MSILInterpreter::SetMaxCallDepth(uint32_t max) noexcept {
-    if (m_impl) m_impl->maxCallDepth = max;
+    if (m_impl) m_impl->maxCallDepth = std::clamp<uint32_t>(max, 1, kMaxCallDepth);
 }
 void MSILInterpreter::SetMaxArraySize(uint32_t max) noexcept {
-    if (m_impl) m_impl->maxArraySize = max;
+    if (m_impl) m_impl->maxArraySize = std::clamp<uint32_t>(max, 1, kHardMaxArraySize);
 }
 
 const std::vector<std::u16string>& MSILInterpreter::GetDecryptedStrings() const noexcept {
