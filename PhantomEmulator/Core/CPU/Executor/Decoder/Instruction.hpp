@@ -12,8 +12,13 @@
 #include "../../../../Common/Constants.hpp"
 #include <cstdint>
 #include <array>
+#include <cstddef>
+#include <limits>
 
 namespace Phantom {
+
+static constexpr uint8_t kMaxDecodedOperands = 3;
+static constexpr uint8_t kInvalidRegisterIndex = 0xFF;
 
 // ============================================================================
 // Opcode Identifier
@@ -66,6 +71,14 @@ enum class RegType : uint8_t {
 // Decoded Operand
 // ============================================================================
 
+/**
+ * @brief One decoded x86/x64 operand.
+ *
+ * The active union member is selected by `type`. Decoder builders fully
+ * initialize the selected member before publishing an operand to executor code.
+ * Thread safety: value type; caller owns synchronization. IRQL: user-mode only.
+ * Failure contract: default construction and Clear() produce OperandType::None.
+ */
 struct DecodedOperand {
     OperandType type = OperandType::None;
     OperandSize size = OperandSize::Size32;
@@ -98,7 +111,19 @@ struct DecodedOperand {
         } rel;
     };
 
-    DecodedOperand() noexcept { std::memset(this, 0, sizeof(*this)); }
+    constexpr DecodedOperand() noexcept
+        : type(OperandType::None)
+        , size(OperandSize::Size32)
+        , imm{0, false}
+    {
+    }
+
+    void Clear() noexcept {
+        type = OperandType::None;
+        size = OperandSize::Size32;
+        imm.value = 0;
+        imm.isSigned = false;
+    }
 
     [[nodiscard]] bool IsRegister() const noexcept { return type == OperandType::Register; }
     [[nodiscard]] bool IsMemory() const noexcept { return type == OperandType::Memory; }
@@ -189,6 +214,15 @@ struct InstructionPrefixes {
 // This is what the decoder produces and the executor consumes.
 // Must be compact for cache efficiency (target: ≤128 bytes).
 
+/**
+ * @brief Fully decoded instruction consumed by the CPU executor.
+ *
+ * The decoder never stores pointers into attacker-controlled byte streams; all
+ * fields are copied, sign-extended where required, and bounded to the x86/x64
+ * 15-byte maximum instruction length. Thread safety: value type. IRQL:
+ * user-mode only. Failure contract: Clear() resets the object to a safe empty
+ * instruction before a decode attempt.
+ */
 struct DecodedInstruction {
     // Opcode identification
     OpcodeMap    opcodeMap   = OpcodeMap::OneByte;
@@ -199,7 +233,7 @@ struct DecodedInstruction {
     InstructionPrefixes prefixes;
 
     // Operands (max 3: dst, src1, src2)
-    std::array<DecodedOperand, 3> operands;
+    std::array<DecodedOperand, kMaxDecodedOperands> operands;
     uint8_t operandCount = 0;
 
     // Effective sizes (resolved from prefixes + mode)
@@ -228,14 +262,21 @@ struct DecodedInstruction {
         *this = DecodedInstruction{};
     }
 
+    [[nodiscard]] bool HasOperand(uint8_t i) const noexcept {
+        return i < operandCount && i < operands.size();
+    }
+
     [[nodiscard]] const DecodedOperand& Op(uint8_t i) const noexcept {
-        return operands[i];
+        return operands[(i < operands.size()) ? i : (operands.size() - 1)];
     }
     [[nodiscard]] DecodedOperand& Op(uint8_t i) noexcept {
-        return operands[i];
+        return operands[(i < operands.size()) ? i : (operands.size() - 1)];
     }
 
     [[nodiscard]] GuestAddress NextRIP() const noexcept {
+        if (address > (std::numeric_limits<GuestAddress>::max)() - length) {
+            return kGuestInvalid;
+        }
         return address + length;
     }
 };
