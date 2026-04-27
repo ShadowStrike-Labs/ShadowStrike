@@ -38,17 +38,18 @@ namespace Phantom::CLR {
 // ============================================================================
 // MetadataParser — One instance per .NET assembly analysis
 // ============================================================================
-//
-// Usage:
-//   MetadataParser parser;
-//   if (parser.Parse(memory, imageBase)) {
-//       for (auto& td : parser.GetTypeDefs()) { ... }
-//       for (auto& md : parser.GetMethodDefs()) { ... }
-//   }
-//
-// Thread safety: NOT thread-safe. Each analysis thread should use its own
-// parser instance. The VirtualMemory reference is only used during Parse().
-
+/**
+ * @brief Defensive ECMA-335 metadata parser for guest .NET PE images.
+ *
+ * The parser copies bounded metadata streams from VirtualMemory, validates all
+ * offsets/counts/index widths before use, and exposes capped table/heap views
+ * for downstream MSIL and .NET behavior analysis.
+ *
+ * Thread safety: not thread-safe; use one parser per analysis thread. The
+ * VirtualMemory reference is only used during Parse(). IRQL: user-mode only.
+ * Failure contract: Parse() and public noexcept readers return false/empty
+ * results on corrupt metadata or allocation failure, leaving parser state reset.
+ */
 class MetadataParser {
 public:
     MetadataParser() noexcept = default;
@@ -63,11 +64,16 @@ public:
     // Core API
     // ========================================================================
 
-    /// Parse .NET metadata from a PE loaded at imageBase in guest memory.
-    /// Returns false if the PE is not a .NET assembly or metadata is corrupt.
+    /**
+     * @brief Parses .NET metadata from a PE loaded at imageBase in guest memory.
+     * @param memory Guest virtual memory containing the mapped PE image.
+     * @param imageBase Guest image base address.
+     * @return true when CLR metadata was parsed successfully; false for native,
+     * truncated, malformed, or resource-exhaustion cases.
+     */
     [[nodiscard]] bool Parse(VirtualMemory& memory, GuestAddress imageBase) noexcept;
 
-    /// Check if parsing succeeded and this is a valid .NET assembly.
+    /** @return true after a successful Parse() call. */
     [[nodiscard]] bool IsValid() const noexcept;
 
     // ========================================================================
@@ -96,26 +102,44 @@ public:
     // Heap Access
     // ========================================================================
 
-    /// Read a null-terminated UTF-8 string from the #Strings heap.
+    /**
+     * @brief Reads a null-terminated UTF-8 string from #Strings.
+     * @return Empty string for offset 0, out-of-range offsets, or allocation failure.
+     */
     [[nodiscard]] std::string ReadString(uint32_t heapOffset) const noexcept;
 
-    /// Read a UTF-16LE user string from the #US heap (compressed-length prefix).
+    /**
+     * @brief Reads a UTF-16LE user string from #US with compressed-length prefix.
+     * @return Empty string for malformed length encodings, odd byte counts, or caps.
+     */
     [[nodiscard]] std::u16string ReadUserString(uint32_t heapOffset) const noexcept;
 
-    /// Read a blob from the #Blob heap (compressed-length prefix).
+    /**
+     * @brief Reads a bounded blob from #Blob with compressed-length prefix.
+     * @return Empty vector for malformed lengths, zero-length blobs, or caps.
+     */
     [[nodiscard]] std::vector<uint8_t> ReadBlob(uint32_t heapOffset) const noexcept;
 
     // ========================================================================
     // Resolution Helpers
     // ========================================================================
 
-    /// Resolve a metadata token to a human-readable "Namespace.Type::Method" name.
+    /**
+     * @brief Resolves a metadata token to "Namespace.Type::Method" style text.
+     * @return Empty string if the token is invalid, unresolved, or allocation fails.
+     */
     [[nodiscard]] std::string ResolveToken(MetadataToken token) const noexcept;
 
-    /// Get the guest address of a MethodDef IL body (imageBase + RVA).
+    /**
+     * @brief Gets the guest address of a MethodDef IL body as imageBase + RVA.
+     * @return nullopt for invalid method indexes, abstract/extern methods, or overflow.
+     */
     [[nodiscard]] std::optional<GuestAddress> GetMethodBodyAddress(uint32_t methodIndex) const noexcept;
 
-    /// Enumerate all user strings from the #US heap.
+    /**
+     * @brief Enumerates bounded user strings from the #US heap.
+     * @return Parsed UTF-16 strings, capped by kMaxParsedStrings.
+     */
     [[nodiscard]] std::vector<std::u16string> GetAllUserStrings() const noexcept;
 
 private:

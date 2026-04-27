@@ -17,6 +17,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom::CLR {
 
@@ -177,7 +180,10 @@ struct BufferCursor {
     }
 
     uint32_t ReadIndex(uint8_t indexSize) noexcept {
-        return (indexSize == 4) ? ReadU32() : static_cast<uint32_t>(ReadU16());
+        if (indexSize == 2) return static_cast<uint32_t>(ReadU16());
+        if (indexSize == 4) return ReadU32();
+        ok = false;
+        return 0;
     }
 
     void Skip(uint32_t count) noexcept {
@@ -188,10 +194,21 @@ struct BufferCursor {
 
 // Overflow-safe imageBase + rva
 [[nodiscard]] bool SafeAddRVA(GuestAddress base, uint32_t rva, GuestAddress& out) noexcept {
-    uint64_t result = base + static_cast<uint64_t>(rva);
-    if (result < base) return false;
-    out = result;
+    const uint64_t delta = static_cast<uint64_t>(rva);
+    if (base > std::numeric_limits<GuestAddress>::max() - delta) return false;
+    out = base + delta;
     return true;
+}
+
+[[nodiscard]] bool ReserveRows(auto& rows, uint32_t cap) noexcept {
+    try {
+        rows.reserve(cap);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 // Count set bits in a 64-bit mask
@@ -301,7 +318,10 @@ bool MetadataParser::Parse(VirtualMemory& memory, GuestAddress imageBase) noexce
 
         m_valid = true;
         return true;
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        Reset();
+        return false;
+    } catch (const std::length_error&) {
         Reset();
         return false;
     }
@@ -448,7 +468,7 @@ bool MetadataParser::ParseMetadataBlob(VirtualMemory& mem) {
         std::string name;
     };
     std::vector<StreamInfo> streams;
-    streams.reserve(m_metadataRoot.streamCount);
+    if (!ReserveRows(streams, m_metadataRoot.streamCount)) return false;
 
     for (uint16_t i = 0; i < m_metadataRoot.streamCount; ++i) {
         StreamInfo si{};
@@ -461,9 +481,15 @@ bool MetadataParser::ParseMetadataBlob(VirtualMemory& mem) {
         const auto* nameStart = reinterpret_cast<const char*>(cur.data + cur.pos);
         uint32_t nameRemaining = cur.size - cur.pos;
         uint32_t nameLen = 0;
-        while (nameLen < nameRemaining && nameLen < kMaxStreamNameLength && nameStart[nameLen] != '\0')
+        bool foundTerminator = false;
+        while (nameLen < nameRemaining && nameLen < kMaxStreamNameLength) {
+            if (nameStart[nameLen] == '\0') {
+                foundTerminator = true;
+                break;
+            }
             ++nameLen;
-        if (nameLen >= nameRemaining) return false;
+        }
+        if (!foundTerminator) return false;
         si.name.assign(nameStart, nameLen);
 
         // Advance past name + null + padding to 4-byte boundary
@@ -566,12 +592,13 @@ uint8_t MetadataParser::CodedIdxSize(
     const MetadataTableId* tables, uint8_t tableCount, uint8_t tagBits) const noexcept
 {
     uint32_t maxRows = 0;
+    if (tables == nullptr || tableCount == 0 || tagBits >= 16) return 4;
     for (uint8_t i = 0; i < tableCount; ++i) {
         auto tid = static_cast<uint8_t>(tables[i]);
         if (tid < kMaxMetadataTables)
             maxRows = std::max(maxRows, m_rowCounts[tid]);
     }
-    uint32_t maxFit = 1u << (16 - tagBits);
+    uint32_t maxFit = 1u << (16u - tagBits);
     return (maxRows < maxFit) ? 2 : 4;
 }
 
@@ -665,6 +692,7 @@ bool MetadataParser::ComputeTableRowSizes() noexcept {
     for (uint8_t i = 0; i < kMaxMetadataTables; ++i) {
         totalBytes += static_cast<uint64_t>(m_rowCounts[i]) * m_tableRowSizes[i];
     }
+    if (m_tableDataOffset > m_tildeData.size()) return false;
     uint64_t available = m_tildeData.size() - m_tableDataOffset;
     if (totalBytes > available) return false;
 
@@ -697,7 +725,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::TypeRef: {
             uint32_t cap = std::min(rows, kMaxParsedTypes);
-            m_typeRefs.reserve(cap);
+            if (!ReserveRows(m_typeRefs, cap)) return false;
             for (uint32_t r = 0; r < rows; ++r) {
                 TypeRefRow row{};
                 row.resolutionScope = cur.ReadIndex(m_resolutionScopeSize);
@@ -714,7 +742,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::TypeDef: {
             uint32_t cap = std::min(rows, kMaxParsedTypes);
-            m_typeDefs.reserve(cap);
+            if (!ReserveRows(m_typeDefs, cap)) return false;
             uint8_t fieldIdxSz  = SimpleIdxSize(T::Field);
             uint8_t methodIdxSz = SimpleIdxSize(T::MethodDef);
             for (uint32_t r = 0; r < rows; ++r) {
@@ -736,7 +764,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::MethodDef: {
             uint32_t cap = std::min(rows, kMaxParsedMethods);
-            m_methodDefs.reserve(cap);
+            if (!ReserveRows(m_methodDefs, cap)) return false;
             uint8_t paramIdxSz = SimpleIdxSize(T::Param);
             for (uint32_t r = 0; r < rows; ++r) {
                 MethodDefRow row{};
@@ -757,7 +785,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::MemberRef: {
             uint32_t cap = std::min(rows, kMaxMemberRefs);
-            m_memberRefs.reserve(cap);
+            if (!ReserveRows(m_memberRefs, cap)) return false;
             for (uint32_t r = 0; r < rows; ++r) {
                 MemberRefRow row{};
                 row.classCodedIndex = cur.ReadIndex(m_memberRefParentSize);
@@ -774,7 +802,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::ModuleRef: {
             uint32_t cap = std::min(rows, kMaxModuleRefs);
-            m_moduleRefs.reserve(cap);
+            if (!ReserveRows(m_moduleRefs, cap)) return false;
             for (uint32_t r = 0; r < rows; ++r) {
                 ModuleRefRow row{};
                 row.name = ReadStringHeap(cur.ReadIndex(S));
@@ -789,7 +817,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::ImplMap: {
             uint32_t cap = std::min(rows, kMaxImplMaps);
-            m_implMaps.reserve(cap);
+            if (!ReserveRows(m_implMaps, cap)) return false;
             uint8_t modRefSz = SimpleIdxSize(T::ModuleRef);
             for (uint32_t r = 0; r < rows; ++r) {
                 ImplMapRow row{};
@@ -808,7 +836,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::FieldRVA: {
             uint32_t cap = std::min(rows, kMaxFieldRVAs);
-            m_fieldRVAs.reserve(cap);
+            if (!ReserveRows(m_fieldRVAs, cap)) return false;
             uint8_t fieldSz = SimpleIdxSize(T::Field);
             for (uint32_t r = 0; r < rows; ++r) {
                 FieldRVARow row{};
@@ -845,7 +873,7 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         case T::AssemblyRef: {
             uint32_t cap = std::min(rows, kMaxAssemblyRefs);
-            m_assemblyRefs.reserve(cap);
+            if (!ReserveRows(m_assemblyRefs, cap)) return false;
             for (uint32_t r = 0; r < rows; ++r) {
                 AssemblyRefRow row{};
                 row.majorVersion       = cur.ReadU16();
@@ -868,7 +896,8 @@ bool MetadataParser::ParseAllTables() {
         // ================================================================
         default: {
             uint64_t skipBytes = static_cast<uint64_t>(rows) * rowSize;
-            if (skipBytes > (cur.size - cur.pos)) return false;
+            if (skipBytes > std::numeric_limits<uint32_t>::max()) return false;
+            if (!cur.CanRead(static_cast<uint32_t>(skipBytes))) return false;
             cur.Skip(static_cast<uint32_t>(skipBytes));
             break;
         }
@@ -897,7 +926,9 @@ std::string MetadataParser::ReadStringHeap(uint32_t offset) const {
 std::string MetadataParser::ReadString(uint32_t heapOffset) const noexcept {
     try {
         return ReadStringHeap(heapOffset);
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
         return {};
     }
 }
@@ -932,43 +963,50 @@ std::u16string MetadataParser::ReadUserString(uint32_t heapOffset) const noexcep
     try {
         if (heapOffset == 0 || heapOffset >= m_usHeap.size()) return {};
 
-    const uint8_t* ptr = m_usHeap.data() + heapOffset;
-    uint32_t remaining = static_cast<uint32_t>(m_usHeap.size()) - heapOffset;
+        const uint8_t* ptr = m_usHeap.data() + heapOffset;
+        uint32_t remaining = static_cast<uint32_t>(m_usHeap.size()) - heapOffset;
 
-    uint32_t headerSize = 0;
-    uint32_t length = DecodeBlobLength(ptr, remaining, headerSize);
-    if (headerSize == 0 || length == 0) return {};
-    if (length > remaining - headerSize) return {};
-    if (length > kMaxUserStringReadLen) return {};
+        uint32_t headerSize = 0;
+        uint32_t length = DecodeBlobLength(ptr, remaining, headerSize);
+        if (headerSize == 0 || length == 0) return {};
+        if (length > remaining - headerSize) return {};
+        if (length > kMaxUserStringReadLen) return {};
 
-    // The blob contains UTF-16LE chars followed by a 1-byte terminal flag
-    const uint8_t* strData = ptr + headerSize;
-    uint32_t charBytes = (length >= 1) ? (length - 1) : 0;
-    uint32_t charCount = charBytes / 2;
-    if (charCount == 0) return {};
+        // The blob contains UTF-16LE chars followed by a 1-byte terminal flag.
+        const uint8_t* strData = ptr + headerSize;
+        uint32_t charBytes = (length >= 1) ? (length - 1) : 0;
+        if ((charBytes % 2u) != 0) return {};
+        uint32_t charCount = charBytes / 2;
+        if (charCount == 0) return {};
 
-    std::u16string result(charCount, u'\0');
-    std::memcpy(result.data(), strData, charCount * 2);
-    return result;
-    } catch (...) {
+        std::u16string result(charCount, u'\0');
+        std::memcpy(result.data(), strData, charCount * 2);
+        return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
         return {};
     }
-}std::vector<uint8_t> MetadataParser::ReadBlob(uint32_t heapOffset) const noexcept {
+}
+
+std::vector<uint8_t> MetadataParser::ReadBlob(uint32_t heapOffset) const noexcept {
     try {
         if (heapOffset >= m_blobHeap.size()) return {};
 
-    const uint8_t* ptr = m_blobHeap.data() + heapOffset;
-    uint32_t remaining = static_cast<uint32_t>(m_blobHeap.size()) - heapOffset;
+        const uint8_t* ptr = m_blobHeap.data() + heapOffset;
+        uint32_t remaining = static_cast<uint32_t>(m_blobHeap.size()) - heapOffset;
 
-    uint32_t headerSize = 0;
-    uint32_t length = DecodeBlobLength(ptr, remaining, headerSize);
-    if (headerSize == 0) return {};
-    if (length == 0) return {};
-    if (length > remaining - headerSize) return {};
-    if (length > kMaxBlobReadLength) return {};
+        uint32_t headerSize = 0;
+        uint32_t length = DecodeBlobLength(ptr, remaining, headerSize);
+        if (headerSize == 0) return {};
+        if (length == 0) return {};
+        if (length > remaining - headerSize) return {};
+        if (length > kMaxBlobReadLength) return {};
 
-    return std::vector<uint8_t>(ptr + headerSize, ptr + headerSize + length);
-    } catch (...) {
+        return std::vector<uint8_t>(ptr + headerSize, ptr + headerSize + length);
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
         return {};
     }
 }
@@ -1058,7 +1096,9 @@ std::string MetadataParser::ResolveToken(MetadataToken token) const noexcept {
     default:
         return {};
     }
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
         return {};
     }
 }
@@ -1086,6 +1126,7 @@ std::vector<std::u16string> MetadataParser::GetAllUserStrings() const noexcept {
     try {
     std::vector<std::u16string> result;
     if (m_usHeap.size() <= 1) return result;
+    if (!ReserveRows(result, kMaxExtractedStrings)) return result;
 
     // #US heap starts with a 0x00 byte (empty entry), iterate from offset 1
     uint32_t offset = 1;
@@ -1100,7 +1141,9 @@ std::vector<std::u16string> MetadataParser::GetAllUserStrings() const noexcept {
         if (headerSize == 0) break;
 
         // Extract this user string if non-empty
-        if (length > 0 && length <= remaining - headerSize) {
+        if (length > remaining - headerSize) break;
+
+        if (length > 0) {
             auto str = ReadUserString(offset);
             if (!str.empty())
                 result.push_back(std::move(str));
@@ -1113,7 +1156,9 @@ std::vector<std::u16string> MetadataParser::GetAllUserStrings() const noexcept {
     }
 
     return result;
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::length_error&) {
         return {};
     }
 }
