@@ -15,19 +15,59 @@ namespace Phantom {
 // Max iterations per REP to avoid infinite loops in emulation
 static constexpr uint64_t kMaxRepIterations = 16 * 1024 * 1024; // 16M
 
+namespace {
+
+[[nodiscard]] bool IsStringOpcode(uint8_t op) noexcept {
+    return op == 0xA4 || op == 0xA5 || op == 0xA6 || op == 0xA7 ||
+           op == 0xAA || op == 0xAB || op == 0xAC || op == 0xAD ||
+           op == 0xAE || op == 0xAF;
+}
+
+[[nodiscard]] bool IsByteStringOpcode(uint8_t op) noexcept {
+    return op == 0xA4 || op == 0xA6 || op == 0xAA || op == 0xAC || op == 0xAE;
+}
+
+[[nodiscard]] bool IsSupportedStringSize(OperandSize size) noexcept {
+    return size == OperandSize::Size8 ||
+           size == OperandSize::Size16 ||
+           size == OperandSize::Size32 ||
+           size == OperandSize::Size64;
+}
+
+[[nodiscard]] uint64_t AddressMask(AddressSize size) noexcept {
+    switch (size) {
+        case AddressSize::Addr16: return 0xFFFFull;
+        case AddressSize::Addr32: return 0xFFFFFFFFull;
+        case AddressSize::Addr64: return 0xFFFFFFFFFFFFFFFFull;
+        default: return 0;
+    }
+}
+
+[[nodiscard]] uint64_t AdvanceStringIndex(uint64_t value, AddressSize addressSize, uint32_t bytes, bool decrement) noexcept {
+    const uint64_t mask = AddressMask(addressSize);
+    return decrement ? ((value - bytes) & mask) : ((value + bytes) & mask);
+}
+
+} // namespace
+
 ErrorCode CPU::ExecuteString(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
+    if (inst.opcodeMap != OpcodeMap::OneByte) return ErrorCode::UnimplementedOpcode;
+
     uint8_t op = inst.opcode;
+    if (!IsStringOpcode(op)) return ErrorCode::UnimplementedOpcode;
+    if (inst.prefixes.hasRep && inst.prefixes.hasRepNE) return ErrorCode::InvalidPrefix;
+
     OperandSize elemSize = inst.operandSize;
 
     // For string ops with 0xA4/0xA5 the operand size selects byte/word/dword/qword
     // 0xA4/0xAA/0xAC/0xA6/0xAE = byte variants (force Size8)
-    if (op == 0xA4 || op == 0xA6 || op == 0xAA || op == 0xAC || op == 0xAE) {
+    if (IsByteStringOpcode(op)) {
         elemSize = OperandSize::Size8;
     }
+    if (!IsSupportedStringSize(elemSize)) return ErrorCode::InvalidOperandSize;
 
     uint32_t byteCount = static_cast<uint32_t>(elemSize);
-    int64_t delta = m_state.eflags.DF() ? -static_cast<int64_t>(byteCount)
-                                         : static_cast<int64_t>(byteCount);
+    const bool decrement = m_state.eflags.DF();
 
     bool hasRep   = inst.prefixes.hasRep;
     bool hasRepNE = inst.prefixes.hasRepNE;
@@ -83,11 +123,11 @@ ErrorCode CPU::ExecuteString(const DecodedInstruction& inst, VirtualMemory& mem)
             err = mem.Write(GetDI(), &val, byteCount);
             if (err != ErrorCode::Success) return err;
 
-            SetSI(GetSI() + delta);
-            SetDI(GetDI() + delta);
+            SetSI(AdvanceStringIndex(GetSI(), inst.addressSize, byteCount, decrement));
+            SetDI(AdvanceStringIndex(GetDI(), inst.addressSize, byteCount, decrement));
+            if (isRep) SetCount(GetCount() - 1);
         }
 
-        if (isRep) SetCount(GetCount() - iterations);
         return ErrorCode::Success;
     }
 
@@ -101,10 +141,10 @@ ErrorCode CPU::ExecuteString(const DecodedInstruction& inst, VirtualMemory& mem)
         for (uint64_t i = 0; i < iterations; i++) {
             auto err = mem.Write(GetDI(), &val, byteCount);
             if (err != ErrorCode::Success) return err;
-            SetDI(GetDI() + delta);
+            SetDI(AdvanceStringIndex(GetDI(), inst.addressSize, byteCount, decrement));
+            if (isRep) SetCount(GetCount() - 1);
         }
 
-        if (isRep) SetCount(GetCount() - iterations);
         return ErrorCode::Success;
     }
 
@@ -118,12 +158,12 @@ ErrorCode CPU::ExecuteString(const DecodedInstruction& inst, VirtualMemory& mem)
         for (uint64_t i = 0; i < iterations; i++) {
             auto err = mem.Read(GetSI(), &val, byteCount);
             if (err != ErrorCode::Success) return err;
-            SetSI(GetSI() + delta);
+            SetSI(AdvanceStringIndex(GetSI(), inst.addressSize, byteCount, decrement));
+            if (isRep) SetCount(GetCount() - 1);
         }
         // Only last value is written to AL/AX/EAX/RAX
         m_state.SetRegBySize(GPR::RAX, val, elemSize);
 
-        if (isRep) SetCount(GetCount() - iterations);
         return ErrorCode::Success;
     }
 
@@ -152,8 +192,8 @@ ErrorCode CPU::ExecuteString(const DecodedInstruction& inst, VirtualMemory& mem)
                     m_state.eflags.UpdateFlagsSub64(a, b, diff); break;
             }
 
-            SetSI(GetSI() + delta);
-            SetDI(GetDI() + delta);
+            SetSI(AdvanceStringIndex(GetSI(), inst.addressSize, byteCount, decrement));
+            SetDI(AdvanceStringIndex(GetDI(), inst.addressSize, byteCount, decrement));
 
             if (isRep) {
                 SetCount(GetCount() - 1);
@@ -190,7 +230,7 @@ ErrorCode CPU::ExecuteString(const DecodedInstruction& inst, VirtualMemory& mem)
                     m_state.eflags.UpdateFlagsSub64(accum, val, diff); break;
             }
 
-            SetDI(GetDI() + delta);
+            SetDI(AdvanceStringIndex(GetDI(), inst.addressSize, byteCount, decrement));
 
             if (isRep) {
                 SetCount(GetCount() - 1);
