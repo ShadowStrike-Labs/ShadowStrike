@@ -24,8 +24,54 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 namespace Phantom {
+
+namespace {
+
+static constexpr size_t kMaxDirectScanBytes = 64ULL * 1024ULL * 1024ULL;
+
+[[nodiscard]] constexpr GuestAddress SaturatingGuestAdd(
+    GuestAddress base,
+    size_t offset) noexcept {
+    const auto delta = static_cast<GuestAddress>(
+        std::min<uint64_t>(static_cast<uint64_t>(offset), std::numeric_limits<GuestAddress>::max()));
+    return (base > std::numeric_limits<GuestAddress>::max() - delta)
+        ? std::numeric_limits<GuestAddress>::max()
+        : base + delta;
+}
+
+[[nodiscard]] constexpr bool HasReadableBytes(
+    size_t offset,
+    size_t required,
+    size_t size) noexcept {
+    return offset <= size && required <= size - offset;
+}
+
+template <typename T>
+[[nodiscard]] bool ReserveNoThrow(std::vector<T>& values, size_t capacity) noexcept {
+    try {
+        values.reserve(capacity);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+[[nodiscard]] bool IsValidSpan(ByteSpan data) noexcept {
+    return data.empty() || data.data() != nullptr;
+}
+
+[[nodiscard]] ByteSpan CappedSpan(ByteSpan data) noexcept {
+    return ByteSpan(data.data(), std::min(data.size(), kMaxDirectScanBytes));
+}
+
+} // namespace
 
 // ============================================================================
 // CPUID Feature Detection
@@ -116,6 +162,9 @@ struct MemoryScanAccel::Impl {
     {
         std::vector<size_t> results;
         if (patLen == 0 || dataLen < patLen) return results;
+        if (!ReserveNoThrow(results, std::min<size_t>(kMaxShellcodeMatches, dataLen))) {
+            return results;
+        }
 
         const size_t searchLen = dataLen - patLen + 1;
         const __m256i firstByte = _mm256_set1_epi8(static_cast<char>(pat[0]));
@@ -159,6 +208,9 @@ struct MemoryScanAccel::Impl {
     {
         std::vector<size_t> results;
         if (patLen == 0 || dataLen < patLen) return results;
+        if (!ReserveNoThrow(results, std::min<size_t>(kMaxShellcodeMatches, dataLen))) {
+            return results;
+        }
 
         const size_t searchLen = dataLen - patLen + 1;
         for (size_t i = 0; i < searchLen; ++i) {
@@ -190,6 +242,9 @@ struct MemoryScanAccel::Impl {
         const uint8_t* data, size_t dataLen, uint8_t value) const noexcept
     {
         std::vector<size_t> results;
+        if (!ReserveNoThrow(results, std::min<size_t>(kMaxROPGadgets, dataLen))) {
+            return results;
+        }
         const __m256i target = _mm256_set1_epi8(static_cast<char>(value));
         size_t i = 0;
 
@@ -221,6 +276,9 @@ struct MemoryScanAccel::Impl {
         const uint8_t* data, size_t dataLen, uint8_t value) noexcept
     {
         std::vector<size_t> results;
+        if (!ReserveNoThrow(results, std::min<size_t>(kMaxROPGadgets, dataLen))) {
+            return results;
+        }
         for (size_t i = 0; i < dataLen; ++i) {
             if (data[i] == value) {
                 results.push_back(i);
@@ -250,9 +308,15 @@ struct MemoryScanAccel::Impl {
 
         const GuestSize allocBytes = memory.GetAllocatedBytes();
         if (allocBytes == 0) return entries;
+        const GuestSize maxAddr = kMaxGuestMemory;
+        const auto maxEntries = static_cast<size_t>(std::min<GuestSize>(
+            PagesNeeded(maxAddr) == 0 ? 0 : PagesNeeded(maxAddr),
+            kMaxEntropyEntries));
+        if (!ReserveNoThrow(entries, maxEntries)) {
+            return entries;
+        }
 
-        // Iterate page-by-page up to the memory ceiling
-        const GuestSize maxAddr = std::min(allocBytes + kMaxGuestMemory, kMaxGuestMemory);
+        std::array<uint8_t, kPageSize> pageBuffer{};
 
         for (GuestAddress addr = 0; addr < maxAddr; addr += kPageSize) {
             // Overflow guard
@@ -261,14 +325,16 @@ struct MemoryScanAccel::Impl {
             const auto prot = memory.GetProtection(addr);
             if (!prot.has_value()) continue; // unmapped page
 
-            const uint8_t* hostPtr = memory.GetHostReadPtr(addr);
-            if (!hostPtr) continue;
+            if (memory.Read(addr, pageBuffer.data(), static_cast<uint32_t>(pageBuffer.size())) !=
+                ErrorCode::Success) {
+                continue;
+            }
 
             PageEntropyEntry entry;
             entry.pageAddress = addr;
             entry.protection = prot.value();
 
-            const double ent = ComputeEntropy(hostPtr, kPageSize);
+            const double ent = ComputeEntropy(pageBuffer.data(), pageBuffer.size());
             entry.entropy = ent;
             entry.isHighEntropy = (ent > 7.0);
             entry.isEncrypted = (ent > 7.5);
@@ -304,7 +370,7 @@ struct MemoryScanAccel::Impl {
                 if (runLen >= 16) {
                     ShellcodeMatch m;
                     m.pattern = ShellcodePattern::NopSled;
-                    m.address = base + runStart;
+                    m.address = SaturatingGuestAdd(base, runStart);
                     m.size = runLen;
                     m.confidence = std::min(1.0f, static_cast<float>(runLen) / 64.0f);
                     m.description = "NOP sled (0x90)";
@@ -331,7 +397,7 @@ struct MemoryScanAccel::Impl {
                 if (runLen >= 16) {
                     ShellcodeMatch m;
                     m.pattern = ShellcodePattern::NopSled;
-                    m.address = base + runStart;
+                    m.address = SaturatingGuestAdd(base, runStart);
                     m.size = runLen;
                     m.confidence = std::min(1.0f, static_cast<float>(runLen) / 64.0f);
                     m.description = "Multi-byte NOP sled (0x0F 0x1F)";
@@ -380,7 +446,7 @@ struct MemoryScanAccel::Impl {
             if (matched) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::GetPCStub;
-                m.address = base + pos;
+                m.address = SaturatingGuestAdd(base, pos);
                 m.size = matchSize;
                 m.confidence = 0.95f;
                 m.description = "GetPC stub: CALL $+5; POP reg";
@@ -421,7 +487,7 @@ struct MemoryScanAccel::Impl {
                 p[4] == 0x58 && p[5] == 0xCD && p[6] == 0x2E) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::EggHunter;
-                m.address = base + pos;
+                m.address = SaturatingGuestAdd(base, pos);
                 m.size = 18;
                 m.confidence = 0.90f;
                 m.description = "Egg hunter (NtAccessCheckAndAuditAlarm)";
@@ -474,7 +540,7 @@ struct MemoryScanAccel::Impl {
             if (matched) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::StackPivot;
-                m.address = base + i;
+                m.address = SaturatingGuestAdd(base, i);
                 m.size = matchSize;
                 m.confidence = 0.85f;
                 m.description = desc;
@@ -496,7 +562,7 @@ struct MemoryScanAccel::Impl {
             if (matches.size() >= kMaxShellcodeMatches) break;
             ShellcodeMatch m;
             m.pattern = ShellcodePattern::PEBWalk;
-            m.address = base + pos;
+            m.address = SaturatingGuestAdd(base, pos);
             m.size = sizeof(kPEB32);
             m.confidence = 0.90f;
             m.description = "PEB access: MOV EAX, FS:[0x30]";
@@ -508,7 +574,7 @@ struct MemoryScanAccel::Impl {
             if (matches.size() >= kMaxShellcodeMatches) break;
             ShellcodeMatch m;
             m.pattern = ShellcodePattern::PEBWalk;
-            m.address = base + pos;
+            m.address = SaturatingGuestAdd(base, pos);
             m.size = sizeof(kPEB64);
             m.confidence = 0.92f;
             m.description = "PEB access: MOV RAX, GS:[0x60]";
@@ -539,7 +605,7 @@ struct MemoryScanAccel::Impl {
                 if (ptr[j] == 0x03 && (ptr[j + 1] & 0xC0) == 0xC0) {
                     ShellcodeMatch m;
                     m.pattern = ShellcodePattern::APIHashLookup;
-                    m.address = base + std::min(i, j);
+                    m.address = SaturatingGuestAdd(base, std::min(i, j));
                     m.size = static_cast<GuestSize>(std::max(i + 3, j + 2) - std::min(i, j));
                     m.confidence = 0.88f;
                     m.description = "API hash loop: ROR reg, 13 + ADD";
@@ -562,7 +628,7 @@ struct MemoryScanAccel::Impl {
             if (i + 1 < len && ptr[i] == 0x0F && ptr[i + 1] == 0x05) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::SyscallStub;
-                m.address = base + i;
+                m.address = SaturatingGuestAdd(base, i);
                 m.size = 2;
                 m.confidence = 0.80f;
                 m.description = "Direct SYSCALL instruction";
@@ -573,7 +639,7 @@ struct MemoryScanAccel::Impl {
             else if (i + 1 < len && ptr[i] == 0xCD && ptr[i + 1] == 0x2E) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::SyscallStub;
-                m.address = base + i;
+                m.address = SaturatingGuestAdd(base, i);
                 m.size = 2;
                 m.confidence = 0.85f;
                 m.description = "INT 0x2E (legacy syscall)";
@@ -633,7 +699,7 @@ struct MemoryScanAccel::Impl {
             if (hasXOR) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::EncoderStub;
-                m.address = base + loopStart;
+                m.address = SaturatingGuestAdd(base, loopStart);
                 m.size = static_cast<GuestSize>(i + 2 - loopStart);
                 m.confidence = 0.82f;
                 m.description = "Encoder/decoder loop (XOR/SUB loop)";
@@ -692,7 +758,7 @@ struct MemoryScanAccel::Impl {
                 if (runLen >= 8) {
                     ShellcodeMatch m;
                     m.pattern = ShellcodePattern::RetSled;
-                    m.address = base + start;
+                m.address = SaturatingGuestAdd(base, start);
                     m.size = runLen;
                     m.confidence = std::min(1.0f, static_cast<float>(runLen) / 32.0f);
                     m.description = "RET sled (consecutive RET instructions)";
@@ -718,7 +784,7 @@ struct MemoryScanAccel::Impl {
                 if (ptr[i + 5] == 0x33 && ptr[i + 6] == 0x00) {
                     ShellcodeMatch m;
                     m.pattern = ShellcodePattern::WoW64Gate;
-                    m.address = base + i;
+                    m.address = SaturatingGuestAdd(base, i);
                     m.size = 7;
                     m.confidence = 0.92f;
                     m.description = "Heaven's Gate: far JMP to 0x33 segment";
@@ -732,7 +798,7 @@ struct MemoryScanAccel::Impl {
             if (i + 2 < len && ptr[i] == 0x6A && ptr[i + 1] == 0x33 && ptr[i + 2] == 0xCB) {
                 ShellcodeMatch m;
                 m.pattern = ShellcodePattern::WoW64Gate;
-                m.address = base + i;
+                m.address = SaturatingGuestAdd(base, i);
                 m.size = 3;
                 m.confidence = 0.90f;
                 m.description = "Heaven's Gate: PUSH 0x33; RETF";
@@ -755,7 +821,7 @@ struct MemoryScanAccel::Impl {
                 if ((modrm & 0xF8) == 0xE0) { // mod=11, reg=4, rm=0..7
                     ShellcodeMatch m;
                     m.pattern = ShellcodePattern::JmpTrampoline;
-                    m.address = base + i;
+                    m.address = SaturatingGuestAdd(base, i);
                     m.size = 2;
                     m.confidence = 0.70f;
                     m.description = "JMP reg (computed jump trampoline)";
@@ -941,8 +1007,14 @@ struct MemoryScanAccel::Impl {
 // ============================================================================
 
 MemoryScanAccel::MemoryScanAccel() noexcept
-    : m_impl(std::make_unique<Impl>())
 {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    } catch (const std::length_error&) {
+        m_impl.reset();
+    }
 }
 
 MemoryScanAccel::~MemoryScanAccel() noexcept = default;
@@ -956,6 +1028,12 @@ MemoryScanAccel& MemoryScanAccel::operator=(MemoryScanAccel&&) noexcept = defaul
 
 MemoryScanResult MemoryScanAccel::ScanAll(VirtualMemory& memory) const noexcept {
     MemoryScanResult result;
+    if (!m_impl) return result;
+    if (!ReserveNoThrow(result.shellcodeMatches, Impl::kMaxShellcodeMatches) ||
+        !ReserveNoThrow(result.ropGadgets, Impl::kMaxROPGadgets) ||
+        !ReserveNoThrow(result.packedRegions, Impl::kMaxPackedRegions)) {
+        return result;
+    }
 
     // 1. Entropy scan of all pages
     result.entropyMap = ScanPageEntropy(memory);
@@ -979,16 +1057,19 @@ MemoryScanResult MemoryScanAccel::ScanAll(VirtualMemory& memory) const noexcept 
     }
 
     // 2. Shellcode + ROP detection on executable pages
+    std::array<uint8_t, kPageSize> pageBuffer{};
     for (const auto& entry : result.entropyMap) {
         if (!HasProt(entry.protection, MemProt::Execute) &&
             !HasProt(entry.protection, MemProt::Read)) {
             continue;
         }
 
-        const uint8_t* hostPtr = memory.GetHostReadPtr(entry.pageAddress);
-        if (!hostPtr) continue;
+        if (memory.Read(entry.pageAddress, pageBuffer.data(), static_cast<uint32_t>(pageBuffer.size())) !=
+            ErrorCode::Success) {
+            continue;
+        }
 
-        const ByteSpan pageData(hostPtr, kPageSize);
+        const ByteSpan pageData(pageBuffer.data(), pageBuffer.size());
 
         // Shellcode detection
         auto shellcode = DetectShellcode(pageData, entry.pageAddress);
@@ -1031,6 +1112,7 @@ MemoryScanResult MemoryScanAccel::ScanAll(VirtualMemory& memory) const noexcept 
 std::vector<PageEntropyEntry> MemoryScanAccel::ScanPageEntropy(
     VirtualMemory& memory) const noexcept
 {
+    if (!m_impl) return {};
     return Impl::EnumeratePages(memory, m_impl->simd);
 }
 
@@ -1043,6 +1125,9 @@ std::vector<ShellcodeMatch> MemoryScanAccel::DetectShellcode(
 {
     std::vector<ShellcodeMatch> matches;
     if (data.empty()) return matches;
+    if (!m_impl || !IsValidSpan(data)) return matches;
+    if (!ReserveNoThrow(matches, Impl::kMaxShellcodeMatches)) return matches;
+    data = CappedSpan(data);
 
     m_impl->DetectNopSled(data, baseAddr, matches);
     m_impl->DetectGetPCStubs(data, baseAddr, matches);
@@ -1070,6 +1155,9 @@ std::vector<ROPGadget> MemoryScanAccel::FindROPGadgets(
 {
     std::vector<ROPGadget> gadgets;
     if (execRegion.empty() || maxGadgetLength == 0) return gadgets;
+    if (!m_impl || !IsValidSpan(execRegion)) return gadgets;
+    if (!ReserveNoThrow(gadgets, Impl::kMaxROPGadgets)) return gadgets;
+    execRegion = CappedSpan(execRegion);
 
     // Cap gadget length to prevent excessive backward scans
     const uint32_t maxLen = std::min(maxGadgetLength, 15u);
@@ -1090,7 +1178,7 @@ std::vector<ROPGadget> MemoryScanAccel::FindROPGadgets(
             const auto info = Impl::ClassifyGadget(gadgetBytes, gadgetLen);
 
             ROPGadget g;
-            g.address = baseAddr + gadgetStart;
+            g.address = SaturatingGuestAdd(baseAddr, gadgetStart);
             g.length = static_cast<uint8_t>(gadgetLen);
             g.description = info.description;
             g.isUseful = info.useful;
@@ -1116,6 +1204,11 @@ std::vector<PackedRegion> MemoryScanAccel::DetectPackedRegions(
     double entropyThreshold) const noexcept
 {
     std::vector<PackedRegion> regions;
+    if (!m_impl) return regions;
+    if (!std::isfinite(entropyThreshold) || entropyThreshold < 0.0 || entropyThreshold > 8.0) {
+        return regions;
+    }
+    if (!ReserveNoThrow(regions, Impl::kMaxPackedRegions)) return regions;
 
     auto entropyMap = ScanPageEntropy(memory);
     if (entropyMap.empty()) return regions;
@@ -1160,19 +1253,15 @@ std::vector<PackedRegion> MemoryScanAccel::DetectPackedRegions(
         region.avgEntropy = entropySum / static_cast<double>(pageCount);
         region.hasWriteExecute = anyWX;
 
-        // Check for decoder loops in the region's first few pages
-        const uint8_t* hostPtr = memory.GetHostReadPtr(region.base);
-        if (hostPtr) {
-            const size_t checkLen = std::min(static_cast<size_t>(region.size),
-                                             static_cast<size_t>(kPageSize * 4));
-            region.hasDecoderLoop = Impl::HasDecoderLoop(hostPtr, checkLen);
-        }
+        std::array<uint8_t, kPageSize * 2> regionPrefix{};
+        const size_t checkLen = std::min(regionPrefix.size(), static_cast<size_t>(region.size));
+        if (checkLen != 0 &&
+            memory.Read(region.base, regionPrefix.data(), static_cast<uint32_t>(checkLen)) ==
+                ErrorCode::Success) {
+            region.hasDecoderLoop = Impl::HasDecoderLoop(regionPrefix.data(), checkLen);
 
-        // Check for packer signatures in the region
-        if (hostPtr) {
-            const size_t sigCheckLen = std::min(static_cast<size_t>(region.size),
-                                                static_cast<size_t>(kPageSize * 2));
-            region.likelyPacker = Impl::MatchPackerSignature(hostPtr, sigCheckLen);
+            const size_t sigCheckLen = std::min(checkLen, static_cast<size_t>(kPageSize * 2));
+            region.likelyPacker = Impl::MatchPackerSignature(regionPrefix.data(), sigCheckLen);
         }
 
         regions.push_back(region);
@@ -1186,6 +1275,8 @@ std::vector<PackedRegion> MemoryScanAccel::DetectPackedRegions(
 // ============================================================================
 
 double MemoryScanAccel::PageEntropy(ByteSpan page) const noexcept {
+    if (!IsValidSpan(page)) return 0.0;
+    page = CappedSpan(page);
     return Impl::ComputeEntropy(page.data(), page.size());
 }
 
@@ -1197,6 +1288,8 @@ std::optional<GuestAddress> MemoryScanAccel::FindNopSled(
     ByteSpan data, GuestAddress base, uint32_t minLength) const noexcept
 {
     if (data.size() < minLength || minLength == 0) return std::nullopt;
+    if (!IsValidSpan(data)) return std::nullopt;
+    data = CappedSpan(data);
 
     const uint8_t* ptr = data.data();
     const size_t len = data.size();
@@ -1208,7 +1301,7 @@ std::optional<GuestAddress> MemoryScanAccel::FindNopSled(
             const size_t start = i;
             while (i < len && ptr[i] == 0x90) ++i;
             if (i - start >= minLength) {
-                return base + start;
+                return SaturatingGuestAdd(base, start);
             }
             continue;
         }
@@ -1227,7 +1320,7 @@ std::optional<GuestAddress> MemoryScanAccel::FindNopSled(
                 i += nopLen;
             }
             if (i - start >= minLength) {
-                return base + start;
+                return SaturatingGuestAdd(base, start);
             }
             continue;
         }
@@ -1246,6 +1339,9 @@ std::vector<GuestAddress> MemoryScanAccel::FindGetPCStubs(
 {
     std::vector<GuestAddress> results;
     if (data.size() < 6) return results;
+    if (!m_impl || !IsValidSpan(data)) return results;
+    if (!ReserveNoThrow(results, Impl::kMaxShellcodeMatches)) return results;
+    data = CappedSpan(data);
 
     static constexpr uint8_t kCallNext[] = { 0xE8, 0x00, 0x00, 0x00, 0x00 };
     auto positions = m_impl->FindPattern(data.data(), data.size(), kCallNext, sizeof(kCallNext));
@@ -1257,12 +1353,12 @@ std::vector<GuestAddress> MemoryScanAccel::FindGetPCStubs(
         const uint8_t next = data[afterCall];
         // pop rax..rdi
         if (next >= 0x58 && next <= 0x5F) {
-            results.push_back(base + pos);
+            results.push_back(SaturatingGuestAdd(base, pos));
         }
         // REX.B + pop r8..r15
         else if (next == 0x41 && afterCall + 1 < data.size()) {
             if (data[afterCall + 1] >= 0x58 && data[afterCall + 1] <= 0x5F) {
-                results.push_back(base + pos);
+                results.push_back(SaturatingGuestAdd(base, pos));
             }
         }
 
@@ -1282,6 +1378,13 @@ std::vector<size_t> MemoryScanAccel::FindAllOccurrences(
     if (data.empty() || pattern.empty() || pattern.size() > data.size()) {
         return {};
     }
+    if (!m_impl || !IsValidSpan(data) || !IsValidSpan(pattern)) {
+        return {};
+    }
+    data = CappedSpan(data);
+    if (pattern.size() > data.size()) {
+        return {};
+    }
     return m_impl->FindPattern(data.data(), data.size(), pattern.data(), pattern.size());
 }
 
@@ -1294,6 +1397,9 @@ std::vector<GuestAddress> MemoryScanAccel::FindPEBAccess(
 {
     std::vector<GuestAddress> results;
     if (data.empty()) return results;
+    if (!m_impl || !IsValidSpan(data)) return results;
+    if (!ReserveNoThrow(results, Impl::kMaxShellcodeMatches)) return results;
+    data = CappedSpan(data);
 
     if (is64Bit) {
         // 64-bit PEB: MOV RAX, GS:[0x60] → 65 48 8B 04 25 60 00 00 00
@@ -1302,7 +1408,7 @@ std::vector<GuestAddress> MemoryScanAccel::FindPEBAccess(
         };
         auto hits = m_impl->FindPattern(data.data(), data.size(), kPEB64, sizeof(kPEB64));
         for (const size_t pos : hits) {
-            results.push_back(base + pos);
+            results.push_back(SaturatingGuestAdd(base, pos));
             if (results.size() >= Impl::kMaxShellcodeMatches) return results;
         }
 
@@ -1320,7 +1426,7 @@ std::vector<GuestAddress> MemoryScanAccel::FindPEBAccess(
                 data[pos + 7] == 0x00 &&
                 data[pos + 8] == 0x00) {
                 // Avoid duplicate with the primary pattern
-                const GuestAddress addr = base + pos;
+                const GuestAddress addr = SaturatingGuestAdd(base, pos);
                 bool duplicate = false;
                 for (const auto& existing : results) {
                     if (existing == addr) { duplicate = true; break; }
@@ -1338,7 +1444,7 @@ std::vector<GuestAddress> MemoryScanAccel::FindPEBAccess(
         };
         auto hits = m_impl->FindPattern(data.data(), data.size(), kPEB32, sizeof(kPEB32));
         for (const size_t pos : hits) {
-            results.push_back(base + pos);
+            results.push_back(SaturatingGuestAdd(base, pos));
             if (results.size() >= Impl::kMaxShellcodeMatches) return results;
         }
 
@@ -1354,7 +1460,7 @@ std::vector<GuestAddress> MemoryScanAccel::FindPEBAccess(
                     if (mod == 0x00 && (modrm & 0x07) == 0x05) {
                         if (data[i + 3] == 0x30 && data[i + 4] == 0x00 &&
                             data[i + 5] == 0x00 && data[i + 6] == 0x00) {
-                            results.push_back(base + i);
+                            results.push_back(SaturatingGuestAdd(base, i));
                             if (results.size() >= Impl::kMaxShellcodeMatches) return results;
                         }
                     }
