@@ -64,7 +64,7 @@ private:
         GuestAddress   pageBase,
         uint16_t       type,
         uint16_t       offset,
-        int64_t        delta) noexcept;
+        uint64_t       delta) noexcept;
 };
 
 } // namespace Phantom
