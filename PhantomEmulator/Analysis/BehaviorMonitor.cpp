@@ -21,6 +21,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
+#include <new>
+#include <span>
 #include <unordered_map>
 #include <utility>
 
@@ -136,6 +140,35 @@ constexpr uint32_t kRuleCount              = 150;
 [[nodiscard]] bool IsInjectionAccess(uint32_t access) noexcept {
     if (access == kProcessAllAccess) return true;
     return (access & kProcessVMWrite) && (access & kProcessVMOperation);
+}
+
+void IncrementSaturating(uint32_t& value) noexcept {
+    if (value < (std::numeric_limits<uint32_t>::max)()) {
+        ++value;
+    }
+}
+
+[[nodiscard]] bool AddGuestSize(GuestAddress base, GuestSize size, GuestAddress& end) noexcept {
+    if (size > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    end = base + size;
+    return true;
+}
+
+[[nodiscard]] bool RangesOverlap(
+    GuestAddress firstBase,
+    GuestSize firstSize,
+    GuestAddress secondBase,
+    GuestSize secondSize) noexcept {
+    if (firstSize == 0 || secondSize == 0) return false;
+    GuestAddress firstEnd = 0;
+    GuestAddress secondEnd = 0;
+    if (!AddGuestSize(firstBase, firstSize, firstEnd) ||
+        !AddGuestSize(secondBase, secondSize, secondEnd)) {
+        return false;
+    }
+    return firstBase < secondEnd && secondBase < firstEnd;
 }
 
 // Combine BehaviorFlag values
@@ -677,7 +710,7 @@ struct CountAccum {
     void Record(uint32_t callIndex, uint64_t instrCount) noexcept {
         if (count == 0) firstInstr = instrCount;
         lastInstr = instrCount;
-        ++count;
+        IncrementSaturating(count);
         if (evidenceCount < kMaxEvidencePerAlert)
             evidence[evidenceCount++] = callIndex;
     }
@@ -687,8 +720,12 @@ struct CountAccum {
         evidenceCount = 0; fired = false;
     }
 
-    [[nodiscard]] std::vector<uint32_t> GetEvidence() const {
-        return { evidence, evidence + evidenceCount };
+    [[nodiscard]] std::vector<uint32_t> GetEvidence() const noexcept {
+        try {
+            return { evidence, evidence + evidenceCount };
+        } catch (const std::bad_alloc&) {
+            return {};
+        }
     }
 };
 
@@ -716,6 +753,7 @@ struct TrackedAlloc {
 
 struct BehaviorMonitor::Impl {
     bool enabled = false;
+    uint32_t droppedEvents = 0;
 
     // --- Alert storage ---
     std::vector<BehaviorAlert> alerts;
@@ -753,30 +791,39 @@ struct BehaviorMonitor::Impl {
         uint32_t count    = 0;
         uint64_t firstInstr = 0;
         uint64_t lastInstr  = 0;
-        std::vector<uint32_t> evidence;
+        std::array<uint32_t, kMaxEvidencePerAlert> evidence{};
+        uint8_t evidenceCount = 0;
         bool fired        = false;
 
-        void Set(const char* which, uint32_t callIndex, uint64_t instr) {
+        void Set(const char* which, uint32_t callIndex, uint64_t instr) noexcept {
             if (StrEqCI(which, "computerName") && !computerName)
-                { computerName = true; ++count; }
+                { computerName = true; IncrementSaturating(count); }
             else if (StrEqCI(which, "userName") && !userName)
-                { userName = true; ++count; }
+                { userName = true; IncrementSaturating(count); }
             else if (StrEqCI(which, "versionEx") && !versionEx)
-                { versionEx = true; ++count; }
+                { versionEx = true; IncrementSaturating(count); }
             else if (StrEqCI(which, "systemInfo") && !systemInfo)
-                { systemInfo = true; ++count; }
+                { systemInfo = true; IncrementSaturating(count); }
             else return;
 
             if (count == 1) firstInstr = instr;
             lastInstr = instr;
-            if (evidence.size() < kMaxEvidencePerAlert)
-                evidence.push_back(callIndex);
+            if (evidenceCount < kMaxEvidencePerAlert)
+                evidence[evidenceCount++] = callIndex;
         }
 
-        void Reset() {
+        void Reset() noexcept {
             computerName = userName = versionEx = systemInfo = false;
             count = 0; firstInstr = lastInstr = 0;
-            evidence.clear(); fired = false;
+            evidenceCount = 0; fired = false;
+        }
+
+        [[nodiscard]] std::vector<uint32_t> GetEvidence() const noexcept {
+            try {
+                return { evidence.data(), evidence.data() + evidenceCount };
+            } catch (const std::bad_alloc&) {
+                return {};
+            }
         }
     } sysInfo;
 
@@ -822,15 +869,33 @@ struct BehaviorMonitor::Impl {
     void EmitAlert(uint32_t ruleId,
                    const std::vector<uint32_t>& evidence,
                    uint64_t instrCount, uint16_t threadId) noexcept;
+    void EmitAlert(uint32_t ruleId,
+                   std::initializer_list<uint32_t> evidence,
+                   uint64_t instrCount, uint16_t threadId) noexcept;
+    void EmitAlert(uint32_t ruleId,
+                   std::span<const uint32_t> evidence,
+                   uint64_t instrCount, uint16_t threadId) noexcept;
 
     void EmitAlertDirect(BehaviorCategory cat, AlertSeverity sev, float conf,
                          const char* desc, const char* mitre,
                          const std::vector<uint32_t>& evidence,
                          uint64_t instrCount, uint16_t threadId) noexcept;
+    void EmitAlertDirect(BehaviorCategory cat, AlertSeverity sev, float conf,
+                         const char* desc, const char* mitre,
+                         std::initializer_list<uint32_t> evidence,
+                         uint64_t instrCount, uint16_t threadId) noexcept;
+    void EmitAlertDirect(BehaviorCategory cat, AlertSeverity sev, float conf,
+                         const char* desc, const char* mitre,
+                         std::span<const uint32_t> evidence,
+                         uint64_t instrCount, uint16_t threadId) noexcept;
 
     void StartMachine(uint32_t ruleId, const APICallDetail& call,
                       uint32_t callIndex, uint64_t handle = 0,
                       uint64_t address = 0) noexcept;
+
+    void RecordDrop() noexcept {
+        IncrementSaturating(droppedEvents);
+    }
 };
 
 // ============================================================================
@@ -841,8 +906,30 @@ void BehaviorMonitor::Impl::EmitAlert(
     uint32_t ruleId, const std::vector<uint32_t>& evidence,
     uint64_t instrCount, uint16_t threadId) noexcept
 {
-    if (alerts.size() >= kMaxAlerts) return;
-    if (ruleId < 1 || ruleId > kRuleCount) return;
+    EmitAlert(ruleId, std::span<const uint32_t>(evidence.data(), evidence.size()),
+              instrCount, threadId);
+}
+
+void BehaviorMonitor::Impl::EmitAlert(
+    uint32_t ruleId, std::initializer_list<uint32_t> evidence,
+    uint64_t instrCount, uint16_t threadId) noexcept
+{
+    EmitAlert(ruleId, std::span<const uint32_t>(evidence.begin(), evidence.size()),
+              instrCount, threadId);
+}
+
+void BehaviorMonitor::Impl::EmitAlert(
+    uint32_t ruleId, std::span<const uint32_t> evidence,
+    uint64_t instrCount, uint16_t threadId) noexcept
+{
+    if (alerts.size() >= kMaxAlerts) {
+        RecordDrop();
+        return;
+    }
+    if (ruleId < 1 || ruleId > kRuleCount) {
+        RecordDrop();
+        return;
+    }
 
     const auto& rule = GetRule(ruleId);
     EmitAlertDirect(rule.category, rule.severity, rule.confidence,
@@ -856,28 +943,57 @@ void BehaviorMonitor::Impl::EmitAlertDirect(
     const std::vector<uint32_t>& evidence,
     uint64_t instrCount, uint16_t threadId) noexcept
 {
-    if (alerts.size() >= kMaxAlerts) return;
+    EmitAlertDirect(cat, sev, conf, desc, mitre,
+                    std::span<const uint32_t>(evidence.data(), evidence.size()),
+                    instrCount, threadId);
+}
+
+void BehaviorMonitor::Impl::EmitAlertDirect(
+    BehaviorCategory cat, AlertSeverity sev, float conf,
+    const char* desc, const char* mitre,
+    std::initializer_list<uint32_t> evidence,
+    uint64_t instrCount, uint16_t threadId) noexcept
+{
+    EmitAlertDirect(cat, sev, conf, desc, mitre,
+                    std::span<const uint32_t>(evidence.begin(), evidence.size()),
+                    instrCount, threadId);
+}
+
+void BehaviorMonitor::Impl::EmitAlertDirect(
+    BehaviorCategory cat, AlertSeverity sev, float conf,
+    const char* desc, const char* mitre,
+    std::span<const uint32_t> evidence,
+    uint64_t instrCount, uint16_t threadId) noexcept
+{
+    if (alerts.size() >= kMaxAlerts) {
+        RecordDrop();
+        return;
+    }
     try {
-        BehaviorAlert alert;
+        BehaviorAlert alert{};
         alert.category           = cat;
         alert.severity           = sev;
         alert.confidence         = conf;
         alert.description        = desc ? desc : "";
         alert.mitreId            = mitre ? mitre : "";
-        alert.evidenceCallIndices = evidence;
+        alert.evidenceCallIndices.assign(evidence.begin(), evidence.end());
         alert.instructionCount   = instrCount;
         alert.threadId           = threadId;
 
         if (static_cast<uint8_t>(sev) > static_cast<uint8_t>(maxSeverity))
             maxSeverity = sev;
 
-        if (alertCallback) {
-            alertCallback(alert);
-        }
-
         alerts.push_back(std::move(alert));
-    } catch (...) {
-        // Allocation failure — silently drop. Non-critical path.
+
+        if (alertCallback) {
+            try {
+                alertCallback(alerts.back());
+            } catch (...) {
+                RecordDrop();
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
     }
 }
 
@@ -889,9 +1005,12 @@ void BehaviorMonitor::Impl::StartMachine(
     uint32_t ruleId, const APICallDetail& call, uint32_t callIndex,
     uint64_t handle, uint64_t address) noexcept
 {
-    if (machines.size() >= kMaxStateMachines) return;
+    if (machines.size() >= kMaxStateMachines) {
+        RecordDrop();
+        return;
+    }
 
-    StateMachine sm;
+    StateMachine sm{};
     sm.ruleId        = ruleId;
     sm.currentState  = 1;
     sm.firstInstr    = static_cast<uint64_t>(call.instructionNum);
@@ -900,12 +1019,16 @@ void BehaviorMonitor::Impl::StartMachine(
     sm.capturedHandle  = handle;
     sm.capturedAddress = address;
     sm.AddEvidence(callIndex);
-    machines.push_back(sm);
+    try {
+        machines.push_back(sm);
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+    }
 }
 
 void BehaviorMonitor::Impl::CompleteMachine(const StateMachine& sm) noexcept {
-    std::vector<uint32_t> ev(sm.evidence, sm.evidence + sm.evidenceCount);
-    EmitAlert(sm.ruleId, ev, sm.lastInstr, sm.originThread);
+    EmitAlert(sm.ruleId, std::span<const uint32_t>(sm.evidence, sm.evidenceCount),
+              sm.lastInstr, sm.originThread);
 }
 
 void BehaviorMonitor::Impl::ExpireMachines(uint64_t instrCount) noexcept {
@@ -913,7 +1036,8 @@ void BehaviorMonitor::Impl::ExpireMachines(uint64_t instrCount) noexcept {
         std::remove_if(machines.begin(), machines.end(),
             [instrCount](const StateMachine& sm) {
                 const auto& info = GetRule(sm.ruleId);
-                return (instrCount - sm.firstInstr) > info.windowSize;
+                return instrCount >= sm.firstInstr &&
+                       (instrCount - sm.firstInstr) > info.windowSize;
             }),
         machines.end());
 }
@@ -929,7 +1053,6 @@ void BehaviorMonitor::Impl::StartNewMachines(
     if (!call.funcName || !call.succeeded) return;
 
     const uint64_t retVal = call.returnValue;
-    const auto instrN = static_cast<uint64_t>(call.instructionNum);
 
     // ---- Rules 1, 2, 10, 11: Start with OpenProcess (injection) ----
     if (FuncIs(call, "OpenProcess")) {
@@ -1427,7 +1550,9 @@ bool BehaviorMonitor::Impl::TryTransition(
 
     // Window check
     uint64_t instr = static_cast<uint64_t>(call.instructionNum);
-    if (info.windowSize > 0 && (instr - sm.firstInstr) > info.windowSize)
+    if (info.windowSize > 0 &&
+        instr >= sm.firstInstr &&
+        (instr - sm.firstInstr) > info.windowSize)
         return false;
 
     bool matched = false;
@@ -2563,7 +2688,9 @@ void BehaviorMonitor::Impl::AdvanceStateMachines(
 
         if (TryTransition(sm, call)) {
             sm.AddEvidence(callIndex);
-            sm.currentState++;
+            if (sm.currentState < (std::numeric_limits<uint8_t>::max)()) {
+                ++sm.currentState;
+            }
             sm.lastInstr = static_cast<uint64_t>(call.instructionNum);
 
             const auto& info = GetRule(sm.ruleId);
@@ -3039,17 +3166,17 @@ void BehaviorMonitor::Impl::UpdateCounters(
     // ---- System info gathering (Rule 42) ----
     if (FuncIsAny(call, "GetComputerNameA", "GetComputerNameW") ||
         FuncIs(call, "GetComputerNameExW")) {
-        try { sysInfo.Set("computerName", callIndex, instrN); } catch (...) {}
+        sysInfo.Set("computerName", callIndex, instrN);
     }
     if (FuncIsAny3(call, "GetUserNameA", "GetUserNameW", "GetUserNameExW")) {
-        try { sysInfo.Set("userName", callIndex, instrN); } catch (...) {}
+        sysInfo.Set("userName", callIndex, instrN);
     }
     if (FuncIsAny3(call, "GetVersionExA", "GetVersionExW", "RtlGetVersion")) {
-        try { sysInfo.Set("versionEx", callIndex, instrN); } catch (...) {}
+        sysInfo.Set("versionEx", callIndex, instrN);
     }
     if (FuncIsAny3(call, "GetSystemInfo", "GetNativeSystemInfo",
                    "NtQuerySystemInformation")) {
-        try { sysInfo.Set("systemInfo", callIndex, instrN); } catch (...) {}
+        sysInfo.Set("systemInfo", callIndex, instrN);
     }
 
     // ---- Network enumeration (Rule 43) ----
@@ -3077,7 +3204,9 @@ void BehaviorMonitor::Impl::CheckCounterThresholds(uint64_t instrCount) noexcept
         bool inWindow       = true;
 
         if (findFileCount.count > 0 && readWriteFileCount.count > 0) {
-            uint64_t span = readWriteFileCount.lastInstr - findFileCount.firstInstr;
+            uint64_t span = (readWriteFileCount.lastInstr >= findFileCount.firstInstr)
+                ? (readWriteFileCount.lastInstr - findFileCount.firstInstr)
+                : 0;
             inWindow = span <= 2'000'000;
         }
 
@@ -3085,16 +3214,28 @@ void BehaviorMonitor::Impl::CheckCounterThresholds(uint64_t instrCount) noexcept
             findFileCount.fired = true;
             auto ev = findFileCount.GetEvidence();
             auto cryptoEv = cryptoAPICount.GetEvidence();
-            ev.insert(ev.end(), cryptoEv.begin(), cryptoEv.end());
-            if (ev.size() > kMaxEvidencePerAlert)
-                ev.resize(kMaxEvidencePerAlert);
+            try {
+                const size_t remaining =
+                    ev.size() < kMaxEvidencePerAlert
+                        ? (kMaxEvidencePerAlert - ev.size())
+                        : 0;
+                ev.insert(ev.end(),
+                          cryptoEv.begin(),
+                          cryptoEv.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  std::min(remaining, cryptoEv.size())));
+            } catch (const std::bad_alloc&) {
+                RecordDrop();
+            }
             EmitAlert(25, ev, instrCount, 0);
         }
     }
 
     // ---- Rule 29: Mass file rename ----
     if (!fileRenameCount.fired && fileRenameCount.count >= 10) {
-        uint64_t span = fileRenameCount.lastInstr - fileRenameCount.firstInstr;
+        uint64_t span = (fileRenameCount.lastInstr >= fileRenameCount.firstInstr)
+            ? (fileRenameCount.lastInstr - fileRenameCount.firstInstr)
+            : 0;
         if (span <= 500'000) {
             fileRenameCount.fired = true;
             EmitAlert(29, fileRenameCount.GetEvidence(), instrCount, 0);
@@ -3103,7 +3244,9 @@ void BehaviorMonitor::Impl::CheckCounterThresholds(uint64_t instrCount) noexcept
 
     // ---- Rule 36: DNS tunneling ----
     if (!dnsQueryCount.fired && dnsQueryCount.count >= 15) {
-        uint64_t span = dnsQueryCount.lastInstr - dnsQueryCount.firstInstr;
+        uint64_t span = (dnsQueryCount.lastInstr >= dnsQueryCount.firstInstr)
+            ? (dnsQueryCount.lastInstr - dnsQueryCount.firstInstr)
+            : 0;
         if (span <= 300'000) {
             dnsQueryCount.fired = true;
             EmitAlert(36, dnsQueryCount.GetEvidence(), instrCount, 0);
@@ -3112,16 +3255,20 @@ void BehaviorMonitor::Impl::CheckCounterThresholds(uint64_t instrCount) noexcept
 
     // ---- Rule 42: System info gathering ----
     if (!sysInfo.fired && sysInfo.count >= 3) {
-        uint64_t span = sysInfo.lastInstr - sysInfo.firstInstr;
+        uint64_t span = (sysInfo.lastInstr >= sysInfo.firstInstr)
+            ? (sysInfo.lastInstr - sysInfo.firstInstr)
+            : 0;
         if (span <= 200'000) {
             sysInfo.fired = true;
-            EmitAlert(42, sysInfo.evidence, instrCount, 0);
+            EmitAlert(42, sysInfo.GetEvidence(), instrCount, 0);
         }
     }
 
     // ---- Rule 43: Network enumeration ----
     if (!netEnumCount.fired && netEnumCount.count >= 2) {
-        uint64_t span = netEnumCount.lastInstr - netEnumCount.firstInstr;
+        uint64_t span = (netEnumCount.lastInstr >= netEnumCount.firstInstr)
+            ? (netEnumCount.lastInstr - netEnumCount.firstInstr)
+            : 0;
         if (span <= 300'000) {
             netEnumCount.fired = true;
             EmitAlert(43, netEnumCount.GetEvidence(), instrCount, 0);
@@ -3130,7 +3277,9 @@ void BehaviorMonitor::Impl::CheckCounterThresholds(uint64_t instrCount) noexcept
 
     // ---- Rule 44: File system recon ----
     if (!driveEnumCount.fired && driveEnumCount.count >= 3) {
-        uint64_t span = driveEnumCount.lastInstr - driveEnumCount.firstInstr;
+        uint64_t span = (driveEnumCount.lastInstr >= driveEnumCount.firstInstr)
+            ? (driveEnumCount.lastInstr - driveEnumCount.firstInstr)
+            : 0;
         if (span <= 300'000) {
             driveEnumCount.fired = true;
             EmitAlert(44, driveEnumCount.GetEvidence(), instrCount, 0);
@@ -3139,7 +3288,9 @@ void BehaviorMonitor::Impl::CheckCounterThresholds(uint64_t instrCount) noexcept
 
     // ---- Rule 45 variant: GetAsyncKeyState loop ----
     if (!keyStateCount.fired && keyStateCount.count >= 50) {
-        uint64_t span = keyStateCount.lastInstr - keyStateCount.firstInstr;
+        uint64_t span = (keyStateCount.lastInstr >= keyStateCount.firstInstr)
+            ? (keyStateCount.lastInstr - keyStateCount.firstInstr)
+            : 0;
         if (span <= 500'000) {
             keyStateCount.fired = true;
             EmitAlert(45, keyStateCount.GetEvidence(), instrCount, 0);
@@ -3177,11 +3328,19 @@ void BehaviorMonitor::Impl::TrackAllocations(
             if (ta.isRWX) {
                 // Rule 12: Reflective DLL — large RWX alloc (>= 4KB = PE-sized)
                 // Rule 13: Classic shellcode — any RWX alloc
-                trackedAllocs.push_back(ta);
+                try {
+                    trackedAllocs.push_back(ta);
+                } catch (const std::bad_alloc&) {
+                    RecordDrop();
+                }
             } else if (ProtIsRW(prot)) {
                 // Rule 14: Staged shellcode — RW alloc (execute comes later)
                 ta.isRWX = false;
-                trackedAllocs.push_back(ta);
+                try {
+                    trackedAllocs.push_back(ta);
+                } catch (const std::bad_alloc&) {
+                    RecordDrop();
+                }
             }
         }
     }
@@ -3190,8 +3349,15 @@ void BehaviorMonitor::Impl::TrackAllocations(
     // via state machines, but we still record for cross-thread tracking)
     if (FuncIs(call, "VirtualAllocEx") && call.returnValue != 0) {
         try {
-            allocOrigins[call.returnValue] = { call.threadId, instrN };
-        } catch (...) {}
+            if (allocOrigins.size() < kMaxResourceEntries ||
+                allocOrigins.find(call.returnValue) != allocOrigins.end()) {
+                allocOrigins[call.returnValue] = { call.threadId, instrN };
+            } else {
+                RecordDrop();
+            }
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+        }
     }
 }
 
@@ -3201,7 +3367,6 @@ void BehaviorMonitor::Impl::TrackAllocations(
 
 void BehaviorMonitor::Impl::TrackResources(const APICallDetail& call) noexcept {
     if (!call.funcName || !call.succeeded) return;
-    if (handleOrigins.size() >= kMaxResourceEntries) return;
 
     const uint64_t instrN = static_cast<uint64_t>(call.instructionNum);
 
@@ -3213,7 +3378,12 @@ void BehaviorMonitor::Impl::TrackResources(const APICallDetail& call) noexcept {
             FuncIsAny(call, "OpenSCManagerA", "OpenSCManagerW") ||
             FuncIsAny(call, "CreateNamedPipeA", "CreateNamedPipeW")) {
             if (call.returnValue != 0 && call.returnValue != static_cast<uint64_t>(-1)) {
-                handleOrigins[call.returnValue] = { call.threadId, instrN };
+                if (handleOrigins.size() < kMaxResourceEntries ||
+                    handleOrigins.find(call.returnValue) != handleOrigins.end()) {
+                    handleOrigins[call.returnValue] = { call.threadId, instrN };
+                } else {
+                    RecordDrop();
+                }
             }
         }
 
@@ -3221,11 +3391,16 @@ void BehaviorMonitor::Impl::TrackResources(const APICallDetail& call) noexcept {
         if (FuncIsAny(call, "VirtualAlloc", "VirtualAllocEx") ||
             FuncIs(call, "NtAllocateVirtualMemory")) {
             if (call.returnValue != 0) {
-                allocOrigins[call.returnValue] = { call.threadId, instrN };
+                if (allocOrigins.size() < kMaxResourceEntries ||
+                    allocOrigins.find(call.returnValue) != allocOrigins.end()) {
+                    allocOrigins[call.returnValue] = { call.threadId, instrN };
+                } else {
+                    RecordDrop();
+                }
             }
         }
-    } catch (...) {
-        // Allocation failure in map — silently ignore
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
     }
 }
 
@@ -3281,15 +3456,17 @@ void BehaviorMonitor::Impl::ProcessAPICall(
 
 BehaviorMonitor::BehaviorMonitor(const EmulationConfig& config) noexcept {
     try {
-        m_impl = std::make_unique<Impl>();
-        m_impl->enabled = config.enableBehaviorMonitor;
-        m_impl->stackBase = 0x0000000080000000ULL;  // From WinConst::kStackBase64
-        m_impl->stackSize = config.stackSize;
-        m_impl->alerts.reserve(256);
-        m_impl->machines.reserve(128);
-        m_impl->trackedAllocs.reserve(64);
-    } catch (...) {
-        // If allocation fails, m_impl stays null; all methods become no-ops
+        auto impl = std::make_unique<Impl>();
+        impl->enabled = config.enableBehaviorMonitor;
+        impl->stackBase = 0x0000000080000000ULL;  // From WinConst::kStackBase64
+        impl->stackSize = config.stackSize;
+        impl->alerts.reserve(256);
+        impl->machines.reserve(128);
+        impl->trackedAllocs.reserve(64);
+        impl->eggHunter.scannedPages.reserve(64);
+        m_impl = std::move(impl);
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
     }
 }
 
@@ -3326,21 +3503,35 @@ void BehaviorMonitor::OnMemoryEvent(const MemoryAccessRecord& record) noexcept {
         }
 
         // If reads come from same small code region but target many pages
-        if (srcPage == impl.eggHunter.codeBase ||
-            (srcPage >= impl.eggHunter.codeBase &&
-             srcPage < impl.eggHunter.codeBase + 2 * kPageSize)) {
+        GuestAddress codeWindowEnd = 0;
+        const bool inCodeWindow =
+            srcPage == impl.eggHunter.codeBase ||
+            (AddGuestSize(impl.eggHunter.codeBase, 2ULL * kPageSize, codeWindowEnd) &&
+             srcPage >= impl.eggHunter.codeBase &&
+             srcPage < codeWindowEnd);
+        if (inCodeWindow) {
             impl.eggHunter.lastInstr = record.instructionCount;
             try {
-                auto [it, inserted] = impl.eggHunter.scannedPages.emplace(dstPage, true);
-                if (inserted) {
-                    impl.eggHunter.uniquePageCount++;
-                    impl.eggHunter.scanCount++;
+                if (impl.eggHunter.scannedPages.size() < 512 ||
+                    impl.eggHunter.scannedPages.find(dstPage) != impl.eggHunter.scannedPages.end()) {
+                    auto [it, inserted] = impl.eggHunter.scannedPages.emplace(dstPage, true);
+                    (void)it;
+                    if (inserted) {
+                        IncrementSaturating(impl.eggHunter.uniquePageCount);
+                        IncrementSaturating(impl.eggHunter.scanCount);
+                    }
+                } else {
+                    impl.RecordDrop();
                 }
-            } catch (...) {}
+            } catch (const std::bad_alloc&) {
+                impl.RecordDrop();
+            }
 
             // Fire if scanning many distinct pages from a small code region
             if (!impl.eggHunter.fired && impl.eggHunter.uniquePageCount >= 32) {
-                uint64_t span = impl.eggHunter.lastInstr - impl.eggHunter.firstInstr;
+                uint64_t span = (impl.eggHunter.lastInstr >= impl.eggHunter.firstInstr)
+                    ? (impl.eggHunter.lastInstr - impl.eggHunter.firstInstr)
+                    : 0;
                 if (span <= 500'000) {
                     impl.eggHunter.fired = true;
                     impl.EmitAlert(15, {}, record.instructionCount, 0);
@@ -3359,8 +3550,7 @@ void BehaviorMonitor::OnMemoryEvent(const MemoryAccessRecord& record) noexcept {
     // Track writes to allocated regions (for shellcode detection)
     if (record.type == MemoryAccessRecord::Type::Write) {
         for (auto& ta : impl.trackedAllocs) {
-            if (record.address >= ta.base &&
-                record.address < ta.base + ta.size) {
+            if (RangesOverlap(record.address, 1, ta.base, ta.size)) {
                 ta.wasWritten = true;
                 break;
             }
@@ -3380,8 +3570,7 @@ void BehaviorMonitor::OnWXTransition(
 
     // ---- Rule 16: Stack-based shellcode ----
     // If execution occurs from the stack region, it's stack-based shellcode
-    if (page >= impl.stackBase &&
-        page < impl.stackBase + impl.stackSize) {
+    if (RangesOverlap(page, 1, impl.stackBase, impl.stackSize)) {
         const auto& r = GetRule(16);
         impl.EmitAlertDirect(r.category, r.severity, r.confidence,
                              r.description, r.mitreId,
@@ -3393,7 +3582,7 @@ void BehaviorMonitor::OnWXTransition(
 
     // Check tracked allocations for W→X transitions
     for (auto& ta : impl.trackedAllocs) {
-        if (page >= ta.base && page < ta.base + ta.size) {
+        if (RangesOverlap(page, 1, ta.base, ta.size)) {
             ta.executed = true;
 
             if (ta.isRWX && ta.wasWritten) {
@@ -3439,7 +3628,7 @@ void BehaviorMonitor::OnProtectionChange(
     if (!oldHasExec && newHasExec && oldHasWrite) {
         // RW → RX/RWX transition — mark relevant allocations
         for (auto& ta : impl.trackedAllocs) {
-            if (base >= ta.base && base < ta.base + ta.size) {
+            if (RangesOverlap(base, size, ta.base, ta.size)) {
                 ta.protChanged = true;
                 break;
             }
@@ -3459,9 +3648,7 @@ void BehaviorMonitor::OnProtectionChange(
 
 void BehaviorMonitor::SetAlertCallback(BehaviorAlertCallback cb) noexcept {
     if (!m_impl) return;
-    try {
-        m_impl->alertCallback = std::move(cb);
-    } catch (...) {}
+    m_impl->alertCallback = std::move(cb);
 }
 
 const std::vector<BehaviorAlert>&
@@ -3486,11 +3673,14 @@ BehaviorMonitor::GetAlertsByCategory(BehaviorCategory cat) const noexcept {
     std::vector<const BehaviorAlert*> result;
     if (!m_impl) return result;
     try {
+        result.reserve(m_impl->alerts.size());
         for (const auto& alert : m_impl->alerts) {
             if (alert.category == cat)
                 result.push_back(&alert);
         }
-    } catch (...) {}
+    } catch (const std::bad_alloc&) {
+        result.clear();
+    }
     return result;
 }
 
@@ -3538,7 +3728,13 @@ void BehaviorMonitor::Reset() noexcept {
     impl.antiDebugFired = false;
     impl.antiVMFired    = false;
 
-    impl.eggHunter = {};
+    impl.eggHunter.codeBase = 0;
+    impl.eggHunter.scanCount = 0;
+    impl.eggHunter.firstInstr = 0;
+    impl.eggHunter.lastInstr = 0;
+    impl.eggHunter.uniquePageCount = 0;
+    impl.eggHunter.scannedPages.clear();
+    impl.eggHunter.fired = false;
 
     // Callback is preserved across reset (intentional)
 }
