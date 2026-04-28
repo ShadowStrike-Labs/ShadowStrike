@@ -8,6 +8,8 @@
 
 #include "SyncPrimitives.hpp"
 #include <algorithm>
+#include <limits>
+#include <new>
 #include <unordered_set>
 
 namespace Phantom {
@@ -23,6 +25,27 @@ void SyncObjectStore::RemoveFromQueue(std::vector<uint32_t>& queue, uint32_t thr
         queue.end());
 }
 
+uint32_t SyncObjectStore::AllocHandle() noexcept
+{
+    for (uint32_t attempts = 0; attempts < (std::numeric_limits<uint32_t>::max)(); ++attempts) {
+        const uint32_t candidate = m_nextHandle++;
+        if (candidate == 0) {
+            continue;
+        }
+        if (!HandleExists(candidate)) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+void SyncObjectStore::RecordDrop() noexcept
+{
+    if (m_droppedOperations < (std::numeric_limits<uint64_t>::max)()) {
+        ++m_droppedOperations;
+    }
+}
+
 // ============================================================================
 // Mutex Operations
 // ============================================================================
@@ -32,6 +55,8 @@ uint32_t SyncObjectStore::CreateMutex(
     bool initialOwner,
     uint32_t creatorTid)
 {
+    if (name.size() > kMaxObjectNameLength) return 0;
+
     // If a named mutex already exists, return the existing handle.
     if (!name.empty()) {
         for (auto& [h, mtx] : m_mutexes) {
@@ -42,10 +67,16 @@ uint32_t SyncObjectStore::CreateMutex(
     }
 
     uint32_t handle = AllocHandle();
+    if (handle == 0) return 0;
 
     EmulatedMutex mtx;
     mtx.handle = handle;
-    mtx.name   = name;
+    try {
+        mtx.name = name;
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+        return 0;
+    }
 
     if (initialOwner) {
         mtx.ownerThreadId  = creatorTid;
@@ -53,7 +84,12 @@ uint32_t SyncObjectStore::CreateMutex(
         mtx.signaled       = false;
     }
 
-    m_mutexes.emplace(handle, std::move(mtx));
+    try {
+        m_mutexes.emplace(handle, std::move(mtx));
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+        return 0;
+    }
     return handle;
 }
 
@@ -74,6 +110,9 @@ bool SyncObjectStore::TryAcquireMutex(uint32_t handle, uint32_t threadId)
 
     if (mtx.ownerThreadId == threadId) {
         // Recursive acquisition by the same thread.
+        if (mtx.recursionCount == (std::numeric_limits<uint32_t>::max)()) {
+            return false;
+        }
         mtx.recursionCount++;
         return true;
     }
@@ -112,6 +151,8 @@ uint32_t SyncObjectStore::CreateEvent(
     bool manualReset,
     bool initialState)
 {
+    if (name.size() > kMaxObjectNameLength) return 0;
+
     // If a named event already exists, return the existing handle.
     if (!name.empty()) {
         for (auto& [h, evt] : m_events) {
@@ -122,14 +163,25 @@ uint32_t SyncObjectStore::CreateEvent(
     }
 
     uint32_t handle = AllocHandle();
+    if (handle == 0) return 0;
 
     EmulatedEvent evt;
     evt.handle      = handle;
-    evt.name        = name;
+    try {
+        evt.name = name;
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+        return 0;
+    }
     evt.manualReset = manualReset;
     evt.signaled    = initialState;
 
-    m_events.emplace(handle, std::move(evt));
+    try {
+        m_events.emplace(handle, std::move(evt));
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+        return 0;
+    }
     return handle;
 }
 
@@ -140,11 +192,13 @@ bool SyncObjectStore::TryWaitEvent(uint32_t handle)
 
     auto& evt = it->second;
 
+    if (evt.pulsePending) return false;
     if (!evt.signaled) return false;
 
     // For auto-reset events, consuming the signal resets it.
     if (!evt.manualReset) {
         evt.signaled = false;
+        evt.pulsePending = false;
     }
     return true;
 }
@@ -155,6 +209,7 @@ void SyncObjectStore::SetEvent(uint32_t handle)
     if (it == m_events.end()) return;
 
     it->second.signaled = true;
+    it->second.pulsePending = false;
 }
 
 void SyncObjectStore::ResetEvent(uint32_t handle)
@@ -163,6 +218,7 @@ void SyncObjectStore::ResetEvent(uint32_t handle)
     if (it == m_events.end()) return;
 
     it->second.signaled = false;
+    it->second.pulsePending = false;
 }
 
 void SyncObjectStore::PulseEvent(uint32_t handle)
@@ -172,10 +228,9 @@ void SyncObjectStore::PulseEvent(uint32_t handle)
 
     auto& evt = it->second;
 
-    // PulseEvent: signal, wake waiting threads, then immediately reset.
+    // PulseEvent: signal current waiters through Signal(), then reset.
     evt.signaled = true;
-    // The scheduler will call Signal() to drain waiters.
-    evt.signaled = false;
+    evt.pulsePending = true;
 }
 
 // ============================================================================
@@ -187,6 +242,10 @@ uint32_t SyncObjectStore::CreateSemaphore(
     int32_t initial,
     int32_t max)
 {
+    if (name.size() > kMaxObjectNameLength || max <= 0 || initial < 0 || initial > max) {
+        return 0;
+    }
+
     if (!name.empty()) {
         for (auto& [h, sem] : m_semaphores) {
             if (sem.name == name) {
@@ -196,14 +255,25 @@ uint32_t SyncObjectStore::CreateSemaphore(
     }
 
     uint32_t handle = AllocHandle();
+    if (handle == 0) return 0;
 
     EmulatedSemaphore sem;
     sem.handle   = handle;
-    sem.name     = name;
+    try {
+        sem.name = name;
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+        return 0;
+    }
     sem.count    = initial;
     sem.maxCount = max;
 
-    m_semaphores.emplace(handle, std::move(sem));
+    try {
+        m_semaphores.emplace(handle, std::move(sem));
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+        return 0;
+    }
     return handle;
 }
 
@@ -224,17 +294,16 @@ bool SyncObjectStore::TryAcquireSemaphore(uint32_t handle)
 
 void SyncObjectStore::ReleaseSemaphore(uint32_t handle, int32_t count)
 {
+    if (count <= 0) return;
+
     auto it = m_semaphores.find(handle);
     if (it == m_semaphores.end()) return;
 
     auto& sem = it->second;
 
-    // Cap at maxCount.
-    int32_t newCount = sem.count + count;
-    if (newCount > sem.maxCount) {
-        newCount = sem.maxCount;
-    }
-    sem.count = newCount;
+    if (sem.count >= sem.maxCount) return;
+    const int32_t remaining = sem.maxCount - sem.count;
+    sem.count += (count > remaining) ? remaining : count;
 }
 
 // ============================================================================
@@ -243,11 +312,17 @@ void SyncObjectStore::ReleaseSemaphore(uint32_t handle, int32_t count)
 
 void SyncObjectStore::InitializeCriticalSection(GuestAddress addr, uint32_t spinCount)
 {
+    if (addr == 0) return;
+
     EmulatedCriticalSection cs;
     cs.address   = addr;
     cs.spinCount = spinCount;
 
-    m_critSections[addr] = std::move(cs);
+    try {
+        m_critSections[addr] = std::move(cs);
+    } catch (const std::bad_alloc&) {
+        RecordDrop();
+    }
 }
 
 void SyncObjectStore::DeleteCriticalSection(GuestAddress addr)
@@ -257,6 +332,8 @@ void SyncObjectStore::DeleteCriticalSection(GuestAddress addr)
 
 bool SyncObjectStore::TryEnterCriticalSection(GuestAddress addr, uint32_t threadId)
 {
+    if (addr == 0) return false;
+
     auto it = m_critSections.find(addr);
     if (it == m_critSections.end()) {
         // Auto-initialize on first use (some malware skips InitializeCriticalSection).
@@ -275,6 +352,9 @@ bool SyncObjectStore::TryEnterCriticalSection(GuestAddress addr, uint32_t thread
 
     if (cs.ownerThreadId == threadId) {
         // Recursive entry.
+        if (cs.recursionCount == (std::numeric_limits<uint32_t>::max)()) {
+            return false;
+        }
         cs.recursionCount++;
         return true;
     }
@@ -321,7 +401,11 @@ std::vector<uint32_t> SyncObjectStore::Signal(uint32_t handle)
                 mtx.ownerThreadId  = waiterTid;
                 mtx.recursionCount = 1;
                 mtx.signaled       = false;
-                woken.push_back(waiterTid);
+                try {
+                    woken.push_back(waiterTid);
+                } catch (const std::bad_alloc&) {
+                    return {};
+                }
             }
             return woken;
         }
@@ -337,13 +421,22 @@ std::vector<uint32_t> SyncObjectStore::Signal(uint32_t handle)
                     // Wake ALL waiters for manual-reset events.
                     woken = std::move(evt.waitQueue);
                     evt.waitQueue.clear();
+                    if (evt.pulsePending) {
+                        evt.signaled = false;
+                        evt.pulsePending = false;
+                    }
                 } else {
                     // Wake exactly one waiter for auto-reset events and reset signal.
                     if (!evt.waitQueue.empty()) {
-                        woken.push_back(evt.waitQueue.front());
+                        try {
+                            woken.push_back(evt.waitQueue.front());
+                        } catch (const std::bad_alloc&) {
+                            return {};
+                        }
                         evt.waitQueue.erase(evt.waitQueue.begin());
-                        evt.signaled = false;
                     }
+                    evt.signaled = false;
+                    evt.pulsePending = false;
                 }
             }
             return woken;
@@ -356,7 +449,11 @@ std::vector<uint32_t> SyncObjectStore::Signal(uint32_t handle)
         if (it != m_semaphores.end()) {
             auto& sem = it->second;
             while (sem.count > 0 && !sem.waitQueue.empty()) {
-                woken.push_back(sem.waitQueue.front());
+                try {
+                    woken.push_back(sem.waitQueue.front());
+                } catch (const std::bad_alloc&) {
+                    return {};
+                }
                 sem.waitQueue.erase(sem.waitQueue.begin());
                 sem.count--;
             }
@@ -374,8 +471,15 @@ void SyncObjectStore::AddWaiter(uint32_t handle, uint32_t threadId)
         auto it = m_mutexes.find(handle);
         if (it != m_mutexes.end()) {
             auto& q = it->second.waitQueue;
-            if (std::find(q.begin(), q.end(), threadId) == q.end()) {
-                q.push_back(threadId);
+            if (q.size() < kMaxWaitQueueLength &&
+                std::find(q.begin(), q.end(), threadId) == q.end()) {
+                try {
+                    q.push_back(threadId);
+                } catch (const std::bad_alloc&) {
+                    RecordDrop();
+                }
+            } else if (q.size() >= kMaxWaitQueueLength) {
+                RecordDrop();
             }
             return;
         }
@@ -385,8 +489,15 @@ void SyncObjectStore::AddWaiter(uint32_t handle, uint32_t threadId)
         auto it = m_events.find(handle);
         if (it != m_events.end()) {
             auto& q = it->second.waitQueue;
-            if (std::find(q.begin(), q.end(), threadId) == q.end()) {
-                q.push_back(threadId);
+            if (q.size() < kMaxWaitQueueLength &&
+                std::find(q.begin(), q.end(), threadId) == q.end()) {
+                try {
+                    q.push_back(threadId);
+                } catch (const std::bad_alloc&) {
+                    RecordDrop();
+                }
+            } else if (q.size() >= kMaxWaitQueueLength) {
+                RecordDrop();
             }
             return;
         }
@@ -396,8 +507,15 @@ void SyncObjectStore::AddWaiter(uint32_t handle, uint32_t threadId)
         auto it = m_semaphores.find(handle);
         if (it != m_semaphores.end()) {
             auto& q = it->second.waitQueue;
-            if (std::find(q.begin(), q.end(), threadId) == q.end()) {
-                q.push_back(threadId);
+            if (q.size() < kMaxWaitQueueLength &&
+                std::find(q.begin(), q.end(), threadId) == q.end()) {
+                try {
+                    q.push_back(threadId);
+                } catch (const std::bad_alloc&) {
+                    RecordDrop();
+                }
+            } else if (q.size() >= kMaxWaitQueueLength) {
+                RecordDrop();
             }
             return;
         }
@@ -451,6 +569,11 @@ uint32_t SyncObjectStore::GetOwnerThread(uint32_t handle) const noexcept
         return itM->second.ownerThreadId;
     }
     return 0;
+}
+
+uint64_t SyncObjectStore::GetDroppedOperationCount() const noexcept
+{
+    return m_droppedOperations;
 }
 
 // ============================================================================
