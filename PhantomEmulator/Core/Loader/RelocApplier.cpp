@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace Phantom {
 
@@ -44,6 +45,16 @@ static constexpr uint32_t kMaxBlockSize =
 
 // Minimum valid block size: header only (no entries — degenerate but legal)
 static constexpr uint32_t kMinBlockSize = sizeof(PE::BaseRelocation);
+
+[[nodiscard]] static bool AddGuestAddress(
+    GuestAddress base, GuestAddress offset, GuestAddress& out) noexcept
+{
+    if (offset > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
 
 // ============================================================================
 // Apply — Walk relocation directory, patch all entries
@@ -61,8 +72,7 @@ RelocResult RelocApplier::Apply(
     // -----------------------------------------------------------------------
     // 1. Compute delta — if the image loaded at its preferred base, nothing to do
     // -----------------------------------------------------------------------
-    const auto delta = static_cast<int64_t>(actualBase) -
-                       static_cast<int64_t>(preferredBase);
+    const uint64_t delta = actualBase - preferredBase;
     if (delta == 0) {
         return result; // No relocations needed
     }
@@ -85,17 +95,25 @@ RelocResult RelocApplier::Apply(
     // -----------------------------------------------------------------------
     // 3. Walk relocation blocks
     // -----------------------------------------------------------------------
-    const GuestAddress dirBase = actualBase + relocDirRVA;
+    GuestAddress dirBase = 0;
+    if (!AddGuestAddress(actualBase, relocDirRVA, dirBase)) {
+        result.error = ErrorCode::MalformedPE;
+        return result;
+    }
     uint32_t offset = 0;
 
-    while (offset + kMinBlockSize <= relocDirSize &&
+    while (offset <= relocDirSize - kMinBlockSize &&
            result.blocksProcessed < PE::kMaxRelocBlocks)
     {
         // -------------------------------------------------------------------
         // 3a. Read the BaseRelocation header for this block
         // -------------------------------------------------------------------
         PE::BaseRelocation block{};
-        const GuestAddress blockAddr = dirBase + offset;
+        GuestAddress blockAddr = 0;
+        if (!AddGuestAddress(dirBase, offset, blockAddr)) {
+            result.error = ErrorCode::MalformedPE;
+            return result;
+        }
 
         ErrorCode err = memory.ReadValue(blockAddr, block);
         if (err != ErrorCode::Success) {
@@ -112,6 +130,10 @@ RelocResult RelocApplier::Apply(
         }
 
         if (block.SizeOfBlock < kMinBlockSize) {
+            result.error = ErrorCode::MalformedPE;
+            return result;
+        }
+        if (((block.SizeOfBlock - kMinBlockSize) % sizeof(uint16_t)) != 0) {
             result.error = ErrorCode::MalformedPE;
             return result;
         }
@@ -137,16 +159,29 @@ RelocResult RelocApplier::Apply(
             entryCount = PE::kMaxRelocsPerBlock;
         }
 
-        const GuestAddress pageBase = actualBase + block.VirtualAddress;
+        GuestAddress pageBase = 0;
+        if (!AddGuestAddress(actualBase, block.VirtualAddress, pageBase)) {
+            result.error = ErrorCode::MalformedPE;
+            return result;
+        }
 
         // -------------------------------------------------------------------
         // 3d. Process each 16-bit relocation entry in this block
         // -------------------------------------------------------------------
-        const GuestAddress entriesAddr = blockAddr + kMinBlockSize;
+        GuestAddress entriesAddr = 0;
+        if (!AddGuestAddress(blockAddr, kMinBlockSize, entriesAddr)) {
+            result.error = ErrorCode::MalformedPE;
+            return result;
+        }
 
         for (uint32_t i = 0; i < entryCount; ++i) {
             uint16_t entry = 0;
-            err = memory.ReadU16(entriesAddr + i * sizeof(uint16_t), entry);
+            GuestAddress entryAddr = 0;
+            if (!AddGuestAddress(entriesAddr, static_cast<GuestAddress>(i) * sizeof(uint16_t), entryAddr)) {
+                result.error = ErrorCode::MalformedPE;
+                return result;
+            }
+            err = memory.ReadU16(entryAddr, entry);
             if (err != ErrorCode::Success) {
                 result.error = ErrorCode::RelocApplyFail;
                 return result;
@@ -163,16 +198,28 @@ RelocResult RelocApplier::Apply(
             // Handle kRelocHighAdj: it consumes the next entry as parameter
             if (type == PE::kRelocHighAdj) {
                 // Read the adjustment value from the next entry
-                uint16_t adjustment = 0;
-                if (i + 1 < entryCount) {
-                    err = memory.ReadU16(entriesAddr + (i + 1) * sizeof(uint16_t), adjustment);
-                    if (err != ErrorCode::Success) {
-                        result.error = ErrorCode::RelocApplyFail;
-                        return result;
-                    }
+                if (i + 1 >= entryCount) {
+                    result.error = ErrorCode::MalformedPE;
+                    return result;
                 }
 
-                const GuestAddress targetAddr = pageBase + relOff;
+                uint16_t adjustment = 0;
+                GuestAddress adjustmentAddr = 0;
+                if (!AddGuestAddress(entriesAddr, static_cast<GuestAddress>(i + 1) * sizeof(uint16_t), adjustmentAddr)) {
+                    result.error = ErrorCode::MalformedPE;
+                    return result;
+                }
+                err = memory.ReadU16(adjustmentAddr, adjustment);
+                if (err != ErrorCode::Success) {
+                    result.error = ErrorCode::RelocApplyFail;
+                    return result;
+                }
+
+                GuestAddress targetAddr = 0;
+                if (!AddGuestAddress(pageBase, relOff, targetAddr)) {
+                    result.error = ErrorCode::MalformedPE;
+                    return result;
+                }
                 uint16_t highWord = 0;
                 err = memory.ReadU16(targetAddr, highWord);
                 if (err != ErrorCode::Success) {
@@ -181,10 +228,10 @@ RelocResult RelocApplier::Apply(
                 }
 
                 // HIGHADJ: (highWord << 16) + adjustment + delta, take high 16 bits
-                const int32_t combined =
-                    (static_cast<int32_t>(highWord) << 16) +
-                    static_cast<int32_t>(adjustment) +
-                    static_cast<int32_t>(delta);
+                const int64_t combined =
+                    (static_cast<int64_t>(highWord) << 16) +
+                    static_cast<int64_t>(adjustment) +
+                    static_cast<int64_t>(static_cast<int32_t>(delta & 0xFFFFFFFFULL));
                 highWord = static_cast<uint16_t>(
                     static_cast<uint32_t>(combined) >> 16);
 
@@ -209,6 +256,10 @@ RelocResult RelocApplier::Apply(
         }
 
         ++result.blocksProcessed;
+        if (block.SizeOfBlock > relocDirSize - offset) {
+            result.error = ErrorCode::MalformedPE;
+            return result;
+        }
         offset += block.SizeOfBlock;
     }
 
@@ -224,9 +275,12 @@ ErrorCode RelocApplier::ApplyEntry(
     GuestAddress   pageBase,
     uint16_t       type,
     uint16_t       offset,
-    int64_t        delta) noexcept
+    uint64_t       delta) noexcept
 {
-    const GuestAddress targetAddr = pageBase + offset;
+    GuestAddress targetAddr = 0;
+    if (!AddGuestAddress(pageBase, offset, targetAddr)) {
+        return ErrorCode::MalformedPE;
+    }
 
     switch (type) {
 
@@ -237,7 +291,7 @@ ErrorCode RelocApplier::ApplyEntry(
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
 
         const auto adjusted = static_cast<uint32_t>(
-            static_cast<int64_t>(value) + delta);
+            static_cast<uint64_t>(value) + delta);
 
         err = memory.WriteU32(targetAddr, adjusted);
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
@@ -250,8 +304,7 @@ ErrorCode RelocApplier::ApplyEntry(
         ErrorCode err = memory.ReadU64(targetAddr, value);
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
 
-        const auto adjusted = static_cast<uint64_t>(
-            static_cast<int64_t>(value) + delta);
+        const auto adjusted = value + delta;
 
         err = memory.WriteU64(targetAddr, adjusted);
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
@@ -266,7 +319,7 @@ ErrorCode RelocApplier::ApplyEntry(
 
         const auto adjusted = static_cast<uint16_t>(
             value + static_cast<uint16_t>(
-                (static_cast<uint32_t>(delta) >> 16) & 0xFFFF));
+                (static_cast<uint32_t>(delta & 0xFFFFFFFFULL) >> 16) & 0xFFFF));
 
         err = memory.WriteU16(targetAddr, adjusted);
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
@@ -280,7 +333,7 @@ ErrorCode RelocApplier::ApplyEntry(
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
 
         const auto adjusted = static_cast<uint16_t>(
-            value + static_cast<uint16_t>(delta & 0xFFFF));
+            value + static_cast<uint16_t>(delta & 0xFFFFULL));
 
         err = memory.WriteU16(targetAddr, adjusted);
         if (err != ErrorCode::Success) return ErrorCode::RelocApplyFail;
