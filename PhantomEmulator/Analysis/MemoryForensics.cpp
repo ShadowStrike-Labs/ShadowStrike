@@ -15,8 +15,10 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
+#include <new>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -50,6 +52,17 @@ static constexpr uint32_t kMaxPagesPerScan        = 16384; // 64 MB / 4KB
 // ============================================================================
 
 namespace {
+
+[[nodiscard]] bool AddGuestOffset(GuestAddress base,
+                                  uint64_t offset,
+                                  GuestAddress& out) noexcept
+{
+    if (offset > std::numeric_limits<GuestAddress>::max() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
 
 // ---- NOP-equivalent detection (32-bit context) ----------------------------
 
@@ -119,7 +132,12 @@ namespace {
 {
     uint32_t sampleLen = static_cast<uint32_t>(
         std::min<GuestSize>(regionSize, maxSample));
-    std::vector<uint8_t> buf(sampleLen);
+    std::vector<uint8_t> buf;
+    try {
+        buf.resize(sampleLen);
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
     if (memory.Read(addr, buf.data(), sampleLen) != ErrorCode::Success) {
         buf.clear();
     }
@@ -138,7 +156,7 @@ namespace {
     std::vector<uint8_t> buf;
     try {
         buf.resize(static_cast<size_t>(size));
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         return {};
     }
     if (memory.Read(addr, buf.data(), static_cast<uint32_t>(
@@ -207,14 +225,22 @@ struct MemoryForensics::Impl {
 
     bool AddFinding(MemoryFindingDetail&& f) noexcept {
         if (findings.size() >= kMaxFindings) return false;
-        findings.push_back(std::move(f));
-        return true;
+        try {
+            findings.push_back(std::move(f));
+            return true;
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
     }
 
     bool AddPayload(ExtractedPayload&& p) noexcept {
         if (payloads.size() >= kMaxExtractedPayloads) return false;
-        payloads.push_back(std::move(p));
-        return true;
+        try {
+            payloads.push_back(std::move(p));
+            return true;
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
     }
 
     bool IsAlreadyFlagged(GuestAddress addr) const noexcept {
@@ -223,7 +249,11 @@ struct MemoryForensics::Impl {
 
     void MarkFlagged(GuestAddress addr) noexcept {
         if (flaggedAddresses.size() < kMaxFindings) {
-            flaggedAddresses.insert(addr);
+            try {
+                flaggedAddresses.insert(addr);
+            } catch (const std::bad_alloc&) {
+                return;
+            }
         }
     }
 
@@ -321,17 +351,29 @@ double MemoryForensics::CalculateEntropy(ByteSpan data) noexcept {
 
 MemoryForensics::MemoryForensics(
     const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (const std::bad_alloc&) {
+        m_impl = nullptr;
+        return;
+    }
     m_impl->entropyThreshold = config.entropyThreshold;
     m_impl->enabled          = config.enableMemoryForensics;
-    m_impl->findings.reserve(256);
-    m_impl->payloads.reserve(16);
+    try {
+        m_impl->findings.reserve(256);
+        m_impl->payloads.reserve(16);
+    } catch (const std::bad_alloc&) {
+        m_impl->findings.clear();
+        m_impl->payloads.clear();
+    }
 }
 
 MemoryForensics::~MemoryForensics() noexcept = default;
 
 void MemoryForensics::Reset() noexcept {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
     m_impl->findings.clear();
     m_impl->payloads.clear();
@@ -346,32 +388,60 @@ void MemoryForensics::Reset() noexcept {
 
 const std::vector<MemoryFindingDetail>&
 MemoryForensics::GetFindings() const noexcept {
-    // Caller expected to call after scanning completes; shared lock for safety.
-    std::shared_lock lock(m_impl->mutex);
-    return m_impl->findings;
+    static const std::vector<MemoryFindingDetail> kEmpty;
+    static thread_local std::vector<MemoryFindingDetail> snapshot;
+    if (!m_impl) return kEmpty;
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->findings;
+        return snapshot;
+    } catch (const std::bad_alloc&) {
+        snapshot.clear();
+        return kEmpty;
+    }
 }
 
 uint32_t MemoryForensics::GetFindingCount() const noexcept {
+    if (!m_impl) return 0;
     std::shared_lock lock(m_impl->mutex);
     return static_cast<uint32_t>(m_impl->findings.size());
 }
 
 std::vector<const MemoryFindingDetail*>
 MemoryForensics::GetFindingsByType(MemoryFinding type) const noexcept {
-    std::shared_lock lock(m_impl->mutex);
     std::vector<const MemoryFindingDetail*> result;
-    for (const auto& f : m_impl->findings) {
-        if (f.type == type) {
-            result.push_back(&f);
+    if (!m_impl) return result;
+    try {
+        static thread_local std::vector<MemoryFindingDetail> snapshot;
+        snapshot.clear();
+        {
+            std::shared_lock lock(m_impl->mutex);
+            snapshot = m_impl->findings;
         }
+        for (const auto& f : snapshot) {
+            if (f.type == type) {
+                result.push_back(&f);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
     return result;
 }
 
 const std::vector<ExtractedPayload>&
 MemoryForensics::GetExtractedPayloads() const noexcept {
-    std::shared_lock lock(m_impl->mutex);
-    return m_impl->payloads;
+    static const std::vector<ExtractedPayload> kEmpty;
+    static thread_local std::vector<ExtractedPayload> snapshot;
+    if (!m_impl) return kEmpty;
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->payloads;
+        return snapshot;
+    } catch (const std::bad_alloc&) {
+        snapshot.clear();
+        return kEmpty;
+    }
 }
 
 // ============================================================================
@@ -384,6 +454,7 @@ void MemoryForensics::ExtractPayload(
     GuestSize size,
     const std::string& desc) noexcept
 {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->payloads.size() >= kMaxExtractedPayloads) return;
@@ -392,7 +463,7 @@ void MemoryForensics::ExtractPayload(
     std::vector<uint8_t> buf;
     try {
         buf.resize(static_cast<size_t>(size));
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         return;
     }
 
@@ -440,6 +511,7 @@ void MemoryForensics::ExtractPayload(
 void MemoryForensics::OnWXTransition(
     const VirtualMemory& memory, GuestAddress page) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->enabled) return;
 
     std::unique_lock lock(m_impl->mutex);
@@ -479,12 +551,17 @@ void MemoryForensics::OnProtectionChange(
     GuestAddress base, GuestSize size,
     MemProt oldProt, MemProt newProt) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->enabled) return;
 
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->protChanges.size() < Impl::kMaxProtChanges) {
-        m_impl->protChanges.push_back({base, size, oldProt, newProt});
+        try {
+            m_impl->protChanges.push_back({base, size, oldProt, newProt});
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     }
 
     // Detect Read/Write → Execute transitions (VirtualProtect-based unpacking)
@@ -512,6 +589,7 @@ void MemoryForensics::OnProtectionChange(
 void MemoryForensics::OnAllocation(
     GuestAddress base, GuestSize size, MemProt prot) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->enabled) return;
 
     std::unique_lock lock(m_impl->mutex);
@@ -537,6 +615,7 @@ void MemoryForensics::OnAllocation(
 void MemoryForensics::OnStackPivot(
     GuestAddress oldRSP, GuestAddress newRSP) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->enabled) return;
 
     std::unique_lock lock(m_impl->mutex);
@@ -577,16 +656,23 @@ void MemoryForensics::ScanAll(
     const VirtualMemory& memory,
     const MemoryTracker& tracker) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->enabled) return;
 
     // 1. Scan all W→X pages
-    auto wxPages = tracker.GetWriteExecutePages();
+    std::vector<GuestAddress> wxPages;
+    std::vector<std::pair<GuestAddress, GuestSize>> rwxAllocs;
+    try {
+        wxPages = tracker.GetWriteExecutePages();
+        rwxAllocs = tracker.GetRWXAllocations();
+    } catch (const std::bad_alloc&) {
+        return;
+    }
     for (GuestAddress page : wxPages) {
         OnWXTransition(memory, page);
     }
 
     // 2. Scan all RWX allocations
-    auto rwxAllocs = tracker.GetRWXAllocations();
     for (const auto& [base, size] : rwxAllocs) {
         ScanRegion(memory, base, size);
     }
@@ -605,8 +691,16 @@ void MemoryForensics::ScanAll(
             }
 
             uint64_t h = FnvHash64(hashBuf.data(), kHeapSprayHashBytes);
-            auto& count = m_impl->heapSprayHashes[h];
-            ++count;
+            uint32_t count = 0;
+            try {
+                auto& storedCount = m_impl->heapSprayHashes[h];
+                if (storedCount < std::numeric_limits<uint32_t>::max()) {
+                    ++storedCount;
+                }
+                count = storedCount;
+            } catch (const std::bad_alloc&) {
+                continue;
+            }
 
             if (count == kHeapSprayMinDupes &&
                 !m_impl->IsAlreadyFlagged(base))
@@ -638,6 +732,7 @@ void MemoryForensics::ScanRegion(
     GuestAddress base,
     GuestSize size) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->enabled) return;
     if (size == 0) return;
 
@@ -653,7 +748,9 @@ void MemoryForensics::ScanRegion(
 
         std::array<uint8_t, kPageScanBuffer> buf{};
         if (memory.Read(cursor, buf.data(), chunkSize) != ErrorCode::Success) {
-            cursor += chunkSize;
+            if (!AddGuestOffset(cursor, chunkSize, cursor)) {
+                break;
+            }
             remaining -= chunkSize;
             continue;
         }
@@ -669,7 +766,9 @@ void MemoryForensics::ScanRegion(
         m_impl->ScanBufferForSuspiciousStrings(buf.data(), chunkSize, cursor);
         lock.unlock();
 
-        cursor += chunkSize;
+        if (!AddGuestOffset(cursor, chunkSize, cursor)) {
+            break;
+        }
         remaining -= chunkSize;
     }
 }
@@ -683,16 +782,27 @@ std::vector<RegionAnalysis> MemoryForensics::AnalyzeAllRegions(
     const MemoryTracker& tracker) const noexcept
 {
     std::vector<RegionAnalysis> results;
+    if (!m_impl) return results;
 
-    auto wxPages = tracker.GetWriteExecutePages();
-    auto rwxAllocs = tracker.GetRWXAllocations();
+    std::vector<GuestAddress> wxPages;
+    std::vector<std::pair<GuestAddress, GuestSize>> rwxAllocs;
+    try {
+        wxPages = tracker.GetWriteExecutePages();
+        rwxAllocs = tracker.GetRWXAllocations();
+    } catch (const std::bad_alloc&) {
+        return results;
+    }
 
     // Collect unique bases
     std::unordered_set<GuestAddress> seen;
 
     auto analyzeOne = [&](GuestAddress base, GuestSize sz) {
         if (seen.count(base)) return;
-        seen.insert(base);
+        try {
+            seen.insert(base);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
 
         RegionAnalysis ra;
         ra.base = base;
@@ -721,13 +831,19 @@ std::vector<RegionAnalysis> MemoryForensics::AnalyzeAllRegions(
         {
             std::shared_lock lock(m_impl->mutex);
             for (const auto& f : m_impl->findings) {
-                if (f.address >= base && f.address < base + sz) {
+                GuestAddress regionEnd = 0;
+                if (AddGuestOffset(base, sz, regionEnd) &&
+                    f.address >= base && f.address < regionEnd) {
                     ++ra.findingCount;
                 }
             }
         }
 
-        results.push_back(ra);
+        try {
+            results.push_back(ra);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     };
 
     for (GuestAddress page : wxPages) {
@@ -1212,7 +1328,7 @@ void MemoryForensics::Impl::ScanBufferForPE(
         if (i + eLfanew + 6 <= len) {
             std::memcpy(&machine, data + i + eLfanew + 4, 2);
         } else {
-            memory.Read(mzAddr + eLfanew + 4, &machine, 2);
+            (void)memory.Read(mzAddr + eLfanew + 4, &machine, 2);
         }
         if (machine == PEConst::kMachineI386 ||
             machine == PEConst::kMachineAMD64) {
@@ -1373,7 +1489,7 @@ void MemoryForensics::Impl::ScanBufferForPE(
             if (i + eLfanew + 22 <= len) {
                 std::memcpy(&sizeOfOpt, data + i + eLfanew + 20, 2);
             } else {
-                memory.Read(mzAddr + eLfanew + 20, &sizeOfOpt, 2);
+                (void)memory.Read(mzAddr + eLfanew + 20, &sizeOfOpt, 2);
             }
 
             // Section headers start at eLfanew + 24 + sizeOfOpt
