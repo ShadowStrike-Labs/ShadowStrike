@@ -465,7 +465,7 @@ static bool HandlePsLookupProcessByProcessId(APIContext& ctx) {
 
     Tracker().IncrementProcessManipulations();
 
-    const auto* eproc = KernelObjectManager::Instance().FindProcess(pid);
+    const auto eproc = KernelObjectManager::Instance().FindProcess(pid);
     if (eproc && outPtr != 0) {
         (void)ctx.Memory().WriteU64(outPtr, eproc->selfPtr);
         ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
@@ -489,7 +489,7 @@ static bool HandlePsLookupThreadByThreadId(APIContext& ctx) {
 
     Tracker().IncrementProcessManipulations();
 
-    const auto* kthread = KernelObjectManager::Instance().FindThread(tid);
+    const auto kthread = KernelObjectManager::Instance().FindThread(tid);
     if (kthread && outPtr != 0) {
         (void)ctx.Memory().WriteU64(outPtr, kthread->selfPtr);
         ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);

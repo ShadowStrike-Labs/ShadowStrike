@@ -10,12 +10,19 @@
 
 #include "KernelStructures.hpp"
 #include "../Memory/VirtualMemory.hpp"
+#include "../../Common/WinMacroUndef.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <unordered_map>
+
+#ifdef CreateProcess
+#undef CreateProcess
+#endif
 
 namespace Phantom {
 
@@ -34,6 +41,29 @@ static constexpr GuestAddress kIdtBaseAddress    = 0xFFFFF80002000000ULL;
 static constexpr GuestAddress kSsdtFuncBase      = 0xFFFFF80003000000ULL;
 static constexpr GuestAddress kIdtHandlerBase    = 0xFFFFF80004000000ULL;
 static constexpr GuestAddress kTokenPoolBase     = 0xFFFF800040000000ULL;
+
+namespace {
+
+[[nodiscard]] bool AddGuest(GuestAddress a, GuestAddress b, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - a < b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+[[nodiscard]] size_t BoundedStringLength(const char* value, size_t maxLen) noexcept {
+    if (value == nullptr || maxLen == 0) {
+        return 0;
+    }
+    size_t len = 0;
+    while (len < maxLen && value[len] != '\0') {
+        ++len;
+    }
+    return len;
+}
+
+} // namespace
 
 // ============================================================================
 // Windows 10/11 SSDT syscall table (top 50 most-abused + many more)
@@ -522,21 +552,42 @@ struct KernelObjectManager::Impl {
 
     [[nodiscard]] GuestAddress AllocProcessAddress() {
         if (nextProcessSlot >= kMaxEmulatedProcesses) return 0;
-        return kEprocessPoolBase + static_cast<GuestAddress>(nextProcessSlot++) * kEprocessStride;
+        GuestAddress addr = 0;
+        if (!AddGuest(kEprocessPoolBase, static_cast<GuestAddress>(nextProcessSlot) * kEprocessStride, addr)) {
+            return 0;
+        }
+        ++nextProcessSlot;
+        return addr;
     }
 
     [[nodiscard]] GuestAddress AllocThreadAddress() {
         if (nextThreadSlot >= kMaxEmulatedThreads) return 0;
-        return kThreadPoolBase + static_cast<GuestAddress>(nextThreadSlot++) * kThreadStride;
+        GuestAddress addr = 0;
+        if (!AddGuest(kThreadPoolBase, static_cast<GuestAddress>(nextThreadSlot) * kThreadStride, addr)) {
+            return 0;
+        }
+        ++nextThreadSlot;
+        return addr;
     }
 
     [[nodiscard]] GuestAddress AllocDriverAddress() {
         if (nextDriverSlot >= kMaxEmulatedDrivers) return 0;
-        return kDriverPoolBase + static_cast<GuestAddress>(nextDriverSlot++) * kDriverStride;
+        GuestAddress addr = 0;
+        if (!AddGuest(kDriverPoolBase, static_cast<GuestAddress>(nextDriverSlot) * kDriverStride, addr)) {
+            return 0;
+        }
+        ++nextDriverSlot;
+        return addr;
     }
 
     [[nodiscard]] GuestAddress AllocTokenAddress() {
-        return kTokenPoolBase + static_cast<GuestAddress>(nextTokenSlot++) * 0x100;
+        if (nextTokenSlot >= kMaxEmulatedProcesses) return 0;
+        GuestAddress addr = 0;
+        if (!AddGuest(kTokenPoolBase, static_cast<GuestAddress>(nextTokenSlot) * 0x100, addr)) {
+            return 0;
+        }
+        ++nextTokenSlot;
+        return addr;
     }
 
     // Link a new EPROCESS into the circular doubly-linked list
@@ -670,13 +721,18 @@ void KernelObjectManager::Reset() {
 bool KernelObjectManager::Initialize(VirtualMemory& memory) {
     std::unique_lock lock(m_impl->mutex);
 
+    try {
+        m_impl->processes.reserve(64);
+        m_impl->threads.reserve(256);
+        m_impl->drivers.reserve(64);
+    } catch (const std::bad_alloc&) {
+        m_impl->memory = nullptr;
+        m_impl->initialized = false;
+        return false;
+    }
+
     m_impl->memory = &memory;
     m_impl->initialized = true;
-
-    m_impl->processes.reserve(64);
-    m_impl->threads.reserve(256);
-    m_impl->drivers.reserve(64);
-
     return true;
 }
 
@@ -691,7 +747,11 @@ GuestAddress KernelObjectManager::CreateProcess(uint32_t pid, uint32_t parentPid
     if (m_impl->processes.size() >= kMaxEmulatedProcesses) return 0;
     if (m_impl->pidIndex.count(pid)) return 0; // duplicate PID
     if (!imageName) return 0;
+    const size_t nameLen = BoundedStringLength(imageName, sizeof(EmulatedEPROCESS::imageFileNameStr));
+    if (nameLen == 0) return 0;
 
+    const uint32_t processSlot = m_impl->nextProcessSlot;
+    const uint32_t tokenSlot = m_impl->nextTokenSlot;
     GuestAddress addr = m_impl->AllocProcessAddress();
     if (addr == 0) return 0;
 
@@ -702,29 +762,53 @@ GuestAddress KernelObjectManager::CreateProcess(uint32_t pid, uint32_t parentPid
 
     // Safe copy of image name (15 chars max + NUL, matching real EPROCESS)
     std::memset(proc.imageFileNameStr, 0, sizeof(proc.imageFileNameStr));
-    const size_t nameLen = std::strlen(imageName);
     const size_t copyLen = (nameLen < 15) ? nameLen : 15;
     std::memcpy(proc.imageFileNameStr, imageName, copyLen);
 
-    proc.imageFileName = addr + 0x100; // offset within virtual EPROCESS
-    proc.peb           = addr + 0x200;
-    proc.objectTable   = addr + 0x300;
+    if (!AddGuest(addr, 0x100, proc.imageFileName) ||
+        !AddGuest(addr, 0x200, proc.peb) ||
+        !AddGuest(addr, 0x300, proc.objectTable)) {
+        m_impl->nextProcessSlot = processSlot;
+        return 0;
+    }
 
     GuestAddress tokenAddr = m_impl->AllocTokenAddress();
+    if (tokenAddr == 0) {
+        m_impl->nextProcessSlot = processSlot;
+        m_impl->nextTokenSlot = tokenSlot;
+        return 0;
+    }
     proc.token = tokenAddr;
 
     proc.createTime = static_cast<uint64_t>(m_impl->processes.size()) + 1;
     proc.exitStatus = 259; // STILL_ACTIVE
 
     // Thread list initially self-referential
-    proc.threadListHead_Flink = addr + offsetof(EmulatedEPROCESS, threadListHead_Flink);
-    proc.threadListHead_Blink = addr + offsetof(EmulatedEPROCESS, threadListHead_Blink);
+    if (!AddGuest(addr, offsetof(EmulatedEPROCESS, threadListHead_Flink), proc.threadListHead_Flink) ||
+        !AddGuest(addr, offsetof(EmulatedEPROCESS, threadListHead_Blink), proc.threadListHead_Blink)) {
+        m_impl->nextProcessSlot = processSlot;
+        m_impl->nextTokenSlot = tokenSlot;
+        return 0;
+    }
 
-    m_impl->processes.push_back(proc);
-    m_impl->LinkProcess(m_impl->processes.back());
-    m_impl->RebuildProcessIndex();
-
-    m_impl->originalTokens[pid] = tokenAddr;
+    try {
+        m_impl->processes.push_back(proc);
+        m_impl->LinkProcess(m_impl->processes.back());
+        m_impl->RebuildProcessIndex();
+        m_impl->originalTokens[pid] = tokenAddr;
+    } catch (const std::bad_alloc&) {
+        m_impl->processes.erase(
+            std::remove_if(m_impl->processes.begin(), m_impl->processes.end(),
+                           [pid](const EmulatedEPROCESS& p) {
+                               return p.uniqueProcessId == pid;
+                           }),
+            m_impl->processes.end());
+        m_impl->pidIndex.erase(pid);
+        m_impl->originalTokens.erase(pid);
+        m_impl->nextProcessSlot = processSlot;
+        m_impl->nextTokenSlot = tokenSlot;
+        return 0;
+    }
 
     return addr;
 }
@@ -736,6 +820,7 @@ bool KernelObjectManager::TerminateProcess(uint32_t pid) {
     if (it == m_impl->pidIndex.end()) return false;
 
     size_t idx = it->second;
+    if (idx >= m_impl->processes.size()) return false;
     m_impl->processes[idx].exitTime = m_impl->processes[idx].createTime + 1;
     m_impl->processes[idx].exitStatus = 0;
 
@@ -752,28 +837,23 @@ bool KernelObjectManager::TerminateProcess(uint32_t pid) {
 
     // Erase the process and rebuild index
     m_impl->processes.erase(m_impl->processes.begin() + static_cast<ptrdiff_t>(idx));
+    m_impl->originalTokens.erase(pid);
     m_impl->RebuildProcessIndex();
 
     return true;
 }
 
-const EmulatedEPROCESS* KernelObjectManager::FindProcess(uint32_t pid) const {
+std::optional<EmulatedEPROCESS> KernelObjectManager::FindProcess(uint32_t pid) const {
     std::shared_lock lock(m_impl->mutex);
 
     auto it = m_impl->pidIndex.find(pid);
-    if (it == m_impl->pidIndex.end()) return nullptr;
-    return &m_impl->processes[it->second];
+    if (it == m_impl->pidIndex.end() || it->second >= m_impl->processes.size()) return std::nullopt;
+    return m_impl->processes[it->second];
 }
 
-std::vector<const EmulatedEPROCESS*> KernelObjectManager::GetProcessList() const {
+std::vector<EmulatedEPROCESS> KernelObjectManager::GetProcessList() const {
     std::shared_lock lock(m_impl->mutex);
-
-    std::vector<const EmulatedEPROCESS*> result;
-    result.reserve(m_impl->processes.size());
-    for (const auto& p : m_impl->processes) {
-        result.push_back(&p);
-    }
-    return result;
+    return m_impl->processes;
 }
 
 bool KernelObjectManager::ValidateProcessList() const {
@@ -802,7 +882,9 @@ GuestAddress KernelObjectManager::CreateThread(uint32_t pid, uint32_t tid, Guest
 
     auto procIt = m_impl->pidIndex.find(pid);
     if (procIt == m_impl->pidIndex.end()) return 0;
+    if (procIt->second >= m_impl->processes.size()) return 0;
 
+    const uint32_t threadSlot = m_impl->nextThreadSlot;
     GuestAddress addr = m_impl->AllocThreadAddress();
     if (addr == 0) return 0;
 
@@ -814,34 +896,54 @@ GuestAddress KernelObjectManager::CreateThread(uint32_t pid, uint32_t tid, Guest
     thread.threadId         = tid;
     thread.startAddress     = startAddr;
     thread.win32StartAddress = startAddr;
-    thread.stackBase        = addr + 0x10000;
+    if (!AddGuest(addr, 0x10000, thread.stackBase) ||
+        thread.stackBase < kStackSize ||
+        !AddGuest(addr, 0x20000, thread.kernelStack) ||
+        !AddGuest(addr, 0x30000, thread.teb)) {
+        m_impl->nextThreadSlot = threadSlot;
+        return 0;
+    }
     thread.stackLimit       = thread.stackBase - kStackSize;
-    thread.kernelStack      = addr + 0x20000;
     thread.state            = 2; // Running
     thread.priority         = 8;
     thread.basePriority     = 8;
     thread.alertable        = false;
-    thread.teb              = addr + 0x30000;
     thread.createTime       = static_cast<uint64_t>(m_impl->threads.size()) + 1;
     thread.previousMode     = 1; // UserMode
 
     // Link into owning process thread list
     thread.threadListEntry_Flink = owner.threadListHead_Flink;
-    thread.threadListEntry_Blink = owner.selfPtr + offsetof(EmulatedEPROCESS, threadListHead_Flink);
+    if (!AddGuest(owner.selfPtr, offsetof(EmulatedEPROCESS, threadListHead_Flink), thread.threadListEntry_Blink)) {
+        m_impl->nextThreadSlot = threadSlot;
+        return 0;
+    }
     owner.threadListHead_Flink   = addr;
 
-    m_impl->threads.push_back(thread);
-    m_impl->RebuildThreadIndex();
+    try {
+        m_impl->threads.push_back(thread);
+        m_impl->RebuildThreadIndex();
+    } catch (const std::bad_alloc&) {
+        m_impl->threads.erase(
+            std::remove_if(m_impl->threads.begin(), m_impl->threads.end(),
+                           [tid](const EmulatedKTHREAD& t) {
+                               return t.threadId == tid;
+                           }),
+            m_impl->threads.end());
+        m_impl->tidIndex.erase(tid);
+        owner.threadListHead_Flink = thread.threadListEntry_Flink;
+        m_impl->nextThreadSlot = threadSlot;
+        return 0;
+    }
 
     return addr;
 }
 
-const EmulatedKTHREAD* KernelObjectManager::FindThread(uint32_t tid) const {
+std::optional<EmulatedKTHREAD> KernelObjectManager::FindThread(uint32_t tid) const {
     std::shared_lock lock(m_impl->mutex);
 
     auto it = m_impl->tidIndex.find(tid);
-    if (it == m_impl->tidIndex.end()) return nullptr;
-    return &m_impl->threads[it->second];
+    if (it == m_impl->tidIndex.end() || it->second >= m_impl->threads.size()) return std::nullopt;
+    return m_impl->threads[it->second];
 }
 
 // ============================================================================
@@ -854,12 +956,19 @@ GuestAddress KernelObjectManager::LoadDriver(const char* name, GuestAddress base
     if (!m_impl->initialized) return 0;
     if (!name) return 0;
     if (m_impl->drivers.size() >= kMaxEmulatedDrivers) return 0;
+    if (base == 0 || size == 0) return 0;
+    const size_t nameLen = BoundedStringLength(name, sizeof(EmulatedDriverObject::driverName));
+    if (nameLen == 0) return 0;
 
     // Reject duplicate driver names
     for (const auto& d : m_impl->drivers) {
-        if (std::strncmp(d.driverName, name, sizeof(d.driverName) - 1) == 0) return 0;
+        if (BoundedStringLength(d.driverName, sizeof(d.driverName)) == nameLen &&
+            std::memcmp(d.driverName, name, nameLen) == 0) {
+            return 0;
+        }
     }
 
+    const uint32_t driverSlot = m_impl->nextDriverSlot;
     GuestAddress addr = m_impl->AllocDriverAddress();
     if (addr == 0) return 0;
 
@@ -870,45 +979,53 @@ GuestAddress KernelObjectManager::LoadDriver(const char* name, GuestAddress base
     drv.driverInit    = base; // DriverEntry at module base by default
     drv.driverUnload  = 0;
     drv.deviceObject  = 0;
-    drv.driverExtension = addr + 0x800;
+    if (!AddGuest(addr, 0x800, drv.driverExtension)) {
+        m_impl->nextDriverSlot = driverSlot;
+        return 0;
+    }
 
     std::memset(drv.driverName, 0, sizeof(drv.driverName));
-    const size_t nameLen = std::strlen(name);
     const size_t copyLen = (nameLen < sizeof(drv.driverName) - 1) ? nameLen : sizeof(drv.driverName) - 1;
     std::memcpy(drv.driverName, name, copyLen);
 
     // Default dispatch table: point all IRP_MJ_* handlers to a sentinel address
-    GuestAddress defaultDispatch = base + 0x100;
+    GuestAddress defaultDispatch = 0;
+    if (!AddGuest(base, 0x100, defaultDispatch)) {
+        m_impl->nextDriverSlot = driverSlot;
+        return 0;
+    }
     for (auto& mf : drv.majorFunction) {
         mf = defaultDispatch;
     }
 
-    m_impl->drivers.push_back(drv);
+    try {
+        m_impl->drivers.push_back(drv);
+    } catch (const std::bad_alloc&) {
+        m_impl->nextDriverSlot = driverSlot;
+        return 0;
+    }
 
     return addr;
 }
 
-const EmulatedDriverObject* KernelObjectManager::FindDriver(const char* name) const {
+std::optional<EmulatedDriverObject> KernelObjectManager::FindDriver(const char* name) const {
     std::shared_lock lock(m_impl->mutex);
 
-    if (!name) return nullptr;
+    if (!name) return std::nullopt;
+    const size_t nameLen = BoundedStringLength(name, sizeof(EmulatedDriverObject::driverName));
+    if (nameLen == 0) return std::nullopt;
     for (const auto& d : m_impl->drivers) {
-        if (std::strncmp(d.driverName, name, sizeof(d.driverName) - 1) == 0) {
-            return &d;
+        if (BoundedStringLength(d.driverName, sizeof(d.driverName)) == nameLen &&
+            std::memcmp(d.driverName, name, nameLen) == 0) {
+            return d;
         }
     }
-    return nullptr;
+    return std::nullopt;
 }
 
-std::vector<const EmulatedDriverObject*> KernelObjectManager::GetDriverList() const {
+std::vector<EmulatedDriverObject> KernelObjectManager::GetDriverList() const {
     std::shared_lock lock(m_impl->mutex);
-
-    std::vector<const EmulatedDriverObject*> result;
-    result.reserve(m_impl->drivers.size());
-    for (const auto& d : m_impl->drivers) {
-        result.push_back(&d);
-    }
-    return result;
+    return m_impl->drivers;
 }
 
 // ============================================================================
@@ -948,7 +1065,7 @@ void KernelObjectManager::InitializeSSDT() {
     ssdt.serviceCount = static_cast<uint32_t>(ssdt.entries.size());
 }
 
-const SSDT& KernelObjectManager::GetSSDT() const {
+SSDT KernelObjectManager::GetSSDT() const {
     std::shared_lock lock(m_impl->mutex);
     return m_impl->ssdt;
 }
