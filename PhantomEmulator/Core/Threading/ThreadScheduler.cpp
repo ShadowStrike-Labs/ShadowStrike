@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <new>
 
 namespace Phantom {
 
@@ -27,6 +28,31 @@ static constexpr uint64_t kTicksPerMs = 1000;
 
 // Guard value for infinite timeouts (matches INFINITE = 0xFFFFFFFF on Windows).
 static constexpr uint32_t kInfiniteTimeout = 0xFFFFFFFF;
+static constexpr uint32_t kWaitTimeout = 0x00000102;
+static constexpr uint32_t kWaitFailed = 0xFFFFFFFF;
+static constexpr uint32_t kMaxSchedulerThreads = 4096;
+
+namespace {
+
+[[nodiscard]] bool AddGuestAddress(GuestAddress base, GuestSize size, GuestAddress& out) noexcept
+{
+    if (size > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + size;
+    return true;
+}
+
+void AddSaturating(uint64_t& target, uint64_t delta) noexcept
+{
+    if (delta > (std::numeric_limits<uint64_t>::max)() - target) {
+        target = (std::numeric_limits<uint64_t>::max)();
+    } else {
+        target += delta;
+    }
+}
+
+} // namespace
 
 // ============================================================================
 // Construction / Destruction
@@ -35,7 +61,14 @@ static constexpr uint32_t kInfiniteTimeout = 0xFFFFFFFF;
 ThreadScheduler::ThreadScheduler(const EmulationConfig& config) noexcept
     : m_config(config)
 {
-    m_threads.reserve(config.maxThreads);
+    if (m_config.maxThreads > kMaxSchedulerThreads) {
+        m_config.maxThreads = kMaxSchedulerThreads;
+    }
+    try {
+        m_threads.reserve(m_config.maxThreads);
+    } catch (const std::bad_alloc&) {
+        m_config.maxThreads = 0;
+    }
 }
 
 ThreadScheduler::~ThreadScheduler() noexcept = default;
@@ -54,10 +87,32 @@ uint32_t ThreadScheduler::CreateThread(
     if (m_threads.size() >= m_config.maxThreads) {
         return 0;  // Thread limit exceeded.
     }
+    if (startAddr == 0 || stackSize < 8) {
+        return 0;
+    }
 
-    uint32_t tid = m_nextThreadId++;
+    GuestAddress stackEnd = 0;
+    if (!AddGuestAddress(stackBase, stackSize, stackEnd)) {
+        return 0;
+    }
 
-    ThreadContext ctx;
+    uint32_t tid = 0;
+    for (uint32_t attempts = 0; attempts < (std::numeric_limits<uint32_t>::max)(); ++attempts) {
+        const uint32_t candidate = m_nextThreadId++;
+        if (candidate != 0 && FindThread(candidate) == nullptr) {
+            tid = candidate;
+            break;
+        }
+    }
+    if (tid == 0) return 0;
+
+    try {
+        m_threads.emplace_back();
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+
+    auto& ctx = m_threads.back();
     ctx.threadId       = tid;
     ctx.ownerProcessId = 1;
     ctx.startAddress   = startAddr;
@@ -81,7 +136,7 @@ uint32_t ThreadScheduler::CreateThread(
 
     // Set up the stack pointer.  The stack grows downward:
     //   RSP = stackBase + stackSize - 8  (leave room for alignment/return address)
-    GuestAddress stackTop = stackBase + stackSize - 8;
+    GuestAddress stackTop = stackEnd - 8;
     ctx.cpuState.SetReg64(GPR::RSP, stackTop);
     ctx.cpuState.SetReg64(GPR::RBP, stackTop);
 
@@ -94,11 +149,10 @@ uint32_t ThreadScheduler::CreateThread(
         // The actual push will be handled when the scheduler writes memory.
     }
 
-    ctx.priority          = 8;
+    ctx.priority          = ThreadContext::kDefaultPriority;
     ctx.lastScheduledTick = m_globalTick;
-    ctx.quantum           = 2000;
+    ctx.quantum           = ThreadContext::kDefaultQuantum;
 
-    m_threads.push_back(std::move(ctx));
     return tid;
 }
 
@@ -211,7 +265,7 @@ uint32_t ThreadScheduler::RunQuantum(
 
     thread.state = ThreadState::Running;
     thread.lastScheduledTick = m_globalTick;
-    thread.contextSwitchCount++;
+    AddSaturating(thread.contextSwitchCount, 1);
 
     LoadThreadState(thread, cpu);
 
@@ -229,9 +283,11 @@ uint32_t ThreadScheduler::RunQuantum(
 
     auto result = cpu.Execute(memory, tracker, quantumConfig);
 
-    instructionsThisQuantum = static_cast<uint32_t>(result.instructionsExecuted);
-    thread.instructionsExecuted += instructionsThisQuantum;
-    m_globalTick += instructionsThisQuantum;
+    instructionsThisQuantum = (result.instructionsExecuted > (std::numeric_limits<uint32_t>::max)())
+        ? (std::numeric_limits<uint32_t>::max)()
+        : static_cast<uint32_t>(result.instructionsExecuted);
+    AddSaturating(thread.instructionsExecuted, instructionsThisQuantum);
+    AddSaturating(m_globalTick, instructionsThisQuantum);
 
     // Save back state after execution.
     SaveThreadState(thread, cpu);
@@ -301,29 +357,42 @@ void ThreadScheduler::WaitOnHandle(uint32_t handle, uint32_t timeoutMs)
     auto* t = GetCurrentThread();
     if (!t) return;
 
+    if (!m_syncStore.HandleExists(handle)) {
+        t->cpuState.SetReg64(GPR::RAX, kWaitFailed);
+        return;
+    }
+
     // Try to acquire immediately.
     bool acquired = false;
 
-    if (m_syncStore.HandleExists(handle)) {
-        // Try mutex first, then event, then semaphore.
-        acquired = m_syncStore.TryAcquireMutex(handle, t->threadId);
-        if (!acquired) {
-            acquired = m_syncStore.TryWaitEvent(handle);
-        }
-        if (!acquired) {
-            acquired = m_syncStore.TryAcquireSemaphore(handle);
-        }
+    // Try mutex first, then event, then semaphore.
+    acquired = m_syncStore.TryAcquireMutex(handle, t->threadId);
+    if (!acquired) {
+        acquired = m_syncStore.TryWaitEvent(handle);
+    }
+    if (!acquired) {
+        acquired = m_syncStore.TryAcquireSemaphore(handle);
     }
 
     if (acquired) {
         // Object was signaled — no need to wait.
         return;
     }
+    if (timeoutMs == 0) {
+        t->cpuState.SetReg64(GPR::RAX, kWaitTimeout);
+        return;
+    }
 
     // Must wait.
     t->state = ThreadState::Waiting;
     t->waitInfo.type          = WaitInfo::WaitType::SingleObject;
-    t->waitInfo.waitHandles   = { handle };
+    try {
+        t->waitInfo.waitHandles = { handle };
+    } catch (const std::bad_alloc&) {
+        t->ClearWait();
+        t->cpuState.SetReg64(GPR::RAX, kWaitFailed);
+        return;
+    }
     t->waitInfo.waitAll       = false;
     t->waitInfo.waitStartTick = m_globalTick;
     t->waitInfo.timeoutMs     = timeoutMs;
@@ -340,6 +409,16 @@ void ThreadScheduler::WaitOnMultiple(
     if (!t) return;
 
     if (handles.empty()) return;
+    if (handles.size() > ThreadContext::kMaxWaitHandles) {
+        t->cpuState.SetReg64(GPR::RAX, kWaitFailed);
+        return;
+    }
+    for (uint32_t h : handles) {
+        if (!m_syncStore.HandleExists(h)) {
+            t->cpuState.SetReg64(GPR::RAX, kWaitFailed);
+            return;
+        }
+    }
 
     if (!waitAll) {
         // WaitAny: try each handle; if any is immediately acquired, return.
@@ -349,37 +428,22 @@ void ThreadScheduler::WaitOnMultiple(
                             m_syncStore.TryAcquireSemaphore(h);
             if (acquired) return;
         }
-    } else {
-        // WaitAll: all handles must be signaled.  We don't acquire any until
-        // all are available (two-phase check).
-        bool allAvailable = true;
-        for (uint32_t h : handles) {
-            if (!m_syncStore.HandleExists(h)) {
-                allAvailable = false;
-                break;
-            }
-            // Peek without consuming — we need to check all before committing.
-            // For simplicity, we skip the optimistic path and go straight to wait.
-            allAvailable = false;
-            break;
-        }
-        // If all were available we'd acquire them here, but the peek-without-
-        // consuming model is complex. For correctness, always wait.
-        if (allAvailable) {
-            // Acquire each one.
-            for (uint32_t h : handles) {
-                m_syncStore.TryAcquireMutex(h, t->threadId);
-                m_syncStore.TryWaitEvent(h);
-                m_syncStore.TryAcquireSemaphore(h);
-            }
-            return;
-        }
+    }
+    if (timeoutMs == 0) {
+        t->cpuState.SetReg64(GPR::RAX, kWaitTimeout);
+        return;
     }
 
     // Must wait on all specified handles.
     t->state = ThreadState::Waiting;
     t->waitInfo.type          = WaitInfo::WaitType::MultipleObjects;
-    t->waitInfo.waitHandles   = handles;
+    try {
+        t->waitInfo.waitHandles = handles;
+    } catch (const std::bad_alloc&) {
+        t->ClearWait();
+        t->cpuState.SetReg64(GPR::RAX, kWaitFailed);
+        return;
+    }
     t->waitInfo.waitAll       = waitAll;
     t->waitInfo.waitStartTick = m_globalTick;
     t->waitInfo.timeoutMs     = timeoutMs;
@@ -428,6 +492,7 @@ void ThreadScheduler::SignalHandle(uint32_t handle)
                         m_syncStore.TryAcquireMutex(h, tid) ||
                         m_syncStore.TryWaitEvent(h) ||
                         m_syncStore.TryAcquireSemaphore(h);
+                    static_cast<void>(otherSignaled);
                     if (!otherSignaled) {
                         canWake = false;
                         break;
@@ -453,15 +518,19 @@ void ThreadScheduler::QueueUserAPC(uint32_t threadId, GuestAddress routine, uint
     auto* t = FindThread(threadId);
     if (!t) return;
     if (t->state == ThreadState::Terminated) return;
+    if (routine == 0) return;
 
     // Cap APC queue to prevent unbounded growth.
-    static constexpr size_t kMaxAPCQueueSize = 256;
-    if (t->apcQueue.size() >= kMaxAPCQueueSize) return;
+    if (t->apcQueue.size() >= ThreadContext::kMaxAPCQueueDepth) return;
 
     APCEntry entry;
     entry.routine   = routine;
     entry.parameter = parameter;
-    t->apcQueue.push_back(entry);
+    try {
+        t->apcQueue.push_back(entry);
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 
     // If the thread is in an alertable wait (WaitType::APC or Sleep), wake it.
     if (t->state == ThreadState::Waiting &&
@@ -562,19 +631,27 @@ const ThreadContext* ThreadScheduler::FindThread(uint32_t threadId) const noexce
 
 bool ThreadScheduler::HasDeadlock() const noexcept
 {
-    return m_syncStore.HasDeadlock();
+    try {
+        return m_syncStore.HasDeadlock();
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
 }
 
 std::vector<uint32_t> ThreadScheduler::GetDeadlockedThreads() const noexcept
 {
-    return m_syncStore.GetDeadlockedThreads();
+    try {
+        return m_syncStore.GetDeadlockedThreads();
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 uint64_t ThreadScheduler::TotalInstructionsExecuted() const noexcept
 {
     uint64_t total = 0;
     for (const auto& t : m_threads) {
-        total += t.instructionsExecuted;
+        AddSaturating(total, t.instructionsExecuted);
     }
     return total;
 }
@@ -716,10 +793,15 @@ void ThreadScheduler::DeliverAPCs(
     // Save the current RIP as the return address.
     GuestAddress savedRIP = cpu.State().GetRIP();
     uint64_t rsp = cpu.State().GetReg64(GPR::RSP);
+    if (rsp < 8) {
+        return;
+    }
 
     // Push the return address onto the guest stack.
     rsp -= 8;
-    memory.WriteU64(rsp, savedRIP);
+    if (memory.WriteU64(rsp, savedRIP) != ErrorCode::Success) {
+        return;
+    }
 
     cpu.State().SetReg64(GPR::RSP, rsp);
     cpu.State().SetReg64(GPR::RCX, apc.parameter);
@@ -741,10 +823,18 @@ uint64_t ThreadScheduler::MsToTicks(uint32_t ms) const noexcept
     if (m_config.enableTimingAcceleration) {
         // Accelerate by 100x: 1 ms of guest time = 10 ticks instead of 1000.
         static constexpr uint64_t kAcceleratedTicksPerMs = 10;
-        return static_cast<uint64_t>(ms) * kAcceleratedTicksPerMs;
+        const uint64_t value = static_cast<uint64_t>(ms);
+        if (value > (std::numeric_limits<uint64_t>::max)() / kAcceleratedTicksPerMs) {
+            return (std::numeric_limits<uint64_t>::max)();
+        }
+        return value * kAcceleratedTicksPerMs;
     }
 
-    return static_cast<uint64_t>(ms) * kTicksPerMs;
+    const uint64_t value = static_cast<uint64_t>(ms);
+    if (value > (std::numeric_limits<uint64_t>::max)() / kTicksPerMs) {
+        return (std::numeric_limits<uint64_t>::max)();
+    }
+    return value * kTicksPerMs;
 }
 
 } // namespace Phantom
