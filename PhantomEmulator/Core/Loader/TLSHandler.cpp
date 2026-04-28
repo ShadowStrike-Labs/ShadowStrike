@@ -17,8 +17,11 @@
 
 #include "TLSHandler.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <new>
 
 namespace Phantom {
 
@@ -38,6 +41,53 @@ static constexpr uint32_t kMaxTLSZeroFill = 16 * 1024 * 1024; // 16 MB
 
 // Instructions budget per callback (configurable, but cap at sane default)
 static constexpr uint64_t kDefaultCallbackInsnLimit = 5'000'000;
+
+namespace {
+
+[[nodiscard]] bool AddGuestAddress(GuestAddress base, GuestAddress offset, GuestAddress& out) noexcept {
+    if (offset > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
+
+[[nodiscard]] bool RangeSize(GuestAddress begin, GuestAddress end, uint64_t& out) noexcept {
+    if (end < begin) {
+        return false;
+    }
+    out = end - begin;
+    return true;
+}
+
+[[nodiscard]] bool ToU32(GuestAddress value, uint32_t& out) noexcept {
+    if (value > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+class BreakpointGuard {
+public:
+    BreakpointGuard(CPU& cpu, GuestAddress address) noexcept
+        : m_cpu(cpu), m_address(address) {
+        m_cpu.AddBreakpoint(m_address);
+    }
+
+    ~BreakpointGuard() noexcept {
+        m_cpu.RemoveBreakpoint(m_address);
+    }
+
+    BreakpointGuard(const BreakpointGuard&) = delete;
+    BreakpointGuard& operator=(const BreakpointGuard&) = delete;
+
+private:
+    CPU& m_cpu;
+    GuestAddress m_address;
+};
+
+} // namespace
 
 // ============================================================================
 // Parse — Read and validate TLS directory
@@ -65,7 +115,10 @@ TLSInfo TLSHandler::Parse(
         return info; // Directory too small — treat as absent
     }
 
-    const GuestAddress tlsDirAddr = imageBase + tlsDirRVA;
+    GuestAddress tlsDirAddr = 0;
+    if (!AddGuestAddress(imageBase, tlsDirRVA, tlsDirAddr)) {
+        return info;
+    }
 
     if (is64Bit) {
         info = Parse64(imageBase, tlsDirAddr, memory);
@@ -100,11 +153,11 @@ TLSInfo TLSHandler::Parse32(
     info.zeroFillSize      = dir.SizeOfZeroFill;
 
     // Validate template data range
-    if (info.rawDataEnd < info.rawDataStart) {
+    uint64_t templateSize = 0;
+    if (!RangeSize(info.rawDataStart, info.rawDataEnd, templateSize)) {
         return info; // Invalid range
     }
 
-    const uint64_t templateSize = info.rawDataEnd - info.rawDataStart;
     if (templateSize > kMaxTLSTemplateSize) {
         return info; // Suspiciously large
     }
@@ -118,6 +171,7 @@ TLSInfo TLSHandler::Parse32(
         err = ReadCallbackArray32(memory, info.callbacksAddress, info.callbacks);
         if (err != ErrorCode::Success) {
             info.callbacks.clear();
+            return info;
         }
     }
 
@@ -149,11 +203,11 @@ TLSInfo TLSHandler::Parse64(
     info.zeroFillSize      = dir.SizeOfZeroFill;
 
     // Validate template data range
-    if (info.rawDataEnd < info.rawDataStart) {
+    uint64_t templateSize = 0;
+    if (!RangeSize(info.rawDataStart, info.rawDataEnd, templateSize)) {
         return info;
     }
 
-    const uint64_t templateSize = info.rawDataEnd - info.rawDataStart;
     if (templateSize > kMaxTLSTemplateSize) {
         return info;
     }
@@ -167,6 +221,7 @@ TLSInfo TLSHandler::Parse64(
         err = ReadCallbackArray64(memory, info.callbacksAddress, info.callbacks);
         if (err != ErrorCode::Success) {
             info.callbacks.clear();
+            return info;
         }
     }
 
@@ -183,25 +238,39 @@ ErrorCode TLSHandler::ReadCallbackArray32(
     GuestAddress               callbacksVA,
     std::vector<GuestAddress>& out) noexcept
 {
-    out.clear();
-    out.reserve(8); // Typical TLS callback count is 1-3
+    try {
+        out.clear();
+        out.reserve(8); // Typical TLS callback count is 1-3
+    } catch (const std::bad_alloc&) {
+        out.clear();
+        return ErrorCode::OutOfMemory;
+    }
 
     for (uint32_t i = 0; i < PE::kMaxTLSCallbacks; ++i) {
+        GuestAddress entryAddress = 0;
+        if (!AddGuestAddress(callbacksVA, static_cast<GuestAddress>(i) * sizeof(uint32_t), entryAddress)) {
+            return ErrorCode::InvalidAddress;
+        }
+
         uint32_t ptr = 0;
-        ErrorCode err = memory.ReadU32(
-            callbacksVA + static_cast<GuestAddress>(i) * sizeof(uint32_t), ptr);
+        ErrorCode err = memory.ReadU32(entryAddress, ptr);
         if (err != ErrorCode::Success) {
             return err;
         }
 
         if (ptr == 0) {
-            break; // Null terminator
+            return ErrorCode::Success; // Null terminator
         }
 
-        out.push_back(static_cast<GuestAddress>(ptr));
+        try {
+            out.push_back(static_cast<GuestAddress>(ptr));
+        } catch (const std::bad_alloc&) {
+            out.clear();
+            return ErrorCode::OutOfMemory;
+        }
     }
 
-    return ErrorCode::Success;
+    return ErrorCode::MalformedPE;
 }
 
 // ============================================================================
@@ -213,25 +282,39 @@ ErrorCode TLSHandler::ReadCallbackArray64(
     GuestAddress               callbacksVA,
     std::vector<GuestAddress>& out) noexcept
 {
-    out.clear();
-    out.reserve(8);
+    try {
+        out.clear();
+        out.reserve(8);
+    } catch (const std::bad_alloc&) {
+        out.clear();
+        return ErrorCode::OutOfMemory;
+    }
 
     for (uint32_t i = 0; i < PE::kMaxTLSCallbacks; ++i) {
+        GuestAddress entryAddress = 0;
+        if (!AddGuestAddress(callbacksVA, static_cast<GuestAddress>(i) * sizeof(uint64_t), entryAddress)) {
+            return ErrorCode::InvalidAddress;
+        }
+
         uint64_t ptr = 0;
-        ErrorCode err = memory.ReadU64(
-            callbacksVA + static_cast<GuestAddress>(i) * sizeof(uint64_t), ptr);
+        ErrorCode err = memory.ReadU64(entryAddress, ptr);
         if (err != ErrorCode::Success) {
             return err;
         }
 
         if (ptr == 0) {
-            break;
+            return ErrorCode::Success;
         }
 
-        out.push_back(ptr);
+        try {
+            out.push_back(ptr);
+        } catch (const std::bad_alloc&) {
+            out.clear();
+            return ErrorCode::OutOfMemory;
+        }
     }
 
-    return ErrorCode::Success;
+    return ErrorCode::MalformedPE;
 }
 
 // ============================================================================
@@ -251,12 +334,23 @@ ErrorCode TLSHandler::InitializeTLSData(
     // -----------------------------------------------------------------------
     // 1. Copy template data from rawDataStart to destination
     // -----------------------------------------------------------------------
-    if (info.rawDataEnd > info.rawDataStart) {
-        const auto templateSize = static_cast<uint32_t>(info.rawDataEnd - info.rawDataStart);
+    uint64_t templateSize64 = 0;
+    if (!RangeSize(info.rawDataStart, info.rawDataEnd, templateSize64)) {
+        return ErrorCode::MalformedPE;
+    }
 
-        if (templateSize > kMaxTLSTemplateSize) {
-            return ErrorCode::MalformedPE;
-        }
+    if (templateSize64 > kMaxTLSTemplateSize || info.zeroFillSize > kMaxTLSZeroFill) {
+        return ErrorCode::MalformedPE;
+    }
+
+    GuestAddress tlsDataEnd = 0;
+    if (!AddGuestAddress(tlsDataDest, templateSize64, tlsDataEnd) ||
+        !AddGuestAddress(tlsDataEnd, info.zeroFillSize, tlsDataEnd)) {
+        return ErrorCode::InvalidAddress;
+    }
+
+    if (templateSize64 > 0) {
+        const auto templateSize = static_cast<uint32_t>(templateSize64);
 
         // Copy byte-by-byte through VirtualMemory (page-boundary safe).
         // For larger templates, copy in page-aligned chunks to reduce overhead.
@@ -266,17 +360,22 @@ ErrorCode TLSHandler::InitializeTLSData(
         while (copied < templateSize) {
             const uint32_t remaining = templateSize - copied;
             const uint32_t chunk = (remaining < kCopyChunkSize) ? remaining : kCopyChunkSize;
+            GuestAddress src = 0;
+            GuestAddress dst = 0;
+            if (!AddGuestAddress(info.rawDataStart, copied, src) ||
+                !AddGuestAddress(tlsDataDest, copied, dst)) {
+                return ErrorCode::InvalidAddress;
+            }
 
             // Read from TLS template source
-            uint8_t buf[kCopyChunkSize];
-            ErrorCode err = memory.Read(
-                info.rawDataStart + copied, buf, chunk);
+            std::array<uint8_t, kCopyChunkSize> buf{};
+            ErrorCode err = memory.Read(src, buf.data(), chunk);
             if (err != ErrorCode::Success) {
                 return ErrorCode::TLSCallbackFail;
             }
 
             // Write to destination
-            err = memory.Write(tlsDataDest + copied, buf, chunk);
+            err = memory.Write(dst, buf.data(), chunk);
             if (err != ErrorCode::Success) {
                 return ErrorCode::TLSCallbackFail;
             }
@@ -288,20 +387,25 @@ ErrorCode TLSHandler::InitializeTLSData(
     // -----------------------------------------------------------------------
     // 2. Zero-fill area after template data
     // -----------------------------------------------------------------------
-    if (info.zeroFillSize > 0 && info.zeroFillSize <= kMaxTLSZeroFill) {
-        const uint64_t templateSize = info.rawDataEnd - info.rawDataStart;
-        const GuestAddress zeroStart = tlsDataDest + templateSize;
+    if (info.zeroFillSize > 0) {
+        GuestAddress zeroStart = 0;
+        if (!AddGuestAddress(tlsDataDest, templateSize64, zeroStart)) {
+            return ErrorCode::InvalidAddress;
+        }
 
         static constexpr uint32_t kZeroChunkSize = 4096;
-        uint8_t zeroBuf[kZeroChunkSize];
-        std::memset(zeroBuf, 0, sizeof(zeroBuf));
+        std::array<uint8_t, kZeroChunkSize> zeroBuf{};
 
         uint32_t zeroed = 0;
         while (zeroed < info.zeroFillSize) {
             const uint32_t remaining = info.zeroFillSize - zeroed;
             const uint32_t chunk = (remaining < kZeroChunkSize) ? remaining : kZeroChunkSize;
+            GuestAddress dst = 0;
+            if (!AddGuestAddress(zeroStart, zeroed, dst)) {
+                return ErrorCode::InvalidAddress;
+            }
 
-            ErrorCode err = memory.Write(zeroStart + zeroed, zeroBuf, chunk);
+            ErrorCode err = memory.Write(dst, zeroBuf.data(), chunk);
             if (err != ErrorCode::Success) {
                 return ErrorCode::TLSCallbackFail;
             }
@@ -355,7 +459,7 @@ ErrorCode TLSHandler::ExecuteCallbacks(
 
     // Set up a breakpoint at the sentinel so the CPU stops when the callback
     // returns to it. We'll clear it when done.
-    cpu.AddBreakpoint(sentinel);
+    BreakpointGuard breakpoint(cpu, sentinel);
 
     for (const GuestAddress callbackAddr : info.callbacks) {
         if (callbackAddr == 0) {
@@ -369,6 +473,7 @@ ErrorCode TLSHandler::ExecuteCallbacks(
         // Set up calling convention
         // -------------------------------------------------------------------
         CPUState& state = cpu.State();
+        uint32_t callback32 = 0;
 
         if (is64Bit) {
             // Microsoft x64 calling convention:
@@ -381,29 +486,35 @@ ErrorCode TLSHandler::ExecuteCallbacks(
 
             // Push return address (sentinel) onto the stack
             const uint64_t rsp = state.RSP();
-            const uint64_t newRsp = rsp - 8;
+            if (rsp < 40) {
+                return ErrorCode::StackUnderflow;
+            }
+            const uint64_t newRsp = rsp - 40;
             state.SetReg64(GPR::RSP, newRsp);
 
             ErrorCode err = memory.WriteU64(newRsp, sentinel);
             if (err != ErrorCode::Success) {
-                cpu.RemoveBreakpoint(sentinel);
                 return ErrorCode::TLSCallbackFail;
             }
 
-            // Allocate shadow space (32 bytes) per Microsoft x64 ABI
-            state.SetReg64(GPR::RSP, newRsp - 32);
-
         } else {
+            uint32_t imageBase32 = 0;
+            if (!ToU32(imageBase, imageBase32) || !ToU32(callbackAddr, callback32)) {
+                return ErrorCode::InvalidAddress;
+            }
+
             // cdecl / stdcall (TLS callbacks use stdcall):
             //   Push in reverse order: lpvReserved, fdwReason, hinstDLL
             //   Then push return address
             uint32_t esp = state.GetReg32(GPR::RSP);
+            if (esp < 16) {
+                return ErrorCode::StackUnderflow;
+            }
 
             // Push lpvReserved = 0
             esp -= 4;
             ErrorCode err = memory.WriteU32(static_cast<GuestAddress>(esp), 0);
             if (err != ErrorCode::Success) {
-                cpu.RemoveBreakpoint(sentinel);
                 return ErrorCode::TLSCallbackFail;
             }
 
@@ -411,17 +522,13 @@ ErrorCode TLSHandler::ExecuteCallbacks(
             esp -= 4;
             err = memory.WriteU32(static_cast<GuestAddress>(esp), reason);
             if (err != ErrorCode::Success) {
-                cpu.RemoveBreakpoint(sentinel);
                 return ErrorCode::TLSCallbackFail;
             }
 
             // Push hinstDLL (imageBase, truncated to 32 bits for PE32)
             esp -= 4;
-            err = memory.WriteU32(
-                static_cast<GuestAddress>(esp),
-                static_cast<uint32_t>(imageBase));
+            err = memory.WriteU32(static_cast<GuestAddress>(esp), imageBase32);
             if (err != ErrorCode::Success) {
-                cpu.RemoveBreakpoint(sentinel);
                 return ErrorCode::TLSCallbackFail;
             }
 
@@ -431,7 +538,6 @@ ErrorCode TLSHandler::ExecuteCallbacks(
                 static_cast<GuestAddress>(esp),
                 static_cast<uint32_t>(sentinel));
             if (err != ErrorCode::Success) {
-                cpu.RemoveBreakpoint(sentinel);
                 return ErrorCode::TLSCallbackFail;
             }
 
@@ -439,7 +545,7 @@ ErrorCode TLSHandler::ExecuteCallbacks(
         }
 
         // Set RIP to callback entry
-        cpu.State().SetRIP(callbackAddr);
+        cpu.State().SetRIP(is64Bit ? callbackAddr : static_cast<GuestAddress>(callback32));
 
         // -------------------------------------------------------------------
         // Execute the callback with a limited instruction budget
@@ -456,17 +562,14 @@ ErrorCode TLSHandler::ExecuteCallbacks(
             break;
         case StopReason::InstructionLimit:
             // Callback ran too long — possible infinite loop / anti-analysis
-            cpu.RemoveBreakpoint(sentinel);
             return ErrorCode::TLSCallbackFail;
         case StopReason::AccessViolation:
         case StopReason::InvalidInstruction:
         case StopReason::StackOverflow:
         case StopReason::Crashed:
-            cpu.RemoveBreakpoint(sentinel);
             return ErrorCode::TLSCallbackFail;
         case StopReason::ExitProcess:
             // Callback called ExitProcess — malware behavior, not an error per se
-            cpu.RemoveBreakpoint(sentinel);
             return ErrorCode::Success;
         case StopReason::APICallTrap:
             // Hit an API hook — this is normal during callback execution
@@ -474,7 +577,6 @@ ErrorCode TLSHandler::ExecuteCallbacks(
         default:
             // Any other stop reason — treat as unexpected
             if (execResult.errorCode != ErrorCode::Success) {
-                cpu.RemoveBreakpoint(sentinel);
                 return ErrorCode::TLSCallbackFail;
             }
             break;
@@ -482,16 +584,15 @@ ErrorCode TLSHandler::ExecuteCallbacks(
 
         // Guard: if the callback consumed the entire budget without hitting
         // the sentinel, something is wrong
-        const uint64_t consumed = cpu.State().instructionCount - startInsn;
+        const uint64_t endInsn = cpu.State().instructionCount;
+        const uint64_t consumed = (endInsn >= startInsn) ? (endInsn - startInsn) : 0;
         if (consumed >= insnLimit &&
             execResult.reason != StopReason::Breakpoint)
         {
-            cpu.RemoveBreakpoint(sentinel);
             return ErrorCode::TLSCallbackFail;
         }
     }
 
-    cpu.RemoveBreakpoint(sentinel);
     return ErrorCode::Success;
 }
 
