@@ -11,7 +11,9 @@
 #include "../../Common/Platform.hpp"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +32,42 @@ static constexpr uint32_t  kMaxPoolAllocs   = 8192;
 static constexpr uint32_t  kGuardPattern    = 0xDEADBEEF;
 static constexpr uint32_t  kGuardSize       = 16;  // bytes of guard on each side
 static constexpr uint32_t  kPoolAlignment   = 16;  // NonPagedPool minimum alignment
+
+namespace {
+
+[[nodiscard]] bool AddGuest(GuestAddress a, GuestSize b, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - a < b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+[[nodiscard]] bool AlignUpGuest(GuestAddress value, GuestSize alignment, GuestAddress& result) noexcept {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    if ((std::numeric_limits<GuestAddress>::max)() - value < alignment - 1) {
+        return false;
+    }
+    result = AlignUp(value, alignment);
+    return true;
+}
+
+[[nodiscard]] bool RangesOverlap(GuestAddress aBase, GuestSize aSize,
+                                 GuestAddress bBase, GuestSize bSize) noexcept {
+    if (aSize == 0 || bSize == 0) {
+        return false;
+    }
+    GuestAddress aEnd = 0;
+    GuestAddress bEnd = 0;
+    if (!AddGuest(aBase, aSize, aEnd) || !AddGuest(bBase, bSize, bEnd)) {
+        return true;
+    }
+    return aBase < bEnd && bBase < aEnd;
+}
+
+} // namespace
 
 // ============================================================================
 // PIMPL Implementation
@@ -65,40 +103,61 @@ struct KernelAddressSpace::Impl {
 
     [[nodiscard]] GuestSize TotalAllocationSize(GuestSize requestedSize) const noexcept {
         // guard_front + aligned_payload + guard_back, page-aligned for large allocs
+        if ((std::numeric_limits<GuestSize>::max)() - requestedSize < kPoolAlignment - 1) {
+            return 0;
+        }
         GuestSize aligned = AlignUp(requestedSize, kPoolAlignment);
+        if ((std::numeric_limits<GuestSize>::max)() - aligned < (kGuardSize * 2ULL)) {
+            return 0;
+        }
         return kGuardSize + aligned + kGuardSize;
     }
 
-    void WriteGuardBytes(GuestAddress allocationBase, GuestSize totalSize) noexcept {
-        if (!memory) return;
+    [[nodiscard]] bool WriteGuardBytes(GuestAddress allocationBase, GuestSize totalSize) noexcept {
+        if (!memory || totalSize < (kGuardSize * 2ULL)) return false;
 
         // Front guard: kGuardSize bytes of kGuardPattern at allocationBase
         for (uint32_t i = 0; i < kGuardSize; i += sizeof(uint32_t)) {
-            (void)memory->WriteU32(allocationBase + i, kGuardPattern);
+            GuestAddress guardAddr = 0;
+            if (!AddGuest(allocationBase, i, guardAddr) ||
+                memory->WriteU32(guardAddr, kGuardPattern) != ErrorCode::Success) {
+                return false;
+            }
         }
 
         // Back guard: kGuardSize bytes of kGuardPattern at end
-        GuestAddress backGuard = allocationBase + totalSize - kGuardSize;
+        GuestAddress backGuard = 0;
+        if (!AddGuest(allocationBase, totalSize - kGuardSize, backGuard)) return false;
         for (uint32_t i = 0; i < kGuardSize; i += sizeof(uint32_t)) {
-            (void)memory->WriteU32(backGuard + i, kGuardPattern);
+            GuestAddress guardAddr = 0;
+            if (!AddGuest(backGuard, i, guardAddr) ||
+                memory->WriteU32(guardAddr, kGuardPattern) != ErrorCode::Success) {
+                return false;
+            }
         }
+        return true;
     }
 
     [[nodiscard]] bool VerifyGuardBytes(GuestAddress allocationBase, GuestSize totalSize) const noexcept {
-        if (!memory) return false;
+        if (!memory || totalSize < (kGuardSize * 2ULL)) return false;
 
         // Verify front guard
         for (uint32_t i = 0; i < kGuardSize; i += sizeof(uint32_t)) {
             uint32_t val = 0;
-            if (memory->ReadU32(allocationBase + i, val) != ErrorCode::Success) return false;
+            GuestAddress guardAddr = 0;
+            if (!AddGuest(allocationBase, i, guardAddr)) return false;
+            if (memory->ReadU32(guardAddr, val) != ErrorCode::Success) return false;
             if (val != kGuardPattern) return false;
         }
 
         // Verify back guard
-        GuestAddress backGuard = allocationBase + totalSize - kGuardSize;
+        GuestAddress backGuard = 0;
+        if (!AddGuest(allocationBase, totalSize - kGuardSize, backGuard)) return false;
         for (uint32_t i = 0; i < kGuardSize; i += sizeof(uint32_t)) {
             uint32_t val = 0;
-            if (memory->ReadU32(backGuard + i, val) != ErrorCode::Success) return false;
+            GuestAddress guardAddr = 0;
+            if (!AddGuest(backGuard, i, guardAddr)) return false;
+            if (memory->ReadU32(guardAddr, val) != ErrorCode::Success) return false;
             if (val != kGuardPattern) return false;
         }
 
@@ -109,10 +168,16 @@ struct KernelAddressSpace::Impl {
         auto& stats = tagStats[tag];
         stats.tag = tag;
         if (isAlloc) {
-            stats.allocCount++;
-            stats.totalBytes += size;
+            if (stats.allocCount < (std::numeric_limits<uint32_t>::max)()) {
+                ++stats.allocCount;
+            }
+            stats.totalBytes = ((std::numeric_limits<GuestSize>::max)() - stats.totalBytes < size)
+                                   ? (std::numeric_limits<GuestSize>::max)()
+                                   : stats.totalBytes + size;
         } else {
-            stats.freeCount++;
+            if (stats.freeCount < (std::numeric_limits<uint32_t>::max)()) {
+                ++stats.freeCount;
+            }
             if (stats.totalBytes >= size) {
                 stats.totalBytes -= size;
             } else {
@@ -264,58 +329,94 @@ std::optional<GuestAddress> KernelAddressSpace::AllocatePool(
     if (size > kMaxSingleAlloc) return std::nullopt;
 
     GuestSize totalSize = m_impl->TotalAllocationSize(size);
+    if (totalSize == 0) return std::nullopt;
 
     // Large allocations get page-aligned for realistic behavior
     bool isLargeAlloc = (size >= kPageSize);
     if (isLargeAlloc) {
+        if ((std::numeric_limits<GuestSize>::max)() - totalSize < kPageSize - 1) {
+            return std::nullopt;
+        }
         totalSize = AlignUp(totalSize, kPageSize);
     }
 
     GuestAddress allocBase = 0;
+    GuestAddress nextCursor = 0;
     MemProt prot = MemProt::RW;
 
     switch (type) {
         case PoolType::NonPagedPool:
         case PoolType::NonPagedPoolNx: {
-            if (m_impl->nonPagedPoolUsed + totalSize > kMaxNonPagedPool) return std::nullopt;
+            if (totalSize > kMaxNonPagedPool ||
+                m_impl->nonPagedPoolUsed > kMaxNonPagedPool - totalSize) {
+                return std::nullopt;
+            }
 
-            allocBase = AlignUp(m_impl->nonPagedPoolCursor, isLargeAlloc ? kPageSize : kPoolAlignment);
-            m_impl->nonPagedPoolCursor = allocBase + totalSize;
-            m_impl->nonPagedPoolUsed  += totalSize;
+            if (!AlignUpGuest(m_impl->nonPagedPoolCursor,
+                              isLargeAlloc ? kPageSize : kPoolAlignment,
+                              allocBase) ||
+                !AddGuest(allocBase, totalSize, nextCursor)) {
+                return std::nullopt;
+            }
 
             // NonPagedPoolNx is RW only (no execute); NonPagedPool is RWX for legacy compat
             prot = (type == PoolType::NonPagedPoolNx) ? MemProt::RW : MemProt::RWX;
             break;
         }
         case PoolType::PagedPool: {
-            if (m_impl->pagedPoolUsed + totalSize > kMaxPagedPool) return std::nullopt;
+            if (totalSize > kMaxPagedPool ||
+                m_impl->pagedPoolUsed > kMaxPagedPool - totalSize) {
+                return std::nullopt;
+            }
 
-            allocBase = AlignUp(m_impl->pagedPoolCursor, isLargeAlloc ? kPageSize : kPoolAlignment);
-            m_impl->pagedPoolCursor = allocBase + totalSize;
-            m_impl->pagedPoolUsed  += totalSize;
+            if (!AlignUpGuest(m_impl->pagedPoolCursor,
+                              isLargeAlloc ? kPageSize : kPoolAlignment,
+                              allocBase) ||
+                !AddGuest(allocBase, totalSize, nextCursor)) {
+                return std::nullopt;
+            }
             prot = MemProt::RW;
             break;
         }
     }
 
     // Map the region in VirtualMemory
+    if ((std::numeric_limits<GuestSize>::max)() - totalSize < kPageSize - 1) {
+        return std::nullopt;
+    }
     GuestSize virtualSize = AlignUp(totalSize, kPageSize);
     auto result = m_impl->memory->Allocate(allocBase, virtualSize, prot);
     if (!result.has_value()) return std::nullopt;
 
     // Write guard bytes
-    m_impl->WriteGuardBytes(allocBase, totalSize);
+    if (!m_impl->WriteGuardBytes(allocBase, totalSize)) {
+        (void)m_impl->memory->Free(allocBase, virtualSize);
+        return std::nullopt;
+    }
 
     // Zero the payload area (between guard regions)
-    GuestAddress payloadBase = allocBase + kGuardSize;
+    GuestAddress payloadBase = 0;
+    if (!AddGuest(allocBase, kGuardSize, payloadBase)) {
+        (void)m_impl->memory->Free(allocBase, virtualSize);
+        return std::nullopt;
+    }
     GuestSize payloadSize = AlignUp(size, kPoolAlignment);
-    std::vector<uint8_t> zeroBuf(static_cast<size_t>(std::min(payloadSize, static_cast<GuestSize>(4096))), 0);
+    std::vector<uint8_t> zeroBuf;
+    try {
+        zeroBuf.assign(static_cast<size_t>(std::min(payloadSize, static_cast<GuestSize>(4096))), 0);
+    } catch (const std::bad_alloc&) {
+        (void)m_impl->memory->Free(allocBase, virtualSize);
+        return std::nullopt;
+    }
     GuestSize remaining = payloadSize;
     GuestAddress writeAddr = payloadBase;
     while (remaining > 0) {
         uint32_t chunk = static_cast<uint32_t>(std::min(remaining, static_cast<GuestSize>(zeroBuf.size())));
-        (void)m_impl->memory->Write(writeAddr, zeroBuf.data(), chunk);
-        writeAddr += chunk;
+        if (m_impl->memory->Write(writeAddr, zeroBuf.data(), chunk) != ErrorCode::Success ||
+            !AddGuest(writeAddr, chunk, writeAddr)) {
+            (void)m_impl->memory->Free(allocBase, virtualSize);
+            return std::nullopt;
+        }
         remaining -= chunk;
     }
 
@@ -327,18 +428,34 @@ std::optional<GuestAddress> KernelAddressSpace::AllocatePool(
     alloc.tag      = tag;
     alloc.freed    = false;
 
-    m_impl->poolAllocations[payloadBase] = alloc;
-    m_impl->allocationCount++;
-    m_impl->UpdateTagStats(tag, size, true);
-
-    // Register as kernel region
     KernelRegionInfo regionInfo{};
     regionInfo.base         = allocBase;
     regionInfo.size         = virtualSize;
-    regionInfo.name         = "PoolAlloc_" + std::to_string(m_impl->allocationCount);
     regionInfo.isSupervisor = true;
     regionInfo.protection   = static_cast<uint32_t>(prot);
-    m_impl->regions.push_back(std::move(regionInfo));
+    try {
+        regionInfo.name = "PoolAlloc_" + std::to_string(m_impl->allocationCount + 1);
+        m_impl->poolAllocations.emplace(payloadBase, alloc);
+        m_impl->regions.push_back(std::move(regionInfo));
+    } catch (const std::bad_alloc&) {
+        m_impl->poolAllocations.erase(payloadBase);
+        (void)m_impl->memory->Free(allocBase, virtualSize);
+        return std::nullopt;
+    }
+
+    switch (type) {
+        case PoolType::NonPagedPool:
+        case PoolType::NonPagedPoolNx:
+            m_impl->nonPagedPoolCursor = nextCursor;
+            m_impl->nonPagedPoolUsed  += totalSize;
+            break;
+        case PoolType::PagedPool:
+            m_impl->pagedPoolCursor = nextCursor;
+            m_impl->pagedPoolUsed  += totalSize;
+            break;
+    }
+    ++m_impl->allocationCount;
+    m_impl->UpdateTagStats(tag, size, true);
 
     return payloadBase;
 }
@@ -354,15 +471,42 @@ void KernelAddressSpace::FreePool(GuestAddress addr) {
     auto& alloc = it->second;
     if (alloc.freed) return; // Double-free protection
 
-    alloc.freed = true;
-    m_impl->UpdateTagStats(alloc.tag, alloc.size, false);
-
     // Reclaim pool usage accounting
     GuestSize totalSize = m_impl->TotalAllocationSize(alloc.size);
+    if (totalSize == 0) return;
     if (alloc.size >= kPageSize) {
+        if ((std::numeric_limits<GuestSize>::max)() - totalSize < kPageSize - 1) {
+            return;
+        }
         totalSize = AlignUp(totalSize, kPageSize);
     }
+    GuestSize virtualSize = AlignUp(totalSize, kPageSize);
+    if (addr < kGuardSize) return;
+    const GuestAddress outerBase = addr - kGuardSize;
 
+    // Poison freed memory with 0xDD pattern (Windows debug behavior)
+    if (m_impl->memory) {
+        GuestSize payloadAligned = AlignUp(alloc.size, kPoolAlignment);
+        std::vector<uint8_t> poison;
+        try {
+            poison.assign(static_cast<size_t>(std::min(payloadAligned, static_cast<GuestSize>(4096))), 0xDD);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
+        GuestSize remaining = payloadAligned;
+        GuestAddress writeAddr = addr;
+        while (remaining > 0) {
+            uint32_t chunk = static_cast<uint32_t>(std::min(remaining, static_cast<GuestSize>(poison.size())));
+            if (m_impl->memory->Write(writeAddr, poison.data(), chunk) != ErrorCode::Success ||
+                !AddGuest(writeAddr, chunk, writeAddr)) {
+                return;
+            }
+            remaining -= chunk;
+        }
+        (void)m_impl->memory->Free(outerBase, virtualSize);
+    }
+
+    alloc.freed = true;
     switch (alloc.poolType) {
         case PoolType::NonPagedPool:
         case PoolType::NonPagedPoolNx:
@@ -380,20 +524,16 @@ void KernelAddressSpace::FreePool(GuestAddress addr) {
             }
             break;
     }
-
-    // Poison freed memory with 0xDD pattern (Windows debug behavior)
-    if (m_impl->memory) {
-        GuestSize payloadAligned = AlignUp(alloc.size, kPoolAlignment);
-        std::vector<uint8_t> poison(static_cast<size_t>(std::min(payloadAligned, static_cast<GuestSize>(4096))), 0xDD);
-        GuestSize remaining = payloadAligned;
-        GuestAddress writeAddr = addr;
-        while (remaining > 0) {
-            uint32_t chunk = static_cast<uint32_t>(std::min(remaining, static_cast<GuestSize>(poison.size())));
-            (void)m_impl->memory->Write(writeAddr, poison.data(), chunk);
-            writeAddr += chunk;
-            remaining -= chunk;
-        }
+    if (m_impl->allocationCount > 0) {
+        --m_impl->allocationCount;
     }
+    m_impl->UpdateTagStats(alloc.tag, alloc.size, false);
+    m_impl->regions.erase(
+        std::remove_if(m_impl->regions.begin(), m_impl->regions.end(),
+                       [outerBase](const KernelRegionInfo& region) {
+                           return region.base == outerBase;
+                       }),
+        m_impl->regions.end());
 }
 
 // ============================================================================
@@ -405,25 +545,26 @@ bool KernelAddressSpace::MapKernelRegion(
     const std::string& name, uint32_t protection,
     const void* data, uint32_t dataSize)
 {
-    if (size == 0) return false;
+    if (size == 0 || name.empty() || name.size() > 128) return false;
+    if (data == nullptr && dataSize != 0) return false;
+    if (dataSize > size) return false;
 
     std::unique_lock lock(m_impl->mutex);
 
     if (!m_impl->initialized || !m_impl->memory) return false;
+    GuestAddress checkedEnd = 0;
+    if (!AddGuest(base, size, checkedEnd)) return false;
+    if (!IsCanonicalAddress(base) || !IsCanonicalAddress(checkedEnd - 1)) return false;
 
     // Validate the base address is in kernel space (or user-shared-data)
     if (!IsKernelAddress(base) && base != kUserSharedData) return false;
 
     // Check for overlap with existing regions
     for (const auto& region : m_impl->regions) {
-        // Overflow-safe overlap check
-        if (base < region.base) {
-            if (base + size > region.base) return false;
-        } else {
-            if (region.base + region.size > base) return false;
-        }
+        if (RangesOverlap(base, size, region.base, region.size)) return false;
     }
 
+    if ((std::numeric_limits<GuestSize>::max)() - size < kPageSize - 1) return false;
     GuestSize virtualSize = AlignUp(size, kPageSize);
     MemProt prot = static_cast<MemProt>(protection);
 
@@ -444,7 +585,12 @@ bool KernelAddressSpace::MapKernelRegion(
     info.name         = name;
     info.isSupervisor = IsKernelAddress(base);
     info.protection   = protection;
-    m_impl->regions.push_back(std::move(info));
+    try {
+        m_impl->regions.push_back(std::move(info));
+    } catch (const std::bad_alloc&) {
+        (void)m_impl->memory->Free(base, virtualSize);
+        return false;
+    }
 
     return true;
 }
@@ -495,100 +641,127 @@ void KernelAddressSpace::InitializeSharedUserData() {
 
     // Map the kernel-mode alias at 0xFFFFF78000000000 (read-write from ring 0)
     auto kernelResult = m_impl->memory->Allocate(kKernelSharedData, kPageSize, MemProt::RW);
-    if (!kernelResult.has_value()) return;
+    if (!kernelResult.has_value()) {
+        (void)m_impl->memory->Free(kUserSharedData, kPageSize);
+        return;
+    }
+
+    auto failSharedDataInit = [&]() noexcept {
+        (void)m_impl->memory->Free(kUserSharedData, kPageSize);
+        (void)m_impl->memory->Free(kKernelSharedData, kPageSize);
+    };
+
+    bool ok = true;
 
     // Populate KUSER_SHARED_DATA fields with realistic Windows 10 21H1 values
     // Reference: ntddk.h KUSER_SHARED_DATA structure
 
     // +0x000: TickCountLowDeprecated (ULONG)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x000, 0x001A0000);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x000, 0x001A0000) == ErrorCode::Success;
 
     // +0x004: TickCountMultiplier (ULONG)
     // Standard value: 0x0FA00000 (multiply by this, shift right 24 to get ms)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x004, 0x0FA00000);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x004, 0x0FA00000) == ErrorCode::Success;
 
     // +0x008: InterruptTime (KSYSTEM_TIME) - 100ns units since boot
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x008, 0x00500000); // LowPart
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x00C, 0x00000002); // High1Time
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x010, 0x00000002); // High2Time
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x008, 0x00500000) == ErrorCode::Success; // LowPart
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x00C, 0x00000002) == ErrorCode::Success; // High1Time
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x010, 0x00000002) == ErrorCode::Success; // High2Time
 
     // +0x014: SystemTime (KSYSTEM_TIME) - 100ns units since 1601-01-01
     // Realistic value: ~132800000000000000 (0x01D7F5D000000000) ≈ mid-2022
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x014, 0x00000000); // LowPart
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x018, 0x01D7F5D0); // High1Time
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x01C, 0x01D7F5D0); // High2Time
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x014, 0x00000000) == ErrorCode::Success; // LowPart
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x018, 0x01D7F5D0) == ErrorCode::Success; // High1Time
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x01C, 0x01D7F5D0) == ErrorCode::Success; // High2Time
 
     // +0x020: TimeZoneBias (KSYSTEM_TIME)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x020, 0x00000000);
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x024, 0x00000000);
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x028, 0x00000000);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x020, 0x00000000) == ErrorCode::Success;
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x024, 0x00000000) == ErrorCode::Success;
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x028, 0x00000000) == ErrorCode::Success;
 
     // +0x02C: ImageNumberLow (USHORT) — x64 PE magic
-    (void)m_impl->memory->WriteU16(kUserSharedData + 0x02C, 0x8664);
+    ok = ok && m_impl->memory->WriteU16(kUserSharedData + 0x02C, 0x8664) == ErrorCode::Success;
 
     // +0x02E: ImageNumberHigh (USHORT)
-    (void)m_impl->memory->WriteU16(kUserSharedData + 0x02E, 0x8664);
+    ok = ok && m_impl->memory->WriteU16(kUserSharedData + 0x02E, 0x8664) == ErrorCode::Success;
 
     // +0x030: NtSystemRoot (WCHAR[260]) — "C:\WINDOWS"
     const wchar_t systemRoot[] = L"C:\\WINDOWS";
     for (size_t i = 0; i < sizeof(systemRoot) / sizeof(wchar_t); ++i) {
-        (void)m_impl->memory->WriteU16(
+        ok = ok && m_impl->memory->WriteU16(
             kUserSharedData + 0x030 + static_cast<GuestAddress>(i * 2),
-            static_cast<uint16_t>(systemRoot[i]));
+            static_cast<uint16_t>(systemRoot[i])) == ErrorCode::Success;
     }
 
     // +0x238: MaxStackTraceDepth (ULONG)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x238, 0x00000020);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x238, 0x00000020) == ErrorCode::Success;
 
     // +0x260: NtMajorVersion (ULONG) — Windows 10
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x260, 10);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x260, 10) == ErrorCode::Success;
 
     // +0x264: NtMinorVersion (ULONG)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x264, 0);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x264, 0) == ErrorCode::Success;
 
     // +0x268: AvailableProcessorFeatures (32 bits) — SSE2, etc.
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x268, 0x00003FFF);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x268, 0x00003FFF) == ErrorCode::Success;
 
     // +0x26C: NtBuildNumber (ULONG) — 19041 (Windows 10 2004)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x26C, 19041);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x26C, 19041) == ErrorCode::Success;
 
     // +0x270: NtProductType (ULONG) — 1 = NtProductWinNt (Workstation)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x270, 1);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x270, 1) == ErrorCode::Success;
 
     // +0x274: ProductTypeIsValid (BOOLEAN)
-    (void)m_impl->memory->WriteU8(kUserSharedData + 0x274, 1);
+    ok = ok && m_impl->memory->WriteU8(kUserSharedData + 0x274, 1) == ErrorCode::Success;
 
     // +0x278: NativeMajorVersion (ULONG)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x278, 10);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x278, 10) == ErrorCode::Success;
 
     // +0x27C: NativeBuildNumber (ULONG)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x27C, 19041);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x27C, 19041) == ErrorCode::Success;
 
     // +0x2D0: KdDebuggerEnabled (UCHAR) — 0 = no debugger attached
-    (void)m_impl->memory->WriteU8(kUserSharedData + 0x2D0, 0);
+    ok = ok && m_impl->memory->WriteU8(kUserSharedData + 0x2D0, 0) == ErrorCode::Success;
 
     // +0x2D4: MitigationPolicies (UCHAR) — enable CFG
-    (void)m_impl->memory->WriteU8(kUserSharedData + 0x2D4, 0x01);
+    ok = ok && m_impl->memory->WriteU8(kUserSharedData + 0x2D4, 0x01) == ErrorCode::Success;
 
     // +0x2D8: CyclesPerYield (USHORT)
-    (void)m_impl->memory->WriteU16(kUserSharedData + 0x2D8, 100);
+    ok = ok && m_impl->memory->WriteU16(kUserSharedData + 0x2D8, 100) == ErrorCode::Success;
 
     // +0x2EC: ActiveProcessorCount (ULONG) — 4 cores
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x2EC, 4);
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x2EC, 4) == ErrorCode::Success;
 
     // +0x320: TickCount (KSYSTEM_TIME — volatile, used by GetTickCount)
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x320, 0x001A0000); // LowPart
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x324, 0x00000000); // High1Time
-    (void)m_impl->memory->WriteU32(kUserSharedData + 0x328, 0x00000000); // High2Time
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x320, 0x001A0000) == ErrorCode::Success; // LowPart
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x324, 0x00000000) == ErrorCode::Success; // High1Time
+    ok = ok && m_impl->memory->WriteU32(kUserSharedData + 0x328, 0x00000000) == ErrorCode::Success; // High2Time
+
+    if (!ok) {
+        failSharedDataInit();
+        return;
+    }
 
     // Now make the user-mode page read-only (ring 3 can only read)
-    (void)m_impl->memory->Protect(kUserSharedData, kPageSize, MemProt::Read);
+    if (!m_impl->memory->Protect(kUserSharedData, kPageSize, MemProt::Read)) {
+        failSharedDataInit();
+        return;
+    }
 
     // Mirror the same data to the kernel-mode alias
     // Read from user page, write to kernel page
-    std::vector<uint8_t> pageData(kPageSize, 0);
-    (void)m_impl->memory->Read(kUserSharedData, pageData.data(), static_cast<uint32_t>(kPageSize));
-    (void)m_impl->memory->Write(kKernelSharedData, pageData.data(), static_cast<uint32_t>(kPageSize));
+    std::vector<uint8_t> pageData;
+    try {
+        pageData.assign(kPageSize, 0);
+    } catch (const std::bad_alloc&) {
+        failSharedDataInit();
+        return;
+    }
+    if (m_impl->memory->Read(kUserSharedData, pageData.data(), static_cast<uint32_t>(kPageSize)) != ErrorCode::Success ||
+        m_impl->memory->Write(kKernelSharedData, pageData.data(), static_cast<uint32_t>(kPageSize)) != ErrorCode::Success) {
+        failSharedDataInit();
+        return;
+    }
 
     // Register both regions
     KernelRegionInfo userInfo{};
@@ -597,15 +770,25 @@ void KernelAddressSpace::InitializeSharedUserData() {
     userInfo.name         = "KUSER_SHARED_DATA (user)";
     userInfo.isSupervisor = false;
     userInfo.protection   = static_cast<uint32_t>(MemProt::Read);
-    m_impl->regions.push_back(std::move(userInfo));
-
     KernelRegionInfo kernelInfo{};
     kernelInfo.base         = kKernelSharedData;
     kernelInfo.size         = kPageSize;
     kernelInfo.name         = "KUSER_SHARED_DATA (kernel)";
     kernelInfo.isSupervisor = true;
     kernelInfo.protection   = static_cast<uint32_t>(MemProt::RW);
-    m_impl->regions.push_back(std::move(kernelInfo));
+    try {
+        m_impl->regions.push_back(std::move(userInfo));
+        m_impl->regions.push_back(std::move(kernelInfo));
+    } catch (const std::bad_alloc&) {
+        m_impl->regions.erase(
+            std::remove_if(m_impl->regions.begin(), m_impl->regions.end(),
+                           [](const KernelRegionInfo& region) {
+                               return region.base == kUserSharedData ||
+                                      region.base == kKernelSharedData;
+                           }),
+            m_impl->regions.end());
+        failSharedDataInit();
+    }
 }
 
 // ============================================================================
