@@ -31,6 +31,9 @@
 #include <cwctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <sstream>
 #include <string_view>
@@ -59,6 +62,7 @@ static constexpr uint32_t kMinASCIIStringLen     = 4;
 static constexpr uint32_t kMinUTF16StringLen     = 4;
 static constexpr size_t   kMaxMemoryScanSize     = 16 * 1024 * 1024;  // 16 MB per scan
 static constexpr size_t   kMaxBase64DecodeLen    = 8192;
+static constexpr uint32_t kMaxBase64Recursion    = 2;
 
 // DGA detection thresholds
 static constexpr float    kDGAEntropyThreshold   = 3.5f;
@@ -70,7 +74,7 @@ static constexpr size_t   kDGAMinLabelLen        = 5;
 // Common TLDs for domain validation
 // ============================================================================
 
-static const std::unordered_set<std::string>& GetCommonTLDs() noexcept {
+[[maybe_unused]] static const std::unordered_set<std::string>& GetCommonTLDs() noexcept {
     static const std::unordered_set<std::string> tlds = {
         "com", "net", "org", "io", "co", "us", "uk", "de", "fr", "ru",
         "cn", "jp", "br", "in", "au", "ca", "it", "es", "nl", "se",
@@ -95,13 +99,24 @@ static const std::unordered_set<std::string>& GetCommonTLDs() noexcept {
 // Known suspicious TLDs (heavily abused by malware)
 // ============================================================================
 
-static const std::unordered_set<std::string>& GetSuspiciousTLDs() noexcept {
+[[maybe_unused]] static const std::unordered_set<std::string>& GetSuspiciousTLDs() noexcept {
     static const std::unordered_set<std::string> tlds = {
         "tk", "cf", "ga", "ml", "gq", "pw", "sx", "su", "cc",
         "top", "xyz", "club", "icu", "buzz", "cam", "monster",
         "rest", "fit", "beauty", "hair", "quest",
     };
     return tlds;
+}
+
+[[nodiscard]] static bool IsSuspiciousTLD(std::string_view tld) noexcept {
+    static constexpr std::array<std::string_view, 21> kSuspiciousTLDs = {{
+        "tk", "cf", "ga", "ml", "gq", "pw", "sx", "su", "cc",
+        "top", "xyz", "club", "icu", "buzz", "cam", "monster",
+        "rest", "fit", "beauty", "hair", "quest",
+    }};
+
+    return std::find(kSuspiciousTLDs.begin(), kSuspiciousTLDs.end(), tld) !=
+           kSuspiciousTLDs.end();
 }
 
 // ============================================================================
@@ -111,9 +126,14 @@ static const std::unordered_set<std::string>& GetSuspiciousTLDs() noexcept {
 static bool IsPersistenceRegistryKey(const std::wstring& key) noexcept {
     // Case-insensitive check for persistence-related paths
     std::wstring lower;
-    lower.reserve(key.size());
-    for (wchar_t c : key) {
-        lower.push_back(static_cast<wchar_t>(std::towlower(c)));
+    try {
+        const size_t len = std::min<size_t>(key.size(), kMaxStringLength);
+        lower.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            lower.push_back(static_cast<wchar_t>(std::towlower(key[i])));
+        }
+    } catch (const std::bad_alloc&) {
+        return false;
     }
 
     static const std::wstring_view kPersistencePatterns[] = {
@@ -156,18 +176,28 @@ static bool IsPersistenceRegistryKey(const std::wstring& key) noexcept {
 
 static std::string WideToNarrow(const std::wstring& wide) noexcept {
     std::string result;
-    result.reserve(wide.size());
-    for (wchar_t c : wide) {
-        if (c < 0x80) {
-            result.push_back(static_cast<char>(c));
-        } else if (c < 0x800) {
-            result.push_back(static_cast<char>(0xC0 | (c >> 6)));
-            result.push_back(static_cast<char>(0x80 | (c & 0x3F)));
-        } else {
-            result.push_back(static_cast<char>(0xE0 | (c >> 12)));
-            result.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
-            result.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    try {
+        const size_t len = std::min<size_t>(wide.size(), kMaxStringLength);
+        result.reserve(std::min<size_t>(len * 3U, kMaxStringLength));
+        for (size_t i = 0; i < len; ++i) {
+            const wchar_t c = wide[i];
+            if (c < 0x80) {
+                result.push_back(static_cast<char>(c));
+            } else if (c < 0x800) {
+                result.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                result.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+            } else {
+                result.push_back(static_cast<char>(0xE0 | (c >> 12)));
+                result.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+            }
+            if (result.size() >= kMaxStringLength) {
+                result.resize(kMaxStringLength);
+                break;
+            }
         }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
     return result;
 }
@@ -180,7 +210,12 @@ static std::string ExtractFileName(const std::wstring& path) noexcept {
     auto pos = path.find_last_of(L"\\/");
     if (pos == std::wstring::npos) return WideToNarrow(path);
     if (pos + 1 >= path.size()) return {};
-    return WideToNarrow(path.substr(pos + 1));
+    try {
+        return WideToNarrow(std::wstring{ path.data() + pos + 1,
+            std::min<size_t>(path.size() - pos - 1, kMaxStringLength) });
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -189,13 +224,17 @@ static std::string ExtractFileName(const std::wstring& path) noexcept {
 
 static std::string DefangDomain(const std::string& domain) noexcept {
     std::string result;
-    result.reserve(domain.size() + 4);
-    for (size_t i = 0; i < domain.size(); ++i) {
-        if (domain[i] == '.') {
-            result += "[.]";
-        } else {
-            result.push_back(domain[i]);
+    try {
+        result.reserve(std::min<size_t>(domain.size() + 4U, kMaxStringLength + 4U));
+        for (size_t i = 0; i < domain.size() && result.size() < kMaxStringLength; ++i) {
+            if (domain[i] == '.') {
+                result += "[.]";
+            } else {
+                result.push_back(domain[i]);
+            }
         }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
     return result;
 }
@@ -205,24 +244,30 @@ static std::string DefangDomain(const std::string& domain) noexcept {
 // ============================================================================
 
 static std::string DefangURL(const std::string& url) noexcept {
-    std::string result = url;
-    // Replace http:// with hxxp://
-    if (result.size() >= 7) {
-        if (result.substr(0, 7) == "http://") {
-            result = "hxxp://" + result.substr(7);
-        } else if (result.size() >= 8 && result.substr(0, 8) == "https://") {
-            result = "hxxps://" + result.substr(8);
+    std::string result;
+    try {
+        result = url.substr(0, kMaxStringLength);
+        // Replace http:// with hxxp://
+        if (result.size() >= 7) {
+            if (result.substr(0, 7) == "http://") {
+                result = "hxxp://" + result.substr(7);
+            } else if (result.size() >= 8 && result.substr(0, 8) == "https://") {
+                result = "hxxps://" + result.substr(8);
+            }
         }
-    }
-    // Also defang the dots in the host portion
-    size_t hostStart = result.find("://");
-    if (hostStart != std::string::npos) {
-        hostStart += 3;
-        size_t hostEnd = result.find('/', hostStart);
-        if (hostEnd == std::string::npos) hostEnd = result.size();
-        std::string host = result.substr(hostStart, hostEnd - hostStart);
-        std::string defangedHost = DefangDomain(host);
-        result = result.substr(0, hostStart) + defangedHost + result.substr(hostEnd);
+
+        // Also defang the dots in the host portion
+        size_t hostStart = result.find("://");
+        if (hostStart != std::string::npos) {
+            hostStart += 3;
+            size_t hostEnd = result.find('/', hostStart);
+            if (hostEnd == std::string::npos) hostEnd = result.size();
+            std::string host = result.substr(hostStart, hostEnd - hostStart);
+            std::string defangedHost = DefangDomain(host);
+            result = result.substr(0, hostStart) + defangedHost + result.substr(hostEnd);
+        }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
     return result;
 }
@@ -383,9 +428,16 @@ struct IPv4Parts {
     auto lastDot = domain.rfind('.');
     if (lastDot == std::string::npos || lastDot + 1 >= domain.size()) return false;
 
-    std::string tld = domain.substr(lastDot + 1);
-    // Convert to lowercase
-    for (auto& ch : tld) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    std::string tld;
+    try {
+        tld = domain.substr(lastDot + 1);
+        // Convert to lowercase
+        for (auto& ch : tld) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
 
     // TLD must be alphabetic
     for (char c : tld) {
@@ -413,72 +465,77 @@ struct ParsedURL {
 [[nodiscard]] static bool ParseURL(const std::string& url, ParsedURL& parsed) noexcept {
     if (url.size() < 10 || url.size() > kMaxStringLength) return false;
 
-    size_t pos = 0;
+    try {
+        size_t pos = 0;
 
-    // Scheme
-    if (url.substr(0, 8) == "https://") {
-        parsed.scheme = "https";
-        parsed.port = 443;
-        pos = 8;
-    } else if (url.substr(0, 7) == "http://") {
-        parsed.scheme = "http";
-        parsed.port = 80;
-        pos = 7;
-    } else if (url.substr(0, 6) == "ftp://") {
-        parsed.scheme = "ftp";
-        parsed.port = 21;
-        pos = 6;
-    } else {
+        // Scheme
+        if (url.compare(0, 8, "https://") == 0) {
+            parsed.scheme = "https";
+            parsed.port = 443;
+            pos = 8;
+        } else if (url.compare(0, 7, "http://") == 0) {
+            parsed.scheme = "http";
+            parsed.port = 80;
+            pos = 7;
+        } else if (url.compare(0, 6, "ftp://") == 0) {
+            parsed.scheme = "ftp";
+            parsed.port = 21;
+            pos = 6;
+        } else {
+            return false;
+        }
+
+        // Host (up to ':', '/', '?', or end)
+        size_t hostStart = pos;
+        while (pos < url.size() && url[pos] != ':' && url[pos] != '/' && url[pos] != '?') {
+            pos++;
+        }
+        parsed.host = url.substr(hostStart, pos - hostStart);
+        if (parsed.host.empty()) return false;
+
+        // Optional port
+        if (pos < url.size() && url[pos] == ':') {
+            pos++;
+            size_t portStart = pos;
+            while (pos < url.size() && url[pos] >= '0' && url[pos] <= '9') {
+                pos++;
+            }
+            if (pos > portStart) {
+                int portVal = 0;
+                for (size_t i = portStart; i < pos; ++i) {
+                    portVal = portVal * 10 + (url[i] - '0');
+                    if (portVal > 65535) return false;
+                }
+                parsed.port = static_cast<uint16_t>(portVal);
+            }
+        }
+
+        // Path
+        if (pos < url.size() && url[pos] == '/') {
+            size_t pathStart = pos;
+            while (pos < url.size() && url[pos] != '?' && url[pos] != ' ' &&
+                   url[pos] != '\t' && url[pos] != '\n' && url[pos] != '\r') {
+                pos++;
+            }
+            parsed.path = url.substr(pathStart, pos - pathStart);
+        }
+
+        // Query
+        if (pos < url.size() && url[pos] == '?') {
+            pos++;
+            size_t queryStart = pos;
+            while (pos < url.size() && url[pos] != ' ' &&
+                   url[pos] != '\t' && url[pos] != '\n') {
+                pos++;
+            }
+            parsed.query = url.substr(queryStart, pos - queryStart);
+        }
+
+        return true;
+    } catch (const std::bad_alloc&) {
+        parsed = {};
         return false;
     }
-
-    // Host (up to ':', '/', '?', or end)
-    size_t hostStart = pos;
-    while (pos < url.size() && url[pos] != ':' && url[pos] != '/' && url[pos] != '?') {
-        pos++;
-    }
-    parsed.host = url.substr(hostStart, pos - hostStart);
-    if (parsed.host.empty()) return false;
-
-    // Optional port
-    if (pos < url.size() && url[pos] == ':') {
-        pos++;
-        size_t portStart = pos;
-        while (pos < url.size() && url[pos] >= '0' && url[pos] <= '9') {
-            pos++;
-        }
-        if (pos > portStart) {
-            int portVal = 0;
-            for (size_t i = portStart; i < pos; ++i) {
-                portVal = portVal * 10 + (url[i] - '0');
-                if (portVal > 65535) return false;
-            }
-            parsed.port = static_cast<uint16_t>(portVal);
-        }
-    }
-
-    // Path
-    if (pos < url.size() && url[pos] == '/') {
-        size_t pathStart = pos;
-        while (pos < url.size() && url[pos] != '?' && url[pos] != ' ' &&
-               url[pos] != '\t' && url[pos] != '\n' && url[pos] != '\r') {
-            pos++;
-        }
-        parsed.path = url.substr(pathStart, pos - pathStart);
-    }
-
-    // Query
-    if (pos < url.size() && url[pos] == '?') {
-        pos++;
-        size_t queryStart = pos;
-        while (pos < url.size() && url[pos] != ' ' &&
-               url[pos] != '\t' && url[pos] != '\n') {
-            pos++;
-        }
-        parsed.query = url.substr(queryStart, pos - queryStart);
-    }
-
-    return true;
 }
 
 // ============================================================================
@@ -536,27 +593,31 @@ static constexpr uint8_t kBase64DecodeTable[256] = {
     if (input.size() > kMaxBase64DecodeLen) return {};
 
     std::string output;
-    output.reserve((input.size() / 4) * 3);
+    try {
+        output.reserve((input.size() / 4) * 3);
 
-    for (size_t i = 0; i < input.size(); i += 4) {
-        uint8_t a = kBase64DecodeTable[static_cast<uint8_t>(input[i])];
-        uint8_t b = kBase64DecodeTable[static_cast<uint8_t>(input[i + 1])];
-        uint8_t c = (input[i + 2] != '=') ?
-                    kBase64DecodeTable[static_cast<uint8_t>(input[i + 2])] : 0;
-        uint8_t d = (input[i + 3] != '=') ?
-                    kBase64DecodeTable[static_cast<uint8_t>(input[i + 3])] : 0;
+        for (size_t i = 0; i < input.size(); i += 4) {
+            uint8_t a = kBase64DecodeTable[static_cast<uint8_t>(input[i])];
+            uint8_t b = kBase64DecodeTable[static_cast<uint8_t>(input[i + 1])];
+            uint8_t c = (input[i + 2] != '=') ?
+                        kBase64DecodeTable[static_cast<uint8_t>(input[i + 2])] : 0;
+            uint8_t d = (input[i + 3] != '=') ?
+                        kBase64DecodeTable[static_cast<uint8_t>(input[i + 3])] : 0;
 
-        if (a == kBase64Invalid || b == kBase64Invalid) break;
+            if (a == kBase64Invalid || b == kBase64Invalid) break;
 
-        output.push_back(static_cast<char>((a << 2) | (b >> 4)));
-        if (input[i + 2] != '=') {
-            if (c == kBase64Invalid) break;
-            output.push_back(static_cast<char>(((b & 0x0F) << 4) | (c >> 2)));
+            output.push_back(static_cast<char>((a << 2) | (b >> 4)));
+            if (input[i + 2] != '=') {
+                if (c == kBase64Invalid) break;
+                output.push_back(static_cast<char>(((b & 0x0F) << 4) | (c >> 2)));
+            }
+            if (input[i + 3] != '=') {
+                if (d == kBase64Invalid) break;
+                output.push_back(static_cast<char>(((c & 0x03) << 6) | d));
+            }
         }
-        if (input[i + 3] != '=') {
-            if (d == kBase64Invalid) break;
-            output.push_back(static_cast<char>(((c & 0x03) << 6) | d));
-        }
+    } catch (const std::bad_alloc&) {
+        output.clear();
     }
 
     return output;
@@ -593,9 +654,14 @@ static constexpr uint8_t kBase64DecodeTable[256] = {
 
 static bool IsCommonSystemPath(const std::wstring& path) noexcept {
     std::wstring lower;
-    lower.reserve(path.size());
-    for (wchar_t c : path) {
-        lower.push_back(static_cast<wchar_t>(std::towlower(c)));
+    try {
+        const size_t len = std::min<size_t>(path.size(), kMaxStringLength);
+        lower.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            lower.push_back(static_cast<wchar_t>(std::towlower(path[i])));
+        }
+    } catch (const std::bad_alloc&) {
+        return false;
     }
 
     // Allow-listed system directories (reads from these are normal)
@@ -653,13 +719,29 @@ struct IOCExtractor::Impl {
     explicit Impl(const EmulationConfig& cfg) noexcept
         : config(cfg)
     {
-        iocs.reserve(512);
-        domainIndex.reserve(256);
-        ipIndex.reserve(256);
-        urlIndex.reserve(256);
-        filePathIndex.reserve(256);
-        registryKeyIndex.reserve(128);
-        mutexIndex.reserve(64);
+        try {
+            iocs.reserve(512);
+            domainIndex.reserve(256);
+            ipIndex.reserve(256);
+            urlIndex.reserve(256);
+            filePathIndex.reserve(256);
+            registryKeyIndex.reserve(128);
+            mutexIndex.reserve(64);
+        } catch (const std::bad_alloc&) {
+            iocs.clear();
+            domainIndex.clear();
+            ipIndex.clear();
+            urlIndex.clear();
+            filePathIndex.clear();
+            registryKeyIndex.clear();
+            mutexIndex.clear();
+        }
+    }
+
+    void IncrementCallIndex() noexcept {
+        if (callIndex < std::numeric_limits<uint32_t>::max()) {
+            ++callIndex;
+        }
     }
 
     // Add or update an IOC entry with deduplication
@@ -669,13 +751,16 @@ struct IOCExtractor::Impl {
                 uint32_t maxTracked) noexcept
     {
         if (value.empty() || value.size() > kMaxStringLength) return;
+        if (!std::isfinite(confidence)) return;
         if (iocs.size() >= kMaxIOCEntries) return;
 
         auto it = index.find(value);
         if (it != index.end()) {
             // Update existing entry
             auto& entry = iocs[it->second];
-            entry.occurrences++;
+            if (entry.occurrences < std::numeric_limits<uint32_t>::max()) {
+                ++entry.occurrences;
+            }
             entry.lastSeen = callIndex;
             if (confidence > entry.confidence) {
                 entry.confidence = confidence;
@@ -685,27 +770,43 @@ struct IOCExtractor::Impl {
 
         if (index.size() >= maxTracked) return;
 
-        IOCEntry entry;
-        entry.type        = type;
-        entry.value       = value;
-        entry.context     = context;
-        entry.confidence  = std::clamp(confidence, 0.0f, 1.0f);
-        entry.firstSeen   = callIndex;
-        entry.lastSeen    = callIndex;
-        entry.occurrences = 1;
-        entry.isDefanged  = false;
+        try {
+            IOCEntry entry;
+            entry.type        = type;
+            entry.value       = value.substr(0, kMaxStringLength);
+            entry.context     = context.substr(0, kMaxStringLength);
+            entry.confidence  = std::clamp(confidence, 0.0f, 1.0f);
+            entry.firstSeen   = callIndex;
+            entry.lastSeen    = callIndex;
+            entry.occurrences = 1;
+            entry.isDefanged  = false;
 
-        size_t idx = iocs.size();
-        iocs.push_back(std::move(entry));
-        index[value] = idx;
+            const size_t idx = iocs.size();
+            iocs.push_back(std::move(entry));
+            try {
+                const auto insertion = index.emplace(iocs.back().value, idx);
+                if (!insertion.second) {
+                    iocs.pop_back();
+                }
+            } catch (const std::bad_alloc&) {
+                iocs.pop_back();
+                return;
+            }
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     }
 
     void AddDomain(const std::string& domain, const std::string& context,
                    float confidence) noexcept {
         std::string lower;
-        lower.reserve(domain.size());
-        for (char c : domain) {
-            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        try {
+            lower.reserve(std::min<size_t>(domain.size(), kMaxStringLength));
+            for (size_t i = 0; i < domain.size() && i < kMaxStringLength; ++i) {
+                lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(domain[i]))));
+            }
+        } catch (const std::bad_alloc&) {
+            return;
         }
         if (!IsValidDomain(lower)) return;
         AddIOC(IOCType::Domain, lower, context, confidence,
@@ -733,7 +834,13 @@ struct IOCExtractor::Impl {
         AddIOC(IOCType::URL, url, context, confidence,
                urlIndex, kMaxURLsTracked);
         // Also extract domain from URL
-        AddDomain(parsed.host, "Extracted from URL: " + url, confidence * 0.9f);
+        try {
+            AddDomain(parsed.host,
+                      (std::string("Extracted from URL: ") + url).substr(0, kMaxStringLength),
+                      confidence * 0.9f);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     }
 
     void AddFilePath(const std::string& path, const std::string& context,
@@ -793,13 +900,16 @@ struct IOCExtractor::Impl {
     }
 
     // Extract IOCs from a raw string found in memory or arguments
-    void ExtractFromString(const std::string& str, const std::string& context) noexcept {
+    void ExtractFromString(const std::string& str,
+                           const std::string& context,
+                           uint32_t depth = 0) noexcept {
         if (str.size() < 4 || str.size() > kMaxStringLength) return;
 
         // Check for URLs
         for (size_t i = 0; i + 10 < str.size(); ++i) {
-            if ((str.substr(i, 7) == "http://" || str.substr(i, 8) == "https://") ||
-                str.substr(i, 6) == "ftp://") {
+            if ((str.compare(i, 7, "http://") == 0 ||
+                 str.compare(i, 8, "https://") == 0) ||
+                str.compare(i, 6, "ftp://") == 0) {
                 // Find URL end (whitespace or null)
                 size_t end = i;
                 while (end < str.size() && str[end] != ' ' && str[end] != '\t' &&
@@ -808,7 +918,11 @@ struct IOCExtractor::Impl {
                     end++;
                 }
                 if (end > i + 8) {
-                    AddURL(str.substr(i, end - i), context, 0.7f);
+                    try {
+                        AddURL(str.substr(i, end - i), context, 0.7f);
+                    } catch (const std::bad_alloc&) {
+                        return;
+                    }
                 }
                 i = end;
             }
@@ -824,10 +938,14 @@ struct IOCExtractor::Impl {
                     end++;
                 }
                 if (end - i >= 7 && end - i <= 15) {
-                    std::string candidate = str.substr(i, end - i);
-                    IPv4Parts parts;
-                    if (ParseIPv4(candidate, parts) && IsValidIPv4(candidate)) {
-                        AddIPv4(candidate, context, 0.6f);
+                    try {
+                        std::string candidate = str.substr(i, end - i);
+                        IPv4Parts parts;
+                        if (ParseIPv4(candidate, parts) && IsValidIPv4(candidate)) {
+                            AddIPv4(candidate, context, 0.6f);
+                        }
+                    } catch (const std::bad_alloc&) {
+                        return;
                     }
                 }
                 i = end;
@@ -842,7 +960,12 @@ struct IOCExtractor::Impl {
         // Check for email addresses (simple pattern: xxx@domain.tld)
         auto atPos = str.find('@');
         if (atPos != std::string::npos && atPos > 0 && atPos + 3 < str.size()) {
-            std::string afterAt = str.substr(atPos + 1);
+            std::string afterAt;
+            try {
+                afterAt = str.substr(atPos + 1);
+            } catch (const std::bad_alloc&) {
+                return;
+            }
             if (IsValidDomain(afterAt)) {
                 // Validate local part (basic: alphanumeric + . _ -)
                 bool validLocal = true;
@@ -862,7 +985,7 @@ struct IOCExtractor::Impl {
         }
 
         // Check for Base64-encoded content
-        if (LooksLikeBase64(str) && str.size() >= 16) {
+        if (depth < kMaxBase64Recursion && LooksLikeBase64(str) && str.size() >= 16) {
             std::string decoded = DecodeBase64(str);
             if (!decoded.empty() && decoded.size() >= 4) {
                 // Re-check decoded content for IOCs
@@ -874,7 +997,14 @@ struct IOCExtractor::Impl {
                     }
                 }
                 if (hasPrintable) {
-                    ExtractFromString(decoded, "Base64-decoded from: " + context);
+                    try {
+                        ExtractFromString(decoded,
+                                          (std::string("Base64-decoded from: ") + context)
+                                              .substr(0, kMaxStringLength),
+                                          depth + 1U);
+                    } catch (const std::bad_alloc&) {
+                        return;
+                    }
                 }
             }
         }
@@ -886,8 +1016,13 @@ struct IOCExtractor::Impl {
 // ============================================================================
 
 IOCExtractor::IOCExtractor(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>(config))
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>(config);
+    } catch (const std::bad_alloc&) {
+        m_impl = nullptr;
+    }
 }
 
 IOCExtractor::~IOCExtractor() noexcept = default;
@@ -897,11 +1032,12 @@ IOCExtractor::~IOCExtractor() noexcept = default;
 // ============================================================================
 
 void IOCExtractor::OnAPICall(const APICallDetail& call) noexcept {
+    if (!m_impl) return;
     if (!call.funcName) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     std::string_view func(call.funcName);
 
@@ -970,6 +1106,7 @@ void IOCExtractor::OnAPICall(const APICallDetail& call) noexcept {
 
 void IOCExtractor::OnMemoryScan(const uint8_t* data, size_t size,
                                 GuestAddress base) noexcept {
+    if (!m_impl) return;
     if (!data || size == 0) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
@@ -977,59 +1114,62 @@ void IOCExtractor::OnMemoryScan(const uint8_t* data, size_t size,
     size_t scanSize = std::min(size, kMaxMemoryScanSize);
 
     std::unique_lock lock(m_impl->mutex);
+    try {
+        std::string context = "Memory scan at 0x" +
+            ([base]() -> std::string {
+                char buf[20];
+                std::snprintf(buf, sizeof(buf), "%016llX",
+                              static_cast<unsigned long long>(base));
+                return std::string(buf);
+            })();
 
-    std::string context = "Memory scan at 0x" +
-        ([base]() -> std::string {
-            char buf[20];
-            std::snprintf(buf, sizeof(buf), "%016llX",
-                          static_cast<unsigned long long>(base));
-            return std::string(buf);
-        })();
+        // Extract ASCII strings
+        std::string currentStr;
+        currentStr.reserve(256);
 
-    // Extract ASCII strings
-    std::string currentStr;
-    currentStr.reserve(256);
-
-    for (size_t i = 0; i < scanSize; ++i) {
-        uint8_t byte = data[i];
-        if (byte >= 0x20 && byte < 0x7F) {
-            currentStr.push_back(static_cast<char>(byte));
-            if (currentStr.size() > kMaxStringLength) {
-                currentStr.clear(); // Too long, not a real string
+        for (size_t i = 0; i < scanSize; ++i) {
+            uint8_t byte = data[i];
+            if (byte >= 0x20 && byte < 0x7F) {
+                currentStr.push_back(static_cast<char>(byte));
+                if (currentStr.size() > kMaxStringLength) {
+                    currentStr.clear(); // Too long, not a real string
+                }
+            } else {
+                if (currentStr.size() >= kMinASCIIStringLen) {
+                    m_impl->ExtractFromString(currentStr, context);
+                }
+                currentStr.clear();
             }
-        } else {
-            if (currentStr.size() >= kMinASCIIStringLen) {
-                m_impl->ExtractFromString(currentStr, context);
-            }
-            currentStr.clear();
         }
-    }
-    if (currentStr.size() >= kMinASCIIStringLen) {
-        m_impl->ExtractFromString(currentStr, context);
-    }
+        if (currentStr.size() >= kMinASCIIStringLen) {
+            m_impl->ExtractFromString(currentStr, context);
+        }
 
-    // Extract UTF-16LE strings
-    std::string utf16Str;
-    utf16Str.reserve(256);
+        // Extract UTF-16LE strings
+        std::string utf16Str;
+        utf16Str.reserve(256);
 
-    for (size_t i = 0; i + 1 < scanSize; i += 2) {
-        uint16_t wchar = static_cast<uint16_t>(data[i]) |
-                         (static_cast<uint16_t>(data[i + 1]) << 8);
-        if (wchar >= 0x20 && wchar < 0x7F) {
-            utf16Str.push_back(static_cast<char>(wchar));
-            if (utf16Str.size() > kMaxStringLength) {
+        for (size_t i = 0; i + 1 < scanSize; i += 2) {
+            uint16_t wchar = static_cast<uint16_t>(data[i]) |
+                             (static_cast<uint16_t>(data[i + 1]) << 8);
+            if (wchar >= 0x20 && wchar < 0x7F) {
+                utf16Str.push_back(static_cast<char>(wchar));
+                if (utf16Str.size() > kMaxStringLength) {
+                    utf16Str.clear();
+                }
+            } else {
+                if (utf16Str.size() >= kMinUTF16StringLen) {
+                    m_impl->ExtractFromString(utf16Str,
+                        "UTF-16 string from " + context);
+                }
                 utf16Str.clear();
             }
-        } else {
-            if (utf16Str.size() >= kMinUTF16StringLen) {
-                m_impl->ExtractFromString(utf16Str,
-                    "UTF-16 string from " + context);
-            }
-            utf16Str.clear();
         }
-    }
-    if (utf16Str.size() >= kMinUTF16StringLen) {
-        m_impl->ExtractFromString(utf16Str, "UTF-16 string from " + context);
+        if (utf16Str.size() >= kMinUTF16StringLen) {
+            m_impl->ExtractFromString(utf16Str, "UTF-16 string from " + context);
+        }
+    } catch (const std::bad_alloc&) {
+        return;
     }
 }
 
@@ -1038,21 +1178,26 @@ void IOCExtractor::OnMemoryScan(const uint8_t* data, size_t size,
 // ============================================================================
 
 void IOCExtractor::OnStringFound(const std::string& str, GuestAddress addr) noexcept {
+    if (!m_impl) return;
     if (str.empty() || str.size() > kMaxStringLength) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
-    std::string context = "String at 0x" +
-        ([addr]() -> std::string {
-            char buf[20];
-            std::snprintf(buf, sizeof(buf), "%016llX",
-                          static_cast<unsigned long long>(addr));
-            return std::string(buf);
-        })();
+    try {
+        std::string context = "String at 0x" +
+            ([addr]() -> std::string {
+                char buf[20];
+                std::snprintf(buf, sizeof(buf), "%016llX",
+                              static_cast<unsigned long long>(addr));
+                return std::string(buf);
+            })();
 
-    m_impl->ExtractFromString(str, context);
+        m_impl->ExtractFromString(str, context);
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1060,13 +1205,20 @@ void IOCExtractor::OnStringFound(const std::string& str, GuestAddress addr) noex
 // ============================================================================
 
 void IOCExtractor::OnNetworkConnect(const std::string& addr, uint16_t port) noexcept {
+    if (!m_impl) return;
     if (addr.empty()) return;
+    if (addr.size() > kMaxStringLength) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
-    std::string context = "Network connection to port " + std::to_string(port);
+    std::string context;
+    try {
+        context = "Network connection to port " + std::to_string(port);
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 
     // Check if it's an IP address
     IPv4Parts parts;
@@ -1087,11 +1239,13 @@ void IOCExtractor::OnNetworkConnect(const std::string& addr, uint16_t port) noex
 // ============================================================================
 
 void IOCExtractor::OnDnsQuery(const std::string& domain) noexcept {
+    if (!m_impl) return;
     if (domain.empty()) return;
+    if (domain.size() > kMaxStringLength) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     m_impl->AddDomain(domain, "DNS query", 0.90f);
 }
@@ -1101,11 +1255,12 @@ void IOCExtractor::OnDnsQuery(const std::string& domain) noexcept {
 // ============================================================================
 
 void IOCExtractor::OnFileAccess(const std::wstring& path, bool isCreate) noexcept {
+    if (!m_impl) return;
     if (path.empty()) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     // Filter benign system path reads (but always track creates/writes)
     if (!isCreate && IsCommonSystemPath(path)) return;
@@ -1129,11 +1284,12 @@ void IOCExtractor::OnFileAccess(const std::wstring& path, bool isCreate) noexcep
 
 void IOCExtractor::OnRegistryAccess(const std::wstring& key,
                                     const std::wstring& value) noexcept {
+    if (!m_impl) return;
     if (key.empty()) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     bool isPersistence = IsPersistenceRegistryKey(key);
     float confidence = isPersistence ? 0.85f : 0.50f;
@@ -1144,8 +1300,13 @@ void IOCExtractor::OnRegistryAccess(const std::wstring& key,
 
     if (!value.empty()) {
         std::string narrowValue = WideToNarrow(value);
-        m_impl->AddRegistryValue(narrowValue,
-            "Registry value in " + narrowKey, confidence * 0.9f);
+        try {
+            m_impl->AddRegistryValue(narrowValue,
+                (std::string("Registry value in ") + narrowKey).substr(0, kMaxStringLength),
+                confidence * 0.9f);
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     }
 }
 
@@ -1154,11 +1315,12 @@ void IOCExtractor::OnRegistryAccess(const std::wstring& key,
 // ============================================================================
 
 void IOCExtractor::OnMutexCreate(const std::wstring& name) noexcept {
+    if (!m_impl) return;
     if (name.empty()) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     std::string narrowName = WideToNarrow(name);
 
@@ -1197,11 +1359,12 @@ void IOCExtractor::OnMutexCreate(const std::wstring& name) noexcept {
 // ============================================================================
 
 void IOCExtractor::OnServiceCreate(const std::wstring& name) noexcept {
+    if (!m_impl) return;
     if (name.empty()) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     std::string narrowName = WideToNarrow(name);
     m_impl->AddService(narrowName, "CreateService", 0.80f);
@@ -1212,11 +1375,12 @@ void IOCExtractor::OnServiceCreate(const std::wstring& name) noexcept {
 // ============================================================================
 
 void IOCExtractor::OnProcessCreate(const std::wstring& cmdline) noexcept {
+    if (!m_impl) return;
     if (cmdline.empty()) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     std::string narrow = WideToNarrow(cmdline);
 
@@ -1232,11 +1396,13 @@ void IOCExtractor::OnProcessCreate(const std::wstring& cmdline) noexcept {
 // ============================================================================
 
 void IOCExtractor::OnPipeCreate(const std::string& name) noexcept {
+    if (!m_impl) return;
     if (name.empty()) return;
+    if (name.size() > kMaxStringLength) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     m_impl->AddPipe(name, "Named pipe created", 0.70f);
 }
@@ -1246,11 +1412,12 @@ void IOCExtractor::OnPipeCreate(const std::string& name) noexcept {
 // ============================================================================
 
 void IOCExtractor::OnUserAgent(const std::string& ua) noexcept {
+    if (!m_impl) return;
     if (ua.empty() || ua.size() > kMaxStringLength) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
     std::unique_lock lock(m_impl->mutex);
-    m_impl->callIndex++;
+    m_impl->IncrementCallIndex();
 
     m_impl->AddUserAgent(ua, "HTTP User-Agent header", 0.75f);
 }
@@ -1260,35 +1427,40 @@ void IOCExtractor::OnUserAgent(const std::string& ua) noexcept {
 // ============================================================================
 
 IOCReport IOCExtractor::GenerateReport() const noexcept {
+    if (!m_impl) return {};
     std::shared_lock lock(m_impl->mutex);
 
     IOCReport report;
 
-    // Create defanged copies
-    report.indicators.reserve(m_impl->iocs.size());
-    for (const auto& ioc : m_impl->iocs) {
-        IOCEntry entry = ioc;
+    try {
+        // Create defanged copies
+        report.indicators.reserve(m_impl->iocs.size());
+        for (const auto& ioc : m_impl->iocs) {
+            IOCEntry entry = ioc;
 
-        // Defang display values
-        switch (entry.type) {
-            case IOCType::Domain:
-                entry.value = DefangDomain(ioc.value);
-                entry.isDefanged = true;
-                break;
-            case IOCType::IPv4:
-            case IOCType::IPv6:
-                entry.value = DefangIP(ioc.value);
-                entry.isDefanged = true;
-                break;
-            case IOCType::URL:
-                entry.value = DefangURL(ioc.value);
-                entry.isDefanged = true;
-                break;
-            default:
-                break;
+            // Defang display values
+            switch (entry.type) {
+                case IOCType::Domain:
+                    entry.value = DefangDomain(ioc.value);
+                    entry.isDefanged = true;
+                    break;
+                case IOCType::IPv4:
+                case IOCType::IPv6:
+                    entry.value = DefangIP(ioc.value);
+                    entry.isDefanged = true;
+                    break;
+                case IOCType::URL:
+                    entry.value = DefangURL(ioc.value);
+                    entry.isDefanged = true;
+                    break;
+                default:
+                    break;
+            }
+
+            report.indicators.push_back(std::move(entry));
         }
-
-        report.indicators.push_back(std::move(entry));
+    } catch (const std::bad_alloc&) {
+        report.indicators.clear();
     }
 
     // Count by type
@@ -1340,7 +1512,11 @@ IOCReport IOCExtractor::GenerateReport() const noexcept {
     if (report.totalMutexes > 0)
         ss << report.totalMutexes << " mutex(es)";
 
-    report.summary = ss.str();
+    try {
+        report.summary = ss.str();
+    } catch (const std::bad_alloc&) {
+        report.summary.clear();
+    }
     // Remove trailing comma-space if present
     if (report.summary.size() >= 2 &&
         report.summary.back() == ' ' &&
@@ -1357,7 +1533,18 @@ IOCReport IOCExtractor::GenerateReport() const noexcept {
 // ============================================================================
 
 const std::vector<IOCEntry>& IOCExtractor::GetAllIOCs() const noexcept {
-    return m_impl->iocs;
+    static const std::vector<IOCEntry> kEmpty;
+    static thread_local std::vector<IOCEntry> snapshot;
+    if (!m_impl) return kEmpty;
+
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->iocs;
+        return snapshot;
+    } catch (const std::bad_alloc&) {
+        snapshot.clear();
+        return kEmpty;
+    }
 }
 
 // ============================================================================
@@ -1365,13 +1552,23 @@ const std::vector<IOCEntry>& IOCExtractor::GetAllIOCs() const noexcept {
 // ============================================================================
 
 std::vector<const IOCEntry*> IOCExtractor::GetByType(IOCType type) const noexcept {
-    std::shared_lock lock(m_impl->mutex);
-
     std::vector<const IOCEntry*> result;
-    for (const auto& ioc : m_impl->iocs) {
-        if (ioc.type == type) {
-            result.push_back(&ioc);
+    if (!m_impl) return result;
+
+    try {
+        static thread_local std::vector<IOCEntry> snapshot;
+        snapshot.clear();
+        {
+            std::shared_lock lock(m_impl->mutex);
+            snapshot = m_impl->iocs;
         }
+        for (const auto& ioc : snapshot) {
+            if (ioc.type == type) {
+                result.push_back(&ioc);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
     return result;
 }
@@ -1381,6 +1578,7 @@ std::vector<const IOCEntry*> IOCExtractor::GetByType(IOCType type) const noexcep
 // ============================================================================
 
 uint32_t IOCExtractor::GetTotalIOCCount() const noexcept {
+    if (!m_impl) return 0;
     std::shared_lock lock(m_impl->mutex);
     return static_cast<uint32_t>(m_impl->iocs.size());
 }
@@ -1398,15 +1596,26 @@ bool IOCExtractor::IsSuspiciousDomain(const std::string& domain) const noexcept 
     // Check for suspicious TLD
     auto lastDot = domain.rfind('.');
     if (lastDot != std::string::npos && lastDot + 1 < domain.size()) {
-        std::string tld = domain.substr(lastDot + 1);
-        for (auto& c : tld) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (GetSuspiciousTLDs().count(tld) > 0) return true;
+        try {
+            std::string tld = domain.substr(lastDot + 1);
+            for (auto& c : tld) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (IsSuspiciousTLD(tld)) return true;
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
     }
 
     // Check for IP-like subdomains
     auto firstDot = domain.find('.');
     if (firstDot != std::string::npos) {
-        std::string firstLabel = domain.substr(0, firstDot);
+        std::string firstLabel;
+        try {
+            firstLabel = domain.substr(0, firstDot);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
         bool allDigitsOrDots = true;
         for (char c : firstLabel) {
             if (c < '0' || c > '9') {
@@ -1452,12 +1661,17 @@ float IOCExtractor::CalculateDomainEntropy(const std::string& domain) const noex
     auto lastDot = domain.rfind('.');
     if (lastDot == std::string::npos) return CalculateEntropy(domain);
 
-    std::string label = domain.substr(0, lastDot);
+    std::string label;
+    try {
+        label = domain.substr(0, lastDot);
 
-    // If there are subdomains, use the second-level label
-    auto secondDot = label.rfind('.');
-    if (secondDot != std::string::npos) {
-        label = label.substr(secondDot + 1);
+        // If there are subdomains, use the second-level label
+        auto secondDot = label.rfind('.');
+        if (secondDot != std::string::npos) {
+            label = label.substr(secondDot + 1);
+        }
+    } catch (const std::bad_alloc&) {
+        return 0.0f;
     }
 
     return CalculateEntropy(label);
@@ -1474,10 +1688,15 @@ bool IOCExtractor::IsDGA(const std::string& domain) const noexcept {
     auto lastDot = domain.rfind('.');
     if (lastDot == std::string::npos) return false;
 
-    std::string label = domain.substr(0, lastDot);
-    auto secondDot = label.rfind('.');
-    if (secondDot != std::string::npos) {
-        label = label.substr(secondDot + 1);
+    std::string label;
+    try {
+        label = domain.substr(0, lastDot);
+        auto secondDot = label.rfind('.');
+        if (secondDot != std::string::npos) {
+            label = label.substr(secondDot + 1);
+        }
+    } catch (const std::bad_alloc&) {
+        return false;
     }
 
     // Convert to lowercase for analysis
@@ -1537,8 +1756,7 @@ bool IOCExtractor::IsDGA(const std::string& domain) const noexcept {
 
     // === Bigram analysis — check for rare letter combinations ===
     uint32_t rareBigrams = 0;
-    static const std::unordered_set<std::string>& commonBigrams = []() -> const std::unordered_set<std::string>& {
-        static const std::unordered_set<std::string> bigrams = {
+    static constexpr std::array<std::string_view, 90> commonBigrams = {{
             "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
             "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
             "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le",
@@ -1547,9 +1765,7 @@ bool IOCExtractor::IsDGA(const std::string& domain) const noexcept {
             "ca", "el", "ta", "la", "ns", "ge", "ly", "ei", "ow", "ad",
             "di", "lo", "us", "pe", "ec", "no", "ol", "tr", "oo", "ct",
             "ss", "pr", "un", "wa", "so", "em", "wi", "op", "su", "ie",
-        };
-        return bigrams;
-    }();
+    }};
 
     if (label.size() >= 4) {
         uint32_t bigramTotal = 0;
@@ -1557,8 +1773,9 @@ bool IOCExtractor::IsDGA(const std::string& domain) const noexcept {
             if (label[i] >= 'a' && label[i] <= 'z' &&
                 label[i + 1] >= 'a' && label[i + 1] <= 'z') {
                 bigramTotal++;
-                std::string bg = label.substr(i, 2);
-                if (commonBigrams.find(bg) == commonBigrams.end()) {
+                std::string_view bg{ label.data() + i, 2 };
+                if (std::find(commonBigrams.begin(), commonBigrams.end(), bg) ==
+                    commonBigrams.end()) {
                     rareBigrams++;
                 }
             }
@@ -1598,6 +1815,7 @@ bool IOCExtractor::IsReservedIP(const std::string& ip) const noexcept {
 // ============================================================================
 
 void IOCExtractor::ScanForIOCsInBuffer(const uint8_t* data, size_t size) noexcept {
+    if (!m_impl) return;
     if (!data || size == 0) return;
     if (!m_impl->config.enableIOCExtraction) return;
 
@@ -1609,6 +1827,7 @@ void IOCExtractor::ScanForIOCsInBuffer(const uint8_t* data, size_t size) noexcep
 // ============================================================================
 
 void IOCExtractor::Reset() noexcept {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
 
     m_impl->iocs.clear();
