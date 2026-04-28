@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -28,10 +30,37 @@ namespace Phantom {
 // Canonical Address Validation
 // ============================================================================
 
-static bool IsCanonicalAddress(uint64_t addr) noexcept {
+static bool RingIsCanonicalAddress(uint64_t addr) noexcept {
     // In x86-64, bits [63:48] must be all-zero or all-one (sign-extension of bit 47)
     uint64_t top17 = addr >> 47;
     return top17 == 0 || top17 == 0x1FFFF;
+}
+
+static bool RingAddGuest(GuestAddress base, uint64_t offset, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - base < offset) {
+        return false;
+    }
+    result = base + offset;
+    return true;
+}
+
+static void RingSaturatingIncrement(std::atomic<uint32_t>& counter) noexcept {
+    uint32_t current = counter.load(std::memory_order_relaxed);
+    while (current != (std::numeric_limits<uint32_t>::max)()) {
+        if (counter.compare_exchange_weak(current, current + 1,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+static bool RingAddSelectorOffset(uint16_t selector, uint16_t offset, uint16_t& result) noexcept {
+    if (selector > (std::numeric_limits<uint16_t>::max)() - offset) {
+        return false;
+    }
+    result = static_cast<uint16_t>(selector + offset);
+    return true;
 }
 
 // ============================================================================
@@ -71,11 +100,29 @@ struct RingTransition::Impl {
 
     mutable std::shared_mutex mutex;
 
-    void RecordEvent(const RingTransitionEvent& event) {
+    bool RecordEvent(const RingTransitionEvent& event) {
         if (history.size() < kMaxTransitionHistory) {
-            history.push_back(event);
+            try {
+                history.push_back(event);
+            } catch (const std::bad_alloc&) {
+                return false;
+            }
         }
-        transitionCount.fetch_add(1, std::memory_order_relaxed);
+        RingSaturatingIncrement(transitionCount);
+        return true;
+    }
+
+    bool RecordSyscall(uint32_t syscallNumber) {
+        try {
+            auto& count = syscallCounts[syscallNumber];
+            if (count < (std::numeric_limits<uint32_t>::max)()) {
+                ++count;
+            }
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        RingSaturatingIncrement(syscallCount);
+        return true;
     }
 };
 
@@ -143,6 +190,17 @@ bool RingTransition::HandleSyscall(CPUState& cpu) {
     GuestAddress fromRIP = cpu.GetRIP();
     uint64_t     fromRSP = cpu.RSP();
     uint32_t     syscallNum = static_cast<uint32_t>(cpu.RAX());
+    GuestAddress lstar = msr->GetLSTAR();
+    if (!RingIsCanonicalAddress(lstar)) {
+        return false;
+    }
+
+    uint64_t star = msr->GetSTAR();
+    uint16_t syscallCS = static_cast<uint16_t>((star >> 32) & 0xFFFF);
+    uint16_t syscallSS = 0;
+    if (syscallCS == 0 || !RingAddSelectorOffset(syscallCS, 8, syscallSS)) {
+        return false;
+    }
 
     // Step 1: Save RIP to RCX
     cpu.SetReg64(GPR::RCX, fromRIP);
@@ -156,10 +214,6 @@ bool RingTransition::HandleSyscall(CPUState& cpu) {
     cpu.eflags.SetRaw(rflags & ~sfmask);
 
     // Step 4: Load CS from STAR[47:32], SS from STAR[47:32]+8
-    uint64_t star = msr->GetSTAR();
-    uint16_t syscallCS = static_cast<uint16_t>((star >> 32) & 0xFFFF);
-    uint16_t syscallSS = syscallCS + 8;
-
     cpu.SetSegmentSelector(SegReg::CS, syscallCS);
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].base   = 0;
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].dpl    = 0;
@@ -179,7 +233,6 @@ bool RingTransition::HandleSyscall(CPUState& cpu) {
     m_impl->currentCPL = 0;
 
     // Step 6: Load RIP from LSTAR
-    GuestAddress lstar = msr->GetLSTAR();
     cpu.SetRIP(lstar);
 
     // Record event
@@ -193,11 +246,10 @@ bool RingTransition::HandleSyscall(CPUState& cpu) {
     event.rsp           = fromRSP;
     event.syscallNumber = syscallNum;
     event.timestamp     = cpu.instructionCount;
-    m_impl->RecordEvent(event);
+    (void)m_impl->RecordEvent(event);
 
     // Track syscall number
-    m_impl->syscallCounts[syscallNum]++;
-    m_impl->syscallCount.fetch_add(1, std::memory_order_relaxed);
+    (void)m_impl->RecordSyscall(syscallNum);
 
     return true;
 }
@@ -225,7 +277,16 @@ bool RingTransition::HandleSysret(CPUState& cpu) {
     GuestAddress targetRIP = cpu.RCX();
 
     // Validate canonical address — Intel SDM: SYSRET #GP if non-canonical
-    if (!IsCanonicalAddress(targetRIP)) {
+    if (!RingIsCanonicalAddress(targetRIP)) {
+        return false;
+    }
+
+    uint64_t star = msr->GetSTAR();
+    uint16_t sysretCSBase = static_cast<uint16_t>((star >> 48) & 0xFFFF);
+    uint16_t userCS = 0;
+    uint16_t userSS = 0;
+    if (!RingAddSelectorOffset(sysretCSBase, 16, userCS) ||
+        !RingAddSelectorOffset(sysretCSBase, 8, userSS)) {
         return false;
     }
 
@@ -237,11 +298,6 @@ bool RingTransition::HandleSysret(CPUState& cpu) {
     cpu.eflags.SetRaw(newFlags);
 
     // Step 3: Load CS from STAR[63:48]+16, SS from STAR[63:48]+8
-    uint64_t star = msr->GetSTAR();
-    uint16_t sysretCSBase = static_cast<uint16_t>((star >> 48) & 0xFFFF);
-    uint16_t userCS = sysretCSBase + 16;
-    uint16_t userSS = sysretCSBase + 8;
-
     cpu.SetSegmentSelector(SegReg::CS, userCS);
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].base   = 0;
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].dpl    = 3;
@@ -270,7 +326,7 @@ bool RingTransition::HandleSysret(CPUState& cpu) {
     event.rsp           = cpu.RSP();
     event.syscallNumber = 0;
     event.timestamp     = cpu.instructionCount;
-    m_impl->RecordEvent(event);
+    (void)m_impl->RecordEvent(event);
 
     return true;
 }
@@ -305,7 +361,11 @@ bool RingTransition::HandleSysenter(CPUState& cpu) {
 
     // Load CS = SYSENTER_CS, SS = SYSENTER_CS + 8
     uint16_t cs = static_cast<uint16_t>(sysenterCS & 0xFFFF);
-    uint16_t ss = cs + 8;
+    uint16_t ss = 0;
+    if (!RingAddSelectorOffset(cs, 8, ss) || !RingIsCanonicalAddress(sysenterESP) ||
+        !RingIsCanonicalAddress(sysenterEIP)) {
+        return false;
+    }
 
     cpu.SetSegmentSelector(SegReg::CS, cs);
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].base   = 0;
@@ -342,10 +402,9 @@ bool RingTransition::HandleSysenter(CPUState& cpu) {
     event.rsp           = fromRSP;
     event.syscallNumber = syscallNum;
     event.timestamp     = cpu.instructionCount;
-    m_impl->RecordEvent(event);
+    (void)m_impl->RecordEvent(event);
 
-    m_impl->syscallCounts[syscallNum]++;
-    m_impl->syscallCount.fetch_add(1, std::memory_order_relaxed);
+    (void)m_impl->RecordSyscall(syscallNum);
 
     return true;
 }
@@ -374,8 +433,20 @@ bool RingTransition::HandleSysexit(CPUState& cpu) {
     GuestAddress fromRIP = cpu.GetRIP();
 
     // In 64-bit mode: CS = SYSENTER_CS + 32, SS = SYSENTER_CS + 40
-    uint16_t userCS = static_cast<uint16_t>((sysenterCS & 0xFFFF) + 32);
-    uint16_t userSS = static_cast<uint16_t>((sysenterCS & 0xFFFF) + 40);
+    uint16_t userCS = 0;
+    uint16_t userSS = 0;
+    const uint16_t sysenterSelector = static_cast<uint16_t>(sysenterCS & 0xFFFF);
+    if (!RingAddSelectorOffset(sysenterSelector, 32, userCS) ||
+        !RingAddSelectorOffset(sysenterSelector, 40, userSS)) {
+        return false;
+    }
+
+    // RIP <- RDX, RSP <- RCX (Intel SDM SYSEXIT specification)
+    GuestAddress targetRIP = cpu.RDX();
+    uint64_t targetRSP     = cpu.RCX();
+    if (!RingIsCanonicalAddress(targetRIP) || !RingIsCanonicalAddress(targetRSP)) {
+        return false;
+    }
 
     cpu.SetSegmentSelector(SegReg::CS, userCS);
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].base   = 0;
@@ -390,10 +461,6 @@ bool RingTransition::HandleSysexit(CPUState& cpu) {
     cpu.segments[static_cast<uint8_t>(SegReg::SS)].dpl    = 3;
     cpu.segments[static_cast<uint8_t>(SegReg::SS)].present = true;
     cpu.segments[static_cast<uint8_t>(SegReg::SS)].type   = 0x03;
-
-    // RIP ← RDX, RSP ← RCX (Intel SDM SYSEXIT specification)
-    GuestAddress targetRIP = cpu.RDX();
-    uint64_t targetRSP     = cpu.RCX();
 
     cpu.SetRIP(targetRIP);
     cpu.SetReg64(GPR::RSP, targetRSP);
@@ -412,7 +479,7 @@ bool RingTransition::HandleSysexit(CPUState& cpu) {
     event.rsp           = targetRSP;
     event.syscallNumber = 0;
     event.timestamp     = cpu.instructionCount;
-    m_impl->RecordEvent(event);
+    (void)m_impl->RecordEvent(event);
 
     return true;
 }
@@ -450,7 +517,10 @@ bool RingTransition::HandleInt2E(CPUState& cpu) {
     // Set kernel-mode segments
     uint16_t cs = static_cast<uint16_t>(sysenterCS & 0xFFFF);
     if (cs == 0) cs = 0x10; // Fallback to standard kernel CS
-    uint16_t ss = cs + 8;
+    uint16_t ss = 0;
+    if (!RingAddSelectorOffset(cs, 8, ss) || !RingIsCanonicalAddress(sysenterEIP)) {
+        return false;
+    }
 
     cpu.SetSegmentSelector(SegReg::CS, cs);
     cpu.segments[static_cast<uint8_t>(SegReg::CS)].base   = 0;
@@ -487,10 +557,9 @@ bool RingTransition::HandleInt2E(CPUState& cpu) {
     event.rsp           = fromRSP;
     event.syscallNumber = syscallNum;
     event.timestamp     = cpu.instructionCount;
-    m_impl->RecordEvent(event);
+    (void)m_impl->RecordEvent(event);
 
-    m_impl->syscallCounts[syscallNum]++;
-    m_impl->syscallCount.fetch_add(1, std::memory_order_relaxed);
+    (void)m_impl->RecordSyscall(syscallNum);
 
     return true;
 }
@@ -507,15 +576,26 @@ bool RingTransition::HandleIret(CPUState& cpu, VirtualMemory& memory) {
 
     // IRETQ pops: RIP, CS, RFLAGS, RSP, SS (each 8 bytes in 64-bit mode)
     uint64_t newRIP = 0, newCS = 0, newRFLAGS = 0, newRSP = 0, newSS = 0;
+    GuestAddress ripSlot = 0, csSlot = 0, flagsSlot = 0, rspSlot = 0, ssSlot = 0;
 
-    if (memory.ReadU64(rsp,      newRIP)    != ErrorCode::Success) return false;
-    if (memory.ReadU64(rsp + 8,  newCS)     != ErrorCode::Success) return false;
-    if (memory.ReadU64(rsp + 16, newRFLAGS) != ErrorCode::Success) return false;
-    if (memory.ReadU64(rsp + 24, newRSP)    != ErrorCode::Success) return false;
-    if (memory.ReadU64(rsp + 32, newSS)     != ErrorCode::Success) return false;
+    if (!RingAddGuest(rsp, 0, ripSlot) ||
+        !RingAddGuest(rsp, 8, csSlot) ||
+        !RingAddGuest(rsp, 16, flagsSlot) ||
+        !RingAddGuest(rsp, 24, rspSlot) ||
+        !RingAddGuest(rsp, 32, ssSlot)) {
+        return false;
+    }
+
+    if (memory.ReadU64(ripSlot,   newRIP)    != ErrorCode::Success) return false;
+    if (memory.ReadU64(csSlot,    newCS)     != ErrorCode::Success) return false;
+    if (memory.ReadU64(flagsSlot, newRFLAGS) != ErrorCode::Success) return false;
+    if (memory.ReadU64(rspSlot,   newRSP)    != ErrorCode::Success) return false;
+    if (memory.ReadU64(ssSlot,    newSS)     != ErrorCode::Success) return false;
 
     // Validate canonical RIP
-    if (!IsCanonicalAddress(newRIP)) {
+    if (!RingIsCanonicalAddress(newRIP) || !RingIsCanonicalAddress(newRSP) ||
+        newCS > (std::numeric_limits<uint16_t>::max)() ||
+        newSS > (std::numeric_limits<uint16_t>::max)()) {
         return false;
     }
 
@@ -555,7 +635,7 @@ bool RingTransition::HandleIret(CPUState& cpu, VirtualMemory& memory) {
     event.rsp           = newRSP;
     event.syscallNumber = 0;
     event.timestamp     = cpu.instructionCount;
-    m_impl->RecordEvent(event);
+    (void)m_impl->RecordEvent(event);
 
     return true;
 }
@@ -588,9 +668,8 @@ bool RingTransition::IsUserMode() const {
 // Transition History
 // ============================================================================
 
-const std::vector<RingTransitionEvent>& RingTransition::GetHistory() const {
-    // Caller must not hold the lock — this returns a reference under implicit shared access.
-    // In practice, this is called during analysis phases, not during active emulation.
+std::vector<RingTransitionEvent> RingTransition::GetHistory() const {
+    std::shared_lock lock(m_impl->mutex);
     return m_impl->history;
 }
 
@@ -666,7 +745,7 @@ std::vector<RingTransitionAnomaly> RingTransition::DetectAnomalies() const {
 
         // Check: Non-canonical return address on SYSRET/IRET
         if ((event.type == TransitionType::Sysret || event.type == TransitionType::Iret) &&
-            !IsCanonicalAddress(event.toRIP)) {
+            !RingIsCanonicalAddress(event.toRIP)) {
             RingTransitionAnomaly anomaly;
             anomaly.type        = RingTransitionAnomaly::Type::NonCanonicalReturn;
             anomaly.description = "Return to non-canonical address 0x" +
