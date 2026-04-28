@@ -20,6 +20,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <shared_mutex>
 
 namespace Phantom {
 
@@ -49,13 +53,41 @@ constexpr uint32_t kProcessParamsOffset  = 0x600;
 
 // Safely assign an error detail string (noexcept-safe)
 void SetDetail(std::string& target, std::string_view msg) noexcept {
-    try { target.assign(msg); } catch (...) {}
+    try { target.assign(msg); } catch (const std::bad_alloc&) {}
+}
+
+[[nodiscard]] bool AddGuestAddress(GuestAddress base, GuestAddress offset, GuestAddress& out) noexcept {
+    if (offset > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
+
+[[nodiscard]] bool AlignUpChecked(GuestSize value, GuestSize alignment, GuestSize& out) noexcept {
+    if (alignment == 0 || value > (std::numeric_limits<GuestSize>::max)() - (alignment - 1)) {
+        return false;
+    }
+    out = AlignUp(value, alignment);
+    return out >= value;
+}
+
+[[nodiscard]] bool ToU32Address(GuestAddress value, uint32_t& out) noexcept {
+    if (value > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
 }
 
 // Write a scalar value at a specific offset from a base guest address
 template <typename T>
 ErrorCode WriteAt(VirtualMemory& mem, GuestAddress base, uint32_t offset, T value) noexcept {
-    return mem.Write(base + offset, &value, sizeof(T));
+    GuestAddress target = 0;
+    if (!AddGuestAddress(base, offset, target)) {
+        return ErrorCode::InvalidAddress;
+    }
+    return mem.Write(target, &value, sizeof(T));
 }
 
 [[nodiscard]] bool IsTarget64(EmulationTarget t) noexcept {
@@ -94,6 +126,7 @@ PELoader::PELoader(VirtualMemory& memory,
 PELoader::LoadResult PELoader::Load(ByteSpan peData,
                                     const EmulationConfig& config) noexcept
 {
+    std::unique_lock loaderLock(m_mutex);
     LoadResult result{};
 
     // ---- 1. Parse PE -------------------------------------------------------
@@ -136,8 +169,9 @@ PELoader::LoadResult PELoader::Load(ByteSpan peData,
     result.image.target  = config.target;
 
     // Validate image size against config limits
-    const GuestSize imageSize = static_cast<GuestSize>(pe.sizeOfImage);
-    if (imageSize == 0 || imageSize > config.maxGuestMemory) {
+    GuestSize imageSize = 0;
+    if (!AlignUpChecked(static_cast<GuestSize>(pe.sizeOfImage), kPageSize, imageSize) ||
+        imageSize == 0 || imageSize > config.maxGuestMemory) {
         result.error = ErrorCode::PETooLarge;
         SetDetail(result.errorDetail, "PE image size exceeds memory limit");
         return result;
@@ -276,7 +310,6 @@ PELoader::LoadResult PELoader::Load(ByteSpan peData,
     }
 
     // ---- 14. Validate and set entry point ----------------------------------
-    result.image.entryPoint = actualBase + pe.entryPointRVA;
     if (pe.entryPointRVA == 0 && !pe.isDLL) {
         result.error = ErrorCode::InvalidEntryPoint;
         SetDetail(result.errorDetail, "PE has no entry point");
@@ -285,6 +318,11 @@ PELoader::LoadResult PELoader::Load(ByteSpan peData,
     if (pe.entryPointRVA >= pe.sizeOfImage) {
         result.error = ErrorCode::InvalidEntryPoint;
         SetDetail(result.errorDetail, "Entry point RVA exceeds image size");
+        return result;
+    }
+    if (!AddGuestAddress(actualBase, pe.entryPointRVA, result.image.entryPoint)) {
+        result.error = ErrorCode::InvalidEntryPoint;
+        SetDetail(result.errorDetail, "Entry point address overflow");
         return result;
     }
 
@@ -298,6 +336,7 @@ PELoader::LoadResult PELoader::Load(ByteSpan peData,
 PELoader::LoadResult PELoader::LoadDLL(ByteSpan peData,
                                         std::string_view dllName) noexcept
 {
+    std::unique_lock loaderLock(m_mutex);
     LoadResult result{};
 
     // ---- 1. Parse PE -------------------------------------------------------
@@ -321,10 +360,10 @@ PELoader::LoadResult PELoader::LoadDLL(ByteSpan peData,
     }
 
     // ---- 2. Allocate at m_nextDLLBase --------------------------------------
-    const GuestSize alignedImageSize = AlignUp(
-        static_cast<GuestSize>(pe.sizeOfImage), kPageSize);
+    GuestSize alignedImageSize = 0;
 
-    if (alignedImageSize == 0 || alignedImageSize > PE::kMaxPEFileSize) {
+    if (!AlignUpChecked(static_cast<GuestSize>(pe.sizeOfImage), kPageSize, alignedImageSize) ||
+        alignedImageSize == 0 || alignedImageSize > PE::kMaxPEFileSize) {
         result.error = ErrorCode::PETooLarge;
         SetDetail(result.errorDetail, "DLL image size invalid");
         return result;
@@ -347,7 +386,14 @@ PELoader::LoadResult PELoader::LoadDLL(ByteSpan peData,
     result.image.imageBase = actualBase;
 
     // Advance next DLL base (64KB alignment granularity, like Windows)
-    m_nextDLLBase = AlignUp(actualBase + alignedImageSize, 0x10000);
+    GuestAddress nextDllBase = 0;
+    if (!AddGuestAddress(actualBase, alignedImageSize, nextDllBase) ||
+        !AlignUpChecked(nextDllBase, 0x10000, nextDllBase)) {
+        result.error = ErrorCode::InvalidAddress;
+        SetDetail(result.errorDetail, "DLL base advancement overflow");
+        return result;
+    }
+    m_nextDLLBase = nextDllBase;
 
     // ---- 3. Map headers + sections -----------------------------------------
     {
@@ -407,7 +453,11 @@ PELoader::LoadResult PELoader::LoadDLL(ByteSpan peData,
 
     // Entry point for DLLs (DllMain)
     if (pe.entryPointRVA != 0 && pe.entryPointRVA < pe.sizeOfImage) {
-        result.image.entryPoint = actualBase + pe.entryPointRVA;
+        if (!AddGuestAddress(actualBase, pe.entryPointRVA, result.image.entryPoint)) {
+            result.error = ErrorCode::InvalidEntryPoint;
+            SetDetail(result.errorDetail, "DLL entry point address overflow");
+            return result;
+        }
     }
 
     return result;
@@ -421,6 +471,7 @@ void PELoader::PrepareCPUState(CPU& cpu,
                                const LoadedImage& image,
                                const EmulationConfig& config) noexcept
 {
+    static_cast<void>(config);
     auto& state = cpu.State();
 
     if (image.is64Bit) {
@@ -436,7 +487,9 @@ void PELoader::PrepareCPUState(CPU& cpu,
         rsp -= 0x28; // 32-byte shadow space + 8-byte return address
 
         // Write sentinel return address at [RSP]
-        m_memory.WriteU64(rsp, kSentinelReturn64);
+        if (m_memory.WriteU64(rsp, kSentinelReturn64) != ErrorCode::Success) {
+            return;
+        }
         state.SetReg64(GPR::RSP, rsp);
 
         // Zero all general-purpose registers except RSP
@@ -481,16 +534,20 @@ void PELoader::PrepareCPUState(CPU& cpu,
         if (image.isDLL) {
             // Push DllMain args right-to-left: lpvReserved, fdwReason, hinstDLL
             esp -= 4;
-            m_memory.WriteU32(esp, 0);  // lpvReserved
+            if (m_memory.WriteU32(esp, 0) != ErrorCode::Success) { return; }  // lpvReserved
             esp -= 4;
-            m_memory.WriteU32(esp, kDllProcessAttach);  // fdwReason
+            if (m_memory.WriteU32(esp, kDllProcessAttach) != ErrorCode::Success) { return; }  // fdwReason
             esp -= 4;
-            m_memory.WriteU32(esp, static_cast<uint32_t>(image.imageBase));  // hinstDLL
+            uint32_t imageBase32 = 0;
+            if (!ToU32Address(image.imageBase, imageBase32) ||
+                m_memory.WriteU32(esp, imageBase32) != ErrorCode::Success) { return; }  // hinstDLL
         }
 
         // Push sentinel return address
         esp -= 4;
-        m_memory.WriteU32(esp, kSentinelReturn32);
+        if (m_memory.WriteU32(esp, kSentinelReturn32) != ErrorCode::Success) {
+            return;
+        }
 
         state.SetReg32(GPR::RSP, static_cast<uint32_t>(esp));
 
@@ -513,6 +570,11 @@ void PELoader::PrepareCPUState(CPU& cpu,
     }
 }
 
+GuestAddress PELoader::GetNextDLLBase() const noexcept {
+    std::shared_lock lock(m_mutex);
+    return m_nextDLLBase;
+}
+
 // ============================================================================
 // AllocateImageMemory — Reserve guest address space for the PE image
 // ============================================================================
@@ -520,10 +582,10 @@ void PELoader::PrepareCPUState(CPU& cpu,
 ErrorCode PELoader::AllocateImageMemory(const ParsedPE& pe,
                                         GuestAddress& actualBase) noexcept
 {
-    const GuestSize imageSize = AlignUp(
-        static_cast<GuestSize>(pe.sizeOfImage), kPageSize);
+    GuestSize imageSize = 0;
 
-    if (imageSize == 0) {
+    if (!AlignUpChecked(static_cast<GuestSize>(pe.sizeOfImage), kPageSize, imageSize) ||
+        imageSize == 0) {
         return ErrorCode::MalformedPE;
     }
 
@@ -565,14 +627,7 @@ ErrorCode PELoader::MapHeaders(const ParsedPE& pe,
         return ErrorCode::MalformedPE;
     }
 
-    auto err = m_memory.MapRegion(
-        actualBase,
-        peData.data(),
-        headerBytes,
-        static_cast<GuestSize>(pe.sizeOfHeaders),
-        MemProt::RW);  // RW initially; set to Read-only after patching
-
-    return err;
+    return m_memory.Write(actualBase, peData.data(), headerBytes);
 }
 
 // ============================================================================
@@ -588,14 +643,19 @@ ErrorCode PELoader::MapSections(const ParsedPE& pe,
             continue; // Skip empty sections
         }
 
-        const GuestAddress sectionBase = actualBase + section.virtualAddress;
-        const GuestSize    virtualSize = static_cast<GuestSize>(section.virtualSize);
+        GuestAddress sectionBase = 0;
+        if (!AddGuestAddress(actualBase, section.virtualAddress, sectionBase)) {
+            return ErrorCode::SectionOverflow;
+        }
+        const GuestSize virtualSize = static_cast<GuestSize>(
+            section.virtualSize != 0 ? section.virtualSize : section.rawDataSize);
 
         // Validate section doesn't exceed image bounds
         if (section.virtualAddress >= pe.sizeOfImage) {
             return ErrorCode::SectionOverflow;
         }
-        if (static_cast<uint64_t>(section.virtualAddress) + virtualSize >
+        if (virtualSize == 0 ||
+            static_cast<uint64_t>(section.virtualAddress) + virtualSize >
             static_cast<uint64_t>(pe.sizeOfImage)) {
             return ErrorCode::SectionOverflow;
         }
@@ -614,20 +674,18 @@ ErrorCode PELoader::MapSections(const ParsedPE& pe,
             copySize = static_cast<uint32_t>(
                 std::min(static_cast<uint64_t>(section.rawDataSize), available));
             // Don't copy more than virtualSize
-            copySize = std::min(copySize, section.virtualSize);
+            copySize = std::min(copySize, static_cast<uint32_t>(virtualSize));
             sourceData = peData.data() + section.rawDataOffset;
         }
 
-        // Map section: copy raw data, zero-fill remainder, apply RW initially
-        auto err = m_memory.MapRegion(
-            sectionBase,
-            sourceData,
-            copySize,
-            virtualSize,
-            MemProt::RW);  // RW for relocation/import patching; corrected later
-
-        if (err != ErrorCode::Success) {
-            return err;
+        // The complete image range is already reserved by AllocateImageMemory.
+        // VirtualMemory returns zeroes for untouched committed pages, matching
+        // PE zero-fill semantics for BSS and VirtualSize > SizeOfRawData tails.
+        if (sourceData != nullptr && copySize > 0) {
+            auto err = m_memory.Write(sectionBase, sourceData, copySize);
+            if (err != ErrorCode::Success) {
+                return err;
+            }
         }
     }
 
@@ -645,14 +703,17 @@ ErrorCode PELoader::ApplySectionProtections(const ParsedPE& pe,
     // Headers: read-only
     const GuestSize headerSize = AlignUp(
         static_cast<GuestSize>(pe.sizeOfHeaders), kPageSize);
-    if (headerSize > 0) {
-        m_memory.Protect(imageBase, headerSize, MemProt::Read);
+    if (headerSize > 0 && !m_memory.Protect(imageBase, headerSize, MemProt::Read)) {
+        return ErrorCode::InvalidAddress;
     }
 
     for (const auto& section : pe.sections) {
         if (section.virtualSize == 0) continue;
 
-        const GuestAddress sectionBase = imageBase + section.virtualAddress;
+        GuestAddress sectionBase = 0;
+        if (!AddGuestAddress(imageBase, section.virtualAddress, sectionBase)) {
+            return ErrorCode::SectionOverflow;
+        }
         const GuestSize    sectionSize = AlignUp(
             static_cast<GuestSize>(section.virtualSize), kPageSize);
 
@@ -674,8 +735,10 @@ ErrorCode PELoader::ApplySectionProtections(const ParsedPE& pe,
 ErrorCode PELoader::SetupStack(LoadedImage& image,
                                const EmulationConfig& config) noexcept
 {
-    const GuestSize stackSize = AlignUp(
-        config.stackSize > 0 ? config.stackSize : kStackSize, kPageSize);
+    GuestSize stackSize = 0;
+    if (!AlignUpChecked(config.stackSize > 0 ? config.stackSize : kStackSize, kPageSize, stackSize)) {
+        return ErrorCode::OutOfMemory;
+    }
 
     // Choose stack base address based on bitness
     const GuestAddress preferredStackBase =
@@ -691,10 +754,14 @@ ErrorCode PELoader::SetupStack(LoadedImage& image,
     }
 
     image.stackBase = *stackOpt;
-    image.stackTop  = image.stackBase + stackSize;
+    if (!AddGuestAddress(image.stackBase, stackSize, image.stackTop)) {
+        return ErrorCode::InvalidAddress;
+    }
 
     // Guard page at the bottom of the stack for overflow detection
-    m_memory.Protect(image.stackBase, kPageSize, MemProt::RW | MemProt::Guard);
+    if (!m_memory.Protect(image.stackBase, kPageSize, MemProt::RW | MemProt::Guard)) {
+        return ErrorCode::InvalidAddress;
+    }
 
     return ErrorCode::Success;
 }
@@ -706,8 +773,10 @@ ErrorCode PELoader::SetupStack(LoadedImage& image,
 ErrorCode PELoader::SetupHeap(LoadedImage& image,
                               const EmulationConfig& config) noexcept
 {
-    const GuestSize heapSize = AlignUp(
-        config.heapSize > 0 ? config.heapSize : kHeapInitial, kPageSize);
+    GuestSize heapSize = 0;
+    if (!AlignUpChecked(config.heapSize > 0 ? config.heapSize : kHeapInitial, kPageSize, heapSize)) {
+        return ErrorCode::OutOfMemory;
+    }
 
     const GuestAddress preferredHeapBase =
         image.is64Bit ? WinConst::kProcessHeapBase64 : kHeapBase32;
@@ -977,8 +1046,9 @@ ErrorCode PELoader::CreatePEB(LoadedImage& image,
 // ============================================================================
 
 ErrorCode PELoader::CreateTEB(LoadedImage& image,
-                              const EmulationConfig& config) noexcept
+                               const EmulationConfig& config) noexcept
 {
+    static_cast<void>(config);
     const GuestAddress tebAddr =
         image.is64Bit ? WinConst::kTEBAddress64 : WinConst::kTEBAddress64;
 

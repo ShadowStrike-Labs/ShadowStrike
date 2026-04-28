@@ -28,6 +28,7 @@
 #include "../../Common/Constants.hpp"
 
 #include <cstdint>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -86,13 +87,14 @@ public:
                          const LoadedImage& image,
                          const EmulationConfig& config) noexcept;
 
-    [[nodiscard]] GuestAddress GetNextDLLBase() const noexcept { return m_nextDLLBase; }
+    [[nodiscard]] GuestAddress GetNextDLLBase() const noexcept;
 
 private:
     VirtualMemory&  m_memory;
     ExportResolver& m_exports;
     ImportResolver& m_imports;
     GuestAddress    m_nextDLLBase = 0;
+    mutable std::shared_mutex m_mutex;
 
     [[nodiscard]] ErrorCode AllocateImageMemory(
         const ParsedPE& pe, GuestAddress& actualBase) noexcept;
