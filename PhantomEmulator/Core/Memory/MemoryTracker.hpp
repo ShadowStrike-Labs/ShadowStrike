@@ -68,9 +68,10 @@ public:
     [[nodiscard]] uint32_t GetUniqueWrittenPages() const noexcept;
 
     // === Full access log (optional, expensive) ===
-    void SetFullTracing(bool enable) noexcept { m_fullTracing = enable; }
-    void RecordAccess(const MemoryAccessRecord& record);
+    void SetFullTracing(bool enable) noexcept;
+    void RecordAccess(const MemoryAccessRecord& record) noexcept;
     [[nodiscard]] std::vector<MemoryAccessRecord> GetAccessLog() const;
+    [[nodiscard]] uint64_t GetDroppedEventCount() const noexcept;
 
 private:
     std::unordered_set<GuestAddress> m_writtenPages;
@@ -80,9 +81,14 @@ private:
     std::vector<MemoryAccessRecord> m_accessLog;
     mutable std::shared_mutex m_mutex;
     bool m_fullTracing = false;
+    uint64_t m_droppedEvents = 0;
 
-    static constexpr uint32_t kMaxAccessLogSize = 10'000'000; // Cap to prevent OOM
+    static constexpr uint32_t kMaxTrackedPages = 1'000'000;
+    static constexpr uint32_t kMaxAccessLogSize = 1'000'000; // Cap to prevent OOM
+    static constexpr uint32_t kMaxRWXAllocations = 10'000;
     static constexpr uint32_t kMaxWXPages = 100'000;
+
+    void RecordDropLocked() noexcept;
 };
 
 } // namespace Phantom
