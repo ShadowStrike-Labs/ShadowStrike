@@ -11,7 +11,12 @@
 #include "HashResolver.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <shared_mutex>
 
 namespace Phantom {
 
@@ -40,10 +45,12 @@ static char ToUpperASCII(char c) noexcept {
 // CRC32 lookup table — IEEE 802.3, polynomial 0xEDB88320 (reflected)
 // ============================================================================
 
+#pragma warning(push)
+#pragma warning(disable: 28020) // DESIGN: constexpr loop is bounded by table.size(); /analyze cannot prove it.
 static constexpr std::array<uint32_t, 256> BuildCRC32Table() noexcept {
     std::array<uint32_t, 256> table{};
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        uint32_t crc = static_cast<uint32_t>(i);
         for (int j = 0; j < 8; ++j) {
             if (crc & 1) {
                 crc = (crc >> 1) ^ 0xEDB88320u;
@@ -55,8 +62,17 @@ static constexpr std::array<uint32_t, 256> BuildCRC32Table() noexcept {
     }
     return table;
 }
+#pragma warning(pop)
 
 static constexpr auto kCRC32Table = BuildCRC32Table();
+
+#pragma warning(push)
+#pragma warning(disable: 28020) // DESIGN: index is narrowed to uint8_t, therefore always < 256.
+static uint32_t CRC32Step(uint32_t crc, uint8_t byte) noexcept {
+    const auto index = static_cast<std::size_t>(static_cast<uint8_t>(crc ^ byte));
+    return kCRC32Table[index] ^ (crc >> 8);
+}
+#pragma warning(pop)
 
 // ============================================================================
 // Hash Algorithm Implementations
@@ -104,7 +120,7 @@ static uint32_t ComputeROR13(std::string_view moduleName,
 static uint32_t ComputeCRC32(std::string_view name) noexcept {
     uint32_t crc = 0xFFFFFFFFu;
     for (const char c : name) {
-        crc = kCRC32Table[static_cast<uint8_t>(crc ^ static_cast<uint8_t>(c))] ^ (crc >> 8);
+        crc = CRC32Step(crc, static_cast<uint8_t>(c));
     }
     return crc ^ 0xFFFFFFFFu;
 }
@@ -114,12 +130,12 @@ static uint32_t ComputeCRC32Full(std::string_view moduleName,
                                   std::string_view funcName) noexcept {
     uint32_t crc = 0xFFFFFFFFu;
     for (const char c : moduleName) {
-        crc = kCRC32Table[static_cast<uint8_t>(crc ^ static_cast<uint8_t>(c))] ^ (crc >> 8);
+        crc = CRC32Step(crc, static_cast<uint8_t>(c));
     }
     constexpr uint8_t sep = '!';
-    crc = kCRC32Table[static_cast<uint8_t>(crc ^ sep)] ^ (crc >> 8);
+    crc = CRC32Step(crc, sep);
     for (const char c : funcName) {
-        crc = kCRC32Table[static_cast<uint8_t>(crc ^ static_cast<uint8_t>(c))] ^ (crc >> 8);
+        crc = CRC32Step(crc, static_cast<uint8_t>(c));
     }
     return crc ^ 0xFFFFFFFFu;
 }
@@ -844,11 +860,17 @@ static constexpr uint32_t kCommonAPICount =
 // ============================================================================
 
 HashResolver::HashResolver() noexcept {
-    m_moduleNames.reserve(32);
-    m_functionNames.reserve(512);
+    try {
+        m_moduleNames.reserve(32);
+        m_functionNames.reserve(512);
+    } catch (const std::bad_alloc&) {
+        m_moduleNames.clear();
+        m_functionNames.clear();
+    }
 }
 
 void HashResolver::Reset() noexcept {
+    std::unique_lock lock(m_mutex);
     for (auto& table : m_tables) {
         table.clear();
     }
@@ -861,60 +883,65 @@ void HashResolver::Reset() noexcept {
 // InsertExport — Hash a (module, function) pair with every algorithm and store
 // ============================================================================
 
-void HashResolver::InsertExport(
+bool HashResolver::InsertExport(
     uint16_t moduleIdx, uint16_t nameIdx,
     std::string_view moduleName, std::string_view funcName,
     GuestAddress address) noexcept
 {
-    HashEntry entry{};
-    entry.address     = address;
-    entry.moduleIndex = moduleIdx;
-    entry.nameIndex   = nameIdx;
+    try {
+        HashEntry entry{};
+        entry.address     = address;
+        entry.moduleIndex = moduleIdx;
+        entry.nameIndex   = nameIdx;
 
-    // Build a lowercase copy of the module name for case-insensitive algorithms
-    // (CRC32Full uses the original casing convention of the module name)
-    std::string moduleLower;
-    moduleLower.reserve(moduleName.size());
-    for (const char c : moduleName) {
-        moduleLower += ToLowerASCII(c);
+        // Build a lowercase copy of the module name for case-insensitive algorithms
+        // (CRC32Full uses the original casing convention of the module name)
+        std::string moduleLower;
+        moduleLower.reserve(moduleName.size());
+        for (const char c : moduleName) {
+            moduleLower += ToLowerASCII(c);
+        }
+
+        auto insert = [&](HashAlgorithm algo, uint32_t h) {
+            const auto idx = static_cast<uint32_t>(algo);
+            // First-insert wins: if a collision exists, the first registered export
+            // is kept. Collisions are rare for real APIs with well-distributed hashes.
+            m_tables[idx].try_emplace(h, entry);
+        };
+
+        // ROR13 — Metasploit convention: uppercase unicode module + ASCII function
+        insert(HashAlgorithm::ROR13, ComputeROR13(moduleName, funcName));
+
+        // CRC32 — function name only
+        insert(HashAlgorithm::CRC32, ComputeCRC32(funcName));
+
+        // DJB2 — function name only
+        insert(HashAlgorithm::DJB2, ComputeDJB2(funcName));
+
+        // FNV-1a — function name only
+        insert(HashAlgorithm::FNV1a, ComputeFNV1a(funcName));
+
+        // SDBM — function name only
+        insert(HashAlgorithm::SDBM, ComputeSDBM(funcName));
+
+        // SuperFastHash — function name only
+        insert(HashAlgorithm::SuperFast, ComputeSuperFast(funcName));
+
+        // MurmurOAAT — function name only
+        insert(HashAlgorithm::MurmurOAAT, ComputeMurmurOAAT(funcName));
+
+        // JenkinsOAAT — function name only
+        insert(HashAlgorithm::JenkinsOAAT, ComputeJenkinsOAAT(funcName));
+
+        // ROR13Wide — wide-char module + wide-char function
+        insert(HashAlgorithm::ROR13Wide, ComputeROR13Wide(moduleName, funcName));
+
+        // CRC32Full — "module.dll!FunctionName"
+        insert(HashAlgorithm::CRC32Full, ComputeCRC32Full(moduleLower, funcName));
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
     }
-
-    auto insert = [&](HashAlgorithm algo, uint32_t h) noexcept {
-        const auto idx = static_cast<uint32_t>(algo);
-        // First-insert wins: if a collision exists, the first registered export
-        // is kept. Collisions are rare for real APIs with well-distributed hashes.
-        m_tables[idx].try_emplace(h, entry);
-    };
-
-    // ROR13 — Metasploit convention: uppercase unicode module + ASCII function
-    insert(HashAlgorithm::ROR13, ComputeROR13(moduleName, funcName));
-
-    // CRC32 — function name only
-    insert(HashAlgorithm::CRC32, ComputeCRC32(funcName));
-
-    // DJB2 — function name only
-    insert(HashAlgorithm::DJB2, ComputeDJB2(funcName));
-
-    // FNV-1a — function name only
-    insert(HashAlgorithm::FNV1a, ComputeFNV1a(funcName));
-
-    // SDBM — function name only
-    insert(HashAlgorithm::SDBM, ComputeSDBM(funcName));
-
-    // SuperFastHash — function name only
-    insert(HashAlgorithm::SuperFast, ComputeSuperFast(funcName));
-
-    // MurmurOAAT — function name only
-    insert(HashAlgorithm::MurmurOAAT, ComputeMurmurOAAT(funcName));
-
-    // JenkinsOAAT — function name only
-    insert(HashAlgorithm::JenkinsOAAT, ComputeJenkinsOAAT(funcName));
-
-    // ROR13Wide — wide-char module + wide-char function
-    insert(HashAlgorithm::ROR13Wide, ComputeROR13Wide(moduleName, funcName));
-
-    // CRC32Full — "module.dll!FunctionName"
-    insert(HashAlgorithm::CRC32Full, ComputeCRC32Full(moduleLower, funcName));
 }
 
 // ============================================================================
@@ -930,60 +957,91 @@ void HashResolver::InsertExport(
 // private data while covering the ~400 APIs that shellcode actually uses.
 
 void HashResolver::BuildFromExports(const ExportResolver& exports) noexcept {
-    Reset();
+    std::unique_lock lock(m_mutex);
 
-    // Pre-size hash maps: each algorithm will store up to kCommonAPICount entries
-    for (auto& table : m_tables) {
-        table.reserve(kCommonAPICount);
-    }
-
-    // Track module names to assign indices (dedup via linear scan — small N)
-    auto internModule = [this](std::string_view name) -> uint16_t {
-        for (uint16_t i = 0; i < static_cast<uint16_t>(m_moduleNames.size()); ++i) {
-            if (m_moduleNames[i] == name) return i;
+    auto clearState = [this]() noexcept {
+        for (auto& table : m_tables) {
+            table.clear();
         }
-        if (m_moduleNames.size() >= kMaxInternedModules) return 0;
-        auto idx = static_cast<uint16_t>(m_moduleNames.size());
-        m_moduleNames.emplace_back(name);
-        return idx;
+        m_moduleNames.clear();
+        m_functionNames.clear();
+        m_moduleCount = 0;
     };
 
-    auto internFunction = [this](std::string_view name) -> uint16_t {
-        // Function names are more numerous — linear scan is acceptable at build
-        // time (this is not a hot path; runs once during session initialization)
-        for (uint16_t i = 0; i < static_cast<uint16_t>(m_functionNames.size()); ++i) {
-            if (m_functionNames[i] == name) return i;
-        }
-        if (m_functionNames.size() >= kMaxInternedFunctions) return 0;
-        auto idx = static_cast<uint16_t>(m_functionNames.size());
-        m_functionNames.emplace_back(name);
-        return idx;
-    };
+    try {
+        clearState();
 
-    for (uint32_t i = 0; i < kCommonAPICount; ++i) {
-        const auto& api = kCommonAPIs[i];
-        const std::string_view dll  = api.dll;
-        const std::string_view func = api.func;
-
-        // Check if module is loaded in the emulator
-        if (!exports.HasModule(dll)) {
-            continue;
+        // Pre-size hash maps: each algorithm will store up to kCommonAPICount entries
+        for (auto& table : m_tables) {
+            table.reserve(kCommonAPICount);
         }
 
-        // Try to resolve the function to a guest address
-        const auto addr = exports.ResolveByName(dll, func);
-        if (!addr.has_value()) {
-            continue;
+        // Track module names to assign indices (dedup via linear scan — small N)
+        auto internModule = [this](std::string_view name) -> std::optional<uint16_t> {
+            for (std::size_t i = 0; i < m_moduleNames.size(); ++i) {
+                if (m_moduleNames[i] == name) {
+                    return static_cast<uint16_t>(i);
+                }
+            }
+            if (m_moduleNames.size() >= kMaxInternedModules ||
+                m_moduleNames.size() > (std::numeric_limits<uint16_t>::max)()) {
+                return std::nullopt;
+            }
+            const auto idx = static_cast<uint16_t>(m_moduleNames.size());
+            m_moduleNames.emplace_back(name);
+            return idx;
+        };
+
+        auto internFunction = [this](std::string_view name) -> std::optional<uint16_t> {
+            // Function names are more numerous — linear scan is acceptable at build
+            // time (this is not a hot path; runs once during session initialization)
+            for (std::size_t i = 0; i < m_functionNames.size(); ++i) {
+                if (m_functionNames[i] == name) {
+                    return static_cast<uint16_t>(i);
+                }
+            }
+            if (m_functionNames.size() >= kMaxInternedFunctions ||
+                m_functionNames.size() > (std::numeric_limits<uint16_t>::max)()) {
+                return std::nullopt;
+            }
+            const auto idx = static_cast<uint16_t>(m_functionNames.size());
+            m_functionNames.emplace_back(name);
+            return idx;
+        };
+
+        for (uint32_t i = 0; i < kCommonAPICount; ++i) {
+            const auto& api = kCommonAPIs[i];
+            const std::string_view dll  = api.dll;
+            const std::string_view func = api.func;
+
+            // Check if module is loaded in the emulator
+            if (!exports.HasModule(dll)) {
+                continue;
+            }
+
+            // Try to resolve the function to a guest address
+            const auto addr = exports.ResolveByName(dll, func);
+            if (!addr.has_value()) {
+                continue;
+            }
+
+            const auto modIdx = internModule(dll);
+            const auto funcIdx = internFunction(func);
+            if (!modIdx.has_value() || !funcIdx.has_value()) {
+                continue;
+            }
+
+            if (!InsertExport(*modIdx, *funcIdx, dll, func, *addr)) {
+                clearState();
+                return;
+            }
         }
 
-        const uint16_t modIdx  = internModule(dll);
-        const uint16_t funcIdx = internFunction(func);
-
-        InsertExport(modIdx, funcIdx, dll, func, *addr);
+        // Count unique modules
+        m_moduleCount = static_cast<uint32_t>(m_moduleNames.size());
+    } catch (const std::bad_alloc&) {
+        clearState();
     }
-
-    // Count unique modules
-    m_moduleCount = static_cast<uint32_t>(m_moduleNames.size());
 }
 
 // ============================================================================
@@ -993,32 +1051,37 @@ void HashResolver::BuildFromExports(const ExportResolver& exports) noexcept {
 std::optional<HashResolution> HashResolver::ResolveByHashExact(
     uint32_t hash, HashAlgorithm algo) const noexcept
 {
-    if (algo >= HashAlgorithm::Unknown) {
+    try {
+        if (algo >= HashAlgorithm::Unknown) {
+            return std::nullopt;
+        }
+
+        std::shared_lock lock(m_mutex);
+        const auto idx = static_cast<uint32_t>(algo);
+        const auto& table = m_tables[idx];
+        const auto it = table.find(hash);
+        if (it == table.end()) {
+            return std::nullopt;
+        }
+
+        const auto& entry = it->second;
+
+        // Validate indices before access
+        if (entry.moduleIndex >= m_moduleNames.size() ||
+            entry.nameIndex >= m_functionNames.size()) {
+            return std::nullopt;
+        }
+
+        HashResolution result{};
+        result.address      = entry.address;
+        result.moduleName   = m_moduleNames[entry.moduleIndex];
+        result.functionName = m_functionNames[entry.nameIndex];
+        result.algorithm    = algo;
+        result.hash         = hash;
+        return result;
+    } catch (const std::bad_alloc&) {
         return std::nullopt;
     }
-
-    const auto idx = static_cast<uint32_t>(algo);
-    const auto& table = m_tables[idx];
-    const auto it = table.find(hash);
-    if (it == table.end()) {
-        return std::nullopt;
-    }
-
-    const auto& entry = it->second;
-
-    // Validate indices before access
-    if (entry.moduleIndex >= m_moduleNames.size() ||
-        entry.nameIndex >= m_functionNames.size()) {
-        return std::nullopt;
-    }
-
-    HashResolution result{};
-    result.address      = entry.address;
-    result.moduleName   = m_moduleNames[entry.moduleIndex];
-    result.functionName = m_functionNames[entry.nameIndex];
-    result.algorithm    = algo;
-    result.hash         = hash;
-    return result;
 }
 
 // ============================================================================
@@ -1104,6 +1167,7 @@ HashAlgorithm HashResolver::DetectAlgorithm(
     HashAlgorithm bestAlgo  = HashAlgorithm::Unknown;
     uint32_t      bestScore = 0;
 
+    std::shared_lock lock(m_mutex);
     for (const auto algo : kOrder) {
         const auto idx = static_cast<uint32_t>(algo);
         const auto& table = m_tables[idx];
@@ -1143,40 +1207,44 @@ std::vector<HashResolution> HashResolver::BatchResolve(
 {
     std::vector<HashResolution> results;
 
-    if (hashes == nullptr || count == 0) {
-        return results;
-    }
-
-    if (count > kMaxBatchSize) {
-        count = kMaxBatchSize;
-    }
-
-    // Auto-detect algorithm if not specified
-    HashAlgorithm resolveAlgo = algo;
-    if (resolveAlgo == HashAlgorithm::Unknown) {
-        resolveAlgo = DetectAlgorithm(hashes, count, 1);
-        if (resolveAlgo == HashAlgorithm::Unknown) {
-            // Fall back to per-hash multi-algorithm resolution
-            results.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                auto r = ResolveByHash(hashes[i], HashAlgorithm::Unknown);
-                if (r.has_value()) {
-                    results.push_back(std::move(*r));
-                }
-            }
+    try {
+        if (hashes == nullptr || count == 0) {
             return results;
         }
-    }
 
-    results.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        auto r = ResolveByHashExact(hashes[i], resolveAlgo);
-        if (r.has_value()) {
-            results.push_back(std::move(*r));
+        if (count > kMaxBatchSize) {
+            count = kMaxBatchSize;
         }
-    }
 
-    return results;
+        // Auto-detect algorithm if not specified
+        HashAlgorithm resolveAlgo = algo;
+        if (resolveAlgo == HashAlgorithm::Unknown) {
+            resolveAlgo = DetectAlgorithm(hashes, count, 1);
+            if (resolveAlgo == HashAlgorithm::Unknown) {
+                // Fall back to per-hash multi-algorithm resolution
+                results.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    auto r = ResolveByHash(hashes[i], HashAlgorithm::Unknown);
+                    if (r.has_value()) {
+                        results.push_back(std::move(*r));
+                    }
+                }
+                return results;
+            }
+        }
+
+        results.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto r = ResolveByHashExact(hashes[i], resolveAlgo);
+            if (r.has_value()) {
+                results.push_back(std::move(*r));
+            }
+        }
+
+        return results;
+    } catch (const std::bad_alloc&) {
+        return results;
+    }
 }
 
 // ============================================================================
@@ -1185,6 +1253,7 @@ std::vector<HashResolution> HashResolver::BatchResolve(
 
 uint32_t HashResolver::GetTotalHashes() const noexcept {
     // Return the count from the most-populated table (ROR13 typically)
+    std::shared_lock lock(m_mutex);
     uint32_t maxCount = 0;
     for (const auto& table : m_tables) {
         const auto sz = static_cast<uint32_t>(table.size());
@@ -1196,6 +1265,7 @@ uint32_t HashResolver::GetTotalHashes() const noexcept {
 }
 
 uint32_t HashResolver::GetModuleCount() const noexcept {
+    std::shared_lock lock(m_mutex);
     return m_moduleCount;
 }
 
