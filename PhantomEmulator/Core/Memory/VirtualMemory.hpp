@@ -121,9 +121,9 @@ public:
 
     // === Statistics ===
 
-    [[nodiscard]] GuestSize GetAllocatedBytes() const noexcept { return m_allocatedBytes; }
-    [[nodiscard]] uint32_t GetAllocatedPages() const noexcept { return m_allocatedPages; }
-    [[nodiscard]] GuestSize GetMaxMemory() const noexcept { return m_maxMemory; }
+    [[nodiscard]] GuestSize GetAllocatedBytes() const noexcept;
+    [[nodiscard]] uint32_t GetAllocatedPages() const noexcept;
+    [[nodiscard]] GuestSize GetMaxMemory() const noexcept;
 
     // === Snapshot/Restore ===
     // Used for unpacking: snapshot before suspected unpack, restore if false positive
