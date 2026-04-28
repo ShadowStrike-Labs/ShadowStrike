@@ -20,6 +20,7 @@
 #include <vector>
 #include <optional>
 #include <unordered_map>
+#include <shared_mutex>
 
 namespace Phantom {
 
@@ -32,9 +33,8 @@ namespace Phantom {
 // Supports name-based and ordinal-based resolution, including
 // chained forwarded exports (e.g., kernel32!HeapAlloc → NTDLL.RtlAllocateHeap).
 //
-// Not thread-safe: expected to be fully populated before concurrent resolution
-// queries begin. Callers must synchronize externally if interleaving registration
-// and resolution across threads.
+// Thread-safe: module registration is exclusive; resolution and enumeration are
+// concurrent readers. Returned values are snapshots and never expose internals.
 
 class ExportResolver {
 public:
@@ -90,6 +90,7 @@ private:
 
     // Key: lowercase DLL name (normalized)
     std::unordered_map<std::string, ModuleExports> m_modules;
+    mutable std::shared_mutex m_mutex;
 
     [[nodiscard]] static std::string NormalizeDLLName(std::string_view name) noexcept;
 
