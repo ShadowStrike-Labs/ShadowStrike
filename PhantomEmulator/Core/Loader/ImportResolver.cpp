@@ -15,6 +15,10 @@
 #include "../Memory/VirtualMemory.hpp"
 
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <shared_mutex>
 
 namespace Phantom {
 
@@ -31,6 +35,25 @@ static constexpr GuestAddress kHookStride = 8;
 
 static char ToLowerASCII(char c) noexcept {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+static bool IsSafeDLLNameChar(char c) noexcept {
+    const auto uc = static_cast<unsigned char>(c);
+    if (uc <= 0x20 || uc >= 0x7F) {
+        return false;
+    }
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') ||
+           c == '.' || c == '_' || c == '-';
+}
+
+static bool AddGuestAddress(GuestAddress base, GuestAddress offset, GuestAddress& out) noexcept {
+    if (offset > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
 }
 
 // ============================================================================
@@ -55,37 +78,45 @@ template <typename T>
 // ============================================================================
 
 std::string ImportResolver::NormalizeDLLName(std::string_view name) noexcept {
-    if (name.empty()) {
+    try {
+        if (name.empty()) {
+            return {};
+        }
+
+        // Strip path components
+        const auto lastSep = name.find_last_of("\\/");
+        if (lastSep != std::string_view::npos) {
+            name = name.substr(lastSep + 1);
+        }
+
+        if (name.empty() || name.size() > PE::kMaxDLLNameLen) {
+            return {};
+        }
+
+        for (const char c : name) {
+            if (!IsSafeDLLNameChar(c)) {
+                return {};
+            }
+        }
+
+        std::string result;
+        result.reserve(name.size() + 4);
+
+        for (const char c : name) {
+            result += ToLowerASCII(c);
+        }
+
+        if (result.size() < 4 || result.compare(result.size() - 4, 4, ".dll") != 0) {
+            if (result.size() > PE::kMaxDLLNameLen - 4U) {
+                return {};
+            }
+            result += ".dll";
+        }
+
+        return result;
+    } catch (const std::bad_alloc&) {
         return {};
     }
-
-    // Strip path components
-    const auto lastSep = name.find_last_of("\\/");
-    if (lastSep != std::string_view::npos) {
-        name = name.substr(lastSep + 1);
-    }
-
-    if (name.empty()) {
-        return {};
-    }
-
-    // Cap length to prevent excessive allocation from hostile data
-    if (name.size() > PE::kMaxDLLNameLen) {
-        name = name.substr(0, PE::kMaxDLLNameLen);
-    }
-
-    std::string result;
-    result.reserve(name.size() + 4);
-
-    for (const char c : name) {
-        result += ToLowerASCII(c);
-    }
-
-    if (result.size() < 4 || result.compare(result.size() - 4, 4, ".dll") != 0) {
-        result += ".dll";
-    }
-
-    return result;
 }
 
 // ============================================================================
@@ -95,18 +126,22 @@ std::string ImportResolver::NormalizeDLLName(std::string_view name) noexcept {
 std::string ImportResolver::MakeHookKey(
     std::string_view dll, std::string_view func) noexcept
 {
-    auto normDll = NormalizeDLLName(dll);
-    if (normDll.empty() || func.empty()) {
+    try {
+        auto normDll = NormalizeDLLName(dll);
+        if (normDll.empty() || func.empty() || func.size() > PE::kMaxExportNameLen) {
+            return {};
+        }
+
+        std::string key;
+        key.reserve(normDll.size() + 1 + func.size());
+        key = std::move(normDll);
+        key += '!';
+        // Export names are case-sensitive per PE spec — preserve casing
+        key.append(func.data(), func.size());
+        return key;
+    } catch (const std::bad_alloc&) {
         return {};
     }
-
-    std::string key;
-    key.reserve(normDll.size() + 1 + func.size());
-    key = std::move(normDll);
-    key += '!';
-    // Export names are case-sensitive per PE spec — preserve casing
-    key.append(func.data(), func.size());
-    return key;
 }
 
 // ============================================================================
@@ -116,18 +151,22 @@ std::string ImportResolver::MakeHookKey(
 std::string ImportResolver::MakeOrdinalKey(
     std::string_view dll, uint16_t ordinal) noexcept
 {
-    auto normDll = NormalizeDLLName(dll);
-    if (normDll.empty()) {
+    try {
+        auto normDll = NormalizeDLLName(dll);
+        if (normDll.empty()) {
+            return {};
+        }
+
+        // "dllname.dll!#12345" — max ordinal string is 5 chars
+        std::string key;
+        key.reserve(normDll.size() + 7);
+        key = std::move(normDll);
+        key += "!#";
+        key += std::to_string(ordinal);
+        return key;
+    } catch (const std::bad_alloc&) {
         return {};
     }
-
-    // "dllname.dll!#12345" — max ordinal string is 5 chars
-    std::string key;
-    key.reserve(normDll.size() + 7);
-    key = std::move(normDll);
-    key += "!#";
-    key += std::to_string(ordinal);
-    return key;
 }
 
 // ============================================================================
@@ -146,6 +185,7 @@ ImportResolver::ImportResolver(const ExportResolver& exports) noexcept
 void ImportResolver::SetAPIHookRange(
     GuestAddress base, GuestSize size) noexcept
 {
+    std::unique_lock lock(m_mutex);
     m_hookBase     = base;
     m_hookSize     = size;
     m_nextHookAddr = base;
@@ -160,9 +200,15 @@ void ImportResolver::RegisterAPIHook(
     std::string_view funcName,
     GuestAddress hookAddress) noexcept
 {
-    auto key = MakeHookKey(dllName, funcName);
-    if (!key.empty() && hookAddress != 0) {
-        m_hooksByName[std::move(key)] = hookAddress;
+    try {
+        auto key = MakeHookKey(dllName, funcName);
+        if (!key.empty() && hookAddress != 0) {
+            std::unique_lock lock(m_mutex);
+            m_hooksByName[std::move(key)] = hookAddress;
+        }
+    } catch (const std::bad_alloc&) {
+        // Preserve the noexcept contract; unresolved imports will fall back to
+        // exports or auto-hook allocation during ResolveAll().
     }
 }
 
@@ -175,9 +221,15 @@ void ImportResolver::RegisterAPIHookByOrdinal(
     uint16_t ordinal,
     GuestAddress hookAddress) noexcept
 {
-    auto key = MakeOrdinalKey(dllName, ordinal);
-    if (!key.empty() && hookAddress != 0) {
-        m_hooksByOrdinal[std::move(key)] = hookAddress;
+    try {
+        auto key = MakeOrdinalKey(dllName, ordinal);
+        if (!key.empty() && hookAddress != 0) {
+            std::unique_lock lock(m_mutex);
+            m_hooksByOrdinal[std::move(key)] = hookAddress;
+        }
+    } catch (const std::bad_alloc&) {
+        // Preserve the noexcept contract; unresolved imports will fall back to
+        // exports or auto-hook allocation during ResolveAll().
     }
 }
 
@@ -194,6 +246,7 @@ std::optional<GuestAddress> ImportResolver::GetHookAddress(
         return std::nullopt;
     }
 
+    std::shared_lock lock(m_mutex);
     const auto it = m_hooksByName.find(key);
     if (it != m_hooksByName.end()) {
         return it->second;
@@ -231,6 +284,10 @@ ImportResolution ImportResolver::ResolveAll(
         return result;
     }
 
+    std::unique_lock lock(m_mutex);
+
+    try {
+
     // ----------------------------------------------------------------
     // Parse PE for section table and data directory locations
     // ----------------------------------------------------------------
@@ -258,8 +315,14 @@ ImportResolution ImportResolver::ResolveAll(
         return result;
     }
 
-    const auto fileSize = static_cast<uint32_t>(peData.size());
     const uint32_t ptrSize = is64Bit ? 8 : 4;
+    uint64_t importDirEndFO = static_cast<uint64_t>(*importDirFO) + importDirEntry.Size;
+    if (importDirEndFO < *importDirFO) {
+        return result;
+    }
+    if (importDirEndFO > peData.size()) {
+        importDirEndFO = peData.size();
+    }
 
     // ----------------------------------------------------------------
     // Walk ImportDescriptor array
@@ -271,7 +334,7 @@ ImportResolution ImportResolver::ResolveAll(
             static_cast<uint64_t>(*importDirFO) +
             static_cast<uint64_t>(descIdx) * sizeof(PE::ImportDescriptor);
 
-        if (descFileOffset64 + sizeof(PE::ImportDescriptor) > peData.size()) {
+        if (descFileOffset64 + sizeof(PE::ImportDescriptor) > importDirEndFO) {
             break; // Descriptor array extends past file bounds
         }
         const auto descFileOffset = static_cast<uint32_t>(descFileOffset64);
@@ -308,6 +371,9 @@ ImportResolution ImportResolver::ResolveAll(
         }
 
         const auto normalDll = NormalizeDLLName(dllName);
+        if (normalDll.empty()) {
+            continue;
+        }
 
         // ----------------------------------------------------------------
         // Determine ILT and IAT RVAs
@@ -390,7 +456,7 @@ ImportResolution ImportResolver::ResolveAll(
                 const auto hintNameFO = PEParser::RVAToFileOffset(pe, hintNameRVA);
                 if (!hintNameFO) {
                     // Record as failed — can't read the import name
-                    std::string failDesc = dllName + "!<invalid_hint_rva_0x";
+                    std::string failDesc = normalDll + "!<invalid_hint_rva_0x";
                     // Simple hex conversion for the RVA
                     char hexBuf[9]{};
                     for (int nibble = 7; nibble >= 0; --nibble) {
@@ -408,7 +474,7 @@ ImportResolution ImportResolver::ResolveAll(
                 // Read hint (2 bytes) then name string
                 if (!ReadFromSpan(peData, *hintNameFO, importHint)) {
                     result.failedImports.push_back(
-                        dllName + "!<truncated_hint>");
+                        normalDll + "!<truncated_hint>");
                     ++result.totalFailed;
                     continue;
                 }
@@ -420,7 +486,7 @@ ImportResolution ImportResolver::ResolveAll(
 
                 if (importName.empty()) {
                     result.failedImports.push_back(
-                        dllName + "!<empty_name>");
+                        normalDll + "!<empty_name>");
                     ++result.totalFailed;
                     continue;
                 }
@@ -434,7 +500,7 @@ ImportResolution ImportResolver::ResolveAll(
 
             // Priority 1: Registered API hooks
             if (isByOrdinal) {
-                const auto hookKey = MakeOrdinalKey(dllName, importOrdinal);
+                const auto hookKey = MakeOrdinalKey(normalDll, importOrdinal);
                 if (!hookKey.empty()) {
                     const auto hookIt = m_hooksByOrdinal.find(hookKey);
                     if (hookIt != m_hooksByOrdinal.end()) {
@@ -443,7 +509,7 @@ ImportResolution ImportResolver::ResolveAll(
                     }
                 }
             } else {
-                const auto hookKey = MakeHookKey(dllName, importName);
+                const auto hookKey = MakeHookKey(normalDll, importName);
                 if (!hookKey.empty()) {
                     const auto hookIt = m_hooksByName.find(hookKey);
                     if (hookIt != m_hooksByName.end()) {
@@ -457,9 +523,9 @@ ImportResolution ImportResolver::ResolveAll(
             if (resolvedAddr == 0) {
                 std::optional<GuestAddress> exportAddr;
                 if (isByOrdinal) {
-                    exportAddr = m_exports.ResolveByOrdinal(dllName, importOrdinal);
+                    exportAddr = m_exports.ResolveByOrdinal(normalDll, importOrdinal);
                 } else {
-                    exportAddr = m_exports.ResolveByName(dllName, importName);
+                    exportAddr = m_exports.ResolveByName(normalDll, importName);
                 }
 
                 if (exportAddr.has_value() && *exportAddr != 0) {
@@ -473,13 +539,14 @@ ImportResolution ImportResolver::ResolveAll(
 
                 if (m_hookBase != 0 && m_hookSize >= kHookStride) {
                     // Overflow-safe: hookEnd = m_hookBase + m_hookSize
-                    const GuestAddress hookEnd = m_hookBase + m_hookSize;
-                    if (hookEnd >= m_hookBase) { // No overflow
+                    GuestAddress hookEnd = 0;
+                    GuestAddress nextHookEnd = 0;
+                    if (AddGuestAddress(m_hookBase, m_hookSize, hookEnd) &&
+                        AddGuestAddress(m_nextHookAddr, kHookStride, nextHookEnd)) {
                         if (m_nextHookAddr >= m_hookBase &&
-                            m_nextHookAddr + kHookStride <= hookEnd &&
-                            m_nextHookAddr + kHookStride > m_nextHookAddr) {
+                            nextHookEnd <= hookEnd) {
                             resolvedAddr   = m_nextHookAddr;
-                            m_nextHookAddr += kHookStride;
+                            m_nextHookAddr = nextHookEnd;
                             isHooked       = true;
                             allocated      = true;
                         }
@@ -490,9 +557,9 @@ ImportResolution ImportResolver::ResolveAll(
                     // Truly unresolvable — record failure
                     std::string failDesc;
                     if (isByOrdinal) {
-                        failDesc = dllName + "!#" + std::to_string(importOrdinal);
+                        failDesc = normalDll + "!#" + std::to_string(importOrdinal);
                     } else {
-                        failDesc = dllName + "!" + importName;
+                        failDesc = normalDll + "!" + importName;
                     }
                     result.failedImports.push_back(std::move(failDesc));
                     ++result.totalFailed;
@@ -503,15 +570,41 @@ ImportResolution ImportResolver::ResolveAll(
             // --------------------------------------------------------
             // Write resolved address into IAT in guest memory
             // --------------------------------------------------------
-            const GuestAddress iatSlotAddr =
-                imageBase +
-                static_cast<GuestAddress>(iatRVA) +
-                static_cast<GuestAddress>(thunkIdx) * ptrSize;
+            GuestAddress iatBaseAddr = 0;
+            GuestAddress iatSlotAddr = 0;
+            const auto thunkOffset = static_cast<GuestAddress>(thunkIdx) * ptrSize;
+            if (!AddGuestAddress(imageBase, static_cast<GuestAddress>(iatRVA), iatBaseAddr) ||
+                !AddGuestAddress(iatBaseAddr, thunkOffset, iatSlotAddr)) {
+                std::string failDesc;
+                if (isByOrdinal) {
+                    failDesc = normalDll + "!#" + std::to_string(importOrdinal) +
+                               " (IAT address overflow)";
+                } else {
+                    failDesc = normalDll + "!" + importName +
+                               " (IAT address overflow)";
+                }
+                result.failedImports.push_back(std::move(failDesc));
+                ++result.totalFailed;
+                continue;
+            }
 
             ErrorCode writeErr = ErrorCode::Success;
             if (is64Bit) {
                 writeErr = memory.WriteU64(iatSlotAddr, resolvedAddr);
             } else {
+                if (resolvedAddr > (std::numeric_limits<uint32_t>::max)()) {
+                    std::string failDesc;
+                    if (isByOrdinal) {
+                        failDesc = normalDll + "!#" + std::to_string(importOrdinal) +
+                                   " (resolved address exceeds 32-bit VA)";
+                    } else {
+                        failDesc = normalDll + "!" + importName +
+                                   " (resolved address exceeds 32-bit VA)";
+                    }
+                    result.failedImports.push_back(std::move(failDesc));
+                    ++result.totalFailed;
+                    continue;
+                }
                 writeErr = memory.WriteU32(
                     iatSlotAddr, static_cast<uint32_t>(resolvedAddr));
             }
@@ -520,10 +613,10 @@ ImportResolution ImportResolver::ResolveAll(
                 // IAT write failed — record but continue resolving others
                 std::string failDesc;
                 if (isByOrdinal) {
-                    failDesc = dllName + "!#" + std::to_string(importOrdinal) +
+                    failDesc = normalDll + "!#" + std::to_string(importOrdinal) +
                                " (IAT write failed)";
                 } else {
-                    failDesc = dllName + "!" + importName +
+                    failDesc = normalDll + "!" + importName +
                                " (IAT write failed)";
                 }
                 result.failedImports.push_back(std::move(failDesc));
@@ -537,7 +630,7 @@ ImportResolution ImportResolver::ResolveAll(
             ImportResolution::ResolvedEntry entry{};
             entry.iatSlotAddress  = iatSlotAddr;
             entry.resolvedAddress = resolvedAddr;
-            entry.dllName         = dllName;
+            entry.dllName         = normalDll;
             entry.isHooked        = isHooked;
             entry.byOrdinal       = isByOrdinal;
 
@@ -557,6 +650,9 @@ ImportResolution ImportResolver::ResolveAll(
     } // end descriptor loop
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return result;
+    }
 }
 
 } // namespace Phantom

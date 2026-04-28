@@ -18,6 +18,7 @@
 #include <string_view>
 #include <vector>
 #include <optional>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace Phantom {
@@ -59,7 +60,8 @@ struct ImportResolution {
 // the resolver auto-allocates a hook address from a configurable range so the
 // API dispatcher can still intercept the call.
 //
-// Not thread-safe: expected to run single-threaded during PE loading.
+// Thread-safe: hook registration and import resolution take exclusive ownership;
+// hook lookup APIs are concurrent readers.
 
 class ImportResolver {
 public:
@@ -94,6 +96,7 @@ private:
     GuestAddress m_hookBase     = 0;
     GuestSize    m_hookSize     = 0;
     GuestAddress m_nextHookAddr = 0;
+    mutable std::shared_mutex m_mutex;
 
     struct HookKey {
         std::string dll;

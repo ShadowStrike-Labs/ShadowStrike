@@ -648,6 +648,11 @@ struct EmulationSession::Impl {
         ImportResolver imports(m_exports);
         imports.SetAPIHookRange(kAPIHookBase, kAPIHookSize);
 
+        // API hooks must be registered before PELoader resolves the import
+        // table; otherwise IAT slots receive auto-allocated addresses that do
+        // not match the dispatcher's handler map.
+        m_dispatcher->WireImports(imports, kAPIHookBase, kAPIHookSize);
+
         // Construct the PE loader
         PELoader loader(m_memory, m_exports, imports);
 
@@ -676,10 +681,6 @@ struct EmulationSession::Impl {
         target.imageBase  = image.imageBase;
         target.imageSize  = image.totalMapped;
         target.is64Bit    = image.is64Bit;
-
-        // Wire the dispatcher's hook addresses into the import resolver so
-        // that the PE's IAT slots point to our hook stubs
-        m_dispatcher->WireImports(imports, kAPIHookBase, kAPIHookSize);
 
         // Build the PEB LDR data now that modules are mapped in memory.
         // This populates the InLoadOrderModuleList/InMemoryOrderModuleList
