@@ -35,14 +35,14 @@ static constexpr APIId kInvalidAPIId = 0xFFFF;
 // ============================================================================
 
 struct SequenceMatch {
-    uint16_t    patternId;          // Which pattern matched
-    const char* patternName;        // Human-readable name (static storage)
-    const char* mitreId;            // MITRE ATT&CK technique ID (static storage)
-    float       confidence;         // 0.0–1.0 match confidence
-    uint8_t     severity;           // 0-4 (maps to ThreatLevel)
-    uint32_t    startCallIndex;     // Index of first call in the match
-    uint32_t    endCallIndex;       // Index of last call in the match
-    uint16_t    threadId;           // Thread where the match was detected
+    uint16_t    patternId = 0;          // Which pattern matched
+    const char* patternName = "";       // Human-readable name (static storage)
+    const char* mitreId = "";           // MITRE ATT&CK technique ID (static storage)
+    float       confidence = 0.0f;      // 0.0-1.0 match confidence
+    uint8_t     severity = 0;           // 0-4 (maps to ThreatLevel)
+    uint32_t    startCallIndex = 0;     // Index of first call in the match
+    uint32_t    endCallIndex = 0;       // Index of last call in the match
+    uint16_t    threadId = 0;           // Thread where the match was detected
 };
 
 // ============================================================================
@@ -50,11 +50,11 @@ struct SequenceMatch {
 // ============================================================================
 
 struct TransitionAnomaly {
-    APIId       fromAPI;            // Source API in the transition
-    APIId       toAPI;              // Target API in the transition
-    double      probability;        // Observed transition probability
-    double      threshold;          // Anomaly threshold that was exceeded
-    uint32_t    callIndex;          // Call index where the anomaly occurred
+    APIId       fromAPI = kInvalidAPIId; // Source API in the transition
+    APIId       toAPI = kInvalidAPIId;   // Target API in the transition
+    double      probability = 0.0;       // Observed transition probability
+    double      threshold = 0.0;         // Anomaly threshold that was exceeded
+    uint32_t    callIndex = 0;           // Call index where the anomaly occurred
 };
 
 // ============================================================================
