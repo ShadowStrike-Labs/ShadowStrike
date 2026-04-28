@@ -94,7 +94,7 @@ enum class EvasionTechnique : uint8_t {
 // ============================================================================
 
 struct EvasionAttempt {
-    EvasionTechnique technique;
+    EvasionTechnique technique        = EvasionTechnique::IsDebuggerPresent;
     std::string      description;
     GuestAddress     rip              = 0; // Instruction pointer at time of attempt
     uint64_t         instructionCount = 0;
