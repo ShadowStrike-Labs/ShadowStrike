@@ -27,9 +27,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 namespace Phantom::CLR {
@@ -39,6 +40,28 @@ namespace Phantom::CLR {
 // ============================================================================
 
 namespace {
+
+[[nodiscard]] bool AddGuestOffset(
+    GuestAddress base,
+    uint64_t offset,
+    GuestAddress& out) noexcept
+{
+    if (offset > (std::numeric_limits<GuestAddress>::max() - base)) {
+        return false;
+    }
+    out = base + static_cast<GuestAddress>(offset);
+    return true;
+}
+
+[[nodiscard]] uint32_t ClampToU32(size_t value) noexcept {
+    return static_cast<uint32_t>(
+        std::min<size_t>(value, std::numeric_limits<uint32_t>::max()));
+}
+
+void IncrementSaturating(uint32_t& value, uint32_t delta = 1) noexcept {
+    const uint32_t remaining = std::numeric_limits<uint32_t>::max() - value;
+    value += std::min(delta, remaining);
+}
 
 // ----------------------------------------------------------------------------
 // Const-safe guest memory reader via GetHostReadPtr (page-granular)
@@ -50,6 +73,7 @@ namespace {
                                    uint32_t size) noexcept
 {
     if (size == 0) return true;
+    if (!dst) return false;
 
     auto* out = static_cast<uint8_t*>(dst);
     uint32_t remaining = size;
@@ -67,7 +91,7 @@ namespace {
 
         std::memcpy(out, hostPtr, toRead);
         out       += toRead;
-        cur       += toRead;
+        if (!AddGuestOffset(cur, toRead, cur)) return false;
         remaining -= toRead;
     }
     return true;
@@ -159,19 +183,23 @@ struct PEInfo {
     if (dos.e_lfanew < 0 ||
         static_cast<uint32_t>(dos.e_lfanew) > 0x10000) return info;
 
-    const GuestAddress ntAddr =
-        imageBase + static_cast<uint32_t>(dos.e_lfanew);
+    GuestAddress ntAddr = 0;
+    if (!AddGuestOffset(imageBase, static_cast<uint32_t>(dos.e_lfanew), ntAddr)) {
+        return info;
+    }
 
     uint32_t ntSig = 0;
     if (!ReadGuestMemory(mem, ntAddr, &ntSig, sizeof(ntSig))) return info;
     if (ntSig != PE::kNTSignature) return info;
 
-    const GuestAddress fhAddr = ntAddr + sizeof(uint32_t);
+    GuestAddress fhAddr = 0;
+    if (!AddGuestOffset(ntAddr, sizeof(uint32_t), fhAddr)) return info;
     PE::FileHeader fh{};
     if (!ReadGuestMemory(mem, fhAddr, &fh, sizeof(fh))) return info;
     if (fh.SizeOfOptionalHeader < 2) return info;
 
-    const GuestAddress optAddr = fhAddr + sizeof(PE::FileHeader);
+    GuestAddress optAddr = 0;
+    if (!AddGuestOffset(fhAddr, sizeof(PE::FileHeader), optAddr)) return info;
     uint16_t magic = 0;
     if (!ReadGuestMemory(mem, optAddr, &magic, sizeof(magic))) return info;
 
@@ -553,6 +581,13 @@ struct DotNetAnalyzer::Impl {
 
     // COR20 header cache
     COR20Header cor20{};
+    uint64_t analysisErrors = 0;
+
+    void RecordAnalysisError() noexcept {
+        if (analysisErrors != std::numeric_limits<uint64_t>::max()) {
+            ++analysisErrors;
+        }
+    }
 
     void ResetWorking() noexcept {
         lastResult       = DotNetAnalysisResult{};
@@ -585,6 +620,7 @@ struct DotNetAnalyzer::Impl {
         hasAmsiReference                 = false;
 
         cor20 = COR20Header{};
+        analysisErrors = 0;
     }
 };
 
@@ -592,9 +628,13 @@ struct DotNetAnalyzer::Impl {
 // Constructor / Destructor / Singleton
 // ============================================================================
 
-DotNetAnalyzer::DotNetAnalyzer() noexcept
-    : m_impl(std::make_unique<Impl>())
-{}
+DotNetAnalyzer::DotNetAnalyzer() noexcept {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    }
+}
 
 DotNetAnalyzer::~DotNetAnalyzer() noexcept = default;
 
@@ -629,6 +669,7 @@ DotNetAnalysisResult DotNetAnalyzer::Analyze(
     VirtualMemory& memory,
     GuestAddress imageBase) noexcept
 {
+    if (!m_impl) return {};
     m_impl->ResetWorking();
     auto& result = m_impl->lastResult;
 
@@ -637,8 +678,9 @@ DotNetAnalysisResult DotNetAnalyzer::Analyze(
     if (!pe.valid || pe.clrRVA == 0 || pe.clrSize < sizeof(COR20Header))
         return result;
 
-    if (!ReadGuestMemory(memory, imageBase + pe.clrRVA,
-                         &m_impl->cor20, sizeof(COR20Header)))
+    GuestAddress cor20Addr = 0;
+    if (!AddGuestOffset(imageBase, pe.clrRVA, cor20Addr)) return result;
+    if (!ReadGuestMemory(memory, cor20Addr, &m_impl->cor20, sizeof(COR20Header)))
         return result;
 
     const auto& cor20 = m_impl->cor20;
@@ -660,8 +702,10 @@ DotNetAnalysisResult DotNetAnalyzer::Analyze(
         ClassifyAPICalls();
         DetectPayloadEmbedding(parser, memory, imageBase);
         ComputeThreatScore();
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Corrupt metadata mid-stream — return partial results.
+        m_impl->RecordAnalysisError();
     }
 
     return result;
@@ -697,14 +741,17 @@ void DotNetAnalyzer::AnalyzeMetadata(const MetadataParser& parser) noexcept {
         const auto& memberRefs  = parser.GetMemberRefs();
         const auto& asmRefs     = parser.GetAssemblyRefs();
 
-        result.typeDefCount    = static_cast<uint32_t>(typeDefs.size());
-        result.methodDefCount  = static_cast<uint32_t>(methodDefs.size());
-        result.memberRefCount  = static_cast<uint32_t>(memberRefs.size());
-        result.assemblyRefCount = static_cast<uint32_t>(asmRefs.size());
+        result.typeDefCount     = ClampToU32(typeDefs.size());
+        result.methodDefCount   = ClampToU32(methodDefs.size());
+        result.memberRefCount   = ClampToU32(memberRefs.size());
+        result.assemblyRefCount = ClampToU32(asmRefs.size());
 
         // Referenced assemblies & framework detection
-        result.referencedAssemblies.reserve(asmRefs.size());
+        const size_t assemblyOutputLimit =
+            std::min<size_t>(asmRefs.size(), kMaxParsedTypes);
+        result.referencedAssemblies.reserve(assemblyOutputLimit);
         for (const auto& aref : asmRefs) {
+            if (result.referencedAssemblies.size() >= assemblyOutputLimit) break;
             result.referencedAssemblies.push_back(aref.name);
 
             if (aref.name == "mscorlib") {
@@ -739,28 +786,29 @@ void DotNetAnalyzer::AnalyzeMetadata(const MetadataParser& parser) noexcept {
             entryTok.Table() == MetadataTableId::MethodDef)
         {
             const uint32_t row = entryTok.Row();
-            if (row > 0 && row <= static_cast<uint32_t>(methodDefs.size()))
+            if (row > 0 && row <= methodDefs.size())
                 result.entryPointMethod = methodDefs[row - 1].name;
         }
 
         // Obfuscation pre-scan: type name statistics
         m_impl->totalTypeCount = result.typeDefCount;
-        for (const auto& td : typeDefs) {
+        for (size_t typeIndex = 0; typeIndex < typeDefs.size(); ++typeIndex) {
+            const auto& td = typeDefs[typeIndex];
             if (HasNonAsciiOrUnprintable(td.typeName))
-                ++m_impl->nonAsciiTypeCount;
+                IncrementSaturating(m_impl->nonAsciiTypeCount);
             if (!td.typeName.empty() && td.typeName.size() < 3)
-                ++m_impl->shortNameTypeCount;
+                IncrementSaturating(m_impl->shortNameTypeCount);
 
             // Detect <Module> with excessive method count (ConfuserEx indicator)
             if (td.typeName == "<Module>" && td.methodList > 0) {
                 // Count methods belonging to <Module>: all methods from
                 // methodList to the next TypeDef's methodList (or end).
-                const uint32_t idx =
-                    static_cast<uint32_t>(&td - typeDefs.data());
                 uint32_t nextMethodList =
-                    static_cast<uint32_t>(methodDefs.size()) + 1;
-                if (idx + 1 < typeDefs.size())
-                    nextMethodList = typeDefs[idx + 1].methodList;
+                    ClampToU32(methodDefs.size()) == std::numeric_limits<uint32_t>::max()
+                        ? std::numeric_limits<uint32_t>::max()
+                        : ClampToU32(methodDefs.size()) + 1;
+                if (typeIndex + 1 < typeDefs.size())
+                    nextMethodList = typeDefs[typeIndex + 1].methodList;
                 if (nextMethodList > td.methodList &&
                     (nextMethodList - td.methodList) > 20) {
                     m_impl->hasModuleTypeManyMethods = true;
@@ -769,14 +817,15 @@ void DotNetAnalyzer::AnalyzeMetadata(const MetadataParser& parser) noexcept {
         }
 
         // Method name statistics
-        m_impl->totalMethodNameCount =
-            static_cast<uint32_t>(methodDefs.size());
+        m_impl->totalMethodNameCount = ClampToU32(methodDefs.size());
         for (const auto& md : methodDefs) {
-            if (md.name.size() == 1) ++m_impl->singleCharMethodCount;
+            if (md.name.size() == 1) IncrementSaturating(m_impl->singleCharMethodCount);
         }
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Partial metadata — continue with what we have.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -798,13 +847,13 @@ void DotNetAnalyzer::AnalyzeMethods(
         const auto& memberRefs = parser.GetMemberRefs();
 
         const uint32_t methodLimit =
-            std::min(static_cast<uint32_t>(methodDefs.size()),
-                     impl.maxMethodsToAnalyze);
+            std::min(ClampToU32(methodDefs.size()), impl.maxMethodsToAnalyze);
 
         // Build a quick lookup: TypeRef index → "Namespace.TypeName"
         std::vector<std::string> typeRefNames;
-        typeRefNames.reserve(typeRefs.size());
+        typeRefNames.reserve(std::min<size_t>(typeRefs.size(), kMaxParsedTypes));
         for (const auto& tr : typeRefs) {
+            if (typeRefNames.size() >= kMaxParsedTypes) break;
             typeRefNames.push_back(
                 tr.typeNamespace.empty()
                     ? tr.typeName
@@ -832,9 +881,10 @@ void DotNetAnalyzer::AnalyzeMethods(
         for (uint32_t i = 0; i < methodLimit; ++i) {
             const auto& md = methodDefs[i];
             if (md.rva == 0) continue;
-            ++impl.totalMethodsWithRVA;
+            IncrementSaturating(impl.totalMethodsWithRVA);
 
-            const GuestAddress bodyVA = imageBase + md.rva;
+            GuestAddress bodyVA = 0;
+            if (!AddGuestOffset(imageBase, md.rva, bodyVA)) continue;
 
             // Read the method header (max 12 bytes for fat header)
             uint8_t headerBuf[12]{};
@@ -848,19 +898,25 @@ void DotNetAnalyzer::AnalyzeMethods(
             const auto& hdr = *headerOpt;
 
             // Compute safe read size
-            uint32_t bodySize = hdr.codeOffset + hdr.codeSize;
-            if (hdr.hasMoreSections)
+            uint32_t bodySize = 0;
+            if (hdr.codeOffset > std::numeric_limits<uint32_t>::max() - hdr.codeSize)
+                continue;
+            bodySize = hdr.codeOffset + hdr.codeSize;
+            if (hdr.hasMoreSections) {
+                if (bodySize > std::numeric_limits<uint32_t>::max() - 4099u)
+                    continue;
                 bodySize = ((bodySize + 3u) & ~3u) + 4096u; // generous EH buffer
+            }
             bodySize = std::min(bodySize, kMaxMethodReadSize);
 
             if (bodySize > kMaxILMethodBodySize) {
-                ++impl.largeILMethodCount;
+                IncrementSaturating(impl.largeILMethodCount);
                 continue;
             }
 
             // Detect oversized IL bodies (Eazfuscator indicator)
             if (hdr.codeSize > kLargeILBodyThreshold)
-                ++impl.largeILMethodCount;
+                IncrementSaturating(impl.largeILMethodCount);
 
             // Read full method body
             std::vector<uint8_t> body(bodySize);
@@ -871,7 +927,7 @@ void DotNetAnalyzer::AnalyzeMethods(
             auto disasm = MSILDisassembler::DisassembleMethod(
                 body.data(), bodySize);
             if (!disasm.valid) continue;
-            ++impl.totalAnalyzedMethods;
+            IncrementSaturating(impl.totalAnalyzedMethods);
 
             // Empty IL detection (DNGuard indicator: nop+ret only)
             if (disasm.instructions.size() <= 2) {
@@ -883,22 +939,27 @@ void DotNetAnalyzer::AnalyzeMethods(
                         break;
                     }
                 }
-                if (allTrivial) ++impl.emptyILMethodCount;
+                if (allTrivial) IncrementSaturating(impl.emptyILMethodCount);
             }
 
             // Switch target counting (control flow obfuscation metric)
             uint32_t methodSwitchTargets = 0;
             for (const auto& instr : disasm.instructions) {
                 if (instr.opcode == MSILOpcode::Switch) {
-                    methodSwitchTargets +=
-                        static_cast<uint32_t>(instr.switchTargets.size());
+                    IncrementSaturating(
+                        methodSwitchTargets,
+                        ClampToU32(instr.switchTargets.size()));
                 }
             }
             if (methodSwitchTargets > 0) {
-                impl.totalSwitchTargets += methodSwitchTargets;
-                ++impl.switchMethodCount;
+                const uint64_t remainingSwitchTargets =
+                    std::numeric_limits<uint64_t>::max() - impl.totalSwitchTargets;
+                impl.totalSwitchTargets += std::min<uint64_t>(
+                    remainingSwitchTargets,
+                    methodSwitchTargets);
+                IncrementSaturating(impl.switchMethodCount);
                 if (methodSwitchTargets > 10)
-                    ++impl.switchHeavyMethodCount;
+                    IncrementSaturating(impl.switchHeavyMethodCount);
             }
 
             // Track all call/callvirt/newobj targets
@@ -992,8 +1053,10 @@ void DotNetAnalyzer::AnalyzeMethods(
             }
         }
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Partial IL analysis — continue with what we have.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -1234,8 +1297,10 @@ void DotNetAnalyzer::DetectObfuscation(const MetadataParser& parser) noexcept {
             addObfuscation(DotNetObfuscation::MixedModeAssembly);
         }
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Partial detection — continue.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -1253,8 +1318,7 @@ void DotNetAnalyzer::ExtractPInvokes(const MetadataParser& parser) noexcept {
         const auto& methodDefs = parser.GetMethodDefs();
 
         result.pInvokeImports.reserve(
-            std::min(static_cast<uint32_t>(implMaps.size()),
-                     kMaxPInvokeImports));
+            std::min<size_t>(implMaps.size(), kMaxPInvokeImports));
 
         for (const auto& im : implMaps) {
             if (result.pInvokeImports.size() >= kMaxPInvokeImports) break;
@@ -1324,8 +1388,10 @@ void DotNetAnalyzer::ExtractPInvokes(const MetadataParser& parser) noexcept {
             result.pInvokeImports.push_back(std::move(entry));
         }
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Partial P/Invoke extraction — continue.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -1338,7 +1404,7 @@ void DotNetAnalyzer::ClassifyAPICalls() noexcept {
         auto& impl   = *m_impl;
         auto& result = impl.lastResult;
 
-        std::unordered_set<uint8_t> seenCategories;
+        std::array<bool, 64> seenCategories{};
 
         for (auto& apiCall : impl.collectedAPICalls) {
             // Match against the classification rule table
@@ -1370,15 +1436,18 @@ void DotNetAnalyzer::ClassifyAPICalls() noexcept {
 
             // Only track classified (suspicious) APIs in the result
             if (apiCall.category != DotNetAPICategory::Unknown) {
-                seenCategories.insert(
-                    static_cast<uint8_t>(apiCall.category));
+                const auto catIndex = static_cast<uint8_t>(apiCall.category);
+                if (catIndex < seenCategories.size()) {
+                    seenCategories[catIndex] = true;
+                }
                 if (result.suspiciousAPICalls.size() < kMaxParsedMethods)
                     result.suspiciousAPICalls.push_back(apiCall);
             }
         }
 
         // Set high-level threat indicator flags from categories
-        for (uint8_t cat : seenCategories) {
+        for (size_t cat = 0; cat < seenCategories.size(); ++cat) {
+            if (!seenCategories[cat]) continue;
             switch (static_cast<DotNetAPICategory>(cat)) {
             case DotNetAPICategory::AssemblyLoadRaw:
                 result.hasReflectionLoading = true;
@@ -1408,8 +1477,10 @@ void DotNetAnalyzer::ClassifyAPICalls() noexcept {
             }
         }
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Partial classification — continue.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -1432,50 +1503,58 @@ void DotNetAnalyzer::DetectPayloadEmbedding(
 
         // --- .NET resource blob (ManifestResource data) ---
         if (cor20.resourcesRVA != 0 && cor20.resourcesSize > 0) {
-            const GuestAddress resBase = imageBase + cor20.resourcesRVA;
+            GuestAddress resBase = 0;
+            if (!AddGuestOffset(imageBase, cor20.resourcesRVA, resBase)) return;
             const uint32_t scanLimit =
                 std::min(cor20.resourcesSize, kMaxResourceScan);
 
             // Walk the resource blob: each entry is [uint32_t length][data…]
             uint32_t offset = 0;
             uint32_t resIndex = 0;
-            while (offset + sizeof(uint32_t) <= scanLimit &&
-                   resIndex < kMaxResources)
-            {
-                uint32_t entryLen = 0;
-                if (!ReadGuestMemory(memory, resBase + offset,
-                                     &entryLen, sizeof(entryLen)))
-                    break;
+            if (scanLimit >= sizeof(uint32_t)) {
+                while (offset <= scanLimit - sizeof(uint32_t) &&
+                       resIndex < kMaxResources)
+                {
+                    uint32_t entryLen = 0;
+                    GuestAddress entryHeaderVA = 0;
+                    if (!AddGuestOffset(resBase, offset, entryHeaderVA)) break;
+                    if (!ReadGuestMemory(memory, entryHeaderVA,
+                                         &entryLen, sizeof(entryLen)))
+                        break;
 
-                offset += sizeof(uint32_t);
+                    offset += sizeof(uint32_t);
 
-                // Validate entry length
-                if (entryLen == 0 || offset + entryLen > scanLimit) break;
+                    // Validate entry length
+                    if (entryLen == 0 || entryLen > scanLimit - offset) break;
 
-                // For entropy analysis, read a sample of the entry
-                constexpr uint32_t kEntropySampleSize = 4096;
-                const uint32_t sampleSize =
-                    std::min(entryLen, kEntropySampleSize);
+                    // For entropy analysis, read a sample of the entry
+                    constexpr uint32_t kEntropySampleSize = 4096;
+                    const uint32_t sampleSize =
+                        std::min(entryLen, kEntropySampleSize);
 
-                std::vector<uint8_t> sample(sampleSize);
-                if (!ReadGuestMemory(memory, resBase + offset,
-                                     sample.data(), sampleSize))
-                    break;
+                    std::vector<uint8_t> sample(sampleSize);
+                    GuestAddress sampleVA = 0;
+                    if (!AddGuestOffset(resBase, offset, sampleVA)) break;
+                    if (!ReadGuestMemory(memory, sampleVA,
+                                         sample.data(), sampleSize))
+                        break;
 
-                const double entropy =
-                    ComputeShannonEntropy(sample.data(), sampleSize);
+                    const double entropy =
+                        ComputeShannonEntropy(sample.data(), sampleSize);
 
-                DotNetResource resEntry;
-                resEntry.name     = "Resource_" + std::to_string(resIndex);
-                resEntry.offset   = offset - static_cast<uint32_t>(sizeof(uint32_t));
-                resEntry.size     = entryLen;
-                resEntry.entropy  = entropy;
-                resEntry.isEncrypted = (entropy > kHighEntropyThreshold);
+                    DotNetResource resEntry;
+                    resEntry.name     = "Resource_" + std::to_string(resIndex);
+                    resEntry.offset   = offset - static_cast<uint32_t>(sizeof(uint32_t));
+                    resEntry.size     = entryLen;
+                    resEntry.entropy  = entropy;
+                    resEntry.isEncrypted = (entropy > kHighEntropyThreshold);
 
-                result.resources.push_back(std::move(resEntry));
-                ++resIndex;
+                    result.resources.push_back(std::move(resEntry));
+                    ++resIndex;
 
-                offset += entryLen;
+                    if (entryLen > scanLimit - offset) break;
+                    offset += entryLen;
+                }
             }
 
             result.resourceCount = resIndex;
@@ -1493,20 +1572,23 @@ void DotNetAnalyzer::DetectPayloadEmbedding(
             constexpr uint32_t kFieldRVAProbeSize = 64 * 1024;
 
             // Verify the address is readable
-            const GuestAddress fieldVA = imageBase + frva.rva;
+            GuestAddress fieldVA = 0;
+            if (!AddGuestOffset(imageBase, frva.rva, fieldVA)) continue;
             if (!memory.IsAccessible(fieldVA, MemProt::Read)) continue;
 
             std::vector<uint8_t> probe(kFieldRVAProbeSize);
             uint32_t actualRead = 0;
             for (uint32_t p = 0; p < kFieldRVAProbeSize; p += kPageSize) {
-                const uint8_t* ptr =
-                    memory.GetHostReadPtr(fieldVA + p);
+                GuestAddress pageVA = 0;
+                if (!AddGuestOffset(fieldVA, p, pageVA)) break;
+                const uint8_t* ptr = memory.GetHostReadPtr(pageVA);
                 if (!ptr) break;
                 const uint32_t chunk =
-                    std::min(kPageSize, static_cast<GuestSize>(kFieldRVAProbeSize - p));
+                    std::min<uint32_t>(static_cast<uint32_t>(kPageSize),
+                                       kFieldRVAProbeSize - p);
                 std::memcpy(probe.data() + p, ptr,
                             static_cast<size_t>(chunk));
-                actualRead += chunk;
+                IncrementSaturating(actualRead, chunk);
             }
 
             if (actualRead < kLargeResourceThreshold) continue;
@@ -1532,8 +1614,10 @@ void DotNetAnalyzer::DetectPayloadEmbedding(
             }
         }
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Partial payload detection — continue.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -1548,12 +1632,17 @@ void DotNetAnalyzer::ComputeThreatScore() noexcept {
         float score  = 0.0f;
 
         // Collect which API categories are present
-        std::unordered_set<uint8_t> seenCats;
-        for (const auto& api : result.suspiciousAPICalls)
-            seenCats.insert(static_cast<uint8_t>(api.category));
+        std::array<bool, 64> seenCats{};
+        for (const auto& api : result.suspiciousAPICalls) {
+            const auto catIndex = static_cast<uint8_t>(api.category);
+            if (catIndex < seenCats.size()) {
+                seenCats[catIndex] = true;
+            }
+        }
 
         auto hasCat = [&](DotNetAPICategory cat) -> bool {
-            return seenCats.count(static_cast<uint8_t>(cat)) > 0;
+            const auto catIndex = static_cast<uint8_t>(cat);
+            return catIndex < seenCats.size() && seenCats[catIndex];
         };
 
         // ---- API-based scoring ----
@@ -1685,11 +1774,10 @@ void DotNetAnalyzer::ComputeThreatScore() noexcept {
         // ---- Deduplicate MITRE IDs ----
 
         {
-            std::unordered_set<std::string> seen;
             std::vector<std::string> deduped;
             deduped.reserve(impl.lastMITREIDs.size());
             for (auto& id : impl.lastMITREIDs) {
-                if (seen.insert(id).second)
+                if (std::find(deduped.begin(), deduped.end(), id) == deduped.end())
                     deduped.push_back(std::move(id));
             }
             impl.lastMITREIDs = std::move(deduped);
@@ -1697,8 +1785,10 @@ void DotNetAnalyzer::ComputeThreatScore() noexcept {
 
         impl.lastThreatScore = std::clamp(score, 0.0f, 1.0f);
 
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordAnalysisError();
     } catch (...) {
-        // Scoring failure — leave score at 0.0.
+        m_impl->RecordAnalysisError();
     }
 }
 
@@ -1707,14 +1797,19 @@ void DotNetAnalyzer::ComputeThreatScore() noexcept {
 // ============================================================================
 
 const DotNetAnalysisResult& DotNetAnalyzer::GetLastResult() const noexcept {
+    static const DotNetAnalysisResult kEmpty;
+    if (!m_impl) return kEmpty;
     return m_impl->lastResult;
 }
 
 float DotNetAnalyzer::GetLastThreatScore() const noexcept {
+    if (!m_impl) return 0.0f;
     return m_impl->lastThreatScore;
 }
 
 const std::vector<std::string>& DotNetAnalyzer::GetLastMITREIDs() const noexcept {
+    static const std::vector<std::string> kEmpty;
+    if (!m_impl) return kEmpty;
     return m_impl->lastMITREIDs;
 }
 
@@ -1723,15 +1818,18 @@ const std::vector<std::string>& DotNetAnalyzer::GetLastMITREIDs() const noexcept
 // ============================================================================
 
 void DotNetAnalyzer::SetMaxMethodsToAnalyze(uint32_t max) noexcept {
+    if (!m_impl) return;
     m_impl->maxMethodsToAnalyze =
         std::min(max, kMaxParsedMethods);
 }
 
 void DotNetAnalyzer::SetEnableStringDecryption(bool enable) noexcept {
+    if (!m_impl) return;
     m_impl->enableStringDecryption = enable;
 }
 
 void DotNetAnalyzer::SetEnablePayloadExtraction(bool enable) noexcept {
+    if (!m_impl) return;
     m_impl->enablePayloadExtraction = enable;
 }
 
