@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -72,8 +73,8 @@ struct HashResolution {
 //   3. Call BuildFromExports() to pre-compute all hash tables
 //   4. Use ResolveByHash() / BatchResolve() during shellcode analysis
 //
-// Not thread-safe during BuildFromExports(). After build completes,
-// all Resolve/Detect methods are safe for concurrent read access.
+// Thread-safe: BuildFromExports()/Reset() take exclusive ownership; Resolve,
+// Detect, BatchResolve, and statistics APIs are concurrent readers.
 
 class HashResolver {
 public:
@@ -128,11 +129,12 @@ private:
 
     // Tracked module count for statistics
     uint32_t m_moduleCount = 0;
+    mutable std::shared_mutex m_mutex;
 
     // Insert a resolved export into all hash tables for all algorithms
-    void InsertExport(uint16_t moduleIdx, uint16_t nameIdx,
-                      std::string_view moduleName, std::string_view funcName,
-                      GuestAddress address) noexcept;
+    [[nodiscard]] bool InsertExport(uint16_t moduleIdx, uint16_t nameIdx,
+                                    std::string_view moduleName, std::string_view funcName,
+                                    GuestAddress address) noexcept;
 };
 
 } // namespace Phantom
