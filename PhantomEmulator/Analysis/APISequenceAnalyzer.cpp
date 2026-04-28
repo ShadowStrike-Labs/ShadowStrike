@@ -20,6 +20,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -763,33 +765,28 @@ static const APINameEntry kAPINames[] = {
 static constexpr uint32_t kAPINameCount =
     static_cast<uint32_t>(sizeof(kAPINames) / sizeof(kAPINames[0]));
 
-// Build a case-insensitive lookup map (Meyers singleton)
-[[nodiscard]] static const std::unordered_map<std::string, APIId>& GetNameMap() noexcept {
-    static const auto sMap = []() {
-        std::unordered_map<std::string, APIId> m;
-        m.reserve(kAPINameCount * 2);
-        for (uint32_t i = 0; i < kAPINameCount; ++i) {
-            std::string lower;
-            lower.reserve(64);
-            for (const char* p = kAPINames[i].funcName; *p; ++p)
-                lower += static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
-            m.emplace(std::move(lower), kAPINames[i].id);
+[[nodiscard]] static bool EqualsAsciiCI(const char* lhs, const char* rhs) noexcept {
+    if (!lhs || !rhs) return false;
+    while (*lhs && *rhs) {
+        const auto a = static_cast<unsigned char>(*lhs);
+        const auto b = static_cast<unsigned char>(*rhs);
+        if (std::tolower(a) != std::tolower(b)) {
+            return false;
         }
-        return m;
-    }();
-    return sMap;
+        ++lhs;
+        ++rhs;
+    }
+    return *lhs == '\0' && *rhs == '\0';
 }
 
 [[nodiscard]] static APIId ResolveAPIId(const char* funcName) noexcept {
     if (!funcName || !funcName[0]) return API_Unknown;
-    char buf[128];
-    uint32_t len = 0;
-    for (; funcName[len] && len < 127; ++len)
-        buf[len] = static_cast<char>(std::tolower(static_cast<unsigned char>(funcName[len])));
-    buf[len] = '\0';
-    const auto& map = GetNameMap();
-    auto it = map.find(std::string(buf, len));
-    return (it != map.end()) ? it->second : API_Unknown;
+    for (const auto& api : kAPINames) {
+        if (EqualsAsciiCI(funcName, api.funcName)) {
+            return api.id;
+        }
+    }
+    return API_Unknown;
 }
 
 // ============================================================================
@@ -1358,28 +1355,7 @@ static const PatternDef kPatterns[] = {
 static constexpr uint32_t kPatternCount =
     static_cast<uint32_t>(sizeof(kPatterns) / sizeof(kPatterns[0]));
 
-// ============================================================================
-// Pattern Index — maps first APIId to list of pattern indices
-// ============================================================================
-
 static constexpr uint32_t kMaxFirstAPIBuckets = API_ID_COUNT;
-
-struct PatternIndex {
-    std::array<std::vector<uint16_t>, kMaxFirstAPIBuckets> byFirstAPI;
-
-    PatternIndex() {
-        for (uint32_t i = 0; i < kPatternCount; ++i) {
-            APIId first = kPatterns[i].sequence[0];
-            if (first < kMaxFirstAPIBuckets)
-                byFirstAPI[first].push_back(static_cast<uint16_t>(i));
-        }
-    }
-};
-
-[[nodiscard]] static const PatternIndex& GetPatternIndex() noexcept {
-    static const PatternIndex sIndex;
-    return sIndex;
-}
 
 // ============================================================================
 // Markov Chain Baseline — Benign transition probabilities
@@ -1564,20 +1540,23 @@ struct TransitionKeyHash {
     }
 };
 
-[[nodiscard]] static const std::unordered_map<TransitionKey, float, TransitionKeyHash>&
-GetBaselineMap() noexcept {
-    static const auto sMap = []() {
-        std::unordered_map<TransitionKey, float, TransitionKeyHash> m;
-        m.reserve(kBaselineCount * 2);
-        for (uint32_t i = 0; i < kBaselineCount; ++i)
-            m[{ kBaseline[i].from, kBaseline[i].to }] = kBaseline[i].probability;
-        return m;
-    }();
-    return sMap;
+// Default probability for transitions not in the baseline.
+static constexpr double kDefaultTransitionProb = 0.0005;
+
+[[nodiscard]] static double LookupBaselineProbability(APIId from, APIId to) noexcept {
+    for (const auto& entry : kBaseline) {
+        if (entry.from == from && entry.to == to) {
+            return static_cast<double>(entry.probability);
+        }
+    }
+    return kDefaultTransitionProb;
 }
 
-// Default probability for transitions not in the baseline
-static constexpr double kDefaultTransitionProb = 0.0005;
+static void IncrementSaturating(uint32_t& value) noexcept {
+    if (value < (std::numeric_limits<uint32_t>::max)()) {
+        ++value;
+    }
+}
 
 } // anonymous namespace
 
@@ -1595,6 +1574,7 @@ struct APISequenceAnalyzer::Impl {
     static constexpr uint32_t kMaxSequenceLen   = 131072;
     static constexpr uint32_t kMaxThreads       = 64;
     static constexpr uint32_t kMaxFreqEntries   = 1024;
+    static constexpr uint32_t kMaxTransitions   = 8192;
 
     // --- Anomaly threshold ---
     double anomalyThreshold = 0.001;
@@ -1679,6 +1659,7 @@ struct APISequenceAnalyzer::Impl {
     std::vector<SequenceMatch> matches;
     std::vector<TransitionAnomaly> anomalies;
     uint8_t maxSeverity = 0;
+    uint32_t droppedEvents = 0;
 
     // --- API frequency ---
     std::unordered_map<APIId, uint32_t> frequency;
@@ -1704,19 +1685,78 @@ struct APISequenceAnalyzer::Impl {
         : enabled(config.enableAPISequenceAnalysis)
     {
         if (!enabled) return;
-        sequence.reserve(std::min<uint32_t>(
-            static_cast<uint32_t>(config.maxAPIcalls), kMaxSequenceLen));
-        activeMatches.reserve(1024);
-        matches.reserve(256);
-        anomalies.reserve(256);
-        threads.reserve(config.maxThreads);
-        transitionCounts.reserve(4096);
-        fromCounts.reserve(512);
-        frequency.reserve(512);
-        reportedSet.reserve(512);
-        crossThreadEvents.reserve(kMaxCrossThreadEvents);
-        callGraph.reserve(512);
-        callGraphIndex.reserve(512);
+        try {
+            const auto sequenceReserve = static_cast<uint32_t>(
+                std::min<uint64_t>(config.maxAPIcalls, kMaxSequenceLen));
+            sequence.reserve(sequenceReserve);
+            activeMatches.reserve(1024);
+            matches.reserve(256);
+            anomalies.reserve(256);
+            threads.reserve(std::min<uint32_t>(config.maxThreads, kMaxThreads));
+            transitionCounts.reserve(4096);
+            fromCounts.reserve(512);
+            frequency.reserve(512);
+            reportedSet.reserve(512);
+            crossThreadEvents.reserve(kMaxCrossThreadEvents);
+            callGraph.reserve(512);
+            callGraphIndex.reserve(512);
+        } catch (const std::bad_alloc&) {
+            enabled = false;
+            RecordDrop();
+        }
+    }
+
+    void RecordDrop() noexcept {
+        IncrementSaturating(droppedEvents);
+    }
+
+    [[nodiscard]] ThreadState* GetThreadState(uint16_t threadId) noexcept {
+        const auto existing = threads.find(threadId);
+        if (existing != threads.end()) {
+            return &existing->second;
+        }
+        if (threads.size() >= kMaxThreads) {
+            RecordDrop();
+            return nullptr;
+        }
+        try {
+            auto [it, inserted] = threads.emplace(threadId, ThreadState{});
+            (void)inserted;
+            return &it->second;
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            return nullptr;
+        }
+    }
+
+    void IncrementFrequency(APIId apiId) noexcept {
+        if (apiId == API_Unknown) return;
+        const auto existing = frequency.find(apiId);
+        if (existing != frequency.end()) {
+            IncrementSaturating(existing->second);
+            return;
+        }
+        if (frequency.size() >= kMaxFreqEntries) {
+            RecordDrop();
+            return;
+        }
+        try {
+            frequency.emplace(apiId, 1U);
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+        }
+    }
+
+    void RecordAnomaly(APIId from, APIId to, double probability, uint32_t callIndex) noexcept {
+        if (anomalies.size() >= kMaxAnomalies) {
+            RecordDrop();
+            return;
+        }
+        try {
+            anomalies.push_back({ from, to, probability, anomalyThreshold, callIndex });
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+        }
     }
 
     // ========================================================================
@@ -1729,32 +1769,38 @@ struct APISequenceAnalyzer::Impl {
         APIId apiId = ResolveAPIId(call.funcName);
 
         // Record in sequence buffer (capped)
-        if (sequence.size() < kMaxSequenceLen)
-            sequence.push_back(apiId);
+        if (sequence.size() < kMaxSequenceLen) {
+            try {
+                sequence.push_back(apiId);
+            } catch (const std::bad_alloc&) {
+                RecordDrop();
+            }
+        }
 
-        ++totalCalls;
+        IncrementSaturating(totalCalls);
 
         // Update frequency
-        if (apiId != API_Unknown && frequency.size() < kMaxFreqEntries)
-            ++frequency[apiId];
+        IncrementFrequency(apiId);
 
         // Per-thread state
-        auto& ts = threads[call.threadId];
+        ThreadState* threadState = GetThreadState(call.threadId);
+        if (!threadState) return;
+        auto& ts = *threadState;
         ts.lastAPIId = apiId;
-        ++ts.callCount;
+        IncrementSaturating(ts.callCount);
 
         // Update per-thread sliding window
         if (apiId != API_Unknown) {
             ts.window[ts.windowPos % 64] = apiId;
-            ++ts.windowPos;
+            IncrementSaturating(ts.windowPos);
             if (ts.windowFill < 64) ++ts.windowFill;
         }
 
         // Tight-loop detection within thread
-        DetectTightLoop(ts, apiId, call.threadId, callIndex);
+        DetectTightLoop(ts, apiId, callIndex);
 
         // Temporal burst detection
-        DetectBurst(ts, call.instructionNum, call.threadId, callIndex);
+        DetectBurst(ts, call.instructionNum, callIndex);
 
         // Markov chain transition analysis
         if (globalLastAPI != kInvalidAPIId && apiId != API_Unknown)
@@ -1788,24 +1834,33 @@ struct APISequenceAnalyzer::Impl {
 
     void AdvancePatternMatching(APIId apiId, uint32_t callIndex, uint16_t threadId) noexcept {
         // 1. Start new matches for any pattern whose first element is this API
-        const auto& idx = GetPatternIndex();
         if (apiId < kMaxFirstAPIBuckets) {
-            const auto& candidates = idx.byFirstAPI[apiId];
-            for (uint16_t patIdx : candidates) {
-                if (activeMatches.size() >= kMaxActiveMatches) break;
+            for (uint32_t patIdx = 0; patIdx < kPatternCount; ++patIdx) {
                 const auto& pat = kPatterns[patIdx];
+                if (pat.sequence[0] != apiId) continue;
+                if (activeMatches.size() >= kMaxActiveMatches) {
+                    RecordDrop();
+                    break;
+                }
                 if (pat.length == 1) {
-                    // Single-element pattern — immediate match
-                    RecordMatch(patIdx, callIndex, callIndex, threadId);
+                    RecordMatch(static_cast<uint16_t>(patIdx), callIndex, callIndex, threadId);
                 } else {
-                    activeMatches.push_back({
-                        patIdx,
-                        1,              // next element to match
-                        callIndex,
-                        callIndex,
-                        threadId,
-                        0
-                    });
+                    if (patIdx > (std::numeric_limits<uint16_t>::max)()) {
+                        RecordDrop();
+                        continue;
+                    }
+                    try {
+                        activeMatches.push_back({
+                            static_cast<uint16_t>(patIdx),
+                            1,              // next element to match
+                            callIndex,
+                            callIndex,
+                            threadId,
+                            0
+                        });
+                    } catch (const std::bad_alloc&) {
+                        RecordDrop();
+                    }
                 }
             }
         }
@@ -1829,7 +1884,9 @@ struct APISequenceAnalyzer::Impl {
                 }
             } else {
                 // Gap
-                ++am.gapAccum;
+                if (am.gapAccum < (std::numeric_limits<uint8_t>::max)()) {
+                    ++am.gapAccum;
+                }
                 if (am.gapAccum > pat.maxGap) {
                     continue; // Exceeded gap tolerance — discard
                 }
@@ -1850,7 +1907,12 @@ struct APISequenceAnalyzer::Impl {
         // Dedup: same pattern starting at same call index
         uint64_t dedupKey = (static_cast<uint64_t>(kPatterns[patIdx].id) << 32) |
                             static_cast<uint64_t>(startIdx);
-        if (!reportedSet.insert(dedupKey).second) return;
+        try {
+            if (!reportedSet.insert(dedupKey).second) return;
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            return;
+        }
 
         const auto& pat = kPatterns[patIdx];
 
@@ -1864,16 +1926,21 @@ struct APISequenceAnalyzer::Impl {
         confidence = confidence * 0.6f + density * 0.4f;
         if (confidence > 1.0f) confidence = 1.0f;
 
-        matches.push_back({
-            pat.id,
-            pat.name,
-            pat.mitreId,
-            confidence,
-            pat.severity,
-            startIdx,
-            endIdx,
-            threadId
-        });
+        try {
+            matches.push_back({
+                pat.id,
+                pat.name,
+                pat.mitreId,
+                confidence,
+                pat.severity,
+                startIdx,
+                endIdx,
+                threadId
+            });
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            return;
+        }
 
         if (pat.severity > maxSeverity)
             maxSeverity = pat.severity;
@@ -1885,29 +1952,51 @@ struct APISequenceAnalyzer::Impl {
 
     void AnalyzeTransition(APIId from, APIId to, uint32_t callIndex) noexcept {
         TransitionKey key{ from, to };
-        ++transitionCounts[key];
-        ++fromCounts[from];
+        uint32_t transitionCount = 0;
+        uint32_t fromCount = 0;
+        try {
+            auto transitionIt = transitionCounts.find(key);
+            if (transitionIt != transitionCounts.end()) {
+                IncrementSaturating(transitionIt->second);
+                transitionCount = transitionIt->second;
+            } else if (transitionCounts.size() < kMaxTransitions) {
+                const auto [insertedIt, inserted] = transitionCounts.emplace(key, 1U);
+                (void)inserted;
+                transitionCount = insertedIt->second;
+            } else {
+                RecordDrop();
+            }
+
+            auto fromIt = fromCounts.find(from);
+            if (fromIt != fromCounts.end()) {
+                IncrementSaturating(fromIt->second);
+                fromCount = fromIt->second;
+            } else if (fromCounts.size() < kMaxFreqEntries) {
+                const auto [insertedIt, inserted] = fromCounts.emplace(from, 1U);
+                (void)inserted;
+                fromCount = insertedIt->second;
+            } else {
+                RecordDrop();
+            }
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            return;
+        }
 
         // Look up baseline probability
-        const auto& baseline = GetBaselineMap();
-        auto baseIt = baseline.find(key);
-        double prob = (baseIt != baseline.end())
-                      ? static_cast<double>(baseIt->second)
-                      : kDefaultTransitionProb;
+        double prob = LookupBaselineProbability(from, to);
 
         // Once we have enough observations, use empirical probability
-        auto fromIt = fromCounts.find(from);
-        if (fromIt != fromCounts.end() && fromIt->second >= 10) {
-            auto tcIt = transitionCounts.find(key);
-            double empirical = static_cast<double>(tcIt->second) /
-                               static_cast<double>(fromIt->second);
+        if (fromCount >= 10 && transitionCount > 0) {
+            double empirical = static_cast<double>(transitionCount) /
+                               static_cast<double>(fromCount);
             // Blend: weight empirical more as sample size grows
-            double alpha = std::min(1.0, static_cast<double>(fromIt->second) / 100.0);
+            double alpha = std::min(1.0, static_cast<double>(fromCount) / 100.0);
             prob = alpha * empirical + (1.0 - alpha) * prob;
         }
 
-        if (prob < anomalyThreshold && anomalies.size() < kMaxAnomalies) {
-            anomalies.push_back({ from, to, prob, anomalyThreshold, callIndex });
+        if (prob < anomalyThreshold) {
+            RecordAnomaly(from, to, prob, callIndex);
         }
     }
 
@@ -1917,23 +2006,15 @@ struct APISequenceAnalyzer::Impl {
     // Detects the same API (or very short cycle) repeated many times,
     // which is characteristic of keyloggers, polling, and brute-force attacks.
 
-    void DetectTightLoop(ThreadState& ts, APIId apiId, uint16_t threadId,
-                         uint32_t callIndex) noexcept {
+    void DetectTightLoop(ThreadState& ts, APIId apiId, uint32_t callIndex) noexcept {
         if (apiId == API_Unknown) return;
 
         // Check if current API matches the most recent unique API
         if (ts.lastUniqueCount > 0 && ts.lastUniqueAPIs[0] == apiId) {
-            ++ts.repeatCount;
+            IncrementSaturating(ts.repeatCount);
             if (ts.repeatCount >= kTightLoopCount) {
                 // Tight loop detected
-                if (anomalies.size() < kMaxAnomalies) {
-                    anomalies.push_back({
-                        apiId, apiId,
-                        0.00005,    // Extremely low probability for tight loops
-                        anomalyThreshold,
-                        callIndex
-                    });
-                }
+                RecordAnomaly(apiId, apiId, 0.00005, callIndex);
                 ts.repeatCount = 0;
             }
         } else {
@@ -1956,14 +2037,19 @@ struct APISequenceAnalyzer::Impl {
     void AnalyzeCrossThread(APIId apiId, uint16_t threadId,
                             uint32_t callIndex, uint32_t instrNum) noexcept {
         // Record injection-related event
-        if (crossThreadEvents.size() < kMaxCrossThreadEvents) {
-            crossThreadEvents.push_back({ threadId, apiId, callIndex, instrNum });
-        } else {
-            // Evict oldest half when full
-            auto mid = crossThreadEvents.begin() +
-                       static_cast<ptrdiff_t>(crossThreadEvents.size() / 2);
-            crossThreadEvents.erase(crossThreadEvents.begin(), mid);
-            crossThreadEvents.push_back({ threadId, apiId, callIndex, instrNum });
+        try {
+            if (crossThreadEvents.size() < kMaxCrossThreadEvents) {
+                crossThreadEvents.push_back({ threadId, apiId, callIndex, instrNum });
+            } else {
+                // Evict oldest half when full
+                auto mid = crossThreadEvents.begin() +
+                           static_cast<ptrdiff_t>(crossThreadEvents.size() / 2);
+                crossThreadEvents.erase(crossThreadEvents.begin(), mid);
+                crossThreadEvents.push_back({ threadId, apiId, callIndex, instrNum });
+            }
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            return;
         }
 
         // Analyze: look for injection-related APIs from different threads
@@ -1974,13 +2060,23 @@ struct APISequenceAnalyzer::Impl {
         if (crossThreadEvents.size() > 32)
             windowStart = static_cast<uint32_t>(crossThreadEvents.size()) - 32;
 
-        // Count distinct threads performing injection-related APIs
-        std::unordered_set<uint16_t> injectionThreads;
+        // Count distinct threads performing injection-related APIs without heap allocation.
+        std::array<uint16_t, 32> injectionThreads{};
+        uint32_t injectionThreadCount = 0;
         bool hasAlloc = false, hasWrite = false, hasExec = false;
 
         for (uint32_t i = windowStart; i < crossThreadEvents.size(); ++i) {
             const auto& evt = crossThreadEvents[i];
-            injectionThreads.insert(evt.threadId);
+            bool seenThread = false;
+            for (uint32_t j = 0; j < injectionThreadCount; ++j) {
+                if (injectionThreads[j] == evt.threadId) {
+                    seenThread = true;
+                    break;
+                }
+            }
+            if (!seenThread && injectionThreadCount < injectionThreads.size()) {
+                injectionThreads[injectionThreadCount++] = evt.threadId;
+            }
 
             switch (evt.apiId) {
                 case API_VirtualAllocEx: case API_NtAllocateVirtualMemory:
@@ -1996,16 +2092,8 @@ struct APISequenceAnalyzer::Impl {
         }
 
         // If multiple threads are coordinating injection-like activity, flag it
-        if (injectionThreads.size() >= 2 && hasAlloc && hasWrite && hasExec) {
-            if (anomalies.size() < kMaxAnomalies) {
-                anomalies.push_back({
-                    API_Unknown,    // Cross-thread, no single source
-                    apiId,
-                    0.00001,        // Extremely suspicious
-                    anomalyThreshold,
-                    callIndex
-                });
-            }
+        if (injectionThreadCount >= 2 && hasAlloc && hasWrite && hasExec) {
+            RecordAnomaly(API_Unknown, apiId, 0.00001, callIndex);
         }
     }
 
@@ -2022,11 +2110,18 @@ struct APISequenceAnalyzer::Impl {
         auto it = callGraphIndex.find(edgeKey);
         if (it != callGraphIndex.end()) {
             if (it->second < callGraph.size())
-                ++callGraph[it->second].count;
+                IncrementSaturating(callGraph[it->second].count);
         } else {
             uint32_t idx = static_cast<uint32_t>(callGraph.size());
-            callGraph.push_back({ callerAddr, calleeAPI, 1 });
-            callGraphIndex[edgeKey] = idx;
+            try {
+                callGraph.push_back({ callerAddr, calleeAPI, 1 });
+                callGraphIndex.emplace(edgeKey, idx);
+            } catch (const std::bad_alloc&) {
+                if (callGraph.size() > idx) {
+                    callGraph.pop_back();
+                }
+                RecordDrop();
+            }
         }
     }
 
@@ -2052,26 +2147,30 @@ struct APISequenceAnalyzer::Impl {
             uint32_t start = (ts.windowPos >= winSize)
                              ? (ts.windowPos - winSize) : 0;
 
-            // Count unique APIs in this window — very low diversity is suspicious
-            std::unordered_set<APIId> unique;
+            // Count unique APIs in this window without heap allocation.
+            std::array<APIId, 64> unique{};
+            uint32_t uniqueCount = 0;
             for (uint32_t i = 0; i < winSize && i < ts.windowFill; ++i) {
                 uint32_t idx = (start + i) % 64;
-                if (ts.window[idx] != API_Unknown)
-                    unique.insert(ts.window[idx]);
+                const APIId current = ts.window[idx];
+                if (current == API_Unknown) continue;
+                bool seen = false;
+                for (uint32_t j = 0; j < uniqueCount; ++j) {
+                    if (unique[j] == current) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen && uniqueCount < unique.size()) {
+                    unique[uniqueCount++] = current;
+                }
             }
 
             // If a window of 16+ calls has ≤ 2 unique APIs, that's anomalous
             // (likely a tight polling/brute-force loop)
-            if (winSize >= 16 && unique.size() <= 2 && unique.size() > 0) {
-                if (anomalies.size() < kMaxAnomalies) {
-                    APIId firstApi = *unique.begin();
-                    anomalies.push_back({
-                        firstApi, firstApi,
-                        0.0002,
-                        anomalyThreshold,
-                        callIndex
-                    });
-                }
+            if (winSize >= 16 && uniqueCount <= 2 && uniqueCount > 0) {
+                APIId firstApi = unique[0];
+                RecordAnomaly(firstApi, firstApi, 0.0002, callIndex);
             }
 
             // Check for crypto + file I/O density (ransomware indicator)
@@ -2094,14 +2193,7 @@ struct APISequenceAnalyzer::Impl {
             // If ≥ 25% of a 16+ window is crypto + file ops, flag ransomware
             if (winSize >= 16 && (cryptoCount + fileCount) >= (winSize / 4)
                 && cryptoCount >= 2 && fileCount >= 2) {
-                if (anomalies.size() < kMaxAnomalies) {
-                    anomalies.push_back({
-                        API_CryptEncrypt, API_WriteFile,
-                        0.0003,
-                        anomalyThreshold,
-                        callIndex
-                    });
-                }
+                RecordAnomaly(API_CryptEncrypt, API_WriteFile, 0.0003, callIndex);
             }
 
             // Check for network + process combo (C2 + lateral movement)
@@ -2122,14 +2214,7 @@ struct APISequenceAnalyzer::Impl {
             }
 
             if (winSize >= 8 && netCount >= 2 && procCount >= 1) {
-                if (anomalies.size() < kMaxAnomalies) {
-                    anomalies.push_back({
-                        API_recv, API_CreateProcess,
-                        0.0004,
-                        anomalyThreshold,
-                        callIndex
-                    });
-                }
+                RecordAnomaly(API_recv, API_CreateProcess, 0.0004, callIndex);
             }
         }
     }
@@ -2138,8 +2223,7 @@ struct APISequenceAnalyzer::Impl {
     // Temporal Burst Detection
     // ========================================================================
 
-    void DetectBurst(ThreadState& ts, uint32_t instrNum,
-                     uint16_t threadId, uint32_t callIndex) noexcept {
+    void DetectBurst(ThreadState& ts, uint32_t instrNum, uint32_t callIndex) noexcept {
         if (ts.lastInstNum == 0) {
             ts.burstStart = instrNum;
             ts.burstCount = 1;
@@ -2150,18 +2234,10 @@ struct APISequenceAnalyzer::Impl {
                          ? (instrNum - ts.lastInstNum) : 0;
 
         if (delta < kBurstWindowInstr) {
-            ++ts.burstCount;
+            IncrementSaturating(ts.burstCount);
             if (ts.burstCount >= kBurstThreshold) {
                 // Burst detected — record as anomaly
-                if (anomalies.size() < kMaxAnomalies) {
-                    anomalies.push_back({
-                        ts.lastAPIId,
-                        ts.lastAPIId,
-                        0.0001,     // Very low probability for burst
-                        anomalyThreshold,
-                        callIndex
-                    });
-                }
+                RecordAnomaly(ts.lastAPIId, ts.lastAPIId, 0.0001, callIndex);
                 ts.burstCount = 0;
                 ts.burstStart = instrNum;
             }
@@ -2199,8 +2275,13 @@ struct APISequenceAnalyzer::Impl {
 // ============================================================================
 
 APISequenceAnalyzer::APISequenceAnalyzer(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>(config))
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>(config);
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    }
 }
 
 APISequenceAnalyzer::~APISequenceAnalyzer() noexcept = default;
@@ -2234,26 +2315,35 @@ std::vector<std::pair<APIId, uint32_t>> APISequenceAnalyzer::GetAPIFrequency() c
     std::vector<std::pair<APIId, uint32_t>> result;
     if (!m_impl) return result;
 
-    result.reserve(m_impl->frequency.size());
-    for (const auto& [id, count] : m_impl->frequency)
-        result.emplace_back(id, count);
+    try {
+        result.reserve(m_impl->frequency.size());
+        for (const auto& [id, count] : m_impl->frequency)
+            result.emplace_back(id, count);
 
-    std::sort(result.begin(), result.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+    } catch (const std::bad_alloc&) {
+        result.clear();
+    }
     return result;
 }
 
 std::vector<TransitionAnomaly> APISequenceAnalyzer::GetTopAnomalies(uint32_t n) const noexcept {
     if (!m_impl || m_impl->anomalies.empty()) return {};
 
-    std::vector<TransitionAnomaly> sorted = m_impl->anomalies;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const TransitionAnomaly& a, const TransitionAnomaly& b) {
-                  return a.probability < b.probability;
-              });
+    std::vector<TransitionAnomaly> sorted;
+    try {
+        sorted = m_impl->anomalies;
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const TransitionAnomaly& a, const TransitionAnomaly& b) {
+                      return a.probability < b.probability;
+                  });
 
-    if (sorted.size() > n)
-        sorted.resize(n);
+        if (sorted.size() > n)
+            sorted.resize(n);
+    } catch (const std::bad_alloc&) {
+        sorted.clear();
+    }
     return sorted;
 }
 
