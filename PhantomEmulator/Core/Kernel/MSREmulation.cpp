@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -33,15 +35,55 @@ static const char* GetMSRName(uint32_t index) noexcept {
         case MSRIndex::PAT:             return "IA32_PAT";
         case MSRIndex::MTRR_DEF_TYPE:   return "IA32_MTRR_DEF_TYPE";
         case MSRIndex::EFER:            return "IA32_EFER";
-        case MSRIndex::STAR:            return "IA64_STAR";
-        case MSRIndex::LSTAR:           return "IA64_LSTAR";
-        case MSRIndex::CSTAR:           return "IA64_CSTAR";
-        case MSRIndex::SFMASK:          return "IA64_SFMASK";
-        case MSRIndex::FS_BASE:         return "IA64_FS_BASE";
-        case MSRIndex::GS_BASE:         return "IA64_GS_BASE";
-        case MSRIndex::KERNEL_GS_BASE:  return "IA64_KERNEL_GS_BASE";
+        case MSRIndex::STAR:            return "IA32_STAR";
+        case MSRIndex::LSTAR:           return "IA32_LSTAR";
+        case MSRIndex::CSTAR:           return "IA32_CSTAR";
+        case MSRIndex::SFMASK:          return "IA32_SFMASK";
+        case MSRIndex::FS_BASE:         return "IA32_FS_BASE";
+        case MSRIndex::GS_BASE:         return "IA32_GS_BASE";
+        case MSRIndex::KERNEL_GS_BASE:  return "IA32_KERNEL_GS_BASE";
         case MSRIndex::TSC_AUX:         return "IA32_TSC_AUX";
         default:                        return "UNKNOWN_MSR";
+    }
+}
+
+[[nodiscard]] bool IsCanonicalAddress(uint64_t value) noexcept {
+    const uint64_t top17 = value >> 47;
+    return top17 == 0 || top17 == 0x1FFFFULL;
+}
+
+[[nodiscard]] bool IsValidMemoryType(uint8_t type) noexcept {
+    switch (type) {
+        case 0x00: // UC
+        case 0x01: // WC
+        case 0x04: // WT
+        case 0x05: // WP
+        case 0x06: // WB
+        case 0x07: // UC-
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] bool IsValidPAT(uint64_t pat) noexcept {
+    for (uint32_t i = 0; i < 8; ++i) {
+        const auto type = static_cast<uint8_t>((pat >> (i * 8)) & 0xFFU);
+        if (!IsValidMemoryType(type)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SaturatingIncrement(std::atomic<uint32_t>& counter) noexcept {
+    uint32_t current = counter.load(std::memory_order_relaxed);
+    while (current != (std::numeric_limits<uint32_t>::max)()) {
+        if (counter.compare_exchange_weak(current, current + 1,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+            return;
+        }
     }
 }
 
@@ -127,6 +169,16 @@ void MSREmulation::InitializeDefaults() {
     std::unique_lock lock(m_impl->mutex);
 
     auto& regs = m_impl->registers;
+    regs.clear();
+    m_impl->originalValues.clear();
+    try {
+        regs.reserve(16);
+        m_impl->originalValues.reserve(16);
+    } catch (const std::bad_alloc&) {
+        regs.clear();
+        m_impl->originalValues.clear();
+        return;
+    }
 
     // EFER: SYSCALL enable + Long Mode Enable + Long Mode Active + NX Enable
     regs[MSRIndex::EFER] = EFERBits::SCE | EFERBits::LME | EFERBits::LMA | EFERBits::NXE;
@@ -200,7 +252,7 @@ bool MSREmulation::ReadMSR(uint32_t msrIndex, uint64_t& value) const {
         value = 0;
     }
 
-    m_impl->readCount.fetch_add(1, std::memory_order_relaxed);
+    SaturatingIncrement(m_impl->readCount);
     return true;
 }
 
@@ -214,14 +266,17 @@ bool MSREmulation::WriteMSR(uint32_t msrIndex, uint64_t value) {
     if (!m_impl->IsSupportedMSR(msrIndex)) {
         return false;
     }
+    const uint64_t previousValue = [this, msrIndex]() noexcept {
+        auto it = m_impl->registers.find(msrIndex);
+        return (it != m_impl->registers.end()) ? it->second : 0ULL;
+    }();
 
     // Enforce write masks on certain MSRs to prevent invalid states
     switch (msrIndex) {
         case MSRIndex::EFER: {
-            // Only SCE, LME, LMA, NXE bits are writable
-            constexpr uint64_t kEFERWriteMask = EFERBits::SCE | EFERBits::LME |
-                                                 EFERBits::LMA | EFERBits::NXE;
-            value &= kEFERWriteMask;
+            // LMA is CPU-derived/read-only; guest WRMSR may alter SCE/LME/NXE only.
+            constexpr uint64_t kEFERWritableMask = EFERBits::SCE | EFERBits::LME | EFERBits::NXE;
+            value = (previousValue & EFERBits::LMA) | (value & kEFERWritableMask);
             break;
         }
         case MSRIndex::DEBUGCTL: {
@@ -232,12 +287,22 @@ bool MSREmulation::WriteMSR(uint32_t msrIndex, uint64_t value) {
         case MSRIndex::MTRR_DEF_TYPE: {
             // Bits [7:0] = type, bit 10 = FE, bit 11 = E
             value &= 0x0CFF;
+            if (!IsValidMemoryType(static_cast<uint8_t>(value & 0xFFU))) {
+                return false;
+            }
             break;
         }
         case MSRIndex::APIC_BASE: {
             // Preserve BSP flag (bit 8), allow enable (bit 11) and base address [35:12]
             constexpr uint64_t kAPICWriteMask = 0x0000000FFFFFF900ULL;
-            value &= kAPICWriteMask;
+            constexpr uint64_t kBspMask = 1ULL << 8;
+            value = (value & (kAPICWriteMask & ~kBspMask)) | (previousValue & kBspMask);
+            break;
+        }
+        case MSRIndex::PAT: {
+            if (!IsValidPAT(value)) {
+                return false;
+            }
             break;
         }
         case MSRIndex::TSC_AUX: {
@@ -250,12 +315,27 @@ bool MSREmulation::WriteMSR(uint32_t msrIndex, uint64_t value) {
             value &= 0xFFFF;
             break;
         }
+        case MSRIndex::LSTAR:
+        case MSRIndex::CSTAR:
+        case MSRIndex::FS_BASE:
+        case MSRIndex::GS_BASE:
+        case MSRIndex::KERNEL_GS_BASE:
+        case MSRIndex::SYSENTER_ESP:
+        case MSRIndex::SYSENTER_EIP:
+            if (!IsCanonicalAddress(value)) {
+                return false;
+            }
+            break;
         default:
             break;
     }
 
-    m_impl->registers[msrIndex] = value;
-    m_impl->writeCount.fetch_add(1, std::memory_order_relaxed);
+    try {
+        m_impl->registers[msrIndex] = value;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    SaturatingIncrement(m_impl->writeCount);
     return true;
 }
 
@@ -306,10 +386,12 @@ GuestAddress MSREmulation::GetFSBase() const {
 void MSREmulation::SwapGS() {
     std::unique_lock lock(m_impl->mutex);
     auto& regs = m_impl->registers;
-    uint64_t gsBase       = regs[MSRIndex::GS_BASE];
-    uint64_t kernelGSBase = regs[MSRIndex::KERNEL_GS_BASE];
-    regs[MSRIndex::GS_BASE]        = kernelGSBase;
-    regs[MSRIndex::KERNEL_GS_BASE] = gsBase;
+    auto gsIt = regs.find(MSRIndex::GS_BASE);
+    auto kernelGsIt = regs.find(MSRIndex::KERNEL_GS_BASE);
+    if (gsIt == regs.end() || kernelGsIt == regs.end()) {
+        return;
+    }
+    std::swap(gsIt->second, kernelGsIt->second);
 }
 
 // ============================================================================
@@ -319,6 +401,11 @@ void MSREmulation::SwapGS() {
 std::vector<MSRModification> MSREmulation::DetectModifications() const {
     std::shared_lock lock(m_impl->mutex);
     std::vector<MSRModification> results;
+    try {
+        results.reserve(16);
+    } catch (const std::bad_alloc&) {
+        return results;
+    }
 
     // Security-critical MSRs to monitor
     static constexpr uint32_t kMonitoredMSRs[] = {
