@@ -108,7 +108,7 @@ public:
     [[nodiscard]] bool IsUserMode() const;
 
     // Transition history
-    [[nodiscard]] const std::vector<RingTransitionEvent>& GetHistory() const;
+    [[nodiscard]] std::vector<RingTransitionEvent> GetHistory() const;
     [[nodiscard]] uint32_t GetSyscallCount() const;
     [[nodiscard]] uint32_t GetTransitionCount() const;
 
