@@ -75,8 +75,8 @@ public:
 
     TaintTracker(const TaintTracker&) = delete;
     TaintTracker& operator=(const TaintTracker&) = delete;
-    TaintTracker(TaintTracker&&) noexcept = default;
-    TaintTracker& operator=(TaintTracker&&) noexcept = default;
+    TaintTracker(TaintTracker&&) = delete;
+    TaintTracker& operator=(TaintTracker&&) = delete;
 
     void Reset() noexcept;
 
@@ -122,6 +122,7 @@ public:
     // === Event Retrieval ===
     [[nodiscard]] std::vector<TaintEvent> GetTaintEvents() const;
     [[nodiscard]] uint32_t GetTaintEventCount() const noexcept;
+    [[nodiscard]] uint64_t GetDroppedEventCount() const noexcept;
 
     // Statistics
     [[nodiscard]] uint32_t GetTaintedPageCount() const noexcept;
@@ -151,11 +152,14 @@ private:
     std::vector<TaintEvent> m_events;
 
     mutable std::shared_mutex m_mutex;
+    uint64_t m_droppedEvents = 0;
 
     // Resource caps
     static constexpr uint32_t kMaxShadowPages   = 131'072;  // 128K pages = 512 MB
     static constexpr uint32_t kMaxTaintEvents    = 100'000;
     static constexpr GuestSize kMaxTaintMarkSize = 64ULL * 1024 * 1024; // 64 MB single mark
+
+    void RecordDropLocked() noexcept;
 };
 
 } // namespace Phantom

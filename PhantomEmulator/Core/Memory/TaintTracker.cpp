@@ -9,17 +9,63 @@
 #include "TaintTracker.hpp"
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
 
 namespace Phantom {
+
+namespace {
+
+[[nodiscard]] bool CheckedEnd(GuestAddress addr, GuestSize size, GuestAddress& end) noexcept {
+    if (size == 0 || size > (std::numeric_limits<GuestAddress>::max)() - addr) {
+        return false;
+    }
+    end = addr + size;
+    return true;
+}
+
+void AdvanceToNextPage(GuestAddress& current, GuestAddress pageBase, GuestAddress end) noexcept {
+    GuestAddress next = 0;
+    if (kPageSize > (std::numeric_limits<GuestAddress>::max)() - pageBase) {
+        current = end;
+        return;
+    }
+    next = pageBase + kPageSize;
+    current = (next > current && next < end) ? next : end;
+}
+
+[[nodiscard]] bool IsValidTaintMask(TaintSource source) noexcept {
+    constexpr uint8_t kAllTaintBits =
+        static_cast<uint8_t>(TaintSource::FileContent) |
+        static_cast<uint8_t>(TaintSource::NetworkData) |
+        static_cast<uint8_t>(TaintSource::UserInput) |
+        static_cast<uint8_t>(TaintSource::RegistryValue) |
+        static_cast<uint8_t>(TaintSource::EnvironmentVar) |
+        static_cast<uint8_t>(TaintSource::ProcessMemory) |
+        static_cast<uint8_t>(TaintSource::CryptoOutput);
+
+    const uint8_t value = static_cast<uint8_t>(source);
+    return value != 0 && (value & ~kAllTaintBits) == 0;
+}
+
+} // namespace
 
 // ============================================================================
 // Reset
 // ============================================================================
 
+void TaintTracker::RecordDropLocked() noexcept {
+    if (m_droppedEvents < (std::numeric_limits<uint64_t>::max)()) {
+        ++m_droppedEvents;
+    }
+}
+
 void TaintTracker::Reset() noexcept {
     std::unique_lock lock(m_mutex);
     m_shadowPages.clear();
     m_events.clear();
+    m_droppedEvents = 0;
 }
 
 // ============================================================================
@@ -35,10 +81,15 @@ TaintTracker::ShadowPage* TaintTracker::GetOrCreatePage(
 
     if (m_shadowPages.size() >= kMaxShadowPages) return nullptr;
 
-    auto page = std::make_unique<ShadowPage>();
-    auto* raw = page.get();
-    m_shadowPages.emplace(pageBase, std::move(page));
-    return raw;
+    try {
+        auto page = std::make_unique<ShadowPage>();
+        auto* raw = page.get();
+        m_shadowPages.emplace(pageBase, std::move(page));
+        return raw;
+    } catch (const std::bad_alloc&) {
+        RecordDropLocked();
+        return nullptr;
+    }
 }
 
 const TaintTracker::ShadowPage* TaintTracker::GetPage(
@@ -50,11 +101,8 @@ const TaintTracker::ShadowPage* TaintTracker::GetPage(
 }
 
 bool TaintTracker::IsPageClean(const ShadowPage& page) noexcept {
-    // Fast check: scan 8 bytes at a time
-    const auto* ptr = reinterpret_cast<const uint64_t*>(page.bytes);
-    constexpr size_t count = kPageSize / sizeof(uint64_t);
-    for (size_t i = 0; i < count; ++i) {
-        if (ptr[i] != 0) return false;
+    for (const TaintSource source : page.bytes) {
+        if (source != TaintSource::None) return false;
     }
     return true;
 }
@@ -68,14 +116,16 @@ void TaintTracker::MarkTainted(
     GuestSize size,
     TaintSource source) noexcept
 {
-    if (size == 0 || source == TaintSource::None) return;
+    if (size == 0 || !IsValidTaintMask(source)) return;
     if (size > kMaxTaintMarkSize) return; // Reject unreasonably large marks
 
     std::unique_lock lock(m_mutex);
 
-    GuestAddress end = addr + size;
-    // Overflow check
-    if (end < addr) end = ~GuestAddress(0);
+    GuestAddress end = 0;
+    if (!CheckedEnd(addr, size, end)) {
+        RecordDropLocked();
+        return;
+    }
 
     GuestAddress current = addr;
     while (current < end) {
@@ -91,7 +141,7 @@ void TaintTracker::MarkTainted(
             page->bytes[offset + i] |= source;
         }
 
-        current = pageBase + kPageSize;
+        AdvanceToNextPage(current, pageBase, end);
     }
 }
 
@@ -104,8 +154,11 @@ void TaintTracker::ClearRange(GuestAddress addr, GuestSize size) noexcept {
 
     std::unique_lock lock(m_mutex);
 
-    GuestAddress end = addr + size;
-    if (end < addr) end = ~GuestAddress(0);
+    GuestAddress end = 0;
+    if (!CheckedEnd(addr, size, end)) {
+        RecordDropLocked();
+        return;
+    }
 
     GuestAddress current = addr;
     while (current < end) {
@@ -124,7 +177,7 @@ void TaintTracker::ClearRange(GuestAddress addr, GuestSize size) noexcept {
             }
         }
 
-        current = pageBase + kPageSize;
+        AdvanceToNextPage(current, pageBase, end);
     }
 }
 
@@ -137,8 +190,8 @@ bool TaintTracker::IsTainted(GuestAddress addr, GuestSize size) const noexcept {
 
     std::shared_lock lock(m_mutex);
 
-    GuestAddress end = addr + size;
-    if (end < addr) end = ~GuestAddress(0);
+    GuestAddress end = 0;
+    if (!CheckedEnd(addr, size, end)) return false;
 
     GuestAddress current = addr;
     while (current < end) {
@@ -154,7 +207,7 @@ bool TaintTracker::IsTainted(GuestAddress addr, GuestSize size) const noexcept {
             }
         }
 
-        current = pageBase + kPageSize;
+        AdvanceToNextPage(current, pageBase, end);
     }
     return false;
 }
@@ -171,8 +224,8 @@ TaintSource TaintTracker::GetTaint(
     std::shared_lock lock(m_mutex);
 
     TaintSource result = TaintSource::None;
-    GuestAddress end = addr + size;
-    if (end < addr) end = ~GuestAddress(0);
+    GuestAddress end = 0;
+    if (!CheckedEnd(addr, size, end)) return TaintSource::None;
 
     GuestAddress current = addr;
     while (current < end) {
@@ -190,7 +243,7 @@ TaintSource TaintTracker::GetTaint(
             if (static_cast<uint8_t>(result) == 0x7F) return result;
         }
 
-        current = pageBase + kPageSize;
+        AdvanceToNextPage(current, pageBase, end);
     }
     return result;
 }
@@ -209,12 +262,12 @@ std::vector<TaintSource> TaintTracker::GetTaintMap(
     std::vector<TaintSource> map;
     try {
         map.resize(static_cast<size_t>(size), TaintSource::None);
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         return {};
     }
 
-    GuestAddress end = addr + size;
-    if (end < addr) return {};
+    GuestAddress end = 0;
+    if (!CheckedEnd(addr, size, end)) return {};
 
     size_t mapIndex = 0;
     GuestAddress current = addr;
@@ -232,7 +285,7 @@ std::vector<TaintSource> TaintTracker::GetTaintMap(
         // else: already TaintSource::None from resize
 
         mapIndex += remaining;
-        current = pageBase + kPageSize;
+        AdvanceToNextPage(current, pageBase, end);
     }
     return map;
 }
@@ -247,26 +300,30 @@ void TaintTracker::PropagateWrite(
     GuestSize size) noexcept
 {
     if (size == 0 || size > kMaxTaintMarkSize) return;
+    GuestAddress srcEnd = 0;
+    GuestAddress dstEnd = 0;
+    if (!CheckedEnd(src, size, srcEnd) || !CheckedEnd(dst, size, dstEnd)) {
+        std::unique_lock lock(m_mutex);
+        RecordDropLocked();
+        return;
+    }
 
     std::unique_lock lock(m_mutex);
 
     // First check if source has any taint at all (fast bail-out)
     bool anyTaint = false;
     {
-        GuestAddress end = src + size;
-        if (end < src) return;
         GuestAddress current = src;
-        while (current < end && !anyTaint) {
+        while (current < srcEnd && !anyTaint) {
             GuestAddress pageBase = PageBase(current);
             const ShadowPage* page = GetPage(pageBase);
             if (page) anyTaint = true;
-            current = pageBase + kPageSize;
+            AdvanceToNextPage(current, pageBase, srcEnd);
         }
     }
     if (!anyTaint) return;
 
     // Copy taint byte-by-byte across page boundaries
-    GuestAddress srcEnd = src + size;
     GuestSize offset = 0;
 
     while (offset < size) {
@@ -319,7 +376,7 @@ void TaintTracker::PropagateTag(
     TaintSource tag) noexcept
 {
     // Delegates to MarkTainted which handles page creation and caps
-    if (tag == TaintSource::None || size == 0) return;
+    if (!IsValidTaintMask(tag) || size == 0) return;
     // Note: lock is taken inside MarkTainted — but we're calling without
     // holding the lock here, so we must release and re-acquire.
     // Since this is just a convenience wrapper, call MarkTainted directly.
@@ -338,14 +395,17 @@ bool TaintTracker::CheckSink(
     uint64_t instrCount,
     uint16_t threadId) noexcept
 {
-    if (dataSize == 0) return false;
+    if (dataSize == 0 || dataSize > kMaxTaintMarkSize) return false;
 
     std::unique_lock lock(m_mutex);
 
     // Check taint without going through the public API (already locked)
     TaintSource sources = TaintSource::None;
-    GuestAddress end = dataAddr + dataSize;
-    if (end < dataAddr) end = ~GuestAddress(0);
+    GuestAddress end = 0;
+    if (!CheckedEnd(dataAddr, dataSize, end)) {
+        RecordDropLocked();
+        return false;
+    }
 
     GuestAddress current = dataAddr;
     while (current < end) {
@@ -361,7 +421,7 @@ bool TaintTracker::CheckSink(
             }
         }
 
-        current = pageBase + kPageSize;
+        AdvanceToNextPage(current, pageBase, end);
     }
 
     if (sources == TaintSource::None) return false;
@@ -375,7 +435,14 @@ bool TaintTracker::CheckSink(
         event.instructionCount = instrCount;
         event.threadId         = threadId;
         event.sinkType         = sinkType;
-        m_events.push_back(event);
+        try {
+            m_events.push_back(event);
+        } catch (const std::bad_alloc&) {
+            RecordDropLocked();
+            return false;
+        }
+    } else {
+        RecordDropLocked();
     }
 
     return true;
@@ -393,6 +460,11 @@ std::vector<TaintEvent> TaintTracker::GetTaintEvents() const {
 uint32_t TaintTracker::GetTaintEventCount() const noexcept {
     std::shared_lock lock(m_mutex);
     return static_cast<uint32_t>(m_events.size());
+}
+
+uint64_t TaintTracker::GetDroppedEventCount() const noexcept {
+    std::shared_lock lock(m_mutex);
+    return m_droppedEvents;
 }
 
 // ============================================================================
