@@ -57,7 +57,7 @@ enum class MemoryFinding : uint8_t {
 // ============================================================================
 
 struct MemoryFindingDetail {
-    MemoryFinding           type;
+    MemoryFinding           type          = MemoryFinding::ShellcodeNopSled;
     GuestAddress            address       = 0;
     GuestSize               size          = 0;
     float                   confidence    = 0.0f;   // 0.0–1.0
