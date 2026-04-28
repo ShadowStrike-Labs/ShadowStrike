@@ -58,7 +58,7 @@ struct WaitInfo {
     };
 
     WaitType type = WaitType::None;
-    uint32_t timeoutMs    = 0;           // 0 = infinite, UINT32_MAX = infinite
+    uint32_t timeoutMs    = 0;           // 0 = poll/no wait, UINT32_MAX = infinite
     uint64_t waitStartTick = 0;          // Global tick when wait began
     std::vector<uint32_t> waitHandles;   // Handle(s) being waited on
     bool waitAll = false;                // WaitForMultipleObjects fWaitAll
@@ -99,6 +99,10 @@ struct ThreadContext {
 
     // Thread-Local Storage (TLS) — 64 slots matching Windows TLS minimum
     static constexpr uint32_t kMaxTLSSlots = 64;
+    static constexpr size_t kMaxWaitHandles = 64;
+    static constexpr size_t kMaxAPCQueueDepth = 256;
+    static constexpr uint8_t kDefaultPriority = 8;
+    static constexpr uint32_t kDefaultQuantum = 2000;
     std::array<uint64_t, kMaxTLSSlots> tlsSlots{};
 
     // Asynchronous Procedure Call queue
@@ -110,9 +114,9 @@ struct ThreadContext {
     uint32_t exitCode             = 0;
 
     // Scheduling metadata
-    uint8_t  priority          = 8;     // Normal priority (Windows THREAD_PRIORITY_NORMAL)
+    uint8_t  priority          = kDefaultPriority; // Windows THREAD_PRIORITY_NORMAL
     uint64_t lastScheduledTick = 0;
-    uint32_t quantum           = 2000;  // Instructions per time slice
+    uint32_t quantum           = kDefaultQuantum;  // Instructions per time slice
 
     // ========================================================================
     // Helpers
@@ -135,7 +139,11 @@ struct ThreadContext {
     }
 
     void ClearWait() noexcept {
-        waitInfo = WaitInfo{};
+        waitInfo.type = WaitInfo::WaitType::None;
+        waitInfo.timeoutMs = 0;
+        waitInfo.waitStartTick = 0;
+        waitInfo.waitHandles.clear();
+        waitInfo.waitAll = false;
     }
 };
 
