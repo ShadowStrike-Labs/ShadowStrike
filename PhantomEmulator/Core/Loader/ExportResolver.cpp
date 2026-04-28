@@ -13,6 +13,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <shared_mutex>
 
 namespace Phantom {
 
@@ -21,6 +25,27 @@ namespace Phantom {
 // ============================================================================
 
 static constexpr uint32_t kMaxForwarderDepth = 8;
+
+static bool AddGuestAddress(GuestAddress base, uint32_t rva, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - base < static_cast<GuestAddress>(rva)) {
+        return false;
+    }
+    result = base + static_cast<GuestAddress>(rva);
+    return true;
+}
+
+static bool AddU32(uint32_t lhs, uint32_t rhs, uint32_t& result) noexcept {
+    if ((std::numeric_limits<uint32_t>::max)() - lhs < rhs) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+static bool IsSafeModuleNameChar(char c) noexcept {
+    const auto ch = static_cast<unsigned char>(c);
+    return ch > 0x20 && ch < 0x7F && c != '\\' && c != '/';
+}
 
 // ============================================================================
 // ASCII-only lowercase (no locale dependency, PE names are always ASCII)
@@ -35,38 +60,45 @@ static char ToLowerASCII(char c) noexcept {
 // ============================================================================
 
 std::string ExportResolver::NormalizeDLLName(std::string_view name) noexcept {
-    if (name.empty()) {
+    try {
+        if (name.empty()) {
+            return {};
+        }
+
+        // Strip any path components (backslash or forward slash)
+        const auto lastSep = name.find_last_of("\\/");
+        if (lastSep != std::string_view::npos) {
+            name = name.substr(lastSep + 1);
+        }
+
+        if (name.empty()) {
+            return {};
+        }
+
+        // Cap input length to prevent excessive allocation from hostile data
+        if (name.size() > PE::kMaxDLLNameLen) {
+            name = name.substr(0, PE::kMaxDLLNameLen);
+        }
+
+        std::string result;
+        result.reserve(name.size() + 4);
+
+        for (const char c : name) {
+            if (!IsSafeModuleNameChar(c)) {
+                return {};
+            }
+            result += ToLowerASCII(c);
+        }
+
+        // Ensure ".dll" extension if not present
+        if (result.size() < 4 || result.compare(result.size() - 4, 4, ".dll") != 0) {
+            result += ".dll";
+        }
+
+        return result;
+    } catch (const std::bad_alloc&) {
         return {};
     }
-
-    // Strip any path components (backslash or forward slash)
-    const auto lastSep = name.find_last_of("\\/");
-    if (lastSep != std::string_view::npos) {
-        name = name.substr(lastSep + 1);
-    }
-
-    if (name.empty()) {
-        return {};
-    }
-
-    // Cap input length to prevent excessive allocation from hostile data
-    if (name.size() > PE::kMaxDLLNameLen) {
-        name = name.substr(0, PE::kMaxDLLNameLen);
-    }
-
-    std::string result;
-    result.reserve(name.size() + 4);
-
-    for (const char c : name) {
-        result += ToLowerASCII(c);
-    }
-
-    // Ensure ".dll" extension if not present
-    if (result.size() < 4 || result.compare(result.size() - 4, 4, ".dll") != 0) {
-        result += ".dll";
-    }
-
-    return result;
 }
 
 // ============================================================================
@@ -86,6 +118,7 @@ ErrorCode ExportResolver::RegisterModule(
         return ErrorCode::MalformedPE;
     }
 
+    try {
     const auto normalName = NormalizeDLLName(moduleName);
     if (normalName.empty()) {
         return ErrorCode::MalformedPE;
@@ -104,19 +137,24 @@ ErrorCode ExportResolver::RegisterModule(
     // Prepare module entry (registered even if no exports — for GetModuleBase)
     ModuleExports modExports;
     modExports.imageBase     = imageBase;
-    modExports.canonicalName = std::string(moduleName);
+    modExports.canonicalName = normalName;
+
+    const auto storeModule = [this, &normalName](ModuleExports&& module) {
+        std::unique_lock lock(m_mutex);
+        m_modules.insert_or_assign(normalName, std::move(module));
+    };
 
     // ----------------------------------------------------------------
     // Locate export directory
     // ----------------------------------------------------------------
     if (pe.numberOfDataDirectories <= PE::kDirExport) {
-        m_modules[normalName] = std::move(modExports);
+        storeModule(std::move(modExports));
         return ErrorCode::Success;
     }
 
     const auto& exportDirEntry = pe.dataDirectories[PE::kDirExport];
     if (exportDirEntry.VirtualAddress == 0 || exportDirEntry.Size == 0) {
-        m_modules[normalName] = std::move(modExports);
+        storeModule(std::move(modExports));
         return ErrorCode::Success;
     }
 
@@ -155,7 +193,7 @@ ErrorCode ExportResolver::RegisterModule(
     }
 
     if (numFunctions == 0) {
-        m_modules[normalName] = std::move(modExports);
+        storeModule(std::move(modExports));
         return ErrorCode::Success;
     }
 
@@ -210,9 +248,10 @@ ErrorCode ExportResolver::RegisterModule(
     // is a pointer to a forwarder string, not actual code.
     // ----------------------------------------------------------------
     const uint32_t exportRVAStart = exportDirEntry.VirtualAddress;
-    const uint32_t exportRVAEnd   = exportDirEntry.VirtualAddress + exportDirEntry.Size;
-    // Guard against overflow in exportRVAEnd
-    const bool exportRangeValid = (exportRVAEnd >= exportRVAStart);
+    uint32_t exportRVAEnd = 0;
+    if (!AddU32(exportDirEntry.VirtualAddress, exportDirEntry.Size, exportRVAEnd)) {
+        return ErrorCode::MalformedPE;
+    }
 
     // Pre-allocate maps
     modExports.byOrdinal.reserve(numFunctions);
@@ -233,7 +272,10 @@ ErrorCode ExportResolver::RegisterModule(
         }
 
         // Compute ordinal, validate it fits in uint16_t
-        const uint32_t ordVal = i + expDir.Base;
+        uint32_t ordVal = 0;
+        if (!AddU32(i, expDir.Base, ordVal)) {
+            continue;
+        }
         if (ordVal > 0xFFFF) {
             continue; // Invalid ordinal — skip
         }
@@ -242,7 +284,7 @@ ErrorCode ExportResolver::RegisterModule(
         ExportEntry entry{};
 
         // Forwarded export: function RVA points within the export directory
-        if (exportRangeValid && funcRVA >= exportRVAStart && funcRVA < exportRVAEnd) {
+        if (funcRVA >= exportRVAStart && funcRVA < exportRVAEnd) {
             const auto fwdFO = PEParser::RVAToFileOffset(pe, funcRVA);
             if (fwdFO) {
                 entry.forwarder = PEParser::ReadString(
@@ -250,7 +292,9 @@ ErrorCode ExportResolver::RegisterModule(
             }
             entry.address = 0;
         } else {
-            entry.address = imageBase + static_cast<GuestAddress>(funcRVA);
+            if (!AddGuestAddress(imageBase, funcRVA, entry.address)) {
+                continue;
+            }
         }
 
         modExports.byOrdinal[ordinal] = entry;
@@ -297,7 +341,7 @@ ErrorCode ExportResolver::RegisterModule(
             continue; // Invalid function entry
         }
 
-        if (exportRangeValid && funcRVA >= exportRVAStart && funcRVA < exportRVAEnd) {
+        if (funcRVA >= exportRVAStart && funcRVA < exportRVAEnd) {
             const auto fwdFO = PEParser::RVAToFileOffset(pe, funcRVA);
             if (fwdFO) {
                 entry.forwarder = PEParser::ReadString(
@@ -305,7 +349,9 @@ ErrorCode ExportResolver::RegisterModule(
             }
             entry.address = 0;
         } else {
-            entry.address = imageBase + static_cast<GuestAddress>(funcRVA);
+            if (!AddGuestAddress(imageBase, funcRVA, entry.address)) {
+                continue;
+            }
         }
 
         modExports.byName[std::move(exportName)] = entry;
@@ -314,8 +360,11 @@ ErrorCode ExportResolver::RegisterModule(
     // ----------------------------------------------------------------
     // Store module (replaces existing registration if any)
     // ----------------------------------------------------------------
-    m_modules[normalName] = std::move(modExports);
+    storeModule(std::move(modExports));
     return ErrorCode::Success;
+    } catch (const std::bad_alloc&) {
+        return ErrorCode::OutOfMemory;
+    }
 }
 
 // ============================================================================
@@ -326,34 +375,43 @@ std::optional<GuestAddress> ExportResolver::ResolveByName(
     std::string_view dllName,
     std::string_view funcName) const noexcept
 {
-    if (dllName.empty() || funcName.empty()) {
+    try {
+        if (dllName.empty() || funcName.empty() || funcName.size() > PE::kMaxExportNameLen) {
+            return std::nullopt;
+        }
+
+        const auto normalName = NormalizeDLLName(dllName);
+        if (normalName.empty()) {
+            return std::nullopt;
+        }
+
+        std::shared_lock lock(m_mutex);
+        const auto modIt = m_modules.find(normalName);
+        if (modIt == m_modules.end()) {
+            return std::nullopt;
+        }
+
+        const auto& mod = modIt->second;
+        const auto it = mod.byName.find(std::string(funcName));
+        if (it == mod.byName.end()) {
+            return std::nullopt;
+        }
+
+        const auto& entry = it->second;
+
+        // Transparently resolve forwarded exports
+        if (!entry.forwarder.empty()) {
+            return ResolveForwarderInternal(entry.forwarder, 0);
+        }
+
+        if (entry.address == 0) {
+            return std::nullopt;
+        }
+
+        return entry.address;
+    } catch (const std::bad_alloc&) {
         return std::nullopt;
     }
-
-    const auto normalName = NormalizeDLLName(dllName);
-    const auto modIt = m_modules.find(normalName);
-    if (modIt == m_modules.end()) {
-        return std::nullopt;
-    }
-
-    const auto& mod = modIt->second;
-    const auto it = mod.byName.find(std::string(funcName));
-    if (it == mod.byName.end()) {
-        return std::nullopt;
-    }
-
-    const auto& entry = it->second;
-
-    // Transparently resolve forwarded exports
-    if (!entry.forwarder.empty()) {
-        return ResolveForwarderInternal(entry.forwarder, 0);
-    }
-
-    if (entry.address == 0) {
-        return std::nullopt;
-    }
-
-    return entry.address;
 }
 
 // ============================================================================
@@ -364,33 +422,42 @@ std::optional<GuestAddress> ExportResolver::ResolveByOrdinal(
     std::string_view dllName,
     uint16_t ordinal) const noexcept
 {
-    if (dllName.empty()) {
+    try {
+        if (dllName.empty()) {
+            return std::nullopt;
+        }
+
+        const auto normalName = NormalizeDLLName(dllName);
+        if (normalName.empty()) {
+            return std::nullopt;
+        }
+
+        std::shared_lock lock(m_mutex);
+        const auto modIt = m_modules.find(normalName);
+        if (modIt == m_modules.end()) {
+            return std::nullopt;
+        }
+
+        const auto& mod = modIt->second;
+        const auto it = mod.byOrdinal.find(ordinal);
+        if (it == mod.byOrdinal.end()) {
+            return std::nullopt;
+        }
+
+        const auto& entry = it->second;
+
+        if (!entry.forwarder.empty()) {
+            return ResolveForwarderInternal(entry.forwarder, 0);
+        }
+
+        if (entry.address == 0) {
+            return std::nullopt;
+        }
+
+        return entry.address;
+    } catch (const std::bad_alloc&) {
         return std::nullopt;
     }
-
-    const auto normalName = NormalizeDLLName(dllName);
-    const auto modIt = m_modules.find(normalName);
-    if (modIt == m_modules.end()) {
-        return std::nullopt;
-    }
-
-    const auto& mod = modIt->second;
-    const auto it = mod.byOrdinal.find(ordinal);
-    if (it == mod.byOrdinal.end()) {
-        return std::nullopt;
-    }
-
-    const auto& entry = it->second;
-
-    if (!entry.forwarder.empty()) {
-        return ResolveForwarderInternal(entry.forwarder, 0);
-    }
-
-    if (entry.address == 0) {
-        return std::nullopt;
-    }
-
-    return entry.address;
 }
 
 // ============================================================================
@@ -400,7 +467,12 @@ std::optional<GuestAddress> ExportResolver::ResolveByOrdinal(
 std::optional<GuestAddress> ExportResolver::ResolveForwarder(
     std::string_view forwarderString) const noexcept
 {
-    return ResolveForwarderInternal(forwarderString, 0);
+    try {
+        std::shared_lock lock(m_mutex);
+        return ResolveForwarderInternal(forwarderString, 0);
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -418,6 +490,7 @@ std::optional<GuestAddress> ExportResolver::ResolveForwarderInternal(
     std::string_view forwarderString,
     uint32_t depth) const noexcept
 {
+    try {
     if (depth >= kMaxForwarderDepth) {
         return std::nullopt;
     }
@@ -439,7 +512,7 @@ std::optional<GuestAddress> ExportResolver::ResolveForwarderInternal(
 
     const auto dllPart  = forwarderString.substr(0, dotPos);
     const auto funcPart = forwarderString.substr(dotPos + 1);
-    if (funcPart.empty()) {
+    if (funcPart.empty() || funcPart.size() > PE::kMaxExportNameLen) {
         return std::nullopt;
     }
 
@@ -470,11 +543,11 @@ std::optional<GuestAddress> ExportResolver::ResolveForwarderInternal(
             if (c < '0' || c > '9') {
                 return std::nullopt;
             }
-            const uint32_t next = ordVal * 10 + static_cast<uint32_t>(c - '0');
-            if (next < ordVal) {
-                return std::nullopt; // Overflow
+            const uint32_t digit = static_cast<uint32_t>(c - '0');
+            if (ordVal > ((std::numeric_limits<uint32_t>::max)() - digit) / 10U) {
+                return std::nullopt;
             }
-            ordVal = next;
+            ordVal = (ordVal * 10U) + digit;
         }
 
         if (ordVal > 0xFFFF) {
@@ -509,6 +582,9 @@ std::optional<GuestAddress> ExportResolver::ResolveForwarderInternal(
     }
 
     return entry.address != 0 ? std::optional(entry.address) : std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -518,17 +594,25 @@ std::optional<GuestAddress> ExportResolver::ResolveForwarderInternal(
 std::optional<GuestAddress> ExportResolver::GetModuleBase(
     std::string_view dllName) const noexcept
 {
-    if (dllName.empty()) {
+    try {
+        if (dllName.empty()) {
+            return std::nullopt;
+        }
+
+        const auto normalName = NormalizeDLLName(dllName);
+        if (normalName.empty()) {
+            return std::nullopt;
+        }
+        std::shared_lock lock(m_mutex);
+        const auto it = m_modules.find(normalName);
+        if (it == m_modules.end()) {
+            return std::nullopt;
+        }
+
+        return it->second.imageBase;
+    } catch (const std::bad_alloc&) {
         return std::nullopt;
     }
-
-    const auto normalName = NormalizeDLLName(dllName);
-    const auto it = m_modules.find(normalName);
-    if (it == m_modules.end()) {
-        return std::nullopt;
-    }
-
-    return it->second.imageBase;
 }
 
 // ============================================================================
@@ -536,12 +620,20 @@ std::optional<GuestAddress> ExportResolver::GetModuleBase(
 // ============================================================================
 
 bool ExportResolver::HasModule(std::string_view dllName) const noexcept {
-    if (dllName.empty()) {
+    try {
+        if (dllName.empty()) {
+            return false;
+        }
+
+        const auto normalName = NormalizeDLLName(dllName);
+        if (normalName.empty()) {
+            return false;
+        }
+        std::shared_lock lock(m_mutex);
+        return m_modules.find(normalName) != m_modules.end();
+    } catch (const std::bad_alloc&) {
         return false;
     }
-
-    const auto normalName = NormalizeDLLName(dllName);
-    return m_modules.find(normalName) != m_modules.end();
 }
 
 // ============================================================================
@@ -549,6 +641,7 @@ bool ExportResolver::HasModule(std::string_view dllName) const noexcept {
 // ============================================================================
 
 std::vector<std::string> ExportResolver::GetModuleNames() const {
+    std::shared_lock lock(m_mutex);
     std::vector<std::string> names;
     names.reserve(m_modules.size());
 
