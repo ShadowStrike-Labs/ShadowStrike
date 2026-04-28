@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <unordered_map>
 
 namespace Phantom {
@@ -248,7 +250,11 @@ struct WoW64Layer::Impl {
     GuestAddress gdtBase = WoW64Const::kGDTBase;
 
     Impl() noexcept {
-        gateEvents.reserve(256);
+        try {
+            gateEvents.reserve(256);
+            syscallMap.reserve(kDefaultSyscalls.size());
+        } catch (const std::bad_alloc&) {
+        }
     }
 };
 
@@ -269,12 +275,40 @@ static bool WideStartsWithCI(std::wstring_view str, std::wstring_view prefix) no
     return true;
 }
 
+[[nodiscard]] static std::wstring MakeWideCopy(std::wstring_view value) noexcept {
+    try {
+        return std::wstring(value);
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
+}
+
+static void IncrementSaturating(uint32_t& value) noexcept {
+    if (value < (std::numeric_limits<uint32_t>::max)()) {
+        ++value;
+    }
+}
+
+[[nodiscard]] static bool AddGuestAddress(GuestAddress base, GuestAddress offset, GuestAddress& out) noexcept {
+    if (offset > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
 WoW64Layer::WoW64Layer() noexcept
-    : m_impl(std::make_unique<Impl>()) {}
+    : m_impl(nullptr) {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    }
+}
 
 WoW64Layer::~WoW64Layer() noexcept = default;
 
@@ -303,92 +337,102 @@ WoW64Layer::~WoW64Layer() noexcept = default;
     info.wow64TransitionStub = WoW64Const::kTransitionStub;
     info.wow64SystemService  = WoW64Const::kSystemService;
 
+    auto fail = [&memory, &info, this]() noexcept {
+        static_cast<void>(memory.Free(info.teb32, WoW64Const::kTEB32_Size));
+        static_cast<void>(memory.Free(info.peb32, WoW64Const::kPEB32_Size));
+        static_cast<void>(memory.Free(m_impl->gdtBase, WoW64Const::kGDTSize));
+        static_cast<void>(memory.Free(info.wow64CpuDllBase, kPageSize));
+        static_cast<void>(memory.Free(info.wow64DllBase, kPageSize));
+        m_impl->syscallMap.clear();
+        return false;
+    };
+
     // Allocate and initialize TEB32 in guest memory
     auto teb32Region = memory.Allocate(
         info.teb32, WoW64Const::kTEB32_Size, MemProt::RW);
-    if (!teb32Region.has_value()) return false;
+    if (!teb32Region.has_value()) return fail();
 
     // Allocate and initialize PEB32 in guest memory
     auto peb32Region = memory.Allocate(
         info.peb32, WoW64Const::kPEB32_Size, MemProt::RW);
-    if (!peb32Region.has_value()) return false;
+    if (!peb32Region.has_value()) return fail();
 
     // --- Fill TEB32 with realistic values ---
     // NT_TIB32.ExceptionList = -1 (no SEH handler yet)
     const uint32_t sehSentinel = 0xFFFFFFFF;
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_SEH, sehSentinel) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // StackBase/StackLimit — use typical WoW64 32-bit stack location
     const uint32_t stackBase32  = 0x00B00000;
     const uint32_t stackLimit32 = 0x00A00000;
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_StackBase, stackBase32) != ErrorCode::Success)
-        return false;
+        return fail();
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_StackLimit, stackLimit32) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // Self pointer: FS:[0x18] = &TEB32
     const uint32_t teb32Lo = static_cast<uint32_t>(info.teb32);
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_Self, teb32Lo) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // ProcessId / ThreadId (realistic fake values)
     const uint32_t fakePid = 4728;
     const uint32_t fakeTid = 8812;
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_ProcessId, fakePid) != ErrorCode::Success)
-        return false;
+        return fail();
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_ThreadId, fakeTid) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // PEB pointer
     const uint32_t peb32Lo = static_cast<uint32_t>(info.peb32);
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_PEB, peb32Lo) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // LastErrorValue = 0
     if (memory.WriteU32(info.teb32 + WoW64Const::kTEB32_LastError, 0) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // --- Fill PEB32 with realistic values ---
     // BeingDebugged = 0 (anti-evasion)
     if (memory.WriteU8(info.peb32 + WoW64Const::kPEB32_BeingDebugged, 0) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // ImageBaseAddress — will be set later in SetupFor32BitPE
     if (memory.WriteU32(info.peb32 + WoW64Const::kPEB32_ImageBase,
                         static_cast<uint32_t>(WinConst::kDefaultImageBase32)) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // ProcessHeap
     const uint32_t heap32 = static_cast<uint32_t>(WinConst::kProcessHeapBase64);
     if (memory.WriteU32(info.peb32 + WoW64Const::kPEB32_ProcessHeap, heap32) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // NumberOfProcessors
     if (memory.WriteU32(info.peb32 + WoW64Const::kPEB32_NumberOfProc, 8) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // OS version: Windows 10.0.19045
     if (memory.WriteU32(info.peb32 + WoW64Const::kPEB32_OSMajorVersion, 10) != ErrorCode::Success)
-        return false;
+        return fail();
     if (memory.WriteU32(info.peb32 + WoW64Const::kPEB32_OSMinorVersion, 0) != ErrorCode::Success)
-        return false;
+        return fail();
     if (memory.WriteU32(info.peb32 + WoW64Const::kPEB32_OSBuildNumber, 19045) != ErrorCode::Success)
-        return false;
+        return fail();
 
     // Allocate minimal GDT region in guest memory
     auto gdtRegion = memory.Allocate(
         m_impl->gdtBase, WoW64Const::kGDTSize, MemProt::RW);
-    if (!gdtRegion.has_value()) return false;
+    if (!gdtRegion.has_value()) return fail();
 
     // Setup segment descriptors
-    if (!SetupSegmentDescriptors(memory, cpu)) return false;
+    if (!SetupSegmentDescriptors(memory, cpu)) return fail();
 
     // Allocate stub pages for WoW64 DLLs (minimal — just enough for transition detection)
     // wow64cpu.dll stub page containing the transition thunk
     auto cpuStubRegion = memory.Allocate(
-        info.wow64CpuDllBase, kPageSize, MemProt::RX);
-    if (!cpuStubRegion.has_value()) return false;
+        info.wow64CpuDllBase, kPageSize, MemProt::RW);
+    if (!cpuStubRegion.has_value()) return fail();
 
     // Write a recognizable pattern at the transition stub address.
     // Real wow64cpu!X86SwitchTo64BitMode does: jmp far [0x33:target]
@@ -403,12 +447,14 @@ WoW64Layer::~WoW64Layer() noexcept = default;
     };
     if (memory.Write(info.wow64TransitionStub, transitionStubCode,
                      static_cast<uint32_t>(sizeof(transitionStubCode))) != ErrorCode::Success)
-        return false;
+        return fail();
+    if (!memory.Protect(info.wow64CpuDllBase, kPageSize, MemProt::RX))
+        return fail();
 
     // wow64.dll stub page containing Wow64SystemServiceEx
     auto wow64StubRegion = memory.Allocate(
-        info.wow64DllBase, kPageSize, MemProt::RX);
-    if (!wow64StubRegion.has_value()) return false;
+        info.wow64DllBase, kPageSize, MemProt::RW);
+    if (!wow64StubRegion.has_value()) return fail();
 
     // Write a minimal stub at Wow64SystemServiceEx: INT 0x2E (syscall trap)
     const uint8_t sysServiceCode[] = {
@@ -418,18 +464,24 @@ WoW64Layer::~WoW64Layer() noexcept = default;
     };
     if (memory.Write(info.wow64SystemService, sysServiceCode,
                      static_cast<uint32_t>(sizeof(sysServiceCode))) != ErrorCode::Success)
-        return false;
+        return fail();
+    if (!memory.Protect(info.wow64DllBase, kPageSize, MemProt::RX))
+        return fail();
 
     // Load default syscall translation table
-    for (const auto& entry : kDefaultSyscalls) {
-        if (m_impl->syscallMap.size() >= WoW64Const::kMaxSyscallEntries) break;
-        SyscallTranslation t;
-        t.wow64Number       = entry.wow64Num;
-        t.nativeNumber      = entry.nativeNum;
-        t.paramCount32      = entry.params32;
-        t.paramCount64      = entry.params64;
-        t.needsPointerThunk = entry.ptrThunk;
-        m_impl->syscallMap[t.wow64Number] = t;
+    try {
+        for (const auto& entry : kDefaultSyscalls) {
+            if (m_impl->syscallMap.size() >= WoW64Const::kMaxSyscallEntries) break;
+            SyscallTranslation t;
+            t.wow64Number       = entry.wow64Num;
+            t.nativeNumber      = entry.nativeNum;
+            t.paramCount32      = entry.params32;
+            t.paramCount64      = entry.params64;
+            t.needsPointerThunk = entry.ptrThunk;
+            m_impl->syscallMap.insert_or_assign(t.wow64Number, t);
+        }
+    } catch (const std::bad_alloc&) {
+        return fail();
     }
 
     m_impl->initialized = true;
@@ -623,7 +675,7 @@ void WoW64Layer::SwitchTo32Bit(CPUState& cpu) noexcept {
     uint64_t rsp = cpu.RSP();
     cpu.SetReg32(GPR::RSP, static_cast<uint32_t>(rsp));
 
-    m_impl->transitionCount++;
+    IncrementSaturating(m_impl->transitionCount);
 }
 
 void WoW64Layer::SwitchTo64Bit(CPUState& cpu) noexcept {
@@ -641,7 +693,7 @@ void WoW64Layer::SwitchTo64Bit(CPUState& cpu) noexcept {
     // GS base points to TEB64
     cpu.SetSegmentBase(SegReg::GS, m_impl->processInfo.teb64);
 
-    m_impl->transitionCount++;
+    IncrementSaturating(m_impl->transitionCount);
 }
 
 // ============================================================================
@@ -689,7 +741,7 @@ void WoW64Layer::ProcessTransition(CPUState& cpu,
 
     // Record the event (bounded)
     if (m_impl->gateEvents.size() < WoW64Const::kMaxGateEvents) {
-        HeavensGateEvent event;
+        HeavensGateEvent event{};
         event.sourceRIP = cpu.GetRIP();
         event.targetRIP = targetRIP;
         event.direction = transition;
@@ -700,7 +752,10 @@ void WoW64Layer::ProcessTransition(CPUState& cpu,
             (transition == WoW64Transition::HeavensGate32to64 ||
              transition == WoW64Transition::HeavensGate64to32);
 
-        m_impl->gateEvents.push_back(event);
+        try {
+            m_impl->gateEvents.push_back(event);
+        } catch (const std::bad_alloc&) {
+        }
     }
 
     // Perform the actual mode switch
@@ -710,13 +765,13 @@ void WoW64Layer::ProcessTransition(CPUState& cpu,
         case WoW64Transition::TurboThunk:
             SwitchTo64Bit(cpu);
             cpu.SetRIP(targetRIP);
-            m_impl->heavensGateCount++;
+            IncrementSaturating(m_impl->heavensGateCount);
             break;
 
         case WoW64Transition::HeavensGate64to32:
             SwitchTo32Bit(cpu);
             cpu.SetRIP(targetRIP);
-            m_impl->heavensGateCount++;
+            IncrementSaturating(m_impl->heavensGateCount);
             break;
 
         case WoW64Transition::None:
@@ -747,7 +802,7 @@ WoW64Layer::GetHeavensGateEvents() const noexcept {
     if (it == m_impl->syscallMap.end()) {
         // Unknown syscall — pass the number through unchanged.
         // The emulator's syscall handler will deal with it.
-        m_impl->syscallThunkCount++;
+        IncrementSaturating(m_impl->syscallThunkCount);
         return true;
     }
 
@@ -765,9 +820,13 @@ WoW64Layer::GetHeavensGateEvents() const noexcept {
     std::array<uint64_t, 16> params{};
     for (uint8_t i = 0; i < paramCount; ++i) {
         uint32_t val32 = 0;
-        GuestAddress paramAddr = static_cast<GuestAddress>(esp) +
-                                 WoW64Const::kStackParamBase32 +
-                                 (static_cast<GuestAddress>(i) * 4);
+        GuestAddress paramAddr = 0;
+        if (!AddGuestAddress(static_cast<GuestAddress>(esp),
+                             WoW64Const::kStackParamBase32 +
+                                 (static_cast<GuestAddress>(i) * 4),
+                             paramAddr)) {
+            return false;
+        }
 
         // Validate the parameter address is in WoW64 range
         if (paramAddr >= WoW64Const::kWoW64AddressLimit) return false;
@@ -784,15 +843,6 @@ WoW64Layer::GetHeavensGateEvents() const noexcept {
     // Translate to 64-bit calling convention (Windows x64 ABI):
     //   RCX = param 1, RDX = param 2, R8 = param 3, R9 = param 4
     //   [RSP+0x28] = param 5, [RSP+0x30] = param 6, ...
-    // Set the native syscall number in EAX
-    cpu.SetReg64(GPR::RAX, static_cast<uint64_t>(trans.nativeNumber));
-
-    // Map first 4 params to registers
-    if (paramCount >= 1) cpu.SetReg64(GPR::RCX, params[0]);
-    if (paramCount >= 2) cpu.SetReg64(GPR::RDX, params[1]);
-    if (paramCount >= 3) cpu.SetReg64(GPR::R8,  params[2]);
-    if (paramCount >= 4) cpu.SetReg64(GPR::R9,  params[3]);
-
     // Remaining params go to the 64-bit stack shadow space.
     // We need to set up the 64-bit stack frame:
     //   RSP must have 32 bytes of shadow space + any additional params.
@@ -807,24 +857,40 @@ WoW64Layer::GetHeavensGateEvents() const noexcept {
         // Validate the new RSP won't wrap or go out of bounds
         if (newRsp > rsp64) return false; // underflow check
 
-        cpu.SetReg64(GPR::RSP, newRsp);
-
         // Write overflow parameters to the stack
         for (uint32_t i = 0; i < overflowCount; ++i) {
-            GuestAddress slotAddr = newRsp + 0x20 + (static_cast<GuestAddress>(i) * 8);
+            GuestAddress slotAddr = 0;
+            if (!AddGuestAddress(newRsp,
+                                 0x20 + (static_cast<GuestAddress>(i) * 8),
+                                 slotAddr)) {
+                return false;
+            }
             if (memory.WriteU64(slotAddr, params[4 + i]) != ErrorCode::Success)
                 return false;
         }
+
+        cpu.SetReg64(GPR::RSP, newRsp);
     }
 
-    m_impl->syscallThunkCount++;
+    // Commit register state only after all memory writes have succeeded.
+    cpu.SetReg64(GPR::RAX, static_cast<uint64_t>(trans.nativeNumber));
+    if (paramCount >= 1) cpu.SetReg64(GPR::RCX, params[0]);
+    if (paramCount >= 2) cpu.SetReg64(GPR::RDX, params[1]);
+    if (paramCount >= 3) cpu.SetReg64(GPR::R8,  params[2]);
+    if (paramCount >= 4) cpu.SetReg64(GPR::R9,  params[3]);
+
+    IncrementSaturating(m_impl->syscallThunkCount);
     return true;
 }
 
 void WoW64Layer::RegisterSyscallTranslation(const SyscallTranslation& entry) noexcept {
     if (!m_impl) return;
     if (m_impl->syscallMap.size() >= WoW64Const::kMaxSyscallEntries) return;
-    m_impl->syscallMap[entry.wow64Number] = entry;
+    if (entry.paramCount32 > 16 || entry.paramCount64 > 16) return;
+    try {
+        m_impl->syscallMap.insert_or_assign(entry.wow64Number, entry);
+    } catch (const std::bad_alloc&) {
+    }
 }
 
 // ============================================================================
@@ -873,8 +939,8 @@ void WoW64Layer::RegisterSyscallTranslation(const SyscallTranslation& entry) noe
 // ============================================================================
 
 [[nodiscard]] std::wstring WoW64Layer::RedirectPath(std::wstring_view path) const noexcept {
-    if (!m_impl) return std::wstring(path);
-    if (!m_impl->fsRedirectionEnabled) return std::wstring(path);
+    if (!m_impl) return MakeWideCopy(path);
+    if (!m_impl->fsRedirectionEnabled) return MakeWideCopy(path);
 
     // WoW64 redirects C:\Windows\System32\ → C:\Windows\SysWOW64\
     // Case-insensitive match
@@ -882,7 +948,7 @@ void WoW64Layer::RegisterSyscallTranslation(const SyscallTranslation& entry) noe
     static constexpr std::wstring_view kSystem32PrefixAlt = L"C:\\Windows\\system32\\";
 
     if (!WideStartsWithCI(path, kSystem32Prefix)) {
-        return std::wstring(path);
+        return MakeWideCopy(path);
     }
 
     // Extract the relative path after System32
@@ -894,17 +960,21 @@ void WoW64Layer::RegisterSyscallTranslation(const SyscallTranslation& entry) noe
             // Check that it's a directory boundary (next char is \ or end)
             if (relativePath.size() == exclusion.size() ||
                 relativePath[exclusion.size()] == L'\\') {
-                return std::wstring(path);
+                return MakeWideCopy(path);
             }
         }
     }
 
     // Perform the redirect
-    std::wstring result;
-    result.reserve(path.size() + 4); // SysWOW64 is slightly longer
-    result = L"C:\\Windows\\SysWOW64\\";
-    result.append(relativePath);
-    return result;
+    try {
+        std::wstring result;
+        result.reserve(path.size() + 4); // SysWOW64 is slightly longer
+        result = L"C:\\Windows\\SysWOW64\\";
+        result.append(relativePath);
+        return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 [[nodiscard]] bool WoW64Layer::IsFsRedirectionDisabled() const noexcept {
@@ -923,7 +993,7 @@ void WoW64Layer::SetFsRedirection(bool enabled) noexcept {
 
 [[nodiscard]] std::wstring WoW64Layer::RedirectRegistryKey(
     std::wstring_view keyPath) const noexcept {
-    if (!m_impl) return std::wstring(keyPath);
+    if (!m_impl) return MakeWideCopy(keyPath);
 
     // WoW64 redirects HKLM\Software\* → HKLM\Software\WOW6432Node\*
     // With specific exclusions.
@@ -931,7 +1001,7 @@ void WoW64Layer::SetFsRedirection(bool enabled) noexcept {
     static constexpr std::wstring_view kSoftwarePrefixAlt = L"HKLM\\SOFTWARE\\";
 
     if (!WideStartsWithCI(keyPath, kSoftwarePrefix)) {
-        return std::wstring(keyPath);
+        return MakeWideCopy(keyPath);
     }
 
     // Extract the relative path after "HKLM\Software\"
@@ -940,7 +1010,7 @@ void WoW64Layer::SetFsRedirection(bool enabled) noexcept {
     // Already redirected? Don't double-redirect.
     static constexpr std::wstring_view kWow6432Node = L"WOW6432Node\\";
     if (WideStartsWithCI(relativePath, kWow6432Node)) {
-        return std::wstring(keyPath);
+        return MakeWideCopy(keyPath);
     }
 
     // Check exclusions
@@ -948,18 +1018,22 @@ void WoW64Layer::SetFsRedirection(bool enabled) noexcept {
         if (WideStartsWithCI(relativePath, exclusion)) {
             if (relativePath.size() == exclusion.size() ||
                 relativePath[exclusion.size()] == L'\\') {
-                return std::wstring(keyPath);
+                return MakeWideCopy(keyPath);
             }
         }
     }
 
     // Perform the redirect: HKLM\Software\X → HKLM\Software\WOW6432Node\X
-    std::wstring result;
-    result.reserve(keyPath.size() + kWow6432Node.size());
-    result = kSoftwarePrefix;
-    result += kWow6432Node;
-    result.append(relativePath);
-    return result;
+    try {
+        std::wstring result;
+        result.reserve(keyPath.size() + kWow6432Node.size());
+        result = kSoftwarePrefix;
+        result += kWow6432Node;
+        result.append(relativePath);
+        return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
