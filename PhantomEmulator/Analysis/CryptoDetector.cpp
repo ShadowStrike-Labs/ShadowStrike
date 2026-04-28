@@ -15,6 +15,10 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <limits>
+#include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
@@ -336,8 +340,9 @@ namespace detail {
 
 consteval std::array<uint32_t, 256> GenerateCrc32Table() noexcept {
     std::array<uint32_t, 256> table{};
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
+    uint32_t tableIndex = 0;
+    for (auto& slot : table) {
+        uint32_t crc = tableIndex++;
         for (uint32_t j = 0; j < 8; ++j) {
             if (crc & 1) {
                 crc = (crc >> 1) ^ 0xEDB88320u;
@@ -345,7 +350,7 @@ consteval std::array<uint32_t, 256> GenerateCrc32Table() noexcept {
                 crc >>= 1;
             }
         }
-        table[i] = crc;
+        slot = crc;
     }
     return table;
 }
@@ -651,6 +656,42 @@ static constexpr size_t kCryptoApiCount = sizeof(kCryptoApis) / sizeof(kCryptoAp
            (static_cast<uint32_t>(p[3]));
 }
 
+[[nodiscard]] bool AddGuestOffset(
+    GuestAddress base, size_t offset, GuestAddress& out) noexcept
+{
+    if (offset > static_cast<size_t>(std::numeric_limits<GuestAddress>::max() - base)) {
+        return false;
+    }
+    out = base + static_cast<GuestAddress>(offset);
+    return true;
+}
+
+[[nodiscard]] GuestAddress SaturatingGuestAddress(
+    GuestAddress base, size_t offset) noexcept
+{
+    GuestAddress out = 0;
+    if (!AddGuestOffset(base, offset, out)) {
+        return std::numeric_limits<GuestAddress>::max();
+    }
+    return out;
+}
+
+[[nodiscard]] bool RangesOverlap(
+    GuestAddress aBase, GuestSize aSize,
+    GuestAddress bBase, GuestSize bSize) noexcept
+{
+    if (aSize == 0 || bSize == 0) {
+        return false;
+    }
+    GuestAddress aEnd = 0;
+    GuestAddress bEnd = 0;
+    if (!AddGuestOffset(aBase, static_cast<size_t>(aSize), aEnd) ||
+        !AddGuestOffset(bBase, static_cast<size_t>(bSize), bEnd)) {
+        return false;
+    }
+    return aBase < bEnd && bBase < aEnd;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -675,7 +716,7 @@ struct CryptoDetector::Impl {
     // State
     // -----------------------------------------------------------------------
 
-    const EmulationConfig& config;
+    EmulationConfig config;
 
     std::vector<CryptoFinding>                    findings;
     std::unordered_map<GuestAddress, XorOpRecord> xorRecords;
@@ -684,6 +725,8 @@ struct CryptoDetector::Impl {
 
     bool hasNetworkActivity = false;
     uint32_t cryptGenRandomCount = 0;  // Tracks CryptGenRandom/BCryptGenRandom calls
+    bool ransomwarePatternEmitted = false;
+    uint64_t droppedEvents = 0;
 
     mutable std::shared_mutex mutex;
 
@@ -694,8 +737,14 @@ struct CryptoDetector::Impl {
     explicit Impl(const EmulationConfig& cfg) noexcept
         : config(cfg)
     {
-        findings.reserve(256);
-        apiCallsSeen.reserve(64);
+        try {
+            findings.reserve(256);
+            apiCallsSeen.reserve(64);
+            flaggedAddresses.reserve(256);
+            xorRecords.reserve(64);
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -704,8 +753,13 @@ struct CryptoDetector::Impl {
 
     bool AddFinding(CryptoFinding&& f) noexcept {
         if (findings.size() >= kMaxFindings) return false;
-        findings.push_back(std::move(f));
-        return true;
+        try {
+            findings.push_back(std::move(f));
+            return true;
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            return false;
+        }
     }
 
     bool IsAlreadyFlagged(GuestAddress addr) const noexcept {
@@ -714,7 +768,26 @@ struct CryptoDetector::Impl {
 
     void MarkFlagged(GuestAddress addr) noexcept {
         if (flaggedAddresses.size() < kMaxFlaggedAddresses) {
-            flaggedAddresses.insert(addr);
+            try {
+                flaggedAddresses.insert(addr);
+            } catch (const std::bad_alloc&) {
+                RecordDrop();
+            }
+        }
+    }
+
+    void RecordDrop() noexcept {
+        if (droppedEvents != std::numeric_limits<uint64_t>::max()) {
+            ++droppedEvents;
+        }
+    }
+
+    template <typename Fn>
+    void RunScanner(Fn&& fn) noexcept {
+        try {
+            fn();
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
         }
     }
 
@@ -726,36 +799,36 @@ struct CryptoDetector::Impl {
         if (!data || len == 0) return;
         if (len > kMaxScanRegionSize) len = static_cast<size_t>(kMaxScanRegionSize);
 
-        ScanForAesSbox(data, len, base);
-        ScanForAesInvSbox(data, len, base);
-        ScanForRC4KSA(data, len, base);
-        ScanForDESTables(data, len, base);
-        ScanForSha256Constants(data, len, base);
-        ScanForSha1Constants(data, len, base);
-        ScanForMd5Constants(data, len, base);
-        ScanForChaCha20Salsa20(data, len, base);
-        ScanForCrc32Table(data, len, base);
-        ScanForBlowfish(data, len, base);
-        ScanForRSAHeaders(data, len, base);
-        ScanForTwofish(data, len, base);
-        ScanForSerpent(data, len, base);
-        ScanForECCConstants(data, len, base);
-        ScanForEncodingTables(data, len, base);
-        ScanForAPIHashes(data, len, base);
-        ScanForObfuscationPatterns(data, len, base);
-        ScanForCustomCrypto(data, len, base);
+        RunScanner([&] { ScanForAesSbox(data, len, base); });
+        RunScanner([&] { ScanForAesInvSbox(data, len, base); });
+        RunScanner([&] { ScanForRC4KSA(data, len, base); });
+        RunScanner([&] { ScanForDESTables(data, len, base); });
+        RunScanner([&] { ScanForSha256Constants(data, len, base); });
+        RunScanner([&] { ScanForSha1Constants(data, len, base); });
+        RunScanner([&] { ScanForMd5Constants(data, len, base); });
+        RunScanner([&] { ScanForChaCha20Salsa20(data, len, base); });
+        RunScanner([&] { ScanForCrc32Table(data, len, base); });
+        RunScanner([&] { ScanForBlowfish(data, len, base); });
+        RunScanner([&] { ScanForRSAHeaders(data, len, base); });
+        RunScanner([&] { ScanForTwofish(data, len, base); });
+        RunScanner([&] { ScanForSerpent(data, len, base); });
+        RunScanner([&] { ScanForECCConstants(data, len, base); });
+        RunScanner([&] { ScanForEncodingTables(data, len, base); });
+        RunScanner([&] { ScanForAPIHashes(data, len, base); });
+        RunScanner([&] { ScanForObfuscationPatterns(data, len, base); });
+        RunScanner([&] { ScanForCustomCrypto(data, len, base); });
     }
 
     // -----------------------------------------------------------------------
     // 1. AES S-box detection
     // -----------------------------------------------------------------------
 
-    void ScanForAesSbox(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForAesSbox(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 256) return;
 
         const size_t searchEnd = len - 256;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // Check for exact contiguous match
@@ -794,12 +867,12 @@ struct CryptoDetector::Impl {
     // 2. AES Inverse S-box detection
     // -----------------------------------------------------------------------
 
-    void ScanForAesInvSbox(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForAesInvSbox(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 256) return;
 
         const size_t searchEnd = len - 256;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kAesInvSbox.data(), 256) == 0) {
@@ -856,13 +929,13 @@ struct CryptoDetector::Impl {
     // 3. RC4 KSA detection — 256-byte permutation of 0..255
     // -----------------------------------------------------------------------
 
-    void ScanForRC4KSA(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForRC4KSA(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 256) return;
 
         // Skip if it's an exact AES S-box (already flagged)
         const size_t searchEnd = len - 256;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (IsPermutationOf0To255(data + i)) {
@@ -907,17 +980,17 @@ struct CryptoDetector::Impl {
     // 4. DES table detection
     // -----------------------------------------------------------------------
 
-    void ScanForDESTables(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForDESTables(const uint8_t* data, size_t len, GuestAddress base) {
         ScanForDesIPTable(data, len, base);
         ScanForDesFPTable(data, len, base);
         ScanForDesSboxes(data, len, base);
     }
 
-    void ScanForDesIPTable(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForDesIPTable(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 64) return;
         const size_t searchEnd = len - 64;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kDesIP.data(), 64) == 0) {
@@ -935,11 +1008,11 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForDesFPTable(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForDesFPTable(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 64) return;
         const size_t searchEnd = len - 64;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kDesFP.data(), 64) == 0) {
@@ -957,14 +1030,14 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForDesSboxes(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForDesSboxes(const uint8_t* data, size_t len, GuestAddress base) {
         // Each DES S-box is 64 bytes. Scan for each independently.
         if (len < 64) return;
         const size_t searchEnd = len - 64;
 
         for (uint32_t sboxIdx = 0; sboxIdx < 8; ++sboxIdx) {
             for (size_t i = 0; i <= searchEnd; ++i) {
-                const GuestAddress addr = base + static_cast<GuestAddress>(i);
+                const GuestAddress addr = SaturatingGuestAddress(base, i);
                 if (IsAlreadyFlagged(addr)) continue;
 
                 if (std::memcmp(data + i, kDesSboxes[sboxIdx].data(), 64) == 0) {
@@ -982,7 +1055,7 @@ struct CryptoDetector::Impl {
                         if (std::memcmp(data + nextOffset,
                                         kDesSboxes[nextBox].data(), 64) == 0) {
                             ++consecutiveBoxes;
-                            MarkFlagged(base + static_cast<GuestAddress>(nextOffset));
+                            MarkFlagged(SaturatingGuestAddress(base, nextOffset));
                             nextOffset += 64;
                             ++nextBox;
                         } else {
@@ -1022,7 +1095,7 @@ struct CryptoDetector::Impl {
     // 5. SHA-256 constant detection
     // -----------------------------------------------------------------------
 
-    void ScanForSha256Constants(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForSha256Constants(const uint8_t* data, size_t len, GuestAddress base) {
         // Scan for H0..H7 init values (32 bytes as uint32_t)
         ScanForU32Array(data, len, base,
                         kSha256Init.data(), kSha256Init.size(),
@@ -1042,7 +1115,7 @@ struct CryptoDetector::Impl {
     // 6. SHA-1 constant detection
     // -----------------------------------------------------------------------
 
-    void ScanForSha1Constants(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForSha1Constants(const uint8_t* data, size_t len, GuestAddress base) {
         ScanForU32Array(data, len, base,
                         kSha1Init.data(), kSha1Init.size(),
                         CryptoAlgorithm::SHA1,
@@ -1054,7 +1127,7 @@ struct CryptoDetector::Impl {
     // 7. MD5 constant detection
     // -----------------------------------------------------------------------
 
-    void ScanForMd5Constants(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForMd5Constants(const uint8_t* data, size_t len, GuestAddress base) {
         // MD5 init values overlap with SHA-1 init values for the first 4,
         // so we need to be careful. The MD5 T table is unique.
         ScanForU32Array(data, len, base,
@@ -1079,7 +1152,7 @@ struct CryptoDetector::Impl {
         const uint8_t* data, size_t len, GuestAddress base,
         const uint32_t* refValues, size_t refCount,
         CryptoAlgorithm algo, const char* description,
-        bool isEncryption) noexcept
+        bool isEncryption)
     {
         const size_t byteLen = refCount * sizeof(uint32_t);
         if (len < byteLen) return;
@@ -1099,7 +1172,7 @@ struct CryptoDetector::Impl {
 
         // Scan for little-endian match
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, refLE.data(), byteLen) == 0) {
@@ -1118,7 +1191,7 @@ struct CryptoDetector::Impl {
 
         // Scan for big-endian match
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, refBE.data(), byteLen) == 0) {
@@ -1161,12 +1234,12 @@ struct CryptoDetector::Impl {
     // 8. ChaCha20 / Salsa20 detection
     // -----------------------------------------------------------------------
 
-    void ScanForChaCha20Salsa20(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForChaCha20Salsa20(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 16) return;
 
         const size_t searchEnd = len - 16;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // "expand 32-byte k"
@@ -1207,7 +1280,7 @@ struct CryptoDetector::Impl {
     // 9. CRC32 table detection
     // -----------------------------------------------------------------------
 
-    void ScanForCrc32Table(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForCrc32Table(const uint8_t* data, size_t len, GuestAddress base) {
         // We need at least 32 consecutive CRC32 table entries (32 × 4 = 128 bytes)
         static constexpr size_t kMinCrc32Entries = 32;
         static constexpr size_t kMinCrc32Bytes   = kMinCrc32Entries * sizeof(uint32_t);
@@ -1216,7 +1289,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - kMinCrc32Bytes;
         for (size_t i = 0; i <= searchEnd; i += 4) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // Check for consecutive CRC32 entries in LE order (native x86)
@@ -1283,7 +1356,7 @@ struct CryptoDetector::Impl {
     // 10. Blowfish P-array + S-box detection (enhanced)
     // -----------------------------------------------------------------------
 
-    void ScanForBlowfish(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForBlowfish(const uint8_t* data, size_t len, GuestAddress base) {
         // Phase 1: Scan for full 18-entry P-array (72 bytes) — high confidence
         static constexpr size_t kFullPBytes = kBlowfishPFull.size() * sizeof(uint32_t);
         if (len >= kFullPBytes) {
@@ -1303,7 +1376,7 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForBlowfishPFull(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForBlowfishPFull(const uint8_t* data, size_t len, GuestAddress base) {
         static constexpr size_t kBytes = kBlowfishPFull.size() * sizeof(uint32_t);
 
         std::array<uint8_t, kBytes> refLE{};
@@ -1317,7 +1390,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - kBytes;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             bool matchLE = (std::memcmp(data + i, refLE.data(), kBytes) == 0);
@@ -1342,7 +1415,7 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForBlowfishPHead(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForBlowfishPHead(const uint8_t* data, size_t len, GuestAddress base) {
         static constexpr size_t kBytes = kBlowfishPInit.size() * sizeof(uint32_t);
 
         std::array<uint8_t, kBytes> refLE{};
@@ -1356,7 +1429,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - kBytes;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             bool matchLE = (std::memcmp(data + i, refLE.data(), kBytes) == 0);
@@ -1379,7 +1452,7 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForBlowfishSBox(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForBlowfishSBox(const uint8_t* data, size_t len, GuestAddress base) {
         static constexpr size_t kBytes = kBlowfishS0Head.size() * sizeof(uint32_t);
 
         std::array<uint8_t, kBytes> refLE{};
@@ -1393,7 +1466,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - kBytes;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             bool matchLE = (std::memcmp(data + i, refLE.data(), kBytes) == 0);
@@ -1419,12 +1492,12 @@ struct CryptoDetector::Impl {
     // 11. RSA ASN.1 header detection
     // -----------------------------------------------------------------------
 
-    void ScanForRSAHeaders(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForRSAHeaders(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 16) return;
 
         const size_t searchEnd = len - 16;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // Pattern 1: SEQUENCE (0x30 0x82) followed by rsaEncryption OID
@@ -1498,18 +1571,18 @@ struct CryptoDetector::Impl {
     // 12. Twofish detection
     // -----------------------------------------------------------------------
 
-    void ScanForTwofish(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForTwofish(const uint8_t* data, size_t len, GuestAddress base) {
         ScanForTwofishQTables(data, len, base);
         ScanForTwofishMDS(data, len, base);
         ScanForTwofishRS(data, len, base);
     }
 
-    void ScanForTwofishQTables(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForTwofishQTables(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kTwofishQ0Head.size()) return;
 
         const size_t searchEnd = len - kTwofishQ0Head.size();
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kTwofishQ0Head.data(), kTwofishQ0Head.size()) == 0) {
@@ -1544,12 +1617,12 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForTwofishMDS(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForTwofishMDS(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kTwofishMDS.size()) return;
 
         const size_t searchEnd = len - kTwofishMDS.size();
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kTwofishMDS.data(), kTwofishMDS.size()) == 0) {
@@ -1567,12 +1640,12 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForTwofishRS(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForTwofishRS(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kTwofishRS.size()) return;
 
         const size_t searchEnd = len - kTwofishRS.size();
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kTwofishRS.data(), kTwofishRS.size()) == 0) {
@@ -1595,12 +1668,12 @@ struct CryptoDetector::Impl {
     // 13. Serpent detection
     // -----------------------------------------------------------------------
 
-    void ScanForSerpent(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForSerpent(const uint8_t* data, size_t len, GuestAddress base) {
         ScanForSerpentSboxes(data, len, base);
         ScanForSerpentPhi(data, len, base);
     }
 
-    void ScanForSerpentSboxes(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForSerpentSboxes(const uint8_t* data, size_t len, GuestAddress base) {
         // Each Serpent S-box is 16 bytes (values 0–15). Require at least 4
         // consecutive S-boxes (64 bytes) to avoid false positives on small nibble tables.
         static constexpr size_t kSingleSboxLen = 16;
@@ -1610,7 +1683,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - kSingleSboxLen;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // Try to match the first S-box at this offset
@@ -1654,7 +1727,7 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForSerpentPhi(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForSerpentPhi(const uint8_t* data, size_t len, GuestAddress base) {
         // Serpent uses phi = 0x9E3779B9 as a round constant in key schedule.
         // This constant is also used by TEA/XTEA, so we flag with moderate confidence.
         if (len < 4) return;
@@ -1670,7 +1743,7 @@ struct CryptoDetector::Impl {
             const uint32_t val = ReadU32LE(data + i);
             if (val == phiLE || val == phiBE) {
                 if (phiCount == 0) {
-                    firstAddr = base + static_cast<GuestAddress>(i);
+                    firstAddr = SaturatingGuestAddress(base, i);
                 }
                 ++phiCount;
             }
@@ -1697,7 +1770,7 @@ struct CryptoDetector::Impl {
     // 14. Elliptic Curve (ECDSA/ECDH) constant detection
     // -----------------------------------------------------------------------
 
-    void ScanForECCConstants(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForECCConstants(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < 32) return;
 
         struct ECCConstant {
@@ -1722,7 +1795,7 @@ struct CryptoDetector::Impl {
             const size_t searchEnd = len - ecc.size;
 
             for (size_t i = 0; i <= searchEnd; ++i) {
-                const GuestAddress addr = base + static_cast<GuestAddress>(i);
+                const GuestAddress addr = SaturatingGuestAddress(base, i);
                 if (IsAlreadyFlagged(addr)) continue;
 
                 if (std::memcmp(data + i, ecc.data, ecc.size) == 0) {
@@ -1748,18 +1821,18 @@ struct CryptoDetector::Impl {
     // 15. Base64 / Base32 / Hex encoding table detection
     // -----------------------------------------------------------------------
 
-    void ScanForEncodingTables(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForEncodingTables(const uint8_t* data, size_t len, GuestAddress base) {
         ScanForBase64Table(data, len, base);
         ScanForBase32Table(data, len, base);
         ScanForHexTable(data, len, base);
     }
 
-    void ScanForBase64Table(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForBase64Table(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kBase64Alphabet.size()) return;
 
         const size_t searchEnd = len - kBase64Alphabet.size();
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // Standard Base64 alphabet match
@@ -1823,12 +1896,12 @@ struct CryptoDetector::Impl {
         return uniqueCount == 64 && hasUpper && hasLower && hasDigit;
     }
 
-    void ScanForBase32Table(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForBase32Table(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kBase32Alphabet.size()) return;
 
         const size_t searchEnd = len - kBase32Alphabet.size();
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             if (std::memcmp(data + i, kBase32Alphabet.data(),
@@ -1847,12 +1920,12 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForHexTable(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForHexTable(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kHexAlphabetLower.size()) return;
 
         const size_t searchEnd = len - kHexAlphabetLower.size();
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             bool matchLower = (std::memcmp(data + i, kHexAlphabetLower.data(),
@@ -1881,7 +1954,7 @@ struct CryptoDetector::Impl {
     // 16. API hash constant detection
     // -----------------------------------------------------------------------
 
-    void ScanForAPIHashes(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForAPIHashes(const uint8_t* data, size_t len, GuestAddress base) {
         // Scan for known API hash constants in memory. Shellcode and packers
         // embed these as immediate operands or in lookup tables.
         // Require a cluster of 2+ known hashes within 256 bytes to reduce FP.
@@ -1913,7 +1986,7 @@ struct CryptoDetector::Impl {
 
         // Cluster hits: find groups within 256-byte windows
         for (size_t h = 0; h < hits.size(); ++h) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(hits[h].offset);
+            const GuestAddress addr = SaturatingGuestAddress(base, hits[h].offset);
             if (IsAlreadyFlagged(addr)) continue;
 
             uint32_t clusterCount = 1;
@@ -1960,13 +2033,13 @@ struct CryptoDetector::Impl {
     // 17. Code obfuscation pattern detection
     // -----------------------------------------------------------------------
 
-    void ScanForObfuscationPatterns(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForObfuscationPatterns(const uint8_t* data, size_t len, GuestAddress base) {
         ScanForNOPSleds(data, len, base);
         ScanForStackStrings(data, len, base);
         ScanForJunkCodePatterns(data, len, base);
     }
 
-    void ScanForNOPSleds(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForNOPSleds(const uint8_t* data, size_t len, GuestAddress base) {
         // Detect NOP sleds: 32+ consecutive 0x90 bytes
         static constexpr size_t kMinNOPSled = 32;
         if (len < kMinNOPSled) return;
@@ -1985,7 +2058,7 @@ struct CryptoDetector::Impl {
                 ++runLen;
             } else {
                 if (inRun && runLen >= kMinNOPSled) {
-                    const GuestAddress addr = base + static_cast<GuestAddress>(runStart);
+                    const GuestAddress addr = SaturatingGuestAddress(base, runStart);
                     if (!IsAlreadyFlagged(addr)) {
                         MarkFlagged(addr);
                         CryptoFinding f;
@@ -2007,7 +2080,7 @@ struct CryptoDetector::Impl {
 
         // Handle run at end of buffer
         if (inRun && runLen >= kMinNOPSled) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(runStart);
+            const GuestAddress addr = SaturatingGuestAddress(base, runStart);
             if (!IsAlreadyFlagged(addr)) {
                 MarkFlagged(addr);
                 CryptoFinding f;
@@ -2024,7 +2097,7 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForStackStrings(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForStackStrings(const uint8_t* data, size_t len, GuestAddress base) {
         // Detect stack string construction:
         // Sequences of MOV [RSP+disp8], imm8 (opcode: C6 44 24 XX YY)
         // or MOV [RBP-disp8], imm8 (opcode: C6 45 XX YY)
@@ -2037,7 +2110,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - kWindowSize;
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             uint32_t stackMoveCount = 0;
@@ -2084,7 +2157,7 @@ struct CryptoDetector::Impl {
         }
     }
 
-    void ScanForJunkCodePatterns(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForJunkCodePatterns(const uint8_t* data, size_t len, GuestAddress base) {
         // Detect junk code insertion patterns:
         // 1. PUSH reg / POP same reg sequences (4+ consecutive pairs)
         // 2. MOV reg, reg (self-move) sequences
@@ -2093,7 +2166,7 @@ struct CryptoDetector::Impl {
 
         const size_t searchEnd = len - (kMinJunkPairs * 2);
         for (size_t i = 0; i <= searchEnd; ++i) {
-            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            const GuestAddress addr = SaturatingGuestAddress(base, i);
             if (IsAlreadyFlagged(addr)) continue;
 
             // Pattern 1: PUSH reg (50-57) followed by POP same reg (58-5F)
@@ -2177,7 +2250,7 @@ struct CryptoDetector::Impl {
     // 18. Custom crypto heuristic (high entropy, unknown algorithm)
     // -----------------------------------------------------------------------
 
-    void ScanForCustomCrypto(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+    void ScanForCustomCrypto(const uint8_t* data, size_t len, GuestAddress base) {
         if (len < kMinCustomCryptoSize) return;
 
         // Scan in 1 KB blocks for high-entropy regions not matching known algorithms
@@ -2186,14 +2259,14 @@ struct CryptoDetector::Impl {
 
         for (size_t blk = 0; blk < blockCount; ++blk) {
             const size_t offset = blk * kBlockSize;
-            const GuestAddress addr = base + static_cast<GuestAddress>(offset);
+            const GuestAddress addr = SaturatingGuestAddress(base, offset);
 
             if (IsAlreadyFlagged(addr)) continue;
 
             // Check if any finding already covers this address
             bool alreadyCovered = false;
             for (const auto& f : findings) {
-                if (addr >= f.address && addr < f.address + f.size) {
+                if (RangesOverlap(addr, 1, f.address, f.size)) {
                     alreadyCovered = true;
                     break;
                 }
@@ -2272,7 +2345,7 @@ struct CryptoDetector::Impl {
         return chiSquared < 400.0;
     }
 
-    [[nodiscard]] static std::string FormatFloat(double val) noexcept {
+    [[nodiscard]] static std::string FormatFloat(double val) {
         // Format to 2 decimal places without <format> header
         char buf[32];
         int written = std::snprintf(buf, sizeof(buf), "%.2f", val);
@@ -2288,7 +2361,7 @@ struct CryptoDetector::Impl {
 
     void ProcessXorOperation(
         GuestAddress rip, uint8_t key,
-        GuestAddress dataAddr, uint32_t size) noexcept
+        GuestAddress dataAddr, uint32_t size)
     {
         if (key == 0) return; // XOR with 0 is a NOP (register zeroing)
 
@@ -2309,7 +2382,9 @@ struct CryptoDetector::Impl {
             rec.lastOpSize   = size;
         }
 
-        ++rec.hitCount;
+        if (rec.hitCount != std::numeric_limits<uint32_t>::max()) {
+            ++rec.hitCount;
+        }
 
         // Check for key change (multi-byte XOR pattern)
         const bool keyChanged = (rec.key != key);
@@ -2330,25 +2405,44 @@ struct CryptoDetector::Impl {
 
     [[nodiscard]] bool IsSequentialXorRange(const XorOpRecord& rec) const noexcept {
         if (rec.firstDataAddr == 0 || rec.lastDataAddr == 0) return false;
+        if (rec.lastOpSize == 0) return false;
+        if (rec.hitCount >
+            (std::numeric_limits<GuestAddress>::max() / rec.lastOpSize)) {
+            return false;
+        }
         // The range should be roughly hitCount * opSize
         const GuestAddress expectedRange =
             static_cast<GuestAddress>(rec.hitCount) * rec.lastOpSize;
-        const GuestAddress actualRange =
+        if (expectedRange >
+            (std::numeric_limits<GuestAddress>::max() / 2)) {
+            return false;
+        }
+        const GuestAddress delta =
             (rec.lastDataAddr > rec.firstDataAddr)
-                ? (rec.lastDataAddr - rec.firstDataAddr + rec.lastOpSize)
-                : (rec.firstDataAddr - rec.lastDataAddr + rec.lastOpSize);
+                ? (rec.lastDataAddr - rec.firstDataAddr)
+                : (rec.firstDataAddr - rec.lastDataAddr);
+        if (delta > std::numeric_limits<GuestAddress>::max() - rec.lastOpSize) {
+            return false;
+        }
+        const GuestAddress actualRange =
+            delta + rec.lastOpSize;
         // Allow 50% tolerance for non-contiguous access patterns
         return actualRange <= expectedRange * 2;
     }
 
     void CheckAndEmitXorFinding(
-        GuestAddress rip, const XorOpRecord& rec, bool isMultiKey) noexcept
+        GuestAddress rip, const XorOpRecord& rec, bool isMultiKey)
     {
         if (IsAlreadyFlagged(rip)) return;
         MarkFlagged(rip);
 
         const GuestAddress rangeStart = std::min(rec.firstDataAddr, rec.lastDataAddr);
-        const GuestAddress rangeEnd   = std::max(rec.firstDataAddr, rec.lastDataAddr) + rec.lastOpSize;
+        const GuestAddress rangeMax   = std::max(rec.firstDataAddr, rec.lastDataAddr);
+        GuestAddress rangeEnd = rangeStart;
+        if (!AddGuestOffset(rangeMax, rec.lastOpSize, rangeEnd) || rangeEnd < rangeStart) {
+            RecordDrop();
+            return;
+        }
 
         CryptoFinding f;
         f.address      = rangeStart;
@@ -2385,7 +2479,7 @@ struct CryptoDetector::Impl {
     // -----------------------------------------------------------------------
 
     void ProcessCryptoAPICall(
-        const char* funcName, const uint64_t* args) noexcept
+        const char* funcName, const uint64_t* args)
     {
         if (!funcName) return;
 
@@ -2407,6 +2501,32 @@ struct CryptoDetector::Impl {
         // Record API call (capped)
         if (apiCallsSeen.size() < kMaxApiCallRecords) {
             apiCallsSeen.emplace_back(funcName);
+        }
+
+        if (name == "CryptGenRandom" || name == "BCryptGenRandom") {
+            // Track random number generation — precedes per-file key derivation
+            // in ransomware encryption chains.
+            if (cryptGenRandomCount != std::numeric_limits<uint32_t>::max()) {
+                ++cryptGenRandomCount;
+            }
+
+            if (!ransomwarePatternEmitted &&
+                cryptGenRandomCount >= 3 &&
+                HasEncryptionAPICalls()) {
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::RansomwarePattern;
+                f.address      = 0;
+                f.size         = 0;
+                f.confidence   = kConfidenceRansomware;
+                f.isEncryption = true;
+                f.description  = "Ransomware per-file key generation pattern: " +
+                                 std::to_string(cryptGenRandomCount) +
+                                 " CryptGenRandom calls interleaved with encryption "
+                                 "— hybrid encryption lifecycle detected";
+                AddFinding(std::move(f));
+                ransomwarePatternEmitted = true;
+            }
+            return;
         }
 
         // Only emit findings for actionable APIs
@@ -2438,29 +2558,6 @@ struct CryptoDetector::Impl {
         if (name == "CryptCreateHash") {
             detectedAlgo = CryptoAlgorithm::CustomHash;
             isEncrypt = false;
-        }
-
-        if (name == "CryptGenRandom" || name == "BCryptGenRandom") {
-            // Track random number generation — precedes per-file key derivation
-            // in ransomware encryption chains
-            ++cryptGenRandomCount;
-
-            // Emit ransomware pattern finding after multiple CryptGenRandom calls
-            // interleaved with encryption API calls
-            if (cryptGenRandomCount >= 3 && HasEncryptionAPICalls()) {
-                CryptoFinding f;
-                f.algorithm    = CryptoAlgorithm::RansomwarePattern;
-                f.address      = 0;
-                f.size         = 0;
-                f.confidence   = kConfidenceRansomware;
-                f.isEncryption = true;
-                f.description  = "Ransomware per-file key generation pattern: " +
-                                 std::to_string(cryptGenRandomCount) +
-                                 " CryptGenRandom calls interleaved with encryption "
-                                 "— hybrid encryption lifecycle detected";
-                AddFinding(std::move(f));
-            }
-            return;
         }
 
         CryptoFinding f;
@@ -2499,7 +2596,7 @@ struct CryptoDetector::Impl {
     // Stats computation
     // -----------------------------------------------------------------------
 
-    [[nodiscard]] CryptoStats ComputeStats() const noexcept {
+    [[nodiscard]] CryptoStats ComputeStats() const {
         CryptoStats stats;
         stats.totalFindings = static_cast<uint32_t>(findings.size());
 
@@ -2513,7 +2610,9 @@ struct CryptoDetector::Impl {
         bool hasStackStr   = false;
         bool hasJunkCode   = false;
 
-        std::unordered_set<uint8_t> algoSeen;
+        static constexpr size_t kAlgorithmSeenSlots = 64;
+        std::array<bool, kAlgorithmSeenSlots> algoSeen{};
+        stats.algorithmsFound.reserve(kAlgorithmSeenSlots);
 
         for (const auto& f : findings) {
             if (f.isEncryption) {
@@ -2523,7 +2622,8 @@ struct CryptoDetector::Impl {
             }
 
             const auto algoVal = static_cast<uint8_t>(f.algorithm);
-            if (algoSeen.insert(algoVal).second) {
+            if (algoVal < algoSeen.size() && !algoSeen[algoVal]) {
+                algoSeen[algoVal] = true;
                 stats.algorithmsFound.push_back(f.algorithm);
             }
 
@@ -2600,7 +2700,7 @@ struct CryptoDetector::Impl {
     // Hex formatting helpers
     // -----------------------------------------------------------------------
 
-    [[nodiscard]] static std::string ToHex64(uint64_t val) noexcept {
+    [[nodiscard]] static std::string ToHex64(uint64_t val) {
         static constexpr char kHexDigits[] = "0123456789ABCDEF";
         std::string result(16, '0');
         for (int i = 15; i >= 0; --i) {
@@ -2613,7 +2713,7 @@ struct CryptoDetector::Impl {
         return result.substr(firstNonZero);
     }
 
-    [[nodiscard]] static std::string ToHex8(uint8_t val) noexcept {
+    [[nodiscard]] static std::string ToHex8(uint8_t val) {
         static constexpr char kHexDigits[] = "0123456789ABCDEF";
         std::string result(2, '0');
         result[0] = kHexDigits[(val >> 4) & 0xF];
@@ -2627,8 +2727,12 @@ struct CryptoDetector::Impl {
 // ============================================================================
 
 CryptoDetector::CryptoDetector(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>(config))
 {
+    try {
+        m_impl = std::make_unique<Impl>(config);
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    }
 }
 
 CryptoDetector::~CryptoDetector() noexcept = default;
@@ -2644,6 +2748,7 @@ CryptoDetector& CryptoDetector::operator=(CryptoDetector&&) noexcept = default;
 void CryptoDetector::ScanRegion(
     const uint8_t* data, size_t size, GuestAddress base) noexcept
 {
+    if (!m_impl) return;
     if (!data || size == 0) return;
     if (!m_impl->config.enableBehaviorMonitor) return;
 
@@ -2657,6 +2762,7 @@ void CryptoDetector::ScanRegion(
 
 void CryptoDetector::ScanAll(const VirtualMemory& memory) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->config.enableBehaviorMonitor) return;
 
     const uint32_t totalPages = memory.GetAllocatedPages();
@@ -2711,8 +2817,13 @@ void CryptoDetector::OnXOROperation(
     GuestAddress rip, uint8_t key,
     GuestAddress dataAddr, uint32_t size) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->config.enableBehaviorMonitor) return;
-    m_impl->ProcessXorOperation(rip, key, dataAddr, size);
+    try {
+        m_impl->ProcessXorOperation(rip, key, dataAddr, size);
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+    }
 }
 
 // ============================================================================
@@ -2722,8 +2833,13 @@ void CryptoDetector::OnXOROperation(
 void CryptoDetector::OnCryptoAPICall(
     const char* funcName, const uint64_t* args) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->config.enableBehaviorMonitor) return;
-    m_impl->ProcessCryptoAPICall(funcName, args);
+    try {
+        m_impl->ProcessCryptoAPICall(funcName, args);
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+    }
 }
 
 // ============================================================================
@@ -2733,6 +2849,8 @@ void CryptoDetector::OnCryptoAPICall(
 const std::vector<CryptoFinding>&
 CryptoDetector::GetFindings() const noexcept
 {
+    static const std::vector<CryptoFinding> kEmpty;
+    if (!m_impl) return kEmpty;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->findings;
 }
@@ -2743,8 +2861,16 @@ CryptoDetector::GetFindings() const noexcept
 
 CryptoStats CryptoDetector::GetStats() const noexcept
 {
+    if (!m_impl) return {};
     std::shared_lock lock(m_impl->mutex);
-    return m_impl->ComputeStats();
+    try {
+        return m_impl->ComputeStats();
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+        CryptoStats stats{};
+        stats.totalFindings = static_cast<uint32_t>(m_impl->findings.size());
+        return stats;
+    }
 }
 
 // ============================================================================
@@ -2754,16 +2880,21 @@ CryptoStats CryptoDetector::GetStats() const noexcept
 std::vector<const CryptoFinding*>
 CryptoDetector::GetByAlgorithm(CryptoAlgorithm algo) const noexcept
 {
+    if (!m_impl) return {};
     std::shared_lock lock(m_impl->mutex);
 
     std::vector<const CryptoFinding*> result;
-    result.reserve(64);
+    try {
+        result.reserve(std::min<size_t>(64, m_impl->findings.size()));
 
-    for (const auto& f : m_impl->findings) {
-        if (f.algorithm == algo) {
-            result.push_back(&f);
-            if (result.size() >= kMaxFindings) break;
+        for (const auto& f : m_impl->findings) {
+            if (f.algorithm == algo) {
+                result.push_back(&f);
+                if (result.size() >= kMaxFindings) break;
+            }
         }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
 
     return result;
@@ -2775,6 +2906,7 @@ CryptoDetector::GetByAlgorithm(CryptoAlgorithm algo) const noexcept
 
 void CryptoDetector::Reset() noexcept
 {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
     m_impl->findings.clear();
     m_impl->xorRecords.clear();
@@ -2782,6 +2914,8 @@ void CryptoDetector::Reset() noexcept
     m_impl->flaggedAddresses.clear();
     m_impl->hasNetworkActivity = false;
     m_impl->cryptGenRandomCount = 0;
+    m_impl->ransomwarePatternEmitted = false;
+    m_impl->droppedEvents = 0;
 }
 
 } // namespace Phantom
