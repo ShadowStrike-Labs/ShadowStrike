@@ -16,9 +16,11 @@
 #pragma once
 
 #include "../../Common/Types.hpp"
+#include "../../Common/WinMacroUndef.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -181,25 +183,25 @@ public:
 
     GuestAddress CreateProcess(uint32_t pid, uint32_t parentPid, const char* imageName);
     bool TerminateProcess(uint32_t pid);
-    [[nodiscard]] const EmulatedEPROCESS* FindProcess(uint32_t pid) const;
-    [[nodiscard]] std::vector<const EmulatedEPROCESS*> GetProcessList() const;
+    [[nodiscard]] std::optional<EmulatedEPROCESS> FindProcess(uint32_t pid) const;
+    [[nodiscard]] std::vector<EmulatedEPROCESS> GetProcessList() const;
     [[nodiscard]] bool ValidateProcessList() const;
 
     // === Thread management ===
 
     GuestAddress CreateThread(uint32_t pid, uint32_t tid, GuestAddress startAddr);
-    [[nodiscard]] const EmulatedKTHREAD* FindThread(uint32_t tid) const;
+    [[nodiscard]] std::optional<EmulatedKTHREAD> FindThread(uint32_t tid) const;
 
     // === Driver management ===
 
     GuestAddress LoadDriver(const char* name, GuestAddress base, uint32_t size);
-    [[nodiscard]] const EmulatedDriverObject* FindDriver(const char* name) const;
-    [[nodiscard]] std::vector<const EmulatedDriverObject*> GetDriverList() const;
+    [[nodiscard]] std::optional<EmulatedDriverObject> FindDriver(const char* name) const;
+    [[nodiscard]] std::vector<EmulatedDriverObject> GetDriverList() const;
 
     // === SSDT management ===
 
     void InitializeSSDT();
-    [[nodiscard]] const SSDT& GetSSDT() const;
+    [[nodiscard]] SSDT GetSSDT() const;
     bool HookSSDTEntry(uint32_t serviceNumber, GuestAddress newAddress);
     [[nodiscard]] std::vector<uint32_t> DetectSSDTHooks() const;
 

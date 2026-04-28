@@ -18,6 +18,11 @@
 #define PHANTOM_UNDEF_(name) \
     /* intentionally empty — placeholder for documentation */
 
+// ---- Win32 API name aliases -------------------------------------------------
+#ifdef CreateProcess
+#  undef CreateProcess
+#endif
+
 // ---- NTSTATUS values (winnt.h / ntstatus.h) -------------------------------
 #ifdef STATUS_SUCCESS
 #  undef STATUS_SUCCESS
