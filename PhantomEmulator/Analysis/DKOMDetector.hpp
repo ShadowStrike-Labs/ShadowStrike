@@ -33,7 +33,7 @@ namespace Phantom {
 // ============================================================================
 
 struct DKOMFinding {
-    DKOMDetection::Type type;
+    DKOMDetection::Type type = DKOMDetection::Type::ProcessUnlinked;
     std::string         description;
     uint32_t            targetPid  = 0;
     GuestAddress        targetAddr = 0;

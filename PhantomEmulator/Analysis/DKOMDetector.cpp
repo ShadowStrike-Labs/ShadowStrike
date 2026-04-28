@@ -18,6 +18,7 @@
 #include <array>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -39,6 +40,8 @@ static constexpr uint32_t kMaxRingTransitions       = 4096;
 static constexpr uint32_t kMaxMemoryWriteRecords    = 8192;
 static constexpr uint32_t kMaxFindings              = 10'000;
 static constexpr uint32_t kMaxMitreTechniques       = 256;
+static constexpr uint32_t kMaxRelatedAPICalls        = 64;
+static constexpr size_t   kMaxStoredAPINameLength    = 128;
 static constexpr float    kDefaultRootkitThreshold  = 60.0f;
 static constexpr float    kMaxSeverityScore         = 100.0f;
 
@@ -166,6 +169,20 @@ struct MITREMapping {
                        [&](std::string_view s) { return s == apiName; });
 }
 
+[[nodiscard]] static bool SameDetectionIdentity(
+    const DKOMDetection& lhs,
+    const DKOMDetection& rhs) noexcept
+{
+    return lhs.type == rhs.type &&
+           lhs.targetPid == rhs.targetPid &&
+           lhs.targetAddr == rhs.targetAddr;
+}
+
+static void IncrementSaturating(uint32_t& value, uint32_t delta = 1) noexcept {
+    const uint32_t remaining = std::numeric_limits<uint32_t>::max() - value;
+    value += std::min(delta, remaining);
+}
+
 // ============================================================================
 // DKOMDetector::Impl
 // ============================================================================
@@ -198,13 +215,32 @@ struct DKOMDetector::Impl {
     // Statistics
     uint32_t totalScans    = 0;
     uint32_t totalFindings = 0;
+    mutable uint64_t droppedEvents = 0;
 
     bool initialized = false;
 
     // Monotonic tick counter used as lightweight logical timestamp
     uint64_t tickCounter = 0;
 
-    [[nodiscard]] uint64_t NextTick() noexcept { return ++tickCounter; }
+    [[nodiscard]] uint64_t NextTick() noexcept {
+        if (tickCounter != std::numeric_limits<uint64_t>::max()) {
+            ++tickCounter;
+        }
+        return tickCounter;
+    }
+
+    void RecordDrop() const noexcept {
+        if (droppedEvents != std::numeric_limits<uint64_t>::max()) {
+            ++droppedEvents;
+        }
+    }
+
+    [[nodiscard]] static std::string TruncateAPIName(const std::string& apiName) {
+        if (apiName.size() <= kMaxStoredAPINameLength) {
+            return apiName;
+        }
+        return apiName.substr(0, kMaxStoredAPINameLength);
+    }
 
     // ========================================================================
     // Correlation helpers
@@ -220,6 +256,7 @@ struct DKOMDetector::Impl {
         for (const auto& entry : it->second) {
             if (IsSuspiciousAPI(entry.apiName)) {
                 outCalls.push_back(entry.apiName);
+                if (outCalls.size() >= kMaxRelatedAPICalls) return true;
                 found = true;
             }
         }
@@ -234,10 +271,10 @@ struct DKOMDetector::Impl {
             for (const auto& entry : calls) {
                 if (IsSuspiciousAPI(entry.apiName)) {
                     outCalls.push_back(entry.apiName);
+                    if (outCalls.size() >= kMaxRelatedAPICalls) return true;
                     found = true;
                 }
             }
-            if (outCalls.size() > 64) break;  // Cap output
         }
         return found;
     }
@@ -277,12 +314,17 @@ struct DKOMDetector::Impl {
 
         // Correlate with API behavior
         std::vector<std::string> relatedAPIs;
-        if (raw.targetPid != 0) {
-            finding.correlatedWithAPIBehavior =
-                HasSuspiciousAPICalls(raw.targetPid, relatedAPIs);
-        } else {
-            finding.correlatedWithAPIBehavior =
-                HasAnySuspiciousAPICalls(relatedAPIs);
+        try {
+            if (raw.targetPid != 0) {
+                finding.correlatedWithAPIBehavior =
+                    HasSuspiciousAPICalls(raw.targetPid, relatedAPIs);
+            } else {
+                finding.correlatedWithAPIBehavior =
+                    HasAnySuspiciousAPICalls(relatedAPIs);
+            }
+        } catch (const std::bad_alloc&) {
+            RecordDrop();
+            finding.correlatedWithAPIBehavior = true;
         }
         if (finding.correlatedWithAPIBehavior) {
             severity += kBoostSuspiciousAPI;
@@ -333,16 +375,28 @@ struct DKOMDetector::Impl {
 
     [[nodiscard]] static std::vector<std::string> CollectMITRETechniques(
             const std::vector<DKOMFinding>& findings) {
-        std::unordered_set<std::string> seen;
         std::vector<std::string> result;
-        result.reserve(kMaxMitreTechniques);
+        try {
+            result.reserve(16);
+        } catch (const std::bad_alloc&) {
+            return result;
+        }
+
+        const auto appendUnique = [&result](const std::string& technique) {
+            if (technique.empty() || result.size() >= kMaxMitreTechniques) {
+                return;
+            }
+            if (std::find(result.begin(), result.end(), technique) == result.end()) {
+                result.push_back(technique);
+            }
+        };
 
         for (const auto& f : findings) {
-            if (!f.mitreTechnique.empty() && seen.insert(f.mitreTechnique).second) {
-                result.push_back(f.mitreTechnique);
-            }
-            if (!f.mitreSubTechnique.empty() && seen.insert(f.mitreSubTechnique).second) {
-                result.push_back(f.mitreSubTechnique);
+            try {
+                appendUnique(f.mitreTechnique);
+                appendUnique(f.mitreSubTechnique);
+            } catch (const std::bad_alloc&) {
+                break;
             }
             if (result.size() >= kMaxMitreTechniques) break;
         }
@@ -372,11 +426,16 @@ struct DKOMDetector::Impl {
         float baseScore = weightedSum / totalWeight;
 
         // Diversity bonus: more distinct types → higher score
-        std::unordered_set<uint8_t> types;
+        std::array<bool, 8> types{};
+        uint32_t typeCount = 0;
         for (const auto& f : findings) {
-            types.insert(static_cast<uint8_t>(f.type));
+            const auto typeIndex = static_cast<uint8_t>(f.type);
+            if (typeIndex < types.size() && !types[typeIndex]) {
+                types[typeIndex] = true;
+                ++typeCount;
+            }
         }
-        float diversityBonus = std::min(static_cast<float>(types.size()) * 3.0f, 15.0f);
+        float diversityBonus = std::min(static_cast<float>(typeCount) * 3.0f, 15.0f);
 
         return std::min(baseScore + diversityBonus, kMaxSeverityScore);
     }
@@ -389,11 +448,11 @@ struct DKOMDetector::Impl {
                               DKOMAnalysisReport& report) noexcept {
         for (const auto& f : findings) {
             switch (f.type) {
-            case DKOMDetection::Type::ProcessUnlinked:  ++report.processesHidden;  break;
-            case DKOMDetection::Type::SSDTHooked:       ++report.ssdtHooksDetected; break;
-            case DKOMDetection::Type::IDTHooked:        ++report.idtHooksDetected;  break;
-            case DKOMDetection::Type::DriverUnlinked:   ++report.driversUnlinked;   break;
-            case DKOMDetection::Type::TokenSwapped:     ++report.tokensSwapped;     break;
+            case DKOMDetection::Type::ProcessUnlinked:  IncrementSaturating(report.processesHidden);  break;
+            case DKOMDetection::Type::SSDTHooked:       IncrementSaturating(report.ssdtHooksDetected); break;
+            case DKOMDetection::Type::IDTHooked:        IncrementSaturating(report.idtHooksDetected);  break;
+            case DKOMDetection::Type::DriverUnlinked:   IncrementSaturating(report.driversUnlinked);   break;
+            case DKOMDetection::Type::TokenSwapped:     IncrementSaturating(report.tokensSwapped);     break;
             case DKOMDetection::Type::ThreadUnlinked:   break;
             case DKOMDetection::Type::CallbackRemoved:  break;
             }
@@ -407,6 +466,7 @@ struct DKOMDetector::Impl {
     void CheckMSRTampering(std::vector<DKOMFinding>& findings) const {
         auto modifications = MSREmulation::Instance().DetectModifications();
         for (const auto& mod : modifications) {
+            if (findings.size() >= kMaxFindings) break;
             if (mod.msrIndex == kMSR_LSTAR || mod.msrIndex == kMSR_EFER ||
                 mod.msrIndex == kMSR_STAR  || mod.msrIndex == kMSR_CSTAR) {
 
@@ -416,7 +476,12 @@ struct DKOMDetector::Impl {
                                   std::to_string(mod.originalValue) + " current=0x" +
                                   std::to_string(mod.currentValue);
                 raw.targetAddr  = static_cast<GuestAddress>(mod.msrIndex);
-                findings.push_back(EnrichDetection(raw));
+                try {
+                    findings.push_back(EnrichDetection(raw));
+                } catch (const std::bad_alloc&) {
+                    RecordDrop();
+                    break;
+                }
             }
         }
     }
@@ -428,6 +493,7 @@ struct DKOMDetector::Impl {
     void CheckRingTransitionAnomalies(std::vector<DKOMFinding>& findings) const {
         auto anomalies = RingTransition::Instance().DetectAnomalies();
         for (const auto& anomaly : anomalies) {
+            if (findings.size() >= kMaxFindings) break;
             DKOMDetection raw;
             raw.description = "Ring transition anomaly: " + anomaly.description;
             raw.targetAddr  = anomaly.event.fromRIP;
@@ -446,7 +512,12 @@ struct DKOMDetector::Impl {
                 break;
             }
 
-            findings.push_back(EnrichDetection(raw));
+            try {
+                findings.push_back(EnrichDetection(raw));
+            } catch (const std::bad_alloc&) {
+                RecordDrop();
+                break;
+            }
         }
     }
 };
@@ -489,6 +560,7 @@ void DKOMDetector::Reset() {
     m_impl->totalScans    = 0;
     m_impl->totalFindings = 0;
     m_impl->tickCounter   = 0;
+    m_impl->droppedEvents = 0;
     m_impl->initialized   = false;
 }
 
@@ -513,6 +585,7 @@ bool DKOMDetector::Initialize() {
     m_impl->totalScans    = 0;
     m_impl->totalFindings = 0;
     m_impl->tickCounter   = 0;
+    m_impl->droppedEvents = 0;
     m_impl->initialized   = true;
 
     return true;
@@ -541,28 +614,53 @@ DKOMAnalysisReport DKOMDetector::RunFullScan() {
 
     // 4. Integrity validations
     if (!kom.ValidateProcessList()) {
-        ++report.processListIntegrityFailures;
+        IncrementSaturating(report.processListIntegrityFailures);
     }
     [[maybe_unused]] bool driverOk = kom.ValidateDriverIntegrity();
 
     // 5. Enrich raw DKOM detections
-    allFindings.reserve(dkomDetections.size() + ssdtHooks.size() + idtHooks.size() + 32);
+    const size_t reserveTarget = std::min<size_t>(
+        kMaxFindings,
+        std::min<size_t>(kMaxFindings, dkomDetections.size()) +
+            std::min<size_t>(kMaxFindings, ssdtHooks.size()) +
+            std::min<size_t>(kMaxFindings, idtHooks.size()) +
+            32);
+    try {
+        allFindings.reserve(std::min<size_t>(reserveTarget, kMaxFindings));
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+    }
 
     for (const auto& detection : dkomDetections) {
         if (allFindings.size() >= kMaxFindings) break;
-        allFindings.push_back(m_impl->EnrichDetection(detection));
+        try {
+            allFindings.push_back(m_impl->EnrichDetection(detection));
+        } catch (const std::bad_alloc&) {
+            m_impl->RecordDrop();
+            break;
+        }
     }
 
     // 6. Add SSDT hook findings
     for (uint32_t svcNum : ssdtHooks) {
         if (allFindings.size() >= kMaxFindings) break;
-        allFindings.push_back(m_impl->MakeSSDTHookFinding(svcNum));
+        try {
+            allFindings.push_back(m_impl->MakeSSDTHookFinding(svcNum));
+        } catch (const std::bad_alloc&) {
+            m_impl->RecordDrop();
+            break;
+        }
     }
 
     // 7. Add IDT hook findings
     for (uint8_t vec : idtHooks) {
         if (allFindings.size() >= kMaxFindings) break;
-        allFindings.push_back(m_impl->MakeIDTHookFinding(vec));
+        try {
+            allFindings.push_back(m_impl->MakeIDTHookFinding(vec));
+        } catch (const std::bad_alloc&) {
+            m_impl->RecordDrop();
+            break;
+        }
     }
 
     // 8. Check MSR tampering via MSREmulation
@@ -587,10 +685,13 @@ DKOMAnalysisReport DKOMDetector::RunFullScan() {
     m_impl->previousIDTHooks    = std::move(idtHooks);
 
     // Update statistics
-    ++m_impl->totalScans;
+    IncrementSaturating(m_impl->totalScans);
     report.totalScans = m_impl->totalScans;
 
-    m_impl->totalFindings += static_cast<uint32_t>(allFindings.size());
+    IncrementSaturating(m_impl->totalFindings,
+                        static_cast<uint32_t>(std::min<size_t>(
+                            allFindings.size(),
+                            std::numeric_limits<uint32_t>::max())));
     report.findings = std::move(allFindings);
 
     return report;
@@ -613,42 +714,52 @@ std::vector<DKOMFinding> DKOMDetector::RunIncrementalScan() {
     auto currentIDT   = kom.DetectIDTHooks();
 
     // Delta: find new DKOM detections not present in previous scan
-    // Use target address + type as identity
-    std::unordered_set<uint64_t> previousKeys;
-    for (const auto& prev : m_impl->previousDKOMResults) {
-        uint64_t key = (static_cast<uint64_t>(prev.type) << 56) ^
-                       prev.targetAddr ^
-                       (static_cast<uint64_t>(prev.targetPid) << 32);
-        previousKeys.insert(key);
-    }
-
+    // Use type + PID + target address as identity; avoid hash-key collisions.
     for (const auto& det : currentDKOM) {
-        uint64_t key = (static_cast<uint64_t>(det.type) << 56) ^
-                       det.targetAddr ^
-                       (static_cast<uint64_t>(det.targetPid) << 32);
-        if (previousKeys.find(key) == previousKeys.end()) {
+        const bool known = std::any_of(
+            m_impl->previousDKOMResults.begin(),
+            m_impl->previousDKOMResults.end(),
+            [&](const DKOMDetection& prev) noexcept {
+                return SameDetectionIdentity(prev, det);
+            });
+        if (!known) {
             if (newFindings.size() >= kMaxFindings) break;
-            newFindings.push_back(m_impl->EnrichDetection(det));
+            try {
+                newFindings.push_back(m_impl->EnrichDetection(det));
+            } catch (const std::bad_alloc&) {
+                m_impl->RecordDrop();
+                break;
+            }
         }
     }
 
     // Delta: new SSDT hooks
-    std::unordered_set<uint32_t> prevSSDTSet(m_impl->previousSSDTHooks.begin(),
-                                              m_impl->previousSSDTHooks.end());
     for (uint32_t svc : currentSSDT) {
-        if (prevSSDTSet.find(svc) == prevSSDTSet.end()) {
+        if (std::find(m_impl->previousSSDTHooks.begin(),
+                      m_impl->previousSSDTHooks.end(),
+                      svc) == m_impl->previousSSDTHooks.end()) {
             if (newFindings.size() >= kMaxFindings) break;
-            newFindings.push_back(m_impl->MakeSSDTHookFinding(svc));
+            try {
+                newFindings.push_back(m_impl->MakeSSDTHookFinding(svc));
+            } catch (const std::bad_alloc&) {
+                m_impl->RecordDrop();
+                break;
+            }
         }
     }
 
     // Delta: new IDT hooks
-    std::unordered_set<uint8_t> prevIDTSet(m_impl->previousIDTHooks.begin(),
-                                            m_impl->previousIDTHooks.end());
     for (uint8_t vec : currentIDT) {
-        if (prevIDTSet.find(vec) == prevIDTSet.end()) {
+        if (std::find(m_impl->previousIDTHooks.begin(),
+                      m_impl->previousIDTHooks.end(),
+                      vec) == m_impl->previousIDTHooks.end()) {
             if (newFindings.size() >= kMaxFindings) break;
-            newFindings.push_back(m_impl->MakeIDTHookFinding(vec));
+            try {
+                newFindings.push_back(m_impl->MakeIDTHookFinding(vec));
+            } catch (const std::bad_alloc&) {
+                m_impl->RecordDrop();
+                break;
+            }
         }
     }
 
@@ -657,8 +768,11 @@ std::vector<DKOMFinding> DKOMDetector::RunIncrementalScan() {
     m_impl->previousSSDTHooks   = std::move(currentSSDT);
     m_impl->previousIDTHooks    = std::move(currentIDT);
 
-    ++m_impl->totalScans;
-    m_impl->totalFindings += static_cast<uint32_t>(newFindings.size());
+    IncrementSaturating(m_impl->totalScans);
+    IncrementSaturating(m_impl->totalFindings,
+                        static_cast<uint32_t>(std::min<size_t>(
+                            newFindings.size(),
+                            std::numeric_limits<uint32_t>::max())));
 
     return newFindings;
 }
@@ -675,16 +789,33 @@ void DKOMDetector::OnAPICall(const std::string& apiName, uint32_t pid) {
         return;  // Cap tracked PIDs
     }
 
-    auto& deque = m_impl->apiCallsPerPid[pid];
+    std::deque<APICallEntry>* dequePtr = nullptr;
+    try {
+        dequePtr = &m_impl->apiCallsPerPid[pid];
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+        return;
+    }
+
+    auto& deque = *dequePtr;
     if (deque.size() >= kMaxAPICallsPerPid) {
         deque.pop_front();
     }
 
     APICallEntry entry;
-    entry.apiName  = apiName;
-    entry.pid      = pid;
+    try {
+        entry.apiName = Impl::TruncateAPIName(apiName);
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+        return;
+    }
+    entry.pid       = pid;
     entry.timestamp = m_impl->NextTick();
-    deque.push_back(std::move(entry));
+    try {
+        deque.push_back(std::move(entry));
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+    }
 }
 
 // ============================================================================
@@ -702,12 +833,21 @@ void DKOMDetector::OnMSRWrite(uint32_t msrIndex, uint64_t value) {
     entry.msrIndex  = msrIndex;
     entry.value     = value;
     entry.timestamp = m_impl->NextTick();
-    m_impl->msrWrites.push_back(entry);
+    try {
+        m_impl->msrWrites.push_back(entry);
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+        return;
+    }
 
     // Track critical MSR writes
     if (msrIndex == kMSR_LSTAR || msrIndex == kMSR_EFER ||
         msrIndex == kMSR_STAR  || msrIndex == kMSR_CSTAR) {
-        m_impl->criticalMSRsWritten.insert(msrIndex);
+        try {
+            m_impl->criticalMSRsWritten.insert(msrIndex);
+        } catch (const std::bad_alloc&) {
+            m_impl->RecordDrop();
+        }
     }
 }
 
@@ -726,7 +866,12 @@ void DKOMDetector::OnRingTransition(uint8_t fromCPL, uint8_t toCPL) {
     entry.fromCPL   = fromCPL;
     entry.toCPL     = toCPL;
     entry.timestamp = m_impl->NextTick();
-    m_impl->ringTransitions.push_back(entry);
+    try {
+        m_impl->ringTransitions.push_back(entry);
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+        return;
+    }
 
     // Flag anomalous transitions: user→kernel bypassing normal syscall path
     // or kernel→user bypassing sysret
@@ -754,7 +899,12 @@ void DKOMDetector::OnMemoryWrite(GuestAddress addr, uint32_t size) {
     entry.addr      = addr;
     entry.size      = size;
     entry.timestamp = m_impl->NextTick();
-    m_impl->memoryWrites.push_back(entry);
+    try {
+        m_impl->memoryWrites.push_back(entry);
+    } catch (const std::bad_alloc&) {
+        m_impl->RecordDrop();
+        return;
+    }
 
     // Writes to kernel address space are inherently suspicious
     if (KernelAddressSpace::IsKernelAddress(addr)) {
@@ -768,6 +918,10 @@ void DKOMDetector::OnMemoryWrite(GuestAddress addr, uint32_t size) {
 
 void DKOMDetector::SetRootkitScoreThreshold(float threshold) {
     std::unique_lock lock(m_impl->mutex);
+    if (!std::isfinite(threshold)) {
+        m_impl->RecordDrop();
+        return;
+    }
     m_impl->rootkitScoreThreshold = std::clamp(threshold, 0.0f, kMaxSeverityScore);
 }
 
