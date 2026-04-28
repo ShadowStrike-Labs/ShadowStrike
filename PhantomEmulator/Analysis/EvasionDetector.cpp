@@ -10,14 +10,16 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <mutex>
+#include <new>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,7 +37,18 @@ static constexpr uint32_t kMaxRegistryPaths         = 4'096;
 static constexpr uint32_t kMaxFilePaths             = 4'096;
 static constexpr uint32_t kMaxInstructionProbeRIPs  = 4'096;
 static constexpr uint32_t kMaxDescriptionLength     = 512;
-static constexpr float    kTotalTechniques          = 61.0f;
+static constexpr uint32_t kMaxInputStringLength     = 4'096;
+static constexpr size_t   kTechniqueCount =
+    static_cast<size_t>(EvasionTechnique::AVX512_EVEXInstruction) + 1U;
+static constexpr float    kTotalTechniques          = static_cast<float>(kTechniqueCount);
+
+[[nodiscard]] size_t TechniqueIndex(EvasionTechnique technique) noexcept {
+    return static_cast<size_t>(technique);
+}
+
+[[nodiscard]] EvasionTechnique TechniqueAt(size_t index) noexcept {
+    return static_cast<EvasionTechnique>(index);
+}
 
 // ============================================================================
 // Evasion Category Classification
@@ -74,14 +87,15 @@ namespace {
 }
 
 [[nodiscard]] bool CaseInsensitiveEquals(const char* a, const char* b) noexcept {
-    if (a == b) return true;
-    if (!a || !b) return false;
-    while (*a && *b) {
-        if (AsciiToLower(*a) != AsciiToLower(*b)) return false;
-        ++a;
-        ++b;
+    if (!a || !b) return a == b;
+
+    for (size_t i = 0; i < kMaxInputStringLength; ++i) {
+        const char ac = a[i];
+        const char bc = b[i];
+        if (AsciiToLower(ac) != AsciiToLower(bc)) return false;
+        if (ac == '\0') return true;
     }
-    return *a == *b;
+    return false;
 }
 
 [[nodiscard]] bool CaseInsensitiveEquals(
@@ -104,13 +118,21 @@ namespace {
     return true;
 }
 
-[[nodiscard]] bool CaseInsensitiveContains(const char* haystack,
-                                           const char* needle) noexcept {
-    if (!haystack || !needle) return false;
-    if (*needle == '\0') return true;
+[[nodiscard]] std::string_view BoundedCStringView(const char* text) noexcept {
+    if (!text) return {};
 
-    const size_t needleLen = std::strlen(needle);
-    const size_t haystackLen = std::strlen(haystack);
+    size_t len = 0;
+    while (len < kMaxInputStringLength && text[len] != '\0') {
+        ++len;
+    }
+    return { text, len };
+}
+
+[[nodiscard]] bool CaseInsensitiveContains(std::string_view haystack,
+                                           std::string_view needle) noexcept {
+    if (needle.empty()) return true;
+    const size_t needleLen = std::min<size_t>(needle.size(), kMaxInputStringLength);
+    const size_t haystackLen = std::min<size_t>(haystack.size(), kMaxInputStringLength);
     if (needleLen > haystackLen) return false;
 
     for (size_t i = 0; i <= haystackLen - needleLen; ++i) {
@@ -126,14 +148,19 @@ namespace {
     return false;
 }
 
+[[nodiscard]] bool CaseInsensitiveContains(const char* haystack,
+                                           const char* needle) noexcept {
+    return CaseInsensitiveContains(BoundedCStringView(haystack), BoundedCStringView(needle));
+}
+
 [[nodiscard]] bool CaseInsensitiveContains(const std::string& haystack,
                                            const char* needle) noexcept {
-    return CaseInsensitiveContains(haystack.c_str(), needle);
+    return CaseInsensitiveContains(std::string_view{ haystack }, BoundedCStringView(needle));
 }
 
 [[nodiscard]] bool CaseInsensitiveContains(const std::string& haystack,
                                            const std::string& needle) noexcept {
-    return CaseInsensitiveContains(haystack.c_str(), needle.c_str());
+    return CaseInsensitiveContains(std::string_view{ haystack }, std::string_view{ needle });
 }
 
 // Safe funcName comparison — handles null funcName pointers
@@ -153,14 +180,39 @@ namespace {
     std::string result;
     try {
         const size_t len = std::min<size_t>(text.size(), kMaxDescriptionLength);
-        result.assign(text.data(), len);
+        result.reserve(len + 3);
+        for (size_t i = 0; i < len; ++i) {
+            const unsigned char ch = static_cast<unsigned char>(text[i]);
+            result.push_back((ch < 0x20U || ch == 0x7FU) ? ' ' : static_cast<char>(ch));
+        }
         if (text.size() > kMaxDescriptionLength) {
             result += "...";
         }
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         result = "(description unavailable)";
     }
     return result;
+}
+
+[[nodiscard]] std::string BuildDescription(std::string_view prefix,
+                                           std::string_view detail) noexcept
+{
+    std::string result;
+    try {
+        const size_t prefixLen = std::min<size_t>(prefix.size(), kMaxDescriptionLength);
+        const size_t remaining =
+            (prefixLen < kMaxDescriptionLength) ? (kMaxDescriptionLength - prefixLen) : 0U;
+        const size_t detailLen = std::min<size_t>(detail.size(), remaining);
+        result.reserve(prefixLen + detailLen + 3U);
+        result.append(prefix.data(), prefixLen);
+        result.append(detail.data(), detailLen);
+        if (detail.size() > detailLen) {
+            result += "...";
+        }
+    } catch (const std::bad_alloc&) {
+        result = "(description unavailable)";
+    }
+    return SafeDescription(result);
 }
 
 } // anonymous namespace
@@ -362,9 +414,12 @@ static constexpr uint64_t kThreadHideFromDebugger     = 17;
 // ============================================================================
 
 struct EvasionDetector::Impl {
+    mutable std::shared_mutex mutex;
+
     // --- Core state ---
     std::vector<EvasionAttempt>     attempts;
-    std::set<EvasionTechnique>      uniqueTechniques;
+    std::array<bool, kTechniqueCount> techniqueSeen{};
+    uint32_t uniqueTechniqueCount = 0;
 
     // --- Timing attack tracking ---
     // Map of RIP → vector of instruction counts at which timing checks occurred
@@ -383,7 +438,7 @@ struct EvasionDetector::Impl {
 
     // --- SetLastError / GetLastError pairing ---
     bool     lastCallWasSetLastError = false;
-    uint32_t setLastErrorInstrNum    = 0;
+    uint64_t setLastErrorInstrNum    = 0;
 
     // --- Internal instruction counter ---
     uint64_t instrCounter = 0;
@@ -401,7 +456,11 @@ struct EvasionDetector::Impl {
     explicit Impl(const EmulationConfig& cfg) noexcept
         : config(cfg)
     {
-        attempts.reserve(256);
+        try {
+            attempts.reserve(256);
+        } catch (const std::bad_alloc&) {
+            attempts.clear();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -444,12 +503,20 @@ struct EvasionDetector::Impl {
             attempt.description      = SafeDescription(description);
             attempt.rip              = rip;
             attempt.instructionCount = instrCount;
-            attempt.severity         = severity;
+            attempt.severity         = std::isfinite(severity)
+                ? std::clamp(severity, 0.0f, 1.0f)
+                : 0.0f;
             attempt.wasDefeated      = defeated;
 
+            const size_t techniqueIndex = TechniqueIndex(technique);
+            if (techniqueIndex < techniqueSeen.size() && !techniqueSeen[techniqueIndex]) {
+                techniqueSeen[techniqueIndex] = true;
+                if (uniqueTechniqueCount < std::numeric_limits<uint32_t>::max()) {
+                    ++uniqueTechniqueCount;
+                }
+            }
             attempts.push_back(std::move(attempt));
-            uniqueTechniques.insert(technique);
-        } catch (...) {
+        } catch (const std::bad_alloc&) {
             // Memory allocation failure — silently drop this attempt.
             // The cap check above prevents unbounded growth; this catch
             // guards against OOM on individual insertions.
@@ -469,16 +536,17 @@ struct EvasionDetector::Impl {
         // Track the registry path (capped)
         try {
             if (registryPathsSeen.size() < kMaxRegistryPaths) {
-                registryPathsSeen.emplace(pathStr);
+                const auto pathView = BoundedCStringView(pathStr);
+                registryPathsSeen.emplace(pathView.data(), pathView.size());
             }
-        } catch (...) {}
+        } catch (const std::bad_alloc&) {}
 
         // VMware indicators
         for (const char* indicator : kVMwareRegistryIndicators) {
             if (CaseInsensitiveContains(pathStr, indicator)) {
                 RecordAttempt(
                     EvasionTechnique::RegQuery_VMware,
-                    std::string("Registry query for VMware indicator: ") + indicator,
+                    BuildDescription("Registry query for VMware indicator: ", indicator),
                     rip, instrNum, 0.6f);
                 return;
             }
@@ -489,7 +557,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveContains(pathStr, indicator)) {
                 RecordAttempt(
                     EvasionTechnique::RegQuery_VBox,
-                    std::string("Registry query for VirtualBox indicator: ") + indicator,
+                    BuildDescription("Registry query for VirtualBox indicator: ", indicator),
                     rip, instrNum, 0.6f);
                 return;
             }
@@ -500,7 +568,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveContains(pathStr, indicator)) {
                 RecordAttempt(
                     EvasionTechnique::RegQuery_HyperV,
-                    std::string("Registry query for Hyper-V indicator: ") + indicator,
+                    BuildDescription("Registry query for Hyper-V indicator: ", indicator),
                     rip, instrNum, 0.6f);
                 return;
             }
@@ -520,16 +588,17 @@ struct EvasionDetector::Impl {
         // Track the file path (capped)
         try {
             if (filePathsSeen.size() < kMaxFilePaths) {
-                filePathsSeen.emplace(pathStr);
+                const auto pathView = BoundedCStringView(pathStr);
+                filePathsSeen.emplace(pathView.data(), pathView.size());
             }
-        } catch (...) {}
+        } catch (const std::bad_alloc&) {}
 
         // VBox device paths
         for (const char* devPath : kVBoxDevicePaths) {
             if (CaseInsensitiveContains(pathStr, devPath)) {
                 RecordAttempt(
                     EvasionTechnique::DeviceQuery_VBox,
-                    std::string("Device open attempt for VirtualBox: ") + devPath,
+                    BuildDescription("Device open attempt for VirtualBox: ", devPath),
                     rip, instrNum, 0.6f);
                 return;
             }
@@ -540,7 +609,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveContains(pathStr, devPath)) {
                 RecordAttempt(
                     EvasionTechnique::DeviceQuery_VMware,
-                    std::string("Device open attempt for VMware: ") + devPath,
+                    BuildDescription("Device open attempt for VMware: ", devPath),
                     rip, instrNum, 0.6f);
                 return;
             }
@@ -551,7 +620,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveContains(pathStr, fileInd)) {
                 RecordAttempt(
                     EvasionTechnique::FileCheck_VMware,
-                    std::string("File access for VMware artifact: ") + fileInd,
+                    BuildDescription("File access for VMware artifact: ", fileInd),
                     rip, instrNum, 0.5f);
                 return;
             }
@@ -562,7 +631,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveContains(pathStr, fileInd)) {
                 RecordAttempt(
                     EvasionTechnique::FileCheck_VBox,
-                    std::string("File access for VirtualBox artifact: ") + fileInd,
+                    BuildDescription("File access for VirtualBox artifact: ", fileInd),
                     rip, instrNum, 0.5f);
                 return;
             }
@@ -584,7 +653,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveEquals(moduleName, dll)) {
                 RecordAttempt(
                     EvasionTechnique::FileCheck_VMware,
-                    std::string("GetModuleHandle for VMware DLL: ") + dll,
+                    BuildDescription("GetModuleHandle for VMware DLL: ", dll),
                     rip, instrNum, 0.55f);
                 return;
             }
@@ -595,7 +664,7 @@ struct EvasionDetector::Impl {
             if (CaseInsensitiveEquals(moduleName, dll)) {
                 RecordAttempt(
                     EvasionTechnique::FileCheck_VBox,
-                    std::string("GetModuleHandle for VirtualBox DLL: ") + dll,
+                    BuildDescription("GetModuleHandle for VirtualBox DLL: ", dll),
                     rip, instrNum, 0.55f);
                 return;
             }
@@ -848,7 +917,9 @@ struct EvasionDetector::Impl {
 
             // If same RIP has multiple timing checks → elevated concern
             if (entries.size() >= 2) {
-                const uint64_t delta = entries.back() - entries.front();
+                const uint64_t delta = (entries.back() >= entries.front())
+                    ? (entries.back() - entries.front())
+                    : std::numeric_limits<uint64_t>::max();
                 // Small delta (few instructions between checks) is a timing attack pattern
                 if (delta < 5000) {
                     RecordAttempt(
@@ -857,7 +928,7 @@ struct EvasionDetector::Impl {
                         rip, instrCount, 0.65f);
                 }
             }
-        } catch (...) {}
+        } catch (const std::bad_alloc&) {}
     }
 
     // ------------------------------------------------------------------
@@ -1102,9 +1173,9 @@ struct EvasionDetector::Impl {
     // ------------------------------------------------------------------
 
     [[nodiscard]] float ComputeEvasionScore() const noexcept {
-        if (uniqueTechniques.empty()) return 0.0f;
+        if (uniqueTechniqueCount == 0) return 0.0f;
 
-        const auto numUnique = static_cast<float>(uniqueTechniques.size());
+        const auto numUnique = static_cast<float>(uniqueTechniqueCount);
 
         // Base score: proportion of known techniques observed
         float score = (numUnique / kTotalTechniques) * 0.5f;
@@ -1115,7 +1186,9 @@ struct EvasionDetector::Impl {
         bool hasAntiSandbox = false;
         bool hasTiming      = false;
 
-        for (const auto& tech : uniqueTechniques) {
+        for (size_t i = 0; i < techniqueSeen.size(); ++i) {
+            if (!techniqueSeen[i]) continue;
+            const auto tech = TechniqueAt(i);
             const EvasionCategory cat = ClassifyTechnique(tech);
             switch (cat) {
                 case EvasionCategory::AntiDebug:
@@ -1167,14 +1240,16 @@ struct EvasionDetector::Impl {
     // ------------------------------------------------------------------
 
     [[nodiscard]] std::string DetermineSophisticationLevel() const noexcept {
-        const auto numUnique = static_cast<uint32_t>(uniqueTechniques.size());
+        const auto numUnique = uniqueTechniqueCount;
 
         // Check for combined timing + VM + sandbox (nation-state indicator)
         bool hasTiming  = false;
         bool hasVM      = false;
         bool hasSandbox = false;
 
-        for (const auto& tech : uniqueTechniques) {
+        for (size_t i = 0; i < techniqueSeen.size(); ++i) {
+            if (!techniqueSeen[i]) continue;
+            const auto tech = TechniqueAt(i);
             const EvasionCategory cat = ClassifyTechnique(tech);
             if (cat == EvasionCategory::AntiVM)      hasVM = true;
             if (cat == EvasionCategory::AntiSandbox)  hasSandbox = true;
@@ -1206,7 +1281,7 @@ EvasionDetector::EvasionDetector(const EmulationConfig& config) noexcept
 {
     try {
         m_impl = std::make_unique<Impl>(config);
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         // If allocation fails, m_impl remains null.
         // All public methods check for null and return safe defaults.
     }
@@ -1224,6 +1299,7 @@ EvasionDetector& EvasionDetector::operator=(EvasionDetector&&) noexcept = defaul
 void EvasionDetector::OnAPICall(const APICallDetail& call) noexcept {
     if (!m_impl) return;
     if (!call.funcName) return;
+    std::unique_lock lock(m_impl->mutex);
 
     // Update internal instruction counter
     if (call.instructionNum > m_impl->instrCounter) {
@@ -1798,6 +1874,7 @@ void EvasionDetector::OnAPICall(const APICallDetail& call) noexcept {
 
 void EvasionDetector::OnTimingCheck(GuestAddress rip, uint64_t instrCount) noexcept {
     if (!m_impl) return;
+    std::unique_lock lock(m_impl->mutex);
 
     // Track this timing event by RIP
     if (m_impl->totalTimingRIPs >= kMaxTimingRIPs &&
@@ -1834,7 +1911,9 @@ void EvasionDetector::OnTimingCheck(GuestAddress rip, uint64_t instrCount) noexc
 
         // Second+ occurrence at same RIP → timing delta attack pattern
         if (entries.size() == 2) {
-            const uint64_t delta = entries[1] - entries[0];
+            const uint64_t delta = (entries[1] >= entries[0])
+                ? (entries[1] - entries[0])
+                : std::numeric_limits<uint64_t>::max();
 
             float severity = 0.7f;
             if (delta < 1000) {
@@ -1862,7 +1941,7 @@ void EvasionDetector::OnTimingCheck(GuestAddress rip, uint64_t instrCount) noexc
                 "Multiple RDTSC reads from same function — advanced timing-based evasion",
                 rip, instrCount, 0.85f);
         }
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         // OOM — silently drop
     }
 }
@@ -1875,6 +1954,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
                                          const std::string& detail) noexcept {
     if (!m_impl) return;
     if (queryType.empty()) return;
+    std::unique_lock lock(m_impl->mutex);
 
     // CPUID-based checks
     if (CaseInsensitiveEquals(queryType, std::string_view("cpuid"))) {
@@ -1903,7 +1983,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("firmware"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::FirmwareTable_Check,
-            std::string("Firmware table query — ") + detail,
+            BuildDescription("Firmware table query - ", detail),
             0, m_impl->instrCounter, 0.65f);
         return;
     }
@@ -1921,8 +2001,8 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
         m_impl->RecordAttempt(
             EvasionTechnique::Filename_Check,
             foundIndicator
-                ? std::string("Filename check matched sandbox indicator in: ") + detail
-                : std::string("Filename self-check: ") + detail,
+                ? BuildDescription("Filename check matched sandbox indicator in: ", detail)
+                : BuildDescription("Filename self-check: ", detail),
             0, m_impl->instrCounter,
             foundIndicator ? 0.55f : 0.45f);
         return;
@@ -1932,7 +2012,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("usb"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::USBHistory_Check,
-            std::string("USB device history query — ") + detail,
+            BuildDescription("USB device history query - ", detail),
             0, m_impl->instrCounter, 0.4f);
         return;
     }
@@ -1941,7 +2021,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("software"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::InstalledSoftware_Check,
-            std::string("Installed software enumeration — ") + detail,
+            BuildDescription("Installed software enumeration - ", detail),
             0, m_impl->instrCounter, 0.35f);
         return;
     }
@@ -1950,7 +2030,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("mouse"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::MouseMovement_Check,
-            std::string("Mouse movement analysis — ") + detail,
+            BuildDescription("Mouse movement analysis - ", detail),
             0, m_impl->instrCounter, 0.4f);
         return;
     }
@@ -1959,7 +2039,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("recentfiles"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::RecentFiles_Check,
-            std::string("Recent files enumeration — ") + detail,
+            BuildDescription("Recent files enumeration - ", detail),
             0, m_impl->instrCounter, 0.35f);
         return;
     }
@@ -1968,7 +2048,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("parent"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::ParentProcess_Check,
-            std::string("Parent process analysis — ") + detail,
+            BuildDescription("Parent process analysis - ", detail),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
@@ -1977,7 +2057,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("screen"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::ScreenResolution_Check,
-            std::string("Screen resolution query — ") + detail,
+            BuildDescription("Screen resolution query - ", detail),
             0, m_impl->instrCounter, 0.35f);
         return;
     }
@@ -1986,7 +2066,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("domain"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::DomainJoined_Check,
-            std::string("Domain membership query — ") + detail,
+            BuildDescription("Domain membership query - ", detail),
             0, m_impl->instrCounter, 0.35f);
         return;
     }
@@ -1995,7 +2075,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("uptime"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::SystemUptime_Check,
-            std::string("System uptime query — ") + detail,
+            BuildDescription("System uptime query - ", detail),
             0, m_impl->instrCounter, 0.35f);
         return;
     }
@@ -2004,7 +2084,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("interaction"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::UserInteraction_Check,
-            std::string("User interaction query — ") + detail,
+            BuildDescription("User interaction query - ", detail),
             0, m_impl->instrCounter, 0.4f);
         return;
     }
@@ -2027,17 +2107,17 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
         if (isVMware) {
             m_impl->RecordAttempt(
                 EvasionTechnique::MACAddress_VMware,
-                std::string("MAC address matched VMware OUI: ") + detail,
+                BuildDescription("MAC address matched VMware OUI: ", detail),
                 0, m_impl->instrCounter, 0.5f);
         } else if (isVBox) {
             m_impl->RecordAttempt(
                 EvasionTechnique::MACAddress_VBox,
-                std::string("MAC address matched VirtualBox OUI: ") + detail,
+                BuildDescription("MAC address matched VirtualBox OUI: ", detail),
                 0, m_impl->instrCounter, 0.5f);
         } else {
             m_impl->RecordAttempt(
                 EvasionTechnique::MACAddress_VMware,
-                std::string("MAC address query for VM detection: ") + detail,
+                BuildDescription("MAC address query for VM detection: ", detail),
                 0, m_impl->instrCounter, 0.4f);
         }
         return;
@@ -2047,7 +2127,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("disk"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::DiskSize_Check,
-            std::string("Disk size query — ") + detail,
+            BuildDescription("Disk size query - ", detail),
             0, m_impl->instrCounter, 0.3f);
         return;
     }
@@ -2056,7 +2136,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("memory"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::MemorySize_Check,
-            std::string("Memory size query — ") + detail,
+            BuildDescription("Memory size query - ", detail),
             0, m_impl->instrCounter, 0.3f);
         return;
     }
@@ -2065,7 +2145,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("processor"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessorCount_Check,
-            std::string("Processor count query — ") + detail,
+            BuildDescription("Processor count query - ", detail),
             0, m_impl->instrCounter, 0.3f);
         return;
     }
@@ -2074,7 +2154,7 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
     if (CaseInsensitiveEquals(queryType, std::string_view("sleep"))) {
         m_impl->RecordAttempt(
             EvasionTechnique::SleepAcceleration,
-            std::string("Sleep acceleration detection — ") + detail,
+            BuildDescription("Sleep acceleration detection - ", detail),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
@@ -2087,6 +2167,9 @@ void EvasionDetector::OnEnvironmentQuery(const std::string& queryType,
 void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexcept {
     if (!m_impl) return;
     if (processName.empty()) return;
+    std::unique_lock lock(m_impl->mutex);
+    const std::string_view processView{ processName.data(),
+        std::min<size_t>(processName.size(), kMaxInputStringLength) };
 
     // Track the process name (capped)
     try {
@@ -2094,15 +2177,15 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
 
         // Normalize to lowercase for dedup
         std::string normalized;
-        normalized.reserve(processName.size());
-        for (char c : processName) {
+        normalized.reserve(processView.size());
+        for (char c : processView) {
             normalized.push_back(AsciiToLower(c));
         }
 
         // Already seen this process name?
         if (m_impl->processNamesSeen.count(normalized) > 0) return;
         m_impl->processNamesSeen.insert(normalized);
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         return;
     }
 
@@ -2111,7 +2194,7 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
         if (CaseInsensitiveEquals(processName.c_str(), mapping.processName)) {
             m_impl->RecordAttempt(
                 mapping.technique,
-                std::string("Process enumeration found analysis tool: ") + mapping.processName,
+                BuildDescription("Process enumeration found analysis tool: ", mapping.processName),
                 0, m_impl->instrCounter, mapping.severity);
             return;
         }
@@ -2122,7 +2205,7 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
     if (CaseInsensitiveContains(processName, "wireshark")) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessCheck_Wireshark,
-            std::string("Process name contains 'wireshark': ") + processName,
+            BuildDescription("Process name contains 'wireshark': ", processName),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
@@ -2134,7 +2217,7 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
             CaseInsensitiveContains(processName, "idapro")) {
             m_impl->RecordAttempt(
                 EvasionTechnique::ProcessCheck_IDA,
-                std::string("Process name matches IDA pattern: ") + processName,
+                BuildDescription("Process name matches IDA pattern: ", processName),
                 0, m_impl->instrCounter, 0.55f);
             return;
         }
@@ -2146,21 +2229,21 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
         CaseInsensitiveContains(processName, "immunitydebugger")) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessCheck_x64dbg,
-            std::string("Process name matches debugger pattern: ") + processName,
+            BuildDescription("Process name matches debugger pattern: ", processName),
             0, m_impl->instrCounter, 0.55f);
         return;
     }
     if (CaseInsensitiveContains(processName, "procmon")) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessCheck_Procmon,
-            std::string("Process name contains 'procmon': ") + processName,
+            BuildDescription("Process name contains 'procmon': ", processName),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
     if (CaseInsensitiveContains(processName, "procexp")) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessCheck_ProcExp,
-            std::string("Process name contains 'procexp': ") + processName,
+            BuildDescription("Process name contains 'procexp': ", processName),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
@@ -2170,7 +2253,7 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
         CaseInsensitiveContains(processName, "vmacthlp")) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessCheck_VMTools,
-            std::string("Process name matches VMware tool pattern: ") + processName,
+            BuildDescription("Process name matches VMware tool pattern: ", processName),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
@@ -2179,14 +2262,14 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
         CaseInsensitiveContains(processName, "vboxcontrol")) {
         m_impl->RecordAttempt(
             EvasionTechnique::ProcessCheck_VBoxTray,
-            std::string("Process name matches VirtualBox tool pattern: ") + processName,
+            BuildDescription("Process name matches VirtualBox tool pattern: ", processName),
             0, m_impl->instrCounter, 0.5f);
         return;
     }
     if (CaseInsensitiveContains(processName, "filemon")) {
         m_impl->RecordAttempt(
             EvasionTechnique::WindowCheck_Filemon,
-            std::string("Process name contains 'filemon': ") + processName,
+            BuildDescription("Process name contains 'filemon': ", processName),
             0, m_impl->instrCounter, 0.4f);
         return;
     }
@@ -2201,6 +2284,7 @@ void EvasionDetector::OnInstructionProbe(
 {
     if (!m_impl) return;
     if (!detail || *detail == '\0') return;
+    std::unique_lock lock(m_impl->mutex);
 
     if (instrCount > m_impl->instrCounter) {
         m_impl->instrCounter = instrCount;
@@ -2224,7 +2308,7 @@ void EvasionDetector::OnInstructionProbe(
         if (!m_impl->instructionProbeRIPs.insert(rip).second) {
             return;
         }
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         return;
     }
 
@@ -2240,16 +2324,26 @@ void EvasionDetector::OnInstructionProbe(
 
 const std::vector<EvasionAttempt>& EvasionDetector::GetAttempts() const noexcept {
     static const std::vector<EvasionAttempt> kEmpty;
+    static thread_local std::vector<EvasionAttempt> snapshot;
     if (!m_impl) return kEmpty;
-    return m_impl->attempts;
+
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->attempts;
+        return snapshot;
+    } catch (const std::bad_alloc&) {
+        snapshot.clear();
+        return kEmpty;
+    }
 }
 
 EvasionSummary EvasionDetector::GetSummary() const noexcept {
     EvasionSummary summary;
     if (!m_impl) return summary;
+    std::shared_lock lock(m_impl->mutex);
 
     summary.totalAttempts    = static_cast<uint32_t>(m_impl->attempts.size());
-    summary.uniqueTechniques = static_cast<uint32_t>(m_impl->uniqueTechniques.size());
+    summary.uniqueTechniques = m_impl->uniqueTechniqueCount;
 
     // Count attempts by category
     for (const auto& attempt : m_impl->attempts) {
@@ -2278,6 +2372,7 @@ EvasionSummary EvasionDetector::GetSummary() const noexcept {
 
 uint32_t EvasionDetector::GetAttemptCount() const noexcept {
     if (!m_impl) return 0;
+    std::shared_lock lock(m_impl->mutex);
     return static_cast<uint32_t>(m_impl->attempts.size());
 }
 
@@ -2288,13 +2383,19 @@ std::vector<const EvasionAttempt*> EvasionDetector::GetByTechnique(
     if (!m_impl) return results;
 
     try {
+        static thread_local std::vector<EvasionAttempt> snapshot;
+        snapshot.clear();
+        {
+            std::shared_lock lock(m_impl->mutex);
+            snapshot = m_impl->attempts;
+        }
         results.reserve(16);
-        for (const auto& attempt : m_impl->attempts) {
+        for (const auto& attempt : snapshot) {
             if (attempt.technique == tech) {
                 results.push_back(&attempt);
             }
         }
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         // OOM on reserve — return what we have
     }
     return results;
@@ -2302,11 +2403,15 @@ std::vector<const EvasionAttempt*> EvasionDetector::GetByTechnique(
 
 bool EvasionDetector::HasTechnique(EvasionTechnique tech) const noexcept {
     if (!m_impl) return false;
-    return m_impl->uniqueTechniques.count(tech) > 0;
+    std::shared_lock lock(m_impl->mutex);
+    const size_t techniqueIndex = TechniqueIndex(tech);
+    return techniqueIndex < m_impl->techniqueSeen.size() &&
+           m_impl->techniqueSeen[techniqueIndex];
 }
 
 float EvasionDetector::GetEvasionScore() const noexcept {
     if (!m_impl) return 0.0f;
+    std::shared_lock lock(m_impl->mutex);
     return m_impl->ComputeEvasionScore();
 }
 
@@ -2316,9 +2421,11 @@ float EvasionDetector::GetEvasionScore() const noexcept {
 
 void EvasionDetector::Reset() noexcept {
     if (!m_impl) return;
+    std::unique_lock lock(m_impl->mutex);
 
     m_impl->attempts.clear();
-    m_impl->uniqueTechniques.clear();
+    m_impl->techniqueSeen.fill(false);
+    m_impl->uniqueTechniqueCount = 0;
     m_impl->timingByRIP.clear();
     m_impl->totalTimingRIPs          = 0;
     m_impl->processNamesSeen.clear();
