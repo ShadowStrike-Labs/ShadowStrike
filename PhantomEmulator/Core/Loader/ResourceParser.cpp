@@ -30,6 +30,8 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
+#include <new>
 
 namespace Phantom {
 
@@ -68,6 +70,31 @@ template <typename T>
     return offset < data.size() && (data.size() - offset) >= size;
 }
 
+[[nodiscard]] bool AddU32(uint32_t base, uint32_t offset, uint32_t& out) noexcept
+{
+    if (offset > (std::numeric_limits<uint32_t>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
+
+[[nodiscard]] bool IsWithinResourceBounds(
+    ByteSpan data,
+    uint32_t offset,
+    uint32_t size,
+    uint32_t resourceBaseFileOffset,
+    uint32_t resourceEndFileOffset) noexcept
+{
+    if (offset < resourceBaseFileOffset || offset > resourceEndFileOffset) {
+        return false;
+    }
+    if (size > resourceEndFileOffset - offset) {
+        return false;
+    }
+    return IsOffsetValid(data, offset, size);
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -83,7 +110,8 @@ std::vector<ResourceEntry> ResourceParser::Parse(
     std::vector<ResourceEntry> result;
 
     // Validate parameters
-    if (data.empty() || resourceDirRVA == 0 || resourceDirSize == 0) {
+    if (data.empty() || data.size() > (std::numeric_limits<uint32_t>::max)() ||
+        resourceDirRVA == 0 || resourceDirSize == 0) {
         return result;
     }
 
@@ -98,13 +126,24 @@ std::vector<ResourceEntry> ResourceParser::Parse(
         return result;
     }
 
-    result.reserve(64); // Pre-allocate for typical resource count
+    try {
+        result.reserve(64); // Pre-allocate for typical resource count
+    } catch (const std::bad_alloc&) {
+        return result;
+    }
+
+    uint32_t resourceEndFileOffset = 0;
+    if (!AddU32(resourceDirFileOffset, resourceDirSize, resourceEndFileOffset) ||
+        resourceEndFileOffset > data.size()) {
+        resourceEndFileOffset = static_cast<uint32_t>(data.size());
+    }
 
     uint32_t entryCount = 0;
     ParseDirectory(
         data,
         resourceDirFileOffset,
         resourceDirFileOffset,
+        resourceEndFileOffset,
         resourceDirRVA,
         0,     // depth = 0 (type level)
         0,     // typeId not yet known
@@ -123,6 +162,7 @@ void ResourceParser::ParseDirectory(
     ByteSpan   data,
     uint32_t   dirFileOffset,
     uint32_t   resourceBaseFileOffset,
+    uint32_t   resourceEndFileOffset,
     uint32_t   resourceBaseRVA,
     uint32_t   depth,
     uint32_t   typeId,
@@ -142,7 +182,9 @@ void ResourceParser::ParseDirectory(
 
     // Read the ResourceDirectory header
     PE::ResourceDirectory dir{};
-    if (!SafeRead(data, dirFileOffset, dir)) {
+    if (!IsWithinResourceBounds(data, dirFileOffset, sizeof(PE::ResourceDirectory),
+                                resourceBaseFileOffset, resourceEndFileOffset) ||
+        !SafeRead(data, dirFileOffset, dir)) {
         return;
     }
 
@@ -156,13 +198,16 @@ void ResourceParser::ParseDirectory(
         : PE::kMaxResourceEntries;
 
     // File offset of the first entry (immediately after the directory header)
-    const uint32_t entriesOffset =
-        dirFileOffset + static_cast<uint32_t>(sizeof(PE::ResourceDirectory));
+    uint32_t entriesOffset = 0;
+    if (!AddU32(dirFileOffset, static_cast<uint32_t>(sizeof(PE::ResourceDirectory)), entriesOffset)) {
+        return;
+    }
 
     // Validate that all entries fit in the buffer
     const uint32_t entriesSize =
         maxEntries * static_cast<uint32_t>(sizeof(PE::ResourceDirectoryEntry));
-    if (!IsOffsetValid(data, entriesOffset, entriesSize)) {
+    if (!IsWithinResourceBounds(data, entriesOffset, entriesSize,
+                                resourceBaseFileOffset, resourceEndFileOffset)) {
         return;
     }
 
@@ -172,8 +217,10 @@ void ResourceParser::ParseDirectory(
         }
 
         PE::ResourceDirectoryEntry entry{};
-        const uint32_t entryOffset =
-            entriesOffset + i * static_cast<uint32_t>(sizeof(PE::ResourceDirectoryEntry));
+        uint32_t entryOffset = 0;
+        if (!AddU32(entriesOffset, i * static_cast<uint32_t>(sizeof(PE::ResourceDirectoryEntry)), entryOffset)) {
+            return;
+        }
 
         if (!SafeRead(data, entryOffset, entry)) {
             return;
@@ -189,7 +236,12 @@ void ResourceParser::ParseDirectory(
         if (isNamed) {
             // NameOrId is an offset (relative to resource section base) to a
             // length-prefixed UTF-16LE string
-            const uint32_t nameOffset = resourceBaseFileOffset + currentId;
+            uint32_t nameOffset = 0;
+            if (!AddU32(resourceBaseFileOffset, currentId, nameOffset) ||
+                !IsWithinResourceBounds(data, nameOffset, sizeof(uint16_t),
+                                        resourceBaseFileOffset, resourceEndFileOffset)) {
+                continue;
+            }
             currentName = ReadResourceName(data, nameOffset);
             // Use a synthetic ID of 0 for named resources
             currentId = 0;
@@ -228,11 +280,15 @@ void ResourceParser::ParseDirectory(
 
         if (isSubdir) {
             // Recurse into subdirectory
-            const uint32_t subdirFileOffset = resourceBaseFileOffset + targetOffset;
+            uint32_t subdirFileOffset = 0;
+            if (!AddU32(resourceBaseFileOffset, targetOffset, subdirFileOffset)) {
+                continue;
+            }
 
             // Validate before recursing
-            if (!IsOffsetValid(data, subdirFileOffset,
-                               static_cast<uint32_t>(sizeof(PE::ResourceDirectory))))
+            if (!IsWithinResourceBounds(data, subdirFileOffset,
+                                        static_cast<uint32_t>(sizeof(PE::ResourceDirectory)),
+                                        resourceBaseFileOffset, resourceEndFileOffset))
             {
                 continue;
             }
@@ -246,6 +302,7 @@ void ResourceParser::ParseDirectory(
                 data,
                 subdirFileOffset,
                 resourceBaseFileOffset,
+                resourceEndFileOffset,
                 resourceBaseRVA,
                 depth + 1,
                 curType,
@@ -255,7 +312,12 @@ void ResourceParser::ParseDirectory(
 
         } else {
             // Leaf node: read ResourceDataEntry
-            const uint32_t dataEntryFileOffset = resourceBaseFileOffset + targetOffset;
+            uint32_t dataEntryFileOffset = 0;
+            if (!AddU32(resourceBaseFileOffset, targetOffset, dataEntryFileOffset) ||
+                !IsWithinResourceBounds(data, dataEntryFileOffset, sizeof(PE::ResourceDataEntry),
+                                        resourceBaseFileOffset, resourceEndFileOffset)) {
+                continue;
+            }
 
             PE::ResourceDataEntry dataEntry{};
             if (!SafeRead(data, dataEntryFileOffset, dataEntry)) {
@@ -287,7 +349,11 @@ void ResourceParser::ParseDirectory(
                 resEntry.name    = std::move(entryName);
             }
 
-            out.push_back(std::move(resEntry));
+            try {
+                out.push_back(std::move(resEntry));
+            } catch (const std::bad_alloc&) {
+                return;
+            }
             ++entryCount;
         }
     }
@@ -303,11 +369,12 @@ std::wstring ResourceParser::ReadResourceName(
     ByteSpan data,
     uint32_t nameFileOffset) noexcept
 {
-    // Read the 16-bit character count
-    uint16_t charCount = 0;
-    if (!SafeRead(data, nameFileOffset, charCount)) {
-        return {};
-    }
+    try {
+        // Read the 16-bit character count
+        uint16_t charCount = 0;
+        if (!SafeRead(data, nameFileOffset, charCount)) {
+            return {};
+        }
 
     if (charCount == 0) {
         return {};
@@ -336,7 +403,10 @@ std::wstring ResourceParser::ReadResourceName(
         result.push_back(static_cast<wchar_t>(ch));
     }
 
-    return result;
+        return result;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -348,12 +418,16 @@ std::vector<ResourceEntry> ResourceParser::FindByType(
     uint32_t type) noexcept
 {
     std::vector<ResourceEntry> result;
-    result.reserve(16);
+    try {
+        result.reserve(16);
 
-    for (const auto& entry : resources) {
-        if (entry.type == type) {
-            result.push_back(entry);
+        for (const auto& entry : resources) {
+            if (entry.type == type) {
+                result.push_back(entry);
+            }
         }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
 
     return result;
@@ -372,7 +446,7 @@ std::optional<ByteSpan> ResourceParser::ExtractData(
         return std::nullopt;
     }
 
-    if (data.empty()) {
+    if (data.empty() || data.size() > (std::numeric_limits<uint32_t>::max)()) {
         return std::nullopt;
     }
 
@@ -429,9 +503,12 @@ std::optional<ByteSpan> ResourceParser::ExtractData(
     PE::FileHeader fileHdr{};
     std::memcpy(&fileHdr, data.data() + peOffset + 4, sizeof(fileHdr));
 
-    const uint32_t optionalHdrOffset = peOffset + 4 + sizeof(PE::FileHeader);
-    const uint32_t sectionTableOffset =
-        optionalHdrOffset + fileHdr.SizeOfOptionalHeader;
+    uint32_t optionalHdrOffset = 0;
+    uint32_t sectionTableOffset = 0;
+    if (!AddU32(peOffset, 4U + static_cast<uint32_t>(sizeof(PE::FileHeader)), optionalHdrOffset) ||
+        !AddU32(optionalHdrOffset, fileHdr.SizeOfOptionalHeader, sectionTableOffset)) {
+        return std::nullopt;
+    }
 
     const uint32_t numSections = fileHdr.NumberOfSections;
     if (numSections > PE::kMaxSections) {
@@ -444,16 +521,22 @@ std::optional<ByteSpan> ResourceParser::ExtractData(
     bool found = false;
 
     for (uint32_t s = 0; s < numSections; ++s) {
-        const uint32_t secOffset =
-            sectionTableOffset + s * static_cast<uint32_t>(sizeof(PE::SectionHeader));
+        uint32_t secOffset = 0;
+        if (!AddU32(sectionTableOffset, s * static_cast<uint32_t>(sizeof(PE::SectionHeader)), secOffset)) {
+            return std::nullopt;
+        }
 
         PE::SectionHeader sec{};
         if (!SafeRead(data, secOffset, sec)) {
             break;
         }
 
-        const uint32_t secEnd = sec.VirtualAddress +
+        const uint32_t effectiveSize =
             ((sec.VirtualSize > sec.SizeOfRawData) ? sec.VirtualSize : sec.SizeOfRawData);
+        uint32_t secEnd = 0;
+        if (!AddU32(sec.VirtualAddress, effectiveSize, secEnd)) {
+            continue;
+        }
 
         if (dataRVA >= sec.VirtualAddress && dataRVA < secEnd) {
             const uint32_t delta = dataRVA - sec.VirtualAddress;
@@ -461,7 +544,9 @@ std::optional<ByteSpan> ResourceParser::ExtractData(
             if (delta < sec.SizeOfRawData &&
                 (sec.SizeOfRawData - delta) >= entry.dataSize)
             {
-                dataFileOffset = sec.PointerToRawData + delta;
+                if (!AddU32(sec.PointerToRawData, delta, dataFileOffset)) {
+                    return std::nullopt;
+                }
                 found = true;
             }
             break;

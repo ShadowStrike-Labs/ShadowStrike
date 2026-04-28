@@ -109,6 +109,7 @@ private:
         ByteSpan   data,
         uint32_t   dirFileOffset,         // File offset of this directory node
         uint32_t   resourceBaseFileOffset, // File offset of resource section start
+        uint32_t   resourceEndFileOffset,  // Exclusive end of declared resource directory data
         uint32_t   resourceBaseRVA,        // RVA of resource section start
         uint32_t   depth,                  // Current recursion depth (0-indexed)
         uint32_t   typeId,                 // Type ID (set at depth 0)
