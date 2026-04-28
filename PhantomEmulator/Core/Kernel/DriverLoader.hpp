@@ -133,15 +133,15 @@ public:
     [[nodiscard]] static bool IsValidKernelDriver(std::span<const uint8_t> image);
 
     // Query loaded drivers
-    [[nodiscard]] const LoadedDriver* FindDriver(const std::string& name) const;
-    [[nodiscard]] const LoadedDriver* FindDriverByAddress(GuestAddress addr) const;
-    [[nodiscard]] std::vector<const LoadedDriver*> GetLoadedDrivers() const;
+    [[nodiscard]] std::optional<LoadedDriver> FindDriver(const std::string& name) const;
+    [[nodiscard]] std::optional<LoadedDriver> FindDriverByAddress(GuestAddress addr) const;
+    [[nodiscard]] std::vector<LoadedDriver> GetLoadedDrivers() const;
     [[nodiscard]] uint32_t GetDriverCount() const;
 
     // Kernel export resolution
     [[nodiscard]] std::optional<GuestAddress> ResolveKernelExport(
         const std::string& moduleName, const std::string& functionName) const;
-    [[nodiscard]] const std::vector<KernelExport>& GetRegisteredExports() const;
+    [[nodiscard]] std::vector<KernelExport> GetRegisteredExports() const;
 
     // Security analysis
     struct DriverSecurityReport {
