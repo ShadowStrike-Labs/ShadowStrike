@@ -314,20 +314,21 @@ ErrorCode PEParser::ValidateNTHeaders(ByteSpan data, int32_t peOffset) noexcept 
 // ============================================================================
 
 ErrorCode PEParser::ParseSections(
-    ByteSpan data, ParsedPE& pe, uint32_t sectionTableOffset) noexcept
+    ByteSpan data, ParsedPE& pe, uint32_t sectionTableOffset,
+    uint16_t sectionCount) noexcept
 {
     const auto fileSize = static_cast<uint32_t>(data.size());
 
     // Verify room for entire section table
     const uint64_t tableEnd =
         static_cast<uint64_t>(sectionTableOffset) +
-        static_cast<uint64_t>(pe.sections.capacity()) * sizeof(PE::SectionHeader);
+        static_cast<uint64_t>(sectionCount) * sizeof(PE::SectionHeader);
     if (tableEnd > fileSize) {
         return ErrorCode::InvalidPEHeader;
     }
 
     // Read each section header
-    for (uint32_t i = 0; i < static_cast<uint32_t>(pe.sections.capacity()); ++i) {
+    for (uint32_t i = 0; i < sectionCount; ++i) {
         const uint32_t off = sectionTableOffset + i * sizeof(PE::SectionHeader);
 
         PE::SectionHeader sh{};
@@ -429,6 +430,13 @@ ErrorCode PEParser::ParseImports(ByteSpan data, ParsedPE& pe) noexcept {
     }
 
     const auto fileSize = static_cast<uint32_t>(data.size());
+    uint64_t importDirEnd = static_cast<uint64_t>(dirFileOff.value()) + dir.Size;
+    if (importDirEnd < dirFileOff.value()) {
+        return ErrorCode::MalformedPE;
+    }
+    if (importDirEnd > fileSize) {
+        importDirEnd = fileSize;
+    }
 
     // Walk the import descriptor array. Each entry is 20 bytes.
     // The array is terminated by an all-zero descriptor.
@@ -437,7 +445,8 @@ ErrorCode PEParser::ParseImports(ByteSpan data, ParsedPE& pe) noexcept {
 
     while (dllCount < PE::kMaxImportDLLs) {
         // Bounds check: room for one ImportDescriptor
-        if (!PE::IsFileOffsetValid(descOffset, sizeof(PE::ImportDescriptor), fileSize)) {
+        if (static_cast<uint64_t>(descOffset) + sizeof(PE::ImportDescriptor) > importDirEnd ||
+            !PE::IsFileOffsetValid(descOffset, sizeof(PE::ImportDescriptor), fileSize)) {
             break; // Truncated table — accept what we have
         }
 
@@ -522,6 +531,9 @@ ErrorCode PEParser::ParseImports(ByteSpan data, ParsedPE& pe) noexcept {
                 }
 
                 parsedDll.entries.push_back(std::move(entry));
+                if (entryOffset > fileSize - sizeof(uint64_t)) {
+                    break;
+                }
                 entryOffset += sizeof(uint64_t);
                 ++entryCount;
             }
@@ -553,12 +565,18 @@ ErrorCode PEParser::ParseImports(ByteSpan data, ParsedPE& pe) noexcept {
                 }
 
                 parsedDll.entries.push_back(std::move(entry));
+                if (entryOffset > fileSize - sizeof(uint32_t)) {
+                    break;
+                }
                 entryOffset += sizeof(uint32_t);
                 ++entryCount;
             }
         }
 
         pe.imports.push_back(std::move(parsedDll));
+        if (descOffset > fileSize - sizeof(PE::ImportDescriptor)) {
+            break;
+        }
         descOffset += sizeof(PE::ImportDescriptor);
         ++dllCount;
     }
@@ -688,7 +706,11 @@ ErrorCode PEParser::ParseExports(ByteSpan data, ParsedPE& pe) noexcept {
     // A forwarded export has its function address RVA pointing *within* the
     // export directory itself (the forwarder string lives there).
     const uint32_t exportDirStart = dir.VirtualAddress;
-    const uint32_t exportDirEnd   = dir.VirtualAddress + dir.Size;
+    const uint64_t exportDirEnd64 = static_cast<uint64_t>(dir.VirtualAddress) + dir.Size;
+    if (exportDirEnd64 > (std::numeric_limits<uint32_t>::max)()) {
+        return ErrorCode::MalformedPE;
+    }
+    const uint32_t exportDirEnd = static_cast<uint32_t>(exportDirEnd64);
 
     // Build the export list: iterate over the function table
     pe.exports.reserve(ed.NumberOfFunctions);
@@ -703,6 +725,9 @@ ErrorCode PEParser::ParseExports(ByteSpan data, ParsedPE& pe) noexcept {
         if (funcRVA == 0) continue;
 
         ParsedExportEntry entry{};
+        if (funcIdx > (std::numeric_limits<uint32_t>::max)() - ed.Base) {
+            return ErrorCode::MalformedPE;
+        }
         entry.ordinal = funcIdx + ed.Base;
 
         // Check if this is a forwarded export
@@ -785,10 +810,10 @@ ErrorCode PEParser::ParseRelocations(ByteSpan data, ParsedPE& pe) noexcept {
             return ErrorCode::MalformedPE;
         }
 
-        totalEntries += numEntries;
-        if (totalEntries > kMaxTotalRelocEntries) {
+        if (numEntries > kMaxTotalRelocEntries - totalEntries) {
             return ErrorCode::MalformedPE;
         }
+        totalEntries += numEntries;
 
         // Bounds-check the block's raw data
         if (!PE::IsFileOffsetValid(cursor, blockHdr.SizeOfBlock, fileSize)) {
@@ -871,7 +896,8 @@ ErrorCode PEParser::ParseTLS(ByteSpan data, ParsedPE& pe) noexcept {
                     if (!SafeRead(data, off, cbAddr)) break;
                     if (cbAddr == 0) break;
                     // Convert VA to RVA
-                    if (cbAddr >= pe.imageBase) {
+                    if (cbAddr >= pe.imageBase &&
+                        (cbAddr - pe.imageBase) <= (std::numeric_limits<uint32_t>::max)()) {
                         pe.tlsCallbackRVAs.push_back(
                             static_cast<uint32_t>(cbAddr - pe.imageBase));
                     }
@@ -1159,7 +1185,7 @@ ParseResult PEParser::Parse(ByteSpan data) noexcept {
     // ------------------------------------------------------------------
     result.pe.sections.reserve(numSections);
     {
-        ErrorCode ec = ParseSections(data, result.pe, sectionTableOffset);
+        ErrorCode ec = ParseSections(data, result.pe, sectionTableOffset, numSections);
         if (ec != ErrorCode::Success) {
             result.error = ec;
             return result;
@@ -1174,7 +1200,7 @@ ParseResult PEParser::Parse(ByteSpan data) noexcept {
         // The entry point must fall within a section that has execute permission.
         bool entryInSection = false;
         for (const auto& sec : result.pe.sections) {
-            const uint32_t vEnd = sec.virtualAddress + sec.virtualSize;
+            const uint64_t vEnd = static_cast<uint64_t>(sec.virtualAddress) + sec.virtualSize;
             if (result.pe.entryPointRVA >= sec.virtualAddress &&
                 result.pe.entryPointRVA < vEnd) {
                 entryInSection = true;
