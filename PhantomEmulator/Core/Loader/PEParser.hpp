@@ -156,7 +156,8 @@ private:
     [[nodiscard]] static ErrorCode ValidateDOSHeader(ByteSpan data) noexcept;
     [[nodiscard]] static ErrorCode ValidateNTHeaders(ByteSpan data, int32_t peOffset) noexcept;
     [[nodiscard]] static ErrorCode ParseSections(
-        ByteSpan data, ParsedPE& pe, uint32_t sectionTableOffset) noexcept;
+        ByteSpan data, ParsedPE& pe, uint32_t sectionTableOffset,
+        uint16_t sectionCount) noexcept;
     [[nodiscard]] static ErrorCode ParseImports(ByteSpan data, ParsedPE& pe) noexcept;
     [[nodiscard]] static ErrorCode ParseExports(ByteSpan data, ParsedPE& pe) noexcept;
     [[nodiscard]] static ErrorCode ParseRelocations(ByteSpan data, ParsedPE& pe) noexcept;
