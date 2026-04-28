@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace Phantom {
 
@@ -49,9 +50,37 @@ constexpr uint32_t kSentinelReturn32 = 0xDEAD'DEAD;
 constexpr uint32_t kLdrDataOffset = 0x400;
 
 // Write a scalar value at a specific offset from a base guest address
+[[nodiscard]] bool AddGuestAddress(GuestAddress base, GuestAddress offset, GuestAddress& out) noexcept {
+    if (offset > (std::numeric_limits<GuestAddress>::max)() - base) {
+        return false;
+    }
+    out = base + offset;
+    return true;
+}
+
+[[nodiscard]] bool AlignUpChecked(GuestSize value, GuestSize alignment, GuestSize& out) noexcept {
+    if (alignment == 0 || value > (std::numeric_limits<GuestSize>::max)() - (alignment - 1)) {
+        return false;
+    }
+    out = AlignUp(value, alignment);
+    return out >= value;
+}
+
+[[nodiscard]] bool ToU32Address(GuestAddress value, uint32_t& out) noexcept {
+    if (value > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
 template <typename T>
 ErrorCode WriteAt(VirtualMemory& mem, GuestAddress base, uint32_t offset, T value) noexcept {
-    return mem.Write(base + offset, &value, sizeof(T));
+    GuestAddress target = 0;
+    if (!AddGuestAddress(base, offset, target)) {
+        return ErrorCode::InvalidAddress;
+    }
+    return mem.Write(target, &value, sizeof(T));
 }
 
 } // anonymous namespace
@@ -87,8 +116,11 @@ ShellcodeLoader::LoadResult ShellcodeLoader::Load(
     const bool is64 = (config.target == EmulationTarget::Shellcode64);
     result.shellcode.is64Bit = is64;
 
-    const GuestSize codeAllocSize = AlignUp(
-        static_cast<GuestSize>(shellcodeData.size()), kPageSize);
+    GuestSize codeAllocSize = 0;
+    if (!AlignUpChecked(static_cast<GuestSize>(shellcodeData.size()), kPageSize, codeAllocSize)) {
+        result.error = ErrorCode::PETooLarge;
+        return result;
+    }
 
     // ---- 2. Allocate RWX region for shellcode ------------------------------
     // Shellcode needs RWX because real shellcode is self-modifying and
@@ -109,12 +141,10 @@ ShellcodeLoader::LoadResult ShellcodeLoader::Load(
     result.shellcode.codeSize   = static_cast<GuestSize>(shellcodeData.size());
 
     // ---- 3. Copy shellcode bytes into allocated region ----------------------
-    auto mapErr = m_memory.MapRegion(
+    auto mapErr = m_memory.Write(
         result.shellcode.codeBase,
         shellcodeData.data(),
-        static_cast<uint32_t>(shellcodeData.size()),
-        codeAllocSize,
-        MemProt::RWX);
+        static_cast<uint32_t>(shellcodeData.size()));
 
     if (mapErr != ErrorCode::Success) {
         result.error = mapErr;
@@ -122,8 +152,11 @@ ShellcodeLoader::LoadResult ShellcodeLoader::Load(
     }
 
     // ---- 4. Allocate stack -------------------------------------------------
-    const GuestSize stackSize = AlignUp(
-        config.stackSize > 0 ? config.stackSize : kStackSize, kPageSize);
+    GuestSize stackSize = 0;
+    if (!AlignUpChecked(config.stackSize > 0 ? config.stackSize : kStackSize, kPageSize, stackSize)) {
+        result.error = ErrorCode::OutOfMemory;
+        return result;
+    }
 
     const GuestAddress stackPreferred = is64 ? kScStackBase64 : kScStackBase32;
 
@@ -137,15 +170,24 @@ ShellcodeLoader::LoadResult ShellcodeLoader::Load(
     }
 
     result.shellcode.stackBase = *stackOpt;
-    result.shellcode.stackTop  = *stackOpt + stackSize;
+    if (!AddGuestAddress(*stackOpt, stackSize, result.shellcode.stackTop)) {
+        result.error = ErrorCode::InvalidAddress;
+        return result;
+    }
 
     // Guard page at the bottom for stack overflow detection
-    m_memory.Protect(result.shellcode.stackBase, kPageSize,
-                     MemProt::RW | MemProt::Guard);
+    if (!m_memory.Protect(result.shellcode.stackBase, kPageSize,
+                          MemProt::RW | MemProt::Guard)) {
+        result.error = ErrorCode::InvalidAddress;
+        return result;
+    }
 
     // ---- 5. Allocate heap --------------------------------------------------
-    const GuestSize heapSize = AlignUp(
-        config.heapSize > 0 ? config.heapSize : kHeapInitial, kPageSize);
+    GuestSize heapSize = 0;
+    if (!AlignUpChecked(config.heapSize > 0 ? config.heapSize : kHeapInitial, kPageSize, heapSize)) {
+        result.error = ErrorCode::OutOfMemory;
+        return result;
+    }
 
     const GuestAddress heapPreferred = is64 ? kScHeapBase64 : kScHeapBase32;
 
@@ -190,6 +232,7 @@ void ShellcodeLoader::PrepareCPUState(
     const LoadedShellcode& sc,
     const EmulationConfig& config) noexcept
 {
+    static_cast<void>(config);
     auto& state = cpu.State();
 
     if (sc.is64Bit) {
@@ -201,7 +244,9 @@ void ShellcodeLoader::PrepareCPUState(
         GuestAddress rsp = AlignDown(sc.stackTop, 16) - 8;
 
         // Write sentinel return address at [RSP]
-        m_memory.WriteU64(rsp, kSentinelReturn64);
+        if (m_memory.WriteU64(rsp, kSentinelReturn64) != ErrorCode::Success) {
+            return;
+        }
         state.SetReg64(GPR::RSP, rsp);
 
         // Zero all GP registers except RSP
@@ -237,8 +282,14 @@ void ShellcodeLoader::PrepareCPUState(
         GuestAddress esp = AlignDown(sc.stackTop, 4) - 4;
 
         // Write sentinel return address
-        m_memory.WriteU32(esp, kSentinelReturn32);
-        state.SetReg32(GPR::RSP, static_cast<uint32_t>(esp));
+        if (m_memory.WriteU32(esp, kSentinelReturn32) != ErrorCode::Success) {
+            return;
+        }
+        uint32_t esp32 = 0;
+        if (!ToU32Address(esp, esp32)) {
+            return;
+        }
+        state.SetReg32(GPR::RSP, esp32);
 
         // Zero all GP registers except ESP
         state.SetReg32(GPR::RAX, 0);
@@ -378,11 +429,15 @@ ErrorCode ShellcodeLoader::CreateMinimalPEB(
         if (err != ErrorCode::Success) return err;
 
         // Ldr pointer
-        err = WriteAt(m_memory, peb, 0x00C, static_cast<uint32_t>(ldrAddr));
+        uint32_t ldrAddr32 = 0;
+        if (!ToU32Address(ldrAddr, ldrAddr32)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, peb, 0x00C, ldrAddr32);
         if (err != ErrorCode::Success) return err;
 
         // ProcessHeap
-        err = WriteAt(m_memory, peb, 0x018, static_cast<uint32_t>(sc.heapBase));
+        uint32_t heapBase32 = 0;
+        if (!ToU32Address(sc.heapBase, heapBase32)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, peb, 0x018, heapBase32);
         if (err != ErrorCode::Success) return err;
 
         // NumberOfProcessors
@@ -415,19 +470,26 @@ ErrorCode ShellcodeLoader::CreateMinimalPEB(
         err = WriteAt(m_memory, ldrAddr, 0x004, static_cast<uint8_t>(1));
         if (err != ErrorCode::Success) return err;
 
-        const uint32_t list0 = static_cast<uint32_t>(ldrAddr + 0x00C);
+        GuestAddress listAddr = 0;
+        uint32_t list0 = 0;
+        if (!AddGuestAddress(ldrAddr, 0x00C, listAddr) ||
+            !ToU32Address(listAddr, list0)) return ErrorCode::InvalidAddress;
         err = WriteAt(m_memory, ldrAddr, 0x00C, list0);
         if (err != ErrorCode::Success) return err;
         err = WriteAt(m_memory, ldrAddr, 0x010, list0);
         if (err != ErrorCode::Success) return err;
 
-        const uint32_t list1 = static_cast<uint32_t>(ldrAddr + 0x014);
+        uint32_t list1 = 0;
+        if (!AddGuestAddress(ldrAddr, 0x014, listAddr) ||
+            !ToU32Address(listAddr, list1)) return ErrorCode::InvalidAddress;
         err = WriteAt(m_memory, ldrAddr, 0x014, list1);
         if (err != ErrorCode::Success) return err;
         err = WriteAt(m_memory, ldrAddr, 0x018, list1);
         if (err != ErrorCode::Success) return err;
 
-        const uint32_t list2 = static_cast<uint32_t>(ldrAddr + 0x01C);
+        uint32_t list2 = 0;
+        if (!AddGuestAddress(ldrAddr, 0x01C, listAddr) ||
+            !ToU32Address(listAddr, list2)) return ErrorCode::InvalidAddress;
         err = WriteAt(m_memory, ldrAddr, 0x01C, list2);
         if (err != ErrorCode::Success) return err;
         err = WriteAt(m_memory, ldrAddr, 0x020, list2);
@@ -450,6 +512,7 @@ ErrorCode ShellcodeLoader::CreateMinimalTEB(
     LoadedShellcode& sc,
     const EmulationConfig& config) noexcept
 {
+    static_cast<void>(config);
     const GuestAddress tebAddr = WinConst::kTEBAddress64;
 
     auto tebOpt = m_memory.Allocate(tebAddr, kPageSize, MemProt::RW);
@@ -474,7 +537,9 @@ ErrorCode ShellcodeLoader::CreateMinimalTEB(
         if (err != ErrorCode::Success) return err;
 
         // StackLimit (above guard page)
-        err = WriteAt(m_memory, teb, 0x010, sc.stackBase + kPageSize);
+        GuestAddress stackLimit = 0;
+        if (!AddGuestAddress(sc.stackBase, kPageSize, stackLimit)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, teb, 0x010, stackLimit);
         if (err != ErrorCode::Success) return err;
 
         // Self → TEB (GS:[0x30])
@@ -505,16 +570,23 @@ ErrorCode ShellcodeLoader::CreateMinimalTEB(
         if (err != ErrorCode::Success) return err;
 
         // StackBase (high address)
-        err = WriteAt(m_memory, teb, 0x004, static_cast<uint32_t>(sc.stackTop));
+        uint32_t stackTop32 = 0;
+        if (!ToU32Address(sc.stackTop, stackTop32)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, teb, 0x004, stackTop32);
         if (err != ErrorCode::Success) return err;
 
         // StackLimit (above guard page)
-        err = WriteAt(m_memory, teb, 0x008,
-                      static_cast<uint32_t>(sc.stackBase + kPageSize));
+        GuestAddress stackLimit = 0;
+        uint32_t stackLimit32 = 0;
+        if (!AddGuestAddress(sc.stackBase, kPageSize, stackLimit) ||
+            !ToU32Address(stackLimit, stackLimit32)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, teb, 0x008, stackLimit32);
         if (err != ErrorCode::Success) return err;
 
         // Self → TEB (FS:[0x18])
-        err = WriteAt(m_memory, teb, 0x018, static_cast<uint32_t>(teb));
+        uint32_t teb32 = 0;
+        if (!ToU32Address(teb, teb32)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, teb, 0x018, teb32);
         if (err != ErrorCode::Success) return err;
 
         // ClientId.UniqueProcess
@@ -526,7 +598,9 @@ ErrorCode ShellcodeLoader::CreateMinimalTEB(
         if (err != ErrorCode::Success) return err;
 
         // PEB pointer
-        err = WriteAt(m_memory, teb, 0x030, static_cast<uint32_t>(sc.pebAddress));
+        uint32_t peb32 = 0;
+        if (!ToU32Address(sc.pebAddress, peb32)) return ErrorCode::InvalidAddress;
+        err = WriteAt(m_memory, teb, 0x030, peb32);
         if (err != ErrorCode::Success) return err;
 
         // LastErrorValue = 0
