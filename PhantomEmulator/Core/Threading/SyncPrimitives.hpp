@@ -45,6 +45,7 @@ struct EmulatedEvent {
     std::string name;
     bool     manualReset       = false;
     bool     signaled          = false;
+    bool     pulsePending      = false;
     std::vector<uint32_t> waitQueue;
 };
 
@@ -155,6 +156,7 @@ public:
 
     // Determine which thread owns the handle (0 if unowned / not a mutex-like object).
     [[nodiscard]] uint32_t GetOwnerThread(uint32_t handle) const noexcept;
+    [[nodiscard]] uint64_t GetDroppedOperationCount() const noexcept;
 
 private:
     std::unordered_map<uint32_t, EmulatedMutex>     m_mutexes;
@@ -164,8 +166,13 @@ private:
 
     // Handle allocator — starts above typical OS handle range to avoid collisions.
     uint32_t m_nextHandle = 0x8000;
+    uint64_t m_droppedOperations = 0;
 
-    [[nodiscard]] uint32_t AllocHandle() noexcept { return m_nextHandle++; }
+    [[nodiscard]] uint32_t AllocHandle() noexcept;
+    void RecordDrop() noexcept;
+
+    static constexpr size_t kMaxObjectNameLength = 260;
+    static constexpr size_t kMaxWaitQueueLength = 4096;
 
     // Internal helper: remove threadId from a specific wait queue vector.
     static void RemoveFromQueue(std::vector<uint32_t>& queue, uint32_t threadId);
