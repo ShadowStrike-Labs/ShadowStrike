@@ -71,14 +71,14 @@ enum class BehaviorCategory : uint8_t {
 // ============================================================================
 
 struct BehaviorAlert {
-    BehaviorCategory             category;
-    AlertSeverity                severity;
-    float                        confidence;            // 0.0-1.0
+    BehaviorCategory             category = BehaviorCategory::Discovery;
+    AlertSeverity                severity = AlertSeverity::Info;
+    float                        confidence = 0.0f;     // 0.0-1.0
     std::string                  description;
     std::string                  mitreId;               // e.g., "T1055.001"
     std::vector<uint32_t>        evidenceCallIndices;   // Indices into API call log
-    uint64_t                     instructionCount;      // When detected
-    uint16_t                     threadId;
+    uint64_t                     instructionCount = 0;  // When detected
+    uint16_t                     threadId = 0;
 };
 
 // Callback for real-time alert notification during emulation
