@@ -2540,9 +2540,8 @@ struct EmulationSession::Impl {
         // Driver security analysis — audit all loaded drivers
         auto& drvLoader = DriverLoader::Instance();
         auto loadedDrivers = drvLoader.GetLoadedDrivers();
-        for (const auto* drv : loadedDrivers) {
-            if (!drv) continue;
-            auto secReport = drvLoader.AnalyzeDriverSecurity(*drv);
+        for (const auto& drv : loadedDrivers) {
+            auto secReport = drvLoader.AnalyzeDriverSecurity(drv);
             if (secReport.hasSuspiciousImports) {
                 for (const auto& technique : secReport.mitreTechniques) {
                     m_kernelMitreTechniques.push_back(technique);
@@ -2868,10 +2867,10 @@ struct EmulationSession::Impl {
 
         // Loaded driver descriptors
         auto& drvLoader = DriverLoader::Instance();
-        auto loadedPtrs = drvLoader.GetLoadedDrivers();
-        result.loadedDrivers.reserve(loadedPtrs.size());
-        for (const auto* drv : loadedPtrs) {
-            if (drv) result.loadedDrivers.push_back(*drv);
+        auto loadedDrivers = drvLoader.GetLoadedDrivers();
+        result.loadedDrivers.reserve(loadedDrivers.size());
+        for (auto& drv : loadedDrivers) {
+            result.loadedDrivers.push_back(std::move(drv));
         }
 
         // Rootkit analysis

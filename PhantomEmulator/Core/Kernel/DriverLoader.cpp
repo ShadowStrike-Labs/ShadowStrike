@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -81,7 +83,7 @@ namespace {
 }
 
 [[nodiscard]] float CalculateEntropy(const uint8_t* data, size_t size) {
-    if (size == 0) return 0.0f;
+    if (data == nullptr || size == 0) return 0.0f;
     uint32_t freq[256] = {};
     for (size_t i = 0; i < size; ++i) {
         freq[data[i]]++;
@@ -96,6 +98,37 @@ namespace {
     return static_cast<float>(entropy);
 }
 
+[[nodiscard]] bool AddU32(uint32_t a, uint32_t b, uint32_t& result) noexcept {
+    if ((std::numeric_limits<uint32_t>::max)() - a < b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+[[nodiscard]] bool AddGuest(GuestAddress a, GuestSize b, GuestAddress& result) noexcept {
+    if ((std::numeric_limits<GuestAddress>::max)() - a < b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+[[nodiscard]] bool AlignUpGuest(GuestAddress value, GuestSize alignment, GuestAddress& result) noexcept {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    if ((std::numeric_limits<GuestAddress>::max)() - value < alignment - 1) {
+        return false;
+    }
+    result = AlignUp(value, alignment);
+    return true;
+}
+
+[[nodiscard]] uint32_t SectionMappedSize(const PE::SectionHeader& sec) noexcept {
+    return std::max(sec.VirtualSize, sec.SizeOfRawData);
+}
+
 // Convert an RVA to a file offset using the section table
 [[nodiscard]] std::optional<uint32_t> RVAToFileOffset(
     uint32_t rva,
@@ -104,13 +137,19 @@ namespace {
 {
     for (uint32_t i = 0; i < sectionCount; ++i) {
         const uint32_t secStart = sections[i].VirtualAddress;
-        const uint32_t secSize  = (sections[i].VirtualSize != 0)
-                                      ? sections[i].VirtualSize
-                                      : sections[i].SizeOfRawData;
-        if (rva >= secStart && rva < secStart + secSize) {
+        const uint32_t secSize  = SectionMappedSize(sections[i]);
+        uint32_t secEnd = 0;
+        if (secSize == 0 || !AddU32(secStart, secSize, secEnd)) {
+            continue;
+        }
+        if (rva >= secStart && rva < secEnd) {
             const uint32_t offset = rva - secStart;
             if (offset < sections[i].SizeOfRawData) {
-                return sections[i].PointerToRawData + offset;
+                uint32_t fileOffset = 0;
+                if (AddU32(sections[i].PointerToRawData, offset, fileOffset)) {
+                    return fileOffset;
+                }
+                return std::nullopt;
             }
             return std::nullopt; // In zero-fill region
         }
@@ -125,7 +164,7 @@ namespace {
     size_t maxLen = PE::kMaxDLLNameLen)
 {
     if (offset >= image.size()) return {};
-    const size_t limit = std::min(image.size(), offset + maxLen);
+    const size_t limit = offset + std::min(maxLen, image.size() - offset);
     size_t end = offset;
     while (end < limit && image[end] != 0) ++end;
     return std::string(reinterpret_cast<const char*>(image.data() + offset),
@@ -174,20 +213,40 @@ struct DriverLoader::Impl {
         if (nextStubIndex >= kMaxStubSlots) return 0;
         const GuestAddress addr = kStubRegionBase +
                                   static_cast<GuestAddress>(nextStubIndex) * kStubSlotSize;
-        ++nextStubIndex;
 
         const uint8_t retInst = 0xC3;
-        (void)memory->Write(addr, &retInst, 1);
+        if (memory == nullptr ||
+            memory->Write(addr, &retInst, sizeof(retInst)) != ErrorCode::Success) {
+            return 0;
+        }
+        ++nextStubIndex;
         return addr;
     }
 
     // ------------------------------------------------------------------
     // Register an export in the lookup table (no lock — caller holds it)
     // ------------------------------------------------------------------
-    void RegisterExportNoLock(const std::string& module,
+    [[nodiscard]] bool RegisterExportNoLock(const std::string& module,
                               const std::string& function,
                               GuestAddress addr) {
-        exportMap[ToLower(module)][ToLower(function)] = addr;
+        if (module.empty() || function.empty() || addr == 0 || exports.size() >= kMaxStubSlots) {
+            return false;
+        }
+
+        const std::string moduleKey = ToLower(module);
+        const std::string functionKey = ToLower(function);
+        auto& functions = exportMap[moduleKey];
+        if (auto it = functions.find(functionKey); it != functions.end()) {
+            it->second = addr;
+            for (auto& existing : exports) {
+                if (ToLower(existing.moduleName) == moduleKey &&
+                    ToLower(existing.functionName) == functionKey) {
+                    existing.stubAddress = addr;
+                    return true;
+                }
+            }
+        }
+        functions[functionKey] = addr;
 
         KernelExport ke;
         ke.moduleName   = module;
@@ -195,6 +254,7 @@ struct DriverLoader::Impl {
         ke.stubAddress  = addr;
         ke.isHooked     = false;
         exports.push_back(std::move(ke));
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -203,7 +263,9 @@ struct DriverLoader::Impl {
     GuestAddress AllocateAndRegister(const std::string& module,
                                      const std::string& function) {
         GuestAddress addr = AllocateStub();
-        if (addr != 0) RegisterExportNoLock(module, function, addr);
+        if (addr != 0 && !RegisterExportNoLock(module, function, addr)) {
+            return 0;
+        }
         return addr;
     }
 
@@ -229,37 +291,47 @@ struct DriverLoader::Impl {
         uint32_t imageSize,
         GuestAddress entryPoint)
     {
+        if (memory == nullptr) return 0;
+        GuestAddress nextObjBase = 0;
+        if (!AddGuest(nextDriverObjBase, kDriverObjSlotSize, nextObjBase)) {
+            return 0;
+        }
         auto allocated = memory->Allocate(nextDriverObjBase,
                                           kDriverObjSlotSize,
                                           MemProt::RW);
         if (!allocated) return 0;
 
         const GuestAddress objBase = *allocated;
-        nextDriverObjBase += kDriverObjSlotSize;
 
         // Type = IO_TYPE_DRIVER (4)
-        (void)memory->WriteU16(objBase + kDrvObjOfs_Type, kIOTypeDriver);
+        bool ok = memory->WriteU16(objBase + kDrvObjOfs_Type, kIOTypeDriver) == ErrorCode::Success;
         // Size field
-        (void)memory->WriteU16(objBase + kDrvObjOfs_Size,
-                         static_cast<uint16_t>(kDrvObjOfs_MajorFunction +
-                                               kIRPMajorFunctionCount * 8));
+        ok = ok && memory->WriteU16(objBase + kDrvObjOfs_Size,
+                                    static_cast<uint16_t>(kDrvObjOfs_MajorFunction +
+                                                          kIRPMajorFunctionCount * 8)) == ErrorCode::Success;
         // DeviceObject = 0 (none yet)
-        (void)memory->WriteU64(objBase + kDrvObjOfs_DeviceObject, 0);
+        ok = ok && memory->WriteU64(objBase + kDrvObjOfs_DeviceObject, 0) == ErrorCode::Success;
         // Flags
-        (void)memory->WriteU32(objBase + kDrvObjOfs_Flags, 0);
+        ok = ok && memory->WriteU32(objBase + kDrvObjOfs_Flags, 0) == ErrorCode::Success;
         // DriverStart
-        (void)memory->WriteU64(objBase + kDrvObjOfs_DriverStart, imageBase);
+        ok = ok && memory->WriteU64(objBase + kDrvObjOfs_DriverStart, imageBase) == ErrorCode::Success;
         // DriverSize
-        (void)memory->WriteU32(objBase + kDrvObjOfs_DriverSize, imageSize);
+        ok = ok && memory->WriteU32(objBase + kDrvObjOfs_DriverSize, imageSize) == ErrorCode::Success;
         // DriverInit (DriverEntry)
-        (void)memory->WriteU64(objBase + kDrvObjOfs_DriverInit, entryPoint);
+        ok = ok && memory->WriteU64(objBase + kDrvObjOfs_DriverInit, entryPoint) == ErrorCode::Success;
         // DriverUnload = 0
-        (void)memory->WriteU64(objBase + kDrvObjOfs_DriverUnload, 0);
+        ok = ok && memory->WriteU64(objBase + kDrvObjOfs_DriverUnload, 0) == ErrorCode::Success;
         // MajorFunction[0..27] = 0
         for (uint32_t i = 0; i < kIRPMajorFunctionCount; ++i) {
-            (void)memory->WriteU64(objBase + kDrvObjOfs_MajorFunction + i * 8, 0);
+            ok = ok && memory->WriteU64(objBase + kDrvObjOfs_MajorFunction + i * 8, 0) == ErrorCode::Success;
         }
 
+        if (!ok) {
+            (void)memory->Free(objBase, kDriverObjSlotSize);
+            return 0;
+        }
+
+        nextDriverObjBase = nextObjBase;
         return objBase;
     }
 
@@ -579,13 +651,22 @@ bool DriverLoader::Initialize(VirtualMemory& memory) {
 
     m_impl->memory = &memory;
 
-    // Allocate the stub region (RWX so we can write stubs and the CPU can
-    // "execute" the RET instruction when import calls land on them).
+    // Map the stub region writable only during emission; make it RX afterwards
+    // so emulated kernel imports do not leave writable executable memory.
     auto stubAlloc = memory.Allocate(kStubRegionBase, kStubRegionSize,
-                                     MemProt::RWX);
+                                     MemProt::RW);
     if (!stubAlloc) return false;
 
     m_impl->RegisterDefaultExports();
+    if (m_impl->exports.empty() ||
+        !memory.Protect(kStubRegionBase, kStubRegionSize, MemProt::RX)) {
+        (void)memory.Free(kStubRegionBase, kStubRegionSize);
+        m_impl->exports.clear();
+        m_impl->exportMap.clear();
+        m_impl->nextStubIndex = 0;
+        m_impl->memory = nullptr;
+        return false;
+    }
     m_impl->initialized = true;
     return true;
 }
@@ -599,15 +680,16 @@ bool DriverLoader::IsValidKernelDriver(std::span<const uint8_t> image) {
 
     const auto* dos = reinterpret_cast<const PE::DOSHeader*>(image.data());
     if (dos->e_magic != PE::kDOSMagic) return false;
+    if (dos->e_lfanew < static_cast<int32_t>(sizeof(PE::DOSHeader))) return false;
 
-    const auto lfanew = static_cast<uint32_t>(dos->e_lfanew);
-    if (lfanew + sizeof(PE::NTHeaders64) > image.size()) return false;
-    if (lfanew < sizeof(PE::DOSHeader)) return false;
+    const auto lfanew = static_cast<size_t>(dos->e_lfanew);
+    if (lfanew > image.size() || image.size() - lfanew < sizeof(PE::NTHeaders64)) return false;
 
     const auto* nt = reinterpret_cast<const PE::NTHeaders64*>(
-                         image.data() + lfanew);
+                          image.data() + lfanew);
     if (nt->Signature != PE::kNTSignature) return false;
     if (nt->FileHdr.Machine != PE::kMachineAMD64) return false;
+    if (nt->FileHdr.SizeOfOptionalHeader < sizeof(PE::OptionalHeader64)) return false;
     if (nt->OptionalHdr.Magic != PE::kPE64Magic) return false;
 
     // Kernel drivers use NATIVE subsystem
@@ -616,8 +698,17 @@ bool DriverLoader::IsValidKernelDriver(std::span<const uint8_t> image) {
     // Sanity limits
     if (nt->OptionalHdr.SizeOfImage == 0) return false;
     if (nt->OptionalHdr.SizeOfImage > kMaxDriverImageSize) return false;
+    if (nt->OptionalHdr.AddressOfEntryPoint >= nt->OptionalHdr.SizeOfImage) return false;
     if (nt->FileHdr.NumberOfSections == 0) return false;
     if (nt->FileHdr.NumberOfSections > PE::kMaxSections) return false;
+
+    const size_t sectionTableOffset = lfanew + sizeof(uint32_t) + sizeof(PE::FileHeader) +
+                                      nt->FileHdr.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(nt->FileHdr.NumberOfSections) *
+                                sizeof(PE::SectionHeader);
+    if (sectionTableOffset > image.size() || image.size() - sectionTableOffset < sectionBytes) {
+        return false;
+    }
 
     return true;
 }
@@ -637,6 +728,7 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
     if (m_impl->drivers.size() >= kMaxLoadedDrivers) return std::nullopt;
     if (driverImage.size() < sizeof(PE::DOSHeader)) return std::nullopt;
     if (driverImage.size() > kMaxDriverImageSize) return std::nullopt;
+    if (driverName.empty() || driverName.size() > PE::kMaxDLLNameLen) return std::nullopt;
 
     // ------------------------------------------------------------------
     // 1. Parse and validate PE headers
@@ -644,15 +736,19 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
 
     const auto* dos = reinterpret_cast<const PE::DOSHeader*>(driverImage.data());
     if (dos->e_magic != PE::kDOSMagic) return std::nullopt;
+    if (dos->e_lfanew < static_cast<int32_t>(sizeof(PE::DOSHeader))) return std::nullopt;
 
-    const auto lfanew = static_cast<uint32_t>(dos->e_lfanew);
-    if (lfanew < sizeof(PE::DOSHeader)) return std::nullopt;
-    if (lfanew + sizeof(PE::NTHeaders64) > driverImage.size()) return std::nullopt;
+    const auto lfanew = static_cast<size_t>(dos->e_lfanew);
+    if (lfanew > driverImage.size() ||
+        driverImage.size() - lfanew < sizeof(PE::NTHeaders64)) {
+        return std::nullopt;
+    }
 
     const auto* nt = reinterpret_cast<const PE::NTHeaders64*>(
-                         driverImage.data() + lfanew);
+                          driverImage.data() + lfanew);
     if (nt->Signature != PE::kNTSignature) return std::nullopt;
     if (nt->FileHdr.Machine != PE::kMachineAMD64) return std::nullopt;
+    if (nt->FileHdr.SizeOfOptionalHeader < sizeof(PE::OptionalHeader64)) return std::nullopt;
     if (nt->OptionalHdr.Magic != PE::kPE64Magic) return std::nullopt;
     if (nt->OptionalHdr.Subsystem != PE::kSubsystemNative) return std::nullopt;
 
@@ -667,14 +763,17 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
     if (sizeOfImage == 0 || sizeOfImage > kMaxDriverImageSize) return std::nullopt;
     if (sizeOfHeaders > sizeOfImage) return std::nullopt;
     if (sizeOfHeaders > driverImage.size()) return std::nullopt;
+    if (entryRVA >= sizeOfImage) return std::nullopt;
 
     // Locate section headers
-    const uint32_t sectionTableOffset = lfanew + 4 +
-                                        static_cast<uint32_t>(sizeof(PE::FileHeader)) +
-                                        nt->FileHdr.SizeOfOptionalHeader;
-    const uint32_t sectionTableEnd = sectionTableOffset +
-                                     sectionCount * static_cast<uint32_t>(sizeof(PE::SectionHeader));
-    if (sectionTableEnd > driverImage.size()) return std::nullopt;
+    const size_t sectionTableOffset = lfanew + sizeof(uint32_t) +
+                                      sizeof(PE::FileHeader) +
+                                      nt->FileHdr.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(sectionCount) * sizeof(PE::SectionHeader);
+    if (sectionTableOffset > driverImage.size() ||
+        driverImage.size() - sectionTableOffset < sectionBytes) {
+        return std::nullopt;
+    }
 
     const auto* sections = reinterpret_cast<const PE::SectionHeader*>(
                                driverImage.data() + sectionTableOffset);
@@ -697,8 +796,14 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                                               MemProt::RW);
         if (!alloc) return std::nullopt;
         loadBase = *alloc;
-        m_impl->nextDriverImageBase = AlignUp(
-            loadBase + sizeOfImage, 0x10000);
+        GuestAddress imageEnd = 0;
+        GuestAddress nextImageBase = 0;
+        if (!AddGuest(loadBase, sizeOfImage, imageEnd) ||
+            !AlignUpGuest(imageEnd, 0x10000, nextImageBase)) {
+            (void)m_impl->memory->Free(loadBase, sizeOfImage);
+            return std::nullopt;
+        }
+        m_impl->nextDriverImageBase = nextImageBase;
     }
 
     // ------------------------------------------------------------------
@@ -720,8 +825,18 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
     driver.fullPath      = driverName;
     driver.imageBase     = loadBase;
     driver.imageSize     = sizeOfImage;
-    driver.entryPoint    = loadBase + entryRVA;
+    if (!AddGuest(loadBase, entryRVA, driver.entryPoint)) {
+        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+        return std::nullopt;
+    }
     driver.loadTimestamp  = Platform::GetHighResolutionTicks();
+    try {
+        driver.sections.reserve(sectionCount);
+        driver.imports.reserve(kMaxImportsPerDriver);
+    } catch (const std::bad_alloc&) {
+        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+        return std::nullopt;
+    }
 
     for (uint32_t i = 0; i < sectionCount; ++i) {
         const auto& sec = sections[i];
@@ -741,17 +856,25 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
         }
 
         // Bounds-check virtual range within image
-        if (static_cast<uint64_t>(sec.VirtualAddress) + sec.VirtualSize >
-            sizeOfImage) {
+        const uint32_t mappedSize = SectionMappedSize(sec);
+        uint32_t sectionEnd = 0;
+        if (mappedSize == 0 ||
+            !AddU32(sec.VirtualAddress, mappedSize, sectionEnd) ||
+            sectionEnd > sizeOfImage) {
             (void)m_impl->memory->Free(loadBase, sizeOfImage);
             return std::nullopt;
         }
 
         // Copy raw data into guest memory
-        const uint32_t copySize = std::min(sec.SizeOfRawData, sec.VirtualSize);
+        const uint32_t copySize = std::min(sec.SizeOfRawData, mappedSize);
         if (copySize > 0) {
+            GuestAddress sectionBase = 0;
+            if (!AddGuest(loadBase, sec.VirtualAddress, sectionBase)) {
+                (void)m_impl->memory->Free(loadBase, sizeOfImage);
+                return std::nullopt;
+            }
             if (m_impl->memory->Write(
-                    loadBase + sec.VirtualAddress,
+                    sectionBase,
                     driverImage.data() + sec.PointerToRawData,
                     copySize) != ErrorCode::Success) {
                 (void)m_impl->memory->Free(loadBase, sizeOfImage);
@@ -764,8 +887,11 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
         char nameBuf[PE::kMaxSectionNameLen + 1] = {};
         std::memcpy(nameBuf, sec.Name, PE::kMaxSectionNameLen);
         ds.name             = nameBuf;
-        ds.virtualAddress   = loadBase + sec.VirtualAddress;
-        ds.virtualSize      = sec.VirtualSize;
+        if (!AddGuest(loadBase, sec.VirtualAddress, ds.virtualAddress)) {
+            (void)m_impl->memory->Free(loadBase, sizeOfImage);
+            return std::nullopt;
+        }
+        ds.virtualSize      = mappedSize;
         ds.rawDataSize      = sec.SizeOfRawData;
         ds.characteristics  = sec.Characteristics;
         ds.isExecutable     = (sec.Characteristics & PE::kSecMemExecute) != 0;
@@ -778,10 +904,9 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
     // 5. Apply relocations (IMAGE_REL_BASED_DIR64)
     // ------------------------------------------------------------------
 
-    const int64_t delta = static_cast<int64_t>(loadBase) -
-                          static_cast<int64_t>(peImageBase);
+    const uint64_t relocationDelta = loadBase - peImageBase;
 
-    if (delta != 0) {
+    if (relocationDelta != 0) {
         if (nt->FileHdr.Characteristics & PE::kCharRelocsStripped) {
             (void)m_impl->memory->Free(loadBase, sizeOfImage);
             return std::nullopt;
@@ -803,15 +928,19 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                 uint32_t totalRelocs = 0;
                 uint32_t processed   = 0;
 
-                while (processed + sizeof(PE::BaseRelocation) <= relocSize) {
+                while (relocSize - processed >= sizeof(PE::BaseRelocation)) {
                     const size_t blockOfs = static_cast<size_t>(*relocFileOfs) + processed;
                     if (blockOfs + sizeof(PE::BaseRelocation) > driverImage.size()) break;
 
                     const auto* block = reinterpret_cast<const PE::BaseRelocation*>(
-                                            driverImage.data() + blockOfs);
+                                             driverImage.data() + blockOfs);
                     if (block->SizeOfBlock == 0) break;
                     if (block->SizeOfBlock < sizeof(PE::BaseRelocation)) break;
-                    if (processed + block->SizeOfBlock > relocSize) break;
+                    if (block->SizeOfBlock > relocSize - processed) break;
+                    if (block->VirtualAddress >= sizeOfImage) {
+                        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+                        return std::nullopt;
+                    }
 
                     const uint32_t entryCount =
                         (block->SizeOfBlock - static_cast<uint32_t>(sizeof(PE::BaseRelocation))) / 2;
@@ -833,17 +962,23 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                         if (type == PE::kRelocAbsolute) continue; // Padding
 
                         if (type == PE::kRelocDir64) {
-                            const GuestAddress relocAddr = loadBase +
-                                                           block->VirtualAddress +
-                                                           offset;
+                            GuestAddress relocAddr = 0;
+                            GuestAddress relocEnd = 0;
+                            if (!AddGuest(loadBase,
+                                          static_cast<GuestSize>(block->VirtualAddress) + offset,
+                                          relocAddr) ||
+                                !AddGuest(relocAddr, sizeof(uint64_t) - 1, relocEnd) ||
+                                (relocEnd - loadBase) >= sizeOfImage) {
+                                (void)m_impl->memory->Free(loadBase, sizeOfImage);
+                                return std::nullopt;
+                            }
                             uint64_t value = 0;
                             if (m_impl->memory->ReadU64(relocAddr, value) !=
                                 ErrorCode::Success) {
                                 (void)m_impl->memory->Free(loadBase, sizeOfImage);
                                 return std::nullopt;
                             }
-                            value = static_cast<uint64_t>(
-                                        static_cast<int64_t>(value) + delta);
+                            value += relocationDelta;
                             if (m_impl->memory->WriteU64(relocAddr, value) !=
                                 ErrorCode::Success) {
                                 (void)m_impl->memory->Free(loadBase, sizeOfImage);
@@ -852,17 +987,23 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                             ++totalRelocs;
                         } else if (type == PE::kRelocHighLow) {
                             // 32-bit relocation (unusual in x64 drivers but legal)
-                            const GuestAddress relocAddr = loadBase +
-                                                           block->VirtualAddress +
-                                                           offset;
+                            GuestAddress relocAddr = 0;
+                            GuestAddress relocEnd = 0;
+                            if (!AddGuest(loadBase,
+                                          static_cast<GuestSize>(block->VirtualAddress) + offset,
+                                          relocAddr) ||
+                                !AddGuest(relocAddr, sizeof(uint32_t) - 1, relocEnd) ||
+                                (relocEnd - loadBase) >= sizeOfImage) {
+                                (void)m_impl->memory->Free(loadBase, sizeOfImage);
+                                return std::nullopt;
+                            }
                             uint32_t value32 = 0;
                             if (m_impl->memory->ReadU32(relocAddr, value32) !=
                                 ErrorCode::Success) {
                                 (void)m_impl->memory->Free(loadBase, sizeOfImage);
                                 return std::nullopt;
                             }
-                            value32 = static_cast<uint32_t>(
-                                          static_cast<int64_t>(value32) + delta);
+                            value32 += static_cast<uint32_t>(relocationDelta);
                             if (m_impl->memory->WriteU32(relocAddr, value32) !=
                                 ErrorCode::Success) {
                                 (void)m_impl->memory->Free(loadBase, sizeOfImage);
@@ -897,9 +1038,14 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                 uint32_t totalImports = 0;
 
                 for (uint32_t descIdx = 0; ; ++descIdx) {
+                    const uint64_t descDirOffset =
+                        static_cast<uint64_t>(descIdx) * sizeof(PE::ImportDescriptor);
+                    if (descDirOffset + sizeof(PE::ImportDescriptor) > importSize) {
+                        break;
+                    }
                     const size_t descOfs =
                         static_cast<size_t>(*importFileOfs) +
-                        descIdx * sizeof(PE::ImportDescriptor);
+                        static_cast<size_t>(descDirOffset);
                     if (descOfs + sizeof(PE::ImportDescriptor) > driverImage.size())
                         break;
 
@@ -925,9 +1071,11 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
 
                     auto iltOfs = RVAToFileOffset(iltRVA, sections, sectionCount);
                     if (!iltOfs) continue;
+                    if (iatRVA >= sizeOfImage) continue;
 
                     for (uint32_t funcIdx = 0; ; ++funcIdx) {
                         if (totalImports >= kMaxImportsPerDriver) break;
+                        if (funcIdx >= PE::kMaxImportsPerDLL) break;
 
                         const size_t entryOfs =
                             static_cast<size_t>(*iltOfs) + funcIdx * 8;
@@ -940,8 +1088,15 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
 
                         DriverImport imp;
                         imp.moduleName = dllName;
-                        imp.iatEntry   = loadBase + iatRVA +
-                                         static_cast<GuestAddress>(funcIdx) * 8;
+                        const GuestSize thunkOffset = static_cast<GuestSize>(funcIdx) * 8;
+                        GuestAddress iatRvaWithIndex = 0;
+                        if (!AddGuest(iatRVA, thunkOffset, iatRvaWithIndex) ||
+                            iatRvaWithIndex > sizeOfImage ||
+                            sizeOfImage - iatRvaWithIndex < sizeof(uint64_t) ||
+                            !AddGuest(loadBase, iatRvaWithIndex, imp.iatEntry)) {
+                            (void)m_impl->memory->Free(loadBase, sizeOfImage);
+                            return std::nullopt;
+                        }
 
                         if (iltEntry & PE::kImportByOrdinal64) {
                             imp.ordinal      = static_cast<uint16_t>(
@@ -974,8 +1129,11 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                         }
 
                         // Patch the IAT in guest memory
-                        (void)m_impl->memory->WriteU64(imp.iatEntry,
-                                                 imp.resolvedAddress);
+                        if (m_impl->memory->WriteU64(imp.iatEntry,
+                                                     imp.resolvedAddress) != ErrorCode::Success) {
+                            (void)m_impl->memory->Free(loadBase, sizeOfImage);
+                            return std::nullopt;
+                        }
 
                         driver.imports.push_back(std::move(imp));
                         ++totalImports;
@@ -985,7 +1143,6 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
                 }
 
                 driver.importCount = totalImports;
-                m_impl->totalImportCount += totalImports;
             }
         }
     }
@@ -1002,9 +1159,12 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
 
     for (const auto& ds : driver.sections) {
         const MemProt prot = SectionCharacteristicsToMemProt(ds.characteristics);
-        (void)m_impl->memory->Protect(ds.virtualAddress,
-                                static_cast<GuestSize>(ds.virtualSize),
-                                prot);
+        if (!m_impl->memory->Protect(ds.virtualAddress,
+                                     static_cast<GuestSize>(ds.virtualSize),
+                                     prot)) {
+            (void)m_impl->memory->Free(loadBase, sizeOfImage);
+            return std::nullopt;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1013,15 +1173,38 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
 
     driver.driverObject = m_impl->CreateDriverObject(
         loadBase, sizeOfImage, driver.entryPoint);
+    if (driver.driverObject == 0) {
+        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+        return std::nullopt;
+    }
 
     // ------------------------------------------------------------------
     // 10. Finalize and register
     // ------------------------------------------------------------------
 
-    m_impl->totalMappedSize += sizeOfImage;
-    m_impl->drivers.push_back(driver);
+    if ((std::numeric_limits<GuestSize>::max)() - m_impl->totalMappedSize < sizeOfImage) {
+        (void)m_impl->memory->Free(driver.driverObject, kDriverObjSlotSize);
+        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+        return std::nullopt;
+    }
+    if ((std::numeric_limits<uint32_t>::max)() - m_impl->totalImportCount < driver.importCount) {
+        (void)m_impl->memory->Free(driver.driverObject, kDriverObjSlotSize);
+        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+        return std::nullopt;
+    }
+    const GuestAddress driverObjectBase = driver.driverObject;
+    try {
+        m_impl->drivers.push_back(std::move(driver));
+    } catch (const std::bad_alloc&) {
+        (void)m_impl->memory->Free(driverObjectBase, kDriverObjSlotSize);
+        (void)m_impl->memory->Free(loadBase, sizeOfImage);
+        return std::nullopt;
+    }
 
-    return driver;
+    m_impl->totalMappedSize += sizeOfImage;
+    m_impl->totalImportCount += m_impl->drivers.back().importCount;
+
+    return m_impl->drivers.back();
 }
 
 // ============================================================================
@@ -1030,6 +1213,7 @@ std::optional<LoadedDriver> DriverLoader::LoadDriver(
 
 bool DriverLoader::UnloadDriver(const std::string& driverName) {
     std::unique_lock lock(m_impl->mutex);
+    if (!m_impl->memory) return false;
 
     auto it = std::find_if(
         m_impl->drivers.begin(), m_impl->drivers.end(),
@@ -1038,10 +1222,17 @@ bool DriverLoader::UnloadDriver(const std::string& driverName) {
     if (it == m_impl->drivers.end()) return false;
 
     (void)m_impl->memory->Free(it->imageBase,
-                         static_cast<GuestSize>(it->imageSize));
+                          static_cast<GuestSize>(it->imageSize));
+    if (it->driverObject != 0) {
+        (void)m_impl->memory->Free(it->driverObject, kDriverObjSlotSize);
+    }
 
-    m_impl->totalMappedSize -= it->imageSize;
-    m_impl->totalImportCount -= it->importCount;
+    m_impl->totalMappedSize = (m_impl->totalMappedSize >= it->imageSize)
+                                  ? m_impl->totalMappedSize - it->imageSize
+                                  : 0;
+    m_impl->totalImportCount = (m_impl->totalImportCount >= it->importCount)
+                                   ? m_impl->totalImportCount - it->importCount
+                                   : 0;
     m_impl->drivers.erase(it);
     return true;
 }
@@ -1050,31 +1241,26 @@ bool DriverLoader::UnloadDriver(const std::string& driverName) {
 // Query methods
 // ============================================================================
 
-const LoadedDriver* DriverLoader::FindDriver(const std::string& name) const {
+std::optional<LoadedDriver> DriverLoader::FindDriver(const std::string& name) const {
     std::shared_lock lock(m_impl->mutex);
     for (const auto& d : m_impl->drivers) {
-        if (d.name == name) return &d;
+        if (d.name == name) return d;
     }
-    return nullptr;
+    return std::nullopt;
 }
 
-const LoadedDriver* DriverLoader::FindDriverByAddress(GuestAddress addr) const {
+std::optional<LoadedDriver> DriverLoader::FindDriverByAddress(GuestAddress addr) const {
     std::shared_lock lock(m_impl->mutex);
     for (const auto& d : m_impl->drivers) {
         if (addr >= d.imageBase && (addr - d.imageBase) < d.imageSize)
-            return &d;
+            return d;
     }
-    return nullptr;
+    return std::nullopt;
 }
 
-std::vector<const LoadedDriver*> DriverLoader::GetLoadedDrivers() const {
+std::vector<LoadedDriver> DriverLoader::GetLoadedDrivers() const {
     std::shared_lock lock(m_impl->mutex);
-    std::vector<const LoadedDriver*> result;
-    result.reserve(m_impl->drivers.size());
-    for (const auto& d : m_impl->drivers) {
-        result.push_back(&d);
-    }
-    return result;
+    return m_impl->drivers;
 }
 
 uint32_t DriverLoader::GetDriverCount() const {
@@ -1094,10 +1280,7 @@ std::optional<GuestAddress> DriverLoader::ResolveKernelExport(
     return m_impl->ResolveExportNoLock(moduleName, functionName);
 }
 
-const std::vector<KernelExport>& DriverLoader::GetRegisteredExports() const {
-    // Returns reference to internal vector — caller must not race with
-    // RegisterKernelExport.  Acceptable: analysis code runs single-threaded
-    // between driver loads.
+std::vector<KernelExport> DriverLoader::GetRegisteredExports() const {
     std::shared_lock lock(m_impl->mutex);
     return m_impl->exports;
 }
@@ -1108,7 +1291,7 @@ void DriverLoader::RegisterKernelExport(
     GuestAddress addr)
 {
     std::unique_lock lock(m_impl->mutex);
-    m_impl->RegisterExportNoLock(module, function, addr);
+    (void)m_impl->RegisterExportNoLock(module, function, addr);
 }
 
 // ============================================================================
