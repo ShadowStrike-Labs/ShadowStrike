@@ -13,9 +13,14 @@
 #include "PhantomCore/AI/CortexTypes.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <new>
 #include <numeric>
+#include <utility>
 
 namespace Phantom {
 
@@ -55,6 +60,9 @@ struct MLClassifier::Impl {
 
     // Normalize a value into [0, 1] with log scaling for wide-range counters
     static float LogNormalize(float value, float maxExpected) noexcept {
+        if (!std::isfinite(value) || !std::isfinite(maxExpected) || maxExpected <= 0.0f) {
+            return 0.0f;
+        }
         if (value <= 0.0f) return 0.0f;
         if (value >= maxExpected) return 1.0f;
         return std::log1pf(value) / std::log1pf(maxExpected);
@@ -62,9 +70,26 @@ struct MLClassifier::Impl {
 
     // Normalize a value into [0, 1] with linear scaling
     static float LinearNormalize(float value, float maxExpected) noexcept {
+        if (!std::isfinite(value) || !std::isfinite(maxExpected) || maxExpected <= 0.0f) {
+            return 0.0f;
+        }
         if (value <= 0.0f) return 0.0f;
         if (value >= maxExpected) return 1.0f;
         return value / maxExpected;
+    }
+
+    static float ClampScore(float value) noexcept {
+        return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+    }
+
+    static float BoundedCounterToFloat(unsigned long long value,
+                                       float maxExpected) noexcept {
+        if (!std::isfinite(maxExpected) || maxExpected <= 0.0f) {
+            return 0.0f;
+        }
+        return (static_cast<long double>(value) >= static_cast<long double>(maxExpected))
+            ? maxExpected
+            : static_cast<float>(value);
     }
 };
 
@@ -73,8 +98,14 @@ struct MLClassifier::Impl {
 // ============================================================================
 
 MLClassifier::MLClassifier(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (const std::bad_alloc&) {
+        m_impl = nullptr;
+        return;
+    }
     m_impl->enabled = config.enableMLClassifier;
 }
 
@@ -98,7 +129,13 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
 
     using namespace FeatureLayout;
 
-    std::vector<float> features(kTotalFeatures, 0.0f);
+    std::vector<float> features;
+    try {
+        features.assign(kTotalFeatures, 0.0f);
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
+    try {
 
     // === Section 1: BehaviorCategory alert counts [0..19] ===
     const auto& alerts = behavior.GetAlerts();
@@ -108,13 +145,13 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
             features[kCategoryAlertCounts + idx] += 1.0f;
 
             // Section 2: max severity per category [20..39]
-            float sevNorm = static_cast<float>(alert.severity) / 4.0f;
+            float sevNorm = Impl::ClampScore(static_cast<float>(alert.severity) / 4.0f);
             features[kCategoryMaxSeverity + idx] =
                 std::max(features[kCategoryMaxSeverity + idx], sevNorm);
 
             // Section 3: max confidence per category [40..59]
             features[kCategoryMaxConfidence + idx] =
-                std::max(features[kCategoryMaxConfidence + idx], alert.confidence);
+                std::max(features[kCategoryMaxConfidence + idx], Impl::ClampScore(alert.confidence));
         }
     }
 
@@ -139,7 +176,7 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
             features[kSequencePatternCounts + patIdx] += 1.0f;
             features[kSequencePatternConfidence + patIdx] =
                 std::max(features[kSequencePatternConfidence + patIdx],
-                         match.confidence);
+                         Impl::ClampScore(match.confidence));
         }
     }
     // Normalize pattern counts
@@ -149,23 +186,29 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
     }
 
     // === Section 7: Memory finding distribution [164..195] ===
-    auto wxPages = memory.GetWriteExecutePages();
-    auto rwxAllocs = memory.GetRWXAllocations();
+    std::vector<GuestAddress> wxPages;
+    std::vector<std::pair<GuestAddress, GuestSize>> rwxAllocs;
+    try {
+        wxPages = memory.GetWriteExecutePages();
+        rwxAllocs = memory.GetRWXAllocations();
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
     // Bin 0: W→X page count (normalized)
     features[kMemoryFindingDistribution] =
-        Impl::LogNormalize(static_cast<float>(wxPages.size()), 10000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(wxPages.size(), 10000.0f), 10000.0f);
     // Bin 1: RWX allocation count (normalized)
     features[kMemoryFindingDistribution + 1] =
-        Impl::LogNormalize(static_cast<float>(rwxAllocs.size()), 1000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(rwxAllocs.size(), 1000.0f), 1000.0f);
     // Bin 2: Unique written pages (normalized)
     features[kMemoryFindingDistribution + 2] =
         Impl::LogNormalize(
-            static_cast<float>(memory.GetUniqueWrittenPages()), 50000.0f);
+            Impl::BoundedCounterToFloat(memory.GetUniqueWrittenPages(), 50000.0f), 50000.0f);
 
     // === Section 8: W→X transition features [196..211] ===
     uint32_t wxCount = memory.GetWriteExecuteCount();
     features[kWXTransitionFeatures] =
-        Impl::LogNormalize(static_cast<float>(wxCount), 100000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(wxCount, 100000.0f), 100000.0f);
 
     // If we have W→X pages, compute entropy of their address distribution
     if (!wxPages.empty()) {
@@ -190,8 +233,9 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
         uint32_t writtenPages = memory.GetUniqueWrittenPages();
         if (writtenPages > 0) {
             features[kWXTransitionFeatures + 2] =
-                std::min(1.0f,
-                    static_cast<float>(wxCount) / static_cast<float>(writtenPages));
+                Impl::ClampScore(
+                    Impl::BoundedCounterToFloat(wxCount, static_cast<float>(writtenPages)) /
+                    Impl::BoundedCounterToFloat(writtenPages, static_cast<float>(writtenPages)));
         }
     }
 
@@ -217,11 +261,16 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
     // This is populated from the instruction trace if available.
     // For now, encode the API call timing distribution as a proxy:
     if (!apiLog.empty()) {
-        uint64_t maxInstrCount = apiLog.back().instructionCount;
+        uint64_t maxInstrCount = 0;
+        for (const auto& call : apiLog) {
+            maxInstrCount = std::max<uint64_t>(maxInstrCount, call.instructionCount);
+        }
         if (maxInstrCount > 0) {
             for (const auto& call : apiLog) {
                 uint32_t bin = static_cast<uint32_t>(
-                    (call.instructionCount * kInstructionBins) / (maxInstrCount + 1));
+                    (static_cast<long double>(call.instructionCount) *
+                     static_cast<long double>(kInstructionBins)) /
+                    (static_cast<long double>(maxInstrCount) + 1.0L));
                 if (bin >= kInstructionBins) bin = kInstructionBins - 1;
                 features[kInstructionDistribution + bin] += 1.0f;
             }
@@ -240,53 +289,67 @@ std::optional<std::vector<float>> MLClassifier::ExtractFeatures(
     // === Section 11: Session-level statistics [340..355] ===
     // 0: Total instructions (log-normalized)
     features[kSessionStatistics] =
-        Impl::LogNormalize(static_cast<float>(totalInstructions), 200'000'000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(totalInstructions, 200'000'000.0f),
+                           200'000'000.0f);
     // 1: Total API calls (log-normalized)
     features[kSessionStatistics + 1] =
-        Impl::LogNormalize(static_cast<float>(apiLog.size()), 1'000'000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(apiLog.size(), 1'000'000.0f),
+                           1'000'000.0f);
     // 2: Total memory allocated (log-normalized to 512 MB)
     features[kSessionStatistics + 2] =
-        Impl::LogNormalize(static_cast<float>(totalMemoryAllocated), 512.0f * 1024 * 1024);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(totalMemoryAllocated,
+                                                       512.0f * 1024 * 1024),
+                           512.0f * 1024 * 1024);
     // 3: W→X count (log-normalized)
     features[kSessionStatistics + 3] =
-        Impl::LogNormalize(static_cast<float>(wxCount), 100'000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(wxCount, 100'000.0f), 100'000.0f);
     // 4: Behavior alert count (log-normalized)
     features[kSessionStatistics + 4] =
-        Impl::LogNormalize(static_cast<float>(alerts.size()), 10'000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(alerts.size(), 10'000.0f), 10'000.0f);
     // 5: Max behavior severity (normalized 0..1)
     features[kSessionStatistics + 5] =
-        static_cast<float>(behavior.GetMaxSeverity()) / 4.0f;
+        Impl::ClampScore(static_cast<float>(behavior.GetMaxSeverity()) / 4.0f);
     // 6: Sequence match count (log-normalized)
     features[kSessionStatistics + 6] =
-        Impl::LogNormalize(static_cast<float>(matches.size()), 1000.0f);
+        Impl::LogNormalize(Impl::BoundedCounterToFloat(matches.size(), 1000.0f), 1000.0f);
     // 7: Max sequence severity (normalized 0..1)
     features[kSessionStatistics + 7] =
-        static_cast<float>(apiSequence.GetMaxSeverity()) / 4.0f;
+        Impl::ClampScore(static_cast<float>(apiSequence.GetMaxSeverity()) / 4.0f);
     // 8: Active state machine count (normalized)
     features[kSessionStatistics + 8] =
         Impl::LinearNormalize(
-            static_cast<float>(behavior.GetActiveStateMachineCount()), 50.0f);
+            Impl::BoundedCounterToFloat(behavior.GetActiveStateMachineCount(), 50.0f), 50.0f);
     // 9: Unique blocked API calls
     {
         uint32_t blockedCount = 0;
         for (const auto& call : apiLog) {
-            if (call.wasBlocked) ++blockedCount;
+            if (call.wasBlocked && blockedCount < std::numeric_limits<uint32_t>::max()) {
+                ++blockedCount;
+            }
         }
         features[kSessionStatistics + 9] =
-            Impl::LogNormalize(static_cast<float>(blockedCount), 10'000.0f);
+            Impl::LogNormalize(Impl::BoundedCounterToFloat(blockedCount, 10'000.0f),
+                               10'000.0f);
     }
     // 10: RWX total size (log-normalized)
     {
         uint64_t rwxTotal = 0;
         for (const auto& [base, size] : rwxAllocs) {
-            rwxTotal += size;
+            (void)base;
+            rwxTotal = (size > std::numeric_limits<uint64_t>::max() - rwxTotal)
+                ? std::numeric_limits<uint64_t>::max()
+                : (rwxTotal + size);
         }
         features[kSessionStatistics + 10] =
-            Impl::LogNormalize(static_cast<float>(rwxTotal), 64.0f * 1024 * 1024);
+            Impl::LogNormalize(Impl::BoundedCounterToFloat(rwxTotal, 64.0f * 1024 * 1024),
+                               64.0f * 1024 * 1024);
     }
     // 11-15: Reserved (stay 0.0f)
 
     return features;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -302,6 +365,7 @@ std::optional<MLClassificationResult> MLClassifier::Classify(
     uint64_t totalMemoryAllocated) const noexcept
 {
     if (!m_impl || !m_impl->enabled) return std::nullopt;
+    try {
 
     // Extract features
     auto features = ExtractFeatures(
@@ -331,14 +395,14 @@ std::optional<MLClassificationResult> MLClassifier::Classify(
 
     // Decode model output:
     // Output[0] = malware probability (sigmoid already applied)
-    result.malwareConfidence = std::clamp((*output)[0], 0.0f, 1.0f);
+    result.malwareConfidence = Impl::ClampScore((*output)[0]);
 
     // Output[1..20] = per-category softmax scores (if model provides them)
     uint8_t bestCategory = 0;
     float bestCategoryScore = 0.0f;
     size_t numCategories = std::min<size_t>(output->size() - 1, 20);
     for (size_t i = 0; i < numCategories; ++i) {
-        float score = std::clamp((*output)[i + 1], 0.0f, 1.0f);
+        float score = Impl::ClampScore((*output)[i + 1]);
         result.categoryScores[i] = score;
         if (score > bestCategoryScore) {
             bestCategoryScore = score;
@@ -348,6 +412,14 @@ std::optional<MLClassificationResult> MLClassifier::Classify(
     result.predictedCategory = bestCategory;
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    } catch (const std::exception&) {
+        MLClassificationResult result;
+        result.modelAvailable = false;
+        result.featureCount = FeatureLayout::kTotalFeatures;
+        return result;
+    }
 }
 
 // ============================================================================
@@ -355,8 +427,12 @@ std::optional<MLClassificationResult> MLClassifier::Classify(
 // ============================================================================
 
 bool MLClassifier::IsModelLoaded() const noexcept {
-    auto& inference = ShadowStrike::AI::ModelInference::Instance();
-    return inference.IsModelLoaded(ShadowStrike::AI::CortexModelType::Emulation);
+    try {
+        auto& inference = ShadowStrike::AI::ModelInference::Instance();
+        return inference.IsModelLoaded(ShadowStrike::AI::CortexModelType::Emulation);
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 bool MLClassifier::IsEnabled() const noexcept {
