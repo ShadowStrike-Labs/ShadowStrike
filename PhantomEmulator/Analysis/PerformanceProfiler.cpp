@@ -18,8 +18,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <thread>
 #include <utility>
@@ -69,9 +71,41 @@ namespace {
     }
 
     constexpr uint64_t kNsPerSecond = 1'000'000'000ULL;
-    const uint64_t whole = (ticks / frequency) * kNsPerSecond;
-    const uint64_t rem = ((ticks % frequency) * kNsPerSecond) / frequency;
-    return whole + rem;
+    const long double ns =
+        (static_cast<long double>(ticks) * static_cast<long double>(kNsPerSecond)) /
+        static_cast<long double>(frequency);
+    return (ns >= static_cast<long double>(std::numeric_limits<uint64_t>::max()))
+        ? std::numeric_limits<uint64_t>::max()
+        : static_cast<uint64_t>(ns);
+}
+
+[[nodiscard]] uint64_t ElapsedTicks(uint64_t nowTicks, uint64_t startTicks) noexcept {
+    return (nowTicks > startTicks) ? (nowTicks - startTicks) : 0;
+}
+
+void SaturatingAdd(uint64_t& target, uint64_t value) noexcept {
+    target = (value > std::numeric_limits<uint64_t>::max() - target)
+        ? std::numeric_limits<uint64_t>::max()
+        : (target + value);
+}
+
+void SaturatingIncrement(uint64_t& target) noexcept {
+    SaturatingAdd(target, 1);
+}
+
+uint64_t SaturatingAtomicIncrement(std::atomic<uint64_t>& value) noexcept {
+    uint64_t current = value.load(std::memory_order_relaxed);
+    while (current != std::numeric_limits<uint64_t>::max()) {
+        const uint64_t desired = current + 1;
+        if (value.compare_exchange_weak(
+                current,
+                desired,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return desired;
+        }
+    }
+    return current;
 }
 
 template <size_t Capacity>
@@ -170,7 +204,7 @@ struct PerformanceProfiler::Impl {
     MemoryProfile memoryProfile{};
     PhaseTimings phaseTimings{};
 
-    std::array<BlockCacheEntry, kBlockCacheSize> blockCache{};
+    std::unique_ptr<BlockCacheEntry[]> blockCache;
     std::array<ThreadContext, kMaxTrackedThreads> threadContexts{};
     std::array<GuestAddress, kRecentBlockRingSize> recentBlocks{};
     uint32_t recentBlockCount = 0;
@@ -179,6 +213,12 @@ struct PerformanceProfiler::Impl {
     FixedPageSet<kTrackedPageSetSize> uniquePages;
     FixedPageSet<kTrackedPageSetSize> executedPages;
     FixedPageSet<kTrackedPageSetSize> writtenExecutablePages;
+
+    Impl()
+        : blockCache(std::make_unique<BlockCacheEntry[]>(kBlockCacheSize))
+    {
+        ResetState();
+    }
 
     [[nodiscard]] ThreadContext* GetThreadContext() noexcept {
         const auto currentId = std::this_thread::get_id();
@@ -205,7 +245,7 @@ struct PerformanceProfiler::Impl {
     }
 
     [[nodiscard]] BlockCacheEntry* FindBlockEntry(GuestAddress address) noexcept {
-        if (address == 0) {
+        if (address == 0 || !blockCache) {
             return nullptr;
         }
 
@@ -228,7 +268,7 @@ struct PerformanceProfiler::Impl {
     }
 
     void EraseBlockEntry(GuestAddress address) noexcept {
-        if (address == 0) {
+        if (address == 0 || !blockCache) {
             return;
         }
 
@@ -313,7 +353,7 @@ struct PerformanceProfiler::Impl {
 
     void UpdatePeakIPS(uint64_t nowTicks) noexcept {
         const uint64_t currentInstructions = totalInstructions.load(std::memory_order_relaxed);
-        const uint64_t elapsedTicks = nowTicks - lastWindowTicks;
+        const uint64_t elapsedTicks = ElapsedTicks(nowTicks, lastWindowTicks);
         if (elapsedTicks == 0 || tickFrequency == 0) {
             return;
         }
@@ -323,7 +363,10 @@ struct PerformanceProfiler::Impl {
             return;
         }
 
-        const uint64_t deltaInstructions = currentInstructions - lastWindowInstructionCount;
+        const uint64_t deltaInstructions =
+            currentInstructions >= lastWindowInstructionCount
+                ? currentInstructions - lastWindowInstructionCount
+                : 0;
         const double ips = static_cast<double>(deltaInstructions) * static_cast<double>(tickFrequency)
             / static_cast<double>(elapsedTicks);
         if (ips > peakIPS) {
@@ -363,7 +406,7 @@ struct PerformanceProfiler::Impl {
                         slot.path.blockCount = length;
                     }
 
-                    ++slot.path.totalExecutions;
+                    SaturatingIncrement(slot.path.totalExecutions);
                     const uint32_t loopIterations = EstimateLoopIterations(length);
                     if (loopIterations > 1) {
                         slot.path.isLoop = true;
@@ -396,7 +439,11 @@ struct PerformanceProfiler::Impl {
         memoryProfile = MemoryProfile{};
         phaseTimings = PhaseTimings{};
         peakIPS = 0.0;
-        blockCache.fill(BlockCacheEntry{});
+        if (blockCache) {
+            for (uint32_t i = 0; i < kBlockCacheSize; ++i) {
+                blockCache[i] = BlockCacheEntry{};
+            }
+        }
         recentBlocks.fill(0);
         recentBlockCount = 0;
         recentBlockHead = 0;
@@ -417,7 +464,9 @@ struct PerformanceProfiler::Impl {
 PerformanceProfiler::PerformanceProfiler() noexcept {
     try {
         m_impl = std::make_unique<Impl>();
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    } catch (const std::exception&) {
         m_impl.reset();
     }
 }
@@ -442,7 +491,7 @@ void PerformanceProfiler::OnInstructionStart(GuestAddress rip) noexcept {
     threadCtx->currentRip = rip;
     threadCtx->instructionStartTicks = nowTicks;
     threadCtx->lastPhaseTicks = nowTicks;
-    m_impl->executedPages.Insert(PageBase(rip));
+    (void)m_impl->executedPages.Insert(PageBase(rip));
 }
 
 void PerformanceProfiler::OnInstructionEnd(
@@ -462,29 +511,29 @@ void PerformanceProfiler::OnInstructionEnd(
 
     auto* threadCtx = m_impl->GetThreadContext();
     if (threadCtx->instructionActive && nowTicks > threadCtx->lastPhaseTicks) {
-        const uint64_t deltaNs = TicksToNs(nowTicks - threadCtx->lastPhaseTicks, m_impl->tickFrequency);
-        m_impl->phaseTimings.executionNs += deltaNs;
-        m_impl->throughput.executeTimeNs += deltaNs;
+        const uint64_t deltaNs =
+            TicksToNs(ElapsedTicks(nowTicks, threadCtx->lastPhaseTicks), m_impl->tickFrequency);
+        SaturatingAdd(m_impl->phaseTimings.executionNs, deltaNs);
+        SaturatingAdd(m_impl->throughput.executeTimeNs, deltaNs);
     }
 
     threadCtx->instructionActive = false;
     threadCtx->lastPhaseTicks = nowTicks;
 
-    const uint64_t currentCount =
-        m_impl->totalInstructions.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t currentCount = SaturatingAtomicIncrement(m_impl->totalInstructions);
 
     switch (static_cast<OpcodeMap>(opcodeMap)) {
         case OpcodeMap::OneByte:
-            ++m_impl->opcodeProfile.frequency[opcode];
+            SaturatingIncrement(m_impl->opcodeProfile.frequency[opcode]);
             break;
         case OpcodeMap::TwoByte:
-            ++m_impl->opcodeProfile.twoByteFreq[opcode];
+            SaturatingIncrement(m_impl->opcodeProfile.twoByteFreq[opcode]);
             break;
         case OpcodeMap::ThreeByte38:
-            ++m_impl->opcodeProfile.threeByteFreq38[opcode];
+            SaturatingIncrement(m_impl->opcodeProfile.threeByteFreq38[opcode]);
             break;
         case OpcodeMap::ThreeByte3A:
-            ++m_impl->opcodeProfile.threeByteFreq3A[opcode];
+            SaturatingIncrement(m_impl->opcodeProfile.threeByteFreq3A[opcode]);
             break;
         default:
             break;
@@ -506,10 +555,10 @@ void PerformanceProfiler::OnBlockEntry(GuestAddress blockStart) noexcept {
 
     auto* threadCtx = m_impl->GetThreadContext();
     threadCtx->currentBlock = blockStart;
-    m_impl->executedPages.Insert(PageBase(blockStart));
+    (void)m_impl->executedPages.Insert(PageBase(blockStart));
 
     if (auto* entry = m_impl->FindBlockEntry(blockStart); entry != nullptr) {
-        ++entry->block.executionCount;
+        SaturatingIncrement(entry->block.executionCount);
         entry->block.lastExecuted = m_impl->totalInstructions.load(std::memory_order_relaxed);
         entry->block.isHot = entry->block.executionCount >= kHotBlockThreshold;
     }
@@ -564,24 +613,25 @@ void PerformanceProfiler::OnMemoryAccess(
 
     auto* threadCtx = m_impl->GetThreadContext();
     if (threadCtx->instructionActive && nowTicks > threadCtx->lastPhaseTicks) {
-        const uint64_t deltaNs = TicksToNs(nowTicks - threadCtx->lastPhaseTicks, m_impl->tickFrequency);
-        m_impl->phaseTimings.memoryNs += deltaNs;
-        m_impl->throughput.memoryAccessTimeNs += deltaNs;
+        const uint64_t deltaNs =
+            TicksToNs(ElapsedTicks(nowTicks, threadCtx->lastPhaseTicks), m_impl->tickFrequency);
+        SaturatingAdd(m_impl->phaseTimings.memoryNs, deltaNs);
+        SaturatingAdd(m_impl->throughput.memoryAccessTimeNs, deltaNs);
         threadCtx->lastPhaseTicks = nowTicks;
     }
 
     if (isWrite) {
-        ++m_impl->memoryProfile.totalWrites;
+        SaturatingIncrement(m_impl->memoryProfile.totalWrites);
     } else {
-        ++m_impl->memoryProfile.totalReads;
+        SaturatingIncrement(m_impl->memoryProfile.totalReads);
     }
 
     if (m_impl->IsStackAddress(addr)) {
-        ++m_impl->memoryProfile.stackAccesses;
+        SaturatingIncrement(m_impl->memoryProfile.stackAccesses);
     }
 
     if (m_impl->IsHeapAddress(addr)) {
-        ++m_impl->memoryProfile.heapAccesses;
+        SaturatingIncrement(m_impl->memoryProfile.heapAccesses);
     }
 
     const GuestAddress startPage = PageBase(addr);
@@ -591,7 +641,7 @@ void PerformanceProfiler::OnMemoryAccess(
         : addr + static_cast<GuestAddress>(size - 1);
     const GuestAddress endPage = PageBase(endAddr);
     if (startPage != endPage) {
-        ++m_impl->memoryProfile.crossPageAccesses;
+        SaturatingIncrement(m_impl->memoryProfile.crossPageAccesses);
     }
 
     if (m_impl->uniquePages.Insert(startPage)) {
@@ -602,12 +652,14 @@ void PerformanceProfiler::OnMemoryAccess(
     }
 
     if (!isWrite && m_impl->executedPages.Contains(startPage)) {
-        ++m_impl->memoryProfile.codeRegionReads;
+        SaturatingIncrement(m_impl->memoryProfile.codeRegionReads);
     }
 
     if (isWrite && m_impl->executedPages.Contains(startPage)) {
         if (m_impl->writtenExecutablePages.Insert(startPage)) {
-            ++m_impl->memoryProfile.writableExecAccesses;
+            if (m_impl->memoryProfile.writableExecAccesses < std::numeric_limits<uint32_t>::max()) {
+                ++m_impl->memoryProfile.writableExecAccesses;
+            }
         }
     }
 }
@@ -625,8 +677,8 @@ void PerformanceProfiler::OnAPICall(
         return;
     }
 
-    m_impl->phaseTimings.apiDispatchNs += durationNs;
-    m_impl->throughput.apiDispatchTimeNs += durationNs;
+    SaturatingAdd(m_impl->phaseTimings.apiDispatchNs, durationNs);
+    SaturatingAdd(m_impl->throughput.apiDispatchTimeNs, durationNs);
     auto* threadCtx = m_impl->GetThreadContext();
     if (threadCtx->instructionActive) {
         threadCtx->lastPhaseTicks = ReadHighResolutionTicks();
@@ -643,8 +695,8 @@ void PerformanceProfiler::OnDecodeComplete(uint64_t durationNs) noexcept {
         return;
     }
 
-    m_impl->phaseTimings.decodingNs += durationNs;
-    m_impl->throughput.decodeTimeNs += durationNs;
+    SaturatingAdd(m_impl->phaseTimings.decodingNs, durationNs);
+    SaturatingAdd(m_impl->throughput.decodeTimeNs, durationNs);
 
     auto* threadCtx = m_impl->GetThreadContext();
     if (threadCtx->instructionActive) {
@@ -663,20 +715,23 @@ BasicBlock* PerformanceProfiler::LookupBlock(GuestAddress address) noexcept {
         return nullptr;
     }
 
-    const auto elapsedTicks = ReadHighResolutionTicks() - startTicks;
-    m_impl->phaseTimings.blockCacheLookupNs += TicksToNs(elapsedTicks, m_impl->tickFrequency);
+    const auto elapsedTicks = ElapsedTicks(ReadHighResolutionTicks(), startTicks);
+    SaturatingAdd(m_impl->phaseTimings.blockCacheLookupNs,
+                  TicksToNs(elapsedTicks, m_impl->tickFrequency));
 
     if (auto* entry = m_impl->FindBlockEntry(address); entry != nullptr) {
-        ++m_impl->phaseTimings.blockCacheHits;
-        return &entry->block;
+        SaturatingIncrement(m_impl->phaseTimings.blockCacheHits);
+        thread_local BasicBlock snapshot;
+        snapshot = entry->block;
+        return &snapshot;
     }
 
-    ++m_impl->phaseTimings.blockCacheMisses;
+    SaturatingIncrement(m_impl->phaseTimings.blockCacheMisses);
     return nullptr;
 }
 
 void PerformanceProfiler::CacheBlock(const BasicBlock& block) noexcept {
-    if (!m_impl || block.startAddress == 0) {
+    if (!m_impl || !m_impl->blockCache || block.startAddress == 0) {
         return;
     }
 
@@ -718,7 +773,7 @@ void PerformanceProfiler::InvalidateBlock(GuestAddress address) noexcept {
 }
 
 void PerformanceProfiler::InvalidateRange(GuestAddress start, GuestSize size) noexcept {
-    if (!m_impl || size == 0) {
+    if (!m_impl || !m_impl->blockCache || size == 0) {
         return;
     }
 
@@ -727,25 +782,29 @@ void PerformanceProfiler::InvalidateRange(GuestAddress start, GuestSize size) no
         (std::numeric_limits<GuestAddress>::max() - start < size)
         ? std::numeric_limits<GuestAddress>::max()
         : start + size;
-    std::array<GuestAddress, kBlockCacheSize> removals{};
-    uint32_t removalCount = 0;
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        for (uint32_t slot = 0; slot < kBlockCacheSize; ++slot) {
+            const auto& entry = m_impl->blockCache[slot];
+            if (entry.key == 0) {
+                continue;
+            }
 
-    for (const auto& entry : m_impl->blockCache) {
-        if (entry.key == 0) {
-            continue;
+            const GuestAddress blockStart = entry.block.startAddress;
+            const GuestAddress blockLength = entry.block.byteLength == 0
+                ? 1
+                : static_cast<GuestAddress>(entry.block.byteLength);
+            const GuestAddress blockEnd =
+                (std::numeric_limits<GuestAddress>::max() - blockStart < blockLength)
+                ? std::numeric_limits<GuestAddress>::max()
+                : blockStart + blockLength;
+            if (blockStart < end && start < blockEnd) {
+                m_impl->EraseBlockEntry(entry.block.startAddress);
+                removed = true;
+                break;
+            }
         }
-
-        const GuestAddress blockStart = entry.block.startAddress;
-        const GuestAddress blockEnd = entry.block.byteLength == 0
-            ? blockStart + 1
-            : blockStart + entry.block.byteLength;
-        if (blockStart < end && start < blockEnd) {
-            removals[removalCount++] = entry.block.startAddress;
-        }
-    }
-
-    for (uint32_t i = 0; i < removalCount; ++i) {
-        m_impl->EraseBlockEntry(removals[i]);
     }
 }
 
@@ -758,7 +817,7 @@ ThroughputStats PerformanceProfiler::GetThroughput() const noexcept {
     std::shared_lock lock(m_impl->mutex);
     snapshot = m_impl->throughput;
     snapshot.totalInstructions = m_impl->totalInstructions.load(std::memory_order_relaxed);
-    snapshot.totalCycles = ReadHighResolutionTicks() - m_impl->startTicks;
+    snapshot.totalCycles = ElapsedTicks(ReadHighResolutionTicks(), m_impl->startTicks);
 
     if (snapshot.totalCycles != 0 && m_impl->tickFrequency != 0) {
         snapshot.instructionsPerSecond =
@@ -787,9 +846,12 @@ OpcodeProfile PerformanceProfiler::GetOpcodeProfile() const noexcept {
 
     std::array<std::pair<uint64_t, uint8_t>, 256> ranked{};
     for (uint32_t i = 0; i < 256; ++i) {
+        uint64_t total = snapshot.frequency[i];
+        SaturatingAdd(total, snapshot.twoByteFreq[i]);
+        SaturatingAdd(total, snapshot.threeByteFreq38[i]);
+        SaturatingAdd(total, snapshot.threeByteFreq3A[i]);
         ranked[i] = {
-            snapshot.frequency[i] + snapshot.twoByteFreq[i]
-                + snapshot.threeByteFreq38[i] + snapshot.threeByteFreq3A[i],
+            total,
             static_cast<uint8_t>(i)
         };
     }
@@ -826,7 +888,8 @@ PhaseTimings PerformanceProfiler::GetPhaseTimings() const noexcept {
 
     std::shared_lock lock(m_impl->mutex);
     snapshot = m_impl->phaseTimings;
-    const uint64_t lookups = snapshot.blockCacheHits + snapshot.blockCacheMisses;
+    uint64_t lookups = snapshot.blockCacheHits;
+    SaturatingAdd(lookups, snapshot.blockCacheMisses);
     if (lookups != 0) {
         snapshot.cacheHitRate =
             static_cast<double>(snapshot.blockCacheHits) / static_cast<double>(lookups);
@@ -857,11 +920,14 @@ std::vector<HotPath> PerformanceProfiler::GetHotPaths(uint32_t maxResults) const
             if (totalInstructions > 0.0) {
                 const double estimatedInstructions =
                     static_cast<double>(path.totalExecutions) * static_cast<double>(path.blockCount);
-                path.executionShare = static_cast<float>((estimatedInstructions / totalInstructions) * 100.0);
+                const double share = (estimatedInstructions / totalInstructions) * 100.0;
+                path.executionShare = static_cast<float>(std::min(share, 100.0));
             }
             results.push_back(path);
         }
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::exception&) {
         return {};
     }
 
