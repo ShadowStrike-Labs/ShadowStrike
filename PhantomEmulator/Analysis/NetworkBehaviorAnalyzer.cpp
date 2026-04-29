@@ -12,7 +12,11 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <new>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +42,26 @@ static constexpr uint32_t kMaxJA3Entries           = 128;
 static constexpr uint32_t kMaxPeerConnections      = 4'096;
 static constexpr uint32_t kMaxTLSCertRecords       = 1'024;
 static constexpr uint32_t kMaxDnsQueryRecords      = 50'000;
+static constexpr uint32_t kMaxTrackedProcesses     = 1'024;
+static constexpr uint32_t kMaxCounterMapEntries    = 10'000;
+
+// Inbound field caps. Network events can originate from hostile samples, so
+// every externally supplied string is bounded before storage, comparison, or
+// forensic evidence construction.
+static constexpr size_t kMaxAddrLength             = 256;
+static constexpr size_t kMaxProtocolLength         = 16;
+static constexpr size_t kMaxMethodLength           = 16;
+static constexpr size_t kMaxDomainLength           = 253;
+static constexpr size_t kMaxUrlLength              = 2'048;
+static constexpr size_t kMaxPathLength             = 1'024;
+static constexpr size_t kMaxHostLength             = 253;
+static constexpr size_t kMaxUserAgentStoredLength  = 512;
+static constexpr size_t kMaxHeaderNameLength       = 128;
+static constexpr size_t kMaxHeaderValueLength      = 512;
+static constexpr size_t kMaxHeaderPairs            = 64;
+static constexpr size_t kMaxBodyInspectLength      = 4'096;
+static constexpr size_t kMaxPipePathLength         = 512;
+static constexpr size_t kMaxEvidenceFieldLength    = 256;
 
 // P2P detection thresholds
 static constexpr uint32_t kP2PPersistentConnThreshold   = 10;
@@ -91,7 +115,7 @@ namespace {
 // ---------- String utilities (no regex, character-by-character) -------------
 
 [[nodiscard]] std::string MakeConnectionKey(const std::string& addr,
-                                            uint16_t port) noexcept
+                                            uint16_t port)
 {
     // addr + ":" + to_string(port)
     std::string key;
@@ -125,7 +149,7 @@ namespace {
     return c;
 }
 
-[[nodiscard]] std::string ToLower(const std::string& s) noexcept {
+[[nodiscard]] std::string ToLower(const std::string& s) {
     std::string result;
     result.reserve(s.size());
     for (char c : s) {
@@ -163,7 +187,7 @@ struct DomainParts {
     bool valid = false;
 };
 
-[[nodiscard]] DomainParts ParseDomain(const std::string& domain) noexcept {
+[[nodiscard]] DomainParts ParseDomain(const std::string& domain) {
     DomainParts parts;
 
     if (domain.empty() || domain.size() > 253) {
@@ -271,7 +295,7 @@ static constexpr const char* kCommonBigrams[] = {
 static constexpr size_t kNumCommonBigrams =
     sizeof(kCommonBigrams) / sizeof(kCommonBigrams[0]);
 
-[[nodiscard]] float ComputeBigramScore(const std::string& s) noexcept {
+[[nodiscard]] float ComputeBigramScore(const std::string& s) {
     if (s.size() < 2) return 1.0f;
 
     std::string lower = ToLower(s);
@@ -355,7 +379,7 @@ static constexpr const char* kDictionaryWords[] = {
 static constexpr size_t kDictionarySize =
     sizeof(kDictionaryWords) / sizeof(kDictionaryWords[0]);
 
-[[nodiscard]] bool ContainsDictionaryWord(const std::string& s) noexcept {
+[[nodiscard]] bool ContainsDictionaryWord(const std::string& s) {
     if (s.size() < 3) return false;
 
     std::string lower = ToLower(s);
@@ -395,7 +419,7 @@ static constexpr const char* kUnusualTLDs[] = {
 static constexpr size_t kNumUnusualTLDs =
     sizeof(kUnusualTLDs) / sizeof(kUnusualTLDs[0]);
 
-[[nodiscard]] bool IsUnusualTLD(const std::string& tld) noexcept {
+[[nodiscard]] bool IsUnusualTLD(const std::string& tld) {
     std::string lower = ToLower(tld);
     for (size_t i = 0; i < kNumUnusualTLDs; ++i) {
         const char* t = kUnusualTLDs[i];
@@ -414,7 +438,7 @@ static constexpr size_t kNumUnusualTLDs =
 // ---------- DGA Score Computation ------------------------------------------
 
 [[nodiscard]] float ComputeDgaScore(const std::string& label,
-                                    const std::string& tld) noexcept
+                                    const std::string& tld)
 {
     if (label.empty()) return 0.0f;
 
@@ -786,7 +810,7 @@ static constexpr const char* kKnownC2Issuers[] = {
 static constexpr size_t kNumKnownC2Issuers =
     sizeof(kKnownC2Issuers) / sizeof(kKnownC2Issuers[0]);
 
-[[nodiscard]] bool IsKnownC2Issuer(const std::string& issuer) noexcept {
+[[nodiscard]] bool IsKnownC2Issuer(const std::string& issuer) {
     std::string lower = ToLower(issuer);
     for (size_t i = 0; i < kNumKnownC2Issuers; ++i) {
         if (StringContainsCaseInsensitive(lower, kKnownC2Issuers[i])) {
@@ -888,7 +912,7 @@ static constexpr size_t kNumExpectedHeaders =
 // ---------- Check for sequential/incremental subdomain patterns ------------
 
 [[nodiscard]] bool AreSubdomainsSequential(
-    const std::unordered_set<std::string>& subdomains) noexcept
+    const std::unordered_set<std::string>& subdomains)
 {
     if (subdomains.size() < 5) return false;
 
@@ -934,6 +958,117 @@ static constexpr size_t kNumExpectedHeaders =
     float seqRatio = static_cast<float>(sequentialCount) /
                      static_cast<float>(numbers.size() - 1);
     return seqRatio > 0.5f;
+}
+
+[[nodiscard]] float ClampScore(float value) noexcept {
+    if (!std::isfinite(value)) return 0.0f;
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+[[nodiscard]] bool ExceedsRatio(uint64_t numerator,
+                                uint64_t denominator,
+                                uint64_t threshold) noexcept {
+    const uint64_t guardedDenominator = (denominator == 0) ? 1 : denominator;
+    if (threshold == 0) return numerator > guardedDenominator;
+    if (guardedDenominator > std::numeric_limits<uint64_t>::max() / threshold) {
+        return false;
+    }
+    return numerator > guardedDenominator * threshold;
+}
+
+void SaturatingAdd(uint64_t& target, uint64_t value) noexcept {
+    target = (value > std::numeric_limits<uint64_t>::max() - target)
+        ? std::numeric_limits<uint64_t>::max()
+        : (target + value);
+}
+
+void SaturatingIncrement(uint32_t& target) noexcept {
+    if (target < std::numeric_limits<uint32_t>::max()) {
+        ++target;
+    }
+}
+
+[[nodiscard]] std::string SanitizeText(const std::string& input, size_t maxLen) {
+    const size_t cappedLen = std::min(input.size(), maxLen);
+    std::string output;
+    output.reserve(cappedLen);
+    for (size_t i = 0; i < cappedLen; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(input[i]);
+        output.push_back((ch == '\r' || ch == '\n' || ch == '\t' || ch < 0x20U)
+            ? ' '
+            : static_cast<char>(ch));
+    }
+    return output;
+}
+
+[[nodiscard]] std::string EvidenceText(const std::string& input) {
+    return SanitizeText(input, kMaxEvidenceFieldLength);
+}
+
+[[nodiscard]] TLSCertInfo SanitizeCert(const TLSCertInfo& cert) {
+    TLSCertInfo clean = cert;
+    clean.commonName = SanitizeText(cert.commonName, kMaxHostLength);
+    clean.issuer = SanitizeText(cert.issuer, kMaxHostLength);
+    return clean;
+}
+
+[[nodiscard]] NetworkEvent SanitizeEvent(const NetworkEvent& event) {
+    NetworkEvent clean;
+    clean.remoteAddr = SanitizeText(event.remoteAddr, kMaxAddrLength);
+    clean.remotePort = event.remotePort;
+    clean.protocol = SanitizeText(event.protocol, kMaxProtocolLength);
+    clean.httpMethod = SanitizeText(event.httpMethod, kMaxMethodLength);
+    clean.httpPath = SanitizeText(event.httpPath, kMaxPathLength);
+    clean.httpHost = SanitizeText(event.httpHost, kMaxHostLength);
+    clean.userAgent = SanitizeText(event.userAgent, kMaxUserAgentStoredLength);
+    clean.dnsQueryDomain = SanitizeText(event.dnsQueryDomain, kMaxDomainLength);
+    clean.dnsQueryType = event.dnsQueryType;
+    clean.namedPipePath = SanitizeText(event.namedPipePath, kMaxPipePathLength);
+    clean.httpContentType = SanitizeText(event.httpContentType, kMaxHeaderValueLength);
+    clean.httpCookie = SanitizeText(event.httpCookie, kMaxHeaderValueLength);
+    clean.payloadSize = event.payloadSize;
+    clean.timestamp = event.timestamp;
+    clean.processId = event.processId;
+    const size_t headerCount = std::min(event.httpHeaders.size(), kMaxHeaderPairs);
+    clean.httpHeaders.reserve(headerCount);
+    for (size_t i = 0; i < headerCount; ++i) {
+        clean.httpHeaders.emplace_back(
+            SanitizeText(event.httpHeaders[i].first, kMaxHeaderNameLength),
+            SanitizeText(event.httpHeaders[i].second, kMaxHeaderValueLength));
+    }
+    return clean;
+}
+
+[[nodiscard]] HTTPRequest SanitizeRequest(const HTTPRequest& request) {
+    HTTPRequest clean;
+    clean.method = SanitizeText(request.method, kMaxMethodLength);
+    clean.url = SanitizeText(request.url, kMaxUrlLength);
+    clean.host = SanitizeText(request.host, kMaxHostLength);
+    clean.userAgent = SanitizeText(request.userAgent, kMaxUserAgentStoredLength);
+    clean.contentType = SanitizeText(request.contentType, kMaxHeaderValueLength);
+    clean.body = SanitizeText(request.body, kMaxBodyInspectLength);
+    const size_t headerCount = std::min(request.headers.size(), kMaxHeaderPairs);
+    clean.headers.reserve(headerCount);
+    for (size_t i = 0; i < headerCount; ++i) {
+        clean.headers.emplace_back(
+            SanitizeText(request.headers[i].first, kMaxHeaderNameLength),
+            SanitizeText(request.headers[i].second, kMaxHeaderValueLength));
+    }
+    return clean;
+}
+
+[[nodiscard]] DNSQueryRecord SanitizeDnsRecord(const DNSQueryRecord& record) {
+    DNSQueryRecord clean = record;
+    clean.domain = SanitizeText(record.domain, kMaxDomainLength);
+    return clean;
+}
+
+[[nodiscard]] bool IsHexChar(char c) noexcept {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
 }
 
 } // anonymous namespace
@@ -1077,7 +1212,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // Impl Constructor
     // ========================================================================
 
-    explicit Impl(const EmulationConfig& cfg) noexcept
+    explicit Impl(const EmulationConfig& cfg)
         : config(&cfg)
     {
         connections.reserve(256);
@@ -1098,7 +1233,10 @@ struct NetworkBehaviorAnalyzer::Impl {
     // ========================================================================
 
     [[nodiscard]] uint64_t Tick() noexcept {
-        return ++instructionCounter;
+        if (instructionCounter < std::numeric_limits<uint64_t>::max()) {
+            ++instructionCounter;
+        }
+        return instructionCounter;
     }
 
     // ========================================================================
@@ -1108,20 +1246,15 @@ struct NetworkBehaviorAnalyzer::Impl {
     void AddAlert(const std::string& type,
                   const std::string& description,
                   float severity,
-                  const std::string& evidence) noexcept
+                  const std::string& evidence)
     {
         if (alerts.size() >= kMaxAlerts) return;
 
-        // Clamp severity to [0, 1]
-        float sev = severity;
-        if (sev < 0.0f) sev = 0.0f;
-        if (sev > 1.0f) sev = 1.0f;
-
         NetworkAlert alert;
-        alert.type        = type;
-        alert.description = description;
-        alert.severity    = sev;
-        alert.evidence    = evidence;
+        alert.type        = SanitizeText(type, 64);
+        alert.description = SanitizeText(description, kMaxUrlLength);
+        alert.severity    = ClampScore(severity);
+        alert.evidence    = EvidenceText(evidence);
         alerts.push_back(std::move(alert));
     }
 
@@ -1132,7 +1265,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     [[nodiscard]] NetworkConnection* GetOrCreateConnection(
         const std::string& addr,
         uint16_t port,
-        const std::string& protocol) noexcept
+        const std::string& protocol)
     {
         std::string key = MakeConnectionKey(addr, port);
 
@@ -1164,7 +1297,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // Score suspicious port
     // ========================================================================
 
-    void ScoreSuspiciousPort(NetworkConnection& conn) noexcept {
+    void ScoreSuspiciousPort(NetworkConnection& conn) {
         if (IsSuspiciousPort(conn.remotePort)) {
             conn.suspiciousness += 0.3f;
             if (conn.suspiciousness > 1.0f) conn.suspiciousness = 1.0f;
@@ -1191,7 +1324,7 @@ struct NetworkBehaviorAnalyzer::Impl {
 
     void CheckBeaconing(const std::string& key,
                         NetworkConnection& conn,
-                        uint64_t timestamp) noexcept
+                        uint64_t timestamp)
     {
         auto& timestamps = connectionTimestamps[key];
 
@@ -1262,13 +1395,11 @@ struct NetworkBehaviorAnalyzer::Impl {
     // Exfiltration Detection (per-connection)
     // ========================================================================
 
-    void CheckExfiltration(NetworkConnection& conn) noexcept {
+    void CheckExfiltration(NetworkConnection& conn) {
         // Per-connection threshold
         if (conn.bytesSent > kExfilBytesThreshold) {
-            uint64_t recvGuard = (conn.bytesReceived > 0)
-                                     ? conn.bytesReceived
-                                     : 1;
-            if (conn.bytesSent > recvGuard * kExfilRatioThreshold) {
+            uint64_t recvGuard = (conn.bytesReceived > 0) ? conn.bytesReceived : 1;
+            if (ExceedsRatio(conn.bytesSent, recvGuard, kExfilRatioThreshold)) {
                 conn.suspiciousness += 0.5f;
                 if (conn.suspiciousness > 1.0f) conn.suspiciousness = 1.0f;
 
@@ -1300,12 +1431,10 @@ struct NetworkBehaviorAnalyzer::Impl {
     // Global Exfiltration Detection
     // ========================================================================
 
-    void CheckGlobalExfiltration() noexcept {
+    void CheckGlobalExfiltration() {
         if (totalBytesSent > kGlobalExfilBytes) {
-            uint64_t recvGuard = (totalBytesReceived > 0)
-                                     ? totalBytesReceived
-                                     : 1;
-            if (totalBytesSent > recvGuard * kGlobalExfilRatio) {
+            uint64_t recvGuard = (totalBytesReceived > 0) ? totalBytesReceived : 1;
+            if (ExceedsRatio(totalBytesSent, recvGuard, kGlobalExfilRatio)) {
                 hasExfiltrationDetected = true;
 
                 std::string evidence =
@@ -1329,7 +1458,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // Encrypted Channel Detection
     // ========================================================================
 
-    void CheckEncryptedChannel(NetworkConnection& conn) noexcept {
+    void CheckEncryptedChannel(NetworkConnection& conn) {
         // Heuristic: large sends to HTTPS ports suggest encrypted exfil
         bool isEncryptedPort = (conn.remotePort == 443  ||
                                 conn.remotePort == 8443 ||
@@ -1360,7 +1489,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // DGA Detection
     // ========================================================================
 
-    void AnalyzeDgaDomain(const std::string& domain) noexcept {
+    void AnalyzeDgaDomain(const std::string& domain) {
         DomainParts parts = ParseDomain(domain);
         if (!parts.valid) return;
         if (parts.label.empty()) return;
@@ -1393,7 +1522,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // DNS Tunneling Detection
     // ========================================================================
 
-    void CheckDnsTunneling(const std::string& domain) noexcept {
+    void CheckDnsTunneling(const std::string& domain) {
         DomainParts parts = ParseDomain(domain);
         if (!parts.valid) return;
 
@@ -1476,7 +1605,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // ========================================================================
 
     void CheckRapidConnections(const std::string& addr,
-                               uint64_t timestamp) noexcept
+                               uint64_t timestamp)
     {
         // Record this connection
         if (recentConnections.size() >= kMaxRecentConnections) {
@@ -1528,8 +1657,8 @@ struct NetworkBehaviorAnalyzer::Impl {
     // ========================================================================
 
     void AnalyzeUserAgent(const std::string& userAgent,
-                          const std::string& method,
-                          const std::string& url) noexcept
+                           const std::string& method,
+                           const std::string& url)
     {
         if (IsUserAgentSuspicious(userAgent)) {
             hasSuspiciousUA = true;
@@ -1560,7 +1689,7 @@ struct NetworkBehaviorAnalyzer::Impl {
     // Reset
     // ========================================================================
 
-    void ResetAll() noexcept {
+    void ResetAll() {
         connections.clear();
         alerts.clear();
         dnsQueries.clear();
@@ -1603,8 +1732,15 @@ struct NetworkBehaviorAnalyzer::Impl {
 
 NetworkBehaviorAnalyzer::NetworkBehaviorAnalyzer(
     const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>(config))
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>(config);
+    } catch (const std::bad_alloc&) {
+        m_impl = nullptr;
+    } catch (const std::exception&) {
+        m_impl = nullptr;
+    }
 }
 
 NetworkBehaviorAnalyzer::~NetworkBehaviorAnalyzer() noexcept = default;
@@ -1623,19 +1759,22 @@ void NetworkBehaviorAnalyzer::OnConnect(const std::string& addr,
 {
     if (!m_impl) return;
     if (addr.empty()) return;
+    try {
 
     uint64_t ts = m_impl->Tick();
+    const std::string cleanAddr = SanitizeText(addr, kMaxAddrLength);
+    const std::string cleanProtocol = SanitizeText(protocol, kMaxProtocolLength);
 
     // Resolve protocol
-    std::string resolvedProtocol = protocol.empty()
+    std::string resolvedProtocol = cleanProtocol.empty()
         ? InferProtocol(port)
-        : protocol;
+        : cleanProtocol;
 
     NetworkConnection* conn =
-        m_impl->GetOrCreateConnection(addr, port, resolvedProtocol);
+        m_impl->GetOrCreateConnection(cleanAddr, port, resolvedProtocol);
     if (!conn) return;
 
-    conn->connectionCount++;
+    SaturatingIncrement(conn->connectionCount);
 
     if (conn->firstSeen == 0) {
         conn->firstSeen = ts;
@@ -1646,11 +1785,14 @@ void NetworkBehaviorAnalyzer::OnConnect(const std::string& addr,
     m_impl->ScoreSuspiciousPort(*conn);
 
     // Beaconing detection
-    std::string key = MakeConnectionKey(addr, port);
+    std::string key = MakeConnectionKey(cleanAddr, port);
     m_impl->CheckBeaconing(key, *conn, ts);
 
     // Rapid connection pattern detection
-    m_impl->CheckRapidConnections(addr, ts);
+    m_impl->CheckRapidConnections(cleanAddr, ts);
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ---------- OnSend ---------------------------------------------------------
@@ -1661,28 +1803,20 @@ void NetworkBehaviorAnalyzer::OnSend(const std::string& addr,
 {
     if (!m_impl) return;
     if (addr.empty() || bytes == 0) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    const std::string cleanAddr = SanitizeText(addr, kMaxAddrLength);
 
     NetworkConnection* conn =
-        m_impl->GetOrCreateConnection(addr, port, "");
+        m_impl->GetOrCreateConnection(cleanAddr, port, "");
     if (!conn) return;
 
     // Accumulate bytes with overflow protection
-    uint64_t newSent = conn->bytesSent;
-    if (newSent <= UINT64_MAX - bytes) {
-        newSent += bytes;
-    } else {
-        newSent = UINT64_MAX;
-    }
-    conn->bytesSent = newSent;
+    SaturatingAdd(conn->bytesSent, bytes);
 
     // Update global total
-    if (m_impl->totalBytesSent <= UINT64_MAX - bytes) {
-        m_impl->totalBytesSent += bytes;
-    } else {
-        m_impl->totalBytesSent = UINT64_MAX;
-    }
+    SaturatingAdd(m_impl->totalBytesSent, bytes);
 
     // Per-connection exfiltration check
     m_impl->CheckExfiltration(*conn);
@@ -1692,6 +1826,9 @@ void NetworkBehaviorAnalyzer::OnSend(const std::string& addr,
 
     // Encrypted channel detection
     m_impl->CheckEncryptedChannel(*conn);
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ---------- OnReceive ------------------------------------------------------
@@ -1702,27 +1839,22 @@ void NetworkBehaviorAnalyzer::OnReceive(const std::string& addr,
 {
     if (!m_impl) return;
     if (addr.empty() || bytes == 0) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    const std::string cleanAddr = SanitizeText(addr, kMaxAddrLength);
 
     NetworkConnection* conn =
-        m_impl->GetOrCreateConnection(addr, port, "");
+        m_impl->GetOrCreateConnection(cleanAddr, port, "");
     if (!conn) return;
 
     // Accumulate bytes with overflow protection
-    uint64_t newRecv = conn->bytesReceived;
-    if (newRecv <= UINT64_MAX - bytes) {
-        newRecv += bytes;
-    } else {
-        newRecv = UINT64_MAX;
-    }
-    conn->bytesReceived = newRecv;
+    SaturatingAdd(conn->bytesReceived, bytes);
 
     // Update global total
-    if (m_impl->totalBytesReceived <= UINT64_MAX - bytes) {
-        m_impl->totalBytesReceived += bytes;
-    } else {
-        m_impl->totalBytesReceived = UINT64_MAX;
+    SaturatingAdd(m_impl->totalBytesReceived, bytes);
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -1732,19 +1864,24 @@ void NetworkBehaviorAnalyzer::OnDnsQuery(const std::string& domain) noexcept
 {
     if (!m_impl) return;
     if (domain.empty()) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    const std::string cleanDomain = SanitizeText(domain, kMaxDomainLength);
 
     // Store query (capped)
     if (m_impl->dnsQueries.size() < kMaxDnsQueries) {
-        m_impl->dnsQueries.push_back(domain);
+        m_impl->dnsQueries.push_back(cleanDomain);
     }
 
     // DGA analysis
-    m_impl->AnalyzeDgaDomain(domain);
+    m_impl->AnalyzeDgaDomain(cleanDomain);
 
     // DNS tunneling analysis
-    m_impl->CheckDnsTunneling(domain);
+    m_impl->CheckDnsTunneling(cleanDomain);
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ---------- OnHttpRequest --------------------------------------------------
@@ -1754,21 +1891,28 @@ void NetworkBehaviorAnalyzer::OnHttpRequest(const std::string& method,
                                             const std::string& userAgent) noexcept
 {
     if (!m_impl) return;
+    try {
 
     uint64_t ts = m_impl->Tick();
+    const std::string cleanMethod = SanitizeText(method, kMaxMethodLength);
+    const std::string cleanUrl = SanitizeText(url, kMaxUrlLength);
+    const std::string cleanUserAgent = SanitizeText(userAgent, kMaxUserAgentStoredLength);
 
     // Store request (capped)
     if (m_impl->httpRequests.size() < kMaxHttpRequests) {
         HttpRequestRecord rec;
-        rec.method    = method;
-        rec.url       = url;
-        rec.userAgent = userAgent;
+        rec.method    = cleanMethod;
+        rec.url       = cleanUrl;
+        rec.userAgent = cleanUserAgent;
         rec.timestamp = ts;
         m_impl->httpRequests.push_back(std::move(rec));
     }
 
     // User-Agent analysis
-    m_impl->AnalyzeUserAgent(userAgent, method, url);
+    m_impl->AnalyzeUserAgent(cleanUserAgent, cleanMethod, cleanUrl);
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ---------- GetConnections -------------------------------------------------
@@ -1872,7 +2016,11 @@ std::vector<std::string>
 NetworkBehaviorAnalyzer::GetDGADomains() const noexcept
 {
     if (!m_impl) return {};
-    return m_impl->dgaDomains;
+    try {
+        return m_impl->dgaDomains;
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 // ---------- Reset ----------------------------------------------------------
@@ -1880,7 +2028,11 @@ NetworkBehaviorAnalyzer::GetDGADomains() const noexcept
 void NetworkBehaviorAnalyzer::Reset() noexcept
 {
     if (!m_impl) return;
-    m_impl->ResetAll();
+    try {
+        m_impl->ResetAll();
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1895,17 +2047,20 @@ void NetworkBehaviorAnalyzer::OnTLSCertObserved(
 {
     if (!m_impl) return;
     if (addr.empty()) return;
+    try {
 
     uint64_t ts = m_impl->Tick();
+    const std::string cleanAddr = SanitizeText(addr, kMaxAddrLength);
+    const TLSCertInfo cleanCert = SanitizeCert(cert);
 
     if (m_impl->tlsCertRecords.size() >= kMaxTLSCertRecords) return;
 
-    TLSAnomalyResult anomaly = AnalyzeTLSCert(cert);
+    TLSAnomalyResult anomaly = AnalyzeTLSCert(cleanCert);
 
     TLSCertRecord record;
-    record.addr          = addr;
+    record.addr          = cleanAddr;
     record.port          = port;
-    record.cert          = cert;
+    record.cert          = cleanCert;
     record.anomalyResult = anomaly;
     record.timestamp     = ts;
     m_impl->tlsCertRecords.push_back(std::move(record));
@@ -1914,18 +2069,21 @@ void NetworkBehaviorAnalyzer::OnTLSCertObserved(
         m_impl->hasTLSAnomalyDetected = true;
 
         std::string evidence =
-            "addr=" + addr + ":" + std::to_string(port) +
-            " cn=" + cert.commonName +
-            " issuer=" + cert.issuer +
-            " self_signed=" + (cert.selfSigned ? "true" : "false") +
+            "addr=" + cleanAddr + ":" + std::to_string(port) +
+            " cn=" + EvidenceText(cleanCert.commonName) +
+            " issuer=" + EvidenceText(cleanCert.issuer) +
+            " self_signed=" + (cleanCert.selfSigned ? "true" : "false") +
             " score=" + std::to_string(anomaly.anomalyScore);
 
         m_impl->AddAlert("tls_anomaly",
-                         "Suspicious TLS certificate from " + addr + ":" +
-                             std::to_string(port) + " (CN=" + cert.commonName +
+                         "Suspicious TLS certificate from " + cleanAddr + ":" +
+                             std::to_string(port) + " (CN=" + EvidenceText(cleanCert.commonName) +
                              ", score=" + std::to_string(anomaly.anomalyScore) + ")",
                          anomaly.anomalyScore,
-                         evidence);
+                          evidence);
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -1936,52 +2094,61 @@ void NetworkBehaviorAnalyzer::OnJA3Observed(
     const JA3Fingerprint& fingerprint) noexcept
 {
     if (!m_impl) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    JA3Fingerprint cleanFingerprint;
+    cleanFingerprint.clientHash = SanitizeText(fingerprint.clientHash, 32);
+    cleanFingerprint.serverHash = SanitizeText(fingerprint.serverHash, 32);
+    cleanFingerprint.knownMalicious = fingerprint.knownMalicious;
+    const std::string cleanAddr = SanitizeText(addr, kMaxAddrLength);
 
     if (m_impl->observedJA3.size() < kMaxJA3Entries) {
-        m_impl->observedJA3.push_back(fingerprint);
+        m_impl->observedJA3.push_back(cleanFingerprint);
     }
 
     // Check client hash against database
-    if (!fingerprint.clientHash.empty()) {
-        JA3MatchResult result = CheckJA3(fingerprint.clientHash);
+    if (!cleanFingerprint.clientHash.empty()) {
+        JA3MatchResult result = CheckJA3(cleanFingerprint.clientHash);
         if (result.matched) {
             m_impl->hasJA3MatchDetected = true;
 
             std::string evidence =
-                "addr=" + addr + ":" + std::to_string(port) +
-                " ja3=" + fingerprint.clientHash +
+                "addr=" + cleanAddr + ":" + std::to_string(port) +
+                " ja3=" + cleanFingerprint.clientHash +
                 " family=" + result.malwareFamily +
                 " confidence=" + std::to_string(result.confidence);
 
             m_impl->AddAlert("ja3_malicious",
-                             "Known malicious JA3 fingerprint: " +
-                                 result.malwareFamily + " (hash=" +
-                                 fingerprint.clientHash + ")",
+                                 "Known malicious JA3 fingerprint: " +
+                                  result.malwareFamily + " (hash=" +
+                                  cleanFingerprint.clientHash + ")",
                              result.confidence,
                              evidence);
         }
     }
 
     // Also check server hash
-    if (!fingerprint.serverHash.empty()) {
-        JA3MatchResult sResult = CheckJA3(fingerprint.serverHash);
+    if (!cleanFingerprint.serverHash.empty()) {
+        JA3MatchResult sResult = CheckJA3(cleanFingerprint.serverHash);
         if (sResult.matched) {
             m_impl->hasJA3MatchDetected = true;
 
             std::string evidence =
-                "addr=" + addr + ":" + std::to_string(port) +
-                " ja3s=" + fingerprint.serverHash +
+                "addr=" + cleanAddr + ":" + std::to_string(port) +
+                " ja3s=" + cleanFingerprint.serverHash +
                 " family=" + sResult.malwareFamily;
 
             m_impl->AddAlert("ja3s_malicious",
                              "Known malicious JA3S fingerprint: " +
-                                 sResult.malwareFamily + " (hash=" +
-                                 fingerprint.serverHash + ")",
+                                  sResult.malwareFamily + " (hash=" +
+                                  cleanFingerprint.serverHash + ")",
                              sResult.confidence * 0.9f,
                              evidence);
         }
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -1990,11 +2157,13 @@ void NetworkBehaviorAnalyzer::OnJA3Observed(
 void NetworkBehaviorAnalyzer::OnNetworkEvent(const NetworkEvent& event) noexcept
 {
     if (!m_impl) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    const NetworkEvent cleanEvent = SanitizeEvent(event);
 
     // Run C2 signature analysis on the event
-    C2DetectionResult c2Result = AnalyzeForC2(event);
+    C2DetectionResult c2Result = AnalyzeForC2(cleanEvent);
     if (c2Result.detected) {
         m_impl->hasC2SignatureDetected = true;
 
@@ -2008,11 +2177,16 @@ void NetworkBehaviorAnalyzer::OnNetworkEvent(const NetworkEvent& event) noexcept
     }
 
     // Track P2P connection graph for process
-    if (event.processId != 0 && !event.remoteAddr.empty()) {
-        auto& procConns = m_impl->processConnGraph[event.processId];
+    if (cleanEvent.processId != 0 && !cleanEvent.remoteAddr.empty() &&
+        (m_impl->processConnGraph.size() < kMaxTrackedProcesses ||
+         m_impl->processConnGraph.find(cleanEvent.processId) != m_impl->processConnGraph.end())) {
+        auto& procConns = m_impl->processConnGraph[cleanEvent.processId];
         if (procConns.size() < kMaxPeerConnections) {
-            procConns.insert(event.remoteAddr);
+            procConns.insert(cleanEvent.remoteAddr);
         }
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -2021,105 +2195,119 @@ void NetworkBehaviorAnalyzer::OnNetworkEvent(const NetworkEvent& event) noexcept
 void NetworkBehaviorAnalyzer::OnDnsQueryEx(const DNSQueryRecord& record) noexcept
 {
     if (!m_impl) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    const DNSQueryRecord cleanRecord = SanitizeDnsRecord(record);
 
     // Store advanced record (capped)
     if (m_impl->dnsAdvancedRecords.size() < kMaxDnsQueryRecords) {
         DnsAdvancedEntry entry;
-        entry.domain    = record.domain;
-        entry.queryType = record.queryType;
-        entry.timestamp = record.timestamp;
-        entry.cnameDepth = record.cnameDepth;
+        entry.domain    = cleanRecord.domain;
+        entry.queryType = cleanRecord.queryType;
+        entry.timestamp = cleanRecord.timestamp;
+        entry.cnameDepth = cleanRecord.cnameDepth;
         m_impl->dnsAdvancedRecords.push_back(std::move(entry));
     }
 
     // Also feed into existing DNS analysis pipeline
-    OnDnsQuery(record.domain);
+    OnDnsQuery(cleanRecord.domain);
 
     // --- TXT record frequency analysis ---
-    if (record.queryType == 16) {  // TXT record
-        DomainParts parts = ParseDomain(record.domain);
+    if (cleanRecord.queryType == 16) {  // TXT record
+        DomainParts parts = ParseDomain(cleanRecord.domain);
         if (parts.valid && !parts.baseDomain.empty()) {
-            auto& txtCount = m_impl->dnsTxtQueryCount[parts.baseDomain];
-            if (txtCount < UINT32_MAX) ++txtCount;
+            if (m_impl->dnsTxtQueryCount.size() < kMaxCounterMapEntries ||
+                m_impl->dnsTxtQueryCount.find(parts.baseDomain) != m_impl->dnsTxtQueryCount.end()) {
+                auto& txtCount = m_impl->dnsTxtQueryCount[parts.baseDomain];
+                SaturatingIncrement(txtCount);
 
-            if (txtCount >= kDnsTxtQueryThreshold) {
-                std::string evidence =
-                    "domain=" + parts.baseDomain +
-                    " txt_queries=" + std::to_string(txtCount);
+                if (txtCount >= kDnsTxtQueryThreshold) {
+                    std::string evidence =
+                        "domain=" + parts.baseDomain +
+                        " txt_queries=" + std::to_string(txtCount);
 
-                m_impl->AddAlert("dns_txt_anomaly",
-                                 "Excessive TXT queries to " + parts.baseDomain +
-                                     " (" + std::to_string(txtCount) +
-                                     " queries — potential DNS tunneling via TXT records)",
-                                 0.65f,
-                                 evidence);
+                    m_impl->AddAlert("dns_txt_anomaly",
+                                     "Excessive TXT queries to " + parts.baseDomain +
+                                         " (" + std::to_string(txtCount) +
+                                         " queries - potential DNS tunneling via TXT records)",
+                                     0.65f,
+                                     evidence);
 
-                m_impl->hasDnsTunnelingDetected = true;
+                    m_impl->hasDnsTunnelingDetected = true;
+                }
             }
         }
     }
 
     // --- CNAME chain depth analysis ---
-    if (record.cnameDepth > kDnsCnameDepthThreshold) {
+    if (cleanRecord.cnameDepth > kDnsCnameDepthThreshold) {
         std::string evidence =
-            "domain=" + record.domain +
-            " cname_depth=" + std::to_string(record.cnameDepth);
+            "domain=" + cleanRecord.domain +
+            " cname_depth=" + std::to_string(cleanRecord.cnameDepth);
 
         m_impl->AddAlert("dns_cname_depth",
-                         "Deep CNAME chain for " + record.domain +
-                             " (depth=" + std::to_string(record.cnameDepth) +
-                             " — possible domain fronting or evasion)",
+                         "Deep CNAME chain for " + cleanRecord.domain +
+                             " (depth=" + std::to_string(cleanRecord.cnameDepth) +
+                             " - possible domain fronting or evasion)",
                          0.5f + 0.1f * static_cast<float>(
-                             record.cnameDepth - kDnsCnameDepthThreshold),
+                             cleanRecord.cnameDepth - kDnsCnameDepthThreshold),
                          evidence);
     }
 
     // --- Query volume per unique domain ---
     {
-        DomainParts parts = ParseDomain(record.domain);
+        DomainParts parts = ParseDomain(cleanRecord.domain);
         if (parts.valid && !parts.baseDomain.empty()) {
-            auto& vol = m_impl->dnsQueryVolume[parts.baseDomain];
-            if (vol < UINT32_MAX) ++vol;
+            if (m_impl->dnsQueryVolume.size() < kMaxCounterMapEntries ||
+                m_impl->dnsQueryVolume.find(parts.baseDomain) != m_impl->dnsQueryVolume.end()) {
+                auto& vol = m_impl->dnsQueryVolume[parts.baseDomain];
+                SaturatingIncrement(vol);
 
-            if (vol == kDnsQueryVolPerDomainThreshold) {
-                std::string evidence =
-                    "domain=" + parts.baseDomain +
-                    " query_count=" + std::to_string(vol);
+                if (vol == kDnsQueryVolPerDomainThreshold) {
+                    std::string evidence =
+                        "domain=" + parts.baseDomain +
+                        " query_count=" + std::to_string(vol);
 
-                m_impl->AddAlert("dns_high_volume",
-                                 "High DNS query volume to " + parts.baseDomain +
-                                     " (" + std::to_string(vol) +
-                                     " queries — possible DNS-based C2 or tunneling)",
-                                 0.6f,
-                                 evidence);
+                    m_impl->AddAlert("dns_high_volume",
+                                     "High DNS query volume to " + parts.baseDomain +
+                                         " (" + std::to_string(vol) +
+                                         " queries - possible DNS-based C2 or tunneling)",
+                                     0.6f,
+                                     evidence);
+                }
             }
         }
     }
 
     // --- Subdomain enumeration detection ---
     {
-        DomainParts parts = ParseDomain(record.domain);
+        DomainParts parts = ParseDomain(cleanRecord.domain);
         if (parts.valid && !parts.subdomain.empty() && !parts.baseDomain.empty()) {
-            auto& subSet = m_impl->subdomainTracker[parts.baseDomain];
-            if (subSet.size() >= kDnsSubdomainEnumThreshold) {
-                if (AreSubdomainsSequential(subSet)) {
-                    std::string evidence =
-                        "base_domain=" + parts.baseDomain +
-                        " subdomain_count=" + std::to_string(subSet.size()) +
-                        " pattern=sequential";
+            auto existing = m_impl->subdomainTracker.find(parts.baseDomain);
+            if (existing != m_impl->subdomainTracker.end()) {
+                const auto& subSet = existing->second;
+                if (subSet.size() >= kDnsSubdomainEnumThreshold) {
+                    if (AreSubdomainsSequential(subSet)) {
+                        std::string evidence =
+                            "base_domain=" + parts.baseDomain +
+                            " subdomain_count=" + std::to_string(subSet.size()) +
+                            " pattern=sequential";
 
-                    m_impl->AddAlert("dns_subdomain_enum",
-                                     "Sequential subdomain enumeration detected under " +
-                                         parts.baseDomain + " (" +
-                                         std::to_string(subSet.size()) +
-                                         " subdomains with sequential pattern)",
-                                     0.7f,
-                                     evidence);
+                        m_impl->AddAlert("dns_subdomain_enum",
+                                         "Sequential subdomain enumeration detected under " +
+                                             parts.baseDomain + " (" +
+                                             std::to_string(subSet.size()) +
+                                             " subdomains with sequential pattern)",
+                                         0.7f,
+                                         evidence);
+                    }
                 }
             }
         }
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -2128,33 +2316,38 @@ void NetworkBehaviorAnalyzer::OnDnsQueryEx(const DNSQueryRecord& record) noexcep
 void NetworkBehaviorAnalyzer::OnHttpRequestEx(const HTTPRequest& request) noexcept
 {
     if (!m_impl) return;
+    try {
 
-    m_impl->Tick();
+    (void)m_impl->Tick();
+    const HTTPRequest cleanRequest = SanitizeRequest(request);
 
     // Feed into existing HTTP analysis
-    OnHttpRequest(request.method, request.url, request.userAgent);
+    OnHttpRequest(cleanRequest.method, cleanRequest.url, cleanRequest.userAgent);
 
     // Run HTTP header analysis
-    float headerScore = AnalyzeHTTPHeaders(request);
+    float headerScore = AnalyzeHTTPHeaders(cleanRequest);
     if (headerScore > 0.5f) {
-        std::string truncatedUA = request.userAgent;
+        std::string truncatedUA = cleanRequest.userAgent;
         if (truncatedUA.size() > 200) {
             truncatedUA.resize(200);
             truncatedUA += "...";
         }
 
         std::string evidence =
-            "method=" + request.method +
-            " url=" + request.url +
+            "method=" + cleanRequest.method +
+            " url=" + cleanRequest.url +
             " user_agent=\"" + truncatedUA + "\"" +
             " header_score=" + std::to_string(headerScore);
 
         m_impl->AddAlert("http_header_anomaly",
-                         "Anomalous HTTP headers in " + request.method + " " +
-                             request.url + " (score=" +
+                         "Anomalous HTTP headers in " + cleanRequest.method + " " +
+                             cleanRequest.url + " (score=" +
                              std::to_string(headerScore) + ")",
                          headerScore,
-                         evidence);
+                          evidence);
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -2167,13 +2360,15 @@ void NetworkBehaviorAnalyzer::OnPeerDiscovery(
 {
     if (!m_impl) return;
     if (processId == 0 || sourceAddr.empty()) return;
+    try {
 
     uint64_t ts = m_impl->Tick();
+    const std::string cleanSource = SanitizeText(sourceAddr, kMaxAddrLength);
 
     if (m_impl->peerDiscoveries.size() < kMaxPeerConnections) {
         PeerDiscoveryRecord rec;
         rec.processId      = processId;
-        rec.sourceAddr     = sourceAddr;
+        rec.sourceAddr     = cleanSource;
         rec.timestamp      = ts;
 
         // Cap the number of discovered addresses stored per record
@@ -2181,17 +2376,20 @@ void NetworkBehaviorAnalyzer::OnPeerDiscovery(
         if (count > 256) count = 256;
         rec.discoveredAddrs.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            rec.discoveredAddrs.push_back(discoveredAddrs[i]);
+            rec.discoveredAddrs.push_back(SanitizeText(discoveredAddrs[i], kMaxAddrLength));
         }
 
         m_impl->peerDiscoveries.push_back(std::move(rec));
     }
 
     // Track in connection graph
-    auto& procConns = m_impl->processConnGraph[processId];
-    for (const auto& addr : discoveredAddrs) {
-        if (procConns.size() >= kMaxPeerConnections) break;
-        procConns.insert(addr);
+    if (m_impl->processConnGraph.size() < kMaxTrackedProcesses ||
+        m_impl->processConnGraph.find(processId) != m_impl->processConnGraph.end()) {
+        auto& procConns = m_impl->processConnGraph[processId];
+        for (const auto& addr : discoveredAddrs) {
+            if (procConns.size() >= kMaxPeerConnections) break;
+            procConns.insert(SanitizeText(addr, kMaxAddrLength));
+        }
     }
 
     // Check for P2P peer discovery pattern:
@@ -2201,16 +2399,19 @@ void NetworkBehaviorAnalyzer::OnPeerDiscovery(
 
         std::string evidence =
             "process=" + std::to_string(processId) +
-            " source=" + sourceAddr +
+            " source=" + cleanSource +
             " discovered_peers=" + std::to_string(discoveredAddrs.size());
 
         m_impl->AddAlert("p2p_peer_discovery",
                          "P2P peer discovery pattern: process " +
-                             std::to_string(processId) +
-                             " obtained " + std::to_string(discoveredAddrs.size()) +
-                             " new peer addresses from " + sourceAddr,
+                              std::to_string(processId) +
+                              " obtained " + std::to_string(discoveredAddrs.size()) +
+                              " new peer addresses from " + cleanSource,
                          0.7f,
-                         evidence);
+                          evidence);
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -2225,6 +2426,8 @@ C2DetectionResult NetworkBehaviorAnalyzer::AnalyzeForC2(
 {
     C2DetectionResult result;
     if (!m_impl) return result;
+    try {
+    const NetworkEvent cleanEvent = SanitizeEvent(event);
 
     float bestConfidence = 0.0f;
     const char* bestFramework = nullptr;
@@ -2238,22 +2441,22 @@ C2DetectionResult NetworkBehaviorAnalyzer::AnalyzeForC2(
 
         if (std::strcmp(sig.matchField, "path") == 0) {
             // Match against HTTP path
-            if (!event.httpPath.empty()) {
-                if (StringContainsCaseInsensitive(event.httpPath, sig.pattern)) {
+            if (!cleanEvent.httpPath.empty()) {
+                if (StringContainsCaseInsensitive(cleanEvent.httpPath, sig.pattern)) {
                     matched = true;
-                    matchDetail = "path=" + event.httpPath;
+                    matchDetail = "path=" + EvidenceText(cleanEvent.httpPath);
                 }
             }
         } else if (std::strcmp(sig.matchField, "cookie") == 0) {
             // Match against HTTP cookie header
-            if (!event.httpCookie.empty()) {
-                if (StringContainsCaseInsensitive(event.httpCookie, sig.pattern)) {
+            if (!cleanEvent.httpCookie.empty()) {
+                if (StringContainsCaseInsensitive(cleanEvent.httpCookie, sig.pattern)) {
                     matched = true;
                     matchDetail = "cookie_match";
                 }
             }
             // Also check headers
-            for (const auto& [hdrName, hdrVal] : event.httpHeaders) {
+            for (const auto& [hdrName, hdrVal] : cleanEvent.httpHeaders) {
                 if (StringContainsCaseInsensitive(hdrName, "cookie") &&
                     StringContainsCaseInsensitive(hdrVal, sig.pattern)) {
                     matched = true;
@@ -2262,30 +2465,30 @@ C2DetectionResult NetworkBehaviorAnalyzer::AnalyzeForC2(
                 }
             }
         } else if (std::strcmp(sig.matchField, "content_type") == 0) {
-            if (!event.httpContentType.empty()) {
-                if (StringContainsCaseInsensitive(event.httpContentType, sig.pattern)) {
+            if (!cleanEvent.httpContentType.empty()) {
+                if (StringContainsCaseInsensitive(cleanEvent.httpContentType, sig.pattern)) {
                     matched = true;
-                    matchDetail = "content_type=" + event.httpContentType;
+                    matchDetail = "content_type=" + EvidenceText(cleanEvent.httpContentType);
                 }
             }
         } else if (std::strcmp(sig.matchField, "pipe") == 0) {
-            if (!event.namedPipePath.empty()) {
-                if (StringContainsCaseInsensitive(event.namedPipePath, sig.pattern)) {
+            if (!cleanEvent.namedPipePath.empty()) {
+                if (StringContainsCaseInsensitive(cleanEvent.namedPipePath, sig.pattern)) {
                     matched = true;
-                    matchDetail = "pipe=" + event.namedPipePath;
+                    matchDetail = "pipe=" + EvidenceText(cleanEvent.namedPipePath);
                 }
             }
         } else if (std::strcmp(sig.matchField, "dns_pattern") == 0) {
-            if (!event.dnsQueryDomain.empty()) {
-                if (StringContainsCaseInsensitive(event.dnsQueryDomain, sig.pattern)) {
+            if (!cleanEvent.dnsQueryDomain.empty()) {
+                if (StringContainsCaseInsensitive(cleanEvent.dnsQueryDomain, sig.pattern)) {
                     matched = true;
-                    matchDetail = "dns=" + event.dnsQueryDomain;
+                    matchDetail = "dns=" + EvidenceText(cleanEvent.dnsQueryDomain);
                 }
             }
         } else if (std::strcmp(sig.matchField, "port") == 0) {
-            if (PortMatchesPattern(event.remotePort, sig.pattern)) {
+            if (PortMatchesPattern(cleanEvent.remotePort, sig.pattern)) {
                 matched = true;
-                matchDetail = "port=" + std::to_string(event.remotePort);
+                matchDetail = "port=" + std::to_string(cleanEvent.remotePort);
             }
         }
 
@@ -2308,6 +2511,9 @@ C2DetectionResult NetworkBehaviorAnalyzer::AnalyzeForC2(
     }
 
     return result;
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 // ---------- AnalyzeTLSCert ------------------------------------------------
@@ -2316,46 +2522,48 @@ TLSAnomalyResult NetworkBehaviorAnalyzer::AnalyzeTLSCert(
     const TLSCertInfo& cert) noexcept
 {
     TLSAnomalyResult result;
+    try {
+    const TLSCertInfo cleanCert = SanitizeCert(cert);
 
     float score = 0.0f;
 
     // Self-signed certificate: strong anomaly signal
-    if (cert.selfSigned) {
+    if (cleanCert.selfSigned) {
         score += 0.4f;
         result.selfSignedCert = true;
     }
 
     // Very short validity period (<30 days): staging/throwaway cert
-    if (cert.shortValidity && cert.validityDays < 30) {
+    if (cleanCert.shortValidity && cleanCert.validityDays < 30) {
         score += 0.3f;
         result.tooShortValidity = true;
-    } else if (cert.shortValidity) {
+    } else if (cleanCert.shortValidity) {
         // 30-90 day validity is mildly suspicious
         score += 0.15f;
         result.tooShortValidity = true;
     }
 
     // IP address in CN: almost never legitimate for real services
-    if (cert.ipAddressCN) {
+    if (cleanCert.ipAddressCN) {
         score += 0.2f;
         result.suspiciousCN = true;
     }
 
     // Recently created certificate (<30 days old)
-    if (cert.recentlyCreated) {
+    if (cleanCert.recentlyCreated) {
         score += 0.2f;
         result.certAgeTooNew = true;
     }
 
     // Known C2 issuer patterns
-    if (IsKnownC2Issuer(cert.issuer) || IsKnownC2Issuer(cert.commonName)) {
+    if (IsKnownC2Issuer(cleanCert.issuer) || IsKnownC2Issuer(cleanCert.commonName)) {
         score += 0.3f;
         result.knownC2Issuer = true;
     }
 
     // Empty or placeholder CN
-    if (cert.commonName.empty() || cert.commonName == "localhost" ||
-        cert.commonName == "server" || cert.commonName == "test") {
+    if (cleanCert.commonName.empty() || cleanCert.commonName == "localhost" ||
+        cleanCert.commonName == "server" || cleanCert.commonName == "test") {
         score += 0.15f;
         result.suspiciousCN = true;
     }
@@ -2365,6 +2573,9 @@ TLSAnomalyResult NetworkBehaviorAnalyzer::AnalyzeTLSCert(
     result.anomalyScore = score;
 
     return result;
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 // ---------- CheckJA3 ------------------------------------------------------
@@ -2374,6 +2585,7 @@ JA3MatchResult NetworkBehaviorAnalyzer::CheckJA3(
 {
     JA3MatchResult result;
     if (hash.empty() || hash.size() != 32) return result;
+    try {
 
     for (size_t i = 0; i < kNumJA3Entries; ++i) {
         const auto& entry = kJA3Database[i];
@@ -2381,7 +2593,7 @@ JA3MatchResult NetworkBehaviorAnalyzer::CheckJA3(
         // Compare 32-character MD5 hex strings
         bool match = true;
         for (size_t j = 0; j < 32; ++j) {
-            if (ToLowerChar(hash[j]) != entry.hash[j]) {
+            if (!IsHexChar(hash[j]) || ToLowerChar(hash[j]) != entry.hash[j]) {
                 match = false;
                 break;
             }
@@ -2397,6 +2609,9 @@ JA3MatchResult NetworkBehaviorAnalyzer::CheckJA3(
     }
 
     return result;
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 // ---------- AnalyzePeerBehavior -------------------------------------------
@@ -2405,6 +2620,7 @@ float NetworkBehaviorAnalyzer::AnalyzePeerBehavior(uint32_t processId) noexcept
 {
     if (!m_impl) return 0.0f;
     if (processId == 0) return 0.0f;
+    try {
 
     float score = 0.0f;
 
@@ -2428,8 +2644,14 @@ float NetworkBehaviorAnalyzer::AnalyzePeerBehavior(uint32_t processId) noexcept
     uint32_t totalDiscoveredPeers = 0;
     for (const auto& disc : m_impl->peerDiscoveries) {
         if (disc.processId == processId) {
-            ++discoveryCount;
-            totalDiscoveredPeers += static_cast<uint32_t>(disc.discoveredAddrs.size());
+            SaturatingIncrement(discoveryCount);
+            const auto discoveredCount = static_cast<uint32_t>(
+                std::min<size_t>(disc.discoveredAddrs.size(),
+                                 std::numeric_limits<uint32_t>::max()));
+            totalDiscoveredPeers =
+                (discoveredCount > std::numeric_limits<uint32_t>::max() - totalDiscoveredPeers)
+                    ? std::numeric_limits<uint32_t>::max()
+                    : (totalDiscoveredPeers + discoveredCount);
         }
     }
 
@@ -2488,6 +2710,9 @@ float NetworkBehaviorAnalyzer::AnalyzePeerBehavior(uint32_t processId) noexcept
     }
 
     return score;
+    } catch (const std::exception&) {
+        return 0.0f;
+    }
 }
 
 // ---------- AnalyzeHTTPHeaders --------------------------------------------
@@ -2496,26 +2721,28 @@ float NetworkBehaviorAnalyzer::AnalyzeHTTPHeaders(
     const HTTPRequest& request) noexcept
 {
     if (!m_impl) return 0.0f;
+    try {
+    const HTTPRequest cleanRequest = SanitizeRequest(request);
 
     float score = 0.0f;
 
     // --- User-Agent analysis ---
 
     // Empty User-Agent
-    if (request.userAgent.empty()) {
+    if (cleanRequest.userAgent.empty()) {
         score += 0.3f;
     }
     // Very short UA (single word or abbreviated)
-    else if (request.userAgent.size() < 10) {
+    else if (cleanRequest.userAgent.size() < 10) {
         score += 0.2f;
     }
     // Known suspicious "Mozilla/4.0" only (no extended info)
-    else if (request.userAgent.size() < 30 &&
-             StringContainsCaseInsensitive(request.userAgent, "Mozilla/4.0")) {
+    else if (cleanRequest.userAgent.size() < 30 &&
+             StringContainsCaseInsensitive(cleanRequest.userAgent, "Mozilla/4.0")) {
         score += 0.15f;
     }
     // Excessively long User-Agent (may be used to exfil data)
-    else if (request.userAgent.size() > kMaxUserAgentLen) {
+    else if (cleanRequest.userAgent.size() > kMaxUserAgentLen) {
         score += 0.2f;
     }
 
@@ -2523,7 +2750,8 @@ float NetworkBehaviorAnalyzer::AnalyzeHTTPHeaders(
     uint32_t missingStandard = 0;
     for (size_t i = 0; i < kNumExpectedHeaders; ++i) {
         bool found = false;
-        for (const auto& [hdrName, hdrVal] : request.headers) {
+        for (const auto& [hdrName, hdrVal] : cleanRequest.headers) {
+            (void)hdrVal;
             if (StringContainsCaseInsensitive(hdrName, kExpectedHeaders[i])) {
                 found = true;
                 break;
@@ -2541,7 +2769,8 @@ float NetworkBehaviorAnalyzer::AnalyzeHTTPHeaders(
     }
 
     // --- Known C2 custom headers ---
-    for (const auto& [hdrName, hdrVal] : request.headers) {
+    for (const auto& [hdrName, hdrVal] : cleanRequest.headers) {
+        (void)hdrVal;
         for (size_t i = 0; i < kNumC2HeaderPatterns; ++i) {
             if (StringContainsCaseInsensitive(hdrName, kC2HeaderPatterns[i].headerName)) {
                 score += kC2HeaderPatterns[i].confidence * 0.5f;
@@ -2551,16 +2780,16 @@ float NetworkBehaviorAnalyzer::AnalyzeHTTPHeaders(
     }
 
     // --- POST body analysis ---
-    if (!request.body.empty() &&
-        (request.method == "POST" || request.method == "PUT")) {
+    if (!cleanRequest.body.empty() &&
+        (cleanRequest.method == "POST" || cleanRequest.method == "PUT")) {
 
         // Base64-encoded body
-        if (LooksLikeBase64(request.body)) {
+        if (LooksLikeBase64(cleanRequest.body)) {
             score += 0.2f;
         }
 
         // High-entropy body (encrypted data)
-        if (LooksLikeEncryptedBlob(request.body)) {
+        if (LooksLikeEncryptedBlob(cleanRequest.body)) {
             score += 0.25f;
         }
     }
@@ -2569,6 +2798,9 @@ float NetworkBehaviorAnalyzer::AnalyzeHTTPHeaders(
     if (score > 1.0f) score = 1.0f;
 
     return score;
+    } catch (const std::exception&) {
+        return 0.0f;
+    }
 }
 
 } // namespace Phantom
