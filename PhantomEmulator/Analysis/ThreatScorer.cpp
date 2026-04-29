@@ -30,6 +30,9 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <new>
 #include <numeric>
 #include <shared_mutex>
 #include <sstream>
@@ -47,6 +50,8 @@ static constexpr uint32_t kMaxScoringFactors     = 4096;
 static constexpr uint32_t kMaxEvasionTechniques   = 256;
 static constexpr uint32_t kMaxMITRETechniquesScored = 512;
 static constexpr uint32_t kMaxReasonsInVerdict    = 64;
+static constexpr size_t kMaxFactorTextLength       = 512;
+static constexpr size_t kMaxTechniqueIdLength      = 32;
 
 static constexpr float kCalibrationFactor         = 1.15f;
 
@@ -86,6 +91,59 @@ static constexpr float kWeightEvasionBase         = 10.0f;
 static constexpr float kWeightMITRETechnique      = 3.0f;
 
 static constexpr size_t kCategoryCount = static_cast<size_t>(MalwareCategory::Count_);
+
+// ============================================================================
+// Defensive numeric and string helpers
+// ============================================================================
+
+[[nodiscard]] static float ClampFinite(float value, float minValue, float maxValue) noexcept {
+    if (!std::isfinite(value)) return minValue;
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+[[nodiscard]] static float SaturatingScoreAdd(float lhs, float rhs) noexcept {
+    if (!std::isfinite(lhs)) lhs = 0.0f;
+    if (!std::isfinite(rhs)) rhs = 0.0f;
+    const double sum = static_cast<double>(lhs) + static_cast<double>(rhs);
+    if (sum >= static_cast<double>(std::numeric_limits<float>::max())) {
+        return std::numeric_limits<float>::max();
+    }
+    return static_cast<float>(std::max(0.0, sum));
+}
+
+static void SaturatingIncrement(uint32_t& value) noexcept {
+    if (value < std::numeric_limits<uint32_t>::max()) {
+        ++value;
+    }
+}
+
+[[nodiscard]] static std::string SanitizeText(std::string_view input,
+                                              size_t maxLength = kMaxFactorTextLength) {
+    const size_t length = std::min(input.size(), maxLength);
+    std::string output;
+    output.reserve(length);
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(input[i]);
+        output.push_back((ch == '\r' || ch == '\n' || ch == '\t' || ch < 0x20U)
+            ? ' '
+            : static_cast<char>(ch));
+    }
+    return output;
+}
+
+[[nodiscard]] static std::string BoundedCString(const char* value,
+                                                size_t maxLength) {
+    if (!value) return {};
+    size_t length = 0;
+    for (; length < maxLength; ++length) {
+        if (value[length] == '\0') {
+            return SanitizeText(std::string_view(value, length), maxLength);
+        }
+    }
+    return {};
+}
 
 // ============================================================================
 // Category contribution table — maps BehaviorCategory → MalwareCategory weights
@@ -368,7 +426,9 @@ static void ApplyBehaviorContributions(
             for (uint8_t c = 0; c < mapping.count; ++c) {
                 auto idx = static_cast<size_t>(mapping.contributions[c].target);
                 if (idx < kCategoryCount) {
-                    categoryScores[idx] += baseAmount * mapping.contributions[c].fraction;
+                    categoryScores[idx] = SaturatingScoreAdd(
+                        categoryScores[idx],
+                        baseAmount * mapping.contributions[c].fraction);
                 }
             }
             return;
@@ -381,8 +441,6 @@ static void ApplyBehaviorContributions(
 // ============================================================================
 
 struct ThreatScorer::Impl {
-    const EmulationConfig& config;
-
     mutable std::shared_mutex mutex;
 
     std::vector<ScoringFactor> factors;
@@ -406,41 +464,53 @@ struct ThreatScorer::Impl {
     float maxSequenceSeverity    = 0.0f;
     float maxMemoryFindingScore  = 0.0f;
 
-    explicit Impl(const EmulationConfig& cfg) noexcept
-        : config(cfg)
+    explicit Impl([[maybe_unused]] const EmulationConfig& cfg)
     {
         factors.reserve(256);
         evasionTechniques.reserve(64);
         mitreTechniques.reserve(128);
     }
 
-    void AddFactorInternal(ScoringFactor&& factor) noexcept {
+    void AddFactorInternal(ScoringFactor&& factor) {
         if (factors.size() >= kMaxScoringFactors) return;
+        factor.source = SanitizeText(factor.source);
+        factor.description = SanitizeText(factor.description);
+        factor.weight = ClampFinite(factor.weight, 0.0f, 100.0f);
+        factor.score = ClampFinite(factor.score, 0.0f, 1.0f);
+        factor.confidence = ClampFinite(factor.confidence, 0.0f, 1.0f);
         factors.push_back(std::move(factor));
     }
 
     void ContributeToCategory(MalwareCategory cat, float amount) noexcept {
         auto idx = static_cast<size_t>(cat);
         if (idx < kCategoryCount) {
-            categoryScores[idx] += amount;
+            categoryScores[idx] = SaturatingScoreAdd(categoryScores[idx], amount);
         }
     }
 
     float ComputeRawScore() const noexcept {
-        float raw = 0.0f;
+        double raw = 0.0;
         for (const auto& f : factors) {
-            raw += f.weight * f.score * f.confidence;
+            const float weight = ClampFinite(f.weight, 0.0f, 100.0f);
+            const float score = ClampFinite(f.score, 0.0f, 1.0f);
+            const float confidence = ClampFinite(f.confidence, 0.0f, 1.0f);
+            raw += static_cast<double>(weight) *
+                   static_cast<double>(score) *
+                   static_cast<double>(confidence);
+            if (raw >= static_cast<double>(std::numeric_limits<float>::max())) {
+                return std::numeric_limits<float>::max();
+            }
         }
-        return raw;
+        return static_cast<float>(std::max(0.0, raw));
     }
 
     float ComputeNormalizedScore() const noexcept {
         float raw = ComputeRawScore();
-        float normalized = raw * kCalibrationFactor;
+        float normalized = std::isfinite(raw) ? raw * kCalibrationFactor : 100.0f;
 
         // Apply synergy bonuses for multi-stage attacks
         float synergy = ComputeSynergyBonus();
-        normalized += synergy;
+        normalized = SaturatingScoreAdd(normalized, synergy);
 
         return std::min(100.0f, std::max(0.0f, normalized));
     }
@@ -543,9 +613,12 @@ struct ThreatScorer::Impl {
         float totalWeight = 0.0f;
 
         for (const auto& f : factors) {
-            float effectiveWeight = f.weight * f.score;
-            totalWeightedConf += f.confidence * effectiveWeight;
-            totalWeight += effectiveWeight;
+            float effectiveWeight =
+                ClampFinite(f.weight, 0.0f, 100.0f) * ClampFinite(f.score, 0.0f, 1.0f);
+            totalWeightedConf = SaturatingScoreAdd(
+                totalWeightedConf,
+                ClampFinite(f.confidence, 0.0f, 1.0f) * effectiveWeight);
+            totalWeight = SaturatingScoreAdd(totalWeight, effectiveWeight);
         }
 
         if (totalWeight <= 0.0f) return 0.0f;
@@ -574,7 +647,7 @@ struct ThreatScorer::Impl {
     }
 
     std::string BuildSummary(ThreatLevel level, float score, float confidence,
-                             MalwareCategory primary, MalwareCategory secondary) const noexcept {
+                             MalwareCategory primary, MalwareCategory secondary) const {
         std::ostringstream ss;
 
         ss << "Verdict: " << ThreatLevelToString(level)
@@ -621,7 +694,7 @@ struct ThreatScorer::Impl {
         return ss.str();
     }
 
-    std::vector<std::string> BuildReasons() const noexcept {
+    std::vector<std::string> BuildReasons() const {
         std::vector<std::string> reasons;
         reasons.reserve(std::min(static_cast<size_t>(kMaxReasonsInVerdict), factors.size()));
 
@@ -662,8 +735,15 @@ struct ThreatScorer::Impl {
 // ============================================================================
 
 ThreatScorer::ThreatScorer(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>(config))
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>(config);
+    } catch (const std::bad_alloc&) {
+        m_impl = nullptr;
+    } catch (const std::exception&) {
+        m_impl = nullptr;
+    }
 }
 
 ThreatScorer::~ThreatScorer() noexcept = default;
@@ -673,6 +753,8 @@ ThreatScorer::~ThreatScorer() noexcept = default;
 // ============================================================================
 
 void ThreatScorer::AddBehaviorAlert(const BehaviorAlert& alert) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     float weight = kWeightBehaviorLow;
@@ -684,7 +766,7 @@ void ThreatScorer::AddBehaviorAlert(const BehaviorAlert& alert) noexcept {
         case AlertSeverity::Info:     weight = 1.0f;                    break;
     }
 
-    float confidence = std::clamp(alert.confidence, 0.0f, 1.0f);
+    float confidence = ClampFinite(alert.confidence, 0.0f, 1.0f);
     float score = 1.0f;
 
     ScoringFactor factor;
@@ -695,7 +777,7 @@ void ThreatScorer::AddBehaviorAlert(const BehaviorAlert& alert) noexcept {
     factor.confidence  = confidence;
 
     m_impl->AddFactorInternal(std::move(factor));
-    m_impl->behaviorAlertCount++;
+    SaturatingIncrement(m_impl->behaviorAlertCount);
 
     if (weight > m_impl->maxAlertSeverityScore) {
         m_impl->maxAlertSeverityScore = weight;
@@ -704,6 +786,9 @@ void ThreatScorer::AddBehaviorAlert(const BehaviorAlert& alert) noexcept {
     // Contribute to malware categories
     float categoryBase = weight * confidence;
     ApplyBehaviorContributions(alert.category, categoryBase, m_impl->categoryScores);
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -711,6 +796,8 @@ void ThreatScorer::AddBehaviorAlert(const BehaviorAlert& alert) noexcept {
 // ============================================================================
 
 void ThreatScorer::AddSequenceMatch(const SequenceMatch& match) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     float weight = kWeightSequenceSev1;
@@ -721,17 +808,18 @@ void ThreatScorer::AddSequenceMatch(const SequenceMatch& match) noexcept {
         default: weight = kWeightSequenceSev1; break;
     }
 
-    float confidence = std::clamp(match.confidence, 0.0f, 1.0f);
+    float confidence = ClampFinite(match.confidence, 0.0f, 1.0f);
 
     ScoringFactor factor;
     factor.source      = "APISequence";
-    factor.description = match.patternName ? match.patternName : "Unknown pattern";
+    factor.description = match.patternName ? BoundedCString(match.patternName, kMaxFactorTextLength)
+                                           : "Unknown pattern";
     factor.weight     = weight;
     factor.score      = 1.0f;
     factor.confidence = confidence;
 
     m_impl->AddFactorInternal(std::move(factor));
-    m_impl->sequenceMatchCount++;
+    SaturatingIncrement(m_impl->sequenceMatchCount);
 
     if (weight > m_impl->maxSequenceSeverity) {
         m_impl->maxSequenceSeverity = weight;
@@ -739,8 +827,8 @@ void ThreatScorer::AddSequenceMatch(const SequenceMatch& match) noexcept {
 
     // Infer category contribution from MITRE technique ID if available
     float categoryBase = weight * confidence;
-    if (match.mitreId && match.mitreId[0] != '\0') {
-        std::string_view mid(match.mitreId);
+    const std::string mid = BoundedCString(match.mitreId, kMaxTechniqueIdLength);
+    if (!mid.empty()) {
         BehaviorCategory inferred = BehaviorCategory::Execution;
         if (mid.starts_with("T1055"))      inferred = BehaviorCategory::ProcessInjection;
         else if (mid.starts_with("T1059")) inferred = BehaviorCategory::Execution;
@@ -767,6 +855,9 @@ void ThreatScorer::AddSequenceMatch(const SequenceMatch& match) noexcept {
                                            inferred = BehaviorCategory::LateralMovement;
         ApplyBehaviorContributions(inferred, categoryBase, m_impl->categoryScores);
     }
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -774,6 +865,8 @@ void ThreatScorer::AddSequenceMatch(const SequenceMatch& match) noexcept {
 // ============================================================================
 
 void ThreatScorer::AddMemoryFinding(const MemoryFindingDetail& finding) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     float weight = 0.0f;
@@ -910,23 +1003,26 @@ void ThreatScorer::AddMemoryFinding(const MemoryFindingDetail& finding) noexcept
             return;
     }
 
-    float confidence = std::clamp(finding.confidence, 0.0f, 1.0f);
+    float confidence = ClampFinite(finding.confidence, 0.0f, 1.0f);
 
     ScoringFactor factor;
     factor.source      = "MemoryForensics";
     factor.description = findingName;
     if (!finding.description.empty()) {
-        factor.description += " — " + finding.description;
+        factor.description += " - " + finding.description;
     }
     factor.weight     = weight;
     factor.score      = 1.0f;
     factor.confidence = confidence;
 
     m_impl->AddFactorInternal(std::move(factor));
-    m_impl->memoryFindingCount++;
+    SaturatingIncrement(m_impl->memoryFindingCount);
 
     if (weight > m_impl->maxMemoryFindingScore) {
         m_impl->maxMemoryFindingScore = weight;
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -935,6 +1031,8 @@ void ThreatScorer::AddMemoryFinding(const MemoryFindingDetail& finding) noexcept
 // ============================================================================
 
 void ThreatScorer::AddBehaviorFlags(BehaviorFlag flags) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     BehaviorFlag newFlags = static_cast<BehaviorFlag>(
@@ -1013,6 +1111,9 @@ void ThreatScorer::AddBehaviorFlags(BehaviorFlag flags) noexcept {
             }
         }
     }
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1021,17 +1122,21 @@ void ThreatScorer::AddBehaviorFlags(BehaviorFlag flags) noexcept {
 
 void ThreatScorer::AddMITRETechnique(const char* techniqueId, float confidence) noexcept {
     if (!techniqueId) return;
+    if (!m_impl) return;
+    try {
+    std::string id = BoundedCString(techniqueId, kMaxTechniqueIdLength);
+    if (id.empty()) return;
 
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->mitreTechniques.size() >= kMaxMITRETechniquesScored) return;
 
-    std::string id(techniqueId);
     auto [it, inserted] = m_impl->mitreTechniques.insert(id);
+    (void)it;
     if (!inserted) return; // already counted
 
-    confidence = std::clamp(confidence, 0.0f, 1.0f);
-    m_impl->mitreTechniqueCount++;
+    confidence = ClampFinite(confidence, 0.0f, 1.0f);
+    SaturatingIncrement(m_impl->mitreTechniqueCount);
 
     ScoringFactor factor;
     factor.source      = "MITREMapping";
@@ -1126,6 +1231,9 @@ void ThreatScorer::AddMITRETechnique(const char* techniqueId, float confidence) 
         m_impl->ContributeToCategory(MalwareCategory::Trojan, catBase * 0.5f);
         m_impl->ContributeToCategory(MalwareCategory::APTImplant, catBase * 0.5f);
     }
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1133,6 +1241,8 @@ void ThreatScorer::AddMITRETechnique(const char* techniqueId, float confidence) 
 // ============================================================================
 
 void ThreatScorer::AddPackerDetection(PackerType packer) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->packerDetected) return; // only score first detection
@@ -1163,6 +1273,9 @@ void ThreatScorer::AddPackerDetection(PackerType packer) noexcept {
         m_impl->ContributeToCategory(MalwareCategory::Trojan, catBase * 0.6f);
         m_impl->ContributeToCategory(MalwareCategory::Dropper, catBase * 0.4f);
     }
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1171,21 +1284,26 @@ void ThreatScorer::AddPackerDetection(PackerType packer) noexcept {
 
 void ThreatScorer::AddEvasionAttempt(const std::string& technique,
                                      float severity) noexcept {
+    if (!m_impl) return;
+    try {
+    const std::string cleanTechnique = SanitizeText(technique);
+    if (cleanTechnique.empty()) return;
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->evasionTechniques.size() >= kMaxEvasionTechniques) return;
 
-    auto [it, inserted] = m_impl->evasionTechniques.insert(technique);
+    auto [it, inserted] = m_impl->evasionTechniques.insert(cleanTechnique);
+    (void)it;
     if (!inserted) return; // already counted this evasion technique
 
-    m_impl->evasionCount++;
+    SaturatingIncrement(m_impl->evasionCount);
 
-    severity = std::clamp(severity, 0.0f, 1.0f);
+    severity = ClampFinite(severity, 0.0f, 1.0f);
     float weight = kWeightEvasionBase * severity;
 
     ScoringFactor factor;
     factor.source      = "EvasionDetection";
-    factor.description = "Evasion: " + technique;
+    factor.description = "Evasion: " + cleanTechnique;
     factor.weight      = weight;
     factor.score       = 1.0f;
     factor.confidence  = 0.80f;
@@ -1198,6 +1316,9 @@ void ThreatScorer::AddEvasionAttempt(const std::string& technique,
     m_impl->ContributeToCategory(MalwareCategory::Rootkit, catBase * 0.25f);
     m_impl->ContributeToCategory(MalwareCategory::Trojan, catBase * 0.20f);
     m_impl->ContributeToCategory(MalwareCategory::Fileless, catBase * 0.15f);
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1205,16 +1326,21 @@ void ThreatScorer::AddEvasionAttempt(const std::string& technique,
 // ============================================================================
 
 void ThreatScorer::AddCustomFactor(const ScoringFactor& factor) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->factors.size() >= kMaxScoringFactors) return;
 
     ScoringFactor f = factor;
-    f.weight     = std::clamp(f.weight, 0.0f, 100.0f);
-    f.score      = std::clamp(f.score, 0.0f, 1.0f);
-    f.confidence = std::clamp(f.confidence, 0.0f, 1.0f);
+    f.weight     = ClampFinite(f.weight, 0.0f, 100.0f);
+    f.score      = ClampFinite(f.score, 0.0f, 1.0f);
+    f.confidence = ClampFinite(f.confidence, 0.0f, 1.0f);
 
     m_impl->AddFactorInternal(std::move(f));
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1236,10 +1362,12 @@ void ThreatScorer::AddMLVerdict(
     uint32_t categoryCount) noexcept
 {
     if (!categoryScores && categoryCount > 0) return;
+    if (!m_impl) return;
+    try {
 
     std::unique_lock lock(m_impl->mutex);
 
-    malwareConfidence = std::clamp(malwareConfidence, 0.0f, 1.0f);
+    malwareConfidence = ClampFinite(malwareConfidence, 0.0f, 1.0f);
 
     // Weight the ML factor based on its own confidence (self-calibrated)
     // High-confidence ML predictions get heavier weight
@@ -1258,8 +1386,13 @@ void ThreatScorer::AddMLVerdict(
     static constexpr float kMLCategoryBlendWeight = 0.4f;
     uint32_t count = std::min<uint32_t>(categoryCount, kCategoryCount);
     for (uint32_t i = 0; i < count; ++i) {
-        float score = std::clamp(categoryScores[i], 0.0f, 1.0f);
-        m_impl->categoryScores[i] += score * kMLCategoryBlendWeight * 10.0f;
+        float score = ClampFinite(categoryScores[i], 0.0f, 1.0f);
+        m_impl->categoryScores[i] = SaturatingScoreAdd(
+            m_impl->categoryScores[i],
+            score * kMLCategoryBlendWeight * 10.0f);
+    }
+    } catch (const std::exception&) {
+        return;
     }
 }
 
@@ -1268,6 +1401,8 @@ void ThreatScorer::AddMLVerdict(
 // ============================================================================
 
 ThreatVerdict ThreatScorer::GenerateVerdict() const noexcept {
+    if (!m_impl) return {};
+    try {
     std::shared_lock lock(m_impl->mutex);
 
     ThreatVerdict verdict;
@@ -1287,6 +1422,12 @@ ThreatVerdict ThreatScorer::GenerateVerdict() const noexcept {
     verdict.reasons = m_impl->BuildReasons();
 
     return verdict;
+    } catch (const std::exception&) {
+        ThreatVerdict verdict;
+        verdict.level = ThreatLevel::Clean;
+        verdict.summary = "Verdict unavailable: threat scoring allocation failed.";
+        return verdict;
+    }
 }
 
 // ============================================================================
@@ -1294,9 +1435,16 @@ ThreatVerdict ThreatScorer::GenerateVerdict() const noexcept {
 // ============================================================================
 
 const std::vector<ScoringFactor>& ThreatScorer::GetFactors() const noexcept {
-    // Caller must hold appropriate synchronization if sharing across threads.
-    // In typical usage, verdict is generated once at end of emulation.
-    return m_impl->factors;
+    static const std::vector<ScoringFactor> kEmpty;
+    if (!m_impl) return kEmpty;
+    try {
+        thread_local std::vector<ScoringFactor> snapshot;
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->factors;
+        return snapshot;
+    } catch (const std::exception&) {
+        return kEmpty;
+    }
 }
 
 // ============================================================================
@@ -1304,13 +1452,23 @@ const std::vector<ScoringFactor>& ThreatScorer::GetFactors() const noexcept {
 // ============================================================================
 
 float ThreatScorer::GetRawScore() const noexcept {
+    if (!m_impl) return 0.0f;
+    try {
     std::shared_lock lock(m_impl->mutex);
     return m_impl->ComputeRawScore();
+    } catch (const std::exception&) {
+        return 0.0f;
+    }
 }
 
 float ThreatScorer::GetNormalizedScore() const noexcept {
+    if (!m_impl) return 0.0f;
+    try {
     std::shared_lock lock(m_impl->mutex);
     return m_impl->ComputeNormalizedScore();
+    } catch (const std::exception&) {
+        return 0.0f;
+    }
 }
 
 // ============================================================================
@@ -1318,9 +1476,15 @@ float ThreatScorer::GetNormalizedScore() const noexcept {
 // ============================================================================
 
 MalwareCategory ThreatScorer::ClassifyMalware() const noexcept {
+    if (!m_impl) return MalwareCategory::Unknown;
+    try {
     std::shared_lock lock(m_impl->mutex);
     auto [primary, _] = m_impl->GetTopCategories();
+    (void)_;
     return primary;
+    } catch (const std::exception&) {
+        return MalwareCategory::Unknown;
+    }
 }
 
 // ============================================================================
@@ -1328,6 +1492,8 @@ MalwareCategory ThreatScorer::ClassifyMalware() const noexcept {
 // ============================================================================
 
 std::vector<std::pair<MalwareCategory, float>> ThreatScorer::GetCategoryScores() const noexcept {
+    if (!m_impl) return {};
+    try {
     std::shared_lock lock(m_impl->mutex);
 
     std::vector<std::pair<MalwareCategory, float>> result;
@@ -1344,6 +1510,9 @@ std::vector<std::pair<MalwareCategory, float>> ThreatScorer::GetCategoryScores()
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
     return result;
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -1351,6 +1520,8 @@ std::vector<std::pair<MalwareCategory, float>> ThreatScorer::GetCategoryScores()
 // ============================================================================
 
 void ThreatScorer::Reset() noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     m_impl->factors.clear();
@@ -1368,6 +1539,9 @@ void ThreatScorer::Reset() noexcept {
     m_impl->maxMemoryFindingScore = 0.0f;
     m_impl->evasionTechniques.clear();
     m_impl->mitreTechniques.clear();
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 } // namespace Phantom
