@@ -25,12 +25,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 namespace Phantom {
 
@@ -40,6 +43,7 @@ namespace Phantom {
 
 static constexpr uint32_t kMaxMappedTechniques = 512;
 static constexpr uint32_t kMaxEvidencePerTechnique = 32;
+static constexpr size_t   kMaxEvidenceLength = 512;
 
 // ============================================================================
 // Static Technique Database
@@ -403,6 +407,29 @@ static const TechniqueDefinition* FindTechDef(const char* id) noexcept {
     return nullptr;
 }
 
+[[nodiscard]] static bool SameText(const char* lhs, const char* rhs) noexcept {
+    if (!lhs || !rhs) return lhs == rhs;
+    return std::strcmp(lhs, rhs) == 0;
+}
+
+[[nodiscard]] static std::string TruncateEvidence(std::string_view evidence) noexcept {
+    std::string result;
+    try {
+        const size_t len = std::min(evidence.size(), kMaxEvidenceLength);
+        result.reserve(len + 3U);
+        for (size_t i = 0; i < len; ++i) {
+            const unsigned char ch = static_cast<unsigned char>(evidence[i]);
+            result.push_back((ch < 0x20U || ch == 0x7FU) ? ' ' : static_cast<char>(ch));
+        }
+        if (evidence.size() > len) {
+            result += "...";
+        }
+    } catch (const std::bad_alloc&) {
+        result.clear();
+    }
+    return result;
+}
+
 // ============================================================================
 // Tactic list for kill-chain coverage
 // ============================================================================
@@ -430,39 +457,56 @@ struct MITREMapper::Impl {
     mutable std::shared_mutex mutex;
 
     std::vector<MITRETechnique> mapped;
-    std::unordered_map<std::string, size_t> idToIndex;
 
     explicit Impl() noexcept {
-        mapped.reserve(128);
-        idToIndex.reserve(128);
+        try {
+            mapped.reserve(128);
+        } catch (const std::bad_alloc&) {
+            mapped.clear();
+        }
+    }
+
+    [[nodiscard]] std::optional<size_t> FindMappedIndex(const char* id) const noexcept {
+        if (!id) return std::nullopt;
+        for (size_t i = 0; i < mapped.size(); ++i) {
+            if (SameText(mapped[i].id, id)) {
+                return i;
+            }
+        }
+        return std::nullopt;
     }
 
     // Add or update a technique with deduplication
     void AddTechnique(const char* id, float confidence,
                       const std::string& evidence) noexcept {
         if (!id) return;
-        if (mapped.size() >= kMaxMappedTechniques && idToIndex.find(id) == idToIndex.end()) {
+        const auto existingIndex = FindMappedIndex(id);
+        if (mapped.size() >= kMaxMappedTechniques && !existingIndex.has_value()) {
             return;
         }
 
-        confidence = std::clamp(confidence, 0.0f, 1.0f);
+        confidence = std::isfinite(confidence) ? std::clamp(confidence, 0.0f, 1.0f) : 0.0f;
+        const std::string safeEvidence = TruncateEvidence(evidence);
 
-        auto it = idToIndex.find(id);
-        if (it != idToIndex.end()) {
+        if (existingIndex.has_value()) {
             // Existing technique — update confidence and add evidence
-            auto& tech = mapped[it->second];
+            auto& tech = mapped[*existingIndex];
             if (confidence > tech.confidence) {
                 tech.confidence = confidence;
             }
             if (tech.evidence.size() < kMaxEvidencePerTechnique &&
-                !evidence.empty()) {
+                !safeEvidence.empty()) {
                 // Avoid duplicate evidence strings
                 bool duplicate = false;
                 for (const auto& ev : tech.evidence) {
-                    if (ev == evidence) { duplicate = true; break; }
+                    if (ev == safeEvidence) { duplicate = true; break; }
                 }
                 if (!duplicate) {
-                    tech.evidence.push_back(evidence);
+                    try {
+                        tech.evidence.push_back(safeEvidence);
+                    } catch (const std::bad_alloc&) {
+                        return;
+                    }
                 }
             }
             return;
@@ -471,27 +515,27 @@ struct MITREMapper::Impl {
         // New technique — look up definition
         const auto* def = FindTechDef(id);
 
+        if (!def) return;
+
         MITRETechnique tech;
-        if (def) {
-            tech.id          = def->id;
-            tech.name        = def->name;
-            tech.tactic      = def->tactic;
-            tech.description = def->description;
-        } else {
-            // Technique not in our static DB — use provided ID
-            tech.id          = id;
-            tech.name        = "Unknown Technique";
-            tech.tactic      = "Unknown";
-            tech.description = "";
-        }
+        tech.id          = def->id;
+        tech.name        = def->name;
+        tech.tactic      = def->tactic;
+        tech.description = def->description;
         tech.confidence = confidence;
-        if (!evidence.empty()) {
-            tech.evidence.push_back(evidence);
+        if (!safeEvidence.empty()) {
+            try {
+                tech.evidence.push_back(safeEvidence);
+            } catch (const std::bad_alloc&) {
+                return;
+            }
         }
 
-        size_t idx = mapped.size();
-        mapped.push_back(std::move(tech));
-        idToIndex[id] = idx;
+        try {
+            mapped.push_back(std::move(tech));
+        } catch (const std::bad_alloc&) {
+            return;
+        }
     }
 };
 
@@ -500,8 +544,13 @@ struct MITREMapper::Impl {
 // ============================================================================
 
 MITREMapper::MITREMapper() noexcept
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(nullptr)
 {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (const std::bad_alloc&) {
+        m_impl = nullptr;
+    }
 }
 
 MITREMapper::~MITREMapper() noexcept = default;
@@ -511,6 +560,8 @@ MITREMapper::~MITREMapper() noexcept = default;
 // ============================================================================
 
 void MITREMapper::OnBehaviorAlert(const BehaviorAlert& alert) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     float conf = std::clamp(alert.confidence, 0.0f, 1.0f);
@@ -664,6 +715,9 @@ void MITREMapper::OnBehaviorAlert(const BehaviorAlert& alert) noexcept {
         default:
             break;
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -671,6 +725,8 @@ void MITREMapper::OnBehaviorAlert(const BehaviorAlert& alert) noexcept {
 // ============================================================================
 
 void MITREMapper::OnBehaviorFlags(BehaviorFlag flags) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     if (HasFlag(flags, BehaviorFlag::FileDropped)) {
@@ -817,6 +873,9 @@ void MITREMapper::OnBehaviorFlags(BehaviorFlag flags) noexcept {
         m_impl->AddTechnique("T1106", 0.5f,
             "Suspicious API usage pattern (BehaviorFlag::SuspiciousAPI)");
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -824,7 +883,9 @@ void MITREMapper::OnBehaviorFlags(BehaviorFlag flags) noexcept {
 // ============================================================================
 
 void MITREMapper::OnAPICall(const APICallDetail& call) noexcept {
+    if (!m_impl) return;
     if (!call.funcName) return;
+    try {
 
     std::unique_lock lock(m_impl->mutex);
 
@@ -1139,6 +1200,9 @@ void MITREMapper::OnAPICall(const APICallDetail& call) noexcept {
             m_impl->AddTechnique("T1106", 0.3f, evidence);
         }
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1146,6 +1210,8 @@ void MITREMapper::OnAPICall(const APICallDetail& call) noexcept {
 // ============================================================================
 
 void MITREMapper::OnMemoryFinding(const MemoryFindingDetail& finding) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     float conf = std::clamp(finding.confidence, 0.0f, 1.0f);
@@ -1247,6 +1313,9 @@ void MITREMapper::OnMemoryFinding(const MemoryFindingDetail& finding) noexcept {
         default:
             break;
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1254,6 +1323,8 @@ void MITREMapper::OnMemoryFinding(const MemoryFindingDetail& finding) noexcept {
 // ============================================================================
 
 void MITREMapper::OnPackerDetected(PackerType packer) noexcept {
+    if (!m_impl) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     std::string evidence = "Packer detected: ";
@@ -1325,6 +1396,9 @@ void MITREMapper::OnPackerDetected(PackerType packer) noexcept {
                 "Software packing implies obfuscation");
             break;
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1332,6 +1406,9 @@ void MITREMapper::OnPackerDetected(PackerType packer) noexcept {
 // ============================================================================
 
 void MITREMapper::OnEvasionAttempt(const std::string& technique) noexcept {
+    if (!m_impl) return;
+    if (technique.size() > kMaxEvidenceLength * 2U) return;
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     std::string evidence = "Evasion technique: " + technique;
@@ -1522,6 +1599,9 @@ void MITREMapper::OnEvasionAttempt(const std::string& technique) noexcept {
     if (technique.find("ptrace") != std::string::npos) {
         m_impl->AddTechnique("T1055.008", 0.7f, evidence);
     }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
 }
 
 // ============================================================================
@@ -1529,7 +1609,17 @@ void MITREMapper::OnEvasionAttempt(const std::string& technique) noexcept {
 // ============================================================================
 
 const std::vector<MITRETechnique>& MITREMapper::GetMappedTechniques() const noexcept {
-    return m_impl->mapped;
+    static const std::vector<MITRETechnique> kEmpty;
+    static thread_local std::vector<MITRETechnique> snapshot;
+    if (!m_impl) return kEmpty;
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->mapped;
+        return snapshot;
+    } catch (const std::bad_alloc&) {
+        snapshot.clear();
+        return kEmpty;
+    }
 }
 
 // ============================================================================
@@ -1537,6 +1627,7 @@ const std::vector<MITRETechnique>& MITREMapper::GetMappedTechniques() const noex
 // ============================================================================
 
 uint32_t MITREMapper::GetTechniqueCount() const noexcept {
+    if (!m_impl) return 0;
     std::shared_lock lock(m_impl->mutex);
     return static_cast<uint32_t>(m_impl->mapped.size());
 }
@@ -1546,25 +1637,40 @@ uint32_t MITREMapper::GetTechniqueCount() const noexcept {
 // ============================================================================
 
 std::vector<MITRETacticSummary> MITREMapper::GetTacticSummary() const noexcept {
+    std::vector<MITRETacticSummary> result;
+    if (!m_impl) return result;
     std::shared_lock lock(m_impl->mutex);
 
-    std::unordered_map<std::string_view, MITRETacticSummary> tacticMap;
+    std::array<MITRETacticSummary, kTacticCount> summaries{};
+    for (size_t i = 0; i < kTacticCount; ++i) {
+        summaries[i].tactic = kAllTactics[i];
+    }
 
     for (const auto& tech : m_impl->mapped) {
         if (!tech.tactic) continue;
-        std::string_view tactic(tech.tactic);
-        auto& summary = tacticMap[tactic];
-        summary.tactic = tech.tactic;
-        summary.techniqueCount++;
-        if (tech.confidence > summary.maxConfidence) {
-            summary.maxConfidence = tech.confidence;
+        for (auto& summary : summaries) {
+            if (SameText(summary.tactic, tech.tactic)) {
+                if (summary.techniqueCount < std::numeric_limits<uint32_t>::max()) {
+                    ++summary.techniqueCount;
+                }
+                if (tech.confidence > summary.maxConfidence) {
+                    summary.maxConfidence = tech.confidence;
+                }
+                break;
+            }
         }
     }
 
-    std::vector<MITRETacticSummary> result;
-    result.reserve(tacticMap.size());
-    for (const auto& [_, summary] : tacticMap) {
-        result.push_back(summary);
+    try {
+        result.reserve(kTacticCount);
+        for (const auto& summary : summaries) {
+            if (summary.techniqueCount > 0) {
+                result.push_back(summary);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        result.clear();
+        return result;
     }
 
     // Sort by technique count descending
@@ -1581,15 +1687,24 @@ std::vector<MITRETacticSummary> MITREMapper::GetTacticSummary() const noexcept {
 // ============================================================================
 
 std::vector<const MITRETechnique*> MITREMapper::GetByTactic(const char* tactic) const noexcept {
-    std::shared_lock lock(m_impl->mutex);
-
     std::vector<const MITRETechnique*> result;
+    if (!m_impl) return result;
     if (!tactic) return result;
 
-    for (const auto& tech : m_impl->mapped) {
-        if (tech.tactic && std::strcmp(tech.tactic, tactic) == 0) {
-            result.push_back(&tech);
+    try {
+        static thread_local std::vector<MITRETechnique> snapshot;
+        snapshot.clear();
+        {
+            std::shared_lock lock(m_impl->mutex);
+            snapshot = m_impl->mapped;
         }
+        for (const auto& tech : snapshot) {
+            if (SameText(tech.tactic, tactic)) {
+                result.push_back(&tech);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        result.clear();
     }
 
     return result;
@@ -1600,12 +1715,18 @@ std::vector<const MITRETechnique*> MITREMapper::GetByTactic(const char* tactic) 
 // ============================================================================
 
 const MITRETechnique* MITREMapper::GetById(const char* id) const noexcept {
-    std::shared_lock lock(m_impl->mutex);
-
+    if (!m_impl) return nullptr;
     if (!id) return nullptr;
-    auto it = m_impl->idToIndex.find(id);
-    if (it == m_impl->idToIndex.end()) return nullptr;
-    return &m_impl->mapped[it->second];
+    static thread_local MITRETechnique snapshot;
+    std::shared_lock lock(m_impl->mutex);
+    const auto existingIndex = m_impl->FindMappedIndex(id);
+    if (!existingIndex.has_value()) return nullptr;
+    try {
+        snapshot = m_impl->mapped[*existingIndex];
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+    return &snapshot;
 }
 
 // ============================================================================
@@ -1613,16 +1734,22 @@ const MITRETechnique* MITREMapper::GetById(const char* id) const noexcept {
 // ============================================================================
 
 uint32_t MITREMapper::GetKillChainCoverage() const noexcept {
+    if (!m_impl) return 0;
     std::shared_lock lock(m_impl->mutex);
 
-    std::unordered_set<std::string_view> observedTactics;
+    std::array<bool, kTacticCount> observedTactics{};
     for (const auto& tech : m_impl->mapped) {
-        if (tech.tactic) {
-            observedTactics.insert(tech.tactic);
+        if (!tech.tactic) continue;
+        for (size_t i = 0; i < kTacticCount; ++i) {
+            if (SameText(kAllTactics[i], tech.tactic)) {
+                observedTactics[i] = true;
+                break;
+            }
         }
     }
 
-    return static_cast<uint32_t>(observedTactics.size());
+    return static_cast<uint32_t>(
+        std::count(observedTactics.begin(), observedTactics.end(), true));
 }
 
 // ============================================================================
@@ -1630,10 +1757,10 @@ uint32_t MITREMapper::GetKillChainCoverage() const noexcept {
 // ============================================================================
 
 void MITREMapper::Reset() noexcept {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
 
     m_impl->mapped.clear();
-    m_impl->idToIndex.clear();
 }
 
 } // namespace Phantom
