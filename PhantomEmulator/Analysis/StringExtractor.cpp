@@ -13,6 +13,9 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -198,7 +201,7 @@ static const auto kBase64DecodeTable = BuildBase64DecodeTable();
 
     try {
         result.reserve(outputLen);
-    } catch (...) {
+    } catch (const std::exception&) {
         return result;
     }
 
@@ -282,10 +285,37 @@ static const auto kBase64DecodeTable = BuildBase64DecodeTable();
 }
 
 [[nodiscard]] std::string ByteToHex(uint8_t b) noexcept {
-    std::string s(2, '0');
+    std::string s;
+    try {
+        s.resize(2, '0');
+    } catch (const std::exception&) {
+        return {};
+    }
     s[0] = HexNibble((b >> 4) & 0x0F);
     s[1] = HexNibble(b & 0x0F);
     return s;
+}
+
+[[nodiscard]] GuestAddress AddGuestOffset(GuestAddress base, size_t offset) noexcept {
+    const GuestAddress guestOffset =
+        offset > static_cast<size_t>(std::numeric_limits<GuestAddress>::max())
+            ? std::numeric_limits<GuestAddress>::max()
+            : static_cast<GuestAddress>(offset);
+    return (std::numeric_limits<GuestAddress>::max() - base < guestOffset)
+        ? std::numeric_limits<GuestAddress>::max()
+        : base + guestOffset;
+}
+
+void NormalizeExtractedText(std::string& value) noexcept {
+    for (char& c : value) {
+        const unsigned char ch = static_cast<unsigned char>(c);
+        if (ch == '\r' || ch == '\n' || ch == '\t' || ch < 0x20U) {
+            c = ' ';
+        }
+    }
+    if (value.size() > kMaxStringLength) {
+        value.resize(kMaxStringLength);
+    }
 }
 
 // ---- IP address parser (manual, no regex) ---------------------------------
@@ -317,7 +347,7 @@ static const auto kBase64DecodeTable = BuildBase64DecodeTable();
 }
 
 // Check if a URL contains a raw IP address (not a domain name)
-[[nodiscard]] bool URLContainsRawIP(const std::string& url) noexcept {
+[[nodiscard]] bool URLContainsRawIP(const std::string& url) {
     // Find "://" and then extract host portion
     size_t schemeEnd = 0;
     for (size_t i = 0; i + 2 < url.size(); ++i) {
@@ -365,6 +395,9 @@ static const auto kBase64DecodeTable = BuildBase64DecodeTable();
     for (size_t i = colonPos + 1; i < url.size(); ++i) {
         if (url[i] == '/') break;
         if (!IsDigit(url[i])) return false;
+        if (port > 6553U || (port == 6553U && static_cast<uint32_t>(url[i] - '0') > 5U)) {
+            return false;
+        }
         port = port * 10 + static_cast<uint32_t>(url[i] - '0');
         ++digits;
         if (port > 65535) return false;
@@ -546,7 +579,7 @@ struct StringExtractor::Impl {
     // Construction
     // -----------------------------------------------------------------------
 
-    explicit Impl(const EmulationConfig& config) noexcept
+    explicit Impl(const EmulationConfig& config)
         : iocExtractionEnabled(config.enableIOCExtraction)
     {
         strings.reserve(1024);
@@ -556,15 +589,19 @@ struct StringExtractor::Impl {
     // Deduplication and insertion
     // -----------------------------------------------------------------------
 
-    bool AddString(ExtractedString&& es) noexcept {
+    bool AddString(ExtractedString&& es) {
         if (strings.size() >= kMaxStrings) return false;
+        if (es.value.empty()) return false;
+        NormalizeExtractedText(es.value);
         if (es.value.empty()) return false;
 
         auto it = dedup.find(es.value);
         if (it != dedup.end()) {
             // Already exists: increment occurrences
             if (it->second < strings.size()) {
-                strings[it->second].occurrences++;
+                if (strings[it->second].occurrences < std::numeric_limits<uint32_t>::max()) {
+                    ++strings[it->second].occurrences;
+                }
             }
             return true;
         }
@@ -572,10 +609,19 @@ struct StringExtractor::Impl {
         if (dedup.size() >= kMaxDedupEntries) return false;
 
         const uint32_t idx = static_cast<uint32_t>(strings.size());
+        std::string key = es.value;
         try {
-            dedup.emplace(es.value, idx);
+            auto [inserted, didInsert] = dedup.emplace(key, idx);
+            (void)inserted;
+            if (!didInsert) {
+                return true;
+            }
             strings.push_back(std::move(es));
-        } catch (...) {
+        } catch (const std::bad_alloc&) {
+            dedup.erase(key);
+            return false;
+        } catch (const std::exception&) {
+            dedup.erase(key);
             return false;
         }
         return true;
@@ -586,7 +632,7 @@ struct StringExtractor::Impl {
     // -----------------------------------------------------------------------
 
     void ExtractAsciiStrings(const uint8_t* data, size_t size,
-                             GuestAddress base) noexcept {
+                             GuestAddress base) {
         if (!data || size == 0) return;
 
         size_t runStart = 0;
@@ -605,7 +651,7 @@ struct StringExtractor::Impl {
                         ExtractedString es;
                         es.value.assign(
                             reinterpret_cast<const char*>(data + runStart), runLen);
-                        es.address = base + static_cast<GuestAddress>(runStart);
+                        es.address = AddGuestOffset(base, runStart);
                         es.isWide = false;
                         es.encoding = "ascii";
                         AddString(std::move(es));
@@ -621,7 +667,7 @@ struct StringExtractor::Impl {
                 ExtractedString es;
                 es.value.assign(
                     reinterpret_cast<const char*>(data + runStart), runLen);
-                es.address = base + static_cast<GuestAddress>(runStart);
+                es.address = AddGuestOffset(base, runStart);
                 es.isWide = false;
                 es.encoding = "ascii";
                 AddString(std::move(es));
@@ -634,7 +680,7 @@ struct StringExtractor::Impl {
     // -----------------------------------------------------------------------
 
     void ExtractWideStrings(const uint8_t* data, size_t size,
-                            GuestAddress base) noexcept {
+                            GuestAddress base) {
         if (!data || size < 2) return;
 
         std::string accumulated;
@@ -660,7 +706,7 @@ struct StringExtractor::Impl {
                     // Truncate run — emit what we have and reset
                     ExtractedString es;
                     es.value = std::move(accumulated);
-                    es.address = base + static_cast<GuestAddress>(runStartByte);
+                    es.address = AddGuestOffset(base, runStartByte);
                     es.isWide = true;
                     es.encoding = "utf16le";
                     AddString(std::move(es));
@@ -672,7 +718,7 @@ struct StringExtractor::Impl {
                     if (accumulated.size() >= kMinWideStringLength) {
                         ExtractedString es;
                         es.value = std::move(accumulated);
-                        es.address = base + static_cast<GuestAddress>(runStartByte);
+                        es.address = AddGuestOffset(base, runStartByte);
                         es.isWide = true;
                         es.encoding = "utf16le";
                         AddString(std::move(es));
@@ -686,7 +732,7 @@ struct StringExtractor::Impl {
         if (inRun && accumulated.size() >= kMinWideStringLength) {
             ExtractedString es;
             es.value = std::move(accumulated);
-            es.address = base + static_cast<GuestAddress>(runStartByte);
+            es.address = AddGuestOffset(base, runStartByte);
             es.isWide = true;
             es.encoding = "utf16le";
             AddString(std::move(es));
@@ -697,7 +743,7 @@ struct StringExtractor::Impl {
     // Base64 detection and decode
     // -----------------------------------------------------------------------
 
-    void DetectBase64Strings() noexcept {
+    void DetectBase64Strings() {
         // Work on a snapshot of current string count to avoid infinite growth
         const size_t count = strings.size();
         for (size_t idx = 0; idx < count; ++idx) {
@@ -786,7 +832,7 @@ struct StringExtractor::Impl {
     // -----------------------------------------------------------------------
 
     void DetectSingleByteXOR(const uint8_t* data, size_t size,
-                             GuestAddress base) noexcept {
+                             GuestAddress base) {
         if (!data || size < kMinXORBlockSize) return;
 
         // Scan in blocks to find high-entropy regions
@@ -826,7 +872,7 @@ struct StringExtractor::Impl {
                     if (result.size() >= kMinAsciiStringLength) {
                         ExtractedString es;
                         es.value = std::move(result);
-                        es.address = base + static_cast<GuestAddress>(offset);
+                        es.address = AddGuestOffset(base, offset);
                         es.isDecoded = true;
                         es.encoding = "xor_0x" + ByteToHex(static_cast<uint8_t>(key));
                         AddString(std::move(es));
@@ -842,7 +888,7 @@ struct StringExtractor::Impl {
     // -----------------------------------------------------------------------
 
     void DetectMultiByteXOR(const uint8_t* data, size_t size,
-                            GuestAddress base) noexcept {
+                            GuestAddress base) {
         if (!data || size < kMinXORBlockSize) return;
 
         static constexpr uint32_t kBlockSize = 256;
@@ -947,7 +993,7 @@ struct StringExtractor::Impl {
 
                         ExtractedString es;
                         es.value = std::move(result);
-                        es.address = base + static_cast<GuestAddress>(offset);
+                        es.address = AddGuestOffset(base, offset);
                         es.isDecoded = true;
                         es.encoding = std::move(enc);
                         AddString(std::move(es));
@@ -962,7 +1008,7 @@ struct StringExtractor::Impl {
     // ROT13 / Caesar shift detection
     // -----------------------------------------------------------------------
 
-    void DetectCaesarStrings() noexcept {
+    void DetectCaesarStrings() {
         const size_t count = strings.size();
         for (size_t idx = 0; idx < count; ++idx) {
             if (strings.size() >= kMaxStrings) break;
@@ -1020,7 +1066,7 @@ struct StringExtractor::Impl {
     // Stack string extraction from tracked writes
     // -----------------------------------------------------------------------
 
-    void ExtractStackString(GuestAddress regionBase) noexcept {
+    void ExtractStackString(GuestAddress regionBase) {
         auto it = stackRegions.find(regionBase);
         if (it == stackRegions.end()) return;
 
@@ -1054,7 +1100,7 @@ struct StringExtractor::Impl {
         if (result.size() >= kMinAsciiStringLength) {
             ExtractedString es;
             es.value = std::move(result);
-            es.address = regionBase + static_cast<GuestAddress>(minOff);
+            es.address = AddGuestOffset(regionBase, minOff);
             es.isDecoded = false;
             es.encoding = "stack";
             AddString(std::move(es));
@@ -1065,7 +1111,7 @@ struct StringExtractor::Impl {
     // String categorization
     // -----------------------------------------------------------------------
 
-    void CategorizeString(ExtractedString& es) const noexcept {
+    void CategorizeString(ExtractedString& es) const {
         const std::string& val = es.value;
         if (val.empty()) return;
 
@@ -1258,7 +1304,7 @@ struct StringExtractor::Impl {
     // Suspiciousness scoring
     // -----------------------------------------------------------------------
 
-    void ScoreString(ExtractedString& es) const noexcept {
+    void ScoreString(ExtractedString& es) const {
         switch (es.category) {
             case StringCategory::SuspiciousCommand:
                 es.suspiciousness = 0.85f;
@@ -1367,7 +1413,7 @@ struct StringExtractor::Impl {
     // Full categorization and scoring pass
     // -----------------------------------------------------------------------
 
-    void CategorizeAndScoreAll() noexcept {
+    void CategorizeAndScoreAll() {
         for (auto& es : strings) {
             CategorizeString(es);
             ScoreString(es);
@@ -1379,7 +1425,7 @@ struct StringExtractor::Impl {
     // -----------------------------------------------------------------------
 
     void ScanRegionImpl(const uint8_t* data, size_t size,
-                        GuestAddress base) noexcept {
+                        GuestAddress base) {
         if (!data || size == 0) return;
         if (!iocExtractionEnabled) return;
 
@@ -1400,7 +1446,7 @@ struct StringExtractor::Impl {
     // Post-extraction analysis (Base64, ROT, categorize, score)
     // -----------------------------------------------------------------------
 
-    void RunPostAnalysis() noexcept {
+    void RunPostAnalysis() {
         DetectBase64Strings();
         DetectCaesarStrings();
         CategorizeAndScoreAll();
@@ -1414,8 +1460,11 @@ struct StringExtractor::Impl {
 StringExtractor::StringExtractor(const EmulationConfig& config) noexcept {
     try {
         m_impl = std::make_unique<Impl>(config);
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    } catch (const std::exception&) {
         // Allocation failure — m_impl remains null
+        m_impl.reset();
     }
 }
 
@@ -1435,8 +1484,12 @@ void StringExtractor::ScanRegion(const uint8_t* data, size_t size,
     static constexpr size_t kMaxScanSize = 64ULL * 1024 * 1024; // 64 MB
     if (size > kMaxScanSize) size = kMaxScanSize;
 
-    m_impl->ScanRegionImpl(data, size, base);
-    m_impl->RunPostAnalysis();
+    try {
+        m_impl->ScanRegionImpl(data, size, base);
+        m_impl->RunPostAnalysis();
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ---- ScanAll --------------------------------------------------------------
@@ -1449,21 +1502,25 @@ void StringExtractor::ScanAll(const VirtualMemory& memory) noexcept {
     // Use GetHostReadPtr to check if a page is mapped and readable.
     // Pages are 4096 bytes, guest space is capped at kMaxScanAddress.
 
-    uint32_t pagesScanned = 0;
-    for (GuestAddress addr = 0; addr < kMaxScanAddress; addr += kSEPageSize) {
-        if (pagesScanned >= kMaxPagesPerScan) break;
-        if (m_impl->strings.size() >= kMaxStrings) break;
+    try {
+        uint32_t pagesScanned = 0;
+        for (GuestAddress addr = 0; addr < kMaxScanAddress; addr += kSEPageSize) {
+            if (pagesScanned >= kMaxPagesPerScan) break;
+            if (m_impl->strings.size() >= kMaxStrings) break;
 
-        const uint8_t* hostPtr = memory.GetHostReadPtr(addr);
-        if (!hostPtr) continue;
+            const uint8_t* hostPtr = memory.GetHostReadPtr(addr);
+            if (!hostPtr) continue;
 
-        // Scan this page for strings (ASCII, wide, XOR)
-        m_impl->ScanRegionImpl(hostPtr, kSEPageSize, addr);
-        ++pagesScanned;
+            // Scan this page for strings (ASCII, wide, XOR)
+            m_impl->ScanRegionImpl(hostPtr, kSEPageSize, addr);
+            ++pagesScanned;
+        }
+
+        // Run post-extraction analysis once after scanning all pages
+        m_impl->RunPostAnalysis();
+    } catch (const std::exception&) {
+        return;
     }
-
-    // Run post-extraction analysis once after scanning all pages
-    m_impl->RunPostAnalysis();
 }
 
 // ---- OnStackWrite ---------------------------------------------------------
@@ -1472,6 +1529,7 @@ void StringExtractor::OnStackWrite(GuestAddress rsp, uint8_t byte,
                                    uint64_t instrCount) noexcept {
     if (!m_impl) return;
     if (!m_impl->iocExtractionEnabled) return;
+    try {
 
     // Page-align the rsp to get the stack region base
     const GuestAddress regionBase = PageBase(rsp);
@@ -1500,6 +1558,9 @@ void StringExtractor::OnStackWrite(GuestAddress rsp, uint8_t byte,
             m_impl->ExtractStackString(regionBase);
         }
     }
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 // ---- GetStrings -----------------------------------------------------------
@@ -1507,7 +1568,13 @@ void StringExtractor::OnStackWrite(GuestAddress rsp, uint8_t byte,
 const std::vector<ExtractedString>& StringExtractor::GetStrings() const noexcept {
     static const std::vector<ExtractedString> kEmpty;
     if (!m_impl) return kEmpty;
-    return m_impl->strings;
+    try {
+        thread_local std::vector<ExtractedString> snapshot;
+        snapshot = m_impl->strings;
+        return snapshot;
+    } catch (const std::exception&) {
+        return kEmpty;
+    }
 }
 
 // ---- GetByCategory --------------------------------------------------------
@@ -1517,10 +1584,20 @@ std::vector<const ExtractedString*> StringExtractor::GetByCategory(
     std::vector<const ExtractedString*> result;
     if (!m_impl) return result;
 
-    for (const auto& es : m_impl->strings) {
-        if (es.category == cat) {
+    try {
+        thread_local std::vector<ExtractedString> snapshot;
+        snapshot.clear();
+        for (const auto& es : m_impl->strings) {
+            if (es.category == cat) {
+                snapshot.push_back(es);
+            }
+        }
+        result.reserve(snapshot.size());
+        for (const auto& es : snapshot) {
             result.push_back(&es);
         }
+    } catch (const std::exception&) {
+        return {};
     }
     return result;
 }
@@ -1538,11 +1615,24 @@ std::vector<const ExtractedString*> StringExtractor::GetSuspiciousStrings(
     float minScore) const noexcept {
     std::vector<const ExtractedString*> result;
     if (!m_impl) return result;
+    if (!std::isfinite(minScore)) {
+        minScore = 0.5f;
+    }
 
-    for (const auto& es : m_impl->strings) {
-        if (es.suspiciousness >= minScore) {
+    try {
+        thread_local std::vector<ExtractedString> snapshot;
+        snapshot.clear();
+        for (const auto& es : m_impl->strings) {
+            if (es.suspiciousness >= minScore) {
+                snapshot.push_back(es);
+            }
+        }
+        result.reserve(snapshot.size());
+        for (const auto& es : snapshot) {
             result.push_back(&es);
         }
+    } catch (const std::exception&) {
+        return {};
     }
     return result;
 }
@@ -1551,9 +1641,13 @@ std::vector<const ExtractedString*> StringExtractor::GetSuspiciousStrings(
 
 void StringExtractor::Reset() noexcept {
     if (!m_impl) return;
-    m_impl->strings.clear();
-    m_impl->dedup.clear();
-    m_impl->stackRegions.clear();
+    try {
+        m_impl->strings.clear();
+        m_impl->dedup.clear();
+        m_impl->stackRegions.clear();
+    } catch (const std::exception&) {
+        return;
+    }
 }
 
 } // namespace Phantom
