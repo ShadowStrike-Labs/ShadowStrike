@@ -54,32 +54,12 @@
 #define ELAM_MAX_REGISTRY_KEY_LENGTH    512
 #define ELAM_CLASSIFICATION_TIMEOUT_MS  25      // Performance target: < 25ms
 
-// Registry paths that are ALWAYS protected from any modification.
-// The Services key is handled separately via ElampIsCriticalServiceWrite()
-// because blanket-blocking all of \Services\* would deny legitimate
-// (non-driver) service installations system-wide.
+// Registry paths to protect
 static const WCHAR* g_ProtectedRegistryPaths[] = {
+    L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services",
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\BootExecute",
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot",
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\EarlyLaunch",
-    NULL
-};
-
-// Services-key prefix (matched separately, with value-name + Start/Type checks).
-static const WCHAR g_ServicesPrefix[] =
-    L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services";
-
-// Sensitive value names under \Services\<svc> whose modification can
-// hijack a kernel driver load. Only writes to these are blocked, and
-// only when the target service is a Type=1/2 driver with Start=0/1.
-static const WCHAR* g_SensitiveServiceValues[] = {
-    L"ImagePath",
-    L"ServiceDll",
-    L"Start",
-    L"Type",
-    L"Group",
-    L"DependOnService",
-    L"DependOnGroup",
     NULL
 };
 
@@ -93,7 +73,7 @@ static PBTD_DETECTOR g_ThreatDetector = NULL;
 static PEC_ELAM_CALLBACKS g_ElamCallbacks = NULL;
 static LARGE_INTEGER g_RegistryCookie = {0};
 static BOOLEAN g_ImageNotifyRegistered = FALSE;
-static volatile LONG_PTR g_SelfModifyingRegistryThread = 0;  // Thread-scoped self-exclusion (PETHREAD)
+static volatile LONG g_SelfModifyingRegistry = 0;  // Self-exclusion for remediation writes
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -116,30 +96,6 @@ ElamRegistryCallbackRoutine(
 static BOOLEAN
 ElamIsProtectedRegistryPath(
     _In_ PUNICODE_STRING KeyPath
-    );
-
-static BOOLEAN
-ElampIsServicesKey(
-    _In_ PUNICODE_STRING KeyPath
-    );
-
-static BOOLEAN
-ElampIsSensitiveServiceValue(
-    _In_opt_ PUNICODE_STRING ValueName
-    );
-
-static NTSTATUS
-ElampReadDwordFromObject(
-    _In_ PVOID KeyObject,
-    _In_ PCWSTR ValueName,
-    _Out_ PULONG Value
-    );
-
-static BOOLEAN
-ElampIsCriticalServiceWrite(
-    _In_ PVOID ServiceKey,
-    _In_opt_ PUNICODE_STRING ValueName,
-    _In_ BOOLEAN IsKeyDelete
     );
 
 static NTSTATUS
@@ -470,8 +426,6 @@ ElamImageLoadCallback(
     RtlCopyMemory(bootInfo.AuthenticodeHashSHA256, driverInfo->AuthentiCodeHash, 32);
     bootInfo.IsSigned = driverInfo->IsSigned;
     bootInfo.IsSignatureValid = driverInfo->IsSigned;
-    bootInfo.IsMicrosoftSigned = driverInfo->IsMicrosoftSigned;
-    bootInfo.IsWHQLSigned = driverInfo->IsWhqlSigned;
 
     // Perform final classification
     classification = ElamClassifyDriver(&bootInfo);
@@ -969,13 +923,11 @@ ElamRegistryCallbackRoutine(
     }
 
     //
-    // Self-exclusion: only allow remediation writes from the *exact same
-    // thread* that set g_SelfModifyingRegistryThread. The previous global
-    // flag (CWE-362) let any concurrent attacker-writer slip through the
-    // small window where our remediation thread had set the flag.
+    // Self-exclusion: allow our own remediation writes through.
+    // ElamTakeRemediationAction sets g_SelfModifyingRegistry before Zw* calls
+    // to prevent the callback from blocking our own registry operations.
     //
-    if ((PETHREAD)ReadPointerNoFence((PVOID*)&g_SelfModifyingRegistryThread) ==
-        PsGetCurrentThread()) {
+    if (InterlockedCompareExchange(&g_SelfModifyingRegistry, 0, 0)) {
         return STATUS_SUCCESS;
     }
 
@@ -995,25 +947,10 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
-                    BOOLEAN block = FALSE;
                     if (ElamIsProtectedRegistryPath(objectName)) {
-                        block = TRUE;
-                    } else if (ElampIsServicesKey(objectName)) {
-                        block = ElampIsCriticalServiceWrite(
-                            setValueInfo->Object,
-                            setValueInfo->ValueName,
-                            FALSE);
-                    }
-                    if (block) {
-                        if (setValueInfo->ValueName != NULL) {
-                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                                "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\\%wZ\n",
-                                objectName, setValueInfo->ValueName);
-                        } else {
-                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                                "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\n",
-                                objectName);
-                        }
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                            "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\n",
+                            objectName);
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -1034,19 +971,7 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
-                    BOOLEAN block = FALSE;
                     if (ElamIsProtectedRegistryPath(objectName)) {
-                        block = TRUE;
-                    } else if (ElampIsServicesKey(objectName)) {
-                        block = ElampIsCriticalServiceWrite(
-                            deleteValueInfo->Object,
-                            deleteValueInfo->ValueName,
-                            FALSE);
-                    }
-                    if (block) {
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                            "[ShadowStrike/ELAM] BLOCKED registry value delete under %wZ\n",
-                            objectName);
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -1067,21 +992,7 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
-                    BOOLEAN block = FALSE;
                     if (ElamIsProtectedRegistryPath(objectName)) {
-                        block = TRUE;
-                    } else if (ElampIsServicesKey(objectName)) {
-                        // Deleting an entire boot/system driver service key is
-                        // always blocked — there is no legitimate reason to
-                        // delete a registered driver key from a non-installer
-                        // context, and the value-name predicate doesn't apply.
-                        block = ElampIsCriticalServiceWrite(
-                            deleteKeyInfo->Object, NULL, TRUE);
-                    }
-                    if (block) {
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                            "[ShadowStrike/ELAM] BLOCKED key delete: %wZ\n",
-                            objectName);
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -1108,8 +1019,7 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
-                    if (ElamIsProtectedRegistryPath(objectName) ||
-                        ElampIsServicesKey(objectName)) {
+                    if (ElamIsProtectedRegistryPath(objectName)) {
                         if (createKeyInfo->CompleteName != NULL) {
                             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                                 "[ShadowStrike/ELAM] New key creation under protected path: %wZ\\%wZ\n",
@@ -1166,184 +1076,6 @@ ElamIsProtectedRegistryPath(
     }
 
     return FALSE;
-}
-
-/**
- * @brief Test whether KeyPath is under the \\Services\\ subtree.
- */
-static BOOLEAN
-ElampIsServicesKey(
-    _In_ PUNICODE_STRING KeyPath
-    )
-{
-    UNICODE_STRING servicesPrefix;
-    UNICODE_STRING prefix;
-
-    if (KeyPath == NULL || KeyPath->Buffer == NULL || KeyPath->Length == 0) {
-        return FALSE;
-    }
-
-    RtlInitUnicodeString(&servicesPrefix, g_ServicesPrefix);
-
-    // Must be at least \\Services\\<one-char>
-    if (KeyPath->Length <= servicesPrefix.Length + sizeof(WCHAR)) {
-        return FALSE;
-    }
-
-    prefix.Buffer = KeyPath->Buffer;
-    prefix.Length = servicesPrefix.Length;
-    prefix.MaximumLength = servicesPrefix.Length;
-
-    if (RtlCompareUnicodeString(&prefix, &servicesPrefix, TRUE) != 0) {
-        return FALSE;
-    }
-
-    // Char immediately after the prefix must be a path separator.
-    WCHAR sep = KeyPath->Buffer[servicesPrefix.Length / sizeof(WCHAR)];
-    return (sep == L'\\');
-}
-
-/**
- * @brief Test whether ValueName is one of the security-critical service values.
- */
-static BOOLEAN
-ElampIsSensitiveServiceValue(
-    _In_opt_ PUNICODE_STRING ValueName
-    )
-{
-    if (ValueName == NULL || ValueName->Buffer == NULL || ValueName->Length == 0) {
-        // A NULL/empty value name on a sensitive key is itself suspicious;
-        // fail safe by treating as sensitive.
-        return TRUE;
-    }
-
-    for (ULONG i = 0; g_SensitiveServiceValues[i] != NULL; i++) {
-        UNICODE_STRING candidate;
-        RtlInitUnicodeString(&candidate, g_SensitiveServiceValues[i]);
-        if (RtlCompareUnicodeString(ValueName, &candidate, TRUE) == 0) {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-/**
- * @brief Read ULONG REG_DWORD value from a registry-callback Object.
- *
- * IRQL: PASSIVE_LEVEL only (registry callbacks fire at PASSIVE for the
- * notify classes we handle). On failure, *Value is left untouched.
- */
-static NTSTATUS
-ElampReadDwordFromObject(
-    _In_ PVOID KeyObject,
-    _In_ PCWSTR ValueName,
-    _Out_ PULONG Value
-    )
-{
-    HANDLE keyHandle = NULL;
-    NTSTATUS status;
-    UNICODE_STRING valueUstr;
-    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
-    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
-    ULONG resultLength = 0;
-
-    PAGED_CODE();
-
-    if (KeyObject == NULL || ValueName == NULL || Value == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    status = ObOpenObjectByPointer(
-        KeyObject,
-        OBJ_KERNEL_HANDLE,
-        NULL,
-        KEY_QUERY_VALUE,
-        *CmKeyObjectType,
-        KernelMode,
-        &keyHandle);
-
-    if (!NT_SUCCESS(status) || keyHandle == NULL) {
-        return status;
-    }
-
-    RtlInitUnicodeString(&valueUstr, ValueName);
-    status = ZwQueryValueKey(
-        keyHandle,
-        &valueUstr,
-        KeyValuePartialInformation,
-        info,
-        sizeof(buffer),
-        &resultLength);
-
-    if (NT_SUCCESS(status) &&
-        info->Type == REG_DWORD &&
-        info->DataLength == sizeof(ULONG)) {
-        *Value = *(ULONG UNALIGNED*)info->Data;
-    } else if (NT_SUCCESS(status)) {
-        // Wrong type or size — treat as not-present
-        status = STATUS_OBJECT_TYPE_MISMATCH;
-    }
-
-    ZwClose(keyHandle);
-    return status;
-}
-
-/**
- * @brief Decide whether a write/delete on a Services\<svc>\... key should be blocked.
- *
- * Blocking criteria (all must hold):
- *   1. The target value is one of the sensitive boot-driver values
- *      (ImagePath/ServiceDll/Start/Type/Group/DependOn*).
- *   2. The owning service is a kernel driver: Type == 1 (KERNEL_DRIVER)
- *      or Type == 2 (FILE_SYSTEM_DRIVER).
- *   3. The owning service starts at boot or system phase: Start == 0 or 1.
- *
- * If Type/Start cannot be read (key being created, race, etc.) the call
- * fails OPEN — we do NOT block, because legitimate driver installs
- * legitimately race the key creation. Boot-image-load callback is the
- * actual enforcement point for unknown drivers.
- *
- * @param ServiceKey  PVOID Object of the \\Services\\<svc> key (or a deeper subkey).
- * @param ValueName   Optional value name being modified (NULL for key delete/create).
- * @param IsKeyDelete TRUE if RegNtPreDeleteKey on the service key itself.
- */
-static BOOLEAN
-ElampIsCriticalServiceWrite(
-    _In_ PVOID ServiceKey,
-    _In_opt_ PUNICODE_STRING ValueName,
-    _In_ BOOLEAN IsKeyDelete
-    )
-{
-    ULONG svcType = 0;
-    ULONG svcStart = 0;
-    NTSTATUS status;
-
-    if (ServiceKey == NULL) {
-        return FALSE;
-    }
-
-    // For value writes/deletes, the value must be sensitive.
-    if (!IsKeyDelete && !ElampIsSensitiveServiceValue(ValueName)) {
-        return FALSE;
-    }
-
-    status = ElampReadDwordFromObject(ServiceKey, L"Type", &svcType);
-    if (!NT_SUCCESS(status)) {
-        // Type unreadable — fail OPEN to avoid breaking legitimate installs.
-        return FALSE;
-    }
-    if (svcType != 1 /* SERVICE_KERNEL_DRIVER */ &&
-        svcType != 2 /* SERVICE_FILE_SYSTEM_DRIVER */) {
-        return FALSE;
-    }
-
-    status = ElampReadDwordFromObject(ServiceKey, L"Start", &svcStart);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
-    }
-
-    // Only protect boot (0) and system (1) phase drivers.
-    return (svcStart == 0 || svcStart == 1);
 }
 
 // ============================================================================
@@ -1737,8 +1469,6 @@ ElamGetSignatureStats(
     PELAM_SIGNATURE_HEADER header;
 
     if (SignatureCount == NULL || HashCount == NULL) {
-        if (SignatureCount != NULL) { *SignatureCount = 0; }
-        if (HashCount != NULL) { *HashCount = 0; }
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1776,23 +1506,14 @@ ElamGetStatistics(
     if (DriversClassified == NULL || DriversGood == NULL ||
         DriversBad == NULL || DriversUnknown == NULL ||
         DriversBlocked == NULL) {
-        if (DriversClassified != NULL) { *DriversClassified = 0; }
-        if (DriversGood != NULL) { *DriversGood = 0; }
-        if (DriversBad != NULL) { *DriversBad = 0; }
-        if (DriversUnknown != NULL) { *DriversUnknown = 0; }
-        if (DriversBlocked != NULL) { *DriversBlocked = 0; }
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Use ReadNoFence on volatile counters to document atomic-read intent
-    // and inhibit compiler tearing.
-    //
-    *DriversClassified = ReadNoFence(&g_ElamGlobals.DriversClassified);
-    *DriversGood = ReadNoFence(&g_ElamGlobals.DriversGood);
-    *DriversBad = ReadNoFence(&g_ElamGlobals.DriversBad);
-    *DriversUnknown = ReadNoFence(&g_ElamGlobals.DriversUnknown);
-    *DriversBlocked = ReadNoFence(&g_ElamGlobals.DriversBlocked);
+    *DriversClassified = g_ElamGlobals.DriversClassified;
+    *DriversGood = g_ElamGlobals.DriversGood;
+    *DriversBad = g_ElamGlobals.DriversBad;
+    *DriversUnknown = g_ElamGlobals.DriversUnknown;
+    *DriversBlocked = g_ElamGlobals.DriversBlocked;
 
     return STATUS_SUCCESS;
 }
@@ -1813,9 +1534,6 @@ ElamCalculateHash(
     )
 {
     if (Buffer == NULL || BufferSize == 0 || Hash == NULL) {
-        if (Hash != NULL) {
-            RtlZeroMemory(Hash, 32);
-        }
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1909,14 +1627,10 @@ ElamTakeRemediationAction(
     // Path: HKLM\System\CurrentControlSet\Control\EarlyLaunch\BlockedDrivers
     // Value: severity score â€” the agent reads this after boot to take action.
     //
+    // Set self-exclusion flag so our registry callback allows these writes
+    // through â€” the BlockedDrivers path is under the protected EarlyLaunch prefix.
     //
-    // Set thread-scoped self-exclusion: the registry callback compares
-    // PsGetCurrentThread() against this and only allows the writes from
-    // *this exact thread*, not any thread that happens to be running
-    // concurrently with our remediation.
-    //
-    WritePointerNoFence((PVOID*)&g_SelfModifyingRegistryThread,
-                        (PVOID)PsGetCurrentThread());
+    InterlockedExchange(&g_SelfModifyingRegistry, 1);
 
     RtlInitUnicodeString(&keyPath,
         L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\EarlyLaunch\\BlockedDrivers");
@@ -1940,7 +1654,7 @@ ElamTakeRemediationAction(
             status);
         RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
             "Registry write failed; logged for manual review");
-        WritePointerNoFence((PVOID*)&g_SelfModifyingRegistryThread, NULL);
+        InterlockedExchange(&g_SelfModifyingRegistry, 0);
         return status;
     }
 
@@ -1985,7 +1699,7 @@ ElamTakeRemediationAction(
     }
 
     ZwClose(keyHandle);
-    WritePointerNoFence((PVOID*)&g_SelfModifyingRegistryThread, NULL);
+    InterlockedExchange(&g_SelfModifyingRegistry, 0);
     return status;
 }
 

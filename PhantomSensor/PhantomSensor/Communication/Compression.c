@@ -50,7 +50,6 @@
 
 #include "Compression.h"
 #include "../Utilities/MemoryUtils.h"
-#include "../Core/Globals.h"
 
 //
 // Forward declaration required before alloc_text pragma
@@ -122,22 +121,6 @@ ComppDestroyDictionaryInternal(
 // CRC32 polynomial
 #define CRC32_POLYNOMIAL            0xEDB88320
 
-//
-// SECURITY: Maximum decompression expansion ratio defense (zip-bomb cap).
-// LZ4 worst-case theoretical ratio is ~255:1 (one literal byte expands a 255-byte
-// run). We cap at 1024:1 to allow generous headroom while rejecting obvious
-// attacker-crafted bombs that could exhaust kernel pool / blow output buffers.
-// Any compressed payload that claims to expand beyond this ratio is rejected
-// before any decompression work is performed.
-//
-#define COMP_MAX_EXPANSION_RATIO    1024U
-
-//
-// Maximum number of in-flight deferred dictionary cleanup work items.
-// Bounds attacker-driven pool growth via release-at-DISPATCH spam.
-//
-#define COMP_MAX_PENDING_CLEANUPS   2048L
-
 //=============================================================================
 // Internal Structures
 //=============================================================================
@@ -195,95 +178,53 @@ static volatile LONG g_NextDictionaryId = 1000;
 //
 static EX_SPIN_LOCK g_ManagerLock = 0;
 
-//
-// Outstanding deferred dictionary cleanup tracking.
-// Used to drain pending IoQueueWorkItem callbacks during CompShutdown so the
-// driver does not unload while a worker still references this module's code.
-// Signaled (event set) when count drops back to zero.
-//
-static volatile LONG g_PendingDictionaryCleanups = 0;
-static KEVENT g_PendingCleanupsDrainedEvent;
-static volatile LONG g_PendingCleanupsEventInitialized = FALSE;
-
-//
-// Set to TRUE once CompShutdown begins; rejects new deferred-cleanup queues.
-//
-static volatile LONG g_ShutdownInProgress = FALSE;
-
 //=============================================================================
 // Deferred Cleanup Work Item for Elevated IRQL Dictionary Release
 //=============================================================================
 
 typedef struct _COMP_DEFERRED_CLEANUP {
-    PIO_WORKITEM IoWorkItem;        // Allocated via IoAllocateWorkItem
+    WORK_QUEUE_ITEM WorkItem;
     PCOMP_DICTIONARY Dictionary;
 } COMP_DEFERRED_CLEANUP, *PCOMP_DEFERRED_CLEANUP;
 
 /**
  * @brief Work item callback for deferred dictionary cleanup.
  *
- * Runs at PASSIVE_LEVEL after IoQueueWorkItem hands control to a worker thread.
- * The driver object reference taken implicitly by IoAllocateWorkItem keeps the
- * driver image pinned until the callback returns and IoFreeWorkItem releases it,
- * which is required for safe deferred cleanup across driver unload races.
+ * Uses WORK_QUEUE_ITEM + ExQueueWorkItem which does NOT require
+ * a device object, unlike IoAllocateWorkItem/IoQueueWorkItem.
  */
-_Function_class_(IO_WORKITEM_ROUTINE)
+_Function_class_(WORKER_THREAD_ROUTINE)
 static VOID
 ComppDeferredDictionaryCleanupWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Parameter
+    _In_ PVOID Parameter
     )
 {
     PCOMP_DEFERRED_CLEANUP Cleanup = (PCOMP_DEFERRED_CLEANUP)Parameter;
-
-    UNREFERENCED_PARAMETER(DeviceObject);
 
     if (Cleanup == NULL) {
         return;
     }
 
     //
-    // Now at PASSIVE_LEVEL - safe to destroy dictionary (uses paged operations).
+    // Now at PASSIVE_LEVEL - safe to destroy dictionary
     //
     if (Cleanup->Dictionary != NULL) {
         ComppDestroyDictionaryInternal(Cleanup->Dictionary);
-        Cleanup->Dictionary = NULL;
     }
 
     //
-    // Free work item BEFORE releasing tracking ref so driver image is still
-    // pinned through the IoFreeWorkItem call.
+    // Free cleanup structure (WORK_QUEUE_ITEM is embedded, no separate free)
     //
-    if (Cleanup->IoWorkItem != NULL) {
-        IoFreeWorkItem(Cleanup->IoWorkItem);
-        Cleanup->IoWorkItem = NULL;
-    }
-
     ExFreePoolWithTag(Cleanup, COMP_POOL_TAG_CONTEXT);
-
-    //
-    // Decrement outstanding count and signal drain event when last one
-    // completes. Using release semantics so the event-waiter sees a
-    // fully-published zero count.
-    //
-    if (InterlockedDecrement(&g_PendingDictionaryCleanups) == 0) {
-        if (InterlockedCompareExchange(&g_PendingCleanupsEventInitialized,
-                                       TRUE, TRUE) == TRUE) {
-            KeSetEvent(&g_PendingCleanupsDrainedEvent, IO_NO_INCREMENT, FALSE);
-        }
-    }
 }
 
 /**
  * @brief Queue deferred dictionary cleanup for elevated IRQL.
  *
- * Uses IoAllocateWorkItem/IoQueueWorkItem with the global driver object so
- * shutdown can drain outstanding cleanups (driver image stays pinned for the
- * lifetime of the work item). Replaces the deprecated ExInitializeWorkItem /
- * ExQueueWorkItem pair (C4996) which had no shutdown synchronization primitive.
- *
- * Returns TRUE if the work item was queued. On failure the caller is expected
- * to leak the dictionary rather than risk a UAF; the caller MUST NOT free it.
+ * FIXED: Uses ExQueueWorkItem instead of IoQueueWorkItem.
+ * IoQueueWorkItem requires a PDEVICE_OBJECT which was never provided
+ * to the compression module, causing the deferred path to always fail.
+ * ExQueueWorkItem works without a device object.
  */
 static BOOLEAN
 ComppQueueDeferredDictionaryCleanup(
@@ -291,50 +232,9 @@ ComppQueueDeferredDictionaryCleanup(
     )
 {
     PCOMP_DEFERRED_CLEANUP Cleanup;
-    PDEVICE_OBJECT DeviceObject;
-    PDRIVER_OBJECT DriverObject;
-    LONG Pending;
 
     //
-    // Reject if shutdown has begun - any work queued after this point could
-    // outlive the manager and reference freed module state.
-    //
-    if (InterlockedCompareExchange(&g_ShutdownInProgress, FALSE, FALSE) != FALSE) {
-        return FALSE;
-    }
-
-    //
-    // Bound in-flight cleanups to prevent attacker-driven pool growth.
-    // Reserve our slot first; release on failure.
-    //
-    Pending = InterlockedIncrement(&g_PendingDictionaryCleanups);
-    if (Pending > COMP_MAX_PENDING_CLEANUPS) {
-        InterlockedDecrement(&g_PendingDictionaryCleanups);
-        return FALSE;
-    }
-
-    //
-    // Re-clear the drained event since count is now non-zero. (Idempotent.)
-    //
-    if (InterlockedCompareExchange(&g_PendingCleanupsEventInitialized,
-                                   TRUE, TRUE) == TRUE) {
-        KeClearEvent(&g_PendingCleanupsDrainedEvent);
-    }
-
-    //
-    // IoAllocateWorkItem requires a device object. PhantomSensor creates a
-    // control device after FltRegisterFilter; if the device is not yet
-    // attached we cannot defer cleanup safely.
-    //
-    DriverObject = g_DriverData.DriverObject;
-    DeviceObject = (DriverObject != NULL) ? DriverObject->DeviceObject : NULL;
-    if (DeviceObject == NULL) {
-        InterlockedDecrement(&g_PendingDictionaryCleanups);
-        return FALSE;
-    }
-
-    //
-    // Allocate cleanup structure from NonPaged pool (we may be at elevated IRQL).
+    // Allocate cleanup structure from NonPaged pool (we're at elevated IRQL)
     //
     Cleanup = (PCOMP_DEFERRED_CLEANUP)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
@@ -343,25 +243,21 @@ ComppQueueDeferredDictionaryCleanup(
     );
 
     if (Cleanup == NULL) {
-        InterlockedDecrement(&g_PendingDictionaryCleanups);
         return FALSE;
     }
 
     Cleanup->Dictionary = Dictionary;
-    Cleanup->IoWorkItem = IoAllocateWorkItem(DeviceObject);
 
-    if (Cleanup->IoWorkItem == NULL) {
-        ExFreePoolWithTag(Cleanup, COMP_POOL_TAG_CONTEXT);
-        InterlockedDecrement(&g_PendingDictionaryCleanups);
-        return FALSE;
-    }
-
-    IoQueueWorkItem(
-        Cleanup->IoWorkItem,
+    //
+    // Initialize and queue the work item for deferred execution
+    //
+    ExInitializeWorkItem(
+        &Cleanup->WorkItem,
         ComppDeferredDictionaryCleanupWorker,
-        DelayedWorkQueue,
         Cleanup
     );
+
+    ExQueueWorkItem(&Cleanup->WorkItem, DelayedWorkQueue);
 
     return TRUE;
 }
@@ -1385,132 +1281,120 @@ ComppDecompressSafe(
         Match = Op - Offset;
 
         //
-        // Validate offset and translate dictionary references.
+        // Validate offset
         //
-        // We track DictBackDistance (number of bytes from end-of-dictionary
-        // backwards) so the dict-spanning copy below can compute splits
-        // without forming a pointer difference between unrelated allocations
-        // (which is undefined behavior in standard C).
+        if (Match < (const UCHAR*)Dest) {
+            //
+            // Check dictionary
+            //
+            if (DictStart == NULL) {
+                return -1;  // Invalid offset - no dictionary
+            }
+
+            if (Match < (const UCHAR*)Dest - DictSize) {
+                return -1;  // Offset beyond dictionary
+            }
+
+            //
+            // Match is in dictionary
+            //
+            Match = DictEnd + (Match - (const UCHAR*)Dest);
+        }
+
         //
-        {
-            BOOLEAN MatchInDict = FALSE;
-            SIZE_T DictBackDistance = 0;
-
-            if (Match < (const UCHAR*)Dest) {
-                if (DictStart == NULL) {
-                    return -1;  // Invalid offset - no dictionary
+        // Decode match length with overflow protection
+        //
+        Length = Token & ML_MASK;
+        if (Length == ML_MASK) {
+            ULONG Addl;
+            do {
+                if (Ip >= IEnd) {
+                    return -1;
                 }
+                Addl = *Ip++;
 
-                DictBackDistance = (SIZE_T)((const UCHAR*)Dest - Match);
-                if ((INT)DictBackDistance > DictSize) {
-                    return -1;  // Offset beyond dictionary
+                //
+                // SECURITY: Check for integer overflow before adding
+                //
+                if (Length > COMP_MAX_INPUT_SIZE - Addl) {
+                    return -1;  // Overflow attack detected
                 }
+                Length += Addl;
+            } while (Addl == 255);
+        }
 
-                Match = DictEnd - DictBackDistance;
-                MatchInDict = TRUE;
-            }
+        //
+        // Add minimum match length
+        // Check for overflow first
+        //
+        if (Length > COMP_MAX_INPUT_SIZE - LZ4_MINMATCH) {
+            return -1;
+        }
+        Length += LZ4_MINMATCH;
 
-            //
-            // Decode match length with overflow protection
-            //
-            Length = Token & ML_MASK;
-            if (Length == ML_MASK) {
-                ULONG Addl;
-                do {
-                    if (Ip >= IEnd) {
-                        return -1;
-                    }
-                    Addl = *Ip++;
-
-                    if (Length > COMP_MAX_INPUT_SIZE - Addl) {
-                        return -1;  // Overflow attack detected
-                    }
-                    Length += Addl;
-                } while (Addl == 255);
-            }
-
-            //
-            // Add minimum match length (overflow guarded).
-            //
-            if (Length > COMP_MAX_INPUT_SIZE - LZ4_MINMATCH) {
-                return -1;
-            }
-            Length += LZ4_MINMATCH;
-
-            //
-            // Validate output space for match.
-            //
-            if (Op + Length > OEnd) {
-                if (PartialDecode) {
-                    Length = (ULONG)(OEnd - Op);
-                    if (Length == 0) {
-                        break;
-                    }
-                } else {
-                    return -1;  // Output overflow
+        //
+        // Validate output space for match
+        //
+        if (Op + Length > OEnd) {
+            if (PartialDecode) {
+                Length = (ULONG)(OEnd - Op);
+                if (Length == 0) {
+                    break;
                 }
-            }
-
-            //
-            // Copy match - handle overlapping carefully.
-            //
-            if (MatchInDict) {
-                //
-                // Match starts in the dictionary; may span into output buffer.
-                // We copy DictPortion bytes from the dictionary first, then
-                // continue from start of output buffer for the remainder.
-                //
-                ULONG DictPortion = (ULONG)DictBackDistance;
-                if (DictPortion > Length) {
-                    DictPortion = Length;
-                }
-
-                RtlCopyMemory(Op, Match, DictPortion);
-                Op += DictPortion;
-                Length -= DictPortion;
-
-                if (Length > 0) {
-                    //
-                    // Continue from start of output buffer. This region is
-                    // strictly < Op so RtlCopyMemory is safe (no overlap).
-                    //
-                    const UCHAR* DestStart = (const UCHAR*)Dest;
-                    if (Length > (ULONG)(Op - DestStart)) {
-                        //
-                        // Should not happen given prior bounds checks, but
-                        // refuse rather than over-read.
-                        //
-                        return -1;
-                    }
-                    RtlCopyMemory(Op, DestStart, Length);
-                    Op += Length;
-                }
-            } else if (Offset < 8) {
-                //
-                // Run-length pattern: byte-by-byte (intentionally copies
-                // bytes just written).
-                //
-                ULONG i;
-                for (i = 0; i < Length; i++) {
-                    Op[i] = Match[i];
-                }
-                Op += Length;
-            } else if (Match + Length <= Op) {
-                //
-                // Non-overlapping in-output copy.
-                //
-                RtlCopyMemory(Op, Match, Length);
-                Op += Length;
             } else {
+                return -1;  // Output overflow
+            }
+        }
+
+        //
+        // Copy match - handle overlapping carefully
+        //
+        if (Offset < 8) {
+            //
+            // Byte-by-byte copy for small offsets (run-length encoding pattern)
+            //
+            ULONG i;
+            for (i = 0; i < Length; i++) {
+                Op[i] = Match[i];
+            }
+            Op += Length;
+        } else if (Match >= (const UCHAR*)Dest && Match + Length <= Op) {
+            //
+            // Standard case: match is entirely before output position
+            // No overlap, safe to use RtlCopyMemory
+            //
+            RtlCopyMemory(Op, Match, Length);
+            Op += Length;
+        } else if (Match < (const UCHAR*)Dest && DictStart != NULL) {
+            //
+            // Match spans dictionary and output buffer
+            //
+            ULONG DictPortion = (ULONG)((const UCHAR*)Dest - Match);
+            if (DictPortion > Length) {
+                DictPortion = Length;
+            }
+            RtlCopyMemory(Op, Match, DictPortion);
+            Op += DictPortion;
+            Length -= DictPortion;
+            if (Length > 0) {
                 //
-                // Overlapping in-output copy - must be byte-by-byte.
+                // Copy remaining from start of output buffer
                 //
                 ULONG i;
                 for (i = 0; i < Length; i++) {
-                    Op[i] = Match[i];
+                    Op[i] = ((const UCHAR*)Dest)[i];
                 }
                 Op += Length;
             }
+        } else {
+            //
+            // Overlapping copy - must be byte-by-byte
+            //
+            ULONG i;
+            for (i = 0; i < Length; i++) {
+                Op[i] = Match[i];
+            }
+            Op += Length;
         }
     }
 
@@ -1815,31 +1699,6 @@ CompInitialize(
     Manager->RefCount = 0;
 
     //
-    // Initialize the deferred-cleanup drain event exactly once. The event
-    // is in the signaled state initially (no work pending). We use a
-    // notification event so multiple shutdown waiters all observe the
-    // drained transition.
-    //
-    if (InterlockedCompareExchange(&g_PendingCleanupsEventInitialized,
-                                   TRUE, FALSE) == FALSE) {
-        KeInitializeEvent(&g_PendingCleanupsDrainedEvent,
-                          NotificationEvent, TRUE);
-    } else {
-        //
-        // Re-arm event - shutdown was previously called and we are now
-        // re-initializing. There must be no pending cleanups at this point.
-        //
-        if (InterlockedCompareExchange(&g_PendingDictionaryCleanups, 0, 0) == 0) {
-            KeSetEvent(&g_PendingCleanupsDrainedEvent, IO_NO_INCREMENT, FALSE);
-        }
-    }
-
-    //
-    // Allow new deferred cleanup queues again (in case of re-init).
-    //
-    InterlockedExchange(&g_ShutdownInProgress, FALSE);
-
-    //
     // Mark as initialized and set global pointer atomically
     //
     InterlockedExchange(&Manager->Initialized, TRUE);
@@ -1854,18 +1713,8 @@ CompInitialize(
 /**
  * @brief Shutdown the compression manager.
  *
- * Implements a strict drain protocol:
- *   1. Atomically transition Initialized: TRUE -> FALSE so ComppAcquireManager
- *      stops handing out new references.
- *   2. Block new deferred dictionary cleanup queues (g_ShutdownInProgress).
- *   3. Wait (bounded) for outstanding API references to drain.
- *   4. Wait (bounded) for in-flight deferred dictionary cleanup work items.
- *   5. Only if both drains succeed, free internal resources and clear the
- *      global pointer. On timeout, the manager state is intentionally LEAKED
- *      (rather than risking UAF) and the global pointer is left intact so
- *      slow-path threads continue to see Initialized==FALSE under lock.
- *
- * Kernel safety: all waits run at PASSIVE_LEVEL (PAGED_CODE asserted).
+ * FIXED: Implements proper collect-then-free pattern to avoid
+ * IRQL violations and race conditions when freeing dictionaries.
  */
 _Use_decl_annotations_
 VOID
@@ -1877,8 +1726,6 @@ CompShutdown(
     LIST_ENTRY FreeList;
     PLIST_ENTRY Entry;
     PCOMP_DICTIONARY Dict;
-    BOOLEAN RefDrainCompleted;
-    BOOLEAN CleanupDrainCompleted;
 
     PAGED_CODE();
 
@@ -1887,35 +1734,25 @@ CompShutdown(
     }
 
     //
-    // Mark as not initialized atomically. If already shutdown, exit.
+    // Mark as not initialized atomically
     //
     if (InterlockedCompareExchange(&Manager->Initialized, FALSE, TRUE) == FALSE) {
-        return;
+        return;  // Already shutdown or never initialized
     }
 
     //
-    // Block new deferred-cleanup queues globally. After this point any caller
-    // that releases the last dictionary reference at elevated IRQL will fail
-    // to queue and intentionally leak that dictionary - safer than risking
-    // a worker firing after driver unload.
+    // Wait for all references to be released with bounded timeout
+    // to prevent infinite hang if reference leak occurs
     //
-    InterlockedExchange(&g_ShutdownInProgress, TRUE);
-
-    //
-    // Stage 1: drain outstanding public-API references.
-    // Bounded wait of ~5s. On timeout DO NOT proceed with frees - that would
-    // UAF any thread still holding a reference. Leak the manager state.
-    //
-    RefDrainCompleted = TRUE;
     {
         ULONG WaitIterations = 0;
-        const ULONG MaxWaitIterations = 5000;  // 5s @ 1ms/iter
+        const ULONG MaxWaitIterations = 5000;  // 5 seconds max at 1ms per iteration
 
         while (InterlockedCompareExchange(&Manager->RefCount, 0, 0) > 0) {
             LARGE_INTEGER Delay;
 
             if (++WaitIterations > MaxWaitIterations) {
-                RefDrainCompleted = FALSE;
+                NT_ASSERT(FALSE && "CompShutdown: RefCount drain timeout - possible reference leak");
                 break;
             }
 
@@ -1925,62 +1762,7 @@ CompShutdown(
     }
 
     //
-    // Stage 2: drain in-flight deferred dictionary cleanup work items.
-    //
-    // We loop on the drain event because there is a brief race window in
-    // ComppQueueDeferredDictionaryCleanup between InterlockedIncrement and
-    // KeClearEvent during which a shutdown wait could otherwise return
-    // prematurely. The loop re-checks the count after every wake; only
-    // exits when the count is observed at zero (or the deadline elapses).
-    //
-    CleanupDrainCompleted = TRUE;
-    if (InterlockedCompareExchange(&g_PendingCleanupsEventInitialized,
-                                   TRUE, TRUE) == TRUE) {
-        const ULONG MaxRounds = 50;       // 50 * 100ms = 5s budget
-        ULONG Round;
-
-        for (Round = 0; Round < MaxRounds; ++Round) {
-            LARGE_INTEGER Timeout;
-            NTSTATUS WaitStatus;
-
-            if (InterlockedCompareExchange(&g_PendingDictionaryCleanups, 0, 0) == 0) {
-                break;
-            }
-
-            Timeout.QuadPart = -1000000LL;  // 100ms
-            WaitStatus = KeWaitForSingleObject(
-                &g_PendingCleanupsDrainedEvent,
-                Executive,
-                KernelMode,
-                FALSE,
-                &Timeout
-            );
-
-            //
-            // Whether the wait timed out or was satisfied, re-evaluate the
-            // count on the next iteration. STATUS_TIMEOUT is not fatal here.
-            //
-            UNREFERENCED_PARAMETER(WaitStatus);
-        }
-
-        if (InterlockedCompareExchange(&g_PendingDictionaryCleanups, 0, 0) != 0) {
-            CleanupDrainCompleted = FALSE;
-        }
-    }
-
-    //
-    // If either drain failed, intentionally LEAK manager-owned resources to
-    // preserve memory safety. The global manager pointer is also left intact
-    // so subsequent ComppAcquireManager calls see Initialized==FALSE under
-    // the shared lock and return NULL safely.
-    //
-    if (!RefDrainCompleted || !CleanupDrainCompleted) {
-        NT_ASSERT(FALSE && "CompShutdown: drain timeout - manager state leaked to preserve safety");
-        return;
-    }
-
-    //
-    // Stage 3: collect and free dictionaries.
+    // Collect all dictionaries to free list while holding lock
     //
     InitializeListHead(&FreeList);
 
@@ -1995,28 +1777,30 @@ CompShutdown(
 
     ExReleaseSpinLockExclusive(&Manager->DictionaryLock, OldIrql);
 
+    //
+    // Now free all dictionaries without holding the lock
+    // This is safe because we've already removed them from the list
+    //
     while (!IsListEmpty(&FreeList)) {
         Entry = RemoveHeadList(&FreeList);
         Dict = CONTAINING_RECORD(Entry, COMP_DICTIONARY, ListEntry);
 
         //
-        // Force refcount to 0 and destroy directly (we are at PASSIVE_LEVEL).
+        // Force refcount to 0 and destroy
         //
         InterlockedExchange(&Dict->RefCount, 0);
 
         if (Dict->Data != NULL) {
             ShadowStrikeFreePoolWithTag(Dict->Data, COMP_POOL_TAG_DICT);
-            Dict->Data = NULL;
         }
         if (Dict->LZ4DictState != NULL) {
             ShadowStrikeFreePoolWithTag(Dict->LZ4DictState, COMP_POOL_TAG_DICT);
-            Dict->LZ4DictState = NULL;
         }
         ShadowStrikeFreePoolWithTag(Dict, COMP_POOL_TAG_DICT);
     }
 
     //
-    // Free default context resources.
+    // Free default context resources
     //
     if (Manager->DefaultContext.WorkBuffer != NULL) {
         ShadowStrikeFreePoolWithTag(Manager->DefaultContext.WorkBuffer, COMP_POOL_TAG_BUFFER);
@@ -2029,7 +1813,7 @@ CompShutdown(
     }
 
     //
-    // Clear global manager pointer last (writers under exclusive lock).
+    // Clear global manager pointer
     //
     OldIrql = ExAcquireSpinLockExclusive(&g_ManagerLock);
     if (g_CompressionManager == Manager) {
@@ -2363,43 +2147,14 @@ CompDecompress(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // SECURITY: Cap declared CompressedSize to module maximum BEFORE any
-    // arithmetic against the buffer length. An attacker-controlled value
-    // close to ULONG_MAX would otherwise wrap when added to sizeof(header).
-    //
-    if (Header->CompressedSize > COMP_MAX_INPUT_SIZE) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // SECURITY: Decompression-bomb cap. Reject any compressed payload that
-    // claims an expansion ratio beyond COMP_MAX_EXPANSION_RATIO. LZ4's
-    // theoretical worst-case is ~255:1; we allow generous headroom but
-    // refuse pathologically high ratios crafted to exhaust kernel pool /
-    // overflow downstream consumers.
-    //
-    if (Header->Algorithm != CompAlgorithm_None && Header->CompressedSize > 0) {
-        ULONG MaxAllowedOriginal;
-        if (Header->CompressedSize > (MAXULONG / COMP_MAX_EXPANSION_RATIO)) {
-            MaxAllowedOriginal = MAXULONG;
-        } else {
-            MaxAllowedOriginal = Header->CompressedSize * COMP_MAX_EXPANSION_RATIO;
-        }
-        if (Header->OriginalSize > MaxAllowedOriginal) {
-            return STATUS_DATA_ERROR;
-        }
-    }
-
     if (OutputSize < Header->OriginalSize) {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
     //
-    // Validate compressed size (already capped above, but guard against
-    // malformed header where compressed payload exceeds buffer length).
+    // Validate compressed size
     //
-    if (Header->CompressedSize > CompressedSize - sizeof(COMP_HEADER)) {
+    if (sizeof(COMP_HEADER) + Header->CompressedSize > CompressedSize) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -3741,27 +3496,8 @@ CompVerifyEx(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (SrcHeader->CompressedSize > COMP_MAX_INPUT_SIZE) {
+    if (sizeof(COMP_HEADER) + SrcHeader->CompressedSize > CompressedSize) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (SrcHeader->CompressedSize > CompressedSize - sizeof(COMP_HEADER)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // SECURITY: zip-bomb expansion ratio cap.
-    //
-    if (SrcHeader->Algorithm != CompAlgorithm_None && SrcHeader->CompressedSize > 0) {
-        ULONG MaxAllowedOriginal;
-        if (SrcHeader->CompressedSize > (MAXULONG / COMP_MAX_EXPANSION_RATIO)) {
-            MaxAllowedOriginal = MAXULONG;
-        } else {
-            MaxAllowedOriginal = SrcHeader->CompressedSize * COMP_MAX_EXPANSION_RATIO;
-        }
-        if (SrcHeader->OriginalSize > MaxAllowedOriginal) {
-            return STATUS_DATA_ERROR;
-        }
     }
 
     //

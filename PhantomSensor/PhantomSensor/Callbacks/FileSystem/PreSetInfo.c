@@ -2339,15 +2339,9 @@ PsipGetRenameDestination(
         }
 
         //
-        // USHORT truncation protection for UNICODE_STRING.
-        // We must guarantee bufferLength = fileNameLength + sizeof(WCHAR)
-        // fits in USHORT so MaximumLength below is not silently truncated.
-        // A previous check of `> MAXUSHORT` allowed fileNameLength == MAXUSHORT
-        // which yielded bufferLength == MAXUSHORT + 2, truncated to 1.
-        // Tightening the bound prevents a corrupt UNICODE_STRING that any
-        // downstream UNICODE_STRING manipulator could turn into an OOB.
+        // USHORT truncation protection for UNICODE_STRING
         //
-        if (fileNameLength > (ULONG)(MAXUSHORT - sizeof(WCHAR))) {
+        if (fileNameLength > MAXUSHORT) {
             return STATUS_NAME_TOO_LONG;
         }
 

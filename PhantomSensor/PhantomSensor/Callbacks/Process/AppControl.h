@@ -74,11 +74,7 @@ MITRE ATT&CK Coverage:
 #define AC_MAX_SIGNER_NAME          256
 #define AC_HASH_BUCKET_COUNT        256
 #define AC_MAX_BUCKET_WALK          128
-//
-// Path walk cap MUST be >= AC_MAX_PATH_RULES, otherwise rules beyond the
-// cap are silently never evaluated -> fail-open bypass of allow/blocklists.
-//
-#define AC_MAX_PATH_WALK            AC_MAX_PATH_RULES
+#define AC_MAX_PATH_WALK            64
 
 // ============================================================================
 // POLICY MODE

@@ -1033,28 +1033,21 @@ PocGetFileClass(
 /**
  * @brief Atomic read of LONG64 value (safe on 32-bit).
  */
-/**
- * @brief Atomic read of LONG64 value.
- *
- * Uses InterlockedCompareExchange64 unconditionally to enforce the
- * campaign-wide torn-read prohibition. On x64 a naturally-aligned
- * LONG64 load is atomic in hardware, but the unconditional CAS keeps
- * this routine semantically correct under any future ABI / compiler
- * changes (e.g., misaligned globals from packed structs, ARM64 builds)
- * and matches the convention used by BehaviorEngine, TelemetryEvents,
- * and the rest of the PhantomSensor stack.
- */
 FORCEINLINE
 LONG64
 PocAtomicRead64(
     _In_ volatile LONG64* Target
     )
 {
+#ifdef _WIN64
+    return *Target;
+#else
     return InterlockedCompareExchange64(Target, 0, 0);
+#endif
 }
 
 /**
- * @brief Atomic read of LONGLONG value.
+ * @brief Atomic read of LONGLONG value (safe on 32-bit).
  */
 FORCEINLINE
 LONGLONG
@@ -1062,7 +1055,11 @@ PocAtomicReadLongLong(
     _In_ volatile LONGLONG* Target
     )
 {
+#ifdef _WIN64
+    return *Target;
+#else
     return (LONGLONG)InterlockedCompareExchange64((volatile LONG64*)Target, 0, 0);
+#endif
 }
 
 #ifdef __cplusplus

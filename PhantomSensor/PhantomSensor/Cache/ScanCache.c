@@ -107,23 +107,6 @@ ShadowStrikeCacheReleaseReference(
     VOID
     );
 
-static
-VOID
-ShadowStrikeCacheClearInternal(
-    VOID
-    );
-
-static
-VOID
-ShadowStrikeCacheCleanupInternal(
-    VOID
-    );
-
-#ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowStrikeCacheClearInternal)
-#pragma alloc_text(PAGE, ShadowStrikeCacheCleanupInternal)
-#endif
-
 // ============================================================================
 // REFERENCE COUNTING FOR SHUTDOWN SYNCHRONIZATION
 // ============================================================================
@@ -208,7 +191,7 @@ ShadowStrikeCacheInitialize(
     //
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    if (ReadBooleanAcquire(&g_ScanCache.Initialized)) {
+    if (g_ScanCache.Initialized) {
         return STATUS_SUCCESS;
     }
 
@@ -302,7 +285,6 @@ ShadowStrikeCacheInitialize(
     }
 
     g_ScanCache.Initialized = TRUE;
-    MemoryBarrier();
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Scan cache initialized (%lu buckets)\n",
@@ -317,11 +299,10 @@ ShadowStrikeCacheShutdown(
     )
 {
     LARGE_INTEGER timeout;
-    LONG activeRefs;
 
     PAGED_CODE();
 
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized)) {
+    if (!g_ScanCache.Initialized) {
         return;
     }
 
@@ -351,10 +332,8 @@ ShadowStrikeCacheShutdown(
 
     //
     // Step 3: Wait for any active references (work item or operations in progress)
-    // Read ActiveReferences atomically to avoid reading stale value across CPUs.
     //
-    activeRefs = InterlockedCompareExchange(&g_ScanCache.ActiveReferences, 0, 0);
-    if (activeRefs > 0) {
+    if (g_ScanCache.ActiveReferences > 0) {
         NTSTATUS waitStatus;
 
         //
@@ -372,42 +351,10 @@ ShadowStrikeCacheShutdown(
         );
 
         if (waitStatus == STATUS_TIMEOUT) {
-            //
-            // Bounded fallback: keep waiting in 5s slices, but clamped, so we
-            // can never proceed to free memory while live threads still hold
-            // references. Returning here while ActiveReferences > 0 would
-            // cause a guaranteed UAF when those threads dereference the
-            // lookaside list / push locks we are about to tear down.
-            //
-            ULONG extraSlices = 0;
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] ScanCache: CRITICAL shutdown wait timed out "
-                       "(ActiveReferences=%ld). Possible reference leak. Continuing "
-                       "to wait in bounded slices to avoid UAF.\n",
-                       InterlockedCompareExchange(&g_ScanCache.ActiveReferences, 0, 0));
-
-            while (InterlockedCompareExchange(&g_ScanCache.ActiveReferences, 0, 0) > 0) {
-                LARGE_INTEGER slice;
-                slice.QuadPart = -50000000LL; // 5s
-                (VOID)KeWaitForSingleObject(
-                    &g_ScanCache.ShutdownEvent,
-                    Executive,
-                    KernelMode,
-                    FALSE,
-                    &slice
-                );
-                if (++extraSlices >= 60) {
-                    //
-                    // 5 minutes elapsed total. Force-fail-safe: log and return.
-                    // Memory will leak rather than UAF the lookaside list.
-                    //
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                               "[ShadowStrike] ScanCache: References never drained "
-                               "(%ld remaining). Skipping lookaside teardown to avoid UAF.\n",
-                               InterlockedCompareExchange(&g_ScanCache.ActiveReferences, 0, 0));
-                    return;
-                }
-            }
+                       "[ShadowStrike] ScanCache: CRITICAL â€” shutdown wait timed out "
+                       "(ActiveReferences=%ld). Possible reference leak.\n",
+                       g_ScanCache.ActiveReferences);
         }
     }
 
@@ -421,25 +368,17 @@ ShadowStrikeCacheShutdown(
             interval.QuadPart = -100000;  // 10ms
             KeDelayExecutionThread(KernelMode, FALSE, &interval);
             if (++spinCount > 3000) {
-                //
-                // Fail-safe: a stuck cleanup means an entry list / push lock
-                // is in use. We MUST NOT proceed to delete the lookaside or
-                // clear the cache from underneath that thread (UAF).
-                // Leak memory rather than corrupt the kernel.
-                //
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "[ShadowStrike] ScanCache: Cleanup spin-wait exceeded 30s, "
-                           "skipping lookaside teardown to avoid UAF\n");
-                return;
+                           "[ShadowStrike] ScanCache: Cleanup spin-wait exceeded 30s, forcing shutdown\n");
+                break;
             }
         }
     }
 
     //
-    // Step 5: Clear all entries (internal variant: references already drained,
-    // we deliberately bypass the public reference gate which would now fail).
+    // Step 5: Clear all entries
     //
-    ShadowStrikeCacheClearInternal();
+    ShadowStrikeCacheClear();
 
     //
     // Step 6: Delete lookaside list
@@ -453,17 +392,11 @@ ShadowStrikeCacheShutdown(
 
     //
     // Log final statistics (using integer math only - no floating point!)
-    // Use atomic 64-bit reads to obtain a coherent snapshot. Direct reads of
-    // `volatile LONG64` are not portably guaranteed atomic on every CPU
-    // configuration; InterlockedCompareExchange64 is.
     //
     {
-        LONG64 totalLookups = InterlockedCompareExchange64(
-            &g_ScanCache.Stats.TotalLookups, 0, 0);
-        LONG64 hits = InterlockedCompareExchange64(
-            &g_ScanCache.Stats.Hits, 0, 0);
-        LONG64 misses = InterlockedCompareExchange64(
-            &g_ScanCache.Stats.Misses, 0, 0);
+        LONG64 totalLookups = g_ScanCache.Stats.TotalLookups;
+        LONG64 hits = g_ScanCache.Stats.Hits;
+        LONG64 misses = g_ScanCache.Stats.Misses;
         LONG hitRatePercent = 0;
 
         if (totalLookups > 0) {
@@ -511,15 +444,14 @@ ShadowStrikeCacheLookup(
     //
     // Check if cache is ready
     //
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized) ||
-        ReadBooleanAcquire(&g_ScanCache.ShutdownInProgress)) {
+    if (!g_ScanCache.Initialized || g_ScanCache.ShutdownInProgress) {
         return FALSE;
     }
 
     //
     // Validate g_DriverData is initialized before accessing Config
     //
-    if (!ReadBooleanAcquire(&g_DriverData.Initialized)) {
+    if (!g_DriverData.Initialized) {
         return FALSE;
     }
 
@@ -632,30 +564,16 @@ ShadowStrikeCacheInsert(
     }
 
     //
-    // SECURITY: Reject transient verdicts. Caching Verdict_Unknown / Error /
-    // Timeout would let a hostile file that successfully induced one
-    // user-mode scanner failure bypass scanning for the entire TTL window.
-    // Only definitive verdicts (Clean / Malicious / Suspicious) are persisted.
-    //
-    if (!ShadowStrikeCacheIsCacheableVerdict(Verdict)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-                   "[ShadowStrike] ScanCache: Refusing to cache transient verdict %d\n",
-                   (int)Verdict);
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
     // Check if cache is ready
     //
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized) ||
-        ReadBooleanAcquire(&g_ScanCache.ShutdownInProgress)) {
+    if (!g_ScanCache.Initialized || g_ScanCache.ShutdownInProgress) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
     // Validate g_DriverData is initialized before accessing Config
     //
-    if (!ReadBooleanAcquire(&g_DriverData.Initialized)) {
+    if (!g_DriverData.Initialized) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -674,13 +592,13 @@ ShadowStrikeCacheInsert(
     }
 
     //
-    // Check entry limit (soft cap, atomic read for clarity). Multiple threads
-    // may pass this check simultaneously when near the limit, allowing a
-    // bounded overshoot of at most (concurrent_insert_threads - 1) entries.
-    // This is acceptable: the limit is a memory budget guard, not a security
-    // boundary. Overshoot is bounded by CPU count (~64 max).
+    // Check entry limit (soft cap â€” read is outside bucket lock for performance).
+    // Multiple threads may pass this check simultaneously when near the limit,
+    // allowing a bounded overshoot of at most (concurrent_insert_threads - 1)
+    // entries. This is acceptable: the limit is a memory budget guard, not a
+    // security boundary. Overshoot is bounded by CPU count (~64 max).
     //
-    currentEntries = InterlockedCompareExchange(&g_ScanCache.Stats.CurrentEntries, 0, 0);
+    currentEntries = g_ScanCache.Stats.CurrentEntries;
     if (currentEntries >= SHADOWSTRIKE_CACHE_MAX_ENTRIES) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike] Cache full, not inserting new entry\n");
@@ -797,7 +715,7 @@ ShadowStrikeCacheRemove(
     PSHADOWSTRIKE_CACHE_ENTRY entry;
     BOOLEAN removed = FALSE;
 
-    if (Key == NULL || !ReadBooleanAcquire(&g_ScanCache.Initialized)) {
+    if (Key == NULL || !g_ScanCache.Initialized) {
         return FALSE;
     }
 
@@ -853,7 +771,7 @@ ShadowStrikeCacheInvalidateVolume(
     PSHADOWSTRIKE_CACHE_ENTRY entry;
     LIST_ENTRY removeList;
 
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized)) {
+    if (!g_ScanCache.Initialized) {
         return 0;
     }
 
@@ -925,32 +843,6 @@ ShadowStrikeCacheClear(
     VOID
     )
 {
-    PAGED_CODE();
-
-    //
-    // Public entry: gate against shutdown via reference protection so we
-    // cannot race with cache teardown. Shutdown calls the internal variant
-    // directly (after references are drained).
-    //
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized)) {
-        return;
-    }
-
-    if (!ShadowStrikeCacheAcquireReference()) {
-        return;
-    }
-
-    ShadowStrikeCacheClearInternal();
-
-    ShadowStrikeCacheReleaseReference();
-}
-
-static
-VOID
-ShadowStrikeCacheClearInternal(
-    VOID
-    )
-{
     ULONG i;
     ULONG totalRemoved = 0;
     PLIST_ENTRY listEntry;
@@ -1015,33 +907,6 @@ ShadowStrikeCacheClearInternal(
 
 VOID
 ShadowStrikeCacheCleanup(
-    VOID
-    )
-{
-    PAGED_CODE();
-
-    //
-    // Public entry: gate against shutdown via reference protection.
-    // The timer callback also acquires a reference; a manual external
-    // call here gets the same protection.
-    //
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized) ||
-        ReadBooleanAcquire(&g_ScanCache.ShutdownInProgress)) {
-        return;
-    }
-
-    if (!ShadowStrikeCacheAcquireReference()) {
-        return;
-    }
-
-    ShadowStrikeCacheCleanupInternal();
-
-    ShadowStrikeCacheReleaseReference();
-}
-
-static
-VOID
-ShadowStrikeCacheCleanupInternal(
     VOID
     )
 {
@@ -1165,15 +1030,10 @@ ShadowStrikeCacheGetStats(
         &g_ScanCache.Stats.CleanupEvictions, 0, 0);
 
     //
-    // 32-bit values: read atomically. Plain reads of volatile LONG are
-    // naturally atomic on x86/x64 today, but using InterlockedCompareExchange
-    // is portable across architectures and prevents the compiler from
-    // issuing a torn or reordered read.
+    // 32-bit values are naturally atomic on x86/x64
     //
-    Stats->CurrentEntries = InterlockedCompareExchange(
-        &g_ScanCache.Stats.CurrentEntries, 0, 0);
-    Stats->PeakEntries = InterlockedCompareExchange(
-        &g_ScanCache.Stats.PeakEntries, 0, 0);
+    Stats->CurrentEntries = g_ScanCache.Stats.CurrentEntries;
+    Stats->PeakEntries = g_ScanCache.Stats.PeakEntries;
 }
 
 VOID
@@ -1287,62 +1147,47 @@ ShadowStrikeCacheBuildKey(
 
     //
     // Get proper volume serial number (REQUIRED)
-    // FltQueryVolumeInformation populates the fixed prefix
-    // (VolumeCreationTime, VolumeSerialNumber, VolumeLabelLength,
-    // SupportsObjects) before the variable-length VolumeLabel. We use a
-    // generously-sized stack buffer so the call returns STATUS_SUCCESS for
-    // all realistic volume label lengths. STATUS_BUFFER_OVERFLOW is still
-    // accepted as a fallback because the prefix is always populated even
-    // when the label is truncated.
+    // Primary: FltQueryVolumeInformation gets the real NTFS/FAT volume serial.
+    // Fallback: Derive from volume properties (weak but usable).
     //
     if (FltObjects->Volume != NULL) {
         //
-        // Buffer = fixed prefix + room for a 128-WCHAR (256-byte) label,
-        // covering all realistic FAT/exFAT/NTFS/ReFS labels with margin.
-        // Avoids dependency on MAXIMUM_VOLUME_LABEL_LENGTH (not exported
-        // by every WDK header revision). Declared as LONGLONG[] to
-        // guarantee 8-byte alignment (FILE_FS_VOLUME_INFORMATION begins
-        // with LARGE_INTEGER VolumeCreationTime).
+        // Primary: Get actual volume serial number from filesystem metadata
         //
-        #define SS_FSVI_BYTES (sizeof(FILE_FS_VOLUME_INFORMATION) + (128 * sizeof(WCHAR)))
-        LONGLONG volumeInfoBuffer[(SS_FSVI_BYTES + sizeof(LONGLONG) - 1) / sizeof(LONGLONG)];
-        PFILE_FS_VOLUME_INFORMATION volumeInfo =
-            (PFILE_FS_VOLUME_INFORMATION)volumeInfoBuffer;
-        IO_STATUS_BLOCK ioStatus = {0};
+        {
+            FILE_FS_VOLUME_INFORMATION volumeInfo;
+            IO_STATUS_BLOCK ioStatus;
 
-        RtlZeroMemory(volumeInfoBuffer, sizeof(volumeInfoBuffer));
+            status = FltQueryVolumeInformation(
+                FltObjects->Instance,
+                &ioStatus,
+                &volumeInfo,
+                sizeof(volumeInfo),
+                FileFsVolumeInformation
+            );
 
-        status = FltQueryVolumeInformation(
-            FltObjects->Instance,
-            &ioStatus,
-            volumeInfo,
-            sizeof(volumeInfoBuffer),
-            FileFsVolumeInformation
-        );
-        #undef SS_FSVI_BYTES
-
-        if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-            //
-            // The fixed prefix (including VolumeSerialNumber) is populated
-            // even on STATUS_BUFFER_OVERFLOW; only the variable-length label
-            // is affected by buffer size.
-            //
-            Key->VolumeSerial = volumeInfo->VolumeSerialNumber;
-            haveVolumeSerial = TRUE;
+            if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+                //
+                // STATUS_BUFFER_OVERFLOW is acceptable â€” the fixed-size fields
+                // (including VolumeSerialNumber) are populated before the
+                // variable-length VolumeLabel.
+                //
+                Key->VolumeSerial = volumeInfo.VolumeSerialNumber;
+                haveVolumeSerial = TRUE;
+            }
         }
 
         //
-        // SECURITY: No fallback. If the real volume serial is unavailable,
-        // caching is disabled for this file. A pseudo-serial derived from
-        // device characteristics is NOT unique across volumes and enables
-        // cache poisoning via key collision.
-        // For an NGAV product, fail-secure: no unique ID -> no caching.
+        // SECURITY FIX: No fallback. If the real volume serial is unavailable,
+        // caching is disabled for this file. The previous fallback derived a
+        // pseudo-serial from DeviceCharacteristics XOR SectorSize, which is
+        // NOT unique across volumes and enables cache poisoning via key collision.
+        // For an NGAV product, fail-secure: no unique ID â†’ no caching.
         //
         if (!haveVolumeSerial) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] ScanCache: Real volume serial unavailable "
-                       "(status=0x%08X) - caching disabled for this file (fail-secure)\n",
-                       status);
+                       "[ShadowStrike] ScanCache: Real volume serial unavailable â€” "
+                       "caching disabled for this file (fail-secure)\n");
         }
     }
 
@@ -1440,11 +1285,11 @@ Routine Description:
     //
     // Check shutdown flag
     //
-    if (ReadBooleanAcquire(&g_ScanCache.ShutdownInProgress)) {
+    if (g_ScanCache.ShutdownInProgress) {
         return;
     }
 
-    if (!ReadBooleanAcquire(&g_ScanCache.Initialized)) {
+    if (!g_ScanCache.Initialized) {
         return;
     }
 
@@ -1457,12 +1302,9 @@ Routine Description:
 
     //
     // Perform cleanup at PASSIVE_LEVEL (guaranteed by TmFlag_WorkItemCallback).
-    // Call the internal variant directly: we already hold the reference, and
-    // the public wrapper would re-acquire one redundantly.
-    // ShadowStrikeCacheCleanupInternal owns the CleanupInProgress re-entrancy
-    // guard.
+    // ShadowStrikeCacheCleanup owns the CleanupInProgress re-entrancy guard.
     //
-    ShadowStrikeCacheCleanupInternal();
+    ShadowStrikeCacheCleanup();
 
     ShadowStrikeCacheReleaseReference();
 }

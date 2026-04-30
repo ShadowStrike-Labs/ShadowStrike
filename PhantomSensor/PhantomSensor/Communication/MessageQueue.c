@@ -313,13 +313,6 @@ MqInitialize(
     g_MqGlobals.LowWaterMark = MQ_DEFAULT_LOW_WATER_MARK;
 
     //
-    // Initialize rundown protection BEFORE creating any resources callers
-    // can touch. Public APIs check RundownInitialized and acquire/release.
-    //
-    ExInitializeRundownProtection(&g_MqGlobals.Rundown);
-    g_MqGlobals.RundownInitialized = TRUE;
-
-    //
     // Initialize priority queues
     //
     for (i = 0; i < MessagePriority_Max; i++) {
@@ -450,15 +443,6 @@ Cleanup:
         g_PendingCompletionLookasideInitialized = FALSE;
     }
 
-    //
-    // Drain rundown for symmetry. No callers can possibly be inside since
-    // we never published the running state, but call this for cleanliness.
-    //
-    if (g_MqGlobals.RundownInitialized) {
-        ExWaitForRundownProtectionRelease(&g_MqGlobals.Rundown);
-        g_MqGlobals.RundownInitialized = FALSE;
-    }
-
     InterlockedExchange(&g_MqGlobals.State, MqState_Uninitialized);
 
     return status;
@@ -578,14 +562,7 @@ MqShutdown(
         KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
         //
-        // Free orphaned completions outside the spinlock.
-        //
-        // ORDER MATTERS: free to lookaside FIRST, then decrement
-        // OutstandingCompletions. If we decremented first and reached zero,
-        // a parallel waiter on AllCompletionsReleasedEvent could observe the
-        // condition, return from MqShutdown's wait below, and proceed to
-        // delete the completion lookaside while we are still about to call
-        // ExFreeToNPagedLookasideList -> pool corruption / BSOD.
+        // Free orphaned completions outside the spinlock
         //
         while (!IsListEmpty(&orphanedCompletions)) {
             orphanEntry = RemoveHeadList(&orphanedCompletions);
@@ -596,21 +573,12 @@ MqShutdown(
                 orphanCompletion->ResponseData = NULL;
             }
 
-            //
-            // Free the structure FIRST while we know the lookaside is alive.
-            // We are MqShutdown ourselves so the lookaside cannot be deleted
-            // out from under us here, but keep this order consistent with
-            // MqpReleasePendingCompletion for defense-in-depth.
-            //
-            if (g_PendingCompletionLookasideInitialized) {
-                ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, orphanCompletion);
-            }
-
-            //
-            // Now release the OutstandingCompletions reference.
-            //
             if (InterlockedDecrement(&g_MqGlobals.OutstandingCompletions) == 0) {
                 KeSetEvent(&g_MqGlobals.AllCompletionsReleasedEvent, IO_NO_INCREMENT, FALSE);
+            }
+
+            if (g_PendingCompletionLookasideInitialized) {
+                ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, orphanCompletion);
             }
         }
     }
@@ -695,24 +663,10 @@ MqShutdown(
     }
 
     //
-    // Drain message-lookaside in-flight callers via rundown protection.
-    // After this returns:
-    //   - No new ExAcquireRundownProtection on g_MqGlobals.Rundown succeeds
-    //   - All public APIs that touch g_MqGlobals.MessageLookaside have exited
-    //
-    // This deterministically eliminates the UAF window against the message
-    // lookaside (alloc/free against a deleted lookaside list).
-    //
-    if (g_MqGlobals.RundownInitialized) {
-        ExWaitForRundownProtectionRelease(&g_MqGlobals.Rundown);
-        g_MqGlobals.RundownInitialized = FALSE;
-    }
-
-    //
     // Delete lookaside lists.
     // Set flags FALSE first to prevent concurrent frees to deleted lists.
     // Safe because all outstanding references are released (waited above)
-    // and no new allocations can occur (state is ShuttingDown + rundown drained).
+    // and no new allocations can occur (state is ShuttingDown).
     //
     if (g_MqGlobals.MessageLookasideInitialized) {
         g_MqGlobals.MessageLookasideInitialized = FALSE;
@@ -727,9 +681,9 @@ MqShutdown(
     }
 
     MQ_LOG_INFO("Final stats: Enqueued=%llu, Dequeued=%llu, Dropped=%llu",
-               (unsigned long long)ReadNoFence64(&g_MqGlobals.TotalMessagesEnqueued),
-               (unsigned long long)ReadNoFence64(&g_MqGlobals.TotalMessagesDequeued),
-               (unsigned long long)ReadNoFence64(&g_MqGlobals.TotalMessagesDropped));
+               (unsigned long long)g_MqGlobals.TotalMessagesEnqueued,
+               (unsigned long long)g_MqGlobals.TotalMessagesDequeued,
+               (unsigned long long)g_MqGlobals.TotalMessagesDropped);
 
     //
     // Transition to shutdown state
@@ -838,30 +792,17 @@ MqEnqueueMessage(
     }
 
     //
-    // Acquire rundown protection. MqShutdown's ExWaitForRundownProtectionRelease
-    // will block until we release. This deterministically prevents the message
-    // lookaside from being deleted while we are mid-allocate / mid-free.
-    //
-    if (!g_MqGlobals.RundownInitialized ||
-        !ExAcquireRundownProtection(&g_MqGlobals.Rundown)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
     // Validate parameters
     //
     if (MessageData == NULL && MessageSize > 0) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (MessageSize > (UINT32)g_MqGlobals.MaxMessageSize) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_BUFFER_OVERFLOW;
     }
 
     if (Priority >= MessagePriority_Max) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -893,7 +834,6 @@ MqEnqueueMessage(
                     BehaviorCategory_ManagementAudit,
                     0, NULL, 0, 0, FALSE, NULL
                 );
-                ExReleaseRundownProtection(&g_MqGlobals.Rundown);
                 return STATUS_DEVICE_BUSY;
             }
             newDepth = currentDepth + 1;
@@ -910,7 +850,6 @@ MqEnqueueMessage(
         //
         InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
         InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -942,7 +881,6 @@ MqEnqueueMessage(
     if (!NT_SUCCESS(status)) {
         MqpFreeMessageInternal(message);
         InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return status;
     }
 
@@ -982,7 +920,6 @@ MqEnqueueMessage(
         *MessageId = message->MessageId;
     }
 
-    ExReleaseRundownProtection(&g_MqGlobals.Rundown);
     return STATUS_SUCCESS;
 }
 
@@ -1034,43 +971,25 @@ MqEnqueueMessageAndWait(
     }
 
     //
-    // Acquire rundown protection. We hold this across the alloc-and-register
-    // phase so MqShutdown cannot delete the message / completion lookasides
-    // out from under us. We RELEASE rundown before the long blocking wait;
-    // by that point the completion structure is on g_PendingCompletionList
-    // and OutstandingCompletions has been incremented, which is the gate
-    // MqShutdown uses for the post-wait teardown.
-    //
-    if (!g_MqGlobals.RundownInitialized ||
-        !ExAcquireRundownProtection(&g_MqGlobals.Rundown)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
     // Validate parameters
     //
     if (MessageData == NULL && MessageSize > 0) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (ResponseBuffer == NULL || ResponseBufferSize == 0) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (ResponseBufferSize > MQ_MAX_RESPONSE_SIZE) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (MessageSize > (UINT32)g_MqGlobals.MaxMessageSize) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_BUFFER_OVERFLOW;
     }
 
     if (Priority >= MessagePriority_Max) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1078,7 +997,6 @@ MqEnqueueMessageAndWait(
     // Check pending completion limit
     //
     if (g_PendingCompletionCount >= MQ_MAX_PENDING_COMPLETIONS) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_TOO_MANY_COMMANDS;
     }
 
@@ -1087,7 +1005,6 @@ MqEnqueueMessageAndWait(
     //
     pendingCompletion = MqpAllocatePendingCompletion();
     if (pendingCompletion == NULL) {
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1109,7 +1026,6 @@ MqEnqueueMessageAndWait(
                     BehaviorCategory_ManagementAudit,
                     0, NULL, 0, 0, FALSE, NULL
                 );
-                ExReleaseRundownProtection(&g_MqGlobals.Rundown);
                 return STATUS_DEVICE_BUSY;
             }
             newDepth = currentDepth + 1;
@@ -1124,7 +1040,6 @@ MqEnqueueMessageAndWait(
         InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
         MqpFreeUnregisteredCompletion(pendingCompletion);
         InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1179,7 +1094,6 @@ MqEnqueueMessageAndWait(
         MqpReleasePendingCompletion(pendingCompletion);  // Release waiter's ref
         MqpFreeMessageInternal(message);
         InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
         return status;
     }
 
@@ -1193,14 +1107,6 @@ MqEnqueueMessageAndWait(
     // Signal message available
     //
     KeSetEvent(&g_MqGlobals.MessageAvailableEvent, IO_NO_INCREMENT, FALSE);
-
-    //
-    // Release rundown BEFORE the long blocking wait so MqShutdown is not
-    // held off indefinitely. From this point on, the completion structure
-    // is on g_PendingCompletionList with OutstandingCompletions incremented;
-    // those references are what gate MqShutdown's lookaside teardown.
-    //
-    ExReleaseRundownProtection(&g_MqGlobals.Rundown);
 
     //
     // Wait for completion
@@ -1243,14 +1149,6 @@ MqEnqueueMessageAndWait(
         }
         *ResponseSize = copySize;
         status = pendingCompletion->CompletionStatus;
-        //
-        // Release the list reference. MqCompleteMessage transitioned the
-        // state to Completed but did NOT remove the entry from the global
-        // pending list â€” without the detach below, every successfully-
-        // completed blocking message would leave a stale list entry holding
-        // a permanent refcount of 1 until subsystem shutdown (slow leak).
-        //
-        MqpDetachPendingCompletion(pendingCompletion);
     } else if (status == STATUS_TIMEOUT || completionState == MqCompletionState_TimedOut) {
         //
         // Timeout - detach completion so MqCompleteMessage won't access it
@@ -1472,34 +1370,8 @@ MqFreeMessage(
     _In_opt_ PQUEUED_MESSAGE Message
     )
 {
-    if (Message == NULL || !MQ_IS_VALID_MESSAGE(Message)) {
-        return;
-    }
-
-    //
-    // Acquire rundown protection so MqShutdown cannot delete the message
-    // lookaside out from under us.
-    //
-    if (g_MqGlobals.RundownInitialized &&
-        ExAcquireRundownProtection(&g_MqGlobals.Rundown)) {
+    if (Message != NULL && MQ_IS_VALID_MESSAGE(Message)) {
         MqpFreeMessageInternal(Message);
-        ExReleaseRundownProtection(&g_MqGlobals.Rundown);
-        return;
-    }
-
-    //
-    // Rundown drained (subsystem shutting down). Pool-allocated messages
-    // are always safe to free directly. Lookaside-allocated messages are
-    // intentionally leaked here - the lookaside teardown is racing with us
-    // and the OS will reclaim non-paged pool when the driver unloads.
-    // Leak is strictly better than potential pool corruption.
-    //
-    if (Message->AllocSource == MqAllocSource_Pool) {
-        Message->Magic = 0;
-        ExFreePoolWithTag(Message, MQ_POOL_TAG_MESSAGE);
-    } else {
-        MQ_LOG_WARNING("MqFreeMessage: lookaside free skipped during shutdown (id=%llu)",
-                      (unsigned long long)Message->MessageId);
     }
 }
 
@@ -2191,14 +2063,7 @@ MqpReleasePendingCompletion(
 
     if (newRefCount == 0) {
         //
-        // Last reference - free response buffer and the structure.
-        //
-        // ORDER CRITICAL: free the structure to the lookaside FIRST, then
-        // decrement OutstandingCompletions. If we decremented first and hit
-        // zero, MqShutdown's wait on AllCompletionsReleasedEvent would
-        // unblock and proceed to delete the completion lookaside -- racing
-        // with our pending ExFreeToNPagedLookasideList call below, which
-        // would corrupt the pool.
+        // Last reference - free response buffer and the structure
         //
         Completion->Magic = 0;  // Invalidate
 
@@ -2207,17 +2072,15 @@ MqpReleasePendingCompletion(
             Completion->ResponseData = NULL;
         }
 
-        if (g_PendingCompletionLookasideInitialized) {
-            ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, Completion);
-        }
-
         //
-        // Now release the OutstandingCompletions reference. Any waiter on
-        // AllCompletionsReleasedEvent will only wake AFTER we have already
-        // returned the structure to the lookaside.
+        // Update outstanding completion count
         //
         if (InterlockedDecrement(&g_MqGlobals.OutstandingCompletions) == 0) {
             KeSetEvent(&g_MqGlobals.AllCompletionsReleasedEvent, IO_NO_INCREMENT, FALSE);
+        }
+
+        if (g_PendingCompletionLookasideInitialized) {
+            ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, Completion);
         }
     } else if (newRefCount < 0) {
         //

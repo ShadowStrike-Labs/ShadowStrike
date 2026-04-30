@@ -452,12 +452,6 @@ ImgpAddModuleToTracking(
     );
 
 static
-VOID
-ImgpReleaseProcessModules(
-    _In_ PIMG_PROCESS_MODULES ProcessModules
-    );
-
-static
 USHORT
 ImgpSafeStringLength(
     _In_reads_(MaxLength) PCWSTR String,
@@ -1609,7 +1603,10 @@ ImageNotifyProcessTerminated(
 {
     PIMG_PROCESS_MODULES processModules = NULL;
     PLIST_ENTRY hashEntry;
+    PLIST_ENTRY moduleEntry;
+    PIMG_MODULE_ENTRY module;
     ULONG bucket;
+    LONG moduleCount = 0;
 
     if (!g_ImgNotify.Config.EnableModuleTracking) {
         return;
@@ -1621,11 +1618,7 @@ ImageNotifyProcessTerminated(
     ExAcquirePushLockExclusive(&g_ImgNotify.ModuleTrackingLock);
 
     //
-    // Find and unlink process entry from the hash bucket. We must not free
-    // the entry while in-flight callers (e.g., ImgpAddModuleToTracking) may
-    // still hold a reference taken by ImgpFindOrCreateProcessModules; instead
-    // we drop the implicit hash reference and let ImgpReleaseProcessModules
-    // perform the actual free when the last reference is gone.
+    // Find and remove process entry
     //
     for (hashEntry = g_ImgNotify.ProcessModuleHash[bucket].Flink;
          hashEntry != &g_ImgNotify.ProcessModuleHash[bucket];
@@ -1645,10 +1638,21 @@ ImageNotifyProcessTerminated(
 
     if (processModules != NULL) {
         //
-        // Drop the hash-table reference. If no concurrent caller holds a
-        // reference, this frees the entry and drains the module list.
+        // Free all module entries
         //
-        ImgpReleaseProcessModules(processModules);
+        while (!IsListEmpty(&processModules->ModuleList)) {
+            moduleEntry = RemoveHeadList(&processModules->ModuleList);
+            module = CONTAINING_RECORD(moduleEntry, IMG_MODULE_ENTRY, ListEntry);
+            ShadowStrikeLookasideFree(&g_ImgNotify.ModuleLookaside, module);
+            moduleCount++;
+        }
+
+        //
+        // Update statistics
+        //
+        InterlockedAdd64(&g_ImgNotify.Stats.ModulesTracked, -moduleCount);
+
+        ShadowStrikeFreePoolWithTag(processModules, IMG_POOL_TAG_MODULE);
     }
 }
 
@@ -3693,12 +3697,6 @@ ImgpFindOrCreateProcessModules(
         processModules = CONTAINING_RECORD(entry, IMG_PROCESS_MODULES, ListEntry);
 
         if (processModules->ProcessId == ProcessId) {
-            //
-            // Take caller reference under the lock so the entry cannot be
-            // reclaimed by ImageNotifyProcessTerminated between this lookup
-            // and the caller's subsequent use.
-            //
-            InterlockedIncrement(&processModules->RefCount);
             ExReleasePushLockShared(&g_ImgNotify.ModuleTrackingLock);
             KeLeaveCriticalRegion();
             return processModules;
@@ -3726,13 +3724,7 @@ ImgpFindOrCreateProcessModules(
     processModules->ProcessId = ProcessId;
     InitializeListHead(&processModules->ModuleList);
     ExInitializePushLock(&processModules->ModuleLock);
-    //
-    // RefCount layout:
-    //   1  - hash table reference (released by ImageNotifyProcessTerminated)
-    //   1  - caller reference (released by ImgpAddModuleToTracking via
-    //        ImgpReleaseProcessModules after it has finished using the entry)
-    //
-    processModules->RefCount = 2;
+    processModules->RefCount = 1;
 
     //
     // Insert into hash table
@@ -3751,10 +3743,8 @@ ImgpFindOrCreateProcessModules(
 
         if (existing->ProcessId == ProcessId) {
             //
-            // Another thread added it - use that one and discard our
-            // freshly-allocated entry. Take caller ref on the survivor.
+            // Another thread added it - use that one
             //
-            InterlockedIncrement(&existing->RefCount);
             ExReleasePushLockExclusive(&g_ImgNotify.ModuleTrackingLock);
             KeLeaveCriticalRegion();
 
@@ -3772,49 +3762,6 @@ ImgpFindOrCreateProcessModules(
 }
 
 
-//
-// Drops a reference taken via ImgpFindOrCreateProcessModules (or the implicit
-// hash-table reference held until ImageNotifyProcessTerminated runs). The
-// last releaser drains the module list and frees the entry.
-//
-static
-VOID
-ImgpReleaseProcessModules(
-    PIMG_PROCESS_MODULES ProcessModules
-    )
-{
-    PLIST_ENTRY moduleEntry;
-    PIMG_MODULE_ENTRY module;
-    LONG drained = 0;
-
-    if (ProcessModules == NULL) {
-        return;
-    }
-
-    if (InterlockedDecrement(&ProcessModules->RefCount) != 0) {
-        return;
-    }
-
-    //
-    // No further references exist: the entry has already been removed from
-    // the hash table (otherwise the hash reference would still be held), so
-    // it is safe to drain the module list without any lock.
-    //
-    while (!IsListEmpty(&ProcessModules->ModuleList)) {
-        moduleEntry = RemoveHeadList(&ProcessModules->ModuleList);
-        module = CONTAINING_RECORD(moduleEntry, IMG_MODULE_ENTRY, ListEntry);
-        ShadowStrikeLookasideFree(&g_ImgNotify.ModuleLookaside, module);
-        drained++;
-    }
-
-    if (drained > 0) {
-        InterlockedAdd64(&g_ImgNotify.Stats.ModulesTracked, -drained);
-    }
-
-    ShadowStrikeFreePoolWithTag(ProcessModules, IMG_POOL_TAG_MODULE);
-}
-
-
 static
 VOID
 ImgpAddModuleToTracking(
@@ -3823,7 +3770,6 @@ ImgpAddModuleToTracking(
 {
     PIMG_PROCESS_MODULES processModules;
     PIMG_MODULE_ENTRY moduleEntry;
-    LONG newCount;
 
     if (Event->ProcessId == NULL) {
         return;
@@ -3835,14 +3781,9 @@ ImgpAddModuleToTracking(
     }
 
     //
-    // Reserve a slot atomically against the per-process cap. Increment first,
-    // then verify; on overshoot, decrement and bail. This bounds the count
-    // even under concurrent loads (ModuleCount is volatile LONG).
+    // Check module limit
     //
-    newCount = InterlockedIncrement(&processModules->ModuleCount);
-    if (newCount > IMG_MAX_TRACKED_MODULES) {
-        InterlockedDecrement(&processModules->ModuleCount);
-        ImgpReleaseProcessModules(processModules);
+    if (processModules->ModuleCount >= IMG_MAX_TRACKED_MODULES) {
         return;
     }
 
@@ -3853,8 +3794,6 @@ ImgpAddModuleToTracking(
         &g_ImgNotify.ModuleLookaside);
 
     if (moduleEntry == NULL) {
-        InterlockedDecrement(&processModules->ModuleCount);
-        ImgpReleaseProcessModules(processModules);
         return;
     }
 
@@ -3883,18 +3822,12 @@ ImgpAddModuleToTracking(
     ExAcquirePushLockExclusive(&processModules->ModuleLock);
 
     InsertTailList(&processModules->ModuleList, &moduleEntry->ListEntry);
+    InterlockedIncrement(&processModules->ModuleCount);
 
     ExReleasePushLockExclusive(&processModules->ModuleLock);
     KeLeaveCriticalRegion();
 
     InterlockedIncrement64(&g_ImgNotify.Stats.ModulesTracked);
-
-    //
-    // Drop the caller reference taken by ImgpFindOrCreateProcessModules.
-    // If the process terminated concurrently, this releaser will be the
-    // last one and will free the entry.
-    //
-    ImgpReleaseProcessModules(processModules);
 }
 
 

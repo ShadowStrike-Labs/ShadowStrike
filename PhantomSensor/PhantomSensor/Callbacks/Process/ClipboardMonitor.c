@@ -74,15 +74,7 @@ typedef struct _CBMON_PROCESS_ENTRY {
     ULONG Indicators;              // CBMON_INDICATOR bitmask
     volatile LONG TempFileWrites;  // Counter within time window
     LARGE_INTEGER WindowStart;     // Start of current counting window
-    volatile LONG Flagged;         // Already reported (atomic 4-byte field; NOT BOOLEAN — InterlockedExchange requires LONG width)
-    //
-    // Reference count protects against the cleanup-thread UAF: lookup
-    // increments the ref under the bucket lock and returns the pointer
-    // for caller use; the corresponding release (Cb MonpReleaseEntry)
-    // decrements and frees once the last user (scanner or remover) is
-    // done. Removal from the bucket list also drops the list-owned ref.
-    //
-    volatile LONG ReferenceCount;
+    BOOLEAN Flagged;               // Already reported
 } CBMON_PROCESS_ENTRY, *PCBMON_PROCESS_ENTRY;
 
 typedef struct _CBMON_STATE {
@@ -146,10 +138,6 @@ static ULONG CbMonpHashPid(_In_ HANDLE ProcessId);
 static PCBMON_PROCESS_ENTRY CbMonpLookupProcess(
     _In_ HANDLE ProcessId,
     _In_ BOOLEAN CreateIfMissing
-    );
-
-static VOID CbMonpReleaseEntry(
-    _In_ PCBMON_PROCESS_ENTRY Entry
     );
 
 static BOOLEAN CbMonpContainsPatternCI(
@@ -232,34 +220,25 @@ CbMonShutdown(VOID)
     ExWaitForRundownProtectionRelease(&g_CbState.RundownRef);
 
     //
-    // Free all tracked process entries. Bound the per-bucket walk against
-    // a corrupted list and drop the list-owner reference (last-ref frees).
+    // Free all tracked process entries
     //
     for (ULONG i = 0; i < CBMON_PROCESS_HASH_BUCKETS; i++) {
-        ULONG drained = 0;
-        while (!IsListEmpty(&g_CbState.ProcessBuckets[i]) &&
-               drained < CBMON_MAX_TRACKED_PROCESSES) {
+        while (!IsListEmpty(&g_CbState.ProcessBuckets[i])) {
             PLIST_ENTRY entry = RemoveHeadList(&g_CbState.ProcessBuckets[i]);
             PCBMON_PROCESS_ENTRY procEntry = CONTAINING_RECORD(
                 entry, CBMON_PROCESS_ENTRY, Link);
-            CbMonpReleaseEntry(procEntry);
-            drained++;
+            ExFreeToNPagedLookasideList(&g_CbState.EntryLookaside, procEntry);
         }
         FltDeletePushLock(&g_CbState.BucketLocks[i]);
     }
 
     ExDeleteNPagedLookasideList(&g_CbState.EntryLookaside);
 
-    g_CbState.TrackedCount = 0;
-    RtlZeroMemory(&g_CbState.Stats, sizeof(CBMON_STATISTICS));
-
-    //
-    // Publish UNINITIALIZED so a subsequent CbMonInitialize succeeds.
-    //
-    InterlockedExchange(&g_CbState.InitState, CBMON_INIT_UNINITIALIZED);
-
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "[ShadowStrike/ClipboardMonitor] Shutdown complete\n");
+        "[ShadowStrike/ClipboardMonitor] Shutdown complete "
+        "(checked=%lld, suspicious=%lld)\n",
+        ReadNoFence64(&g_CbState.Stats.TotalProcessesChecked),
+        ReadNoFence64(&g_CbState.Stats.SuspiciousDetections));
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -275,11 +254,7 @@ CbMonCheckProcessCreate(
 
     PAGED_CODE();
 
-    if (CreateInfo == NULL) {
-        return CbIndicator_None;
-    }
-
-    if (ReadAcquire(&g_CbState.InitState) != CBMON_INIT_READY) {
+    if (g_CbState.InitState != CBMON_INIT_READY) {
         return CbIndicator_None;
     }
 
@@ -365,7 +340,6 @@ CbMonCheckProcessCreate(
         PCBMON_PROCESS_ENTRY entry = CbMonpLookupProcess(ProcessId, TRUE);
         if (entry != NULL) {
             InterlockedOr((volatile LONG*)&entry->Indicators, (LONG)indicators);
-            CbMonpReleaseEntry(entry);
         }
 
         InterlockedIncrement64(&g_CbState.Stats.SuspiciousDetections);
@@ -404,11 +378,7 @@ CbMonCheckFileWrite(
     LARGE_INTEGER now;
     BOOLEAN suspicious = FALSE;
 
-    if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
-        return FALSE;
-    }
-
-    if (ReadAcquire(&g_CbState.InitState) != CBMON_INIT_READY) {
+    if (g_CbState.InitState != CBMON_INIT_READY) {
         return FALSE;
     }
 
@@ -421,9 +391,6 @@ CbMonCheckFileWrite(
     //
     entry = CbMonpLookupProcess(ProcessId, FALSE);
     if (entry == NULL || entry->Indicators == CbIndicator_None) {
-        if (entry != NULL) {
-            CbMonpReleaseEntry(entry);
-        }
         ExReleaseRundownProtection(&g_CbState.RundownRef);
         return FALSE;
     }
@@ -432,7 +399,6 @@ CbMonCheckFileWrite(
     // Check if writing to temp/appdata paths (clipboard dump targets)
     //
     if (!CbMonpIsTempPath(FileName)) {
-        CbMonpReleaseEntry(entry);
         ExReleaseRundownProtection(&g_CbState.RundownRef);
         return FALSE;
     }
@@ -454,10 +420,10 @@ CbMonCheckFileWrite(
         } else {
             LONG count = InterlockedIncrement(&entry->TempFileWrites);
 
-            if (count >= CBMON_TEMP_WRITE_THRESHOLD &&
-                InterlockedCompareExchange(&entry->Flagged, 1, 0) == 0) {
+            if (count >= CBMON_TEMP_WRITE_THRESHOLD && !entry->Flagged) {
                 InterlockedOr((volatile LONG*)&entry->Indicators,
                               (LONG)CbIndicator_RapidTempFileWrites);
+                InterlockedExchange((volatile LONG*)&entry->Flagged, TRUE);
                 suspicious = TRUE;
 
                 InterlockedIncrement64(&g_CbState.Stats.FileWriteMatches);
@@ -485,7 +451,6 @@ CbMonCheckFileWrite(
         }
     }
 
-    CbMonpReleaseEntry(entry);
     ExReleaseRundownProtection(&g_CbState.RundownRef);
     return suspicious;
 }
@@ -500,17 +465,11 @@ CbMonGetStatistics(
         return STATUS_INVALID_PARAMETER;
     }
 
-    RtlZeroMemory(Stats, sizeof(*Stats));
-
-    if (ReadAcquire(&g_CbState.InitState) != CBMON_INIT_READY) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    Stats->TotalProcessesChecked = ReadNoFence64(&g_CbState.Stats.TotalProcessesChecked);
-    Stats->SuspiciousDetections  = ReadNoFence64(&g_CbState.Stats.SuspiciousDetections);
-    Stats->CommandLineMatches    = ReadNoFence64(&g_CbState.Stats.CommandLineMatches);
-    Stats->FileWriteMatches      = ReadNoFence64(&g_CbState.Stats.FileWriteMatches);
-    Stats->CrossProcessMatches   = ReadNoFence64(&g_CbState.Stats.CrossProcessMatches);
+    Stats->TotalProcessesChecked = g_CbState.Stats.TotalProcessesChecked;
+    Stats->SuspiciousDetections = g_CbState.Stats.SuspiciousDetections;
+    Stats->CommandLineMatches = g_CbState.Stats.CommandLineMatches;
+    Stats->FileWriteMatches = g_CbState.Stats.FileWriteMatches;
+    Stats->CrossProcessMatches = g_CbState.Stats.CrossProcessMatches;
 
     return STATUS_SUCCESS;
 }
@@ -552,12 +511,6 @@ CbMonpLookupProcess(
         PCBMON_PROCESS_ENTRY candidate = CONTAINING_RECORD(
             entry, CBMON_PROCESS_ENTRY, Link);
         if (candidate->ProcessId == ProcessId) {
-            //
-            // Take an additional reference under the bucket lock so the
-            // entry cannot be freed by a concurrent CbMonRemoveProcess
-            // while the caller is using it.
-            //
-            InterlockedIncrement(&candidate->ReferenceCount);
             procEntry = candidate;
             break;
         }
@@ -583,10 +536,6 @@ CbMonpLookupProcess(
 
         RtlZeroMemory(procEntry, sizeof(CBMON_PROCESS_ENTRY));
         procEntry->ProcessId = ProcessId;
-        //
-        // ReferenceCount=2: one for the list ownership, one for the caller.
-        //
-        procEntry->ReferenceCount = 2;
 
         KeEnterCriticalRegion();
         FltAcquirePushLockExclusive(&g_CbState.BucketLocks[bucket]);
@@ -604,11 +553,8 @@ CbMonpLookupProcess(
                     check, CBMON_PROCESS_ENTRY, Link);
                 if (existing->ProcessId == ProcessId) {
                     //
-                    // Another thread inserted â€” use existing, free ours.
-                    // Take a caller reference on the existing entry first
-                    // so the caller still owns a valid pointer.
+                    // Another thread inserted â€” use existing, free ours
                     //
-                    InterlockedIncrement(&existing->ReferenceCount);
                     FltReleasePushLock(&g_CbState.BucketLocks[bucket]);
                     KeLeaveCriticalRegion();
                     ExFreeToNPagedLookasideList(&g_CbState.EntryLookaside, procEntry);
@@ -625,24 +571,6 @@ CbMonpLookupProcess(
     }
 
     return procEntry;
-}
-
-//
-// Drop a caller reference taken by CbMonpLookupProcess. When the count
-// drops to zero (i.e., both the list-owner ref and the last caller ref
-// are gone), free the entry to the lookaside.
-//
-static VOID
-CbMonpReleaseEntry(
-    _In_ PCBMON_PROCESS_ENTRY Entry
-    )
-{
-    if (Entry == NULL) {
-        return;
-    }
-    if (InterlockedDecrement(&Entry->ReferenceCount) == 0) {
-        ExFreeToNPagedLookasideList(&g_CbState.EntryLookaside, Entry);
-    }
 }
 
 static BOOLEAN
@@ -790,7 +718,7 @@ IRQL:
 
     PAGED_CODE();
 
-    if (ReadAcquire(&g_CbState.InitState) != CBMON_INIT_READY) {
+    if (g_CbState.InitState != CBMON_INIT_READY) {
         return;
     }
 
@@ -823,12 +751,7 @@ IRQL:
     KeLeaveCriticalRegion();
 
     if (procEntry != NULL) {
-        //
-        // Drop the list-owner reference; if scanners still hold caller refs
-        // (taken by CbMonpLookupProcess under the bucket lock), the entry is
-        // freed by the last release. This eliminates the cleanup-thread UAF.
-        //
-        CbMonpReleaseEntry(procEntry);
+        ExFreeToNPagedLookasideList(&g_CbState.EntryLookaside, procEntry);
     }
 
     ExReleaseRundownProtection(&g_CbState.RundownRef);

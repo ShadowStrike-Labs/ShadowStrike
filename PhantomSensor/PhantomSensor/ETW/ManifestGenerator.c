@@ -250,19 +250,6 @@ MgpAppendXmlEscaped(
     _In_z_ PCSTR String
     );
 
-//
-// Identifier validation (C / ETW manifest "symbol" rules: [A-Za-z_][A-Za-z0-9_]*).
-// A defense-in-depth gate on every Symbol/Name field that is later embedded
-// verbatim into XML "symbol" attributes, $(string.Foo.Bar) message refs or
-// emitted as C preprocessor identifiers. Returns TRUE only if the entire
-// NUL-terminated string at String fits the grammar and length limit.
-//
-static BOOLEAN
-MgpIsValidIdentifier(
-    _In_z_ PCSTR String,
-    _In_ SIZE_T MaxLength
-    );
-
 static NTSTATUS
 MgpFormatGuid(
     _In_ PCGUID Guid,
@@ -735,16 +722,6 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // The provider symbol is emitted verbatim into XML attributes
-    // ("symbol=\"%s_PROVIDER\"") and into C preprocessor identifiers
-    // ("#define %s_EVENT_..."). Reject anything that is not a strict
-    // C identifier within the storage bound (terminator inclusive).
-    //
-    if (!MgpIsValidIdentifier(ProviderSymbol, MG_MAX_PROVIDER_SYMBOL)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
     Status = MgpAcquireReference(Generator);
     if (!NT_SUCCESS(Status)) {
         return Status;
@@ -901,23 +878,6 @@ Return Value:
     InitializeListHead(&NewChannel->ListEntry);
 
     //
-    // Defense-in-depth: force NUL-termination on caller-supplied
-    // CHAR[] fields after the bulk copy, then reject anything whose
-    // Symbol is not a valid C/ETW identifier (the Symbol is emitted
-    // both into XML "symbol" attributes and into manifest message
-    // references, so unescaped specials would corrupt the manifest).
-    //
-    NewChannel->Name[MG_MAX_CHANNEL_NAME - 1] = '\0';
-    NewChannel->Symbol[MG_MAX_CHANNEL_NAME - 1] = '\0';
-
-    if (NewChannel->Name[0] == '\0' ||
-        !MgpIsValidIdentifier(NewChannel->Symbol, MG_MAX_CHANNEL_NAME)) {
-        ExFreePoolWithTag(NewChannel, MG_CHN_POOL_TAG);
-        MgpReleaseReference(Generator);
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
     // Assign message ID if not set
     //
     if (NewChannel->MessageId == 0) {
@@ -1009,19 +969,6 @@ Return Value:
     RtlCopyMemory(NewTask, Task, sizeof(MG_TASK_DEFINITION));
     InitializeListHead(&NewTask->ListEntry);
 
-    //
-    // Force NUL-term and reject non-identifier Symbols (see channel path).
-    //
-    NewTask->Name[MG_MAX_TASK_NAME - 1] = '\0';
-    NewTask->Symbol[MG_MAX_TASK_NAME - 1] = '\0';
-
-    if (NewTask->Name[0] == '\0' ||
-        !MgpIsValidIdentifier(NewTask->Symbol, MG_MAX_TASK_NAME)) {
-        ExFreePoolWithTag(NewTask, MG_TSK_POOL_TAG);
-        MgpReleaseReference(Generator);
-        return STATUS_INVALID_PARAMETER;
-    }
-
     if (NewTask->MessageId == 0) {
         NewTask->MessageId = (ULONG)InterlockedIncrement(&Generator->NextMessageId);
     }
@@ -1087,19 +1034,6 @@ Return Value:
     RtlCopyMemory(NewKeyword, Keyword, sizeof(MG_KEYWORD_DEFINITION));
     InitializeListHead(&NewKeyword->ListEntry);
 
-    //
-    // Force NUL-term and reject non-identifier Symbols (see channel path).
-    //
-    NewKeyword->Name[MG_MAX_KEYWORD_NAME - 1] = '\0';
-    NewKeyword->Symbol[MG_MAX_KEYWORD_NAME - 1] = '\0';
-
-    if (NewKeyword->Name[0] == '\0' ||
-        !MgpIsValidIdentifier(NewKeyword->Symbol, MG_MAX_KEYWORD_NAME)) {
-        ExFreePoolWithTag(NewKeyword, MG_KWD_POOL_TAG);
-        MgpReleaseReference(Generator);
-        return STATUS_INVALID_PARAMETER;
-    }
-
     if (NewKeyword->MessageId == 0) {
         NewKeyword->MessageId = (ULONG)InterlockedIncrement(&Generator->NextMessageId);
     }
@@ -1164,19 +1098,6 @@ Return Value:
 
     RtlCopyMemory(NewOpcode, Opcode, sizeof(MG_OPCODE_DEFINITION));
     InitializeListHead(&NewOpcode->ListEntry);
-
-    //
-    // Force NUL-term and reject non-identifier Symbols (see channel path).
-    //
-    NewOpcode->Name[MG_MAX_OPCODE_NAME - 1] = '\0';
-    NewOpcode->Symbol[MG_MAX_OPCODE_NAME - 1] = '\0';
-
-    if (NewOpcode->Name[0] == '\0' ||
-        !MgpIsValidIdentifier(NewOpcode->Symbol, MG_MAX_OPCODE_NAME)) {
-        ExFreePoolWithTag(NewOpcode, MG_OPC_POOL_TAG);
-        MgpReleaseReference(Generator);
-        return STATUS_INVALID_PARAMETER;
-    }
 
     if (NewOpcode->MessageId == 0) {
         NewOpcode->MessageId = (ULONG)InterlockedIncrement(&Generator->NextMessageId);
@@ -2008,23 +1929,6 @@ Return Value:
                         );
                 }
             }
-
-            //
-            // Validate event name as a C/ETW identifier. Non-identifier
-            // names are rejected by the header generator and force the
-            // manifest emitter onto its escape-only path; surface as
-            // an explicit validation error so operators can fix the
-            // schema before deploy.
-            //
-            if (!MgpIsValidIdentifier(Event->EventName, ES_MAX_EVENT_NAME)) {
-                Errors++;
-                if (BuilderInitialized) {
-                    MgpStringBuilderAppendFormat(&ErrorBuilder,
-                        "ERROR: Event id %u has non-identifier name (must match [A-Za-z_][A-Za-z0-9_]*)\r\n",
-                        Event->EventId
-                        );
-                }
-            }
         }
 
         ExReleasePushLockShared(&Generator->Schema->EventLock);
@@ -2169,15 +2073,7 @@ Return Value:
             PES_EVENT_DEFINITION FieldEvent = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
             for (ULONG fi = 0; fi < FieldEvent->FieldCount; fi++) {
-                //
-                // The schema layer (EventSchema) accepts every type up
-                // to EsType_MAX; the manifest layer only knows how to
-                // emit the first MG_FIELD_TYPE_COUNT of them. Anything
-                // at or above EsType_MAX is a true corruption marker;
-                // values in [MG_FIELD_TYPE_COUNT, EsType_MAX) fall back
-                // to "win:UnicodeString" at emit time and are not flagged.
-                //
-                if ((ULONG)FieldEvent->Fields[fi].Type >= (ULONG)EsType_MAX) {
+                if (FieldEvent->Fields[fi].Type >= MG_FIELD_TYPE_COUNT) {
                     Errors++;
                     if (BuilderInitialized) {
                         MgpStringBuilderAppendFormat(&ErrorBuilder,
@@ -2185,7 +2081,7 @@ Return Value:
                             FieldEvent->EventName,
                             (ULONG)fi,
                             (ULONG)FieldEvent->Fields[fi].Type,
-                            (ULONG)(EsType_MAX - 1));
+                            (ULONG)(MG_FIELD_TYPE_COUNT - 1));
                     }
                 }
             }
@@ -2712,17 +2608,12 @@ MgpStringBuilderAppendFormatV(
 Routine Description:
     Appends a formatted string using va_list.
     Uses pool-allocated temp buffer to avoid consuming kernel stack.
-    Retries with progressively larger buffers if initial 2KB buffer is
-    insufficient, up to a hard 32KB ceiling.
-
-    The caller's va_list is consumed only via va_copy() instances so a
-    second pass is well-defined under C99/C++11 va_list semantics.
+    Retries with larger buffer if initial 2KB buffer is insufficient.
 --*/
 {
     NTSTATUS Status;
     PCHAR TempBuffer;
     SIZE_T TempSize = MG_FORMAT_TEMP_BUFFER_SIZE;
-    va_list ArgsCopy;
 
     if (Builder->Overflow) {
         return STATUS_BUFFER_OVERFLOW;
@@ -2738,65 +2629,40 @@ Routine Description:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // First attempt with a fresh va_list copy. Reusing the caller's
-    // Args after RtlStringCchVPrintfA is undefined behaviour.
-    //
-    va_copy(ArgsCopy, Args);
     Status = RtlStringCchVPrintfA(
         TempBuffer,
         TempSize,
         Format,
-        ArgsCopy
+        Args
         );
-    va_end(ArgsCopy);
 
     //
-    // If truncated, retry with a larger buffer (8KB, 16KB, 32KB).
+    // If truncated, retry with progressively larger buffers (up to 32KB cap)
     //
     if (Status == STATUS_BUFFER_OVERFLOW) {
-        SIZE_T const RetrySizes[] = { 8192, 16384, 32768 };
-        ULONG i;
-
         ExFreePoolWithTag(TempBuffer, Builder->PoolTag);
-        TempBuffer = NULL;
 
-        for (i = 0; i < ARRAYSIZE(RetrySizes); i++) {
-            TempSize = RetrySizes[i];
-
-            TempBuffer = (PCHAR)ExAllocatePool2(
-                POOL_FLAG_PAGED,
-                TempSize,
-                Builder->PoolTag
-                );
-
-            if (TempBuffer == NULL) {
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-
-            va_copy(ArgsCopy, Args);
-            Status = RtlStringCchVPrintfA(
-                TempBuffer,
-                TempSize,
-                Format,
-                ArgsCopy
-                );
-            va_end(ArgsCopy);
-
-            if (Status != STATUS_BUFFER_OVERFLOW) {
-                break;
-            }
-
-            ExFreePoolWithTag(TempBuffer, Builder->PoolTag);
-            TempBuffer = NULL;
+        TempSize = MG_FORMAT_TEMP_BUFFER_SIZE * 4;     // 8KB
+        if (TempSize > 32768) {
+            TempSize = 32768;
         }
+
+        TempBuffer = (PCHAR)ExAllocatePool2(
+            POOL_FLAG_PAGED,
+            TempSize,
+            Builder->PoolTag
+            );
 
         if (TempBuffer == NULL) {
-            //
-            // Exhausted the retry ladder; surface the truncation.
-            //
-            return STATUS_BUFFER_OVERFLOW;
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
+
+        Status = RtlStringCchVPrintfA(
+            TempBuffer,
+            TempSize,
+            Format,
+            Args
+            );
     }
 
     if (NT_SUCCESS(Status)) {
@@ -2828,78 +2694,6 @@ Routine Description:
     }
 
     return Status;
-}
-
-static BOOLEAN
-MgpIsValidIdentifier(
-    _In_z_ PCSTR String,
-    _In_ SIZE_T MaxLength
-    )
-/*++
-Routine Description:
-    Validates that String is a non-empty C-style identifier
-    matching [A-Za-z_][A-Za-z0-9_]* and is NUL-terminated within
-    MaxLength bytes (terminator inclusive).
-
-    Rejects any byte that could break either:
-      - XML attribute parsing (",',<,>,&,whitespace, control chars), or
-      - C preprocessor identifier rules (anything outside [A-Za-z0-9_]).
-
-    This is a hard gate applied at every public entry that accepts
-    operator-controlled "symbol" strings (provider, channel, task,
-    keyword, opcode), so generation hot paths can safely format the
-    field with a plain "%s".
---*/
-{
-    SIZE_T i;
-
-    if (String == NULL || MaxLength < 2) {
-        return FALSE;
-    }
-
-    //
-    // First byte: letter or underscore (digit start would form an
-    // invalid C identifier).
-    //
-    {
-        CHAR c = String[0];
-        BOOLEAN First =
-            (c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z') ||
-            (c == '_');
-        if (!First) {
-            return FALSE;
-        }
-    }
-
-    //
-    // Remaining bytes up to MaxLength-1 must be identifier chars,
-    // terminated by NUL inside the bound.
-    //
-    for (i = 1; i < MaxLength; i++) {
-        CHAR c = String[i];
-        if (c == '\0') {
-            //
-            // Reject zero-length identifiers (covered above) and
-            // require at least one body character past the first
-            // letter/underscore? No — single-letter identifiers are
-            // legal C and ETW. Accept i >= 1.
-            //
-            return TRUE;
-        }
-        if (!((c >= 'A' && c <= 'Z') ||
-              (c >= 'a' && c <= 'z') ||
-              (c >= '0' && c <= '9') ||
-              (c == '_'))) {
-            return FALSE;
-        }
-    }
-
-    //
-    // Ran past MaxLength without seeing a terminator: caller's buffer
-    // is not NUL-terminated within bounds.
-    //
-    return FALSE;
 }
 
 static NTSTATUS
@@ -3220,33 +3014,18 @@ Routine Description:
 
         Level = CONTAINING_RECORD(Entry, MG_LEVEL_DEFINITION, ListEntry);
 
-        //
-        // Name is a free-form string and MUST be XML-escaped before
-        // being embedded in an attribute value. Symbol is gated by
-        // MgpIsValidIdentifier at registration so a "%s" emission is
-        // safe for both XML and C-identifier contexts.
-        //
-        Status = MgpStringBuilderAppend(Builder,
+        Status = MgpStringBuilderAppendFormat(Builder,
             "                    <level\r\n"
-            "                        name=\""
+            "                        name=\"%s\"\r\n"
+            "                        symbol=\"%s_%s\"\r\n"
+            "                        value=\"%u\"\r\n"
+            "                        message=\"$(string.Level.%s)\"/>\r\n",
+            Level->Name,
+            Generator->ProviderSymbol,
+            Level->Symbol,
+            Level->Value,
+            Level->Symbol
             );
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpAppendXmlEscaped(Builder, Level->Name);
-        }
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "\"\r\n"
-                "                        symbol=\"%s_%s\"\r\n"
-                "                        value=\"%u\"\r\n"
-                "                        message=\"$(string.Level.%s)\"/>\r\n",
-                Generator->ProviderSymbol,
-                Level->Symbol,
-                Level->Value,
-                Level->Symbol
-                );
-        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -3301,31 +3080,18 @@ Routine Description:
 
         Task = CONTAINING_RECORD(Entry, MG_TASK_DEFINITION, ListEntry);
 
-        //
-        // Escape free-form Name; Symbol is identifier-validated at
-        // registration, safe for "%s" in both XML and C contexts.
-        //
-        Status = MgpStringBuilderAppend(Builder,
+        Status = MgpStringBuilderAppendFormat(Builder,
             "                    <task\r\n"
-            "                        name=\""
+            "                        name=\"%s\"\r\n"
+            "                        symbol=\"%s_%s\"\r\n"
+            "                        value=\"%u\"\r\n"
+            "                        message=\"$(string.Task.%s)\"/>\r\n",
+            Task->Name,
+            Generator->ProviderSymbol,
+            Task->Symbol,
+            Task->Value,
+            Task->Symbol
             );
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpAppendXmlEscaped(Builder, Task->Name);
-        }
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "\"\r\n"
-                "                        symbol=\"%s_%s\"\r\n"
-                "                        value=\"%u\"\r\n"
-                "                        message=\"$(string.Task.%s)\"/>\r\n",
-                Generator->ProviderSymbol,
-                Task->Symbol,
-                Task->Value,
-                Task->Symbol
-                );
-        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -3380,31 +3146,18 @@ Routine Description:
 
         Opcode = CONTAINING_RECORD(Entry, MG_OPCODE_DEFINITION, ListEntry);
 
-        //
-        // Escape free-form Name; Symbol is identifier-validated at
-        // registration, safe for "%s" in both XML and C contexts.
-        //
-        Status = MgpStringBuilderAppend(Builder,
+        Status = MgpStringBuilderAppendFormat(Builder,
             "                    <opcode\r\n"
-            "                        name=\""
+            "                        name=\"%s\"\r\n"
+            "                        symbol=\"%s_%s\"\r\n"
+            "                        value=\"%u\"\r\n"
+            "                        message=\"$(string.Opcode.%s)\"/>\r\n",
+            Opcode->Name,
+            Generator->ProviderSymbol,
+            Opcode->Symbol,
+            Opcode->Value,
+            Opcode->Symbol
             );
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpAppendXmlEscaped(Builder, Opcode->Name);
-        }
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "\"\r\n"
-                "                        symbol=\"%s_%s\"\r\n"
-                "                        value=\"%u\"\r\n"
-                "                        message=\"$(string.Opcode.%s)\"/>\r\n",
-                Generator->ProviderSymbol,
-                Opcode->Symbol,
-                Opcode->Value,
-                Opcode->Symbol
-                );
-        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -3459,31 +3212,18 @@ Routine Description:
 
         Keyword = CONTAINING_RECORD(Entry, MG_KEYWORD_DEFINITION, ListEntry);
 
-        //
-        // Escape free-form Name; Symbol is identifier-validated at
-        // registration, safe for "%s" in both XML and C contexts.
-        //
-        Status = MgpStringBuilderAppend(Builder,
+        Status = MgpStringBuilderAppendFormat(Builder,
             "                    <keyword\r\n"
-            "                        name=\""
+            "                        name=\"%s\"\r\n"
+            "                        symbol=\"%s_%s\"\r\n"
+            "                        mask=\"0x%016llX\"\r\n"
+            "                        message=\"$(string.Keyword.%s)\"/>\r\n",
+            Keyword->Name,
+            Generator->ProviderSymbol,
+            Keyword->Symbol,
+            Keyword->Mask,
+            Keyword->Symbol
             );
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpAppendXmlEscaped(Builder, Keyword->Name);
-        }
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "\"\r\n"
-                "                        symbol=\"%s_%s\"\r\n"
-                "                        mask=\"0x%016llX\"\r\n"
-                "                        message=\"$(string.Keyword.%s)\"/>\r\n",
-                Generator->ProviderSymbol,
-                Keyword->Symbol,
-                Keyword->Mask,
-                Keyword->Symbol
-                );
-        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -3543,26 +3283,11 @@ Routine Description:
             continue;
         }
 
-        //
-        // Escape Event->EventName: it is operator-controlled string from
-        // the schema. Both the template "tid" attribute here and the
-        // matching "template" reference in the events section must use
-        // the same XML-escape, otherwise the manifest fails to validate
-        // (and if we did not escape at all, an attacker controlling the
-        // event name could close the attribute and inject elements).
-        //
         Status = MgpStringBuilderAppendFormat(Builder,
-            "                    <template tid=\"%s",
-            MG_TEMPLATE_NAME_PREFIX
+            "                    <template tid=\"%s%s\">\r\n",
+            MG_TEMPLATE_NAME_PREFIX,
+            Event->EventName
             );
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpAppendXmlEscaped(Builder, Event->EventName);
-        }
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpStringBuilderAppend(Builder, "\">\r\n");
-        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -3685,34 +3410,18 @@ Routine Description:
                 LevelRef = "win:Verbose";
             }
 
-            //
-            // Escape EventName for every XML attribute that contains it
-            // (event "symbol", template ref, message ref, $(string.Event.*)).
-            // Symbols/keywords/level refs use already-validated identifier
-            // tokens, but EventName is operator-controlled free-form text
-            // from the schema — defense in depth requires escape.
-            //
             Status = MgpStringBuilderAppendFormat(Builder,
                 "                    <event\r\n"
                 "                        value=\"%u\"\r\n"
-                "                        symbol=\"%s_EVENT_",
+                "                        symbol=\"%s_EVENT_%s\"\r\n"
+                "                        level=\"%s\"\r\n"
+                "                        keywords=\"0x%016llX\"\r\n",
                 Event->EventId,
-                Generator->ProviderSymbol
+                Generator->ProviderSymbol,
+                Event->EventName,
+                LevelRef,
+                Event->Keywords
                 );
-
-            if (NT_SUCCESS(Status)) {
-                Status = MgpAppendXmlEscaped(Builder, Event->EventName);
-            }
-
-            if (NT_SUCCESS(Status)) {
-                Status = MgpStringBuilderAppendFormat(Builder,
-                    "\"\r\n"
-                    "                        level=\"%s\"\r\n"
-                    "                        keywords=\"0x%016llX\"\r\n",
-                    LevelRef,
-                    Event->Keywords
-                    );
-            }
         }
 
         if (!NT_SUCCESS(Status)) {
@@ -3724,17 +3433,10 @@ Routine Description:
         //
         if (Event->FieldCount > 0) {
             Status = MgpStringBuilderAppendFormat(Builder,
-                "                        template=\"%s",
-                MG_TEMPLATE_NAME_PREFIX
+                "                        template=\"%s%s\"\r\n",
+                MG_TEMPLATE_NAME_PREFIX,
+                Event->EventName
                 );
-
-            if (NT_SUCCESS(Status)) {
-                Status = MgpAppendXmlEscaped(Builder, Event->EventName);
-            }
-
-            if (NT_SUCCESS(Status)) {
-                Status = MgpStringBuilderAppend(Builder, "\"\r\n");
-            }
 
             if (!NT_SUCCESS(Status)) {
                 break;
@@ -3762,17 +3464,10 @@ Routine Description:
             }
         }
 
-        Status = MgpStringBuilderAppend(Builder,
-            "                        message=\"$(string.Event."
+        Status = MgpStringBuilderAppendFormat(Builder,
+            "                        message=\"$(string.Event.%s)\"/>\r\n",
+            Event->EventName
             );
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpAppendXmlEscaped(Builder, Event->EventName);
-        }
-
-        if (NT_SUCCESS(Status)) {
-            Status = MgpStringBuilderAppend(Builder, ")\"/>\r\n");
-        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -4029,17 +3724,10 @@ Routine Description:
 
             Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
 
-            Status = MgpStringBuilderAppend(Builder,
-                "                <string id=\"Event."
+            Status = MgpStringBuilderAppendFormat(Builder,
+                "                <string id=\"Event.%s\" value=\"",
+                Event->EventName
                 );
-
-            if (NT_SUCCESS(Status)) {
-                Status = MgpAppendXmlEscaped(Builder, Event->EventName);
-            }
-
-            if (NT_SUCCESS(Status)) {
-                Status = MgpStringBuilderAppend(Builder, "\" value=\"");
-            }
 
             if (NT_SUCCESS(Status)) {
                 PCSTR Desc = (Event->Description[0] != '\0') ? Event->Description : Event->EventName;
@@ -4191,26 +3879,6 @@ Routine Description:
          Entry = Entry->Flink) {
 
         Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, OrderedEntry);
-
-        //
-        // The event name is concatenated into a C preprocessor macro
-        // identifier ("#define %s_EVENT_%s ..."). If it is not a valid
-        // C identifier, emitting it would produce a header that fails
-        // to compile and silently ship broken telemetry. Emit a marked
-        // skip-comment instead so operators can diagnose at build time.
-        //
-        if (!MgpIsValidIdentifier(Event->EventName, ES_MAX_EVENT_NAME)) {
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "// SKIPPED: event id %u has non-identifier name (rejected by header generator)\r\n",
-                Event->EventId
-                );
-
-            if (!NT_SUCCESS(Status)) {
-                break;
-            }
-
-            continue;
-        }
 
         Status = MgpStringBuilderAppendFormat(Builder,
             "#define %s_EVENT_%s    %u\r\n",

@@ -1462,15 +1462,10 @@ Return Value:
                 InterlockedAdd64(&g_PcState.Stats.TotalScanTimeMs, DurationMs);
 
                 //
-                // Atomic max update using compare-exchange loop.
-                // Initial read uses InterlockedCompareExchange64 with
-                // (0,0) to guarantee a torn-free 8-byte load even on
-                // architectures that don't naturally make aligned
-                // 64-bit loads atomic (campaign rule).
+                // Atomic max update using compare-exchange loop
                 //
                 {
-                    LONG64 OldMax = InterlockedCompareExchange64(
-                        &g_PcState.Stats.MaxScanTimeMs, 0, 0);
+                    LONG64 OldMax = g_PcState.Stats.MaxScanTimeMs;
                     while (DurationMs > OldMax) {
                         LONG64 Prev = InterlockedCompareExchange64(
                             &g_PcState.Stats.MaxScanTimeMs,
@@ -2055,72 +2050,24 @@ Routine Description:
         return STATUS_SUCCESS;
     }
 
-    //
-    // SAFETY: PcpMatchWildcard requires null-terminated strings.
-    // UNICODE_STRING buffers are NOT guaranteed null-terminated.
-    // Build a bounded null-terminated stack/pool copy so detection
-    // is never silently no-op'd when the input lacks a terminator.
-    //
-    {
-        WCHAR StackBuffer[260];
-        PWCHAR HeapBuffer = NULL;
-        PWCHAR Terminated = NULL;
-        USHORT FileChars = (USHORT)(FileName->Length / sizeof(WCHAR));
-        SIZE_T BytesNeeded;
-        BOOLEAN BufferOwned = FALSE;
-
-        //
-        // Cap to the documented maximum path length to thwart
-        // attacker-controlled allocation amplification.
-        //
-        if (FileChars > (PC_MAX_PATH_LENGTH / sizeof(WCHAR))) {
-            ExReleasePushLockShared(&g_PcState.HoneypotLock);
-            KeLeaveCriticalRegion();
-            return STATUS_SUCCESS;
-        }
-
-        BytesNeeded = ((SIZE_T)FileChars + 1) * sizeof(WCHAR);
-
-        if (BytesNeeded <= sizeof(StackBuffer)) {
-            Terminated = StackBuffer;
-        } else {
-            HeapBuffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-                NonPagedPoolNx,
-                BytesNeeded,
-                PC_POOL_TAG
-                );
-            if (HeapBuffer == NULL) {
-                ExReleasePushLockShared(&g_PcState.HoneypotLock);
-                KeLeaveCriticalRegion();
-                //
-                // Fail-closed on allocation failure: do not silently
-                // disable honeypot detection. Caller treats error as
-                // "not a honeypot" which keeps file flow live, but
-                // the surface is reported via NTSTATUS.
-                //
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            Terminated = HeapBuffer;
-            BufferOwned = TRUE;
-        }
-
-        if (FileChars > 0) {
-            RtlCopyMemory(Terminated, FileName->Buffer, FileChars * sizeof(WCHAR));
-        }
-        Terminated[FileChars] = L'\0';
-
-        for (i = 0; i < PatternCount && i < PC_MAX_HONEYPOT_PATTERNS; i++) {
-            if (g_PcState.Honeypot.Patterns[i].Buffer != NULL &&
-                g_PcState.Honeypot.Patterns[i].Length > 0) {
-                if (PcpMatchWildcard(Terminated, g_PcState.Honeypot.Patterns[i].Buffer)) {
+    for (i = 0; i < PatternCount && i < PC_MAX_HONEYPOT_PATTERNS; i++) {
+        if (g_PcState.Honeypot.Patterns[i].Buffer != NULL &&
+            g_PcState.Honeypot.Patterns[i].Length > 0) {
+            //
+            // SAFETY: PcpMatchWildcard requires null-terminated strings.
+            // UNICODE_STRING buffers are NOT guaranteed null-terminated.
+            // FltGetFileNameInformation typically null-terminates, but
+            // verify defensively: if MaximumLength > Length, the byte
+            // at Length position should be a null terminator.
+            //
+            USHORT CharPos = FileName->Length / sizeof(WCHAR);
+            if (FileName->MaximumLength > FileName->Length &&
+                FileName->Buffer[CharPos] == L'\0') {
+                if (PcpMatchWildcard(FileName->Buffer, g_PcState.Honeypot.Patterns[i].Buffer)) {
                     *IsHoneypot = TRUE;
                     break;
                 }
             }
-        }
-
-        if (BufferOwned && HeapBuffer != NULL) {
-            ShadowStrikeFreePoolWithTag(HeapBuffer, PC_POOL_TAG);
         }
     }
 
@@ -2366,28 +2313,14 @@ NTSTATUS
 PcGetStatistics(
     _Out_ PPC_STATISTICS Stats
     )
-/*++
-Routine Description:
-    Returns a torn-free snapshot of PreCreate statistics.
-
-    CRITICAL: A naive RtlCopyMemory of the stats block races with
-    InterlockedIncrement64/Add64 calls used by the hot callback path
-    and can produce torn LONG64 reads on the LONG64 fields. We acquire
-    StatsLock (the same lock used by PcResetStatistics) to obtain an
-    atomic snapshot consistent with the writers' barrier semantics.
-
-    Performance: this is a low-frequency telemetry/admin call.
---*/
 {
-    KIRQL OldIrql;
+    PAGED_CODE();
 
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeAcquireSpinLock(&g_PcState.StatsLock, &OldIrql);
     RtlCopyMemory(Stats, &g_PcState.Stats, sizeof(PC_STATISTICS));
-    KeReleaseSpinLock(&g_PcState.StatsLock, OldIrql);
 
     return STATUS_SUCCESS;
 }

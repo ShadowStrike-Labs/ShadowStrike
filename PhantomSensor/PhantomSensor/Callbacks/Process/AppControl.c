@@ -296,15 +296,6 @@ AcShutdown(VOID)
     ExDeleteNPagedLookasideList(&g_AcState.HashRuleLookaside);
     ExDeleteNPagedLookasideList(&g_AcState.PathRuleLookaside);
 
-    //
-    // Reset state to UNINITIALIZED so a subsequent AcInitialize() can succeed
-    // (e.g., driver re-load on the same boot). Counters are already zeroed
-    // by AcInitialize on the next entry path.
-    //
-    g_AcState.HashRuleCount = 0;
-    g_AcState.PathRuleCount = 0;
-    InterlockedExchange(&g_AcState.State, 0);
-
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/AC] Shutdown complete. "
                "Checked=%lld, Blocked=%lld, Audited=%lld\n",
@@ -332,18 +323,6 @@ AcCheckProcessExecution(
 
     PAGED_CODE();
     UNREFERENCED_PARAMETER(ParentProcessId);
-
-    //
-    // Validate caller-supplied UNICODE_STRING. ProcessNotify is the primary
-    // caller and Windows guarantees a non-NULL Buffer for image-file-name on
-    // create, but defense-in-depth NULL/zero-length checks prevent BSOD if
-    // the kernel callback contract changes or a different caller is added.
-    //
-    if (ImageFileName == NULL ||
-        ImageFileName->Buffer == NULL ||
-        ImageFileName->Length == 0) {
-        return AcVerdict_Allow;
-    }
 
     if (!AcpEnterOperation()) {
         return AcVerdict_Allow;
@@ -417,14 +396,6 @@ AcCheckProcessExecution(
             }
             InterlockedIncrement64(&g_AcState.Stats.RulesLearned);
             break;
-        default:
-            //
-            // Fail closed on corrupted policy mode value: treat as Enforce.
-            // PolicyMode is volatile and may be set via IOCTL; an unexpected
-            // value must never silently degrade enforcement.
-            //
-            Verdict = AcVerdict_Block;
-            break;
         }
     }
 
@@ -490,12 +461,6 @@ AcCheckImageLoad(
 
     PAGED_CODE();
 
-    if (ImageFileName == NULL ||
-        ImageFileName->Buffer == NULL ||
-        ImageFileName->Length == 0) {
-        return AcVerdict_Allow;
-    }
-
     if (!AcpEnterOperation()) {
         return AcVerdict_Allow;
     }
@@ -543,20 +508,6 @@ AcGetStatistics(
     _Out_ PAC_STATISTICS Statistics
     )
 {
-    if (Statistics == NULL) {
-        return;
-    }
-
-    //
-    // Always zero output first so callers see a defined snapshot if the
-    // module is not READY (e.g., shutdown raced with stats query).
-    //
-    RtlZeroMemory(Statistics, sizeof(AC_STATISTICS));
-
-    if (ReadAcquire(&g_AcState.State) != 2) {
-        return;
-    }
-
     Statistics->ExecutionsChecked = ReadNoFence64(&g_AcState.Stats.ExecutionsChecked);
     Statistics->ExecutionsAllowed = ReadNoFence64(&g_AcState.Stats.ExecutionsAllowed);
     Statistics->ExecutionsBlocked = ReadNoFence64(&g_AcState.Stats.ExecutionsBlocked);
@@ -800,22 +751,38 @@ AcpLearnHashRule(
     PAC_HASH_RULE NewRule;
     LIST_ENTRY *ListEntry;
     ULONG WalkCount = 0;
-    BOOLEAN Duplicate = FALSE;
 
     PAGED_CODE();
 
     //
-    // Cap total hash rules to prevent unbounded growth during learning.
-    // Re-checked under exclusive lock below to close the TOCTOU window.
+    // Cap total hash rules to prevent unbounded growth during learning
     //
-    if ((ULONG)ReadNoFence(&g_AcState.HashRuleCount) >= AC_MAX_HASH_RULES) {
+    if ((ULONG)g_AcState.HashRuleCount >= AC_MAX_HASH_RULES) {
         return;
     }
 
     Bucket = AcpHashBucketIndex(Hash);
 
     //
-    // Allocate first to keep critical section short.
+    // Check if hash already exists (avoid duplicates)
+    //
+    FltAcquirePushLockShared(&g_AcState.HashBuckets[Bucket].Lock);
+    for (ListEntry = g_AcState.HashBuckets[Bucket].Head.Flink;
+         ListEntry != &g_AcState.HashBuckets[Bucket].Head &&
+         WalkCount < AC_MAX_BUCKET_WALK;
+         ListEntry = ListEntry->Flink, WalkCount++) {
+
+        PAC_HASH_RULE Existing = CONTAINING_RECORD(
+            ListEntry, AC_HASH_RULE, Link);
+        if (RtlCompareMemory(Existing->Hash, Hash, AC_HASH_SIZE) == AC_HASH_SIZE) {
+            FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
+            return;  // Already known
+        }
+    }
+    FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
+
+    //
+    // Allocate and insert new allow rule
     //
     NewRule = (PAC_HASH_RULE)ExAllocateFromNPagedLookasideList(
         &g_AcState.HashRuleLookaside);
@@ -826,50 +793,12 @@ AcpLearnHashRule(
     RtlZeroMemory(NewRule, sizeof(AC_HASH_RULE));
     NewRule->RuleType = AcRule_HashAllow;
     RtlCopyMemory(NewRule->Hash, Hash, AC_HASH_SIZE);
+    NewRule->RuleId = (ULONG)InterlockedIncrement(&g_AcState.HashRuleCount);
     KeQuerySystemTimePrecise(&NewRule->CreatedTime);
 
-    //
-    // Atomically dedupe-and-insert under exclusive bucket lock to eliminate
-    // the previous TOCTOU between shared-lookup and exclusive-insert that
-    // admitted duplicate rules and could exceed AC_MAX_HASH_RULES under
-    // concurrent learns.
-    //
     FltAcquirePushLockExclusive(&g_AcState.HashBuckets[Bucket].Lock);
-
-    for (ListEntry = g_AcState.HashBuckets[Bucket].Head.Flink;
-         ListEntry != &g_AcState.HashBuckets[Bucket].Head &&
-         WalkCount < AC_MAX_BUCKET_WALK;
-         ListEntry = ListEntry->Flink, WalkCount++) {
-
-        PAC_HASH_RULE Existing = CONTAINING_RECORD(
-            ListEntry, AC_HASH_RULE, Link);
-        if (RtlCompareMemory(Existing->Hash, Hash, AC_HASH_SIZE) == AC_HASH_SIZE) {
-            Duplicate = TRUE;
-            break;
-        }
-    }
-
-    if (!Duplicate) {
-        //
-        // Re-validate global cap atomically: if reservation would overflow
-        // the cap, reject without inserting.
-        //
-        LONG Prev = InterlockedIncrement(&g_AcState.HashRuleCount);
-        if ((ULONG)Prev > AC_MAX_HASH_RULES) {
-            InterlockedDecrement(&g_AcState.HashRuleCount);
-            Duplicate = TRUE; // reuse cleanup path
-        } else {
-            NewRule->RuleId = (ULONG)Prev;
-            InsertTailList(&g_AcState.HashBuckets[Bucket].Head, &NewRule->Link);
-        }
-    }
-
+    InsertTailList(&g_AcState.HashBuckets[Bucket].Head, &NewRule->Link);
     FltReleasePushLock(&g_AcState.HashBuckets[Bucket].Lock);
-
-    if (Duplicate) {
-        ExFreeToNPagedLookasideList(&g_AcState.HashRuleLookaside, NewRule);
-        return;
-    }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike/AC] LEARNED: Added hash-allow rule #%lu (bucket=%lu)\n",

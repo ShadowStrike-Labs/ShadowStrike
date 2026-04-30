@@ -50,7 +50,6 @@ typedef struct _BDV_DRIVER_INFO {
     // Signature
     BOOLEAN IsSigned;
     BOOLEAN IsWhqlSigned;
-    BOOLEAN IsMicrosoftSigned;          // Microsoft (Windows/Code Signing/Corporation) publisher detected
     UNICODE_STRING SignerName;
     UCHAR ThumbPrint[20];               // SHA-1 of signing cert
     

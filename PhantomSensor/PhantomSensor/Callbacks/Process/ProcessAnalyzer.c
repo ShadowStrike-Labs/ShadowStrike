@@ -304,7 +304,6 @@ typedef struct _PA_ANALYZER_INTERNAL {
     LIST_ENTRY AnalysisList;
     EX_PUSH_LOCK ListLock;
     volatile LONG AnalysisCount;
-    volatile LONG CachedCount;
 
     //
     // Analysis cache hash table
@@ -890,8 +889,6 @@ PaShutdown(
         KeLeaveCriticalRegion();
     }
 
-    Internal->CachedCount = 0;
-
     //
     // Clear main list (don't free from here - already collected via hash buckets)
     //
@@ -1282,7 +1279,7 @@ PaInvalidateProcess(
     ULONG Hash;
     PLIST_ENTRY Entry, Next;
     PPA_ANALYSIS_INTERNAL Analysis;
-    LIST_ENTRY ToFreeList;
+    PPA_ANALYSIS_INTERNAL ToFree = NULL;
 
     PAGED_CODE();
 
@@ -1292,14 +1289,8 @@ PaInvalidateProcess(
 
     Hash = PapHashProcessId(ProcessId);
 
-    InitializeListHead(&ToFreeList);
-
     //
-    // Drain ALL cached entries for this PID under the bucket exclusive
-    // lock. Multiple entries can legitimately coexist for the same PID
-    // value when the process is recycled, so the previous single-match
-    // implementation could leave stale entries behind for callers that
-    // subsequently see ProcessId reuse.
+    // Find and remove from hash bucket
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Internal->HashBuckets[Hash].Lock);
@@ -1313,15 +1304,11 @@ PaInvalidateProcess(
 
         if (Analysis->Public.ProcessId == ProcessId) {
             RemoveEntryList(&Analysis->HashEntry);
+            InitializeListHead(&Analysis->HashEntry);
             InterlockedDecrement(&Internal->HashBuckets[Hash].Count);
-            InterlockedDecrement(&Internal->CachedCount);
             Analysis->InCache = FALSE;
-
-            //
-            // Reuse HashEntry as scratch linkage on the deferred-free
-            // list. Safe because Analysis->InCache is now FALSE.
-            //
-            InsertTailList(&ToFreeList, &Analysis->HashEntry);
+            ToFree = Analysis;
+            break;
         }
     }
 
@@ -1329,24 +1316,20 @@ PaInvalidateProcess(
     KeLeaveCriticalRegion();
 
     //
-    // Drop list-membership refs outside the hash lock.
+    // Remove from main list and dereference outside the hash lock
     //
-    while (!IsListEmpty(&ToFreeList)) {
-        Entry = RemoveHeadList(&ToFreeList);
-        Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
-        InitializeListHead(&Analysis->HashEntry);
-
+    if (ToFree != NULL) {
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Internal->ListLock);
-        if (!IsListEmpty(&Analysis->ListEntry)) {
-            RemoveEntryList(&Analysis->ListEntry);
-            InitializeListHead(&Analysis->ListEntry);
+        if (!IsListEmpty(&ToFree->ListEntry)) {
+            RemoveEntryList(&ToFree->ListEntry);
+            InitializeListHead(&ToFree->ListEntry);
             InterlockedDecrement(&Internal->AnalysisCount);
         }
         ExReleasePushLockExclusive(&Internal->ListLock);
         KeLeaveCriticalRegion();
 
-        PapDereferenceAnalysis(Internal, Analysis);
+        PapDereferenceAnalysis(Internal, ToFree);
     }
 }
 
@@ -1503,7 +1486,6 @@ PapDereferenceAnalysis(
                 RemoveEntryList(&Analysis->HashEntry);
                 InitializeListHead(&Analysis->HashEntry);
                 InterlockedDecrement(&Analyzer->HashBuckets[Hash].Count);
-                InterlockedDecrement(&Analyzer->CachedCount);
                 Analysis->InCache = FALSE;
             }
             ExReleasePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
@@ -1586,85 +1568,18 @@ PapInsertCachedAnalysis(
     _In_ PPA_ANALYZER_INTERNAL Analyzer,
     _In_ PPA_ANALYSIS_INTERNAL Analysis
     )
-/*++
-Routine Description:
-    Atomically caches an analysis under the strict invariants:
-      (a) the cache never exceeds Config.MaxCachedAnalyses entries; and
-      (b) at most one cached entry exists per (ProcessId, CreationTime)
-          tuple so that PapLookupCachedAnalysis is not racey against
-          concurrent inserters.
-
-    The previous implementation read AnalysisCount (the total live
-    analysis count, including outstanding caller refs) for the quota
-    check, which both (i) over-bounded the cache against unrelated
-    in-flight analyses and (ii) was racy: two threads could each see the
-    count below the cap and both insert. It also performed no dedup,
-    allowing duplicate cache entries when two threads raced through
-    PaAnalyzeProcess for the same PID.
-
-Return Value:
-    STATUS_SUCCESS                  Inserted; cache now holds an extra ref.
-    STATUS_QUOTA_EXCEEDED           Cache full.
-    STATUS_OBJECT_NAME_COLLISION    Equivalent entry already cached;
-                                    caller's Analysis is unchanged and
-                                    still owned by the caller.
---*/
 {
     ULONG Hash;
-    PLIST_ENTRY Entry;
-    PPA_ANALYSIS_INTERNAL Existing;
-    LONG Snapshot;
 
     //
-    // Reserve a cache slot atomically. Snapshot-and-CAS pattern: the
-    // published count never crosses the configured cap.
+    // Check quota
     //
-    for (;;) {
-        Snapshot = ReadAcquire(&Analyzer->CachedCount);
-        if ((ULONG)Snapshot >= Analyzer->Config.MaxCachedAnalyses) {
-            return STATUS_QUOTA_EXCEEDED;
-        }
-        if (InterlockedCompareExchange(
-                &Analyzer->CachedCount,
-                Snapshot + 1,
-                Snapshot) == Snapshot) {
-            break;
-        }
+    if ((ULONG)Analyzer->AnalysisCount >= Analyzer->Config.MaxCachedAnalyses) {
+        return STATUS_QUOTA_EXCEEDED;
     }
 
     Hash = PapHashProcessId(Analysis->Public.ProcessId);
     Analysis->HashBucket = Hash;
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
-
-    //
-    // Authoritative duplicate check under the bucket exclusive lock.
-    // PaAnalyzeProcess performs an unsynchronized PapLookupCachedAnalysis
-    // before allocating; without this re-check, two threads racing on
-    // the same (PID, CreationTime) would both publish entries.
-    //
-    for (Entry = Analyzer->HashBuckets[Hash].AnalysisList.Flink;
-         Entry != &Analyzer->HashBuckets[Hash].AnalysisList;
-         Entry = Entry->Flink) {
-
-        Existing = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
-
-        if (Existing->Public.ProcessId == Analysis->Public.ProcessId &&
-            Existing->ProcessCreationTime.QuadPart ==
-                Analysis->ProcessCreationTime.QuadPart) {
-
-            ExReleasePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
-            KeLeaveCriticalRegion();
-
-            //
-            // Roll back the reservation; caller retains exclusive
-            // ownership of Analysis.
-            //
-            InterlockedDecrement(&Analyzer->CachedCount);
-            return STATUS_OBJECT_NAME_COLLISION;
-        }
-    }
 
     //
     // Take a reference for cache membership.
@@ -1672,6 +1587,9 @@ Return Value:
     // This prevents UAF when caller calls PaFreeAnalysis while entry is cached.
     //
     PapReferenceAnalysis(Analysis);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
 
     InsertTailList(&Analyzer->HashBuckets[Hash].AnalysisList, &Analysis->HashEntry);
     InterlockedIncrement(&Analyzer->HashBuckets[Hash].Count);
@@ -1702,7 +1620,6 @@ PapRemoveCachedAnalysisLocked(
     RemoveEntryList(&Analysis->HashEntry);
     InitializeListHead(&Analysis->HashEntry);
     InterlockedDecrement(&Analyzer->HashBuckets[Hash].Count);
-    InterlockedDecrement(&Analyzer->CachedCount);
     Analysis->InCache = FALSE;
 }
 
@@ -1748,15 +1665,11 @@ PapCleanupStaleCache(
             //
             if ((CurrentTime.QuadPart - Analysis->AnalysisTime.QuadPart) > TimeoutTicks) {
                 //
-                // Only remove if refcount is 1 (only cache reference).
-                // Use InterlockedCompareExchange for an atomic read; a
-                // direct read of the volatile LONG is non-portable and
-                // could otherwise tear under aggressive optimization.
+                // Only remove if refcount is 1 (only cache reference)
                 //
-                if (InterlockedCompareExchange(&Analysis->RefCount, 0, 0) == 1) {
+                if (Analysis->RefCount == 1) {
                     RemoveEntryList(&Analysis->HashEntry);
                     InterlockedDecrement(&Analyzer->HashBuckets[i].Count);
-                    InterlockedDecrement(&Analyzer->CachedCount);
                     Analysis->InCache = FALSE;
 
                     //

@@ -669,17 +669,11 @@ MgSetOutputPaths(
  * @brief Set provider symbol name for header generation.
  *
  * The symbol name is used as prefix for generated constants and macros.
- * It is emitted verbatim into both XML "symbol" attributes and C
- * preprocessor identifiers, so it MUST match the C identifier grammar
- * [A-Za-z_][A-Za-z0-9_]* and fit within MG_MAX_PROVIDER_SYMBOL bytes
- * (terminator inclusive). Anything else is rejected.
  *
  * @param Generator         Generator instance
  * @param ProviderSymbol    Symbol name (e.g., "SHADOWSTRIKE")
  *
  * @return STATUS_SUCCESS on success
- * @return STATUS_INVALID_PARAMETER if ProviderSymbol is NULL or not a
- *         valid identifier within bounds
  *
  * @irql PASSIVE_LEVEL
  */
@@ -736,18 +730,11 @@ MgSetFlags(
  *
  * Channels organize events in Windows Event Viewer.
  *
- * Channel->Name must be non-empty. Channel->Symbol must be a valid
- * C identifier ([A-Za-z_][A-Za-z0-9_]*) NUL-terminated within
- * MG_MAX_CHANNEL_NAME bytes; the Symbol is embedded verbatim into XML
- * "symbol" attributes, $(string.Channel.*) message references, and the
- * generated C header. Any other input is rejected.
- *
  * @param Generator     Generator instance
  * @param Channel       Channel definition
  *
  * @return STATUS_SUCCESS on success
  * @return STATUS_DUPLICATE_NAME if channel already exists
- * @return STATUS_INVALID_PARAMETER if Name/Symbol fail validation
  *
  * @irql PASSIVE_LEVEL
  */
@@ -763,15 +750,10 @@ MgRegisterChannel(
  *
  * Tasks group related events (e.g., "FileOperations", "ProcessEvents").
  *
- * Task->Name must be non-empty. Task->Symbol must be a valid C
- * identifier within MG_MAX_TASK_NAME bytes (see MgRegisterChannel for
- * the rationale).
- *
  * @param Generator     Generator instance
  * @param Task          Task definition
  *
  * @return STATUS_SUCCESS on success
- * @return STATUS_INVALID_PARAMETER if Name/Symbol fail validation
  *
  * @irql PASSIVE_LEVEL
  */
@@ -787,15 +769,10 @@ MgRegisterTask(
  *
  * Keywords enable filtering of events by category.
  *
- * Keyword->Name must be non-empty. Keyword->Symbol must be a valid C
- * identifier within MG_MAX_KEYWORD_NAME bytes (see MgRegisterChannel
- * for the rationale).
- *
  * @param Generator     Generator instance
  * @param Keyword       Keyword definition
  *
  * @return STATUS_SUCCESS on success
- * @return STATUS_INVALID_PARAMETER if Name/Symbol fail validation
  *
  * @irql PASSIVE_LEVEL
  */
@@ -811,15 +788,10 @@ MgRegisterKeyword(
  *
  * Opcodes indicate the operation type (start, stop, info, etc.).
  *
- * Opcode->Name must be non-empty. Opcode->Symbol must be a valid C
- * identifier within MG_MAX_OPCODE_NAME bytes (see MgRegisterChannel
- * for the rationale).
- *
  * @param Generator     Generator instance
  * @param Opcode        Opcode definition
  *
  * @return STATUS_SUCCESS on success
- * @return STATUS_INVALID_PARAMETER if Name/Symbol fail validation
  *
  * @irql PASSIVE_LEVEL
  */

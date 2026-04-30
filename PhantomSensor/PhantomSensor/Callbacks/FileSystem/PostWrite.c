@@ -809,25 +809,10 @@ ShadowStrikePostWrite(
         contextAcquired = TRUE;
 
         //
-        // Mark stream context as dirty - file has been modified.
+        // Mark stream context as dirty - file has been modified
         //
-        // CONCURRENCY: Dirty/Scanned are guarded by Context->Lock everywhere
-        // else in the stack (PocApplyCompletionContext, PocUpdateStreamContext,
-        // PocMarkFileModified, PocInvalidateScanResult). Writing them
-        // unlocked here lost updates against concurrent post-create paths
-        // and could publish a half-cleared Scanned flag while another
-        // thread was applying a fresh scan verdict, causing duplicate
-        // scans or stale "clean" verdicts to survive a write. Acquire
-        // exclusive for the BOOLEAN flips; the file-identity reads below
-        // are stable for the lifetime of the stream context and do not
-        // need the lock.
-        //
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&streamContext->Lock);
         streamContext->Dirty = TRUE;
         streamContext->Scanned = FALSE;  // Force re-scan
-        ExReleasePushLockExclusive(&streamContext->Lock);
-        KeLeaveCriticalRegion();
 
         //
         // Capture file identity for analysis
@@ -1019,15 +1004,9 @@ ShadowStrikePostWrite(
 
     //
     // Track per-process activity with proper synchronization.
-    // The activity pointer is into the global array — hold the lock
-    // EXCLUSIVE during the modify section to prevent both
-    // PwpCleanupProcessActivity from zeroing the entry concurrently
-    // (race between process termination and pending I/O) and
-    // concurrent post-write callers from racing on non-atomic fields
-    // (LastWriteTime / WindowStart LARGE_INTEGER, IsRateLimited,
-    // IsFlagged, TrackedFiles[] array, TrackedFileCount). Shared was
-    // incorrect: PwpUpdateProcessActivity and PwpTrackUniqueFile both
-    // perform unprotected struct mutations.
+    // The activity pointer is into the global array â€” hold the shared lock
+    // during access to prevent PwpCleanupProcessActivity from zeroing the
+    // entry concurrently (race between process termination and pending I/O).
     //
     processActivity = PwpGetOrCreateProcessActivity(writeContext.ProcessId);
     if (processActivity != NULL) {
@@ -1035,7 +1014,7 @@ ShadowStrikePostWrite(
         ULONG alertScore = 0;
 
         KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&g_PostWriteState.ActivityLock);
+        ExAcquirePushLockShared(&g_PostWriteState.ActivityLock);
 
         //
         // Re-validate: entry may have been cleaned up between
@@ -1073,7 +1052,7 @@ ShadowStrikePostWrite(
             }
         }
 
-        ExReleasePushLockExclusive(&g_PostWriteState.ActivityLock);
+        ExReleasePushLockShared(&g_PostWriteState.ActivityLock);
         KeLeaveCriticalRegion();
 
         //

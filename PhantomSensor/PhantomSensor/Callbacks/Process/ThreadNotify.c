@@ -2999,42 +2999,24 @@ TnRegisterCallback(
 
     //
     // Wait for old entry references to drain safely.
-    //
-    // Initial RefCount==1 represents the publisher's reference held while
-    // the entry is reachable through g_TnMonitor.CallbackEntry. Now that
-    // we have swapped it out under the exclusive lock, no new consumer can
-    // observe and acquire it; we drop the publisher reference here so the
-    // counter can reach zero once any in-flight consumers release theirs.
-    //
-    // On timeout we MUST NOT free the entry â€” a consumer that holds a live
-    // reference would then dereference freed pool. We log loudly and leak
-    // the entry instead. 5000 x 1ms = 5s is a generous bound; reaching it
-    // indicates a stuck callback (deadlock, deeply blocked I/O, or worse)
-    // that requires investigation. Leaking O(callback-entry) bytes is the
-    // safe choice over a confirmed UAF.
+    // Use KeDelayExecutionThread instead of YieldProcessor spin to avoid
+    // BSOD if the bounded spin exhausts â€” old approach freed memory
+    // while another thread could still reference it (use-after-free).
     //
     if (oldEntry != NULL) {
         LARGE_INTEGER delay;
         ULONG drainIterations = 0;
         delay.QuadPart = -10000;    // 1ms intervals
 
-        InterlockedDecrement(&oldEntry->RefCount);
-
-        while (InterlockedCompareExchange(&oldEntry->RefCount, 0, 0) > 0) {
+        while (oldEntry->RefCount > 0) {
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
             if (++drainIterations >= 5000) {    // 5s safety cap
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "[ShadowStrike] TnRegisterCallback: refcount drain timeout "
-                           "(refs=%ld) â€” leaking old entry %p to avoid UAF\n",
-                           ReadNoFence(&oldEntry->RefCount), oldEntry);
-                oldEntry = NULL;
+                           "[ShadowStrike] TnRegisterCallback: refcount drain timeout\n");
                 break;
             }
         }
-
-        if (oldEntry != NULL) {
-            ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
-        }
+        ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
 
     return STATUS_SUCCESS;
@@ -3062,31 +3044,22 @@ TnUnregisterCallback(
 
     if (oldEntry != NULL) {
         //
-        // See TnRegisterCallback for full rationale: drop the publisher
-        // reference so the counter can reach zero, drain consumer refs,
-        // and leak (NEVER free) on timeout to prevent UAF.
+        // Wait for references to drain safely.
+        // Must not free while another thread holds a reference.
         //
         LARGE_INTEGER delay;
         ULONG drainIterations = 0;
         delay.QuadPart = -10000;    // 1ms intervals
 
-        InterlockedDecrement(&oldEntry->RefCount);
-
-        while (InterlockedCompareExchange(&oldEntry->RefCount, 0, 0) > 0) {
+        while (oldEntry->RefCount > 0) {
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
             if (++drainIterations >= 5000) {    // 5s safety cap
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "[ShadowStrike] TnUnregisterCallback: refcount drain timeout "
-                           "(refs=%ld) â€” leaking old entry %p to avoid UAF\n",
-                           ReadNoFence(&oldEntry->RefCount), oldEntry);
-                oldEntry = NULL;
+                           "[ShadowStrike] TnUnregisterCallback: refcount drain timeout\n");
                 break;
             }
         }
-
-        if (oldEntry != NULL) {
-            ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
-        }
+        ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
     }
 }
 

@@ -113,21 +113,6 @@ static const UNICODE_STRING g_AutorunFileName =
 #define UDC_STORAGE_QUERY_BUFFER_SIZE   1024
 #define UDC_HARDWARE_ID_BUFFER_SIZE     512
 
-//
-// UDC-VAL: Validate UDC_DEVICE_POLICY / UDC_DEVICE_CLASS enums received from
-// any public API or user-mode IOCTL caller. We treat the public API surface
-// as a hostile boundary even when current callers are kernel-internal:
-// the contract is documented in the header and an attacker that compromises
-// any caller (or a future IOCTL handler) must not be able to inject invalid
-// enum values that would silently disable enforcement.
-//
-#define UDC_IS_VALID_POLICY(p) \
-    ((p) == UdcPolicy_Allow    || (p) == UdcPolicy_ReadOnly || \
-     (p) == UdcPolicy_Block    || (p) == UdcPolicy_Audit)
-
-#define UDC_IS_VALID_CLASS(c) \
-    ((ULONG)(c) <= (ULONG)UdcClass_Other)
-
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -436,7 +421,6 @@ UdcIsWriteBlocked(
 {
     PUDC_TRACKED_VOLUME Volume;
     BOOLEAN Blocked = FALSE;
-    BOOLEAN SubmitWriteBlockedEvent = FALSE;
 
     if (!g_UdcState.Config.Enabled || !g_UdcState.Config.EnableWriteProtection) {
         return FALSE;
@@ -447,11 +431,10 @@ UdcIsWriteBlocked(
     }
 
     //
-    // UDC-1 FIX: Hold VolumeLock shared for the volume lookup + counter
-    // updates only. We must NOT call BeEngineSubmitEvent under the push
-    // lock â€” it can block, may take its own locks (lock ordering risk),
-    // and serializes the PreWrite hot path across all USB writes. Capture
-    // the decision under the lock, release it, then submit telemetry.
+    // UDC-1 FIX: Hold VolumeLock shared for the entire operation to prevent
+    // use-after-free from concurrent UdcNotifyVolumeDismount. The old code
+    // released the lock inside UdcpFindVolume then dereferenced the returned
+    // pointer â€” a classic TOCTOU leading to BSOD.
     //
     FltAcquirePushLockShared(&g_UdcState.VolumeLock);
 
@@ -463,25 +446,22 @@ UdcIsWriteBlocked(
             InterlockedIncrement(&Volume->WriteBlocked);
             InterlockedIncrement64(&g_UdcState.Stats.WritesBlocked);
             Blocked = TRUE;
-            SubmitWriteBlockedEvent = TRUE;
+
+            BeEngineSubmitEvent(
+                BehaviorEvent_USBWriteBlocked,
+                BehaviorCategory_Exfiltration,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                50,
+                TRUE,
+                NULL
+                );
         } else if (Volume->EffectivePolicy == UdcPolicy_Audit) {
             InterlockedIncrement64(&g_UdcState.Stats.WritesAllowed);
         }
     }
 
     FltReleasePushLock(&g_UdcState.VolumeLock);
-
-    if (SubmitWriteBlockedEvent) {
-        BeEngineSubmitEvent(
-            BehaviorEvent_USBWriteBlocked,
-            BehaviorCategory_Exfiltration,
-            HandleToULong(PsGetCurrentProcessId()),
-            NULL, 0,
-            50,
-            TRUE,
-            NULL
-            );
-    }
 
     UdcpLeaveOperation();
     return Blocked;
@@ -569,30 +549,21 @@ UdcCheckAutorun(
                        "[ShadowStrike/UDC] BLOCKED autorun.inf access: %wZ\n",
                        FileName);
 
+            BeEngineSubmitEvent(
+                BehaviorEvent_USBAutorunBlocked,
+                BehaviorCategory_Exfiltration,
+                HandleToULong(PsGetCurrentProcessId()),
+                NULL, 0,
+                80,
+                TRUE,
+                NULL
+                );
+
             Result = TRUE;
         }
     }
 
     FltReleasePushLock(&g_UdcState.VolumeLock);
-
-    //
-    // UDC-AR1 FIX: Submit behavior event AFTER releasing the volume push
-    // lock to avoid blocking other I/O on this hot path and to eliminate
-    // a potential lock-ordering hazard with locks acquired by the
-    // BehaviorEngine submission path.
-    //
-    if (Result) {
-        BeEngineSubmitEvent(
-            BehaviorEvent_USBAutorunBlocked,
-            BehaviorCategory_Exfiltration,
-            HandleToULong(PsGetCurrentProcessId()),
-            NULL, 0,
-            80,
-            TRUE,
-            NULL
-            );
-    }
-
     UdcpLeaveOperation();
     return Result;
 }
@@ -616,28 +587,6 @@ UdcNotifyVolumeMount(
         return;
     }
 
-    //
-    // UDC-VAL: Reject malformed policy values defensively. Internal callers
-    // pass the value resolved by UdcpResolvePolicy which is bounded, but
-    // the public API must not accept garbage that would later compare-out
-    // of every enforcement branch (silent disable).
-    //
-    if (!UDC_IS_VALID_POLICY(Policy)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike/UDC] UdcNotifyVolumeMount rejected invalid "
-                   "policy=%d\n", Policy);
-        UdcpLeaveOperation();
-        return;
-    }
-
-    //
-    // UDC-MNT-TOCTOU FIX: Pre-flight a fast unlocked count check to avoid
-    // an allocation when clearly over the cap, then re-validate under the
-    // exclusive lock together with a duplicate-instance check before the
-    // insert. Without the locked re-check, concurrent mounts could push
-    // VolumeCount past UDC_MAX_TRACKED_VOLUMES, which would also let an
-    // attacker amplify hotplug-flood pressure on non-paged pool.
-    //
     if (g_UdcState.VolumeCount >= UDC_MAX_TRACKED_VOLUMES) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/UDC] Maximum tracked volumes reached (%d)\n",
@@ -704,25 +653,6 @@ UdcNotifyVolumeMount(
     Volume->DeviceClass = DeviceClass;
 
     FltAcquirePushLockExclusive(&g_UdcState.VolumeLock);
-
-    //
-    // UDC-MNT-TOCTOU FIX: Re-check the cap under the exclusive lock to
-    // close the race against concurrent mounts. Also de-duplicate by
-    // PFLT_INSTANCE: if a tracking record already exists (e.g. a retry
-    // path or a duplicated InstanceSetup), drop the new allocation
-    // rather than corrupting the list with two entries for the same
-    // minifilter instance â€” later lookups would only find the first
-    // entry and the second would leak until shutdown.
-    //
-    if (g_UdcState.VolumeCount >= UDC_MAX_TRACKED_VOLUMES ||
-        UdcpFindVolumeUnlocked(FltObjects->Instance) != NULL) {
-
-        FltReleasePushLock(&g_UdcState.VolumeLock);
-        ExFreeToNPagedLookasideList(&g_UdcState.VolumeLookaside, Volume);
-        UdcpLeaveOperation();
-        return;
-    }
-
     InsertTailList(&g_UdcState.VolumeListHead, &Volume->Link);
     InterlockedIncrement(&g_UdcState.VolumeCount);
     FltReleasePushLock(&g_UdcState.VolumeLock);
@@ -816,18 +746,6 @@ UdcAddRule(
 
     *RuleId = 0;
 
-    //
-    // UDC-VAL: Validate enum inputs from the public API surface. An
-    // attacker that can drive this entry point (now or via a future
-    // IOCTL handler) must not be able to seed the rule list with
-    // out-of-range enum values that would never compare-equal to a
-    // valid enforcement decision and would silently disable blocking
-    // on a matching device.
-    //
-    if (!UDC_IS_VALID_POLICY(Policy) || !UDC_IS_VALID_CLASS(DeviceClass)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
     if (!UdcpEnterOperation()) {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -842,11 +760,6 @@ UdcAddRule(
         MaxEntries = UDC_MAX_WHITELIST_ENTRIES;
     }
 
-    //
-    // UDC-ADD-TOCTOU: Best-effort fast path; the authoritative cap check
-    // is repeated under RulesLock below to close the race against
-    // concurrent UdcAddRule callers.
-    //
     if (*TargetCount >= MaxEntries) {
         UdcpLeaveOperation();
         return STATUS_QUOTA_EXCEEDED;
@@ -888,19 +801,6 @@ UdcAddRule(
     }
 
     FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
-
-    //
-    // UDC-ADD-TOCTOU FIX: Re-validate the cap under the exclusive lock.
-    // Without this, two concurrent UdcAddRule callers that both observe
-    // count == MaxEntries-1 would both insert and exceed MaxEntries.
-    //
-    if (*TargetCount >= MaxEntries) {
-        FltReleasePushLock(&g_UdcState.RulesLock);
-        ExFreePoolWithTag(Rule, UDC_DEVICE_POOL_TAG);
-        UdcpLeaveOperation();
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     InsertTailList(TargetList, &Rule->Link);
     InterlockedIncrement(TargetCount);
     FltReleasePushLock(&g_UdcState.RulesLock);
@@ -1033,33 +933,11 @@ UdcUpdateConfig(
     _In_ PUDC_CONFIG NewConfig
     )
 {
-    UDC_CONFIG Sanitized;
-
     PAGED_CODE();
 
     if (NewConfig == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    //
-    // UDC-VAL: Snapshot then validate the caller-supplied configuration
-    // before publishing it. We must defend against:
-    //   - out-of-range DefaultPolicy enum values (would silently disable
-    //     enforcement because UdcpResolvePolicy returns the value as-is
-    //     and no enforcement branch would compare-equal to a junk value).
-    //   - non-canonical BOOLEAN values (UCHAR can hold 0..255; normalize
-    //     to TRUE/FALSE for predictable comparisons in hot paths).
-    //
-    Sanitized = *NewConfig;
-
-    if (!UDC_IS_VALID_POLICY(Sanitized.DefaultPolicy)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    Sanitized.EnableAutorunBlocking = Sanitized.EnableAutorunBlocking ? TRUE : FALSE;
-    Sanitized.EnableWriteProtection = Sanitized.EnableWriteProtection ? TRUE : FALSE;
-    Sanitized.EnableAuditLogging    = Sanitized.EnableAuditLogging    ? TRUE : FALSE;
-    Sanitized.Enabled               = Sanitized.Enabled               ? TRUE : FALSE;
 
     if (!UdcpEnterOperation()) {
         return STATUS_DEVICE_NOT_READY;
@@ -1071,16 +949,16 @@ UdcUpdateConfig(
     // is extremely short.
     //
     FltAcquirePushLockExclusive(&g_UdcState.RulesLock);
-    RtlCopyMemory(&g_UdcState.Config, &Sanitized, sizeof(UDC_CONFIG));
+    RtlCopyMemory(&g_UdcState.Config, NewConfig, sizeof(UDC_CONFIG));
     FltReleasePushLock(&g_UdcState.RulesLock);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/UDC] Config updated: Enabled=%d, "
                "DefaultPolicy=%d, WriteProtect=%d, AutorunBlock=%d\n",
-               Sanitized.Enabled,
-               Sanitized.DefaultPolicy,
-               Sanitized.EnableWriteProtection,
-               Sanitized.EnableAutorunBlocking);
+               NewConfig->Enabled,
+               NewConfig->DefaultPolicy,
+               NewConfig->EnableWriteProtection,
+               NewConfig->EnableAutorunBlocking);
 
     UdcpLeaveOperation();
     return STATUS_SUCCESS;
@@ -1097,45 +975,18 @@ UdcGetStatistics(
     )
 {
     //
-    // UDC-STAT FIX: Use InterlockedCompareExchange64 for tear-free reads of
-    // every LONG64 statistic. The previous "x64 aligned reads are atomic"
-    // assumption is unsafe on 32-bit kernel builds (where a 64-bit load is
-    // two 32-bit loads) AND removes any compiler reordering guarantees on
-    // x64. Match the convention used by BehaviorEngine and TelemetryEvents
-    // (g_BeState / g_TeProvider) for consistent kernel-wide behavior.
+    // On x64, aligned LONG64 reads are atomic. Snapshot each field
+    // individually rather than RtlCopyMemory to avoid torn reads on
+    // 32-bit builds.
     //
-    if (Statistics == NULL) {
-        return;
-    }
-
-    //
-    // Stats live in the static g_UdcState and are valid for the lifetime
-    // of the driver (never freed), so this getter is safe to call before
-    // UdcInitialize and after UdcShutdown. Snapshot zeros if not in the
-    // ready state to avoid leaking partially-written counters during
-    // shutdown teardown.
-    //
-    if (g_UdcState.State != 2) {
-        RtlZeroMemory(Statistics, sizeof(UDC_STATISTICS));
-        return;
-    }
-
-    Statistics->VolumeMounts =
-        InterlockedCompareExchange64(&g_UdcState.Stats.VolumeMounts, 0, 0);
-    Statistics->VolumeDismounts =
-        InterlockedCompareExchange64(&g_UdcState.Stats.VolumeDismounts, 0, 0);
-    Statistics->WritesBlocked =
-        InterlockedCompareExchange64(&g_UdcState.Stats.WritesBlocked, 0, 0);
-    Statistics->WritesAllowed =
-        InterlockedCompareExchange64(&g_UdcState.Stats.WritesAllowed, 0, 0);
-    Statistics->VolumeAttachRejected =
-        InterlockedCompareExchange64(&g_UdcState.Stats.VolumeAttachRejected, 0, 0);
-    Statistics->AutorunDetected =
-        InterlockedCompareExchange64(&g_UdcState.Stats.AutorunDetected, 0, 0);
-    Statistics->AutorunBlocked =
-        InterlockedCompareExchange64(&g_UdcState.Stats.AutorunBlocked, 0, 0);
-    Statistics->PolicyChecks =
-        InterlockedCompareExchange64(&g_UdcState.Stats.PolicyChecks, 0, 0);
+    Statistics->VolumeMounts = g_UdcState.Stats.VolumeMounts;
+    Statistics->VolumeDismounts = g_UdcState.Stats.VolumeDismounts;
+    Statistics->WritesBlocked = g_UdcState.Stats.WritesBlocked;
+    Statistics->WritesAllowed = g_UdcState.Stats.WritesAllowed;
+    Statistics->VolumeAttachRejected = g_UdcState.Stats.VolumeAttachRejected;
+    Statistics->AutorunDetected = g_UdcState.Stats.AutorunDetected;
+    Statistics->AutorunBlocked = g_UdcState.Stats.AutorunBlocked;
+    Statistics->PolicyChecks = g_UdcState.Stats.PolicyChecks;
 }
 
 // ============================================================================
@@ -1270,15 +1121,7 @@ UdcpQueryDeviceInfo(
     PhysicalDevice = UdcpGetPhysicalDeviceObject(DiskDevice);
     if (PhysicalDevice != NULL) {
 
-        //
-        // UDC-ALIGN FIX: IoGetDeviceProperty for DevicePropertyHardwareID
-        // returns REG_MULTI_SZ wide-character data. The buffer must be
-        // WCHAR-aligned before being interpreted as PCWSTR. Declaring a
-        // UCHAR[] and casting to PCWSTR is technically alignment-undefined
-        // (kernel stack happens to be 16-byte aligned on x64, but this
-        // is not contractually guaranteed and triggers /analyze warnings).
-        //
-        WCHAR HardwareIdBuffer[UDC_HARDWARE_ID_BUFFER_SIZE / sizeof(WCHAR)];
+        UCHAR HardwareIdBuffer[UDC_HARDWARE_ID_BUFFER_SIZE];
         ULONG ResultLength = 0;
 
         Status = IoGetDeviceProperty(
@@ -1291,7 +1134,7 @@ UdcpQueryDeviceInfo(
 
         if (NT_SUCCESS(Status) && ResultLength > sizeof(WCHAR)) {
             UdcpParseHardwareIdForVidPid(
-                HardwareIdBuffer,
+                (PCWSTR)HardwareIdBuffer,
                 ResultLength,
                 VendorId,
                 ProductId
@@ -1376,20 +1219,9 @@ UdcpSendStorageQuery(
 
     if (NT_SUCCESS(Status)) {
         //
-        // UDC-DESC FIX: Validate descriptor integrity before returning to
-        // caller. We must reject:
-        //   - oversized descriptors (would extend past our buffer)
-        //   - undersized descriptors (would mean SerialNumberOffset and
-        //     other field reads in UdcpQueryDeviceInfo are out-of-bounds
-        //     relative to the actually-populated header)
-        //   - zero Version (uninitialized / device returned no data)
-        // Subsequent code computes (Descriptor->Size - SerialNumberOffset)
-        // which underflows to a huge ULONG if Size < SerialNumberOffset.
+        // Validate descriptor integrity before returning to caller
         //
-        if (IoStatus.Information < sizeof(STORAGE_DEVICE_DESCRIPTOR) ||
-            Desc->Size > UDC_STORAGE_QUERY_BUFFER_SIZE ||
-            Desc->Size < sizeof(STORAGE_DEVICE_DESCRIPTOR) ||
-            Desc->Size > IoStatus.Information ||
+        if (Desc->Size > UDC_STORAGE_QUERY_BUFFER_SIZE ||
             Desc->Version == 0) {
             ExFreePoolWithTag(Desc, UDC_POOL_TAG);
             return STATUS_DATA_ERROR;

@@ -224,18 +224,10 @@ typedef struct _MM_HASH_BUCKET {
 //
 typedef struct _MM_MAPPER {
     //
-    // Initialization state.
+    // Initialization state
     //
-    // 'Initialized' is set in MmInitialize and cleared in MmShutdown.  Reads
-    // are performed via InterlockedCompareExchange8 to avoid torn reads on
-    // architectures where alignment-shifted 1-byte reads are non-atomic
-    // (e.g. some ARM64 sub-byte access patterns).  'ShuttingDown' is the
-    // primary kill-switch that races with the public API rundown gate below.
-    //
-    volatile BOOLEAN Initialized;
-    volatile BOOLEAN TechniquesLoaded;
-    volatile BOOLEAN ShuttingDown;
-    BOOLEAN Reserved0;                  // explicit alignment padding
+    BOOLEAN Initialized;
+    BOOLEAN TechniquesLoaded;
 
     //
     // Tactics (protected by TechniqueLock)
@@ -272,22 +264,6 @@ typedef struct _MM_MAPPER {
     // IRQL: Raises to DISPATCH_LEVEL
     //
     KSPIN_LOCK DetectionLock;
-
-    //
-    // Rundown / shutdown drain
-    //
-    // RefCount starts at 1 (the initial reference owned by MmInitialize).
-    // Every public API call attempts an atomic increment and re-checks
-    // ShuttingDown to defeat the gate-then-increment race against
-    // MmShutdown.  MmShutdown sets ShuttingDown atomically, drops the initial
-    // reference, then waits on RefZeroEvent for all in-flight callers to
-    // drain before freeing any module state.  Without this gate, a concurrent
-    // MmLookupTechnique / MmRecordDetection / MmGet* would dereference the
-    // push lock or spin lock that MmShutdown is about to free, causing a
-    // kernel UAF.
-    //
-    volatile LONG RefCount;
-    KEVENT RefZeroEvent;
 
     //
     // Statistics (atomically updated)

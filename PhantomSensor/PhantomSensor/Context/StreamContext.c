@@ -189,7 +189,6 @@ ShadowAcquireStreamContextShared(
 {
     KIRQL oldIrql;
     LONG state;
-    BOOLEAN runProtAcquired = FALSE;
 
     // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
@@ -198,35 +197,44 @@ ShadowAcquireStreamContextShared(
     }
 
     //
-    // Phase 1: Acquire lifetime lock, verify state, and atomically take
-    // a rundown reference while still under the lock. Cleanup also takes
-    // LifetimeLock to flip State -> TEARDOWN, so by the time we release
-    // it here either:
-    //   (a) State was ACTIVE and we own a rundown ref that must complete
-    //       before cleanup's ExWaitForRundownProtectionRelease returns, or
-    //   (b) State was not ACTIVE and we bail without a ref.
+    // Phase 1: Acquire lifetime lock and verify state
     //
     KeAcquireSpinLock(&Context->LifetimeLock, &oldIrql);
 
     state = Context->State;
 
-    if (state == SHADOW_CONTEXT_STATE_ACTIVE && Context->RundownInitialized) {
-        runProtAcquired = ExAcquireRundownProtection(&Context->Rundown);
-    }
-
-    KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
-
-    if (!runProtAcquired) {
+    if (state != SHADOW_CONTEXT_STATE_ACTIVE) {
+        //
+        // Context is not active (uninitialized, initializing, or teardown)
+        //
+        KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
         InterlockedIncrement(&g_StreamContextTelemetry.LockAcquisitionFailures);
         return FALSE;
     }
 
     //
-    // Phase 2: Now safe to acquire the Resource. Rundown protection
-    // guarantees ExDeleteResourceLite cannot run before our matching
-    // release in ShadowReleaseStreamContext.
+    // Phase 2: Enter critical region and acquire Resource while still holding
+    // LifetimeLock. This ensures cleanup cannot proceed until we have the Resource.
+    //
+    // Note: We're at DISPATCH_LEVEL due to spin lock, but KeEnterCriticalRegion
+    // is safe at any IRQL. ExAcquireResourceSharedLite requires <= APC_LEVEL,
+    // so we must release spin lock first, but only after entering critical region.
+    //
+    // CRITICAL: The sequence is:
+    // 1. KeEnterCriticalRegion (safe at DISPATCH)
+    // 2. Release spin lock (drops to PASSIVE)
+    // 3. Acquire Resource (requires PASSIVE/APC)
     //
     KeEnterCriticalRegion();
+    KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
+
+    //
+    // Now at PASSIVE_LEVEL, acquire the Resource
+    // State was ACTIVE when we checked, and cleanup cannot proceed because:
+    // - Cleanup acquires LifetimeLock to set State = TEARDOWN
+    // - Cleanup then waits for Resource to be free
+    // - We're about to acquire Resource, so cleanup will wait for us
+    //
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
 
     return TRUE;
@@ -244,7 +252,6 @@ ShadowAcquireStreamContextExclusive(
 {
     KIRQL oldIrql;
     LONG state;
-    BOOLEAN runProtAcquired = FALSE;
 
     // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
 
@@ -253,28 +260,24 @@ ShadowAcquireStreamContextExclusive(
     }
 
     //
-    // Phase 1: Atomic state check + rundown reference acquisition under
-    // LifetimeLock — see shared-acquire commentary for rationale.
+    // Phase 1: Acquire lifetime lock and verify state
     //
     KeAcquireSpinLock(&Context->LifetimeLock, &oldIrql);
 
     state = Context->State;
 
-    if (state == SHADOW_CONTEXT_STATE_ACTIVE && Context->RundownInitialized) {
-        runProtAcquired = ExAcquireRundownProtection(&Context->Rundown);
-    }
-
-    KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
-
-    if (!runProtAcquired) {
+    if (state != SHADOW_CONTEXT_STATE_ACTIVE) {
+        KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
         InterlockedIncrement(&g_StreamContextTelemetry.LockAcquisitionFailures);
         return FALSE;
     }
 
     //
-    // Phase 2: Acquire ERESOURCE exclusive
+    // Phase 2: Enter critical region, release spin lock, acquire Resource
     //
     KeEnterCriticalRegion();
+    KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
+
     ExAcquireResourceExclusiveLite(&Context->Resource, TRUE);
 
     return TRUE;
@@ -302,14 +305,6 @@ ShadowReleaseStreamContext(
 
     ExReleaseResourceLite(&Context->Resource);
     KeLeaveCriticalRegion();
-
-    //
-    // Drop the rundown reference taken in the matching acquire. Once
-    // every in-flight acquirer has dropped its reference, a cleanup
-    // that has flipped State to TEARDOWN can proceed past
-    // ExWaitForRundownProtectionRelease and safely delete the resource.
-    //
-    ExReleaseRundownProtection(&Context->Rundown);
 }
 
 // ============================================================================
@@ -508,6 +503,7 @@ ShadowCleanupStreamContext(
     PSHADOW_STREAM_CONTEXT ctx = (PSHADOW_STREAM_CONTEXT)Context;
     KIRQL oldIrql;
     LONG previousState;
+    ULONG waitCount = 0;
     USHORT fileNameLength = 0;
 
     // No PAGED_CODE() — acquires spinlock (DISPATCH_LEVEL).
@@ -521,40 +517,68 @@ ShadowCleanupStreamContext(
     }
 
     //
-    // STEP 1: Transition State to TEARDOWN under LifetimeLock.
-    // This guarantees that any acquirer racing with us either:
-    //   (a) Observed ACTIVE and acquired a rundown reference before we
-    //       grabbed LifetimeLock — they will be drained by step 2, or
-    //   (b) Observes TEARDOWN and aborts without touching Resource.
+    // STEP 1: Transition State to TEARDOWN under LifetimeLock
+    // This prevents any new lock acquisitions from succeeding
     //
     KeAcquireSpinLock(&ctx->LifetimeLock, &oldIrql);
     previousState = InterlockedExchange(&ctx->State, SHADOW_CONTEXT_STATE_TEARDOWN);
     KeReleaseSpinLock(&ctx->LifetimeLock, oldIrql);
 
     //
-    // STEP 2: Drain in-flight acquirers via rundown protection.
+    // If context was never fully initialized, skip resource cleanup
     //
-    // The previous implementation used ExIsResourceAcquiredExclusiveLite /
-    // ExIsResourceAcquiredSharedLite which only report the CALLING thread's
-    // ownership of the resource — they always returned 0 here, so the
-    // wait loop was a silent no-op. That left a UAF window where another
-    // thread could be between the LifetimeLock release and the matching
-    // ExAcquireResource* call, and we would happily ExDeleteResourceLite
-    // out from under it. Rundown protection closes that gap deterministically.
-    //
-    if (ctx->RundownInitialized) {
-        ExWaitForRundownProtectionRelease(&ctx->Rundown);
+    if (previousState == SHADOW_CONTEXT_STATE_UNINITIALIZED) {
+        goto CleanupComplete;
+    }
+
+    if (previousState == SHADOW_CONTEXT_STATE_INITIALIZING) {
+        //
+        // Context was being initialized when cleanup triggered
+        // ERESOURCE may or may not be initialized - check via heuristic
+        // This is a rare race condition
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Context cleanup during initialization\n");
+        goto CleanupComplete;
     }
 
     //
-    // STEP 3: Now safe to delete ERESOURCE. We use the explicit
-    // ResourceInitialized flag rather than inferring from State so a
-    // cleanup that runs while State == INITIALIZING still tears down a
-    // resource that was successfully created before the failure path.
+    // STEP 2: Wait for any active Resource holders to release
+    // The State is now TEARDOWN, so no new acquisitions will succeed
+    // Existing holders will eventually release
     //
-    if (ctx->ResourceInitialized) {
+    // Use exponential backoff to avoid spinning too aggressively
+    //
+    while (ExIsResourceAcquiredExclusiveLite(&ctx->Resource) ||
+           ExIsResourceAcquiredSharedLite(&ctx->Resource) > 0) {
+
+        waitCount++;
+
+        if (waitCount > 1000) {
+            //
+            // Something is very wrong - a thread is holding the Resource
+            // for an extremely long time during cleanup
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] CRITICAL: Resource still held after 1000 waits in cleanup\n");
+            NT_ASSERT(FALSE);
+            break;
+        }
+
+        //
+        // Brief sleep with increasing delay (1ms, 2ms, 4ms, ... up to 100ms)
+        //
+        LARGE_INTEGER delay;
+        ULONG delayMs = (waitCount < 7) ? (1 << waitCount) : 100;
+        delay.QuadPart = -((LONGLONG)delayMs * 10000);
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+    //
+    // STEP 3: Now safe to delete ERESOURCE
+    //
+    if (previousState == SHADOW_CONTEXT_STATE_ACTIVE) {
         ExDeleteResourceLite(&ctx->Resource);
-        ctx->ResourceInitialized = FALSE;
     }
 
     //
@@ -578,6 +602,7 @@ ShadowCleanupStreamContext(
     //
     RtlSecureZeroMemory(ctx->FileHash, sizeof(ctx->FileHash));
 
+CleanupComplete:
     //
     // Update telemetry
     //
@@ -588,8 +613,6 @@ ShadowCleanupStreamContext(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] Cleaned up stream context %p (previousState=%d)\n",
                ctx, previousState);
-#else
-    UNREFERENCED_PARAMETER(previousState);
 #endif
 }
 
@@ -965,15 +988,6 @@ ShadowAllocateStreamContext(
     ctx->State = SHADOW_CONTEXT_STATE_INITIALIZING;
 
     //
-    // Initialize rundown protection BEFORE the resource. Cleanup uses
-    // RundownInitialized to decide whether to call
-    // ExWaitForRundownProtectionRelease, so flipping the flag must
-    // happen-before any path that could trigger cleanup.
-    //
-    ExInitializeRundownProtection(&ctx->Rundown);
-    ctx->RundownInitialized = TRUE;
-
-    //
     // Initialize ERESOURCE lock
     //
     status = ExInitializeResourceLite(&ctx->Resource);
@@ -985,7 +999,6 @@ ShadowAllocateStreamContext(
         FltReleaseContext(ctx);
         return status;
     }
-    ctx->ResourceInitialized = TRUE;
 
     //
     // Initialize default state fields
@@ -1286,7 +1299,7 @@ ShadowQueryVolumeSerial(
         FileFsVolumeInformation
     );
 
-    if (!NT_SUCCESS(status) && status != STATUS_BUFFER_OVERFLOW) {
+    if (!NT_SUCCESS(status)) {
 #if SHADOW_DEBUG_VERBOSE_LOGGING
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                    "[ShadowStrike] FltQueryVolumeInformation failed: 0x%08X\n", status);
@@ -1294,10 +1307,6 @@ ShadowQueryVolumeSerial(
         return;
     }
 
-    //
-    // STATUS_BUFFER_OVERFLOW still populates the fixed header (which holds
-    // VolumeSerialNumber); only the trailing VolumeLabel character data is
-    // truncated, and we do not use it.
     //
     // Store volume serial - no lock needed during initialization
     //

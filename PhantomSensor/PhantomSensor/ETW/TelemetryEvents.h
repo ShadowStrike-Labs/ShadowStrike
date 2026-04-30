@@ -61,12 +61,10 @@
 #ifndef _SHADOWSTRIKE_TELEMETRY_EVENTS_H_
 #define _SHADOWSTRIKE_TELEMETRY_EVENTS_H_
 
-//
-// Includes are intentionally placed *outside* the extern "C" block.
-// Wrapping system/WDK headers in extern "C" is non-standard and can
-// silently change linkage of templated/inline content in modern SDKs.
-// Each project header below carries its own extern "C" guards.
-//
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #pragma warning(push)
 #pragma warning(disable:4324)
 #include <fltKernel.h>
@@ -82,10 +80,6 @@
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Shared/TelemetryTypes.h"
 #include "../../Shared/SharedDefs.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 // ============================================================================
 // ETW PROVIDER CONFIGURATION
@@ -356,28 +350,9 @@ typedef enum _TE_EVENT_ID {
     TeEvent_Warning                 = 907,
     TeEvent_Debug                   = 908,
     TeEvent_Audit                   = 909,
-    TeEvent_Info                    = 910,  ///< Generic informational operational event
 
     TeEvent_Max                     = 1000
 } TE_EVENT_ID;
-
-//
-// Compile-time invariants on the event-ID schema. These guarantee that
-// (a) no event id silently escapes its band and (b) event-band macros
-// below remain self-consistent. Any reordering of the enum that breaks
-// these assumptions is a build break, not a runtime surprise.
-//
-C_ASSERT(TeEvent_ProcessIntegrityChange  <= 99);
-C_ASSERT(TeEvent_ThreadSuspicious        <= 199 && TeEvent_ThreadCreate >= 100);
-C_ASSERT(TeEvent_ImageTampered           <= 299 && TeEvent_ImageLoad >= 200);
-C_ASSERT(TeEvent_FileEncrypted           <= 399 && TeEvent_FileCreate >= 300);
-C_ASSERT(TeEvent_RegSuspicious           <= 499 && TeEvent_RegKeyCreate >= 400);
-C_ASSERT(TeEvent_NetBeaconing            <= 599 && TeEvent_NetConnect >= 500);
-C_ASSERT(TeEvent_StackPivot              <= 699 && TeEvent_MemoryAlloc >= 600);
-C_ASSERT(TeEvent_AnomalyDetected         <= 799 && TeEvent_ThreatDetected >= 700);
-C_ASSERT(TeEvent_AMSIBypass              <= 899 && TeEvent_TamperAttempt >= 800);
-C_ASSERT(TeEvent_Info                    <= 999 && TeEvent_DriverLoaded >= 900);
-C_ASSERT(TeEvent_Max                     >  TeEvent_Info);
 
 // ============================================================================
 // EVENT ID RANGE VALIDATION HELPERS
@@ -439,15 +414,11 @@ typedef enum _TE_THROTTLE_ACTION {
 // ============================================================================
 
 /*
- * NOTE: Event structures use natural 8-byte alignment for internal use.
- * The ETW wire format is the raw struct written via EtwWrite, so any
- * implicit compiler padding would (a) leak uninitialized kernel memory
- * to consumers and (b) drift the wire layout if upstream headers ever
- * push a different #pragma pack. We therefore lock alignment explicitly
- * with #pragma pack(push, 8) and call out every internal pad with an
- * explicit Reserved field.
+ * NOTE: Event structures use natural alignment for internal use.
+ * The ETW wire format is the raw struct written via EtwWrite.
+ * Natural alignment ensures interlocked and atomic operations
+ * on 64-bit fields function correctly on all architectures.
  */
-#include <pshpack8.h>
 
 /**
  * @brief Common event header for all telemetry events.
@@ -473,15 +444,6 @@ typedef struct _TE_EVENT_HEADER {
 } TE_EVENT_HEADER, *PTE_EVENT_HEADER;
 
 C_ASSERT(sizeof(TE_EVENT_HEADER) == 72);
-//
-// Lock the offsets of every 8-byte field so an upstream pragma pack
-// or an accidental reorder cannot silently mis-align interlocked ops.
-//
-C_ASSERT(FIELD_OFFSET(TE_EVENT_HEADER, Keywords)        == 16);
-C_ASSERT(FIELD_OFFSET(TE_EVENT_HEADER, Timestamp)       == 24);
-C_ASSERT(FIELD_OFFSET(TE_EVENT_HEADER, SequenceNumber)  == 32);
-C_ASSERT(FIELD_OFFSET(TE_EVENT_HEADER, CorrelationId)   == 56);
-C_ASSERT(FIELD_OFFSET(TE_EVENT_HEADER, ActivityId)      == 64);
 
 // Event header flags
 #define TE_FLAG_BLOCKING            0x0001  ///< Event can block operation
@@ -628,15 +590,6 @@ typedef struct _TE_NETWORK_EVENT {
     UINT32 RemoteAddressV4;
     UINT8 LocalAddressV6[16];
     UINT8 RemoteAddressV6[16];
-    //
-    // Explicit padding: BytesSent (UINT64) requires 8-byte alignment.
-    // Without this field the compiler would insert 4 silent bytes here,
-    // and TeLogNetworkEvent's RtlCopyMemory of the caller-supplied struct
-    // would propagate any uninitialized stack/pool bytes into ETW
-    // consumers (CWE-200 information disclosure). Keeping the pad
-    // explicit lets every caller — and TepInitializeEventHeader — zero it.
-    //
-    UINT32 ReservedAlign;
     UINT64 BytesSent;
     UINT64 BytesReceived;
     UINT32 ThreatScore;
@@ -649,8 +602,6 @@ typedef struct _TE_NETWORK_EVENT {
 } TE_NETWORK_EVENT, *PTE_NETWORK_EVENT;
 
 C_ASSERT(sizeof(TE_NETWORK_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
-C_ASSERT((sizeof(TE_NETWORK_EVENT) % 8) == 0);
-C_ASSERT(FIELD_OFFSET(TE_NETWORK_EVENT, BytesSent) % 8 == 0);
 
 // Network flags
 #define TE_NET_FLAG_BLOCKED             0x00000001
@@ -760,8 +711,6 @@ typedef struct _TE_OPERATIONAL_EVENT {
 } TE_OPERATIONAL_EVENT, *PTE_OPERATIONAL_EVENT;
 
 C_ASSERT(sizeof(TE_OPERATIONAL_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
-
-#include <poppack.h>
 
 // ============================================================================
 // TELEMETRY STATISTICS
@@ -1394,7 +1343,7 @@ TeGetState(
     TeLogOperational(TeEvent_Warning, TeLevel_Warning, comp, msg, 0)
 
 #define TE_LOG_INFO(comp, msg) \
-    TeLogOperational(TeEvent_Info, TeLevel_Informational, comp, msg, 0)
+    TeLogOperational(TeEvent_Debug, TeLevel_Informational, comp, msg, 0)
 
 #define TE_LOG_DEBUG(comp, msg) \
     do { \

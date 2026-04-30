@@ -681,18 +681,6 @@ PctBuildChain(
     ULONG depth = 0;
     BOOLEAN firstNode = TRUE;
     BOOLEAN processTerminated = FALSE;
-    //
-    // Cycle-detection set: PID-reuse can cause the parent traversal to
-    // re-enter a PID that was already visited (e.g., A -> B -> A after
-    // PID A is recycled to a descendant). We track every visited PID and
-    // bail with HasOrphanedProcess if a cycle is observed; the depth cap
-    // alone is insufficient to keep the chain consistent.
-    //
-    HANDLE visitedPids[PCT_MAX_CHAIN_DEPTH];
-    ULONG visitedCount = 0;
-    ULONG cycleIdx;
-    BOOLEAN cycleDetected = FALSE;
-    BOOLEAN releaseRundown = FALSE;
 
     //
     // Validate parameters and tracker
@@ -714,7 +702,6 @@ PctBuildChain(
     if (!PctpAcquireRundownProtection(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-    releaseRundown = TRUE;
 
     //
     // Allocate chain structure
@@ -730,7 +717,6 @@ PctBuildChain(
     chain->Signature = PCT_CHAIN_SIGNATURE;
     chain->AllocSource = PctAllocSourceLookaside;
     chain->OwningTracker = internal;
-    chain->TrackerRundownHeld = FALSE;
     chain->LeafProcessId = ProcessId;
     KeQuerySystemTime(&chain->BuildTime);
     InitializeListHead(&chain->ChainList);
@@ -745,28 +731,6 @@ PctBuildChain(
            (ULONG_PTR)currentPid != 0 &&
            (ULONG_PTR)currentPid != 4 &&  // System process
            depth < PCT_MAX_CHAIN_DEPTH) {
-
-        //
-        // Cycle check: if we have already walked through this PID in the
-        // current ancestry traversal, the chain has folded back on itself
-        // (typically due to recycled PIDs). Stop and mark as orphaned so
-        // we never produce a chain that re-references the same PID twice.
-        //
-        for (cycleIdx = 0; cycleIdx < visitedCount; cycleIdx++) {
-            if (visitedPids[cycleIdx] == currentPid) {
-                cycleDetected = TRUE;
-                break;
-            }
-        }
-        if (cycleDetected) {
-            chain->HasOrphanedProcess = TRUE;
-            InterlockedIncrement64(&Tracker->Stats.OrphanedProcesses);
-            break;
-        }
-
-        if (visitedCount < PCT_MAX_CHAIN_DEPTH) {
-            visitedPids[visitedCount++] = currentPid;
-        }
 
         //
         // Allocate node for this process
@@ -885,16 +849,8 @@ PctBuildChain(
         InterlockedIncrement64(&Tracker->Stats.SuspiciousChains);
     }
 
-    //
-    // DESIGN: Caller-owned chains are allocated from this tracker's lookaside
-    // lists and contain lookaside-backed nodes. Keep the tracker rundown held
-    // after returning so PctShutdown cannot delete the lookasides or free the
-    // tracker before the caller releases the chain with PctFreeChain.
-    //
-    chain->TrackerRundownHeld = TRUE;
     *Chain = chain;
     chain = NULL;
-    releaseRundown = FALSE;
     status = STATUS_SUCCESS;
 
 Cleanup:
@@ -902,9 +858,7 @@ Cleanup:
         PctpFreeChainInternal(internal, chain);
     }
 
-    if (releaseRundown) {
-        PctpReleaseRundownProtection(internal);
-    }
+    PctpReleaseRundownProtection(internal);
 
     return status;
 }
@@ -1178,7 +1132,6 @@ PctFreeChain(
     PPCT_TRACKER_INTERNAL tracker;
     PLIST_ENTRY listEntry;
     PPCT_CHAIN_NODE node;
-    BOOLEAN releaseTrackerRundown = FALSE;
 
     if (Chain == NULL) {
         return;
@@ -1194,24 +1147,26 @@ PctFreeChain(
         return;
     }
 
-    tracker = NULL;
-    if (Chain->TrackerRundownHeld != FALSE) {
+    //
+    // Get the owning tracker if available (for lookaside deallocation)
+    //
+    tracker = (PPCT_TRACKER_INTERNAL)Chain->OwningTracker;
+
+    //
+    // Validate tracker if present
+    //
+    if (tracker != NULL && tracker->Signature != PCT_SIGNATURE) {
         //
-        // The chain owns a tracker rundown reference transferred from
-        // PctBuildChain. That reference keeps the tracker and its lookaside
-        // lists alive even after shutdown has started, so it is safe to use
-        // the owning tracker for lookaside-backed node/chain deallocation.
+        // Tracker is invalid - fall back to pool deallocation
         //
-        tracker = (PPCT_TRACKER_INTERNAL)Chain->OwningTracker;
-        if (tracker == NULL || tracker->Signature != PCT_SIGNATURE) {
-            //
-            // Chain metadata is corrupt. Returning leaks this malformed chain
-            // but avoids freeing lookaside allocations through an invalid
-            // tracker pointer, which would be a kernel write primitive.
-            //
-            return;
-        }
-        releaseTrackerRundown = TRUE;
+        tracker = NULL;
+    }
+
+    //
+    // Check if tracker is shutting down - if so, use pool deallocation
+    //
+    if (tracker != NULL && tracker->Public.ShuttingDown) {
+        tracker = NULL;
     }
 
     //
@@ -1229,7 +1184,7 @@ PctFreeChain(
     //
     // Decrement chain count if we have a valid tracker
     //
-    if (tracker != NULL) {
+    if (tracker != NULL && !tracker->Public.ShuttingDown) {
         InterlockedDecrement(&tracker->Public.ChainCount);
     }
 
@@ -1237,7 +1192,6 @@ PctFreeChain(
     // Clear signature before freeing
     //
     Chain->Signature = 0;
-    Chain->TrackerRundownHeld = FALSE;
 
     //
     // Free chain structure based on allocation source
@@ -1248,10 +1202,6 @@ PctFreeChain(
         ExFreeToNPagedLookasideList(&tracker->ChainLookaside, Chain);
     } else {
         ShadowStrikeFreePoolWithTag(Chain, PCT_POOL_TAG);
-    }
-
-    if (releaseTrackerRundown) {
-        PctpReleaseRundownProtection(tracker);
     }
 }
 
@@ -1281,18 +1231,15 @@ PctGetStatistics(
     }
 
     //
-    // Writers use InterlockedIncrement64; mirror that with interlocked
-    // read snapshots so this DISPATCH_LEVEL getter cannot expose torn
-    // counters on 32-bit builds or under aggressive compiler reordering.
+    // Copy statistics (reads are atomic for LONG64 on x64)
     //
-    Stats->ChainsBuilt = InterlockedCompareExchange64(&Tracker->Stats.ChainsBuilt, 0, 0);
-    Stats->ChainsFromCache = InterlockedCompareExchange64(&Tracker->Stats.ChainsFromCache, 0, 0);
-    Stats->SpoofingDetected = InterlockedCompareExchange64(&Tracker->Stats.SpoofingDetected, 0, 0);
-    Stats->SuspiciousChains = InterlockedCompareExchange64(&Tracker->Stats.SuspiciousChains, 0, 0);
-    Stats->OrphanedProcesses = InterlockedCompareExchange64(&Tracker->Stats.OrphanedProcesses, 0, 0);
-    Stats->AllocationFailures = InterlockedCompareExchange64(&Tracker->Stats.AllocationFailures, 0, 0);
-    Stats->ProcessLookupFailures =
-        InterlockedCompareExchange64(&Tracker->Stats.ProcessLookupFailures, 0, 0);
+    Stats->ChainsBuilt = Tracker->Stats.ChainsBuilt;
+    Stats->ChainsFromCache = Tracker->Stats.ChainsFromCache;
+    Stats->SpoofingDetected = Tracker->Stats.SpoofingDetected;
+    Stats->SuspiciousChains = Tracker->Stats.SuspiciousChains;
+    Stats->OrphanedProcesses = Tracker->Stats.OrphanedProcesses;
+    Stats->AllocationFailures = Tracker->Stats.AllocationFailures;
+    Stats->ProcessLookupFailures = Tracker->Stats.ProcessLookupFailures;
     Stats->StartTime = Tracker->Stats.StartTime;
 
     return STATUS_SUCCESS;
@@ -1482,14 +1429,9 @@ PctpFreeChainInternal(
 {
     PLIST_ENTRY listEntry;
     PPCT_CHAIN_NODE node;
-    BOOLEAN releaseTrackerRundown = FALSE;
 
     if (Chain == NULL) {
         return;
-    }
-
-    if (Chain->TrackerRundownHeld != FALSE && Tracker != NULL) {
-        releaseTrackerRundown = TRUE;
     }
 
     //
@@ -1505,7 +1447,6 @@ PctpFreeChainInternal(
     // Clear signature
     //
     Chain->Signature = 0;
-    Chain->TrackerRundownHeld = FALSE;
 
     //
     // Free chain based on allocation source
@@ -1517,10 +1458,6 @@ PctpFreeChainInternal(
         ExFreeToNPagedLookasideList(&Tracker->ChainLookaside, Chain);
     } else {
         ShadowStrikeFreePoolWithTag(Chain, PCT_POOL_TAG);
-    }
-
-    if (releaseTrackerRundown) {
-        PctpReleaseRundownProtection(Tracker);
     }
 }
 

@@ -1,4 +1,4 @@
-// This is a personal academic project. Dear PVS-Studio, please check it.
+﻿// This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
@@ -557,7 +557,7 @@ EmShutdown(
     //
     timeout.QuadPart = EMP_SHUTDOWN_TIMEOUT;
 
-    while (ReadAcquire(&Monitor->ReferenceCount) > 0) {
+    while (Monitor->ReferenceCount > 0) {
         waitStatus = KeWaitForSingleObject(
             &Monitor->ShutdownCompleteEvent,
             Executive,
@@ -666,7 +666,7 @@ EmCaptureEnvironment(
     //
     // Check shutdown
     //
-    if (ReadAcquire(&Monitor->ShuttingDown)) {
+    if (Monitor->ShuttingDown) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -675,7 +675,7 @@ EmCaptureEnvironment(
     //
     // Double-check shutdown after acquiring reference
     //
-    if (ReadAcquire(&Monitor->ShuttingDown)) {
+    if (Monitor->ShuttingDown) {
         EmpReleaseMonitorReference(Monitor);
         return STATUS_DEVICE_NOT_READY;
     }
@@ -872,27 +872,26 @@ EmAnalyzeEnvironment(
 
     *Flags = EmSuspicion_None;
 
-    if (ReadAcquire(&Monitor->ShuttingDown)) {
+    if (Monitor->ShuttingDown) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     EmpAcquireMonitorReference(Monitor);
 
     //
-    // Acquire shared lock first; AnalysisComplete must be examined under
-    // the lock that publishes it (line ~932) — otherwise concurrent
-    // analyzers can both see FALSE and race the publish.
+    // Check if already analyzed
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Env->VariableLock);
-
     if (Env->AnalysisComplete) {
         *Flags = Env->SuspicionFlags;
-        ExReleasePushLockShared(&Env->VariableLock);
-        KeLeaveCriticalRegion();
         EmpReleaseMonitorReference(Monitor);
         return STATUS_SUCCESS;
     }
+
+    //
+    // Acquire lock for variable list access during analysis
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Env->VariableLock);
 
     //
     // Analyze proxy settings
@@ -1120,7 +1119,7 @@ EmpReleaseMonitorReference(
 {
     LONG newCount = InterlockedDecrement(&Monitor->ReferenceCount);
 
-    if (newCount == 0 && ReadAcquire(&Monitor->ShuttingDown)) {
+    if (newCount == 0 && Monitor->ShuttingDown) {
         KeSetEvent(&Monitor->ShutdownCompleteEvent, IO_NO_INCREMENT, FALSE);
     }
 }

@@ -777,13 +777,6 @@ Cleanup:
         //
         InterlockedExchangePointer((PVOID*)&g_TbManager, NULL);
 
-        //
-        // Defense-in-depth: invalidate the signature before freeing so
-        // a stale debug observer reading the freed pool cannot mistake
-        // it for a live manager.
-        //
-        manager->Signature = 0;
-
         ExFreePoolWithTag(manager, TB_POOL_TAG_BUFFER);
     }
 
@@ -836,26 +829,6 @@ TbShutdown(
     //
     Manager->State = TbBufferState_Shutdown;
     KeSetEvent(&Manager->ShutdownEvent, IO_NO_INCREMENT, FALSE);
-
-    //
-    // Wake any consumers blocked waiting for telemetry.  They must
-    // observe State == Shutdown (or the imminent Signature clear) and
-    // return promptly so they are not still inside a Manager-touching
-    // path when we proceed to free per-CPU buffers below.  Without
-    // this, waiters only unblock on their own timeout, delaying clean
-    // shutdown by up to TbDequeueBatch's caller-supplied TimeoutMs.
-    //
-    KeSetEvent(&Manager->GlobalConsumerEvent, IO_NO_INCREMENT, FALSE);
-    for (i = 0; i < Manager->ActiveCpuCount; i++) {
-        if (Manager->PerCpuBuffers[i] != NULL) {
-            KeSetEvent(&Manager->PerCpuBuffers[i]->RingBuffer.ConsumerEvent,
-                       IO_NO_INCREMENT, FALSE);
-            KeSetEvent(&Manager->PerCpuBuffers[i]->RingBuffer.DrainEvent,
-                       IO_NO_INCREMENT, FALSE);
-        }
-    }
-    KeSetEvent(&Manager->GlobalOverflow.ConsumerEvent, IO_NO_INCREMENT, FALSE);
-    KeSetEvent(&Manager->GlobalOverflow.DrainEvent, IO_NO_INCREMENT, FALSE);
 
     //
     // Wait for flush thread to exit
@@ -966,7 +939,6 @@ TbStart(
     NTSTATUS status;
     OBJECT_ATTRIBUTES objAttr;
     HANDLE threadHandle = NULL;
-    PVOID threadObject = NULL;
 
     PAGED_CODE();
 
@@ -976,14 +948,6 @@ TbStart(
 
     if (Manager->State != TbBufferState_Initializing &&
         Manager->State != TbBufferState_Paused) {
-        return STATUS_INVALID_STATE_TRANSITION;
-    }
-
-    //
-    // Sanity: previous run must have cleaned up the thread reference.
-    // If this is non-NULL we would leak the previous PETHREAD on assignment.
-    //
-    if (Manager->FlushThread != NULL) {
         return STATUS_INVALID_STATE_TRANSITION;
     }
 
@@ -1013,29 +977,21 @@ TbStart(
     }
 
     //
-    // Get thread reference into a LOCAL pointer.
-    //
-    // CRITICAL: Per MSDN, if ObReferenceObjectByHandle fails, the OUT
-    // pointer value is undefined. Writing directly to Manager->FlushThread
-    // would leave a garbage pointer that subsequent TbStop/TbShutdown
-    // would dereference — instant BSOD.  Use a local, then publish only
-    // on success.
+    // Get thread reference
     //
     status = ObReferenceObjectByHandle(
         threadHandle,
         THREAD_ALL_ACCESS,
         *PsThreadType,
         KernelMode,
-        &threadObject,
+        (PVOID*)&Manager->FlushThread,
         NULL
     );
 
     if (!NT_SUCCESS(status)) {
         //
-        // Thread was created but we can't get a reference.
-        // Signal shutdown to the orphaned thread; it will observe
-        // FlushThreadRunning=0 and the ShutdownEvent and exit on its
-        // own.  Manager->FlushThread is left untouched (NULL).
+        // Thread was created but we can't get a reference
+        // Signal shutdown to orphaned thread
         //
         InterlockedExchange(&Manager->FlushThreadRunning, 0);
         KeSetEvent(&Manager->ShutdownEvent, IO_NO_INCREMENT, FALSE);
@@ -1043,7 +999,6 @@ TbStart(
         return status;
     }
 
-    Manager->FlushThread = (PETHREAD)threadObject;
     ZwClose(threadHandle);
 
     //

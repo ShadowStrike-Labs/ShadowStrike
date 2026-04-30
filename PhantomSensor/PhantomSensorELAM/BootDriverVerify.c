@@ -177,21 +177,6 @@ BdvpFreeDriverInfoPaths(
     _Inout_ PBDV_DRIVER_INFO Info
     );
 
-static VOID
-BdvpDetectPublisher(
-    _In_reads_bytes_(Size) PCUCHAR Buffer,
-    _In_ ULONG Size,
-    _Inout_ PBDV_DRIVER_INFO Info
-    );
-
-static BOOLEAN
-BdvpScanUtf16Ci(
-    _In_reads_bytes_(Size) PCUCHAR Buffer,
-    _In_ ULONG Size,
-    _In_reads_(NeedleCch) const WCHAR* Needle,
-    _In_ ULONG NeedleCch
-    );
-
 // ============================================================================
 // BLOOM FILTER IMPLEMENTATION
 // ============================================================================
@@ -711,7 +696,6 @@ BdvpExtractCertificateInfo(
 
     Info->IsSigned = FALSE;
     Info->IsWhqlSigned = FALSE;
-    Info->IsMicrosoftSigned = FALSE;
     RtlZeroMemory(Info->ThumbPrint, sizeof(Info->ThumbPrint));
 
     dosHeader = (PIMAGE_DOS_HEADER)ImageBase;
@@ -772,115 +756,7 @@ BdvpExtractCertificateInfo(
             );
     }
 
-    //
-    // DESIGN: Lightweight publisher detection without a full ASN.1/PKCS#7
-    // parser at boot time. Authenticode certificate Subject DNs are encoded
-    // as UTF-16LE BMPString or PrintableString inside the PKCS#7 blob; we
-    // scan the cert table for known Microsoft publisher CN substrings. This
-    // is a heuristic fast-path used by several commercial ELAM drivers — it
-    // is NOT relied upon as the sole trust primitive (final classification
-    // also consults SignatureStore + KnownGood hash list). The scan is
-    // bounded by the cert directory size and capped to 64 KB to defeat
-    // pathological blobs.
-    //
-    if (securityDir->Size > 8) {
-        ULONG scanSize = securityDir->Size - 8;
-        if (scanSize > 65536) {
-            scanSize = 65536;
-        }
-        BdvpDetectPublisher(certTable + 8, scanSize, Info);
-    }
-
     return STATUS_SUCCESS;
-}
-
-//
-// Static UTF-16LE publisher markers searched within the PKCS#7 blob.
-// All comparisons are case-insensitive and bounded by the blob size.
-//
-static const WCHAR BdvpMsCorporation[] = L"Microsoft Corporation";
-static const WCHAR BdvpMsWindows[]     = L"Microsoft Windows";
-static const WCHAR BdvpMsCodeSigning[] = L"Microsoft Code Signing";
-static const WCHAR BdvpWhqlPublisher[] = L"Microsoft Windows Hardware Compatibility Publisher";
-static const WCHAR BdvpWhqlPubAlt[]    = L"Microsoft Windows Hardware Compatibility";
-
-/**
- * @brief Case-insensitive bounded UTF-16LE substring scan inside a raw byte buffer.
- *
- * The PKCS#7 blob is byte-addressable and may contain unaligned UTF-16
- * strings; we step at byte granularity (UTF-16 strings are typically
- * 2-byte aligned within ASN.1 BMPString fields, but defending against
- * misalignment is cheap and avoids missing matches).
- *
- * @param Buffer  PKCS#7 blob start (skipping WIN_CERTIFICATE header)
- * @param Size    Blob size in bytes
- * @param Needle  Null-terminated UTF-16LE substring (lowercased internally)
- * @param NeedleCch  Length of Needle in WCHARs (excluding terminator)
- * @return TRUE if the substring is found at any byte offset in Buffer.
- */
-static BOOLEAN
-BdvpScanUtf16Ci(
-    _In_reads_bytes_(Size) PCUCHAR Buffer,
-    _In_ ULONG Size,
-    _In_reads_(NeedleCch) const WCHAR* Needle,
-    _In_ ULONG NeedleCch
-    )
-{
-    if (Buffer == NULL || Needle == NULL || NeedleCch == 0) {
-        return FALSE;
-    }
-
-    ULONG needleBytes = NeedleCch * sizeof(WCHAR);
-    if (Size < needleBytes) {
-        return FALSE;
-    }
-
-    ULONG lastStart = Size - needleBytes;
-    for (ULONG offset = 0; offset <= lastStart; offset += 2) {
-        const WCHAR* candidate = (const WCHAR*)(Buffer + offset);
-        ULONG i;
-        for (i = 0; i < NeedleCch; i++) {
-            WCHAR a = RtlUpcaseUnicodeChar(candidate[i]);
-            WCHAR b = RtlUpcaseUnicodeChar(Needle[i]);
-            if (a != b) {
-                break;
-            }
-        }
-        if (i == NeedleCch) {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-/**
- * @brief Populate Info->IsMicrosoftSigned and Info->IsWhqlSigned by
- *        scanning the PKCS#7 blob for known publisher CN substrings.
- */
-static VOID
-BdvpDetectPublisher(
-    _In_reads_bytes_(Size) PCUCHAR Buffer,
-    _In_ ULONG Size,
-    _Inout_ PBDV_DRIVER_INFO Info
-    )
-{
-    if (BdvpScanUtf16Ci(Buffer, Size, BdvpWhqlPublisher,
-                        (ULONG)(RTL_NUMBER_OF(BdvpWhqlPublisher) - 1)) ||
-        BdvpScanUtf16Ci(Buffer, Size, BdvpWhqlPubAlt,
-                        (ULONG)(RTL_NUMBER_OF(BdvpWhqlPubAlt) - 1))) {
-        Info->IsWhqlSigned = TRUE;
-        Info->IsMicrosoftSigned = TRUE;
-        return;
-    }
-
-    if (BdvpScanUtf16Ci(Buffer, Size, BdvpMsWindows,
-                        (ULONG)(RTL_NUMBER_OF(BdvpMsWindows) - 1)) ||
-        BdvpScanUtf16Ci(Buffer, Size, BdvpMsCodeSigning,
-                        (ULONG)(RTL_NUMBER_OF(BdvpMsCodeSigning) - 1)) ||
-        BdvpScanUtf16Ci(Buffer, Size, BdvpMsCorporation,
-                        (ULONG)(RTL_NUMBER_OF(BdvpMsCorporation) - 1))) {
-        Info->IsMicrosoftSigned = TRUE;
-    }
 }
 
 /**
