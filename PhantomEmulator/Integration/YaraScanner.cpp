@@ -900,26 +900,89 @@ bool YaraScanner::LoadCompiledRules(std::span<const uint8_t> data) noexcept {
     std::lock_guard<std::mutex> lock(m_impl->scanMutex);
 
     // YARA's yr_rules_load only accepts a file path, so we must write a
-    // temporary file. Use a deterministic path alongside our binary.
+    // temporary file.
+    //
+    // DESIGN (Tier 4 — CWE-377 insecure temp file, CWE-367 TOCTOU,
+    // CWE-59 symlink-following): the previous implementation wrote
+    // "yara_compiled_rules.bin" in std::filesystem::current_path() using
+    // a deterministic filename. That gave any local non-privileged user
+    // (including the emulated guest's host counterpart) a race window to
+    // pre-plant a junction or hardlink at the path before the fopen, or
+    // to swap the file between fwrite and yr_rules_load. Mitigations:
+    //   1. Place the file under the system temp directory, not the
+    //      current working directory which can be attacker-controlled.
+    //   2. Embed PID + a high-resolution counter in the filename so two
+    //      concurrent emulator instances cannot collide and a pre-planted
+    //      file at a guessed path cannot be racing the legitimate write.
+    //   3. On Windows, open with CREATE_NEW + FILE_FLAG_DELETE_ON_CLOSE
+    //      and FILE_SHARE_READ only, so an existing file at the path
+    //      causes failure rather than overwrite, and the file is removed
+    //      automatically even on crash. yr_rules_load opens the path by
+    //      name so we keep the handle open across the load and rely on
+    //      Windows' name-locking to prevent swap.
     std::error_code ec;
-    auto tempPath = std::filesystem::current_path(ec) / "yara_compiled_rules.bin";
+    auto tempDir = std::filesystem::temp_directory_path(ec);
     if (ec) return false;
 
-    FILE* fp = nullptr;
+    static std::atomic<uint64_t> s_counter{0};
+    const uint64_t seq = s_counter.fetch_add(1, std::memory_order_relaxed);
 #ifdef PHANTOM_WINDOWS
-    if (fopen_s(&fp, tempPath.string().c_str(), "wb") != 0 || !fp) return false;
+    const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
 #else
-    fp = std::fopen(tempPath.string().c_str(), "wb");
-    if (!fp) return false;
+    const auto pid = static_cast<uint64_t>(::getpid());
 #endif
+    char nameBuf[96];
+    std::snprintf(nameBuf, sizeof(nameBuf),
+                  "phantom_yara_%llu_%llu.bin",
+                  static_cast<unsigned long long>(pid),
+                  static_cast<unsigned long long>(seq));
+    auto tempPath = tempDir / nameBuf;
 
-    size_t written = std::fwrite(data.data(), 1, data.size(), fp);
-    std::fclose(fp);
+#ifdef PHANTOM_WINDOWS
+    // CREATE_NEW fails if the path already exists — defeats pre-plant races.
+    HANDLE hFile = ::CreateFileA(
+        tempPath.string().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
 
-    if (written != data.size()) {
-        std::filesystem::remove(tempPath, ec);
+    DWORD totalWritten = 0;
+    while (totalWritten < data.size()) {
+        const auto remaining = data.size() - totalWritten;
+        const DWORD chunk = remaining > 0x40000000u
+                                ? 0x40000000u
+                                : static_cast<DWORD>(remaining);
+        DWORD wroteNow = 0;
+        if (!::WriteFile(hFile, data.data() + totalWritten, chunk,
+                         &wroteNow, nullptr) || wroteNow == 0) {
+            ::CloseHandle(hFile);
+            return false;
+        }
+        totalWritten += wroteNow;
+    }
+    if (!::FlushFileBuffers(hFile)) {
+        ::CloseHandle(hFile);
         return false;
     }
+#else
+    // POSIX: O_CREAT|O_EXCL gives the same anti-race property; mode 0600
+    // restricts to the owning user.
+    int fd = ::open(tempPath.string().c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return false;
+    size_t totalWrittenP = 0;
+    while (totalWrittenP < data.size()) {
+        ssize_t w = ::write(fd, data.data() + totalWrittenP,
+                            data.size() - totalWrittenP);
+        if (w <= 0) { ::close(fd); ::unlink(tempPath.string().c_str()); return false; }
+        totalWrittenP += static_cast<size_t>(w);
+    }
+    ::close(fd);
+#endif
 
     // Destroy previous rules
     if (m_impl->rules && m_impl->fn_yr_rules_destroy) {
@@ -929,7 +992,13 @@ bool YaraScanner::LoadCompiledRules(std::span<const uint8_t> data) noexcept {
     }
 
     int rc = m_impl->fn_yr_rules_load(tempPath.string().c_str(), &m_impl->rules);
+
+#ifdef PHANTOM_WINDOWS
+    // FILE_FLAG_DELETE_ON_CLOSE removes the file once the handle closes.
+    ::CloseHandle(hFile);
+#else
     std::filesystem::remove(tempPath, ec);
+#endif
 
     if (rc != YR_ERROR_SUCCESS || !m_impl->rules) {
         m_impl->scanErrors.fetch_add(1, std::memory_order_relaxed);
