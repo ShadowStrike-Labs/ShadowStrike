@@ -466,6 +466,12 @@ bool KernelIPCBridge::Impl::ValidateRequest(const EmulationRequest& req) noexcep
     if (req.sampleSize > kMaxSampleSize) return false;
     if (req.sampleType > 3) return false;
     if (req.priority > 3) return false;
+    // DESIGN: cap per-request timeout at 10× the default. Without a cap a
+    // hostile client (or a kernel driver bug producing UINT32_MAX) could
+    // pin a worker thread for ~50 days reading the sample payload, exhausting
+    // the kMaxConcurrentSessions slot pool and starving legitimate scans.
+    constexpr uint32_t kMaxRequestTimeoutMs = kDefaultTimeoutMs * 10u;
+    if (req.timeout > kMaxRequestTimeoutMs) return false;
     return true;
 }
 
@@ -752,26 +758,30 @@ void KernelIPCBridge::Impl::HandleConnection(uint32_t slotIndex) noexcept {
 
         // Validate
         if (!ValidateRequest(req)) {
-            // Send error response and continue
+            // Send error response and continue. WriteExact failure here is
+            // best-effort — the client may have already disconnected; we
+            // still want to attempt the response so a well-behaved client
+            // observes the rejection rather than a blank pipe.
             EmulationResponse errResp{};
             errResp.magic     = kResponseMagic;
             errResp.version   = kProtocolVersion;
             errResp.requestId = req.requestId;
             errResp.verdict   = 0; // Clean — we didn't analyze
             errResp.flags     = 0;
-            WriteExact(conn.hPipe, &errResp, sizeof(errResp));
+            (void)WriteExact(conn.hPipe, &errResp, sizeof(errResp));
             continue;
         }
 
         // Rate limit
         if (!rateLimiter.Allow()) {
-            // Send response with zero results
+            // Send response with zero results. WriteExact best-effort —
+            // see ValidateRequest path above.
             EmulationResponse rlResp{};
             rlResp.magic     = kResponseMagic;
             rlResp.version   = kProtocolVersion;
             rlResp.requestId = req.requestId;
             rlResp.flags     = kRespFlagTruncated;
-            WriteExact(conn.hPipe, &rlResp, sizeof(rlResp));
+            (void)WriteExact(conn.hPipe, &rlResp, sizeof(rlResp));
             continue;
         }
 
