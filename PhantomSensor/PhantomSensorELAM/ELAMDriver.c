@@ -54,12 +54,32 @@
 #define ELAM_MAX_REGISTRY_KEY_LENGTH    512
 #define ELAM_CLASSIFICATION_TIMEOUT_MS  25      // Performance target: < 25ms
 
-// Registry paths to protect
+// Registry paths that are ALWAYS protected from any modification.
+// The Services key is handled separately via ElampIsCriticalServiceWrite()
+// because blanket-blocking all of \Services\* would deny legitimate
+// (non-driver) service installations system-wide.
 static const WCHAR* g_ProtectedRegistryPaths[] = {
-    L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services",
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\BootExecute",
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot",
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\EarlyLaunch",
+    NULL
+};
+
+// Services-key prefix (matched separately, with value-name + Start/Type checks).
+static const WCHAR g_ServicesPrefix[] =
+    L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services";
+
+// Sensitive value names under \Services\<svc> whose modification can
+// hijack a kernel driver load. Only writes to these are blocked, and
+// only when the target service is a Type=1/2 driver with Start=0/1.
+static const WCHAR* g_SensitiveServiceValues[] = {
+    L"ImagePath",
+    L"ServiceDll",
+    L"Start",
+    L"Type",
+    L"Group",
+    L"DependOnService",
+    L"DependOnGroup",
     NULL
 };
 
@@ -96,6 +116,30 @@ ElamRegistryCallbackRoutine(
 static BOOLEAN
 ElamIsProtectedRegistryPath(
     _In_ PUNICODE_STRING KeyPath
+    );
+
+static BOOLEAN
+ElampIsServicesKey(
+    _In_ PUNICODE_STRING KeyPath
+    );
+
+static BOOLEAN
+ElampIsSensitiveServiceValue(
+    _In_opt_ PUNICODE_STRING ValueName
+    );
+
+static NTSTATUS
+ElampReadDwordFromObject(
+    _In_ PVOID KeyObject,
+    _In_ PCWSTR ValueName,
+    _Out_ PULONG Value
+    );
+
+static BOOLEAN
+ElampIsCriticalServiceWrite(
+    _In_ PVOID ServiceKey,
+    _In_opt_ PUNICODE_STRING ValueName,
+    _In_ BOOLEAN IsKeyDelete
     );
 
 static NTSTATUS
@@ -426,6 +470,8 @@ ElamImageLoadCallback(
     RtlCopyMemory(bootInfo.AuthenticodeHashSHA256, driverInfo->AuthentiCodeHash, 32);
     bootInfo.IsSigned = driverInfo->IsSigned;
     bootInfo.IsSignatureValid = driverInfo->IsSigned;
+    bootInfo.IsMicrosoftSigned = driverInfo->IsMicrosoftSigned;
+    bootInfo.IsWHQLSigned = driverInfo->IsWhqlSigned;
 
     // Perform final classification
     classification = ElamClassifyDriver(&bootInfo);
@@ -949,10 +995,25 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
+                    BOOLEAN block = FALSE;
                     if (ElamIsProtectedRegistryPath(objectName)) {
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                            "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\n",
-                            objectName);
+                        block = TRUE;
+                    } else if (ElampIsServicesKey(objectName)) {
+                        block = ElampIsCriticalServiceWrite(
+                            setValueInfo->Object,
+                            setValueInfo->ValueName,
+                            FALSE);
+                    }
+                    if (block) {
+                        if (setValueInfo->ValueName != NULL) {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\\%wZ\n",
+                                objectName, setValueInfo->ValueName);
+                        } else {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                "[ShadowStrike/ELAM] BLOCKED registry value modification: %wZ\n",
+                                objectName);
+                        }
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -973,7 +1034,19 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
+                    BOOLEAN block = FALSE;
                     if (ElamIsProtectedRegistryPath(objectName)) {
+                        block = TRUE;
+                    } else if (ElampIsServicesKey(objectName)) {
+                        block = ElampIsCriticalServiceWrite(
+                            deleteValueInfo->Object,
+                            deleteValueInfo->ValueName,
+                            FALSE);
+                    }
+                    if (block) {
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                            "[ShadowStrike/ELAM] BLOCKED registry value delete under %wZ\n",
+                            objectName);
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -994,7 +1067,21 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
+                    BOOLEAN block = FALSE;
                     if (ElamIsProtectedRegistryPath(objectName)) {
+                        block = TRUE;
+                    } else if (ElampIsServicesKey(objectName)) {
+                        // Deleting an entire boot/system driver service key is
+                        // always blocked — there is no legitimate reason to
+                        // delete a registered driver key from a non-installer
+                        // context, and the value-name predicate doesn't apply.
+                        block = ElampIsCriticalServiceWrite(
+                            deleteKeyInfo->Object, NULL, TRUE);
+                    }
+                    if (block) {
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                            "[ShadowStrike/ELAM] BLOCKED key delete: %wZ\n",
+                            objectName);
                         status = STATUS_ACCESS_DENIED;
                     }
                     CmCallbackReleaseKeyObjectIDEx(objectName);
@@ -1021,7 +1108,8 @@ ElamRegistryCallbackRoutine(
                     );
 
                 if (NT_SUCCESS(lookupStatus) && objectName != NULL) {
-                    if (ElamIsProtectedRegistryPath(objectName)) {
+                    if (ElamIsProtectedRegistryPath(objectName) ||
+                        ElampIsServicesKey(objectName)) {
                         if (createKeyInfo->CompleteName != NULL) {
                             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                                 "[ShadowStrike/ELAM] New key creation under protected path: %wZ\\%wZ\n",
@@ -1078,6 +1166,184 @@ ElamIsProtectedRegistryPath(
     }
 
     return FALSE;
+}
+
+/**
+ * @brief Test whether KeyPath is under the \\Services\\ subtree.
+ */
+static BOOLEAN
+ElampIsServicesKey(
+    _In_ PUNICODE_STRING KeyPath
+    )
+{
+    UNICODE_STRING servicesPrefix;
+    UNICODE_STRING prefix;
+
+    if (KeyPath == NULL || KeyPath->Buffer == NULL || KeyPath->Length == 0) {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&servicesPrefix, g_ServicesPrefix);
+
+    // Must be at least \\Services\\<one-char>
+    if (KeyPath->Length <= servicesPrefix.Length + sizeof(WCHAR)) {
+        return FALSE;
+    }
+
+    prefix.Buffer = KeyPath->Buffer;
+    prefix.Length = servicesPrefix.Length;
+    prefix.MaximumLength = servicesPrefix.Length;
+
+    if (RtlCompareUnicodeString(&prefix, &servicesPrefix, TRUE) != 0) {
+        return FALSE;
+    }
+
+    // Char immediately after the prefix must be a path separator.
+    WCHAR sep = KeyPath->Buffer[servicesPrefix.Length / sizeof(WCHAR)];
+    return (sep == L'\\');
+}
+
+/**
+ * @brief Test whether ValueName is one of the security-critical service values.
+ */
+static BOOLEAN
+ElampIsSensitiveServiceValue(
+    _In_opt_ PUNICODE_STRING ValueName
+    )
+{
+    if (ValueName == NULL || ValueName->Buffer == NULL || ValueName->Length == 0) {
+        // A NULL/empty value name on a sensitive key is itself suspicious;
+        // fail safe by treating as sensitive.
+        return TRUE;
+    }
+
+    for (ULONG i = 0; g_SensitiveServiceValues[i] != NULL; i++) {
+        UNICODE_STRING candidate;
+        RtlInitUnicodeString(&candidate, g_SensitiveServiceValues[i]);
+        if (RtlCompareUnicodeString(ValueName, &candidate, TRUE) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/**
+ * @brief Read ULONG REG_DWORD value from a registry-callback Object.
+ *
+ * IRQL: PASSIVE_LEVEL only (registry callbacks fire at PASSIVE for the
+ * notify classes we handle). On failure, *Value is left untouched.
+ */
+static NTSTATUS
+ElampReadDwordFromObject(
+    _In_ PVOID KeyObject,
+    _In_ PCWSTR ValueName,
+    _Out_ PULONG Value
+    )
+{
+    HANDLE keyHandle = NULL;
+    NTSTATUS status;
+    UNICODE_STRING valueUstr;
+    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+    ULONG resultLength = 0;
+
+    PAGED_CODE();
+
+    if (KeyObject == NULL || ValueName == NULL || Value == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = ObOpenObjectByPointer(
+        KeyObject,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        KEY_QUERY_VALUE,
+        *CmKeyObjectType,
+        KernelMode,
+        &keyHandle);
+
+    if (!NT_SUCCESS(status) || keyHandle == NULL) {
+        return status;
+    }
+
+    RtlInitUnicodeString(&valueUstr, ValueName);
+    status = ZwQueryValueKey(
+        keyHandle,
+        &valueUstr,
+        KeyValuePartialInformation,
+        info,
+        sizeof(buffer),
+        &resultLength);
+
+    if (NT_SUCCESS(status) &&
+        info->Type == REG_DWORD &&
+        info->DataLength == sizeof(ULONG)) {
+        *Value = *(ULONG UNALIGNED*)info->Data;
+    } else if (NT_SUCCESS(status)) {
+        // Wrong type or size — treat as not-present
+        status = STATUS_OBJECT_TYPE_MISMATCH;
+    }
+
+    ZwClose(keyHandle);
+    return status;
+}
+
+/**
+ * @brief Decide whether a write/delete on a Services\<svc>\... key should be blocked.
+ *
+ * Blocking criteria (all must hold):
+ *   1. The target value is one of the sensitive boot-driver values
+ *      (ImagePath/ServiceDll/Start/Type/Group/DependOn*).
+ *   2. The owning service is a kernel driver: Type == 1 (KERNEL_DRIVER)
+ *      or Type == 2 (FILE_SYSTEM_DRIVER).
+ *   3. The owning service starts at boot or system phase: Start == 0 or 1.
+ *
+ * If Type/Start cannot be read (key being created, race, etc.) the call
+ * fails OPEN — we do NOT block, because legitimate driver installs
+ * legitimately race the key creation. Boot-image-load callback is the
+ * actual enforcement point for unknown drivers.
+ *
+ * @param ServiceKey  PVOID Object of the \\Services\\<svc> key (or a deeper subkey).
+ * @param ValueName   Optional value name being modified (NULL for key delete/create).
+ * @param IsKeyDelete TRUE if RegNtPreDeleteKey on the service key itself.
+ */
+static BOOLEAN
+ElampIsCriticalServiceWrite(
+    _In_ PVOID ServiceKey,
+    _In_opt_ PUNICODE_STRING ValueName,
+    _In_ BOOLEAN IsKeyDelete
+    )
+{
+    ULONG svcType = 0;
+    ULONG svcStart = 0;
+    NTSTATUS status;
+
+    if (ServiceKey == NULL) {
+        return FALSE;
+    }
+
+    // For value writes/deletes, the value must be sensitive.
+    if (!IsKeyDelete && !ElampIsSensitiveServiceValue(ValueName)) {
+        return FALSE;
+    }
+
+    status = ElampReadDwordFromObject(ServiceKey, L"Type", &svcType);
+    if (!NT_SUCCESS(status)) {
+        // Type unreadable — fail OPEN to avoid breaking legitimate installs.
+        return FALSE;
+    }
+    if (svcType != 1 /* SERVICE_KERNEL_DRIVER */ &&
+        svcType != 2 /* SERVICE_FILE_SYSTEM_DRIVER */) {
+        return FALSE;
+    }
+
+    status = ElampReadDwordFromObject(ServiceKey, L"Start", &svcStart);
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    // Only protect boot (0) and system (1) phase drivers.
+    return (svcStart == 0 || svcStart == 1);
 }
 
 // ============================================================================
