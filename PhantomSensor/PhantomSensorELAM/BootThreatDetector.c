@@ -901,7 +901,6 @@ BtdScanDriver(
     PBTD_PATTERN_ENTRY patternEntry;
     KIRQL oldIrql;
     ULONG matchOffset;
-    LONG currentDetected;
     BOOLEAN patternMatched = FALSE;
     BTD_THREAT_TYPE matchedThreatType = BtdThreat_None;
     CHAR matchedThreatName[64] = {0};
@@ -933,14 +932,18 @@ BtdScanDriver(
 
     if (NT_SUCCESS(status) && isVulnerable) {
 
-        currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
-        if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
-            InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+        // Reserve a detection slot atomically; roll back on any failure.
+        // The previous read-only cap check (CWE-362) let N concurrent
+        // scanners overcommit DetectedList past BTD_MAX_DETECTED_THREATS.
+        LONG reserved = InterlockedIncrement(&Detector->DetectedCount);
+        if (reserved > BTD_MAX_DETECTED_THREATS) {
+            InterlockedDecrement(&Detector->DetectedCount);
             return STATUS_QUOTA_EXCEEDED;
         }
 
         threat = BtdpAllocateThreat(internal);
         if (threat == NULL) {
+            InterlockedDecrement(&Detector->DetectedCount);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -965,7 +968,6 @@ BtdScanDriver(
 
         KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
         InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-        InterlockedIncrement(&Detector->DetectedCount);
         KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
 
         InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
@@ -1063,14 +1065,16 @@ BtdScanDriver(
         //
         if (patternMatched) {
 
-            currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
-            if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
-                InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+            // Reserve a detection slot atomically (CWE-362 close).
+            LONG reserved = InterlockedIncrement(&Detector->DetectedCount);
+            if (reserved > BTD_MAX_DETECTED_THREATS) {
+                InterlockedDecrement(&Detector->DetectedCount);
                 return STATUS_QUOTA_EXCEEDED;
             }
 
             threat = BtdpAllocateThreat(internal);
             if (threat == NULL) {
+                InterlockedDecrement(&Detector->DetectedCount);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
@@ -1101,7 +1105,6 @@ BtdScanDriver(
 
             KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
             InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-            InterlockedIncrement(&Detector->DetectedCount);
             KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
 
             InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
@@ -1117,14 +1120,16 @@ BtdScanDriver(
     //
     if (DriverInfo->Classification == BdvClass_Unknown_Bad) {
 
-        currentDetected = InterlockedCompareExchange(&Detector->DetectedCount, 0, 0);
-        if (currentDetected >= BTD_MAX_DETECTED_THREATS) {
-            InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
+        // Reserve a detection slot atomically (CWE-362 close).
+        LONG reserved = InterlockedIncrement(&Detector->DetectedCount);
+        if (reserved > BTD_MAX_DETECTED_THREATS) {
+            InterlockedDecrement(&Detector->DetectedCount);
             return STATUS_QUOTA_EXCEEDED;
         }
 
         threat = BtdpAllocateThreat(internal);
         if (threat == NULL) {
+            InterlockedDecrement(&Detector->DetectedCount);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1149,7 +1154,6 @@ BtdScanDriver(
 
         KeAcquireSpinLock(&Detector->DetectedLock, &oldIrql);
         InsertTailList(&Detector->DetectedList, &threat->ListEntry);
-        InterlockedIncrement(&Detector->DetectedCount);
         KeReleaseSpinLock(&Detector->DetectedLock, oldIrql);
 
         InterlockedIncrement64(&Detector->Stats.ThreatsDetected);
@@ -1184,6 +1188,9 @@ BtdLoadVulnerableList(
     ULONG i;
     SIZE_T expectedSize;
     LONG currentCount;
+    ULONG entryCount;
+    ULONG version;
+    ULONG magic;
 
     if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 1, 1)) {
         return STATUS_INVALID_PARAMETER;
@@ -1196,38 +1203,54 @@ BtdLoadVulnerableList(
     header = (PBTD_VULN_LIST_HEADER)Data;
 
     //
+    // CWE-367 (double-fetch): snapshot header fields into locals once under
+    // SEH so a malicious or partially-mapped buffer cannot mutate the values
+    // between validation and use, and cannot BSOD via unmapped-page faults.
+    //
+    __try {
+        magic = header->Magic;
+        version = header->Version;
+        entryCount = header->EntryCount;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/BTD] BtdLoadVulnerableList: exception 0x%08X reading header\n",
+            GetExceptionCode());
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    //
     // Validate header
     //
-    if (header->Magic != BTD_VULN_LIST_MAGIC) {
+    if (magic != BTD_VULN_LIST_MAGIC) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[ShadowStrike/BTD] BtdLoadVulnerableList: invalid magic 0x%08X (expected 0x%08X)\n",
-            header->Magic, BTD_VULN_LIST_MAGIC);
+            magic, BTD_VULN_LIST_MAGIC);
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (header->Version != BTD_VULN_LIST_VERSION) {
+    if (version != BTD_VULN_LIST_VERSION) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[ShadowStrike/BTD] BtdLoadVulnerableList: unsupported version %u\n",
-            header->Version);
+            version);
         return STATUS_NOT_SUPPORTED;
     }
 
-    if (header->EntryCount == 0) {
+    if (entryCount == 0) {
         return STATUS_SUCCESS;
     }
 
     //
-    // Integer overflow check: EntryCount * sizeof(record) + header
+    // Integer overflow check: entryCount * sizeof(record) + header
     //
-    if (header->EntryCount > BTD_MAX_VULNERABLE_DRIVERS) {
+    if (entryCount > BTD_MAX_VULNERABLE_DRIVERS) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[ShadowStrike/BTD] BtdLoadVulnerableList: entry count %u exceeds max %u\n",
-            header->EntryCount, BTD_MAX_VULNERABLE_DRIVERS);
+            entryCount, BTD_MAX_VULNERABLE_DRIVERS);
         return STATUS_INVALID_PARAMETER;
     }
 
     expectedSize = sizeof(BTD_VULN_LIST_HEADER) +
-                   (SIZE_T)header->EntryCount * sizeof(BTD_VULN_LIST_RECORD);
+                   (SIZE_T)entryCount * sizeof(BTD_VULN_LIST_RECORD);
 
     if (DataSize < expectedSize) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -1238,34 +1261,52 @@ BtdLoadVulnerableList(
 
     records = (PBTD_VULN_LIST_RECORD)((PUCHAR)Data + sizeof(BTD_VULN_LIST_HEADER));
 
-    for (i = 0; i < header->EntryCount; i++) {
+    for (i = 0; i < entryCount; i++) {
+
+        BTD_VULN_LIST_RECORD localRecord;
 
         //
-        // Enforce global cap
+        // CWE-367 / CWE-20: snapshot the entire record into a local under SEH
+        // so subsequent validation and copy operations cannot be raced or
+        // crashed by a corrupted source buffer.
         //
-        currentCount = InterlockedCompareExchange(&Detector->VulnerableCount, 0, 0);
-        if (currentCount >= BTD_MAX_VULNERABLE_DRIVERS) {
+        __try {
+            RtlCopyMemory(&localRecord, &records[i], sizeof(localRecord));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike/BTD] Exception 0x%08X reading record #%u\n",
+                GetExceptionCode(), i);
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        //
+        // Reserve a vulnerable-list slot atomically (CWE-362 close).
+        //
+        currentCount = InterlockedIncrement(&Detector->VulnerableCount);
+        if (currentCount > BTD_MAX_VULNERABLE_DRIVERS) {
+            InterlockedDecrement(&Detector->VulnerableCount);
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                 "[ShadowStrike/BTD] Vulnerable list cap reached (%u), loaded %u of %u new entries\n",
-                BTD_MAX_VULNERABLE_DRIVERS, i, header->EntryCount);
+                BTD_MAX_VULNERABLE_DRIVERS, i, entryCount);
             break;
         }
 
         //
         // Validate string fields are null-terminated within their bounds
         //
-        if (records[i].DriverName[sizeof(records[i].DriverName) - 1] != '\0' ||
-            records[i].CVE[sizeof(records[i].CVE) - 1] != '\0' ||
-            records[i].Vendor[sizeof(records[i].Vendor) - 1] != '\0') {
+        if (localRecord.DriverName[sizeof(localRecord.DriverName) - 1] != '\0' ||
+            localRecord.CVE[sizeof(localRecord.CVE) - 1] != '\0' ||
+            localRecord.Vendor[sizeof(localRecord.Vendor) - 1] != '\0') {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                 "[ShadowStrike/BTD] Skipping entry #%u: unterminated string field\n", i);
+            InterlockedDecrement(&Detector->VulnerableCount);
             continue;
         }
 
-        if (records[i].SeverityScore > 100) {
+        if (localRecord.SeverityScore > 100) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                 "[ShadowStrike/BTD] Clamping entry #%u severity from %u to 100\n",
-                i, records[i].SeverityScore);
+                i, localRecord.SeverityScore);
         }
 
         entry = (PBTD_VULNERABLE_ENTRY)ExAllocatePool2(
@@ -1275,16 +1316,17 @@ BtdLoadVulnerableList(
             );
 
         if (entry == NULL) {
+            InterlockedDecrement(&Detector->VulnerableCount);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
         RtlZeroMemory(entry, sizeof(BTD_VULNERABLE_ENTRY));
 
-        RtlCopyMemory(entry->Hash, records[i].Hash, BTD_HASH_SIZE);
-        RtlStringCbCopyA(entry->DriverName, sizeof(entry->DriverName), records[i].DriverName);
-        RtlStringCbCopyA(entry->CVE, sizeof(entry->CVE), records[i].CVE);
-        RtlStringCbCopyA(entry->Vendor, sizeof(entry->Vendor), records[i].Vendor);
-        entry->SeverityScore = min(records[i].SeverityScore, 100);
+        RtlCopyMemory(entry->Hash, localRecord.Hash, BTD_HASH_SIZE);
+        RtlStringCbCopyA(entry->DriverName, sizeof(entry->DriverName), localRecord.DriverName);
+        RtlStringCbCopyA(entry->CVE, sizeof(entry->CVE), localRecord.CVE);
+        RtlStringCbCopyA(entry->Vendor, sizeof(entry->Vendor), localRecord.Vendor);
+        entry->SeverityScore = min(localRecord.SeverityScore, 100);
 
         RtlStringCbPrintfA(entry->Description, sizeof(entry->Description),
                           "Vulnerable driver: %s (%s)", entry->DriverName, entry->CVE);
@@ -1292,7 +1334,6 @@ BtdLoadVulnerableList(
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Detector->VulnerableLock);
         InsertTailList(&Detector->VulnerableList, &entry->ListEntry);
-        InterlockedIncrement(&Detector->VulnerableCount);
         ExReleasePushLockExclusive(&Detector->VulnerableLock);
         KeLeaveCriticalRegion();
     }
