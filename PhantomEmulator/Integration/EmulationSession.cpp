@@ -749,7 +749,12 @@ struct EmulationSession::Impl {
 
         // Build LDR data
         auto& envBuilder = VirtualOS::EnvironmentBuilder::Instance();
-        envBuilder.BuildLdrData(m_memory);
+        // DESIGN: BuildLdrData failure is non-fatal for shellcode — many
+        // shellcode payloads either don't walk LDR at all or tolerate a
+        // partially-populated PEB_LDR_DATA. We continue regardless and let
+        // the in-guest code fall over deterministically if it depends on it,
+        // which produces a cleaner emulation trace than aborting the session.
+        (void)envBuilder.BuildLdrData(m_memory);
 
         // Configure CPU registers for shellcode entry
         loader.PrepareCPUState(m_cpu, sc, m_config);
@@ -803,7 +808,9 @@ struct EmulationSession::Impl {
         m_dispatcher->WireImports(imports, kAPIHookBase, kAPIHookSize);
 
         auto& envBuilder = VirtualOS::EnvironmentBuilder::Instance();
-        envBuilder.BuildLdrData(m_memory);
+        // DESIGN: BuildLdrData failure is non-fatal for raw buffers (same
+        // reasoning as the shellcode path above).
+        (void)envBuilder.BuildLdrData(m_memory);
 
         // Configure CPU manually (no PE/shellcode loader to do this)
         SetupCPUForBuffer(entry, is64Bit, errorOut);
@@ -842,7 +849,24 @@ struct EmulationSession::Impl {
             // code executes RET, it will jump to an unmapped address and
             // trigger an access violation — a clean exit signal.
             constexpr uint64_t kSentinelReturn = 0xDEADDEADDEADDEADULL;
-            m_memory.WriteU64(rsp, kSentinelReturn);
+            const ErrorCode wErr = m_memory.WriteU64(rsp, kSentinelReturn);
+            if (wErr != ErrorCode::Success) {
+                // Sentinel write failed — buffer return semantics will fall
+                // through to whatever zero/uninit data is on the stack page,
+                // but the page itself is mapped RW so execution can proceed.
+                // Surface the condition on the error channel for diagnostics
+                // without aborting the session.
+                errorOut = "EmulateBuffer: stack sentinel WriteU64 failed (ErrorCode " +
+                           std::to_string(static_cast<uint32_t>(wErr)) + ") — continuing";
+            }
+        } else {
+            // Stack allocation failed: the CPU has no valid RSP and the very
+            // first push/call inside the buffer will fault. Make the failure
+            // explicit so callers / telemetry see a real reason instead of
+            // a silent crash trace.
+            errorOut = "EmulateBuffer: failed to allocate " +
+                       std::to_string(m_config.stackSize) +
+                       " bytes for guest stack at 0x" + ToHex64(kBufferStackBase);
         }
 
         // Set segment bases for TEB/PEB access
@@ -904,6 +928,11 @@ struct EmulationSession::Impl {
     // most critical path — it fires for every emulated Win32/NT API call.
 
     void WireCPUCallbacks(const LoadedTarget& target) noexcept {
+        // DESIGN: target is reserved for future per-target callback tuning
+        // (e.g., enabling 32-bit-specific FS/GS context callbacks for WoW64
+        // PEs). Currently the global hook range is sufficient. Keep the
+        // parameter so the wiring contract is stable across future tuning.
+        (void)target;
         // Tell the CPU where our hook sentinel addresses live
         m_cpu.SetAPIHookRange(kAPIHookBase, kAPIHookSize);
 
@@ -1198,6 +1227,11 @@ struct EmulationSession::Impl {
 
     void RouteProcessEvents(const APICallDetail& call,
                             const CPUState& cpu) noexcept {
+        // DESIGN: cpu is reserved for future register-derived heuristics
+        // (e.g., reading thread-context register snapshots for SetThreadContext
+        // to capture the staged shellcode RIP). Currently all routing
+        // decisions are derived from the API call detail's argument array.
+        (void)cpu;
         if (!m_config.enableMultiProcess || !call.funcName) return;
 
         const std::string_view fn{call.funcName};
@@ -1210,7 +1244,12 @@ struct EmulationSession::Impl {
             if (call.argCount > 4 && (call.args[4] & 0x4u)) {
                 flags = ProcessCreationFlags::CreateSuspended;
             }
-            m_processManager.CreateChildProcess(
+            // DESIGN: returned child PID is intentionally unused here —
+            // ProcessManager retains the new entry in its internal table and
+            // future routing (WriteProcessMemory, NtCreateThreadEx, etc.)
+            // looks the child up by guest-supplied targetPid. Discarding the
+            // return value here does not leak any state.
+            (void)m_processManager.CreateChildProcess(
                 L"<unknown>",   // imagePath (extracted by IOCExtractor)
                 L"<unknown>",   // commandLine
                 flags,
@@ -1278,7 +1317,12 @@ struct EmulationSession::Impl {
         // === Resume thread (final step for many injection chains) ===
         if (fn == "ResumeThread" || fn == "NtResumeThread") {
             uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
-            m_processManager.ResumeProcess(targetPid);
+            // DESIGN: ResumeProcess returns false for unknown PIDs — that's
+            // expected when the guest resumes a process it didn't create
+            // through our emulator (e.g., the initial sample). The detection
+            // value is in the *attempt*, which ProcessManager has already
+            // recorded internally.
+            (void)m_processManager.ResumeProcess(targetPid);
             return;
         }
     }
@@ -1293,8 +1337,11 @@ struct EmulationSession::Impl {
         // and translate the syscall number through the thunk table before
         // dispatching to the standard 64-bit syscall handler.
         if (m_config.enableWoW64 && m_wow64Layer.IsInitialized()) {
-            // Thunk 32-bit syscall number to 64-bit equivalent
-            m_wow64Layer.ThunkSyscall(cpu, mem);
+            // Thunk 32-bit syscall number to 64-bit equivalent. A failed
+            // thunk (unknown 32-bit syscall index) leaves the CPU state
+            // unchanged so the standard 64-bit dispatcher below can still
+            // reject it cleanly via DispatchSyscall returning false.
+            (void)m_wow64Layer.ThunkSyscall(cpu, mem);
         }
 
         bool handled = m_dispatcher->DispatchSyscall(cpu, mem);
@@ -1540,6 +1587,12 @@ struct EmulationSession::Impl {
     // ========================================================================
 
     void ProcessWXTransitions(const LoadedTarget& target) noexcept {
+        // DESIGN: target is reserved for future imageBase/imageSize-aware
+        // filtering (e.g., suppressing WX events that fall inside the loaded
+        // PE's legitimate code section). Current pipeline treats every WX
+        // page as a candidate; suppression happens downstream in the
+        // unpacking engine which already has the image layout.
+        (void)target;
         auto wxPages = m_tracker.GetWriteExecutePages();
         if (wxPages.empty()) return;
 
@@ -1648,13 +1701,22 @@ struct EmulationSession::Impl {
         if (m_unpackingEngine.IsComplete()) {
             GuestAddress oep = m_unpackingEngine.GetFinalOEP();
             if (oep != 0 && target.imageBase != 0 && target.imageSize > 0) {
-                // Try to dump a valid PE from memory at the OEP
-                m_unpackingEngine.DumpPE(
+                // Try to dump a valid PE from memory at the OEP. DumpPE
+                // returns the dumped image bytes; we currently do not stage
+                // the dump into the result struct (it is exposed to callers
+                // through GetLayers()/GetFinalOEP() metadata). Capture the
+                // value to satisfy [[nodiscard]] without changing observable
+                // behaviour.
+                auto dumped = m_unpackingEngine.DumpPE(
                     m_memory, target.imageBase, target.imageSize);
+                (void)dumped;
 
-                // Attempt import reconstruction on the unpacked PE
+                // Attempt import reconstruction on the unpacked PE. A
+                // failed reconstruction (e.g., partial IAT) is non-fatal —
+                // the unpacking engine has already published the layer
+                // history, which is the primary unpacking artefact.
                 VirtualMemory& memRef = m_memory;
-                m_unpackingEngine.ReconstructImports(
+                (void)m_unpackingEngine.ReconstructImports(
                     memRef, target.imageBase, target.imageSize);
             }
         }
@@ -2035,6 +2097,11 @@ struct EmulationSession::Impl {
         if (bypassEvents.empty()) return;
 
         for (const auto& evt : bypassEvents) {
+            // DESIGN: per-event detail is intentionally not unpacked here —
+            // every entry in the AMSI bypass log corresponds to one bypass
+            // attempt and feeds a single detection. The static description
+            // string below is what the threat scorer / MITRE mapper key on.
+            (void)evt;
             const char* desc = "amsi_bypass_detected";
 
             m_evasionDetector.OnEnvironmentQuery("amsi-bypass", desc);
@@ -2074,6 +2141,9 @@ struct EmulationSession::Impl {
         if (blindingEvents.empty()) return;
 
         for (const auto& evt : blindingEvents) {
+            // DESIGN: see CollectAmsiForensics — each event maps 1:1 to a
+            // detection keyed off the static description below.
+            (void)evt;
             const char* desc = "etw_telemetry_blinding";
 
             m_evasionDetector.OnEnvironmentQuery("etw-blinding", desc);
@@ -2929,7 +2999,12 @@ struct EmulationSession::Impl {
         // because it modifies segment descriptors and CS selector.
         if (m_config.enableWoW64 && !target.is64Bit) {
             if (m_wow64Layer.Initialize(m_memory, m_cpu.State())) {
-                m_wow64Layer.SetupFor32BitPE(
+                // SetupFor32BitPE failure leaves WoW64 partially initialised
+                // (Initialize already succeeded). The session will still
+                // execute under 32-bit segments; a missed setup just means
+                // some thunks won't fire — the dispatcher will surface that
+                // as unhandled APIs rather than crash the emulator.
+                (void)m_wow64Layer.SetupFor32BitPE(
                     m_memory, m_cpu.State(),
                     target.imageBase, target.entryPoint);
             }
@@ -2974,8 +3049,26 @@ struct EmulationSession::Impl {
 // ============================================================================
 
 EmulationSession::EmulationSession(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>(config))
-{}
+    : m_impl(nullptr)
+{
+    // DESIGN: ctor is declared noexcept but std::make_unique<Impl>(config)
+    // can throw std::bad_alloc (Impl owns dozens of subsystems and reserves
+    // multiple vectors during construction). Catch the allocation failure
+    // and leave m_impl null — every public Emulate* / RequestAbort /
+    // GetConfig method already null-guards m_impl, so a session
+    // constructed under memory pressure becomes inert and surfaces a
+    // clean error to the caller instead of std::terminate.
+    try {
+        m_impl = std::make_unique<Impl>(config);
+    } catch (const std::bad_alloc&) {
+        // m_impl stays nullptr; subsequent Emulate* calls return a
+        // PhantomEmulationResult with success=false.
+    } catch (const std::exception&) {
+        // Any other subsystem-construction exception is caught for the
+        // same reason — exception types are not part of the noexcept
+        // contract and must not escape.
+    }
+}
 
 EmulationSession::~EmulationSession() noexcept = default;
 
@@ -3144,6 +3237,16 @@ void EmulationSession::RequestAbort() noexcept {
 // ============================================================================
 
 const EmulationConfig& EmulationSession::GetConfig() const noexcept {
+    // DESIGN: return a stable fallback when the session was constructed
+    // under memory pressure (m_impl == nullptr) or has been moved-from.
+    // The fallback is a default-initialised EmulationConfig with a static
+    // storage duration so the returned reference remains valid for the
+    // lifetime of the process. Avoids a null dereference for callers that
+    // probe configuration after a failed construction.
+    if (!m_impl) {
+        static const EmulationConfig kDefaultConfig{};
+        return kDefaultConfig;
+    }
     return m_impl->m_config;
 }
 
