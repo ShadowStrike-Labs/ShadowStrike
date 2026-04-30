@@ -61,7 +61,6 @@
 //
 extern ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
 extern BOOLEAN PsIsSystemProcess(_In_ PEPROCESS Process);
-extern LONGLONG PsGetProcessCreateTimeQuadPart(_In_ PEPROCESS Process);
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -693,7 +692,6 @@ PrShutdown(
         // Just free the relationship here
         //
         PrpFreeRelationship(internal, relationship);
-        InterlockedIncrement64(&Graph->Stats.RelationshipsRemoved);
 
         listEntry = nextEntry;
     }
@@ -911,84 +909,14 @@ PrAddProcess(
     }
 
     //
-    // Check if process already exists. If we find an existing node with a
-    // strictly different process create time, the previous owner of this
-    // PID exited without our exit notify firing (rare but possible during
-    // shutdown races) and the kernel reused the PID. Treat the stale node
-    // as removed so the new node can be inserted.
+    // Check if process already exists
     //
     existingNode = PrpFindNodeLocked(internal, ProcessId);
     if (existingNode != NULL) {
-        BOOLEAN pidReused = FALSE;
-
-        if (node->CreateTime.QuadPart != 0 &&
-            existingNode->CreateTime.QuadPart != 0 &&
-            existingNode->CreateTime.QuadPart != node->CreateTime.QuadPart) {
-            pidReused = TRUE;
-        }
-
-        if (!pidReused) {
-            ExReleasePushLockExclusive(&Graph->NodeLock);
-            KeLeaveCriticalRegion();
-            status = STATUS_OBJECT_NAME_EXISTS;
-            goto Cleanup;
-        }
-
-        //
-        // PID reuse confirmed â€” evict the stale node from lookup tables
-        // AND clean up its relationships so the new insert below succeeds
-        // and we don't leak relationships until graph shutdown. We hold
-        // NodeLock exclusive, so no concurrent PrAddRelationship can be
-        // mid-insert into this stale node's list.
-        //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "[ProcessRelationship] PID reuse detected for PID %lu (old=%lld new=%lld); evicting stale node\n",
-            HandleToULong(ProcessId),
-            existingNode->CreateTime.QuadPart,
-            node->CreateTime.QuadPart);
-
-        existingNode->Removed = TRUE;
-
-        {
-            PLIST_ENTRY staleEntry;
-            PLIST_ENTRY staleNext;
-            PPR_RELATIONSHIP staleRel;
-
-            staleEntry = existingNode->RelationshipList.Flink;
-            while (staleEntry != &existingNode->RelationshipList) {
-                staleNext = staleEntry->Flink;
-                staleRel = CONTAINING_RECORD(staleEntry, PR_RELATIONSHIP, NodeListEntry);
-
-                RemoveEntryList(&staleRel->NodeListEntry);
-
-                ExAcquirePushLockExclusive(&Graph->RelationshipLock);
-                RemoveEntryList(&staleRel->GlobalListEntry);
-                InterlockedDecrement(&Graph->RelationshipCount);
-                ExReleasePushLockExclusive(&Graph->RelationshipLock);
-
-                PrpFreeRelationship(internal, staleRel);
-                InterlockedDecrement(&existingNode->RelationshipCount);
-                InterlockedIncrement64(&Graph->Stats.RelationshipsRemoved);
-
-                staleEntry = staleNext;
-            }
-        }
-
-        PrpRemoveNodeLocked(internal, existingNode);
-
-        {
-            LONG staleRefCount = InterlockedDecrement(&existingNode->RefCount);
-            if (staleRefCount == 0) {
-                if (existingNode->ImageName.Buffer != NULL) {
-                    ShadowStrikeFreePoolWithTag(existingNode->ImageName.Buffer, PR_POOL_TAG);
-                    existingNode->ImageName.Buffer = NULL;
-                }
-                existingNode->Signature = 0;
-                PrpFreeNode(internal, existingNode);
-            }
-        }
-
-        InterlockedIncrement64(&Graph->Stats.NodesRemoved);
+        ExReleasePushLockExclusive(&Graph->NodeLock);
+        KeLeaveCriticalRegion();
+        status = STATUS_OBJECT_NAME_EXISTS;
+        goto Cleanup;
     }
 
     //
@@ -1168,7 +1096,6 @@ PrRemoveProcess(
 
         PrpFreeRelationship(internal, relationship);
         InterlockedDecrement(&node->RelationshipCount);
-        InterlockedIncrement64(&Graph->Stats.RelationshipsRemoved);
 
         listEntry = nextEntry;
     }
@@ -1219,10 +1146,6 @@ PrAddRelationship(
     PPR_PROCESS_NODE targetNode = NULL;
     LONG currentCount;
     KLOCK_QUEUE_HANDLE lockHandle;
-    BOOLEAN inserted = FALSE;
-    UINT32 capturedScore = 0;
-    PR_RELATIONSHIP_TYPE capturedType = Type;
-    PR_RELATIONSHIP_INFO eventCopy;
 
     NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
 
@@ -1308,68 +1231,33 @@ PrAddRelationship(
             if (!sourceNode->Removed && sourceNode->RelationshipCount < PR_MAX_CONNECTIONS) {
                 InsertTailList(&sourceNode->RelationshipList, &relationship->NodeListEntry);
                 InterlockedIncrement(&sourceNode->RelationshipCount);
-                inserted = TRUE;
             }
 
             KeReleaseInStackQueuedSpinLock(&lockHandle);
         }
     }
 
-    //
-    // CRITICAL ORDERING: Insert into the global relationship list BEFORE
-    // releasing NodeLock. If we release NodeLock here, PrRemoveProcess
-    // could acquire NodeLock exclusive, walk the source node's list, and
-    // free this relationship before the global-list insert completes â€”
-    // resulting in a use-after-free write to GlobalListEntry and a corrupt
-    // global list. By performing the insert under NodeLock (shared), we
-    // serialize against PrRemoveProcess (which needs NodeLock exclusive).
-    //
-    // Lock order (NodeLock â†’ RelationshipLock) matches PrRemoveProcess.
-    //
-    if (inserted) {
-        ExAcquirePushLockExclusive(&Graph->RelationshipLock);
-        InsertTailList(&Graph->RelationshipList, &relationship->GlobalListEntry);
-        InterlockedIncrement(&Graph->RelationshipCount);
-        ExReleasePushLockExclusive(&Graph->RelationshipLock);
-
-        //
-        // Snapshot fields we will read after releasing locks. We MUST NOT
-        // dereference 'relationship' once NodeLock is released â€” a concurrent
-        // PrRemoveProcess of the source can free it the moment we drop the
-        // shared lock.
-        //
-        capturedScore = relationship->SuspicionScore;
-        capturedType = relationship->Type;
-        eventCopy.Type = relationship->Type;
-        eventCopy.SourceProcessId = relationship->SourceProcessId;
-        eventCopy.TargetProcessId = relationship->TargetProcessId;
-        eventCopy.Timestamp = relationship->Timestamp;
-        eventCopy.SuspicionScore = relationship->SuspicionScore;
-    }
-
     ExReleasePushLockShared(&Graph->NodeLock);
     KeLeaveCriticalRegion();
 
     //
-    // If the source node was missing/removed/full, fail cleanly.
+    // Add to global relationship list
     //
-    if (!inserted) {
-        status = (sourceNode == NULL) ? STATUS_NOT_FOUND : STATUS_QUOTA_EXCEEDED;
-        goto Cleanup;
-    }
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Graph->RelationshipLock);
 
-    //
-    // From this point on, 'relationship' MUST NOT be dereferenced â€” use the
-    // snapshot in 'eventCopy' / 'capturedScore' / 'capturedType' instead.
-    //
-    relationship = NULL;
+    InsertTailList(&Graph->RelationshipList, &relationship->GlobalListEntry);
+    InterlockedIncrement(&Graph->RelationshipCount);
+
+    ExReleasePushLockExclusive(&Graph->RelationshipLock);
+    KeLeaveCriticalRegion();
 
     //
     // Update statistics
     //
     InterlockedIncrement64(&Graph->Stats.RelationshipsTracked);
-    if (capturedType < PrRelation_MaxType) {
-        InterlockedIncrement64(&Graph->Stats.RelationshipsByType[capturedType]);
+    if (Type < PrRelation_MaxType) {
+        InterlockedIncrement64(&Graph->Stats.RelationshipsByType[Type]);
     }
 
     //
@@ -1379,13 +1267,10 @@ PrAddRelationship(
     // on top of the raw type score. Only submit when the enriched score
     // meets the threshold â€” low-noise signal for kill-chain detection.
     //
-    // We pass a stack-local copy (eventCopy) â€” never the live pointer â€”
-    // since BehaviorEngine RtlCopyMemory's the buffer synchronously.
-    //
-    if (capturedScore >= PR_BE_SUBMISSION_THRESHOLD) {
+    if (relationship->SuspicionScore >= PR_BE_SUBMISSION_THRESHOLD) {
         BEHAVIOR_EVENT_TYPE beType;
 
-        switch (capturedType) {
+        switch (Type) {
         case PrRelation_RemoteThread:
             beType = BehaviorEvent_RemoteThreadCreate;
             break;
@@ -1407,14 +1292,15 @@ PrAddRelationship(
             beType,
             BehaviorCategory_CodeInjection,
             HandleToULong(SourceId),
-            &eventCopy,
-            sizeof(eventCopy),
-            capturedScore,
+            relationship,
+            sizeof(PR_RELATIONSHIP),
+            (UINT32)relationship->SuspicionScore,
             FALSE,
             NULL
             );
     }
 
+    relationship = NULL;
     status = STATUS_SUCCESS;
 
 Cleanup:
@@ -1468,7 +1354,6 @@ PrGetNodeInfo(
     if (node == NULL || node->Removed) {
         ExReleasePushLockShared(&Graph->NodeLock);
         KeLeaveCriticalRegion();
-        InterlockedIncrement64(&Graph->Stats.LookupCount);
         PrpReleaseGraphReference(internal);
         return STATUS_NOT_FOUND;
     }
@@ -2244,18 +2129,12 @@ PrpCacheProcessInfo(
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
-    LONGLONG createTimeQpart;
 
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         Node->SessionId = 0;
-        //
-        // Leave Node->CreateTime as set by caller (KeQuerySystemTime fallback).
-        // Without an EPROCESS, we cannot retrieve the authoritative process
-        // creation time used for PID-reuse disambiguation.
-        //
         return;
     }
 
@@ -2263,18 +2142,6 @@ PrpCacheProcessInfo(
     // Cache session ID
     //
     Node->SessionId = PsGetProcessSessionId(process);
-
-    //
-    // Capture the authoritative process creation time from the EPROCESS for
-    // PID-reuse disambiguation. The kernel records process creation time in
-    // 100ns-since-1601 units; identical PID with a strictly different
-    // creation time indicates PID reuse and a stale node that must be
-    // evicted from the graph.
-    //
-    createTimeQpart = PsGetProcessCreateTimeQuadPart(process);
-    if (createTimeQpart != 0) {
-        Node->CreateTime.QuadPart = createTimeQpart;
-    }
 
     //
     // Detect system-context processes:

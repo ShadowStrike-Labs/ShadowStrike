@@ -772,13 +772,6 @@ ElcbProcessBootDriver(
     if (savedCallback != NULL) {
         RtlCopyMemory(&publicCopy, &driver->Public, sizeof(EC_BOOT_DRIVER));
 
-        //
-        // The flat copy carries Flink/Blink pointing into the live list.
-        // If a misbehaving callback called RemoveEntryList(&publicCopy.ListEntry)
-        // it would corrupt the real list. Detach the snapshot's ListEntry.
-        //
-        InitializeListHead(&publicCopy.ListEntry);
-
         // Deep-copy DriverPath string data to stack buffer
         if (driver->Public.DriverPath.Buffer != NULL && driver->Public.DriverPath.Length > 0) {
             ULONG copyLen = min(driver->Public.DriverPath.Length,
@@ -878,18 +871,6 @@ ElcbSetBootPhase(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Validate Phase against the known enum range. Storing arbitrary
-    // values would allow a caller to wedge ElcbGetBootPhase consumers
-    // into undefined enum states.
-    //
-    if (Phase != EcPhase_Early &&
-        Phase != EcPhase_BeforeDriverInit &&
-        Phase != EcPhase_AfterDriverInit &&
-        Phase != EcPhase_Complete) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
     if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
         return STATUS_DELETE_PENDING;
     }
@@ -975,27 +956,16 @@ ElcbGetStatistics(
     if (Callbacks == NULL ||
         DriversProcessed == NULL || DriversAllowed == NULL ||
         DriversBlocked == NULL) {
-        if (DriversProcessed != NULL) { *DriversProcessed = 0; }
-        if (DriversAllowed != NULL) { *DriversAllowed = 0; }
-        if (DriversBlocked != NULL) { *DriversBlocked = 0; }
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!ExAcquireRundownProtection(&Callbacks->RundownRef)) {
-        *DriversProcessed = 0;
-        *DriversAllowed = 0;
-        *DriversBlocked = 0;
         return STATUS_DELETE_PENDING;
     }
 
-    //
-    // Use ReadNoFence64 for atomic read of 64-bit counters on x64 (single
-    // aligned 64-bit load is naturally atomic; ReadNoFence64 documents the
-    // intent and inhibits compiler tearing).
-    //
-    *DriversProcessed = ReadNoFence64(&Callbacks->Stats.DriversProcessed);
-    *DriversAllowed = ReadNoFence64(&Callbacks->Stats.DriversAllowed);
-    *DriversBlocked = ReadNoFence64(&Callbacks->Stats.DriversBlocked);
+    *DriversProcessed = Callbacks->Stats.DriversProcessed;
+    *DriversAllowed = Callbacks->Stats.DriversAllowed;
+    *DriversBlocked = Callbacks->Stats.DriversBlocked;
 
     ExReleaseRundownProtection(&Callbacks->RundownRef);
     return STATUS_SUCCESS;

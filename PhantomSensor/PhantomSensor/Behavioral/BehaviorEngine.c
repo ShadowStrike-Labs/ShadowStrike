@@ -694,11 +694,7 @@ BeEngineInitialize(
     }
 
     //
-    // Get thread object reference. CRITICAL: keep handle open until we
-    // either (a) succeed and acquire ETHREAD reference, or (b) fail and
-    // wait on the still-open handle for the orphaned thread to terminate.
-    // Closing the handle without waiting on Ob-failure leaves a live kernel
-    // thread accessing g_BeState while CleanupResources zeroes it — UAF/BSOD.
+    // Get thread object reference
     //
     status = ObReferenceObjectByHandle(
         threadHandle,
@@ -709,41 +705,16 @@ BeEngineInitialize(
         NULL
         );
 
+    ZwClose(threadHandle);
+
     if (!NT_SUCCESS(status)) {
         //
-        // Signal worker to terminate, then wait on the still-open handle.
-        // We do NOT have an ETHREAD reference yet, so we must wait via handle.
+        // Signal thread to stop
         //
         g_BeState.WorkerStopping = TRUE;
         KeSetEvent(&g_BeState.WorkerStopEvent, IO_NO_INCREMENT, FALSE);
-        KeSetEvent(&g_BeState.WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
-
-        {
-            LARGE_INTEGER waitTimeout;
-            NTSTATUS waitStatus;
-
-            waitTimeout.QuadPart = -((LONGLONG)BE_WORKER_SHUTDOWN_TIMEOUT_MS * 10000);
-            waitStatus = ZwWaitForSingleObject(threadHandle, FALSE, &waitTimeout);
-            if (waitStatus == STATUS_TIMEOUT) {
-                //
-                // Indefinite fallback: returning would leave a live kernel
-                // thread accessing g_BeState we are about to zero — guaranteed BSOD.
-                //
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                    "[ShadowStrike:BehaviorEngine] init-time worker shutdown "
-                    "timeout (status=0x%08X) — waiting indefinitely to prevent UAF\n",
-                    waitStatus);
-                (VOID)ZwWaitForSingleObject(threadHandle, FALSE, NULL);
-            }
-        }
-
-        ZwClose(threadHandle);
-        threadHandle = NULL;
         goto CleanupResources;
     }
-
-    ZwClose(threadHandle);
-    threadHandle = NULL;
 
     //
     // Initialize timing
@@ -1105,13 +1076,7 @@ BeEngineSetEnabled(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     g_BeState.Enabled = Enable;
-
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1320,20 +1285,10 @@ BeEngineProcessCreate(
     }
 
     //
-    // Rundown gate: spans the lookaside allocation and hash insertion
-    // so shutdown cannot delete g_BeState.ProcessLock or the lookaside
-    // mid-flight.
-    //
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
     // Allocate process context
     //
     context = BepAllocateProcessContext();
     if (context == NULL) {
-        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1419,16 +1374,11 @@ BeEngineProcessCreate(
     status = BepInsertProcessContext(context);
     if (!NT_SUCCESS(status)) {
         BepFreeProcessContext(context);
-        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return status;
     }
 
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
-
     //
-    // Submit process creation event (BeEngineSubmitEvent has its own
-    // rundown gate, so we release ours first to keep the protection
-    // window minimal.)
+    // Submit process creation event
     //
     return BeEngineSubmitEvent(
         BehaviorEvent_ProcessCreate,
@@ -1461,13 +1411,11 @@ BeEngineProcessTerminate(
     }
 
     //
-    // Find and update context. Flag mutation must be atomic — concurrent
-    // BeEngineReleaseProcessContext at DISPATCH_LEVEL also writes Flags
-    // without holding ProcessLock.
+    // Find and update context
     //
     status = BeEngineGetProcessContext(ProcessId, &context);
     if (NT_SUCCESS(status)) {
-        InterlockedOr((LONG*)&context->Flags, BE_PROC_FLAG_TERMINATED);
+        context->Flags |= BE_PROC_FLAG_TERMINATED;
         BeEngineReleaseProcessContext(context);
     }
 
@@ -1515,15 +1463,6 @@ BeEngineGetChain(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Rundown gate: prevents shutdown from freeing g_ChainHashLock /
-    // chain memory while we are in this function. Failed acquire means
-    // shutdown has begun draining — fail closed.
-    //
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     hashIndex = BepHashChainId(ChainId);
 
     FltAcquirePushLockShared(&g_ChainHashLock);
@@ -1567,7 +1506,6 @@ BeEngineGetChain(
     }
 
     FltReleasePushLock(&g_ChainHashLock);
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return status;
 }
 
@@ -1603,21 +1541,8 @@ BeEngineGetProcessChains(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_BeState.Initialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Rundown gate: protects the direct g_BeState.ProcessLock acquire
-    // below from racing with shutdown deleting the ERESOURCE.
-    //
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     status = BeEngineGetProcessContext(ProcessId, &context);
     if (!NT_SUCCESS(status)) {
-        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return status;
     }
 
@@ -1670,7 +1595,6 @@ BeEngineGetProcessChains(
     *ChainCount = count;
     BeEngineReleaseProcessContext(context);
 
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1716,23 +1640,6 @@ BeEngineReleaseChain(
             BOOLEAN needFree = FALSE;
 
             //
-            // Rundown gate: shutdown may have already begun draining
-            // and deleting g_BeState.ChainLock / lookasides. If we
-            // can't acquire rundown, defer freeing — leak is bounded
-            // (driver unload reclaims the pool); the alternative is
-            // ExAcquireResourceExclusiveLite on a deleted ERESOURCE,
-            // which BSODs.
-            //
-            if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-                //
-                // Mark inactive so that if shutdown hasn't yet drained
-                // the chain list, the shutdown drain will free us.
-                //
-                InterlockedExchange8((CHAR*)&Chain->IsActive, FALSE);
-                return;
-            }
-
-            //
             // CRITICAL: Acquire ChainLock BEFORE setting IsActive = FALSE.
             // Setting the flag without the lock created a race with
             // BepCleanupStaleChains: the worker could see !IsActive, remove
@@ -1775,17 +1682,13 @@ BeEngineReleaseChain(
 
                 BepFreeChain(Chain);
             }
-
-            ExReleaseRundownProtection(&g_BeState.RundownRef);
         } else {
             //
             // At DISPATCH_LEVEL: mark inactive for worker cleanup.
             // Only one thread can reach RefCount==0 (InterlockedDecrement
-            // is atomic), so this 1-byte store is safe; we use
-            // InterlockedExchange8 for a strict torn-write guarantee
-            // against the concurrent !IsActive read in BepCleanupStaleChains.
+            // is atomic), so this store is safe without additional locking.
             //
-            InterlockedExchange8((CHAR*)&Chain->IsActive, FALSE);
+            Chain->IsActive = FALSE;
         }
     }
 }
@@ -1801,7 +1704,6 @@ BeEngineMarkChainFalsePositive(
 {
     PBE_ATTACK_CHAIN chain;
     NTSTATUS status;
-    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -1810,17 +1712,8 @@ BeEngineMarkChainFalsePositive(
         return status;
     }
 
-    //
-    // Acquire the chain's spinlock to serialize state mutations
-    // with concurrent BepProcessSingleEvent / BeEngineRemediateChain
-    // readers/writers. Without this, Flags |= and IsActive = FALSE
-    // race with similar mutations elsewhere (torn read of Flags
-    // bitmask, lost updates).
-    //
-    KeAcquireSpinLock(&chain->Lock, &oldIrql);
     chain->Flags |= BE_CHAIN_FLAG_FALSE_POSITIVE;
     chain->IsActive = FALSE;
-    KeReleaseSpinLock(&chain->Lock, oldIrql);
 
     BeEngineReleaseChain(chain);
     return STATUS_SUCCESS;
@@ -1932,11 +1825,6 @@ BeEngineRemediateChain(
     NTSTATUS status;
     UINT32 terminatedCount = 0;
     UINT32 skippedCount = 0;
-    KIRQL oldIrql;
-    UINT32 primaryProcessId;
-    UINT32 cumulativeThreatScore;
-    UINT32 relatedProcessIds[32];
-    UINT32 relatedProcessCount;
 
     PAGED_CODE();
 
@@ -1946,57 +1834,37 @@ BeEngineRemediateChain(
     }
 
     //
-    // Atomically validate state and claim the remediation under chain->Lock.
-    // Setting IsRemediated=TRUE here serves as a single-shot guard so two
-    // concurrent BeEngineRemediateChain calls cannot both terminate the
-    // primary process. We snapshot all decision-relevant fields under the
-    // lock so the long-running ZwTerminate / FbeRollback work below
-    // operates on consistent data, even if another thread modifies the
-    // chain after we drop the lock.
+    // SECURITY: Validate chain is suitable for remediation
     //
-    KeAcquireSpinLock(&chain->Lock, &oldIrql);
-
     if (chain->Flags & BE_CHAIN_FLAG_FALSE_POSITIVE) {
-        KeReleaseSpinLock(&chain->Lock, oldIrql);
+        //
+        // Chain marked as false positive - do not remediate
+        //
         BeEngineReleaseChain(chain);
         return STATUS_INVALID_DEVICE_STATE;
     }
 
     if (chain->IsRemediated) {
-        KeReleaseSpinLock(&chain->Lock, oldIrql);
+        //
+        // Already remediated
+        //
         BeEngineReleaseChain(chain);
         return STATUS_SUCCESS;
     }
 
+    //
+    // SECURITY: Validate threat level before termination
+    // Only allow termination if chain has sufficient threat score
+    //
     if ((RemediationFlags & (BE_REMEDIATE_TERMINATE_PRIMARY | BE_REMEDIATE_TERMINATE_RELATED)) &&
         chain->CumulativeThreatScore < g_BeState.HighThreatThreshold) {
-        KeReleaseSpinLock(&chain->Lock, oldIrql);
+        //
+        // Threat score too low for process termination
+        // This prevents abuse of remediation API
+        //
         BeEngineReleaseChain(chain);
         return STATUS_ACCESS_DENIED;
     }
-
-    primaryProcessId = chain->PrimaryProcessId;
-    cumulativeThreatScore = chain->CumulativeThreatScore;
-    relatedProcessCount = chain->RelatedProcessCount;
-    if (relatedProcessCount > RTL_NUMBER_OF(relatedProcessIds)) {
-        relatedProcessCount = RTL_NUMBER_OF(relatedProcessIds);
-    }
-    if (relatedProcessCount > 0) {
-        RtlCopyMemory(relatedProcessIds,
-                      chain->RelatedProcessIds,
-                      relatedProcessCount * sizeof(UINT32));
-    }
-
-    //
-    // Claim the remediation. Subsequent concurrent calls will see
-    // IsRemediated and return STATUS_SUCCESS above without re-running
-    // the termination logic.
-    //
-    chain->IsRemediated = TRUE;
-
-    KeReleaseSpinLock(&chain->Lock, oldIrql);
-
-    UNREFERENCED_PARAMETER(cumulativeThreatScore);
 
     //
     // Rollback file modifications if ransomware detected
@@ -2007,7 +1875,7 @@ BeEngineRemediateChain(
         FBE_ROLLBACK_RESULT rollbackResult;
 
         rollbackResult = FbeRollbackProcess(
-            (HANDLE)(ULONG_PTR)primaryProcessId,
+            (HANDLE)(ULONG_PTR)chain->PrimaryProcessId,
             &filesRestored
             );
 
@@ -2015,7 +1883,7 @@ BeEngineRemediateChain(
             DPFLTR_IHVDRIVER_ID,
             (rollbackResult == FbeRollback_Success) ? DPFLTR_INFO_LEVEL : DPFLTR_WARNING_LEVEL,
             "[ShadowStrike/BehaviorEngine] Ransomware rollback for PID %u: result=%d, files=%lu\n",
-            primaryProcessId,
+            chain->PrimaryProcessId,
             rollbackResult,
             filesRestored
             );
@@ -2028,7 +1896,7 @@ BeEngineRemediateChain(
         //
         // CRITICAL: Check if primary process is critical system process
         //
-        if (BepIsCriticalProcess(primaryProcessId)) {
+        if (BepIsCriticalProcess(chain->PrimaryProcessId)) {
             //
             // Cannot terminate critical process - skip but continue
             //
@@ -2038,7 +1906,7 @@ BeEngineRemediateChain(
             OBJECT_ATTRIBUTES oa;
             CLIENT_ID clientId;
 
-            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)primaryProcessId;
+            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)chain->PrimaryProcessId;
             clientId.UniqueThread = NULL;
             InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -2058,8 +1926,8 @@ BeEngineRemediateChain(
     // Terminate related processes if requested
     //
     if (RemediationFlags & BE_REMEDIATE_TERMINATE_RELATED) {
-        for (UINT32 i = 0; i < relatedProcessCount; i++) {
-            UINT32 relatedPid = relatedProcessIds[i];
+        for (UINT32 i = 0; i < chain->RelatedProcessCount; i++) {
+            UINT32 relatedPid = chain->RelatedProcessIds[i];
 
             //
             // CRITICAL: Check if related process is critical system process
@@ -2090,13 +1958,11 @@ BeEngineRemediateChain(
     }
 
     //
-    // Finalize chain state under the spinlock to prevent torn writes
-    // racing with concurrent state mutations elsewhere in the engine.
+    // Mark chain as remediated
     //
-    KeAcquireSpinLock(&chain->Lock, &oldIrql);
+    chain->IsRemediated = TRUE;
     chain->IsActive = FALSE;
     chain->Flags |= BE_CHAIN_FLAG_AUTO_REMEDIATE;
-    KeReleaseSpinLock(&chain->Lock, oldIrql);
 
     if (terminatedCount > 0) {
         InterlockedIncrement64(&g_BeState.TotalThreatsBlocked);
@@ -2132,14 +1998,6 @@ BeEngineGetProcessContext(
     *Context = NULL;
 
     if (!g_BeState.Initialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Rundown gate: blocks shutdown from deleting g_ProcessHashLock or
-    // freeing context memory while we hold a hash-table iterator.
-    //
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2186,7 +2044,6 @@ BeEngineGetProcessContext(
     }
 
     FltReleasePushLock(&g_ProcessHashLock);
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return status;
 }
 
@@ -2228,17 +2085,6 @@ BeEngineReleaseProcessContext(
             BOOLEAN needFree = FALSE;
 
             //
-            // Rundown gate: shutdown may have already begun draining
-            // and deleting g_BeState.ProcessLock / lookasides. Failed
-            // acquire means we must defer freeing — driver unload will
-            // reclaim the pool. Acquiring a deleted ERESOURCE BSODs.
-            //
-            if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-                InterlockedOr((LONG*)&Context->Flags, BE_PROC_FLAG_TERMINATED);
-                return;
-            }
-
-            //
             // CRITICAL: Acquire ProcessLock BEFORE setting the
             // TERMINATED flag. Setting the flag without the lock
             // created a race with BepCleanupStaleProcessContexts:
@@ -2263,17 +2109,13 @@ BeEngineReleaseProcessContext(
             if (needFree) {
                 BepFreeProcessContext(Context);
             }
-
-            ExReleaseRundownProtection(&g_BeState.RundownRef);
         } else {
             //
             // At DISPATCH_LEVEL: mark terminated for worker cleanup.
             // Only one thread can reach RefCount==0 (InterlockedDecrement
-            // is atomic). Use InterlockedOr for a strict torn-write
-            // guarantee against the concurrent Flags read in
-            // BepCleanupStaleProcessContexts.
+            // is atomic), so this store is safe without additional locking.
             //
-            InterlockedOr((LONG*)&Context->Flags, BE_PROC_FLAG_TERMINATED);
+            Context->Flags |= BE_PROC_FLAG_TERMINATED;
         }
     }
 }
@@ -2334,12 +2176,7 @@ BeEngineLoadRules(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     if (g_BeState.LoadedRuleCount + RuleCount > BE_MAX_RULES) {
-        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -2381,7 +2218,6 @@ BeEngineLoadRules(
 
     ExReleaseResourceLite(&g_BeState.RuleLock);
     KeLeaveCriticalRegion();
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return status;
 }
 
@@ -2400,10 +2236,6 @@ BeEngineSetRuleEnabled(
     NTSTATUS status = STATUS_NOT_FOUND;
 
     if (!g_BeState.Initialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2433,7 +2265,6 @@ BeEngineSetRuleEnabled(
 
     ExReleaseResourceLite(&g_BeState.RuleLock);
     KeLeaveCriticalRegion();
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return status;
 }
 
@@ -2460,10 +2291,6 @@ BeEngineGetRuleStats(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&g_BeState.RuleLock, TRUE);
 
@@ -2483,7 +2310,6 @@ BeEngineGetRuleStats(
 
     ExReleaseResourceLite(&g_BeState.RuleLock);
     KeLeaveCriticalRegion();
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return status;
 }
 
@@ -2537,31 +2363,16 @@ BeEngineGetProcessTechniques(
 
     *TechniqueCount = 0;
 
-    if (!g_BeState.Initialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     status = BeEngineGetProcessContext(ProcessId, &context);
     if (!NT_SUCCESS(status)) {
-        ExReleaseRundownProtection(&g_BeState.RundownRef);
         return status;
     }
 
     count = min(context->ObservedTechniqueCount, MaxTechniques);
-    if (count > RTL_NUMBER_OF(context->ObservedTechniques)) {
-        count = RTL_NUMBER_OF(context->ObservedTechniques);
-    }
-    if (count > 0) {
-        RtlCopyMemory(TechniqueIds, context->ObservedTechniques, count * sizeof(UINT32));
-    }
+    RtlCopyMemory(TechniqueIds, context->ObservedTechniques, count * sizeof(UINT32));
     *TechniqueCount = count;
 
     BeEngineReleaseProcessContext(context);
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -2590,10 +2401,6 @@ BeEngineGetStatisticsSafe(
     RtlZeroMemory(Stats, sizeof(BEHAVIOR_ENGINE_STATISTICS));
 
     if (!g_BeState.Initialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2628,25 +2435,14 @@ BeEngineGetStatisticsSafe(
     KeQuerySystemTime(&currentTime);
     Stats->EngineUptimeMs = (UINT64)(currentTime.QuadPart / 10000) - g_BeState.LastStatisticsReportTime;
 
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Get behavioral engine statistics (INTERNAL ONLY).
  *
- * WARNING: Exposes internal counter snapshots and configuration values.
- * MUST NOT be exposed to user-mode (use BeEngineGetStatisticsSafe).
- *
- * SECURITY: We deliberately do NOT memcpy the entire BEHAVIOR_ENGINE_GLOBALS
- * struct. The struct embeds ERESOURCE / NPAGED_LOOKASIDE_LIST / KEVENT /
- * LIST_ENTRY / EX_RUNDOWN_REF objects whose internal pointers reference
- * the live engine. A caller using a memcpy'd copy as an actual lock or
- * list head would corrupt those objects and BugCheck the system.
- *
- * Instead we copy only the safe scalar fields and zero the embedded
- * synchronization primitives in the destination so that it is obvious
- * the copy must not be used as a live BEHAVIOR_ENGINE_GLOBALS instance.
+ * WARNING: Exposes internal kernel pointers and lock states.
+ * MUST NOT be exposed to user-mode. Use BeEngineGetStatisticsSafe instead.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -2662,56 +2458,7 @@ BeEngineGetStatistics(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (!ExAcquireRundownProtection(&g_BeState.RundownRef)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    //
-    // Zero the destination first so any field we don't explicitly copy
-    // (locks, lookasides, list heads, events, worker handle, rundown ref)
-    // is left in a zeroed state — never holds stale pointers from
-    // g_BeState.
-    //
-    RtlZeroMemory(Stats, sizeof(BEHAVIOR_ENGINE_GLOBALS));
-
-    //
-    // Configuration (immutable after Initialize, safe to read without lock).
-    //
-    Stats->Initialized = g_BeState.Initialized;
-    Stats->Enabled = g_BeState.Enabled;
-    Stats->ChainTimeoutMs = g_BeState.ChainTimeoutMs;
-    Stats->MaxActiveChains = g_BeState.MaxActiveChains;
-    Stats->MaxEventsPerChain = g_BeState.MaxEventsPerChain;
-    Stats->CorrelationWindowMs = g_BeState.CorrelationWindowMs;
-    Stats->HighThreatThreshold = g_BeState.HighThreatThreshold;
-    Stats->CriticalThreshold = g_BeState.CriticalThreshold;
-    Stats->MaxPendingEvents = g_BeState.MaxPendingEvents;
-
-    //
-    // Counters protected by their respective locks — racy reads here are
-    // acceptable for diagnostics; values may be slightly stale.
-    //
-    Stats->ActiveChainCount = g_BeState.ActiveChainCount;
-    Stats->ProcessContextCount = g_BeState.ProcessContextCount;
-    Stats->LoadedRuleCount = g_BeState.LoadedRuleCount;
-    Stats->EnabledRuleCount = g_BeState.EnabledRuleCount;
-    Stats->PendingEventCount = g_BeState.PendingEventCount;
-
-    //
-    // Atomic 64-bit counters.
-    //
-    Stats->TotalEventsProcessed = InterlockedCompareExchange64(&g_BeState.TotalEventsProcessed, 0, 0);
-    Stats->TotalEventsCorrelated = InterlockedCompareExchange64(&g_BeState.TotalEventsCorrelated, 0, 0);
-    Stats->TotalChainsCreated = InterlockedCompareExchange64(&g_BeState.TotalChainsCreated, 0, 0);
-    Stats->TotalRuleMatches = InterlockedCompareExchange64(&g_BeState.TotalRuleMatches, 0, 0);
-    Stats->TotalThreatsDetected = InterlockedCompareExchange64(&g_BeState.TotalThreatsDetected, 0, 0);
-    Stats->TotalThreatsBlocked = InterlockedCompareExchange64(&g_BeState.TotalThreatsBlocked, 0, 0);
-    Stats->EventsDropped = InterlockedCompareExchange64(&g_BeState.EventsDropped, 0, 0);
-
-    Stats->LastChainCleanupTime = g_BeState.LastChainCleanupTime;
-    Stats->LastStatisticsReportTime = g_BeState.LastStatisticsReportTime;
-
-    ExReleaseRundownProtection(&g_BeState.RundownRef);
+    RtlCopyMemory(Stats, &g_BeState, sizeof(BEHAVIOR_ENGINE_GLOBALS));
     return STATUS_SUCCESS;
 }
 
@@ -2750,51 +2497,15 @@ BepInitializeHashTables(
 
 /**
  * @brief Cleanup hash tables.
- *
- * Drains BOTH hash tables, freeing every BE_PROCESS_HASH_ENTRY and
- * BE_CHAIN_HASH_ENTRY allocation. Called from BeEngineShutdown BEFORE
- * the chain/context structs themselves are freed so that no concurrent
- * BeEngineGetChain / BeEngineGetProcessContext call can find a dangling
- * pointer in the hash table.
- *
- * Also called on the init-failure cleanup path; in that case the buckets
- * may already be empty but the drain is still safe (IsListEmpty short-circuit).
- *
- * SAFETY: Must run with no other readers/writers active. Either:
- *  (a) BeEngineShutdown has stopped the worker and waited on the rundown ref, or
- *  (b) BeEngineInitialize is unwinding before publishing g_BeState.Initialized=TRUE
- *      so no public-API caller can have a reference yet.
  */
 static VOID
 BepCleanupHashTables(
     VOID
     )
 {
-    ULONG i;
-
     //
-    // Drain process context hash table.
+    // Hash tables use static arrays, entries freed during shutdown
     //
-    for (i = 0; i < BE_PROCESS_HASH_BUCKETS; i++) {
-        while (!IsListEmpty(&g_ProcessHashTable[i])) {
-            PLIST_ENTRY entry = RemoveHeadList(&g_ProcessHashTable[i]);
-            PBE_PROCESS_HASH_ENTRY hashEntry =
-                CONTAINING_RECORD(entry, BE_PROCESS_HASH_ENTRY, HashListEntry);
-            ExFreePoolWithTag(hashEntry, BE_POOL_TAG_GENERAL);
-        }
-    }
-
-    //
-    // Drain chain hash table.
-    //
-    for (i = 0; i < BE_CHAIN_HASH_BUCKETS; i++) {
-        while (!IsListEmpty(&g_ChainHashTable[i])) {
-            PLIST_ENTRY entry = RemoveHeadList(&g_ChainHashTable[i]);
-            PBE_CHAIN_HASH_ENTRY hashEntry =
-                CONTAINING_RECORD(entry, BE_CHAIN_HASH_ENTRY, HashListEntry);
-            ExFreePoolWithTag(hashEntry, BE_POOL_TAG_CHAIN);
-        }
-    }
 }
 
 /**
@@ -4614,77 +4325,34 @@ BepCleanupStaleChains(
         chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ListEntry);
 
         //
-        // Check if chain is stale — either explicitly inactive, or last
-        // update was long enough ago to be considered expired. We then
-        // ATOMICALLY claim the chain by transitioning RefCount to a
-        // sentinel value (0). This closes a UAF race window where a
-        // concurrent BeEngineGetChain holding only the chain hash lock
-        // could bump RefCount between a non-atomic "<= 1" check and
-        // BepRemoveChainFromHash, then dereference freed memory.
+        // Check if chain is stale
         //
-        // BeEngineGetChain uses CmpXchg(RefCount, oldRef+1, oldRef) with
-        // a guard "oldRef > 0" — once we set RefCount to 0 first, the
-        // reader's CmpXchg fails, retries, sees 0, gives up. If the
-        // reader wins the race instead, RefCount goes from 1 to 2 and
-        // our claim CmpXchg(1->0) fails — we skip this chain and let
-        // the next cleanup pass catch it after the reader releases.
-        //
-        {
-            LONG currentRef;
-            BOOLEAN expired;
-            BOOLEAN claimed = FALSE;
+        if (!chain->IsActive ||
+            (currentTimeMs - chain->LastUpdateTime > g_BeState.ChainTimeoutMs &&
+             chain->RefCount <= 1)) {
 
-            currentRef = ReadNoFence(&chain->RefCount);
-            expired = (currentTimeMs - chain->LastUpdateTime > g_BeState.ChainTimeoutMs);
+            RemoveEntryList(&chain->ListEntry);
+            g_BeState.ActiveChainCount--;
 
-            if (!chain->IsActive || expired) {
-                if (currentRef == 0) {
-                    //
-                    // Already abandoned by BeEngineReleaseChain at
-                    // DISPATCH_LEVEL (it set IsActive=FALSE and left
-                    // the freeing to us). Claim ownership.
-                    //
-                    claimed = TRUE;
-                } else if (currentRef == 1) {
-                    //
-                    // Try to atomically claim by transitioning 1->0.
-                    // On success no reader can resurrect the refcount.
-                    //
-                    if (InterlockedCompareExchange(&chain->RefCount, 0, 1) == 1) {
-                        claimed = TRUE;
-                    }
-                }
-                //
-                // currentRef > 1 (live readers): leave for next pass.
-                //
-            }
+            //
+            // Remove from hash table while still holding ChainLock.
+            // This prevents concurrent hash lookups from acquiring
+            // a reference to a chain we're about to free.
+            //
+            BepRemoveChainFromHash(chain);
 
-            if (!claimed) {
-                continue;
-            }
+            //
+            // Remove from process context's chain list.
+            // KeEnterCriticalRegion nests safely â€” we already entered above.
+            //
+            KeEnterCriticalRegion();
+            ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+            RemoveEntryList(&chain->ProcessListEntry);
+            ExReleaseResourceLite(&g_BeState.ProcessLock);
+            KeLeaveCriticalRegion();
+
+            InsertTailList(&staleList, &chain->ListEntry);
         }
-
-        RemoveEntryList(&chain->ListEntry);
-        g_BeState.ActiveChainCount--;
-
-        //
-        // Remove from hash table while still holding ChainLock.
-        // This prevents concurrent hash lookups from acquiring
-        // a reference to a chain we're about to free.
-        //
-        BepRemoveChainFromHash(chain);
-
-        //
-        // Remove from process context's chain list.
-        // KeEnterCriticalRegion nests safely — we already entered above.
-        //
-        KeEnterCriticalRegion();
-        ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
-        RemoveEntryList(&chain->ProcessListEntry);
-        ExReleaseResourceLite(&g_BeState.ProcessLock);
-        KeLeaveCriticalRegion();
-
-        InsertTailList(&staleList, &chain->ListEntry);
     }
 
     ExReleaseResourceLite(&g_BeState.ChainLock);
@@ -4737,59 +4405,27 @@ BepCleanupStaleProcessContexts(
         context = CONTAINING_RECORD(entry, BE_PROCESS_CONTEXT, ListEntry);
 
         //
-        // Skip contexts not yet eligible for cleanup. We require:
-        //   - process explicitly terminated
-        //   - cleanup not already done by BeEngineReleaseProcessContext
-        //   - no live external references
+        // Check if process is terminated and has no references.
+        // CLEANUP_DONE prevents double-remove if BeEngineReleaseProcessContext
+        // already handled this context's list removal.
         //
-        // The RefCount==1 case must be claimed atomically: a concurrent
-        // BeEngineGetProcessContext holding only g_ProcessHashLock could
-        // bump RefCount between a non-atomic "<= 1" check and BepRemove
-        // ProcessContextFromHash, then dereference freed memory after we
-        // free. The CmpXchg(1->0) closes that race exactly the same way
-        // BepCleanupStaleChains does for chains.
-        //
-        if (!(context->Flags & BE_PROC_FLAG_TERMINATED) ||
-            (context->Flags & BE_PROC_FLAG_CLEANUP_DONE)) {
-            continue;
-        }
+        if ((context->Flags & BE_PROC_FLAG_TERMINATED) &&
+            !(context->Flags & BE_PROC_FLAG_CLEANUP_DONE) &&
+            context->RefCount <= 1) {
 
-        {
-            LONG currentRef = ReadNoFence(&context->RefCount);
-            BOOLEAN claimed = FALSE;
+            context->Flags |= BE_PROC_FLAG_CLEANUP_DONE;
+            RemoveEntryList(&context->ListEntry);
+            g_BeState.ProcessContextCount--;
 
-            if (currentRef == 0) {
-                //
-                // Already abandoned by BeEngineReleaseProcessContext at
-                // DISPATCH_LEVEL — claim it.
-                //
-                claimed = TRUE;
-            } else if (currentRef == 1) {
-                if (InterlockedCompareExchange(&context->RefCount, 0, 1) == 1) {
-                    claimed = TRUE;
-                }
-            }
             //
-            // currentRef > 1: live readers — skip, retry next pass.
+            // Remove from hash table while still holding ProcessLock.
+            // This prevents a concurrent hash lookup from acquiring a
+            // reference to a context we're about to free.
             //
+            BepRemoveProcessContextFromHash(context);
 
-            if (!claimed) {
-                continue;
-            }
+            InsertTailList(&staleList, &context->ListEntry);
         }
-
-        context->Flags |= BE_PROC_FLAG_CLEANUP_DONE;
-        RemoveEntryList(&context->ListEntry);
-        g_BeState.ProcessContextCount--;
-
-        //
-        // Remove from hash table while still holding ProcessLock.
-        // This prevents a concurrent hash lookup from acquiring a
-        // reference to a context we're about to free.
-        //
-        BepRemoveProcessContextFromHash(context);
-
-        InsertTailList(&staleList, &context->ListEntry);
     }
 
     ExReleaseResourceLite(&g_BeState.ProcessLock);

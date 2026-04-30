@@ -3888,29 +3888,16 @@ ShadowStrikeRegisterProcessCallbacks(
     //
     status = ImageNotifyInitialize(NULL);
     if (NT_SUCCESS(status)) {
-        NTSTATUS regStatus = RegisterImageNotify();
-        if (NT_SUCCESS(regStatus)) {
-            g_DriverData.ImageNotifyRegistered = TRUE;
-            *OutFlags |= InitFlag_ImageCallbackReg;
-            g_InitFlags |= InitFlag_ImageCallbackReg;
-            ShadowStrikeLogInitStatus("Image Notify", regStatus);
-        } else {
-            //
-            // Registration failed AFTER successful Initialize() — must tear
-            // down the subsystem to avoid a permanent leak of internal state
-            // (lookasides, locks, hash tables) that ImageNotifyInitialize
-            // allocated. Without this, ImageNotifyShutdown is never reached
-            // because g_DriverData.ImageNotifyRegistered stays FALSE and the
-            // unload path skips it.
-            //
-            ImageNotifyShutdown();
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] WARNING: RegisterImageNotify failed after init: 0x%08X — subsystem torn down\n",
-                       regStatus);
-        }
+        status = RegisterImageNotify();
+    }
+    if (NT_SUCCESS(status)) {
+        g_DriverData.ImageNotifyRegistered = TRUE;
+        *OutFlags |= InitFlag_ImageCallbackReg;
+        g_InitFlags |= InitFlag_ImageCallbackReg;
+        ShadowStrikeLogInitStatus("Image Notify", status);
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] WARNING: ImageNotifyInitialize failed: 0x%08X\n",
+                   "[ShadowStrike] WARNING: ImageNotify initialization failed: 0x%08X\n",
                    status);
     }
 

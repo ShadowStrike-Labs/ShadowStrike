@@ -910,8 +910,6 @@ ShadowAlpcTrackPort(
     //
     // Add to global list (lock hierarchy: global list second)
     //
-    PSHADOW_ALPC_PORT_ENTRY evictionCandidate = NULL;
-
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&state->PortListLock);
 
@@ -919,44 +917,17 @@ ShadowAlpcTrackPort(
     InterlockedIncrement(&state->PortCount);
 
     //
-    // SECURITY FIX (Tier 4 — DoS / pool exhaustion):
-    // Previous behavior only signaled the worker when over capacity but
-    // still inserted, allowing PortCount to grow unbounded over the
-    // 5-minute TTL window. Under sustained ALPC port creation (e.g.
-    // malware spawning threads that create thousands of ports), this
-    // exhausts the nonpaged lookaside pool. Now: when over the configured
-    // cap, capture the global-list LRU tail as an eviction candidate and
-    // hold a reference to keep it alive after the lock is released. The
-    // candidate is removed from both lists below using the canonical
-    // ShadowAlpcRemovePort path, which honors the hash-bucket → global-
-    // list lock hierarchy.
+    // Evict if over limit - FIXED: No nested locking, just mark for cleanup
     //
     if (state->PortCount > (LONG)state->MaxPorts) {
-        PLIST_ENTRY tailEntry = state->PortList.Blink;
-        if (tailEntry != &state->PortList && tailEntry != &portEntry->GlobalEntry) {
-            evictionCandidate = CONTAINING_RECORD(tailEntry, SHADOW_ALPC_PORT_ENTRY, GlobalEntry);
-            //
-            // Hold a reference so the entry stays alive after we drop
-            // PortListLock and re-enter via ShadowAlpcRemovePort.
-            //
-            ShadowAlpcpReferencePortEntry(evictionCandidate);
-        }
+        //
+        // Signal worker thread to clean up stale entries
+        //
         KeSetEvent(&state->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
     }
 
     ExReleasePushLockExclusive(&state->PortListLock);
     KeLeaveCriticalRegion();
-
-    //
-    // Perform eviction with correct lock order. ShadowAlpcRemovePort takes
-    // the hash bucket lock first, then PortListLock — never under our held
-    // locks. If the candidate was already removed by a concurrent close,
-    // the search is a no-op and only our held reference is released.
-    //
-    if (evictionCandidate != NULL) {
-        ShadowAlpcRemovePort(evictionCandidate->PortObject);
-        ShadowAlpcReleasePortEntry(evictionCandidate);
-    }
 
     //
     // Update statistics
@@ -2258,22 +2229,13 @@ ShadowAlpcpGetPortTypeViaCreation(
     *AlpcPortType = NULL;
 
     //
-    // Generate unique port name in the driver's namespace.
-    // FIX (Tier 1 — robustness): including only PsGetCurrentProcessId()
-    // (always System on driver load) risks STATUS_OBJECT_NAME_COLLISION
-    // when the driver is reloaded before the kernel namespace fully
-    // releases the prior probe name, leaving object callbacks
-    // unregistered and ALPC monitoring silently degraded. Mix in the
-    // performance counter (which advances monotonically across loads) to
-    // guarantee per-load uniqueness.
+    // Generate unique port name in the driver's namespace
     //
-    LARGE_INTEGER perfCounter = KeQueryPerformanceCounter(NULL);
     status = RtlStringCchPrintfW(
         portNameBuffer,
         RTL_NUMBER_OF(portNameBuffer),
-        L"\\KernelObjects\\ShadowStrike_TypeProbe_%p_%08X",
-        PsGetCurrentProcessId(),
-        (ULONG)(perfCounter.LowPart ^ perfCounter.HighPart)
+        L"\\KernelObjects\\ShadowStrike_TypeProbe_%p",
+        PsGetCurrentProcessId()
     );
 
     if (!NT_SUCCESS(status)) {

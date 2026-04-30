@@ -972,39 +972,19 @@ Routine Description:
         g_ProcessMonitor.LookasideInitialized = FALSE;
     }
 
-    //
-    // Snapshot statistics with interlocked reads to avoid any torn-read
-    // window on architectures where 64-bit aligned reads are not guaranteed
-    // atomic relative to concurrent writers, and to defeat compiler reordering.
-    //
-    {
-        LONG64 SnapCreations = InterlockedCompareExchange64(
-            &g_ProcessMonitor.Stats.ProcessCreations, 0, 0);
-        LONG64 SnapTerminations = InterlockedCompareExchange64(
-            &g_ProcessMonitor.Stats.ProcessTerminations, 0, 0);
-        LONG64 SnapBlocked = InterlockedCompareExchange64(
-            &g_ProcessMonitor.Stats.ProcessesBlocked, 0, 0);
-        LONG64 SnapPpidSpoof = InterlockedCompareExchange64(
-            &g_ProcessMonitor.Stats.PpidSpoofingDetected, 0, 0);
-        LONG64 SnapRateDrops = InterlockedCompareExchange64(
-            &g_ProcessMonitor.Stats.RateLimitDrops, 0, 0);
-        LONG64 SnapPoolDrops = InterlockedCompareExchange64(
-            &g_ProcessMonitor.Stats.PoolLimitDrops, 0, 0);
-
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_INFO_LEVEL,
-            "[ShadowStrike/ProcessNotify] Process monitoring shutdown. "
-            "Stats: Created=%lld, Terminated=%lld, Blocked=%lld, PpidSpoof=%lld, "
-            "RateLimitDrops=%lld, PoolLimitDrops=%lld\n",
-            SnapCreations,
-            SnapTerminations,
-            SnapBlocked,
-            SnapPpidSpoof,
-            SnapRateDrops,
-            SnapPoolDrops
-            );
-    }
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/ProcessNotify] Process monitoring shutdown. "
+        "Stats: Created=%lld, Terminated=%lld, Blocked=%lld, PpidSpoof=%lld, "
+        "RateLimitDrops=%lld, PoolLimitDrops=%lld\n",
+        g_ProcessMonitor.Stats.ProcessCreations,
+        g_ProcessMonitor.Stats.ProcessTerminations,
+        g_ProcessMonitor.Stats.ProcessesBlocked,
+        g_ProcessMonitor.Stats.PpidSpoofingDetected,
+        g_ProcessMonitor.Stats.RateLimitDrops,
+        g_ProcessMonitor.Stats.PoolLimitDrops
+        );
 }
 
 
@@ -3838,71 +3818,64 @@ PnpHandleProcessTermination(
     ScMonitorRemoveProcessContext(HandleToULong(ProcessId));
 
     //
-    // Look up process context. NOTE: it is legitimate for Context to be NULL:
-    // the creating callback may have skipped tracking due to exclusion,
-    // known-system early-out, rate-limit drop, pool-limit drop, allocation
-    // failure, or PnpInsertProcessContext failure. The downstream subsystem
-    // cleanups below (telemetry, MhUnprotectProcess, ObInvalidateCachedPid,
-    // AuUnprotectProcess, FbeCommitProcess, etc.) MUST still run because
-    // those subsystems can be populated by paths other than ProcessNotify.
-    // Skipping them on Context==NULL was a critical bug: stale entries
-    // survived PID recycle (security bypass) and EPROCESS references leaked.
+    // Look up process context
     //
     Context = PnpLookupProcessContext(ProcessId);
-
-    if (Context != NULL) {
-        //
-        // Record termination time
-        //
-        KeQuerySystemTime(&Context->TerminateTime);
-
-        //
-        // Send termination notification (fire-and-forget)
-        //
-        PnpSendProcessNotification(Context, FALSE, NULL);
-
-        //
-        // Also notify via ScanBridge for consistent telemetry pipeline coverage.
-        // Thread/Image/Registry notifications all go through ScanBridge;
-        // process termination should too for circuit breaker + stats tracking.
-        //
-        ShadowStrikeSendProcessEvent(
-            Context->ProcessId,
-            Context->ParentProcessId,
-            FALSE,
-            &Context->ImagePath,
-            NULL
-        );
-
-        //
-        // Stream process termination event to telemetry buffer.
-        //
-        {
-            PTB_MANAGER tbMgr = ShadowStrikeGetTelemetryBuffer();
-            if (tbMgr != NULL) {
-                struct {
-                    ULONG ProcessId;
-                    ULONG ParentProcessId;
-                    ULONG SessionId;
-                    ULONG ExitCode;
-                } tbPayload;
-                tbPayload.ProcessId = HandleToULong(Context->ProcessId);
-                tbPayload.ParentProcessId = HandleToULong(Context->ParentProcessId);
-                tbPayload.SessionId = Context->SessionId;
-                tbPayload.ExitCode = 0;
-                TbEnqueue(tbMgr, TbEntryType_ProcessTerminate,
-                          &tbPayload, sizeof(tbPayload), NULL);
-            }
-        }
-
-        //
-        // Emit ETW telemetry for process termination
-        //
-        TeLogProcessTerminate(
-            HandleToULong(Context->ProcessId),
-            0  // ExitCode not reliably available at PASSIVE_LEVEL cleanup
-        );
+    if (Context == NULL) {
+        return;
     }
+
+    //
+    // Record termination time
+    //
+    KeQuerySystemTime(&Context->TerminateTime);
+
+    //
+    // Send termination notification (fire-and-forget)
+    //
+    PnpSendProcessNotification(Context, FALSE, NULL);
+
+    //
+    // Also notify via ScanBridge for consistent telemetry pipeline coverage.
+    // Thread/Image/Registry notifications all go through ScanBridge;
+    // process termination should too for circuit breaker + stats tracking.
+    //
+    ShadowStrikeSendProcessEvent(
+        Context->ProcessId,
+        Context->ParentProcessId,
+        FALSE,
+        &Context->ImagePath,
+        NULL
+    );
+
+    //
+    // Stream process termination event to telemetry buffer.
+    //
+    {
+        PTB_MANAGER tbMgr = ShadowStrikeGetTelemetryBuffer();
+        if (tbMgr != NULL) {
+            struct {
+                ULONG ProcessId;
+                ULONG ParentProcessId;
+                ULONG SessionId;
+                ULONG ExitCode;
+            } tbPayload;
+            tbPayload.ProcessId = HandleToULong(Context->ProcessId);
+            tbPayload.ParentProcessId = HandleToULong(Context->ParentProcessId);
+            tbPayload.SessionId = Context->SessionId;
+            tbPayload.ExitCode = 0;
+            TbEnqueue(tbMgr, TbEntryType_ProcessTerminate,
+                      &tbPayload, sizeof(tbPayload), NULL);
+        }
+    }
+
+    //
+    // Emit ETW telemetry for process termination
+    //
+    TeLogProcessTerminate(
+        HandleToULong(Context->ProcessId),
+        0  // ExitCode not reliably available at PASSIVE_LEVEL cleanup
+    );
 
     //
     // Commit (discard) any pending file backup entries for this process.
@@ -4091,16 +4064,14 @@ PnpHandleProcessTermination(
     MmMonitorNotifyInjectionProcessExit(ProcessId);
 
     //
-    // Remove from tracking (Context-dependent operations)
+    // Remove from tracking
     //
-    if (Context != NULL) {
-        PnpRemoveProcessContext(Context);
+    PnpRemoveProcessContext(Context);
 
-        //
-        // Release lookup reference
-        //
-        PnpDereferenceContext(Context);
-    }
+    //
+    // Release lookup reference
+    //
+    PnpDereferenceContext(Context);
 }
 
 

@@ -730,70 +730,17 @@ AdInitialize(
             NULL
         );
 
+        ZwClose(threadHandle);
+
         if (!NT_SUCCESS(status)) {
             //
-            // FIX (Tier 1/4 - P0 UAF): Previous behavior set CleanupThread=NULL
-            // and proceeded to mark the detector initialized. The system thread
-            // was still running but untrackable; on AdShutdown the wait was
-            // skipped, and the thread would access freed detector memory after
-            // ExFreePoolWithTag -> BSOD.
+            // Thread is running but we cannot track it.
+            // Signal termination and proceed; thread will self-terminate.
             //
-            // Now: signal the thread to terminate, wait on the handle (which
-            // is still open and grants SYNCHRONIZE via THREAD_ALL_ACCESS),
-            // close the handle, then bail out with the full failure-cleanup
-            // path so the partially-initialized detector is fully torn down.
-            //
-            LARGE_INTEGER waitTimeout;
-            NTSTATUS waitStatus;
-
             InterlockedExchange(&detector->CleanupTerminate, TRUE);
             KeSetEvent(&detector->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
-
-            waitTimeout.QuadPart = -((LONGLONG)AD_SHUTDOWN_TIMEOUT_MS * 10000);
-            waitStatus = ZwWaitForSingleObject(threadHandle, FALSE, &waitTimeout);
-            if (waitStatus == STATUS_TIMEOUT) {
-                //
-                // Thread did not exit — wait indefinitely. Returning here
-                // would leave a live thread accessing soon-to-be-freed memory.
-                //
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                    "[ShadowStrike:AnomalyDetector] Cleanup thread did not exit "
-                    "after ObReferenceObjectByHandle failure; waiting indefinitely\n");
-                ZwWaitForSingleObject(threadHandle, FALSE, NULL);
-            }
-
-            ZwClose(threadHandle);
             detector->CleanupThread = NULL;
-
-            //
-            // Tear down everything created so far. Mirrors the cleanup
-            // performed by the AdpCreateGlobalBaseline failure branch above.
-            //
-            KeEnterCriticalRegion();
-            ExAcquirePushLockExclusive(&detector->GlobalBaselineLock);
-            while (!IsListEmpty(&detector->GlobalBaselines)) {
-                PLIST_ENTRY be = RemoveHeadList(&detector->GlobalBaselines);
-                PAD_BASELINE_INTERNAL bl = CONTAINING_RECORD(
-                    be, AD_BASELINE_INTERNAL, ListEntry
-                );
-                ExFreeToNPagedLookasideList(&detector->BaselineLookaside, bl);
-            }
-            ExReleasePushLockExclusive(&detector->GlobalBaselineLock);
-            KeLeaveCriticalRegion();
-
-            if (detector->LookasideInitialized) {
-                ExDeleteNPagedLookasideList(&detector->BaselineLookaside);
-                ExDeleteNPagedLookasideList(&detector->AnomalyLookaside);
-                ExDeleteNPagedLookasideList(&detector->ProcessBaselineLookaside);
-            }
-
-            ExFreePoolWithTag(detector->ScratchBuffer, AD_POOL_TAG);
-            AdpFreeHashTable(&detector->ProcessHash.Buckets);
-            ExFreePoolWithTag(detector, AD_POOL_TAG);
-            return status;
         }
-
-        ZwClose(threadHandle);
     }
 
     //
@@ -1659,42 +1606,16 @@ AdGetStatistics(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // FIX (Tier 1/4 - P1 UAF): Previous version read detector fields with no
-    // reference held and no shutdown check. AdShutdown could invalidate Magic
-    // and free the detector between AdpValidateDetector and the field reads.
-    // Now we route through the same gate every other public API uses
-    // (validate -> ShuttingDown check -> AdpReferenceDetector).
-    //
-    if (Detector->ShuttingDown) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    AdpReferenceDetector(Detector);
-
     RtlZeroMemory(Statistics, sizeof(AD_STATISTICS));
 
-    //
-    // SamplesProcessed / AnomaliesDetected are volatile LONG64 written via
-    // InterlockedIncrement64; read atomically with InterlockedCompareExchange64
-    // to guarantee acquire ordering and avoid compiler tearing speculation.
-    // ProcessBaselineCount / AnomalyCount are volatile LONG (32-bit aligned
-    // reads are atomic on x64) but we use Interlocked for ordering symmetry.
-    //
-    Statistics->SamplesProcessed =
-        InterlockedCompareExchange64(&Detector->Stats.SamplesProcessed, 0, 0);
-    Statistics->AnomaliesDetected =
-        InterlockedCompareExchange64(&Detector->Stats.AnomaliesDetected, 0, 0);
-    Statistics->ProcessBaselineCount =
-        InterlockedCompareExchange(&Detector->ProcessBaselineCount, 0, 0);
-    Statistics->AnomalyCount =
-        InterlockedCompareExchange(&Detector->AnomalyCount, 0, 0);
+    Statistics->SamplesProcessed = Detector->Stats.SamplesProcessed;
+    Statistics->AnomaliesDetected = Detector->Stats.AnomaliesDetected;
+    Statistics->ProcessBaselineCount = Detector->ProcessBaselineCount;
+    Statistics->AnomalyCount = Detector->AnomalyCount;
     Statistics->StartTime = Detector->Stats.StartTime;
 
     KeQuerySystemTime(&currentTime);
     Statistics->Uptime.QuadPart = currentTime.QuadPart - Detector->Stats.StartTime.QuadPart;
-
-    AdpDereferenceDetector(Detector);
 
     return STATUS_SUCCESS;
 }

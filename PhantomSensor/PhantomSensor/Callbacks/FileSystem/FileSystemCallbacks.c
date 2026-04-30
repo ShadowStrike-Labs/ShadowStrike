@@ -202,14 +202,12 @@ typedef struct _FSC_PROCESS_FILE_CONTEXT {
     LARGE_INTEGER WindowStartTime;
 
     //
-    // Behavioral flags (volatile LONG so InterlockedXxx is well-defined for
-    // both writers in FscpDetectRansomwareBehavior / FscpUpdateProcessFileMetrics
-    // and readers in ShadowStrikeQueryProcessFileContext).
+    // Behavioral flags
     //
-    volatile LONG BehaviorFlags;
-    volatile LONG SuspicionScore;
-    volatile LONG IsRansomwareSuspect;
-    volatile LONG IsExfiltrationSuspect;
+    ULONG BehaviorFlags;
+    ULONG SuspicionScore;
+    BOOLEAN IsRansomwareSuspect;
+    BOOLEAN IsExfiltrationSuspect;
 
     //
     // Reference counting
@@ -1627,11 +1625,9 @@ Return Value:
     }
 
     //
-    // Check process context limit to prevent pool exhaustion.
-    // Atomic load — paired with InterlockedIncrement/Decrement on writers.
+    // Check process context limit to prevent pool exhaustion
     //
-    if (InterlockedCompareExchange(&g_FscState.ProcessContextCount, 0, 0)
-            >= FSC_MAX_TRACKED_PROCESSES) {
+    if (g_FscState.ProcessContextCount >= FSC_MAX_TRACKED_PROCESSES) {
         return NULL;
     }
 
@@ -1660,10 +1656,9 @@ Return Value:
     ExAcquirePushLockExclusive(&g_FscState.ProcessContextLock);
 
     //
-    // Re-check limit under lock (atomic load for codebase consistency)
+    // Re-check limit under lock
     //
-    if (InterlockedCompareExchange(&g_FscState.ProcessContextCount, 0, 0)
-            >= FSC_MAX_TRACKED_PROCESSES) {
+    if (g_FscState.ProcessContextCount >= FSC_MAX_TRACKED_PROCESSES) {
         ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
         KeLeaveCriticalRegion();
         ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, NewContext);
@@ -1754,11 +1749,10 @@ Arguments:
     ExAcquirePushLockExclusive(&g_FscState.ProcessContextLock);
 
     //
-    // Re-check atomically: another thread may have incremented refcount
-    // (lockless fast-path in FscpReferenceProcessContext) between our
-    // decrement and lock acquisition. Plain read could observe a stale 0.
+    // Re-check: another thread may have referenced this context after our
+    // decrement but before we acquired the lock.
     //
-    if (InterlockedCompareExchange(&Context->RefCount, 0, 0) == 0) {
+    if (Context->RefCount == 0) {
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
             InitializeListHead(&Context->ListEntry);
@@ -1839,12 +1833,11 @@ Return Value:
     CurrentSecond = CurrentTime.QuadPart / 10000000LL;
 
     //
-    // Atomic 64-bit load of the stored start time. Codebase convention for
-    // volatile LONG64 — InterlockedCompareExchange64(...,0,0) is the
-    // documented atomic-load idiom.
+    // Read the stored start time ONCE atomically. On x64, aligned 64-bit reads
+    // are atomic for volatile fields. Avoids the previous CAS-to-self antipattern
+    // which read the volatile 3 times (Value, Comparand, Exchange all from same field).
     //
-    OldStart = InterlockedCompareExchange64(
-        &g_FscState.CurrentSecondStart100ns, 0, 0);
+    OldStart = *(volatile LONG64*)&g_FscState.CurrentSecondStart100ns;
     OldSecond = OldStart / 10000000LL;
 
     if (CurrentSecond != OldSecond) {
@@ -2029,12 +2022,7 @@ Arguments:
     }
 
     KeQuerySystemTime(&CurrentTime);
-    //
-    // Atomic 64-bit store so concurrent readers (FscpCleanupStaleContexts)
-    // never observe a torn timestamp.
-    //
-    InterlockedExchange64(&ProcessContext->LastActivityTime.QuadPart,
-                          CurrentTime.QuadPart);
+    ProcessContext->LastActivityTime = CurrentTime;
 
     //
     // Reset time window if expired (1 second window).
@@ -2042,8 +2030,7 @@ Arguments:
     // multiple threads zeroing counts and losing data.
     //
     {
-        LONG64 OldWindowStart = InterlockedCompareExchange64(
-            &ProcessContext->WindowStartTime.QuadPart, 0, 0);
+        LONG64 OldWindowStart = *(volatile LONG64*)&ProcessContext->WindowStartTime.QuadPart;
         TimeDiff.QuadPart = CurrentTime.QuadPart - OldWindowStart;
         if (TimeDiff.QuadPart > (10000000LL)) {  // 1 second in 100ns units
             //
@@ -2098,9 +2085,8 @@ Arguments:
         ProcessContext->RecentRenames > FSC_RANSOMWARE_RENAME_THRESHOLD) {
 
         if (FscpDetectRansomwareBehavior(ProcessContext)) {
-            InterlockedExchange(&ProcessContext->IsRansomwareSuspect, 1);
-            InterlockedOr(&ProcessContext->BehaviorFlags,
-                          (LONG)FSC_BEHAVIOR_MASS_MODIFY);
+            ProcessContext->IsRansomwareSuspect = TRUE;
+            ProcessContext->BehaviorFlags |= FSC_BEHAVIOR_MASS_MODIFY;
 
             InterlockedIncrement64(&g_FscState.Stats.RansomwareDetections);
 
@@ -2110,9 +2096,9 @@ Arguments:
                 "[ShadowStrike/FS] RANSOMWARE BEHAVIOR DETECTED: PID=%lu, "
                 "Mods=%ld, Dels=%ld, Renames=%ld\n",
                 HandleToULong(ProcessId),
-                InterlockedCompareExchange(&ProcessContext->RecentModifications, 0, 0),
-                InterlockedCompareExchange(&ProcessContext->RecentDeletions, 0, 0),
-                InterlockedCompareExchange(&ProcessContext->RecentRenames, 0, 0)
+                ProcessContext->RecentModifications,
+                ProcessContext->RecentDeletions,
+                ProcessContext->RecentRenames
                 );
 
             //
@@ -2150,70 +2136,57 @@ Return Value:
 --*/
 {
     ULONG Score = 0;
-    LONG ExistingFlags;
-
-    //
-    // Snapshot once to avoid recomputing across the function (and so the
-    // historical-pattern checks see a consistent view).
-    //
-    LONG RecentRenames     = InterlockedCompareExchange(&ProcessContext->RecentRenames, 0, 0);
-    LONG RecentDeletions   = InterlockedCompareExchange(&ProcessContext->RecentDeletions, 0, 0);
-    LONG RecentModif       = InterlockedCompareExchange(&ProcessContext->RecentModifications, 0, 0);
-    LONG64 FilesRenamed    = InterlockedCompareExchange64(&ProcessContext->FilesRenamed, 0, 0);
-    LONG64 FilesDeleted    = InterlockedCompareExchange64(&ProcessContext->FilesDeleted, 0, 0);
-
-    ExistingFlags = InterlockedCompareExchange(&ProcessContext->BehaviorFlags, 0, 0);
 
     //
     // Check for mass rename (common in ransomware)
     //
-    if (RecentRenames > FSC_RANSOMWARE_RENAME_THRESHOLD) {
+    if (ProcessContext->RecentRenames > FSC_RANSOMWARE_RENAME_THRESHOLD) {
         Score += 40;
-        InterlockedOr(&ProcessContext->BehaviorFlags, (LONG)FSC_BEHAVIOR_MASS_RENAME);
+        ProcessContext->BehaviorFlags |= FSC_BEHAVIOR_MASS_RENAME;
     }
 
     //
     // Check for mass delete
     //
-    if (RecentDeletions > FSC_RANSOMWARE_DELETE_THRESHOLD) {
+    if (ProcessContext->RecentDeletions > FSC_RANSOMWARE_DELETE_THRESHOLD) {
         Score += 35;
-        InterlockedOr(&ProcessContext->BehaviorFlags, (LONG)FSC_BEHAVIOR_MASS_DELETE);
+        ProcessContext->BehaviorFlags |= FSC_BEHAVIOR_MASS_DELETE;
     }
 
     //
     // Check for mass modify
     //
-    if (RecentModif > FSC_RANSOMWARE_DELETE_THRESHOLD) {
+    if (ProcessContext->RecentModifications > FSC_RANSOMWARE_DELETE_THRESHOLD) {
         Score += 30;
-        InterlockedOr(&ProcessContext->BehaviorFlags, (LONG)FSC_BEHAVIOR_MASS_MODIFY);
+        ProcessContext->BehaviorFlags |= FSC_BEHAVIOR_MASS_MODIFY;
     }
 
     //
     // Check historical patterns
     //
-    if (FilesRenamed > 1000) {
+    if (ProcessContext->FilesRenamed > 1000) {
         Score += 20;
     }
 
-    if (FilesDeleted > 500) {
+    if (ProcessContext->FilesDeleted > 500) {
         Score += 15;
     }
 
     //
     // High entropy writes would add to score (checked elsewhere)
     //
-    if (ExistingFlags & FSC_BEHAVIOR_HIGH_ENTROPY) {
+    if (ProcessContext->BehaviorFlags & FSC_BEHAVIOR_HIGH_ENTROPY) {
         Score += 25;
     }
 
     //
     // Extension changes are suspicious
     //
-    if (ExistingFlags & FSC_BEHAVIOR_EXTENSION_CHANGE) {
+    if (ProcessContext->BehaviorFlags & FSC_BEHAVIOR_EXTENSION_CHANGE) {
         Score += 20;
     }
 
-    InterlockedExchange(&ProcessContext->SuspicionScore, (LONG)Score);
+    ProcessContext->SuspicionScore = Score;
 
     return (Score >= 70);  // 70% threshold for ransomware classification
 }
@@ -2292,16 +2265,8 @@ Routine Description:
         // Check if context is stale (no activity for 5 minutes)
         // Only remove if RefCount is 1 (only list reference)
         //
-        //
-        // Atomic 64-bit load — paired with InterlockedExchange64 writer in
-        // FscpUpdateProcessFileMetrics. Plain read could tear and falsely
-        // mark a recently-active context as stale (premature free → UAF).
-        //
-        LONG64 LastActivity = InterlockedCompareExchange64(
-            &Context->LastActivityTime.QuadPart, 0, 0);
-
-        if ((CurrentTime.QuadPart - LastActivity) > TimeoutInterval.QuadPart) {
-            if (InterlockedCompareExchange(&Context->RefCount, 0, 0) == 1) {
+        if ((CurrentTime.QuadPart - Context->LastActivityTime.QuadPart) > TimeoutInterval.QuadPart) {
+            if (Context->RefCount == 1) {
                 RemoveEntryList(&Context->ListEntry);
                 InitializeListHead(&Context->ListEntry);
                 InterlockedDecrement(&g_FscState.ProcessContextCount);
@@ -2389,44 +2354,26 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    //
-    // Zero out outputs up-front so callers see well-defined values even on
-    // shutdown / not-found paths.
-    //
-    if (PreCreateCalls != NULL)       { *PreCreateCalls = 0; }
-    if (FilesBlocked != NULL)         { *FilesBlocked = 0; }
-    if (RansomwareDetections != NULL) { *RansomwareDetections = 0; }
-    if (VolumeCount != NULL)          { *VolumeCount = 0; }
-
-    //
-    // Gate the read against concurrent shutdown — without this the read
-    // races with ShadowStrikeCleanupFileSystemCallbacks tearing down state.
-    //
-    if (!FscpAcquireRundownProtection()) {
-        return STATUS_SHUTDOWN_IN_PROGRESS;
+    if (!g_FscState.Initialized) {
+        return STATUS_NOT_FOUND;
     }
 
     if (PreCreateCalls != NULL) {
-        *PreCreateCalls = (ULONG64)InterlockedCompareExchange64(
-            &g_FscState.Stats.PreCreateCalls, 0, 0);
+        *PreCreateCalls = (ULONG64)g_FscState.Stats.PreCreateCalls;
     }
 
     if (FilesBlocked != NULL) {
-        *FilesBlocked = (ULONG64)InterlockedCompareExchange64(
-            (volatile LONG64*)&g_DriverData.Stats.FilesBlocked, 0, 0);
+        *FilesBlocked = (ULONG64)g_DriverData.Stats.FilesBlocked;
     }
 
     if (RansomwareDetections != NULL) {
-        *RansomwareDetections = (ULONG64)InterlockedCompareExchange64(
-            &g_FscState.Stats.RansomwareDetections, 0, 0);
+        *RansomwareDetections = (ULONG64)g_FscState.Stats.RansomwareDetections;
     }
 
     if (VolumeCount != NULL) {
-        *VolumeCount = (ULONG)InterlockedCompareExchange(
-            &g_FscState.VolumeCount, 0, 0);
+        *VolumeCount = (ULONG)g_FscState.VolumeCount;
     }
 
-    FscpReleaseRundownProtection();
     return STATUS_SUCCESS;
 }
 
@@ -2454,46 +2401,28 @@ Return Value:
 {
     PFSC_PROCESS_FILE_CONTEXT Context;
 
-    //
-    // Zero outputs up-front so error paths leave callers in a defined state.
-    //
-    if (IsRansomwareSuspect != NULL) { *IsRansomwareSuspect = FALSE; }
-    if (SuspicionScore != NULL)      { *SuspicionScore = 0; }
-    if (BehaviorFlags != NULL)       { *BehaviorFlags = 0; }
-
-    if (!FscpAcquireRundownProtection()) {
-        return STATUS_SHUTDOWN_IN_PROGRESS;
+    if (!g_FscState.Initialized) {
+        return STATUS_NOT_FOUND;
     }
 
     Context = FscpLookupProcessContext(ProcessId, FALSE);
     if (Context == NULL) {
-        FscpReleaseRundownProtection();
         return STATUS_NOT_FOUND;
     }
 
-    //
-    // Snapshot fields atomically. SuspicionScore / BehaviorFlags are written
-    // from FscpDetectRansomwareBehavior and IsRansomwareSuspect from
-    // FscpUpdateProcessFileMetrics — readers must use InterlockedXxx.
-    //
     if (IsRansomwareSuspect != NULL) {
-        *IsRansomwareSuspect =
-            (BOOLEAN)(InterlockedCompareExchange(
-                &Context->IsRansomwareSuspect, 0, 0) != 0);
+        *IsRansomwareSuspect = Context->IsRansomwareSuspect;
     }
 
     if (SuspicionScore != NULL) {
-        *SuspicionScore = (ULONG)InterlockedCompareExchange(
-            &Context->SuspicionScore, 0, 0);
+        *SuspicionScore = Context->SuspicionScore;
     }
 
     if (BehaviorFlags != NULL) {
-        *BehaviorFlags = (ULONG)InterlockedCompareExchange(
-            &Context->BehaviorFlags, 0, 0);
+        *BehaviorFlags = Context->BehaviorFlags;
     }
 
     FscpDereferenceProcessContext(Context);
-    FscpReleaseRundownProtection();
 
     return STATUS_SUCCESS;
 }
@@ -2515,17 +2444,10 @@ Arguments:
     FileName - Optional file name.
 --*/
 {
-    //
-    // Gate against shutdown — without rundown protection a concurrent
-    // ShadowStrikeCleanupFileSystemCallbacks can free the lookaside lists
-    // and process-context list while we are mid-update.
-    //
-    if (!FscpAcquireRundownProtection()) {
+    if (!g_FscState.Initialized) {
         return;
     }
 
     FscpUpdateProcessFileMetrics(ProcessId, OperationType, FileName);
-
-    FscpReleaseRundownProtection();
 }
 

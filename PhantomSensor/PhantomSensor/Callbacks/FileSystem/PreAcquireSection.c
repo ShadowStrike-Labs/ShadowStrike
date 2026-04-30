@@ -1586,7 +1586,7 @@ IRQL:
             if (MappingRecord != NULL && PaspDetectHollowingPattern(ProcessContext, MappingRecord)) {
                 MappingFlags |= PAS_MAP_FLAG_HOLLOWING_SUSPECT;
                 ProcessContext->IsHollowingSuspect = TRUE;
-                InterlockedOr((PLONG)&ProcessContext->BehaviorFlags, PAS_BEHAVIOR_HOLLOWING);
+                ProcessContext->BehaviorFlags |= PAS_BEHAVIOR_HOLLOWING;
                 SuspicionScore += 30;
                 InterlockedIncrement64((PLONG64)&g_PasState.Stats.HollowingDetected);
             }
@@ -1598,7 +1598,7 @@ IRQL:
         if (g_PasState.Config.EnableInjectionDetection) {
             if (MappingRecord != NULL && PaspDetectInjectionPattern(ProcessContext, MappingRecord)) {
                 ProcessContext->IsInjectionSuspect = TRUE;
-                InterlockedOr((PLONG)&ProcessContext->BehaviorFlags, PAS_BEHAVIOR_CROSS_PROCESS);
+                ProcessContext->BehaviorFlags |= PAS_BEHAVIOR_CROSS_PROCESS;
                 SuspicionScore += 25;
                 InterlockedIncrement64((PLONG64)&g_PasState.Stats.InjectionDetected);
             }
@@ -1611,7 +1611,7 @@ IRQL:
             if (MappingRecord != NULL && PaspDetectReflectiveLoading(ProcessContext, MappingRecord)) {
                 MappingFlags |= PAS_MAP_FLAG_REFLECTIVE_SUSPECT;
                 ProcessContext->IsReflectiveSuspect = TRUE;
-                InterlockedOr((PLONG)&ProcessContext->BehaviorFlags, PAS_BEHAVIOR_REFLECTIVE);
+                ProcessContext->BehaviorFlags |= PAS_BEHAVIOR_REFLECTIVE;
                 SuspicionScore += 35;
                 InterlockedIncrement64((PLONG64)&g_PasState.Stats.ReflectiveDetected);
             }
@@ -1621,7 +1621,7 @@ IRQL:
         // Check for rapid mapping anomaly
         //
         if ((ULONG)ProcessContext->RecentMappings > g_PasState.Config.AnomalyThreshold) {
-            InterlockedOr((PLONG)&ProcessContext->BehaviorFlags, PAS_BEHAVIOR_RAPID_MAPPING);
+            ProcessContext->BehaviorFlags |= PAS_BEHAVIOR_RAPID_MAPPING;
             SuspicionScore += 15;
         }
     }
@@ -2008,14 +2008,7 @@ PaspDereferenceProcessContext(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PasState.ProcessContextLock);
 
-    //
-    // Re-read RefCount under the exclusive lock. Atomic CAS read pairs
-    // correctly with the InterlockedDecrement above and with any
-    // PaspReferenceProcessContext that completed before we acquired the
-    // lock (a thread that held a list-walk shared reference may have
-    // re-incremented after our decrement to zero).
-    //
-    if (InterlockedCompareExchange(&Context->RefCount, 0, 0) == 0) {
+    if (Context->RefCount == 0) {
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
             InitializeListHead(&Context->ListEntry);
@@ -2540,18 +2533,8 @@ PaspDetectHollowingPattern(
 
     RecentExecs = (ULONG)InterlockedCompareExchange(
         &ProcessContext->RecentExecutables, 0, 0);
-    //
-    // Tear-free reads of 64-bit counters. ImageMappings / TotalMappings are
-    // mutated by InterlockedIncrement64 in PaspUpdateProcessMetrics; pair
-    // them with InterlockedCompareExchange64 reads to satisfy the
-    // campaign-wide torn-read prohibition (and to remain correct on any
-    // future build that drops natural alignment, e.g. ARM64 with packed
-    // structs).
-    //
-    ImageMappings = (UINT64)InterlockedCompareExchange64(
-        (volatile LONG64*)&ProcessContext->ImageMappings, 0, 0);
-    TotalMappings = (UINT64)InterlockedCompareExchange64(
-        (volatile LONG64*)&ProcessContext->TotalMappings, 0, 0);
+    ImageMappings = ProcessContext->ImageMappings;
+    TotalMappings = ProcessContext->TotalMappings;
 
     //
     // Check for multiple executable mappings in short time window

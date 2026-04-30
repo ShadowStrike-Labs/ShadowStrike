@@ -490,7 +490,7 @@ PmpLookupBaseline(
     _In_ HANDLE ProcessId
     );
 
-static NTSTATUS
+static VOID
 PmpInsertBaseline(
     _In_ PPM_MONITOR_INTERNAL Monitor,
     _In_ PPM_PROCESS_BASELINE Baseline
@@ -1133,23 +1133,20 @@ Return Value:
     }
 
     //
-    // Check if baseline already exists. This is a fast-path early-out
-    // only -- the authoritative dedup is performed under lock by
-    // PmpInsertBaseline below, so the caller is robust against concurrent
-    // PmRecordBaseline calls for the same PID.
+    // Check baseline limit
+    //
+    if ((ULONG)InterlockedCompareExchange(&Internal->BaselineCount, 0, 0) >= PM_MAX_BASELINES) {
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Check if baseline already exists
     //
     Existing = PmpLookupBaseline(Internal, ProcessId);
     if (Existing != NULL) {
         PmpDereferenceBaseline(Internal, Existing);
         return STATUS_ALREADY_REGISTERED;
     }
-
-    //
-    // NOTE: The PM_MAX_BASELINES quota check that previously ran here
-    // was non-atomic (read-then-act) and could be overshot by concurrent
-    // PmRecordBaseline calls. The quota is now enforced atomically inside
-    // PmpInsertBaseline via a snapshot-and-CAS reservation pattern.
-    //
 
     //
     // Get process object
@@ -1268,19 +1265,9 @@ Return Value:
     Baseline->LastCheckTime = Baseline->BaselineTime;
 
     //
-    // Insert into tracking structures. PmpInsertBaseline atomically
-    // enforces the quota and rejects duplicate PIDs that may have been
-    // registered concurrently after our early-out check above.
+    // Insert into tracking structures
     //
-    Status = PmpInsertBaseline(Internal, Baseline);
-    if (!NT_SUCCESS(Status)) {
-        ObDereferenceObject(Process);
-        PmpDereferenceBaseline(Internal, Baseline);
-        if (Status == STATUS_OBJECT_NAME_COLLISION) {
-            return STATUS_ALREADY_REGISTERED;
-        }
-        return Status;
-    }
+    PmpInsertBaseline(Internal, Baseline);
 
     //
     // Update statistics
@@ -2093,103 +2080,41 @@ PmpLookupBaseline(
 }
 
 
-static NTSTATUS
+static VOID
 PmpInsertBaseline(
     _In_ PPM_MONITOR_INTERNAL Monitor,
     _In_ PPM_PROCESS_BASELINE Baseline
     )
-/*++
-Routine Description:
-    Atomically inserts a baseline into the global list and the per-bucket
-    hash table while enforcing both (a) the global PM_MAX_BASELINES quota
-    and (b) the no-duplicate-PID invariant. The caller retains ownership
-    of the baseline on failure and must free it.
-
-Return Value:
-    STATUS_SUCCESS              Baseline inserted; an additional list ref
-                                has been taken on it.
-    STATUS_QUOTA_EXCEEDED       Insertion would exceed PM_MAX_BASELINES.
-    STATUS_OBJECT_NAME_COLLISION
-                                A non-terminated baseline for the same PID
-                                already exists. Caller frees Baseline.
---*/
 {
     ULONG BucketIndex;
     PPM_HASH_BUCKET Bucket;
-    PLIST_ENTRY Entry;
-    PPM_PROCESS_BASELINE Existing;
-    LONG ReservedCount;
 
     //
-    // Reserve quota slot atomically. Snapshot-and-CAS pattern: any thread
-    // that observes the count already at the limit refuses without ever
-    // letting the published count exceed PM_MAX_BASELINES.
+    // Reference for list storage
     //
-    for (;;) {
-        ReservedCount = ReadAcquire(&Monitor->BaselineCount);
-        if ((ULONG)ReservedCount >= PM_MAX_BASELINES) {
-            return STATUS_QUOTA_EXCEEDED;
-        }
-        if (InterlockedCompareExchange(
-                &Monitor->BaselineCount,
-                ReservedCount + 1,
-                ReservedCount) == ReservedCount) {
-            break;
-        }
-    }
-
-    BucketIndex = PmpHashProcessId(Baseline->ProcessId);
-    Bucket = &Monitor->HashTable[BucketIndex];
+    PmpReferenceBaseline(Baseline);
 
     //
     // LOCK ORDERING: Baseline lock first, then hash bucket lock
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Monitor->BaselineLock);
-    ExAcquirePushLockExclusive(&Bucket->Lock);
-
-    //
-    // Re-check for an existing non-terminated baseline for this PID. The
-    // public PmpLookupBaseline call performed by PmRecordBaseline is racy
-    // against concurrent inserters; this is the authoritative check that
-    // guarantees we never publish two baselines for the same PID.
-    //
-    for (Entry = Bucket->List.Flink;
-         Entry != &Bucket->List;
-         Entry = Entry->Flink) {
-
-        Existing = CONTAINING_RECORD(Entry, PM_PROCESS_BASELINE, HashEntry);
-
-        if (Existing->ProcessId == Baseline->ProcessId &&
-            !Existing->IsTerminated) {
-
-            ExReleasePushLockExclusive(&Bucket->Lock);
-            ExReleasePushLockExclusive(&Monitor->BaselineLock);
-            KeLeaveCriticalRegion();
-
-            //
-            // Roll back the quota reservation: this baseline will not be
-            // published, and the caller is responsible for freeing it.
-            //
-            InterlockedDecrement(&Monitor->BaselineCount);
-            return STATUS_OBJECT_NAME_COLLISION;
-        }
-    }
-
-    //
-    // Reference for list storage. Done after the duplicate check so that
-    // a collision path never taints the baseline's reference count.
-    //
-    PmpReferenceBaseline(Baseline);
 
     InsertTailList(&Monitor->ProcessBaselines, &Baseline->ListEntry);
-    InsertTailList(&Bucket->List, &Baseline->HashEntry);
+    InterlockedIncrement(&Monitor->BaselineCount);
 
+    //
+    // Insert into hash table
+    //
+    BucketIndex = PmpHashProcessId(Baseline->ProcessId);
+    Bucket = &Monitor->HashTable[BucketIndex];
+
+    ExAcquirePushLockExclusive(&Bucket->Lock);
+    InsertTailList(&Bucket->List, &Baseline->HashEntry);
     ExReleasePushLockExclusive(&Bucket->Lock);
+
     ExReleasePushLockExclusive(&Monitor->BaselineLock);
     KeLeaveCriticalRegion();
-
-    return STATUS_SUCCESS;
 }
 
 

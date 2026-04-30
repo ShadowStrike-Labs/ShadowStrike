@@ -798,14 +798,8 @@ EsAcquireReference(
     _In_ PES_SCHEMA Schema
 )
 {
-    //
-    // Volatile read of ShuttingDown to defeat compiler hoisting / stale
-    // cache. EsShutdown's drain loop tolerates a brief race where a thread
-    // observes ShuttingDown=FALSE just before it flips to TRUE: the drain
-    // simply waits for the extra reference to be released.
-    //
     if (Schema != NULL && Schema->Magic == ES_SCHEMA_MAGIC &&
-        !(*(volatile BOOLEAN*)&Schema->ShuttingDown)) {
+        !Schema->ShuttingDown) {
         InterlockedIncrement(&Schema->ReferenceCount);
     }
 }
@@ -922,101 +916,26 @@ EsRegisterEvent(
     newEvent->ReferenceCount = 1;
 
     //
-    // Validate field types and per-field bounds at registration time.
-    // Prevents downstream OOB reads on g_FieldTypeNames/g_FieldTypeSizes
-    // and bogus offsets from being persisted into a serialized schema.
-    // Also force null-termination on free-form string members copied
-    // from a possibly-untrusted PCES_EVENT_DEFINITION (e.g., a
-    // deserialized payload that bypassed RtlStringCchCopyA).
-    //
-    for (ULONG vi = 0; vi < newEvent->FieldCount; vi++) {
-        PES_FIELD_DEFINITION vf = &newEvent->Fields[vi];
-        if ((ULONG)vf->Type >= EsType_MAX ||
-            (ULONG)vf->ElementType >= EsType_MAX) {
-            EspFreeEventDefinition(Schema, newEvent);
-            return STATUS_INVALID_PARAMETER;
-        }
-        //
-        // Field offset + fixed size must fit within USHORT to prevent
-        // arithmetic overflow in downstream consumers that combine them.
-        //
-        if (vf->Size > 0 &&
-            (ULONG)vf->Offset + (ULONG)vf->Size > 0xFFFFu) {
-            EspFreeEventDefinition(Schema, newEvent);
-            return STATUS_INTEGER_OVERFLOW;
-        }
-        vf->FieldName[ES_MAX_FIELD_NAME - 1]   = '\0';
-        vf->Description[ES_MAX_DESCRIPTION - 1] = '\0';
-        vf->OutType[RTL_NUMBER_OF(vf->OutType) - 1] = '\0';
-        vf->MapName[RTL_NUMBER_OF(vf->MapName) - 1] = '\0';
-    }
-
-    //
-    // Force null-termination on top-level string members for the same
-    // reason: callers may construct definitions via direct memcpy.
-    //
-    newEvent->EventName[ES_MAX_EVENT_NAME - 1]      = '\0';
-    newEvent->Description[ES_MAX_DESCRIPTION - 1]   = '\0';
-    newEvent->ChannelName[ES_MAX_CHANNEL_NAME - 1]  = '\0';
-    newEvent->TaskName[ES_MAX_TASK_NAME - 1]        = '\0';
-    newEvent->OpcodeName[ES_MAX_OPCODE_NAME - 1]    = '\0';
-    newEvent->TemplateName[ES_MAX_EVENT_NAME - 1]   = '\0';
-    newEvent->Message[ES_MAX_DESCRIPTION - 1]       = '\0';
-
-    //
     // Compute name hash
     //
     newEvent->NameHash = EspHashEventName(newEvent->EventName);
 
     //
-    // Calculate minimum data size from required fixed fields.
-    // For arrays with FixedCount, the actual fixed footprint is
-    // Size * ArrayCount; promote to ULONGLONG before multiplication
-    // and check for overflow at each accumulation step.
+    // Calculate minimum data size from fixed fields (with overflow check)
     //
     newEvent->MinDataSize = 0;
     for (ULONG i = 0; i < newEvent->FieldCount; i++) {
         PCES_FIELD_DEFINITION field = &newEvent->Fields[i];
-        ULONG contribution;
-
-        if (field->Flags & EsFieldFlag_Optional) {
-            continue;
-        }
-        if (field->Size == 0) {
-            //
-            // Variable-length / NULL-typed required fields contribute
-            // nothing to the static minimum; per-field length is
-            // enforced at validation time.
-            //
-            continue;
-        }
-
-        contribution = (ULONG)field->Size;
-        if ((field->Flags & (EsFieldFlag_Array | EsFieldFlag_FixedCount)) &&
-            field->ArrayCount > 0) {
-            ULONGLONG product = (ULONGLONG)field->Size *
-                                (ULONGLONG)field->ArrayCount;
-            if (product > MAXULONG) {
-                EspFreeEventDefinition(Schema, newEvent);
-                return STATUS_INTEGER_OVERFLOW;
+        if (!(field->Flags & EsFieldFlag_Optional)) {
+            if (field->Size > 0) {
+                ULONG newSize = newEvent->MinDataSize + field->Size;
+                if (newSize < newEvent->MinDataSize) {
+                    EspFreeEventDefinition(Schema, newEvent);
+                    return STATUS_INTEGER_OVERFLOW;
+                }
+                newEvent->MinDataSize = newSize;
             }
-            contribution = (ULONG)product;
         }
-
-        if (contribution > MAXULONG - newEvent->MinDataSize) {
-            EspFreeEventDefinition(Schema, newEvent);
-            return STATUS_INTEGER_OVERFLOW;
-        }
-        newEvent->MinDataSize += contribution;
-    }
-
-    //
-    // If MaxDataSize is specified, MinDataSize must not exceed it.
-    //
-    if (newEvent->MaxDataSize > 0 &&
-        newEvent->MinDataSize > newEvent->MaxDataSize) {
-        EspFreeEventDefinition(Schema, newEvent);
-        return STATUS_INVALID_PARAMETER;
     }
 
     //
@@ -1572,14 +1491,7 @@ EsValidateEventEx(
         return status;
     }
 
-    //
-    // Hold the reference locally only — never publish it through the
-    // validation context. Doing so would expose a pointer that is
-    // released before this function returns, creating a UAF trap on
-    // every error path. ES_VALIDATION_CONTEXT.Event is documented as
-    // always NULL on return and is preserved for ABI compatibility.
-    //
-    Context->Event = NULL;
+    Context->Event = event;
 
     //
     // Validate minimum size
@@ -1688,16 +1600,6 @@ EsValidateEventEx(
     }
 
     EsReleaseEventReference(event);
-
-    //
-    // Do NOT leave Context->Event pointing at the released definition.
-    // The caller has no reference, so the pointer would be a stale alias
-    // that could survive concurrent EsUnregisterEvent / EsShutdown.
-    // Validation detail is conveyed through ErrorMessage / Result /
-    // ErrorFieldIndex; the event identity is encoded in the EventId
-    // parameter the caller already owns.
-    //
-    Context->Event = NULL;
 
     return STATUS_SUCCESS;
 }
@@ -3679,17 +3581,9 @@ EspXmlFreeContext(
 }
 
 //
-// EspXmlEscapeString - Escape XML special characters in a string.
-// Returns: number of characters required (excluding null terminator) to
-// hold the fully escaped output. If DestSize is 0 or Dest is NULL, only
-// the size query is performed.
-//
-// Defensive truncation: if the destination is too small, the function
-// stops writing as soon as the next entity would overflow, then writes
-// a null terminator at the last safely-written position. This guarantees
-// the destination is always null-terminated and never exposes uninitialised
-// pool / stack bytes through a partially-written escape sequence
-// (kernel info-leak hardening).
+// EspXmlEscapeString - Escape XML special characters in a string
+// Returns: number of characters written (excluding null terminator)
+// If DestSize is 0, returns the required size (excluding null terminator)
 //
 static SIZE_T
 EspXmlEscapeString(
@@ -3700,61 +3594,63 @@ EspXmlEscapeString(
 {
     SIZE_T needed = 0;
     SIZE_T pos = 0;
-    BOOLEAN canWrite = (Dest != NULL && DestSize > 0);
-    BOOLEAN truncated = FALSE;
-
-    if (canWrite) {
-        Dest[0] = '\0';
-    }
 
     if (Src == NULL) {
+        if (Dest != NULL && DestSize > 0) {
+            Dest[0] = '\0';
+        }
         return 0;
     }
 
     while (*Src != '\0') {
-        PCSTR replacement;
-        SIZE_T repLen;
+        PCSTR replacement = NULL;
+        SIZE_T repLen = 0;
 
-        switch ((UCHAR)*Src) {
-        case '&':  replacement = "&amp;";  repLen = 5; break;
-        case '<':  replacement = "&lt;";   repLen = 4; break;
-        case '>':  replacement = "&gt;";   repLen = 4; break;
-        case '"':  replacement = "&quot;"; repLen = 6; break;
-        case '\'': replacement = "&apos;"; repLen = 6; break;
-        default:   replacement = NULL;     repLen = 1; break;
+        switch (*Src) {
+        case '&':
+            replacement = "&amp;";
+            repLen = 5;
+            break;
+        case '<':
+            replacement = "&lt;";
+            repLen = 4;
+            break;
+        case '>':
+            replacement = "&gt;";
+            repLen = 4;
+            break;
+        case '"':
+            replacement = "&quot;";
+            repLen = 6;
+            break;
+        case '\'':
+            replacement = "&apos;";
+            repLen = 6;
+            break;
+        default:
+            replacement = NULL;
+            repLen = 1;
+            break;
         }
 
-        needed += repLen;
-
-        //
-        // Only write if the entity (plus the trailing NUL) fits. As soon
-        // as we cannot fit a full entity, mark truncated and stop writing
-        // — never emit partial escape sequences that could (a) corrupt
-        // downstream XML parsers, or (b) leak adjacent uninitialised
-        // memory between the last valid byte and the terminator.
-        //
-        if (canWrite && !truncated) {
-            if (pos + repLen + 1 > DestSize) {
-                truncated = TRUE;
-            } else {
+        if (Dest != NULL && DestSize > 0) {
+            if (pos + repLen < DestSize) {
                 if (replacement != NULL) {
                     RtlCopyMemory(Dest + pos, replacement, repLen);
                 } else {
                     Dest[pos] = *Src;
                 }
-                pos += repLen;
             }
         }
 
+        needed += repLen;
+        pos += repLen;
         Src++;
     }
 
-    if (canWrite) {
-        //
-        // pos is always within [0, DestSize - 1] because the write guard
-        // requires pos + repLen + 1 <= DestSize.
-        //
-        Dest[pos] = '\0';
+    if (Dest != NULL && DestSize > 0) {
+        SIZE_T termPos = (pos < DestSize) ? pos : DestSize - 1;
+        Dest[termPos] = '\0';
     }
 
     return needed;
@@ -3830,27 +3726,16 @@ EspXmlAppend(
     va_copy(argsCopy, args);
 
     //
-    // Try to format into remaining buffer.
-    //
-    // If remaining is too small for RtlStringCchVPrintfA to even attempt
-    // a write (cchDest must be > 0 and able to hold at least the NUL),
-    // synthesise STATUS_BUFFER_OVERFLOW so the geometric growth path
-    // below kicks in. Without this, RtlStringCchVPrintfA with cchDest==0
-    // returns STATUS_INVALID_PARAMETER, which would surface to callers
-    // as a hard manifest-generation failure on a buffer that was simply
-    // exhausted.
+    // Try to format into remaining buffer
     //
     remaining = Context->BufferSize - Context->CurrentPos;
-    if (remaining < 2) {
-        status = STATUS_BUFFER_OVERFLOW;
-    } else {
-        status = RtlStringCchVPrintfA(
-            Context->Buffer + Context->CurrentPos,
-            remaining,
-            Format,
-            args
-        );
-    }
+
+    status = RtlStringCchVPrintfA(
+        Context->Buffer + Context->CurrentPos,
+        remaining,
+        Format,
+        args
+    );
 
     if (status == STATUS_BUFFER_OVERFLOW) {
         //

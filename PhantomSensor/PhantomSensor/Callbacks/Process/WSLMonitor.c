@@ -118,11 +118,6 @@ static const UNICODE_STRING g_NativeEscapeTargets[] = {
     RTL_CONSTANT_STRING(L"rundll32.exe"),
     RTL_CONSTANT_STRING(L"certutil.exe"),
     RTL_CONSTANT_STRING(L"bitsadmin.exe"),
-    RTL_CONSTANT_STRING(L"wmic.exe"),
-    RTL_CONSTANT_STRING(L"msbuild.exe"),
-    RTL_CONSTANT_STRING(L"installutil.exe"),
-    RTL_CONSTANT_STRING(L"regasm.exe"),
-    RTL_CONSTANT_STRING(L"regsvcs.exe"),
 };
 
 #define WSL_NATIVE_ESCAPE_TARGET_COUNT \
@@ -405,29 +400,19 @@ WslMonCheckProcessCreate(
     //
     // Step 3: Enforce capacity limit to prevent NonPagedPool exhaustion
     // under attack. An adversary spawning thousands of WSL processes would
-    // otherwise cause unbounded memory consumption (WSL-5). We reserve a
-    // slot atomically up front so concurrent threads cannot race past the
-    // ceiling; on any subsequent failure path (allocation, duplicate PID)
-    // the reservation is rolled back. This eliminates the TOCTOU window
-    // between reading TotalTrackedCount and incrementing it later.
+    // otherwise cause unbounded memory consumption (WSL-5).
     //
-    {
-        LONG newTotal = InterlockedIncrement(&g_WslState.TotalTrackedCount);
-        if (newTotal > WSL_MAX_TRACKED_PROCESSES) {
-            //
-            // Exceeded the cap -- roll back our reservation and bail.
-            //
-            InterlockedDecrement(&g_WslState.TotalTrackedCount);
+    if (InterlockedCompareExchange(
+            &g_WslState.TotalTrackedCount, 0, 0) >= WSL_MAX_TRACKED_PROCESSES) {
 
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike/WSL] Capacity limit reached (%d). "
-                       "PID=%lu not tracked (Type=%d)\n",
-                       WSL_MAX_TRACKED_PROCESSES,
-                       HandleToULong(ProcessId), Type);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/WSL] Capacity limit reached (%d). "
+                   "PID=%lu not tracked (Type=%d)\n",
+                   WSL_MAX_TRACKED_PROCESSES,
+                   HandleToULong(ProcessId), Type);
 
-            WslpLeaveOperation();
-            return Type;
-        }
+        WslpLeaveOperation();
+        return Type;
     }
 
     //
@@ -437,7 +422,6 @@ WslMonCheckProcessCreate(
         &g_WslState.ProcessLookaside);
 
     if (NewProc == NULL) {
-        InterlockedDecrement(&g_WslState.TotalTrackedCount);
         WslpLeaveOperation();
         return Type;
     }
@@ -472,12 +456,10 @@ WslMonCheckProcessCreate(
             //
             // Duplicate PID already tracked. This can happen with rapid
             // process creation/termination where the termination callback
-            // hasn't fired yet. Discard the new entry and roll back the
-            // capacity reservation.
+            // hasn't fired yet. Discard the new entry.
             //
             FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
             ExFreeToNPagedLookasideList(&g_WslState.ProcessLookaside, NewProc);
-            InterlockedDecrement(&g_WslState.TotalTrackedCount);
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                        "[ShadowStrike/WSL] Duplicate PID=%lu, skipping insert\n",
@@ -492,6 +474,7 @@ WslMonCheckProcessCreate(
     }
     FltReleasePushLock(&g_WslState.ProcessBuckets[Bucket].Lock);
 
+    InterlockedIncrement(&g_WslState.TotalTrackedCount);
     InterlockedIncrement64(&g_WslState.Stats.WslProcessesDetected);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,

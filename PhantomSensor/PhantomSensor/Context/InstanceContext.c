@@ -1324,14 +1324,8 @@ ShadowpQueryVolumeSerialNumber(
         FileFsVolumeInformation
     );
 
-    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-        //
-        // STATUS_BUFFER_OVERFLOW still populates the fixed-size header
-        // (VolumeSerialNumber lives in the fixed portion before the
-        // variable VolumeLabel). Treat it as success for serial query.
-        //
+    if (NT_SUCCESS(status)) {
         *SerialNumber = volumeBuffer.VolumeInfo.VolumeSerialNumber;
-        return STATUS_SUCCESS;
     }
 
     return status;
@@ -1449,19 +1443,9 @@ ShadowpAllocateAndCopyString(
     }
 
     //
-    // Cap length to prevent excessive allocations.
+    // Cap length to prevent excessive allocations
     //
-    // Defensive: also guarantee allocationLength + sizeof(WCHAR) cannot
-    // overflow USHORT when materialised into UNICODE_STRING::MaximumLength.
-    // The largest legal allocationLength is therefore MAXUSHORT - sizeof(WCHAR).
-    //
-    {
-        ULONG cappedLength = min((ULONG)Source->Length, MaxLength);
-        if (cappedLength > (ULONG)(MAXUSHORT - sizeof(WCHAR))) {
-            cappedLength = (ULONG)(MAXUSHORT - sizeof(WCHAR));
-        }
-        allocationLength = (USHORT)cappedLength;
-    }
+    allocationLength = (USHORT)min(Source->Length, MaxLength);
 
     //
     // Calculate total size with null terminator
