@@ -204,6 +204,16 @@ typedef struct _ACT_TRACKER {
     volatile LONG CleanupStopping;
 
     //
+    // Tracker lifetime management - prevents UAF between concurrent public
+    // API calls and ActShutdown. ShuttingDown is the gate; RefCount counts
+    // active public-API frames; RefZeroEvent is signaled when RefCount hits
+    // zero so Shutdown can safely free the tracker.
+    //
+    volatile LONG ShuttingDown;
+    volatile LONG RefCount;
+    KEVENT RefZeroEvent;
+
+    //
     // Statistics
     //
     struct {
