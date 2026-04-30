@@ -191,6 +191,15 @@ typedef struct _IOM_MATCHER_INTERNAL {
     volatile BOOLEAN ShuttingDown;
 
     //
+    // Matcher-wide reference counting (drains in-flight callers across shutdown).
+    // RefCount starts at 1 (the initial reference held by IomInitialize) and is
+    // incremented by every public API entry that succeeds the ShuttingDown gate.
+    // IomShutdown drops the initial reference and waits on RefZeroEvent.
+    //
+    volatile LONG RefCount;
+    KEVENT RefZeroEvent;
+
+    //
     // Global IOC storage
     //
     LIST_ENTRY GlobalIOCList;
@@ -443,6 +452,79 @@ IompSafeStringLength(
  */
 static PCO_CACHE g_IomMatchCoCache = NULL;
 
+// ============================================================================
+// MATCHER-WIDE REFERENCE COUNTING
+// ============================================================================
+
+/**
+ * @brief Try to acquire a reference on the matcher.
+ *
+ * Returns FALSE if shutdown has begun OR the reference count has already
+ * dropped to 0.  Re-checks ShuttingDown after the increment to defeat the
+ * gate-then-increment race against IomShutdown.
+ *
+ * Every public API must call this and pair it with IompDereferenceMatcher
+ * on every exit path.
+ */
+static BOOLEAN
+IompTryReferenceMatcher(
+    _In_ PIOM_MATCHER_INTERNAL Matcher
+    )
+{
+    LONG oldCount;
+    LONG newCount;
+
+    if (Matcher == NULL) {
+        return FALSE;
+    }
+
+    if (Matcher->ShuttingDown) {
+        return FALSE;
+    }
+
+    do {
+        oldCount = InterlockedCompareExchange(&Matcher->RefCount, 0, 0);
+        if (oldCount <= 0) {
+            return FALSE;
+        }
+        newCount = oldCount + 1;
+    } while (InterlockedCompareExchange(&Matcher->RefCount, newCount, oldCount) != oldCount);
+
+    //
+    // Re-check shutdown after the increment.  If IomShutdown set ShuttingDown
+    // between our first check and the increment, release the reference and
+    // refuse so the drain wait observes our departure.
+    //
+    if (Matcher->ShuttingDown) {
+        if (InterlockedDecrement(&Matcher->RefCount) == 0) {
+            KeSetEvent(&Matcher->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/**
+ * @brief Release a reference acquired via IompTryReferenceMatcher.
+ *
+ * Signals RefZeroEvent when the count reaches zero so IomShutdown can free
+ * the matcher safely.
+ */
+static VOID
+IompDereferenceMatcher(
+    _In_ PIOM_MATCHER_INTERNAL Matcher
+    )
+{
+    if (Matcher == NULL) {
+        return;
+    }
+
+    if (InterlockedDecrement(&Matcher->RefCount) == 0) {
+        KeSetEvent(&Matcher->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 _Use_decl_annotations_
 NTSTATUS
 IomInitialize(
@@ -629,6 +711,15 @@ IomInitialize(
     matcher->CleanupTimerId = 0;
 
     //
+    // Initialize matcher-wide reference counting.
+    // RefCount starts at 1 (the initial reference held by IomInitialize).
+    // RefZeroEvent is a NotificationEvent so a one-shot signal latches and any
+    // waiter (including a future re-entrant shutdown) sees it.
+    //
+    matcher->RefCount = 1;
+    KeInitializeEvent(&matcher->RefZeroEvent, NotificationEvent, FALSE);
+
+    //
     // Create cleanup thread and start timer if expiration is enabled
     //
     if (matcher->Config.EnableExpiration) {
@@ -663,11 +754,24 @@ IomInitialize(
         if (!NT_SUCCESS(status)) {
             //
             // Thread is running but we cannot reference it.
-            // Signal termination and wait via handle before freeing matcher.
+            // Signal termination and wait via handle (bounded, then indefinite
+            // fallback) before freeing matcher.  An orphan worker referencing
+            // the freed matcher would be a kernel UAF, so never bypass the wait.
             //
+            LARGE_INTEGER threadTimeout;
+            NTSTATUS waitStatus;
+
             matcher->CleanupTerminate = TRUE;
             KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
-            ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+
+            threadTimeout.QuadPart = -((LONGLONG)5 * 10 * 1000 * 1000); // 5 seconds
+            waitStatus = ZwWaitForSingleObject(threadHandle, FALSE, &threadTimeout);
+            if (waitStatus == STATUS_TIMEOUT) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] IOCMatcher: ObRef-fail path: cleanup thread did not exit within 5s; "
+                           "falling back to indefinite wait to prevent matcher UAF\n");
+                ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+            }
             matcher->CleanupThread = NULL;
 
             ZwClose(threadHandle);
@@ -778,12 +882,13 @@ IomShutdown(
     }
 
     //
-    // Signal shutdown FIRST (atomic)
+    // Signal shutdown FIRST (atomic) so all subsequent public API entries
+    // fail their TryReference gate.
     //
     InterlockedExchange8((volatile char*)&matcher->ShuttingDown, TRUE);
 
     //
-    // Cancel cleanup timer via TimerManager
+    // Cancel cleanup timer via TimerManager (waits for in-flight callbacks).
     //
     {
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
@@ -794,19 +899,83 @@ IomShutdown(
 
     //
     // Terminate cleanup thread: signal terminate, wake thread, wait for exit
+    // with a bounded timeout.  An orphan worker referencing a freed matcher
+    // would be a kernel UAF, so on timeout we log and fall back to an
+    // indefinite wait rather than ever proceeding without the join.
     //
     if (matcher->CleanupThread != NULL) {
+        LARGE_INTEGER cleanupTimeout;
+        NTSTATUS waitStatus;
+
         InterlockedExchange8((volatile char*)&matcher->CleanupTerminate, TRUE);
         KeSetEvent(&matcher->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
-        KeWaitForSingleObject(
+
+        cleanupTimeout.QuadPart = -((LONGLONG)10 * 10 * 1000 * 1000); // 10 seconds
+        waitStatus = KeWaitForSingleObject(
             matcher->CleanupThread,
             Executive,
             KernelMode,
             FALSE,
-            NULL
+            &cleanupTimeout
         );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] IOCMatcher: Cleanup thread did not exit within 10s; "
+                       "falling back to indefinite wait to prevent matcher UAF\n");
+            KeWaitForSingleObject(
+                matcher->CleanupThread,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
+
         ObDereferenceObject(matcher->CleanupThread);
         matcher->CleanupThread = NULL;
+    }
+
+    //
+    // Drop the initial matcher reference.  Public APIs that observed
+    // ShuttingDown=FALSE before our atomic exchange and then incremented
+    // RefCount will release their references on exit, eventually driving
+    // the count to zero and signalling RefZeroEvent.
+    //
+    IompDereferenceMatcher(matcher);
+
+    //
+    // Wait for all in-flight callers to drain.  Bounded at 30 seconds, then
+    // indefinite fallback: a stuck caller is logged but never bypassed,
+    // because freeing the matcher under a live caller would be a kernel UAF.
+    //
+    {
+        LARGE_INTEGER drainTimeout;
+        NTSTATUS waitStatus;
+
+        drainTimeout.QuadPart = -((LONGLONG)30 * 10 * 1000 * 1000); // 30 seconds
+        waitStatus = KeWaitForSingleObject(
+            &matcher->RefZeroEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &drainTimeout
+        );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            LONG outstanding = InterlockedCompareExchange(&matcher->RefCount, 0, 0);
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] IOCMatcher: Drain wait timed out at 30s with %ld outstanding "
+                       "reference(s); falling back to indefinite wait to prevent matcher UAF\n",
+                       outstanding);
+            KeWaitForSingleObject(
+                &matcher->RefZeroEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
     }
 
     //
@@ -925,7 +1094,7 @@ IomLoadIOC(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized || matcher->ShuttingDown) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -933,6 +1102,7 @@ IomLoadIOC(
     // Validate IOC type
     //
     if (IOC->Type == IomType_Unknown || IOC->Type >= IomType_MaxValue) {
+        IompDereferenceMatcher(matcher);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -941,6 +1111,7 @@ IomLoadIOC(
     //
     actualLength = IompSafeStringLength(IOC->Value, IOM_MAX_IOC_LENGTH);
     if (actualLength == 0 || actualLength >= IOM_MAX_IOC_LENGTH) {
+        IompDereferenceMatcher(matcher);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -952,6 +1123,7 @@ IomLoadIOC(
         // If caller specified length, it must match
         //
         if (IOC->ValueLength > actualLength) {
+            IompDereferenceMatcher(matcher);
             return STATUS_INVALID_PARAMETER;
         }
         actualLength = IOC->ValueLength;
@@ -961,14 +1133,22 @@ IomLoadIOC(
     // Validate hash lengths for hash-type IOCs
     //
     if (!IompValidateHashLength(IOC->Type, actualLength)) {
+        IompDereferenceMatcher(matcher);
         return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Check IOC limit
+    // Atomically reserve a slot against MaxIOCs.  Multiple concurrent loaders
+    // could each pass a non-atomic check and then increment past the cap, so
+    // we increment first and roll back if we exceeded the limit.
     //
-    if ((ULONG)matcher->IOCCount >= matcher->Config.MaxIOCs) {
-        return STATUS_QUOTA_EXCEEDED;
+    {
+        LONG newCount = InterlockedIncrement(&matcher->IOCCount);
+        if ((ULONG)newCount > matcher->Config.MaxIOCs || newCount <= 0) {
+            InterlockedDecrement(&matcher->IOCCount);
+            IompDereferenceMatcher(matcher);
+            return STATUS_QUOTA_EXCEEDED;
+        }
     }
 
     //
@@ -983,6 +1163,8 @@ IomLoadIOC(
     }
 
     if (newIOC == NULL) {
+        InterlockedDecrement(&matcher->IOCCount);
+        IompDereferenceMatcher(matcher);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1061,7 +1243,9 @@ IomLoadIOC(
 
     InsertTailList(&matcher->GlobalIOCList, &newIOC->GlobalListEntry);
     InsertTailList(&matcher->HashBuckets[bucket], &newIOC->HashBucketEntry);
-    InterlockedIncrement(&matcher->IOCCount);
+    //
+    // IOCCount was already incremented during the atomic slot reservation above.
+    //
 
     ExReleasePushLockExclusive(&matcher->HashLock);
     ExReleasePushLockExclusive(&matcher->GlobalLock);
@@ -1078,6 +1262,7 @@ IomLoadIOC(
         InterlockedIncrement64(&matcher->Stats.IOCsLoaded);
     }
 
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
@@ -1125,7 +1310,7 @@ IomLoadFromBuffer(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized || matcher->ShuttingDown) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1138,6 +1323,7 @@ IomLoadFromBuffer(
         //
         safeBuffer = ExAllocatePoolZero(PagedPool, Size, IOM_POOL_TAG);
         if (safeBuffer == NULL) {
+            IompDereferenceMatcher(matcher);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1149,8 +1335,10 @@ IomLoadFromBuffer(
             RtlCopyMemory(safeBuffer, Buffer, Size);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
+            NTSTATUS exceptionStatus = GetExceptionCode();
             ExFreePoolWithTag(safeBuffer, IOM_POOL_TAG);
-            return GetExceptionCode();
+            IompDereferenceMatcher(matcher);
+            return exceptionStatus;
         }
 
         bufferStart = (PCSTR)safeBuffer;
@@ -1216,9 +1404,11 @@ IomLoadFromBuffer(
     }
 
     if (loaded == 0 && errors > 0) {
+        IompDereferenceMatcher(matcher);
         return STATUS_INVALID_PARAMETER;
     }
 
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
@@ -1242,7 +1432,7 @@ IomRegisterCallback(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized || matcher->ShuttingDown) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1257,6 +1447,7 @@ IomRegisterCallback(
         );
 
         if (newReg == NULL) {
+            IompDereferenceMatcher(matcher);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1281,6 +1472,7 @@ IomRegisterCallback(
         ExFreePoolWithTag(oldReg, IOM_POOL_TAG);
     }
 
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
@@ -1336,7 +1528,7 @@ IomMatch(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized || matcher->ShuttingDown) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1599,6 +1791,7 @@ IomMatch(
         IompNotifyCallback(matcher, Result);
     }
 
+    IompDereferenceMatcher(matcher);
     return status;
 }
 
@@ -1678,21 +1871,23 @@ IomGetStatistics(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
-    // Copy statistics (lock-free reads of volatile LONG64)
+    // Copy statistics with InterlockedCompareExchange64 to defeat torn reads
+    // of volatile LONG64 on 32-bit targets where 64-bit MOV is not atomic.
     //
-    Stats->IOCsLoaded = matcher->Stats.IOCsLoaded;
-    Stats->IOCsExpired = matcher->Stats.IOCsExpired;
-    Stats->MatchesFound = matcher->Stats.MatchesFound;
-    Stats->QueriesPerformed = matcher->Stats.QueriesPerformed;
-    Stats->BloomFilterHits = matcher->Stats.BloomFilterHits;
-    Stats->BloomFilterMisses = matcher->Stats.BloomFilterMisses;
-    Stats->StartTime = matcher->Stats.StartTime;
+    Stats->IOCsLoaded        = (LONG64)InterlockedCompareExchange64(&matcher->Stats.IOCsLoaded, 0, 0);
+    Stats->IOCsExpired       = (LONG64)InterlockedCompareExchange64(&matcher->Stats.IOCsExpired, 0, 0);
+    Stats->MatchesFound      = (LONG64)InterlockedCompareExchange64(&matcher->Stats.MatchesFound, 0, 0);
+    Stats->QueriesPerformed  = (LONG64)InterlockedCompareExchange64(&matcher->Stats.QueriesPerformed, 0, 0);
+    Stats->BloomFilterHits   = (LONG64)InterlockedCompareExchange64(&matcher->Stats.BloomFilterHits, 0, 0);
+    Stats->BloomFilterMisses = (LONG64)InterlockedCompareExchange64(&matcher->Stats.BloomFilterMisses, 0, 0);
+    Stats->StartTime         = matcher->Stats.StartTime;
 
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
@@ -1711,11 +1906,13 @@ IomGetIOCCount(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    *Count = matcher->IOCCount;
+    *Count = InterlockedCompareExchange(&matcher->IOCCount, 0, 0);
+
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
@@ -1739,7 +1936,7 @@ IomRemoveIOC(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized || matcher->ShuttingDown) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1761,9 +1958,11 @@ IomRemoveIOC(
     ExReleasePushLockExclusive(&matcher->GlobalLock);
 
     if (!found) {
+        IompDereferenceMatcher(matcher);
         return STATUS_NOT_FOUND;
     }
 
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
@@ -1783,12 +1982,13 @@ IomCleanupExpired(
 
     matcher = (PIOM_MATCHER_INTERNAL)Matcher;
 
-    if (!matcher->Initialized || matcher->ShuttingDown) {
+    if (!IompTryReferenceMatcher(matcher)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     IompCleanupExpiredIOCsWorker(matcher);
 
+    IompDereferenceMatcher(matcher);
     return STATUS_SUCCESS;
 }
 
