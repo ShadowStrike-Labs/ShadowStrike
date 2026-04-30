@@ -235,8 +235,24 @@ uint32_t ProcessManager::CreateChildProcess(
     child.parentProcessId = parentPid;
     child.mainThreadId    = tid;
     child.flags           = flags;
-    child.imagePath       = std::wstring(imagePath);
-    child.commandLine     = std::wstring(commandLine);
+    // DESIGN: defense-in-depth — even though guest-API readers already cap
+    // PE-image paths and command-line lengths, the wstring_view here flows
+    // through OnParentPIDAttribute / event logging and downstream UI/IPC
+    // serialisers. A hostile guest that bypasses an upstream cap could
+    // otherwise inflate the per-process descriptor without bound. Cap
+    // each string at 32 KiB chars (Win32 MAX_PATH × 32, well above any
+    // legitimate path or command line).
+    constexpr size_t kMaxNameChars = 32u * 1024u;
+    {
+        const auto truncImage = imagePath.size() > kMaxNameChars
+                                    ? imagePath.substr(0, kMaxNameChars)
+                                    : imagePath;
+        const auto truncCmd   = commandLine.size() > kMaxNameChars
+                                    ? commandLine.substr(0, kMaxNameChars)
+                                    : commandLine;
+        child.imagePath   = std::wstring(truncImage);
+        child.commandLine = std::wstring(truncCmd);
+    }
 
     // Determine initial state
     if (HasFlag(flags, ProcessCreationFlags::CreateSuspended)) {
