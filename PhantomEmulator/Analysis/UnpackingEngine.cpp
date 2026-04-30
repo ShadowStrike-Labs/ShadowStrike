@@ -174,6 +174,33 @@ static constexpr uint32_t kMaxStringSearch      = 64u * 1024u;
 // Shannon entropy
 // --------------------------------------------------------------------------
 
+// DESIGN: Sanitize API/function names before they are stored in the api log
+// or in the import-reconstruction list. Strips control characters (including
+// CR/LF/tab/NUL/DEL) that would enable log injection if these names ever flow
+// into structured logs, and caps total length so a hostile guest cannot push
+// unbounded strings through the OnAPICall/RecordImport paths.
+[[nodiscard]] std::string SanitizeFuncName(const char* name) noexcept {
+    if (!name) return {};
+    constexpr size_t kMaxFuncNameLen = 256;
+    std::string out;
+    try {
+        out.reserve(64);
+        for (size_t i = 0; i < kMaxFuncNameLen; ++i) {
+            const char raw = name[i];
+            if (raw == '\0') break;
+            const unsigned char c = static_cast<unsigned char>(raw);
+            // Strip control characters (0x00-0x1F and 0x7F) — log injection guard
+            if (c < 0x20 || c == 0x7F) continue;
+            out.push_back(static_cast<char>(c));
+        }
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::exception&) {
+        return {};
+    }
+    return out;
+}
+
 [[nodiscard]] double ShannonEntropy(const uint8_t* data, size_t len) noexcept {
     if (!data || len == 0) return 0.0;
 
@@ -2009,21 +2036,38 @@ bool UnpackingEngine::Impl::CheckStandardPrologue(
 // ============================================================================
 
 UnpackingEngine::UnpackingEngine(const EmulationConfig& config) noexcept
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(nullptr)
 {
-    m_impl->config.maxLayers              = config.maxUnpackLayers;
-    m_impl->config.entropyThreshold       = config.entropyThreshold;
-    m_impl->config.minOEPInstructions     = config.minOEPInstructions;
-    m_impl->config.captureEveryLayer      = config.captureUnpackLayers;
-    m_impl->config.enablePackerDetection  = config.enableUnpacking;
-    m_impl->config.enableImportReconstruction = config.enableUnpacking;
+    // DESIGN: PIMPL allocation may fail on memory pressure. We absorb
+    // std::bad_alloc here to honor the noexcept contract; subsequent public
+    // methods null-guard `m_impl` and degrade gracefully (return defaults,
+    // do nothing) so the engine becomes inert instead of crashing the host.
+    try {
+        m_impl = std::make_unique<Impl>();
+        m_impl->config.maxLayers              = config.maxUnpackLayers;
+        m_impl->config.entropyThreshold       = config.entropyThreshold;
+        m_impl->config.minOEPInstructions     = config.minOEPInstructions;
+        m_impl->config.captureEveryLayer      = config.captureUnpackLayers;
+        m_impl->config.enablePackerDetection  = config.enableUnpacking;
+        m_impl->config.enableImportReconstruction = config.enableUnpacking;
 
-    m_impl->layers.reserve(config.maxUnpackLayers);
-    m_impl->oepCandidates.reserve(32);
-    m_impl->apiLog.reserve(1024);
-    m_impl->entropyHistory.reserve(256);
-    m_impl->protLog.reserve(256);
-    m_impl->trackedImports.reserve(256);
+        // Cap reservation count to defend against hostile config values
+        // (e.g. config.maxUnpackLayers = UINT32_MAX would attempt a 4 GiB
+        // allocation here under pre-hardening behavior).
+        constexpr uint32_t kReserveCap = 1024;
+        const uint32_t layersReserve = std::min(config.maxUnpackLayers, kReserveCap);
+
+        m_impl->layers.reserve(layersReserve);
+        m_impl->oepCandidates.reserve(32);
+        m_impl->apiLog.reserve(1024);
+        m_impl->entropyHistory.reserve(256);
+        m_impl->protLog.reserve(256);
+        m_impl->trackedImports.reserve(256);
+    } catch (const std::bad_alloc&) {
+        m_impl.reset();
+    } catch (const std::exception&) {
+        m_impl.reset();
+    }
 }
 
 UnpackingEngine::~UnpackingEngine() noexcept = default;
@@ -2042,6 +2086,13 @@ void UnpackingEngine::OnWXTransition(
     GuestAddress rip,
     uint64_t instrCount) noexcept
 {
+    // DESIGN: tracker is reserved for future cross-correlation with the
+    // memory-tracker's write-history (e.g. attribution of which thread did
+    // the W transition). Acknowledged here to silence unused-parameter
+    // warnings without altering the public API.
+    (void)tracker;
+    if (!m_impl) return;
+
     std::unique_lock lock(m_impl->mutex);
 
     if (m_impl->complete) return;
@@ -2049,6 +2100,10 @@ void UnpackingEngine::OnWXTransition(
         m_impl->complete = true;
         return;
     }
+
+    // Containment: any std::bad_alloc thrown by inner vector mutations must
+    // not propagate out of this noexcept callback.
+    try {
 
     m_impl->lastWXPage  = page;
     m_impl->lastWXRip   = rip;
@@ -2196,15 +2251,27 @@ void UnpackingEngine::OnWXTransition(
             m_impl->AddOEPCandidate(tailTarget, OEPMethod::TailJump, 0.8, instrCount);
         }
     }
+    } catch (const std::bad_alloc&) {
+        // Allocation failure inside vector mutations — engine continues
+        // with whatever state was already committed; OEP detection may be
+        // incomplete but no protection regression.
+    } catch (const std::exception&) {
+        // Defensive containment for any unexpected throw.
+    }
 }
 
 void UnpackingEngine::OnInstruction(GuestAddress rip,
                                      uint64_t instrCount) noexcept
 {
+    if (!m_impl) return;
     // Fast bail — avoid lock overhead when not actively tracking
     if (!m_impl->unpacking || m_impl->complete) return;
 
     std::unique_lock lock(m_impl->mutex);
+
+    // DESIGN: bad_alloc from the OEP-candidate vector or sort cannot escape
+    // a noexcept callback; absorb here and continue the loop.
+    try {
 
     m_impl->totalInstructions = instrCount;
     m_impl->prevRip           = rip;
@@ -2291,6 +2358,9 @@ void UnpackingEngine::OnInstruction(GuestAddress rip,
             m_impl->finalOEPMethod = layer.oepMethod;
         }
     }
+    } catch (const std::bad_alloc&) {
+    } catch (const std::exception&) {
+    }
 }
 
 // ============================================================================
@@ -2301,12 +2371,18 @@ void UnpackingEngine::OnProtectionChange(
     GuestAddress base, GuestSize size,
     MemProt oldProt, MemProt newProt) noexcept
 {
+    if (!m_impl) return;
     if (!m_impl->unpacking && !HasProt(newProt, MemProt::Execute)) return;
 
     std::unique_lock lock(m_impl->mutex);
 
-    if (m_impl->protLog.size() < kMaxProtChanges) {
-        m_impl->protLog.push_back({base, size, oldProt, newProt});
+    try {
+        if (m_impl->protLog.size() < kMaxProtChanges) {
+            m_impl->protLog.push_back({base, size, oldProt, newProt});
+        }
+    } catch (const std::bad_alloc&) {
+        // Drop this record — protection scoring degrades but engine continues.
+    } catch (const std::exception&) {
     }
 
     // If a region gains Execute permission after being Writable,
@@ -2331,18 +2407,26 @@ void UnpackingEngine::OnProtectionChange(
 void UnpackingEngine::OnAPICall(const char* funcName,
                                  uint64_t instrCount) noexcept
 {
+    if (!m_impl) return;
     if (!funcName) return;
+
+    // Sanitize and length-cap the function name before it ever touches our
+    // logs. This neutralizes log-injection (CR/LF) and bounds memory cost
+    // even if the guest produces pathological API names.
+    const std::string sanitized = SanitizeFuncName(funcName);
+    if (sanitized.empty()) return;
 
     std::unique_lock lock(m_impl->mutex);
 
+    try {
     // Track for import reconstruction
     if (m_impl->config.enableImportReconstruction) {
-        m_impl->RecordImport(funcName);
+        m_impl->RecordImport(sanitized.c_str());
     }
 
     // Record in API log (capped)
     if (m_impl->apiLog.size() < kMaxTrackedAPICalls) {
-        m_impl->apiLog.push_back({funcName, instrCount});
+        m_impl->apiLog.push_back({sanitized, instrCount});
     }
 
     // --- OEP heuristic: APICallAfterDecode ---
@@ -2377,6 +2461,9 @@ void UnpackingEngine::OnAPICall(const char* funcName,
 
     m_impl->lastAPIInstr          = instrCount;
     m_impl->instrSinceLastAPICall = 0;
+    } catch (const std::bad_alloc&) {
+    } catch (const std::exception&) {
+    }
 }
 
 // ============================================================================
@@ -2384,22 +2471,39 @@ void UnpackingEngine::OnAPICall(const char* funcName,
 // ============================================================================
 
 uint32_t UnpackingEngine::GetCurrentLayer() const noexcept {
+    if (!m_impl) return 0;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->currentLayerIdx;
 }
 
 const std::vector<UnpackLayer>& UnpackingEngine::GetLayers() const noexcept {
-    // Note: caller must not hold this reference across mutations.
-    // Safe for analysis after emulation completes.
-    return m_impl->layers;
+    // DESIGN: return a snapshot via thread_local storage so external readers
+    // (e.g. EmulationSession) cannot observe a vector being mutated under the
+    // shared_mutex. The reference is valid for the lifetime of the calling
+    // thread until its next call into GetLayers; callers iterate immediately
+    // (range-for) and never store the reference, matching that contract.
+    thread_local std::vector<UnpackLayer> snapshot;
+    snapshot.clear();
+    if (!m_impl) return snapshot;
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        snapshot = m_impl->layers;
+    } catch (const std::bad_alloc&) {
+        snapshot.clear();
+    } catch (const std::exception&) {
+        snapshot.clear();
+    }
+    return snapshot;
 }
 
 bool UnpackingEngine::IsUnpacking() const noexcept {
+    if (!m_impl) return false;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->unpacking;
 }
 
 bool UnpackingEngine::IsComplete() const noexcept {
+    if (!m_impl) return false;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->complete;
 }
@@ -2409,11 +2513,13 @@ bool UnpackingEngine::IsComplete() const noexcept {
 // ============================================================================
 
 GuestAddress UnpackingEngine::GetFinalOEP() const noexcept {
+    if (!m_impl) return 0;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->finalOEP;
 }
 
 OEPMethod UnpackingEngine::GetOEPMethod() const noexcept {
+    if (!m_impl) return OEPMethod::WXTransition;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->finalOEPMethod;
 }
@@ -2427,6 +2533,16 @@ PackerType UnpackingEngine::DetectPacker(
     GuestAddress imageBase,
     GuestSize imageSize) const noexcept
 {
+    if (!m_impl) return PackerType::Unknown;
+    // DESIGN: imageSize is reserved for future per-section bound checks
+    // against the supplied image extent. Today the PE parser already
+    // self-bounds via SizeOfImage in the PE header.
+    (void)imageSize;
+    // DESIGN: noexcept contract — the body allocates std::vector and
+    // std::string internally and we cannot let std::bad_alloc escape into
+    // emulation callers and call std::terminate. Treat alloc failure as
+    // "detection unavailable" and fall through to Unknown.
+    try {
     PEHeaderInfo hdr{};
     if (!ReadPEHeaders(memory, imageBase, hdr)) return PackerType::Unknown;
 
@@ -3483,6 +3599,11 @@ PackerType UnpackingEngine::DetectPacker(
     }
 
     return (bestScore >= kDetectionThreshold) ? bestType : PackerType::Unknown;
+    } catch (const std::bad_alloc&) {
+        return PackerType::Unknown;
+    } catch (const std::exception&) {
+        return PackerType::Unknown;
+    }
 }
 
 // ============================================================================
@@ -3496,19 +3617,32 @@ std::vector<uint8_t> UnpackingEngine::DumpPE(
 {
     std::vector<uint8_t> result;
 
+    if (!m_impl) return result;
+    // DESIGN: imageSize is reserved for cross-checking the dumped image
+    // extent against an externally-supplied bound; today the PE header's
+    // SizeOfImage is the canonical source and is itself capped below.
+    (void)imageSize;
+
     PEHeaderInfo hdr{};
     if (!ReadPEHeaders(memory, imageBase, hdr)) return result;
 
     if (hdr.sizeOfImage == 0 || hdr.sizeOfImage > m_impl->config.maxDumpSize) return result;
 
+    // DESIGN: noexcept guard — extensive vector growth below cannot raise
+    // bad_alloc into the emulator. Failure => return empty vector; caller
+    // should treat this as "PE dump unavailable" and skip artifact emission.
+    try {
     const uint32_t fileAlignment = std::max(hdr.fileAlignment, 0x200u);
     const uint32_t sectionAlignment = std::max(hdr.sectionAlignment, 0x1000u);
 
     // --- Phase 1: Read original headers from guest memory ---
     const uint32_t headerSize = AlignUp32(hdr.sizeOfHeaders, fileAlignment);
     std::vector<uint8_t> headers(headerSize, 0);
-    ReadGuestBytes(memory, imageBase, headers.data(),
-                   std::min(hdr.sizeOfHeaders, headerSize));
+    // DESIGN: header read failure is non-fatal — `headers` is value-initialized
+    // to zero, producing a zero-filled MZ stub. The dumped PE will be
+    // syntactically invalid but the caller can still inspect partial data.
+    (void)ReadGuestBytes(memory, imageBase, headers.data(),
+                         std::min(hdr.sizeOfHeaders, headerSize));
 
     // --- Phase 2: Compute new file layout ---
     struct SectionLayout {
@@ -3663,6 +3797,11 @@ std::vector<uint8_t> UnpackingEngine::DumpPE(
     }
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return std::vector<uint8_t>{};
+    } catch (const std::exception&) {
+        return std::vector<uint8_t>{};
+    }
 }
 
 // ============================================================================
@@ -3674,6 +3813,14 @@ bool UnpackingEngine::ReconstructImports(
     GuestAddress imageBase,
     GuestSize imageSize) noexcept
 {
+    if (!m_impl) return false;
+    // DESIGN: imageSize reserved for future bound-checking when patching
+    // section-bounded structures; PE header bounds suffice today.
+    (void)imageSize;
+    // DESIGN: noexcept guard — interior allocations (vector<ImportEntry>,
+    // string concat, vector<uint8_t> growth for the new section) cannot
+    // be allowed to escape and terminate the emulator.
+    try {
     std::unique_lock lock(m_impl->mutex);
 
     // --- Step 1: Try to validate the existing import directory ---
@@ -3918,6 +4065,9 @@ bool UnpackingEngine::ReconstructImports(
     }
 
     // Update the PE import directory to point to our new section.
+    // DESIGN: a silent failure to patch the import directory results in a
+    // corrupt dumped PE — surface it so the caller can react rather than
+    // ship a broken artifact.
     const uint32_t eLfanew = hdr.eLfanew;
 
     if (hdr.is64Bit) {
@@ -3927,7 +4077,10 @@ bool UnpackingEngine::ReconstructImports(
         PE::DataDirectory importDir{};
         importDir.VirtualAddress = importRVA;
         importDir.Size           = iddSize;
-        memory.Write(imageBase + dirOff, &importDir, sizeof(importDir));
+        if (memory.Write(imageBase + dirOff, &importDir, sizeof(importDir))
+            != ErrorCode::Success) {
+            return false;
+        }
     } else {
         const uint32_t dirOff = eLfanew + 4 + sizeof(PE::FileHeader) +
             offsetof(PE::OptionalHeader32, DataDirectories) +
@@ -3935,7 +4088,10 @@ bool UnpackingEngine::ReconstructImports(
         PE::DataDirectory importDir{};
         importDir.VirtualAddress = importRVA;
         importDir.Size           = iddSize;
-        memory.Write(imageBase + dirOff, &importDir, sizeof(importDir));
+        if (memory.Write(imageBase + dirOff, &importDir, sizeof(importDir))
+            != ErrorCode::Success) {
+            return false;
+        }
     }
 
     // Mark success
@@ -3951,6 +4107,11 @@ bool UnpackingEngine::ReconstructImports(
     }
 
     return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 // ============================================================================
@@ -3958,13 +4119,21 @@ bool UnpackingEngine::ReconstructImports(
 // ============================================================================
 
 double UnpackingEngine::GetCurrentEntropy() const noexcept {
+    if (!m_impl) return 0.0;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->currentEntropy;
 }
 
 std::vector<std::pair<uint64_t, double>> UnpackingEngine::GetEntropyHistory() const noexcept {
-    std::shared_lock lock(m_impl->mutex);
-    return m_impl->entropyHistory;
+    if (!m_impl) return {};
+    try {
+        std::shared_lock lock(m_impl->mutex);
+        return m_impl->entropyHistory;
+    } catch (const std::bad_alloc&) {
+        return {};
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 // ============================================================================
@@ -3972,6 +4141,7 @@ std::vector<std::pair<uint64_t, double>> UnpackingEngine::GetEntropyHistory() co
 // ============================================================================
 
 void UnpackingEngine::Reset() noexcept {
+    if (!m_impl) return;
     std::unique_lock lock(m_impl->mutex);
 
     m_impl->layers.clear();
@@ -4016,6 +4186,12 @@ VMAnalysisResult UnpackingEngine::AnalyzeVirtualMachine(
 {
     VMAnalysisResult result{};
 
+    if (!m_impl) return result;
+
+    // DESIGN: noexcept contract — VM analysis allocates score tables and
+    // section-name strings; absorb bad_alloc here and return whatever was
+    // partially populated (or empty result) rather than terminating.
+    try {
     PEHeaderInfo hdr{};
     if (!ReadPEHeaders(memory, imageBase, hdr)) return result;
 
@@ -4303,9 +4479,15 @@ VMAnalysisResult UnpackingEngine::AnalyzeVirtualMachine(
     }
 
     return result;
+    } catch (const std::bad_alloc&) {
+        return VMAnalysisResult{};
+    } catch (const std::exception&) {
+        return VMAnalysisResult{};
+    }
 }
 
 VMArch UnpackingEngine::GetDetectedVM() const noexcept {
+    if (!m_impl) return VMArch::Unknown;
     std::shared_lock lock(m_impl->mutex);
     return m_impl->detectedVM;
 }
