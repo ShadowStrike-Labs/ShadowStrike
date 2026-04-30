@@ -260,9 +260,15 @@ ResultConverter::ConvertAPICall(const Phantom::APICallDetail& call) noexcept
         rec.severity = ShadowStrike::Core::Engine::APISeverity::Benign;
     }
 
-    // Serialize arguments to strings
-    rec.arguments.reserve(call.argCount);
-    for (uint32_t i = 0; i < call.argCount && i < 8; ++i) {
+    // Serialize arguments to strings.
+    // DESIGN: reserve at most kMaxArgs (the loop cap below) — call.argCount
+    // arrives from a guest API hook and could be UINT32_MAX in adversarial
+    // input, which would otherwise trigger a multi-GiB std::vector reserve
+    // (CWE-789).
+    constexpr uint32_t kMaxArgs = 8;
+    const uint32_t reserveCount = std::min(call.argCount, kMaxArgs);
+    rec.arguments.reserve(reserveCount);
+    for (uint32_t i = 0; i < call.argCount && i < kMaxArgs; ++i) {
         char buf[24];
         std::snprintf(buf, sizeof(buf), "0x%llX",
                       static_cast<unsigned long long>(call.args[i]));
