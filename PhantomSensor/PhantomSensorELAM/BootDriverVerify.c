@@ -741,10 +741,15 @@ BdvpExtractCertificateInfo(
 
     Info->IsSigned = TRUE;
 
-    // Compute SHA-1 of raw PKCS#7 certificate blob (skip WIN_CERTIFICATE header)
+    // Compute SHA-1 of raw PKCS#7 certificate blob (skip WIN_CERTIFICATE header).
+    // Failure is non-fatal: ThumbPrint stays zeroed (already RtlZeroMemory'd above).
+    // DESIGN: Thumbprint is a heuristic identifier only; classification never
+    // trusts it as a security primitive, so a hash failure cannot weaken the
+    // verdict. Discard is intentional — silenced via (VOID) cast to satisfy
+    // /analyze C6031.
     certTable = (PUCHAR)ImageBase + securityDir->VirtualAddress;
     if (securityDir->Size >= 8) {
-        ShadowStrikeComputeSha1(
+        (VOID)ShadowStrikeComputeSha1(
             certTable + 8,
             min(securityDir->Size - 8, 4096),
             Info->ThumbPrint
@@ -810,7 +815,7 @@ BdvpDeepCopyDriverPath(
         return STATUS_INVALID_PARAMETER;
     }
 
-    newBuffer = (PWCH)ExAllocatePool2(POOL_FLAG_NON_PAGED, SourcePath->Length, 'PvdB');
+    newBuffer = (PWCH)ExAllocatePool2(POOL_FLAG_NON_PAGED, SourcePath->Length, BDV_POOL_TAG);
     if (newBuffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -852,7 +857,7 @@ BdvpFreeDriverInfoPaths(
     )
 {
     if (Info->DriverPath.Buffer != NULL) {
-        ExFreePoolWithTag(Info->DriverPath.Buffer, 'PvdB');
+        ExFreePoolWithTag(Info->DriverPath.Buffer, BDV_POOL_TAG);
         Info->DriverPath.Buffer = NULL;
         Info->DriverPath.Length = 0;
         Info->DriverPath.MaximumLength = 0;
@@ -1072,7 +1077,17 @@ BdvLoadConfiguration(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlCopyMemory(newConfig, ConfigData, ConfigSize);
+    // Defense-in-depth: even though the documented contract is that ConfigData
+    // is a kernel-resident buffer owned by the caller, wrap the copy in SEH so
+    // a corrupted or partially-mapped source cannot BSOD the system. Failures
+    // here mean the new config is rejected; the previously-installed config is
+    // left untouched.
+    __try {
+        RtlCopyMemory(newConfig, ConfigData, ConfigSize);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ExFreePoolWithTag(newConfig, BDV_POOL_TAG);
+        return GetExceptionCode();
+    }
 
     // Swap under push lock for synchronization with readers
     KeEnterCriticalRegion();
@@ -1128,9 +1143,17 @@ BdvVerifyDriver(
     internal = CONTAINING_RECORD(Verifier, BDV_VERIFIER_INTERNAL, Public);
     *Info = NULL;
 
-    // Enforce verified list cap to prevent unbounded memory growth
-    if ((ULONG)InterlockedCompareExchange(&Verifier->VerifiedCount, 0, 0) >= BDV_MAX_VERIFIED_DRIVERS) {
-        return STATUS_QUOTA_EXCEEDED;
+    // Atomically reserve a verified-list slot up front to close the TOCTOU
+    // window between the cap check and the eventual InsertTailList. A simple
+    // "if (VerifiedCount >= MAX) return" followed by a later increment lets
+    // N concurrent verifiers each pass the gate and overcommit the list.
+    // Reserve-then-rollback-on-failure is race-free.
+    {
+        LONG reserved = InterlockedIncrement(&Verifier->VerifiedCount);
+        if (reserved > BDV_MAX_VERIFIED_DRIVERS) {
+            InterlockedDecrement(&Verifier->VerifiedCount);
+            return STATUS_QUOTA_EXCEEDED;
+        }
     }
 
     // Allocate driver info from lookaside
@@ -1190,10 +1213,10 @@ BdvVerifyDriver(
         goto Cleanup;
     }
 
-    // Add to verified list
+    // Add to verified list (slot was already reserved via InterlockedIncrement
+    // at function entry — do NOT increment a second time).
     KeAcquireSpinLock(&Verifier->VerifiedLock, &oldIrql);
     InsertTailList(&Verifier->VerifiedList, &driverInfo->ListEntry);
-    InterlockedIncrement(&Verifier->VerifiedCount);
     KeReleaseSpinLock(&Verifier->VerifiedLock, oldIrql);
 
     // Update statistics
@@ -1207,6 +1230,9 @@ Cleanup:
         BdvpFreeDriverInfoPaths(driverInfo);
         ExFreeToNPagedLookasideList(&internal->DriverInfoLookaside, driverInfo);
     }
+    // Roll back the slot reservation we took at function entry — the entry
+    // was never inserted into the VerifiedList.
+    InterlockedDecrement(&Verifier->VerifiedCount);
 
     return status;
 }
