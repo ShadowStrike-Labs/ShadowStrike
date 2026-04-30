@@ -208,10 +208,18 @@ struct PhantomEmulationResult {
     }
 
     [[nodiscard]] uint32_t TotalAlertCount() const noexcept {
-        return static_cast<uint32_t>(behaviorAlerts.size()) +
-               static_cast<uint32_t>(sequenceMatches.size()) +
-               static_cast<uint32_t>(memoryFindings.size()) +
-               static_cast<uint32_t>(evasionAttempts.size());
+        // DESIGN: saturating accumulation. Each vector size is size_t (≥64-bit on
+        // x64); summing four can overflow uint32_t for pathological corpora and a
+        // narrowing cast alone (static_cast<uint32_t>(size())) silently wraps.
+        // Clamp at UINT32_MAX so callers see a stable upper bound rather than a
+        // wrapped value that misrepresents alert volume in dashboards / telemetry.
+        constexpr uint64_t kCap = static_cast<uint64_t>(UINT32_MAX);
+        const uint64_t total =
+            static_cast<uint64_t>(behaviorAlerts.size()) +
+            static_cast<uint64_t>(sequenceMatches.size()) +
+            static_cast<uint64_t>(memoryFindings.size()) +
+            static_cast<uint64_t>(evasionAttempts.size());
+        return static_cast<uint32_t>(total > kCap ? kCap : total);
     }
 };
 
