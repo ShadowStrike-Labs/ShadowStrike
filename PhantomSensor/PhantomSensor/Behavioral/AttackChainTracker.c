@@ -57,6 +57,69 @@
 
 static VOID ActpCleanupWorkerThread(_In_ PVOID StartContext);
 
+//
+// Tracker lifetime ref-count helpers. Pattern:
+//   - ActpTryReferenceTracker: returns TRUE on success with ref held.
+//                              Refuses if ShuttingDown is set or RefCount<=0.
+//   - ActpDereferenceTracker:  releases ref; signals RefZeroEvent on 0.
+// Initial ref of 1 is taken in ActInitialize and dropped in ActShutdown
+// just before the wait on RefZeroEvent. This serializes free() against
+// every public API frame that holds a ref.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+ActpTryReferenceTracker(
+    _In_ PACT_TRACKER Tracker
+    )
+{
+    LONG oldRef;
+    LONG newRef;
+
+    //
+    // Fast-path gate: if shutdown has begun, refuse. We must re-check after
+    // the increment because Shutdown sets ShuttingDown WITHOUT holding any
+    // lock that this path touches.
+    //
+    if (InterlockedCompareExchange(&Tracker->ShuttingDown, 0, 0) != 0) {
+        return FALSE;
+    }
+
+    do {
+        oldRef = InterlockedCompareExchange(&Tracker->RefCount, 0, 0);
+        if (oldRef <= 0) {
+            return FALSE;
+        }
+        newRef = oldRef + 1;
+    } while (InterlockedCompareExchange(&Tracker->RefCount, newRef, oldRef) != oldRef);
+
+    //
+    // Re-check ShuttingDown after the bump. If shutdown raced in between
+    // the gate check and the increment, release and refuse so the caller
+    // sees a consistent "going away" state.
+    //
+    if (InterlockedCompareExchange(&Tracker->ShuttingDown, 0, 0) != 0) {
+        if (InterlockedDecrement(&Tracker->RefCount) == 0) {
+            KeSetEvent(&Tracker->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+ActpDereferenceTracker(
+    _In_ PACT_TRACKER Tracker
+    )
+{
+    LONG newRef = InterlockedDecrement(&Tracker->RefCount);
+    NT_ASSERT(newRef >= 0);
+    if (newRef == 0) {
+        KeSetEvent(&Tracker->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ActInitialize)
 #pragma alloc_text(PAGE, ActGetChain)
@@ -505,6 +568,16 @@ ActInitialize(
     tracker->CleanupThread = NULL;
 
     //
+    // Initialize tracker lifetime management. Initial RefCount=1 is held by
+    // the "live" tracker itself; ActShutdown drops it before waiting on
+    // RefZeroEvent so all client APIs must observe ShuttingDown=TRUE OR
+    // hold a ref that blocks shutdown's wait.
+    //
+    tracker->ShuttingDown = FALSE;
+    tracker->RefCount = 1;
+    KeInitializeEvent(&tracker->RefZeroEvent, NotificationEvent, FALSE);
+
+    //
     // Initialize statistics
     //
     KeQuerySystemTime(&tracker->Stats.StartTime);
@@ -548,11 +621,23 @@ ActInitialize(
                 //
                 // Thread is running but ObRef failed.
                 // Signal termination and wait via handle before closing.
+                // Use bounded wait first (5s), then fall back to indefinite
+                // wait so we never leave an orphan thread, but also surface
+                // a hang if one occurs.
                 //
+                LARGE_INTEGER boundedTimeout;
+                NTSTATUS waitStatus;
+
                 InterlockedExchange(&tracker->CleanupStopping, TRUE);
                 KeSetEvent(&tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 
-                ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+                boundedTimeout.QuadPart = -50000000LL; // 5 seconds
+                waitStatus = ZwWaitForSingleObject(threadHandle, FALSE, &boundedTimeout);
+                if (waitStatus == STATUS_TIMEOUT) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike] AttackChainTracker: cleanup thread did not exit in 5s after ObRef failure; falling back to indefinite wait\n");
+                    (VOID)ZwWaitForSingleObject(threadHandle, FALSE, NULL);
+                }
                 tracker->CleanupThread = NULL;
 
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
@@ -598,6 +683,8 @@ ActShutdown(
     LIST_ENTRY tempList;
     PACT_CALLBACK_REGISTRATION oldReg;
     KIRQL oldIrql;
+    LARGE_INTEGER boundedTimeout;
+    NTSTATUS waitStatus;
 
     if (Tracker == NULL) {
         return;
@@ -608,21 +695,70 @@ ActShutdown(
     }
 
     //
-    // Signal cleanup thread to stop and wait for it
+    // Set shutdown gate FIRST. Any concurrent public API call that has not
+    // yet taken a tracker reference will be rejected by ActpTryReferenceTracker;
+    // any call that already holds a ref will block our wait below until it
+    // dereferences. This is the linchpin of our UAF protection.
+    //
+    InterlockedExchange(&Tracker->ShuttingDown, TRUE);
+
+    //
+    // Signal cleanup thread to stop and wait for it. Bounded wait first,
+    // indefinite fallback so we never free underneath a live worker.
     //
     InterlockedExchange(&Tracker->CleanupStopping, TRUE);
     KeSetEvent(&Tracker->CleanupWakeEvent, IO_NO_INCREMENT, FALSE);
 
     if (Tracker->CleanupThread != NULL) {
-        KeWaitForSingleObject(
+        boundedTimeout.QuadPart = -100000000LL; // 10 seconds
+        waitStatus = KeWaitForSingleObject(
             Tracker->CleanupThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            &boundedTimeout
+        );
+        if (waitStatus == STATUS_TIMEOUT) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] AttackChainTracker: cleanup thread did not exit in 10s; falling back to indefinite wait\n");
+            (VOID)KeWaitForSingleObject(
+                Tracker->CleanupThread,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
+        ObDereferenceObject(Tracker->CleanupThread);
+        Tracker->CleanupThread = NULL;
+    }
+
+    //
+    // Drop the initial lifetime ref taken in ActInitialize, then wait for
+    // every in-flight public API frame to release its ref. Once RefCount==0,
+    // RefZeroEvent is signaled and we own the tracker exclusively.
+    //
+    ActpDereferenceTracker(Tracker);
+
+    boundedTimeout.QuadPart = -300000000LL; // 30 seconds
+    waitStatus = KeWaitForSingleObject(
+        &Tracker->RefZeroEvent,
+        Executive,
+        KernelMode,
+        FALSE,
+        &boundedTimeout
+    );
+    if (waitStatus == STATUS_TIMEOUT) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] AttackChainTracker: RefCount drain timed out at 30s (RefCount=%d); falling back to indefinite wait\n",
+                   InterlockedCompareExchange(&Tracker->RefCount, 0, 0));
+        (VOID)KeWaitForSingleObject(
+            &Tracker->RefZeroEvent,
             Executive,
             KernelMode,
             FALSE,
             NULL
         );
-        ObDereferenceObject(Tracker->CleanupThread);
-        Tracker->CleanupThread = NULL;
     }
 
     //
@@ -669,10 +805,10 @@ ActShutdown(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Attack chain tracker shutdown (events=%lld, chains=%lld, expired=%lld, attacks=%lld)\n",
-               Tracker->Stats.EventsProcessed,
-               Tracker->Stats.ChainsCreated,
-               Tracker->Stats.ChainsExpired,
-               Tracker->Stats.AttacksConfirmed);
+               InterlockedCompareExchange64(&Tracker->Stats.EventsProcessed, 0, 0),
+               InterlockedCompareExchange64(&Tracker->Stats.ChainsCreated, 0, 0),
+               InterlockedCompareExchange64(&Tracker->Stats.ChainsExpired, 0, 0),
+               InterlockedCompareExchange64(&Tracker->Stats.AttacksConfirmed, 0, 0));
 
     ExFreePoolWithTag(Tracker, ACT_POOL_TAG);
 }
@@ -714,6 +850,10 @@ ActRegisterCallback(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ActpTryReferenceTracker(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
     // Allocate new registration structure
     //
@@ -724,6 +864,7 @@ ActRegisterCallback(
     );
 
     if (newReg == NULL) {
+        ActpDereferenceTracker(Tracker);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -745,6 +886,7 @@ ActRegisterCallback(
         ExFreePoolWithTag(oldReg, ACT_CALLBACK_TAG);
     }
 
+    ActpDereferenceTracker(Tracker);
     return STATUS_SUCCESS;
 }
 
@@ -768,6 +910,10 @@ ActUnregisterCallback(
         return;
     }
 
+    if (!ActpTryReferenceTracker(Tracker)) {
+        return;
+    }
+
     KeAcquireSpinLock(&Tracker->CallbackLock, &oldIrql);
     oldReg = Tracker->CallbackReg;
     Tracker->CallbackReg = NULL;
@@ -776,6 +922,8 @@ ActUnregisterCallback(
     if (oldReg != NULL) {
         ExFreePoolWithTag(oldReg, ACT_CALLBACK_TAG);
     }
+
+    ActpDereferenceTracker(Tracker);
 }
 
 // ============================================================================
@@ -829,14 +977,20 @@ ActSubmitEvent(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ActpTryReferenceTracker(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
     // Validate ProcessName if provided
     //
     if (ProcessName != NULL) {
         if (ProcessName->Buffer == NULL && ProcessName->Length > 0) {
+            ActpDereferenceTracker(Tracker);
             return STATUS_INVALID_PARAMETER;
         }
         if (ProcessName->Length > ACT_MAX_PROCESS_NAME_LEN) {
+            ActpDereferenceTracker(Tracker);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -845,12 +999,15 @@ ActSubmitEvent(
     // Validate Evidence
     //
     if (Evidence != NULL && EvidenceSize == 0) {
+        ActpDereferenceTracker(Tracker);
         return STATUS_INVALID_PARAMETER;
     }
     if (Evidence == NULL && EvidenceSize > 0) {
+        ActpDereferenceTracker(Tracker);
         return STATUS_INVALID_PARAMETER;
     }
     if (EvidenceSize > ACT_MAX_EVIDENCE_SIZE) {
+        ActpDereferenceTracker(Tracker);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -898,6 +1055,7 @@ ActSubmitEvent(
     if (chain == NULL) {
         ExReleasePushLockExclusive(&Tracker->ChainLock);
         KeLeaveCriticalRegion();
+        ActpDereferenceTracker(Tracker);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -941,6 +1099,7 @@ ActSubmitEvent(
             ActReleaseChain(chain);
         }
         ActReleaseChain(chain);
+        ActpDereferenceTracker(Tracker);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -992,8 +1151,16 @@ ActSubmitEvent(
             // This is a HIGH-VALUE event â€” confirmed multi-stage attacks
             // are rare and critical for SOC correlation.
             //
+            //
+            // Pack first 8 bytes of GUID into UINT64 via memcpy to avoid
+            // strict-aliasing UB and unaligned-access undefined behavior;
+            // GUID has 4-byte alignment but UINT64 deref requires 8-byte.
+            //
+            UINT64 chainIdHi = 0;
+            RtlCopyMemory(&chainIdHi, &chain->ChainId, sizeof(chainIdHi));
+
             TeLogAttackChain(
-                *(UINT64*)&chain->ChainId,
+                chainIdHi,
                 (ATTACK_CHAIN_STAGE)chain->CurrentState,
                 (UINT32)(ULONG_PTR)event->ProcessId,
                 (BEHAVIOR_EVENT_TYPE)0,     // ACT_CHAIN_EVENT carries no EventType
@@ -1060,6 +1227,7 @@ ActSubmitEvent(
     //
     ActReleaseChain(chain);
 
+    ActpDereferenceTracker(Tracker);
     return STATUS_SUCCESS;
 }
 
@@ -1099,6 +1267,10 @@ ActGetChain(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ActpTryReferenceTracker(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Tracker->ChainLock);
 
@@ -1120,6 +1292,8 @@ ActGetChain(
 
     ExReleasePushLockShared(&Tracker->ChainLock);
     KeLeaveCriticalRegion();
+
+    ActpDereferenceTracker(Tracker);
 
     if (found == NULL) {
         return STATUS_NOT_FOUND;
@@ -1159,6 +1333,10 @@ ActCorrelateEvents(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ActpTryReferenceTracker(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Tracker->ChainLock);
 
@@ -1169,6 +1347,8 @@ ActCorrelateEvents(
 
     ExReleasePushLockShared(&Tracker->ChainLock);
     KeLeaveCriticalRegion();
+
+    ActpDereferenceTracker(Tracker);
 
     if (found == NULL) {
         return STATUS_NOT_FOUND;
@@ -1211,6 +1391,10 @@ ActGetActiveChains(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ActpTryReferenceTracker(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Tracker->ChainLock);
 
@@ -1237,6 +1421,7 @@ ActGetActiveChains(
     KeLeaveCriticalRegion();
 
     *ChainCount = count;
+    ActpDereferenceTracker(Tracker);
     return STATUS_SUCCESS;
 }
 
@@ -1557,10 +1742,9 @@ ActpCreateEvent(
 
         copyLength = min(ProcessName->Length, ACT_MAX_PROCESS_NAME_LEN);
 
-        event->ProcessName.MaximumLength = copyLength + sizeof(WCHAR);
         event->ProcessName.Buffer = (PWCH)ExAllocatePool2(
             POOL_FLAG_NON_PAGED,
-            event->ProcessName.MaximumLength,
+            (SIZE_T)copyLength + sizeof(WCHAR),
             ACT_EVENT_TAG
         );
 
@@ -1569,7 +1753,13 @@ ActpCreateEvent(
                           ProcessName->Buffer,
                           copyLength);
             event->ProcessName.Length = copyLength;
+            event->ProcessName.MaximumLength = copyLength + sizeof(WCHAR);
         }
+        //
+        // On allocation failure leave Buffer=NULL, Length=0, MaximumLength=0
+        // (zero-initialized) — preserves UNICODE_STRING invariant
+        // (NULL Buffer => MaximumLength must be 0).
+        //
     }
 
     //
@@ -1767,7 +1957,7 @@ ActpUpdateChainScoreLocked(
     // Reconstruct combo bonus from applied combo bitmask
     //
     for (i = 0; g_DangerousCombos[i].Technique1 != 0; i++) {
-        if (Chain->AppliedComboMask & (1 << g_DangerousCombos[i].ComboIndex)) {
+        if (Chain->AppliedComboMask & (1UL << g_DangerousCombos[i].ComboIndex)) {
             comboBonus = ActpSaturatingAdd(comboBonus, g_DangerousCombos[i].BonusScore);
         }
     }
@@ -1881,7 +2071,7 @@ ActpCountPhasesLocked(
 
         event = CONTAINING_RECORD(listEntry, ACT_CHAIN_EVENT, ListEntry);
         if (event->Phase < 32) {
-            phaseMask |= (1 << event->Phase);
+            phaseMask |= (1UL << event->Phase);
         }
     }
 
@@ -1889,7 +2079,7 @@ ActpCountPhasesLocked(
     // Count bits set
     //
     for (i = 0; i < 32; i++) {
-        if (phaseMask & (1 << i)) {
+        if (phaseMask & (1UL << i)) {
             count++;
         }
     }
@@ -1927,7 +2117,7 @@ ActpCheckDangerousCombosLocked(
         // Check against dangerous combos
         //
         for (i = 0; g_DangerousCombos[i].Technique1 != 0; i++) {
-            comboBit = 1 << g_DangerousCombos[i].ComboIndex;
+            comboBit = 1UL << g_DangerousCombos[i].ComboIndex;
 
             //
             // Skip if this combo was already applied
