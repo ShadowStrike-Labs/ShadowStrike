@@ -73,7 +73,7 @@ static PBTD_DETECTOR g_ThreatDetector = NULL;
 static PEC_ELAM_CALLBACKS g_ElamCallbacks = NULL;
 static LARGE_INTEGER g_RegistryCookie = {0};
 static BOOLEAN g_ImageNotifyRegistered = FALSE;
-static volatile LONG g_SelfModifyingRegistry = 0;  // Self-exclusion for remediation writes
+static volatile LONG_PTR g_SelfModifyingRegistryThread = 0;  // Thread-scoped self-exclusion (PETHREAD)
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -923,11 +923,13 @@ ElamRegistryCallbackRoutine(
     }
 
     //
-    // Self-exclusion: allow our own remediation writes through.
-    // ElamTakeRemediationAction sets g_SelfModifyingRegistry before Zw* calls
-    // to prevent the callback from blocking our own registry operations.
+    // Self-exclusion: only allow remediation writes from the *exact same
+    // thread* that set g_SelfModifyingRegistryThread. The previous global
+    // flag (CWE-362) let any concurrent attacker-writer slip through the
+    // small window where our remediation thread had set the flag.
     //
-    if (InterlockedCompareExchange(&g_SelfModifyingRegistry, 0, 0)) {
+    if ((PETHREAD)ReadPointerNoFence((PVOID*)&g_SelfModifyingRegistryThread) ==
+        PsGetCurrentThread()) {
         return STATUS_SUCCESS;
     }
 
@@ -1469,6 +1471,8 @@ ElamGetSignatureStats(
     PELAM_SIGNATURE_HEADER header;
 
     if (SignatureCount == NULL || HashCount == NULL) {
+        if (SignatureCount != NULL) { *SignatureCount = 0; }
+        if (HashCount != NULL) { *HashCount = 0; }
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1506,14 +1510,23 @@ ElamGetStatistics(
     if (DriversClassified == NULL || DriversGood == NULL ||
         DriversBad == NULL || DriversUnknown == NULL ||
         DriversBlocked == NULL) {
+        if (DriversClassified != NULL) { *DriversClassified = 0; }
+        if (DriversGood != NULL) { *DriversGood = 0; }
+        if (DriversBad != NULL) { *DriversBad = 0; }
+        if (DriversUnknown != NULL) { *DriversUnknown = 0; }
+        if (DriversBlocked != NULL) { *DriversBlocked = 0; }
         return STATUS_INVALID_PARAMETER;
     }
 
-    *DriversClassified = g_ElamGlobals.DriversClassified;
-    *DriversGood = g_ElamGlobals.DriversGood;
-    *DriversBad = g_ElamGlobals.DriversBad;
-    *DriversUnknown = g_ElamGlobals.DriversUnknown;
-    *DriversBlocked = g_ElamGlobals.DriversBlocked;
+    //
+    // Use ReadNoFence on volatile counters to document atomic-read intent
+    // and inhibit compiler tearing.
+    //
+    *DriversClassified = ReadNoFence(&g_ElamGlobals.DriversClassified);
+    *DriversGood = ReadNoFence(&g_ElamGlobals.DriversGood);
+    *DriversBad = ReadNoFence(&g_ElamGlobals.DriversBad);
+    *DriversUnknown = ReadNoFence(&g_ElamGlobals.DriversUnknown);
+    *DriversBlocked = ReadNoFence(&g_ElamGlobals.DriversBlocked);
 
     return STATUS_SUCCESS;
 }
@@ -1534,6 +1547,9 @@ ElamCalculateHash(
     )
 {
     if (Buffer == NULL || BufferSize == 0 || Hash == NULL) {
+        if (Hash != NULL) {
+            RtlZeroMemory(Hash, 32);
+        }
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1627,10 +1643,14 @@ ElamTakeRemediationAction(
     // Path: HKLM\System\CurrentControlSet\Control\EarlyLaunch\BlockedDrivers
     // Value: severity score â€” the agent reads this after boot to take action.
     //
-    // Set self-exclusion flag so our registry callback allows these writes
-    // through â€” the BlockedDrivers path is under the protected EarlyLaunch prefix.
     //
-    InterlockedExchange(&g_SelfModifyingRegistry, 1);
+    // Set thread-scoped self-exclusion: the registry callback compares
+    // PsGetCurrentThread() against this and only allows the writes from
+    // *this exact thread*, not any thread that happens to be running
+    // concurrently with our remediation.
+    //
+    WritePointerNoFence((PVOID*)&g_SelfModifyingRegistryThread,
+                        (PVOID)PsGetCurrentThread());
 
     RtlInitUnicodeString(&keyPath,
         L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\EarlyLaunch\\BlockedDrivers");
@@ -1654,7 +1674,7 @@ ElamTakeRemediationAction(
             status);
         RtlStringCbCopyA(Threat->ActionReason, sizeof(Threat->ActionReason),
             "Registry write failed; logged for manual review");
-        InterlockedExchange(&g_SelfModifyingRegistry, 0);
+        WritePointerNoFence((PVOID*)&g_SelfModifyingRegistryThread, NULL);
         return status;
     }
 
@@ -1699,7 +1719,7 @@ ElamTakeRemediationAction(
     }
 
     ZwClose(keyHandle);
-    InterlockedExchange(&g_SelfModifyingRegistry, 0);
+    WritePointerNoFence((PVOID*)&g_SelfModifyingRegistryThread, NULL);
     return status;
 }
 
