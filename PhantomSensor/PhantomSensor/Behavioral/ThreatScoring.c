@@ -1,4 +1,4 @@
-﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
@@ -438,7 +438,7 @@ TsShutdown(
     //
     // Wait for ALL outstanding rundown references to drain.
     // This blocks until every in-flight TspAcquireContext has called
-    // TspReleaseContext. No timeout â€” BSOD-safe.
+    // TspReleaseContext. No timeout -" BSOD-safe.
     //
     ExWaitForRundownProtectionRelease(&Engine->RundownRef);
 
@@ -479,6 +479,8 @@ TsSetThresholds(
     _In_ ULONG BlockedThreshold
     )
 {
+    NTSTATUS Status;
+
     PAGED_CODE();
 
     if (Engine == NULL || !Engine->Initialized) {
@@ -490,17 +492,31 @@ TsSetThresholds(
     }
 
     //
+    // Acquire rundown protection: TsShutdown frees the engine struct after
+    // ExWaitForRundownProtectionRelease, so writes to Engine->Thresholds
+    // without this gate race the free and corrupt pool / fault on freed
+    // memory.  All other paths that touch engine fields acquire either
+    // Engine->RundownRef directly (TsOnProcessCreate / TsRunMaintenancePass)
+    // or via TspAcquireContext.
+    //
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // Validate thresholds
     //
     if (SuspiciousThreshold > 100 ||
         MaliciousThreshold > 100 ||
         BlockedThreshold > 100) {
-        return STATUS_INVALID_PARAMETER;
+        Status = STATUS_INVALID_PARAMETER;
+        goto Cleanup;
     }
 
     if (SuspiciousThreshold >= MaliciousThreshold ||
         MaliciousThreshold >= BlockedThreshold) {
-        return STATUS_INVALID_PARAMETER;
+        Status = STATUS_INVALID_PARAMETER;
+        goto Cleanup;
     }
 
     //
@@ -513,7 +529,11 @@ TsSetThresholds(
     InterlockedExchange((volatile LONG*)&Engine->Thresholds.BlockedThreshold,
         (LONG)BlockedThreshold);
 
-    return STATUS_SUCCESS;
+    Status = STATUS_SUCCESS;
+
+Cleanup:
+    ExReleaseRundownProtection(&Engine->RundownRef);
+    return Status;
 }
 
 _Use_decl_annotations_
@@ -533,12 +553,17 @@ TsSetWeights(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
     // Copy weights atomically (structure copy under lock would be safer
     // but for perf we accept torn reads on config)
     //
     RtlCopyMemory(&Engine->Weights, Weights, sizeof(TS_WEIGHT_CONFIG));
 
+    ExReleaseRundownProtection(&Engine->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -563,8 +588,27 @@ TsSetDecayConfig(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Reject a zero decay interval when decay is enabled -" the maintenance
+    // worker divides AgeSeconds by DecayIntervalSeconds and a zero value
+    // historically caused the per-factor decay branch to be skipped via a
+    // bare `continue` inside a while-loop whose iterator advance lived
+    // outside the if/else block, which spun the worker on a single node
+    // forever.  The loop has been hardened, but reject the degenerate
+    // configuration up front so callers never produce decay-disabled
+    // contexts that look enabled.
+    //
+    if (DecayConfig->EnableDecay && DecayConfig->DecayIntervalSeconds == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     RtlCopyMemory(&Engine->DecayConfig, DecayConfig, sizeof(TS_DECAY_CONFIG));
 
+    ExReleaseRundownProtection(&Engine->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -581,8 +625,19 @@ TsGetStatistics(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!Engine->Initialized || Engine->ShuttingDown) {
+        RtlZeroMemory(Statistics, sizeof(TS_STATISTICS));
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->RundownRef)) {
+        RtlZeroMemory(Statistics, sizeof(TS_STATISTICS));
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     RtlCopyMemory(Statistics, &Engine->Stats, sizeof(TS_STATISTICS));
 
+    ExReleaseRundownProtection(&Engine->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1194,10 +1249,15 @@ TsRunMaintenancePass(
                 Context->ScoreValid = FALSE;
             } else {
                 //
-                // Apply decay (guard against zero interval)
+                // Apply decay (guard against zero interval).  Use a labelled
+                // jump rather than `continue` -" the while-loop's iterator
+                // advance lives outside the if/else block, and a bare
+                // `continue` here would never advance FactorEntry, spinning
+                // the worker thread forever on the same node and pinning a
+                // CPU at 100% until the engine shuts down.
                 //
                 if (Engine->DecayConfig.DecayIntervalSeconds == 0) {
-                    continue;
+                    goto NextFactor;
                 }
                 DecayIntervals = AgeSeconds / (LONG64)Engine->DecayConfig.DecayIntervalSeconds;
 
@@ -1219,6 +1279,7 @@ TsRunMaintenancePass(
                 }
             }
 
+NextFactor:
             FactorEntry = NextEntry;
         }
 
