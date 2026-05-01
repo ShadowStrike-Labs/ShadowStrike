@@ -1,4 +1,4 @@
-﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
@@ -435,7 +435,11 @@ IRQL:
     InterlockedExchange64(&NewParser->Stats.CommandsParsed, 0);
     InterlockedExchange64(&NewParser->Stats.SuspiciousFound, 0);
 
-    NewParser->Initialized = TRUE;
+    //
+    // Publish initialization with release semantics so other threads
+    // that observe Initialized==1 see a fully constructed parser.
+    //
+    InterlockedExchange(&NewParser->Initialized, 1);
     *Parser = NewParser;
 
     DbgPrintEx(
@@ -482,11 +486,15 @@ IRQL:
         return;
     }
 
-    if (!Parser->Initialized) {
+    //
+    // Atomically transition from initialized to not-initialized so any
+    // concurrent ClpParse/ClpAnalyze observers exit cleanly. The caller
+    // remains responsible for ensuring no new entries are pending before
+    // the parser memory is freed below — this is the documented contract.
+    //
+    if (InterlockedExchange(&Parser->Initialized, 0) == 0) {
         return;
     }
-
-    Parser->Initialized = FALSE;
 
     //
     // Read statistics atomically for logging
@@ -552,7 +560,7 @@ IRQL:
     //
     // Validate parameters
     //
-    if (Parser == NULL || !Parser->Initialized) {
+    if (Parser == NULL || ReadAcquire(&Parser->Initialized) == 0) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
@@ -682,7 +690,7 @@ IRQL:
     //
     // Validate parameters
     //
-    if (Parser == NULL || !Parser->Initialized) {
+    if (Parser == NULL || ReadAcquire(&Parser->Initialized) == 0) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
@@ -743,6 +751,11 @@ IRQL:
                     }
 
                     if (IsEncFlag && i + 1 < Parsed->ArgumentCount) {
+                        //
+                        // Free any previously-attached DecodedContent so a
+                        // re-analysis cannot leak the prior buffer.
+                        //
+                        ClppFreeUnicodeStringSafe(&Parsed->DecodedContent);
                         Status = ClpDecodeBase64(
                             &Parsed->Arguments[i + 1].Value,
                             &Parsed->DecodedContent
@@ -979,7 +992,7 @@ IRQL:
 
     PAGED_CODE();
 
-    if (Parser == NULL || !Parser->Initialized) {
+    if (Parser == NULL || ReadAcquire(&Parser->Initialized) == 0) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
