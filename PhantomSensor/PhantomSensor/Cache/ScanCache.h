@@ -42,7 +42,7 @@
  * - No floating-point operations in kernel code
  *
  * @author ShadowStrike Security Team
- * @version 1.1.0
+ * @version 1.2.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -112,11 +112,21 @@ extern "C" {
 
 /**
  * @brief Cache entry key - uniquely identifies a file.
+ *
+ * SECURITY/CORRECTNESS: Field order is chosen to eliminate internal
+ * compiler-inserted padding bytes. The previous layout
+ * `ULONG; UINT64; UINT64; LARGE_INTEGER` produced 4 bytes of internal
+ * padding between VolumeSerial and FileId on x64. Hashing/comparing
+ * raw struct bytes therefore mixed in uninitialized stack memory,
+ * which (a) made the hash non-deterministic for keys that were not
+ * pre-zeroed by callers, and (b) could cause false cache misses or
+ * (worse) incidental hits across unrelated scans. The new layout
+ * places all 8-byte members first, then the 4-byte VolumeSerial,
+ * then an explicit, named `Reserved` 4-byte tail so every byte is
+ * caller-controlled. Hashing now operates on individual fields and
+ * never reads tail padding.
  */
 typedef struct _SHADOWSTRIKE_CACHE_KEY {
-    /// @brief Volume serial number (actual serial, not pointer)
-    ULONG VolumeSerial;
-
     /// @brief File ID (from FileInternalInformation)
     UINT64 FileId;
 
@@ -126,13 +136,28 @@ typedef struct _SHADOWSTRIKE_CACHE_KEY {
     /// @brief Last write time at time of scan
     LARGE_INTEGER LastWriteTime;
 
+    /// @brief Volume serial number (actual serial, not pointer)
+    ULONG VolumeSerial;
+
+    /// @brief Explicit tail padding. MUST be zero-initialized by callers.
+    /// Reserved for future expansion (e.g. file generation/version counter).
+    ULONG Reserved;
+
 } SHADOWSTRIKE_CACHE_KEY, *PSHADOWSTRIKE_CACHE_KEY;
 
 //
-// Compile-time verification: hash function casts CACHE_KEY to PULONG,
-// so the struct size must be evenly divisible by sizeof(ULONG).
+// Compile-time verification: layout invariants.
+// 1) Total struct size remains 32 bytes (ABI stability).
+// 2) Size remains a multiple of sizeof(ULONG) (legacy invariant).
+// 3) No internal padding between members (sum of member sizes equals
+//    sizeof(struct)). This guarantees raw-byte equality of two zeroed
+//    structs that differ only by named member values.
 //
+C_ASSERT(sizeof(SHADOWSTRIKE_CACHE_KEY) == 32);
 C_ASSERT(sizeof(SHADOWSTRIKE_CACHE_KEY) % sizeof(ULONG) == 0);
+C_ASSERT(sizeof(SHADOWSTRIKE_CACHE_KEY) ==
+         (sizeof(UINT64) + sizeof(UINT64) + sizeof(LARGE_INTEGER) +
+          sizeof(ULONG) + sizeof(ULONG)));
 
 /**
  * @brief Cached verdict entry.
@@ -442,10 +467,36 @@ ShadowStrikeCacheIsValidVerdict(
 }
 
 /**
+ * @brief Determine whether a verdict is safe to persist in the cache.
+ *
+ * SECURITY: Transient outcomes (Unknown / Error / Timeout) MUST NOT be
+ * cached. If a hostile or malformed file forced the user-mode scanner
+ * into a transient failure, caching that result would let the same
+ * malicious file bypass scanning for the entire TTL window after a
+ * single induced failure. Only definitive verdicts are cacheable.
+ *
+ * @param Verdict  Verdict to evaluate.
+ * @return TRUE if the verdict represents a definitive scan result.
+ */
+FORCEINLINE
+BOOLEAN
+ShadowStrikeCacheIsCacheableVerdict(
+    _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict
+    )
+{
+    return (Verdict == Verdict_Clean ||
+            Verdict == Verdict_Malicious ||
+            Verdict == Verdict_Suspicious);
+}
+
+/**
  * @brief Calculate hash for cache key.
  *
- * Uses FNV-1a hash with 32-byte key structure.
- * Optimized to process 4 bytes at a time where possible.
+ * Uses FNV-1a hash over the named key members only. Padding/Reserved
+ * bytes are intentionally excluded so two keys with identical logical
+ * content always hash identically, regardless of whether the caller
+ * pre-zeroed the struct. Member order in the hash is fixed and is
+ * independent of struct layout for forward compatibility.
  *
  * @param Key  Cache key.
  * @return Hash value.
@@ -456,27 +507,27 @@ ShadowStrikeCacheHash(
     _In_ PSHADOWSTRIKE_CACHE_KEY Key
     )
 {
-    //
-    // FNV-1a hash optimized for the key structure
-    // Process as ULONG values for better performance
-    //
     ULONG hash = 2166136261u;
-    PULONG values = (PULONG)Key;
-    SIZE_T count = sizeof(SHADOWSTRIKE_CACHE_KEY) / sizeof(ULONG);
+    UINT8 buffer[sizeof(UINT64) * 3 + sizeof(ULONG)];
+    SIZE_T offset = 0;
     SIZE_T i;
 
-    for (i = 0; i < count; i++) {
-        //
-        // XOR each byte of the ULONG separately for proper FNV-1a
-        //
-        ULONG val = values[i];
-        hash ^= (val & 0xFF);
-        hash *= 16777619u;
-        hash ^= ((val >> 8) & 0xFF);
-        hash *= 16777619u;
-        hash ^= ((val >> 16) & 0xFF);
-        hash *= 16777619u;
-        hash ^= ((val >> 24) & 0xFF);
+    //
+    // Pack significant fields into a contiguous, layout-independent
+    // byte stream. This avoids reading any compiler padding and is
+    // robust against future layout changes.
+    //
+    RtlCopyMemory(buffer + offset, &Key->FileId, sizeof(UINT64));
+    offset += sizeof(UINT64);
+    RtlCopyMemory(buffer + offset, &Key->FileSize, sizeof(UINT64));
+    offset += sizeof(UINT64);
+    RtlCopyMemory(buffer + offset, &Key->LastWriteTime.QuadPart, sizeof(UINT64));
+    offset += sizeof(UINT64);
+    RtlCopyMemory(buffer + offset, &Key->VolumeSerial, sizeof(ULONG));
+    offset += sizeof(ULONG);
+
+    for (i = 0; i < offset; i++) {
+        hash ^= buffer[i];
         hash *= 16777619u;
     }
 
