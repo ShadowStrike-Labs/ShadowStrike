@@ -181,13 +181,13 @@ typedef struct _OB_SYSTEM_PROCESS_INFORMATION {
 #define OB_RATE_LIMIT_WINDOW_100NS      (1LL * 10000000LL)
 
 //
-// System paths for validation
+// Well-known process names (using ANSI for PsGetProcessImageFileName compatibility).
 //
-static const CHAR* g_SystemRoot = "\\SYSTEMROOT\\SYSTEM32\\";
-static const CHAR* g_WindowsRoot = "\\WINDOWS\\SYSTEM32\\";
-
-//
-// Well-known process names (using ANSI for PsGetProcessImageFileName compatibility)
+// NOTE: All path validation goes through ObpValidateProcessPath which uses
+// SeLocateProcessImageName-resolved NT image paths and cached System32 device
+// path / install path UNICODE_STRING prefixes. Stale ANSI \SystemRoot constants
+// were removed (they were unused and would have triggered /W4 unused-variable
+// warnings under /WX).
 //
 static const CHAR* g_LsassNames[] = {
     "lsass.exe",
@@ -1088,21 +1088,28 @@ ShadowStrikeThreadPreCallback(
     isCrossProcess = TRUE;
 
     //
+    // Determine operation type FIRST â€” isKernelHandle must be set before any
+    // logic that branches on it (cross-session check, etc.).
+    //
+    // BUG FIX: previously the cross-session check ran BEFORE isKernelHandle was
+    // assigned, which meant the !isKernelHandle guard was always TRUE
+    // (variable defaulted to FALSE), so kernel-mode handle creations were
+    // erroneously subjected to user-mode cross-session monitoring.
+    //
+    isKernelHandle = (OperationInformation->KernelHandle != FALSE);
+    isDuplicate = (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE);
+
+    //
     // Cross-session detection for threads (mirrors process callback logic).
     // Cross-session thread handle access is suspicious â€” indicates lateral
     // movement or session-hopping attacks (e.g., Session 0 â†’ Session 1).
+    // Skip for kernel handles which legitimately span sessions.
     //
     if (context->EnableCrossSessionMonitoring && !isKernelHandle) {
         sourceSessionId = PsGetProcessSessionId(sourceProcess);
         targetSessionId = PsGetProcessSessionId(targetProcess);
         isCrossSession = (sourceSessionId != targetSessionId);
     }
-
-    //
-    // Determine operation type
-    //
-    isKernelHandle = (OperationInformation->KernelHandle != FALSE);
-    isDuplicate = (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE);
 
     //
     // Kernel-mode handles - only protect ShadowStrike
@@ -1263,7 +1270,7 @@ ShadowStrikeThreadPreCallback(
                 FALSE,  // IsProcessHandle = FALSE for threads
                 isDuplicate,
                 isKernelHandle,
-                FALSE,  // Cross-session
+                isCrossSession,
                 suspicionScore
             );
         }
