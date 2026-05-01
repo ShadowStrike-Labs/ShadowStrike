@@ -535,11 +535,18 @@ Return Value:
     // Statistics are already zeroed by RtlZeroMemory above.
     // In-flight writer count starts at 0.
     //
-
+    // NOTE: Do NOT force Enabled = FALSE here. ETW may invoke
+    // EtwpEnableCallback synchronously from inside EtwRegister above
+    // when one or more controllers already have the provider enabled
+    // (e.g., a SIEM session that started before the driver loaded, or
+    // an autologger). In that case the callback has already published
+    // Enabled = TRUE plus the level/keyword filter, and clobbering it
+    // here would silently drop every event from those pre-existing
+    // sessions until the controller toggles enablement again. The
+    // RtlZeroMemory above already zero-initialized Enabled, so the
+    // only writer between then and now is the legitimate enable
+    // callback â€” preserve its result.
     //
-    // Enabled = FALSE. Will be set by enable callback when a consumer attaches.
-    //
-    InterlockedExchange(&g_EtwGlobals.Enabled, FALSE);
 
     //
     // Transition: INITIALIZING -> READY (publish to other threads)
@@ -569,6 +576,7 @@ Routine Description:
     ULONG spinCount;
     LONG64 drainStartTime;
     LARGE_INTEGER delay;
+    BOOLEAN drainComplete;
 
     PAGED_CODE();
 
@@ -601,16 +609,28 @@ Routine Description:
     KeQuerySystemTimePrecise((PLARGE_INTEGER)&drainStartTime);
     delay.QuadPart = -(LONGLONG)(ETW_SHUTDOWN_DRAIN_SLEEP_MS * 10000);
     spinCount = 0;
+    drainComplete = TRUE;
 
     while (ReadAcquire(&g_EtwGlobals.InFlightWriters) > 0) {
         LONG64 now;
         KeQuerySystemTimePrecise((PLARGE_INTEGER)&now);
         if ((now - drainStartTime) > ETW_SHUTDOWN_MAX_DRAIN_100NS) {
             //
-            // Drain timeout exceeded. Proceed with teardown.
-            // EtwUnregister will internally synchronize with any
-            // in-progress EtwWrite calls.
+            // Drain timeout exceeded. We CANNOT safely tear down the
+            // lookaside list while a writer is still holding (or about
+            // to free) a buffer allocated from it â€” that would be a
+            // hard use-after-free on system pool. EtwUnregister only
+            // synchronizes the EnableCallback; it does NOT wait for
+            // EtwWrite callers or our surrounding writer routines.
             //
+            // We therefore proceed to EtwUnregister (which is safe â€”
+            // in-flight EtwWrites either drained or will fail with an
+            // invalid handle) but leak the lookaside list on the
+            // timeout path. A controlled, bounded leak at unload is
+            // strictly preferable to a non-paged-pool UAF that would
+            // bug-check or be exploitable.
+            //
+            drainComplete = FALSE;
             break;
         }
 
@@ -623,7 +643,8 @@ Routine Description:
     }
 
     //
-    // All writers have drained. Unregister from ETW.
+    // Unregister from ETW. After this returns, no further ETW callbacks
+    // will fire and EtwWrite calls with the old handle return error.
     //
     if (g_EtwGlobals.ProviderHandle != 0) {
         EtwUnregister(g_EtwGlobals.ProviderHandle);
@@ -631,12 +652,21 @@ Routine Description:
     }
 
     //
-    // Cleanup lookaside list
+    // Cleanup lookaside list â€” only if drain completed cleanly.
+    // If it timed out, we deliberately leak the lookaside structure to
+    // avoid a UAF on any straggler writer that still has an outstanding
+    // buffer or is mid-allocation. Driver-unload-time leaks are bounded
+    // by the lookaside depth and tagged for postmortem identification.
     //
-    ExDeleteNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside);
+    if (drainComplete) {
+        ExDeleteNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside);
+    }
 
     //
-    // Final state transition
+    // Final state transition. On the leaked-lookaside path we still
+    // mark the provider Shutdown so re-initialization is rejected;
+    // re-initializing after a drain timeout would compound the leak
+    // and is not a supported operation.
     //
     InterlockedExchange(&g_EtwGlobals.State, EtwState_Shutdown);
 }
