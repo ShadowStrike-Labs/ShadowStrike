@@ -395,11 +395,11 @@ TaOnProcessTerminated(
  *
  * @param[in] Analyzer - Analyzer handle
  * @param[out] Stats - Receives statistics
- * @return STATUS_SUCCESS or error code
+ * @return STATUS_SUCCESS or STATUS_DEVICE_NOT_READY if shutting down
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (acquires rundown protection internally)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 TaGetStatistics(
