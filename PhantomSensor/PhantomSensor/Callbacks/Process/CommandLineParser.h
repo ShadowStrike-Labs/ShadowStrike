@@ -129,7 +129,12 @@ typedef struct _CLP_PARSED_COMMAND {
 // Parser context structure
 //
 typedef struct _CLP_PARSER {
-    BOOLEAN Initialized;
+    //
+    // 4-byte atomic state flag (replaces BOOLEAN to allow Interlocked
+    // publish on init and atomic teardown signal on shutdown — eliminates
+    // the read/shutdown race against concurrent ClpParse/ClpAnalyze).
+    //
+    volatile LONG Initialized;
 
     //
     // LOLBin database with reader-writer synchronization
