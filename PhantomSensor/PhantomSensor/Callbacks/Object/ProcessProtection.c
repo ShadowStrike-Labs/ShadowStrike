@@ -399,6 +399,23 @@ Return Value:
     }
 
     //
+    // Mark subsystem as initialized BEFORE detecting critical processes.
+    //
+    // Rationale: PpDetectCriticalProcesses() calls PpAddProtectedProcess()
+    // for each critical PID (LSASS, CSRSS, services.exe, etc.).
+    // PpAddProtectedProcess() short-circuits when Initialized == 0, so if
+    // we deferred this flag until AFTER detection, the entire critical
+    // process cache would silently remain empty and LSASS/credential-dump
+    // protection would never engage.
+    //
+    // This is safe: at this point all locks, lists, hash tables, rundown
+    // protection, and process-notify callback are already initialized.
+    // ObjectCallback registration happens later in the driver init path,
+    // so no Pp* pre-callback can fire mid-detection.
+    //
+    InterlockedExchange(&g_ProcessProtection.Initialized, TRUE);
+
+    //
     // Detect and cache critical system processes
     //
     Status = PpDetectCriticalProcesses();
@@ -413,8 +430,6 @@ Return Value:
         // Non-fatal: continue without pre-cached critical processes
         //
     }
-
-    InterlockedExchange(&g_ProcessProtection.Initialized, TRUE);
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
@@ -2174,6 +2189,7 @@ Routine Description:
     KIRQL OldIrql;
     BOOLEAN AlreadyTracked;
     ULONG i;
+    LONG CurrentOpCount;
 
     KeQuerySystemTime(&CurrentTime);
 
@@ -2182,7 +2198,11 @@ Routine Description:
     //
     InterlockedExchange64(&Tracker->LastActivity.QuadPart, CurrentTime.QuadPart);
 
-    InterlockedIncrement(&Tracker->HandleOperationCount);
+    //
+    // Capture the post-increment value so the threshold comparison below
+    // uses an atomic snapshot rather than a torn re-read of the field.
+    //
+    CurrentOpCount = InterlockedIncrement(&Tracker->HandleOperationCount);
 
     if (IsSuspicious) {
         InterlockedIncrement(&Tracker->SuspiciousOperationCount);
@@ -2203,7 +2223,7 @@ Routine Description:
         //
         // Within time window - check threshold
         //
-        if (Tracker->HandleOperationCount > PP_SUSPICIOUS_HANDLE_THRESHOLD) {
+        if (CurrentOpCount > PP_SUSPICIOUS_HANDLE_THRESHOLD) {
             if (InterlockedExchange(&Tracker->IsRateLimited, TRUE) == FALSE) {
                 InterlockedIncrement64(&g_ProcessProtection.Stats.RateLimitedOperations);
             }
