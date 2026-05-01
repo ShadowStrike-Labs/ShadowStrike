@@ -528,13 +528,22 @@ ShadowStrikeScanBridgeShutdown(
     }
 
     //
-    // Cleanup lookaside lists
+    // Cleanup lookaside lists.
+    //
+    // CRITICAL ORDERING: clear LookasideInitialized FIRST with a memory
+    // barrier so any concurrent SbAllocateMessageBuffer / SbFreeMessageBuffer
+    // call (the buffer APIs are part of the public header and may be called
+    // by sibling modules outside our rundown) observes the flag transition
+    // before the lookaside structures are torn down. Reading lookaside as
+    // valid then dispatching ExFreeToNPagedLookasideList on a deleted list
+    // is a non-recoverable BSOD.
     //
     if (g_ScanBridge.LookasideInitialized) {
+        g_ScanBridge.LookasideInitialized = FALSE;
+        KeMemoryBarrier();
         ExDeleteNPagedLookasideList(&g_ScanBridge.StandardBufferLookaside);
         ExDeleteNPagedLookasideList(&g_ScanBridge.LargeBufferLookaside);
         ExDeleteNPagedLookasideList(&g_ScanBridge.RequestLookaside);
-        g_ScanBridge.LookasideInitialized = FALSE;
     }
 
     //
@@ -713,19 +722,60 @@ SbBuildFileScanRequestEx(
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
         //
-        // Truncate path if necessary
+        // Truncate path to fit within the maximum message envelope.
+        // Compute the path budget as (max - fixed overhead - process name)
+        // and force WCHAR alignment to avoid mid-cutting a UTF-16 code
+        // unit that the user-mode service would later misparse.
         //
-        ULONG excess = totalSize - SHADOWSTRIKE_MAX_MESSAGE_SIZE;
-        if (excess < filePathLen) {
-            filePathLen -= excess;
-            totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
-        } else {
+        ULONG fixedOverhead;
+        ULONG availableForPath;
+        NTSTATUS overheadStatus;
+
+        //
+        // fixedOverhead = HEADER + FILE_SCAN_REQUEST + 2 * sizeof(WCHAR)
+        // (two trailing null terminators) + processNameLen.
+        //
+        overheadStatus = SbpSafeAddUlong(
+            sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+            sizeof(FILE_SCAN_REQUEST),
+            &fixedOverhead);
+        if (!NT_SUCCESS(overheadStatus)) {
+            status = overheadStatus;
+            goto Cleanup;
+        }
+        overheadStatus = SbpSafeAddUlong(fixedOverhead, 2 * sizeof(WCHAR), &fixedOverhead);
+        if (!NT_SUCCESS(overheadStatus)) {
+            status = overheadStatus;
+            goto Cleanup;
+        }
+        overheadStatus = SbpSafeAddUlong(fixedOverhead, processNameLen, &fixedOverhead);
+        if (!NT_SUCCESS(overheadStatus)) {
+            status = overheadStatus;
+            goto Cleanup;
+        }
+
+        if (fixedOverhead >= SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
             //
-            // Cannot fit even minimal message
+            // Process name and headers alone exceed envelope: we cannot
+            // fit even an empty path. Fail closed rather than emit a
+            // truncated/inconsistent record.
             //
             status = SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE;
             goto Cleanup;
         }
+
+        availableForPath = SHADOWSTRIKE_MAX_MESSAGE_SIZE - fixedOverhead;
+        //
+        // Round DOWN to a WCHAR boundary so the truncated path is a
+        // valid UTF-16 sequence (no half code units).
+        //
+        availableForPath &= ~1UL;
+
+        if (filePathLen > availableForPath) {
+            filePathLen = availableForPath;
+        }
+
+        totalSize = fixedOverhead + filePathLen;
     }
 
     //
@@ -1076,10 +1126,21 @@ SbSendScanRequestEx(
     }
 
     //
-    // Record end time and calculate latency
+    // Record end time and calculate latency.
+    // Clamp negative deltas (clock skew, system-time adjustment) to zero
+    // and saturate at MAXULONG to prevent UINT32 wrap-around producing
+    // bogus billion-millisecond values that would poison telemetry and
+    // SLA dashboards.
     //
     KeQuerySystemTime(&endTime);
-    Result->LatencyMs = (ULONG)((endTime.QuadPart - startTime.QuadPart) / 10000);
+    {
+        LONG64 latencyTicks = endTime.QuadPart - startTime.QuadPart;
+        LONG64 latencyMs = latencyTicks > 0 ? latencyTicks / 10000 : 0;
+        if (latencyMs > (LONG64)MAXULONG) {
+            latencyMs = (LONG64)MAXULONG;
+        }
+        Result->LatencyMs = (ULONG)latencyMs;
+    }
 
     //
     // Update statistics
