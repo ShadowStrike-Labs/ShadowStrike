@@ -324,6 +324,22 @@ typedef struct _MESSAGE_QUEUE_GLOBALS {
     // Outstanding completion tracking for safe shutdown
     volatile LONG OutstandingCompletions;
     KEVENT AllCompletionsReleasedEvent;
+
+    //
+    // Rundown protection for the MESSAGE lookaside list. Public APIs that
+    // touch g_MqGlobals.MessageLookaside (alloc / free) acquire this rundown
+    // for the duration of the lookaside operation. MqShutdown waits for the
+    // rundown to drain BEFORE calling ExDeleteNPagedLookasideList; this
+    // deterministically eliminates the UAF window where an in-flight caller
+    // would otherwise free/alloc against a deleted lookaside (pool corruption).
+    //
+    // The pending-completion lookaside has its own gating (OutstandingCompletions),
+    // and its alloc/free order is fixed so that the free-to-lookaside happens
+    // before the OutstandingCompletions decrement that releases MqShutdown.
+    //
+    EX_RUNDOWN_REF Rundown;
+    BOOLEAN RundownInitialized;
+    UINT8 Reserved5[7];
 } MESSAGE_QUEUE_GLOBALS, *PMESSAGE_QUEUE_GLOBALS;
 
 // ============================================================================
