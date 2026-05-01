@@ -2085,13 +2085,32 @@ EcpProcessEventBatch(
 
         //
         // Process through subscription callback.
-        // The subscription pointer is reference-counted, so it remains
-        // valid even if EcUnsubscribe was called concurrently.
-        // We still invoke the callback even if subscription was deactivated
-        // since the event was already matched and queued.
+        //
+        // The subscription pointer is reference-counted, so the EC_SUBSCRIPTION
+        // structure itself remains valid even after EcUnsubscribe. However,
+        // EcUnsubscribe MUST be a hard rundown barrier for the user-supplied
+        // EventCallbackContext: once EcUnsubscribe returns, the caller is
+        // entitled to free that context. Invoking the callback here after
+        // unsubscribe would dereference freed caller memory (callback
+        // in-flight UAF).
+        //
+        // Therefore we ONLY invoke the callback if the subscription is still
+        // Active AND no unsubscribe is pending. Events that were matched and
+        // queued before unsubscribe are silently dropped on the worker side
+        // (still freed and refcount released below). This matches the
+        // documented contract: "after EcUnsubscribe returns, no further
+        // callbacks will be invoked for that subscription".
+        //
+        // The order of checks matters: we read UnsubscribePending FIRST so
+        // that any unsubscribe ordered before the queue dequeue is observed.
+        // The ConsumerState check guards against late callbacks during
+        // shutdown teardown.
         //
         if (Record->Subscription != NULL &&
-            Record->Subscription->Config.EventCallback != NULL) {
+            Record->Subscription->Config.EventCallback != NULL &&
+            !InterlockedCompareExchange(&Record->Subscription->UnsubscribePending, 0, 0) &&
+            InterlockedCompareExchange(&Record->Subscription->State, 0, 0) == (LONG)EcSubState_Active &&
+            InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Running) {
 
             LARGE_INTEGER SubStart, SubEnd;
             LONG64 SubTimeUs;
@@ -2136,6 +2155,15 @@ EcpProcessEventBatch(
             if (Result == EcResult_Error) {
                 InterlockedIncrement64(&Consumer->Stats.TotalErrors);
             }
+        } else if (Record->Subscription != NULL) {
+            //
+            // Subscription was unsubscribed, suspended, or consumer is no
+            // longer Running between the time the event was matched/queued
+            // and dispatch. Account this as a drop for visibility but do
+            // NOT invoke the user callback (rundown barrier).
+            //
+            InterlockedIncrement64(&Record->Subscription->Stats.EventsDropped);
+            InterlockedIncrement64(&Consumer->Stats.TotalEventsDropped);
         }
 
         //
