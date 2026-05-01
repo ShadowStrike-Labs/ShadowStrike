@@ -236,10 +236,12 @@ typedef struct _SHADOW_STREAM_CONTEXT {
     // =========================================================================
 
     /**
-     * @brief Spin lock protecting State transitions.
+     * @brief Spin lock protecting State transitions and rundown publication.
      *
-     * CRITICAL: This lock is held very briefly only during State checks/transitions.
-     * It ensures atomicity between checking State and acquiring Resource.
+     * Held very briefly during state checks combined with rundown protection
+     * acquisition. Ensures the (state == ACTIVE) decision and the matching
+     * ExAcquireRundownProtection happen atomically with respect to cleanup,
+     * which moves state to TEARDOWN under the same lock.
      */
     KSPIN_LOCK LifetimeLock;
 
@@ -252,13 +254,37 @@ typedef struct _SHADOW_STREAM_CONTEXT {
     volatile LONG State;
 
     /**
+     * @brief TRUE if Resource was successfully initialized and must be
+     * deleted in cleanup. Decoupled from State so a cleanup that races
+     * INITIALIZING does not double-free or skip a real ERESOURCE.
+     */
+    BOOLEAN ResourceInitialized;
+
+    /**
+     * @brief TRUE if Rundown was initialized and must be torn down in cleanup.
+     */
+    BOOLEAN RundownInitialized;
+
+    /**
      * @brief Reserved padding for alignment to 8-byte boundary.
      */
-    ULONG Reserved0;
+    UCHAR Reserved0[2];
 
     // =========================================================================
     // Synchronization
     // =========================================================================
+
+    /**
+     * @brief Rundown protection covering all Resource access windows.
+     *
+     * Acquired under LifetimeLock immediately after the State == ACTIVE
+     * check, and released after ExReleaseResource on the unlock path.
+     * Cleanup calls ExWaitForRundownProtectionRelease to drain in-flight
+     * acquirers before deleting Resource — this replaces the previously
+     * incorrect ExIsResourceAcquired*Lite-based wait, which only reports
+     * the calling thread's own ownership and therefore did nothing.
+     */
+    EX_RUNDOWN_REF Rundown;
 
     /**
      * @brief ERESOURCE lock for thread-safe access to all context fields.
@@ -266,7 +292,8 @@ typedef struct _SHADOW_STREAM_CONTEXT {
      * CRITICAL: Must be initialized with ExInitializeResourceLite before use.
      * CRITICAL: Must be deleted with ExDeleteResourceLite in cleanup callback.
      * CRITICAL: Can only be acquired at IRQL == PASSIVE_LEVEL.
-     * CRITICAL: Only acquire when State == ACTIVE (verified under LifetimeLock).
+     * CRITICAL: Only acquire when State == ACTIVE AND rundown protection is
+     * held (verified atomically under LifetimeLock).
      */
     ERESOURCE Resource;
 
