@@ -139,6 +139,7 @@ typedef struct _PCT_PROCESS_CHAIN {
     // Opaque pointer to owning tracker (for proper deallocation)
     //
     PVOID OwningTracker;
+    BOOLEAN TrackerRundownHeld;
 
     //
     // Target process identification
