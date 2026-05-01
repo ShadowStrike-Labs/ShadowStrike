@@ -1665,7 +1665,16 @@ TppUpdateTrackerActivity(
     }
 
     KeQuerySystemTime(&currentTime);
-    Tracker->LastActivity = currentTime;
+
+    //
+    // Atomic 64-bit write — TpCleanupExpiredTrackers reads
+    // LastActivity.QuadPart under ActivitySpinLock, but this writer does
+    // not hold that lock, so a plain assignment is a torn write on 32-bit
+    // and could cause TpCleanupExpiredTrackers to evict a still-active
+    // tracker (use-after-update) or miss an expired one. InterlockedExchange64
+    // matches the project-wide 32-bit safety pattern (TpAtomicRead64).
+    //
+    InterlockedExchange64(&Tracker->LastActivity.QuadPart, currentTime.QuadPart);
 
     //
     // Update atomic counters
