@@ -754,10 +754,17 @@ typedef struct _ES_EVENT_DATA_DESC {
 
 /**
  * @brief Validation context
+ *
+ * On return from EsValidateEventEx the @c Event pointer is always NULL:
+ * the validator releases the reference it acquired internally before
+ * returning, and exposing the released pointer would be a use-after-free
+ * trap for callers. The event identity is encoded by @c EventId in the
+ * EsValidate* call the caller already issued. Diagnostic detail lives in
+ * @c Result, @c ErrorFieldIndex, and @c ErrorMessage.
  */
 typedef struct _ES_VALIDATION_CONTEXT {
     PCES_SCHEMA Schema;
-    PCES_EVENT_DEFINITION Event;
+    PCES_EVENT_DEFINITION Event;     ///< Always NULL on return; do not deref
     PVOID EventData;
     SIZE_T DataSize;
     ES_VALIDATION_RESULT Result;
