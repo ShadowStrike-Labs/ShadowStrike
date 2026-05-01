@@ -430,31 +430,53 @@ Routine Description:
     // use-after-free from concurrent EncEncrypt/EncDecrypt operations that
     // obtained a key ref before Manager->Initialized was set to FALSE.
     //
+    // Leak-on-timeout policy: if a key's RefCount cannot be drained within
+    // the 5-second budget, we INTENTIONALLY LEAK that key (its memory and
+    // BCrypt handles) rather than freeing under live references and causing
+    // a kernel UAF. This matches the campaign-wide drain protocol used in
+    // Compression.c shutdown and the threadnotify drain commit (866faa51).
+    //
     while (!IsListEmpty(&keysToFree)) {
+        BOOLEAN drainCompleted;
+
         entry = RemoveHeadList(&keysToFree);
         key = CONTAINING_RECORD(entry, ENC_KEY, ListEntry);
 
         //
-        // Mark as being destroyed to prevent new AddRefs
+        // Mark as being destroyed to prevent new AddRefs.
+        // ReadAcquire/WriteRelease ordering is provided by EncKeyAddRef.
         //
-        key->IsBeingDestroyed = TRUE;
+        InterlockedExchange((volatile LONG*)&key->IsBeingDestroyed, TRUE);
         key->IsActive = FALSE;
 
         //
-        // Drain in-flight references. After IsBeingDestroyed is set,
-        // EncKeyAddRef will fail, so no new refs can be acquired.
+        // Drain in-flight references.
         //
+        drainCompleted = FALSE;
         {
             LARGE_INTEGER drainDelay;
             ULONG drainWaitCount = 0;
             drainDelay.QuadPart = -10000LL;  // 1ms
-            while (ReadNoFence(&key->RefCount) > 0) {
+            while (ReadAcquire(&key->RefCount) > 0) {
                 if (++drainWaitCount > 5000) {
-                    // 5 second timeout per key â€” break to avoid hang
+                    // 5s timeout reached - LEAK this key rather than free
+                    // under live references (UAF avoidance).
                     break;
                 }
                 KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
             }
+            if (ReadAcquire(&key->RefCount) == 0) {
+                drainCompleted = TRUE;
+            }
+        }
+
+        if (!drainCompleted) {
+            //
+            // Refs still in flight. Leak the key + obfuscation buffer +
+            // BCrypt handle to preserve memory safety. The pool tags are
+            // visible in poolmon to surface this in production.
+            //
+            continue;
         }
 
         EncpCleanupBCryptKey(key);
@@ -799,10 +821,19 @@ Routine Description:
     ExReleaseFastMutex(&key->ObfuscationMutex);
 
     //
-    // Add to key list under exclusive lock
+    // Add to key list under exclusive lock. Re-check the limit here to
+    // close the TOCTOU window between the early KeyCount check and the
+    // insert: with N concurrent generators this could otherwise allow
+    // the cap to be exceeded.
     //
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
+    if (Manager->KeyCount >= ENC_MAX_KEYS) {
+        ExReleaseResourceLite(&Manager->KeyListLock);
+        KeLeaveCriticalRegion();
+        status = STATUS_QUOTA_EXCEEDED;
+        goto Cleanup;
+    }
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
     ExReleaseResourceLite(&Manager->KeyListLock);
@@ -1038,10 +1069,17 @@ Routine Description:
     ExReleaseFastMutex(&key->ObfuscationMutex);
 
     //
-    // Add to key list
+    // Add to key list under exclusive lock. Enforce ENC_MAX_KEYS under
+    // lock to prevent the cap from being exceeded by concurrent callers.
     //
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
+    if (Manager->KeyCount >= ENC_MAX_KEYS) {
+        ExReleaseResourceLite(&Manager->KeyListLock);
+        KeLeaveCriticalRegion();
+        status = STATUS_QUOTA_EXCEEDED;
+        goto Cleanup;
+    }
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
     ExReleaseResourceLite(&Manager->KeyListLock);
@@ -1238,10 +1276,17 @@ Routine Description:
     ExReleaseFastMutex(&key->ObfuscationMutex);
 
     //
-    // Add to key list
+    // Add to key list under exclusive lock with cap enforcement to
+    // prevent ENC_MAX_KEYS from being exceeded by concurrent imports.
     //
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
+    if (Manager->KeyCount >= ENC_MAX_KEYS) {
+        ExReleaseResourceLite(&Manager->KeyListLock);
+        KeLeaveCriticalRegion();
+        status = STATUS_QUOTA_EXCEEDED;
+        goto Cleanup;
+    }
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
     ExReleaseResourceLite(&Manager->KeyListLock);
@@ -1398,16 +1443,22 @@ Routine Description:
     // After marking IsBeingDestroyed and removing from all lists,
     // no new AddRefs can succeed. Wait for existing holders to release.
     //
+    // Leak-on-timeout policy: if RefCount cannot be drained within the
+    // 5-second budget we INTENTIONALLY LEAK the key (its memory, BCrypt
+    // handle, and obfuscation buffer) rather than freeing under live
+    // references and causing a kernel UAF. The pool tags surface in
+    // poolmon to make the leak visible in production.
+    //
     drainDelay.QuadPart = -10000LL;  // 1ms
     drainWaitCount = 0;
 
-    while (ReadNoFence(&Key->RefCount) > 0) {
+    while (ReadAcquire(&Key->RefCount) > 0) {
         if (++drainWaitCount > 5000) {
             //
-            // 5 second timeout â€” break to avoid driver hang.
-            // Remaining refs are leaked encrypt/decrypt operations.
+            // 5 second timeout reached. Refusing to free a key with
+            // outstanding references — leak rather than corrupt callers.
             //
-            break;
+            return;
         }
         KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
     }
