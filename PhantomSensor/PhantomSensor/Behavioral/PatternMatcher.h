@@ -212,6 +212,17 @@ typedef struct _PM_MATCHER {
     //
     volatile BOOLEAN Initialized;
     volatile BOOLEAN ShuttingDown;
+    BOOLEAN Reserved0[2];
+
+    //
+    // Rundown gate: prevents shutdown teardown from racing public-API callers.
+    // RefCount starts at 1 (the initialization reference). Public APIs hold a
+    // transient reference for the duration of the call via Try/Deref helpers;
+    // PtmShutdown sets ShuttingDown, drops the initial reference, and waits on
+    // RefZeroEvent before freeing any state.
+    //
+    volatile LONG RefCount;
+    KEVENT RefZeroEvent;
 
     //
     // Pattern storage
