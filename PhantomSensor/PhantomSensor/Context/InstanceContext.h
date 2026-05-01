@@ -220,8 +220,10 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     /// @brief TRUE if Resource was successfully initialized (CRITICAL for cleanup)
     BOOLEAN ResourceInitialized;
 
-    /// @brief TRUE if context is fully initialized and ready for use
-    BOOLEAN Initialized;
+    /// @brief TRUE if context is fully initialized and ready for use.
+    /// Declared volatile to enforce acquire/release ordering for the
+    /// publication-checked, lock-free fast paths in lookup helpers.
+    volatile BOOLEAN Initialized;
 
     /// @brief Padding for alignment
     BOOLEAN Reserved1[2];
