@@ -1348,7 +1348,21 @@ PocGetOrCreateHandleContext(
     ExInitializePushLock(&context->Lock);
     context->ProcessId = PsGetCurrentProcessId();
     context->ThreadId = PsGetCurrentThreadId();
-    context->DesiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+
+    //
+    // SECURITY: SecurityContext may be NULL for kernel-initiated opens
+    // (IoCreateFileEx with no IO_DRIVER_CREATE_CONTEXT, NtCreateSection
+    // image mapping paths, certain FastIO callers). Dereferencing without
+    // a NULL guard causes a kernel NULL pointer BSOD. Default to zero
+    // desired access when not provided.
+    //
+    if (Data->Iopb->Parameters.Create.SecurityContext != NULL) {
+        context->DesiredAccess =
+            Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    } else {
+        context->DesiredAccess = 0;
+    }
+
     context->CreateOptions = Data->Iopb->Parameters.Create.Options & FILE_VALID_OPTION_FLAGS;
     context->ShareAccess = Data->Iopb->Parameters.Create.ShareAccess;
     KeQuerySystemTime(&context->OpenTime);
