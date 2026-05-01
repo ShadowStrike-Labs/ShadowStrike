@@ -1166,6 +1166,13 @@ HtGetHandlesInfo(
 
     RtlZeroMemory(Info, sizeof(HT_PROCESS_HANDLES_INFO));
 
+    //
+    // Read cached aggregate fields under the per-snapshot lock to avoid torn
+    // reads racing concurrent HtAnalyzeHandles writers.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Handles->Lock);
+
     Info->ProcessId = Handles->ProcessId;
     Info->HandleCount = Handles->HandleCount;
     Info->AggregatedSuspicion = Handles->AggregatedSuspicion;
@@ -1179,6 +1186,9 @@ HtGetHandlesInfo(
     Info->CrossProcessHandleCount = Handles->CrossProcessHandleCount;
     Info->HighPrivilegeHandleCount = Handles->HighPrivilegeHandleCount;
     Info->SnapshotTime = Handles->SnapshotTime;
+
+    ExReleasePushLockShared(&Handles->Lock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -1274,18 +1284,33 @@ HtRecordDuplication(
     }
 
     //
-    // Check duplication limit
+    // Atomically reserve a duplication slot: snapshot-and-CAS pattern to
+    // prevent the classic "TOCTOU on the counter" where multiple concurrent
+    // callers can each pass a non-atomic read-then-increment quota check and
+    // collectively overshoot Config.MaxDuplications, exhausting nonpaged pool.
     //
-    if ((ULONG)Tracker->DuplicationCount >= Tracker->Config.MaxDuplications) {
-        HtpReleaseRundownProtection(Tracker);
-        return STATUS_QUOTA_EXCEEDED;
+    {
+        LONG Snapshot;
+        for (;;) {
+            Snapshot = ReadAcquire(&Tracker->DuplicationCount);
+            if (Snapshot < 0 || (ULONG)Snapshot >= Tracker->Config.MaxDuplications) {
+                HtpReleaseRundownProtection(Tracker);
+                return STATUS_QUOTA_EXCEEDED;
+            }
+            if (InterlockedCompareExchange(&Tracker->DuplicationCount,
+                                            Snapshot + 1,
+                                            Snapshot) == Snapshot) {
+                break;
+            }
+        }
     }
 
     //
-    // Allocate duplication record
+    // Allocate duplication record (slot is already reserved; rollback on failure)
     //
     Record = HtpAllocateDuplicationRecord(Tracker);
     if (Record == NULL) {
+        InterlockedDecrement(&Tracker->DuplicationCount);
         HtpReleaseRundownProtection(Tracker);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1320,12 +1345,11 @@ HtRecordDuplication(
     Record->SuspicionFlags = Suspicion;
 
     //
-    // Insert into duplication list
+    // Insert into duplication list (slot already reserved above).
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Tracker->DuplicationLock);
     InsertTailList(&Tracker->DuplicationList, &Record->ListEntry);
-    InterlockedIncrement(&Tracker->DuplicationCount);
     ExReleasePushLockExclusive(&Tracker->DuplicationLock);
     KeLeaveCriticalRegion();
 
@@ -1372,10 +1396,14 @@ HtAnalyzeHandles(
     }
 
     //
-    // Aggregate suspicion from all handles
+    // Aggregate suspicion from all handles. We acquire the lock EXCLUSIVE
+    // because we will be mutating Handles->AggregatedSuspicion / SuspicionScore
+    // (cached for HtGetHandlesInfo readers). Holding only a shared lock here
+    // would race against concurrent HtAnalyzeHandles callers and produce torn
+    // reads in HtGetHandlesInfo.
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Handles->Lock);
+    ExAcquirePushLockExclusive(&Handles->Lock);
 
     for (Entry = Handles->HandleList.Flink;
          Entry != &Handles->HandleList;
@@ -1385,9 +1413,6 @@ HtAnalyzeHandles(
         AggregatedSuspicion |= HandleEntry->SuspicionFlags;
     }
 
-    ExReleasePushLockShared(&Handles->Lock);
-    KeLeaveCriticalRegion();
-
     //
     // Check for many handles (potential handle table attack)
     //
@@ -1396,14 +1421,18 @@ HtAnalyzeHandles(
     }
 
     //
-    // Update handle structure
+    // Update cached aggregate fields under exclusive lock to publish a
+    // consistent (flags, score) pair to readers.
     //
     Handles->AggregatedSuspicion = AggregatedSuspicion;
     Handles->SuspicionScore = HtpCalculateSuspicionScore(AggregatedSuspicion);
 
+    ExReleasePushLockExclusive(&Handles->Lock);
+    KeLeaveCriticalRegion();
+
     *Flags = AggregatedSuspicion;
     if (Score != NULL) {
-        *Score = Handles->SuspicionScore;
+        *Score = HtpCalculateSuspicionScore(AggregatedSuspicion);
     }
 
     HtpReleaseRundownProtection(Tracker);
@@ -1829,14 +1858,51 @@ HtpInsertProcessHandles(
     )
 {
     ULONG Hash;
+    PLIST_ENTRY ScanEntry;
+    PHT_PROCESS_HANDLES Existing;
+    LIST_ENTRY EvictedList;
 
     Hash = HtpHashProcessId(Handles->ProcessId);
     Handles->HashBucket = Hash;
+    InitializeListHead(&EvictedList);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
 
     if (!Handles->InHashTable) {
+        //
+        // Evict any stale cached snapshot for this PID. Without this, repeated
+        // calls to HtSnapshotHandles() for the same process accumulate entries
+        // in the hash bucket and the global process list (NPAGED-POOL LEAK,
+        // bucket walk degenerates to O(n)). We collect evicted entries to
+        // dereference them after releasing the bucket lock to avoid holding the
+        // lock across the lookaside free path.
+        //
+        for (ScanEntry = Tracker->HashBuckets[Hash].ProcessList.Flink;
+             ScanEntry != &Tracker->HashBuckets[Hash].ProcessList;
+             /* advanced inside */) {
+
+            Existing = CONTAINING_RECORD(ScanEntry, HT_PROCESS_HANDLES, HashEntry);
+            ScanEntry = ScanEntry->Flink;
+
+            if (Existing->ProcessId == Handles->ProcessId &&
+                Existing != Handles &&
+                Existing->InHashTable) {
+
+                RemoveEntryList(&Existing->HashEntry);
+                InitializeListHead(&Existing->HashEntry);
+                InterlockedDecrement(&Tracker->HashBuckets[Hash].Count);
+                Existing->InHashTable = FALSE;
+
+                //
+                // Defer dereference (drops the hash-table reference) until
+                // after we have released the bucket lock. Reuse HashEntry as
+                // a transient eviction-list link since InHashTable=FALSE.
+                //
+                InsertTailList(&EvictedList, &Existing->HashEntry);
+            }
+        }
+
         InsertTailList(&Tracker->HashBuckets[Hash].ProcessList, &Handles->HashEntry);
         InterlockedIncrement(&Tracker->HashBuckets[Hash].Count);
         Handles->InHashTable = TRUE;
@@ -1854,6 +1920,28 @@ HtpInsertProcessHandles(
         InterlockedIncrement(&Tracker->ProcessCount);
         ExReleasePushLockExclusive(&Tracker->ProcessListLock);
         KeLeaveCriticalRegion();
+
+        //
+        // Process evictions: unlink each from the global list and drop the
+        // reference previously held by the hash table.
+        //
+        while (!IsListEmpty(&EvictedList)) {
+            PLIST_ENTRY Evicted = RemoveHeadList(&EvictedList);
+            Existing = CONTAINING_RECORD(Evicted, HT_PROCESS_HANDLES, HashEntry);
+            InitializeListHead(&Existing->HashEntry);
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
+            if (!IsListEmpty(&Existing->GlobalEntry)) {
+                RemoveEntryList(&Existing->GlobalEntry);
+                InitializeListHead(&Existing->GlobalEntry);
+                InterlockedDecrement(&Tracker->ProcessCount);
+            }
+            ExReleasePushLockExclusive(&Tracker->ProcessListLock);
+            KeLeaveCriticalRegion();
+
+            HtpDereferenceProcessHandles(Tracker, Existing);
+        }
     } else {
         ExReleasePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
         KeLeaveCriticalRegion();
