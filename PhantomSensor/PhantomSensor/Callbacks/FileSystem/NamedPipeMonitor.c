@@ -280,6 +280,15 @@ typedef struct _NPM_MONITOR_STATE {
     BOOLEAN LookasideInitialized;
 
     //
+    // In-flight counter for NpMonFreeEvent. Rundown protection cannot be used
+    // here because the documented IRQL contract is <= DISPATCH_LEVEL while
+    // ExAcquireRundownProtection requires <= APC_LEVEL. Shutdown clears
+    // LookasideInitialized, issues a full memory barrier, then spins on this
+    // counter to ensure no Free path is mid-call before ExDeleteNPagedLookasideList.
+    //
+    volatile LONG FreeEventInFlight;
+
+    //
     // Rate limiting
     //
     LARGE_INTEGER RateWindowStart;
@@ -548,12 +557,32 @@ NpMonShutdown(
     }
 
     //
-    // Destroy lookaside lists â€” mark unavailable FIRST to prevent
-    // in-flight NpMonFreeEvent from using them after deletion
+    // Destroy lookaside lists.
+    //
+    // Sequence:
+    //   1. Clear LookasideInitialized (visible publication).
+    //   2. Full memory barrier — pairs with the InterlockedIncrement in
+    //      NpMonFreeEvent so that any Free that has already incremented
+    //      FreeEventInFlight observes a TRUE LookasideInitialized, and any
+    //      Free that observes FALSE has not yet (and will not) call
+    //      ExFreeToNPagedLookasideList.
+    //   3. Spin until FreeEventInFlight drains to zero. Bounded by
+    //      DISPATCH_LEVEL execution windows; should be microseconds.
+    //   4. Delete the lookaside lists.
     //
     if (g_NpmState.LookasideInitialized) {
         g_NpmState.LookasideInitialized = FALSE;
         MemoryBarrier();
+
+        //
+        // Drain any in-flight NpMonFreeEvent callers that already passed the
+        // InterlockedIncrement but have not yet completed the
+        // LookasideInitialized check + ExFreeToNPagedLookasideList.
+        //
+        while (InterlockedCompareExchange(&g_NpmState.FreeEventInFlight, 0, 0) != 0) {
+            KeStallExecutionProcessor(10);
+        }
+
         ExDeleteNPagedLookasideList(&g_NpmState.EntryLookaside);
         ExDeleteNPagedLookasideList(&g_NpmState.EventLookaside);
     }
@@ -563,9 +592,9 @@ NpMonShutdown(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Named Pipe Monitor shutdown complete "
                "(Tracked=%lld, Blocked=%lld, C2=%lld)\n",
-               g_NpmState.Stats.TotalPipesCreated,
-               g_NpmState.Stats.TotalPipesBlocked,
-               g_NpmState.Stats.C2PipesDetected);
+               InterlockedCompareExchange64(&g_NpmState.Stats.TotalPipesCreated, 0, 0),
+               InterlockedCompareExchange64(&g_NpmState.Stats.TotalPipesBlocked, 0, 0),
+               InterlockedCompareExchange64(&g_NpmState.Stats.C2PipesDetected,   0, 0));
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -905,16 +934,39 @@ NpMonGetStatistics(
     _Out_ PNPM_STATISTICS Stats
     )
 {
-    Stats->TotalPipesCreated       = ReadNoFence64((PLONG64)&g_NpmState.Stats.TotalPipesCreated);
-    Stats->TotalPipesConnected     = ReadNoFence64((PLONG64)&g_NpmState.Stats.TotalPipesConnected);
-    Stats->TotalPipesBlocked       = ReadNoFence64((PLONG64)&g_NpmState.Stats.TotalPipesBlocked);
-    Stats->SuspiciousPipesDetected = ReadNoFence64((PLONG64)&g_NpmState.Stats.SuspiciousPipesDetected);
-    Stats->C2PipesDetected         = ReadNoFence64((PLONG64)&g_NpmState.Stats.C2PipesDetected);
-    Stats->HighEntropyPipesDetected= ReadNoFence64((PLONG64)&g_NpmState.Stats.HighEntropyPipesDetected);
-    Stats->CrossProcessConnections = ReadNoFence64((PLONG64)&g_NpmState.Stats.CrossProcessConnections);
-    Stats->SpoofedSystemPipes      = ReadNoFence64((PLONG64)&g_NpmState.Stats.SpoofedSystemPipes);
-    Stats->EventsQueued            = ReadNoFence64((PLONG64)&g_NpmState.Stats.EventsQueued);
-    Stats->EventsDropped           = ReadNoFence64((PLONG64)&g_NpmState.Stats.EventsDropped);
+    //
+    // Zero-out up-front so callers see well-defined zeros on the shutdown path.
+    //
+    RtlZeroMemory(Stats, sizeof(*Stats));
+
+    //
+    // Gate against shutdown — without this, a reader can outrace
+    // NpMonShutdown which tears down the lookaside lists / rundown.
+    // The Stats struct itself lives in static storage and is not freed,
+    // but going through the rundown gate also forces happens-before vs
+    // the in-flight writers.
+    //
+    if (!ExAcquireRundownProtection(&g_NpmState.RundownRef)) {
+        return;
+    }
+
+    //
+    // Codebase atomic-load idiom (matches FBE / FSC / Behavioral).
+    // Replaces ReadNoFence64 which doesn't satisfy the ShadowStrike
+    // contract for `volatile LONG64` reads.
+    //
+    Stats->TotalPipesCreated       = InterlockedCompareExchange64(&g_NpmState.Stats.TotalPipesCreated,       0, 0);
+    Stats->TotalPipesConnected     = InterlockedCompareExchange64(&g_NpmState.Stats.TotalPipesConnected,     0, 0);
+    Stats->TotalPipesBlocked       = InterlockedCompareExchange64(&g_NpmState.Stats.TotalPipesBlocked,       0, 0);
+    Stats->SuspiciousPipesDetected = InterlockedCompareExchange64(&g_NpmState.Stats.SuspiciousPipesDetected, 0, 0);
+    Stats->C2PipesDetected         = InterlockedCompareExchange64(&g_NpmState.Stats.C2PipesDetected,         0, 0);
+    Stats->HighEntropyPipesDetected= InterlockedCompareExchange64(&g_NpmState.Stats.HighEntropyPipesDetected,0, 0);
+    Stats->CrossProcessConnections = InterlockedCompareExchange64(&g_NpmState.Stats.CrossProcessConnections, 0, 0);
+    Stats->SpoofedSystemPipes      = InterlockedCompareExchange64(&g_NpmState.Stats.SpoofedSystemPipes,      0, 0);
+    Stats->EventsQueued            = InterlockedCompareExchange64(&g_NpmState.Stats.EventsQueued,            0, 0);
+    Stats->EventsDropped           = InterlockedCompareExchange64(&g_NpmState.Stats.EventsDropped,           0, 0);
+
+    ExReleaseRundownProtection(&g_NpmState.RundownRef);
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -930,10 +982,21 @@ NpMonDequeueEvent(
 
     *Event = NULL;
 
+    //
+    // Rundown gate — protects EventQueue / EventLock / EventLookaside against
+    // concurrent NpMonShutdown which drains the queue and tears down the
+    // lookaside list. Without this, a caller can be parked on EventLock while
+    // shutdown completes, then operate on a freed list head.
+    //
+    if (!ExAcquireRundownProtection(&g_NpmState.RundownRef)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
     KeAcquireSpinLock(&g_NpmState.EventLock, &oldIrql);
 
     if (IsListEmpty(&g_NpmState.EventQueue)) {
         KeReleaseSpinLock(&g_NpmState.EventLock, oldIrql);
+        ExReleaseRundownProtection(&g_NpmState.RundownRef);
         return STATUS_NO_MORE_ENTRIES;
     }
 
@@ -943,6 +1006,8 @@ NpMonDequeueEvent(
     KeReleaseSpinLock(&g_NpmState.EventLock, oldIrql);
 
     *Event = CONTAINING_RECORD(entry, NPM_PIPE_EVENT, ListEntry);
+
+    ExReleaseRundownProtection(&g_NpmState.RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -957,9 +1022,26 @@ NpMonFreeEvent(
         return;
     }
 
+    //
+    // In-flight gate — must work at DISPATCH_LEVEL (rundown does not).
+    // Shutdown clears LookasideInitialized, issues a full barrier, then waits
+    // for FreeEventInFlight to drain to zero. The Increment must precede the
+    // LookasideInitialized read to establish happens-before with shutdown's
+    // store-then-barrier-then-wait sequence.
+    //
+    InterlockedIncrement(&g_NpmState.FreeEventInFlight);
+
     if (g_NpmState.LookasideInitialized) {
         ExFreeToNPagedLookasideList(&g_NpmState.EventLookaside, Event);
+    } else {
+        //
+        // Shutdown has torn down the lookaside list (or is about to). Bounded
+        // leakage of one event is preferable to UAF on a destroyed list.
+        // This path is taken only at process teardown.
+        //
     }
+
+    InterlockedDecrement(&g_NpmState.FreeEventInFlight);
 }
 
 // ============================================================================
@@ -1536,10 +1618,15 @@ NpmCheckRateLimit(
     KeQuerySystemTimePrecise(&now);
 
     //
-    // Read the rate window start ONCE atomically. On x64, aligned 64-bit reads
-    // are naturally atomic â€” avoids the CAS-to-self triple-read antipattern.
+    // Atomic 64-bit load — codebase contract rejects naked `*(volatile LONGLONG*)`
+    // even on x64 (see FBE / FSC / Behavioral). InterlockedCompareExchange64
+    // with (0,0) is the canonical zero-effect atomic read.
     //
-    oldStart = *(volatile LONGLONG*)&g_NpmState.RateWindowStart.QuadPart;
+    oldStart = InterlockedCompareExchange64(
+        &g_NpmState.RateWindowStart.QuadPart,
+        0,
+        0
+    );
 
     elapsed = now.QuadPart - oldStart;
 
