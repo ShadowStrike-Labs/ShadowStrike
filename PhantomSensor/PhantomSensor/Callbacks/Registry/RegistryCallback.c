@@ -57,6 +57,19 @@
 #include "../../Performance/PerformanceMonitor.h"
 #include "../../Performance/ResourceThrottling.h"
 
+//
+// InterlockedCompareExchange8 is a compiler intrinsic that is not always
+// declared in WDK kernel-mode headers depending on toolchain/version.
+// Mirror the manual declaration pattern used by Behavioral/PatternMatcher.c
+// to guarantee availability without altering shared headers.
+//
+#ifndef InterlockedCompareExchange8
+char _InterlockedCompareExchange8(char volatile*, char, char);
+#pragma intrinsic(_InterlockedCompareExchange8)
+#define InterlockedCompareExchange8(Destination, Exchange, Comparand) \
+    _InterlockedCompareExchange8((char volatile*)(Destination), (char)(Exchange), (char)(Comparand))
+#endif
+
 // ============================================================================
 // POOL TAGS
 // ============================================================================
@@ -621,7 +634,19 @@ ShadowStrikeRegisterRegistryCallback(
         return STATUS_UNSUCCESSFUL;
     }
 
-    if (g_RegistryMonitor.CallbackRegistered) {
+    if (DriverObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Atomic claim of the registration slot.  Without this, two concurrent
+    // callers could both pass the prior boolean check and double-register
+    // (CmRegisterCallbackEx would return success for both, leaking a cookie).
+    //
+    if (InterlockedCompareExchange8(
+            (CHAR volatile*)&g_RegistryMonitor.CallbackRegistered,
+            TRUE,
+            FALSE) != FALSE) {
         return STATUS_ALREADY_REGISTERED;
     }
 
@@ -641,17 +666,26 @@ ShadowStrikeRegisterRegistryCallback(
     );
 
     if (!NT_SUCCESS(status)) {
+        //
+        // Roll back the registered flag so a subsequent retry can succeed.
+        //
+        InterlockedExchange8(
+            (CHAR volatile*)&g_RegistryMonitor.CallbackRegistered,
+            FALSE);
+        g_RegistryMonitor.CallbackCookie.QuadPart = 0;
+
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to register registry callback: 0x%08X\n",
+                   "[ShadowStrike] CmRegisterCallbackEx failed: 0x%08X\n",
                    status);
         return status;
     }
 
     //
-    // Store cookie in global driver data as well
+    // Mirror cookie to the global driver data atomically.
     //
-    g_DriverData.RegistryCallbackCookie = g_RegistryMonitor.CallbackCookie;
-    g_RegistryMonitor.CallbackRegistered = TRUE;
+    InterlockedExchange64(
+        (volatile LONG64*)&g_DriverData.RegistryCallbackCookie.QuadPart,
+        g_RegistryMonitor.CallbackCookie.QuadPart);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Registry callback registered (Cookie: 0x%I64X)\n",
@@ -667,29 +701,53 @@ ShadowStrikeUnregisterRegistryCallback(
     )
 {
     NTSTATUS status;
+    LARGE_INTEGER cookie;
 
     PAGED_CODE();
 
-    if (!g_RegistryMonitor.CallbackRegistered) {
+    //
+    // Atomic compare-exchange on CallbackRegistered to ensure exactly one
+    // caller performs CmUnRegisterCallback. This eliminates the prior race
+    // where a concurrent unregister could double-call CmUnRegisterCallback
+    // with a stale cookie or a concurrent register/unregister could observe
+    // an inconsistent registered/cookie state.
+    //
+    if (InterlockedCompareExchange8(
+            (CHAR volatile*)&g_RegistryMonitor.CallbackRegistered,
+            FALSE,
+            TRUE) != TRUE) {
         return;
     }
 
-    if (g_RegistryMonitor.CallbackCookie.QuadPart == 0) {
-        g_RegistryMonitor.CallbackRegistered = FALSE;
+    //
+    // Snapshot cookie atomically and clear the global to prevent reuse.
+    // Once cleared, CmUnRegisterCallback below will rundown all in-flight
+    // callbacks and synchronously block until the last one returns.
+    //
+    cookie.QuadPart = InterlockedExchange64(
+        (volatile LONG64*)&g_RegistryMonitor.CallbackCookie.QuadPart,
+        0);
+
+    if (cookie.QuadPart == 0) {
         return;
     }
 
-    status = CmUnRegisterCallback(g_RegistryMonitor.CallbackCookie);
+    status = CmUnRegisterCallback(cookie);
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to unregister registry callback: 0x%08X\n",
-                   status);
+                   "[ShadowStrike] CmUnRegisterCallback failed: 0x%08X (cookie=0x%I64X)\n",
+                   status, cookie.QuadPart);
+        //
+        // Even on failure CM marks the slot inactive; do not retry to avoid
+        // touching a freed registration. Mirror to global driver data only
+        // on success to avoid leaving stale cookies for diagnostics.
+        //
     }
 
-    g_RegistryMonitor.CallbackCookie.QuadPart = 0;
-    g_DriverData.RegistryCallbackCookie.QuadPart = 0;
-    g_RegistryMonitor.CallbackRegistered = FALSE;
+    InterlockedExchange64(
+        (volatile LONG64*)&g_DriverData.RegistryCallbackCookie.QuadPart,
+        0);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Registry callback unregistered\n");
@@ -1633,43 +1691,28 @@ ShadowStrikeRegistryCallbackRoutine(
     UNREFERENCED_PARAMETER(CallbackContext);
 
     //
-    // CRITICAL: Check driver readiness
+    // CRITICAL: Check driver readiness. Re-checked on every entry because
+    // CmUnRegisterCallback drains in-flight callbacks but new callbacks may
+    // race against the driver entering a stopped state.
     //
     if (!SHADOWSTRIKE_IS_READY()) {
         return STATUS_SUCCESS;
     }
 
     //
-    // CRITICAL: Validate Argument1 (notify class)
+    // SECURITY: Argument1 carries the REG_NOTIFY_CLASS value (NOT a pointer).
+    // RegNtPreDeleteKey is defined as 0 in the WDK enum; a "if (Argument1 ==
+    // NULL)" guard would silently drop EVERY pre-delete-key notification,
+    // breaking ransomware/persistence-removal detection. We therefore convert
+    // unconditionally and rely on RegpNotifyClassToOperation + the explicit
+    // pre-class allow-list below to filter unsupported values.
     //
-    if (Argument1 == NULL) {
-        return STATUS_SUCCESS;
-    }
-
     notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
-    operation = RegpNotifyClassToOperation(notifyClass);
 
     //
-    // Filter to operations we care about
-    //
-    if (operation == RegOpNone) {
-        return STATUS_SUCCESS;
-    }
-
-    SSPM_LATENCY_BEGIN(reg);
-
-    //
-    // Track registry operation rate for DoS mitigation
-    //
-    {
-        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
-        if (rtThrottler != NULL) {
-            RtReportUsage(rtThrottler, RtResourceRegOps, 1);
-        }
-    }
-
-    //
-    // Only process Pre-operations for blocking, Post for logging
+    // Filter to the pre-operation classes we actually handle.  Hoisted ahead
+    // of any latency instrumentation so all early-exits below the
+    // SSPM_LATENCY_BEGIN call honour the begin/end pairing contract.
     //
     switch (notifyClass) {
         case RegNtPreDeleteKey:
@@ -1680,14 +1723,22 @@ ShadowStrikeRegistryCallbackRoutine(
         case RegNtPreSetKeySecurity:
             break;
         default:
-            //
-            // Not a pre-operation we handle
-            //
             return STATUS_SUCCESS;
     }
 
+    operation = RegpNotifyClassToOperation(notifyClass);
+    if (operation == RegOpNone) {
+        //
+        // Defensive: should not happen given the allow-list above, but guards
+        // against future enum additions.
+        //
+        return STATUS_SUCCESS;
+    }
+
     //
-    // CRITICAL: Validate Argument2 before any dereference
+    // CRITICAL: Validate Argument2 before any dereference. CM is documented
+    // to always provide a non-NULL info pointer for the pre-classes above,
+    // but a NULL here is treated as "skip" rather than dereferenced.
     //
     if (Argument2 == NULL) {
         return STATUS_SUCCESS;
@@ -1696,10 +1747,22 @@ ShadowStrikeRegistryCallbackRoutine(
     processId = PsGetCurrentProcessId();
 
     //
-    // Skip analysis if the requesting process is excluded
+    // Skip analysis if the requesting process is excluded.
     //
     if (ShadowStrikeIsProcessExcluded(processId, NULL)) {
         return STATUS_SUCCESS;
+    }
+
+    SSPM_LATENCY_BEGIN(reg);
+
+    //
+    // Track registry operation rate for DoS mitigation.
+    //
+    {
+        PRT_THROTTLER rtThrottler = ShadowStrikeGetResourceThrottler();
+        if (rtThrottler != NULL) {
+            RtReportUsage(rtThrottler, RtResourceRegOps, 1);
+        }
     }
 
     //
@@ -1768,11 +1831,11 @@ ShadowStrikeRegistryCallbackRoutine(
             break;
         }
         default:
-            return STATUS_SUCCESS;
+            goto Cleanup;
     }
 
     if (keyObject == NULL) {
-        return STATUS_SUCCESS;
+        goto Cleanup;
     }
 
     //
@@ -1784,7 +1847,8 @@ ShadowStrikeRegistryCallbackRoutine(
         // Path resolution failed - allow operation but log
         //
         InterlockedIncrement64(&g_RegistryMonitor.Statistics.PathResolutionErrors);
-        return STATUS_SUCCESS;
+        status = STATUS_SUCCESS;
+        goto Cleanup;
     }
 
     //
@@ -1801,6 +1865,12 @@ ShadowStrikeRegistryCallbackRoutine(
         PWCH fullBuffer;
 
         if (totalLen > REG_MAX_PATH_ALLOCATION || totalLen > MAXUSHORT) {
+            //
+            // Truncate: continue with parent (RootObject) path only.  This
+            // preserves coverage for the common case where the parent itself
+            // is a monitored or protected path (e.g., a Run key).
+            //
+            InterlockedIncrement64(&g_RegistryMonitor.Statistics.PathResolutionErrors);
             goto SkipCreatePathBuild;
         }
 
@@ -1855,11 +1925,35 @@ SkipCreatePathBuild:
 
             PREG_SET_VALUE_KEY_INFORMATION info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
 
+            //
+            // ValueName may be NULL or carry a zero-length buffer; the
+            // analyzer requires a non-NULL UNICODE_STRING with a buffer.
+            // Synthesize an empty UNICODE_STRING when CM passes NULL so we
+            // can still classify the parent key for persistence locations
+            // that monitor any value-write activity.
+            //
+            UNICODE_STRING emptyValueName = {0};
+            PUNICODE_STRING valueName = info->ValueName;
+            if (valueName == NULL || valueName->Buffer == NULL) {
+                valueName = &emptyValueName;
+            }
+
+            //
+            // SECURITY: Cap captured data size to mitigate hostile callers
+            // passing huge sizes that would cascade through telemetry queues.
+            // The downstream ScanBridge applies its own clamp; we apply an
+            // earlier clamp to keep classification fast and bounded.
+            //
+            ULONG capturedDataSize = info->DataSize;
+            if (capturedDataSize > SHADOWSTRIKE_MAX_REG_DATA_CAPTURE) {
+                capturedDataSize = SHADOWSTRIKE_MAX_REG_DATA_CAPTURE;
+            }
+
             ShadowStrikeAnalyzeRegistryPersistence(
                 &keyPath,
-                info->ValueName,
+                valueName,
                 info->Data,
-                info->DataSize,
+                capturedDataSize,
                 info->Type
             );
         }
@@ -2202,6 +2296,7 @@ SkipCreatePathBuild:
     //
     // Cleanup path buffer
     //
+Cleanup:
     if (keyPath.Buffer != NULL) {
         ExFreePoolWithTag(keyPath.Buffer, REG_PATH_TAG);
         keyPath.Buffer = NULL;
@@ -2219,7 +2314,7 @@ SkipCreatePathBuild:
 
     SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
                      SsPmMetric_CallbackLatencyUs, reg);
-    return STATUS_SUCCESS;
+    return status;
 }
 
 // ============================================================================
@@ -2453,9 +2548,57 @@ ShadowStrikeGetRegistryStatistics(
     }
 
     //
-    // Copy statistics - no lock needed for atomic reads
+    // SECURITY/CORRECTNESS: A bulk RtlCopyMemory races against concurrent
+    // InterlockedIncrement64 producers and is NOT guaranteed atomic on a
+    // per-LONG64 basis (the implementation may use 4-byte movs, especially
+    // on x86-built kernels), producing torn 64-bit reads that could surface
+    // on management dashboards as nonsensical (e.g., negative) counters.
     //
-    RtlCopyMemory(Statistics, &g_RegistryMonitor.Statistics, sizeof(SHADOWSTRIKE_REG_STATISTICS));
+    // Use ReadNoFence64 per LONG64 field so each counter is read with a
+    // single 8-byte aligned load.  The non-atomic LARGE_INTEGER StartTime
+    // is captured under a brief copy after the counters â€” it is set once
+    // at startup/reset and is not torn in practice.
+    //
+    PSHADOWSTRIKE_REG_STATISTICS s = &g_RegistryMonitor.Statistics;
+
+    Statistics->TotalOperations          = ReadNoFence64(&s->TotalOperations);
+    Statistics->CreateKeyOperations      = ReadNoFence64(&s->CreateKeyOperations);
+    Statistics->OpenKeyOperations        = ReadNoFence64(&s->OpenKeyOperations);
+    Statistics->DeleteKeyOperations      = ReadNoFence64(&s->DeleteKeyOperations);
+    Statistics->RenameKeyOperations      = ReadNoFence64(&s->RenameKeyOperations);
+    Statistics->SetValueOperations       = ReadNoFence64(&s->SetValueOperations);
+    Statistics->DeleteValueOperations    = ReadNoFence64(&s->DeleteValueOperations);
+    Statistics->QueryOperations          = ReadNoFence64(&s->QueryOperations);
+
+    Statistics->PersistenceDetections    = ReadNoFence64(&s->PersistenceDetections);
+    Statistics->DefenseEvasionDetections = ReadNoFence64(&s->DefenseEvasionDetections);
+    Statistics->RansomwareIndicators     = ReadNoFence64(&s->RansomwareIndicators);
+    Statistics->SecurityPolicyChanges    = ReadNoFence64(&s->SecurityPolicyChanges);
+    Statistics->CertificateStoreChanges  = ReadNoFence64(&s->CertificateStoreChanges);
+    Statistics->ServiceCreations         = ReadNoFence64(&s->ServiceCreations);
+    Statistics->RunKeyModifications      = ReadNoFence64(&s->RunKeyModifications);
+    Statistics->IFEOModifications        = ReadNoFence64(&s->IFEOModifications);
+
+    Statistics->SelfProtectionBlocks     = ReadNoFence64(&s->SelfProtectionBlocks);
+    Statistics->ThreatBlocks             = ReadNoFence64(&s->ThreatBlocks);
+    Statistics->PolicyBlocks             = ReadNoFence64(&s->PolicyBlocks);
+
+    Statistics->NotificationsSent        = ReadNoFence64(&s->NotificationsSent);
+    Statistics->NotificationsDropped     = ReadNoFence64(&s->NotificationsDropped);
+
+    Statistics->PathResolutionErrors     = ReadNoFence64(&s->PathResolutionErrors);
+    Statistics->ContextAllocationErrors  = ReadNoFence64(&s->ContextAllocationErrors);
+    Statistics->AnalysisErrors           = ReadNoFence64(&s->AnalysisErrors);
+
+    Statistics->TotalLatencyUs           = ReadNoFence64(&s->TotalLatencyUs);
+    Statistics->MaxLatencyUs             = ReadNoFence64(&s->MaxLatencyUs);
+
+    //
+    // StartTime is set once via KeQuerySystemTime under cleanup-locked init
+    // path; an aligned 8-byte read is sufficient here.
+    //
+    Statistics->StartTime.QuadPart       = ReadNoFence64(
+        (volatile LONG64*)&s->StartTime.QuadPart);
 }
 
 _Use_decl_annotations_
