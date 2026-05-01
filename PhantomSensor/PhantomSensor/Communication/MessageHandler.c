@@ -172,6 +172,20 @@ typedef struct _MH_GLOBALS {
     UINT8 Reserved[4];
 
     //
+    // Rundown protection for public APIs.
+    //
+    // Gates every externally callable entry point (dispatch, protected process
+    // queries / mutations, authorization checks). Shutdown waits for in-flight
+    // callers to release before tearing down the lookaside list and clearing
+    // protected process entries. This eliminates the public-API shutdown UAF
+    // window where (e.g.) a process-termination callback invoking
+    // MhUnprotectProcess could free into a deleted lookaside list.
+    //
+    EX_RUNDOWN_REF Rundown;
+    BOOLEAN RundownInitialized;
+    UINT8 Reserved3[7];
+
+    //
     // Handler table
     //
     MH_HANDLER_ENTRY Handlers[MH_MAX_HANDLERS];
@@ -502,6 +516,15 @@ MhInitialize(
     //
 
     //
+    // Initialize rundown protection BEFORE registering handlers, so any
+    // public-API caller that races with the tail of init either sees
+    // InitState != INITIALIZED (early-out) or successfully acquires
+    // rundown against a fully-prepared structure.
+    //
+    ExInitializeRundownProtection(&g_MhGlobals.Rundown);
+    g_MhGlobals.RundownInitialized = TRUE;
+
+    //
     // Initialize handler table
     //
     RtlZeroMemory(g_MhGlobals.Handlers, sizeof(g_MhGlobals.Handlers));
@@ -640,6 +663,16 @@ CleanupOnError:
         g_MhGlobals.LookasideInitialized = FALSE;
     }
 
+    //
+    // Run down the rundown ref so a future re-init starts from a clean slate.
+    // No callers can possibly be inside since InitState was never published as
+    // INITIALIZED, but call this for symmetry and to satisfy verification.
+    //
+    if (g_MhGlobals.RundownInitialized) {
+        ExWaitForRundownProtectionRelease(&g_MhGlobals.Rundown);
+        g_MhGlobals.RundownInitialized = FALSE;
+    }
+
     InterlockedExchange(&g_MhGlobals.InitState, MH_STATE_UNINITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -674,45 +707,35 @@ MhShutdown(
     }
 
     //
-    // Wait for all in-flight handler invocations to drain.
-    // After InitState is UNINITIALIZED, no new invocations will start,
-    // but existing ones may still be running.
+    // Wait for all in-flight public-API callers to release their rundown
+    // reference. After this returns:
+    //   - No new ExAcquireRundownProtection on g_MhGlobals.Rundown can succeed
+    //   - All callers currently inside the public APIs have exited
     //
-    {
-        ULONG drainAttempts = 0;
-        const ULONG maxDrainAttempts = 500;  // 5 seconds max
-        BOOLEAN allDrained;
+    // This deterministically eliminates the public-API shutdown UAF window
+    // against the protected-process lookaside list and the dispatch path.
+    // Replaces the previous bounded-poll-then-leak strategy, which violated
+    // the zero-finding policy (accepted-risk pool leak on timeout).
+    //
+    if (g_MhGlobals.RundownInitialized) {
+        ExWaitForRundownProtectionRelease(&g_MhGlobals.Rundown);
+        g_MhGlobals.RundownInitialized = FALSE;
+    }
 
-        do {
-            allDrained = TRUE;
-            for (ULONG i = 0; i < MH_MAX_HANDLERS; i++) {
-                if (g_MhGlobals.Handlers[i].ActiveInvocations > 0) {
-                    allDrained = FALSE;
-                    break;
-                }
-            }
-
-            if (!allDrained) {
-                LARGE_INTEGER delay;
-                delay.QuadPart = -100000;  // 10ms
-                KeDelayExecutionThread(KernelMode, FALSE, &delay);
-            }
-        } while (!allDrained && ++drainAttempts < maxDrainAttempts);
-
-        if (!allDrained) {
+    //
+    // Defense-in-depth: although rundown release guarantees no callers are in
+    // dispatch, also assert that all handler ActiveInvocations are zero. If
+    // any non-zero count is observed we log loudly but still proceed safely:
+    // the rundown wait already guarantees no thread is inside the handler
+    // call site, so the counter can only be non-zero due to a logic bug.
+    //
+    for (ULONG i = 0; i < MH_MAX_HANDLERS; i++) {
+        LONG active = ReadNoFence(&g_MhGlobals.Handlers[i].ActiveInvocations);
+        if (active != 0) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike/MH] CRITICAL: Shutdown drain timeout - "
-                       "handlers still active after %u attempts, "
-                       "skipping resource cleanup to prevent BSOD\n",
-                       drainAttempts);
-
-            //
-            // Active handlers may be traversing the protected process list
-            // or allocating from the lookaside. Destroying these resources
-            // now would cause pool corruption / use-after-free / BSOD.
-            // Accept the pool leak â€” OS reclaims on driver unload.
-            //
-            return;
+                       "[ShadowStrike/MH] WARNING: handler %u ActiveInvocations=%d "
+                       "after rundown drained - logic bug suspected\n",
+                       i, active);
         }
     }
 
@@ -741,15 +764,17 @@ MhShutdown(
     }
 
     //
-    // Log final statistics
+    // Log final statistics. Use ReadNoFence64 for clarity; on x64 aligned
+    // 64-bit reads are atomic but we go through the API for SAL/Verifier
+    // consistency and to make intent explicit.
     //
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/MH] Shutdown - Processed=%lld, Succeeded=%lld, Failed=%lld, Invalid=%lld, Unauthorized=%lld\n",
-               g_MhGlobals.TotalMessagesProcessed,
-               g_MhGlobals.TotalMessagesSucceeded,
-               g_MhGlobals.TotalMessagesFailed,
-               g_MhGlobals.TotalInvalidMessages,
-               g_MhGlobals.TotalUnauthorizedAttempts);
+               ReadNoFence64(&g_MhGlobals.TotalMessagesProcessed),
+               ReadNoFence64(&g_MhGlobals.TotalMessagesSucceeded),
+               ReadNoFence64(&g_MhGlobals.TotalMessagesFailed),
+               ReadNoFence64(&g_MhGlobals.TotalInvalidMessages),
+               ReadNoFence64(&g_MhGlobals.TotalUnauthorizedAttempts));
 }
 
 // ============================================================================
@@ -1260,6 +1285,15 @@ ShadowStrikeProcessUserMessage(
     }
 
     //
+    // Acquire rundown protection. Once held, MhShutdown's
+    // ExWaitForRundownProtectionRelease will block until we release.
+    // If shutdown has already started, acquire fails - bail out early.
+    //
+    if (!ExAcquireRundownProtection(&g_MhGlobals.Rundown)) {
+        return SHADOWSTRIKE_ERROR_NOT_INITIALIZED;
+    }
+
+    //
     // Update statistics
     //
     InterlockedIncrement64(&g_MhGlobals.TotalMessagesProcessed);
@@ -1282,6 +1316,7 @@ ShadowStrikeProcessUserMessage(
         InterlockedIncrement64(&g_MhGlobals.TotalInvalidMessages);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/MH] Invalid message received: 0x%08X\n", status);
+        ExReleaseRundownProtection(&g_MhGlobals.Rundown);
         return status;
     }
 
@@ -1297,6 +1332,7 @@ ShadowStrikeProcessUserMessage(
                        "[ShadowStrike/MH] Unauthorized attempt for message type %u from PID %p\n",
                        header->MessageType, ClientContext->ClientProcessId);
 
+            ExReleaseRundownProtection(&g_MhGlobals.Rundown);
             return STATUS_ACCESS_DENIED;
         }
     }
@@ -1310,6 +1346,7 @@ ShadowStrikeProcessUserMessage(
         MhpFreeKernelBuffer(kernelBuffer);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/MH] Message type out of range: %u\n", header->MessageType);
+        ExReleaseRundownProtection(&g_MhGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1339,6 +1376,7 @@ ShadowStrikeProcessUserMessage(
         MhpFreeKernelBuffer(kernelBuffer);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                    "[ShadowStrike/MH] No handler for message type: %u\n", header->MessageType);
+        ExReleaseRundownProtection(&g_MhGlobals.Rundown);
         return STATUS_SUCCESS;
     }
 
@@ -1430,6 +1468,7 @@ ShadowStrikeProcessUserMessage(
         InterlockedIncrement64(&g_MhGlobals.TotalMessagesFailed);
     }
 
+    ExReleaseRundownProtection(&g_MhGlobals.Rundown);
     return status;
 }
 
@@ -1569,6 +1608,34 @@ MhpHandlePolicyUpdate(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "[ShadowStrike/MH] Invalid MaxPendingRequests: %u\n",
                    policy->MaxPendingRequests);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate MaxScanFileSize. Cap at 16 GiB to prevent attacker-controlled
+    // values from disabling size-based scan policies or forcing pathological
+    // allocations downstream.
+    //
+    #define MH_MAX_SCAN_FILE_SIZE_BYTES   (0x400000000ULL)   // 16 GiB
+    if (policy->MaxScanFileSize == 0 ||
+        policy->MaxScanFileSize > MH_MAX_SCAN_FILE_SIZE_BYTES) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] Invalid MaxScanFileSize: %llu (max: %llu)\n",
+                   policy->MaxScanFileSize,
+                   (ULONGLONG)MH_MAX_SCAN_FILE_SIZE_BYTES);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate CacheTTLSeconds. Cap at 30 days; zero is permitted (cache
+    // disabled / immediate expiry).
+    //
+    #define MH_MAX_CACHE_TTL_SECONDS      (2592000UL)        // 30 days
+    if (policy->CacheTTLSeconds > MH_MAX_CACHE_TTL_SECONDS) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/MH] Invalid CacheTTLSeconds: %u (max: %u)\n",
+                   policy->CacheTTLSeconds,
+                   (ULONG)MH_MAX_CACHE_TTL_SECONDS);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -2370,6 +2437,14 @@ MhIsProcessProtected(
         return FALSE;
     }
 
+    //
+    // Acquire rundown protection so MhShutdown cannot delete the lookaside
+    // list out from under us. Release before returning.
+    //
+    if (!ExAcquireRundownProtection(&g_MhGlobals.Rundown)) {
+        return FALSE;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_MhGlobals.ProtectedProcessLock);
 
@@ -2386,6 +2461,8 @@ MhIsProcessProtected(
 
     ExReleasePushLockShared(&g_MhGlobals.ProtectedProcessLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&g_MhGlobals.Rundown);
 
     return found;
 }
@@ -2418,6 +2495,10 @@ MhGetProcessProtectionFlags(
         return SHADOWSTRIKE_ERROR_NOT_INITIALIZED;
     }
 
+    if (!ExAcquireRundownProtection(&g_MhGlobals.Rundown)) {
+        return SHADOWSTRIKE_ERROR_NOT_INITIALIZED;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_MhGlobals.ProtectedProcessLock);
 
@@ -2435,6 +2516,8 @@ MhGetProcessProtectionFlags(
 
     ExReleasePushLockShared(&g_MhGlobals.ProtectedProcessLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&g_MhGlobals.Rundown);
 
     return status;
 }
@@ -2457,6 +2540,17 @@ MhUnprotectProcess(
     }
 
     if (g_MhGlobals.InitState != MH_STATE_INITIALIZED) {
+        return SHADOWSTRIKE_ERROR_NOT_INITIALIZED;
+    }
+
+    //
+    // CRITICAL: Acquire rundown protection BEFORE touching the lookaside.
+    // MhUnprotectProcess is called from process-termination callbacks, which
+    // can fire concurrently with driver unload. Without rundown, ExFreeTo-
+    // NPagedLookasideList against an already-deleted lookaside is UAF / pool
+    // corruption.
+    //
+    if (!ExAcquireRundownProtection(&g_MhGlobals.Rundown)) {
         return SHADOWSTRIKE_ERROR_NOT_INITIALIZED;
     }
 
@@ -2488,6 +2582,8 @@ MhUnprotectProcess(
 
     ExReleasePushLockExclusive(&g_MhGlobals.ProtectedProcessLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&g_MhGlobals.Rundown);
 
     return status;
 }
