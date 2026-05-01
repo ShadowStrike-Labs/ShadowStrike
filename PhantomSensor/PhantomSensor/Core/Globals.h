@@ -416,16 +416,14 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 #define SHADOWSTRIKE_COUNT_OPERATION() \
     InterlockedIncrement64(&g_DriverData.TotalOperationsProcessed)
 
-/// @brief Enter a protected operation (DEPRECATED â€” use SHADOWSTRIKE_ACQUIRE_RUNDOWN directly)
-/// @note These no-ops are retained for backward compat in deprecated code paths
-/// (e.g. ShadowStrikePreAcquireForSectionSync in FilterRegistration.c).
-/// All active callbacks use SHADOWSTRIKE_ACQUIRE_RUNDOWN/RELEASE_RUNDOWN instead.
-#define SHADOWSTRIKE_ENTER_OPERATION() \
-    do { (void)0; } while(0)
-
-/// @brief Leave a protected operation (DEPRECATED â€” use SHADOWSTRIKE_RELEASE_RUNDOWN directly)
-#define SHADOWSTRIKE_LEAVE_OPERATION() \
-    do { (void)0; } while(0)
+//
+// NOTE: SHADOWSTRIKE_ENTER_OPERATION / SHADOWSTRIKE_LEAVE_OPERATION were
+// removed. All callbacks use SHADOWSTRIKE_ACQUIRE_RUNDOWN /
+// SHADOWSTRIKE_RELEASE_RUNDOWN directly. The previous referenced caller
+// (ShadowStrikePreAcquireForSectionSync) has itself been removed and the
+// IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION path now lives in
+// PreAcquireSection.c.
+//
 
 /// @brief Generate next message ID
 #define SHADOWSTRIKE_NEXT_MESSAGE_ID() \
