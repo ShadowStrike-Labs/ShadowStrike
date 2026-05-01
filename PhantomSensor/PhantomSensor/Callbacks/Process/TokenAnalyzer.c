@@ -238,6 +238,17 @@ typedef struct _TA_ANALYZER_INTERNAL {
     //
     TA_STATISTICS Stats;
 
+    //
+    // Outstanding token info accounting. Tracks every TA_TOKEN_INFO_INTERNAL
+    // allocation that has not yet been returned to the pool/lookaside list.
+    // TaShutdown blocks on TokenDrainEvent until this counter reaches zero
+    // so the analyzer pool / lookaside list cannot be torn down while an
+    // external caller still references a token info (UAF prevention on the
+    // shutdown path: TapFreeTokenInfoInternal touches Analyzer fields).
+    //
+    volatile LONG OutstandingTokenInfos;
+    KEVENT TokenDrainEvent;
+
 } TA_ANALYZER_INTERNAL, *PTA_ANALYZER_INTERNAL;
 
 // ============================================================================
@@ -259,13 +270,13 @@ _IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TapInitializeWellKnownSids(VOID);
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
 TapAcquireAnalyzerReference(
     _Inout_ PTA_ANALYZER_INTERNAL Analyzer
 );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 TapReleaseAnalyzerReference(
     _Inout_ PTA_ANALYZER_INTERNAL Analyzer
@@ -568,6 +579,16 @@ TaInitialize(
     analyzer->ShuttingDown = FALSE;
 
     //
+    // Outstanding-token-info drain coordination. Initial state is signaled
+    // because zero token infos are outstanding immediately after init.
+    // Every TapAllocateTokenInfo transitions the counter from 0 -> 1 and
+    // clears the event; every TapFreeTokenInfoInternal that drops it back
+    // to 0 sets the event. TaShutdown waits on this with a bounded timeout.
+    //
+    analyzer->OutstandingTokenInfos = 0;
+    KeInitializeEvent(&analyzer->TokenDrainEvent, NotificationEvent, TRUE);
+
+    //
     // Initialize statistics
     //
     KeQuerySystemTime(&analyzer->Stats.StartTime);
@@ -636,10 +657,12 @@ TaShutdown(
     ExWaitForRundownProtectionRelease(&analyzer->RundownRef);
 
     //
-    // Free all cached token info entries
-    // At this point, only entries with external references remain
-    // We mark them as orphaned (Analyzer = NULL) so TaReleaseTokenInfo
-    // can still free them properly
+    // Free all cached token info entries.
+    // We MUST NOT null out tokenInfo->Analyzer here: TapFreeTokenInfoInternal
+    // relies on the Analyzer pointer to decrement OutstandingTokenInfos and
+    // signal TokenDrainEvent. Cache eviction is safe because TaShutdown waits
+    // on TokenDrainEvent below before deleting the lookaside list / freeing
+    // the analyzer pool.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&analyzer->CacheLock);
@@ -649,24 +672,19 @@ TaShutdown(
         tokenInfo = CONTAINING_RECORD(entry, TA_TOKEN_INFO_INTERNAL, CacheEntry);
 
         //
-        // Clear cache linkage
+        // Clear cache linkage state. External holders (if any) will see
+        // InCache == FALSE and skip the cache-lock path on release.
         //
         InitializeListHead(&tokenInfo->CacheEntry);
         InterlockedExchange(&tokenInfo->InCache, FALSE);
 
         //
-        // Orphan the entry - it will be freed when its refcount reaches 0
-        //
-        tokenInfo->Analyzer = NULL;
-
-        //
-        // Release cache's reference
+        // Release cache's reference. If no external references remain the
+        // entry is freed back to the lookaside list immediately; otherwise
+        // the last TaReleaseTokenInfo call will free it and signal drain.
         //
         if (InterlockedDecrement(&tokenInfo->ReferenceCount) == 0) {
-            //
-            // No external references, free now
-            //
-            TapFreeTokenInfoInternal(NULL, tokenInfo);
+            TapFreeTokenInfoInternal(analyzer, tokenInfo);
         }
     }
 
@@ -692,6 +710,55 @@ TaShutdown(
 
     ExReleasePushLockExclusive(&analyzer->BaselineLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Wait for any externally-held token info references to drain. Bounded
+    // by TA_SHUTDOWN_TIMEOUT to prevent unkillable shutdown if a caller
+    // leaks a reference. On timeout we abandon the analyzer pool / lookaside
+    // (memory leak) rather than risk a use-after-free in the still-pending
+    // TaReleaseTokenInfo call. A non-zero counter at this point indicates a
+    // caller bug and is a serious diagnostic event.
+    //
+    if (InterlockedCompareExchange(&analyzer->OutstandingTokenInfos, 0, 0) > 0) {
+        LARGE_INTEGER timeout;
+        NTSTATUS waitStatus;
+
+        timeout.QuadPart = TA_SHUTDOWN_TIMEOUT;
+
+        waitStatus = KeWaitForSingleObject(
+            &analyzer->TokenDrainEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+
+        if (waitStatus != STATUS_SUCCESS) {
+            //
+            // Drain timed out -- some caller still holds a token info.
+            // Tearing down the lookaside list here would cause a UAF in
+            // their pending TaReleaseTokenInfo call. Mark the analyzer as
+            // permanently invalid and leak it; surface the leak via a
+            // bug-check-quality diagnostic for telemetry pipelines.
+            //
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike/Token] Shutdown drain timeout: "
+                "%ld outstanding token info references leaked\n",
+                InterlockedCompareExchange(&analyzer->OutstandingTokenInfos, 0, 0)
+            );
+
+            //
+            // Invalidate magic so any further TaGetStatistics/TaReference*
+            // calls fail validation, but leave LookasideInitialized intact
+            // so still-pending TaReleaseTokenInfo paths can complete.
+            //
+            analyzer->Magic = 0;
+            analyzer->Initialized = FALSE;
+            return;
+        }
+    }
 
     //
     // Delete lookaside list
@@ -1562,7 +1629,19 @@ TaGetStatistics(
     }
 
     //
-    // Copy statistics (atomic reads)
+    // Rundown protection prevents the analyzer pool from being freed by a
+    // concurrent TaShutdown while we read the statistics block. Without
+    // this, a caller racing TaShutdown could observe the magic check,
+    // then read freed memory.
+    //
+    if (!TapAcquireAnalyzerReference(analyzer)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Copy statistics. Each field is a single 64-bit aligned value on x64
+    // so the read is atomic; the snapshot may be slightly inconsistent
+    // across counters but that is acceptable for monitoring telemetry.
     //
     Stats->TokensAnalyzed = analyzer->Stats.TokensAnalyzed;
     Stats->AttacksDetected = analyzer->Stats.AttacksDetected;
@@ -1571,6 +1650,8 @@ TaGetStatistics(
     Stats->BaselinesCreated = analyzer->Stats.BaselinesCreated;
     Stats->BaselinesEvicted = analyzer->Stats.BaselinesEvicted;
     Stats->StartTime = analyzer->Stats.StartTime;
+
+    TapReleaseAnalyzerReference(analyzer);
 
     return STATUS_SUCCESS;
 }
@@ -1698,6 +1779,16 @@ TapAllocateTokenInfo(
     tokenInfo->InCache = FALSE;
     InitializeListHead(&tokenInfo->CacheEntry);
 
+    //
+    // Account for outstanding token info allocations. The drain event is
+    // cleared on the 0 -> 1 transition; TapFreeTokenInfoInternal restores
+    // it on the N -> 0 transition. TaShutdown blocks on this event before
+    // freeing the analyzer pool / lookaside list.
+    //
+    if (InterlockedIncrement(&Analyzer->OutstandingTokenInfos) == 1) {
+        KeClearEvent(&Analyzer->TokenDrainEvent);
+    }
+
     *TokenInfo = tokenInfo;
 
     return STATUS_SUCCESS;
@@ -1711,12 +1802,21 @@ TapFreeTokenInfoInternal(
 )
 {
     ULONG i;
+    PTA_ANALYZER_INTERNAL accountAnalyzer;
 
     PAGED_CODE();
 
     if (TokenInfo == NULL) {
         return;
     }
+
+    //
+    // Capture the analyzer used for outstanding-token accounting BEFORE we
+    // hand the block back to the lookaside list / pool. The TokenInfo
+    // pointer is unsafe to dereference after the free, and we must drop the
+    // outstanding counter exactly once on the analyzer that incremented it.
+    //
+    accountAnalyzer = (Analyzer != NULL) ? Analyzer : TokenInfo->Analyzer;
 
     //
     // Free allocated SIDs (with validation)
@@ -1739,14 +1839,29 @@ TapFreeTokenInfoInternal(
     }
 
     TokenInfo->Magic = 0;
+    TokenInfo->Analyzer = NULL;
 
     //
-    // Free to lookaside list or pool
+    // Free to lookaside list or pool. Prefer the analyzer's lookaside list
+    // when it is still valid; otherwise fall back to direct pool free
+    // (post-shutdown / orphaned-allocation path).
     //
-    if (Analyzer != NULL && Analyzer->LookasideInitialized) {
-        ExFreeToNPagedLookasideList(&Analyzer->TokenInfoLookaside, TokenInfo);
+    if (accountAnalyzer != NULL && accountAnalyzer->LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&accountAnalyzer->TokenInfoLookaside, TokenInfo);
     } else {
         ShadowStrikeFreePoolWithTag(TokenInfo, TA_TOKEN_INFO_TAG);
+    }
+
+    //
+    // Drop the outstanding-token reference last. After this point the
+    // TokenInfo block is no longer ours and must not be touched. Signaling
+    // the drain event allows TaShutdown to proceed with tearing down the
+    // analyzer once the count reaches zero.
+    //
+    if (accountAnalyzer != NULL) {
+        if (InterlockedDecrement(&accountAnalyzer->OutstandingTokenInfos) == 0) {
+            KeSetEvent(&accountAnalyzer->TokenDrainEvent, IO_NO_INCREMENT, FALSE);
+        }
     }
 }
 
