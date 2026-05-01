@@ -234,11 +234,11 @@ FbepGetFileSize(
     _Out_ PLARGE_INTEGER FileSize
     );
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
 FbepEnterOperation(VOID);
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 FbepLeaveOperation(VOID);
 
@@ -620,11 +620,11 @@ FbePreWriteBackup(
     }
 
     //
-    // Check capacity limits
+    // Check capacity limits (atomic load — TotalEntryCount is volatile LONG)
     //
-    if (g_FbeState.TotalEntryCount >= FBE_MAX_TOTAL_ENTRIES) {
+    if (InterlockedCompareExchange(&g_FbeState.TotalEntryCount, 0, 0) >= FBE_MAX_TOTAL_ENTRIES) {
         FbepEvictLruEntries(0);
-        if (g_FbeState.TotalEntryCount >= FBE_MAX_TOTAL_ENTRIES) {
+        if (InterlockedCompareExchange(&g_FbeState.TotalEntryCount, 0, 0) >= FBE_MAX_TOTAL_ENTRIES) {
             InterlockedIncrement64(&g_FbeState.Stats.BackupsFailed);
             FbepLeaveOperation();
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -647,13 +647,14 @@ FbePreWriteBackup(
     }
 
     //
-    // Check total backup size and evict if needed
+    // Check total backup size and evict if needed.
+    // Use atomic 64-bit read to avoid torn read on concurrent updates.
     //
-    if (g_FbeState.Stats.CurrentBackupDiskUsage + FileSize.QuadPart >
-        g_FbeState.Config.MaxTotalBackupSize) {
+    if (InterlockedCompareExchange64(&g_FbeState.Stats.CurrentBackupDiskUsage, 0, 0) +
+        FileSize.QuadPart > g_FbeState.Config.MaxTotalBackupSize) {
         FbepEvictLruEntries(FileSize.QuadPart);
-        if (g_FbeState.Stats.CurrentBackupDiskUsage + FileSize.QuadPart >
-            g_FbeState.Config.MaxTotalBackupSize) {
+        if (InterlockedCompareExchange64(&g_FbeState.Stats.CurrentBackupDiskUsage, 0, 0) +
+            FileSize.QuadPart > g_FbeState.Config.MaxTotalBackupSize) {
             InterlockedIncrement64(&g_FbeState.Stats.BackupsFailed);
             FbepLeaveOperation();
             return STATUS_DISK_FULL;
@@ -742,9 +743,10 @@ FbePreWriteBackup(
     }
 
     //
-    // Check per-process entry limit
+    // Check per-process entry limit (atomic load — Tracker->EntryCount is volatile)
     //
-    if ((ULONG)Tracker->EntryCount >= g_FbeState.Config.MaxEntriesPerProcess) {
+    if ((ULONG)InterlockedCompareExchange(&Tracker->EntryCount, 0, 0) >=
+        g_FbeState.Config.MaxEntriesPerProcess) {
         FbepDeleteBackupFile(&Entry->BackupPath);
         FbepFreeEntry(Entry);
         InterlockedIncrement64(&g_FbeState.Stats.BackupsFailed);
@@ -794,16 +796,18 @@ FbePreWriteBackup(
     InterlockedIncrement(&g_FbeState.TotalEntryCount);
 
     //
-    // Update statistics
+    // Update statistics — read CurrentUsage atomically AFTER the add so the
+    // peak update sees a consistent post-increment value (not a stale snapshot).
     //
     InterlockedIncrement64(&g_FbeState.Stats.BackupsCreated);
     InterlockedAdd64(&g_FbeState.Stats.TotalBytesBackedUp, BytesCopied.QuadPart);
-    InterlockedAdd64(&g_FbeState.Stats.CurrentBackupDiskUsage, BytesCopied.QuadPart);
+    LONGLONG CurrentUsage = InterlockedAdd64(
+        &g_FbeState.Stats.CurrentBackupDiskUsage, BytesCopied.QuadPart);
 
-    LONGLONG CurrentUsage = g_FbeState.Stats.CurrentBackupDiskUsage;
     LONGLONG PeakUsage;
     do {
-        PeakUsage = g_FbeState.Stats.PeakBackupDiskUsage;
+        PeakUsage = InterlockedCompareExchange64(
+            &g_FbeState.Stats.PeakBackupDiskUsage, 0, 0);
         if (CurrentUsage <= PeakUsage) break;
     } while (InterlockedCompareExchange64(
         &g_FbeState.Stats.PeakBackupDiskUsage,
@@ -912,17 +916,17 @@ FbePreSetInfoBackup(
     }
 
     //
-    // Capacity check and eviction
+    // Capacity check and eviction (atomic loads to avoid torn reads)
     //
     if (FileSize.QuadPart > 0 &&
-        g_FbeState.Stats.CurrentBackupDiskUsage + FileSize.QuadPart >
-        g_FbeState.Config.MaxTotalBackupSize) {
+        InterlockedCompareExchange64(&g_FbeState.Stats.CurrentBackupDiskUsage, 0, 0) +
+            FileSize.QuadPart > g_FbeState.Config.MaxTotalBackupSize) {
         FbepEvictLruEntries(FileSize.QuadPart);
     }
 
-    if (g_FbeState.TotalEntryCount >= FBE_MAX_TOTAL_ENTRIES) {
+    if (InterlockedCompareExchange(&g_FbeState.TotalEntryCount, 0, 0) >= FBE_MAX_TOTAL_ENTRIES) {
         FbepEvictLruEntries(0);
-        if (g_FbeState.TotalEntryCount >= FBE_MAX_TOTAL_ENTRIES) {
+        if (InterlockedCompareExchange(&g_FbeState.TotalEntryCount, 0, 0) >= FBE_MAX_TOTAL_ENTRIES) {
             InterlockedIncrement64(&g_FbeState.Stats.BackupsFailed);
             FbepLeaveOperation();
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -1010,7 +1014,8 @@ FbePreSetInfoBackup(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    if ((ULONG)Tracker->EntryCount >= g_FbeState.Config.MaxEntriesPerProcess) {
+    if ((ULONG)InterlockedCompareExchange(&Tracker->EntryCount, 0, 0) >=
+        g_FbeState.Config.MaxEntriesPerProcess) {
         if (BytesCopied.QuadPart > 0) {
             FbepDeleteBackupFile(&Entry->BackupPath);
         }
@@ -1241,6 +1246,7 @@ FbeCommitProcess(
 {
     PFBE_PROCESS_TRACKER Tracker;
     LIST_ENTRY *ListEntry;
+    LIST_ENTRY *NextEntry;
     ULONG BucketIndex;
 
     PAGED_CODE();
@@ -1257,32 +1263,71 @@ FbeCommitProcess(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike/FBE] Committing (discarding) %ld backups for PID=%lu\n",
-               Tracker->EntryCount, HandleToULong(ProcessId));
+               InterlockedCompareExchange(&Tracker->EntryCount, 0, 0),
+               HandleToULong(ProcessId));
 
     //
-    // Remove all entries from this process
+    // Phase 1: Under tracker lock, claim every entry by CAS-ing State
+    // from Valid|Pending → RolledBack. Entries already CAS'd to Evicted by
+    // FbepEvictLruEntries are NOT touched — eviction owns their teardown
+    // and will release them under its own lock sequence.
     //
+    // Claimed entries are unlinked from the per-process list here so that
+    // a concurrent eviction visiting the same tracker (under tracker lock)
+    // will not RemoveEntryList them a second time.
+    //
+    LIST_ENTRY ClaimedHead;
+    InitializeListHead(&ClaimedHead);
+
     FltAcquirePushLockExclusive(&Tracker->Lock);
 
-    while (!IsListEmpty(&Tracker->BackupEntries)) {
-        ListEntry = RemoveHeadList(&Tracker->BackupEntries);
+    ListEntry = Tracker->BackupEntries.Flink;
+    while (ListEntry != &Tracker->BackupEntries) {
+        NextEntry = ListEntry->Flink;
         PFBE_BACKUP_ENTRY Entry = CONTAINING_RECORD(
             ListEntry, FBE_BACKUP_ENTRY, ProcessLink);
 
-        FltReleasePushLock(&Tracker->Lock);
+        LONG Prev = InterlockedCompareExchange(
+            &Entry->State, FbeEntryState_RolledBack, FbeEntryState_Valid);
+        //
+        // Pending entries are NOT claimed: an in-flight backup I/O owns
+        // them and will transition to Valid/Failed shortly. The next
+        // commit pass (or shutdown) will catch them. Claiming a Pending
+        // entry here would race with the initiator's still-running write.
+        //
 
+        if (Prev == FbeEntryState_Valid) {
+            RemoveEntryList(&Entry->ProcessLink);
+            InterlockedDecrement(&Tracker->EntryCount);
+            InsertTailList(&ClaimedHead, &Entry->ProcessLink);
+        }
         //
-        // Remove from hash bucket
+        // Else: state was Evicted/RolledBack/Failed — eviction or a prior
+        // commit/rollback owns this entry. Leave it linked; the owner will
+        // remove it from the process list under tracker lock.
         //
+
+        ListEntry = NextEntry;
+    }
+
+    FltReleasePushLock(&Tracker->Lock);
+
+    //
+    // Phase 2: Free claimed entries outside the tracker lock.
+    // Each claimed entry: remove from hash bucket, remove from LRU,
+    // delete backup file, free.
+    //
+    while (!IsListEmpty(&ClaimedHead)) {
+        ListEntry = RemoveHeadList(&ClaimedHead);
+        PFBE_BACKUP_ENTRY Entry = CONTAINING_RECORD(
+            ListEntry, FBE_BACKUP_ENTRY, ProcessLink);
+
         BucketIndex = FbepComputeBucketIndex(Entry->ProcessId, &Entry->OriginalPath);
         FltAcquirePushLockExclusive(&g_FbeState.Buckets[BucketIndex].Lock);
         RemoveEntryList(&Entry->HashLink);
         InterlockedDecrement(&g_FbeState.Buckets[BucketIndex].Count);
         FltReleasePushLock(&g_FbeState.Buckets[BucketIndex].Lock);
 
-        //
-        // Remove from LRU
-        //
         FltAcquirePushLockExclusive(&g_FbeState.LruLock);
         RemoveEntryList(&Entry->LruLink);
         FltReleasePushLock(&g_FbeState.LruLock);
@@ -1290,32 +1335,47 @@ FbeCommitProcess(
         InterlockedDecrement(&g_FbeState.TotalEntryCount);
 
         //
-        // Delete backup file and free entry
+        // BackupFileSize is only authoritative once state reached Valid;
+        // for entries claimed from Pending the file may or may not exist
+        // (CopyFileToBackup deletes its partial output on error). It is
+        // always safe to attempt deletion — DeleteBackupFile tolerates
+        // STATUS_OBJECT_NAME_NOT_FOUND.
         //
-        if (Entry->State == FbeEntryState_Valid) {
+        if (Entry->BackupFileSize.QuadPart > 0) {
             InterlockedAdd64(&g_FbeState.Stats.CurrentBackupDiskUsage,
                              -Entry->BackupFileSize.QuadPart);
-            FbepDeleteBackupFile(&Entry->BackupPath);
         }
+        FbepDeleteBackupFile(&Entry->BackupPath);
 
         FbepFreeEntry(Entry);
-
-        FltAcquirePushLockExclusive(&Tracker->Lock);
     }
 
-    Tracker->EntryCount = 0;
-    FltReleasePushLock(&Tracker->Lock);
-
     //
-    // Remove tracker from process bucket
+    // Remove tracker from process bucket only if it has no remaining
+    // (eviction-owned) entries. Otherwise leave the tracker so eviction
+    // can complete its teardown safely.
     //
-    ULONG ProcBucket = FbepProcessBucketIndex(ProcessId);
-    FltAcquirePushLockExclusive(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
-    RemoveEntryList(&Tracker->Link);
-    InterlockedDecrement(&g_FbeState.ProcessBuckets[ProcBucket].Count);
-    FltReleasePushLock(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
+    if (InterlockedCompareExchange(&Tracker->EntryCount, 0, 0) == 0) {
+        ULONG ProcBucket = FbepProcessBucketIndex(ProcessId);
+        FltAcquirePushLockExclusive(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
+        //
+        // Re-check under exclusive lock: an entry could have been created
+        // in the tiny window. EntryCount is authoritative under tracker lock,
+        // so re-acquire briefly for the final decision.
+        //
+        FltAcquirePushLockShared(&Tracker->Lock);
+        BOOLEAN Empty = IsListEmpty(&Tracker->BackupEntries);
+        FltReleasePushLock(&Tracker->Lock);
 
-    FbepFreeTracker(Tracker);
+        if (Empty) {
+            RemoveEntryList(&Tracker->Link);
+            InterlockedDecrement(&g_FbeState.ProcessBuckets[ProcBucket].Count);
+            FltReleasePushLock(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
+            FbepFreeTracker(Tracker);
+        } else {
+            FltReleasePushLock(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
+        }
+    }
 
     FbepLeaveOperation();
 }
@@ -1330,7 +1390,44 @@ FbeGetStatistics(
     _Out_ PFBE_STATISTICS Statistics
     )
 {
-    RtlCopyMemory(Statistics, &g_FbeState.Stats, sizeof(FBE_STATISTICS));
+    //
+    // Always zero output first so callers see a valid snapshot even
+    // if the engine is not running (post-shutdown / pre-init).
+    //
+    RtlZeroMemory(Statistics, sizeof(FBE_STATISTICS));
+
+    //
+    // Gate against shutdown UAF — without rundown protection a concurrent
+    // FbeShutdown could free trackers while we are reading global stats.
+    // The Stats sub-structure is part of g_FbeState which has static storage,
+    // so reads are safe even after shutdown, but this preserves the contract
+    // that public APIs always observe a consistent in-flight state.
+    //
+    if (!FbepEnterOperation()) {
+        return;
+    }
+
+    //
+    // Atomic per-field 64-bit reads to avoid torn values on x86 / cross-cache-line
+    // updates. RtlCopyMemory of the whole struct is NOT atomic for LONG64 fields.
+    //
+    Statistics->TotalBackupRequests        = InterlockedCompareExchange64(&g_FbeState.Stats.TotalBackupRequests, 0, 0);
+    Statistics->BackupsCreated             = InterlockedCompareExchange64(&g_FbeState.Stats.BackupsCreated, 0, 0);
+    Statistics->BackupsSkippedDuplicate    = InterlockedCompareExchange64(&g_FbeState.Stats.BackupsSkippedDuplicate, 0, 0);
+    Statistics->BackupsSkippedSize         = InterlockedCompareExchange64(&g_FbeState.Stats.BackupsSkippedSize, 0, 0);
+    Statistics->BackupsSkippedExtension    = InterlockedCompareExchange64(&g_FbeState.Stats.BackupsSkippedExtension, 0, 0);
+    Statistics->BackupsFailed              = InterlockedCompareExchange64(&g_FbeState.Stats.BackupsFailed, 0, 0);
+    Statistics->TotalBytesBackedUp         = InterlockedCompareExchange64(&g_FbeState.Stats.TotalBytesBackedUp, 0, 0);
+    Statistics->TotalBytesRolledBack       = InterlockedCompareExchange64(&g_FbeState.Stats.TotalBytesRolledBack, 0, 0);
+    Statistics->RollbackRequests           = InterlockedCompareExchange64(&g_FbeState.Stats.RollbackRequests, 0, 0);
+    Statistics->RollbacksSucceeded         = InterlockedCompareExchange64(&g_FbeState.Stats.RollbacksSucceeded, 0, 0);
+    Statistics->RollbacksFailed            = InterlockedCompareExchange64(&g_FbeState.Stats.RollbacksFailed, 0, 0);
+    Statistics->RollbackFilesRestored      = InterlockedCompareExchange64(&g_FbeState.Stats.RollbackFilesRestored, 0, 0);
+    Statistics->EntriesEvicted             = InterlockedCompareExchange64(&g_FbeState.Stats.EntriesEvicted, 0, 0);
+    Statistics->CurrentBackupDiskUsage     = InterlockedCompareExchange64(&g_FbeState.Stats.CurrentBackupDiskUsage, 0, 0);
+    Statistics->PeakBackupDiskUsage        = InterlockedCompareExchange64(&g_FbeState.Stats.PeakBackupDiskUsage, 0, 0);
+
+    FbepLeaveOperation();
 }
 
 
@@ -1343,13 +1440,22 @@ FbeHasBackups(
     ULONG ProcBucket = FbepProcessBucketIndex(ProcessId);
     BOOLEAN Found = FALSE;
 
+    //
+    // Gate against shutdown — without rundown protection a concurrent
+    // FbeShutdown could free trackers while we walk the bucket list.
+    //
+    if (!FbepEnterOperation()) {
+        return FALSE;
+    }
+
     FltAcquirePushLockShared(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
 
     LIST_ENTRY *ListEntry = g_FbeState.ProcessBuckets[ProcBucket].Head.Flink;
     while (ListEntry != &g_FbeState.ProcessBuckets[ProcBucket].Head) {
         PFBE_PROCESS_TRACKER Tracker = CONTAINING_RECORD(
             ListEntry, FBE_PROCESS_TRACKER, Link);
-        if (Tracker->ProcessId == ProcessId && Tracker->EntryCount > 0) {
+        if (Tracker->ProcessId == ProcessId &&
+            InterlockedCompareExchange(&Tracker->EntryCount, 0, 0) > 0) {
             Found = TRUE;
             break;
         }
@@ -1357,6 +1463,7 @@ FbeHasBackups(
     }
 
     FltReleasePushLock(&g_FbeState.ProcessBuckets[ProcBucket].Lock);
+    FbepLeaveOperation();
     return Found;
 }
 
@@ -1653,8 +1760,7 @@ FbepCopyFileToBackup(
         FILE_CREATE,                    // Fail if exists
         FILE_NON_DIRECTORY_FILE |
             FILE_WRITE_THROUGH |
-            FILE_SYNCHRONOUS_IO_NONALERT |
-            FILE_NO_INTERMEDIATE_BUFFERING,
+            FILE_SYNCHRONOUS_IO_NONALERT,
         NULL,
         0,
         IO_IGNORE_SHARE_ACCESS_CHECK
@@ -1681,8 +1787,7 @@ FbepCopyFileToBackup(
                     FILE_CREATE,
                     FILE_NON_DIRECTORY_FILE |
                         FILE_WRITE_THROUGH |
-                        FILE_SYNCHRONOUS_IO_NONALERT |
-                        FILE_NO_INTERMEDIATE_BUFFERING,
+                        FILE_SYNCHRONOUS_IO_NONALERT,
                     NULL,
                     0,
                     IO_IGNORE_SHARE_ACCESS_CHECK
@@ -1708,8 +1813,7 @@ FbepCopyFileToBackup(
                 FILE_SUPERSEDE,
                 FILE_NON_DIRECTORY_FILE |
                     FILE_WRITE_THROUGH |
-                    FILE_SYNCHRONOUS_IO_NONALERT |
-                    FILE_NO_INTERMEDIATE_BUFFERING,
+                    FILE_SYNCHRONOUS_IO_NONALERT,
                 NULL,
                 0,
                 IO_IGNORE_SHARE_ACCESS_CHECK
@@ -1723,33 +1827,30 @@ FbepCopyFileToBackup(
     }
 
     //
-    // Copy file content in chunks
+    // Copy file content in chunks. With FILE_WRITE_THROUGH (no
+    // intermediate buffering disabled) we can use natural sizes — no
+    // sector-alignment dance, no risk of disclosing uninitialized
+    // kernel pool to disk via padding.
     //
     Offset.QuadPart = 0;
 
     while (Offset.QuadPart < FileSize.QuadPart) {
 
         ULONG ReadSize = FBE_IO_BUFFER_SIZE;
-        if (FileSize.QuadPart - Offset.QuadPart < (LONGLONG)ReadSize) {
-            ReadSize = (ULONG)(FileSize.QuadPart - Offset.QuadPart);
+        LONGLONG Remaining = FileSize.QuadPart - Offset.QuadPart;
+        if (Remaining < (LONGLONG)ReadSize) {
+            ReadSize = (ULONG)Remaining;
         }
 
         //
-        // Align read size for non-buffered I/O
+        // Read from source using FltReadFile.
         //
-        ULONG AlignedReadSize = (ReadSize + 511) & ~511u;
-        if (AlignedReadSize > FBE_IO_BUFFER_SIZE) {
-            AlignedReadSize = FBE_IO_BUFFER_SIZE;
-        }
-
-        //
-        // Read from source using FltReadFile
-        //
+        BytesRead = 0;
         Status = FltReadFile(
             FltObjects->Instance,
             FltObjects->FileObject,
             &Offset,
-            AlignedReadSize,
+            ReadSize,
             CopyBuffer,
             FLTFL_IO_OPERATION_NON_CACHED |
                 FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET,
@@ -1774,15 +1875,23 @@ FbepCopyFileToBackup(
         }
 
         //
-        // Write to backup file
+        // Defense-in-depth: clamp BytesRead to ReadSize. A misbehaving
+        // lower filter could in theory inflate BytesRead beyond what
+        // we requested; we must never write more than the buffer holds.
         //
-        ULONG AlignedWriteSize = (BytesRead + 511) & ~511u;
+        if (BytesRead > ReadSize) {
+            BytesRead = ReadSize;
+        }
 
+        //
+        // Write to backup file. Write exactly BytesRead — no padding,
+        // no kernel-pool disclosure to disk.
+        //
         Status = FltWriteFile(
             FltObjects->Instance,
             BackupFileObject,
             &Offset,
-            AlignedWriteSize,
+            BytesRead,
             CopyBuffer,
             FLTFL_IO_OPERATION_NON_CACHED |
                 FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET,
@@ -1798,11 +1907,6 @@ FbepCopyFileToBackup(
         Offset.QuadPart += BytesRead;
     }
 
-    //
-    // Report actual file bytes backed up, not aligned I/O offset.
-    // Non-buffered writes pad to sector boundary; Offset may exceed FileSize.
-    // Using FileSize ensures CurrentBackupDiskUsage is accurate.
-    //
     BytesCopied->QuadPart = min(Offset.QuadPart, FileSize.QuadPart);
     Status = STATUS_SUCCESS;
 
@@ -2312,49 +2416,72 @@ FbepEvictLruEntries(
 
     PAGED_CODE();
 
-    FltAcquirePushLockExclusive(&g_FbeState.LruLock);
-
-    while (!IsListEmpty(&g_FbeState.LruHead) && Evicted < MaxEvict) {
+    while (Evicted < MaxEvict) {
 
         //
-        // Check if we've freed enough space.
-        // Re-checked EVERY iteration (including after lock reacquire) to
-        // prevent over-eviction when concurrent inserts/commits change counts.
+        // Re-check capacity at every iteration (atomic loads).
         //
+        LONGLONG Usage = InterlockedCompareExchange64(
+            &g_FbeState.Stats.CurrentBackupDiskUsage, 0, 0);
+        LONG TotalCount = InterlockedCompareExchange(
+            &g_FbeState.TotalEntryCount, 0, 0);
+
         if (BytesNeeded > 0 &&
-            g_FbeState.Stats.CurrentBackupDiskUsage + BytesNeeded <=
-            g_FbeState.Config.MaxTotalBackupSize &&
-            g_FbeState.TotalEntryCount < FBE_MAX_TOTAL_ENTRIES) {
+            Usage + BytesNeeded <= g_FbeState.Config.MaxTotalBackupSize &&
+            TotalCount < FBE_MAX_TOTAL_ENTRIES) {
+            break;
+        }
+        if (BytesNeeded == 0 && TotalCount < FBE_MAX_TOTAL_ENTRIES) {
             break;
         }
 
-        if (BytesNeeded == 0 && g_FbeState.TotalEntryCount < FBE_MAX_TOTAL_ENTRIES) {
-            break;
+        //
+        // Phase 1: under LRU lock, locate the oldest entry and CAS-claim it
+        // (Valid|Pending → Evicted). If a claim succeeds we own teardown.
+        // Skip entries already claimed by commit (RolledBack) or another evictor.
+        //
+        Entry = NULL;
+
+        FltAcquirePushLockExclusive(&g_FbeState.LruLock);
+
+        ListEntry = g_FbeState.LruHead.Flink;
+        while (ListEntry != &g_FbeState.LruHead) {
+            PFBE_BACKUP_ENTRY Candidate = CONTAINING_RECORD(
+                ListEntry, FBE_BACKUP_ENTRY, LruLink);
+
+            //
+            // Only claim Valid entries. Pending entries are mid-flight
+            // (CopyFileToBackup running) and owned by their initiator —
+            // attempting to evict them races with active I/O and risks
+            // freeing memory another thread is writing into.
+            //
+            LONG Prev = InterlockedCompareExchange(
+                &Candidate->State, FbeEntryState_Evicted, FbeEntryState_Valid);
+
+            if (Prev == FbeEntryState_Valid) {
+                //
+                // Claim succeeded — unlink from LRU under the lock so no
+                // other thread observes us in the LRU list anymore.
+                //
+                RemoveEntryList(&Candidate->LruLink);
+                Entry = Candidate;
+                break;
+            }
+
+            ListEntry = ListEntry->Flink;
         }
 
-        ListEntry = RemoveHeadList(&g_FbeState.LruHead);
-        Entry = CONTAINING_RECORD(ListEntry, FBE_BACKUP_ENTRY, LruLink);
-
-        //
-        // Mark as evicted under LRU lock to prevent concurrent rollback
-        // from claiming this entry via CAS on State.
-        //
-        // FSC-6: Lock ordering note â€” we release LruLock before acquiring
-        // BucketLock/TrackerLock, which is the opposite of the insert path.
-        // This is safe because:
-        // 1. State=Evicted prevents concurrent rollback (CAS check)
-        // 2. Hash lookup finds entry but State=Evicted causes skip
-        // 3. EntryCount decrement is eventually consistent
-        //
-        LONG PrevState = InterlockedExchange(&Entry->State, FbeEntryState_Evicted);
-
-        //
-        // Release LRU lock during I/O (file delete may block)
-        //
         FltReleasePushLock(&g_FbeState.LruLock);
 
+        if (Entry == NULL) {
+            //
+            // Nothing claimable — bail (avoids a busy-wait loop with no progress).
+            //
+            break;
+        }
+
         //
-        // Remove from hash bucket
+        // Phase 2: remove from hash bucket and per-process tracker.
         //
         ULONG BucketIndex = FbepComputeBucketIndex(Entry->ProcessId, &Entry->OriginalPath);
         FltAcquirePushLockExclusive(&g_FbeState.Buckets[BucketIndex].Lock);
@@ -2362,9 +2489,6 @@ FbepEvictLruEntries(
         InterlockedDecrement(&g_FbeState.Buckets[BucketIndex].Count);
         FltReleasePushLock(&g_FbeState.Buckets[BucketIndex].Lock);
 
-        //
-        // Remove from process tracker
-        //
         PFBE_PROCESS_TRACKER Tracker = FbepFindTracker(Entry->ProcessId);
         if (Tracker != NULL) {
             FltAcquirePushLockExclusive(&Tracker->Lock);
@@ -2376,27 +2500,20 @@ FbepEvictLruEntries(
         InterlockedDecrement(&g_FbeState.TotalEntryCount);
 
         //
-        // Delete backup file and update accounting
+        // Delete backup file and update accounting.
+        // BackupFileSize is non-zero only after CopyFileToBackup completed.
         //
-        if (PrevState == FbeEntryState_Valid) {
+        if (Entry->BackupFileSize.QuadPart > 0) {
             InterlockedAdd64(&g_FbeState.Stats.CurrentBackupDiskUsage,
                              -Entry->BackupFileSize.QuadPart);
-            FbepDeleteBackupFile(&Entry->BackupPath);
         }
+        FbepDeleteBackupFile(&Entry->BackupPath);
 
         InterlockedIncrement64(&g_FbeState.Stats.EntriesEvicted);
 
         FbepFreeEntry(Entry);
         Evicted++;
-
-        //
-        // Re-acquire LRU lock for next iteration.
-        // Capacity is re-checked at loop top to prevent over-eviction.
-        //
-        FltAcquirePushLockExclusive(&g_FbeState.LruLock);
     }
-
-    FltReleasePushLock(&g_FbeState.LruLock);
 
     if (Evicted > 0) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
@@ -2409,11 +2526,15 @@ FbepEvictLruEntries(
 // PRIVATE â€” LIFECYCLE HELPERS
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
 FbepEnterOperation(VOID)
 {
-    if (g_FbeState.State != 2) {
+    //
+    // Atomic load — State is volatile LONG written by Init/Shutdown CAS.
+    // Without this, a stale read could let an operation slip past shutdown.
+    //
+    if (InterlockedCompareExchange(&g_FbeState.State, 0, 0) != 2) {
         return FALSE;
     }
 
@@ -2421,7 +2542,7 @@ FbepEnterOperation(VOID)
 }
 
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 FbepLeaveOperation(VOID)
 {
