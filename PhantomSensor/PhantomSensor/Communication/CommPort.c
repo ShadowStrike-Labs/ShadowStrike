@@ -490,8 +490,39 @@ ShadowStrikeCreateCommunicationPort(
     // Initialize client port reference array
     //
     RtlZeroMemory(g_ClientPortRefs, sizeof(g_ClientPortRefs));
+    RtlZeroMemory(g_ClientSessionEncKeys, sizeof(g_ClientSessionEncKeys));
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
         g_ClientPortRefs[i].SlotIndex = i;
+    }
+
+    //
+    // Generate per-boot HMAC transport key BEFORE creating the port.
+    //
+    // SECURITY: FltCreateCommunicationPort publishes the port atomically;
+    // a connecting client could fire ConnectNotify (and produce its first
+    // send) before we finished generating the key — that would leave the
+    // initial messages without HMAC authentication.  Generating the key
+    // before port publication closes that window. Non-fatal on RNG failure
+    // (HMAC is then gracefully skipped, matching the documented contract).
+    //
+    {
+        NTSTATUS keyStatus = BCryptGenRandom(
+            NULL,
+            g_CommHmacKey,
+            SHADOWSTRIKE_HMAC_KEY_SIZE,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        );
+        if (NT_SUCCESS(keyStatus)) {
+            g_CommHmacKeyReady = TRUE;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "[ShadowStrike] HMAC transport key generated\n");
+        } else {
+            g_CommHmacKeyReady = FALSE;
+            RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] HMAC key generation failed (0x%08X) — "
+                       "transport HMAC will be skipped\n", keyStatus);
+        }
     }
 
     //
@@ -546,24 +577,6 @@ ShadowStrikeCreateCommunicationPort(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Communication port created successfully\n");
 
-    //
-    // Generate per-boot HMAC key for transport message authentication.
-    // Uses system CSPRNG; non-fatal if unavailable (HMAC is gracefully skipped).
-    //
-    {
-        NTSTATUS keyStatus = BCryptGenRandom(
-            NULL,
-            g_CommHmacKey,
-            SHADOWSTRIKE_HMAC_KEY_SIZE,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG
-        );
-        if (NT_SUCCESS(keyStatus)) {
-            g_CommHmacKeyReady = TRUE;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                       "[ShadowStrike] HMAC transport key generated\n");
-        }
-    }
-
     return STATUS_SUCCESS;
 }
 
@@ -575,6 +588,7 @@ ShadowStrikeCloseCommunicationPort(
     LONG i;
     LONG waitCount;
     LARGE_INTEGER waitInterval;
+    BOOLEAN markedForFinalize[SHADOWSTRIKE_MAX_CONNECTIONS] = {0};
 
     PAGED_CODE();
 
@@ -582,17 +596,25 @@ ShadowStrikeCloseCommunicationPort(
                "[ShadowStrike] Closing communication port\n");
 
     //
-    // Mark all clients as disconnecting and wait for references to drain
+    // PASS 1: Atomically transition each live slot to "disconnecting".
+    //
+    // We track which slots WE marked (Disconnecting transitioned 0->1) so we
+    // alone are responsible for releasing the baseline reference held since
+    // ConnectNotify.  Slots already marked by a prior DisconnectNotify path
+    // are owned by that path and must not be double-decremented.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
 
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        if (g_ClientPortRefs[i].ClientPort != NULL) {
+        if (g_ClientPortRefs[i].ClientPort == NULL) {
+            continue;
+        }
+        if (InterlockedExchange(&g_ClientPortRefs[i].Disconnecting, 1) == 0) {
             //
-            // Mark as disconnecting - no new references can be acquired
+            // Transitioned 0 -> 1; we own the baseline reference drop.
             //
-            InterlockedExchange(&g_ClientPortRefs[i].Disconnecting, 1);
+            markedForFinalize[i] = TRUE;
         }
     }
 
@@ -600,59 +622,62 @@ ShadowStrikeCloseCommunicationPort(
     KeLeaveCriticalRegion();
 
     //
-    // Wait for all outstanding references to drain (with timeout)
+    // PASS 2: Drop the baseline reference for every slot we marked.  The
+    // last reference releaser (could be us, could be an in-flight sender)
+    // will call ShadowStrikeFinalizeClientDisconnect, which closes the
+    // client port handle and scrubs session key material.  This restores
+    // proper cleanup semantics — previously the baseline reference was
+    // never dropped at shutdown, leaking every connected client port plus
+    // its session key for the lifetime of the OS load.
+    //
+    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+        if (!markedForFinalize[i]) {
+            continue;
+        }
+        if (InterlockedDecrement(&g_ClientPortRefs[i].ReferenceCount) == 0) {
+            ShadowStrikeFinalizeClientDisconnect(i);
+        }
+    }
+
+    //
+    // PASS 3: Wait for any slots whose references are still held by
+    // in-flight senders to drain naturally.  Once their last sender
+    // releases, finalize will run and clean the slot.
     //
     waitInterval.QuadPart = -10000LL * 100;  // 100ms intervals
-    waitCount = 0;
 
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        waitCount = 0;  // Reset per slot to give each client full drain window
-        while (g_ClientPortRefs[i].ReferenceCount > 0 && waitCount < 50) {
+        if (g_ClientPortRefs[i].ClientPort == NULL) {
+            continue;
+        }
+        waitCount = 0;
+        while (g_ClientPortRefs[i].ClientPort != NULL && waitCount < 50) {
             KeDelayExecutionThread(KernelMode, FALSE, &waitInterval);
             waitCount++;
         }
 
-        if (g_ClientPortRefs[i].ReferenceCount > 0) {
+        if (g_ClientPortRefs[i].ClientPort != NULL) {
+            //
+            // Drain timed out — an in-flight sender is stuck holding a
+            // reference (e.g., FltSendMessage waiting on user-mode reply).
+            // Leak the slot rather than UAF: the port handle and key
+            // material will be reclaimed by the OS at full driver unload.
+            //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] CRITICAL: Client slot %ld still has %ld references at shutdown — "
+                       "[ShadowStrike] CRITICAL: Client slot %ld still has %ld refs after drain timeout — "
                        "leaking port to avoid use-after-free BSOD\n",
                        i, g_ClientPortRefs[i].ReferenceCount);
         }
     }
 
     //
-    // Now close all client ports under lock — only slots with zero refs
+    // ConnectedClients is decremented inside ShadowStrikeFinalizeClientDisconnect
+    // for every successfully closed slot.  Force the global counter to zero
+    // so observers cannot see stale "connected" state for any leaked slot.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
-
-    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        if (g_ClientPortRefs[i].ClientPort != NULL) {
-            if (g_ClientPortRefs[i].ReferenceCount > 0) {
-                //
-                // Skip slots with outstanding references to avoid BSOD.
-                // The port handle and key material will be cleaned up
-                // when the driver unloads (OS reclaims all allocations).
-                //
-                continue;
-            }
-            if (g_ClientSessionEncKeys[i] != NULL) {
-                ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[i]);
-            }
-
-            RtlSecureZeroMemory(g_ClientPortRefs[i].SessionKey,
-                                sizeof(g_ClientPortRefs[i].SessionKey));
-            FltCloseClientPort(
-                g_DriverData.FilterHandle,
-                &g_ClientPortRefs[i].ClientPort
-            );
-            RtlZeroMemory(&g_ClientPortRefs[i], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
-            g_ClientPortRefs[i].SlotIndex = i;
-        }
-    }
-
     g_DriverData.ConnectedClients = 0;
-
     ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
     KeLeaveCriticalRegion();
 
@@ -985,8 +1010,18 @@ ShadowStrikeConnectNotify(
 
     //
     // Derive per-session encryption key using HKDF.
-    // IKM = client image hash (verified above), Salt = random,
-    // Info = "ShadowStrike-KEX-v1" to domain-separate.
+    //
+    // IKM is the concatenation of:
+    //   - the verified client image hash (binds key to authenticated identity)
+    //   - the per-boot kernel HMAC secret  (binds key to this kernel session,
+    //                                       defeats any attacker who only knows
+    //                                       the deterministic image hash and
+    //                                       the wire salt)
+    //
+    // Salt = random per session, Info = "ShadowStrike-KEX-v1" for domain
+    // separation.  If the per-boot secret is unavailable (RNG failure during
+    // port creation), we fall back to image-hash-only IKM rather than refuse
+    // service, but degraded operation is logged.
     //
     {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
@@ -997,12 +1032,21 @@ ShadowStrikeConnectNotify(
         // Generate random salt for HKDF and nonce prefix for this session
         //
         UCHAR hkdfSalt[32];
+        UCHAR ikm[sizeof(imageHash) + SHADOWSTRIKE_HMAC_KEY_SIZE];
+        ULONG ikmLength = sizeof(imageHash);
         NTSTATUS keyStatus = BCryptGenRandom(
             NULL,
             g_ClientPortRefs[slotIndex].SessionNoncePrefix,
             sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG
         );
+
+        RtlCopyMemory(ikm, imageHash, sizeof(imageHash));
+        if (g_CommHmacKeyReady) {
+            RtlCopyMemory(ikm + sizeof(imageHash), g_CommHmacKey,
+                          SHADOWSTRIKE_HMAC_KEY_SIZE);
+            ikmLength = sizeof(imageHash) + SHADOWSTRIKE_HMAC_KEY_SIZE;
+        }
 
         if (NT_SUCCESS(keyStatus)) {
             keyStatus = BCryptGenRandom(
@@ -1014,7 +1058,7 @@ ShadowStrikeConnectNotify(
                 static const char hkdfInfo[] = "ShadowStrike-KEX-v1";
                 keyStatus = EncHkdfDerive(
                     hmacHandle,
-                    imageHash, sizeof(imageHash),   // IKM = verified image hash
+                    ikm, ikmLength,                 // IKM = imageHash || perBootSecret
                     hkdfSalt, sizeof(hkdfSalt),     // Salt = random
                     (PVOID)hkdfInfo, sizeof(hkdfInfo) - 1,
                     g_ClientPortRefs[slotIndex].SessionKey,
@@ -1088,14 +1132,17 @@ ShadowStrikeConnectNotify(
             kexMsg.ProtocolFlags = SHADOWSTRIKE_KEX_PROTOCOL_FLAG_MANDATORY_ENCRYPTION;
 
             //
-            // Derive KWK (Key-Wrapping-Key) from imageHash + salt.
-            // User-mode will derive the same KWK to unwrap the session key.
+            // Derive KWK (Key-Wrapping-Key) from the same dual-component IKM
+            // (imageHash || perBootSecret) used for the session key, so that
+            // a user-mode peer who can authenticate (image hash) and shares
+            // the per-boot secret out-of-band cannot be substituted by an
+            // attacker who only knows the deterministic image hash.
             //
             UCHAR kwk[32] = {0};
             static const char kwkInfo[] = "ShadowStrike-KWK-v1";
             NTSTATUS kwkStatus = EncHkdfDerive(
                 hmacHandle,
-                imageHash, sizeof(imageHash),
+                ikm, ikmLength,
                 hkdfSalt, sizeof(hkdfSalt),
                 (PVOID)kwkInfo, sizeof(kwkInfo) - 1,
                 kwk, sizeof(kwk)
@@ -1149,7 +1196,14 @@ ShadowStrikeConnectNotify(
                     }
 
                     RtlSecureZeroMemory(wrappedOutput, sizeof(wrappedOutput));
-                    EncKeyRelease(wrapKey);
+                    //
+                    // EncKeyRelease decrements refs but does NOT auto-destroy
+                    // when the count hits zero — the contract (see Encryption.h
+                    // and ShadowStrikeReleaseSessionCryptoKey) requires the
+                    // caller to invoke EncDestroyKey on the final release.
+                    // Use the helper which encapsulates that contract.
+                    //
+                    ShadowStrikeReleaseSessionCryptoKey(&wrapKey);
                 } else {
                     kwkStatus = NT_SUCCESS(wrapKeyStatus) ? STATUS_ENCRYPTION_FAILED
                                                           : wrapKeyStatus;
@@ -1166,6 +1220,7 @@ ShadowStrikeConnectNotify(
             if (!NT_SUCCESS(keyStatus)) {
                 RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
                 RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+                RtlSecureZeroMemory(ikm, sizeof(ikm));
                 if (g_ClientSessionEncKeys[slotIndex] != NULL) {
                     ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
                 }
@@ -1200,6 +1255,7 @@ ShadowStrikeConnectNotify(
             if (!NT_SUCCESS(kexSendStatus)) {
                 RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
                 RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+                RtlSecureZeroMemory(ikm, sizeof(ikm));
                 if (g_ClientSessionEncKeys[slotIndex] != NULL) {
                     ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
                 }
@@ -1241,12 +1297,14 @@ ShadowStrikeConnectNotify(
             RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
             g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
             RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+            RtlSecureZeroMemory(ikm, sizeof(ikm));
 
             ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
             KeLeaveCriticalRegion();
             return STATUS_ENCRYPTION_FAILED;
         }
         RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
+        RtlSecureZeroMemory(ikm, sizeof(ikm));
     }
 
     //
@@ -1688,8 +1746,10 @@ ShadowStrikeMessageNotify(
                 clientPortContext.ClientPort = clientRef->ClientPort;
                 clientPortContext.ClientProcessId = clientRef->ClientProcessId;
                 clientPortContext.ConnectedTime = clientRef->ConnectedTime;
-                clientPortContext.MessagesSent = clientRef->MessagesSent;
-                clientPortContext.RepliesReceived = clientRef->RepliesReceived;
+                clientPortContext.MessagesSent =
+                    (UINT64)InterlockedOr64((volatile LONG64*)&clientRef->MessagesSent, 0);
+                clientPortContext.RepliesReceived =
+                    (UINT64)InterlockedOr64((volatile LONG64*)&clientRef->RepliesReceived, 0);
                 clientPortContext.IsPrimaryScanner = clientRef->IsPrimaryScanner;
 
                 status = ShadowStrikeProcessUserMessage(
@@ -2655,14 +2715,24 @@ ShadowStrikeSendNotification(
                        "enqueue may be dropped. Consider client reconnect.\n",
                        MqGetQueueDepth());
         }
-        MqEnqueueMessage(
-            (SHADOWSTRIKE_MESSAGE_TYPE)Notification->MessageType,
-            sendBuffer,
-            sendSize,
-            MessagePriority_Normal,
-            MQ_MSG_FLAG_NOTIFY_ONLY,
-            NULL
-        );
+        {
+            NTSTATUS mqStatus = MqEnqueueMessage(
+                (SHADOWSTRIKE_MESSAGE_TYPE)Notification->MessageType,
+                sendBuffer,
+                sendSize,
+                MessagePriority_Normal,
+                MQ_MSG_FLAG_NOTIFY_ONLY,
+                NULL
+            );
+            if (!NT_SUCCESS(mqStatus)) {
+                SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/CommPort] MqEnqueueMessage dropped notification "
+                           "(type=%u, size=%lu, status=0x%08X, depth=%u)\n",
+                           (unsigned)Notification->MessageType,
+                           (unsigned long)sendSize, mqStatus, MqGetQueueDepth());
+            }
+        }
 
         if (usedCompression) {
             ExFreePoolWithTag(sendBuffer, 'cmCP');
@@ -2876,14 +2946,23 @@ ShadowStrikeSendProcessNotification(
                 RtlCopyMemory(
                     (PUCHAR)mqHeader + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
                     Notification, Size);
-                MqEnqueueMessage(
-                    ShadowStrikeMessageProcessNotify,
-                    mqHeader,
-                    mqSize,
-                    MessagePriority_Normal,
-                    MQ_MSG_FLAG_NOTIFY_ONLY,
-                    NULL
-                );
+                {
+                    NTSTATUS mqStatus = MqEnqueueMessage(
+                        ShadowStrikeMessageProcessNotify,
+                        mqHeader,
+                        mqSize,
+                        MessagePriority_Normal,
+                        MQ_MSG_FLAG_NOTIFY_ONLY,
+                        NULL
+                    );
+                    if (!NT_SUCCESS(mqStatus)) {
+                        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                   "[ShadowStrike/CommPort] MqEnqueueMessage dropped process notify "
+                                   "(size=%lu, status=0x%08X, depth=%u)\n",
+                                   (unsigned long)mqSize, mqStatus, MqGetQueueDepth());
+                    }
+                }
                 ExFreePoolWithTag(mqHeader, 'mqCP');
             }
         }
