@@ -782,6 +782,30 @@ MmpCleanupPartialLoad(
     _In_ PMM_MAPPER Mapper
     );
 
+//
+// ============================================================================
+// PRIVATE — RUNDOWN GATE
+// ============================================================================
+//
+// Every public API path that dereferences fields on PMM_MAPPER beyond the
+// initial NULL check must be wrapped with MmpTryReferenceMapper /
+// MmpDereferenceMapper to guarantee MmShutdown does not free the mapper while
+// a concurrent caller is mid-flight.  MmInitialize seeds RefCount = 1 so the
+// mapper is "live" until MmShutdown drops that initial reference.
+//
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+MmpTryReferenceMapper(
+    _In_opt_ PMM_MAPPER Mapper
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+MmpDereferenceMapper(
+    _In_ PMM_MAPPER Mapper
+    );
+
 // ============================================================================
 // PUBLIC API - INITIALIZATION
 // ============================================================================
@@ -842,6 +866,15 @@ MmInitialize(
     KeInitializeSpinLock(&mapper->DetectionLock);
 
     //
+    // Initialize rundown gate.  RefZeroEvent is a NotificationEvent so the
+    // signal latches; once raised, every subsequent KeWaitForSingleObject
+    // returns immediately, which is the correct semantics for shutdown drain.
+    //
+    KeInitializeEvent(&mapper->RefZeroEvent, NotificationEvent, FALSE);
+    mapper->RefCount = 1;
+    mapper->ShuttingDown = FALSE;
+
+    //
     // Allocate hash table
     //
     status = MmpAllocateHashTable(mapper);
@@ -855,8 +888,8 @@ MmInitialize(
     //
     KeQuerySystemTime(&mapper->Stats.StartTime);
 
-    mapper->Initialized = TRUE;
-    mapper->TechniquesLoaded = FALSE;
+    InterlockedExchange8((volatile CHAR*)&mapper->TechniquesLoaded, (CHAR)FALSE);
+    InterlockedExchange8((volatile CHAR*)&mapper->Initialized, (CHAR)TRUE);
     *Mapper = mapper;
 
     return STATUS_SUCCESS;
@@ -887,19 +920,75 @@ MmShutdown(
     PMM_DETECTION detection;
     KIRQL oldIrql;
 
+    PAGED_CODE();
+
     if (Mapper == NULL) {
         return;
     }
 
+    //
+    // Idempotency: if MmInitialize never finished or MmShutdown already ran
+    // once, bail without touching state.  Initialized is volatile and read
+    // here at PASSIVE_LEVEL only.
+    //
     if (!Mapper->Initialized) {
         return;
     }
 
     //
-    // Mark as not initialized atomically to prevent new operations
+    // Atomically signal shutdown FIRST so every public API that observes
+    // this flag refuses entry.  Order matters: this MUST happen before we
+    // drop our initial reference, otherwise late callers could observe
+    // RefCount==0 in MmpTryReferenceMapper and refuse for the wrong reason
+    // (which is also safe but masks logic bugs in development).
     //
-    InterlockedExchange8((volatile CHAR*)&Mapper->Initialized, FALSE);
-    InterlockedExchange8((volatile CHAR*)&Mapper->TechniquesLoaded, FALSE);
+    InterlockedExchange8((volatile CHAR*)&Mapper->ShuttingDown, (CHAR)TRUE);
+    InterlockedExchange8((volatile CHAR*)&Mapper->Initialized, (CHAR)FALSE);
+    InterlockedExchange8((volatile CHAR*)&Mapper->TechniquesLoaded, (CHAR)FALSE);
+
+    //
+    // Drop the initial reference owned by MmInitialize.  In-flight public
+    // API callers that incremented past us will hold the count above zero
+    // until they finish; once the last one releases, RefZeroEvent is
+    // signalled.
+    //
+    MmpDereferenceMapper(Mapper);
+
+    //
+    // Wait for all in-flight public API callers to drain.  Bounded at 30s
+    // followed by an indefinite fallback: a stuck caller is logged but
+    // never bypassed, because freeing the mapper out from under a live
+    // caller is a kernel UAF that crashes every endpoint.
+    //
+    {
+        LARGE_INTEGER drainTimeout;
+        NTSTATUS waitStatus;
+
+        drainTimeout.QuadPart = -((LONGLONG)30 * 10 * 1000 * 1000); // 30 seconds
+        waitStatus = KeWaitForSingleObject(
+            &Mapper->RefZeroEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &drainTimeout
+        );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            LONG outstanding = InterlockedCompareExchange(&Mapper->RefCount, 0, 0);
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] MITREMapper: Drain wait timed out at 30s "
+                       "with %ld outstanding reference(s); falling back to "
+                       "indefinite wait to prevent mapper UAF\n",
+                       outstanding);
+            KeWaitForSingleObject(
+                &Mapper->RefZeroEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
+    }
 
     //
     // Initialize temporary collection lists
@@ -945,15 +1034,17 @@ MmShutdown(
     KeReleaseSpinLock(&Mapper->DetectionLock, oldIrql);
 
     //
-    // Now free everything outside of locks
-    // Free techniques first (they may hold tactic references conceptually,
-    // though we use weak refs so order doesn't matter for correctness)
+    // Free everything outside of locks.  Techniques are freed before tactics
+    // so any (logically weak) tactic pointer in a technique stays valid for
+    // the duration of MmpFreeTechnique, which only walks the technique's
+    // own indicator list.
     //
     while (!IsListEmpty(&tempTechniques)) {
         listEntry = RemoveHeadList(&tempTechniques);
         technique = CONTAINING_RECORD(listEntry, MM_TECHNIQUE, ListEntry);
         //
-        // Force release - we're shutting down
+        // Force release - we're shutting down and the rundown gate has
+        // guaranteed no in-flight caller still holds a reference.
         //
         technique->RefCount = 0;
         MmpFreeTechnique(technique);
@@ -970,13 +1061,16 @@ MmShutdown(
     }
 
     //
-    // Free detections
+    // Free detections.  Use MmReleaseDetection (rather than forcing
+    // RefCount=0) so that any external holder that legitimately referenced
+    // a detection via MmGetRecentDetections before shutdown can release
+    // it cleanly without double-free or assert.  External holders MUST
+    // release before MmShutdown returns (this is the published contract).
     //
     while (!IsListEmpty(&tempDetections)) {
         listEntry = RemoveHeadList(&tempDetections);
         detection = CONTAINING_RECORD(listEntry, MM_DETECTION, ListEntry);
-        detection->RefCount = 0;
-        MmpFreeDetection(detection);
+        MmReleaseDetection(detection);
     }
 
     //
@@ -988,6 +1082,83 @@ MmShutdown(
     // Free mapper structure
     //
     ExFreePoolWithTag(Mapper, MM_POOL_TAG_MAPPER);
+}
+
+// ============================================================================
+// PRIVATE - RUNDOWN GATE IMPLEMENTATION
+// ============================================================================
+
+/**
+ * @brief Try to acquire a reference on the mapper.
+ *
+ * Returns FALSE if shutdown has begun OR the reference count has already
+ * dropped to 0.  Re-checks ShuttingDown after the increment to defeat the
+ * gate-then-increment race against MmShutdown.
+ *
+ * Every public API must call this and pair it with MmpDereferenceMapper
+ * on every exit path.
+ *
+ * @irql <= DISPATCH_LEVEL (uses interlocked operations only).
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+MmpTryReferenceMapper(
+    _In_opt_ PMM_MAPPER Mapper
+    )
+{
+    LONG oldCount;
+    LONG newCount;
+
+    if (Mapper == NULL) {
+        return FALSE;
+    }
+
+    if (Mapper->ShuttingDown) {
+        return FALSE;
+    }
+
+    do {
+        oldCount = InterlockedCompareExchange(&Mapper->RefCount, 0, 0);
+        if (oldCount <= 0) {
+            return FALSE;
+        }
+        newCount = oldCount + 1;
+    } while (InterlockedCompareExchange(&Mapper->RefCount, newCount, oldCount) != oldCount);
+
+    //
+    // Re-check shutdown after the increment.  If MmShutdown set ShuttingDown
+    // between our first check and the increment, release the reference and
+    // refuse so the drain wait observes our departure.
+    //
+    if (Mapper->ShuttingDown) {
+        if (InterlockedDecrement(&Mapper->RefCount) == 0) {
+            KeSetEvent(&Mapper->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/**
+ * @brief Release a reference acquired via MmpTryReferenceMapper.
+ *
+ * Signals RefZeroEvent when the count reaches zero so MmShutdown can free
+ * the mapper safely.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+MmpDereferenceMapper(
+    _In_ PMM_MAPPER Mapper
+    )
+{
+    if (Mapper == NULL) {
+        return;
+    }
+
+    if (InterlockedDecrement(&Mapper->RefCount) == 0) {
+        KeSetEvent(&Mapper->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+    }
 }
 
 // ============================================================================
@@ -1023,12 +1194,18 @@ MmLoadTechniques(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!Mapper->Initialized) {
+    if (!MmpTryReferenceMapper(Mapper)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (!Mapper->Initialized) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto Done;
+    }
+
     if (Mapper->TechniquesLoaded) {
-        return STATUS_ALREADY_COMPLETE;
+        status = STATUS_ALREADY_COMPLETE;
+        goto Done;
     }
 
     KeEnterCriticalRegion();
@@ -1093,7 +1270,7 @@ MmLoadTechniques(
         InterlockedIncrement64(&Mapper->Stats.TechniquesLoaded);
     }
 
-    Mapper->TechniquesLoaded = TRUE;
+    InterlockedExchange8((volatile CHAR*)&Mapper->TechniquesLoaded, (CHAR)TRUE);
 
 Cleanup:
     if (!NT_SUCCESS(status)) {
@@ -1106,6 +1283,8 @@ Cleanup:
     ExReleasePushLockExclusive(&Mapper->TechniqueLock);
     KeLeaveCriticalRegion();
 
+Done:
+    MmpDereferenceMapper(Mapper);
     return status;
 }
 
@@ -1145,7 +1324,12 @@ MmLookupTechnique(
 
     *Technique = NULL;
 
+    if (!MmpTryReferenceMapper(Mapper)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (!Mapper->Initialized || !Mapper->TechniquesLoaded) {
+        MmpDereferenceMapper(Mapper);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1169,6 +1353,8 @@ MmLookupTechnique(
 
     ExReleasePushLockShared(&Mapper->TechniqueLock);
     KeLeaveCriticalRegion();
+
+    MmpDereferenceMapper(Mapper);
 
     if (found == NULL) {
         return STATUS_NOT_FOUND;
@@ -1203,6 +1389,8 @@ MmLookupByName(
     PLIST_ENTRY listEntry;
     PMM_TECHNIQUE technique;
     PMM_TECHNIQUE found = NULL;
+    SIZE_T nameLength = 0;
+    NTSTATUS lengthStatus;
 
     PAGED_CODE();
 
@@ -1212,15 +1400,26 @@ MmLookupByName(
 
     *Technique = NULL;
 
-    if (!Mapper->Initialized || !Mapper->TechniquesLoaded) {
+    //
+    // Bound the input string length defensively before any internal use.
+    // RtlInitAnsiString -> strlen would otherwise walk an attacker-supplied
+    // non-terminated buffer to OOB.  The longest match candidate is the
+    // technique Name field (MM_TECHNIQUE_DEF::Name -> 128 chars), so any
+    // string longer than that cannot match anyway; cap at 256 for slack and
+    // future-proofing.  RtlStringCbLengthA is the kernel-safe bounded scan.
+    //
+    lengthStatus = RtlStringCbLengthA(Name, 256, &nameLength);
+    if (!NT_SUCCESS(lengthStatus) || nameLength == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!MmpTryReferenceMapper(Mapper)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Validate name is not empty
-    //
-    if (Name[0] == '\0') {
-        return STATUS_INVALID_PARAMETER;
+    if (!Mapper->Initialized || !Mapper->TechniquesLoaded) {
+        MmpDereferenceMapper(Mapper);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     InterlockedIncrement64(&Mapper->Stats.TechniqueLookups);
@@ -1258,6 +1457,8 @@ MmLookupByName(
 
     ExReleasePushLockShared(&Mapper->TechniqueLock);
     KeLeaveCriticalRegion();
+
+    MmpDereferenceMapper(Mapper);
 
     if (found == NULL) {
         return STATUS_NOT_FOUND;
@@ -1402,7 +1603,12 @@ MmRecordDetection(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!MmpTryReferenceMapper(Mapper)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (!Mapper->Initialized) {
+        MmpDereferenceMapper(Mapper);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1437,6 +1643,7 @@ MmRecordDetection(
         if (technique != NULL) {
             MmReleaseTechnique(technique);
         }
+        MmpDereferenceMapper(Mapper);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1486,6 +1693,7 @@ MmRecordDetection(
         MmReleaseDetection(evictDetection);
     }
 
+    MmpDereferenceMapper(Mapper);
     return STATUS_SUCCESS;
 }
 
@@ -1536,7 +1744,12 @@ MmGetTechniquesByTactic(
         return STATUS_SUCCESS;
     }
 
+    if (!MmpTryReferenceMapper(Mapper)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (!Mapper->Initialized || !Mapper->TechniquesLoaded) {
+        MmpDereferenceMapper(Mapper);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1550,6 +1763,7 @@ MmGetTechniquesByTactic(
     if (tactic == NULL) {
         ExReleasePushLockShared(&Mapper->TechniqueLock);
         KeLeaveCriticalRegion();
+        MmpDereferenceMapper(Mapper);
         return STATUS_NOT_FOUND;
     }
 
@@ -1571,6 +1785,8 @@ MmGetTechniquesByTactic(
 
     ExReleasePushLockShared(&Mapper->TechniqueLock);
     KeLeaveCriticalRegion();
+
+    MmpDereferenceMapper(Mapper);
 
     *Count = count;
     return STATUS_SUCCESS;
@@ -1619,7 +1835,12 @@ MmGetRecentDetections(
         return STATUS_SUCCESS;
     }
 
+    if (!MmpTryReferenceMapper(Mapper)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     if (!Mapper->Initialized) {
+        MmpDereferenceMapper(Mapper);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1668,6 +1889,8 @@ MmGetRecentDetections(
     }
 
     KeReleaseSpinLock(&Mapper->DetectionLock, oldIrql);
+
+    MmpDereferenceMapper(Mapper);
 
     *Count = count;
     return STATUS_SUCCESS;
