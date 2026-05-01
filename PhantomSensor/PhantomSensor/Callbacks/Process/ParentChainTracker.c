@@ -681,6 +681,17 @@ PctBuildChain(
     ULONG depth = 0;
     BOOLEAN firstNode = TRUE;
     BOOLEAN processTerminated = FALSE;
+    //
+    // Cycle-detection set: PID-reuse can cause the parent traversal to
+    // re-enter a PID that was already visited (e.g., A -> B -> A after
+    // PID A is recycled to a descendant). We track every visited PID and
+    // bail with HasOrphanedProcess if a cycle is observed; the depth cap
+    // alone is insufficient to keep the chain consistent.
+    //
+    HANDLE visitedPids[PCT_MAX_CHAIN_DEPTH];
+    ULONG visitedCount = 0;
+    ULONG cycleIdx;
+    BOOLEAN cycleDetected = FALSE;
 
     //
     // Validate parameters and tracker
@@ -731,6 +742,28 @@ PctBuildChain(
            (ULONG_PTR)currentPid != 0 &&
            (ULONG_PTR)currentPid != 4 &&  // System process
            depth < PCT_MAX_CHAIN_DEPTH) {
+
+        //
+        // Cycle check: if we have already walked through this PID in the
+        // current ancestry traversal, the chain has folded back on itself
+        // (typically due to recycled PIDs). Stop and mark as orphaned so
+        // we never produce a chain that re-references the same PID twice.
+        //
+        for (cycleIdx = 0; cycleIdx < visitedCount; cycleIdx++) {
+            if (visitedPids[cycleIdx] == currentPid) {
+                cycleDetected = TRUE;
+                break;
+            }
+        }
+        if (cycleDetected) {
+            chain->HasOrphanedProcess = TRUE;
+            InterlockedIncrement64(&Tracker->Stats.OrphanedProcesses);
+            break;
+        }
+
+        if (visitedCount < PCT_MAX_CHAIN_DEPTH) {
+            visitedPids[visitedCount++] = currentPid;
+        }
 
         //
         // Allocate node for this process
