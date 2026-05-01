@@ -328,7 +328,10 @@ AbdInitialize(
         AbdpResolveExports();
     }
 
-    MemoryBarrier();
+    //
+    // InterlockedExchange provides full memory barrier; explicit MemoryBarrier
+    // would be redundant. Publish READY state with release semantics.
+    //
     InterlockedExchange(&g_AbdState.State, ABD_STATE_READY);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -386,6 +389,7 @@ AbdShutdown(
     if (g_AbdState.CleanAmsiCopy != NULL) {
         ExFreePoolWithTag(g_AbdState.CleanAmsiCopy, ABD_POOL_TAG_BASELINE);
         g_AbdState.CleanAmsiCopy = NULL;
+        g_AbdState.CleanAmsiSize = 0;
     }
 
     //
@@ -429,6 +433,10 @@ AbdNotifyImageLoad(
 {
     PAGED_CODE();
 
+    if (ImageName == NULL || ImageBase == NULL || ImageSize == 0) {
+        return;
+    }
+
     if (!AbdIsActive()) {
         return;
     }
@@ -469,6 +477,10 @@ AbdScanProcess(
 
     PAGED_CODE();
 
+    if (Detection == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     RtlZeroMemory(Detection, sizeof(ABD_DETECTION));
     Detection->BypassType = AbdBypass_None;
 
@@ -500,6 +512,18 @@ AbdScanProcess(
         PVOID functionAddress;
 
         if (!func->Resolved || func->RvaOffset == 0) {
+            continue;
+        }
+
+        //
+        // Defense in depth: ensure RvaOffset + prologue is within the
+        // tracked amsi.dll mapping in the target process before reading.
+        // Prevents pointer-arithmetic wrap and reads outside the module.
+        //
+        if (procEntry->AmsiBase == NULL ||
+            procEntry->AmsiSize == 0 ||
+            (SIZE_T)func->RvaOffset >= procEntry->AmsiSize ||
+            (SIZE_T)func->RvaOffset + ABD_PROLOGUE_SIZE > procEntry->AmsiSize) {
             continue;
         }
 
@@ -749,6 +773,21 @@ AbdGetStatistics(
     _Out_ PABD_STATISTICS Stats
     )
 {
+    if (Stats == NULL) {
+        return;
+    }
+
+    //
+    // Always zero the output first; if the detector has not been initialized
+    // (or is shutting down), callers receive a well-defined zero snapshot
+    // rather than a torn read of an uninitialized BSS structure.
+    //
+    RtlZeroMemory(Stats, sizeof(ABD_STATISTICS));
+
+    if (ReadAcquire(&g_AbdState.State) != ABD_STATE_READY) {
+        return;
+    }
+
     Stats->ProcessesMonitored     = ReadNoFence64((PLONG64)&g_AbdState.Stats.ProcessesMonitored);
     Stats->AmsiLoadsObserved      = ReadNoFence64((PLONG64)&g_AbdState.Stats.AmsiLoadsObserved);
     Stats->BypassesDetected       = ReadNoFence64((PLONG64)&g_AbdState.Stats.BypassesDetected);
@@ -1040,6 +1079,16 @@ AbdpFindExportRva(
     }
 
     //
+    // Bound-check the export directory's declared range against the image.
+    // A hostile or truncated PE could declare an oversized export directory;
+    // catch overflow and out-of-range before any further parsing.
+    //
+    if (exportDirSize > ImageSize ||
+        (SIZE_T)exportDirRva + exportDirSize > ImageSize) {
+        return 0;
+    }
+
+    //
     // For on-disk PE, we need to convert RVA to file offset.
     // Walk sections to find the one containing the export directory.
     //
@@ -1070,10 +1119,30 @@ AbdpFindExportRva(
         return 0;
     }
 
-    if (namesOffset + exportDir->NumberOfNames * sizeof(ULONG) > ImageSize ||
-        ordinalsOffset + exportDir->NumberOfNames * sizeof(USHORT) > ImageSize ||
-        functionsOffset + exportDir->NumberOfFunctions * sizeof(ULONG) > ImageSize) {
-        return 0;
+    //
+    // Integer-overflow-safe table size validation. NumberOfNames /
+    // NumberOfFunctions are attacker-controlled (PE on disk); compute the
+    // table size as SIZE_T after a per-entry cap to avoid 32-bit wrap when
+    // multiplied by sizeof(ULONG)/sizeof(USHORT).
+    //
+    {
+        const ULONG kMaxEntries = 0x100000UL; // 1M exports — far above any sane DLL
+        if (exportDir->NumberOfNames == 0 ||
+            exportDir->NumberOfNames > kMaxEntries ||
+            exportDir->NumberOfFunctions == 0 ||
+            exportDir->NumberOfFunctions > kMaxEntries) {
+            return 0;
+        }
+
+        SIZE_T namesBytes      = (SIZE_T)exportDir->NumberOfNames * sizeof(ULONG);
+        SIZE_T ordinalsBytes   = (SIZE_T)exportDir->NumberOfNames * sizeof(USHORT);
+        SIZE_T functionsBytes  = (SIZE_T)exportDir->NumberOfFunctions * sizeof(ULONG);
+
+        if ((SIZE_T)namesOffset + namesBytes > ImageSize ||
+            (SIZE_T)ordinalsOffset + ordinalsBytes > ImageSize ||
+            (SIZE_T)functionsOffset + functionsBytes > ImageSize) {
+            return 0;
+        }
     }
 
     addressOfNames = (PULONG)((PUCHAR)ImageBase + namesOffset);
@@ -1123,9 +1192,24 @@ AbdpRvaToFileOffset(
     PAGED_CODE();
 
     for (ULONG i = 0; i < NumberOfSections; i++) {
-        if (Rva >= Sections[i].VirtualAddress &&
-            Rva < Sections[i].VirtualAddress + Sections[i].SizeOfRawData) {
-            return Rva - Sections[i].VirtualAddress + Sections[i].PointerToRawData;
+        ULONG sectionVa  = Sections[i].VirtualAddress;
+        ULONG sectionRaw = Sections[i].SizeOfRawData;
+        ULONG sectionPtr = Sections[i].PointerToRawData;
+
+        //
+        // Defend against ULONG overflow: if VA + raw size wraps, skip section.
+        //
+        if (sectionRaw > MAXULONG - sectionVa) {
+            continue;
+        }
+        ULONG sectionEnd = sectionVa + sectionRaw;
+
+        if (Rva >= sectionVa && Rva < sectionEnd) {
+            ULONG delta = Rva - sectionVa;
+            if (delta > MAXULONG - sectionPtr) {
+                return 0;
+            }
+            return delta + sectionPtr;
         }
     }
     return 0;
@@ -1416,6 +1500,18 @@ AbdpReadProcessMemory(
     KAPC_STATE apcState;
 
     PAGED_CODE();
+
+    if (Buffer == NULL || Address == NULL || Size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Cap individual reads to defend against runaway probe sizes from any
+    // future caller. The current callers use ABD_PROLOGUE_SIZE only.
+    //
+    if (Size > PAGE_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
