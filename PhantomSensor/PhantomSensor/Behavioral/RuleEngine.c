@@ -148,6 +148,17 @@ typedef struct _RE_ENGINE {
     volatile LONG Initialized;      // Atomic initialization flag
 
     //
+    // Rundown gate: prevents shutdown teardown from racing public-API callers.
+    // RefCount starts at 1 (the initialization reference). Public APIs hold a
+    // transient reference for the duration of the call via Try/Deref helpers;
+    // ReShutdown sets ShuttingDown, drops the initial reference, and waits on
+    // RefZeroEvent before freeing any state.
+    //
+    volatile LONG ShuttingDown;
+    volatile LONG RefCount;
+    KEVENT RefZeroEvent;
+
+    //
     // Rules sorted by priority
     //
     LIST_ENTRY RuleList;
@@ -277,8 +288,13 @@ RepFreeRuleInternal(
     );
 
 static BOOLEAN
-RepValidateEngine(
+RepTryReferenceEngine(
     _In_opt_ PRE_ENGINE Engine
+    );
+
+static VOID
+RepDereferenceEngine(
+    _In_ PRE_ENGINE Engine
     );
 
 static BOOLEAN
@@ -354,6 +370,14 @@ Return Value:
 
     RtlZeroMemory(engine, sizeof(RE_ENGINE));
     engine->Signature = RE_ENGINE_SIGNATURE;
+
+    //
+    // Initialize rundown gate BEFORE anything else can publish the engine.
+    // RefCount = 1 represents the initialization reference owned by ReShutdown.
+    //
+    KeInitializeEvent(&engine->RefZeroEvent, NotificationEvent, FALSE);
+    InterlockedExchange(&engine->RefCount, 1);
+    InterlockedExchange(&engine->ShuttingDown, FALSE);
 
     //
     // Initialize synchronization primitives
@@ -462,6 +486,50 @@ Arguments:
     }
 
     //
+    // Engage rundown gate: refuse new TryReference callers, then drop the
+    // initialization reference.  Existing in-flight callers continue to hold
+    // references; we wait below until all of them have released.
+    //
+    InterlockedExchange(&Engine->ShuttingDown, TRUE);
+    RepDereferenceEngine(Engine);
+
+    //
+    // Bounded drain wait (30 seconds).  If callers are stuck, log and fall
+    // back to an indefinite wait rather than freeing under their feet â€”
+    // freeing the push lock or lookasides while a caller is inside would
+    // crash millions of endpoints.
+    //
+    {
+        LARGE_INTEGER timeout;
+        NTSTATUS waitStatus;
+
+        timeout.QuadPart = -300000000LL;  // 30 seconds in 100ns units
+        waitStatus = KeWaitForSingleObject(
+            &Engine->RefZeroEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike] RuleEngine: shutdown drain timed out at 30s "
+                "with RefCount=%ld; falling back to indefinite wait.\n",
+                ReadAcquire(&Engine->RefCount)
+            );
+            (VOID)KeWaitForSingleObject(
+                &Engine->RefZeroEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL
+            );
+        }
+    }
+
+    //
     // CRITICAL: No timer/DPC in this implementation, so no need to flush.
     // If a timer were present, we would need:
     // KeCancelTimer(&Engine->CleanupTimer);
@@ -560,11 +628,12 @@ Return Value:
     //
     // Validate parameters
     //
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!RepValidateRule(Rule)) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -573,6 +642,7 @@ Return Value:
     //
     ruleIdLen = RepSafeStringLength(Rule->RuleId, sizeof(Rule->RuleId));
     if (ruleIdLen == 0 || ruleIdLen >= sizeof(Rule->RuleId)) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -588,6 +658,7 @@ Return Value:
     }
 
     if (internalRule == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -618,6 +689,7 @@ Return Value:
     status = RepCompileRule(internalRule);
     if (!NT_SUCCESS(status)) {
         RepFreeRuleInternal(Engine, internalRule);
+        RepDereferenceEngine(Engine);
         return status;
     }
 
@@ -655,6 +727,7 @@ Return Value:
         ExReleasePushLockExclusive(&Engine->RuleLock);
         KeLeaveCriticalRegion();
         RepFreeRuleInternal(Engine, internalRule);
+        RepDereferenceEngine(Engine);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -673,6 +746,7 @@ Return Value:
     ExReleasePushLockExclusive(&Engine->RuleLock);
     KeLeaveCriticalRegion();
 
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -701,16 +775,18 @@ Return Value:
 
     PAGED_CODE();
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (RuleId == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
     ruleIdLen = RepSafeStringLength(RuleId, RE_MAX_RULE_ID_LEN + 1);
     if (ruleIdLen == 0 || ruleIdLen > RE_MAX_RULE_ID_LEN) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -721,6 +797,7 @@ Return Value:
     if (rule == NULL) {
         ExReleasePushLockExclusive(&Engine->RuleLock);
         KeLeaveCriticalRegion();
+        RepDereferenceEngine(Engine);
         return STATUS_NOT_FOUND;
     }
 
@@ -740,6 +817,7 @@ Return Value:
     ExReleasePushLockExclusive(&Engine->RuleLock);
     KeLeaveCriticalRegion();
 
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -769,16 +847,18 @@ Return Value:
 
     PAGED_CODE();
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (RuleId == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
     ruleIdLen = RepSafeStringLength(RuleId, RE_MAX_RULE_ID_LEN + 1);
     if (ruleIdLen == 0 || ruleIdLen > RE_MAX_RULE_ID_LEN) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -789,6 +869,7 @@ Return Value:
     if (rule == NULL) {
         ExReleasePushLockExclusive(&Engine->RuleLock);
         KeLeaveCriticalRegion();
+        RepDereferenceEngine(Engine);
         return STATUS_NOT_FOUND;
     }
 
@@ -797,6 +878,7 @@ Return Value:
     ExReleasePushLockExclusive(&Engine->RuleLock);
     KeLeaveCriticalRegion();
 
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -835,15 +917,17 @@ Return Value:
 
     PAGED_CODE();
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!RepValidateContext(Context)) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (Result == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -861,6 +945,7 @@ Return Value:
     );
 
     if (result == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -998,6 +1083,7 @@ Return Value:
     KeLeaveCriticalRegion();
 
     *Result = result;
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -1056,15 +1142,17 @@ Return Value:
 
     PAGED_CODE();
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!RepValidateContext(Context)) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (Result == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1163,6 +1251,7 @@ Return Value:
     ExReleasePushLockShared(&Engine->RuleLock);
     KeLeaveCriticalRegion();
 
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -1195,16 +1284,18 @@ Return Value:
 
     PAGED_CODE();
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (RuleId == NULL || Rule == NULL) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
     ruleIdLen = RepSafeStringLength(RuleId, RE_MAX_RULE_ID_LEN + 1);
     if (ruleIdLen == 0 || ruleIdLen > RE_MAX_RULE_ID_LEN) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1215,6 +1306,7 @@ Return Value:
     if (internalRule == NULL || internalRule->MarkedForDeletion) {
         ExReleasePushLockShared(&Engine->RuleLock);
         KeLeaveCriticalRegion();
+        RepDereferenceEngine(Engine);
         return STATUS_NOT_FOUND;
     }
 
@@ -1227,6 +1319,7 @@ Return Value:
     ExReleasePushLockShared(&Engine->RuleLock);
     KeLeaveCriticalRegion();
 
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -1259,11 +1352,12 @@ Return Value:
 
     PAGED_CODE();
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (Rules == NULL || ActualCount == NULL || MaxCount == 0) {
+        RepDereferenceEngine(Engine);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1289,6 +1383,7 @@ Return Value:
     KeLeaveCriticalRegion();
 
     *ActualCount = count;
+    RepDereferenceEngine(Engine);
     return STATUS_SUCCESS;
 }
 
@@ -1313,7 +1408,7 @@ Arguments:
 
     RtlZeroMemory(Stats, sizeof(RE_ENGINE_STATS));
 
-    if (!RepValidateEngine(Engine)) {
+    if (!RepTryReferenceEngine(Engine)) {
         return;
     }
 
@@ -1322,17 +1417,35 @@ Arguments:
     Stats->Blocks = Engine->Stats.Blocks;
     Stats->StartTime = Engine->Stats.StartTime;
     Stats->RuleCount = (ULONG)Engine->RuleCount;
+
+    RepDereferenceEngine(Engine);
 }
 
 // ============================================================================
 // INTERNAL - VALIDATION HELPERS
 // ============================================================================
 
+//
+// Rundown-gate helpers.  Public APIs that touch engine state must bracket
+// every dereference of Engine fields with Try/Deref so that ReShutdown can
+// safely tear the engine down without racing in-flight callers.
+//
+// The gate prevents the classic shutdown UAF: a caller passes the
+// !ShuttingDown check, ReShutdown then frees the lookasides / push locks /
+// engine struct, and the caller's subsequent dereference touches freed
+// memory.  TryReference performs an atomic increment that is rejected if
+// ShuttingDown was already set OR becomes set immediately after; in the
+// race-loss case the helper releases its tentative ref and signals
+// RefZeroEvent if it was the last one.
+//
 static BOOLEAN
-RepValidateEngine(
+RepTryReferenceEngine(
     _In_opt_ PRE_ENGINE Engine
     )
 {
+    LONG oldCount;
+    LONG newCount;
+
     if (Engine == NULL) {
         return FALSE;
     }
@@ -1341,11 +1454,48 @@ RepValidateEngine(
         return FALSE;
     }
 
-    if (!Engine->Initialized) {
+    if (ReadAcquire(&Engine->ShuttingDown)) {
+        return FALSE;
+    }
+
+    for (;;) {
+        oldCount = ReadAcquire(&Engine->RefCount);
+        if (oldCount <= 0) {
+            return FALSE;
+        }
+        if (InterlockedCompareExchange(&Engine->RefCount,
+                                       oldCount + 1,
+                                       oldCount) == oldCount) {
+            break;
+        }
+    }
+
+    //
+    // Re-check after increment: ShuttingDown may have been latched between
+    // our first read and the successful CAS.  If so, undo and signal.
+    //
+    if (ReadAcquire(&Engine->ShuttingDown)) {
+        newCount = InterlockedDecrement(&Engine->RefCount);
+        if (newCount == 0) {
+            KeSetEvent(&Engine->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+        }
         return FALSE;
     }
 
     return TRUE;
+}
+
+static VOID
+RepDereferenceEngine(
+    _In_ PRE_ENGINE Engine
+    )
+{
+    LONG newCount;
+
+    newCount = InterlockedDecrement(&Engine->RefCount);
+    if (newCount == 0) {
+        KeSetEvent(&Engine->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+    }
 }
 
 static BOOLEAN
