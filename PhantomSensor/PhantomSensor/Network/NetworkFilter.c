@@ -433,6 +433,8 @@ NfpReadConfig(_Out_ PNETWORK_MONITOR_CONFIG ConfigOut)
 #pragma alloc_text(PAGE, NfpCreateAndInsertConnection)
 #pragma alloc_text(PAGE, NfpProcessOutboundConnect)
 #pragma alloc_text(PAGE, NfpProcessInboundAccept)
+#pragma alloc_text(PAGE, NfpProcessDnsPacket)
+#pragma alloc_text(PAGE, NfpProcessInboundDnsResponse)
 #pragma alloc_text(PAGE, NfpAnalyzeConnection)
 
 // ============================================================================
@@ -4091,6 +4093,8 @@ NfpProcessDnsPacket(
     LARGE_INTEGER currentTime;
     PNF_DNS_ENTRY dnsEntry;
 
+    PAGED_CODE();
+
     ClassifyOut->actionType = FWP_ACTION_PERMIT;
 
     if (LayerData == NULL) {
@@ -4363,6 +4367,11 @@ Done:
  * Called from NfInboundTransportClassify when source port == 53.
  * Routes the raw response packet to DnsProcessResponse for correlation
  * with pending queries and answer analysis.
+ *
+ * @irql PASSIVE_LEVEL
+ * @remarks MUST run at PASSIVE_LEVEL because DnsProcessResponse acquires locks.
+ *          Caller (NfInboundTransportClassify) guards with KeGetCurrentIrql()
+ *          > APC_LEVEL early-exit (line 1956).
  */
 static VOID
 NfpProcessInboundDnsResponse(
@@ -4378,6 +4387,8 @@ NfpProcessInboundDnsResponse(
     UCHAR localBuffer[512];
     BOOLEAN allocated = FALSE;
     UINT32 serverAddr;
+
+    PAGED_CODE();
 
     ClassifyOut->actionType = FWP_ACTION_PERMIT;
 
