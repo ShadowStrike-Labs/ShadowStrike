@@ -916,6 +916,7 @@ HpRecordHandle(
     PHP_PROCESS_CONTEXT processContext;
     PHP_HANDLE_ENTRY handleEntry;
     KIRQL oldIrql;
+    HP_CONFIG localConfig;
 
     if (Engine == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -925,7 +926,19 @@ HpRecordHandle(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (!Engine->Config.Enabled || !Engine->Config.TrackAllHandles) {
+    //
+    // Snapshot config under ConfigLock for consistent hot-path read.
+    // Matches the pattern used by HpAnalyzeHandleOperation; without this
+    // a concurrent HpSetConfiguration could shear Enabled/TrackAllHandles
+    // against MaxHandlesPerProcess.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->ConfigLock);
+    RtlCopyMemory(&localConfig, &Engine->Config, sizeof(HP_CONFIG));
+    ExReleasePushLockShared(&Engine->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    if (!localConfig.Enabled || !localConfig.TrackAllHandles) {
         return STATUS_SUCCESS;
     }
 
@@ -938,9 +951,10 @@ HpRecordHandle(
     }
 
     //
-    // Check handle limit
+    // Check handle limit against the snapshot to avoid an attacker racing
+    // HpSetConfiguration to defeat the per-process cap.
     //
-    if (processContext->HandleCount >= (LONG)Engine->Config.MaxHandlesPerProcess) {
+    if (processContext->HandleCount >= (LONG)localConfig.MaxHandlesPerProcess) {
         HppReleaseProcessContext(Engine, processContext);
         return STATUS_QUOTA_EXCEEDED;
     }
@@ -998,6 +1012,7 @@ HpRecordDuplication(
     PHP_PROCESS_CONTEXT processContext;
     PHP_HANDLE_ENTRY handleEntry;
     KIRQL oldIrql;
+    HP_CONFIG localConfig;
 
     UNREFERENCED_PARAMETER(SourceHandle);
 
@@ -1009,7 +1024,16 @@ HpRecordDuplication(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (!Engine->Config.Enabled) {
+    //
+    // Snapshot config under ConfigLock â€” same rationale as HpRecordHandle.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->ConfigLock);
+    RtlCopyMemory(&localConfig, &Engine->Config, sizeof(HP_CONFIG));
+    ExReleasePushLockShared(&Engine->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    if (!localConfig.Enabled) {
         return STATUS_SUCCESS;
     }
 
@@ -1018,6 +1042,16 @@ HpRecordDuplication(
     processContext = HppFindOrCreateProcessContext(Engine, TargetProcess);
     if (processContext == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Enforce per-process duplication quota â€” without this an attacker
+    // can flood DuplicateHandle() against a tracked process and exhaust
+    // non-paged pool through unlimited HP_HANDLE_ENTRY allocations.
+    //
+    if (processContext->HandleCount >= (LONG)localConfig.MaxHandlesPerProcess) {
+        HppReleaseProcessContext(Engine, processContext);
+        return STATUS_QUOTA_EXCEEDED;
     }
 
     handleEntry = HppCreateHandleEntry(Engine);
@@ -1072,6 +1106,7 @@ HpRecordHandleClose(
     PHP_HANDLE_ENTRY handleEntry = NULL;
     PLIST_ENTRY entry;
     KIRQL oldIrql;
+    BOOLEAN enabled;
 
     if (Engine == NULL) {
         return;
@@ -1081,7 +1116,16 @@ HpRecordHandleClose(
         return;
     }
 
-    if (!Engine->Config.Enabled) {
+    //
+    // Snapshot just the Enabled flag under ConfigLock for consistent read.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->ConfigLock);
+    enabled = Engine->Config.Enabled;
+    ExReleasePushLockShared(&Engine->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    if (!enabled) {
         return;
     }
 
@@ -1625,8 +1669,13 @@ HpFlushAllTracking(
         HppReleaseProcessContext(Engine, processContext);
     }
 
-    Engine->Stats.TrackedProcesses = 0;
-    Engine->Stats.ActiveHandles = 0;
+    //
+    // Reset gauge counters atomically to avoid torn writes against
+    // concurrent Interlocked* updates from HpRecordHandle / record paths
+    // (those increments do not hold ProcessListLock or ProcessHash.Lock).
+    //
+    InterlockedExchange(&Engine->Stats.TrackedProcesses, 0);
+    InterlockedExchange(&Engine->Stats.ActiveHandles, 0);
 
     ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
     ExReleasePushLockExclusive(&Engine->ProcessListLock);
@@ -1650,6 +1699,7 @@ HpFlushAllTracking(
 
 // ============================================================================
 // PRIVATE FUNCTIONS - TIMER
+// ============================================================================
 // ============================================================================
 
 /**
@@ -1885,8 +1935,23 @@ HppCreateProcessContext(
     ExAcquirePushLockExclusive(&Engine->ProcessHash.Lock);
 
     //
-    // Re-check: another thread may have created this context already
+    // Re-check: another thread may have created this context already,
+    // and (defense-in-depth) verify we have not crossed the global
+    // tracked-process cap while the unlocked fast-fail above was racing
+    // with concurrent HppCreateProcessContext callers.
     //
+    if (Engine->Stats.TrackedProcesses >= HP_MAX_TRACKED_PROCESSES) {
+        ExReleasePushLockExclusive(&Engine->ProcessHash.Lock);
+        ExReleasePushLockExclusive(&Engine->ProcessListLock);
+        KeLeaveCriticalRegion();
+
+        if (context->Process != NULL) {
+            ObDereferenceObject(context->Process);
+        }
+        ExFreeToNPagedLookasideList(&Engine->ProcessContextLookaside, context);
+        return NULL;
+    }
+
     for (entry = Engine->ProcessHash.Buckets[bucket].Flink;
          entry != &Engine->ProcessHash.Buckets[bucket];
          entry = entry->Flink) {
@@ -2294,7 +2359,14 @@ HppIsSystemProcess(
     _In_ HANDLE ProcessId
     )
 {
-    return (ProcessId == (HANDLE)(ULONG_PTR)4);
+    //
+    // Cover both PID 0 (Idle) and PID 4 (System). Both run in kernel
+    // context and hold pseudo-handles that cannot legitimately be
+    // duplicated by user-mode attackers, so we want them flagged as
+    // system targets uniformly.
+    //
+    return (ProcessId == (HANDLE)(ULONG_PTR)0 ||
+            ProcessId == (HANDLE)(ULONG_PTR)4);
 }
 
 /**
