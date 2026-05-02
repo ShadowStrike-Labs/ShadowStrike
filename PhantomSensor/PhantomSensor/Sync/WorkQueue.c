@@ -854,11 +854,20 @@ WqiCompleteWorkItem(
         }
     }
 
+    //
+    // FIX WQ-C1: Dereference (which may push back to FreeList SLIST or
+    // ExFreeToNPagedLookasideList via WqiFreeWorkItem) MUST happen while
+    // we still hold rundown protection. Otherwise, releasing rundown
+    // unblocks ShadowStrikeWorkQueueShutdown's ExWaitForRundownProtection
+    // Release, which then proceeds to ExDeleteNPagedLookasideList while
+    // we are still in the middle of pushing/freeing into that very
+    // lookaside â€” classic use-after-delete bugcheck. Holding rundown
+    // across the free is the cheapest correctness fix.
+    //
+    WqiDereferenceWorkItem(Item);
+
     // Release rundown protection (acquired at submission time)
     ExReleaseRundownProtection(&g_WqManager.RundownProtection);
-
-    // Dereference â€” may free the item
-    WqiDereferenceWorkItem(Item);
 }
 
 // ============================================================================
@@ -926,8 +935,10 @@ WqiDelayTimerDpcCallback(
         InterlockedDecrement(&g_WqManager.PendingCount);
         InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
         InterlockedIncrement64(&g_WqManager.Stats.TotalCancelled);
-        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        // FIX WQ-C1: Free under rundown protection, then release. See
+        // matching comment in WqiCompleteWorkItem for rationale.
         WqiDereferenceWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
         return;
     }
 
@@ -948,8 +959,9 @@ WqiDelayTimerDpcCallback(
         InterlockedDecrement(&g_WqManager.PendingCount);
         InterlockedDecrement(&g_WqManager.Stats.CurrentPending);
         InterlockedIncrement64(&g_WqManager.Stats.TotalFailed);
-        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
+        // FIX WQ-C1: Free under rundown protection, then release.
         WqiDereferenceWorkItem(Item);
+        ExReleaseRundownProtection(&g_WqManager.RundownProtection);
     }
 }
 
