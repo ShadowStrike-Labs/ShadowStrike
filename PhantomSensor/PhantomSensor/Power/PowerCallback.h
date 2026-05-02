@@ -41,8 +41,9 @@
  *
  * IRQL Safety:
  * - System state callback may fire at DISPATCH_LEVEL
- * - All callback work is deferred to PASSIVE_LEVEL via work items
- * - State query functions use atomic reads or spin locks
+ * - Heavy callback work is deferred to a dedicated PASSIVE_LEVEL worker
+ *   thread via a spin-lock-protected event ring and a kernel event
+ * - State query functions use atomic/volatile reads or push locks
  * - No push locks acquired above APC_LEVEL
  *
  * @author ShadowStrike Security Team

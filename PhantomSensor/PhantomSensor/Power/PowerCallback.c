@@ -28,21 +28,29 @@
  * IRQL Safety Model:
  * - PwrpSystemStateCallback may fire at DISPATCH_LEVEL.
  *   It MUST NOT acquire push locks or allocate paged pool.
- *   All heavy work is deferred to PwrpDeferredEventWorkRoutine
- *   via IoQueueWorkItem (runs at PASSIVE_LEVEL).
+ *   It briefly holds DeferredCtxLock (KSPIN_LOCK) to enqueue an event type,
+ *   bumps interlocked counters, and signals WorkerWakeEvent. All heavy
+ *   processing (allocation, push-lock acquisition, callback dispatch) is
+ *   performed by PwrpWorkerThreadRoutine at PASSIVE_LEVEL.
  * - PwrpPowerSettingCallback runs at PASSIVE_LEVEL per MSDN.
  *   It may safely use push locks and allocate memory.
  * - State query functions that use push locks are annotated APC_LEVEL max.
  *   Lock-free query functions use volatile reads and are DISPATCH_LEVEL safe.
  *
- * Lock Ordering (to prevent deadlocks):
- *   StateLock â†’ EventHistoryLock â†’ CallbackLock
- *   (Never acquire in reverse order)
+ * Lock Ordering (sequential; locks are never nested):
+ *   StateLock, EventHistoryLock, CallbackLock are each acquired and released
+ *   in turn by PwrpProcessPowerEvent (UpdateState -> RecordEvent -> Notify).
+ *   No code path holds two of these simultaneously.
  *
- * Work Item Safety:
- *   - WorkItemQueued flag prevents double-queuing (IoQueueWorkItem contract).
- *   - WorkItemComplete event ensures shutdown waits for in-flight work items.
- *   - IoFreeWorkItem is only called after the work item has finished.
+ * Worker Thread / Shutdown Safety:
+ *   - WorkerThread is a dedicated PsCreateSystemThread that drains the
+ *     deferred event ring on WorkerWakeEvent (SynchronizationEvent).
+ *   - Shutdown order: set ShuttingDown -> drain PendingOperations ->
+ *     unregister OS callbacks (Po/Ex APIs synchronize against in-flight
+ *     callbacks) -> set WorkerTerminate + signal -> KeWaitForSingleObject
+ *     on the worker thread -> ObDereferenceObject -> free history/callbacks.
+ *   - Resume validation triggered from the worker is gated by ShuttingDown
+ *     so teardown is never raced by re-registration.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0 (Enterprise Edition)
@@ -352,15 +360,23 @@ ShadowRegisterPowerCallbacks(
     PAGED_CODE();
 
     //
-    // Zero the struct first, then attempt the CAS. This prevents a window
-    // where RtlZeroMemory resets the CAS sentinel back to 0, allowing
-    // a concurrent initializer through.
+    // Establish exclusive ownership BEFORE touching the rest of the struct.
+    // Zeroing first and CAS'ing afterwards is unsafe: a second thread could
+    // RtlZeroMemory the sentinel that the first thread just installed and
+    // also pass the CAS, causing concurrent double-initialization.
     //
-    RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
-
     if (InterlockedCompareExchange(&g_PowerState.Initialized, -1, 0) != 0) {
         return STATUS_ALREADY_INITIALIZED;
     }
+
+    //
+    // We are now the sole initializer. Zero the rest of the struct in case
+    // of a previous Register/Unregister cycle (Unregister deliberately does
+    // not zero, so stale handles/lists may otherwise be observed). Preserve
+    // the sentinel by restoring it after the bulk clear.
+    //
+    RtlZeroMemory(&g_PowerState, sizeof(SHADOW_POWER_GLOBALS));
+    InterlockedExchange(&g_PowerState.Initialized, -1);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Initializing power management subsystem\n");
@@ -502,13 +518,17 @@ ShadowRegisterPowerCallbacks(
  * @brief Shutdown the power management subsystem.
  *
  * Order of operations:
- * 1. Set ShuttingDown flag (prevents new events/work)
- * 2. Wait for pending operations
- * 3. Unregister all OS callbacks (no new callbacks will fire)
- * 4. Wait for any in-flight work item to complete
- * 5. Free work item
- * 6. Free event history and callback list under their locks
- * 7. Clear Initialized flag
+ * 1. Set ShuttingDown flag (prevents new events from being queued/processed)
+ * 2. Wait for pending operations (ShadowPowerEnterOperation/Leave callers)
+ * 3. Unregister all OS callbacks. PoUnregisterPowerSettingCallback and
+ *    ExUnregisterCallback synchronize against in-flight invocations, so
+ *    after step 3 no new PwrpSystemStateCallback or PwrpPowerSettingCallback
+ *    invocation can begin and any in-progress one has returned.
+ * 4. Signal WorkerTerminate, wake the worker, and KeWaitForSingleObject
+ *    on the worker thread until it exits; then ObDereferenceObject it.
+ * 5. Free event history and callback list under their respective push locks.
+ * 6. Clear Initialized flag (struct intentionally not zeroed: late
+ *    DISPATCH-level readers must observe valid lock memory).
  */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
@@ -580,7 +600,7 @@ ShadowUnregisterPowerCallbacks(
     }
 
     //
-    // Step 6: Free event history
+    // Step 5: Free event history
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PowerState.EventHistoryLock);
@@ -624,7 +644,7 @@ ShadowUnregisterPowerCallbacks(
                g_PowerState.Stats.ConnectedStandbyTransitions);
 
     //
-    // Step 7: Mark as uninitialized.
+    // Step 6: Mark as uninitialized.
     // Do NOT RtlZeroMemory the struct â€” that would destroy lock state
     // that late readers might still touch momentarily.
     //
