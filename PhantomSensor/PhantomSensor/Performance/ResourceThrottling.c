@@ -99,7 +99,8 @@ static VOID
 RtpRefillBurstTokens(
     _Inout_ PRT_RESOURCE_STATE State,
     _In_ PRT_RESOURCE_CONFIG Config,
-    _In_ LARGE_INTEGER CurrentTime
+    _In_ LARGE_INTEGER CurrentTime,
+    _In_ ULONG Multiplier
 );
 
 static RT_THROTTLE_ACTION
@@ -116,16 +117,11 @@ RtpNotifyCallback(
 );
 
 static PRT_PROCESS_QUOTA
-RtpFindProcessQuota(
-    _In_ PRT_THROTTLER Throttler,
-    _In_ HANDLE ProcessId
-);
-
-static PRT_PROCESS_QUOTA
-RtpFindOrCreateProcessQuota(
+RtpFindOrCreateProcessQuotaLocked(
     _In_ PRT_THROTTLER Throttler,
     _In_ HANDLE ProcessId,
-    _In_ BOOLEAN CreateIfNotFound
+    _In_ BOOLEAN CreateIfNotFound,
+    _Out_ PKIRQL OldIrql
 );
 
 static ULONG RtpHashProcessId(_In_ HANDLE ProcessId);
@@ -1069,26 +1065,14 @@ RtReportProcessUsage(
     RtReportUsage(Throttler, Resource, Delta);
 
     //
-    // Use locked lookup to prevent UAF: if RtRemoveProcess runs
-    // concurrently, it cannot free the quota while we hold the lock.
+    // Look up or create the per-process quota with ProcessQuotas.Lock held
+    // throughout. Holding the lock across the field updates closes the
+    // UAF window where RtRemoveProcess could free the quota between a
+    // lookup release and a field-write re-acquire.
     //
-    quota = RtpLookupProcessQuotaLocked(Throttler, ProcessId, &oldIrql);
+    quota = RtpFindOrCreateProcessQuotaLocked(Throttler, ProcessId, TRUE, &oldIrql);
     if (quota == NULL) {
-        //
-        // No existing quota â€” try create via the full lookup path.
-        // RtpFindOrCreateProcessQuota allocates under the lock, which is safe.
-        //
-        quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
-        if (quota == NULL) {
-            return STATUS_SUCCESS;
-        }
-        //
-        // RtpFindOrCreateProcessQuota released the lock. Re-acquire
-        // for the update. The quota is either found (existing) or just
-        // inserted â€” RtRemoveProcess cannot race here because the process
-        // is still running if it's reporting usage.
-        //
-        KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     InterlockedAdd64(&quota->ResourceUsage[Resource], Delta);
@@ -1193,28 +1177,18 @@ RtSetProcessExemption(
     }
 
     //
-    // Use locked lookup first. If not found, create via the full path
-    // (which allocates under lock and returns with lock released).
+    // Hold ProcessQuotas.Lock across both the lookup/create and the
+    // field write so that RtRemoveProcess cannot free the quota between
+    // the create and the assignment (closes UAF window).
     //
-    quota = RtpLookupProcessQuotaLocked(Throttler, ProcessId, &oldIrql);
-    if (quota != NULL) {
-        quota->Exempt = Exempt;
-        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
-        return STATUS_SUCCESS;
-    }
-
-    //
-    // Not found â€” create. RtpFindOrCreateProcessQuota handles its own locking.
-    //
-    quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, TRUE);
+    quota = RtpFindOrCreateProcessQuotaLocked(Throttler, ProcessId, TRUE, &oldIrql);
     if (quota == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // Just created â€” no concurrent free possible yet. Safe to write.
-    //
     quota->Exempt = Exempt;
+
+    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -1645,23 +1619,14 @@ RtpMonitorTimerCallback(
     }
 
     //
-    // On battery power, refill burst tokens at 2Ã— rate to reduce
-    // CPU overhead from throttle-induced retries. Protection is
-    // still active (limits unchanged), but throttling is less aggressive.
+    // Battery-aware burst refill is folded into RtpUpdateResourceState
+    // (see ShadowPowerIsOnBattery() multiplier on RtpRefillBurstTokens).
+    // The previous post-loop refill here was dead code: RtpUpdateResourceState
+    // had already advanced LastTokenRefillTime, so a second call computed
+    // timeDelta == 0 and returned immediately, never delivering the
+    // intended 2Ã— refill. The unlocked second call also raced with locked
+    // readers in RtCheckThrottle/RtConsumeBurstTokens.
     //
-    if (ShadowPowerIsOnBattery()) {
-        LARGE_INTEGER now;
-        KeQuerySystemTime(&now);
-
-        for (i = 0; i < RT_MAX_RESOURCE_TYPES; i++) {
-            if (throttler->Configs[i].Enabled) {
-                RtpRefillBurstTokens(
-                    &throttler->States[i],
-                    &throttler->Configs[i],
-                    now);
-            }
-        }
-    }
 
     ExReleaseRundownProtection(&throttler->RundownRef);
 }
@@ -1767,9 +1732,12 @@ RtpUpdateResourceState(
     RtpCalculateRate(state, currentTime);
 
     //
-    // Refill burst tokens (uses separate LastTokenRefillTime)
+    // Refill burst tokens (uses separate LastTokenRefillTime).
+    // On battery, refill at 2Ã— rate to reduce CPU overhead from
+    // throttle-induced retries while limits remain unchanged.
     //
-    RtpRefillBurstTokens(state, config, currentTime);
+    RtpRefillBurstTokens(state, config, currentTime,
+                         ShadowPowerIsOnBattery() ? 2u : 1u);
 
     currentUsage = state->CurrentUsage;
 
@@ -1916,13 +1884,18 @@ static VOID
 RtpRefillBurstTokens(
     _Inout_ PRT_RESOURCE_STATE State,
     _In_ PRT_RESOURCE_CONFIG Config,
-    _In_ LARGE_INTEGER CurrentTime
+    _In_ LARGE_INTEGER CurrentTime,
+    _In_ ULONG Multiplier
 )
 {
     LONG64 timeDelta;
     LONG tokensToAdd;
     LONG currentTokens;
     LONG newTokens;
+
+    if (Multiplier == 0) {
+        Multiplier = 1;
+    }
 
     //
     // Use LastTokenRefillTime (not LastRateCalcTime)
@@ -1933,7 +1906,7 @@ RtpRefillBurstTokens(
         return;
     }
 
-    tokensToAdd = (LONG)(timeDelta * RT_TOKEN_REFILL_RATE);
+    tokensToAdd = (LONG)(timeDelta * RT_TOKEN_REFILL_RATE * (LONG64)Multiplier);
     if (tokensToAdd <= 0) {
         return;
     }
@@ -2125,66 +2098,42 @@ RtpLookupProcessQuotaLocked(
 }
 
 /**
- * @brief Find existing process quota (read-only, no allocation).
+ * @brief Find or allocate a process quota entry, returning with the
+ *        ProcessQuotas.Lock HELD on success.
  *
- * Uses KSPIN_LOCK â€” safe at DISPATCH_LEVEL.
+ * On success, the caller MUST release the lock with
+ *     KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, *OldIrql)
+ * after completing all field accesses on the returned quota. Holding
+ * the lock across the caller's field updates closes the use-after-free
+ * window where RtRemoveProcess could otherwise free the quota between a
+ * lookup-release and a field-write.
+ *
+ * On NULL return (not found / capacity exceeded / allocation failure)
+ * the lock is RELEASED.
+ *
+ * Process quotas are individually heap-allocated from NonPagedPoolNx.
+ * Allocation occurs under the spin lock â€” NonPagedPoolNx allocations
+ * are safe at DISPATCH_LEVEL, and allocating under the lock avoids
+ * TOCTOU on ActiveCount.
  */
 static PRT_PROCESS_QUOTA
-RtpFindProcessQuota(
-    _In_ PRT_THROTTLER Throttler,
-    _In_ HANDLE ProcessId
-)
-{
-    ULONG bucket;
-    PLIST_ENTRY entry;
-    PRT_PROCESS_QUOTA quota;
-    KIRQL oldIrql;
-
-    bucket = RtpHashProcessId(ProcessId);
-
-    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
-
-    for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
-         entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
-         entry = entry->Flink) {
-
-        quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
-
-        if (quota->ProcessId == ProcessId && quota->InUse) {
-            KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
-            return quota;
-        }
-    }
-
-    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
-    return NULL;
-}
-
-/**
- * @brief Find or allocate a process quota entry.
- *
- * Process quotas are now individually heap-allocated from NonPagedPoolNx,
- * not embedded in the RT_THROTTLER struct. This reduces the base struct size
- * and makes cleanup straightforward.
- *
- * Uses KSPIN_LOCK â€” safe at DISPATCH_LEVEL.
- */
-static PRT_PROCESS_QUOTA
-RtpFindOrCreateProcessQuota(
+RtpFindOrCreateProcessQuotaLocked(
     _In_ PRT_THROTTLER Throttler,
     _In_ HANDLE ProcessId,
-    _In_ BOOLEAN CreateIfNotFound
+    _In_ BOOLEAN CreateIfNotFound,
+    _Out_ PKIRQL OldIrql
 )
 {
     ULONG bucket;
     PLIST_ENTRY entry;
     PRT_PROCESS_QUOTA quota;
-    PRT_PROCESS_QUOTA newQuota = NULL;
-    KIRQL oldIrql;
+    PRT_PROCESS_QUOTA newQuota;
+
+    *OldIrql = PASSIVE_LEVEL;
 
     bucket = RtpHashProcessId(ProcessId);
 
-    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, &oldIrql);
+    KeAcquireSpinLock(&Throttler->ProcessQuotas.Lock, OldIrql);
 
     for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
          entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
@@ -2193,29 +2142,23 @@ RtpFindOrCreateProcessQuota(
         quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
 
         if (quota->ProcessId == ProcessId && quota->InUse) {
-            KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+            //
+            // Found â€” return with lock HELD.
+            //
             return quota;
         }
     }
 
     if (!CreateIfNotFound) {
-        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, *OldIrql);
         return NULL;
     }
 
-    //
-    // Check capacity
-    //
     if (Throttler->ProcessQuotas.ActiveCount >= RT_MAX_TRACKED_PROCESSES) {
-        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, *OldIrql);
         return NULL;
     }
 
-    //
-    // Release lock before allocation (can't allocate at DISPATCH on some paths)
-    // Actually ShadowStrikeAllocatePoolWithTag from NonPagedPoolNx is safe
-    // at DISPATCH_LEVEL. Allocate under lock to avoid TOCTOU on ActiveCount.
-    //
     newQuota = (PRT_PROCESS_QUOTA)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(RT_PROCESS_QUOTA),
@@ -2223,7 +2166,7 @@ RtpFindOrCreateProcessQuota(
     );
 
     if (newQuota == NULL) {
-        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
+        KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, *OldIrql);
         return NULL;
     }
 
@@ -2238,8 +2181,9 @@ RtpFindOrCreateProcessQuota(
 
     InterlockedIncrement(&Throttler->ProcessQuotas.ActiveCount);
 
-    KeReleaseSpinLock(&Throttler->ProcessQuotas.Lock, oldIrql);
-
+    //
+    // Return with lock HELD.
+    //
     return newQuota;
 }
 
