@@ -514,48 +514,87 @@ IRQL:
     }
 
     //
-    // Now free all timers directly (bypass refcount â€” we own everything)
+    // FIX TM-C1: If the work-item drain timed out, in-flight
+    // TmpWorkItemRoutine instances still hold raw pointers to both
+    // individual timer structs (via `timerInternal->Timer.*`,
+    // `WorkItemQueued`, `RefCount`) and to the Manager itself
+    // (`manager->PendingWorkItems`, `manager->AllWorkItemsDrained`).
+    // Freeing any of that memory while those work items are still
+    // executing is a guaranteed kernel UAF. The previous TM-M1 fix
+    // only suppressed `IoFreeWorkItem`, not the pool frees that
+    // follow â€” which is insufficient. On drain failure we must leak
+    // the entire shutdown set (timer structs, copied contexts, and
+    // the Manager) for the lifetime of the system; a bounded NonPaged
+    // leak is strictly preferable to a pool UAF / bugcheck.
     //
-    while (!IsListEmpty(&timersToFree)) {
-        entry = RemoveHeadList(&timersToFree);
-        timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL, Timer.ListEntry);
+    if (workItemsDrained) {
+        while (!IsListEmpty(&timersToFree)) {
+            entry = RemoveHeadList(&timersToFree);
+            timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL,
+                                              Timer.ListEntry);
 
-        //
-        // Signal cancel event if anyone is waiting
-        //
-        KeSetEvent(&timerInternal->Timer.CancelEvent, IO_NO_INCREMENT, FALSE);
+            //
+            // Signal cancel event if anyone is waiting
+            //
+            KeSetEvent(&timerInternal->Timer.CancelEvent,
+                       IO_NO_INCREMENT, FALSE);
 
-        //
-        // Free work item if allocated â€” but ONLY if drain completed
-        //
-        if (timerInternal->WorkItem != NULL && workItemsDrained) {
-            IoFreeWorkItem(timerInternal->WorkItem);
-            timerInternal->WorkItem = NULL;
+            //
+            // Free work item if allocated
+            //
+            if (timerInternal->WorkItem != NULL) {
+                IoFreeWorkItem(timerInternal->WorkItem);
+                timerInternal->WorkItem = NULL;
+            }
+
+            //
+            // Free context if we own it (ContextSize > 0 means we copied it)
+            //
+            if (timerInternal->Timer.Context != NULL &&
+                timerInternal->Timer.ContextSize > 0) {
+                ShadowStrikeFreePoolWithTag(
+                    timerInternal->Timer.Context,
+                    TM_POOL_TAG_CONTEXT
+                    );
+            }
+
+            //
+            // Free timer structure
+            //
+            timerInternal->Signature = 0;
+            ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
         }
 
         //
-        // Free context if we own it (ContextSize > 0 means we copied it)
+        // Free the manager
         //
-        if (timerInternal->Timer.Context != NULL &&
-            timerInternal->Timer.ContextSize > 0) {
-            ShadowStrikeFreePoolWithTag(
-                timerInternal->Timer.Context,
-                TM_POOL_TAG_CONTEXT
-                );
+        ShadowStrikeFreePoolWithTag(Manager, TM_POOL_TAG_CONTEXT);
+    }
+    else {
+        //
+        // Drain timed out â€” still-running work items reference both
+        // every timer struct and the Manager. We deliberately leak
+        // the entire shutdown set rather than risk a UAF bugcheck.
+        // Drain only signal events on each timer so any external
+        // waiters unblock; do NOT touch WorkItem, Context, Signature,
+        // or release pool memory.
+        //
+        for (entry = timersToFree.Flink;
+             entry != &timersToFree;
+             entry = entry->Flink) {
+            timerInternal = CONTAINING_RECORD(entry, TM_TIMER_INTERNAL,
+                                              Timer.ListEntry);
+            KeSetEvent(&timerInternal->Timer.CancelEvent,
+                       IO_NO_INCREMENT, FALSE);
         }
 
-        //
-        // Free timer structure
-        //
-        timerInternal->Signature = 0;
-        ShadowStrikeFreePoolWithTag(timerInternal, TM_POOL_TAG_TIMER);
+#if DBG
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike:TM] TmShutdown: leaking timers and Manager "
+            "due to work-item drain timeout to avoid UAF\n");
+#endif
     }
     }  // end workItemsDrained scope
-
-    //
-    // Free the manager
-    //
-    ShadowStrikeFreePoolWithTag(Manager, TM_POOL_TAG_CONTEXT);
 }
 
 
