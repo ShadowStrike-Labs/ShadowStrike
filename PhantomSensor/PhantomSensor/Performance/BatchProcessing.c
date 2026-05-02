@@ -162,7 +162,8 @@ __declspec(noinline)
 static VOID
 BppDrainReadyQueue(
     _In_ PBP_PROCESSOR Processor,
-    _In_ BOOLEAN InvokeCallback
+    _In_ BOOLEAN InvokeCallback,
+    _In_ BOOLEAN ReplenishSpare
     );
 
 static VOID NTAPI
@@ -357,9 +358,13 @@ BpShutdown(
     }
 
     //
-    // Drain and free any remaining ready batches (no callback â€” shutting down)
+    // Drain and free any remaining ready batches (no callback â€” shutting down).
+    // ReplenishSpare=FALSE ensures BppDrainReadyQueue does NOT allocate a new
+    // SpareBatch from the lookaside after we have already freed it above;
+    // otherwise the freshly allocated batch would leak when we delete the
+    // lookaside list a few lines below.
     //
-    BppDrainReadyQueue(Processor, FALSE);
+    BppDrainReadyQueue(Processor, FALSE, FALSE);
 
     if (Processor->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&Processor->BatchLookaside);
@@ -969,7 +974,8 @@ __declspec(noinline)
 static VOID
 BppDrainReadyQueue(
     _In_ PBP_PROCESSOR Processor,
-    _In_ BOOLEAN InvokeCallback
+    _In_ BOOLEAN InvokeCallback,
+    _In_ BOOLEAN ReplenishSpare
     )
 {
     KIRQL oldIrql;
@@ -1033,7 +1039,11 @@ BppDrainReadyQueue(
     // The NULL check is inside the lock to avoid racing with concurrent
     // BpQueueEvent which can consume SpareBatch at DISPATCH_LEVEL.
     //
-    if (Processor->LookasideInitialized) {
+    // ReplenishSpare is FALSE on the shutdown drain path, where the caller
+    // has already freed SpareBatch and is about to delete the lookaside
+    // list â€” a fresh allocation here would leak.
+    //
+    if (ReplenishSpare && Processor->LookasideInitialized) {
         KIRQL spareIrql;
         KeAcquireSpinLock(&Processor->BatchLock, &spareIrql);
         if (Processor->SpareBatch == NULL) {
@@ -1089,8 +1099,10 @@ BppProcessingThread(
             // StopEvent signaled â€” drain remaining batches and exit.
             // BpStop already moved the current batch to ready queue
             // before signaling, so we drain everything here.
+            // ReplenishSpare=FALSE because the processor is shutting down;
+            // BpShutdown will free the SpareBatch and tear down the lookaside.
             //
-            BppDrainReadyQueue(proc, TRUE);
+            BppDrainReadyQueue(proc, TRUE, FALSE);
             break;
         }
 
@@ -1099,8 +1111,9 @@ BppProcessingThread(
         // BppDrainReadyQueue drains ALL batches in the ready queue, so
         // even if multiple batches were queued before the thread woke,
         // they are all processed in this single drain cycle.
+        // ReplenishSpare=TRUE keeps the hot path stocked with a spare batch.
         //
-        BppDrainReadyQueue(proc, TRUE);
+        BppDrainReadyQueue(proc, TRUE, TRUE);
     }
 
     ExReleaseRundownProtection(&proc->RundownRef);
