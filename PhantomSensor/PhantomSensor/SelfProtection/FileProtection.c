@@ -159,6 +159,14 @@ struct _FP_ENGINE {
     volatile LONG Initialized;
 
     //
+    // Rundown protection: ensures FpShutdown blocks until all in-flight
+    // public-API callers have released their references. Public APIs
+    // acquire the rundown reference BEFORE dereferencing engine state;
+    // FpShutdown sets Initialized=FALSE then waits the rundown drain.
+    //
+    EX_RUNDOWN_REF Rundown;
+
+    //
     // Protected paths (linked list, reference-counted entries)
     //
     LIST_ENTRY ProtectedPathList;
@@ -347,6 +355,8 @@ FpInitialize(
     InitializeListHead(&NewEngine->ProtectedPathList);
     ExInitializePushLock(&NewEngine->PathListLock);
 
+    ExInitializeRundownProtection(&NewEngine->Rundown);
+
     RtlZeroMemory(NewEngine->ProtectedExtensions, sizeof(NewEngine->ProtectedExtensions));
     ExInitializePushLock(&NewEngine->ExtensionLock);
 
@@ -391,6 +401,14 @@ FpShutdown(
     if (InterlockedCompareExchange(&Engine->Initialized, FALSE, TRUE) != TRUE) {
         return;
     }
+
+    //
+    // Drain in-flight public-API callers BEFORE freeing engine state.
+    // After ExWaitForRundownProtectionRelease returns, no thread can
+    // observe the engine via ExAcquireRundownProtection (it returns FALSE),
+    // and any thread that already acquired has released.
+    //
+    ExWaitForRundownProtectionRelease(&Engine->Rundown);
 
     //
     // Free all protected paths
@@ -447,8 +465,16 @@ FpConfigure(
 {
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return STATUS_DELETE_PENDING;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -465,6 +491,7 @@ FpConfigure(
     ExReleasePushLockExclusive(&Engine->ConfigLock);
     KeLeaveCriticalRegion();
 
+    ExReleaseRundownProtection(&Engine->Rundown);
     return STATUS_SUCCESS;
 }
 
@@ -490,7 +517,7 @@ FpAddProtectedPath(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -503,6 +530,14 @@ FpAddProtectedPath(
         return STATUS_NAME_TOO_LONG;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return STATUS_DELETE_PENDING;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     NewPath = (PFP_PROTECTED_PATH)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(FP_PROTECTED_PATH),
@@ -510,6 +545,7 @@ FpAddProtectedPath(
         );
 
     if (NewPath == NULL) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -548,6 +584,7 @@ FpAddProtectedPath(
         ExReleasePushLockExclusive(&Engine->PathListLock);
         KeLeaveCriticalRegion();
         ShadowStrikeFreePoolWithTag(NewPath, FP_POOL_TAG_RULE);
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -578,9 +615,11 @@ FpAddProtectedPath(
 
     if (NewPath != NULL) {
         ShadowStrikeFreePoolWithTag(NewPath, FP_POOL_TAG_RULE);
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_DUPLICATE_OBJECTID;
     }
 
+    ExReleaseRundownProtection(&Engine->Rundown);
     return STATUS_SUCCESS;
 }
 
@@ -620,7 +659,7 @@ FpRemoveProtectedPath(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -633,6 +672,14 @@ FpRemoveProtectedPath(
         return STATUS_NAME_TOO_LONG;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return STATUS_DELETE_PENDING;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
     // Allocate normalization buffer from pool instead of stack (was 2KB on stack)
     //
@@ -643,6 +690,7 @@ FpRemoveProtectedPath(
         );
 
     if (NormalizedPath == NULL) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -678,9 +726,11 @@ FpRemoveProtectedPath(
 
     if (FoundPath != NULL) {
         FppReleaseProtectedPath(FoundPath);
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_SUCCESS;
     }
 
+    ExReleaseRundownProtection(&Engine->Rundown);
     return STATUS_NOT_FOUND;
 }
 
@@ -698,14 +748,21 @@ FpAddProtectedExtension(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE) ||
-        Extension == NULL) {
+    if (Engine == NULL || Extension == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     ExtLen = wcslen(Extension);
     if (ExtLen == 0 || ExtLen >= FP_MAX_EXTENSION_LENGTH) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return STATUS_DELETE_PENDING;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     KeEnterCriticalRegion();
@@ -734,6 +791,7 @@ FpAddProtectedExtension(
     ExReleasePushLockExclusive(&Engine->ExtensionLock);
     KeLeaveCriticalRegion();
 
+    ExReleaseRundownProtection(&Engine->Rundown);
     return Status;
 }
 
@@ -748,7 +806,15 @@ FpClearAllRules(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return;
     }
 
@@ -774,6 +840,8 @@ FpClearAllRules(
 
     ExReleasePushLockExclusive(&Engine->ExtensionLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&Engine->Rundown);
 }
 
 //=============================================================================
@@ -823,22 +891,33 @@ FpCheckAccess(
         *OutProtectionFlags = 0;
     }
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
+        return FpAccess_Allow;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return FpAccess_Allow;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return FpAccess_Allow;
     }
 
     if (FilePath == NULL || FilePath->Buffer == NULL || FilePath->Length == 0) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return FpAccess_Allow;
     }
 
     InterlockedIncrement64(&Engine->Stats.TotalChecks);
 
     if (ShadowStrikeIsProcessProtected(RequestorPid, NULL)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return FpAccess_Allow;
     }
 
     PathLength = FilePath->Length / sizeof(WCHAR);
     if (PathLength >= FP_MAX_PATH_LENGTH) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return FpAccess_Allow;
     }
 
@@ -863,6 +942,7 @@ FpCheckAccess(
         );
 
     if (NormalizedPath == NULL) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return FpAccess_Allow;
     }
 
@@ -874,6 +954,7 @@ FpCheckAccess(
 
     if (MatchedRulePath == NULL) {
         ShadowStrikeFreePoolWithTag(NormalizedPath, FP_POOL_TAG_WORK);
+        ExReleaseRundownProtection(&Engine->Rundown);
         return FpAccess_Allow;
     }
 
@@ -1147,6 +1228,7 @@ FpCheckAccess(
     ShadowStrikeFreePoolWithTag(NormalizedPath, FP_POOL_TAG_WORK);
     ShadowStrikeFreePoolWithTag(MatchedRulePath, FP_POOL_TAG_WORK);
 
+    ExReleaseRundownProtection(&Engine->Rundown);
     return Result;
 }
 
@@ -1614,7 +1696,15 @@ FpLogAccessAttempt(
     LARGE_INTEGER CurrentTime;
     USHORT CopyLen;
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return;
     }
 
@@ -1630,11 +1720,13 @@ FpLogAccessAttempt(
         KeLeaveCriticalRegion();
 
         if (!AuditEnabled) {
+            ExReleaseRundownProtection(&Engine->Rundown);
             return;
         }
     }
 
     if (FilePath == NULL || FilePath->Buffer == NULL) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return;
     }
 
@@ -1649,6 +1741,7 @@ FpLogAccessAttempt(
         );
 
     if (Entry == NULL) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return;
     }
 
@@ -1690,6 +1783,8 @@ FpLogAccessAttempt(
 
     ExReleasePushLockExclusive(&Engine->AuditLogLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&Engine->Rundown);
 }
 
 _Use_decl_annotations_
@@ -1721,7 +1816,11 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return STATUS_DELETE_PENDING;
+    }
     if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1729,6 +1828,7 @@ Routine Description:
     *BufferCount = 0;
 
     if (MaxEntries == 0) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return STATUS_BUFFER_TOO_SMALL;
     }
 
@@ -1750,6 +1850,7 @@ Routine Description:
 
     *BufferCount = Copied;
 
+    ExReleaseRundownProtection(&Engine->Rundown);
     return STATUS_SUCCESS;
 }
 
@@ -1764,7 +1865,15 @@ FpClearAuditLog(
 
     PAGED_CODE();
 
-    if (Engine == NULL || !InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+    if (Engine == NULL) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return;
+    }
+    if (!InterlockedCompareExchange(&Engine->Initialized, TRUE, TRUE)) {
+        ExReleaseRundownProtection(&Engine->Rundown);
         return;
     }
 
@@ -1781,6 +1890,8 @@ FpClearAuditLog(
 
     ExReleasePushLockExclusive(&Engine->AuditLogLock);
     KeLeaveCriticalRegion();
+
+    ExReleaseRundownProtection(&Engine->Rundown);
 }
 
 //=============================================================================
@@ -1806,6 +1917,10 @@ Routine Description:
         return;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return;
+    }
+
     RtlZeroMemory(Stats, sizeof(FP_STATISTICS));
 
     Stats->TotalChecks          = InterlockedCompareExchange64(&Engine->Stats.TotalChecks, 0, 0);
@@ -1818,9 +1933,12 @@ Routine Description:
     Stats->BlockedSetSecurity   = InterlockedCompareExchange64(&Engine->Stats.BlockedSetSecurity, 0, 0);
     Stats->BlockedHardlinks     = InterlockedCompareExchange64(&Engine->Stats.BlockedHardlinks, 0, 0);
     Stats->BlockedStreams        = InterlockedCompareExchange64(&Engine->Stats.BlockedStreams, 0, 0);
+    Stats->BlockedExecutes      = InterlockedCompareExchange64(&Engine->Stats.BlockedExecutes, 0, 0);
     Stats->AuditEvents          = InterlockedCompareExchange64(&Engine->Stats.AuditEvents, 0, 0);
     Stats->BypassAttempts        = InterlockedCompareExchange64(&Engine->Stats.BypassAttempts, 0, 0);
     Stats->StartTime            = Engine->Stats.StartTime;
+
+    ExReleaseRundownProtection(&Engine->Rundown);
 }
 
 _Use_decl_annotations_
@@ -1843,6 +1961,10 @@ Routine Description:
         return;
     }
 
+    if (!ExAcquireRundownProtection(&Engine->Rundown)) {
+        return;
+    }
+
     KeQuerySystemTime(&CurrentTime);
 
     InterlockedExchange64(&Engine->Stats.TotalChecks, 0);
@@ -1855,10 +1977,13 @@ Routine Description:
     InterlockedExchange64(&Engine->Stats.BlockedSetSecurity, 0);
     InterlockedExchange64(&Engine->Stats.BlockedHardlinks, 0);
     InterlockedExchange64(&Engine->Stats.BlockedStreams, 0);
+    InterlockedExchange64(&Engine->Stats.BlockedExecutes, 0);
     InterlockedExchange64(&Engine->Stats.AuditEvents, 0);
     InterlockedExchange64(&Engine->Stats.BypassAttempts, 0);
 
     Engine->Stats.StartTime = CurrentTime;
+
+    ExReleaseRundownProtection(&Engine->Rundown);
 }
 
 //=============================================================================
