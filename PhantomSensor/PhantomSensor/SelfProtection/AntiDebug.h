@@ -193,7 +193,7 @@ AdbRegisterCallback(
     _In_opt_ PVOID Context
     );
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 AdbCheckForDebugger(
     _In_ PADB_PROTECTOR Protector,
