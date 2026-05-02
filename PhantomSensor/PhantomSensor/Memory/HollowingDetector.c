@@ -904,10 +904,17 @@ PhAnalyzeProcess(
     result->HollowingDetected = (result->Type != PhHollowing_None);
 
     //
-    // Calculate analysis duration
+    // Calculate analysis duration. Clamp on clock warp / skew so a backwards
+    // jump cannot synthesize an ~4.29e9 ms duration via unsigned wrap.
     //
     KeQuerySystemTime(&endTime);
-    result->AnalysisDurationMs = (ULONG)((endTime.QuadPart - startTime.QuadPart) / 10000);
+    if (endTime.QuadPart > startTime.QuadPart) {
+        result->AnalysisDurationMs =
+            (ULONG)min((ULONGLONG)((endTime.QuadPart - startTime.QuadPart) / 10000),
+                       (ULONGLONG)MAXULONG);
+    } else {
+        result->AnalysisDurationMs = 0;
+    }
 
     //
     // Update statistics
@@ -1077,10 +1084,17 @@ PhAnalyzeAtCreation(
     result->HollowingDetected = (result->Type != PhHollowing_None);
 
     //
-    // Record timing
+    // Record timing. Clamp on clock warp so a backwards jump cannot
+    // synthesize an ~4.29e9 ms duration via unsigned wrap.
     //
     KeQuerySystemTime(&endTime);
-    result->AnalysisDurationMs = (ULONG)((endTime.QuadPart - startTime.QuadPart) / 10000);
+    if (endTime.QuadPart > startTime.QuadPart) {
+        result->AnalysisDurationMs =
+            (ULONG)min((ULONGLONG)((endTime.QuadPart - startTime.QuadPart) / 10000),
+                       (ULONGLONG)MAXULONG);
+    } else {
+        result->AnalysisDurationMs = 0;
+    }
 
     //
     // Update stats
@@ -2077,7 +2091,7 @@ PhpAnalyzePEB(
                         &bytesRead
                     );
 
-                    if (NT_SUCCESS(status)) {
+                    if (NT_SUCCESS(status) && bytesRead == pebImagePath.Length) {
                         pebImagePath.Buffer[pebImagePath.Length / sizeof(WCHAR)] = L'\0';
 
                         //
@@ -2512,6 +2526,24 @@ PhpCompareMemoryWithFile(
     );
 
     if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+
+    //
+    // CWE-393 defense: ZwReadFile may return less than requested
+    // (sparse file, end-of-file, network share, alternate data stream
+    // truncation). Comparing the full requested length against trailing
+    // zeroed bytes in fileBuffer or stale memoryBuffer would fabricate
+    // a "hash mismatch" and trigger a false hollowing detection. Clamp
+    // compareSize to the actually read length and reject below the
+    // minimum image size.
+    //
+    if (ioStatus.Information < compareSize) {
+        compareSize = (SIZE_T)ioStatus.Information;
+    }
+
+    if (compareSize < PH_MIN_IMAGE_SIZE) {
+        status = STATUS_INVALID_IMAGE_FORMAT;
         goto Cleanup;
     }
 
@@ -3033,27 +3065,47 @@ PhpCopyUnicodeString(
     _In_ ULONG PoolTag
     )
 {
+    USHORT srcLength;
+    USHORT maxLength;
+
     RtlZeroMemory(Dest, sizeof(UNICODE_STRING));
 
     if (Src == NULL || Src->Buffer == NULL || Src->Length == 0) {
         return;
     }
 
-    Dest->MaximumLength = Src->Length + sizeof(WCHAR);
     //
-    // M-2 fix: Use PagedPool â€” all callers run at PASSIVE_LEVEL and
+    // CWE-190 defense: Src->Length is USHORT; the legacy
+    //   Dest->MaximumLength = Src->Length + sizeof(WCHAR);
+    // assignment truncates back into a USHORT, so a Src->Length of
+    // 0xFFFE / 0xFFFF wraps MaximumLength to 1 / 2 bytes while the
+    // subsequent RtlCopyMemory still copies Src->Length bytes -- pool
+    // heap overflow. Reject any length that is not WCHAR-aligned or
+    // that does not leave room for the trailing UNICODE_NULL.
+    //
+    srcLength = Src->Length;
+    if ((srcLength % sizeof(WCHAR)) != 0 ||
+        srcLength > (USHORT)(MAXUSHORT - sizeof(WCHAR))) {
+        return;
+    }
+
+    maxLength = (USHORT)(srcLength + sizeof(WCHAR));
+
+    //
+    // M-2 fix: Use PagedPool - all callers run at PASSIVE_LEVEL and
     // these are file path strings. Saves NonPagedPool pressure.
     //
     Dest->Buffer = (PWCH)ShadowStrikeAllocatePoolWithTag(
         PagedPool,
-        Dest->MaximumLength,
+        maxLength,
         PoolTag
     );
 
     if (Dest->Buffer != NULL) {
-        RtlCopyMemory(Dest->Buffer, Src->Buffer, Src->Length);
-        Dest->Length = Src->Length;
-        Dest->Buffer[Dest->Length / sizeof(WCHAR)] = L'\0';
+        RtlCopyMemory(Dest->Buffer, Src->Buffer, srcLength);
+        Dest->Length = srcLength;
+        Dest->MaximumLength = maxLength;
+        Dest->Buffer[srcLength / sizeof(WCHAR)] = L'\0';
     }
 }
 
