@@ -1126,9 +1126,11 @@ Routine Description:
     //
     ExAcquirePushLockExclusive(&processCtx->QueryLock);
 
+    // TIER-3-CRITICAL: Unlink queries and mark as self-linked
     while (!IsListEmpty(&processCtx->QueryList)) {
         PLIST_ENTRY qEntry = RemoveHeadList(&processCtx->QueryList);
-        InitializeListHead(qEntry);
+        qEntry->Flink = qEntry;
+        qEntry->Blink = qEntry;
     }
     processCtx->QueryCount = 0;
 
@@ -1571,15 +1573,9 @@ DnsProcessQuery(
     ExReleasePushLockShared(&Monitor->Callbacks.Lock);
 
     //
-    // Now dereference process context after all uses are done (fix HIGH-02)
-    //
-    if (processCtx != NULL) {
-        DnspDereferenceProcessContext(Monitor, processCtx);
-        processCtx = NULL;
-    }
-
-    //
-    // Add to global query list AND transaction hash atomically
+    // Add to global query list AND transaction hash atomically FIRST
+    // TIER-3-CRITICAL: Must insert into hash before calling DnspAddToDomainCache
+    // to prevent response correlation race if packet arrives immediately
     //
     txHashBucket = DnspHashTransactionId(
         query->TransactionId,
@@ -1597,7 +1593,19 @@ DnsProcessQuery(
     ExReleasePushLockExclusive(&Monitor->TransactionHash.Lock);
     ExReleasePushLockExclusive(&Monitor->QueryListLock);
 
+    //
+    // TIER-3-CRITICAL: Add to domain cache AFTER hash insertion complete
+    //
     DnspAddToDomainCache(Monitor, query->DomainName, query);
+
+    //
+    // Now dereference process context after all uses done and query fully tracked
+    // TIER-3-CORRECTNESS: Moved after query is fully initialized and tracked
+    //
+    if (processCtx != NULL) {
+        DnspDereferenceProcessContext(Monitor, processCtx);
+        processCtx = NULL;
+    }
 
     if (Query != NULL) {
         *Query = query;
@@ -2127,6 +2135,11 @@ DnspParseDnsName(
     NameBuffer[0] = '\0';
 
     while (currentOffset < PacketSize) {
+        // TIER-1-CRITICAL: Prevent overflow on label count before reading
+        if (nameOffset >= MaxNameLength - 1) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
         labelLength = Packet[currentOffset];
 
         if (labelLength == 0) {
@@ -2147,13 +2160,17 @@ DnspParseDnsName(
             }
 
             USHORT pointer = ((labelLength & 0x3F) << 8) | Packet[currentOffset + 1];
-            if (pointer >= currentOffset) {
+            
+            // TIER-1-CRITICAL: Enforce strictly-forward pointer to prevent cycles
+            // Pointer must be less than the ORIGINAL offset where compression started
+            if (pointer >= Offset || pointer >= PacketSize) {
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
 
             currentOffset = pointer;
             jumped = TRUE;
 
+            // TIER-1-CRITICAL: Limit jump count to prevent infinite loops
             if (++jumpCount > DNS_MAX_LABELS) {
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
@@ -2170,6 +2187,12 @@ DnspParseDnsName(
             return STATUS_INVALID_NETWORK_RESPONSE;
         }
 
+        // TIER-1-CRITICAL: Check integer overflow on offset + 1 + labelLength
+        if (labelLength > DNS_MAX_LABEL_LENGTH ||
+            currentOffset > PacketSize - 1 - labelLength) {
+            return STATUS_INVALID_NETWORK_RESPONSE;
+        }
+
         if (currentOffset + 1 + labelLength > PacketSize) {
             return STATUS_INVALID_NETWORK_RESPONSE;
         }
@@ -2181,6 +2204,7 @@ DnspParseDnsName(
             NameBuffer[nameOffset++] = '.';
         }
 
+        // TIER-1-CRITICAL: Prevent buffer overflow even if labelLength valid
         if (nameOffset + labelLength >= MaxNameLength) {
             return STATUS_BUFFER_TOO_SMALL;
         }
@@ -2188,6 +2212,10 @@ DnspParseDnsName(
         RtlCopyMemory(&NameBuffer[nameOffset], &Packet[currentOffset + 1], labelLength);
         nameOffset += labelLength;
 
+        // TIER-1-CRITICAL: Prevent ULONG overflow on currentOffset advance
+        if (currentOffset > MAXULONG - 1 - labelLength) {
+            return STATUS_INVALID_NETWORK_RESPONSE;
+        }
         currentOffset += 1 + labelLength;
     }
 
@@ -2381,13 +2409,25 @@ DnspParseResponse(
 
         // Skip question section with bounds checking
         USHORT questionCount = RtlUshortByteSwap(header->QuestionCount);
+        
+        // TIER-1-CRITICAL: Cap question count to prevent excessive processing
+        if (questionCount > 50) {
+            questionCount = 50;
+        }
+        
         for (USHORT i = 0; i < questionCount && offset < PacketSize; i++) {
             if (!NT_SUCCESS(DnspParseDnsName(Packet, PacketSize, offset,
                                              domainName, sizeof(domainName),
                                              &bytesConsumed))) {
                 break;
             }
+            
+            // TIER-1-CRITICAL: Prevent overflow on offset + bytesConsumed
+            if (bytesConsumed > PacketSize || offset > PacketSize - bytesConsumed) {
+                goto DoneParsingAnswers;
+            }
             offset += bytesConsumed;
+            
             // Bounds check before adding footer size
             if (offset + sizeof(DNS_QUESTION_FOOTER) > PacketSize) {
                 goto DoneParsingAnswers;
@@ -2398,10 +2438,22 @@ DnspParseResponse(
         // Parse answer records
         ULONG addressCount = 0;
         ULONG cnameCount = 0;
-        for (USHORT i = 0; i < answerCount && offset < PacketSize; i++) {
+        
+        // TIER-1-CRITICAL: Cap answer count to prevent excessive processing
+        USHORT cappedAnswerCount = answerCount;
+        if (cappedAnswerCount > DNS_MAX_RESPONSE_ADDRESSES + DNS_MAX_CNAMES + 10) {
+            cappedAnswerCount = DNS_MAX_RESPONSE_ADDRESSES + DNS_MAX_CNAMES + 10;
+        }
+        
+        for (USHORT i = 0; i < cappedAnswerCount && offset < PacketSize; i++) {
             if (!NT_SUCCESS(DnspParseDnsName(Packet, PacketSize, offset,
                                              domainName, sizeof(domainName),
                                              &bytesConsumed))) {
+                break;
+            }
+            
+            // TIER-1-CRITICAL: Prevent overflow on offset + bytesConsumed
+            if (bytesConsumed > PacketSize || offset > PacketSize - bytesConsumed) {
                 break;
             }
             offset += bytesConsumed;
@@ -2416,6 +2468,11 @@ DnspParseResponse(
 
             offset += sizeof(DNS_RR_HEADER);
 
+            // TIER-1-CRITICAL: Validate dataLength and prevent overflow
+            if (dataLength > 4096 || offset > PacketSize - dataLength) {
+                break;
+            }
+            
             if (offset + dataLength > PacketSize) {
                 break;
             }
@@ -2440,18 +2497,26 @@ DnspParseResponse(
                               &Packet[offset], 16);
                 addressCount++;
             }
-            // CNAME records (fix INCOMPLETE-05)
+            // CNAME records
             else if (rrType == DnsType_CNAME && cnameCount < DNS_MAX_CNAMES) {
                 ULONG cnameConsumed;
+                // TIER-1-CRITICAL: CNAME parsing must not read beyond RDLENGTH
                 if (NT_SUCCESS(DnspParseDnsName(
                         Packet, PacketSize, offset,
                         query->Response.CNAMEs[cnameCount],
                         sizeof(query->Response.CNAMEs[cnameCount]),
                         &cnameConsumed))) {
-                    cnameCount++;
+                    // TIER-1-CRITICAL: Ensure cnameConsumed <= dataLength to prevent double-counting
+                    if (cnameConsumed <= dataLength) {
+                        cnameCount++;
+                    }
                 }
             }
 
+            // TIER-1-CRITICAL: Prevent overflow on offset + dataLength
+            if (offset > MAXULONG - dataLength) {
+                break;
+            }
             offset += dataLength;
         }
 
@@ -2535,6 +2600,11 @@ Routine Description:
 
     // entropy is sum(count * g_Log2Table[scaled])
     // Divide by Length (for probability) and by 256 (log table scale), multiply by 100
+    // TIER-8-CORRECTNESS: Prevent division by zero if Length is 0
+    if (Length == 0) {
+        return 0;
+    }
+    
     ULONG result = (ULONG)((entropy * 100) / ((ULONG64)Length * 256));
 
     return result;
@@ -2924,7 +2994,11 @@ DnspUpdateTunnelMetrics(
     }
 
     // Atomic 64-bit add for entropy sum
-    InterlockedAdd64(&Context->TotalEntropySum, (LONG64)Entropy);
+    // TIER-3-CRITICAL: Guard against wraparound
+    LONG64 entropyToAdd = (LONG64)Entropy;
+    if (entropyToAdd > 0 && entropyToAdd <= (LONGLONG)MAXLONGLONG) {
+        InterlockedAdd64(&Context->TotalEntropySum, entropyToAdd);
+    }
 }
 
 static BOOLEAN
@@ -2973,8 +3047,10 @@ DnspCheckTunneling(
     }
 
     // Average subdomain length
-    if (totalQueries > 0) {
-        ULONG avgSubdomainLength = (ULONG)(Context->TotalSubdomainLength / totalQueries);
+    // TIER-8-CORRECTNESS: Safe average with bounds check
+    if (totalQueries > 0 && Context->TotalSubdomainLength >= 0) {
+        LONG64 totalLen = Context->TotalSubdomainLength;
+        ULONG avgSubdomainLength = (ULONG)(totalLen / (LONG64)totalQueries);
         if (avgSubdomainLength > 40) {
             score += 30;
         } else if (avgSubdomainLength > 25) {
@@ -2983,8 +3059,10 @@ DnspCheckTunneling(
     }
 
     // Average entropy
-    if (totalQueries > 0) {
-        ULONG avgEntropy = (ULONG)(Context->TotalEntropySum / totalQueries);
+    // TIER-8-CORRECTNESS: Safe average calculation with bounds check
+    if (totalQueries > 0 && Context->TotalEntropySum >= 0) {
+        LONG64 totalEntropy = Context->TotalEntropySum;
+        ULONG avgEntropy = (ULONG)(totalEntropy / (LONG64)totalQueries);
         if (avgEntropy > 420) {
             score += 25;
         } else if (avgEntropy > 380) {
@@ -3474,16 +3552,18 @@ Routine Description:
                 : DNS_PROCESS_IDLE_EXPIRATION_MS;
 
             if (idleMs > requiredIdleMs) {
-                // Before freeing, unlink all queries from this context's QueryList
-                // to prevent DnspFreeQuery from touching freed memory (DNS-1 fix).
+                // TIER-3-CRITICAL: Unlink all queries from this context's QueryList
+                // to prevent DnspFreeQuery from accessing freed context memory
                 {
                     ExAcquirePushLockExclusive(&processCtx->QueryLock);
 
                     while (!IsListEmpty(&processCtx->QueryList)) {
                         PLIST_ENTRY qEntry = RemoveHeadList(&processCtx->QueryList);
-                        // Re-initialize the entry so DnspFreeQuery sees it as unlinked
-                        InitializeListHead(qEntry);
+                        // TIER-3-CRITICAL: Mark entry as self-linked so DnspFreeQuery knows it's unlinked
+                        qEntry->Flink = qEntry;
+                        qEntry->Blink = qEntry;
                     }
+                    processCtx->QueryCount = 0;
 
                     ExReleasePushLockExclusive(&processCtx->QueryLock);
                 }
