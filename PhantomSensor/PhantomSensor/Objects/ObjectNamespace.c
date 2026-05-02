@@ -204,7 +204,12 @@ ShadowpAllocateAndInitializeSid(
 
     *Sid = NULL;
 
-    if (SubAuthorityCount == 0 || SubAuthorityCount > SID_MAX_SUB_AUTHORITIES) {
+    //
+    // This helper only stores SubAuthority0/1; anything beyond would be
+    // left zero-initialized and silently misrepresent the requested SID.
+    // Reject counts outside the two values used by this module.
+    //
+    if (SubAuthorityCount == 0 || SubAuthorityCount > 2) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -221,9 +226,7 @@ ShadowpAllocateAndInitializeSid(
         return status;
     }
 
-    if (SubAuthorityCount >= 1) {
-        *RtlSubAuthoritySid(newSid, 0) = SubAuthority0;
-    }
+    *RtlSubAuthoritySid(newSid, 0) = SubAuthority0;
     if (SubAuthorityCount >= 2) {
         *RtlSubAuthoritySid(newSid, 1) = SubAuthority1;
     }
@@ -629,9 +632,26 @@ ShadowCreateNamespaceObject(
     }
     else if (ObjectType == *MmSectionObjectType) {
         LARGE_INTEGER maxSize;
-        maxSize.QuadPart = (SectionSize > 0)
-            ? (LONGLONG)SectionSize
-            : (LONGLONG)SHADOW_DEFAULT_SECTION_SIZE;
+        SIZE_T effectiveSize = (SectionSize > 0)
+            ? SectionSize
+            : (SIZE_T)SHADOW_DEFAULT_SECTION_SIZE;
+
+        //
+        // Cap the requested commit size to bound resource pressure and
+        // guarantee the value fits safely in a positive LONGLONG. Rejecting
+        // oversized requests is preferable to silently truncating, since a
+        // caller relying on the larger size would then operate on an
+        // unexpectedly small mapping.
+        //
+        if (effectiveSize > SHADOW_MAX_SECTION_SIZE) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Section size 0x%Ix exceeds cap 0x%llx\n",
+                       effectiveSize, (unsigned long long)SHADOW_MAX_SECTION_SIZE);
+            ShadowDereferenceNamespace();
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        maxSize.QuadPart = (LONGLONG)effectiveSize;
 
         status = ZwCreateSection(
             ObjectHandle,
@@ -1230,21 +1250,45 @@ ShadowpVerifyDirectoryDacl(
     }
 
     //
-    // Walk each ACE. Reject if any ACCESS_ALLOWED_ACE grants to a SID
-    // that is neither SYSTEM nor BUILTIN\Administrators.
+    // Walk each ACE. Reject if any ACE grants access to a SID that is not
+    // SYSTEM or BUILTIN\Administrators. Only the canonical
+    // ACCESS_ALLOWED_ACE_TYPE (granting) and ACCESS_DENIED_ACE_TYPE (which
+    // can only restrict, never grant) are accepted. Any other ACE type
+    // â€” callback, object, compound, or anything we do not explicitly
+    // recognize â€” is treated as a hijack signal and the directory is
+    // refused. This blocks evasion via ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+    // ACCESS_ALLOWED_OBJECT_ACE_TYPE, etc., where a permissive grant could
+    // otherwise be smuggled in past a naive AceType == ALLOWED check.
     //
     for (ULONG i = 0; i < dacl->AceCount; i++) {
         PACE_HEADER aceHeader = NULL;
 
         status = RtlGetAce(dacl, i, (PVOID*)&aceHeader);
-        if (!NT_SUCCESS(status)) {
+        if (!NT_SUCCESS(status) || aceHeader == NULL) {
             acceptable = FALSE;
             break;
         }
 
         if (aceHeader->AceType == ACCESS_ALLOWED_ACE_TYPE) {
             PACCESS_ALLOWED_ACE allowedAce = (PACCESS_ALLOWED_ACE)aceHeader;
-            PSID aceSid = (PSID)&allowedAce->SidStart;
+            PSID aceSid;
+
+            //
+            // Bound-check: the ACE must be large enough to contain the
+            // fixed header plus a SID. RtlGetAce validates AceSize against
+            // ACL bounds, but does not validate that AceSize covers a
+            // well-formed SID payload.
+            //
+            if (aceHeader->AceSize < FIELD_OFFSET(ACCESS_ALLOWED_ACE, SidStart) + sizeof(ULONG)) {
+                acceptable = FALSE;
+                break;
+            }
+
+            aceSid = (PSID)&allowedAce->SidStart;
+            if (!RtlValidSid(aceSid)) {
+                acceptable = FALSE;
+                break;
+            }
 
             if (!RtlEqualSid(aceSid, systemSid) &&
                 !RtlEqualSid(aceSid, adminsSid)) {
@@ -1254,6 +1298,21 @@ ShadowpVerifyDirectoryDacl(
                 acceptable = FALSE;
                 break;
             }
+        }
+        else if (aceHeader->AceType == ACCESS_DENIED_ACE_TYPE) {
+            //
+            // ACCESS_DENIED ACEs cannot grant rights; they only restrict.
+            // Allow them through without further inspection.
+            //
+            continue;
+        }
+        else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Directory DACL contains unsupported ACE "
+                       "type 0x%X (index %u) â€” rejecting (possible hijack)\n",
+                       aceHeader->AceType, i);
+            acceptable = FALSE;
+            break;
         }
     }
 
