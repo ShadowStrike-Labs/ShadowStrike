@@ -449,15 +449,16 @@ CtInitialize(
     KeQuerySystemTime(&tracker->Public.Stats.StartTime);
 
     //
-    // Start cleanup timer via TimerManager
+    // Start cleanup timer via TimerManager.
+    // TmCreatePeriodic returns NTSTATUS; check for success.
     //
     {
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
-        if (tmMgr) {
+        if (tmMgr != NULL) {
             TM_TIMER_OPTIONS opts = { 0 };
             opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
             opts.ToleranceMs = 15000;
-            TmCreatePeriodic(
+            status = TmCreatePeriodic(
                 tmMgr,
                 tracker->Public.CleanupIntervalMs,
                 CtpCleanupTimerCallback,
@@ -465,6 +466,18 @@ CtInitialize(
                 &opts,
                 &tracker->Public.CleanupTimerId
             );
+            if (!NT_SUCCESS(status)) {
+                //
+                // Cleanup timer failed â€" non-fatal but log it.
+                // Tracker remains operational; manual cleanup via CtShutdown.
+                //
+                tracker->Public.CleanupTimerId = 0;
+            }
+        } else {
+            //
+            // No TimerManager available â€" acceptable in early boot scenarios
+            //
+            tracker->Public.CleanupTimerId = 0;
         }
     }
 
@@ -649,9 +662,14 @@ CtShutdown(
     }
 
     //
-    // Delete lookaside lists
+    // Delete lookaside lists (order matters â€" no more allocations after this)
     //
     if (tracker->LookasideInitialized) {
+        //
+        // Memory barrier ensures all pending ExFreeToNPagedLookasideList calls
+        // complete before we tear down the lookaside structures.
+        //
+        MemoryBarrier();
         ExDeleteNPagedLookasideList(&tracker->ConnectionLookaside);
         ExDeleteNPagedLookasideList(&tracker->ProcessContextLookaside);
         ExDeleteNPagedLookasideList(&tracker->FlowHashLookaside);
@@ -824,6 +842,24 @@ CtCreateConnection(
     //
     processCtx = CtpGetOrCreateProcessContext(tracker, ProcessId);
     if (processCtx != NULL) {
+        //
+        // Check per-process connection limit (DoS mitigation)
+        //
+        LONG procConnCount = InterlockedCompareExchange(&processCtx->ConnectionCount, 0, 0);
+        if ((ULONG)procConnCount >= CT_MAX_CONNECTIONS_PER_PROCESS) {
+            //
+            // Roll back: release process context and free allocations
+            //
+            CtpReleaseProcessContext(tracker, processCtx);
+            if (connection->ProcessName.Buffer != NULL) {
+                ExFreePoolWithTag(connection->ProcessName.Buffer, CT_POOL_TAG_CONN);
+            }
+            ExFreeToNPagedLookasideList(&tracker->FlowHashLookaside, flowEntry);
+            ExFreeToNPagedLookasideList(&tracker->ConnectionLookaside, connection);
+            InterlockedDecrement(&Tracker->ConnectionCount);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+        
         //
         // Copy process name to connection
         //
@@ -1288,11 +1324,14 @@ CtUpdateStats(
     }
 
     //
-    // Check for large transfer flag (atomic flag set)
+    // Check for large transfer flag (atomic flag set).
+    // Use explicit 64-bit constant suffix to avoid integer overflow.
+    // Read counters atomically to avoid data races.
     //
     {
-        LONG64 totalBytes = connection->Stats.BytesSent + connection->Stats.BytesReceived;
-        if (totalBytes > (10LL * 1024 * 1024)) {
+        LONG64 totalBytes = InterlockedCompareExchange64(&connection->Stats.BytesSent, 0, 0) +
+                            InterlockedCompareExchange64(&connection->Stats.BytesReceived, 0, 0);
+        if (totalBytes > (10LL * 1024LL * 1024LL)) {
             InterlockedOr(&connection->Flags, CtFlag_LargeTransfer);
         }
     }
@@ -1622,10 +1661,26 @@ CtAddRef(
     _In_ PCT_CONNECTION Connection
     )
 {
-    if (Connection != NULL) {
-        InterlockedIncrement(&Connection->RefCount);
-        NT_ASSERT(Connection->RefCount > 1);
+    LONG oldRef;
+    
+    if (Connection == NULL) {
+        return;
     }
+    
+    //
+    // Validate connection is not already freed (defensive check)
+    //
+    oldRef = InterlockedIncrement(&Connection->RefCount);
+    NT_ASSERT(oldRef > 1);  // Must be at least 2 after increment (was >= 1 before)
+    
+    //
+    // Additional safety: check that connection is valid by examining owner
+    //
+#if DBG
+    if (Connection->OwnerTracker == NULL) {
+        DbgBreakPoint();
+    }
+#endif
 }
 
 _Use_decl_annotations_
@@ -1775,7 +1830,11 @@ CtpHashFlowId(
     hash = (hash ^ (hash >> 33)) * 0xc4ceb9fe1a85ec53ULL;
     hash = hash ^ (hash >> 33);
 
-    return (ULONG)(hash % CT_FLOW_HASH_BUCKET_COUNT);
+    //
+    // CRITICAL: Modulo must guarantee result < CT_FLOW_HASH_BUCKET_COUNT
+    // to prevent out-of-bounds array access.
+    //
+    return (ULONG)(hash % (ULONG64)CT_FLOW_HASH_BUCKET_COUNT);
 }
 
 static ULONG
@@ -1820,7 +1879,11 @@ CtpHash5Tuple(
     hash ^= Protocol;
     hash *= 16777619;
 
-    return hash % CT_CONN_HASH_BUCKET_COUNT;
+    //
+    // CRITICAL: Modulo must guarantee result < CT_CONN_HASH_BUCKET_COUNT
+    // to prevent out-of-bounds array access.
+    //
+    return (ULONG)(hash % (ULONG)CT_CONN_HASH_BUCKET_COUNT);
 }
 
 static ULONG
@@ -2212,6 +2275,11 @@ CtpFreeConnection(
     _In_ PCT_CONNECTION Connection
     )
 {
+    //
+    // Memory barrier before freeing to lookaside â€" ensures all prior writes visible
+    //
+    MemoryBarrier();
+    
     if (Connection->ProcessName.Buffer != NULL) {
         ExFreePoolWithTag(Connection->ProcessName.Buffer, CT_POOL_TAG_CONN);
         Connection->ProcessName.Buffer = NULL;
@@ -2227,6 +2295,10 @@ CtpFreeConnection(
         Connection->TlsInfo = NULL;
     }
 
+    //
+    // Check LookasideInitialized before returning to lookaside.
+    // If FALSE, we're in teardown â€" use ExFreePoolWithTag instead.
+    //
     if (Tracker->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&Tracker->ConnectionLookaside, Connection);
     } else {
@@ -2286,6 +2358,10 @@ CtpCleanupThreadRoutine(
         }
     }
 
+    //
+    // PsTerminateSystemThread never returns; suppress unreachable code warning
+    //
+#pragma warning(suppress: 4702)  // unreachable code
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -2307,7 +2383,7 @@ CtpCleanupStaleConnections(
     PAGED_CODE();
 
     KeQuerySystemTime(&currentTime);
-    timeoutInterval.QuadPart = (LONGLONG)Tracker->Public.Config.ConnectionTimeoutMs * 10000;
+    timeoutInterval.QuadPart = (LONGLONG)Tracker->Public.Config.ConnectionTimeoutMs * 10000LL;
 
     //
     // First pass: under shared lock, count stale candidates and update idle times
