@@ -43,11 +43,21 @@
  * 4. On process termination, remove PID from trusted set.
  *
  * Thread Safety:
- * - Bitmap ops use InterlockedOr/InterlockedAnd for lock-free reads at any IRQL.
- * - BitmapExtendedInfo and hash table use EX_PUSH_LOCK (requires <= APC_LEVEL).
- * - All public lookup APIs callable at <= APC_LEVEL.
+ * - TrustedPidBitmap and BitmapExtendedInfo are both serialized by EX_PUSH_LOCKs
+ *   (BitmapLock for the bit array; ExtendedInfoLock for the extended-info
+ *   pointer table). Readers use shared acquires, writers use exclusive. The
+ *   bit operations themselves are plain reads/writes under the lock - no
+ *   Interlocked* primitives are required, and none are used.
+ * - Hash table buckets are serialized by HashLock (one EX_PUSH_LOCK covers the
+ *   whole table; per-bucket spinlocks would be a future refinement).
+ * - Lock ordering when two locks are held: ExtendedInfoLock is acquired before
+ *   BitmapLock (see ShadowStrikeRemoveTrustedProcess). All other paths hold at
+ *   most one of these locks at a time, so this is the only relevant ordering.
+ * - All public lookup APIs callable at <= APC_LEVEL (push locks require it).
  * - Race-safe initialization via InterlockedCompareExchange state machine.
- * - Bounded shutdown drain via KeWaitForSingleObject with timeout.
+ * - Bounded shutdown drain via KeWaitForSingleObject with timeout; on timeout
+ *   the code deliberately leaks pool/lookaside memory rather than free objects
+ *   that may still be in use by a stuck reader (see Shutdown for details).
  *
  * @author ShadowStrike Security Team
  * @version 2.1.0
@@ -634,6 +644,7 @@ ShadowStrikeProcessExclusionShutdown(
     PPE_PID_ENTRY pidEntry;
     LARGE_INTEGER timeout;
     LONG previousState;
+    NTSTATUS waitStatus;
     ULONG i;
 
     PAGED_CODE();
@@ -658,13 +669,29 @@ ShadowStrikeProcessExclusionShutdown(
     PepReleaseReference();
 
     timeout.QuadPart = PE_SHUTDOWN_TIMEOUT_100NS;
-    KeWaitForSingleObject(
+    waitStatus = KeWaitForSingleObject(
         &ctx->ShutdownEvent,
         Executive,
         KernelMode,
         FALSE,
         &timeout
         );
+
+    //
+    // If the drain timed out, an outstanding reader still holds a reference
+    // to the trusted-PID set. Freeing the bitmap, extended-info table, hash
+    // entries, or the lookaside backing store now would create a use-after-
+    // free in that reader. Deliberately leak the engine state in this case:
+    // the driver is unloading anyway and the leak is bounded to a single
+    // shutdown. Leave State = SHUTTING_DOWN so re-init is rejected, mirroring
+    // the ETWProvider shutdown precedent.
+    //
+    if (waitStatus == STATUS_TIMEOUT) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ProcessExclusion shutdown drain timed out; "
+                   "leaking engine state to avoid use-after-free\n");
+        return;
+    }
 
     //
     // Free extended info for bitmap PIDs
@@ -1192,6 +1219,7 @@ ShadowStrikeAddTrustedProcess(
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     ULONG_PTR pidValue = (ULONG_PTR)ProcessId;
     NTSTATUS status = STATUS_SUCCESS;
+    PEPROCESS process = NULL;
 
     if (!PepIsReady()) {
         return STATUS_DEVICE_NOT_READY;
@@ -1200,6 +1228,20 @@ ShadowStrikeAddTrustedProcess(
     if (ProcessId == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+
+    //
+    // Validate that ProcessId refers to a real, currently running process.
+    // Without this check an attacker who can reach this API (or anyone able to
+    // submit a manual exclusion through the trust boundary) could pre-exclude
+    // a future PID and silence the engine the moment that PID is recycled.
+    // Mirror the validation performed in ShadowStrikeAddPidExclusion.
+    //
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ObDereferenceObject(process);
+    process = NULL;
 
     if (!PepAcquireReference()) {
         return STATUS_DEVICE_NOT_READY;
