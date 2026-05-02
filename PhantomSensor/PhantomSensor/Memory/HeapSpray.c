@@ -730,6 +730,7 @@ Return Value:
     PHS_PROCESS_CONTEXT context;
     PHS_ALLOCATION_RECORD record = NULL;
     LARGE_INTEGER currentTime;
+    LARGE_INTEGER windowStartCopy;
     ULONG bucketIndex;
     ULONG sprayScore;
     BOOLEAN sprayDetected = FALSE;
@@ -737,12 +738,27 @@ Return Value:
     SIZE_T totalAllocatedSize;
     LONG allocationCount;
     LONG allocationsInWindow;
+    UCHAR localPattern[HS_PATTERN_SAMPLE_SIZE];
+    ULONG localRepetitionScore = 0;
+    HS_SPRAY_TYPE detectedType;
+    KAPC_STATE apcState;
+    BOOLEAN attached = FALSE;
 
     if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0)) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (Address == NULL || Size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Reject obviously unreasonable sizes early. SIZE_T near MAXSIZE_T can
+    // only originate from corrupted upstream telemetry; the heap-spray
+    // accounting math assumes Size fits comfortably in a SIZE_T sum across
+    // HS_MAX_TRACKED_ALLOCATIONS records.
+    //
+    if (Size > (SIZE_T)0x80000000ULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -802,7 +818,21 @@ Return Value:
     // We must be at <= APC_LEVEL and must use ProbeForRead instead of
     // MmIsAddressValid (which is unreliable and can return stale results).
     //
+    // CRITICAL: The caller may be in a different process context than the
+    // target (e.g., cross-process NtAllocateVirtualMemoryEx, or a worker
+    // thread dispatching post-syscall telemetry). Without attaching, the
+    // ProbeForRead/RtlCopyMemory below would either read the *caller's*
+    // address space at the same VA (information disclosure / wrong data)
+    // or AV on an unmapped page in the wrong process. Attach when the
+    // target EPROCESS differs from the current process.
+    //
     RtlZeroMemory(record->PatternSample, HS_PATTERN_SAMPLE_SIZE);
+
+    if (context->Process != NULL &&
+        context->Process != PsGetCurrentProcess()) {
+        KeStackAttachProcess(context->Process, &apcState);
+        attached = TRUE;
+    }
 
     __try {
         SIZE_T sampleSize = min(Size, HS_PATTERN_SAMPLE_SIZE);
@@ -829,6 +859,16 @@ Return Value:
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         record->PatternHash = 0;
         record->RepetitionScore = 0;
+        //
+        // Wipe any partially-copied bytes so a faulting page does not leak
+        // stale stack/pool contents into downstream pattern analysis.
+        //
+        RtlZeroMemory(record->PatternSample, HS_PATTERN_SAMPLE_SIZE);
+    }
+
+    if (attached) {
+        KeUnstackDetachProcess(&apcState);
+        attached = FALSE;
     }
 
     //
@@ -861,6 +901,17 @@ Return Value:
     totalAllocatedSize = context->TotalAllocatedSize;
     allocationCount = context->AllocationCount;
     allocationsInWindow = InterlockedCompareExchange(&context->AllocationsInWindow, 0, 0);
+    windowStartCopy = context->WindowStartTime;
+
+    //
+    // Snapshot pattern + repetition under the lock. After the lock is
+    // released another thread may prune or deallocate this record and
+    // recycle its memory through the allocation pool, so the record
+    // pointer must NOT be dereferenced for pattern/score data outside
+    // the critical section. (UAF fix.)
+    //
+    RtlCopyMemory(localPattern, record->PatternSample, HS_PATTERN_SAMPLE_SIZE);
+    localRepetitionScore = record->RepetitionScore;
 
     ExReleasePushLockExclusive(&context->AllocationLock);
     KeLeaveCriticalRegion();
@@ -879,11 +930,12 @@ Return Value:
 
         sprayDetected = TRUE;
         InterlockedExchange(&context->SprayInProgress, TRUE);
-        InterlockedExchange(&context->SuspectedType, (LONG)HspDetectSprayType(
+        detectedType = HspDetectSprayType(
             context,
-            record->PatternSample,
+            localPattern,
             HS_PATTERN_SAMPLE_SIZE
-            ));
+            );
+        InterlockedExchange(&context->SuspectedType, (LONG)detectedType);
 
         InterlockedIncrement64(&Detector->Stats.SpraysDetected);
     } else if (sprayScore < HS_MIN_SCORE_FOR_SPRAY / 2) {
@@ -916,7 +968,7 @@ Return Value:
         if (allocationsInWindow > HS_HIGH_ALLOC_RATE_THRESHOLD) {
             sprayResult.Flags |= HsFlag_HighAllocationRate;
         }
-        if (record->RepetitionScore > HS_REPETITION_THRESHOLD) {
+        if (localRepetitionScore > HS_REPETITION_THRESHOLD) {
             sprayResult.Flags |= HsFlag_RepeatedPattern;
         }
         if (Protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
@@ -926,27 +978,33 @@ Return Value:
         if (((ULONG_PTR)Address & 0xFFFF) == 0) {
             sprayResult.Flags |= HsFlag_AlignedAddresses;
         }
-        if (HspContainsShellcodeSignatures(record->PatternSample, HS_PATTERN_SAMPLE_SIZE)) {
+        if (HspContainsShellcodeSignatures(localPattern, HS_PATTERN_SAMPLE_SIZE)) {
             sprayResult.Flags |= HsFlag_ShellcodePattern;
         }
 
         //
-        // Copy dominant pattern
+        // Copy dominant pattern from the locked snapshot, not the record.
         //
         RtlCopyMemory(
             sprayResult.DominantPattern,
-            record->PatternSample,
+            localPattern,
             min(64, HS_PATTERN_SAMPLE_SIZE)
             );
         sprayResult.DominantPatternSize = min(64, HS_PATTERN_SAMPLE_SIZE);
 
         //
-        // Timing information
+        // Timing information. Clamp DurationMs to 0 if the captured window
+        // start is in the future relative to currentTime (clock skew or
+        // a freshly created context where WindowStartTime > sample time).
         //
-        sprayResult.FirstAllocation = context->WindowStartTime;
+        sprayResult.FirstAllocation = windowStartCopy;
         sprayResult.LastAllocation = currentTime;
-        sprayResult.DurationMs = (ULONG)((currentTime.QuadPart -
-                                          context->WindowStartTime.QuadPart) / 10000);
+        if (currentTime.QuadPart > windowStartCopy.QuadPart) {
+            sprayResult.DurationMs = (ULONG)((currentTime.QuadPart -
+                                              windowStartCopy.QuadPart) / 10000);
+        } else {
+            sprayResult.DurationMs = 0;
+        }
 
         //
         // Invoke callbacks
@@ -1194,9 +1252,22 @@ Return Value:
     result->AllocationCount = allocCount;
     result->TotalSize = totalSize;
     result->AverageSize = (allocCount > 0) ? totalSize / allocCount : 0;
-    result->LowestAddress = lowestAddr;
-    result->HighestAddress = highestAddr;
-    result->AddressSpan = (SIZE_T)((ULONG_PTR)highestAddr - (ULONG_PTR)lowestAddr);
+
+    //
+    // Address-range fields are only meaningful when at least one record
+    // was sampled. With allocCount == 0 the lowest sentinel (MAXULONG_PTR)
+    // and uninitialized highest (0) would underflow AddressSpan into a
+    // garbage value reported to behavior consumers.
+    //
+    if (allocCount > 0) {
+        result->LowestAddress = lowestAddr;
+        result->HighestAddress = highestAddr;
+        result->AddressSpan = (SIZE_T)((ULONG_PTR)highestAddr - (ULONG_PTR)lowestAddr);
+    } else {
+        result->LowestAddress = NULL;
+        result->HighestAddress = NULL;
+        result->AddressSpan = 0;
+    }
     result->AlignedCount = alignedCount;
     result->PatternRepetitions = maxPatternCount;
 
@@ -1300,12 +1371,18 @@ Return Value:
     }
 
     //
-    // Timing
+    // Timing. Clamp DurationMs to 0 if the captured window start is in the
+    // future relative to currentTime (clock skew or freshly-created
+    // context where no allocations have rolled the window yet).
     //
     result->FirstAllocation = context->WindowStartTime;
     result->LastAllocation = currentTime;
-    result->DurationMs = (ULONG)((currentTime.QuadPart -
-                                  context->WindowStartTime.QuadPart) / 10000);
+    if (currentTime.QuadPart > context->WindowStartTime.QuadPart) {
+        result->DurationMs = (ULONG)((currentTime.QuadPart -
+                                      context->WindowStartTime.QuadPart) / 10000);
+    } else {
+        result->DurationMs = 0;
+    }
 
     //
     // Calculate allocations per second
@@ -2052,22 +2129,27 @@ Routine Description:
     }
 
     //
-    // Check for object spray (vtable-like patterns)
+    // Check for object spray (vtable-like patterns). Guard against
+    // SampleSize < sizeof(PVOID), where the unsigned subtraction below
+    // would wrap to a huge value and run the loop off the end of the
+    // sample buffer.
     //
     ULONG ptrCount = 0;
-    for (i = 0; i < SampleSize - sizeof(PVOID) + 1; i += sizeof(PVOID)) {
-        ULONG_PTR ptr;
-        RtlCopyMemory(&ptr, &PatternSample[i], sizeof(ULONG_PTR));
-        //
-        // Check if it looks like a valid user-mode pointer
-        //
-        if (ptr > 0x10000 && ptr <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS) {
-            ptrCount++;
+    if (SampleSize >= sizeof(PVOID)) {
+        for (i = 0; i + sizeof(PVOID) <= SampleSize; i += sizeof(PVOID)) {
+            ULONG_PTR ptr;
+            RtlCopyMemory(&ptr, &PatternSample[i], sizeof(ULONG_PTR));
+            //
+            // Check if it looks like a valid user-mode pointer
+            //
+            if (ptr > 0x10000 && ptr <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS) {
+                ptrCount++;
+            }
         }
-    }
 
-    if (ptrCount > (SampleSize / sizeof(PVOID)) * 80 / 100) {
-        return HsSprayType_ObjectSpray;
+        if (ptrCount > (SampleSize / sizeof(PVOID)) * 80 / 100) {
+            return HsSprayType_ObjectSpray;
+        }
     }
 
     return HsSprayType_Unknown;
