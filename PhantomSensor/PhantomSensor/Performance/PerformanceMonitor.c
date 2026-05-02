@@ -117,11 +117,20 @@ struct _SSPM_MONITOR {
     KSPIN_LOCK CallbackLock;
 
     //
-    // Periodic collection timer (managed by TimerManager)
+    // Periodic collection timer (managed by TimerManager).
+    // CollectionLock serializes Enable/Disable/Shutdown timer-control paths
+    // so the timer id is never leaked or double-cancelled.
     //
     ULONG CollectionTimerId;
     ULONG CollectionIntervalMs;
     volatile LONG CollectionEnabled;
+    KGUARDED_MUTEX CollectionLock;
+
+    //
+    // Per-instance battery skip ticker. MUST be per-monitor (not module-static)
+    // so multiple monitors do not interleave each other's skip cadence.
+    //
+    volatile LONG BatterySkipTick;
 
     //
     // Global statistics
@@ -293,6 +302,7 @@ SsPmInitialize(
     KeInitializeEvent(&Mon->DrainEvent, NotificationEvent, TRUE);
     KeInitializeSpinLock(&Mon->ThresholdLock);
     KeInitializeSpinLock(&Mon->CallbackLock);
+    KeInitializeGuardedMutex(&Mon->CollectionLock);
 
     //
     // Allocate ring buffers for each metric
@@ -366,8 +376,11 @@ SsPmShutdown(
     InterlockedExchange(&Monitor->Initialized, 0);
 
     //
-    // Phase 2: Stop collection timer via TimerManager
+    // Phase 2: Stop collection timer via TimerManager.
+    // Serialize with any in-flight Enable/Disable callers via CollectionLock.
     //
+    KeAcquireGuardedMutex(&Monitor->CollectionLock);
+    InterlockedExchange(&Monitor->CollectionEnabled, 0);
     if (Monitor->CollectionTimerId != 0) {
         PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
         if (tmMgr) {
@@ -375,6 +388,7 @@ SsPmShutdown(
         }
         Monitor->CollectionTimerId = 0;
     }
+    KeReleaseGuardedMutex(&Monitor->CollectionLock);
 
     //
     // Phase 3: Wait for in-flight operations to drain.
@@ -761,6 +775,11 @@ SsPmEnableCollection(
     _In_ ULONG IntervalMs
     )
 {
+    NTSTATUS status;
+    PTM_MANAGER tmMgr;
+    ULONG newTimerId = 0;
+    TM_TIMER_OPTIONS opts;
+
     PAGED_CODE();
 
     if (Monitor == NULL) {
@@ -776,36 +795,87 @@ SsPmEnableCollection(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (InterlockedCompareExchange(&Monitor->ShuttingDown, 0, 0) != 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    tmMgr = ShadowStrikeGetTimerManager();
+    if (tmMgr == NULL) {
+        //
+        // Without a TimerManager we cannot honor the contract of periodic
+        // collection. Fail explicitly rather than silently disabling
+        // monitoring.
+        //
+#if DBG
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] SsPmEnableCollection: TimerManager unavailable\n");
+#endif
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    KeAcquireGuardedMutex(&Monitor->CollectionLock);
+
     //
-    // Cancel any existing timer first
+    // Re-check shutdown under the lock to close races with SsPmShutdown.
+    //
+    if (InterlockedCompareExchange(&Monitor->ShuttingDown, 0, 0) != 0) {
+        KeReleaseGuardedMutex(&Monitor->CollectionLock);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Cancel any existing timer first (synchronous wait to drain callback).
     //
     if (Monitor->CollectionTimerId != 0) {
-        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
-        if (tmMgr) {
-            TmCancel(tmMgr, Monitor->CollectionTimerId, TRUE);
-        }
+        TmCancel(tmMgr, Monitor->CollectionTimerId, TRUE);
         Monitor->CollectionTimerId = 0;
     }
 
     Monitor->CollectionIntervalMs = IntervalMs;
 
-    {
-        PTM_MANAGER tmMgr = ShadowStrikeGetTimerManager();
-        if (tmMgr) {
-            TM_TIMER_OPTIONS opts = { 0 };
-            opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
-            opts.ToleranceMs = IntervalMs / 10;  // 10% coalescing tolerance
-            TmCreatePeriodic(
-                tmMgr,
-                IntervalMs,
-                SspmiCollectionTimerCallback,
-                Monitor,
-                &opts,
-                &Monitor->CollectionTimerId);
-        }
+    //
+    // Publish CollectionEnabled BEFORE creating the timer so the first
+    // callback (which may be queued promptly under load) does not
+    // short-circuit on a stale CollectionEnabled==0.
+    //
+    InterlockedExchange(&Monitor->CollectionEnabled, 1);
+
+    RtlZeroMemory(&opts, sizeof(opts));
+    opts.Flags = TmFlag_WorkItemCallback | TmFlag_Coalescable;
+    opts.ToleranceMs = IntervalMs / 10;  // 10% coalescing tolerance
+
+    status = TmCreatePeriodic(
+        tmMgr,
+        IntervalMs,
+        SspmiCollectionTimerCallback,
+        Monitor,
+        &opts,
+        &newTimerId);
+
+    if (!NT_SUCCESS(status) || newTimerId == 0) {
+        //
+        // Roll back: clear CollectionEnabled so future Disable/Shutdown is a
+        // no-op and the caller learns of the failure.
+        //
+        InterlockedExchange(&Monitor->CollectionEnabled, 0);
+        Monitor->CollectionTimerId = 0;
+        KeReleaseGuardedMutex(&Monitor->CollectionLock);
+
+#if DBG
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] SsPmEnableCollection: TmCreatePeriodic failed 0x%08X (interval=%lu ms)\n",
+            status, IntervalMs);
+#endif
+        return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
     }
 
-    InterlockedExchange(&Monitor->CollectionEnabled, 1);
+    Monitor->CollectionTimerId = newTimerId;
+
+    KeReleaseGuardedMutex(&Monitor->CollectionLock);
 
     return STATUS_SUCCESS;
 }
@@ -826,6 +896,8 @@ SsPmDisableCollection(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    KeAcquireGuardedMutex(&Monitor->CollectionLock);
+
     InterlockedExchange(&Monitor->CollectionEnabled, 0);
 
     if (Monitor->CollectionTimerId != 0) {
@@ -835,6 +907,8 @@ SsPmDisableCollection(
         }
         Monitor->CollectionTimerId = 0;
     }
+
+    KeReleaseGuardedMutex(&Monitor->CollectionLock);
 
     return STATUS_SUCCESS;
 }
@@ -971,11 +1045,11 @@ Routine Description:
     //
     // On battery, skip every other collection cycle to reduce CPU overhead.
     // The heartbeat still fires (timer alive detection), but full metric
-    // collection frequency is halved â€” CrowdStrike-style power conservation.
+    // collection frequency is halved. Per-instance counter so multiple
+    // monitors do not interfere with each other's skip cadence.
     //
     if (ShadowPowerIsOnBattery()) {
-        static volatile LONG s_BatterySkipTick = 0;
-        if (InterlockedIncrement(&s_BatterySkipTick) & 1) {
+        if (InterlockedIncrement(&Monitor->BatterySkipTick) & 1) {
             return;
         }
     }
