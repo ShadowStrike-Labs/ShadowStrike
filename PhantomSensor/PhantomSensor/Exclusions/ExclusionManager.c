@@ -652,8 +652,19 @@ ShadowStrikeIsPathExcluded(
     }
 
     //
-    // Check path exclusions
+    // Check path exclusions.
     //
+    // Hoist the system-time query out of the per-entry loop. KeQuerySystemTime
+    // is inexpensive (KUSER_SHARED_DATA read) but on a busy filter callback
+    // path with hundreds of exclusions this used to dispatch the call once
+    // per entry. A single sample at the top of the scan is sufficient: a TTL
+    // can only be missed by at most one walk (next walk reclaims it), and
+    // ShadowStrikeCleanupExpiredExclusions is the authoritative reaper.
+    //
+    {
+        LARGE_INTEGER scanTime;
+        KeQuerySystemTime(&scanTime);
+
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_ExclusionManager.PathLock);
 
@@ -664,14 +675,11 @@ ShadowStrikeIsPathExcluded(
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
 
         //
-        // Skip expired entries
+        // Skip expired entries (single sample taken before the loop)
         //
-        if (entry->ExpireTime.QuadPart != 0) {
-            LARGE_INTEGER currentTime;
-            KeQuerySystemTime(&currentTime);
-            if (currentTime.QuadPart > entry->ExpireTime.QuadPart) {
-                continue;
-            }
+        if (entry->ExpireTime.QuadPart != 0 &&
+            scanTime.QuadPart > entry->ExpireTime.QuadPart) {
+            continue;
         }
 
         //
@@ -696,6 +704,7 @@ ShadowStrikeIsPathExcluded(
 
     ExReleasePushLockShared(&g_ExclusionManager.PathLock);
     KeLeaveCriticalRegion();
+    } /* scanTime scope */
 
     ExclusionpReleaseRundown();
 
@@ -759,6 +768,7 @@ ShadowStrikeIsExtensionExcluded(
                 excluded = TRUE;
                 InterlockedIncrement(&entry->HitCount);
                 InterlockedIncrement64(&g_ExclusionManager.Stats.ExtensionMatches);
+                InterlockedIncrement64(&g_ExclusionManager.Stats.TotalBypassed);
                 break;
             }
         }
