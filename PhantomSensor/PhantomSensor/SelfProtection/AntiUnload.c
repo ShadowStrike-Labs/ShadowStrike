@@ -323,11 +323,20 @@ AuSetLevel(
     if (Protector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (!Protector->Initialized) {
-        return STATUS_DEVICE_NOT_READY;
-    }
     if (Level > AuLevel_Full) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Acquire rundown BEFORE inspecting Initialized so a concurrent
+    // AuShutdown cannot free the protector out from under us.
+    //
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -341,6 +350,7 @@ AuSetLevel(
     if ((LONG)Level == oldLevel) {
         ExReleasePushLockExclusive(&Protector->ConfigLock);
         KeLeaveCriticalRegion();
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return STATUS_SUCCESS;
     }
 
@@ -359,6 +369,7 @@ AuSetLevel(
             InterlockedExchange(&Protector->Level, (LONG)AuLevel_Basic);
             ExReleasePushLockExclusive(&Protector->ConfigLock);
             KeLeaveCriticalRegion();
+            ExReleaseRundownProtection(&Protector->RundownRef);
             return status;
         }
     } else if ((LONG)Level < (LONG)AuLevel_Full && oldLevel >= (LONG)AuLevel_Full) {
@@ -373,6 +384,7 @@ AuSetLevel(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Protection level: %d -> %d\n", oldLevel, (LONG)Level);
 
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -392,7 +404,12 @@ AuRegisterCallback(
     if (Protector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
     if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -405,6 +422,7 @@ AuRegisterCallback(
     ExReleasePushLockExclusive(&Protector->ConfigLock);
     KeLeaveCriticalRegion();
 
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -421,8 +439,16 @@ AuProtectProcess(
     KIRQL oldIrql;
     ULONG i;
 
-    if (Protector == NULL || !Protector->Initialized || ProcessId == NULL) {
+    if (Protector == NULL || ProcessId == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     KeAcquireSpinLock(&Protector->PidLock, &oldIrql);
@@ -433,6 +459,7 @@ AuProtectProcess(
     for (i = 0; i < Protector->ProtectedPidCount; i++) {
         if (Protector->ProtectedPids[i] == ProcessId) {
             KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+            ExReleaseRundownProtection(&Protector->RundownRef);
             return STATUS_DUPLICATE_OBJECTID;
         }
     }
@@ -442,6 +469,7 @@ AuProtectProcess(
     //
     if (Protector->ProtectedPidCount >= AU_MAX_PROTECTED_PIDS) {
         KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -453,6 +481,7 @@ AuProtectProcess(
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Protected PID registered: %p\n", ProcessId);
 
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -469,7 +498,15 @@ AuUnprotectProcess(
     KIRQL oldIrql;
     ULONG i;
 
-    if (Protector == NULL || !Protector->Initialized || ProcessId == NULL) {
+    if (Protector == NULL || ProcessId == NULL) {
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return;
     }
 
@@ -491,6 +528,8 @@ AuUnprotectProcess(
     }
 
     KeReleaseSpinLock(&Protector->PidLock, oldIrql);
+
+    ExReleaseRundownProtection(&Protector->RundownRef);
 }
 
 /**
@@ -517,7 +556,11 @@ AuGetEvents(
 
     *Count = 0;
 
+    if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
+        return STATUS_DELETE_PENDING;
+    }
     if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -557,6 +600,7 @@ AuGetEvents(
     KeReleaseSpinLock(&Protector->EventLock, oldIrql);
 
     *Count = count;
+    ExReleaseRundownProtection(&Protector->RundownRef);
     return STATUS_SUCCESS;
 }
 
@@ -1130,9 +1174,12 @@ AupNotifyCallback(
     PVOID context;
 
     //
-    // Read callback/context atomically under shared lock.
-    // We're in an OB callback context (â‰¤ APC_LEVEL typically),
-    // but push locks require KeEnterCriticalRegion.
+    // Hold the ConfigLock SHARED across the user upcall so that a
+    // future AuRegisterCallback (which acquires it EXCLUSIVE) cannot
+    // return while a callback is still in flight against the OLD
+    // function pointer. The contract forbids the callback from
+    // re-entering Au APIs, so this cannot deadlock against any
+    // shared-acquired Au path.
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Protector->ConfigLock);
@@ -1140,10 +1187,10 @@ AupNotifyCallback(
     callback = Protector->UserCallback;
     context = Protector->CallbackContext;
 
+    if (callback != NULL) {
+        (VOID)callback(AttemptType, CallerPid, context);
+    }
+
     ExReleasePushLockShared(&Protector->ConfigLock);
     KeLeaveCriticalRegion();
-
-    if (callback != NULL) {
-        callback(AttemptType, CallerPid, context);
-    }
 }
