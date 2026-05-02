@@ -776,9 +776,21 @@ Arguments:
         while (!IsListEmpty(&Internal->ProcessBuckets[i].ContextList)) {
             PLIST_ENTRY CtxEntry = RemoveHeadList(&Internal->ProcessBuckets[i].ContextList);
             PINJ_PROCESS_CONTEXT Context = CONTAINING_RECORD(CtxEntry, INJ_PROCESS_CONTEXT, HashEntry);
+            InitializeListHead(&Context->HashEntry);
+            Internal->ProcessBuckets[i].Count--;
+            InterlockedDecrement(&Internal->ProcessContextCount);
             KeReleaseSpinLock(&Internal->ProcessBuckets[i].Lock, OldIrql);
 
-            InjpFreeProcessContext(Internal, Context);
+            //
+            // FIX [MEDIUM][CWE-672]: Honor the reference count instead of force-freeing.
+            // InjpLookupProcessContext seeds RefCount = 2 (one for the hash table, one
+            // for the caller); a context may legitimately have RefCount > 1 if any
+            // outstanding consumer (InjDetectInjection path) is still in flight. Direct
+            // ExFreeToNPagedLookasideList here would yank the structure out from under
+            // the live consumer -> use-after-free. Decrementing the hash-table
+            // ownership reference frees only when the last live reference is released.
+            //
+            InjpDereferenceProcessContext(Internal, Context);
 
             KeAcquireSpinLock(&Internal->ProcessBuckets[i].Lock, &OldIrql);
         }
@@ -962,7 +974,31 @@ Return Value:
     if (Internal->Public.Config.EnableAutoBlocking) {
         if (InjpShouldBlockInjection(Internal, Operation)) {
             InterlockedIncrement64(&Internal->Public.Stats.BlockedInjections);
+
+            //
+            // FIX [HIGH][CWE-416]: When chain correlation is enabled the operation
+            // was just inserted into a chain's OperationList by
+            // InjpCorrelateOperationWithChain (above). Freeing it after only
+            // detaching from the hash bucket leaves Chain->OperationList holding
+            // a dangling pointer; the worker thread (InjpAnalyzeChain /
+            // InjpCalculateOperationPatterns) and InjpFreeChain will dereference
+            // freed lookaside memory -> use-after-free / bugcheck.
+            //
+            // Detach from the parent chain under ChainLock prior to free. Lock
+            // ordering is preserved: bucket lock is dropped by InjpRemoveOperation
+            // before ChainLock is acquired here, so the documented Chain(2) >
+            // Bucket(1) ordering is honored.
+            //
             InjpRemoveOperation(Internal, Operation);
+            {
+                KIRQL ChainIrql;
+                KeAcquireSpinLock(&Internal->ChainLock, &ChainIrql);
+                if (!IsListEmpty(&Operation->ChainEntry)) {
+                    RemoveEntryList(&Operation->ChainEntry);
+                    InitializeListHead(&Operation->ChainEntry);
+                }
+                KeReleaseSpinLock(&Internal->ChainLock, ChainIrql);
+            }
             InjpFreeOperation(Internal, Operation);
             return STATUS_ACCESS_DENIED;
         }
@@ -1476,12 +1512,31 @@ Return Value:
     Stats->ActiveChains = (ULONG64)Internal->ActiveChainCount;
 
     //
-    // Calculate uptime
+    // Calculate uptime.
+    //
+    // FIX [MEDIUM][CWE-191][CWE-197]: KeQuerySystemTime returns wall-clock UTC, not
+    // monotonic. Admin or NTP can move the clock backward between StartTime sampling
+    // and now, producing a negative LONGLONG delta. Dividing a negative LONGLONG by
+    // 10000000 yields another negative LONGLONG; the unchecked cast to ULONG then
+    // produces a near-MAXULONG value, presenting a wildly incorrect uptime to any
+    // operator/SIEM consumer of INJ_STATISTICS. The dual saturation below clamps the
+    // delta to a non-negative range and to MAXULONG before the narrowing cast.
     //
     KeQuerySystemTime(&CurrentTime);
-    Stats->UptimeSeconds = (ULONG)(
-        (CurrentTime.QuadPart - Internal->Public.Stats.StartTime.QuadPart) / 10000000
-        );
+    {
+        LONGLONG ElapsedTicks = CurrentTime.QuadPart -
+                                Internal->Public.Stats.StartTime.QuadPart;
+        LONGLONG ElapsedSeconds;
+
+        if (ElapsedTicks < 0) {
+            ElapsedTicks = 0;
+        }
+        ElapsedSeconds = ElapsedTicks / 10000000;
+        if (ElapsedSeconds > (LONGLONG)MAXULONG) {
+            ElapsedSeconds = (LONGLONG)MAXULONG;
+        }
+        Stats->UptimeSeconds = (ULONG)ElapsedSeconds;
+    }
 
     return STATUS_SUCCESS;
 }
