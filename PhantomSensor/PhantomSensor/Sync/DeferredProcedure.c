@@ -248,9 +248,20 @@ DpcShutdown(
     *Manager = NULL;
 
     //
-    // STEP 1: Gate â€” reject all new DpcQueue calls.
+    // STEP 1: Gate â€” reject all new DpcQueue calls. Use CAS so a second
+    // concurrent or sequential DpcShutdown call returns without
+    // double-freeing the manager pool memory.
     //
-    InterlockedExchange(&mgr->Initialized, 0);
+    if (InterlockedCompareExchange(&mgr->Initialized, 0, 1) != 1) {
+        //
+        // Another thread already started shutdown. The first caller
+        // owns teardown; we must not race it (the manager pointer is
+        // about to be freed). Restoring *Manager would deny the first
+        // caller its view of completion, and overwriting NULL is
+        // harmless to us.
+        //
+        return;
+    }
 
     //
     // STEP 2: Cancel all queued (but not yet running) DPCs.
