@@ -1170,6 +1170,17 @@ MsRemovePattern(
         return STATUS_INVALID_PARAMETER_1;
     }
 
+    //
+    // FIX MS-C1: Hold an outstanding reference for the entire body so that
+    // MsShutdown blocks behind us before tearing down PatternLock, the
+    // pattern lookaside, and the scanner block. Without this, a removal
+    // racing with shutdown would unblock on a freed push-lock and free a
+    // pattern back to a deleted lookaside.
+    //
+    if (!MspTryAcquireReference(scanner)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&scanner->Base.PatternLock);
 
@@ -1232,6 +1243,8 @@ MsRemovePattern(
     ExReleasePushLockExclusive(&scanner->Base.PatternLock);
     KeLeaveCriticalRegion();
 
+    MspReleaseReference(scanner);
+
     return status;
 }
 
@@ -1253,6 +1266,13 @@ MsEnablePattern(
         return STATUS_INVALID_PARAMETER_1;
     }
 
+    //
+    // FIX MS-C1: See MsRemovePattern.
+    //
+    if (!MspTryAcquireReference(scanner)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&scanner->Base.PatternLock);
 
@@ -1268,6 +1288,8 @@ MsEnablePattern(
 
     ExReleasePushLockExclusive(&scanner->Base.PatternLock);
     KeLeaveCriticalRegion();
+
+    MspReleaseReference(scanner);
 
     return status;
 }
@@ -1291,6 +1313,13 @@ MsRebuildSearchTables(
 
     if (scanner->Magic != MS_SCANNER_MAGIC) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // FIX MS-C1: See MsRemovePattern.
+    //
+    if (!MspTryAcquireReference(scanner)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     KeEnterCriticalRegion();
@@ -1323,6 +1352,8 @@ MsRebuildSearchTables(
 
     ExReleasePushLockExclusive(&scanner->Base.PatternLock);
     KeLeaveCriticalRegion();
+
+    MspReleaseReference(scanner);
 
     return STATUS_SUCCESS;
 }
@@ -1907,6 +1938,15 @@ MsCancelScan(
         return STATUS_INVALID_PARAMETER_1;
     }
 
+    //
+    // FIX MS-C1: Hold a reference for the body so that a concurrent
+    // MsShutdown cannot tear down ActiveScansLock or the scanner block
+    // while we walk the list.
+    //
+    if (!MspTryAcquireReference(scanner)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&scanner->Base.ActiveScansLock);
 
@@ -1926,6 +1966,8 @@ MsCancelScan(
 
     ExReleasePushLockExclusive(&scanner->Base.ActiveScansLock);
     KeLeaveCriticalRegion();
+
+    MspReleaseReference(scanner);
 
     return status;
 }
@@ -2196,6 +2238,16 @@ MsGetStatistics(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    //
+    // FIX MS-C1: Hold a reference while reading the statistics block so
+    // that MsShutdown cannot free the scanner out from under us. All reads
+    // here are atomic LONG/LONG64 fields, but the scanner block itself
+    // (and Stats.StartTime) requires lifetime protection.
+    //
+    if (!MspTryAcquireReference(scanner)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     RtlZeroMemory(Stats, sizeof(MS_STATISTICS));
 
     Stats->PatternCount = (ULONG)scanner->Base.PatternCount;
@@ -2214,6 +2266,8 @@ MsGetStatistics(
     if (Stats->TotalScans > 0) {
         Stats->AverageScanTimeMs = (ULONG)(scanner->Base.Stats.CumulativeScanTimeMs / Stats->TotalScans);
     }
+
+    MspReleaseReference(scanner);
 
     return STATUS_SUCCESS;
 }
