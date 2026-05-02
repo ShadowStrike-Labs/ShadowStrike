@@ -386,7 +386,43 @@ FiGetStatistics(
     _Out_ PFI_STATISTICS Statistics
     )
 {
-    RtlCopyMemory(Statistics, &g_FiState.Stats, sizeof(FI_STATISTICS));
+    if (Statistics == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(Statistics, sizeof(FI_STATISTICS));
+
+    //
+    // Take a rundown reference so a concurrent FiShutdown is forced to
+    // drain before any state is repurposed. Although g_FiState lives in
+    // BSS and is never freed, the rundown wait also serializes against
+    // an in-flight FiInitialize that would otherwise be observable in a
+    // partially-constructed form (e.g. before BootStatus is set).
+    //
+    if (!FipEnterOperation()) {
+        //
+        // Module not initialized or shutdown in progress: leave the
+        // caller's buffer zeroed (CurrentBootStatus == FiBoot_Unknown).
+        //
+        return;
+    }
+
+    //
+    // Read each volatile counter via InterlockedCompareExchange64 to
+    // guarantee atomicity vs. concurrent InterlockedIncrement64 callers
+    // and to defeat compiler reordering / partial-word reads.
+    //
+    Statistics->IntegrityChecks =
+        InterlockedCompareExchange64(&g_FiState.Stats.IntegrityChecks, 0, 0);
+    Statistics->ThreatsDetected =
+        InterlockedCompareExchange64(&g_FiState.Stats.ThreatsDetected, 0, 0);
+    Statistics->EspAccessBlocked =
+        InterlockedCompareExchange64(&g_FiState.Stats.EspAccessBlocked, 0, 0);
+    Statistics->BcdModificationsDetected =
+        InterlockedCompareExchange64(&g_FiState.Stats.BcdModificationsDetected, 0, 0);
+    Statistics->CurrentBootStatus = g_FiState.Stats.CurrentBootStatus;
+
+    FipLeaveOperation();
 }
 
 // ============================================================================
@@ -510,8 +546,35 @@ FipIsEspPath(
 static BOOLEAN
 FipEnterOperation(VOID)
 {
-    if (g_FiState.State != 2) return FALSE;
-    return ExAcquireRundownProtection(&g_FiState.RundownRef);
+    //
+    // Cheap pre-check: if the module isn't running, fail fast without
+    // touching the rundown reference. The authoritative state machine
+    // transition happens via InterlockedCompareExchange in FiShutdown,
+    // so a stale read here is safe — the rundown acquire below is the
+    // real serialization point.
+    //
+    if (ReadAcquire(&g_FiState.State) != 2) {
+        return FALSE;
+    }
+
+    if (!ExAcquireRundownProtection(&g_FiState.RundownRef)) {
+        return FALSE;
+    }
+
+    //
+    // Re-validate state after acquiring the rundown reference. This
+    // closes the narrow window where FiShutdown observed State==2,
+    // transitioned it to 3, and is now waiting on rundown drain.
+    // Acquiring before the wait begins is benign (we hold a ref, the
+    // wait blocks until we release), but rejecting late acquirers
+    // shortens the shutdown path and prevents new work from starting.
+    //
+    if (ReadAcquire(&g_FiState.State) != 2) {
+        ExReleaseRundownProtection(&g_FiState.RundownRef);
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static VOID
