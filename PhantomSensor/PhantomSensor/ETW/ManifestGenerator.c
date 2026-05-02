@@ -48,6 +48,20 @@ Implementation Features:
 #include <ntstrsafe.h>
 #include <wdm.h>
 
+//
+// va_copy is C99 and is supplied by MSVC <stdarg.h> for both C and C++ since
+// VS2013, but the WDK kernel preprocessor environment does not always expose
+// the macro under /TC. MgpStringBuilderAppendFormatV depends on it to consume
+// the caller's va_list across the geometric retry ladder without invoking the
+// undefined behaviour of reusing a va_list after a vprintf-family call.
+// Provide the same guarded fallback as EventSchema.c. On the MSVC x64 ABI a
+// va_list is a simple pointer that vprintf-family routines take by value, so
+// a plain assignment is functionally equivalent to va_copy for this codebase.
+//
+#ifndef va_copy
+#define va_copy(dest, src) ((dest) = (src))
+#endif
+
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
