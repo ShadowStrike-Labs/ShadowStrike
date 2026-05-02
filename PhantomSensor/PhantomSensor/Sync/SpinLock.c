@@ -605,16 +605,24 @@ ShadowStrikeReleaseQueuedSpinLock(
 {
     PSHADOWSTRIKE_QUEUED_SPINLOCK Lock = LockHandle->ParentLock;
 
-#if SHADOWSTRIKE_DEADLOCK_DETECTION
-    if (Lock != NULL) {
-        ShadowRecordLockRelease(Lock);
+    //
+    // Defensive guard: ParentLock is set ONLY on a successful acquire
+    // (or successful TryAcquire). A NULL ParentLock here means the
+    // caller passed a handle from a failed TryAcquire, or is double-
+    // releasing a previously-released handle â€” both of which would
+    // dispatch into KeReleaseInStackQueuedSpinLock with a zeroed
+    // KLOCK_QUEUE_HANDLE â†’ undefined behavior. Bail out quietly.
+    //
+    if (Lock == NULL) {
+        return;
     }
+
+#if SHADOWSTRIKE_DEADLOCK_DETECTION
+    ShadowRecordLockRelease(Lock);
 #endif
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    if (Lock != NULL) {
-        ShadowRecordRelease(&Lock->Stats);
-    }
+    ShadowRecordRelease(&Lock->Stats);
 #endif
 
     //
@@ -623,13 +631,19 @@ ShadowStrikeReleaseQueuedSpinLock(
     // KeAcquireInStackQueuedSpinLock). Release via the plain spinlock
     // path and restore IRQL manually.
     //
-    if (LockHandle->LockHandle.LockQueue.Lock == NULL && Lock != NULL) {
+    if (LockHandle->LockHandle.LockQueue.Lock == NULL) {
         KIRQL OldIrql = LockHandle->LockHandle.OldIrql;
         KeReleaseSpinLockFromDpcLevel(&Lock->Lock);
         KeLowerIrql(OldIrql);
     } else {
         KeReleaseInStackQueuedSpinLock(&LockHandle->LockHandle);
     }
+
+    //
+    // Clear ParentLock so a stray double-release is caught by the
+    // guard above instead of corrupting another thread's queued lock.
+    //
+    LockHandle->ParentLock = NULL;
 }
 
 /**
@@ -721,16 +735,21 @@ ShadowStrikeReleaseQueuedSpinLockFromDpcLevel(
     _Inout_ PSHADOWSTRIKE_INSTACK_QUEUED_LOCK LockHandle
 )
 {
-#if SHADOWSTRIKE_DEADLOCK_DETECTION
-    if (LockHandle->ParentLock != NULL) {
-        ShadowRecordLockRelease(LockHandle->ParentLock);
+    //
+    // Same guard as the non-DPC path: NULL ParentLock means the handle
+    // is either from a failed TryAcquire or already-released. Avoid
+    // dispatching the kernel queued-release with a zeroed handle.
+    //
+    if (LockHandle->ParentLock == NULL) {
+        return;
     }
+
+#if SHADOWSTRIKE_DEADLOCK_DETECTION
+    ShadowRecordLockRelease(LockHandle->ParentLock);
 #endif
 
 #if SHADOWSTRIKE_LOCK_STATISTICS
-    if (LockHandle->ParentLock != NULL) {
-        ShadowRecordRelease(&LockHandle->ParentLock->Stats);
-    }
+    ShadowRecordRelease(&LockHandle->ParentLock->Stats);
 #endif
 
     //
@@ -738,11 +757,13 @@ ShadowStrikeReleaseQueuedSpinLockFromDpcLevel(
     // KeTryToAcquireSpinLockAtDpcLevel, not in-stack queued API). Passing
     // such a handle to KeReleaseInStackQueuedSpinLockFromDpcLevel is UB.
     //
-    if (LockHandle->LockHandle.LockQueue.Lock == NULL && LockHandle->ParentLock != NULL) {
+    if (LockHandle->LockHandle.LockQueue.Lock == NULL) {
         KeReleaseSpinLockFromDpcLevel(&LockHandle->ParentLock->Lock);
     } else {
         KeReleaseInStackQueuedSpinLockFromDpcLevel(&LockHandle->LockHandle);
     }
+
+    LockHandle->ParentLock = NULL;
 }
 
 // ============================================================================
