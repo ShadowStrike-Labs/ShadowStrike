@@ -125,6 +125,13 @@ typedef struct _AWQ_WORK_ITEM_I {
     LARGE_INTEGER           SubmitTime;
     LARGE_INTEGER           ExecutionStartTime; // Set when callback begins
 
+    //
+    // Non-zero while the item lives on a serialization key's PendingItems
+    // list (linked via QueueLink). Used by cancel paths to route between
+    // the priority-queue lock and the serialization lock without racing.
+    //
+    volatile LONG           OnSerialPending;
+
 } AWQ_WORK_ITEM_I, *PAWQ_WORK_ITEM_I;
 
 // ============================================================================
@@ -280,6 +287,16 @@ static NTSTATUS AwqpSerializationCheck(_In_ PAWQ_MANAGER_I Mgr, _In_ PAWQ_WORK_I
 static VOID AwqpSerializationRelease(_In_ PAWQ_MANAGER_I Mgr, _In_ ULONG64 Key);
 
 static VOID AwqpCheckDrainComplete(_In_ PAWQ_MANAGER_I Mgr);
+
+//
+// Cancel and complete every successor of the given chain head.
+// Successors live in the hash + ActiveItems list but are NOT on any
+// priority queue, so cancelling the head alone leaks them and stalls
+// drain/shutdown. Caller must own no AWQ locks. Item->NextInChain is
+// cleared so a concurrent path cannot re-walk the same chain.
+//
+static VOID AwqpCancelChainSuccessors(_In_ PAWQ_MANAGER_I Mgr,
+                                      _In_ PAWQ_WORK_ITEM_I Item);
 
 // ============================================================================
 // Helper: safe acquire/release for push lock with critical region
@@ -541,7 +558,17 @@ AwqShutdown(
     AWQ_UNLOCK_EXCLUSIVE(&Mgr->WorkerLock);
 
     //
-    // Signal each worker to stop and wait for thread exit
+    // Signal each worker to stop and wait for thread exit.
+    //
+    // We MUST NOT free the manager while any worker thread is still alive:
+    // workers continue to read Mgr->State, Mgr->NewWorkEvent, etc. on every
+    // loop iteration. A bounded timeout followed by ExFreePool would be a
+    // guaranteed BSOD use-after-free as soon as the leaked worker resumes.
+    //
+    // We therefore wait with a diagnostic timeout, log a warning if the
+    // wait does not complete in time, and then re-wait without bound. A
+    // hung user callback can stall shutdown, but that is strictly
+    // preferable to corrupting the kernel pool.
     //
     Timeout.QuadPart = -((LONGLONG)AWQ_SHUTDOWN_TIMEOUT_MS * 10000);
 
@@ -554,14 +581,22 @@ AwqShutdown(
         if (W->ThreadObject != NULL) {
             NTSTATUS waitStatus = KeWaitForSingleObject(
                 W->ThreadObject, Executive, KernelMode, FALSE, &Timeout);
-            if (waitStatus == STATUS_TIMEOUT) {
-                //
-                // FIX AWQ-H3: Thread still running â€” do NOT free W.
-                // UAF worse than small pool leak. Thread will eventually exit.
-                //
-                ObDereferenceObject(W->ThreadObject);
-                continue;  // leak W â€” do NOT free
+
+            while (waitStatus == STATUS_TIMEOUT) {
+#if DBG
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[ShadowStrike] AWQ: Worker thread %u still running %u ms after "
+                    "shutdown signal; continuing to wait (callback may be stuck).\n",
+                    W->ThreadId, AWQ_SHUTDOWN_TIMEOUT_MS);
+#endif
+                // Re-arm signaling in case the worker missed the wake-up.
+                KeSetEvent(&Mgr->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+                KeSetEvent(&Mgr->NewWorkEvent, IO_NO_INCREMENT, FALSE);
+
+                waitStatus = KeWaitForSingleObject(
+                    W->ThreadObject, Executive, KernelMode, FALSE, &Timeout);
             }
+
             ObDereferenceObject(W->ThreadObject);
         }
         ExFreePoolWithTag(W, AWQ_POOL_TAG_THREAD);
@@ -588,17 +623,7 @@ AwqShutdown(
             PAWQ_WORK_ITEM_I Item = CONTAINING_RECORD(Entry, AWQ_WORK_ITEM_I, QueueLink);
 
             // Cancel any chained successors before completing this item
-            {
-                PAWQ_WORK_ITEM_I Chain = Item->NextInChain;
-                Item->NextInChain = NULL;
-                while (Chain != NULL) {
-                    PAWQ_WORK_ITEM_I Next = Chain->NextInChain;
-                    Chain->NextInChain = NULL;
-                    InterlockedExchange(&Chain->State, (LONG)AwqItemState_Cancelled);
-                    AwqpCompleteItem(Mgr, Chain, STATUS_CANCELLED);
-                    Chain = Next;
-                }
-            }
+            AwqpCancelChainSuccessors(Mgr, Item);
 
             InterlockedExchange(&Item->State, (LONG)AwqItemState_Cancelled);
             AwqpCompleteItem(Mgr, Item, STATUS_CANCELLED);
@@ -630,6 +655,7 @@ AwqShutdown(
         while (!IsListEmpty(&SK->PendingItems)) {
             PLIST_ENTRY PE = RemoveHeadList(&SK->PendingItems);
             PAWQ_WORK_ITEM_I PI = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
+            InterlockedExchange(&PI->OnSerialPending, 0);
             InterlockedExchange(&PI->State, (LONG)AwqItemState_Cancelled);
             AwqpCompleteItem(Mgr, PI, STATUS_CANCELLED);
         }
@@ -733,8 +759,6 @@ AwqDrain(
     PAWQ_MANAGER_I Mgr;
     NTSTATUS Status;
     LARGE_INTEGER Timeout;
-    ULONG TotalPending = 0;
-    ULONG i;
 
     PAGED_CODE();
 
@@ -743,12 +767,22 @@ AwqDrain(
     if (!ExAcquireRundownProtection(&Mgr->RundownRef)) return STATUS_DELETE_PENDING;
 
     //
-    // Check if already empty
+    // Use ActiveItems.Count as the in-flight gauge. It is incremented in
+    // AwqpRegisterItem (called BEFORE the item is enqueued or pushed onto
+    // the serialization pending list) and decremented in AwqpUnregisterItem
+    // (called from AwqpCompleteItem). It therefore covers every item in
+    // existence between submit and completion, including:
+    //   - items waiting in priority queues
+    //   - items currently executing in workers
+    //   - items deferred on serialization PendingItems
+    //   - items mid-retry between dequeue and re-enqueue
     //
-    for (i = 0; i < AwqPriority_Count; i++) {
-        TotalPending += (ULONG)Mgr->Queues[i].ItemCount;
-    }
-    if (TotalPending == 0 && Mgr->ActiveWorkerCount == 0) {
+    // The previous implementation summed Queue[i].ItemCount + ActiveWorkerCount,
+    // which leaves a window between AwqpDequeue (decrements ItemCount) and
+    // the ActiveWorkerCount increment in AwqpExecuteItem where both read zero,
+    // letting drain falsely complete with work still in flight.
+    //
+    if (Mgr->ActiveItems.Count == 0) {
         ExReleaseRundownProtection(&Mgr->RundownRef);
         return STATUS_SUCCESS;
     }
@@ -765,18 +799,13 @@ AwqDrain(
     InterlockedExchange(&Mgr->State, (LONG)AwqQueueState_Draining);
 
     //
-    // Re-check: items may have completed between initial check and state change
+    // Re-check after publishing Draining: items may have completed in the
+    // window between the initial check and the state change.
     //
-    {
-        ULONG PostCheckPending = 0;
-        for (i = 0; i < AwqPriority_Count; i++) {
-            PostCheckPending += (ULONG)Mgr->Queues[i].ItemCount;
-        }
-        if (PostCheckPending == 0 && Mgr->ActiveWorkerCount == 0) {
-            InterlockedExchange(&Mgr->State, (LONG)AwqQueueState_Running);
-            ExReleaseRundownProtection(&Mgr->RundownRef);
-            return STATUS_SUCCESS;
-        }
+    if (Mgr->ActiveItems.Count == 0) {
+        InterlockedExchange(&Mgr->State, (LONG)AwqQueueState_Running);
+        ExReleaseRundownProtection(&Mgr->RundownRef);
+        return STATUS_SUCCESS;
     }
 
     if (TimeoutMs == 0) TimeoutMs = AWQ_SHUTDOWN_TIMEOUT_MS;
@@ -1146,6 +1175,40 @@ AwqCancel(
     }
 
     //
+    // Route 1: item is parked on a serialization key's PendingItems list.
+    // Its QueueLink lives under the serialization lock, NOT the priority
+    // queue lock â€” the priority-queue path below would corrupt that list
+    // by removing a link the queue lock does not protect.
+    //
+    if (Item->OnSerialPending != 0) {
+        BOOLEAN RemovedFromSerial = FALSE;
+
+        AWQ_LOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+        if (Item->OnSerialPending != 0 &&
+            InterlockedCompareExchange(&Item->State,
+                (LONG)AwqItemState_Cancelled,
+                (LONG)AwqItemState_Queued) == (LONG)AwqItemState_Queued) {
+            RemoveEntryList(&Item->QueueLink);
+            InitializeListHead(&Item->QueueLink);
+            InterlockedExchange(&Item->OnSerialPending, 0);
+            RemovedFromSerial = TRUE;
+        }
+        AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+
+        if (RemovedFromSerial) {
+            AwqpCancelChainSuccessors(Mgr, Item);
+            AwqpCompleteItem(Mgr, Item, STATUS_CANCELLED);
+            InterlockedIncrement64(&Mgr->Stats.TotalCancelled);
+            AwqpDerefItem(Mgr, Item);
+            ExReleaseRundownProtection(&Mgr->RundownRef);
+            return STATUS_SUCCESS;
+        }
+        // Fall through â€” the item was already promoted out of the pending
+        // list and is now on a priority queue (or running/done). Handle
+        // through the priority-queue cancel path below.
+    }
+
+    //
     // Try to cancel: CAS must be done UNDER the queue lock to prevent
     // a race with AwqpDequeue. Without the lock, Dequeue could remove
     // the item from the list between our CAS and RemoveEntryList,
@@ -1166,6 +1229,13 @@ AwqCancel(
     }
 
     if (Removed) {
+        //
+        // Cancel chained successors BEFORE completing this item: completion
+        // releases the existence reference and may free the item, after
+        // which Item->NextInChain would be a dangling read.
+        //
+        AwqpCancelChainSuccessors(Mgr, Item);
+
         AwqpCompleteItem(Mgr, Item, STATUS_CANCELLED);
         InterlockedIncrement64(&Mgr->Stats.TotalCancelled);
         // CompleteItem releases existence + tracking refs; release FindItem ref
@@ -1231,17 +1301,72 @@ AwqCancelByKey(
         AWQ_UNLOCK_EXCLUSIVE(&Q->Lock);
 
         //
-        // Complete cancelled items outside the lock
+        // Complete cancelled items outside the lock. Walk each item's
+        // chain so successors do not leak in the hash/ActiveItems list.
         //
         while (!IsListEmpty(&ToCancel)) {
             Entry = RemoveHeadList(&ToCancel);
             PAWQ_WORK_ITEM_I Item = CONTAINING_RECORD(Entry, AWQ_WORK_ITEM_I, QueueLink);
+            AwqpCancelChainSuccessors(Mgr, Item);
             AwqpCompleteItem(Mgr, Item, STATUS_CANCELLED);
             CancelledCount++;
         }
     }
 
     InterlockedAdd64(&Mgr->Stats.TotalCancelled, CancelledCount);
+
+    //
+    // Also walk the serialization-key pending list for this key. Items
+    // parked there are NOT on any priority queue, so the loop above never
+    // sees them â€” without this pass, AwqCancelByKey would silently leak
+    // every deferred submission for the key.
+    //
+    {
+        PLIST_ENTRY Entry;
+        PAWQ_SKEY SK = NULL;
+        LIST_ENTRY ToCancel;
+        InitializeListHead(&ToCancel);
+
+        AWQ_LOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+        for (Entry = Mgr->Serialization.KeyList.Flink;
+             Entry != &Mgr->Serialization.KeyList;
+             Entry = Entry->Flink) {
+            PAWQ_SKEY Cur = CONTAINING_RECORD(Entry, AWQ_SKEY, ListEntry);
+            if (Cur->Key == SerializationKey) {
+                SK = Cur;
+                break;
+            }
+        }
+        if (SK != NULL) {
+            PLIST_ENTRY PE, Next;
+            for (PE = SK->PendingItems.Flink;
+                 PE != &SK->PendingItems;
+                 PE = Next) {
+                Next = PE->Flink;
+                PAWQ_WORK_ITEM_I PI = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
+
+                if (!(PI->Flags & AwqFlag_CanCancel)) continue;
+
+                if (InterlockedCompareExchange(&PI->State,
+                        (LONG)AwqItemState_Cancelled,
+                        (LONG)AwqItemState_Queued) == (LONG)AwqItemState_Queued) {
+                    RemoveEntryList(PE);
+                    InterlockedExchange(&PI->OnSerialPending, 0);
+                    InsertTailList(&ToCancel, PE);
+                }
+            }
+        }
+        AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+
+        while (!IsListEmpty(&ToCancel)) {
+            PLIST_ENTRY PE = RemoveHeadList(&ToCancel);
+            PAWQ_WORK_ITEM_I PI = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
+            AwqpCancelChainSuccessors(Mgr, PI);
+            AwqpCompleteItem(Mgr, PI, STATUS_CANCELLED);
+            InterlockedIncrement64(&Mgr->Stats.TotalCancelled);
+        }
+    }
+
     ExReleaseRundownProtection(&Mgr->RundownRef);
     return STATUS_SUCCESS;
 }
@@ -1803,6 +1928,38 @@ AwqpFindItem(
 }
 
 // ============================================================================
+// Internal: Cancel chained successors of a head item.
+//
+// Successors of a chain head live in the hash + ActiveItems list but are
+// never placed on a priority queue (only the head is enqueued, and each
+// completing item enqueues its NextInChain). When the head is cancelled
+// or fails, the successors must be cancelled and completed, otherwise
+// they leak forever and stall drain/shutdown.
+//
+// Caller must hold no AWQ locks. The chain pointer of the head is cleared
+// so that a concurrent path cannot re-walk the same chain.
+// ============================================================================
+
+static VOID
+AwqpCancelChainSuccessors(
+    _In_ PAWQ_MANAGER_I Mgr,
+    _In_ PAWQ_WORK_ITEM_I Item
+    )
+{
+    PAWQ_WORK_ITEM_I Successor = Item->NextInChain;
+    Item->NextInChain = NULL;
+
+    while (Successor != NULL) {
+        PAWQ_WORK_ITEM_I Next = Successor->NextInChain;
+        Successor->NextInChain = NULL;
+        InterlockedExchange(&Successor->State, (LONG)AwqItemState_Cancelled);
+        InterlockedIncrement64(&Mgr->Stats.TotalCancelled);
+        AwqpCompleteItem(Mgr, Successor, STATUS_CANCELLED);
+        Successor = Next;
+    }
+}
+
+// ============================================================================
 // Internal: Enqueue / Dequeue
 // ============================================================================
 
@@ -1939,8 +2096,11 @@ AwqpSerializationCheck(
     }
 
     //
-    // Key is busy â€” defer item to pending list
+    // Key is busy â€” defer item to pending list. Mark BEFORE inserting so
+    // a concurrent AwqCancel (which finds via hash) sees the marker before
+    // racing the link manipulation.
     //
+    InterlockedExchange(&Item->OnSerialPending, 1);
     InsertTailList(&SK->PendingItems, &Item->QueueLink);
     AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
 
@@ -1953,52 +2113,80 @@ AwqpSerializationRelease(
     _In_ ULONG64 Key
     )
 {
-    PLIST_ENTRY Entry;
-    PAWQ_SKEY SK = NULL;
-    PAWQ_WORK_ITEM_I NextItem = NULL;
+    //
+    // Iterate: each loop iteration releases one active count. If the next
+    // pending item's enqueue fails, fail that item and re-release for the
+    // following pending item. Looping (vs. recursion) bounds stack use even
+    // when a transient queue-full condition rejects many pending items.
+    //
+    for (;;) {
+        PLIST_ENTRY Entry;
+        PAWQ_SKEY SK = NULL;
+        PAWQ_WORK_ITEM_I NextItem = NULL;
+        NTSTATUS EnqStatus;
 
-    AWQ_LOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+        AWQ_LOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
 
-    for (Entry = Mgr->Serialization.KeyList.Flink;
-         Entry != &Mgr->Serialization.KeyList;
-         Entry = Entry->Flink) {
-        PAWQ_SKEY Cur = CONTAINING_RECORD(Entry, AWQ_SKEY, ListEntry);
-        if (Cur->Key == Key) {
-            SK = Cur;
-            break;
+        for (Entry = Mgr->Serialization.KeyList.Flink;
+             Entry != &Mgr->Serialization.KeyList;
+             Entry = Entry->Flink) {
+            PAWQ_SKEY Cur = CONTAINING_RECORD(Entry, AWQ_SKEY, ListEntry);
+            if (Cur->Key == Key) {
+                SK = Cur;
+                break;
+            }
         }
-    }
 
-    if (SK == NULL) {
+        if (SK == NULL) {
+            AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+            return;
+        }
+
+        InterlockedDecrement(&SK->ActiveCount);
+
+        if (SK->ActiveCount == 0 && !IsListEmpty(&SK->PendingItems)) {
+            //
+            // Dequeue next pending item for this key.
+            //
+            PLIST_ENTRY PE = RemoveHeadList(&SK->PendingItems);
+            InitializeListHead(PE);  // safe re-link in AwqpEnqueue
+            NextItem = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
+            InterlockedExchange(&NextItem->OnSerialPending, 0);
+            InterlockedIncrement(&SK->ActiveCount);
+        } else if (SK->ActiveCount == 0 && IsListEmpty(&SK->PendingItems)) {
+            //
+            // No more items â€” remove key entry.
+            //
+            RemoveEntryList(&SK->ListEntry);
+            AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
+            ExFreePoolWithTag(SK, AWQ_POOL_TAG_SKEY);
+            return;
+        }
+
         AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
-        return;
-    }
 
-    InterlockedDecrement(&SK->ActiveCount);
+        if (NextItem == NULL) {
+            return;
+        }
 
-    if (SK->ActiveCount == 0 && !IsListEmpty(&SK->PendingItems)) {
+        EnqStatus = AwqpEnqueue(Mgr, NextItem);
+        if (NT_SUCCESS(EnqStatus)) {
+            return;
+        }
+
         //
-        // Dequeue next pending item for this key
+        // Enqueue failed (queue full / shutting down). The pending item is
+        // already registered in the hash + ActiveItems list and we own the
+        // serialization slot for it. Fail the item, then loop to release
+        // its slot and try the next pending item â€” otherwise the chain of
+        // pending items would be permanently stuck behind one failure.
         //
-        PLIST_ENTRY PE = RemoveHeadList(&SK->PendingItems);
-        NextItem = CONTAINING_RECORD(PE, AWQ_WORK_ITEM_I, QueueLink);
-        InterlockedIncrement(&SK->ActiveCount);
-    } else if (SK->ActiveCount == 0 && IsListEmpty(&SK->PendingItems)) {
-        //
-        // No more items â€” remove key entry
-        //
-        RemoveEntryList(&SK->ListEntry);
-        AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
-        ExFreePoolWithTag(SK, AWQ_POOL_TAG_SKEY);
-
-        // No next item to enqueue
-        return;
-    }
-
-    AWQ_UNLOCK_EXCLUSIVE(&Mgr->Serialization.Lock);
-
-    if (NextItem != NULL) {
-        AwqpEnqueue(Mgr, NextItem);
+        InterlockedExchange(&NextItem->State, (LONG)AwqItemState_Failed);
+        InterlockedIncrement64(&Mgr->Stats.TotalFailed);
+        AwqpCompleteItem(Mgr, NextItem, EnqStatus);
+        AwqpCheckDrainComplete(Mgr);
+        // Loop continues â€” we still hold one ActiveCount for NextItem to
+        // release on this key.
     }
 }
 
@@ -2092,21 +2280,34 @@ AwqpExecuteItem(
     InterlockedIncrement64(&Worker->ItemsProcessed);
 
     //
-    // Handle retry
+    // Handle retry. If re-enqueue fails (e.g. the queue is full or shutting
+    // down), the item must NOT be left dangling: it is still registered in
+    // the hash + ActiveItems list, so a leak here would block drain/shutdown
+    // forever and leave AwqWaitForItem callers waiting on an event that
+    // never signals.
     //
     if (!NT_SUCCESS(Status) &&
         (Item->Flags & AwqFlag_RetryOnFailure) &&
         Item->RetryCount < Item->MaxRetries) {
 
+        NTSTATUS RetryStatus;
+
         Item->RetryCount++;
         InterlockedExchange(&Item->State, (LONG)AwqItemState_Queued);
         InterlockedIncrement64(&Mgr->Stats.TotalRetries);
 
+        RetryStatus = AwqpEnqueue(Mgr, Item);
+        if (NT_SUCCESS(RetryStatus)) {
+            return;
+        }
+
         //
-        // Re-enqueue (no blocking delay â€” just re-submit)
+        // Enqueue failed â€” fall through and complete the item with the
+        // re-enqueue failure code so all bookkeeping is released.
         //
-        AwqpEnqueue(Mgr, Item);
-        return;
+        InterlockedExchange(&Item->State, (LONG)AwqItemState_Failed);
+        Status = RetryStatus;
+        // Do not "return" â€” fall through to chain/complete handling below.
     }
 
     //
@@ -2117,18 +2318,9 @@ AwqpExecuteItem(
     if (Item->NextInChain != NULL) {
         if (NT_SUCCESS(Status)) {
             NextChainItem = Item->NextInChain;
+            Item->NextInChain = NULL;
         } else {
-            //
-            // Walk chain successors and cancel each one
-            //
-            PAWQ_WORK_ITEM_I Orphan = Item->NextInChain;
-            while (Orphan != NULL) {
-                PAWQ_WORK_ITEM_I NextOrphan = Orphan->NextInChain;
-                InterlockedExchange(&Orphan->State, (LONG)AwqItemState_Cancelled);
-                InterlockedIncrement64(&Mgr->Stats.TotalCancelled);
-                AwqpCompleteItem(Mgr, Orphan, STATUS_CANCELLED);
-                Orphan = NextOrphan;
-            }
+            AwqpCancelChainSuccessors(Mgr, Item);
         }
     }
 
@@ -2234,13 +2426,12 @@ AwqpCheckDrainComplete(
 {
     if (Mgr->State != (LONG)AwqQueueState_Draining) return;
 
-    ULONG TotalPending = 0;
-    ULONG i;
-    for (i = 0; i < AwqPriority_Count; i++) {
-        TotalPending += (ULONG)Mgr->Queues[i].ItemCount;
-    }
-
-    if (TotalPending == 0 && Mgr->ActiveWorkerCount == 0) {
+    //
+    // Use the same authoritative in-flight gauge as AwqDrain. Counting
+    // queues + ActiveWorkerCount is racy because the dequeue/execute
+    // boundary briefly observes both as zero.
+    //
+    if (Mgr->ActiveItems.Count == 0) {
         KeSetEvent(&Mgr->DrainCompleteEvent, IO_NO_INCREMENT, FALSE);
     }
 }
@@ -2410,8 +2601,17 @@ AwqpWorkerThread(
                     BOOLEAN ShouldExit = FALSE;
 
                     AWQ_LOCK_EXCLUSIVE(&Mgr->WorkerLock);
-                    if ((ULONG)Mgr->WorkerCount > Mgr->MinWorkers) {
+                    //
+                    // Re-validate state UNDER the lock. If shutdown has begun,
+                    // it has already moved this worker to a stack-local list
+                    // (or is about to). Self-removing here would corrupt that
+                    // list. Let the outer loop observe ShuttingDown and exit
+                    // through the normal path; shutdown will join us.
+                    //
+                    if (Mgr->State == (LONG)AwqQueueState_Running &&
+                        (ULONG)Mgr->WorkerCount > Mgr->MinWorkers) {
                         RemoveEntryList(&Worker->ListEntry);
+                        InitializeListHead(&Worker->ListEntry);
                         InterlockedDecrement(&Mgr->WorkerCount);
                         InterlockedDecrement(&Mgr->IdleWorkerCount);
                         ShouldExit = TRUE;
@@ -2426,6 +2626,12 @@ AwqpWorkerThread(
 
                         PsTerminateSystemThread(STATUS_SUCCESS);
                         // No return
+                    } else {
+                        //
+                        // Reset idle window so we do not spin in this branch
+                        // every wait cycle while shutdown is in progress.
+                        //
+                        Worker->IdleStartTime = Now;
                     }
                 }
             }
