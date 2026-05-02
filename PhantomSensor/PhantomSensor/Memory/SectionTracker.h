@@ -244,7 +244,8 @@ typedef struct _SECTION_ENTRY {
 
     LIST_ENTRY MapList;
     EX_PUSH_LOCK MapListLock;              // Push lock (was spin lock)
-    volatile LONG MapCount;
+    volatile LONG MapCount;                // Historical: total maps ever inserted
+    volatile LONG ActiveMapCount;          // Currently-active maps (incremented on map, decremented on unmap)
     volatile LONG CrossProcessMapCount;
 
     volatile LONG SuspicionFlags;          // Atomically updated via InterlockedOr
