@@ -1,4 +1,4 @@
-﻿// This is a personal academic project. Dear PVS-Studio, please check it.
+// This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
@@ -220,7 +220,9 @@ typedef struct _C2_DESTINATION {
     BOOLEAN IsConfirmedC2;
 
     //
-    // Associated processes â€” protected by DestinationLock
+    // Associated processes - protected by DestinationLock.
+    // IMPORTANT: These store process IDs (PIDs, type HANDLE), NOT process object handles.
+    // No ObReferenceObject/ObDereferenceObject needed - PIDs are opaque integer values.
     //
     HANDLE AssociatedProcesses[16];
     ULONG ProcessCount;
