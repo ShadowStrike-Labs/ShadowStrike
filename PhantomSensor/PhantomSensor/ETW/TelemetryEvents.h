@@ -651,6 +651,14 @@ typedef struct _TE_NETWORK_EVENT {
 C_ASSERT(sizeof(TE_NETWORK_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 C_ASSERT((sizeof(TE_NETWORK_EVENT) % 8) == 0);
 C_ASSERT(FIELD_OFFSET(TE_NETWORK_EVENT, BytesSent) % 8 == 0);
+//
+// Lock the explicit pad offsets so a future field-reorder cannot quietly
+// repurpose them and start leaking real data on the wire.
+//
+C_ASSERT(FIELD_OFFSET(TE_NETWORK_EVENT, ReservedAlign) ==
+         FIELD_OFFSET(TE_NETWORK_EVENT, BytesSent) - sizeof(UINT32));
+C_ASSERT(FIELD_OFFSET(TE_NETWORK_EVENT, Reserved) ==
+         FIELD_OFFSET(TE_NETWORK_EVENT, DnsQueryType) + sizeof(UINT16));
 
 // Network flags
 #define TE_NET_FLAG_BLOCKED             0x00000001
@@ -717,6 +725,13 @@ typedef struct _TE_DETECTION_EVENT {
 } TE_DETECTION_EVENT, *PTE_DETECTION_EVENT;
 
 C_ASSERT(sizeof(TE_DETECTION_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
+//
+// Embedded-enum ABI lock. THREAT_SEVERITY is laid out by value into the
+// wire-format struct; if a future enum value forces MSVC to widen it,
+// every byte after Severity shifts and ETW consumers de-serialize garbage.
+// Pin its underlying size at build time.
+//
+C_ASSERT(sizeof(THREAT_SEVERITY) == sizeof(UINT32));
 
 /**
  * @brief Security alert telemetry event.
@@ -760,6 +775,14 @@ typedef struct _TE_OPERATIONAL_EVENT {
 } TE_OPERATIONAL_EVENT, *PTE_OPERATIONAL_EVENT;
 
 C_ASSERT(sizeof(TE_OPERATIONAL_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
+//
+// Embedded-enum ABI lock for TE_OPERATIONAL_EVENT. Same rationale as
+// TE_DETECTION_EVENT: these enums are emitted by value on the ETW wire,
+// so their underlying width must remain int (4 bytes).
+//
+C_ASSERT(sizeof(DRIVER_COMPONENT_ID)        == sizeof(UINT32));
+C_ASSERT(sizeof(COMPONENT_HEALTH_STATUS)    == sizeof(UINT32));
+C_ASSERT(sizeof(TELEMETRY_ERROR_SEVERITY)   == sizeof(UINT32));
 
 #include <poppack.h>
 
