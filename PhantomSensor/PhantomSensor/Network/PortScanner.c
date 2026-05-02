@@ -1054,12 +1054,25 @@ Routine Description:
     //
     if (NewResult->ScanDetected) {
         InterlockedIncrement64(&Detector->Stats.ScansDetected);
+
+        //
+        // Source detection state is shared with concurrent SspsCheckForScan
+        // callers and with future readers (telemetry). Serialize the write
+        // under the source's exclusive ConnectionLock so a concurrent
+        // analyzer cannot observe a partially-updated state triple.
+        //
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Source->ConnectionLock);
         Source->ScanDetected = TRUE;
         Source->DetectedScanType = NewResult->Type;
         Source->ConfidenceScore = NewResult->ConfidenceScore;
+        ExReleasePushLockExclusive(&Source->ConnectionLock);
+        KeLeaveCriticalRegion();
 
         //
-        // Submit to behavioral engine for attack chain correlation (T1046)
+        // Submit to behavioral engine for attack chain correlation (T1046).
+        // Done after dropping the source lock so we never call into another
+        // subsystem while holding it (lock-ordering hygiene).
         //
         BeEngineSubmitEvent(
             BehaviorEvent_PortScanning,
