@@ -126,6 +126,17 @@ extern "C" {
  */
 #define SHADOW_DEFAULT_SECTION_SIZE (64 * 1024)
 
+/**
+ * @brief Maximum permitted section size for namespace section objects (bytes).
+ *
+ * Caps caller-supplied SectionSize to bound commit charge and prevent
+ * DoS via oversized SEC_COMMIT sections. Values above this are rejected
+ * with STATUS_INVALID_PARAMETER. 256 MiB is well above any legitimate
+ * shared-memory channel the driver creates while remaining safely within
+ * a positive LONGLONG.
+ */
+#define SHADOW_MAX_SECTION_SIZE     (256ULL * 1024ULL * 1024ULL)
+
 // ============================================================================
 // INITIALIZATION STATE VALUES
 // ============================================================================
@@ -340,8 +351,9 @@ ShadowIsNamespaceInitialized(
  *
  * @return TRUE if protection acquired, FALSE if namespace is shutting down.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL  (ExAcquireRundownProtection contract)
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowReferenceNamespace(
     VOID
@@ -350,8 +362,9 @@ ShadowReferenceNamespace(
 /**
  * @brief Release rundown protection on the namespace.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL  (ExReleaseRundownProtection contract)
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowDereferenceNamespace(
     VOID
