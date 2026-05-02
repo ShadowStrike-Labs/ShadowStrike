@@ -468,12 +468,24 @@ ShadowStrikeShutdownSelfProtection(
 
         if (ReadNoFence(&g_SelfProtectActiveOps) > 0) {
             //
-            // Active operations did not drain after 50 seconds.
-            // Controlled bugcheck is safer than silent UAF pool corruption.
+            // Active operations did not drain after 50 seconds. Proceeding
+            // to free the protected lists with in-flight ObCallback /
+            // ShouldBlockFileAccess / ShouldBlockRegistryAccess callers
+            // would dereference freed pool memory. A controlled bugcheck
+            // is the only safe option â€” silent UAF would corrupt the
+            // non-paged pool and produce delayed, unattributable crashes.
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "[ShadowStrike] CRITICAL: SelfProtect shutdown drain failed, ActiveOps=%ld\n",
                 ReadNoFence(&g_SelfProtectActiveOps));
+
+            KeBugCheckEx(
+                DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                (ULONG_PTR)ReadNoFence(&g_SelfProtectActiveOps),
+                (ULONG_PTR)&g_SelfProtectActiveOps,
+                (ULONG_PTR)&g_SelfProtectDrainEvent,
+                (ULONG_PTR)0x55501u  // sentinel: SelfProtect drain timeout
+                );
         }
     }
 
