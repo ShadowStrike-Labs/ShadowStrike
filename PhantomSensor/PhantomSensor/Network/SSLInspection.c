@@ -634,10 +634,23 @@ SslInspectClientHello(
     SslpSnapshotSession(NewSession, Snapshot);
 
     //
-    // Add to session list under exclusive lock
+    // Add to session list under exclusive lock.  The capacity check is
+    // re-validated INSIDE the same critical section so concurrent
+    // SslInspectClientHello callers cannot collectively exceed
+    // SSL_MAX_ACTIVE_SESSIONS (the unlocked early-out at function entry
+    // is only an optimistic fast-path; the authoritative cap lives here).
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Inspector->SessionLock);
+
+    if (Inspector->SessionCount >= (LONG)SSL_MAX_ACTIVE_SESSIONS) {
+        ExReleasePushLockExclusive(&Inspector->SessionLock);
+        KeLeaveCriticalRegion();
+        ExFreePoolWithTag(Snapshot, SSL_POOL_TAG_RESULT);
+        ExFreePoolWithTag(NewSession, SSL_POOL_TAG_SESSION);
+        SSL_RELEASE_RUNDOWN(Inspector);
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     InsertTailList(&Inspector->SessionList, &NewSession->ListEntry);
     InterlockedIncrement(&Inspector->SessionCount);
