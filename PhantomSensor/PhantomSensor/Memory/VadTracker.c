@@ -2650,13 +2650,26 @@ VadpInsertProcessHash(
 /*++
 Routine Description:
     Inserts a process context into the chained hash table.
-    Caller must hold ProcessListLock or ProcessHash.Lock exclusive.
+
+    VAD2-H4: This routine itself acquires ProcessHash.Lock exclusive. The
+    hash bucket lists are read by VadpLookupProcessContext under
+    ProcessHash.Lock shared, NOT under ProcessListLock. Mutating the
+    bucket Flink/Blink while a concurrent reader walks it produces torn
+    reads and dangling pointers. Lock order: ProcessListLock (outer,
+    optional) -> ProcessHash.Lock (inner).
 --*/
 {
     ULONG Hash;
 
     Hash = VadpHashProcessId(Context->ProcessId);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Tracker->Public.ProcessHash.Lock);
+
     InsertTailList(&Tracker->Public.ProcessHash.Buckets[Hash], &Context->HashEntry);
+
+    ExReleasePushLockExclusive(&Tracker->Public.ProcessHash.Lock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -2669,11 +2682,18 @@ VadpRemoveProcessHash(
 /*++
 Routine Description:
     Removes a process context from the chained hash table.
-    Caller must hold ProcessListLock or ProcessHash.Lock exclusive.
+
+    VAD2-H4: This routine itself acquires ProcessHash.Lock exclusive
+    to serialize against concurrent VadpLookupProcessContext readers
+    that hold ProcessHash.Lock shared. See VadpInsertProcessHash.
 --*/
 {
-    UNREFERENCED_PARAMETER(Tracker);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Tracker->Public.ProcessHash.Lock);
 
     RemoveEntryList(&Context->HashEntry);
     InitializeListHead(&Context->HashEntry);
+
+    ExReleasePushLockExclusive(&Tracker->Public.ProcessHash.Lock);
+    KeLeaveCriticalRegion();
 }
