@@ -248,11 +248,7 @@ AdbInitialize(
         //
         // Drain event list before freeing context to prevent pool leak.
         //
-        while (!IsListEmpty(&Ctx->EventList)) {
-            PLIST_ENTRY Entry = RemoveHeadList(&Ctx->EventList);
-            PADB_EVENT Evt = CONTAINING_RECORD(Entry, ADB_EVENT, ListEntry);
-            ExFreePoolWithTag(Evt, ADB_POOL_TAG_EVENT);
-        }
+        AdbpFreeEventList(&Ctx->EventList);
         ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
         return Status;
     }
@@ -278,11 +274,7 @@ AdbInitialize(
         //
         // Thread has exited â€” drain event list before freeing context.
         //
-        while (!IsListEmpty(&Ctx->EventList)) {
-            PLIST_ENTRY Entry = RemoveHeadList(&Ctx->EventList);
-            PADB_EVENT Evt = CONTAINING_RECORD(Entry, ADB_EVENT, ListEntry);
-            ExFreePoolWithTag(Evt, ADB_POOL_TAG_EVENT);
-        }
+        AdbpFreeEventList(&Ctx->EventList);
         ExFreePoolWithTag(Ctx, ADB_POOL_TAG_CTX);
         return Status;
     }
@@ -417,7 +409,12 @@ AdbRegisterCallback(
 // AdbCheckForDebugger
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+//
+// AdbCheckForDebugger calls AdbpDetectUserDebugger, which invokes
+// ZwQueryInformationProcess. That system service requires PASSIVE_LEVEL,
+// so this entry point must also be restricted to PASSIVE_LEVEL.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 AdbCheckForDebugger(
     _In_ PADB_PROTECTOR Protector,
@@ -765,19 +762,28 @@ AdbpRecordEvent(
 
     InterlockedIncrement64(&Protector->Stats.TotalDetections);
 
-    // Invoke callback if registered (read under callback lock, call outside)
+    //
+    // Invoke the registered callback while holding the callback lock SHARED.
+    // This guarantees AdbRegisterCallback (which acquires the lock EXCLUSIVE)
+    // cannot return until every in-flight callback invocation has completed,
+    // satisfying the lifetime contract documented in AntiDebug.h.
+    //
+    // The callback contract forbids re-entering any ADB API, so holding the
+    // shared push lock across the upcall cannot deadlock against any other
+    // ADB operation (only AdbRegisterCallback takes this lock exclusively,
+    // and that is precisely what we want to gate).
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Protector->CallbackLock);
     CallbackFn = Protector->UserCallback;
     CallbackCtx = Protector->CallbackContext;
-    ExReleasePushLockShared(&Protector->CallbackLock);
-    KeLeaveCriticalRegion();
-
     if (CallbackFn != NULL) {
         // SnapForCallback was taken before the event was visible to other threads
-        CallbackFn(Type, &SnapForCallback, CallbackCtx);
+        (VOID)CallbackFn(Type, &SnapForCallback, CallbackCtx);
         InterlockedIncrement64(&Protector->Stats.CallbackInvocations);
     }
+    ExReleasePushLockShared(&Protector->CallbackLock);
+    KeLeaveCriticalRegion();
 }
 
 // ============================================================================
@@ -790,15 +796,29 @@ AdbpSnapshotEvent(
     _Out_ PADB_EVENT_INFO Dest
     )
 {
+    USHORT NameLen;
+
     Dest->Type = Source->Type;
     Dest->ProcessId = Source->ProcessId;
-    Dest->ProcessNameLength = Source->ProcessNameLength;
     Dest->Timestamp = Source->Timestamp;
     Dest->WasBlocked = Source->WasBlocked;
 
-    RtlCopyMemory(Dest->ProcessName, Source->ProcessName,
-                   (SIZE_T)(Source->ProcessNameLength + 1) * sizeof(WCHAR));
-    // Null-terminate just in case
+    //
+    // Defensive clamp: ProcessNameLength must leave room for a terminator
+    // inside the destination buffer even if memory corruption produced an
+    // out-of-range value.
+    //
+    NameLen = Source->ProcessNameLength;
+    if (NameLen >= ADB_MAX_PROCESS_NAME) {
+        NameLen = ADB_MAX_PROCESS_NAME - 1;
+    }
+    Dest->ProcessNameLength = NameLen;
+
+    if (NameLen > 0) {
+        RtlCopyMemory(Dest->ProcessName, Source->ProcessName,
+                      (SIZE_T)NameLen * sizeof(WCHAR));
+    }
+    Dest->ProcessName[NameLen] = L'\0';
     Dest->ProcessName[ADB_MAX_PROCESS_NAME - 1] = L'\0';
 
     RtlCopyMemory(Dest->Details, Source->Details, ADB_MAX_DETAIL_LENGTH);
@@ -916,7 +936,11 @@ AdbpDetectHypervisor(VOID)
     //
     __cpuid(CpuInfo, 1);
 
-    if (CpuInfo[2] & (1 << 31)) {
+    //
+    // Use unsigned 1u to avoid signed-shift undefined behavior; the bit 31
+    // test must be done on an unsigned interpretation of the ECX register.
+    //
+    if (((ULONG)CpuInfo[2] & (1u << 31)) != 0) {
         return TRUE;
     }
 
