@@ -1145,6 +1145,20 @@ MmMonitorRemoveProcessContext(
         return;
     }
 
+    //
+    // FIX MM-C1: Hold an outstanding reference for the entire body. The
+    // shutdown drain only waits for OutstandingRefs to reach zero before
+    // tearing down sub-modules (HeapSprayDetector, VadTracker, etc.). A
+    // process-exit notification arriving on another core after MmpIsActive()
+    // returned TRUE but before this routine finishes would otherwise race
+    // with MmMonitorShutdown freeing g_MemoryMonitor.HeapSprayDetector below
+    // and inside MmpFreeProcessContext (VadStopTracking via the VadTracker
+    // pointer). Acquiring the ref forces shutdown to block until we are out.
+    //
+    if (!MmpAcquireRef()) {
+        return;
+    }
+
     Hash = MmpHashProcessId(ProcessId);
 
     //
@@ -1200,6 +1214,11 @@ MmMonitorRemoveProcessContext(
             ULongToHandle(ProcessId)
         );
     }
+
+    //
+    // Release the outstanding ref acquired at function entry (FIX MM-C1).
+    //
+    MmpReleaseRef();
 }
 
 // ============================================================================
@@ -2018,7 +2037,18 @@ MmMonitorScanForShellcode(
                     Event->RegionSize = Size;
                     Event->Entropy = Entropy;
                     Event->ThreatScore = (Entropy * 100) / 8000;
-                    Event->Confidence = min(50, (Entropy - 6000) / 40);  // Lower confidence for entropy-only
+                    //
+                    // FIX MM-M1: Guard against UINT32 unsigned underflow when Entropy < 6000.
+                    // ShellcodeScanThreshold defaults to 5000, so we can legitimately enter
+                    // this branch with Entropy in [5000, 5999]. Without the guard, the
+                    // wrap-around (UINT32_MAX - delta) divided by 40 stays huge and the
+                    // min() clamp returned the maximum heuristic confidence (50) for what
+                    // is actually a borderline-low entropy region — a false-positive
+                    // severity inflation.
+                    //
+                    Event->Confidence = (Entropy >= 6000)
+                        ? min(50u, (Entropy - 6000) / 40)
+                        : 0;
                     Event->Flags |= SHELLCODE_FLAG_HIGH_ENTROPY;
 
                     RtlCopyMemory(Event->ContentSample, Buffer,
@@ -2045,7 +2075,12 @@ MmMonitorScanForShellcode(
                 Event->RegionSize = Size;
                 Event->Entropy = Entropy;
                 Event->ThreatScore = (Entropy * 100) / 8000;
-                Event->Confidence = min(50, (Entropy - 6000) / 40);
+                //
+                // FIX MM-M1: Same underflow guard as the SdAnalyzeBuffer fallback above.
+                //
+                Event->Confidence = (Entropy >= 6000)
+                    ? min(50u, (Entropy - 6000) / 40)
+                    : 0;
                 Event->Flags |= SHELLCODE_FLAG_HIGH_ENTROPY;
 
                 RtlCopyMemory(Event->ContentSample, Buffer,
@@ -2624,14 +2659,28 @@ MmMonitorBuildVadMap(
         }
 
         //
-        // Move to next region
+        // Move to next region. Defensive guards:
+        //   - RegionSize == 0 would otherwise leave CurrentAddress unchanged
+        //     and burn MaxRegions iterations against the same address. Treat
+        //     it as end-of-enumeration.
+        //   - Pointer wrap detected by the existing CurrentAddress < BaseAddress
+        //     check terminates the loop on address-space rollover.
+        //   - Strict-progress check ensures the next address is strictly past
+        //     the just-processed region.
         //
-        CurrentAddress = (PVOID)((ULONG_PTR)MemInfo.BaseAddress + MemInfo.RegionSize);
-        if (CurrentAddress < MemInfo.BaseAddress) {
-            //
-            // Overflow - reached end of address space
-            //
+        if (MemInfo.RegionSize == 0) {
             break;
+        }
+
+        {
+            PVOID NextAddress = (PVOID)((ULONG_PTR)MemInfo.BaseAddress + MemInfo.RegionSize);
+            if (NextAddress < MemInfo.BaseAddress || NextAddress <= CurrentAddress) {
+                //
+                // Overflow or non-progress - reached end of address space.
+                //
+                break;
+            }
+            CurrentAddress = NextAddress;
         }
     }
 
