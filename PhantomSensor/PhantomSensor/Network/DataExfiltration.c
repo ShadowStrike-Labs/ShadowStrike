@@ -899,6 +899,7 @@ DxAddPattern(
     PDX_PATTERN newPattern = NULL;
     SIZE_T nameLen;
     SIZE_T categoryLen;
+    NTSTATUS status;
 
     PAGED_CODE();
 
@@ -947,13 +948,15 @@ DxAddPattern(
     newPattern->PatternId = (ULONG)InterlockedIncrement(&Detector->NextPatternId);
 
     //
-    // Copy pattern name (safe truncation)
+    // Copy pattern name. Use RtlStringCbLengthA for safe length calculation.
     //
-    nameLen = strlen(PatternName);
-    if (nameLen >= sizeof(newPattern->PatternName)) {
-        nameLen = sizeof(newPattern->PatternName) - 1;
+    status = RtlStringCbLengthA(PatternName, sizeof(newPattern->PatternName) - 1, &nameLen);
+    if (!NT_SUCCESS(status)) {
+        nameLen = 0;
     }
-    RtlCopyMemory(newPattern->PatternName, PatternName, nameLen);
+    if (nameLen > 0) {
+        RtlCopyMemory(newPattern->PatternName, PatternName, nameLen);
+    }
     newPattern->PatternName[nameLen] = '\0';
 
     //
@@ -978,14 +981,16 @@ DxAddPattern(
     newPattern->RefCount = 1;
 
     //
-    // Copy category
+    // Copy category. Use RtlStringCbLengthA for safe length calculation.
     //
     if (Category != NULL) {
-        categoryLen = strlen(Category);
-        if (categoryLen >= sizeof(newPattern->Category)) {
-            categoryLen = sizeof(newPattern->Category) - 1;
+        status = RtlStringCbLengthA(Category, sizeof(newPattern->Category) - 1, &categoryLen);
+        if (!NT_SUCCESS(status)) {
+            categoryLen = 0;
         }
-        RtlCopyMemory(newPattern->Category, Category, categoryLen);
+        if (categoryLen > 0) {
+            RtlCopyMemory(newPattern->Category, Category, categoryLen);
+        }
         newPattern->Category[categoryLen] = '\0';
     } else {
         RtlCopyMemory(newPattern->Category, "General", 8);
@@ -1174,20 +1179,32 @@ DxAnalyzeTraffic(
     // Propagate hostname into transfer context if provided and not yet set.
     // Hostname originates from DNS resolution or HTTP Host header and is
     // critical for cloud storage / personal email destination classification.
+    // Use RtlStringCbLengthA for safe length calculation with overflow protection.
     //
     if (Hostname != NULL && Hostname[0] != '\0' && transfer->Hostname[0] == '\0') {
-        SIZE_T hostLen = strlen(Hostname);
-        if (hostLen >= sizeof(transfer->Hostname)) {
-            hostLen = sizeof(transfer->Hostname) - 1;
+        SIZE_T hostLen = 0;
+        NTSTATUS lenStatus = RtlStringCbLengthA(Hostname, sizeof(transfer->Hostname) - 1, &hostLen);
+        if (NT_SUCCESS(lenStatus)) {
+            RtlCopyMemory(transfer->Hostname, Hostname, hostLen);
+            transfer->Hostname[hostLen] = '\0';
         }
-        RtlCopyMemory(transfer->Hostname, Hostname, hostLen);
-        transfer->Hostname[hostLen] = '\0';
     }
 
     //
-    // Update transfer statistics (atomic increment for SIZE_T)
+    // Update transfer statistics.
+    // SIZE_T is unsigned; DataSize is SIZE_T. Check for overflow before adding.
     //
-    InterlockedAdd64(&transfer->BytesTransferred, (LONG64)DataSize);
+    {
+        LONG64 currentBytes = transfer->BytesTransferred;
+        if ((ULONG64)currentBytes + DataSize > (ULONG64)MAXLONGLONG) {
+            //
+            // Would overflow LONG64 - cap at max to prevent wrap
+            //
+            InterlockedExchange64(&transfer->BytesTransferred, MAXLONGLONG);
+        } else {
+            InterlockedAdd64(&transfer->BytesTransferred, (LONG64)DataSize);
+        }
+    }
     KeQuerySystemTime(&transfer->LastActivityTime);
 
     //
@@ -1406,47 +1423,84 @@ DxRecordTransfer(
     }
 
     //
-    // Update transfer statistics (atomic)
+    // Update transfer statistics.
+    // BytesSent is SIZE_T (unsigned). Check for overflow before adding to LONG64.
     //
-    InterlockedAdd64(&transfer->BytesTransferred, (LONG64)BytesSent);
+    {
+        LONG64 currentBytes = transfer->BytesTransferred;
+        if ((ULONG64)currentBytes + BytesSent > (ULONG64)MAXLONGLONG) {
+            //
+            // Would overflow LONG64 - cap at max to prevent wrap
+            //
+            InterlockedExchange64(&transfer->BytesTransferred, MAXLONGLONG);
+        } else {
+            InterlockedAdd64(&transfer->BytesTransferred, (LONG64)BytesSent);
+        }
+    }
     KeQuerySystemTime(&currentTime);
     transfer->LastActivityTime = currentTime;
 
     //
-    // Calculate bytes per second (atomic write for thread safety)
+    // Calculate bytes per second (atomic write for thread safety).
+    // Use explicit 1000LL to ensure LONGLONG arithmetic, preventing overflow.
     //
     if (transfer->StartTime.QuadPart > 0) {
-        LONGLONG elapsedMs = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000;
+        LONGLONG elapsedMs = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000LL;
         if (elapsedMs > 0) {
-            LONG64 bps = ((LONG64)transfer->BytesTransferred * 1000) / elapsedMs;
-            InterlockedExchange64((volatile LONG64*)&transfer->BytesPerSecond, bps);
-        }
-    }
-
-    //
-    // Check for burst transfer
-    //
-    if ((SIZE_T)transfer->BytesTransferred > DX_BURST_THRESHOLD_BYTES) {
-        LONGLONG burstWindow = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000;
-        if (burstWindow > 0 && burstWindow < DX_BURST_WINDOW_MS) {
-            transfer->Indicators |= DxIndicator_BurstTransfer;
-            if (transfer->SuspicionScore < 75) {
-                transfer->SuspicionScore = 75;
+            LONG64 currentBytes = InterlockedCompareExchange64(&transfer->BytesTransferred, 0, 0);
+            //
+            // Guard against overflow in (currentBytes * 1000LL)
+            //
+            if (currentBytes <= MAXLONGLONG / 1000LL) {
+                LONG64 bps = (currentBytes * 1000LL) / elapsedMs;
+                InterlockedExchange64((volatile LONG64*)&transfer->BytesPerSecond, bps);
+            } else {
+                //
+                // Overflow would occur - compute safely by dividing first
+                //
+                LONG64 bps = currentBytes / elapsedMs;
+                bps *= 1000LL;
+                InterlockedExchange64((volatile LONG64*)&transfer->BytesPerSecond, bps);
             }
         }
     }
 
     //
-    // Check volume threshold
+    // Check for burst transfer.
+    // Use InterlockedOr for atomic flag update and explicit LL constants for time arithmetic.
     //
-    if ((SIZE_T)transfer->BytesTransferred > Detector->Config.VolumeThresholdPerMinute) {
-        transfer->Indicators |= DxIndicator_HighVolume;
-
-        if (transfer->SuspicionScore < 50) {
-            transfer->SuspicionScore = 50;
+    {
+        LONG64 currentBytes = InterlockedCompareExchange64(&transfer->BytesTransferred, 0, 0);
+        if ((ULONG64)currentBytes > DX_BURST_THRESHOLD_BYTES) {
+            LONGLONG burstWindow = (currentTime.QuadPart - transfer->StartTime.QuadPart) / 10000LL;
+            if (burstWindow > 0 && burstWindow < (LONGLONG)DX_BURST_WINDOW_MS) {
+                InterlockedOr((volatile LONG*)&transfer->Indicators, DxIndicator_BurstTransfer);
+                
+                ULONG currentScore = (ULONG)InterlockedCompareExchange(
+                    (volatile LONG*)&transfer->SuspicionScore, 0, 0);
+                if (currentScore < 75) {
+                    InterlockedExchange((volatile LONG*)&transfer->SuspicionScore, 75);
+                }
+            }
         }
+    }
 
-        DxpCreateAlert(Detector, transfer, DxExfil_LargeUpload, FALSE);
+    //
+    // Check volume threshold. Use atomic operations for flag and score updates.
+    //
+    {
+        LONG64 currentBytes = InterlockedCompareExchange64(&transfer->BytesTransferred, 0, 0);
+        if ((ULONG64)currentBytes > Detector->Config.VolumeThresholdPerMinute) {
+            InterlockedOr((volatile LONG*)&transfer->Indicators, DxIndicator_HighVolume);
+
+            ULONG currentScore = (ULONG)InterlockedCompareExchange(
+                (volatile LONG*)&transfer->SuspicionScore, 0, 0);
+            if (currentScore < 50) {
+                InterlockedExchange((volatile LONG*)&transfer->SuspicionScore, 50);
+            }
+
+            (VOID)DxpCreateAlert(Detector, transfer, DxExfil_LargeUpload, FALSE);
+        }
     }
 
     DxpDereferenceTransfer(Detector, transfer);
@@ -1480,8 +1534,14 @@ DxInspectContent(
     ULONG matchOffset;
     SIZE_T inspectSize;
     SIZE_T nameLen;
+    NTSTATUS status;
 
     PAGED_CODE();
+
+    //
+    // Suppress unused variable warnings when RtlStringCbLengthA calls are removed by compiler optimization
+    //
+    UNREFERENCED_PARAMETER(status);
 
     if (Detector == NULL || !Detector->Initialized ||
         Data == NULL || DataSize == 0 ||
@@ -2065,13 +2125,29 @@ DxpMatchPattern(
  *
  * Replaces _stricmp which is not a documented kernel-mode API.
  */
+/**
+ * @brief Case-insensitive ANSI string comparison (kernel-safe).
+ *
+ * Replaces _stricmp which is not a documented kernel-mode API.
+ * Bounded to prevent unbounded loops on malformed or hostile input.
+ *
+ * @param String1 First string.
+ * @param String2 Second string.
+ * @return TRUE if strings match (case-insensitive), FALSE otherwise.
+ */
 static BOOLEAN
 DxpCaseInsensitiveCompareA(
     _In_ PCSTR String1,
     _In_ PCSTR String2
     )
 {
-    while (*String1 && *String2) {
+    SIZE_T maxLen = 1024;
+    SIZE_T i = 0;
+
+    //
+    // Bounded loop to prevent infinite iterations on hostile input
+    //
+    while (i < maxLen && *String1 && *String2) {
         CHAR c1 = *String1;
         CHAR c2 = *String2;
 
@@ -2084,33 +2160,59 @@ DxpCaseInsensitiveCompareA(
 
         String1++;
         String2++;
+        i++;
     }
 
+    //
+    // Both must terminate at the same position
+    //
     return (*String1 == *String2);
 }
 
+/**
+ * @brief Check if hostname matches a known cloud storage domain.
+ *
+ * Uses bounded string operations to prevent overflow on hostile input.
+ * Suffix match ensures "evil.dropbox.com.attacker.net" is rejected.
+ *
+ * @param Hostname Hostname to check (may be user-controlled).
+ * @return TRUE if matches a cloud storage domain, FALSE otherwise.
+ */
 static BOOLEAN
 DxpIsCloudStorageDestination(
     _In_ PCSTR Hostname
     )
 {
     ULONG i;
-    SIZE_T hostnameLen;
-    SIZE_T domainLen;
+    SIZE_T hostnameLen = 0;
+    SIZE_T domainLen = 0;
+    NTSTATUS status;
 
     if (Hostname == NULL || Hostname[0] == '\0') {
         return FALSE;
     }
 
-    hostnameLen = strlen(Hostname);
+    //
+    // Use RtlStringCbLengthA with max bound to prevent unbounded strlen
+    //
+    status = RtlStringCbLengthA(Hostname, 512, &hostnameLen);
+    if (!NT_SUCCESS(status) || hostnameLen == 0) {
+        return FALSE;
+    }
 
     for (i = 0; g_CloudStorageDomains[i] != NULL; i++) {
-        domainLen = strlen(g_CloudStorageDomains[i]);
+        status = RtlStringCbLengthA(g_CloudStorageDomains[i], 512, &domainLen);
+        if (!NT_SUCCESS(status)) {
+            continue;
+        }
 
         if (hostnameLen >= domainLen) {
             if (DxpCaseInsensitiveCompareA(
                     Hostname + hostnameLen - domainLen,
                     g_CloudStorageDomains[i])) {
+                //
+                // Ensure it's a true suffix (not "evildropbox.com")
+                //
                 if (hostnameLen == domainLen ||
                     Hostname[hostnameLen - domainLen - 1] == '.') {
                     return TRUE;
@@ -2122,28 +2224,50 @@ DxpIsCloudStorageDestination(
     return FALSE;
 }
 
+/**
+ * @brief Check if hostname matches a known personal email domain.
+ *
+ * Uses bounded string operations to prevent overflow on hostile input.
+ * Suffix match ensures "evil.gmail.com.attacker.net" is rejected.
+ *
+ * @param Hostname Hostname to check (may be user-controlled).
+ * @return TRUE if matches a personal email domain, FALSE otherwise.
+ */
 static BOOLEAN
 DxpIsPersonalEmailDomain(
     _In_ PCSTR Hostname
     )
 {
     ULONG i;
-    SIZE_T hostnameLen;
-    SIZE_T domainLen;
+    SIZE_T hostnameLen = 0;
+    SIZE_T domainLen = 0;
+    NTSTATUS status;
 
     if (Hostname == NULL || Hostname[0] == '\0') {
         return FALSE;
     }
 
-    hostnameLen = strlen(Hostname);
+    //
+    // Use RtlStringCbLengthA with max bound to prevent unbounded strlen
+    //
+    status = RtlStringCbLengthA(Hostname, 512, &hostnameLen);
+    if (!NT_SUCCESS(status) || hostnameLen == 0) {
+        return FALSE;
+    }
 
     for (i = 0; g_PersonalEmailDomains[i] != NULL; i++) {
-        domainLen = strlen(g_PersonalEmailDomains[i]);
+        status = RtlStringCbLengthA(g_PersonalEmailDomains[i], 512, &domainLen);
+        if (!NT_SUCCESS(status)) {
+            continue;
+        }
 
         if (hostnameLen >= domainLen) {
             if (DxpCaseInsensitiveCompareA(
                     Hostname + hostnameLen - domainLen,
                     g_PersonalEmailDomains[i])) {
+                //
+                // Ensure it's a true suffix (not "evilgmail.com")
+                //
                 if (hostnameLen == domainLen ||
                     Hostname[hostnameLen - domainLen - 1] == '.') {
                     return TRUE;
@@ -2377,6 +2501,7 @@ DxpCreateAlert(
     ULONG i;
     PEPROCESS process = NULL;
     NTSTATUS lookupStatus;
+    NTSTATUS status;
 
     //
     // Early limit check (racy but avoids allocation in common case)
@@ -2384,6 +2509,11 @@ DxpCreateAlert(
     if ((ULONG)Detector->AlertCount >= DX_MAX_ALERTS) {
         return STATUS_QUOTA_EXCEEDED;
     }
+
+    //
+    // Suppress unused variable warnings when RtlStringCbLengthA calls are removed by compiler optimization
+    //
+    UNREFERENCED_PARAMETER(status);
 
     //
     // Allocate alert from general pool (not lookaside) so DxFreeAlert
@@ -2447,8 +2577,20 @@ DxpCreateAlert(
         RtlCopyMemory(&alert->RemoteAddress.IPv4, &Transfer->RemoteAddress.IPv4, sizeof(IN_ADDR));
     }
 
-    RtlCopyMemory(alert->Hostname, Transfer->Hostname, sizeof(alert->Hostname) - 1);
-    alert->Hostname[sizeof(alert->Hostname) - 1] = '\0';
+    //
+    // Copy hostname with safe length calculation
+    //
+    {
+        SIZE_T hostLen = 0;
+        NTSTATUS hostStatus = RtlStringCbLengthA(Transfer->Hostname,
+            sizeof(alert->Hostname) - 1, &hostLen);
+        if (NT_SUCCESS(hostStatus) && hostLen > 0) {
+            RtlCopyMemory(alert->Hostname, Transfer->Hostname, hostLen);
+            alert->Hostname[hostLen] = '\0';
+        } else {
+            alert->Hostname[0] = '\0';
+        }
+    }
 
     //
     // Transfer details
