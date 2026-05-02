@@ -1464,9 +1464,16 @@ Routine Description:
                 result->ChainDetected = TRUE;
             }
         } else {
-            if (consecutiveGadgets > 0 && consecutiveGadgets < Detector->Config.MinChainLength) {
-                consecutiveGadgets = 0;
-            }
+            //
+            // Stack value above 0x10000 but not in gadget DB: a legitimate
+            // return address or unindexed code address. It breaks the
+            // contiguous chain regardless of how long the streak is â€” the
+            // attacker's gadget sequence cannot tolerate a non-gadget word
+            // in the middle without a controlled fix-up. This mirrors
+            // RoppDetectChain's symmetric reset and prevents synthetic
+            // chain elongation across legitimate frames.
+            //
+            consecutiveGadgets = 0;
         }
     }
 
