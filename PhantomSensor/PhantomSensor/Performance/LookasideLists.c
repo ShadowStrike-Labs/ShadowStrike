@@ -440,13 +440,26 @@ LlShutdown(
 #endif
 
         //
-        // Drain references
+        // Drain references.
+        //
+        // Every lookaside is created with an initial creation reference of 1
+        // (LlCreateLookasideEx sets RefCountAndState to RefCount=1). That
+        // baseline reference is never released by callers â€” it is implicitly
+        // owned by the manager itself and is reclaimed when this teardown
+        // path frees the structure. The Destroying flag has already been set
+        // in step 3, so any concurrent LlReferenceLookaside returns FALSE
+        // and the refcount can only decrement from this point. Wait for it
+        // to drop to the creation baseline (<= 1), matching the LlDestroy-
+        // Lookaside drain condition. Waiting for <= 0 would always time out
+        // (the creation reference never goes away) and stall driver unload
+        // by up to LL_REFCOUNT_DRAIN_MAX_ITERATIONS *
+        // LL_REFCOUNT_DRAIN_INTERVAL_MS per managed list.
         //
         for (ULONG i = 0; i < LL_REFCOUNT_DRAIN_MAX_ITERATIONS; i++) {
             LONG64 Combined = InterlockedCompareExchange64(
                 &Lookaside->RefCountAndState, 0, 0
             );
-            if (LlpExtractRefCount(Combined) <= 0) {
+            if (LlpExtractRefCount(Combined) <= 1) {
                 break;
             }
             KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
