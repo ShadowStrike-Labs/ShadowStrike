@@ -1787,6 +1787,18 @@ TeLogNetworkEvent(
         return GetExceptionCode();
     }
 
+    //
+    // Defense-in-depth: the wire-format struct contains explicit pad
+    // fields (ReservedAlign, Reserved) that exist solely to keep
+    // BytesSent 8-byte aligned and to fill an even-byte hole before
+    // RemoteHostname. We do not trust the caller to have zeroed them;
+    // EtwWrite below emits sizeof(TE_NETWORK_EVENT) bytes verbatim, so
+    // any stale stack/pool content in those slots would be disclosed
+    // to ETW consumers (CWE-200). Force them to zero unconditionally.
+    //
+    localEvent->ReservedAlign = 0;
+    localEvent->Reserved      = 0;
+
     TepInitializeEventHeader(
         &localEvent->Header,
         EventId,
