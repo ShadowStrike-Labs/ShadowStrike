@@ -1509,16 +1509,17 @@ SdAddApiHash(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     if (ApiName == NULL || DllName == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Detector->ApiHashes.HashCount >= SD_MAX_API_HASHES) {
-        return STATUS_QUOTA_EXCEEDED;
+    //
+    // SC2-H2: Acquire detector reference to prevent SdShutdown from racing
+    // with this insertion and freeing the hash table beneath us. SdpIsReady
+    // alone is a single-shot snapshot and offers no protection past the check.
+    //
+    if (!SdpAcquireReference(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -1531,6 +1532,7 @@ SdAddApiHash(
     );
 
     if (entry == NULL) {
+        SdpReleaseReference(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1546,6 +1548,19 @@ SdAddApiHash(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Detector->ApiHashes.Lock);
 
+    //
+    // SC2-H3: Re-check the cap under exclusive lock. The original read was
+    // unlocked, so concurrent inserts could each pass the threshold and all
+    // succeed, exceeding SD_MAX_API_HASHES.
+    //
+    if (Detector->ApiHashes.HashCount >= SD_MAX_API_HASHES) {
+        ExReleasePushLockExclusive(&Detector->ApiHashes.Lock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(entry, SD_POOL_TAG_PATTERN);
+        SdpReleaseReference(Detector);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     if (Detector->ApiHashes.HashTable == NULL) {
         //
         // First entry - create list head
@@ -1560,6 +1575,7 @@ SdAddApiHash(
             ExReleasePushLockExclusive(&Detector->ApiHashes.Lock);
             KeLeaveCriticalRegion();
             ShadowStrikeFreePoolWithTag(entry, SD_POOL_TAG_PATTERN);
+            SdpReleaseReference(Detector);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1573,6 +1589,7 @@ SdAddApiHash(
     ExReleasePushLockExclusive(&Detector->ApiHashes.Lock);
     KeLeaveCriticalRegion();
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1596,12 +1613,17 @@ SdLookupApiHash(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SdpIsReady(Detector)) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     if (ApiName == NULL || DllName == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // SC2-H2: Acquire detector reference for the duration of the lookup.
+    // The previous SdpIsReady check did not prevent SdShutdown from racing
+    // in and freeing the hash list while we walked it.
+    //
+    if (!SdpAcquireReference(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     ApiName[0] = '\0';
@@ -1627,6 +1649,7 @@ SdLookupApiHash(
     ExReleasePushLockShared(&Detector->ApiHashes.Lock);
     KeLeaveCriticalRegion();
 
+    SdpReleaseReference(Detector);
     return status;
 }
 
