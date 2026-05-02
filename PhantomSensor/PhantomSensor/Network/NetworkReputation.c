@@ -548,6 +548,8 @@ NrLookupIP(
     ULONG hash;
     PNR_ENTRY entry;
     LARGE_INTEGER now;
+    BOOLEAN reportMalicious = FALSE;
+    UINT32 reportScore = 0;
 
     PAGED_CODE();
 
@@ -655,19 +657,13 @@ NrLookupIP(
         }
 
         //
-        // Submit known-bad reputation to behavioral engine (MITRE T1071)
+        // Capture data needed for behavioral telemetry; defer submission
+        // until after we drop the push lock so we never call into another
+        // subsystem while holding our cache lock (lock-ordering hygiene).
         //
         if (entry->Reputation >= NrReputation_Malicious) {
-            BeEngineSubmitEvent(
-                BehaviorEvent_C2Communication,
-                BehaviorCategory_NetworkOperation,
-                0,  // ProcessId not available at lookup layer
-                NULL,
-                0,
-                (UINT32)entry->Score,
-                FALSE,
-                NULL
-                );
+            reportMalicious = TRUE;
+            reportScore = (UINT32)entry->Score;
         }
 
         //
@@ -686,6 +682,25 @@ NrLookupIP(
 
     ExReleasePushLockShared(&Manager->EntryLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Submit known-bad reputation to behavioral engine (MITRE T1071).
+    // Done after lock release to avoid coupling NR push lock with
+    // BehaviorEngine internal locks.
+    //
+    if (reportMalicious) {
+        BeEngineSubmitEvent(
+            BehaviorEvent_C2Communication,
+            BehaviorCategory_NetworkOperation,
+            0,  // ProcessId not available at lookup layer
+            NULL,
+            0,
+            reportScore,
+            FALSE,
+            NULL
+            );
+    }
+
     ExReleaseRundownProtection(&Manager->RundownRef);
 
     return STATUS_SUCCESS;
@@ -705,6 +720,8 @@ NrLookupDomain(
     CHAR normalizedDomain[NR_MAX_DOMAIN_LENGTH + 1];
     ULONG dgaScore;
     LARGE_INTEGER now;
+    BOOLEAN reportMalicious = FALSE;
+    UINT32 reportScore = 0;
 
     PAGED_CODE();
 
@@ -789,19 +806,12 @@ NrLookupDomain(
         }
 
         //
-        // Submit known-bad domain reputation to behavioral engine (MITRE T1071)
+        // Capture data needed for behavioral telemetry; defer submission
+        // until after we drop the push lock (lock-ordering hygiene).
         //
         if (entry->Reputation >= NrReputation_Malicious) {
-            BeEngineSubmitEvent(
-                BehaviorEvent_C2Communication,
-                BehaviorCategory_NetworkOperation,
-                0,
-                NULL,
-                0,
-                (UINT32)entry->Score,
-                FALSE,
-                NULL
-                );
+            reportMalicious = TRUE;
+            reportScore = (UINT32)entry->Score;
         }
 
         KeQuerySystemTime(&now);
@@ -822,22 +832,40 @@ NrLookupDomain(
             RtlStringCchCopyA(Result->ThreatName,
                               sizeof(Result->ThreatName),
                               "Suspicious DGA-like domain");
-
-            BeEngineSubmitEvent(
-                BehaviorEvent_DGADomain,
-                BehaviorCategory_NetworkOperation,
-                0,
-                NULL,
-                0,
-                (UINT32)dgaScore,
-                FALSE,
-                NULL
-                );
         }
     }
 
     ExReleasePushLockShared(&Manager->EntryLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Submit telemetry to behavioral engine after releasing the cache lock
+    // to avoid coupling NR's push lock with BehaviorEngine internal locks.
+    //
+    if (reportMalicious) {
+        BeEngineSubmitEvent(
+            BehaviorEvent_C2Communication,
+            BehaviorCategory_NetworkOperation,
+            0,
+            NULL,
+            0,
+            reportScore,
+            FALSE,
+            NULL
+            );
+    } else if (Result->Found && (Result->Flags & NR_FLAG_DGA_HEURISTIC)) {
+        BeEngineSubmitEvent(
+            BehaviorEvent_DGADomain,
+            BehaviorCategory_NetworkOperation,
+            0,
+            NULL,
+            0,
+            (UINT32)dgaScore,
+            FALSE,
+            NULL
+            );
+    }
+
     ExReleaseRundownProtection(&Manager->RundownRef);
 
     return STATUS_SUCCESS;
