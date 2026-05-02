@@ -207,7 +207,7 @@ typedef struct _CT_CONNECTION {
         IN6_ADDR IPv6;
     } RemoteAddress;
     USHORT RemotePort;
-    CHAR RemoteHostname[256];           // If resolved
+    CHAR RemoteHostname[256];           // If resolved, always NUL-terminated
 
     //
     // Process context â€” ProcessId is immutable after creation.
@@ -421,11 +421,35 @@ typedef VOID (*CT_CONNECTION_CALLBACK)(
 // Public API - Initialization
 //=============================================================================
 
+/**
+ * @brief Initialize the connection tracker.
+ * 
+ * Allocates and initializes all tracking structures, hash tables, lookaside
+ * lists, and starts the periodic cleanup timer. Must be called at PASSIVE_LEVEL.
+ * 
+ * @param Tracker Receives pointer to initialized tracker on success
+ * @return STATUS_SUCCESS or error code
+ * 
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtInitialize(
     _Out_ PCONNECTION_TRACKER* Tracker
     );
 
+/**
+ * @brief Shutdown and free the connection tracker.
+ * 
+ * Stops cleanup timer, drains all connections and process contexts, and frees
+ * all resources. May be called at IRQL <= DISPATCH_LEVEL (acquires spinlocks).
+ * 
+ * @param Tracker Tracker to shutdown (invalidated on return)
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 CtShutdown(
     _Inout_ PCONNECTION_TRACKER Tracker
@@ -435,6 +459,30 @@ CtShutdown(
 // Public API - Connection Management
 //=============================================================================
 
+/**
+ * @brief Create and track a new network connection.
+ * 
+ * Allocates a connection entry, indexes it by FlowId and 5-tuple, associates
+ * with process context, and returns a referenced pointer. Caller must release
+ * via CtRelease when done.
+ * 
+ * @param Tracker Initialized tracker
+ * @param FlowId WFP flow identifier (must be unique)
+ * @param ProcessId Originating process ID
+ * @param Direction Connection direction
+ * @param Protocol IPPROTO_TCP, IPPROTO_UDP, etc.
+ * @param LocalAddress Pointer to IN_ADDR or IN6_ADDR (kernel mode)
+ * @param LocalPort Local port in host byte order
+ * @param RemoteAddress Pointer to IN_ADDR or IN6_ADDR (kernel mode)
+ * @param RemotePort Remote port in host byte order
+ * @param IsIPv6 TRUE for IPv6, FALSE for IPv4
+ * @param Connection Receives referenced connection pointer on success
+ * @return STATUS_SUCCESS, STATUS_DUPLICATE_OBJECTID, or error
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL (acquires spinlocks internally)
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtCreateConnection(
     _In_ PCONNECTION_TRACKER Tracker,
@@ -450,6 +498,18 @@ CtCreateConnection(
     _Out_ PCT_CONNECTION* Connection
     );
 
+/**
+ * @brief Update connection state atomically.
+ * 
+ * @param Tracker Initialized tracker
+ * @param FlowId Flow identifier
+ * @param NewState New state to set
+ * @return STATUS_SUCCESS, STATUS_NOT_FOUND, or error
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtUpdateConnectionState(
     _In_ PCONNECTION_TRACKER Tracker,
@@ -457,6 +517,20 @@ CtUpdateConnectionState(
     _In_ CT_CONNECTION_STATE NewState
     );
 
+/**
+ * @brief Remove connection from tracking.
+ * 
+ * Transitions to Closed state, removes from all indices, and releases list reference.
+ * Connection is freed when all external references are released.
+ * 
+ * @param Tracker Initialized tracker
+ * @param FlowId Flow identifier
+ * @return STATUS_SUCCESS, STATUS_NOT_FOUND, or error
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtRemoveConnection(
     _In_ PCONNECTION_TRACKER Tracker,
@@ -467,6 +541,20 @@ CtRemoveConnection(
 // Public API - Connection Lookup
 //=============================================================================
 
+/**
+ * @brief Find connection by WFP flow ID.
+ * 
+ * Returns a referenced pointer; caller must release via CtRelease.
+ * 
+ * @param Tracker Initialized tracker
+ * @param FlowId Flow identifier
+ * @param Connection Receives referenced connection pointer on success
+ * @return STATUS_SUCCESS or STATUS_NOT_FOUND
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtFindByFlowId(
     _In_ PCONNECTION_TRACKER Tracker,
@@ -474,6 +562,25 @@ CtFindByFlowId(
     _Out_ PCT_CONNECTION* Connection
     );
 
+/**
+ * @brief Find connection by 5-tuple endpoints.
+ * 
+ * Returns a referenced pointer; caller must release via CtRelease.
+ * 
+ * @param Tracker Initialized tracker
+ * @param LocalAddress Pointer to IN_ADDR or IN6_ADDR
+ * @param LocalPort Local port in host byte order
+ * @param RemoteAddress Pointer to IN_ADDR or IN6_ADDR
+ * @param RemotePort Remote port in host byte order
+ * @param Protocol IPPROTO_*
+ * @param IsIPv6 TRUE for IPv6, FALSE for IPv4
+ * @param Connection Receives referenced connection pointer on success
+ * @return STATUS_SUCCESS or STATUS_NOT_FOUND
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtFindByEndpoints(
     _In_ PCONNECTION_TRACKER Tracker,
@@ -490,6 +597,24 @@ CtFindByEndpoints(
 // Public API - Statistics Update
 //=============================================================================
 
+/**
+ * @brief Update connection statistics atomically.
+ * 
+ * Increments byte and packet counters, updates last activity timestamp.
+ * All updates are lock-free via Interlocked operations.
+ * 
+ * @param Tracker Initialized tracker
+ * @param FlowId Flow identifier
+ * @param BytesSent Bytes sent since last update (clamped to LONG64_MAX)
+ * @param BytesReceived Bytes received since last update (clamped to LONG64_MAX)
+ * @param PacketsSent Packets sent
+ * @param PacketsReceived Packets received
+ * @return STATUS_SUCCESS, STATUS_NOT_FOUND, or error
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 CtUpdateStats(
     _In_ PCONNECTION_TRACKER Tracker,
@@ -560,14 +685,36 @@ CtUnregisterCallback(
 // Public API - Reference Counting
 //=============================================================================
 
+/**
+ * @brief Increment connection reference count.
+ * 
+ * Must be called for every pointer copy that will be held across potential
+ * blocking operations or async callbacks.
+ * 
+ * @param Connection Connection to reference (must not be NULL)
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 CtAddRef(
     _In_ PCT_CONNECTION Connection
     );
 
+/**
+ * @brief Decrement connection reference count.
+ * 
+ * Frees connection when refcount drops to zero. Connection must have been
+ * removed from all lists before the last reference is released.
+ * 
+ * @param Connection Connection to release (NULL is safe)
+ * 
+ * @irql IRQL <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 CtRelease(
-    _In_ PCT_CONNECTION Connection
+    _In_opt_ PCT_CONNECTION Connection
     );
 
 //=============================================================================
@@ -594,6 +741,18 @@ CtGetStatistics(
 // Public API - Process Lifecycle
 //=============================================================================
 
+/**
+ * @brief Notification that a process has terminated.
+ * 
+ * Removes process context from tracking. Stale connections referencing the
+ * process will be cleaned up by the periodic timer.
+ * 
+ * @param Tracker Initialized tracker
+ * @param ProcessId Terminated process ID
+ * 
+ * @irql IRQL <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 CtProcessTerminated(
     _In_ PCONNECTION_TRACKER Tracker,
