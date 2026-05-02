@@ -867,6 +867,7 @@ SecTrackSectionMap(
 
     InsertTailList(&entry->MapList, &mapEntry->ListEntry);
     InterlockedIncrement(&entry->MapCount);
+    InterlockedIncrement(&entry->ActiveMapCount);
 
     if (isCrossProcess) {
         InterlockedIncrement(&entry->CrossProcessMapCount);
@@ -950,6 +951,13 @@ SecTrackSectionUnmap(
 
                 mapEntry->IsMapped = FALSE;
                 KeQuerySystemTime(&mapEntry->UnmapTime);
+                //
+                // Decrement ActiveMapCount under MapListLock exclusive so the
+                // periodic cleanup timer can correctly identify entries whose
+                // historical maps have all been unmapped. The public MapCount
+                // remains a historical-total counter for forensic reporting.
+                //
+                InterlockedDecrement(&entry->ActiveMapCount);
                 found = TRUE;
                 break;
             }
@@ -1815,7 +1823,7 @@ SecpCleanupTimerCallback(
             nextEntry = listEntry->Flink;
             entry = CONTAINING_RECORD(listEntry, SECTION_ENTRY, ListEntry);
 
-            if (entry->MapCount == 0 &&
+            if (entry->ActiveMapCount == 0 &&
                 (currentTime.QuadPart - entry->CreateTime.QuadPart) > SEC_STALE_THRESHOLD_100NS) {
 
                 SecpRemoveEntryLocked(internal, entry);
