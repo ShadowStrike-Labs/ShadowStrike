@@ -929,8 +929,7 @@ CpProtectCallback(
 
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized ||
-        Registration == NULL || Callback == NULL) {
+    if (Protector == NULL || Registration == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -940,6 +939,10 @@ CpProtectCallback(
 
     if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -1040,12 +1043,16 @@ CpUnprotectCallback(
 
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized || Registration == NULL) {
+    if (Protector == NULL || Registration == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -1090,12 +1097,16 @@ CpRegisterTamperCallback(
 {
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized || Callback == NULL) {
+    if (Protector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -1124,7 +1135,7 @@ CpEnablePeriodicVerify(
 {
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized) {
+    if (Protector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1133,12 +1144,16 @@ CpEnablePeriodicVerify(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Protector->VerifyThread == NULL) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
     if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (Protector->VerifyThread == NULL) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -1188,12 +1203,16 @@ CpDisablePeriodicVerify(
 {
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized) {
+    if (Protector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     InterlockedExchange(&Protector->PeriodicEnabled, FALSE);
@@ -1235,7 +1254,7 @@ CpVerifyAll(
 
     PAGED_CODE();
 
-    if (Protector == NULL || !Protector->Initialized || TamperedCount == NULL) {
+    if (Protector == NULL || TamperedCount == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1243,6 +1262,10 @@ CpVerifyAll(
 
     if (!ExAcquireRundownProtection(&Protector->RundownRef)) {
         return STATUS_DELETE_PENDING;
+    }
+    if (!Protector->Initialized) {
+        ExReleaseRundownProtection(&Protector->RundownRef);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     KeQuerySystemTime(&now);
@@ -1529,21 +1552,23 @@ CppNotifyTamper(
     _In_ PCP_CALLBACK_ENTRY_INTERNAL Entry
     )
 {
-    CP_TAMPER_CALLBACK callback;
-    PVOID context;
-
     //
-    // Read callback + context under shared lock to get a consistent
-    // snapshot (CpRegisterTamperCallback writes under exclusive).
+    // Hold the configuration lock SHARED across the user upcall so that an
+    // EXCLUSIVE re-registration or unregistration of the tamper callback is
+    // forced to wait until any in-flight invocation completes. The user
+    // contract for CP_TAMPER_CALLBACK forbids re-entry into the public API,
+    // so deadlock is structurally impossible.
     //
     CppAcquireLockShared(&Protector->CallbackLock);
-    callback = Protector->TamperCallback;
-    context = Protector->TamperContext;
-    CppReleaseLockShared(&Protector->CallbackLock);
+
+    CP_TAMPER_CALLBACK callback = Protector->TamperCallback;
+    PVOID context = Protector->TamperContext;
 
     if (callback != NULL) {
         callback(Entry->Type, Entry->Registration, context);
     }
+
+    CppReleaseLockShared(&Protector->CallbackLock);
 }
 
 // ============================================================================
