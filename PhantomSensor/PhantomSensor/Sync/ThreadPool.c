@@ -715,11 +715,11 @@ TpAddThreads(
         created++;
     }
 
-    if (created > 0) {
-        InterlockedAdd64(&Pool->Stats.ThreadsCreated, created);
-    }
-
-    return created > 0 ? STATUS_SUCCESS : status;
+    //
+    // FIX TP-MED-1: Stats.ThreadsCreated is incremented inside TppCreateThread
+    // upon success â€” do not double-count here.
+    //
+    return (created > 0) ? STATUS_SUCCESS : status;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -837,9 +837,12 @@ TpRemoveThreads(
         TppDestroyThread(threadInfo, WaitForCompletion);
     }
 
-    if (removed > 0) {
-        InterlockedAdd64(&Pool->Stats.ThreadsDestroyed, removed);
-    }
+    //
+    // FIX TP-MED-1: Stats.ThreadsDestroyed is incremented in the worker
+    // thread's exit path (Registered branch). Counting here would double-
+    // count once the worker self-terminates (or if TppDestroyThread reverts
+    // to self-cleanup on Wait=FALSE / timeout).
+    //
 
     return STATUS_SUCCESS;
 }
@@ -1535,14 +1538,32 @@ TppCreateThread(
     );
     if (!NT_SUCCESS(status)) {
         //
-        // FIX TP-C2: Thread is already created but we can't get the object.
-        // Signal it to stop, then WAIT for termination before closing handle.
-        // Without the wait, driver unload can free code pages while thread runs.
+        // FIX TP-C2 / TP-CRIT-1: Thread is already created but we can't get
+        // the object reference. Take ownership of cleanup so the worker
+        // does not also try to free the same resources.
         //
-        info->StopRequested = 1;
+        // 1. Set OwnerWillDestroy=1 BEFORE releasing StartEvent so the
+        //    worker, when it wakes and observes StopRequested, skips its
+        //    self-cleanup branch (no double-free of info, no spurious
+        //    cleanup callback for an unregistered thread).
+        // 2. WAIT for thread termination before closing handle â€” without
+        //    the wait, driver unload can free code pages while the thread
+        //    is still executing.
+        //
+        {
+            PSSPM_MONITOR pm = ShadowStrikeGetPerformanceMonitor();
+            if (pm != NULL) {
+                SsPmRecordSample(pm, SsPmMetric_DroppedEvents, 1);
+            }
+        }
+        InterlockedExchange(&info->OwnerWillDestroy, 1);
+        InterlockedExchange(&info->StopRequested, 1);
+        info->ShutdownRequested = TRUE;
         KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
         ZwWaitForSingleObject(threadHandle, FALSE, NULL);
         ZwClose(threadHandle);
+        TppReleasePoolReference(Pool);
+        ShadowStrikeFreePoolWithTag(info, TP_POOL_TAG_THREAD);
         return status;
     }
 
@@ -1557,7 +1578,17 @@ TppCreateThread(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike:TP] TppCreateThread: ThreadList corrupted, cannot insert thread %u\n",
                    info->ThreadIndex);
-        info->StopRequested = 1;
+        //
+        // FIX TP-CRIT-1: Take exclusive ownership of cleanup so the worker
+        // does not also free the same resources. Worker is already running
+        // (PsCreateSystemThread succeeded) and will wake on StartEvent; if
+        // OwnerWillDestroy is left at 0, both creator and worker would
+        // ZwClose the same handle, ObDereference the same object, release
+        // the pool reference twice, and double-free `info`.
+        //
+        InterlockedExchange(&info->OwnerWillDestroy, 1);
+        InterlockedExchange(&info->StopRequested, 1);
+        info->ShutdownRequested = TRUE;
         KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
         ZwWaitForSingleObject(threadHandle, FALSE, NULL);
         ZwClose(threadHandle);
@@ -1577,6 +1608,13 @@ TppCreateThread(
     // Signal thread to begin
     //
     KeSetEvent(&info->StartEvent, IO_NO_INCREMENT, FALSE);
+
+    //
+    // FIX TP-MED-1: Account thread creation centrally here so all entry
+    // points (TpCreate initial threads, TpAddThreads, TppEvaluateScaling
+    // scale-up) record the event exactly once.
+    //
+    InterlockedIncrement64(&Pool->Stats.ThreadsCreated);
 
     *ThreadInfo = info;
     return STATUS_SUCCESS;
@@ -1940,6 +1978,13 @@ ExitCleanup:
         InterlockedDecrement(&pool->ThreadCount);
 
         //
+        // FIX TP-MED-1: Always count thread destruction in the worker's
+        // exit path â€” regardless of who (self vs. owner) frees `info`. This
+        // is the single canonical accounting site for ThreadsDestroyed.
+        //
+        InterlockedIncrement64(&pool->Stats.ThreadsDestroyed);
+
+        //
         // Signal if last thread
         //
         if (InterlockedCompareExchange(&pool->ThreadCount, 0, 0) == 0) {
@@ -1982,7 +2027,10 @@ ExitCleanup:
         }
 
         threadInfo->Magic = 0;
-        InterlockedIncrement64(&pool->Stats.ThreadsDestroyed);
+        //
+        // FIX TP-MED-1: Stats.ThreadsDestroyed is now incremented earlier in
+        // the Registered branch so it counts every exit exactly once.
+        //
         TppReleasePoolReference(pool);
         ShadowStrikeFreePoolWithTag(threadInfo, TP_POOL_TAG_THREAD);
     }
@@ -2153,12 +2201,13 @@ TppEvaluateScaling(
         //
         // CRITICAL-01 fix: PsCreateSystemThread now runs at PASSIVE_LEVEL
         // (this function is called from a work item routine).
+        // FIX TP-MED-1: Stats.ThreadsCreated is incremented inside
+        // TppCreateThread â€” do not double-count here.
         //
         PTP_THREAD_INFO newThread;
         NTSTATUS status = TppCreateThread(Pool, &newThread);
         if (NT_SUCCESS(status)) {
             InterlockedIncrement64(&Pool->Stats.ScaleUpCount);
-            InterlockedIncrement64(&Pool->Stats.ThreadsCreated);
         }
     } else if (shouldScaleDown) {
         //
