@@ -683,7 +683,8 @@ CopDestroyCacheInternal(
         InterlockedAdd64(&manager->CurrentTotalMemory, -(LONG64)memoryFreed);
     }
 
-    Cache->Initialized = FALSE;
+    Cache->Manager = NULL;
+    InterlockedExchange(&Cache->Initialized, FALSE);
     ShadowStrikeFreePoolWithTag(Cache, CO_POOL_TAG);
 }
 
@@ -726,6 +727,17 @@ CoFlush(
 
             nextEntry = listEntry->Flink;
             cacheEntry = CONTAINING_RECORD(listEntry, CO_CACHE_ENTRY, HashEntry);
+
+            /*
+             * Skip entries already marked Evicting. Such entries are owned
+             * by an in-flight CopEvictLRUEntry that has removed them from
+             * the LRU list and is about to acquire the bucket lock to unlink
+             * them from the hash chain. Calling CopRemoveEntryFromCache here
+             * would double-free.
+             */
+            if (cacheEntry->State == CoEntryStateEvicting) {
+                continue;
+            }
 
             /* CopRemoveEntryFromCache requires bucket lock held â€” we hold it */
             CopRemoveEntryFromCache(Cache, cacheEntry, TRUE);
@@ -825,6 +837,7 @@ CoPutEx(
             SIZE_T oldSize = existingEntry->DataSize;
             ShadowStrikeFreePoolWithTag(existingEntry->Data, CO_DATA_POOL_TAG);
             InterlockedAdd64(&Cache->MemoryUsage, -(LONG64)oldSize);
+            InterlockedAdd64(&Cache->Stats.CurrentMemory, -(LONG64)oldSize);
             if (Cache->Manager != NULL) {
                 InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, -(LONG64)oldSize);
             }
@@ -844,6 +857,7 @@ CoPutEx(
 
         if (dataCopy != NULL) {
             InterlockedAdd64(&Cache->MemoryUsage, (LONG64)DataSize);
+            InterlockedAdd64(&Cache->Stats.CurrentMemory, (LONG64)DataSize);
             if (Cache->Manager != NULL) {
                 InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, (LONG64)DataSize);
             }
@@ -885,6 +899,7 @@ CoPutEx(
                 SIZE_T oldSize = existingEntry->DataSize;
                 ShadowStrikeFreePoolWithTag(existingEntry->Data, CO_DATA_POOL_TAG);
                 InterlockedAdd64(&Cache->MemoryUsage, -(LONG64)oldSize);
+                InterlockedAdd64(&Cache->Stats.CurrentMemory, -(LONG64)oldSize);
                 if (Cache->Manager != NULL) {
                     InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, -(LONG64)oldSize);
                 }
@@ -901,6 +916,7 @@ CoPutEx(
             InterlockedExchange64(&existingEntry->LastAccessTimeQpc, currentTime.QuadPart);
             if (dataCopy != NULL) {
                 InterlockedAdd64(&Cache->MemoryUsage, (LONG64)DataSize);
+                InterlockedAdd64(&Cache->Stats.CurrentMemory, (LONG64)DataSize);
                 if (Cache->Manager != NULL) {
                     InterlockedAdd64(&Cache->Manager->CurrentTotalMemory, (LONG64)DataSize);
                 }
@@ -1697,7 +1713,20 @@ CopFindEntryInBucket(
 
         entry = CONTAINING_RECORD(listEntry, CO_CACHE_ENTRY, HashEntry);
 
-        if (entry->Key == Key && entry->State != CoEntryStateInvalid) {
+        /*
+         * Skip both Invalid and Evicting entries.
+         *
+         * Evicting is set by CopEvictLRUEntry between releasing the shard
+         * LRU lock and acquiring the bucket lock. Until that thread has
+         * finished unlinking the entry from the bucket, the entry is still
+         * physically on the hash chain but logically dead â€” returning it
+         * here would let CoInvalidate/CoGet expiry/CoPutEx update path
+         * call CopRemoveEntryFromCache against an entry the LRU evictor
+         * is about to free, producing a double-free / use-after-free race.
+         */
+        if (entry->Key == Key &&
+            entry->State != CoEntryStateInvalid &&
+            entry->State != CoEntryStateEvicting) {
             return entry;
         }
     }
