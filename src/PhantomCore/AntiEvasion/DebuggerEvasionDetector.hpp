@@ -2062,10 +2062,15 @@ namespace ShadowStrike {
 
             /**
              * @brief Parse IAT and detect imports of timing-related APIs
+             *
+             * @param moduleSize SizeOfImage from MODULEINFO. Used to bound-check
+             *                   every RVA derived from attacker-controlled PE
+             *                   directory contents before pointer arithmetic.
              */
             void AnalyzeIATForTimingAPIs(
                 HANDLE hProcess,
                 LPVOID moduleBase,
+                DWORD moduleSize,
                 DWORD importDirRva,
                 DWORD importDirSize,
                 bool is64Bit,
@@ -2074,10 +2079,15 @@ namespace ShadowStrike {
 
             /**
              * @brief Process imports from a single DLL for timing API detection
+             *
+             * @param moduleSize SizeOfImage of the target module. Required to
+             *                   validate thunk and name RVAs against module
+             *                   bounds before dereferencing.
              */
             void ProcessDLLImportsForTiming(
                 HANDLE hProcess,
                 LPVOID moduleBase,
+                DWORD moduleSize,
                 const IMAGE_IMPORT_DESCRIPTOR* importDesc,
                 const char* dllName,
                 bool is64Bit,
