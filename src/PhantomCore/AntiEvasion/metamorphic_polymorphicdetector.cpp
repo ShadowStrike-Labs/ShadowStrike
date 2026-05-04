@@ -91,7 +91,14 @@ public:
     // STATE
     // ========================================================================
 
-    bool m_initialized = false;
+    // Initialization state — atomic so unsynchronized readers in the public
+    // API entry points (AnalyzeFile/AnalyzeBuffer/AnalyzeProcess/PerformFuzzyMatching/
+    // ComputeFuzzyHash/ComputeTLSH and the disasm-gated paths inside
+    // PerformSimilarityAnalysis) cannot race with Initialize()/Shutdown(), which
+    // both mutate the flag while only some readers hold m_mutex. Without
+    // atomicity this is a data race (UB) under the C++ memory model even
+    // though it appears to work on x86.
+    std::atomic<bool> m_initialized{ false };
     mutable std::shared_mutex m_mutex;
 
     // External stores
@@ -104,7 +111,12 @@ public:
     Phantom::Disasm::Decoder m_decoder32;
     Phantom::Disasm::Decoder m_decoder64;
     Phantom::Disasm::Formatter m_formatter;
-    bool m_disasmInitialized = false;
+    // Atomic for the same reason as m_initialized: many disasm-gated callers
+    // (DisassembleBuffer, DetectDecryptionLoops, AnalyzeFileInternal,
+    // AnalyzeProcessInternal, PerformSimilarityAnalysis) read this flag
+    // without acquiring m_mutex, while Initialize()/Shutdown() write it under
+    // unique_lock.
+    std::atomic<bool> m_disasmInitialized{ false };
 
     // Cache
     mutable std::shared_mutex m_cacheMutex;
@@ -5013,7 +5025,7 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
             fuzzyHv.type = SignatureStore::HashType::FUZZY;
             const auto& hashBytes = *fuzzyHashStr;
             fuzzyHv.length = static_cast<uint8_t>(
-                std::min(hashBytes.size(), static_cast<size_t>(64)));
+                std::min(hashBytes.size(), fuzzyHv.data.size()));
             std::memcpy(fuzzyHv.data.data(), hashBytes.data(), fuzzyHv.length);
 
             auto fuzzyMatches = m_impl->m_hashStore->FuzzyMatch(fuzzyHv, 70);
@@ -5045,7 +5057,7 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
             tlshHv.type = SignatureStore::HashType::TLSH;
             const auto& tlshBytes = *tlshHash;
             tlshHv.length = static_cast<uint8_t>(
-                std::min(tlshBytes.size(), static_cast<size_t>(64)));
+                std::min(tlshBytes.size(), tlshHv.data.size()));
             std::memcpy(tlshHv.data.data(), tlshBytes.data(), tlshHv.length);
 
             auto tlshMatches = m_impl->m_hashStore->FuzzyMatch(tlshHv, 60);
