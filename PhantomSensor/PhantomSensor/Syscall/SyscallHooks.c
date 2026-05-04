@@ -68,7 +68,7 @@
 /** @brief Shutdown drain poll interval: 1 ms */
 #define SH_DRAIN_POLL_INTERVAL_100NS        (-10000LL)
 
-/** @brief Maximum drain wait iterations before forced teardown (10 seconds) */
+/** @brief Drain warning threshold: log a diagnostic after this many polls (~10 seconds at 1ms intervals) */
 #define SH_MAX_DRAIN_ITERATIONS             10000
 
 /** @brief Rate limit window: 1 second in 100ns units */
@@ -458,6 +458,12 @@ ShpReleaseHookRef(
 
 /**
  * @brief Wait for all active callbacks on a specific hook to drain.
+ *
+ * Spins indefinitely. We deliberately do NOT bail after
+ * SH_MAX_DRAIN_ITERATIONS â€” freeing a hook with outstanding callback
+ * references would be a guaranteed kernel UAF. The threshold only triggers
+ * a warning so a wedged callback is visible in the debug log without
+ * compromising memory safety.
  */
 static VOID
 ShpDrainHookCallbacks(
@@ -466,6 +472,7 @@ ShpDrainHookCallbacks(
 {
     LARGE_INTEGER interval;
     ULONG iterations = 0;
+    BOOLEAN warned = FALSE;
 
     interval.QuadPart = SH_DRAIN_POLL_INTERVAL_100NS;
 
@@ -473,10 +480,11 @@ ShpDrainHookCallbacks(
     {
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
         iterations++;
-        if (iterations == SH_MAX_DRAIN_ITERATIONS) {
+        if (!warned && iterations >= SH_MAX_DRAIN_ITERATIONS) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                 "[ShadowStrike] SyscallHooks: Hook drain taking long, %ld callbacks remain\n",
                 Hook->ActiveCallbackCount);
+            warned = TRUE;
         }
     }
 }
@@ -996,6 +1004,14 @@ ShEnableHook(
      * Acquire shared lock to prevent concurrent ShUnregisterHook from
      * freeing the hook between our magic check and the enable toggle.
      * Shared lock is sufficient â€” we're not modifying the hash table.
+     *
+     * NOTE: ShUnregisterHook releases the exclusive lock BEFORE draining
+     * and freeing the hook. Validating magic alone would leave a UAF
+     * window where Unregister scrubs (or the lookaside slot is reused for
+     * an unrelated hook with the same magic) between our shared-lock
+     * acquire and the Enabled toggle. To close the window we acquire a
+     * per-hook callback reference under the shared lock; ShpDrainHookCallbacks
+     * waits for it to drop, keeping the hook valid until we are done.
      */
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&fw->HookLock);
@@ -1007,13 +1023,17 @@ ShEnableHook(
         return STATUS_INVALID_PARAMETER;
     }
 
+    ShpAcquireHookRef(hook);
+
+    ExReleasePushLockShared(&fw->HookLock);
+    KeLeaveCriticalRegion();
+
     prev = InterlockedExchange(&hook->Enabled, 1);
     if (prev == 0) {
         InterlockedIncrement(&fw->EnabledHookCount);
     }
 
-    ExReleasePushLockShared(&fw->HookLock);
-    KeLeaveCriticalRegion();
+    ShpReleaseHookRef(hook);
 
     return STATUS_SUCCESS;
 }
@@ -1044,6 +1064,8 @@ ShDisableHook(
     /*
      * Acquire shared lock to prevent concurrent ShUnregisterHook from
      * freeing the hook between our magic check and the disable toggle.
+     * Per the same reasoning as ShEnableHook, also bump the hook callback
+     * reference to keep the hook alive across the post-shared-lock toggle.
      */
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&fw->HookLock);
@@ -1055,13 +1077,17 @@ ShDisableHook(
         return STATUS_INVALID_PARAMETER;
     }
 
+    ShpAcquireHookRef(hook);
+
+    ExReleasePushLockShared(&fw->HookLock);
+    KeLeaveCriticalRegion();
+
     prev = InterlockedExchange(&hook->Enabled, 0);
     if (prev != 0) {
         InterlockedDecrement(&fw->EnabledHookCount);
     }
 
-    ExReleasePushLockShared(&fw->HookLock);
-    KeLeaveCriticalRegion();
+    ShpReleaseHookRef(hook);
 
     return STATUS_SUCCESS;
 }
