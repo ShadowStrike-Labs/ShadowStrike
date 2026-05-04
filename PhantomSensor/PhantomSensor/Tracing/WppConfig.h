@@ -364,11 +364,18 @@ WppGenerateCorrelationId(
     VOID
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/**
+ * @brief Initialize a trace context for structured/correlated logging.
+ *
+ * Defensive: a NULL @p Context is rejected with STATUS_INVALID_PARAMETER
+ * rather than dereferenced; the SAL contract is therefore _Out_opt_.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 WppCreateTraceContext(
-    _Out_ PWPP_TRACE_CONTEXT Context,
+    _Out_opt_ PWPP_TRACE_CONTEXT Context,
     _In_ WPP_COMPONENT_ID ComponentId,
     _In_ UINT64 ParentCorrelationId
     );
@@ -404,11 +411,18 @@ WppResetStatistics(
 // EXTENDED API (previously in WppConfig.c, now in Trace.c)
 // ============================================================================
 
-/** @irql <= DISPATCH_LEVEL */
+/**
+ * @brief Snapshot the current trace configuration.
+ *
+ * NULL @p Config is rejected with STATUS_INVALID_PARAMETER; SAL is _Out_opt_
+ * to match the defensive contract.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 WppGetConfiguration(
-    _Out_ PWPP_TRACE_CONFIG Config
+    _Out_opt_ PWPP_TRACE_CONFIG Config
     );
 
 /** @irql <= DISPATCH_LEVEL */
@@ -456,11 +470,18 @@ WppGetSequenceNumber(
     VOID
     );
 
-/** @irql <= DISPATCH_LEVEL */
+/**
+ * @brief Retrieve the active session GUID.
+ *
+ * NULL @p SessionGuid is rejected with STATUS_INVALID_PARAMETER; SAL is
+ * _Out_opt_ to match the defensive contract.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 WppGetSessionGuid(
-    _Out_ PGUID SessionGuid
+    _Out_opt_ PGUID SessionGuid
     );
 
 /** @irql <= DISPATCH_LEVEL */
