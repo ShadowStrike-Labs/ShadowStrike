@@ -115,6 +115,7 @@ constexpr size_t kByteGroups           = 16;
 
 // --- String Extraction ---
 constexpr size_t kMinStringLength      = 5;
+constexpr size_t kMaxStringLength      = 4096;   // hard cap per captured run (DoS guard)
 constexpr size_t kMaxStringsCollected  = 100000;
 
 // --- Import/Export Hashing ---
@@ -393,14 +394,14 @@ bool FeatureExtractor::Initialize() noexcept {
                     kNumSuspiciousStrings, kNumKnownSectionNames);
         return true;
     }
-    catch (const std::exception& ex) {
+    catch (const std::exception&) {
         SS_LOG_ERROR(kLogCategory, L"Initialization failed: allocation error");
         return false;
     }
 }
 
 // ============================================================================
-// ExtractPEFeatures  (2381 features, EMBER-aligned)
+// ExtractPEFeatures  (2568 features, EMBER 2024 aligned)
 // ============================================================================
 
 std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
@@ -588,7 +589,6 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
     // ====================================================================
     {
         std::array<double, kEntropyBins * kByteGroups> jointHist{};
-        size_t windowCount = 0;
 
         for (size_t offset = 0; offset + kEntropyWindowSize <= fileSize;
              offset += kEntropyWindowStep)
@@ -612,7 +612,6 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
                 jointHist[entropyBin * kByteGroups + g] +=
                     static_cast<double>(groupCounts[g]);
             }
-            ++windowCount;
         }
 
         // Normalize to sum = 1.0
@@ -649,6 +648,12 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
                 if (inRun) {
                     size_t runLen = i - currentRunStart;
                     if (runLen >= kMinStringLength) {
+                        // Cap each captured run to bound subsequent O(N) scans
+                        // (suspicious-string search, IP heuristic, entropy).
+                        // Without this cap an adversarial PE consisting of one
+                        // multi-MB printable run would amplify to multi-GB CPU
+                        // work per scanned file.
+                        if (runLen > kMaxStringLength) runLen = kMaxStringLength;
                         extractedStrings.emplace_back(
                             reinterpret_cast<const char*>(fileBytes.data() + currentRunStart),
                             runLen);
@@ -661,6 +666,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
         if (inRun) {
             size_t runLen = fileSize - currentRunStart;
             if (runLen >= kMinStringLength && extractedStrings.size() < kMaxStringsCollected) {
+                if (runLen > kMaxStringLength) runLen = kMaxStringLength;
                 extractedStrings.emplace_back(
                     reinterpret_cast<const char*>(fileBytes.data() + currentRunStart),
                     runLen);
@@ -1402,14 +1408,30 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractMemoryFeatures(
 
     // ---- Protection flags (4 bits: R, W, X, G) ----
     {
-        // Windows protection constants:
-        // PAGE_READONLY=0x02, PAGE_READWRITE=0x04, PAGE_EXECUTE=0x10
-        // PAGE_EXECUTE_READ=0x20, PAGE_EXECUTE_READWRITE=0x40, PAGE_GUARD=0x100
-        uint32_t prot = region.protection;
-        bool r = (prot & 0x02) || (prot & 0x04) || (prot & 0x20) || (prot & 0x40);
-        bool w = (prot & 0x04) || (prot & 0x08) || (prot & 0x40) || (prot & 0x80);
-        bool x = (prot & 0x10) || (prot & 0x20) || (prot & 0x40) || (prot & 0x80);
-        bool g = (prot & 0x100) != 0;
+        // Windows page protection base codes are mutually-exclusive values
+        // (PAGE_NOACCESS=0x01, PAGE_READONLY=0x02, PAGE_READWRITE=0x04,
+        //  PAGE_WRITECOPY=0x08, PAGE_EXECUTE=0x10, PAGE_EXECUTE_READ=0x20,
+        //  PAGE_EXECUTE_READWRITE=0x40, PAGE_EXECUTE_WRITECOPY=0x80).
+        // Treating them as independent bitmask flags miscoded WRITECOPY
+        // and EXECUTE_WRITECOPY pages as not-readable. PAGE_GUARD (0x100),
+        // PAGE_NOCACHE (0x200), PAGE_WRITECOMBINE (0x400) are real modifier
+        // bits and are masked off before decoding the base code.
+        constexpr uint32_t kBaseProtMask = 0x000000FFu;
+        constexpr uint32_t kPageGuard    = 0x00000100u;
+
+        const uint32_t base = region.protection & kBaseProtMask;
+        bool r = false, w = false, x = false;
+        switch (base) {
+            case 0x02: r = true; break;                              // READONLY
+            case 0x04: r = true; w = true; break;                    // READWRITE
+            case 0x08: r = true; w = true; break;                    // WRITECOPY (CoW, readable)
+            case 0x10: x = true; break;                              // EXECUTE
+            case 0x20: r = true; x = true; break;                    // EXECUTE_READ
+            case 0x40: r = true; w = true; x = true; break;          // EXECUTE_READWRITE
+            case 0x80: r = true; w = true; x = true; break;          // EXECUTE_WRITECOPY
+            default: break;                                          // NOACCESS or unknown
+        }
+        const bool g = (region.protection & kPageGuard) != 0;
         features[idx++] = r ? 1.0f : 0.0f;
         features[idx++] = w ? 1.0f : 0.0f;
         features[idx++] = x ? 1.0f : 0.0f;
