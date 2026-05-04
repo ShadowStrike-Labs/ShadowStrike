@@ -2184,31 +2184,51 @@ ShadowStrikeParseCommandLine(
     // and the final argument is silently dropped, evading argument-level detection.
     //
     if (inArg && inQuotes) {
-        if (argCount < maxArgs) {
-            USHORT argLen = (USHORT)(cmdLen - argStart);
+        if (argCount >= maxArgs) {
+            //
+            // SECURITY FIX: Argument cap reached with a pending quoted tail.
+            // Failing loudly prevents an attacker from hiding the trailing
+            // (most-attacker-controlled) argument of a quoted command line
+            // from per-argument detection rules by overflowing the cap.
+            //
+            status = STATUS_BUFFER_OVERFLOW;
+            goto cleanup;
+        }
 
-            if (argLen > 0) {
-                argArray[argCount] = (PUNICODE_STRING)ExAllocatePool2(
-                    POOL_FLAG_PAGED,
-                    sizeof(UNICODE_STRING),
-                    SHADOW_STRING_TAG
-                );
+        USHORT argLen = (USHORT)(cmdLen - argStart);
 
-                if (argArray[argCount] != NULL) {
-                    UNICODE_STRING tempArg;
-                    tempArg.Buffer = &CommandLine->Buffer[argStart];
-                    tempArg.Length = argLen * sizeof(WCHAR);
-                    tempArg.MaximumLength = tempArg.Length;
+        if (argLen > 0) {
+            argArray[argCount] = (PUNICODE_STRING)ExAllocatePool2(
+                POOL_FLAG_PAGED,
+                sizeof(UNICODE_STRING),
+                SHADOW_STRING_TAG
+            );
 
-                    status = ShadowStrikeCloneUnicodeString(argArray[argCount], &tempArg);
-                    if (NT_SUCCESS(status)) {
-                        argCount++;
-                    } else {
-                        ExFreePoolWithTag(argArray[argCount], SHADOW_STRING_TAG);
-                        argArray[argCount] = NULL;
-                        goto cleanup;
-                    }
-                }
+            if (argArray[argCount] == NULL) {
+                //
+                // SECURITY FIX: Do not silently drop the trailing argument
+                // on allocation failure. An adversary that can pressure the
+                // paged pool would otherwise be able to suppress the final
+                // segment of a quoted command line from per-argument
+                // detection rules. Mirror the in-loop allocation-failure
+                // behavior and surface STATUS_INSUFFICIENT_RESOURCES.
+                //
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto cleanup;
+            }
+
+            UNICODE_STRING tempArg;
+            tempArg.Buffer = &CommandLine->Buffer[argStart];
+            tempArg.Length = argLen * sizeof(WCHAR);
+            tempArg.MaximumLength = tempArg.Length;
+
+            status = ShadowStrikeCloneUnicodeString(argArray[argCount], &tempArg);
+            if (NT_SUCCESS(status)) {
+                argCount++;
+            } else {
+                ExFreePoolWithTag(argArray[argCount], SHADOW_STRING_TAG);
+                argArray[argCount] = NULL;
+                goto cleanup;
             }
         }
     }
