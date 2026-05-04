@@ -751,6 +751,72 @@ namespace ShadowStrike::AntiEvasion {
     };
 
     // ========================================================================
+    // RAII: EventLogHandleGuard
+    // Closes the handle returned by OpenEventLogW/OpenBackupEventLogW with
+    // CloseEventLog (NOT CloseHandle). Handles deterministic cleanup on every
+    // exit path including thrown std::bad_alloc from std::vector::push_back.
+    // ========================================================================
+    class EventLogHandleGuard {
+    public:
+        explicit EventLogHandleGuard(HANDLE h = nullptr) noexcept : m_handle(h) {}
+        ~EventLogHandleGuard() noexcept {
+            if (m_handle) {
+                ::CloseEventLog(m_handle);
+            }
+        }
+        EventLogHandleGuard(const EventLogHandleGuard&) = delete;
+        EventLogHandleGuard& operator=(const EventLogHandleGuard&) = delete;
+        EventLogHandleGuard(EventLogHandleGuard&& other) noexcept : m_handle(other.m_handle) { other.m_handle = nullptr; }
+        EventLogHandleGuard& operator=(EventLogHandleGuard&& other) noexcept {
+            if (this != &other) {
+                if (m_handle) ::CloseEventLog(m_handle);
+                m_handle = other.m_handle;
+                other.m_handle = nullptr;
+            }
+            return *this;
+        }
+        [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
+        [[nodiscard]] explicit operator bool() const noexcept { return m_handle != nullptr; }
+    private:
+        HANDLE m_handle;
+    };
+
+    // ========================================================================
+    // RAII: ProcessHeapBlockGuard
+    // Frees a HeapAlloc(GetProcessHeap()) allocation with HeapFree on every
+    // exit path. Required for exception-safety since downstream container
+    // operations (push_back, std::to_wstring) can throw std::bad_alloc.
+    // ========================================================================
+    class ProcessHeapBlockGuard {
+    public:
+        explicit ProcessHeapBlockGuard(void* p = nullptr) noexcept : m_ptr(p) {}
+        ~ProcessHeapBlockGuard() noexcept {
+            if (m_ptr) {
+                ::HeapFree(::GetProcessHeap(), 0, m_ptr);
+            }
+        }
+        ProcessHeapBlockGuard(const ProcessHeapBlockGuard&) = delete;
+        ProcessHeapBlockGuard& operator=(const ProcessHeapBlockGuard&) = delete;
+        ProcessHeapBlockGuard(ProcessHeapBlockGuard&& other) noexcept : m_ptr(other.m_ptr) { other.m_ptr = nullptr; }
+        ProcessHeapBlockGuard& operator=(ProcessHeapBlockGuard&& other) noexcept {
+            if (this != &other) {
+                if (m_ptr) ::HeapFree(::GetProcessHeap(), 0, m_ptr);
+                m_ptr = other.m_ptr;
+                other.m_ptr = nullptr;
+            }
+            return *this;
+        }
+        void reset(void* p = nullptr) noexcept {
+            if (m_ptr) ::HeapFree(::GetProcessHeap(), 0, m_ptr);
+            m_ptr = p;
+        }
+        [[nodiscard]] void* get() const noexcept { return m_ptr; }
+        [[nodiscard]] explicit operator bool() const noexcept { return m_ptr != nullptr; }
+    private:
+        void* m_ptr;
+    };
+
+    // ========================================================================
     // SAFE FILE SYSTEM HELPERS
     // Wrap fs::exists calls to handle exceptions and TOCTOU races gracefully
     // ========================================================================
@@ -3325,10 +3391,10 @@ namespace ShadowStrike::AntiEvasion {
             if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs", 0, KEY_READ, &hRecentDocsKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
                 DWORD valueCount = 0;
-                RegQueryInfoKeyW(hRecentDocsKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, &valueCount, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hRecentDocsKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, &valueCount, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hRecentDocsKey);
 
-                if (subKeyCount < 2 && valueCount < 5) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 2 && valueCount < 5) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
                     detection.confidence = 0.55;
                     detection.detectedValue = std::to_wstring(valueCount) + L" values, " + std::to_wstring(subKeyCount) + L" subkeys";
@@ -3344,10 +3410,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hComDlgKey;
             if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\OpenSavePidlMRU", 0, KEY_READ, &hComDlgKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hComDlgKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hComDlgKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hComDlgKey);
 
-                if (subKeyCount < 3) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 3) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
                     detection.confidence = 0.50;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" file type categories";
@@ -3363,10 +3429,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hTypedURLsKey;
             if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Internet Explorer\\TypedURLs", 0, KEY_READ, &hTypedURLsKey) == ERROR_SUCCESS) {
                 DWORD valueCount = 0;
-                RegQueryInfoKeyW(hTypedURLsKey, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &valueCount, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hTypedURLsKey, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &valueCount, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hTypedURLsKey);
 
-                if (valueCount < 3) {
+                if (qStatus == ERROR_SUCCESS && valueCount < 3) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_NoTypedURLs);
                     detection.confidence = 0.45;
                     detection.detectedValue = std::to_wstring(valueCount) + L" typed URLs";
@@ -3383,10 +3449,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hUninstallKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", 0, KEY_READ, &hUninstallKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hUninstallKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hUninstallKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hUninstallKey);
 
-                if (subKeyCount < 15) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 15) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_MissingSoftwareKeys);
                     detection.confidence = 0.55;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" programs";
@@ -3404,10 +3470,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hNetworkProfiles;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles", 0, KEY_READ, &hNetworkProfiles) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hNetworkProfiles, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hNetworkProfiles, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hNetworkProfiles);
 
-                if (subKeyCount < 2) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 2) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_MissingSoftwareKeys);
                     detection.confidence = 0.50;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" network profiles";
@@ -3561,10 +3627,10 @@ namespace ShadowStrike::AntiEvasion {
             // ================================================================
             // 6. CHECK WINDOWS EVENT LOG SIZE (Small log = fresh system)
             // ================================================================
-            HANDLE hEventLog = OpenEventLogW(nullptr, L"Application");
+            EventLogHandleGuard hEventLog(OpenEventLogW(nullptr, L"Application"));
             if (hEventLog) {
                 DWORD numRecords = 0;
-                if (GetNumberOfEventLogRecords(hEventLog, &numRecords)) {
+                if (GetNumberOfEventLogRecords(hEventLog.get(), &numRecords)) {
                     if (numRecords < 100) {
                         EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ACTIVITY_UserIdleDetection);
                         detection.confidence = 0.50;
@@ -3576,7 +3642,6 @@ namespace ShadowStrike::AntiEvasion {
                         found = true;
                     }
                 }
-                CloseEventLog(hEventLog);
             }
 
             return found;
@@ -3721,17 +3786,35 @@ namespace ShadowStrike::AntiEvasion {
             // ================================================================
             FIXED_INFO* pFixedInfo = nullptr;
             ULONG ulOutBufLen = sizeof(FIXED_INFO);
-            pFixedInfo = reinterpret_cast<FIXED_INFO*>(HeapAlloc(GetProcessHeap(), 0, ulOutBufLen));
-            
+            // RAII guard ensures HeapFree on every exit path including
+            // std::bad_alloc thrown by push_back/std::to_wstring below.
+            ProcessHeapBlockGuard pFixedInfoGuard(
+                HeapAlloc(GetProcessHeap(), 0, ulOutBufLen));
+            pFixedInfo = static_cast<FIXED_INFO*>(pFixedInfoGuard.get());
+
             if (pFixedInfo) {
                 if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
-                    HeapFree(GetProcessHeap(), 0, pFixedInfo);
-                    pFixedInfo = reinterpret_cast<FIXED_INFO*>(HeapAlloc(GetProcessHeap(), 0, ulOutBufLen));
+                    // Cap re-allocation to a sane maximum to defend against a
+                    // malicious driver returning a huge required buffer size.
+                    constexpr ULONG kMaxFixedInfoBytes = 256u * 1024u;
+                    if (ulOutBufLen == 0 || ulOutBufLen > kMaxFixedInfoBytes) {
+                        SS_LOG_WARN(L"EnvironmentEvasionDetector",
+                            L"GetNetworkParams reported implausible size %lu", ulOutBufLen);
+                        return found;
+                    }
+                    pFixedInfoGuard.reset(HeapAlloc(GetProcessHeap(), 0, ulOutBufLen));
+                    pFixedInfo = static_cast<FIXED_INFO*>(pFixedInfoGuard.get());
                 }
 
                 if (pFixedInfo && GetNetworkParams(pFixedInfo, &ulOutBufLen) == NO_ERROR) {
-                    std::string dnsServer = pFixedInfo->DnsServerList.IpAddress.String;
-                    
+                    // FIXED_INFO::DnsServerList::IpAddress::String is a fixed
+                    // 16-byte char array; use the bounded length to avoid OOB
+                    // reads if the OS ever fails to NUL-terminate.
+                    const char* dnsRaw = pFixedInfo->DnsServerList.IpAddress.String;
+                    const size_t dnsCap = sizeof(pFixedInfo->DnsServerList.IpAddress.String);
+                    const size_t dnsLen = ::strnlen(dnsRaw, dnsCap);
+                    std::string dnsServer(dnsRaw, dnsLen);
+
                     // Check for suspicious DNS servers
                     if (dnsServer.empty() || dnsServer == "0.0.0.0" || dnsServer == "127.0.0.1") {
                         EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_SuspiciousDNS);
@@ -3742,10 +3825,6 @@ namespace ShadowStrike::AntiEvasion {
                         outDetections.push_back(detection);
                         found = true;
                     }
-                }
-
-                if (pFixedInfo) {
-                    HeapFree(GetProcessHeap(), 0, pFixedInfo);
                 }
             }
 
@@ -4200,10 +4279,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hTaskKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks", 0, KEY_READ, &hTaskKey) == ERROR_SUCCESS) {
                 DWORD taskCount = 0;
-                RegQueryInfoKeyW(hTaskKey, nullptr, nullptr, nullptr, &taskCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hTaskKey, nullptr, nullptr, nullptr, &taskCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hTaskKey);
 
-                if (taskCount < 50) {
+                if (qStatus == ERROR_SUCCESS && taskCount < 50) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
                     detection.confidence = 0.45;
                     detection.detectedValue = std::to_wstring(taskCount) + L" scheduled tasks";
@@ -4244,12 +4323,12 @@ namespace ShadowStrike::AntiEvasion {
             // 6. EVENT LOG TIMESTAMP ANALYSIS
             // ================================================================
             // Check if earliest event log entry is very recent
-            HANDLE hEventLog = OpenEventLogW(nullptr, L"System");
+            EventLogHandleGuard hEventLog(OpenEventLogW(nullptr, L"System"));
             if (hEventLog) {
                 DWORD oldestRecord = 0;
                 DWORD numRecords = 0;
-                if (GetOldestEventLogRecord(hEventLog, &oldestRecord) && 
-                    GetNumberOfEventLogRecords(hEventLog, &numRecords)) {
+                if (GetOldestEventLogRecord(hEventLog.get(), &oldestRecord) &&
+                    GetNumberOfEventLogRecords(hEventLog.get(), &numRecords)) {
                     
                     // If very few records, it's a fresh system
                     if (numRecords < 200) {
@@ -4263,7 +4342,6 @@ namespace ShadowStrike::AntiEvasion {
                         found = true;
                     }
                 }
-                CloseEventLog(hEventLog);
             }
 
             // ================================================================
@@ -4813,10 +4891,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hUsbStorKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Enum\\USBSTOR", 0, KEY_READ, &hUsbStorKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hUsbStorKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hUsbStorKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hUsbStorKey);
 
-                if (subKeyCount < 1) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 1) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PERIPHERAL_NoUSBHistory);
                     detection.confidence = 0.70;
                     detection.detectedValue = L"0 USB storage devices";
@@ -4834,10 +4912,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hBluetoothKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices", 0, KEY_READ, &hBluetoothKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hBluetoothKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hBluetoothKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hBluetoothKey);
 
-                if (subKeyCount < 1) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 1) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PERIPHERAL_NoBluetoothPairings);
                     detection.confidence = 0.40;
                     detection.detectedValue = L"0 paired Bluetooth devices";
@@ -4854,10 +4932,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hPrintersKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Print\\Printers", 0, KEY_READ, &hPrintersKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hPrintersKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hPrintersKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hPrintersKey);
 
-                if (subKeyCount < 1) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 1) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PERIPHERAL_NoPrinters);
                     detection.confidence = 0.45;
                     detection.detectedValue = L"0 printers installed";
@@ -4874,10 +4952,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hAudioKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e96c-e325-11ce-bfc1-08002be10318}", 0, KEY_READ, &hAudioKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hAudioKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hAudioKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hAudioKey);
 
-                if (subKeyCount < 2) {  // Usually at least default audio device
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 2) {  // Usually at least default audio device
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PERIPHERAL_NoAudioDevices);
                     detection.confidence = 0.50;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" audio devices";
@@ -4894,10 +4972,10 @@ namespace ShadowStrike::AntiEvasion {
             HKEY hCameraKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{ca3e7ab9-b4c3-4ae6-8251-579ef933890f}", 0, KEY_READ, &hCameraKey) == ERROR_SUCCESS) {
                 DWORD subKeyCount = 0;
-                RegQueryInfoKeyW(hCameraKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                LSTATUS qStatus = RegQueryInfoKeyW(hCameraKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 RegCloseKey(hCameraKey);
 
-                if (subKeyCount < 1) {
+                if (qStatus == ERROR_SUCCESS && subKeyCount < 1) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PERIPHERAL_NoWebcam);
                     detection.confidence = 0.35;
                     detection.detectedValue = L"No camera devices";
