@@ -211,9 +211,13 @@ struct PhantomCortex::Impl {
         std::chrono::microseconds elapsed) noexcept
     {
         totalInferences.fetch_add(1, std::memory_order_relaxed);
-        totalInferenceTimeUs.fetch_add(
-            static_cast<uint64_t>(elapsed.count()),
-            std::memory_order_relaxed);
+        // Clamp non-positive durations to zero before widening to uint64_t.
+        // A negative or zero count would either wrap around (negative ->
+        // huge unsigned value) and corrupt the average-latency computation
+        // in GetStats, or contribute nothing useful to the running total.
+        const int64_t raw = elapsed.count();
+        const uint64_t safeUs = (raw > 0) ? static_cast<uint64_t>(raw) : 0;
+        totalInferenceTimeUs.fetch_add(safeUs, std::memory_order_relaxed);
 
         switch (verdict) {
             case ThreatVerdict::Malicious:
@@ -1082,7 +1086,12 @@ bool PhantomCortex::UpdateModels(
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"Post-swap integrity check FAILED for %ls model — rolling back",
                 kModelLabels[i]);
-            cache.Rollback(modelType);
+            if (!cache.Rollback(modelType)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ModelCache::Rollback failed for %ls after post-swap "
+                    L"integrity failure — slot may be left without an active model",
+                    kModelLabels[i]);
+            }
             m_impl->modelLoadErrors.fetch_add(1, std::memory_order_relaxed);
             ++modelsFailed;
             continue;
@@ -1094,7 +1103,12 @@ bool PhantomCortex::UpdateModels(
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"ModelCache returned no path after successful swap for %ls",
                 kModelLabels[i]);
-            cache.Rollback(modelType);
+            if (!cache.Rollback(modelType)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ModelCache::Rollback failed for %ls after missing-path "
+                    L"recovery — slot may be left without an active model",
+                    kModelLabels[i]);
+            }
             m_impl->modelLoadErrors.fetch_add(1, std::memory_order_relaxed);
             ++modelsFailed;
             continue;
@@ -1104,12 +1118,32 @@ bool PhantomCortex::UpdateModels(
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"ModelInference failed to load swapped %ls model from: %ls — rolling back",
                 kModelLabels[i], activePath->c_str());
-            cache.Rollback(modelType);
+            const bool rolledBack = cache.Rollback(modelType);
+            if (!rolledBack) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ModelCache::Rollback failed for %ls — slot may be left "
+                    L"without an active model; manual intervention required",
+                    kModelLabels[i]);
+            }
 
-            // Attempt to reload the rolled-back model
+            // Attempt to reload the rolled-back model so the inference
+            // engine and the cache do not diverge (split-brain). If this
+            // recovery itself fails, escalate via an error log rather than
+            // silently leaving the slot unloaded.
             auto rollbackPath = cache.GetModelPath(modelType);
             if (rollbackPath.has_value()) {
-                inference.LoadModel(modelType, *rollbackPath);
+                if (!inference.LoadModel(modelType, *rollbackPath)) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Recovery LoadModel of rolled-back %ls model failed at: %ls "
+                        L"— inference slot is unloaded while cache reports a model present",
+                        kModelLabels[i], rollbackPath->c_str());
+                }
+            }
+            else if (rolledBack) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Rollback for %ls reported success but no model path is "
+                    L"available — inference slot will remain unloaded",
+                    kModelLabels[i]);
             }
 
             m_impl->modelLoadErrors.fetch_add(1, std::memory_order_relaxed);
