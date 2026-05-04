@@ -42,10 +42,10 @@
 #include <shared_mutex>
 #include <filesystem>
 #include <algorithm>
-#include <cstring>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <cwctype>
 
 #include "../Utils/Logger.hpp"
 #include "../Utils/HashUtils.hpp"
@@ -98,10 +98,21 @@ namespace {
     // ----------------------------------------------------------------
 
     [[nodiscard]] bool ContainsTraversal(const std::filesystem::path& p) noexcept {
+        // Inspect each lexical component rather than performing a substring
+        // match on the wide string: legitimate NTFS file names may contain
+        // ".." (e.g. "build..stage.onnx") yet only the literal ".." path
+        // segment is meaningful for traversal.
         try {
-            const auto str = p.wstring();
-            if (str.find(L"..") != std::wstring::npos) {
-                return true;
+            for (const auto& component : p) {
+                if (component == std::filesystem::path(L"..") ||
+                    component == std::filesystem::path(L".")) {
+                    // "." segments are benign on their own but are never
+                    // expected inside ModelCache slot paths; rejecting them
+                    // also closes path-normalization edge cases.
+                    if (component == std::filesystem::path(L"..")) {
+                        return true;
+                    }
+                }
             }
         }
         catch (...) {
@@ -129,6 +140,25 @@ namespace {
             if (towlower(static_cast<wint_t>(url[i])) != kHttpsPrefix[i]) {
                 return false;
             }
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // SHA-256 hex digest format validation (64 lower-case hex chars).
+    // Defends against malformed hash arguments reaching the constant-
+    // time comparator and ensures any caller-supplied digest matches
+    // the canonical wire format used by the manifest pipeline.
+    // ----------------------------------------------------------------
+
+    [[nodiscard]] bool IsValidSha256Hex(const std::wstring& hex) noexcept {
+        constexpr size_t kSha256HexLen = 64;
+        if (hex.size() != kSha256HexLen) return false;
+        for (wchar_t c : hex) {
+            const bool digit = (c >= L'0' && c <= L'9');
+            const bool lower = (c >= L'a' && c <= L'f');
+            const bool upper = (c >= L'A' && c <= L'F');
+            if (!digit && !lower && !upper) return false;
         }
         return true;
     }
@@ -434,6 +464,25 @@ struct ModelCache::Impl {
                     L"Cannot hash current model for slot '%ls'", kSlotNames[idx]);
                 return false;
             }
+            // Manifest is unavailable — previous-hash provenance is unknown.
+            s.previousHash.clear();
+        }
+
+        // If a previous model exists on disk but the manifest did not record
+        // its hash (e.g. legacy install, manifest corruption), recompute it
+        // here so Rollback can still perform an integrity check rather than
+        // blindly trusting an unauthenticated file.
+        if (s.hasPrevious && s.previousHash.empty()) {
+            std::wstring prevHash;
+            if (ComputeFileSha256Hex(s.previousModel, prevHash)) {
+                s.previousHash = prevHash;
+            }
+            else {
+                SS_LOG_WARN(kLogCategory,
+                    L"ProbeSlot: cannot hash previous model for slot '%ls'; "
+                    L"rollback will be refused for this slot until a new swap "
+                    L"establishes provenance", kSlotNames[idx]);
+            }
         }
         return true;
     }
@@ -457,16 +506,40 @@ struct ModelCache::Impl {
             std::string sha;
             if (Utils::JSON::Get<std::string>(doc, "sha256", sha)) {
                 s.currentHash = Utils::StringUtils::ToWide(sha);
+                if (!IsValidSha256Hex(s.currentHash)) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Manifest sha256 has invalid format for slot '%ls'",
+                        kSlotNames[idx]);
+                    s.currentHash.clear();
+                    return false;
+                }
             }
             else {
                 return false;
             }
 
+            // Optional previous-model hash — present when this slot was
+            // produced by SwapModel/DownloadModel and the prior model was
+            // backed up. Required by Rollback's integrity check across
+            // process restarts.
+            std::string prevSha;
+            if (Utils::JSON::Get<std::string>(doc, "previous_sha256", prevSha)) {
+                std::wstring wprev = Utils::StringUtils::ToWide(prevSha);
+                if (IsValidSha256Hex(wprev)) {
+                    s.previousHash = std::move(wprev);
+                }
+                else {
+                    SS_LOG_WARN(kLogCategory,
+                        L"Manifest previous_sha256 has invalid format for "
+                        L"slot '%ls'; ignoring", kSlotNames[idx]);
+                }
+            }
+
             // Version
             uint32_t major = 0, minor = 0, patch = 0;
-            Utils::JSON::Get<uint32_t>(doc, "version.major", major);
-            Utils::JSON::Get<uint32_t>(doc, "version.minor", minor);
-            Utils::JSON::Get<uint32_t>(doc, "version.patch", patch);
+            (void)Utils::JSON::Get<uint32_t>(doc, "version.major", major);
+            (void)Utils::JSON::Get<uint32_t>(doc, "version.minor", minor);
+            (void)Utils::JSON::Get<uint32_t>(doc, "version.patch", patch);
             s.version.major = major;
             s.version.minor = minor;
             s.version.patch = patch;
@@ -504,6 +577,14 @@ struct ModelCache::Impl {
 
             Utils::JSON::Set(doc, "sha256",
                 Utils::StringUtils::ToNarrow(s.currentHash));
+
+            // Persist the previous-model hash so Rollback can verify
+            // integrity of previous.onnx after a process restart. Absent
+            // entries are intentional (no rollback target available).
+            if (s.hasPrevious && !s.previousHash.empty()) {
+                Utils::JSON::Set(doc, "previous_sha256",
+                    Utils::StringUtils::ToNarrow(s.previousHash));
+            }
 
             Utils::JSON::Set(doc, "trained_at",
                 Utils::StringUtils::ToNarrow(
@@ -846,10 +927,34 @@ bool ModelCache::SwapModel(CortexModelType type,
                 L"SwapModel step 4 (activate) failed for slot '%ls'; "
                 L"restoring previous model", kSlotNames[idx]);
 
-            // Restore from previous
+            // Attempt to restore from previous and reflect on-disk truth
+            // in the slot state. Never assume the restore SafeRename
+            // succeeded — a failure here means the slot has no current
+            // model and callers must treat it as empty until the next
+            // SwapModel/DownloadModel cycle.
+            bool restored = false;
             if (s.hasPrevious && SafeExists(s.previousModel)) {
-                SafeRename(s.previousModel, s.currentModel);
+                restored = SafeRename(s.previousModel, s.currentModel);
+                if (!restored) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"SwapModel: failed to restore previous model for "
+                        L"slot '%ls'; slot left without active model",
+                        kSlotNames[idx]);
+                }
+            }
+            if (restored) {
+                s.hasModel    = SafeExists(s.currentModel);
                 s.hasPrevious = false;
+                // currentHash already reflects the previous (now-current)
+                // model from step 3, so no further mutation is required.
+            }
+            else {
+                s.hasModel    = SafeExists(s.currentModel);
+                s.hasPrevious = SafeExists(s.previousModel);
+                if (!s.hasModel) {
+                    s.currentHash.clear();
+                    s.version.modelHash.clear();
+                }
             }
             SafeRemove(s.stagingModel);
             return false;
@@ -912,8 +1017,46 @@ bool ModelCache::Rollback(CortexModelType type) noexcept {
             return false;
         }
 
+        // Pre-rollback integrity gate: refuse to promote an unverified
+        // previous model. If the previous-model hash was recorded in the
+        // manifest (or recomputed at probe time), the on-disk file must
+        // match it byte-for-byte. A mismatch here means previous.onnx is
+        // either tampered with or corrupted, and rolling forward to a
+        // potentially malicious model would be far worse than refusing
+        // recovery and leaving the slot in its current (broken) state.
+        if (!s.previousHash.empty()) {
+            std::wstring preCheckHash;
+            if (!ComputeFileSha256Hex(s.previousModel, preCheckHash)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Rollback aborted: cannot hash previous model for "
+                    L"slot '%ls'", kSlotNames[idx]);
+                return false;
+            }
+            if (!ConstantTimeHashCompare(preCheckHash, s.previousHash)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Rollback aborted: previous model hash mismatch for "
+                    L"slot '%ls' (expected=%ls got=%ls); on-disk previous "
+                    L"file is not trusted",
+                    kSlotNames[idx], s.previousHash.c_str(),
+                    preCheckHash.c_str());
+                return false;
+            }
+        }
+        else {
+            // No recorded provenance for previous.onnx — refuse rather than
+            // silently activate an unauthenticated artifact.
+            SS_LOG_ERROR(kLogCategory,
+                L"Rollback aborted: previous model has no recorded SHA-256 "
+                L"for slot '%ls'", kSlotNames[idx]);
+            return false;
+        }
+
         // Clean any leftover staging file
         SafeRemove(s.stagingModel);
+
+        // Capture the verified previous hash before any rename so we can
+        // restore state precisely if the rename fails.
+        const std::wstring promotedHash = s.previousHash;
 
         // Remove current (may be corrupt)
         SafeRemove(s.currentModel);
@@ -922,27 +1065,44 @@ bool ModelCache::Rollback(CortexModelType type) noexcept {
         if (!SafeRename(s.previousModel, s.currentModel)) {
             SS_LOG_ERROR(kLogCategory,
                 L"Rollback: rename failed for slot '%ls'", kSlotNames[idx]);
-            s.hasModel    = false;
-            s.hasPrevious = false;
+            s.hasModel    = SafeExists(s.currentModel);
+            s.hasPrevious = SafeExists(s.previousModel);
+            if (!s.hasModel) {
+                s.currentHash.clear();
+                s.version.modelHash.clear();
+            }
             return false;
         }
 
-        s.currentHash = s.previousHash;
-        s.hasModel    = true;
-        s.hasPrevious = false;
+        s.currentHash       = promotedHash;
+        s.hasModel          = true;
+        s.hasPrevious       = false;
         s.previousHash.clear();
-        s.version.modelHash = s.currentHash;
+        s.version.modelHash = promotedHash;
 
-        // Recompute hash to ensure integrity
+        // Post-rename integrity verification: the file we just promoted
+        // must still hash to the value we validated above. A mismatch
+        // here implies a TOCTOU race or filesystem inconsistency — refuse
+        // to mark the slot operational.
         std::wstring verifyHash;
-        if (ComputeFileSha256Hex(s.currentModel, verifyHash)) {
-            if (!s.currentHash.empty() && !ConstantTimeHashCompare(verifyHash, s.currentHash)) {
-                SS_LOG_WARN(kLogCategory,
-                    L"Rollback: previous model hash mismatch for slot '%ls'; "
-                    L"updating stored hash", kSlotNames[idx]);
-            }
-            s.currentHash       = verifyHash;
-            s.version.modelHash = verifyHash;
+        if (!ComputeFileSha256Hex(s.currentModel, verifyHash)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Rollback: cannot re-hash promoted model for slot '%ls'",
+                kSlotNames[idx]);
+            s.hasModel = false;
+            s.currentHash.clear();
+            s.version.modelHash.clear();
+            return false;
+        }
+        if (!ConstantTimeHashCompare(verifyHash, promotedHash)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Rollback: promoted model hash diverged post-rename for "
+                L"slot '%ls' (expected=%ls got=%ls)",
+                kSlotNames[idx], promotedHash.c_str(), verifyHash.c_str());
+            s.hasModel = false;
+            s.currentHash.clear();
+            s.version.modelHash.clear();
+            return false;
         }
 
         m_impl->SaveManifest(idx);
@@ -985,6 +1145,19 @@ bool ModelCache::DownloadModel(CortexModelType type,
         if (expectedSha256.empty()) {
             SS_LOG_ERROR(kLogCategory,
                 L"DownloadModel called with empty expected SHA-256");
+            return false;
+        }
+        // Normalize and validate canonical SHA-256 hex form before any
+        // network or filesystem work — rejects malformed digests early
+        // and ensures the constant-time comparator below operates on
+        // equal-length hex strings.
+        std::wstring expectedLower = expectedSha256;
+        std::transform(expectedLower.begin(), expectedLower.end(),
+                       expectedLower.begin(), ::towlower);
+        if (!IsValidSha256Hex(expectedLower)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"DownloadModel rejected malformed SHA-256 (expected 64 "
+                L"hex characters)");
             return false;
         }
         if (!IsHttpsUrl(url)) {
@@ -1048,11 +1221,7 @@ bool ModelCache::DownloadModel(CortexModelType type,
             return false;
         }
 
-        // Constant-time comparison: normalize to lowercase
-        std::wstring expectedLower = expectedSha256;
-        std::transform(expectedLower.begin(), expectedLower.end(),
-                       expectedLower.begin(), ::towlower);
-
+        // Constant-time comparison against pre-validated canonical hex
         if (!ConstantTimeHashCompare(downloadedHash, expectedLower)) {
             SS_LOG_ERROR(kLogCategory,
                 L"SHA-256 mismatch for slot '%ls': expected=%ls got=%ls",
@@ -1082,9 +1251,27 @@ bool ModelCache::DownloadModel(CortexModelType type,
             SS_LOG_ERROR(kLogCategory,
                 L"DownloadModel step 4 (activate) failed for slot '%ls'; "
                 L"restoring previous model", kSlotNames[idx]);
+            bool restored = false;
             if (s.hasPrevious && SafeExists(s.previousModel)) {
-                SafeRename(s.previousModel, s.currentModel);
+                restored = SafeRename(s.previousModel, s.currentModel);
+                if (!restored) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"DownloadModel: failed to restore previous model "
+                        L"for slot '%ls'; slot left without active model",
+                        kSlotNames[idx]);
+                }
+            }
+            if (restored) {
+                s.hasModel    = SafeExists(s.currentModel);
                 s.hasPrevious = false;
+            }
+            else {
+                s.hasModel    = SafeExists(s.currentModel);
+                s.hasPrevious = SafeExists(s.previousModel);
+                if (!s.hasModel) {
+                    s.currentHash.clear();
+                    s.version.modelHash.clear();
+                }
             }
             SafeRemove(s.stagingModel);
             return false;
