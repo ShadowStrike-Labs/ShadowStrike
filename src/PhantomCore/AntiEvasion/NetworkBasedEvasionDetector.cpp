@@ -682,12 +682,22 @@ namespace ShadowStrike::AntiEvasion {
 
     bool NetworkBasedEvasionDetector::Impl::Initialize(NetworkEvasionError* err) noexcept {
         try {
-            // Atomically check if already initialized — avoid race where
-            // thread A sets true, WSAStartup fails, sets false, but thread B
-            // saw true and returned success prematurely.
-            bool expected = false;
-            if (!m_initialized.compare_exchange_strong(expected, false)) {
-                return true; // Already initialized (expected was true)
+            // Fast path: already initialized — atomic acquire to synchronise
+            // with the release-store at the end of a successful init below.
+            if (m_initialized.load(std::memory_order_acquire)) {
+                return true;
+            }
+
+            // Serialize Initialize/Shutdown using m_mutex (same mutex Shutdown
+            // takes) so concurrent first-time initializers cannot both call
+            // WSAStartup, and so we cannot race with Shutdown's WSACleanup.
+            // The previous compare_exchange_strong(expected=false, desired=false)
+            // was a no-op CAS that never reserved the init slot — two threads
+            // could both fall through and call WSAStartup, while Shutdown's
+            // single WSACleanup would unbalance the WinSock reference count.
+            std::unique_lock lock(m_mutex);
+            if (m_initialized.load(std::memory_order_relaxed)) {
+                return true;
             }
 
             SS_LOG_INFO(LOG_CATEGORY, L"NetworkBasedEvasionDetector: Initializing...");
@@ -706,7 +716,9 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            // Set initialized ONLY after all initialization succeeds
+            // Set initialized ONLY after all initialization succeeds. Release
+            // store pairs with the acquire load above and with public-API
+            // readers that consult m_initialized without taking m_mutex.
             m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(LOG_CATEGORY, L"NetworkBasedEvasionDetector: Initialized successfully");
@@ -3284,20 +3296,48 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
-            // Check Internet Explorer proxy settings using ANSI version
-            INTERNET_PROXY_INFO proxyInfo = {};
-            DWORD proxyInfoSize = sizeof(proxyInfo);
+            // Check Internet Explorer / WinHTTP proxy settings.
+            //
+            // INTERNET_OPTION_PROXY returns an INTERNET_PROXY_INFO whose
+            // lpszProxy / lpszProxyBypass members point INTO the caller-
+            // supplied buffer (immediately past the struct), not at any
+            // WinInet-internal storage. The buffer must therefore be large
+            // enough to hold both the struct AND the proxy/bypass strings;
+            // sizeof(INTERNET_PROXY_INFO) alone is too small and will either
+            // fail with ERROR_INSUFFICIENT_BUFFER or return an empty string,
+            // silently disabling system-proxy detection.
+            std::array<std::uint8_t, 4096> proxyBuf{};
+            DWORD proxyInfoSize = static_cast<DWORD>(proxyBuf.size());
+            auto* const proxyInfo =
+                reinterpret_cast<INTERNET_PROXY_INFO*>(proxyBuf.data());
 
-            if (InternetQueryOptionA(nullptr, INTERNET_OPTION_PROXY, &proxyInfo, &proxyInfoSize)) {
-                // lpszProxy and lpszProxyBypass point to WinInet-internal
-                // static buffers. They must NOT be freed by the caller.
+            if (InternetQueryOptionA(nullptr, INTERNET_OPTION_PROXY,
+                                     proxyInfo, &proxyInfoSize) &&
+                proxyInfoSize >= sizeof(INTERNET_PROXY_INFO))
+            {
+                if (proxyInfo->dwAccessType == INTERNET_OPEN_TYPE_PROXY &&
+                    proxyInfo->lpszProxy != nullptr)
+                {
+                    // Bounds-check the embedded pointer before dereference:
+                    // it must lie strictly within the caller-supplied buffer
+                    // and a NUL terminator must be reachable inside the
+                    // reported length.
+                    const char* const bufBegin =
+                        reinterpret_cast<const char*>(proxyBuf.data());
+                    const char* const bufEnd = bufBegin + proxyInfoSize;
+                    const char* const proxyStr =
+                        reinterpret_cast<const char*>(proxyInfo->lpszProxy);
 
-                if (proxyInfo.lpszProxy && proxyInfo.lpszProxy[0] != '\0') {
-                    // InternetQueryOptionA writes ANSI strings; lpszProxy is
-                    // typed as LPCTSTR but contains narrow chars in practice.
-                    outProxyAddress = Utils::StringUtils::ToWide(
-                        reinterpret_cast<const char*>(proxyInfo.lpszProxy));
-                    return true;
+                    if (proxyStr >= bufBegin && proxyStr < bufEnd) {
+                        const size_t maxLen =
+                            static_cast<size_t>(bufEnd - proxyStr);
+                        const size_t actualLen = ::strnlen(proxyStr, maxLen);
+                        if (actualLen > 0 && actualLen < maxLen) {
+                            outProxyAddress = Utils::StringUtils::ToWide(
+                                std::string(proxyStr, actualLen));
+                            return true;
+                        }
+                    }
                 }
             }
 
