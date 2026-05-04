@@ -59,8 +59,6 @@
 // ============================================================================
 
 #include <intrin.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
 
 // ============================================================================
 // Standard library
@@ -76,7 +74,6 @@
 #include <atomic>
 #include <cstring>
 #include <thread>
-#include <fstream>
 
 #if SHADOWSTRIKE_HAS_ONNXRUNTIME
 
@@ -155,10 +152,44 @@ static bool CheckOrtStatus(const OrtApi* api, OrtStatus* status, const wchar_t* 
 
     const char* msg = api->GetErrorMessage(status);
     if (msg) {
-        // Convert narrow ORT message to wide for logging
-        wchar_t wbuf[512]{};
-        MultiByteToWideChar(CP_UTF8, 0, msg, -1, wbuf, _countof(wbuf) - 1);
-        SS_LOG_ERROR(kLogTag, L"%ls: ORT error — %ls", context, wbuf);
+        // Convert the narrow ORT message via a two-call MultiByteToWideChar
+        // pattern: a fixed-size stack buffer was previously used and would
+        // silently truncate (and on ERROR_INSUFFICIENT_BUFFER zero out)
+        // diagnostic strings longer than 511 wide chars, which is the worst
+        // possible outcome for an audit trail. Cap conversion at 64 KiB to
+        // bound allocation under hostile input.
+        constexpr int kMaxWide = 64 * 1024;
+        const int needed = MultiByteToWideChar(CP_UTF8, 0, msg, -1, nullptr, 0);
+        if (needed > 1 && needed <= kMaxWide) {
+            try {
+                std::wstring wbuf(static_cast<size_t>(needed), L'\0');
+                const int written = MultiByteToWideChar(
+                    CP_UTF8, 0, msg, -1, wbuf.data(), needed);
+                if (written > 0) {
+                    // MultiByteToWideChar with cbMultiByte=-1 includes the
+                    // terminator in the count; trim it so %ls does not log
+                    // a trailing NUL.
+                    if (!wbuf.empty() && wbuf.back() == L'\0') {
+                        wbuf.pop_back();
+                    }
+                    SS_LOG_ERROR(kLogTag, L"%ls: ORT error — %ls", context, wbuf.c_str());
+                } else {
+                    SS_LOG_ERROR(kLogTag,
+                        L"%ls: ORT error (message conversion failed, win32=%lu)",
+                        context, GetLastError());
+                }
+            } catch (...) {
+                SS_LOG_ERROR(kLogTag,
+                    L"%ls: ORT error (allocation failed for message)", context);
+            }
+        } else if (needed > kMaxWide) {
+            SS_LOG_ERROR(kLogTag,
+                L"%ls: ORT error (message exceeds %d wide chars; suppressed)",
+                context, kMaxWide);
+        } else {
+            SS_LOG_ERROR(kLogTag,
+                L"%ls: ORT error (empty or invalid message)", context);
+        }
     } else {
         SS_LOG_ERROR(kLogTag, L"%ls: ORT returned unknown error", context);
     }
@@ -181,46 +212,22 @@ static bool CheckOrtStatus(const OrtApi* api, OrtStatus* status, const wchar_t* 
 [[nodiscard]] static std::wstring ComputeModelFileHash(const std::filesystem::path& filePath) noexcept {
     using namespace ShadowStrike::Utils::HashUtils;
 
-    Hasher hasher(Algorithm::SHA256);
-    if (!hasher.Init()) {
-        SS_LOG_ERROR(kLogTag, L"ComputeModelFileHash: Hasher init failed for %ls",
-                     filePath.c_str());
-        return {};
-    }
-
-    // Read file in chunks to avoid large allocations
-    constexpr size_t kChunkSize = 1u << 20; // 1 MB
-    std::ifstream ifs(filePath, std::ios::binary);
-    if (!ifs.is_open()) {
-        SS_LOG_ERROR(kLogTag, L"ComputeModelFileHash: cannot open %ls", filePath.c_str());
-        return {};
-    }
-
-    std::vector<char> buf;
-    try {
-        buf.resize(kChunkSize);
-    } catch (...) {
-        SS_LOG_ERROR(kLogTag, L"ComputeModelFileHash: allocation failed");
-        return {};
-    }
-
-    while (ifs.good()) {
-        ifs.read(buf.data(), static_cast<std::streamsize>(kChunkSize));
-        const auto bytesRead = static_cast<size_t>(ifs.gcount());
-        if (bytesRead == 0) break;
-        if (!hasher.Update(buf.data(), bytesRead)) {
-            SS_LOG_ERROR(kLogTag, L"ComputeModelFileHash: Hasher update failed");
-            return {};
-        }
-    }
-
+    // Delegate to the canonical HashUtils streaming SHA-256 implementation
+    // rather than re-rolling a chunked ifstream loop here. ComputeFile
+    // already performs bounded buffered reads, validates the algorithm,
+    // and produces a fixed-size digest on success.
     std::vector<uint8_t> digest;
-    if (!hasher.Final(digest)) {
-        SS_LOG_ERROR(kLogTag, L"ComputeModelFileHash: Hasher finalize failed");
+    Error err;
+    if (!ComputeFile(Algorithm::SHA256, filePath.wstring(), digest, &err)) {
+        SS_LOG_ERROR(kLogTag,
+            L"ComputeModelFileHash: HashUtils::ComputeFile failed for %ls (win32=%lu)",
+            filePath.c_str(), err.win32);
         return {};
     }
 
-    // Convert to lowercase hex wstring
+    // Canonical lowercase hex form (64 chars for SHA-256). Guard the
+    // narrow→wide conversion against allocation failure even though the
+    // size is bounded.
     const std::string hexNarrow = ToHexLower(digest);
     std::wstring hexWide;
     try {
@@ -491,7 +498,14 @@ bool ModelInference::Initialize(const CortexConfig& config) noexcept {
         std::unique_lock lock(m_impl->modelMutex);
 
         if (m_impl->initialized) {
-            SS_LOG_INFO(kLogTag, L"Initialize: already initialized, returning true");
+            // Refresh runtime-tunable configuration so callers can adjust
+            // values such as inference timeouts via a re-Initialize without
+            // a full Shutdown/Initialize cycle. Hardware caps and ORT env
+            // are deliberately not re-probed here; those require explicit
+            // teardown.
+            m_impl->config = config;
+            SS_LOG_INFO(kLogTag,
+                L"Initialize: already initialized — refreshed runtime config");
             return true;
         }
 
@@ -643,7 +657,27 @@ bool ModelInference::LoadModel(CortexModelType type,
         }
 
         const size_t idx = static_cast<size_t>(type);
+
+        // Snapshot ORT handles under a shared lock and hold the lock
+        // throughout the read-only ORT interactions below. m_impl->ortApi,
+        // m_impl->env and m_impl->memoryInfo are mutated only by Initialize
+        // and Shutdown under exclusive lock; reading them without any lock
+        // races against ReleaseAll(). The shared lock is dropped just
+        // before the final commit phase, which then re-acquires an
+        // exclusive lock and re-checks 'initialized'.
+        std::shared_lock<std::shared_mutex> readLock(m_impl->modelMutex);
+        if (!m_impl->initialized) {
+            SS_LOG_ERROR(kLogTag,
+                L"LoadModel(%ls): engine not initialized",
+                kModelTypeNames[idx]);
+            return false;
+        }
         const OrtApi* api = m_impl->ortApi;
+        if (!api) {
+            SS_LOG_ERROR(kLogTag,
+                L"LoadModel(%ls): ORT API unavailable", kModelTypeNames[idx]);
+            return false;
+        }
 
         // -----------------------------------------------------------
         // Validate file exists and is within size limits
@@ -719,17 +753,13 @@ bool ModelInference::LoadModel(CortexModelType type,
         // -----------------------------------------------------------
         // Execution provider: DirectML (GPU) if available and enabled
         // -----------------------------------------------------------
-        {
-            std::shared_lock readLock(m_impl->modelMutex);
-            if (m_impl->config.useGPU && m_impl->hasDirectML) {
-                readLock.unlock();
-                if (AppendDirectMLProvider(api, rawOpts)) {
-                    SS_LOG_INFO(kLogTag, L"LoadModel(%ls): DirectML EP attached",
-                                kModelTypeNames[idx]);
-                } else {
-                    SS_LOG_WARN(kLogTag, L"LoadModel(%ls): DirectML unavailable, using CPU",
-                                kModelTypeNames[idx]);
-                }
+        if (m_impl->config.useGPU && m_impl->hasDirectML) {
+            if (AppendDirectMLProvider(api, rawOpts)) {
+                SS_LOG_INFO(kLogTag, L"LoadModel(%ls): DirectML EP attached",
+                            kModelTypeNames[idx]);
+            } else {
+                SS_LOG_WARN(kLogTag, L"LoadModel(%ls): DirectML unavailable, using CPU",
+                            kModelTypeNames[idx]);
             }
         }
 
@@ -965,6 +995,11 @@ bool ModelInference::LoadModel(CortexModelType type,
         size_t committedInputCount  = 0;
         size_t committedOutputCount = 0;
         {
+            // Drop the shared lock before upgrading to exclusive — the
+            // shared_mutex does not support in-place upgrade. The recheck
+            // of m_impl->initialized below closes the small window where
+            // Shutdown could have run between the unlock and re-lock.
+            readLock.unlock();
             std::unique_lock lock(m_impl->modelMutex);
             if (!m_impl->initialized) {
                 SS_LOG_ERROR(kLogTag,
@@ -1052,7 +1087,6 @@ std::optional<std::vector<float>> ModelInference::Infer(
         }
 
         const size_t idx = static_cast<size_t>(type);
-        const OrtApi* api = m_impl->ortApi;
 
         // Validate input span
         if (inputData.empty() || inputShape.empty()) {
@@ -1088,12 +1122,21 @@ std::optional<std::vector<float>> ModelInference::Infer(
         }
 
         // -----------------------------------------------------------
-        // Shared lock — ORT sessions are thread-safe for Run()
+        // Shared lock — ORT sessions are thread-safe for Run().
+        // m_impl->ortApi must be read under this lock to race-safely
+        // observe Initialize/Shutdown transitions.
         // -----------------------------------------------------------
         std::shared_lock lock(m_impl->modelMutex);
 
         if (!m_impl->initialized) {
             SS_LOG_ERROR(kLogTag, L"Infer(%ls): engine not initialized",
+                         kModelTypeNames[idx]);
+            return std::nullopt;
+        }
+
+        const OrtApi* api = m_impl->ortApi;
+        if (!api) {
+            SS_LOG_ERROR(kLogTag, L"Infer(%ls): ORT API unavailable",
                          kModelTypeNames[idx]);
             return std::nullopt;
         }
@@ -1341,14 +1384,21 @@ std::optional<std::vector<std::vector<float>>> ModelInference::InferBatch(
         }
 
         // -----------------------------------------------------------
-        // Run full batch through ORT in a single call
+        // Run full batch through ORT in a single call. ortApi must be
+        // read after acquiring the shared lock so we observe Shutdown
+        // safely instead of dereferencing a potentially-released handle.
         // -----------------------------------------------------------
-        const OrtApi* api = m_impl->ortApi;
-
         std::shared_lock lock(m_impl->modelMutex);
 
         if (!m_impl->initialized) {
             SS_LOG_ERROR(kLogTag, L"InferBatch(%ls): engine not initialized",
+                         kModelTypeNames[idx]);
+            return std::nullopt;
+        }
+
+        const OrtApi* api = m_impl->ortApi;
+        if (!api) {
+            SS_LOG_ERROR(kLogTag, L"InferBatch(%ls): ORT API unavailable",
                          kModelTypeNames[idx]);
             return std::nullopt;
         }
