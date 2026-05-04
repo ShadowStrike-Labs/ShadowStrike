@@ -112,6 +112,17 @@ ShadowReferenceKtmTransaction(
             return FALSE;
         }
 
+        //
+        // Hardening: refuse increment that would overflow LONG_MAX into
+        // a negative value (which would alias the DESTROYING sentinel and
+        // produce undefined behavior in C). Realistically unreachable, but
+        // refcount saturation is cheaper than an exploit primitive.
+        //
+        if (oldRefCount >= LONG_MAX - 1) {
+            InterlockedIncrement64(&g_KtmMonitorState.Stats.RefCountRaces);
+            return FALSE;
+        }
+
         newRefCount = oldRefCount + 1;
 
         if (InterlockedCompareExchange(
@@ -279,7 +290,35 @@ ShadowGetProcessImageName(
     status = SeLocateProcessImageName(process, &processImageName);
     if (NT_SUCCESS(status) && processImageName != NULL && processImageName->Buffer != NULL) {
 
-        ImageName->MaximumLength = processImageName->Length + sizeof(WCHAR);
+        //
+        // SECURITY: Cap source length to prevent USHORT overflow when
+        // computing MaximumLength = Length + sizeof(WCHAR). A malicious
+        // or corrupted source with Length == USHRT_MAX would wrap to
+        // 1 byte, yielding a heap overflow on the subsequent copy.
+        // We additionally clamp to a sane absolute ceiling.
+        //
+        const USHORT kMaxImagePathBytes =
+            (USHORT)(SHADOW_MAX_FILE_PATH * sizeof(WCHAR));
+        USHORT srcLength = processImageName->Length;
+
+        if (srcLength > kMaxImagePathBytes) {
+            srcLength = kMaxImagePathBytes;
+        }
+
+        if (srcLength > (USHORT)(USHRT_MAX - sizeof(WCHAR))) {
+            //
+            // Defense-in-depth: the cap above already prevents this, but
+            // keep an explicit guard so future changes cannot regress.
+            //
+            ExFreePool(processImageName);
+            ObDereferenceObject(process);
+            ImageName->Buffer = NULL;
+            ImageName->Length = 0;
+            ImageName->MaximumLength = 0;
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        ImageName->MaximumLength = srcLength + (USHORT)sizeof(WCHAR);
         ImageName->Buffer = (PWCH)ExAllocatePool2(
             POOL_FLAG_NON_PAGED,
             ImageName->MaximumLength,
@@ -287,11 +326,13 @@ ShadowGetProcessImageName(
         );
 
         if (ImageName->Buffer != NULL) {
-            RtlCopyUnicodeString(ImageName, processImageName);
             //
-            // Guarantee null-termination for safe %ws usage
+            // Copy the (possibly truncated) source manually instead of
+            // RtlCopyUnicodeString so we honor srcLength precisely.
             //
-            ImageName->Buffer[ImageName->Length / sizeof(WCHAR)] = L'\0';
+            RtlCopyMemory(ImageName->Buffer, processImageName->Buffer, srcLength);
+            ImageName->Length = srcLength;
+            ImageName->Buffer[srcLength / sizeof(WCHAR)] = L'\0';
         } else {
             ImageName->MaximumLength = 0;
             status = STATUS_INSUFFICIENT_RESOURCES;
@@ -399,12 +440,25 @@ ShadowKtmPortDisconnectNotify(
     )
 {
     PSHADOW_KTM_MONITOR_STATE state = (PSHADOW_KTM_MONITOR_STATE)ConnectionCookie;
+    PFLT_PORT clientPort;
 
     PAGED_CODE();
 
-    if (state != NULL && state->ClientPort != NULL) {
-        FltCloseClientPort(state->FilterHandle, &state->ClientPort);
-        state->ClientPort = NULL;
+    if (state == NULL) {
+        return;
+    }
+
+    //
+    // Atomically claim the client port handle so that only ONE path
+    // (this disconnect notify OR ShadowCleanupKtmMonitor) ever calls
+    // FltCloseClientPort on it. Without this, a shutdown racing with
+    // a client disconnect would double-close the port.
+    //
+    clientPort = (PFLT_PORT)InterlockedExchangePointer(
+        (PVOID*)&state->ClientPort, NULL);
+
+    if (clientPort != NULL && state->FilterHandle != NULL) {
+        FltCloseClientPort(state->FilterHandle, &clientPort);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike] KTM port: Client disconnected\n");
@@ -445,7 +499,26 @@ ShadowKtmPortMessageNotify(
     // (DISPATCH_LEVEL), so writing directly to user-mode would BSOD
     // if the page is paged out (IRQL_NOT_LESS_OR_EQUAL).
     //
-    if (OutputBuffer != NULL && OutputBufferLength >= sizeof(SHADOW_KTM_STATISTICS)) {
+    if (OutputBuffer == NULL || OutputBufferLength == 0) {
+        //
+        // No output buffer supplied â€” report required size so the
+        // caller can re-issue with a properly sized buffer.
+        //
+        *ReturnOutputBufferLength = sizeof(SHADOW_KTM_STATISTICS);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    if (OutputBufferLength < sizeof(SHADOW_KTM_STATISTICS)) {
+        //
+        // Honest error so user mode can resize. Returning STATUS_SUCCESS
+        // here would make the user-mode caller believe the operation
+        // succeeded with zero bytes, masking integration bugs.
+        //
+        *ReturnOutputBufferLength = sizeof(SHADOW_KTM_STATISTICS);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    {
         SHADOW_KTM_STATISTICS localStats;
         ShadowGetKtmStatistics(&localStats);
 
@@ -459,7 +532,6 @@ ShadowKtmPortMessageNotify(
                        GetExceptionCode());
             return GetExceptionCode();
         }
-        return STATUS_SUCCESS;
     }
 
     return STATUS_SUCCESS;
@@ -721,9 +793,17 @@ ShadowCleanupKtmMonitor(
         state->ServerPort = NULL;
     }
 
-    if (state->ClientPort != NULL) {
-        FltCloseClientPort(state->FilterHandle, &state->ClientPort);
-        state->ClientPort = NULL;
+    //
+    // Atomically claim the client port to avoid racing with
+    // ShadowKtmPortDisconnectNotify which uses the same exchange.
+    //
+    {
+        PFLT_PORT clientPort = (PFLT_PORT)InterlockedExchangePointer(
+            (PVOID*)&state->ClientPort, NULL);
+
+        if (clientPort != NULL && state->FilterHandle != NULL) {
+            FltCloseClientPort(state->FilterHandle, &clientPort);
+        }
     }
 
     state->CommunicationPortOpen = FALSE;
@@ -938,11 +1018,19 @@ ShadowTrackTransaction(
     //
     status = ShadowGetProcessImageName(ProcessId, &imageN);
     if (NT_SUCCESS(status) && imageN.Buffer != NULL) {
-        USHORT copyLength = min(imageN.Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
+        //
+        // Avoid signed/unsigned mismatch in min(): both operands USHORT.
+        // SHADOW_MAX_PROCESS_NAME is 256 so (USHORT)(SHADOW_MAX_PROCESS_NAME - 1)
+        // is well within USHORT range.
+        //
+        USHORT srcChars = (USHORT)(imageN.Length / sizeof(WCHAR));
+        const USHORT maxChars = (USHORT)(SHADOW_MAX_PROCESS_NAME - 1);
+        USHORT copyLength = (srcChars < maxChars) ? srcChars : maxChars;
+
         RtlCopyMemory(
             transaction->ProcessName,
             imageN.Buffer,
-            copyLength * sizeof(WCHAR)
+            (SIZE_T)copyLength * sizeof(WCHAR)
         );
         transaction->ProcessName[copyLength] = L'\0';
         ExFreePoolWithTag(imageN.Buffer, SHADOW_KTM_STRING_TAG);
@@ -1522,6 +1610,7 @@ ShadowKtmEnlistInTransaction(
     NTSTATUS status;
     PFLT_CONTEXT existingContext = NULL;
     PSHADOW_KTM_TRANSACTION_CONTEXT txnCtx = NULL;
+    PFLT_FILTER filterHandle;
 
     PAGED_CODE();
 
@@ -1533,7 +1622,18 @@ ShadowKtmEnlistInTransaction(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (g_DriverData.FilterHandle == NULL) {
+    //
+    // Use the module-owned FilterHandle captured during init. Falling
+    // back to g_DriverData.FilterHandle would couple this module to
+    // global init order; the local handle is set in
+    // ShadowCreateKtmCommunicationPort and is the authoritative one.
+    //
+    filterHandle = g_KtmMonitorState.FilterHandle;
+    if (filterHandle == NULL) {
+        filterHandle = g_DriverData.FilterHandle;
+    }
+
+    if (filterHandle == NULL) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1558,7 +1658,7 @@ ShadowKtmEnlistInTransaction(
     // at elevated IRQL during teardown.
     //
     status = FltAllocateContext(
-        g_DriverData.FilterHandle,
+        filterHandle,
         FLT_TRANSACTION_CONTEXT,
         sizeof(SHADOW_KTM_TRANSACTION_CONTEXT),
         NonPagedPoolNx,
