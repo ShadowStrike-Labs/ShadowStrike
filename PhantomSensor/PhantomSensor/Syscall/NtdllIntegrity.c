@@ -2240,6 +2240,16 @@ Routine Description:
     BOOLEAN currentIsSyscall;
 
     //
+    // Defensive: callers always pass NI_PROLOGUE_SIZE (16), but reject any
+    // call below the minimum we read in the worst-case branch (13 bytes for
+    // the MOV R10 / JMP R10 trampoline pattern) so future callers cannot
+    // silently introduce OOB reads on Current/Expected prologues.
+    //
+    if (CurrentPrologue == NULL || ExpectedPrologue == NULL || Size < 13) {
+        return NiMod_None;
+    }
+
+    //
     // First check if they match exactly
     //
     if (RtlCompareMemory(CurrentPrologue, ExpectedPrologue, Size) == Size) {
@@ -2384,8 +2394,16 @@ Routine Description:
         return FALSE;
     }
 
+    //
+    // Read syscall number via memcpy to avoid unaligned ULONG access through
+    // a PUCHAR base. Although x64 tolerates unaligned loads, casting a PUCHAR
+    // to PULONG and dereferencing is strict-aliasing/UB; RtlCopyMemory both
+    // satisfies aliasing rules and is safe for any alignment.
+    //
     if (SyscallNumber != NULL) {
-        *SyscallNumber = *(PULONG)&Prologue[4];
+        ULONG number;
+        RtlCopyMemory(&number, &Prologue[4], sizeof(number));
+        *SyscallNumber = number;
     }
 
     //
@@ -2418,6 +2436,16 @@ Routine Description:
 
 --*/
 {
+    //
+    // Defensive: callers always pass NI_PROLOGUE_SIZE (16). Reject calls
+    // below the syscall-stub minimum so unsigned `Size - 1` cannot underflow
+    // into a multi-petabyte loop bound and so the unconditional indexed reads
+    // [0]..[7] below remain in-bounds for any future caller.
+    //
+    if (CurrentPrologue == NULL || ExpectedPrologue == NULL || Size < 12) {
+        return FALSE;
+    }
+
     //
     // Check mov r10, rcx
     //
