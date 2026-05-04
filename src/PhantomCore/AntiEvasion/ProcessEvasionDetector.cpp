@@ -452,7 +452,7 @@ namespace ShadowStrike::AntiEvasion {
 
         [[nodiscard]] bool Initialize(ProcessEvasionError* err) noexcept;
         void Shutdown() noexcept;
-        void InitializeDisassembler() noexcept;
+        [[nodiscard]] bool InitializeDisassembler() noexcept;
         void InitializeNtFunctions() noexcept;
 
         // Process information helpers
@@ -529,8 +529,15 @@ namespace ShadowStrike::AntiEvasion {
 
             SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Initializing...");
 
-            // Initialize PhantomDisassembler
-            InitializeDisassembler();
+            // Initialize PhantomDisassembler — propagate failure: PhantomDisassembler
+            // is required for inline-hook and anti-debug instruction detection.
+            if (!InitializeDisassembler()) {
+                if (err) {
+                    err->win32Code = ERROR_INVALID_FUNCTION;
+                    err->message = L"Failed to initialize PhantomDisassembler";
+                }
+                return false;
+            }
 
             // Initialize NT function pointers
             InitializeNtFunctions();
@@ -578,20 +585,34 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
-    void ProcessEvasionDetector::Impl::InitializeDisassembler() noexcept {
-        if (m_disasmInitialized) return;
+    bool ProcessEvasionDetector::Impl::InitializeDisassembler() noexcept {
+        if (m_disasmInitialized) return true;
+
+        // SECURITY FIX: Decoder/Formatter::Init are [[nodiscard]] - must propagate failure.
+        // Using a partially-initialized decoder yields undefined disassembly results,
+        // which would silently degrade inline-hook and anti-debug detection coverage.
 
         // Initialize 64-bit decoder (primary platform)
-        m_decoder64.Init(Phantom::Disasm::MachineMode::Long64);
+        if (m_decoder64.Init(Phantom::Disasm::MachineMode::Long64) != Phantom::Disasm::Status::Success) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"PhantomDisassembler: 64-bit decoder Init failed");
+            return false;
+        }
 
         // Initialize 32-bit decoder (for WoW64 processes)
-        m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32);
+        if (m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32) != Phantom::Disasm::Status::Success) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"PhantomDisassembler: 32-bit decoder Init failed");
+            return false;
+        }
 
         // Initialize formatter for disassembly output
-        m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
+        if (m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel) != Phantom::Disasm::Status::Success) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"PhantomDisassembler: formatter Init failed");
+            return false;
+        }
 
         m_disasmInitialized = true;
         SS_LOG_DEBUG(LOG_CATEGORY, L"PhantomDisassembler initialized (64-bit and 32-bit modes)");
+        return true;
     }
 
     void ProcessEvasionDetector::Impl::InitializeNtFunctions() noexcept {
