@@ -128,6 +128,23 @@ namespace CortexConstants {
     /// @brief Maximum allowed inference timeout in milliseconds (30 seconds)
     inline constexpr uint32_t MAX_INFERENCE_TIMEOUT_MS = 30000;
 
+    // ------------------------------------------------------------------
+    // Compile-time training-parity guards
+    // ------------------------------------------------------------------
+    // These constants form the binding contract between the Python
+    // training pipeline and the production inference path. A silent
+    // numeric drift here will not produce a runtime error — it will
+    // produce systematically wrong verdicts. Pin the derived values at
+    // compile time so any edit to the source constants breaks the build.
+    static_assert(BEHAVIORAL_FEATURE_COUNT == 2048,
+                  "BEHAVIORAL_FEATURE_COUNT diverged from training pipeline (512 x 4)");
+    static_assert(EMULATION_FEATURE_COUNT  == 4096,
+                  "EMULATION_FEATURE_COUNT diverged from training pipeline (1024 x 4)");
+    static_assert(MAX_BATCH_SIZE > 0,
+                  "MAX_BATCH_SIZE must be positive");
+    static_assert(MAX_INFERENCE_TIMEOUT_MS >= DEFAULT_INFERENCE_TIMEOUT_MS,
+                  "MAX_INFERENCE_TIMEOUT_MS must dominate DEFAULT_INFERENCE_TIMEOUT_MS");
+
 }  // namespace CortexConstants
 
 // ============================================================================
@@ -147,6 +164,13 @@ enum class CortexModelType : uint8_t {
     Network     = 3,    ///< Network flow classification
     Emulation   = 4     ///< Post-emulation trace classification
 };
+
+// Lock the ensemble verdict array width to the number of model types.
+// Adding a new CortexModelType without bumping MODEL_COUNT would cause
+// the ensemble aggregator to silently drop the new model's verdict.
+static_assert(static_cast<size_t>(CortexModelType::Emulation) + 1
+              == CortexConstants::MODEL_COUNT,
+              "CortexConstants::MODEL_COUNT must equal the cardinality of CortexModelType");
 
 // ============================================================================
 // VERDICT ENUMERATIONS
@@ -273,11 +297,18 @@ struct APICallRecord {
  *
  * @warning The `data` span is a non-owning view. The caller must ensure
  *          the backing memory remains valid for the duration of analysis.
+ *
+ * @note `size` records the *original* VAS region size as observed by the
+ *       sensor. When the sensor caps a large region, `data.size()` is the
+ *       captured slice while `size` retains the full region length, allowing
+ *       downstream models to reason about truncation. Callers MUST treat
+ *       `data.size()` (not `size`) as the authoritative byte count of the
+ *       captured payload.
  */
 struct MemoryRegionInfo {
-    std::span<const uint8_t>    data;           ///< Raw region bytes (non-owning)
+    std::span<const uint8_t>    data;           ///< Captured region bytes (non-owning)
     uintptr_t                   baseAddress = 0;
-    size_t                      size        = 0;
+    size_t                      size        = 0; ///< Original (pre-capture) region size; may exceed data.size()
     uint32_t                    protection  = 0; ///< PAGE_EXECUTE_READWRITE, etc.
 };
 
