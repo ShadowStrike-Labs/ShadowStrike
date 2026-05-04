@@ -692,6 +692,28 @@ namespace ShadowStrike::AntiEvasion {
     static constexpr const wchar_t* LOG_CATEGORY = L"DebuggerEvasion";
 
     // ========================================================================
+    // PE BOUNDS HELPERS
+    // ========================================================================
+
+    /// @brief Validate that an RVA is strictly inside the module image.
+    /// @param rva     Untrusted RVA from a PE directory entry.
+    /// @param length  Number of bytes that will be read starting at rva.
+    /// @param moduleSize Authoritative SizeOfImage from MODULEINFO.
+    /// @return true if [rva, rva + length) lies inside [0, moduleSize).
+    /// Performs the check without unsigned-overflow ambiguity by computing
+    /// length first against the available tail space at rva.
+    [[nodiscard]] static constexpr bool IsRvaInModule(
+        uint64_t rva,
+        uint64_t length,
+        uint64_t moduleSize
+    ) noexcept {
+        if (moduleSize == 0) return false;
+        if (rva >= moduleSize) return false;
+        const uint64_t avail = moduleSize - rva;
+        return length <= avail;
+    }
+
+    // ========================================================================
     // HELPER FUNCTIONS
     // ========================================================================
 
@@ -2002,7 +2024,7 @@ namespace ShadowStrike::AntiEvasion {
                         // PEB.NtGlobalFlag check
                         // Offset 0xBC (x64), 0x68 (x86) for modern Windows
                         size_t ntGlobalFlagOffset = result.is64Bit ? 0xBC : 0x68;
-                        if (ntGlobalFlagOffset < bytesRead - 4) {
+                        if (ntGlobalFlagOffset + 4 <= bytesRead) {
                             uint32_t ntGlobalFlag = *reinterpret_cast<uint32_t*>(&pebBuffer[ntGlobalFlagOffset]);
                             result.pebInfo.ntGlobalFlag = ntGlobalFlag;
 
@@ -2154,6 +2176,14 @@ namespace ShadowStrike::AntiEvasion {
                         .Confidence(1.0)
                         .Severity(EvasionSeverity::High)
                         .Build());
+
+                    // The kernel duplicates the debug object into our process so
+                    // we own this handle and must release it deterministically.
+                    if (!CloseHandle(hDebugObj)) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"AnalyzeAPIUsage: CloseHandle(DebugObject) failed (gle=%u)",
+                            GetLastError());
+                    }
                 }
             }
         }
@@ -2603,6 +2633,12 @@ namespace ShadowStrike::AntiEvasion {
                 if (!ReadProcessMemory(hProcess, pRemoteFunc, remoteBytes, sizeof(remoteBytes), &bytesRead)) {
                     continue;
                 }
+                // A short read truncates remoteBytes leaving the tail zeroed; a
+                // 16-byte memcmp against zero-padded data would synthesize false
+                // positives. Require enough bytes to disassemble a normal stub.
+                if (bytesRead < 16) {
+                    continue;
+                }
 
                 // Read local function bytes
                 uint8_t localBytes[32] = {};
@@ -2751,6 +2787,19 @@ namespace ShadowStrike::AntiEvasion {
             if (tlsRva == 0) {
                 return false; // No TLS directory
             }
+
+            // Validate TLS RVA strictly within module image to prevent OOB
+            // pointer arithmetic when the directory is corrupted or attacker-
+            // controlled. The TLS directory is at minimum 24 bytes (32-bit) /
+            // 40 bytes (64-bit); require the larger to be present.
+            const uint32_t tlsHeaderMin = is64Bit ? 40u : 24u;
+            if (!IsRvaInModule(tlsRva, tlsHeaderMin, modInfo.SizeOfImage)) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"CheckTLSCallbacksInternal: TLS directory RVA 0x%X out of module bounds 0x%X",
+                    tlsRva, modInfo.SizeOfImage);
+                return false;
+            }
+            (void)tlsSize;
 
             // Read TLS directory
             uint8_t tlsBuffer[64] = {};
@@ -3173,13 +3222,22 @@ namespace ShadowStrike::AntiEvasion {
                 reinterpret_cast<IMAGE_NT_HEADERS32*>(headerBuffer.data() + dosHeader->e_lfanew)->OptionalHeader.AddressOfEntryPoint;
 
             if (entryPointRva != 0) {
-                void* pEntryPoint = static_cast<uint8_t*>(modInfo.lpBaseOfDll) + entryPointRva;
                 constexpr size_t SCAN_SIZE = 8192; // Scan 8KB for better coverage
-                std::vector<uint8_t> codeBuffer(SCAN_SIZE);
+                if (!IsRvaInModule(entryPointRva, 1, modInfo.SizeOfImage)) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"AnalyzeTimingPatterns: entry point RVA 0x%X exceeds module size 0x%X",
+                        entryPointRva, modInfo.SizeOfImage);
+                } else {
+                    void* pEntryPoint = static_cast<uint8_t*>(modInfo.lpBaseOfDll) + entryPointRva;
+                    // Cap the scan to whatever lies inside the module image.
+                    const size_t avail = static_cast<size_t>(modInfo.SizeOfImage) - entryPointRva;
+                    const size_t scanSize = std::min<size_t>(SCAN_SIZE, avail);
+                    std::vector<uint8_t> codeBuffer(scanSize);
 
-                if (ReadProcessMemory(hProcess, pEntryPoint, codeBuffer.data(), SCAN_SIZE, &bytesRead) && bytesRead > 0) {
-                    ScanCodeForTimingInstructions(decoder, codeBuffer.data(), bytesRead,
-                        reinterpret_cast<uintptr_t>(pEntryPoint), result);
+                    if (ReadProcessMemory(hProcess, pEntryPoint, codeBuffer.data(), scanSize, &bytesRead) && bytesRead > 0) {
+                        ScanCodeForTimingInstructions(decoder, codeBuffer.data(), bytesRead,
+                            reinterpret_cast<uintptr_t>(pEntryPoint), result);
+                    }
                 }
             }
 
@@ -3206,7 +3264,14 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             if (importDirRva != 0 && importDirSize > 0) {
-                AnalyzeIATForTimingAPIs(hProcess, modInfo.lpBaseOfDll, importDirRva, importDirSize, is64Bit, result);
+                if (!IsRvaInModule(importDirRva, importDirSize, modInfo.SizeOfImage)) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"AnalyzeTimingPatterns: import directory RVA 0x%X size 0x%X out of module bounds 0x%X",
+                        importDirRva, importDirSize, modInfo.SizeOfImage);
+                } else {
+                    AnalyzeIATForTimingAPIs(hProcess, modInfo.lpBaseOfDll,
+                        modInfo.SizeOfImage, importDirRva, importDirSize, is64Bit, result);
+                }
             }
 
             // ================================================================
@@ -3493,12 +3558,19 @@ namespace ShadowStrike::AntiEvasion {
     void DebuggerEvasionDetector::AnalyzeIATForTimingAPIs(
         HANDLE hProcess,
         LPVOID moduleBase,
+        DWORD moduleSize,
         DWORD importDirRva,
         DWORD importDirSize,
         bool is64Bit,
         DebuggerEvasionResult& result
     ) noexcept {
-        if (!hProcess || !moduleBase || importDirRva == 0) return;
+        if (!hProcess || !moduleBase || importDirRva == 0 || moduleSize == 0) return;
+        if (!IsRvaInModule(importDirRva, importDirSize, moduleSize)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"AnalyzeIATForTimingAPIs: import dir RVA/size 0x%X/0x%X out of module bounds 0x%X",
+                importDirRva, importDirSize, moduleSize);
+            return;
+        }
 
         // Build lookup map for fast API matching
         std::unordered_map<std::string, const TimingAPIInfo*> timingApiMap;
@@ -3509,9 +3581,14 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<const TimingAPIInfo*> importedTimingAPIs;
 
         try {
-            // Read Import Directory
+            // Read Import Directory; cap to actual module tail to avoid OOB.
             constexpr size_t MAX_IMPORT_DIR_SIZE = 65536;
-            const size_t readSize = std::min<size_t>(importDirSize + 4096, MAX_IMPORT_DIR_SIZE);
+            const size_t availTail = static_cast<size_t>(moduleSize) - importDirRva;
+            const size_t requested = std::min<size_t>(
+                static_cast<size_t>(importDirSize) + 4096,
+                MAX_IMPORT_DIR_SIZE);
+            const size_t readSize = std::min<size_t>(requested, availTail);
+            if (readSize < sizeof(IMAGE_IMPORT_DESCRIPTOR)) return;
             std::vector<uint8_t> importBuffer(readSize);
 
             SIZE_T bytesRead = 0;
@@ -3521,40 +3598,70 @@ namespace ShadowStrike::AntiEvasion {
                 return;
             }
 
-            // Walk Import Descriptors
-            auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(importBuffer.data());
+            // Walk Import Descriptors. Bound the walk by both MAX_DLLS and the
+            // amount of memory actually returned by RPM so we never read past
+            // importBuffer when the attacker omits the terminator.
             constexpr size_t MAX_DLLS = 256;
             size_t dllCount = 0;
+            size_t descOffset = 0;
 
-            while (importDesc->Name != 0 && dllCount < MAX_DLLS) {
-                // Validate RVA bounds
-                if (importDesc->Name < importDirRva || importDesc->Name > importDirRva + readSize) {
-                    // Name RVA is outside our buffer, need to read it separately
+            while (dllCount < MAX_DLLS &&
+                   descOffset + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= bytesRead) {
+                const IMAGE_IMPORT_DESCRIPTOR* importDesc =
+                    reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(importBuffer.data() + descOffset);
+
+                if (importDesc->Name == 0) break; // End-of-table sentinel.
+
+                // Validate Name RVA against the full module image, not just the
+                // import-directory buffer. Attacker-controlled Name can point
+                // anywhere in the 32-bit RVA space.
+                if (!IsRvaInModule(importDesc->Name, 1, moduleSize)) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"AnalyzeIATForTimingAPIs: import descriptor Name RVA 0x%X exceeds module size 0x%X",
+                        importDesc->Name, moduleSize);
+                    descOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                    dllCount++;
+                    continue;
+                }
+
+                if (importDesc->Name < importDirRva || importDesc->Name >= importDirRva + readSize) {
+                    // Name RVA is outside our buffer, need to read it separately.
                     char dllNameBuf[256] = {};
                     void* dllNameAddr = static_cast<uint8_t*>(moduleBase) + importDesc->Name;
 
-                    if (!ReadProcessMemory(hProcess, dllNameAddr, dllNameBuf, sizeof(dllNameBuf) - 1, &bytesRead)) {
-                        importDesc++;
+                    SIZE_T nameRead = 0;
+                    if (!ReadProcessMemory(hProcess, dllNameAddr, dllNameBuf, sizeof(dllNameBuf) - 1, &nameRead) || nameRead == 0) {
+                        descOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
                         dllCount++;
                         continue;
                     }
                     dllNameBuf[sizeof(dllNameBuf) - 1] = '\0';
 
-                    // Process this DLL's imports
-                    ProcessDLLImportsForTiming(hProcess, moduleBase, importDesc, dllNameBuf, is64Bit,
+                    ProcessDLLImportsForTiming(hProcess, moduleBase, moduleSize, importDesc, dllNameBuf, is64Bit,
                         timingApiMap, importedTimingAPIs, result);
                 }
                 else {
-                    // Name is within our buffer
-                    size_t nameOffset = importDesc->Name - importDirRva;
-                    if (nameOffset < readSize) {
-                        const char* dllName = reinterpret_cast<const char*>(importBuffer.data() + nameOffset);
-                        ProcessDLLImportsForTiming(hProcess, moduleBase, importDesc, dllName, is64Bit,
-                            timingApiMap, importedTimingAPIs, result);
+                    // Name is within our buffer.
+                    const size_t nameOffset = importDesc->Name - importDirRva;
+                    if (nameOffset < bytesRead) {
+                        // Force null-termination boundary using strnlen on the
+                        // remaining buffer to avoid OOB if no NUL is present.
+                        const char* nameStart = reinterpret_cast<const char*>(importBuffer.data() + nameOffset);
+                        const size_t maxScan = bytesRead - nameOffset;
+                        const size_t nameLen = ::strnlen(nameStart, maxScan);
+                        if (nameLen == maxScan) {
+                            // No NUL within buffer: copy out and terminate explicitly.
+                            std::string safeName(nameStart, nameLen);
+                            ProcessDLLImportsForTiming(hProcess, moduleBase, moduleSize, importDesc, safeName.c_str(), is64Bit,
+                                timingApiMap, importedTimingAPIs, result);
+                        } else {
+                            ProcessDLLImportsForTiming(hProcess, moduleBase, moduleSize, importDesc, nameStart, is64Bit,
+                                timingApiMap, importedTimingAPIs, result);
+                        }
                     }
                 }
 
-                importDesc++;
+                descOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
                 dllCount++;
             }
 
@@ -3618,6 +3725,7 @@ namespace ShadowStrike::AntiEvasion {
     void DebuggerEvasionDetector::ProcessDLLImportsForTiming(
         HANDLE hProcess,
         LPVOID moduleBase,
+        DWORD moduleSize,
         const IMAGE_IMPORT_DESCRIPTOR* importDesc,
         const char* dllName,
         bool is64Bit,
@@ -3625,11 +3733,17 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<const TimingAPIInfo*>& importedTimingAPIs,
         DebuggerEvasionResult& result
     ) noexcept {
-        if (!importDesc || !dllName) return;
+        if (!importDesc || !dllName || moduleSize == 0) return;
 
         // Use OriginalFirstThunk (Import Name Table) if available, else FirstThunk (IAT)
         DWORD thunkRva = importDesc->OriginalFirstThunk ? importDesc->OriginalFirstThunk : importDesc->FirstThunk;
         if (thunkRva == 0) return;
+        if (!IsRvaInModule(thunkRva, sizeof(IMAGE_THUNK_DATA32), moduleSize)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"ProcessDLLImportsForTiming: thunk RVA 0x%X exceeds module size 0x%X",
+                thunkRva, moduleSize);
+            return;
+        }
 
         // Convert DLL name to lowercase for comparison
         std::string dllNameLower(dllName);
@@ -3637,10 +3751,13 @@ namespace ShadowStrike::AntiEvasion {
             [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
         try {
-            // Read thunk array (limited to reasonable size)
+            // Read thunk array (limited to reasonable size and to module tail)
             constexpr size_t MAX_THUNKS = 4096;
             const size_t thunkSize = is64Bit ? sizeof(IMAGE_THUNK_DATA64) : sizeof(IMAGE_THUNK_DATA32);
-            std::vector<uint8_t> thunkBuffer(MAX_THUNKS * thunkSize);
+            const size_t availTail = static_cast<size_t>(moduleSize) - thunkRva;
+            const size_t requested = std::min<size_t>(MAX_THUNKS * thunkSize, availTail);
+            if (requested < thunkSize) return;
+            std::vector<uint8_t> thunkBuffer(requested);
 
             SIZE_T bytesRead = 0;
             void* thunkAddr = static_cast<uint8_t*>(moduleBase) + thunkRva;
@@ -3651,14 +3768,14 @@ namespace ShadowStrike::AntiEvasion {
 
             size_t thunkCount = 0;
             const size_t maxValidOffset = bytesRead >= thunkSize ? bytesRead - thunkSize : 0;
-            
+
             while (thunkCount < MAX_THUNKS) {
                 // SECURITY: Bounds check - ensure we don't read beyond bytesRead
                 const size_t currentOffset = thunkCount * thunkSize;
                 if (currentOffset > maxValidOffset) {
                     break; // Would read past the data we actually got
                 }
-                
+
                 uint64_t thunkValue = 0;
 
                 if (is64Bit) {
@@ -3675,10 +3792,16 @@ namespace ShadowStrike::AntiEvasion {
                 // Check if import by ordinal
                 const uint64_t ordinalFlag = is64Bit ? IMAGE_ORDINAL_FLAG64 : IMAGE_ORDINAL_FLAG32;
                 if (!(thunkValue & ordinalFlag)) {
-                    // Import by name - read IMAGE_IMPORT_BY_NAME
-                    DWORD nameRva = static_cast<DWORD>(thunkValue);
+                    // Import by name - read IMAGE_IMPORT_BY_NAME at (RVA + 2) skipping Hint.
+                    // Validate the RVA against the module image; reject anything
+                    // that would wrap or cross the module boundary.
+                    const DWORD nameRva = static_cast<DWORD>(thunkValue);
+                    if (!IsRvaInModule(static_cast<uint64_t>(nameRva) + 2, 1, moduleSize)) {
+                        thunkCount++;
+                        continue;
+                    }
                     char funcNameBuf[256] = {};
-                    void* funcNameAddr = static_cast<uint8_t*>(moduleBase) + nameRva + 2; // Skip Hint
+                    void* funcNameAddr = static_cast<uint8_t*>(moduleBase) + nameRva + 2;
 
                     if (ReadProcessMemory(hProcess, funcNameAddr, funcNameBuf, sizeof(funcNameBuf) - 1, &bytesRead)) {
                         funcNameBuf[sizeof(funcNameBuf) - 1] = '\0';
@@ -4365,6 +4488,11 @@ namespace ShadowStrike::AntiEvasion {
                 if (!ReadProcessMemory(hProcess, pRemoteFunc, remoteBytes, sizeof(remoteBytes), &bytesRead)) {
                     continue;
                 }
+                // Reject short reads to avoid memcmp synthesizing a false hook
+                // signal against zero-padded tail bytes.
+                if (bytesRead < 16) {
+                    continue;
+                }
 
                 memcpy(localBytes, pLocalFunc, sizeof(localBytes));
 
@@ -4422,19 +4550,26 @@ namespace ShadowStrike::AntiEvasion {
                     SIZE_T bytesRead = 0;
 
                     if (ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, headerBuffer, sizeof(headerBuffer), &bytesRead)) {
+                        if (bytesRead < sizeof(IMAGE_DOS_HEADER)) {
+                            // Insufficient header data; skip entry-point check.
+                        } else {
                         auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(headerBuffer);
                         if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE &&
+                            dosHeader->e_lfanew > 0 &&
+                            static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) <= bytesRead &&
                             static_cast<size_t>(dosHeader->e_lfanew) < sizeof(headerBuffer) - sizeof(IMAGE_NT_HEADERS64)) {
 
                             auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(headerBuffer + dosHeader->e_lfanew);
                             if (ntHeaders->Signature == IMAGE_NT_SIGNATURE) {
                                 DWORD entryPointRva = ntHeaders->OptionalHeader.AddressOfEntryPoint;
 
-                                if (entryPointRva != 0) {
+                                if (entryPointRva != 0 &&
+                                    IsRvaInModule(entryPointRva, 16, modInfo.SizeOfImage)) {
                                     void* pEntryPoint = static_cast<uint8_t*>(modInfo.lpBaseOfDll) + entryPointRva;
                                     uint8_t epBytes[16] = {};
 
-                                    if (ReadProcessMemory(hProcess, pEntryPoint, epBytes, sizeof(epBytes), &bytesRead)) {
+                                    if (ReadProcessMemory(hProcess, pEntryPoint, epBytes, sizeof(epBytes), &bytesRead) &&
+                                        bytesRead >= sizeof(epBytes)) {
                                         // Check for hook at entry point
                                         std::wstring hookDetails;
                                         if (m_impl->DetectInlineHook(epBytes, bytesRead, result.is64Bit, hookDetails)) {
@@ -4451,6 +4586,7 @@ namespace ShadowStrike::AntiEvasion {
                                 }
                             }
                         }
+                        } // close: bytesRead < sizeof(IMAGE_DOS_HEADER) else-branch
                     }
                 }
             }
