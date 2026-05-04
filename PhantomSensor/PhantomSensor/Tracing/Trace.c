@@ -331,11 +331,22 @@ WppGetTraceFlags(
     VOID
     )
 {
+    LONG Enabled;
+    LONG Disabled;
+
     if (!g_TraceInitialized) {
         return 0;
     }
 
-    return g_TraceConfig.EnabledFlags & ~g_TraceConfig.DisabledFlags;
+    //
+    // Snapshot both bitmasks via interlocked reads to avoid observing a
+    // half-updated state when WppSetTraceFlags is racing on another CPU.
+    // CompareExchange(0,0) is a load with full memory barrier on x86/x64.
+    //
+    Enabled  = InterlockedCompareExchange((volatile LONG*)&g_TraceConfig.EnabledFlags, 0, 0);
+    Disabled = InterlockedCompareExchange((volatile LONG*)&g_TraceConfig.DisabledFlags, 0, 0);
+
+    return (ULONG)(Enabled & ~Disabled);
 }
 
 _Use_decl_annotations_
@@ -354,10 +365,16 @@ WppSetRateLimit(
         MaxTracesPerSecond = TRACE_MAX_RATE_LIMIT;
     }
 
-    g_TraceConfig.MaxTracesPerSecond = MaxTracesPerSecond;
+    //
+    // Atomic publish so a concurrent TracepCheckRateLimit reader on another
+    // CPU sees a coherent value rather than relying on natural alignment.
+    //
+    (VOID)InterlockedExchange((volatile LONG*)&g_TraceConfig.MaxTracesPerSecond,
+                              (LONG)MaxTracesPerSecond);
 
     //
-    // Reset window.
+    // Reset window AFTER publishing the new ceiling so the next admission
+    // check is governed by the new limit, not the previous one.
     //
     KeQuerySystemTime(&CurrentTime);
     InterlockedExchange64(&g_TraceConfig.CurrentSecondStart, CurrentTime.QuadPart);
@@ -403,8 +420,13 @@ WppCreateTraceContext(
 
     Context->CorrelationId       = WppGenerateCorrelationId();
     Context->ParentCorrelationId = ParentCorrelationId;
-    Context->ProcessId           = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
-    Context->ThreadId            = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
+    //
+    // HandleToUlong narrows a HANDLE to ULONG with documented MS semantics
+    // (truncation of the upper 32 bits) and silences SAL/MSVC narrowing
+    // diagnostics. Windows process/thread client IDs always fit in 32 bits.
+    //
+    Context->ProcessId           = HandleToUlong(PsGetCurrentProcessId());
+    Context->ThreadId            = HandleToUlong(PsGetCurrentThreadId());
     Context->ComponentId         = (UINT32)ComponentId;
     Context->SubComponentId      = 0;
 
@@ -787,7 +809,12 @@ WppFormatStatus(
         return 0;
     }
 
-    FormatStatus = RtlStringCchPrintfA(Buffer, BufferSize, "0x%08X", Status);
+    //
+    // NTSTATUS is signed LONG; cast to ULONG so %08X (unsigned int) renders
+    // negative values as their canonical 0xCxxxxxxx form rather than the
+    // sign-promoted equivalent that an aggressive optimizer might select.
+    //
+    FormatStatus = RtlStringCchPrintfA(Buffer, BufferSize, "0x%08X", (ULONG)Status);
     if (!NT_SUCCESS(FormatStatus)) {
         Buffer[0] = '\0';
         return 0;
@@ -962,8 +989,17 @@ TracepCheckRateLimit(
     LARGE_INTEGER CurrentTime;
     LONG64 WindowStart;
     LONG CurrentCount;
+    ULONG MaxPerSecond;
 
-    if (g_TraceConfig.MaxTracesPerSecond == 0) {
+    //
+    // Snapshot the configured ceiling once. A racing WppSetRateLimit may
+    // republish it concurrently; using a single load keeps the comparison
+    // self-consistent and avoids re-reading after the increment below.
+    //
+    MaxPerSecond = (ULONG)InterlockedCompareExchange(
+        (volatile LONG*)&g_TraceConfig.MaxTracesPerSecond, 0, 0);
+
+    if (MaxPerSecond == 0) {
         return TRUE;
     }
 
@@ -972,7 +1008,14 @@ TracepCheckRateLimit(
     WindowStart = InterlockedCompareExchange64(
         &g_TraceConfig.CurrentSecondStart, 0, 0);
 
-    if ((CurrentTime.QuadPart - WindowStart) >= TRACE_RATE_RESET_100NS) {
+    //
+    // Defensive: if the system time briefly moves backwards across a
+    // KeSetSystemTime, treat the window as expired and reseed instead of
+    // computing a negative delta and overflowing the comparison.
+    //
+    if (CurrentTime.QuadPart < WindowStart ||
+        (CurrentTime.QuadPart - WindowStart) >= TRACE_RATE_RESET_100NS)
+    {
         //
         // Try to claim the window reset. Only one thread wins the CAS;
         // losers proceed with the old window (which is fine â€” approximate).
@@ -988,7 +1031,13 @@ TracepCheckRateLimit(
 
     CurrentCount = InterlockedIncrement(&g_TraceConfig.CurrentSecondTraces);
 
-    if ((ULONG)CurrentCount > g_TraceConfig.MaxTracesPerSecond) {
+    //
+    // CurrentCount can in principle wrap to a negative value if a pathological
+    // burst (>2^31 increments inside a single 1-second window) ever occurred
+    // â€” cap is TRACE_MAX_RATE_LIMIT (1M) so this is impossible in practice,
+    // but guard against the signed-comparison pitfall anyway.
+    //
+    if (CurrentCount < 0 || (ULONG)CurrentCount > MaxPerSecond) {
         return FALSE;
     }
 
@@ -1003,23 +1052,48 @@ TracepGenerateSessionGuid(
     LARGE_INTEGER SystemTime;
     LARGE_INTEGER PerfCounter;
     PUCHAR GuidBytes;
+    ULONG_PTR Pid;
 
     if (SessionGuid == NULL) {
         return;
     }
 
+    //
+    // C_ASSERT the layout we rely on so any future GUID padding/reorder
+    // change becomes a compile-time error rather than a silent corruption.
+    //
+    C_ASSERT(sizeof(GUID) == 16);
+    C_ASSERT(FIELD_OFFSET(GUID, Data1) == 0);
+    C_ASSERT(FIELD_OFFSET(GUID, Data4) == 8);
+
     KeQuerySystemTime(&SystemTime);
     PerfCounter = KeQueryPerformanceCounter(NULL);
 
+    //
+    // Cache the PID once: PsGetCurrentProcessId returns the *current*
+    // thread's owning PID and re-invoking it across kernel APIs is wasteful
+    // and theoretically inconsistent if the routine were ever inlined into
+    // a context where the value could differ between calls.
+    //
+    Pid = (ULONG_PTR)PsGetCurrentProcessId();
+
     GuidBytes = (PUCHAR)SessionGuid;
-    RtlCopyMemory(GuidBytes, &SystemTime.QuadPart, 8);
+    RtlCopyMemory(GuidBytes,     &SystemTime.QuadPart, 8);
     RtlCopyMemory(GuidBytes + 8, &PerfCounter.QuadPart, 8);
 
-    GuidBytes[0] ^= (UCHAR)((ULONG_PTR)PsGetCurrentProcessId() & 0xFF);
-    GuidBytes[1] ^= (UCHAR)(((ULONG_PTR)PsGetCurrentProcessId() >> 8) & 0xFF);
+    GuidBytes[0] ^= (UCHAR)( Pid        & 0xFF);
+    GuidBytes[1] ^= (UCHAR)((Pid >> 8)  & 0xFF);
+    GuidBytes[2] ^= (UCHAR)((Pid >> 16) & 0xFF);
+    GuidBytes[3] ^= (UCHAR)((Pid >> 24) & 0xFF);
 
-    SessionGuid->Data3 = (SessionGuid->Data3 & 0x0FFF) | 0x4000;
-    SessionGuid->Data4[0] = (SessionGuid->Data4[0] & 0x3F) | 0x80;
+    //
+    // RFC 4122 v4 layout: set version (top nibble of Data3) and variant
+    // (top two bits of Data4[0]). The remaining bits stay derived from
+    // system/perf counters â€” adequate uniqueness for an in-driver session
+    // correlation ID (this is NOT a security-grade random GUID).
+    //
+    SessionGuid->Data3    = (USHORT)((SessionGuid->Data3 & 0x0FFF) | 0x4000);
+    SessionGuid->Data4[0] = (UCHAR)((SessionGuid->Data4[0] & 0x3F) | 0x80);
 }
 
 // ============================================================================
