@@ -1131,12 +1131,15 @@ public:
 
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
+            // SECURITY FIX: Capture GetLastError() once; subsequent calls can clobber it.
+            const DWORD lastErr = ::GetLastError();
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = lastErr;
                 err->message = L"Failed to memory-map file";
                 err->context = filePath;
             }
-            result.errors.push_back({ GetLastError(), L"Failed to open file", filePath });
+            result.errors.push_back({ lastErr, L"Failed to open file", filePath });
+            m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
@@ -1145,6 +1148,8 @@ public:
                 err->win32Code = ERROR_EMPTY;
                 err->message = L"File is empty";
             }
+            result.errors.push_back({ ERROR_EMPTY, L"File is empty", filePath });
+            m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
@@ -1156,6 +1161,7 @@ public:
                 err->message = L"File exceeds maximum analysis size";
             }
             result.errors.push_back({ ERROR_FILE_TOO_LARGE, L"File too large", filePath });
+            m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
@@ -1425,8 +1431,12 @@ public:
             sec.isReadable = peSec.isReadable;
             sec.isEmpty = (peSec.virtualSize > 0 && peSec.rawSize == 0);
 
+            // SECURITY FIX: rawAddress + rawSize are uint32_t - additive form can wrap
+            // before promotion to size_t. Use overflow-safe form against mapped size.
+            const size_t mappedSize = mappedFile.size();
             if (peSec.rawSize >= MIN_SECTION_SIZE_FOR_ENTROPY &&
-                peSec.rawAddress + peSec.rawSize <= mappedFile.size()) {
+                static_cast<size_t>(peSec.rawAddress) <= mappedSize &&
+                static_cast<size_t>(peSec.rawSize) <= mappedSize - static_cast<size_t>(peSec.rawAddress)) {
                 sec.entropy = CalculateEntropy(
                     static_cast<const uint8_t*>(mappedFile.data()) + peSec.rawAddress,
                     peSec.rawSize
@@ -1591,39 +1601,36 @@ public:
                static_cast<double>(peInfo.fileSize)) * 100.0
             : 0.0;
 
-        // SECURITY FIX: Validate overlay size before accessing magic bytes
-        // Must have at least 4 bytes to safely check all magic patterns
-        if (peInfo.overlayOffset + 16 <= mappedFile.size() && peInfo.overlaySize >= 4) {
-            const uint8_t* overlayData = static_cast<const uint8_t*>(mappedFile.data()) +
-                peInfo.overlayOffset;
-            
-            // Copy only available bytes, capped at 16
-            const size_t bytesToCopy = std::min({size_t(16), peInfo.overlaySize, 
-                mappedFile.size() - peInfo.overlayOffset});
-            std::copy_n(overlayData, bytesToCopy, outOverlay.magicBytes.begin());
+        // SECURITY FIX: Overflow-safe bounds + closed gap for overlays of size [4..15].
+        // Previous logic required 16 bytes available AND >=4 bytes overlay, so overlays
+        // sized 4-15 were never inspected for magic bytes. Now: if at least 1 byte is
+        // available, copy what we can (capped at 16) and identify formats whenever the
+        // required prefix length is satisfied.
+        const size_t mappedSize = mappedFile.size();
+        if (peInfo.overlayOffset <= mappedSize) {
+            const size_t available = mappedSize - peInfo.overlayOffset;
+            const size_t overlayClamped = std::min(peInfo.overlaySize, available);
+            const size_t bytesToCopy = std::min<size_t>(16, overlayClamped);
+            if (bytesToCopy > 0) {
+                const uint8_t* overlayData = static_cast<const uint8_t*>(mappedFile.data()) +
+                    peInfo.overlayOffset;
+                std::copy_n(overlayData, bytesToCopy, outOverlay.magicBytes.begin());
 
-            // Now safe to access bytes 0-3
-            if (overlayData[0] == 0x50 && overlayData[1] == 0x4B) {
-                outOverlay.detectedFormat = L"ZIP/JAR archive";
-            } else if (overlayData[0] == 0x52 && overlayData[1] == 0x61 &&
-                       overlayData[2] == 0x72 && overlayData[3] == 0x21) {
-                outOverlay.detectedFormat = L"RAR archive";
-            } else if (overlayData[0] == 0x37 && overlayData[1] == 0x7A &&
-                       overlayData[2] == 0xBC && overlayData[3] == 0xAF) {
-                outOverlay.detectedFormat = L"7-Zip archive";
-            } else if (overlayData[0] == 0x1F && overlayData[1] == 0x8B) {
-                outOverlay.detectedFormat = L"GZIP compressed";
-            } else if (overlayData[0] == 0xEF && overlayData[1] == 0xBE &&
-                       overlayData[2] == 0xAD && overlayData[3] == 0xDE) {
-                outOverlay.detectedFormat = L"NSIS installer data";
+                if (bytesToCopy >= 2 && overlayData[0] == 0x50 && overlayData[1] == 0x4B) {
+                    outOverlay.detectedFormat = L"ZIP/JAR archive";
+                } else if (bytesToCopy >= 4 && overlayData[0] == 0x52 && overlayData[1] == 0x61 &&
+                           overlayData[2] == 0x72 && overlayData[3] == 0x21) {
+                    outOverlay.detectedFormat = L"RAR archive";
+                } else if (bytesToCopy >= 4 && overlayData[0] == 0x37 && overlayData[1] == 0x7A &&
+                           overlayData[2] == 0xBC && overlayData[3] == 0xAF) {
+                    outOverlay.detectedFormat = L"7-Zip archive";
+                } else if (bytesToCopy >= 2 && overlayData[0] == 0x1F && overlayData[1] == 0x8B) {
+                    outOverlay.detectedFormat = L"GZIP compressed";
+                } else if (bytesToCopy >= 4 && overlayData[0] == 0xEF && overlayData[1] == 0xBE &&
+                           overlayData[2] == 0xAD && overlayData[3] == 0xDE) {
+                    outOverlay.detectedFormat = L"NSIS installer data";
+                }
             }
-        }
-        // Handle case where overlay exists but is less than 4 bytes
-        else if (peInfo.overlayOffset < mappedFile.size() && peInfo.overlaySize > 0 && peInfo.overlaySize < 4) {
-            const size_t bytesToCopy = std::min(peInfo.overlaySize, mappedFile.size() - peInfo.overlayOffset);
-            const uint8_t* overlayData = static_cast<const uint8_t*>(mappedFile.data()) + peInfo.overlayOffset;
-            std::copy_n(overlayData, bytesToCopy, outOverlay.magicBytes.begin());
-            // Cannot reliably identify format with < 4 bytes
         }
 
         // SECURITY FIX: Prevent integer overflow in bounds check
@@ -2161,7 +2168,10 @@ public:
     void UpdateCache(const std::wstring& filePath, const PackingInfo& result) noexcept {
         std::unique_lock lock(m_cacheMutex);
 
-        // Evict oldest entries if cache is full (simple FIFO eviction)
+        // Bounded-size eviction: pop arbitrary entries until below capacity.
+        // Note: std::unordered_map iteration order is unspecified - this is not
+        // strictly FIFO/LRU but provides deterministic capacity bounding under
+        // the cacheMutex. Replace with intrusive list+map if true LRU is needed.
         while (m_cache.size() >= PackerConstants::MAX_CACHE_ENTRIES) {
             m_cache.erase(m_cache.begin());
         }
@@ -2244,7 +2254,15 @@ public:
         if (callbackCopy) {
             try {
                 callbackCopy(result.filePath, match);
-            } catch (...) {}
+            } catch (const std::exception& ex) {
+                // SECURITY FIX: Never fail silently - a misbehaving callback must be observable.
+                SS_LOG_WARN(L"PackerDetector",
+                    L"Detection callback threw std::exception (suppressed in noexcept context)");
+                (void)ex;
+            } catch (...) {
+                SS_LOG_WARN(L"PackerDetector",
+                    L"Detection callback threw unknown exception (suppressed in noexcept context)");
+            }
         }
         result.packerMatches.push_back(std::move(match));
     }
@@ -2255,9 +2273,20 @@ private:
     // ========================================================================
 
     [[nodiscard]] bool InitializeDisassembler() noexcept {
-        m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32);
-        m_decoder64.Init(Phantom::Disasm::MachineMode::Long64);
-        m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
+        // SECURITY FIX: Decoder/Formatter::Init are [[nodiscard]] - propagate failure.
+        // Using a partially-initialized decoder yields undefined disassembly results.
+        if (m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32) != Phantom::Disasm::Status::Success) {
+            SS_LOG_ERROR(L"PackerDetector", L"Decoder32 Init failed");
+            return false;
+        }
+        if (m_decoder64.Init(Phantom::Disasm::MachineMode::Long64) != Phantom::Disasm::Status::Success) {
+            SS_LOG_ERROR(L"PackerDetector", L"Decoder64 Init failed");
+            return false;
+        }
+        if (m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel) != Phantom::Disasm::Status::Success) {
+            SS_LOG_ERROR(L"PackerDetector", L"Formatter Init failed");
+            return false;
+        }
         return true;
     }
 
@@ -2620,39 +2649,31 @@ private:
         result.overlayInfo.percentageOfFile =
             (static_cast<double>(peInfo.overlaySize) / static_cast<double>(size)) * 100.0;
 
-        // SECURITY FIX: Validate overlay size >= 4 before accessing magic bytes
-        // Also use overflow-safe bounds checking
-        if (peInfo.overlayOffset <= size && peInfo.overlaySize >= 4 &&
-            16 <= size - peInfo.overlayOffset) {
-            const uint8_t* overlayData = buffer + peInfo.overlayOffset;
-            
-            // Copy available bytes, capped at 16 and actual overlay size
-            const size_t bytesToCopy = std::min({size_t(16), peInfo.overlaySize,
-                size - peInfo.overlayOffset});
-            std::copy_n(overlayData, bytesToCopy, result.overlayInfo.magicBytes.begin());
-
-            // Now safe to check 4-byte magic patterns
-            if (overlayData[0] == 0x50 && overlayData[1] == 0x4B) {
-                result.overlayInfo.detectedFormat = L"ZIP archive";
-            } else if (overlayData[0] == 0xEF && overlayData[1] == 0xBE &&
-                       overlayData[2] == 0xAD && overlayData[3] == 0xDE) {
-                result.overlayInfo.detectedFormat = L"NSIS data";
-            } else if (overlayData[0] == 0x52 && overlayData[1] == 0x61 &&
-                       overlayData[2] == 0x72 && overlayData[3] == 0x21) {
-                result.overlayInfo.detectedFormat = L"RAR archive";
-            } else if (overlayData[0] == 0x37 && overlayData[1] == 0x7A &&
-                       overlayData[2] == 0xBC && overlayData[3] == 0xAF) {
-                result.overlayInfo.detectedFormat = L"7-Zip archive";
-            } else if (overlayData[0] == 0x1F && overlayData[1] == 0x8B) {
-                result.overlayInfo.detectedFormat = L"GZIP compressed";
-            }
-        }
-        // Handle small overlays (< 4 bytes) - still copy what's available
-        else if (peInfo.overlayOffset <= size && peInfo.overlaySize > 0 && peInfo.overlaySize < 4) {
-            const size_t bytesToCopy = std::min(peInfo.overlaySize, size - peInfo.overlayOffset);
+        // SECURITY FIX: Overflow-safe bounds + closed gap for overlays of size [4..15].
+        // Previous additive form (16 <= size - peInfo.overlayOffset) skipped overlays
+        // smaller than 16 bytes but >=4. Identify whatever prefix length is satisfied.
+        if (peInfo.overlayOffset <= size) {
+            const size_t available = size - peInfo.overlayOffset;
+            const size_t overlayClamped = std::min(peInfo.overlaySize, available);
+            const size_t bytesToCopy = std::min<size_t>(16, overlayClamped);
             if (bytesToCopy > 0) {
-                std::copy_n(buffer + peInfo.overlayOffset, bytesToCopy,
-                    result.overlayInfo.magicBytes.begin());
+                const uint8_t* overlayData = buffer + peInfo.overlayOffset;
+                std::copy_n(overlayData, bytesToCopy, result.overlayInfo.magicBytes.begin());
+
+                if (bytesToCopy >= 2 && overlayData[0] == 0x50 && overlayData[1] == 0x4B) {
+                    result.overlayInfo.detectedFormat = L"ZIP archive";
+                } else if (bytesToCopy >= 4 && overlayData[0] == 0xEF && overlayData[1] == 0xBE &&
+                           overlayData[2] == 0xAD && overlayData[3] == 0xDE) {
+                    result.overlayInfo.detectedFormat = L"NSIS data";
+                } else if (bytesToCopy >= 4 && overlayData[0] == 0x52 && overlayData[1] == 0x61 &&
+                           overlayData[2] == 0x72 && overlayData[3] == 0x21) {
+                    result.overlayInfo.detectedFormat = L"RAR archive";
+                } else if (bytesToCopy >= 4 && overlayData[0] == 0x37 && overlayData[1] == 0x7A &&
+                           overlayData[2] == 0xBC && overlayData[3] == 0xAF) {
+                    result.overlayInfo.detectedFormat = L"7-Zip archive";
+                } else if (bytesToCopy >= 2 && overlayData[0] == 0x1F && overlayData[1] == 0x8B) {
+                    result.overlayInfo.detectedFormat = L"GZIP compressed";
+                }
             }
         }
 
@@ -3255,8 +3276,14 @@ private:
         if (callbackCopy) {
             try {
                 callbackCopy(result.filePath, match);
+            } catch (const std::exception& ex) {
+                // SECURITY FIX: Never fail silently in noexcept context.
+                SS_LOG_WARN(L"PackerDetector",
+                    L"Detection callback threw std::exception (suppressed)");
+                (void)ex;
             } catch (...) {
-                // Callback threw — do not propagate in noexcept context
+                SS_LOG_WARN(L"PackerDetector",
+                    L"Detection callback threw unknown exception (suppressed)");
             }
         }
 
