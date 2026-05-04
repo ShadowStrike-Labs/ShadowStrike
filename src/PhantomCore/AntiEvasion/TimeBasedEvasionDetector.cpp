@@ -708,6 +708,11 @@ struct TimeBasedEvasionDetector::Impl {
     // ========================================================================
 
     std::atomic<bool> m_initialized{ false };
+    // CONCURRENCY: tracks in-flight async analyses so Shutdown can drain
+    // before tearing down the thread pool. Without this the lambda body
+    // (which captures `this`) can run against a destroyed Impl when the
+    // owning detector goes out of scope shortly after Shutdown returns.
+    std::atomic<size_t> m_pendingAsync{ 0 };
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_monitorMutex;
     mutable std::shared_mutex m_callbackMutex;
@@ -770,6 +775,13 @@ struct TimeBasedEvasionDetector::Impl {
         std::unique_lock lock(m_mutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
+            // Re-init request: caller's pool/config are silently *not* adopted
+            // because doing so mid-flight would race with worker tasks already
+            // queued against the previous pool. Log loudly so a host that
+            // expects to swap pools knows to call Shutdown() first.
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"TimeBasedEvasionDetector::Initialize called while already initialized; "
+                L"new ThreadPool/config discarded. Caller must Shutdown() first to swap.");
             return true;
         }
 
@@ -798,6 +810,26 @@ struct TimeBasedEvasionDetector::Impl {
 
         // Stop monitoring thread
         StopAllMonitoring();
+
+        // CONCURRENCY FIX (#2): drain in-flight async submissions before we
+        // release the pool. Bounded wait — if a worker is wedged on a long
+        // ReadProcessMemory we still proceed after the deadline rather than
+        // hang Shutdown forever. The pool's own destructor will then join the
+        // worker threads, which provides the final barrier for those tasks.
+        {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+            while (m_pendingAsync.load(std::memory_order_acquire) > 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            const auto leaked = m_pendingAsync.load(std::memory_order_acquire);
+            if (leaked > 0) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"TimeBasedEvasionDetector::Shutdown drain timed out with %zu pending async tasks",
+                    leaked);
+            }
+        }
 
         // Clear state
         {
@@ -859,8 +891,19 @@ struct TimeBasedEvasionDetector::Impl {
         result.processId = processId;
         result.analysisStartTime = std::chrono::system_clock::now();
 
+        // CONCURRENCY FIX: snapshot the config under shared_lock once and
+        // reuse the local copy for every subsequent decision. Reading
+        // m_config fields directly (e.g. enableResultCache, sampleInterval,
+        // resultCacheTTL) while another thread is mid-UpdateConfig produces
+        // torn reads on chrono::milliseconds and size_t.
+        TimingDetectorConfig config;
+        {
+            std::shared_lock lock(m_mutex);
+            config = m_config;
+        }
+
         // Check cache first
-        if (m_config.enableResultCache) {
+        if (config.enableResultCache) {
             auto cached = GetCachedResult(processId);
             if (cached) {
                 m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -890,12 +933,7 @@ struct TimeBasedEvasionDetector::Impl {
             result.parentProcessName = parentInfo.name;
         }
 
-        // Run detection checks
-        TimingDetectorConfig config;
-        {
-            std::shared_lock lock(m_mutex);
-            config = m_config;
-        }
+        // Run detection checks (use the already-captured config snapshot above).
 
         if (config.detectRDTSC) {
             CheckRDTSCAbuse(processId, procInfo.is64Bit, result);
@@ -946,6 +984,34 @@ struct TimeBasedEvasionDetector::Impl {
             m_stats.totalEvasionsDetected.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // STATS FIX: maintain EMA of analysis duration (alpha = 1/8) via a CAS
+        // loop and surface lastAnalysisTimestamp. detectionsByType is updated
+        // via per-finding fan-out below. These fields were declared but never
+        // written outside Reset(), leaving telemetry permanently zeroed.
+        {
+            const uint64_t durationUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    result.analysisEndTime - result.analysisStartTime).count());
+            uint64_t prev = m_stats.avgAnalysisDurationUs.load(std::memory_order_relaxed);
+            for (;;) {
+                const uint64_t next = (prev == 0)
+                    ? durationUs
+                    : prev - (prev >> 3) + (durationUs >> 3);
+                if (m_stats.avgAnalysisDurationUs.compare_exchange_weak(
+                        prev, next, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+            m_stats.lastAnalysisTimestamp.store(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()),
+                std::memory_order_relaxed);
+        }
+        for (const auto& finding : result.findings) {
+            const auto idx = static_cast<uint8_t>(finding.type);
+            m_stats.detectionsByType[idx].fetch_add(1, std::memory_order_relaxed);
+        }
+
         // Update cache
         if (config.enableResultCache) {
             UpdateCache(processId, result);
@@ -958,7 +1024,18 @@ struct TimeBasedEvasionDetector::Impl {
         uint32_t processId,
         std::function<void(TimingEvasionResult)> callback)
     {
-        if (!m_threadPool) {
+        // CONCURRENCY FIX: read m_threadPool under m_mutex so a concurrent
+        // Shutdown() cannot race the null-check against the deref. Take a copy
+        // of the shared_ptr; the local strong reference keeps the pool alive
+        // for the duration of Submit() even if Shutdown completes immediately
+        // afterwards.
+        std::shared_ptr<Utils::ThreadPool> pool;
+        {
+            std::shared_lock lock(m_mutex);
+            pool = m_threadPool;
+        }
+
+        if (!pool) {
             // Run synchronously if no thread pool
             callback(AnalyzeProcess(processId));
             return true;
@@ -969,7 +1046,16 @@ struct TimeBasedEvasionDetector::Impl {
         // ThreadPool properly manages thread lifetime and allows graceful shutdown
         try {
             // Use Submit with TaskContext parameter as required by ThreadPool API
-            (void)m_threadPool->Submit([this, processId, callback = std::move(callback)](const Utils::TaskContext& /*ctx*/) {
+            m_pendingAsync.fetch_add(1, std::memory_order_acq_rel);
+            (void)pool->Submit([this, processId, callback = std::move(callback)](const Utils::TaskContext& /*ctx*/) {
+                // RAII guard: always decrement on exit so Shutdown's drain
+                // makes forward progress even on exceptions thrown out of
+                // AnalyzeProcess or the user's callback.
+                struct PendingGuard {
+                    std::atomic<size_t>& counter;
+                    ~PendingGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
+                } pendingGuard{ m_pendingAsync };
+
                 // Check if detector is still active before proceeding
                 if (!m_initialized.load(std::memory_order_acquire)) {
                     SS_LOG_WARN(LOG_CATEGORY, L"Async analysis cancelled - detector shutdown");
@@ -990,6 +1076,9 @@ struct TimeBasedEvasionDetector::Impl {
             });
             return true;
         } catch (const std::exception& e) {
+            // Submit threw before the task was queued — undo the increment
+            // we made above to avoid wedging Shutdown's drain forever.
+            m_pendingAsync.fetch_sub(1, std::memory_order_acq_rel);
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to queue async analysis: %hs", e.what());
             return false;
         }
@@ -1080,7 +1169,12 @@ struct TimeBasedEvasionDetector::Impl {
 
             SIZE_T bytesRead = 0;
             if (Utils::ProcessUtils::ReadProcessMemory(processId,
-                mainModule.baseAddress, codeBuffer.data(), scanSize, &bytesRead)) {
+                mainModule.baseAddress, codeBuffer.data(), scanSize, &bytesRead) &&
+                bytesRead >= TimingPatterns::RDTSC_PATTERN.size()) {
+                // ROBUSTNESS FIX: ReadProcessMemory can succeed with bytesRead
+                // == 0 (or below the minimum pattern size) on protected pages.
+                // Skip pattern scanning / disasm in that case to avoid wasted
+                // work and ensure no degenerate disasm walk.
 
                 // Count RDTSC instructions
                 analysis.rdtscCount = TimingPatterns::CountPatternOccurrences(
@@ -1659,6 +1753,14 @@ struct TimeBasedEvasionDetector::Impl {
             else if (typeVal >= 40 && typeVal <= 59) ++apiCount;    // API Timing (40-59)
             else if (typeVal >= 60 && typeVal <= 79) ++ntpCount;    // NTP/Network (60-79)
             else if (typeVal >= 80 && typeVal <= 119) ++apiCount;   // Hardware+SideChannel → API category
+            // CORRELATION FIX: types 120-139 (TimingAntiDebug family) were
+            // previously dropped on the floor here, so a process raising only
+            // an anti-debug timing finding plus, say, an RDTSC finding never
+            // tripped the multi-technique correlation. Route into rdtscCount
+            // since the anti-debug family is dominated by rdtsc-style probes.
+            else if (typeVal >= 120 && typeVal <= 139) ++rdtscCount;
+            // 140+ (MultiTechniqueEvasion sentinel) intentionally not counted
+            // here — that bucket is *produced* by this routine, not consumed.
         }
 
         size_t categoryCount = 0;
@@ -1728,8 +1830,13 @@ struct TimeBasedEvasionDetector::Impl {
         result.confidence = maxConfidence;
         result.severity = maxSeverity;
         result.primaryEvasionType = primaryType;
-        result.isEvasive = (result.threatScore >= 20.0f ||
-            maxSeverity >= TimingEvasionSeverity::Medium);
+        // CORRECTNESS FIX: only *raise* isEvasive — Check* routines may have
+        // already set it on Low-severity findings whose threatScore alone
+        // would not cross the threshold here. Overwriting unconditionally
+        // silently downgrades those detections.
+        result.isEvasive = result.isEvasive ||
+            (result.threatScore >= 20.0f) ||
+            (maxSeverity >= TimingEvasionSeverity::Medium);
     }
 
     void AddMitreMappings(TimingEvasionResult& result) {
@@ -1783,30 +1890,52 @@ struct TimeBasedEvasionDetector::Impl {
     // ========================================================================
 
     [[nodiscard]] bool StartMonitoring(uint32_t processId) {
+        // CONCURRENCY FIX: snapshot config under m_mutex (writers take unique
+        // mode in UpdateConfig). Reading maxMonitoredProcesses /
+        // maxEventsPerProcess directly across threads is a torn-read race.
+        size_t maxMonitored, maxEventsPerProc;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            maxMonitored     = m_config.maxMonitoredProcesses;
+            maxEventsPerProc = m_config.maxEventsPerProcess;
+        }
+
         std::unique_lock lock(m_monitorMutex);
 
-        if (m_monitoredProcesses.size() >= m_config.maxMonitoredProcesses) {
+        // CAP FIX: use try_emplace so a brand-new PID is only inserted once
+        // we have observed the cap permits it. The previous operator[]
+        // pattern would default-insert a null unique_ptr before the cap
+        // check observed it, and any allocation failure during the
+        // subsequent make_unique would leave that null entry behind,
+        // permanently consuming a monitoring slot.
+        auto it = m_monitoredProcesses.find(processId);
+        const bool isNew = (it == m_monitoredProcesses.end());
+        if (isNew && m_monitoredProcesses.size() >= maxMonitored) {
             SS_LOG_WARN(LOG_CATEGORY, L"Maximum monitored processes reached");
             return false;
         }
 
-        auto& ctx = m_monitoredProcesses[processId];
-        if (!ctx) {
-            ctx = std::make_unique<ProcessMonitoringContext>();
+        if (isNew) {
+            auto ins = m_monitoredProcesses.try_emplace(processId,
+                std::make_unique<ProcessMonitoringContext>());
+            it = ins.first;
+            auto& ctx = it->second;
             ctx->processId = processId;
-            ctx->maxEventCapacity = m_config.maxEventsPerProcess;
-            ctx->events.reserve(m_config.maxEventsPerProcess);
+            ctx->maxEventCapacity = maxEventsPerProc;
+            ctx->events.reserve(maxEventsPerProc);
             m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
-        } else if (ctx->state == MonitoringState::Completed) {
+        } else if (it->second->state == MonitoringState::Completed) {
             // Re-activating a completed process — reset context and re-count
-            ctx = std::make_unique<ProcessMonitoringContext>();
+            it->second = std::make_unique<ProcessMonitoringContext>();
+            auto& ctx = it->second;
             ctx->processId = processId;
-            ctx->maxEventCapacity = m_config.maxEventsPerProcess;
-            ctx->events.reserve(m_config.maxEventsPerProcess);
+            ctx->maxEventCapacity = maxEventsPerProc;
+            ctx->events.reserve(maxEventsPerProc);
             m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
         }
         // If already Active or Paused, do NOT increment counter
 
+        auto& ctx = it->second;
         ctx->state = MonitoringState::Active;
         ctx->startTime = std::chrono::steady_clock::now();
         ctx->lastUpdate = ctx->startTime;
@@ -1964,6 +2093,14 @@ struct TimeBasedEvasionDetector::Impl {
     }
 
     [[nodiscard]] std::optional<TimingEvasionResult> GetCachedResult(uint32_t processId) const {
+        // CONCURRENCY FIX: read resultCacheTTL under m_mutex; otherwise an
+        // ongoing UpdateConfig would tear the chrono::milliseconds value here.
+        std::chrono::minutes ttl;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            ttl = m_config.resultCacheTTL;
+        }
+
         std::shared_lock lock(m_cacheMutex);
 
         auto it = m_resultCache.find(processId);
@@ -1976,7 +2113,7 @@ struct TimeBasedEvasionDetector::Impl {
         auto age = std::chrono::duration_cast<std::chrono::minutes>(
             now - it->second.timestamp);
 
-        if (age > m_config.resultCacheTTL) {
+        if (age > ttl) {
             return std::nullopt;
         }
 
@@ -2091,9 +2228,18 @@ private:
             while (m_monitoringActive.load(std::memory_order_acquire)) {
                 MonitoringLoop();
 
-                // Sleep for sample interval
+                // CONCURRENCY FIX: snapshot sampleInterval under m_mutex;
+                // a torn read of chrono::milliseconds during UpdateConfig
+                // could otherwise produce a negative or garbage timeout
+                // and degenerate wait_for into a busy spin.
+                std::chrono::milliseconds interval;
+                {
+                    std::shared_lock cfgLock(m_mutex);
+                    interval = m_config.sampleInterval;
+                }
+
                 std::unique_lock lock(m_monitoringCvMutex);
-                m_monitoringCv.wait_for(lock, m_config.sampleInterval, [this]() {
+                m_monitoringCv.wait_for(lock, interval, [this]() {
                     return !m_monitoringActive.load(std::memory_order_acquire);
                 });
             }
@@ -2180,11 +2326,18 @@ public:
     }
 
     void RecordTimingEvent(const TimingEventRecord& event) {
+        // CONCURRENCY FIX: snapshot maxEventsPerProcess under m_mutex.
+        size_t maxEvents;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            maxEvents = m_config.maxEventsPerProcess;
+        }
+
         {
             std::unique_lock lock(m_monitorMutex);
             auto it = m_monitoredProcesses.find(event.processId);
             if (it != m_monitoredProcesses.end()) {
-                it->second->AddEvent(event, m_config.maxEventsPerProcess);
+                it->second->AddEvent(event, maxEvents);
             }
         }
 
@@ -2224,7 +2377,12 @@ public:
                      j < std::min(i + MAX_DISTANCE, bufferSize - 1); ++j) {
                     if (TimingPatterns::MatchPattern(buffer, bufferSize, j, TimingPatterns::RDTSC_PATTERN)) {
                         ++count;
-                        i = j;  // Skip past this combo
+                        // CORRECTNESS FIX: advance only past the CPUID we just
+                        // consumed (the outer ++i then steps one further).
+                        // Previously we jumped i to j (the RDTSC offset) which
+                        // skipped any intermediate bytes that might host an
+                        // adjacent CPUID-RDTSC pair in chained anti-VM idioms.
+                        i += TimingPatterns::CPUID_PATTERN.size() - 1;
                         break;
                     }
                 }
@@ -2288,6 +2446,12 @@ public:
 
             offset += instruction.length;
             ++instructionCount;
+            // LIVELOCK GUARD: defensively bail if the decoder ever returns
+            // success with length 0 — without this we would spin until
+            // MAX_INSTRUCTIONS_PER_SCAN at 100% CPU.
+            if (instruction.length == 0) {
+                ++offset;
+            }
         }
 
         analysis.rdtscCount = std::max(analysis.rdtscCount, rdtscCount);
