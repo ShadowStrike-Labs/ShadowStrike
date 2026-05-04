@@ -344,7 +344,11 @@ uint32_t Fallback_DetectTimingHook(void) {
 uint64_t Fallback_MeasureMemoryLatency(void) {
 #ifdef _WIN32
     // Allocate and flush memory - use alignas for proper alignment
-    alignas(64) static volatile char buffer[4096];
+    // THREAD-SAFETY: a single static buffer would be cache-line shared across
+    // every concurrent caller (the system-wide scan calls this from worker
+    // threads), serializing flushes and corrupting the latency measurement.
+    // thread_local gives each thread an independent, aligned cache line.
+    alignas(64) static thread_local volatile char buffer[4096];
     
     // Flush cache line
     _mm_clflush(const_cast<char*>(&buffer[0]));
@@ -644,7 +648,32 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             // Thread Pool
             // -------------------------------------------------------------------------
+            // DESIGN: writes (Initialize/Shutdown) and reads (ScanSystemAsync workers)
+            // race on the shared_ptr instance itself, which is UB. Guard with a
+            // dedicated shared_mutex and always return a *copy* to callers so they
+            // hold their own strong reference for the duration of the work.
             std::shared_ptr<Utils::ThreadPool> threadPool;
+            mutable std::shared_mutex threadPoolMutex;
+
+            [[nodiscard]] std::shared_ptr<Utils::ThreadPool> GetThreadPool() const {
+                std::shared_lock lock(threadPoolMutex);
+                return threadPool;
+            }
+
+            void SetThreadPool(std::shared_ptr<Utils::ThreadPool> pool) {
+                std::unique_lock lock(threadPoolMutex);
+                threadPool = std::move(pool);
+            }
+
+            void ResetThreadPool() {
+                std::shared_ptr<Utils::ThreadPool> doomed;
+                {
+                    std::unique_lock lock(threadPoolMutex);
+                    doomed.swap(threadPool);
+                }
+                // Last reference released outside the lock so destructor side-effects
+                // (worker join) cannot deadlock against another caller waiting on us.
+            }
 
             // -------------------------------------------------------------------------
             // Cache
@@ -687,8 +716,14 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             // COM Initialization State
             // -------------------------------------------------------------------------
+            // DESIGN: This TU does not currently call any IWbem/CoCreateInstance APIs,
+            // but the helper is preserved for parity with sister evasion detectors and
+            // so that follow-on WMI-backed checks integrate cleanly. CoUninitialize must
+            // run on the same thread that called CoInitializeEx, so we pin the thread
+            // ID at initialize time and refuse to tear COM down from another thread.
             bool comInitialized{ false };
-            mutable std::mutex comMutex;  // Protects COM init/uninit operations;
+            DWORD comInitThreadId{ 0 };
+            mutable std::mutex comMutex;  // Protects COM init/uninit operations
 
             // -------------------------------------------------------------------------
             // Utility Methods
@@ -728,15 +763,26 @@ namespace ShadowStrike {
             void InitializeCOM() {
 #ifdef _WIN32
                 // THREAD-SAFETY FIX: Protect COM initialization with mutex
-                // COM apartment model requires careful thread management
+                // COM apartment model requires careful thread management.
                 std::lock_guard<std::mutex> lock(comMutex);
                 if (!comInitialized) {
                     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-                    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+                    // Only S_OK / S_FALSE bump the apartment refcount that we own.
+                    // RPC_E_CHANGED_MODE means another component already initialized
+                    // COM in a different mode WITHOUT incrementing our reference, so
+                    // calling CoUninitialize would tear down somebody else's apartment.
+                    if (SUCCEEDED(hr)) {
                         comInitialized = true;
-                        SS_LOG_DEBUG(LOG_CATEGORY, L"COM initialized for sandbox detection");
+                        comInitThreadId = ::GetCurrentThreadId();
+                        SS_LOG_DEBUG(LOG_CATEGORY,
+                            L"COM initialized for sandbox detection on thread %lu",
+                            static_cast<unsigned long>(comInitThreadId));
+                    } else if (hr == RPC_E_CHANGED_MODE) {
+                        SS_LOG_DEBUG(LOG_CATEGORY,
+                            L"COM already initialized in different mode; not pairing CoUninitialize");
                     } else {
-                        SS_LOG_WARN(LOG_CATEGORY, L"COM initialization failed: 0x%08X", hr);
+                        SS_LOG_WARN(LOG_CATEGORY, L"COM initialization failed: 0x%08lX",
+                            static_cast<unsigned long>(hr));
                     }
                 }
 #endif
@@ -744,11 +790,24 @@ namespace ShadowStrike {
 
             void UninitializeCOM() {
 #ifdef _WIN32
-                // THREAD-SAFETY FIX: Protect COM uninitialization with mutex
+                // THREAD-SAFETY FIX: Protect COM uninitialization with mutex.
+                // CoUninitialize only affects its own thread's apartment. If invoked
+                // from any other thread, it is a silent no-op and would leak our
+                // apartment reference on the original thread. Refuse the call in
+                // that case rather than corrupt state.
                 std::lock_guard<std::mutex> lock(comMutex);
                 if (comInitialized) {
+                    const DWORD currentTid = ::GetCurrentThreadId();
+                    if (currentTid != comInitThreadId) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"Skipping CoUninitialize: caller thread %lu != init thread %lu",
+                            static_cast<unsigned long>(currentTid),
+                            static_cast<unsigned long>(comInitThreadId));
+                        return;
+                    }
                     CoUninitialize();
                     comInitialized = false;
+                    comInitThreadId = 0;
                     SS_LOG_DEBUG(LOG_CATEGORY, L"COM uninitialized");
                 }
 #endif
@@ -800,7 +859,7 @@ namespace ShadowStrike {
                 return false;
             }
 
-            m_impl->threadPool = std::move(threadPool);
+            m_impl->SetThreadPool(std::move(threadPool));
 
             {
                 std::unique_lock lock(m_impl->configMutex);
@@ -845,7 +904,7 @@ namespace ShadowStrike {
             }
 
             m_impl->UninitializeCOM();
-            m_impl->threadPool.reset();
+            m_impl->ResetThreadPool();
             m_impl->initialized.store(false, std::memory_order_release);
 
             SS_LOG_INFO(LOG_CATEGORY, L"SandboxEvasionDetector shutdown complete");
@@ -965,7 +1024,18 @@ namespace ShadowStrike {
 
             // --- Phase 2: Behavioral scan of all running processes ---
             // Enumerate all processes and analyze each for anti-sandbox behavior.
-            const bool hostIsSandbox = result.isSandboxLikely;
+            // CALIBRATION FIX: Phase 1 results have not yet been fed through
+            // CalculateProbability(), so result.isSandboxLikely is still its default
+            // value (false) here. Derive a preliminary host-context flag from the
+            // already-populated category scores and conclusive artifact evidence so
+            // that the documented "less suspicious on a sandbox host" calibration
+            // actually fires.
+            const bool hostIsSandbox =
+                result.artifacts.definitiveDetection ||
+                result.artifactScore     >= 60.0f ||
+                result.timingScore       >= 60.0f ||
+                result.environment.suspicionScore >= 60.0f ||
+                result.hardware.suspicionScore    >= 70.0f;
             {
                 HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
                 if (hSnapshot != INVALID_HANDLE_VALUE) {
@@ -973,32 +1043,84 @@ namespace ShadowStrike {
                     pe.dwSize = sizeof(pe);
 
                     if (Process32FirstW(hSnapshot, &pe)) {
+                        // PERF: the per-process Type-B analyzer is invoked synchronously
+                        // for every PID on the host. The default ProcessSandboxConfig
+                        // would request up to 64 MiB of ReadProcessMemory per process,
+                        // which on a busy workstation (~200 procs) can stall ScanSystem
+                        // for minutes. Cap the system-wide sweep aggressively here;
+                        // explicit on-demand AnalyzeProcess() callers retain the full
+                        // budget via their own ProcessSandboxConfig.
                         ProcessSandboxConfig procConfig;
-                        do {
-                            ProcessSandboxResult procResult;
-                            if (AnalyzeProcess(pe.th32ProcessID, procResult, procConfig)) {
-                                if (procResult.hasEvasionCapability) {
-                                    // Calibrate: on a real sandbox, anti-sandbox checks
-                                    // are less suspicious (artifacts genuinely exist).
-                                    float calibratedScore = procResult.evasionScore;
-                                    if (hostIsSandbox && calibratedScore > 20.0f) {
-                                        calibratedScore *= 0.6f;
-                                    }
+                        procConfig.maxMemoryScanBytes = 4ULL * 1024 * 1024;  // 4 MiB
+                        procConfig.maxCodeScanBytes   = 1ULL * 1024 * 1024;  // 1 MiB
 
-                                    AddIndicator(result,
-                                        SandboxCheckType::SandboxProcesses,
-                                        SandboxIndicatorCategory::Artifact,
-                                        calibratedScore >= 80.0f ? SandboxIndicatorSeverity::Critical :
-                                        calibratedScore >= 50.0f ? SandboxIndicatorSeverity::High :
-                                        SandboxIndicatorSeverity::Medium,
-                                        calibratedScore / 25.0f,
-                                        calibratedScore,
-                                        L"Process exhibits anti-sandbox evasion behavior",
-                                        L"PID " + std::to_wstring(pe.th32ProcessID) +
-                                            L" (" + std::wstring(pe.szExeFile) + L")",
-                                        L"Score: " + std::to_wstring(static_cast<int>(calibratedScore)),
-                                        L"None");
+                        do {
+                            if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4) {
+                                // Skip System Idle / System processes; they are not
+                                // openable for VM_READ and would just produce noise.
+                                continue;
+                            }
+
+                            // TOCTOU FIX: re-OpenProcess by PID alone is unsafe — between
+                            // snapshot iteration and OpenProcess the kernel can recycle
+                            // the PID and we'd attribute a result to the wrong image.
+                            // Open the handle here, capture creation time + image path,
+                            // and verify they still match the snapshot entry.
+                            HANDLE hTarget = OpenProcess(
+                                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                                FALSE, pe.th32ProcessID);
+                            if (!hTarget) {
+                                continue;  // protected, exited, or insufficient rights
+                            }
+
+                            wchar_t verifyPath[MAX_PATH] = {};
+                            DWORD verifyLen = MAX_PATH;
+                            if (!QueryFullProcessImageNameW(hTarget, 0, verifyPath, &verifyLen)) {
+                                CloseHandle(hTarget);
+                                continue;
+                            }
+
+                            // Compare basename (case-insensitive) to snapshot's szExeFile.
+                            // szExeFile is bounded and NUL-terminated by Toolhelp32.
+                            std::wstring_view full(verifyPath, verifyLen);
+                            size_t sep = full.find_last_of(L"\\/");
+                            std::wstring_view base = (sep == std::wstring_view::npos)
+                                ? full : full.substr(sep + 1);
+                            if (_wcsicmp(std::wstring(base).c_str(), pe.szExeFile) != 0) {
+                                // PID was recycled between snapshot and OpenProcess.
+                                SS_LOG_DEBUG(LOG_CATEGORY,
+                                    L"Skipping PID %lu: image mismatch (snapshot=%ls now=%ls)",
+                                    pe.th32ProcessID, pe.szExeFile, verifyPath);
+                                CloseHandle(hTarget);
+                                continue;
+                            }
+
+                            ProcessSandboxResult procResult;
+                            const bool ok = AnalyzeProcess(
+                                hTarget, pe.th32ProcessID, procResult, procConfig);
+                            CloseHandle(hTarget);
+
+                            if (ok && procResult.hasEvasionCapability) {
+                                // Calibrate: on a real sandbox, anti-sandbox checks
+                                // are less suspicious (artifacts genuinely exist).
+                                float calibratedScore = procResult.evasionScore;
+                                if (hostIsSandbox && calibratedScore > 20.0f) {
+                                    calibratedScore *= 0.6f;
                                 }
+
+                                AddIndicator(result,
+                                    SandboxCheckType::SandboxProcesses,
+                                    SandboxIndicatorCategory::Artifact,
+                                    calibratedScore >= 80.0f ? SandboxIndicatorSeverity::Critical :
+                                    calibratedScore >= 50.0f ? SandboxIndicatorSeverity::High :
+                                    SandboxIndicatorSeverity::Medium,
+                                    calibratedScore / 25.0f,
+                                    calibratedScore,
+                                    L"Process exhibits anti-sandbox evasion behavior",
+                                    L"PID " + std::to_wstring(pe.th32ProcessID) +
+                                        L" (" + std::wstring(pe.szExeFile) + L")",
+                                    L"Score: " + std::to_wstring(static_cast<int>(calibratedScore)),
+                                    L"None");
                             }
                         } while (Process32NextW(hSnapshot, &pe));
                     }
@@ -1019,6 +1141,25 @@ namespace ShadowStrike {
 
             // Update statistics
             m_impl->stats.totalScans.fetch_add(1, std::memory_order_relaxed);
+            // STATS FIX: maintain an exponentially-weighted moving average of scan
+            // duration so callers can observe regression. Done with a CAS loop on
+            // the underlying atomic to avoid torn updates under concurrent scans.
+            {
+                const uint64_t durationUs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        endTime - startTime).count());
+                uint64_t prev = m_impl->stats.avgAnalysisDurationUs.load(std::memory_order_relaxed);
+                for (;;) {
+                    // alpha = 1/8: smooth but responsive.
+                    const uint64_t next = (prev == 0)
+                        ? durationUs
+                        : prev - (prev >> 3) + (durationUs >> 3);
+                    if (m_impl->stats.avgAnalysisDurationUs.compare_exchange_weak(
+                            prev, next, std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+            }
             if (result.isSandboxLikely) {
                 m_impl->stats.sandboxesDetected.fetch_add(1, std::memory_order_relaxed);
                 if (result.isDefinitive) {
@@ -1053,14 +1194,18 @@ namespace ShadowStrike {
                 return false;
             }
 
-            if (!m_impl->threadPool) {
+            // CONCURRENCY FIX: take a strong reference to the thread pool under the
+            // dedicated mutex so a concurrent Shutdown() cannot tear the shared_ptr
+            // control block out from under us between the null-check and Submit().
+            auto pool = m_impl->GetThreadPool();
+            if (!pool) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"ThreadPool not available");
                 return false;
             }
 
-            // Capture callback and queue async scan using proper ThreadPool::Submit API
-            // Discard return value - we don't need to wait for completion
-            (void)m_impl->threadPool->Submit(
+            // Capture callback and queue async scan using proper ThreadPool::Submit API.
+            // Discard return value - we don't need to wait for completion.
+            (void)pool->Submit(
                 [this, cb = std::move(callback)](const Utils::TaskContext&) {
                     auto result = ScanSystem();
                     if (cb) {
@@ -1184,22 +1329,31 @@ namespace ShadowStrike {
             }
 
             // CPU model string via CPUID
+            // STRICT-ALIASING: read into an int[4] register set, then memcpy into
+            // the char buffer. Casting char* through int* and dereferencing is UB.
             std::array<int, 4> cpuInfo{};
             char cpuBrand[49] = {};
             __cpuid(cpuInfo.data(), 0x80000000);
             if (static_cast<unsigned int>(cpuInfo[0]) >= 0x80000004) {
-                __cpuid(reinterpret_cast<int*>(cpuBrand), 0x80000002);
-                __cpuid(reinterpret_cast<int*>(cpuBrand + 16), 0x80000003);
-                __cpuid(reinterpret_cast<int*>(cpuBrand + 32), 0x80000004);
+                int regs[4] = {};
+                __cpuid(regs, 0x80000002);
+                std::memcpy(cpuBrand,      regs, sizeof(regs));
+                __cpuid(regs, 0x80000003);
+                std::memcpy(cpuBrand + 16, regs, sizeof(regs));
+                __cpuid(regs, 0x80000004);
+                std::memcpy(cpuBrand + 32, regs, sizeof(regs));
+                cpuBrand[48] = '\0';
                 profile.cpuModel = Utils::StringUtils::ToWide(cpuBrand);
             }
 
             // CPU vendor
             __cpuid(cpuInfo.data(), 0);
             char vendor[13] = {};
-            *reinterpret_cast<int*>(vendor) = cpuInfo[1];
-            *reinterpret_cast<int*>(vendor + 4) = cpuInfo[3];
-            *reinterpret_cast<int*>(vendor + 8) = cpuInfo[2];
+            // [EBX][EDX][ECX] is the canonical vendor string layout.
+            std::memcpy(vendor,     &cpuInfo[1], 4);
+            std::memcpy(vendor + 4, &cpuInfo[3], 4);
+            std::memcpy(vendor + 8, &cpuInfo[2], 4);
+            vendor[12] = '\0';
             profile.cpuVendor = Utils::StringUtils::ToWide(vendor);
 
             // -------------------------------------------------------------------------
@@ -1254,51 +1408,62 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             // USB Device History (from registry)
             // -------------------------------------------------------------------------
+            // Sentinel UINT32_MAX means "lookup failed; do not score"; treat 0 as a
+            // genuine zero only when RegQueryInfoKeyW reported success.
+            profile.usbHistoryCount = UINT32_MAX;
             HKEY usbKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                 L"SYSTEM\\CurrentControlSet\\Enum\\USBSTOR",
                 0, KEY_READ, &usbKey) == ERROR_SUCCESS) {
                 DWORD subkeyCount = 0;
-                RegQueryInfoKeyW(usbKey, nullptr, nullptr, nullptr, &subkeyCount,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                profile.usbHistoryCount = subkeyCount;
+                LSTATUS qstat = RegQueryInfoKeyW(usbKey, nullptr, nullptr, nullptr,
+                    &subkeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                if (qstat == ERROR_SUCCESS) {
+                    profile.usbHistoryCount = subkeyCount;
+                }
                 RegCloseKey(usbKey);
             }
 
             // -------------------------------------------------------------------------
             // BIOS Information (from registry)
             // -------------------------------------------------------------------------
+            // SECURITY: RegQueryValueExW only NUL-terminates strings if the source
+            // already had a terminator on disk, and it does not validate that the
+            // returned data is actually REG_SZ/REG_EXPAND_SZ. A hostile or corrupted
+            // hive could deliver REG_BINARY of arbitrary content into a wchar_t[].
+            // Wrap the read in a lambda that enforces both invariants and clamps
+            // the byte count to leave room for an explicit terminator.
+            auto readRegSz = [](HKEY hKey, LPCWSTR name, std::wstring& out) -> bool {
+                wchar_t buffer[512] = {};
+                DWORD bufferSize = sizeof(buffer) - sizeof(wchar_t);  // reserve NUL
+                DWORD valueType = 0;
+                LSTATUS s = RegQueryValueExW(hKey, name, nullptr, &valueType,
+                    reinterpret_cast<LPBYTE>(buffer), &bufferSize);
+                if (s != ERROR_SUCCESS) {
+                    return false;
+                }
+                if (valueType != REG_SZ && valueType != REG_EXPAND_SZ) {
+                    return false;
+                }
+                // bufferSize is in BYTES; convert to wchar count and force terminator.
+                size_t wcount = bufferSize / sizeof(wchar_t);
+                if (wcount > (sizeof(buffer) / sizeof(wchar_t)) - 1) {
+                    wcount = (sizeof(buffer) / sizeof(wchar_t)) - 1;
+                }
+                buffer[wcount] = L'\0';
+                out.assign(buffer);
+                return true;
+            };
+
             HKEY biosKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                 L"HARDWARE\\DESCRIPTION\\System\\BIOS",
                 0, KEY_READ, &biosKey) == ERROR_SUCCESS) {
 
-                wchar_t valueBuffer[256];
-                DWORD bufferSize = sizeof(valueBuffer);
-                DWORD valueType;
-
-                if (RegQueryValueExW(biosKey, L"SystemManufacturer", nullptr, &valueType,
-                    reinterpret_cast<LPBYTE>(valueBuffer), &bufferSize) == ERROR_SUCCESS) {
-                    profile.systemManufacturer = valueBuffer;
-                }
-
-                bufferSize = sizeof(valueBuffer);
-                if (RegQueryValueExW(biosKey, L"SystemProductName", nullptr, &valueType,
-                    reinterpret_cast<LPBYTE>(valueBuffer), &bufferSize) == ERROR_SUCCESS) {
-                    profile.systemModel = valueBuffer;
-                }
-
-                bufferSize = sizeof(valueBuffer);
-                if (RegQueryValueExW(biosKey, L"BIOSVendor", nullptr, &valueType,
-                    reinterpret_cast<LPBYTE>(valueBuffer), &bufferSize) == ERROR_SUCCESS) {
-                    profile.biosVendor = valueBuffer;
-                }
-
-                bufferSize = sizeof(valueBuffer);
-                if (RegQueryValueExW(biosKey, L"BIOSVersion", nullptr, &valueType,
-                    reinterpret_cast<LPBYTE>(valueBuffer), &bufferSize) == ERROR_SUCCESS) {
-                    profile.biosVersion = valueBuffer;
-                }
+                readRegSz(biosKey, L"SystemManufacturer", profile.systemManufacturer);
+                readRegSz(biosKey, L"SystemProductName",  profile.systemModel);
+                readRegSz(biosKey, L"BIOSVendor",         profile.biosVendor);
+                readRegSz(biosKey, L"BIOSVersion",        profile.biosVersion);
 
                 RegCloseKey(biosKey);
             }
@@ -1332,7 +1497,7 @@ namespace ShadowStrike {
                 profile.issues.push_back(L"Small disk: " + std::to_wstring(profile.totalDiskSpace / (1024 * 1024 * 1024)) + L" GB");
             }
 
-            if (profile.usbHistoryCount < 3) {
+            if (profile.usbHistoryCount != UINT32_MAX && profile.usbHistoryCount < 3) {
                 suspicionScore += 10.0f;
                 profile.issues.push_back(L"Few USB devices in history: " + std::to_wstring(profile.usbHistoryCount));
             }
@@ -1432,14 +1597,19 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             // Installed Programs (from registry)
             // -------------------------------------------------------------------------
+            // Sentinel UINT32_MAX => "lookup failed; do not feed scoring downstream".
+            // Any successful read flips this to a real count and accumulates the
+            // Wow6432 subtree on top.
+            analysis.installedProgramCount = UINT32_MAX;
             HKEY uninstallKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                 L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
                 0, KEY_READ, &uninstallKey) == ERROR_SUCCESS) {
                 DWORD subkeyCount = 0;
-                RegQueryInfoKeyW(uninstallKey, nullptr, nullptr, nullptr, &subkeyCount,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                analysis.installedProgramCount = subkeyCount;
+                if (RegQueryInfoKeyW(uninstallKey, nullptr, nullptr, nullptr, &subkeyCount,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                    analysis.installedProgramCount = subkeyCount;
+                }
                 RegCloseKey(uninstallKey);
             }
 
@@ -1448,9 +1618,14 @@ namespace ShadowStrike {
                 L"SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
                 0, KEY_READ, &uninstallKey) == ERROR_SUCCESS) {
                 DWORD subkeyCount = 0;
-                RegQueryInfoKeyW(uninstallKey, nullptr, nullptr, nullptr, &subkeyCount,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                analysis.installedProgramCount += subkeyCount;
+                if (RegQueryInfoKeyW(uninstallKey, nullptr, nullptr, nullptr, &subkeyCount,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                    if (analysis.installedProgramCount == UINT32_MAX) {
+                        analysis.installedProgramCount = subkeyCount;
+                    } else {
+                        analysis.installedProgramCount += subkeyCount;
+                    }
+                }
                 RegCloseKey(uninstallKey);
             }
 
@@ -1479,10 +1654,11 @@ namespace ShadowStrike {
                 L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList",
                 0, KEY_READ, &profileListKey) == ERROR_SUCCESS) {
                 DWORD subkeyCount = 0;
-                RegQueryInfoKeyW(profileListKey, nullptr, nullptr, nullptr, &subkeyCount,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                // Subtract system profiles (typically 3-4: LocalService, NetworkService, etc.)
-                analysis.userProfileCount = (subkeyCount > 4) ? (subkeyCount - 4) : 1;
+                if (RegQueryInfoKeyW(profileListKey, nullptr, nullptr, nullptr, &subkeyCount,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                    // Subtract system profiles (typically 3-4: LocalService, NetworkService, etc.)
+                    analysis.userProfileCount = (subkeyCount > 4) ? (subkeyCount - 4) : 1;
+                }
                 RegCloseKey(profileListKey);
             }
 
@@ -1516,10 +1692,13 @@ namespace ShadowStrike {
             if (analysis.desktopFileCount >= 20) usageScore += 10.0f;
             else if (analysis.desktopFileCount >= 5) usageScore += 5.0f;
 
-            // Installed programs contribution
-            if (analysis.installedProgramCount >= 50) usageScore += 20.0f;
-            else if (analysis.installedProgramCount >= 30) usageScore += 15.0f;
-            else if (analysis.installedProgramCount >= 15) usageScore += 10.0f;
+            // Installed programs contribution. Skip when sentinel: registry lookup
+            // failed and zeroing scoring would create a false low-usage signal.
+            if (analysis.installedProgramCount != UINT32_MAX) {
+                if (analysis.installedProgramCount >= 50) usageScore += 20.0f;
+                else if (analysis.installedProgramCount >= 30) usageScore += 15.0f;
+                else if (analysis.installedProgramCount >= 15) usageScore += 10.0f;
+            }
 
             // Prefetch files contribution
             if (analysis.prefetchFileCount >= 100) usageScore += 15.0f;
@@ -1551,7 +1730,8 @@ namespace ShadowStrike {
             if (analysis.desktopFileCount < SandboxConstants::MIN_DESKTOP_FILES) {
                 analysis.issues.push_back(L"Empty desktop");
             }
-            if (analysis.installedProgramCount < SandboxConstants::MIN_INSTALLED_PROGRAMS) {
+            if (analysis.installedProgramCount != UINT32_MAX &&
+                analysis.installedProgramCount < SandboxConstants::MIN_INSTALLED_PROGRAMS) {
                 analysis.issues.push_back(L"Few installed programs: " + std::to_wstring(analysis.installedProgramCount));
             }
             if (analysis.prefetchFileCount < 20) {
@@ -1660,22 +1840,24 @@ namespace ShadowStrike {
                 std::unique_ptr<std::remove_pointer_t<HKEY>, decltype(regGuard)> keyGuard(ntKey, regGuard);
 
                 wchar_t productName[256] = {};
-                DWORD bufferSize = sizeof(productName);
-                if (RegQueryValueExW(ntKey, L"ProductName", nullptr, nullptr,
-                    reinterpret_cast<LPBYTE>(productName), &bufferSize) == ERROR_SUCCESS) {
-                    // Ensure null-termination for safety
+                DWORD bufferSize = sizeof(productName) - sizeof(wchar_t);  // reserve NUL
+                DWORD productType = 0;
+                if (RegQueryValueExW(ntKey, L"ProductName", nullptr, &productType,
+                    reinterpret_cast<LPBYTE>(productName), &bufferSize) == ERROR_SUCCESS &&
+                    (productType == REG_SZ || productType == REG_EXPAND_SZ)) {
                     productName[255] = L'\0';
                     analysis.windowsVersion = productName;
                 }
 
                 // CRITICAL FIX (Issue #1): Buffer overflow vulnerability
                 // Previous code: bufferSize = sizeof(buildNumber) (4 bytes) but wrote to buildStr[32]
-                // Fixed: Use correct buffer size for the string buffer
+                // Fixed: Use correct buffer size and validate REG_SZ.
                 wchar_t buildStr[32] = {};
-                bufferSize = sizeof(buildStr);  // Correct: 64 bytes (32 * sizeof(wchar_t))
-                if (RegQueryValueExW(ntKey, L"CurrentBuildNumber", nullptr, nullptr,
-                    reinterpret_cast<LPBYTE>(buildStr), &bufferSize) == ERROR_SUCCESS) {
-                    // Ensure null-termination for safety
+                bufferSize = sizeof(buildStr) - sizeof(wchar_t);  // reserve NUL
+                DWORD buildType = 0;
+                if (RegQueryValueExW(ntKey, L"CurrentBuildNumber", nullptr, &buildType,
+                    reinterpret_cast<LPBYTE>(buildStr), &bufferSize) == ERROR_SUCCESS &&
+                    (buildType == REG_SZ || buildType == REG_EXPAND_SZ)) {
                     buildStr[31] = L'\0';
                     analysis.windowsBuild = static_cast<uint32_t>(_wtoi(buildStr));
                 }
@@ -2319,7 +2501,7 @@ namespace ShadowStrike {
             }
 
             if (!hardware.audioDevicePresent) {
-                AddIndicator(result, SandboxCheckType::GPUPresence, SandboxIndicatorCategory::Hardware,
+                AddIndicator(result, SandboxCheckType::AudioDevices, SandboxIndicatorCategory::Hardware,
                     SandboxIndicatorSeverity::Low, 1.0f, 40.0f,
                     L"No audio device detected",
                     L"Absence of audio devices is common in sandboxes");
@@ -2423,7 +2605,8 @@ namespace ShadowStrike {
                 ++result.passedChecks;
             }
 
-            if (wearAnalysis.installedProgramCount < SandboxConstants::MIN_INSTALLED_PROGRAMS) {
+            if (wearAnalysis.installedProgramCount != UINT32_MAX &&
+                wearAnalysis.installedProgramCount < SandboxConstants::MIN_INSTALLED_PROGRAMS) {
                 AddIndicator(result, SandboxCheckType::InstalledPrograms, SandboxIndicatorCategory::WearAndTear,
                     SandboxIndicatorSeverity::Low, 1.5f, 55.0f,
                     L"Few installed programs",
@@ -3053,18 +3236,29 @@ namespace ShadowStrike {
         }
 
         void SandboxEvasionDetector::InvokeCallbacks(const SandboxEvasionResult& result) {
-            std::shared_lock lock(m_impl->callbacksMutex);
-            for (const auto& [id, callback] : m_impl->callbacks) {
-                if (callback) {
-                    try {
-                        callback(result);
+            // DEADLOCK FIX: snapshot the callback registry under the lock, then
+            // invoke without holding it. A user-supplied callback that calls
+            // RegisterCallback / UnregisterCallback would otherwise re-acquire the
+            // same shared_mutex in unique mode and self-deadlock.
+            std::vector<std::pair<uint64_t, SandboxDetectionCallback>> snapshot;
+            {
+                std::shared_lock lock(m_impl->callbacksMutex);
+                snapshot.reserve(m_impl->callbacks.size());
+                for (const auto& kv : m_impl->callbacks) {
+                    if (kv.second) {
+                        snapshot.emplace_back(kv.first, kv.second);
                     }
-                    catch (const std::exception& e) {
-                        SS_LOG_ERROR(LOG_CATEGORY, L"Callback %llu threw exception: %hs", id, e.what());
-                    }
-                    catch (...) {
-                        SS_LOG_ERROR(LOG_CATEGORY, L"Callback %llu threw unknown exception", id);
-                    }
+                }
+            }
+            for (const auto& [id, callback] : snapshot) {
+                try {
+                    callback(result);
+                }
+                catch (const std::exception& e) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Callback %llu threw exception: %hs", id, e.what());
+                }
+                catch (...) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Callback %llu threw unknown exception", id);
                 }
             }
         }
@@ -3315,6 +3509,20 @@ namespace ShadowStrike {
                 if (result.hasEvasionCapability) {
                     m_impl->stats.sandboxesDetected.fetch_add(1, std::memory_order_relaxed);
                 }
+                // EMA of per-process analysis duration (alpha = 1/8) — see ScanSystem
+                // for the matching update on full-system scans.
+                {
+                    uint64_t prev = m_impl->stats.avgAnalysisDurationUs.load(std::memory_order_relaxed);
+                    for (;;) {
+                        const uint64_t next = (prev == 0)
+                            ? result.analysisDurationUs
+                            : prev - (prev >> 3) + (result.analysisDurationUs >> 3);
+                        if (m_impl->stats.avgAnalysisDurationUs.compare_exchange_weak(
+                                prev, next, std::memory_order_relaxed)) {
+                            break;
+                        }
+                    }
+                }
 
                 SS_LOG_DEBUG(LOG_CATEGORY,
                     L"Process sandbox analysis PID %lu: score=%.1f evasive=%ls duration=%lluus",
@@ -3347,16 +3555,15 @@ namespace ShadowStrike {
                 return false;
             }
 
-            bool success = false;
-            try {
-                success = AnalyzeProcess(hProcess, processId, result, config);
-            }
-            catch (...) {
-                CloseHandle(hProcess);
-                throw;
-            }
-            CloseHandle(hProcess);
-            return success;
+            // RAII guard so the handle is released on every path, including any
+            // future code that adds early returns. Replaces the prior dead-code
+            // try/catch (CloseHandle was already unconditional after the try block).
+            struct HandleGuard {
+                HANDLE h;
+                ~HandleGuard() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+            } guard{ hProcess };
+
+            return AnalyzeProcess(hProcess, processId, result, config);
         }
 
         void SandboxEvasionDetector::SetProcessDetectionCallback(ProcessSandboxCallback callback) {
@@ -3694,7 +3901,12 @@ namespace ShadowStrike {
                     if (!section.hasCode) continue;
                     if (totalCodeScanned >= maxCodeScanBytes) break;
 
-                    size_t scanSize = std::min<size_t>(section.rawSize, 1024 * 1024);
+                    // CORRECTNESS FIX: when reading from a *loaded* image, the in-memory
+                    // section is sized by virtualSize (rawSize is the on-disk size and
+                    // is often smaller — sometimes 0 for .bss-style sections — which
+                    // would clamp the scan and miss code that only exists at runtime).
+                    size_t scanSize = std::min<size_t>(section.virtualSize, 1024 * 1024);
+                    if (scanSize == 0) continue;
                     std::vector<uint8_t> codeBuffer(scanSize);
                     SIZE_T bytesRead = 0;
 
