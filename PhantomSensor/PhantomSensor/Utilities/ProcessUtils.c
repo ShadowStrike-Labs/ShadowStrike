@@ -1779,6 +1779,22 @@ ShadowStrikeGetCreatingProcess(
     ProcessId = PsGetProcessId(Process);
 
     //
+    // Guard: the push lock and CreatingContextTable list-heads are only
+    // valid once the module has reached the INITIALIZED state. Touching
+    // ListHead->Flink before InitializeListHead has been called would
+    // dereference a NULL Flink pointer in the iteration loop below and
+    // BSOD the kernel. Without an explicit guard, ShadowStrikeGetProcessInfo
+    // could reach this path on the very first call before any consumer
+    // has triggered ShadowProcessUtilsInitialize. Fall back to the
+    // inherited (potentially spoofed) parent ID instead, which is what
+    // the not-found path already does.
+    //
+    if (g_ProcessUtilsState.InitializationState != PROCUTILS_STATE_INITIALIZED) {
+        *CreatingProcessId = PsGetProcessInheritedFromUniqueProcessId(Process);
+        return STATUS_SUCCESS;
+    }
+
+    //
     // Look up in our creating context table
     //
     Hash = ShadowHashProcessId(ProcessId);
@@ -1869,6 +1885,22 @@ ShadowStrikeStoreCreatingProcessContext(
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessUtilsState.CreatingContextLock);
+
+    //
+    // Re-check state and capacity inside the lock. The unlocked precheck
+    // above is racy against ShadowProcessUtilsCleanup (which transitions
+    // the state to UNINITIALIZED before draining) and against concurrent
+    // Store callers that could each pass the unlocked cap check and
+    // collectively exceed SHADOW_CREATING_CONTEXT_TABLE_SIZE * 4.
+    // Re-checking under the exclusive lock makes both decisions authoritative.
+    //
+    if (g_ProcessUtilsState.InitializationState != PROCUTILS_STATE_INITIALIZED ||
+        g_ProcessUtilsState.CreatingContextCount >= SHADOW_CREATING_CONTEXT_TABLE_SIZE * 4) {
+        ExReleasePushLockExclusive(&g_ProcessUtilsState.CreatingContextLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(ContextEntry, SHADOW_PROCINFO_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     ListHead = &g_ProcessUtilsState.CreatingContextTable[Hash];
     InsertTailList(ListHead, &ContextEntry->ListEntry);
