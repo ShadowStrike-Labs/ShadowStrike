@@ -438,6 +438,113 @@ ShadowStrikeAllocatePoolWithTag(
     return Buffer;
 }
 
+/**
+ * @brief Single allocation attempt that respects allocator-selecting flags.
+ *
+ * Used both for the initial attempt and retry attempts from
+ * ShadowStrikeAllocatePoolWithFlags so that retry preserves alignment /
+ * contiguity / quota semantics required by the caller's free path.
+ *
+ * Stats tracking is deferred to the caller (which uses the final result),
+ * except for paths that delegate to other tracked allocators
+ * (Aligned/Contiguous/PoolWithTag), which already track themselves.
+ * Only the in-place quota path performs its own tracking here.
+ */
+static
+PVOID
+ShadowStrikeAllocateOnceWithFlags(
+    _In_ POOL_TYPE PoolType,
+    _In_ SIZE_T NumberOfBytes,
+    _In_ ULONG Tag,
+    _In_ ULONG Flags
+    )
+{
+    PVOID Buffer = NULL;
+
+    //
+    // Aligned paths â€” delegated allocator tracks size against ALIGNED_TAG.
+    //
+    if (Flags & ShadowAllocCacheAligned) {
+        return ShadowStrikeAllocateAligned(
+            PoolType,
+            NumberOfBytes,
+            SHADOWSTRIKE_CACHE_LINE_SIZE,
+            Tag
+        );
+    }
+
+    if (Flags & ShadowAllocPageAligned) {
+        return ShadowStrikeAllocateAligned(
+            PoolType,
+            NumberOfBytes,
+            PAGE_SIZE,
+            Tag
+        );
+    }
+
+    //
+    // Contiguous physical memory.
+    // CRITICAL: Contiguous allocations MUST be freed with
+    // ShadowStrikeFreeContiguous â€” never ShadowStrikeFree.
+    //
+    if (Flags & ShadowAllocContiguous) {
+        PHYSICAL_ADDRESS Lowest = { 0 };
+        PHYSICAL_ADDRESS Highest;
+        PHYSICAL_ADDRESS Boundary = { 0 };
+
+        Highest.QuadPart = (LONGLONG)-1;
+
+        return ShadowStrikeAllocateContiguous(
+            NumberOfBytes,
+            Lowest,
+            Highest,
+            Boundary,
+            MmNonCached
+        );
+    }
+
+    //
+    // Quota-charged allocation.  ExAllocatePool2 returns NULL on failure
+    // by default; the legacy path raises and must be wrapped in SEH.
+    // This path performs its own statistics tracking because it bypasses
+    // ShadowStrikeAllocatePoolWithTag.
+    //
+    if (Flags & ShadowAllocChargeQuota) {
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+        POOL_FLAGS QuotaFlags = POOL_FLAG_USE_QUOTA;
+        if (PoolType == PagedPool || PoolType == PagedPoolCacheAligned) {
+            QuotaFlags |= POOL_FLAG_PAGED;
+        } else {
+            QuotaFlags |= POOL_FLAG_NON_PAGED;
+        }
+        Buffer = ExAllocatePool2(QuotaFlags, NumberOfBytes, Tag);
+        //
+        // ExAllocatePool2 zeros memory by default (no POOL_FLAG_UNINITIALIZED).
+        //
+#else
+        __try {
+            Buffer = ExAllocatePoolWithQuotaTag(PoolType, NumberOfBytes, Tag);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Buffer = NULL;
+        }
+        if (Buffer != NULL) {
+            RtlZeroMemory(Buffer, NumberOfBytes);
+        }
+#endif
+        if (Buffer != NULL) {
+            MEMORY_TRACK_ALLOC(NumberOfBytes);
+        } else {
+            MEMORY_TRACK_FAILURE();
+        }
+        return Buffer;
+    }
+
+    //
+    // Standard allocation (tracked by ShadowStrikeAllocatePoolWithTag).
+    //
+    return ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
+}
+
 _Must_inspect_result_
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _When_(PoolType == PagedPool, _IRQL_requires_max_(APC_LEVEL))
@@ -451,101 +558,56 @@ ShadowStrikeAllocatePoolWithFlags(
     _In_ ULONG Flags
     )
 {
-    PVOID Buffer = NULL;
+    PVOID Buffer;
 
     //
-    // Handle alignment flags by delegating to aligned allocator.
-    // NOTE: Aligned allocations MUST be freed with ShadowStrikeFreeAligned.
+    // Reject mutually-exclusive allocator-selecting flag combinations.
+    // Aligned + Contiguous, or multiple alignments, would silently pick
+    // one path and produce a buffer the caller's free path cannot handle.
     //
-    if (Flags & ShadowAllocCacheAligned) {
-        Buffer = ShadowStrikeAllocateAligned(
-            PoolType,
-            NumberOfBytes,
-            SHADOWSTRIKE_CACHE_LINE_SIZE,
-            Tag
-        );
-        goto HandlePostAllocationFlags;
-    }
-
-    if (Flags & ShadowAllocPageAligned) {
-        Buffer = ShadowStrikeAllocateAligned(
-            PoolType,
-            NumberOfBytes,
-            PAGE_SIZE,
-            Tag
-        );
-        goto HandlePostAllocationFlags;
-    }
-
-    //
-    // Handle contiguous memory request.
-    // CRITICAL: Contiguous allocations MUST be freed with
-    // ShadowStrikeFreeContiguous â€” never ShadowStrikeFree.
-    //
-    if (Flags & ShadowAllocContiguous) {
-        PHYSICAL_ADDRESS Lowest = { 0 };
-        PHYSICAL_ADDRESS Highest = { .QuadPart = -1 };
-        PHYSICAL_ADDRESS Boundary = { 0 };
-
-        Buffer = ShadowStrikeAllocateContiguous(
-            NumberOfBytes,
-            Lowest,
-            Highest,
-            Boundary,
-            MmNonCached
-        );
-        goto HandlePostAllocationFlags;
-    }
-
-    //
-    // Standard allocation.
-    // If ChargeQuota is requested, use ExAllocatePool2 with POOL_FLAG_USE_QUOTA
-    // directly (ExAllocatePool2 returns NULL on failure, safe without __try).
-    //
-    if (Flags & ShadowAllocChargeQuota) {
-#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
-        POOL_FLAGS QuotaFlags = POOL_FLAG_USE_QUOTA;
-        if (PoolType == PagedPool || PoolType == PagedPoolCacheAligned) {
-            QuotaFlags |= POOL_FLAG_PAGED;
-        } else {
-            QuotaFlags |= POOL_FLAG_NON_PAGED;
-        }
-        Buffer = ExAllocatePool2(QuotaFlags, NumberOfBytes, Tag);
-#else
+    {
+        ULONG AllocatorFlags = Flags & (ShadowAllocCacheAligned |
+                                        ShadowAllocPageAligned  |
+                                        ShadowAllocContiguous);
         //
-        // Legacy path: ExAllocatePoolWithQuotaTag raises on failure,
-        // so wrap in SEH and convert to NULL return.
+        // Count set bits via Brian Kernighan trick â€” at most one allowed.
         //
-        __try {
-            Buffer = ExAllocatePoolWithQuotaTag(PoolType, NumberOfBytes, Tag);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Buffer = NULL;
+        if (AllocatorFlags != 0 && (AllocatorFlags & (AllocatorFlags - 1)) != 0) {
+            MEMORY_TRACK_FAILURE();
+            if (Flags & ShadowAllocRaiseOnFailure) {
+                ExRaiseStatus(STATUS_INVALID_PARAMETER);
+            }
+            return NULL;
         }
-        if (Buffer != NULL) {
-            RtlZeroMemory(Buffer, NumberOfBytes);
-        }
-#endif
-    } else {
-        Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
     }
 
-HandlePostAllocationFlags:
+    //
+    // First attempt honoring all allocator-selecting flags.
+    //
+    Buffer = ShadowStrikeAllocateOnceWithFlags(PoolType, NumberOfBytes, Tag, Flags);
 
     //
     // Handle must-succeed flag (retry logic).
-    // Only retry at <= APC_LEVEL where we can sleep. At DISPATCH_LEVEL,
-    // retrying without delay is a pointless busy-wait that will not help.
-    // NOTE: For aligned/contiguous paths that jump here, retry uses standard
-    // pool allocation â€” the original path already exhausted its allocator.
+    // Only retry at <= APC_LEVEL where we can sleep â€” at DISPATCH_LEVEL,
+    // retrying without delay is a pointless busy-wait.
+    // CRITICAL: Retry uses ShadowStrikeAllocateOnceWithFlags so the same
+    // allocator is invoked.  Previous code retried with
+    // ShadowStrikeAllocatePoolWithTag, which silently dropped alignment /
+    // contiguity guarantees and corrupted the caller's free path.
     //
     if (Buffer == NULL && (Flags & ShadowAllocMustSucceed)) {
         if (KeGetCurrentIrql() <= APC_LEVEL) {
             LARGE_INTEGER Delay;
-            Delay.QuadPart = -10 * 1000; // 1ms
+            Delay.QuadPart = -10 * 1000; // 1 ms relative
 
             for (ULONG Retry = 0; Retry < 3 && Buffer == NULL; Retry++) {
                 KeDelayExecutionThread(KernelMode, FALSE, &Delay);
-                Buffer = ShadowStrikeAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
+                Buffer = ShadowStrikeAllocateOnceWithFlags(
+                    PoolType,
+                    NumberOfBytes,
+                    Tag,
+                    Flags
+                );
             }
         }
     }
@@ -1637,6 +1699,10 @@ ShadowStrikeCreateMdl(
 {
     PMDL NewMdl = NULL;
 
+    if (Mdl == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     *Mdl = NULL;
 
     if (Buffer == NULL || Length == 0) {
@@ -1647,24 +1713,27 @@ ShadowStrikeCreateMdl(
         return STATUS_BUFFER_OVERFLOW;
     }
 
+    //
+    // Validate the buffer is in kernel space BEFORE allocating an MDL.
+    // MmBuildMdlForNonPagedPool on user-mode or paged memory is undefined
+    // behavior and will BSOD.  Validating first avoids a useless
+    // IoAllocateMdl/IoFreeMdl round-trip on caller error and prevents
+    // any chance of partially building an MDL on a hostile address.
+    //
+    if (Buffer < MmSystemRangeStart) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
     NewMdl = IoAllocateMdl(Buffer, (ULONG)Length, FALSE, FALSE, NULL);
     if (NewMdl == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Build MDL for non-paged kernel buffer.
-    // IMPORTANT: Caller MUST ensure Buffer points to non-paged pool.
-    // MmBuildMdlForNonPagedPool on paged memory is undefined behavior
-    // and will cause BSOD under memory pressure.
+    // Caller MUST ensure Buffer points to non-paged pool.  We have already
+    // validated kernel-range membership; pageability cannot be proven from
+    // kernel mode without owning the allocation contract.
     //
-    // We validate the buffer is in kernel space as a basic sanity check.
-    //
-    if (Buffer < MmSystemRangeStart) {
-        IoFreeMdl(NewMdl);
-        return STATUS_INVALID_ADDRESS;
-    }
-
     MmBuildMdlForNonPagedPool(NewMdl);
 
     *Mdl = NewMdl;
@@ -1974,23 +2043,35 @@ ShadowStrikeFreeContiguous(
     _In_ SIZE_T NumberOfBytes
     )
 {
+    SIZE_T WipeSize;
+
     if (BaseAddress == NULL) {
         return;
     }
 
     //
-    // Secure wipe before freeing (physical memory could be reused)
-    // Limit size at DISPATCH_LEVEL to avoid DPC timeout
+    // Defense-in-depth: clamp NumberOfBytes to the same upper bound
+    // enforced by ShadowStrikeAllocateContiguous so that a corrupted or
+    // attacker-influenced size cannot direct the secure-wipe loop past
+    // the legitimate allocation and into adjacent kernel memory.
     //
-    if (NumberOfBytes > 0) {
-        if (KeGetCurrentIrql() >= DISPATCH_LEVEL && NumberOfBytes > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
+    WipeSize = (NumberOfBytes > SHADOWSTRIKE_MAX_ALLOCATION_SIZE)
+                   ? SHADOWSTRIKE_MAX_ALLOCATION_SIZE
+                   : NumberOfBytes;
+
+    //
+    // Secure wipe before freeing (physical memory could be reused).
+    // Limit size at DISPATCH_LEVEL to avoid DPC timeout.
+    //
+    if (WipeSize > 0) {
+        if (KeGetCurrentIrql() >= DISPATCH_LEVEL && WipeSize > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
             ShadowStrikeSecureZeroMemory(BaseAddress, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
         } else {
-            ShadowStrikeSecureZeroMemory(BaseAddress, NumberOfBytes);
+            ShadowStrikeSecureZeroMemory(BaseAddress, WipeSize);
         }
     }
 
     MmFreeContiguousMemory(BaseAddress);
 
-    MEMORY_TRACK_FREE(NumberOfBytes);
+    MEMORY_TRACK_FREE(WipeSize);
 }
