@@ -68,13 +68,30 @@ namespace {
     // Path Security
     // ----------------------------------------------------------------
 
+    // Component-level traversal check. Substring matching on the full
+    // wstring rejects legitimate names containing ".." (e.g. "foo..bar")
+    // and would also flag UNC/extended-length prefixes such as "\\?\".
+    // The only sequence we must reject is a path component equal to "..".
     [[nodiscard]] bool ContainsTraversal(const std::filesystem::path& p) noexcept {
         try {
-            const auto str = p.wstring();
-            return str.find(L"..") != std::wstring::npos;
+            for (const auto& part : p) {
+                // path::iterator yields each component as a path; compare
+                // against the wide ".." token.
+                if (part.native() == L"..") {
+                    return true;
+                }
+            }
+            return false;
         }
-        catch (...) { return true; }
+        catch (...) {
+            // Any iteration failure must be treated as untrusted input.
+            return true;
+        }
     }
+
+    /// Hard upper bound on a registry-supplied path (defends against an
+    /// attacker-populated REG_SZ that could otherwise inflate the working set).
+    inline constexpr size_t kMaxRegistryPathLength = 32767;  // NTFS max (\\?\ extended)
 
     // ----------------------------------------------------------------
     // Threshold Clamping
@@ -176,6 +193,11 @@ namespace {
             const auto [ptr, ec] = std::from_chars(
                 narrow.data(), narrow.data() + narrow.size(), result);
             if (ec != std::errc{} || ptr != narrow.data() + narrow.size()) {
+                return false;
+            }
+            // Reject NaN / +-Inf at parse time so the caller sees a clean
+            // failure rather than a silent clamp inside ValidateConfig().
+            if (!std::isfinite(result)) {
                 return false;
             }
             out = result;
@@ -409,7 +431,14 @@ bool CortexConfigManager::LoadFromRegistry() noexcept {
         {
             std::wstring dir;
             if (readRegString(L"ModelDirectory", dir)) {
-                cfg.modelDirectory = std::filesystem::path(dir);
+                if (dir.size() > kMaxRegistryPathLength) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Registry ModelDirectory length (%zu) exceeds %zu; rejecting",
+                        dir.size(), kMaxRegistryPathLength);
+                }
+                else if (!dir.empty()) {
+                    cfg.modelDirectory = std::filesystem::path(std::move(dir));
+                }
             }
         }
 
@@ -521,32 +550,47 @@ bool CortexConfigManager::SaveConfig(
             snapshot = m_impl->config;
         }
 
-        // Build JSON document
+        // Defense-in-depth: re-validate the snapshot before serializing so
+        // a corrupted in-memory state (e.g. a future code path mutating the
+        // config without going through Load*) cannot be persisted to disk.
+        ValidateConfig(snapshot);
+
+        // Build JSON document. Utils::JSON::Set is [[nodiscard]] — every
+        // failure must be propagated; silent type-mismatch corruption of the
+        // serialized config is unacceptable.
         Utils::JSON::Json doc;
 
-        Utils::JSON::Set(doc, "modelDirectory",
+        bool ok = true;
+        ok = ok && Utils::JSON::Set(doc, "modelDirectory",
             Utils::StringUtils::ToNarrow(snapshot.modelDirectory.wstring()));
 
-        Utils::JSON::Set(doc, "staticThreshold",
+        ok = ok && Utils::JSON::Set(doc, "staticThreshold",
             static_cast<double>(snapshot.staticThreshold));
-        Utils::JSON::Set(doc, "behavioralThreshold",
+        ok = ok && Utils::JSON::Set(doc, "behavioralThreshold",
             static_cast<double>(snapshot.behavioralThreshold));
-        Utils::JSON::Set(doc, "memoryThreshold",
+        ok = ok && Utils::JSON::Set(doc, "memoryThreshold",
             static_cast<double>(snapshot.memoryThreshold));
-        Utils::JSON::Set(doc, "networkThreshold",
+        ok = ok && Utils::JSON::Set(doc, "networkThreshold",
             static_cast<double>(snapshot.networkThreshold));
-        Utils::JSON::Set(doc, "emulationThreshold",
+        ok = ok && Utils::JSON::Set(doc, "emulationThreshold",
             static_cast<double>(snapshot.emulationThreshold));
-        Utils::JSON::Set(doc, "ensembleThreshold",
+        ok = ok && Utils::JSON::Set(doc, "ensembleThreshold",
             static_cast<double>(snapshot.ensembleThreshold));
 
-        Utils::JSON::Set(doc, "useGPU",    snapshot.useGPU);
-        Utils::JSON::Set(doc, "useAVX512", snapshot.useAVX512);
+        ok = ok && Utils::JSON::Set(doc, "useGPU",    snapshot.useGPU);
+        ok = ok && Utils::JSON::Set(doc, "useAVX512", snapshot.useAVX512);
 
-        Utils::JSON::Set(doc, "maxBatchSize",
+        ok = ok && Utils::JSON::Set(doc, "maxBatchSize",
             static_cast<uint32_t>(snapshot.maxBatchSize));
-        Utils::JSON::Set(doc, "inferenceTimeoutMs",
+        ok = ok && Utils::JSON::Set(doc, "inferenceTimeoutMs",
             static_cast<uint32_t>(snapshot.inferenceTimeoutMs));
+
+        if (!ok) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SaveConfig: failed to populate JSON document for %ls",
+                configPath.c_str());
+            return false;
+        }
 
         // Write to disk
         Utils::JSON::SaveOptions saveOpt;
