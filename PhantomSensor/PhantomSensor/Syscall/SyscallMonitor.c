@@ -115,6 +115,13 @@ static const UINT32 s_RiskMultiplierNum[] = { 100, 100, 150, 200, 300 };
 #define SC_RISK_MULTIPLIER_DEN          100
 
 //
+// Cap on caller-requested NTDLL hook enumeration. Bounds the
+// NonPagedPoolNx allocation in ScMonitorGetNtdllHooks against an
+// untrusted MaxFunctions parameter.
+//
+#define SC_MAX_NTDLL_HOOK_REQUEST       4096
+
+//
 // Allowlist of Nt* functions eligible for restoration via
 // ScMonitorRestoreNtdllFunction. Only commonly-hooked security-critical
 // APIs are listed. Functions NOT on this list are rejected to prevent
@@ -2209,6 +2216,16 @@ ScMonitorGetNtdllHooks(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Bound caller-supplied capacity to a sane upper limit.
+    // Without this, MaxFunctions is multiplied by sizeof(PNI_FUNCTION_STATE)
+    // for a NonPagedPoolNx allocation, which a buggy or hostile caller could
+    // weaponize into a multi-gigabyte pool request.
+    //
+    if (MaxFunctions > SC_MAX_NTDLL_HOOK_REQUEST) {
+        MaxFunctions = SC_MAX_NTDLL_HOOK_REQUEST;
+    }
+
     *FunctionCount = 0;
     RtlZeroMemory(HookedFunctions, MaxFunctions * sizeof(HOOKED_FUNCTION_ENTRY));
 
@@ -2823,7 +2840,8 @@ ScpSafeReadUserPtr(
     }
 
     __try {
-        ProbeForRead((PVOID)(ULONG_PTR)UserPtr, sizeof(PVOID), sizeof(ULONG));
+        ProbeForRead((PVOID)(ULONG_PTR)UserPtr,
+            sizeof(ULONG_PTR), sizeof(ULONG_PTR));
         Value = *(volatile ULONG_PTR*)(ULONG_PTR)UserPtr;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Value = 0;
