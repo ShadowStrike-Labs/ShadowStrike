@@ -288,6 +288,22 @@ using Middleware = std::function<bool(const HttpRequest& request, HttpResponse& 
 /// @brief Check if a path contains traversal attempts (e.g., "..")
 [[nodiscard]] bool ContainsPathTraversal(std::string_view path) noexcept;
 
+/**
+ * @brief Validate an HTTP header field name per RFC 7230 §3.2.6 (token).
+ *
+ * Rejects empty names and any byte not in the RFC token set. Used as the
+ * primary defense against response-header injection / response splitting.
+ */
+[[nodiscard]] bool IsValidHeaderName(std::string_view name) noexcept;
+
+/**
+ * @brief Validate an HTTP header field value (RFC 7230 §3.2 field-content).
+ *
+ * Rejects CR, LF, NUL and other control bytes that would allow CRLF injection
+ * or smuggling on the response wire. Tabs are permitted (RFC field-vchar).
+ */
+[[nodiscard]] bool IsValidHeaderValue(std::string_view value) noexcept;
+
 // ============================================================================
 // INLINE IMPLEMENTATIONS
 // ============================================================================
