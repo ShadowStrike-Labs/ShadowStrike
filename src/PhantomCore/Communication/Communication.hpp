@@ -28,13 +28,14 @@
 
 #pragma once
 
-#include <cstdint>
-#include <string>
-#include <vector>
+#include <atomic>
 #include <chrono>
-#include <optional>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace ShadowStrike {
 namespace Communication {
