@@ -160,8 +160,9 @@ namespace {
     [[nodiscard]] bool Fallback_CheckCPUIDHypervisorBit() noexcept {
         int cpuInfo[4] = { 0 };
         __cpuid(cpuInfo, 1);  // Leaf 1 contains feature flags
-        // ECX bit 31 indicates hypervisor present
-        return (cpuInfo[2] & (1 << 31)) != 0;
+        // ECX bit 31 indicates hypervisor present (unsigned literal avoids
+        // shift-into-sign-bit undefined behavior diagnosed by /W4 + UBSAN).
+        return (static_cast<uint32_t>(cpuInfo[2]) & (1u << 31)) != 0;
     }
 
     /// @brief Fallback: Get CPUID vendor string using intrinsics
@@ -174,7 +175,7 @@ namespace {
         // Check if hypervisor is present first
         int featureInfo[4] = { 0 };
         __cpuid(featureInfo, 1);
-        if ((featureInfo[2] & (1 << 31)) == 0) {
+        if ((static_cast<uint32_t>(featureInfo[2]) & (1u << 31)) == 0) {
             buffer[0] = '\0';
             return;
         }
@@ -300,7 +301,12 @@ namespace {
             totalCycles += (end - start);
         }
 
-        return totalCycles / iterations;
+        // Contract: returns TOTAL accumulated cycles across all iterations
+        // to mirror the assembly implementation in EnvironmentEvasionDetector_x64.asm
+        // (MeasureCPUIDTiming). Callers that need the per-iteration average must
+        // divide by `iterations` themselves. Returning an average here would
+        // silently shift detection thresholds whenever USE_ASM_FUNCTIONS toggles.
+        return totalCycles;
     }
 
     // ------------------------------------------------------------------------
@@ -400,7 +406,10 @@ namespace {
             totalCycles += (end - start);
         }
 
-        return totalCycles / iterations;
+        // Contract: returns TOTAL accumulated cycles to match the assembly
+        // implementation (MeasureInstructionTiming in EnvironmentEvasionDetector_x64.asm).
+        // See note on Fallback_MeasureCPUIDTiming for rationale.
+        return totalCycles;
     }
 
     // ------------------------------------------------------------------------
@@ -432,7 +441,7 @@ namespace {
         
         // Check if hypervisor is present
         __cpuid(cpuInfo, 1);
-        if ((cpuInfo[2] & (1 << 31)) == 0) {
+        if ((static_cast<uint32_t>(cpuInfo[2]) & (1u << 31)) == 0) {
             return 0;  // No hypervisor
         }
 
@@ -850,10 +859,13 @@ namespace {
             L"SOFTWARE\\VMware, Inc.\\VMware Tools",
             0, KEY_READ, &key) == ERROR_SUCCESS) {
             
-            // Check if machine is domain-joined (indicates enterprise)
+            // Check if machine is domain-joined (indicates enterprise).
+            // GetComputerNameExW expects `lpnSize` in WCHARs (not bytes); using
+            // sizeof(domain) would overstate capacity by a factor of two and could
+            // permit the API to write up to 1024 bytes into a 512-byte buffer.
             wchar_t domain[256] = {};
-            DWORD size = sizeof(domain);
-            
+            DWORD size = ARRAYSIZE(domain);
+
             if (GetComputerNameExW(ComputerNameDnsDomain, domain, &size) && wcslen(domain) > 0) {
                 // Domain-joined VMware = likely enterprise vSphere
                 RegCloseKey(key);
@@ -2074,11 +2086,16 @@ void VMEvasionDetector::CheckDevices(VMEvasionResult& result) {
             }
 
             if (success) {
-                // Hardware IDs are REG_MULTI_SZ (list of null-terminated strings, double-null terminated)
+                // Hardware IDs are REG_MULTI_SZ (list of null-terminated strings, double-null
+                // terminated). Treat the registry payload as untrusted: bound traversal by the
+                // returned `requiredSize` (in WCHARs) so a malformed value missing its terminating
+                // double-NUL cannot drive wcslen / pointer arithmetic past the buffer.
                 wchar_t* currentId = buffer.data();
+                const size_t bufferWchars = (requiredSize / sizeof(wchar_t));
+                wchar_t* const bufferEnd = buffer.data() + bufferWchars;
                 bool deviceMatch = false;
 
-                while (*currentId && !deviceMatch) {
+                while (currentId < bufferEnd && *currentId && !deviceMatch) {
                     std::wstring idStr(currentId);
                     // Normalize to lower case for comparison (ToUpper not available, checking against ToUpper constants requires adjustment)
                     // Note: We'll compare lower-to-lower since ToUpper isn't in Utils
@@ -2116,8 +2133,15 @@ void VMEvasionDetector::CheckDevices(VMEvasionResult& result) {
                         }
                     }
 
-                    // Move to next string in MULTI_SZ
-                    currentId += wcslen(currentId) + 1;
+                    // Move to next string in MULTI_SZ, using a bounded length so
+                    // a missing NUL terminator cannot read past `bufferEnd`.
+                    const size_t remaining = static_cast<size_t>(bufferEnd - currentId);
+                    const size_t segLen = wcsnlen(currentId, remaining);
+                    if (segLen >= remaining) {
+                        // Unterminated segment — abort traversal of this property.
+                        break;
+                    }
+                    currentId += segLen + 1;
                 }
             }
         }
@@ -2893,10 +2917,11 @@ void VMEvasionDetector::CalculateFinalScore(VMEvasionResult& result) {
             // Require multiple suspicious indicators to flag as evasion
             result.isSuspiciousEvasion = (suspiciousIndicators >= 3);
             
-            // Check for enterprise VMware (domain-joined) - not suspicious
+            // Check for enterprise VMware (domain-joined) - not suspicious.
+            // GetComputerNameExW's `lpnSize` is in WCHARs, not bytes.
             if (result.detectedType == VMType::VMware || result.detectedType == VMType::HyperV) {
                 wchar_t domain[256] = {};
-                DWORD size = sizeof(domain);
+                DWORD size = ARRAYSIZE(domain);
                 if (GetComputerNameExW(ComputerNameDnsDomain, domain, &size) && wcslen(domain) > 0) {
                     result.isEnterpriseVirtualization = true;
                     result.isSuspiciousEvasion = false;  // Domain-joined = enterprise
@@ -3690,9 +3715,18 @@ bool VMEvasionDetector::AnalyzeProcessExtended(
             } else {
                 std::shared_ptr<void> hProcess(rawHandle, [](void* h) { CloseHandle(static_cast<HANDLE>(h)); });
 
-                // Determine if target is 64-bit
+                // Determine if target is 64-bit. If IsWow64Process fails we cannot
+                // trust `isWow64`; default to host bitness (this binary is x64) and
+                // log the failure so the operator can investigate token/permission
+                // issues rather than silently mis-classifying scan candidates.
                 BOOL isWow64 = FALSE;
-                IsWow64Process(static_cast<HANDLE>(hProcess.get()), &isWow64);
+                if (!IsWow64Process(static_cast<HANDLE>(hProcess.get()), &isWow64)) {
+                    SS_LOG_WARN(L"AntiEvasion",
+                        L"AnalyzeProcessForAntiVMBehavior: IsWow64Process failed for PID %lu (error %lu); "
+                        L"defaulting target architecture to host (x64)",
+                        processId, GetLastError());
+                    isWow64 = FALSE;
+                }
                 const bool targetIs64Bit = !isWow64;
 
                 SYSTEM_INFO sysInfo{};
