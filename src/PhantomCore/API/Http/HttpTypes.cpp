@@ -33,14 +33,29 @@ namespace Http {
 // ============================================================================
 
 size_t CaseInsensitiveHash::operator()(std::string_view key) const noexcept {
-    size_t hash = 0x811c9dc5ULL; // FNV-1a offset basis
-    for (char c : key) {
-        auto lower = static_cast<unsigned char>(
-            (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c);
-        hash ^= lower;
-        hash *= 0x01000193ULL; // FNV-1a prime
+    // FNV-1a. Use the 64-bit constants when size_t is 64-bit so the
+    // hash actually mixes the upper bits; the 32-bit constants leave
+    // the upper 32 bits of size_t identically zero, which collapses
+    // the unordered_map's bucket distribution on 64-bit Windows.
+    if constexpr (sizeof(size_t) >= 8) {
+        size_t hash = static_cast<size_t>(0xcbf29ce484222325ULL); // FNV-1a 64 offset
+        for (char c : key) {
+            const auto lower = static_cast<unsigned char>(
+                (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c);
+            hash ^= lower;
+            hash *= static_cast<size_t>(0x100000001b3ULL); // FNV-1a 64 prime
+        }
+        return hash;
+    } else {
+        size_t hash = 0x811c9dc5u; // FNV-1a 32 offset
+        for (char c : key) {
+            const auto lower = static_cast<unsigned char>(
+                (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c);
+            hash ^= lower;
+            hash *= 0x01000193u; // FNV-1a 32 prime
+        }
+        return hash;
     }
-    return hash;
 }
 
 bool CaseInsensitiveEqual::operator()(std::string_view a, std::string_view b) const noexcept {
@@ -86,14 +101,39 @@ std::optional<size_t> HttpRequest::GetContentLength() const noexcept {
 bool HttpRequest::IsKeepAlive() const noexcept {
     auto conn = GetHeader("Connection");
     if (!conn) {
-        // HTTP/1.1 defaults to keep-alive
+        // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
         return httpVersion.find("1.1") != std::string::npos;
     }
-    // Case-insensitive check for "close"
-    std::string lower(conn->size(), '\0');
-    std::transform(conn->begin(), conn->end(), lower.begin(),
-        [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
-    return lower.find("close") == std::string::npos;
+
+    // RFC 7230 §6.1: Connection is a comma-separated list of tokens.
+    // A substring match for "close" matches "close-foo" or "x-close" — not
+    // RFC compliant and a smuggling/keep-alive desync hazard. Tokenize.
+    std::string_view sv(*conn);
+    size_t pos = 0;
+    while (pos < sv.size()) {
+        // Skip leading OWS / commas.
+        while (pos < sv.size() && (sv[pos] == ' ' || sv[pos] == '\t' || sv[pos] == ',')) {
+            ++pos;
+        }
+        const size_t start = pos;
+        while (pos < sv.size() && sv[pos] != ',') ++pos;
+        size_t end = pos;
+        // Trim trailing OWS.
+        while (end > start && (sv[end - 1] == ' ' || sv[end - 1] == '\t')) --end;
+
+        const auto token = sv.substr(start, end - start);
+        if (token.size() == 5) {
+            // Case-insensitive compare to "close".
+            char buf[5];
+            for (size_t i = 0; i < 5; ++i) {
+                char c = token[i];
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+                buf[i] = c;
+            }
+            if (std::memcmp(buf, "close", 5) == 0) return false;
+        }
+    }
+    return true;
 }
 
 std::string_view HttpRequest::GetBodyString() const noexcept {
@@ -141,11 +181,61 @@ std::optional<std::string> HttpRequest::GetQueryParam(std::string_view name) con
 // HttpResponse
 // ============================================================================
 
+namespace {
+
+// Internal: append a JSON-escaped UTF-8 string to `out`.
+// Escapes per RFC 8259: ", \, control bytes (< 0x20). High-bit bytes are
+// passed through; the producer is responsible for valid UTF-8.
+void AppendJsonEscaped(std::string& out, std::string_view in) {
+    out.reserve(out.size() + in.size() + 2);
+    for (char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+}
+
+// Strict response-side header gate. Skips any header that fails name/value
+// validation. Centralized so SetHeader, SetContentType and Serialize all
+// agree on what is wire-emittable.
+[[nodiscard]] bool IsWireSafeHeader(std::string_view name, std::string_view value) noexcept {
+    return IsValidHeaderName(name) && IsValidHeaderValue(value);
+}
+
+} // namespace
+
 void HttpResponse::SetHeader(std::string name, std::string value) {
+    // Defense in depth against response-header injection / response splitting
+    // (CWE-113). Reject on construction so a bad value never reaches Serialize.
+    if (!IsWireSafeHeader(name, value)) {
+        return;
+    }
     headers[std::move(name)] = std::move(value);
 }
 
 void HttpResponse::SetContentType(std::string_view contentType) {
+    if (!IsValidHeaderValue(contentType)) {
+        // Fall back to a hardcoded safe default rather than emit a poisoned
+        // Content-Type that could enable MIME-confusion or response splitting.
+        headers["Content-Type"] = "application/octet-stream";
+        return;
+    }
     headers["Content-Type"] = std::string(contentType);
 }
 
@@ -176,29 +266,14 @@ HttpResponse HttpResponse::MakeError(HttpStatus httpStatus, std::string_view mes
     json += ",\"status\":\"";
     json += HttpStatusReasonPhrase(httpStatus);
     json += "\",\"message\":\"";
-    // Escape JSON special characters in message
-    for (char c : message) {
-        switch (c) {
-            case '"':  json += "\\\""; break;
-            case '\\': json += "\\\\"; break;
-            case '\n': json += "\\n";  break;
-            case '\r': json += "\\r";  break;
-            case '\t': json += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
-                    json += buf;
-                } else {
-                    json += c;
-                }
-                break;
-        }
-    }
+    AppendJsonEscaped(json, message);
     json += "\"";
     if (!requestId.empty()) {
+        // Bug previously: requestId was concatenated raw, allowing JSON
+        // injection (and reflected XSS for clients that render the field
+        // un-encoded). Always escape.
         json += ",\"request_id\":\"";
-        json += requestId;
+        AppendJsonEscaped(json, requestId);
         json += "\"";
     }
     json += "}}";
@@ -215,6 +290,7 @@ HttpResponse HttpResponse::MakeJson(HttpStatus httpStatus, std::string_view json
 }
 
 std::vector<uint8_t> HttpResponse::Serialize() const {
+    // Build status line
     std::string statusLine = HTTP_VERSION_11;
     statusLine += ' ';
     statusLine += std::to_string(static_cast<uint16_t>(status));
@@ -222,35 +298,49 @@ std::vector<uint8_t> HttpResponse::Serialize() const {
     statusLine += HttpStatusReasonPhrase(status);
     statusLine += CRLF;
 
-    // Build header block
+    // Build header block.
+    //
+    // Security: we MUST emit a single, truthful Content-Length matching the
+    // exact body byte count and we MUST never emit Transfer-Encoding. A
+    // caller-supplied Content-Length that disagrees with body.size() is the
+    // textbook HTTP request-smuggling primitive (CWE-444); a caller-supplied
+    // Transfer-Encoding combined with our Content-Length triggers TE.CL
+    // smuggling. Strip both unconditionally, then re-add Content-Length below.
+    //
+    // Each header is also re-validated here as a defence-in-depth gate against
+    // CWE-113 response splitting; SetHeader already rejects bad values, but
+    // the headers map is publicly mutable so we must not trust its current
+    // contents at the wire boundary.
     std::string headerBlock;
     headerBlock.reserve(512);
 
-    bool hasContentLength = false;
-    bool hasContentType = false;
     for (const auto& [key, val] : headers) {
+        if (CaseInsensitiveEqual{}(key, "Content-Length")) continue;
+        if (CaseInsensitiveEqual{}(key, "Transfer-Encoding")) continue;
+        if (!IsWireSafeHeader(key, val)) continue;
+
         headerBlock += key;
         headerBlock += ": ";
         headerBlock += val;
         headerBlock += CRLF;
-
-        // Track which standard headers are present
-        if (CaseInsensitiveEqual{}(key, "Content-Length")) hasContentLength = true;
-        if (CaseInsensitiveEqual{}(key, "Content-Type"))   hasContentType = true;
     }
 
-    // Auto-add Content-Length if not set
-    if (!hasContentLength) {
-        headerBlock += "Content-Length: ";
-        headerBlock += std::to_string(body.size());
-        headerBlock += CRLF;
-    }
-
-    // Terminate headers
+    headerBlock += "Content-Length: ";
+    headerBlock += std::to_string(body.size());
     headerBlock += CRLF;
 
-    // Assemble final output
-    size_t totalSize = statusLine.size() + headerBlock.size() + body.size();
+    // Terminate header block.
+    headerBlock += CRLF;
+
+    // Cap final size sanity-check: status line + headers + body must not
+    // exceed SIZE_MAX. Practically impossible at this scale but cheap to
+    // guard against a future caller pushing a huge body and headers map.
+    const size_t headerBytes = statusLine.size() + headerBlock.size();
+    if (body.size() > SIZE_MAX - headerBytes) {
+        return {};
+    }
+    const size_t totalSize = headerBytes + body.size();
+
     std::vector<uint8_t> result;
     result.reserve(totalSize);
     result.insert(result.end(), statusLine.begin(), statusLine.end());
@@ -332,6 +422,40 @@ bool ContainsPathTraversal(std::string_view path) noexcept {
     if (path.find('\\') != std::string_view::npos) return true;
 
     return false;
+}
+
+// ============================================================================
+// Header Name / Value Validation (RFC 7230)
+// ============================================================================
+
+bool IsValidHeaderName(std::string_view name) noexcept {
+    if (name.empty() || name.size() > MAX_HEADER_LINE_LENGTH) return false;
+    // RFC 7230 token: 1*tchar
+    //   tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "."
+    //         / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+    for (unsigned char c : name) {
+        const bool isAlpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool isDigit = (c >= '0' && c <= '9');
+        const bool isOther =
+            c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+            c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+            c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+        if (!isAlpha && !isDigit && !isOther) return false;
+    }
+    return true;
+}
+
+bool IsValidHeaderValue(std::string_view value) noexcept {
+    if (value.size() > MAX_HEADER_LINE_LENGTH) return false;
+    // RFC 7230 §3.2: field-value contains VCHAR / SP / HTAB / obs-text.
+    // Reject CR, LF, NUL and other C0 controls (except HTAB) — these enable
+    // header injection / response splitting (CWE-113).
+    for (unsigned char c : value) {
+        if (c == '\r' || c == '\n' || c == '\0') return false;
+        if (c < 0x20 && c != '\t') return false;
+        if (c == 0x7F) return false; // DEL
+    }
+    return true;
 }
 
 // ============================================================================
