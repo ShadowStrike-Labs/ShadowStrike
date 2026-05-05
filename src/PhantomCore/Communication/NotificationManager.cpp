@@ -958,6 +958,14 @@ void NotificationManagerImpl::NotifyError(const std::string& msg, int code) {
 void NotificationManagerImpl::ShowSimple(const std::wstring& title,
                                           const std::wstring& message,
                                           NotificationLevel level) {
+    // FIX [BUG #27]: Reject enqueue after Shutdown so the post-join
+    // m_queue.clear() drain in Shutdown() cannot race with new producers
+    // pushing a notification onto a queue that nothing will service.
+    if (!m_running.load(std::memory_order_acquire)) {
+        Utils::Logger::Debug("Show rejected: manager not running");
+        return;
+    }
+
     Notification n;
     n.notificationId = GenerateNotificationId();
     n.title = title;
@@ -981,6 +989,12 @@ void NotificationManagerImpl::ShowSimple(const std::wstring& title,
 }
 
 std::string NotificationManagerImpl::ShowFull(const Notification& notification) {
+    // FIX [BUG #27]: see ShowSimple — reject post-Shutdown enqueue.
+    if (!m_running.load(std::memory_order_acquire)) {
+        Utils::Logger::Debug("ShowFull rejected: manager not running");
+        return {};
+    }
+
     Notification n = notification;
     if (n.notificationId.empty())
         n.notificationId = GenerateNotificationId();
@@ -1005,6 +1019,12 @@ std::string NotificationManagerImpl::ShowFull(const Notification& notification) 
 
 void NotificationManagerImpl::ShowThreatAlertSimple(const std::wstring& threatName,
                                                      const std::wstring& filePath) {
+    // FIX [BUG #27]: see ShowSimple — reject post-Shutdown enqueue.
+    if (!m_running.load(std::memory_order_acquire)) {
+        Utils::Logger::Debug("ShowThreatAlert rejected: manager not running");
+        return;
+    }
+
     Notification n;
     n.notificationId = GenerateNotificationId();
     n.level = NotificationLevel::Critical;
@@ -1029,6 +1049,12 @@ void NotificationManagerImpl::ShowThreatAlertSimple(const std::wstring& threatNa
 }
 
 std::string NotificationManagerImpl::ShowThreatAlertFull(const ThreatNotification& threat) {
+    // FIX [BUG #27]: see ShowSimple — reject post-Shutdown enqueue.
+    if (!m_running.load(std::memory_order_acquire)) {
+        Utils::Logger::Debug("ShowThreatAlertFull rejected: manager not running");
+        return {};
+    }
+
     Notification n;
     n.notificationId = GenerateNotificationId();
     n.level = NotificationLevel::Critical;
