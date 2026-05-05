@@ -717,20 +717,26 @@ private:
 // MACROS
 // ============================================================================
 
-#define SS_NOTIFY(title, message) \
+#define SHADOWSTRIKE_NOTIFY(title, message) \
     ::ShadowStrike::Communication::NotificationManager::Instance().Show(title, message)
 
-#define SS_NOTIFY_INFO(title, message) \
+#define SHADOWSTRIKE_NOTIFY_INFO(title, message) \
     ::ShadowStrike::Communication::NotificationManager::Instance().Show( \
         title, message, ::ShadowStrike::Communication::NotificationLevel::Info)
 
-#define SS_NOTIFY_WARNING(title, message) \
+#define SHADOWSTRIKE_NOTIFY_WARNING(title, message) \
     ::ShadowStrike::Communication::NotificationManager::Instance().Show( \
         title, message, ::ShadowStrike::Communication::NotificationLevel::Warning)
 
-#define SS_NOTIFY_CRITICAL(title, message) \
+#define SHADOWSTRIKE_NOTIFY_CRITICAL(title, message) \
     ::ShadowStrike::Communication::NotificationManager::Instance().Show( \
         title, message, ::ShadowStrike::Communication::NotificationLevel::Critical)
 
-#define SS_NOTIFY_THREAT(threat, path) \
+#define SHADOWSTRIKE_NOTIFY_THREAT(threat, path) \
     ::ShadowStrike::Communication::NotificationManager::Instance().ShowThreatAlert(threat, path)
+
+// Preserve the legacy short macro only when the Windows SDK has not already
+// claimed SS_NOTIFY for static-control styles.
+#ifndef SS_NOTIFY
+#define SS_NOTIFY(title, message) SHADOWSTRIKE_NOTIFY(title, message)
+#endif
