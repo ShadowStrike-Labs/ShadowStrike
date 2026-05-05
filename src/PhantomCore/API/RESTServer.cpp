@@ -23,6 +23,7 @@
 #include "PhantomCore/Utils/Logger.hpp"
 #include "PhantomCore/Utils/CryptoUtils.hpp"
 #include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
 #include "PhantomCore/Utils/Base64Utils.hpp"
 #include "PhantomCore/Config/ConfigManager.hpp"
 #include "PhantomCore/Config/ProductTier.hpp"
@@ -38,11 +39,14 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <charconv>
 #include <chrono>
 #include <deque>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +58,88 @@ namespace API {
 // ============================================================================
 
 static constexpr const wchar_t* LOG_CAT = L"API.REST";
+
+// ============================================================================
+// INTERNAL HELPERS (file-local)
+// ============================================================================
+
+namespace {
+
+// PBKDF2-based password hash storage format identifier.
+// Format: "pbkdf2$<iterations>$<hex_salt>$<hex_key>"
+//   - iterations: decimal ASCII (uint32, lower-bounded by MIN_PBKDF2_ITERATIONS)
+//   - hex_salt:   lowercase hex, exactly PBKDF2_SALT_BYTES * 2 chars
+//   - hex_key:    lowercase hex, exactly PBKDF2_KEY_BYTES  * 2 chars
+constexpr std::string_view PBKDF2_PREFIX = "pbkdf2$";
+constexpr size_t           PBKDF2_SALT_BYTES = 32;
+constexpr size_t           PBKDF2_KEY_BYTES  = 32;
+
+// Strict size_t parser used for query parameters.
+// Returns parsed value clamped to [0, max], or std::nullopt on malformed input.
+// Unlike std::stoul / std::stoi this never throws.
+[[nodiscard]] std::optional<size_t> ParseSizeTClamped(std::string_view sv,
+                                                      size_t maxAllowed) noexcept {
+    if (sv.empty()) return std::nullopt;
+    size_t value = 0;
+    const char* first = sv.data();
+    const char* last  = sv.data() + sv.size();
+    auto [ptr, ec] = std::from_chars(first, last, value, 10);
+    if (ec != std::errc{} || ptr != last) {
+        return std::nullopt;
+    }
+    return std::min(value, maxAllowed);
+}
+
+// Decompose a Web Origin (scheme://host[:port]) and extract the host portion.
+// Returns empty if the origin is malformed.
+[[nodiscard]] std::string_view ExtractOriginHost(std::string_view origin) noexcept {
+    const auto schemeSep = origin.find("://");
+    if (schemeSep == std::string_view::npos) return {};
+    auto rest = origin.substr(schemeSep + 3);
+    // Strip path (anything after the next '/')
+    const auto pathStart = rest.find('/');
+    if (pathStart != std::string_view::npos) rest = rest.substr(0, pathStart);
+    // Strip port (anything after the last ':' that isn't inside [..] IPv6 literal)
+    if (!rest.empty() && rest.front() == '[') {
+        const auto bracket = rest.find(']');
+        if (bracket == std::string_view::npos) return {};
+        // Keep "[host]" including brackets — host comparison expects this form.
+        return rest.substr(0, bracket + 1);
+    }
+    const auto portSep = rest.rfind(':');
+    if (portSep != std::string_view::npos) rest = rest.substr(0, portSep);
+    return rest;
+}
+
+// Whether an Origin header value is one of the on-host loopback addresses
+// (used only when the operator did not configure an explicit allow-list).
+[[nodiscard]] bool IsLoopbackOrigin(std::string_view origin) noexcept {
+    const auto host = ExtractOriginHost(origin);
+    if (host.empty()) return false;
+    return host == "127.0.0.1" || host == "[::1]" || host == "localhost";
+}
+
+// Lossless UTF-16 -> UTF-8 conversion for JSON serialization.
+// Falls back to '?' substitution if the conversion fails so we never feed
+// invalid UTF-8 into nlohmann::json::dump (which throws on bad encoding).
+[[nodiscard]] std::string WideToJsonUtf8(std::wstring_view wide) noexcept {
+    if (wide.empty()) return {};
+    auto narrow = Utils::StringUtils::ToNarrow(wide);
+    if (narrow.empty()) {
+        // Conversion lost everything; emit a placeholder rather than empty
+        // so consumers can detect that a non-empty wide value was unmappable.
+        return std::string(wide.size(), '?');
+    }
+    return narrow;
+}
+
+// Encode raw bytes as lowercase hex (used for password hash storage).
+[[nodiscard]] std::string BytesToHex(std::span<const uint8_t> bytes) noexcept {
+    return Utils::HashUtils::ToHexLower(
+        std::vector<uint8_t>(bytes.begin(), bytes.end()));
+}
+
+} // anonymous namespace
 
 // ============================================================================
 // SESSION STRUCTURE
@@ -199,13 +285,12 @@ public:
             m_httpServer->SetSSEEndpoint("/api/v1/events/stream");
         }
 
-        m_state.store(ServerState::Starting, std::memory_order_release);
+        m_stats.Reset();
         m_stats.startTime = std::chrono::steady_clock::now();
 
         SS_LOG_INFO(LOG_CAT, L"REST server initialized on %hs:%u",
                     config.bindAddress.c_str(), config.port);
 
-        m_state.store(ServerState::Stopped, std::memory_order_release);
         m_initialized = true;
         return true;
     }
@@ -267,9 +352,12 @@ public:
     void Shutdown() {
         Stop();
 
-        if (m_httpServer) {
-            m_httpServer->Shutdown();
-            m_httpServer.reset();
+        {
+            std::unique_lock lock(m_httpServerMutex);
+            if (m_httpServer) {
+                m_httpServer->Shutdown();
+                m_httpServer.reset();
+            }
         }
 
         {
@@ -296,9 +384,11 @@ public:
         return m_state.load(std::memory_order_acquire);
     }
     [[nodiscard]] uint16_t GetPort() const noexcept {
+        std::shared_lock lock(m_httpServerMutex);
         return m_httpServer ? m_httpServer->GetPort() : 0;
     }
     [[nodiscard]] std::string GetBindAddress() const noexcept {
+        std::shared_lock lock(m_configMutex);
         return m_config.bindAddress;
     }
 
@@ -345,6 +435,7 @@ public:
     // ========================================================================
 
     void BroadcastEvent(SSEEventType type, std::string_view jsonData) {
+        std::shared_lock lock(m_httpServerMutex);
         if (!m_httpServer || !IsRunning()) return;
 
         static constexpr const char* EVENT_NAMES[] = {
@@ -361,6 +452,7 @@ public:
     }
 
     [[nodiscard]] size_t GetSSEClientCount() const noexcept {
+        std::shared_lock lock(m_httpServerMutex);
         return m_httpServer ? m_httpServer->GetSSEClientCount() : 0;
     }
 
@@ -369,6 +461,7 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool RegisterGetRoute(std::string_view path, RouteHandler handler) {
+        std::shared_lock lock(m_httpServerMutex);
         if (!m_httpServer) return false;
 
         auto wrappedHandler = [h = std::move(handler)](
@@ -384,6 +477,7 @@ public:
     }
 
     [[nodiscard]] bool RegisterPostRoute(std::string_view path, RouteHandler handler) {
+        std::shared_lock lock(m_httpServerMutex);
         if (!m_httpServer) return false;
 
         auto wrappedHandler = [h = std::move(handler)](
@@ -453,16 +547,27 @@ private:
 
             const std::string originStr(origin.value());
 
-            // For localhost, allow same-origin variations
+            // Cap origin length to prevent log/header amplification
+            if (originStr.size() > 256) {
+                return true; // ignore obviously bogus origins
+            }
+
             bool allowed = false;
+            bool wildcardMatch = false;
+
             if (m_config.corsOrigins.empty()) {
-                // Same-origin only: allow localhost variations
-                allowed = (originStr.find("://localhost") != std::string::npos ||
-                           originStr.find("://127.0.0.1") != std::string::npos ||
-                           originStr.find("://[::1]") != std::string::npos);
+                // Same-origin only: allow loopback hosts (exact host parse —
+                // never substring match, which would let
+                // "http://localhost.attacker.example" through).
+                allowed = IsLoopbackOrigin(originStr);
             } else {
                 for (const auto& ao : m_config.corsOrigins) {
-                    if (ao == originStr || ao == "*") {
+                    if (ao == "*") {
+                        wildcardMatch = true;
+                        allowed = true;
+                        break;
+                    }
+                    if (ao == originStr) {
                         allowed = true;
                         break;
                     }
@@ -470,13 +575,27 @@ private:
             }
 
             if (allowed) {
-                res.SetHeader("Access-Control-Allow-Origin", originStr);
-                res.SetHeader("Access-Control-Allow-Methods",
-                              "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-                res.SetHeader("Access-Control-Allow-Headers",
-                              "Content-Type, Authorization, X-CSRF-Token, X-Request-Id");
-                res.SetHeader("Access-Control-Allow-Credentials", "true");
-                res.SetHeader("Access-Control-Max-Age", "3600");
+                if (wildcardMatch) {
+                    // CORS spec: when ACAO is "*", credentials are NOT permitted
+                    // and the origin MUST NOT be reflected (would otherwise become
+                    // a credentialed cross-origin escape).
+                    res.SetHeader("Access-Control-Allow-Origin", "*");
+                    res.SetHeader("Access-Control-Allow-Methods",
+                                  "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+                    res.SetHeader("Access-Control-Allow-Headers",
+                                  "Content-Type, X-Request-Id");
+                    res.SetHeader("Access-Control-Max-Age", "3600");
+                } else {
+                    // Specific origin allow-list match — credentials permitted.
+                    res.SetHeader("Access-Control-Allow-Origin", originStr);
+                    res.SetHeader("Vary", "Origin");
+                    res.SetHeader("Access-Control-Allow-Methods",
+                                  "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+                    res.SetHeader("Access-Control-Allow-Headers",
+                                  "Content-Type, Authorization, X-CSRF-Token, X-Request-Id");
+                    res.SetHeader("Access-Control-Allow-Credentials", "true");
+                    res.SetHeader("Access-Control-Max-Age", "3600");
+                }
             }
 
             // Handle preflight
@@ -585,13 +704,29 @@ private:
                 return false;
             }
 
-            // Get session token from Authorization header to look up CSRF
+            // Get session token from Authorization header to look up CSRF.
+            // Auth middleware already validated this header on protected routes;
+            // we re-check here defensively because middleware ordering changes
+            // would otherwise silently bypass CSRF enforcement.
             const auto authHeader = req.GetHeader("Authorization");
-            if (!authHeader.has_value()) return true; // auth middleware handles this
+            if (!authHeader.has_value()) {
+                m_stats.rejectedRequests.fetch_add(1, std::memory_order_relaxed);
+                res = Http::HttpResponse::MakeError(
+                    Http::HttpStatus::Forbidden,
+                    "CSRF check requires an authenticated session");
+                return false;
+            }
 
             const std::string_view authVal = authHeader.value();
             constexpr std::string_view BEARER_PREFIX = "Bearer ";
-            if (authVal.size() <= BEARER_PREFIX.size()) return true;
+            if (authVal.size() <= BEARER_PREFIX.size() ||
+                authVal.substr(0, BEARER_PREFIX.size()) != BEARER_PREFIX) {
+                m_stats.rejectedRequests.fetch_add(1, std::memory_order_relaxed);
+                res = Http::HttpResponse::MakeError(
+                    Http::HttpStatus::Forbidden,
+                    "CSRF check requires a Bearer authorization header");
+                return false;
+            }
 
             const std::string sessionToken(authVal.substr(BEARER_PREFIX.size()));
             const std::string expectedCsrf = GetSessionCsrfToken(sessionToken);
@@ -795,17 +930,6 @@ private:
             return;
         }
 
-        // Enforce session limit
-        {
-            std::shared_lock lock(m_sessionMutex);
-            if (m_sessions.size() >= m_config.maxSessions) {
-                res = Http::HttpResponse::MakeError(
-                    Http::HttpStatus::TooManyRequests,
-                    "Maximum active sessions reached");
-                return;
-            }
-        }
-
         // Create session
         auto session = CreateSession(req.remoteAddress);
         if (session.token.empty()) {
@@ -818,12 +942,24 @@ private:
         const auto tokenCopy = session.token;
         const auto csrfCopy = session.csrfToken;
 
-        // Store session
+        // Atomically prune expired sessions, enforce the cap, and insert the
+        // new session under one exclusive lock to eliminate the TOCTOU window
+        // between the prior size-check (shared) and insert (unique) phases.
         {
             std::unique_lock lock(m_sessionMutex);
-            m_sessions[session.token] = std::move(session);
+            PruneExpiredSessionsLocked();
+
+            if (m_sessions.size() >= m_config.maxSessions) {
+                res = Http::HttpResponse::MakeError(
+                    Http::HttpStatus::TooManyRequests,
+                    "Maximum active sessions reached");
+                return;
+            }
+
+            m_sessions.emplace(session.token, std::move(session));
+            m_stats.activeSessions.store(m_sessions.size(),
+                                         std::memory_order_relaxed);
         }
-        m_stats.activeSessions.fetch_add(1, std::memory_order_relaxed);
 
         nlohmann::json resp;
         resp["token"] = tokenCopy;
@@ -914,7 +1050,7 @@ private:
             Config::ProductTierManager::Instance().IsInitialized()) {
             auto& tier = Config::ProductTierManager::Instance();
             std::wstring_view tierName = tier.GetTierDisplayName();
-            j["tier"]["name"] = std::string(tierName.begin(), tierName.end());
+            j["tier"]["name"] = WideToJsonUtf8(tierName);
             j["tier"]["level"] = static_cast<uint8_t>(tier.GetCurrentTier());
         }
 
@@ -966,6 +1102,14 @@ private:
             j["quarantine"]["total_items"] = qm.GetEntryCount();
             j["quarantine"]["active_items"] = qm.GetEntryCount(
                 Core::Engine::QuarantineState::Active);
+            j["quarantine"]["bytes_stored"] =
+                qStats.currentVaultSize.load(std::memory_order_relaxed);
+            j["quarantine"]["entries_added"] =
+                qStats.totalQuarantined.load(std::memory_order_relaxed);
+            j["quarantine"]["entries_restored"] =
+                qStats.totalRestored.load(std::memory_order_relaxed);
+            j["quarantine"]["entries_deleted"] =
+                qStats.totalDeleted.load(std::memory_order_relaxed);
         }
 
         res.SetJsonBody(j.dump());
@@ -1046,8 +1190,8 @@ private:
             std::wstring_view tierName = tier.GetTierName();
             std::wstring_view displayName = tier.GetTierDisplayName();
 
-            j["tier"] = std::string(tierName.begin(), tierName.end());
-            j["display_name"] = std::string(displayName.begin(), displayName.end());
+            j["tier"] = WideToJsonUtf8(tierName);
+            j["display_name"] = WideToJsonUtf8(displayName);
             j["level"] = static_cast<uint8_t>(tier.GetCurrentTier());
 
             const auto& info = tier.GetLicenseInfo();
@@ -1172,8 +1316,16 @@ private:
                 return;
             }
 
-            // Convert to wide string
-            std::wstring widePath(pathStr.begin(), pathStr.end());
+            // Convert input path (UTF-8) to wide (UTF-16) using the proper
+            // Utils helper — naive iterator-range copy would corrupt any
+            // non-ASCII byte and miscount on multi-byte sequences.
+            std::wstring widePath = Utils::StringUtils::ToWide(pathStr);
+            if (widePath.empty() && !pathStr.empty()) {
+                res = Http::HttpResponse::MakeError(
+                    Http::HttpStatus::BadRequest,
+                    "Scan target contains an invalid UTF-8 path");
+                return;
+            }
             targets.push_back(std::move(widePath));
         }
 
@@ -1252,9 +1404,8 @@ private:
                 jobJson["elapsed_ms"] = p.elapsed.count();
                 jobJson["estimated_remaining_ms"] = p.estimatedRemaining.count();
 
-                // Convert current file to narrow string for JSON
-                std::string currentFile(p.currentFile.begin(), p.currentFile.end());
-                jobJson["current_file"] = std::move(currentFile);
+                // Convert current file (UTF-16) to UTF-8 for JSON.
+                jobJson["current_file"] = WideToJsonUtf8(p.currentFile);
             }
 
             j["active_jobs"].push_back(std::move(jobJson));
@@ -1285,11 +1436,9 @@ private:
         for (const auto& entry : entries) {
             nlohmann::json item;
             item["id"] = entry.entryId;
-            item["file_name"] = std::string(entry.fileName.begin(), entry.fileName.end());
-            item["original_path"] = std::string(entry.originalPath.begin(),
-                                                entry.originalPath.end());
-            item["threat_name"] = std::string(entry.threatName.begin(),
-                                              entry.threatName.end());
+            item["file_name"] = WideToJsonUtf8(entry.fileName);
+            item["original_path"] = WideToJsonUtf8(entry.originalPath);
+            item["threat_name"] = WideToJsonUtf8(entry.threatName);
             item["threat_score"] = entry.threatScore;
             item["state"] = static_cast<uint8_t>(entry.state);
             item["quarantine_time"] = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1335,7 +1484,13 @@ private:
                     "Path traversal detected in restore path");
                 return;
             }
-            restorePath = std::wstring(rp.begin(), rp.end());
+            restorePath = Utils::StringUtils::ToWide(rp);
+            if (restorePath.empty() && !rp.empty()) {
+                res = Http::HttpResponse::MakeError(
+                    Http::HttpStatus::BadRequest,
+                    "Restore path contains invalid UTF-8");
+                return;
+            }
         }
 
         auto result = qm.RestoreFile(entryId, restorePath);
@@ -1419,11 +1574,11 @@ private:
             return;
         }
 
-        // Parse query params for filtering
+        // Parse query params for filtering. std::stoul throws on malformed
+        // input — we never let user-controlled query values reach it.
         const auto limitParam = req.GetQueryParam("limit");
-
         const size_t limit = limitParam.has_value()
-            ? std::min(static_cast<size_t>(std::stoul(limitParam.value())), size_t{100})
+            ? ParseSizeTClamped(limitParam.value(), 100).value_or(50)
             : size_t{50};
 
         const auto threatAlerts = alerts.GetRecentAlerts(limit);
@@ -1601,7 +1756,7 @@ private:
 
         const auto limitParam = req.GetQueryParam("limit");
         const size_t limit = limitParam.has_value()
-            ? std::min(static_cast<size_t>(std::stoul(limitParam.value())), size_t{100})
+            ? ParseSizeTClamped(limitParam.value(), 100).value_or(50)
             : size_t{50};
 
         const auto recentAlerts = alertSystem.GetRecentAlerts(limit);
@@ -1814,16 +1969,54 @@ private:
         return it->second.csrfToken;
     }
 
+    // Remove sessions that have exceeded the configured idle timeout.
+    // Caller MUST hold m_sessionMutex exclusively.
+    void PruneExpiredSessionsLocked() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::seconds(m_config.sessionTimeoutSeconds);
+        size_t removed = 0;
+        for (auto it = m_sessions.begin(); it != m_sessions.end(); ) {
+            if (now - it->second.lastActivity > timeout) {
+                it = m_sessions.erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+        }
+        if (removed > 0) {
+            m_stats.activeSessions.store(m_sessions.size(),
+                                         std::memory_order_relaxed);
+            SS_LOG_INFO(LOG_CAT, L"Pruned %zu expired session(s)", removed);
+        }
+    }
+
     // ========================================================================
     // AUTHENTICATION HELPERS
     // ========================================================================
 
     [[nodiscard]] bool ValidateCredentials(const std::string& password) const {
-        // Get stored password hash from ConfigurationDB
-        // For Community edition, the user sets a local dashboard passphrase
+        // The dashboard credential is provisioned out-of-band (installer or
+        // CLI) by writing "api.dashboard.password_hash" via ConfigManager.
+        // Allowing the first /auth/login request to *set* the password — as
+        // an earlier revision did — exposes a trivial squatting bypass for
+        // any local user able to reach the loopback port before the operator.
+        // We therefore refuse all logins until the hash is provisioned.
         auto& cm = Config::ConfigManager::Instance();
         if (!cm.IsInitialized()) {
-            SS_LOG_ERROR(LOG_CAT, L"Cannot validate credentials — ConfigManager not initialized");
+            SS_LOG_ERROR(LOG_CAT,
+                L"Cannot validate credentials — ConfigManager not initialized");
+            return false;
+        }
+
+        if (password.empty()) {
+            return false;
+        }
+
+        // Cap to defeat absurdly large password DoS (PBKDF2 cost scales).
+        constexpr size_t MAX_PASSWORD_BYTES = 1024;
+        if (password.size() > MAX_PASSWORD_BYTES) {
+            SS_LOG_WARN(LOG_CAT,
+                L"Login rejected: password exceeds %zu bytes", MAX_PASSWORD_BYTES);
             return false;
         }
 
@@ -1831,39 +2024,90 @@ private:
             "api.dashboard.password_hash", "");
 
         if (storedHash.empty()) {
-            // No password configured yet — first-time setup
-            // Allow login with any non-empty password and store its hash
-            if (password.empty()) return false;
-
-            Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
-            if (!hasher.Init()) return false;
-            if (!hasher.Update(reinterpret_cast<const uint8_t*>(password.data()),
-                               password.size())) return false;
-
-            std::vector<uint8_t> digest;
-            if (!hasher.Final(digest)) return false;
-
-            std::string hashOut = Utils::HashUtils::ToHexLower(digest);
-            if (hashOut.empty()) return false;
-
-            (void)cm.SetValue<std::string>("api.dashboard.password_hash", hashOut);
-            SS_LOG_INFO(LOG_CAT, L"Dashboard password configured (first-time setup)");
-            return true;
+            SS_LOG_ERROR(LOG_CAT,
+                L"Dashboard password is not provisioned — refusing login. "
+                L"Set 'api.dashboard.password_hash' (pbkdf2$<iter>$<hex_salt>$<hex_key>) "
+                L"via the ShadowStrike CLI before starting the REST server.");
+            return false;
         }
 
-        // Hash the provided password and compare
-        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
-        if (!hasher.Init()) return false;
-        if (!hasher.Update(reinterpret_cast<const uint8_t*>(password.data()),
-                           password.size())) return false;
+        // Only PBKDF2 hashes are accepted. Legacy bare-SHA-256 hashes from
+        // earlier builds must be re-provisioned; we never accept them.
+        if (storedHash.size() < PBKDF2_PREFIX.size() ||
+            storedHash.compare(0, PBKDF2_PREFIX.size(), PBKDF2_PREFIX) != 0) {
+            SS_LOG_ERROR(LOG_CAT,
+                L"Dashboard password hash uses an unsupported format — "
+                L"only PBKDF2 ('pbkdf2$<iter>$<hex_salt>$<hex_key>') is accepted. "
+                L"Re-provision the password hash to enable logins.");
+            return false;
+        }
 
-        std::vector<uint8_t> digest;
-        if (!hasher.Final(digest)) return false;
+        // Parse "pbkdf2$<iter>$<hex_salt>$<hex_key>"
+        std::string_view body{storedHash};
+        body.remove_prefix(PBKDF2_PREFIX.size());
 
-        std::string inputHash = Utils::HashUtils::ToHexLower(digest);
-        if (inputHash.empty()) return false;
+        const auto iterEnd = body.find('$');
+        if (iterEnd == std::string_view::npos) return false;
+        const auto iterStr = body.substr(0, iterEnd);
+        body.remove_prefix(iterEnd + 1);
 
-        return ConstantTimeCompare(inputHash, storedHash);
+        const auto saltEnd = body.find('$');
+        if (saltEnd == std::string_view::npos) return false;
+        const auto saltHex = body.substr(0, saltEnd);
+        const auto keyHex  = body.substr(saltEnd + 1);
+
+        uint32_t iterations = 0;
+        {
+            auto [ptr, ec] = std::from_chars(iterStr.data(),
+                                             iterStr.data() + iterStr.size(),
+                                             iterations, 10);
+            if (ec != std::errc{} || ptr != iterStr.data() + iterStr.size()) {
+                SS_LOG_ERROR(LOG_CAT, L"Dashboard password hash: malformed iteration count");
+                return false;
+            }
+        }
+        // OWASP minimum, with a small fudge factor matching KDFParams::IsValid.
+        if (iterations < (Utils::CryptoUtils::MIN_PBKDF2_ITERATIONS / 10)) {
+            SS_LOG_ERROR(LOG_CAT,
+                L"Dashboard password hash: iteration count %u below safe minimum",
+                iterations);
+            return false;
+        }
+
+        std::vector<uint8_t> salt;
+        std::vector<uint8_t> expectedKey;
+        if (!Utils::HashUtils::FromHex(saltHex, salt) ||
+            !Utils::HashUtils::FromHex(keyHex, expectedKey)) {
+            SS_LOG_ERROR(LOG_CAT, L"Dashboard password hash: malformed hex payload");
+            return false;
+        }
+        if (salt.empty() || expectedKey.empty() ||
+            expectedKey.size() != PBKDF2_KEY_BYTES) {
+            SS_LOG_ERROR(LOG_CAT, L"Dashboard password hash: unexpected component sizes");
+            return false;
+        }
+
+        Utils::CryptoUtils::KDFParams params;
+        params.algorithm  = Utils::CryptoUtils::KDFAlgorithm::PBKDF2_SHA256;
+        params.iterations = iterations;
+        params.keyLength  = expectedKey.size();
+        params.salt       = std::move(salt);
+
+        std::vector<uint8_t> derived;
+        if (!Utils::CryptoUtils::KeyDerivation::DeriveKey(password, params, derived)) {
+            SS_LOG_ERROR(LOG_CAT, L"PBKDF2 derivation failed during credential validation");
+            return false;
+        }
+
+        // Constant-time comparison of raw bytes.
+        if (derived.size() != expectedKey.size()) {
+            return false;
+        }
+        volatile uint8_t diff = 0;
+        for (size_t i = 0; i < derived.size(); ++i) {
+            diff |= static_cast<uint8_t>(derived[i] ^ expectedKey[i]);
+        }
+        return diff == 0;
     }
 
     // ========================================================================
@@ -1984,6 +2228,7 @@ private:
     // ========================================================================
 
     std::unique_ptr<Http::HttpServer>   m_httpServer;
+    mutable std::shared_mutex           m_httpServerMutex;
     std::unique_ptr<RateLimiter>        m_generalLimiter;
     std::unique_ptr<RateLimiter>        m_authLimiter;
 
@@ -2038,9 +2283,10 @@ void RESTServerStatistics::Reset() noexcept {
 // ============================================================================
 
 bool RESTServerConfig::IsValid() const noexcept {
-    // Bind address must be localhost
-    if (bindAddress != "127.0.0.1" && bindAddress != "::1" &&
-        bindAddress != "localhost") {
+    // Bind address must be a numeric loopback literal — DNS resolution of
+    // "localhost" can be hijacked via the hosts file or NRPT and is therefore
+    // disallowed even though it would normally resolve to a loopback address.
+    if (bindAddress != "127.0.0.1" && bindAddress != "::1") {
         return false;
     }
 
