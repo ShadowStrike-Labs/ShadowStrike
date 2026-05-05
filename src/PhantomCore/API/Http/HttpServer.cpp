@@ -56,10 +56,28 @@ enum class IoOperation : uint8_t {
 // INTERNAL: Per-I/O Data (OVERLAPPED extension)
 // ============================================================================
 
+struct Connection;
+
 struct IoContext : OVERLAPPED {
     IoOperation operation = IoOperation::Read;
     WSABUF wsaBuf{};
     std::vector<uint8_t> buffer;
+
+    // DESIGN: Self-reference holding the owning Connection alive while an
+    // overlapped I/O is in flight. Set immediately before WSARecv/WSASend,
+    // cleared by the IOCP worker as soon as the completion is dequeued.
+    // This is the lifetime guarantee that prevents OS-side use-after-free of
+    // the OVERLAPPED block when CloseConnection erases the Connection from
+    // the map while a WSARecv/WSASend is still pending in the kernel — the
+    // close generates a cancellation completion that the worker must still
+    // be able to dereference safely.
+    //
+    // No reference cycle: although the Connection owns this IoContext, the
+    // self-reference only exists for the bounded interval between submit
+    // and completion-dequeue. Every successful submit is paired with exactly
+    // one completion (success, error, or cancellation), at which point the
+    // worker moves the shared_ptr out and the cycle is broken.
+    std::shared_ptr<Connection> selfRef;
 
     IoContext() noexcept {
         std::memset(static_cast<OVERLAPPED*>(this), 0, sizeof(OVERLAPPED));
@@ -79,7 +97,11 @@ struct Connection {
     std::string remoteAddress;
     uint16_t remotePort = 0;
     std::chrono::steady_clock::time_point connectedAt;
-    std::chrono::steady_clock::time_point lastActivityAt;
+
+    // lastActivityAt is read by the timeout thread without holding ioMutex,
+    // so we store it as an atomic of nanoseconds-since-epoch.
+    std::atomic<int64_t> lastActivityNs{0};
+
     uint32_t requestCount = 0;
 
     // Receive accumulator
@@ -93,13 +115,37 @@ struct Connection {
     std::deque<std::vector<uint8_t>> sendQueue;
     bool sendInProgress = false;
 
+    // Set by SendResponse when the response carries Connection: close so
+    // OnWriteComplete actually closes the socket once the queue drains
+    // instead of looping back into another WSARecv. Previously the keepAlive
+    // flag was reflected only in the response header, leaving the connection
+    // open after fatal parse errors and PayloadTooLarge responses.
+    bool closeAfterSend = false;
+
     // SSE flag
     bool isSSE = false;
+
+    // Per-connection serialisation. IOCP can deliver Read and Write
+    // completions for the same socket on different worker threads
+    // concurrently; without this lock OnReadComplete and OnWriteComplete
+    // would race on recvBuffer / sendQueue / state / sendInProgress.
+    std::mutex ioMutex;
 
     Connection() {
         recvBuffer.reserve(DEFAULT_READ_BUFFER_SIZE * 4);
         readCtx = std::make_unique<IoContext>();
         writeCtx = std::make_unique<IoContext>();
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        lastActivityNs.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
+            std::memory_order_relaxed);
+    }
+
+    void TouchActivity() noexcept {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        lastActivityNs.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
+            std::memory_order_relaxed);
     }
 };
 
@@ -177,8 +223,16 @@ ParseResult RequestParser::Parse(
 {
     consumed = 0;
 
-    // Enforce maximum total headers size (Slowloris / memory exhaustion protection)
-    if (dataLen > m_config.maxHeadersTotalSize + m_config.maxBodySize) {
+    // Enforce maximum total request size (Slowloris / memory-exhaustion
+    // protection). Compute the cap with a saturating add so two attacker-
+    // chosen config values cannot wrap size_t.
+    size_t maxTotal;
+    if (m_config.maxBodySize > SIZE_MAX - m_config.maxHeadersTotalSize) {
+        maxTotal = SIZE_MAX;
+    } else {
+        maxTotal = m_config.maxHeadersTotalSize + m_config.maxBodySize;
+    }
+    if (dataLen > maxTotal) {
         error = "Request exceeds maximum allowed size";
         return ParseResult::Error;
     }
@@ -222,6 +276,8 @@ ParseResult RequestParser::Parse(
     // Parse headers
     size_t headerCount = 0;
     size_t pos = firstLineEnd + 2; // skip \r\n
+    bool sawContentLength = false;
+    size_t contentLengthValue = 0;
     while (pos < headerEnd) {
         auto lineEnd = view.find("\r\n", pos);
         if (lineEnd == std::string_view::npos || lineEnd > headerEnd) break;
@@ -239,6 +295,49 @@ ParseResult RequestParser::Parse(
             return ParseResult::Error;
         }
 
+        // Reject obs-fold (RFC 7230 §3.2.4): a header line beginning with SP
+        // or HTAB is a continuation of the previous header. We don't unfold,
+        // and accepting it un-unfolded is itself a smuggling vector.
+        if (line[0] == ' ' || line[0] == '\t') {
+            error = "Obsolete header line folding is not supported";
+            return ParseResult::Error;
+        }
+
+        // CL/TE smuggling defence: detect duplicate or conflicting
+        // Content-Length values, and reject any Transfer-Encoding.
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos && colon > 0) {
+            const auto name = line.substr(0, colon);
+            if (CaseInsensitiveEqual{}(name, "Transfer-Encoding")) {
+                error = "Transfer-Encoding is not supported";
+                return ParseResult::Error;
+            }
+            if (CaseInsensitiveEqual{}(name, "Content-Length")) {
+                // Extract value (trim OWS).
+                size_t vs = colon + 1;
+                while (vs < line.size() && (line[vs] == ' ' || line[vs] == '\t')) ++vs;
+                size_t ve = line.size();
+                while (ve > vs && (line[ve - 1] == ' ' || line[ve - 1] == '\t')) --ve;
+                const auto valueSv = line.substr(vs, ve - vs);
+
+                size_t parsed = 0;
+                auto [ptr, ec] = std::from_chars(
+                    valueSv.data(), valueSv.data() + valueSv.size(), parsed);
+                if (ec != std::errc{} || ptr != valueSv.data() + valueSv.size()) {
+                    error = "Malformed Content-Length";
+                    return ParseResult::Error;
+                }
+                if (sawContentLength && parsed != contentLengthValue) {
+                    // RFC 7230 §3.3.3: duplicate Content-Length with
+                    // disagreeing values is a smuggling primitive — reject.
+                    error = "Conflicting Content-Length headers";
+                    return ParseResult::Error;
+                }
+                sawContentLength = true;
+                contentLengthValue = parsed;
+            }
+        }
+
         if (!ParseHeaderLine(line, request, error)) {
             return ParseResult::Error;
         }
@@ -248,16 +347,20 @@ ParseResult RequestParser::Parse(
 
     // Determine body length
     size_t bodyLength = 0;
-    auto contentLength = request.GetContentLength();
-    if (contentLength) {
-        bodyLength = *contentLength;
+    if (sawContentLength) {
+        bodyLength = contentLengthValue;
         if (bodyLength > m_config.maxBodySize) {
             error = "Request body too large";
             return ParseResult::Error;
         }
     }
 
-    // Check if we have the complete body
+    // Check if we have the complete body. Use a saturating add so a
+    // pathological Content-Length cannot wrap totalNeeded back below dataLen.
+    if (bodyLength > SIZE_MAX - headersSize) {
+        error = "Request body too large";
+        return ParseResult::Error;
+    }
     size_t totalNeeded = headersSize + bodyLength;
     if (dataLen < totalNeeded) {
         return ParseResult::Incomplete;
@@ -325,6 +428,23 @@ bool RequestParser::ParseRequestLine(
         return false;
     }
 
+    // Reject CR/LF/NUL and other C0 controls in the decoded path. Otherwise
+    // a request like "GET /%0d%0aSet-Cookie:foo HTTP/1.1" would put raw CRLF
+    // into request.path; any later code that echoes the path into a log line
+    // or response header would trigger CRLF injection.
+    for (unsigned char c : request.path) {
+        if (c < 0x20 || c == 0x7F) {
+            error = "Control characters in path";
+            return false;
+        }
+    }
+    for (unsigned char c : request.queryString) {
+        if (c == '\r' || c == '\n' || c == '\0') {
+            error = "Control characters in query string";
+            return false;
+        }
+    }
+
     request.httpVersion = std::string(rest.substr(sp2 + 1));
 
     // Only accept HTTP/1.0 and HTTP/1.1
@@ -368,7 +488,23 @@ bool RequestParser::ParseHeaderLine(
         --valEnd;
     }
 
-    request.headers[std::string(name)] = std::string(line.substr(valStart, valEnd - valStart));
+    auto rawValue = line.substr(valStart, valEnd - valStart);
+
+    // RFC 7230 §3.2: reject NUL and other C0 controls except HTAB. CR/LF
+    // cannot reach here (we split on CRLF) but a smuggled NUL or 0x01..0x08
+    // in a header value would be propagated downstream; reject up front.
+    for (unsigned char c : rawValue) {
+        if (c == '\0' || c == 0x7F) {
+            error = "NUL or DEL in header value";
+            return false;
+        }
+        if (c < 0x20 && c != '\t') {
+            error = "Control character in header value";
+            return false;
+        }
+    }
+
+    request.headers[std::string(name)] = std::string(rawValue);
     return true;
 }
 
@@ -515,9 +651,14 @@ private:
     std::vector<std::thread> m_workerThreads;
     std::atomic<bool> m_stopRequested{false};
 
-    // Connections
+    // Connections — shared_ptr so an in-flight worker can keep a Connection
+    // alive past CloseConnection's map erase. Required for IOCP correctness:
+    // closesocket() generates a cancellation completion for every pending
+    // OVERLAPPED, and the kernel still dereferences our IoContext at that
+    // point. The Connection (and its IoContext) must remain valid until
+    // every outstanding I/O has completed.
     mutable std::shared_mutex m_connectionsMutex;
-    std::unordered_map<SOCKET, std::unique_ptr<Connection>> m_connections;
+    std::unordered_map<SOCKET, std::shared_ptr<Connection>> m_connections;
 
     // Routing
     Router m_router;
@@ -540,13 +681,15 @@ private:
     void WorkerLoop();
     void TimeoutLoop();
 
-    void OnReadComplete(Connection& conn, DWORD bytesTransferred);
-    void OnWriteComplete(Connection& conn, DWORD bytesTransferred);
+    void OnReadComplete(const std::shared_ptr<Connection>& conn, DWORD bytesTransferred);
+    void OnWriteComplete(const std::shared_ptr<Connection>& conn, DWORD bytesTransferred);
 
-    void ProcessRequest(Connection& conn, HttpRequest& request);
-    void SendResponse(Connection& conn, HttpResponse& response, bool keepAlive);
-    void StartAsyncRead(Connection& conn);
-    void StartAsyncSend(Connection& conn);
+    void ProcessRequest(const std::shared_ptr<Connection>& conn, HttpRequest& request);
+    // Locked: caller holds conn->ioMutex.
+    void SendResponseLocked(Connection& conn, HttpResponse& response, bool keepAlive);
+    void StartAsyncRead(const std::shared_ptr<Connection>& conn);
+    // Locked: caller holds conn->ioMutex.
+    void StartAsyncSendLocked(const std::shared_ptr<Connection>& conn);
     void CloseConnection(SOCKET sock);
 
     void AddSecurityHeaders(HttpResponse& response) const;
@@ -670,6 +813,16 @@ bool HttpServerImpl::Start() {
     // Disable Nagle for responsive API responses
     setsockopt(m_listenSocket, IPPROTO_TCP, TCP_NODELAY,
         reinterpret_cast<const char*>(&optVal), sizeof(optVal));
+
+    // For an IPv6 listener, force IPV6_V6ONLY=1. Without this, on systems
+    // where the OS default is dual-stack, "::1" would also accept IPv4
+    // connections — bypassing the AF_INET-specific localhost check below
+    // by surfacing peers as "::ffff:127.0.0.1".
+    if (addrResult->ai_family == AF_INET6) {
+        DWORD v6only = 1;
+        setsockopt(m_listenSocket, IPPROTO_IPV6, IPV6_V6ONLY,
+            reinterpret_cast<const char*>(&v6only), sizeof(v6only));
+    }
 
     // Bind
     rv = bind(m_listenSocket, addrResult->ai_addr, static_cast<int>(addrResult->ai_addrlen));
@@ -890,25 +1043,23 @@ void HttpServerImpl::AcceptLoop() {
             continue;
         }
 
-        // Create connection state
-        auto conn = std::make_unique<Connection>();
+        // Create connection state (shared_ptr — see m_connections design note)
+        auto conn = std::make_shared<Connection>();
         conn->socket = clientSocket;
         conn->remoteAddress = addrBuf;
         conn->remotePort = remotePort;
         conn->connectedAt = std::chrono::steady_clock::now();
-        conn->lastActivityAt = conn->connectedAt;
+        conn->TouchActivity();
 
-        // Start async read
-        Connection* connPtr = conn.get();
         {
             std::unique_lock lock(m_connectionsMutex);
-            m_connections[clientSocket] = std::move(conn);
+            m_connections[clientSocket] = conn;
         }
 
         m_stats.totalConnections.fetch_add(1, std::memory_order_relaxed);
         m_stats.activeConnections.fetch_add(1, std::memory_order_relaxed);
 
-        StartAsyncRead(*connPtr);
+        StartAsyncRead(conn);
     }
 }
 
@@ -928,48 +1079,62 @@ void HttpServerImpl::WorkerLoop() {
             m_iocp, &bytesTransferred, &completionKey, &overlapped,
             1000); // 1 second timeout to allow periodic stop checks
 
+        // Adopt the self-reference held by the IoContext (if any) BEFORE
+        // doing anything else. This guarantees the Connection (and the
+        // OVERLAPPED block) survive for the entire duration of this
+        // dispatch even if CloseConnection has already removed it from
+        // m_connections on another thread.
+        std::shared_ptr<Connection> ioOwner;
+        IoContext* ioCtx = nullptr;
+        if (overlapped) {
+            ioCtx = static_cast<IoContext*>(overlapped);
+            ioOwner = std::move(ioCtx->selfRef);
+        }
+
         if (!success) {
             if (!overlapped) {
-                // Timeout or error, not associated with any I/O
+                // Timeout or error not associated with any I/O.
                 continue;
             }
-            // I/O error on a socket
-            SOCKET sock = static_cast<SOCKET>(completionKey);
+            // I/O error or cancellation on a socket. ioOwner already keeps
+            // the Connection alive; close drops the map entry once.
+            const SOCKET sock = static_cast<SOCKET>(completionKey);
             CloseConnection(sock);
             continue;
         }
 
         if (!overlapped) {
-            // Null overlapped = shutdown signal from PostQueuedCompletionStatus
+            // Null overlapped = shutdown signal from PostQueuedCompletionStatus.
             break;
         }
 
-        SOCKET sock = static_cast<SOCKET>(completionKey);
-        auto* ioCtx = static_cast<IoContext*>(overlapped);
+        const SOCKET sock = static_cast<SOCKET>(completionKey);
 
-        // Look up connection
-        Connection* conn = nullptr;
-        {
+        // Prefer the I/O-context-held shared_ptr over a fresh map lookup —
+        // it is the canonical, race-free reference. Fall back to the map
+        // only if the IoContext somehow had no selfRef (defence in depth).
+        std::shared_ptr<Connection> conn = ioOwner;
+        if (!conn) {
             std::shared_lock lock(m_connectionsMutex);
             auto it = m_connections.find(sock);
             if (it == m_connections.end()) continue;
-            conn = it->second.get();
+            conn = it->second;
         }
 
         if (bytesTransferred == 0 && ioCtx->operation == IoOperation::Read) {
-            // Graceful disconnect by peer
+            // Graceful disconnect by peer.
             CloseConnection(sock);
             continue;
         }
 
-        conn->lastActivityAt = std::chrono::steady_clock::now();
+        conn->TouchActivity();
 
         switch (ioCtx->operation) {
             case IoOperation::Read:
-                OnReadComplete(*conn, bytesTransferred);
+                OnReadComplete(conn, bytesTransferred);
                 break;
             case IoOperation::Write:
-                OnWriteComplete(*conn, bytesTransferred);
+                OnWriteComplete(conn, bytesTransferred);
                 break;
             default:
                 break;
@@ -987,27 +1152,28 @@ void HttpServerImpl::TimeoutLoop() {
     while (!m_stopRequested.load(std::memory_order_acquire)) {
         Sleep(2000); // Check every 2 seconds
 
-        auto now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+
         std::vector<SOCKET> toClose;
 
         {
             std::shared_lock lock(m_connectionsMutex);
-            for (auto& [sock, conn] : m_connections) {
-                auto idleSec = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - conn->lastActivityAt).count();
-
-                // SSE connections have no idle timeout
+            for (const auto& [sock, conn] : m_connections) {
                 if (conn->isSSE) continue;
 
+                const int64_t lastNs = conn->lastActivityNs.load(std::memory_order_relaxed);
+                const auto idleSec = (nowNs - lastNs) / 1'000'000'000LL;
+
+                std::lock_guard ioLock(conn->ioMutex);
                 if (conn->state == ConnectionState::Reading &&
                     conn->recvBuffer.empty() &&
-                    static_cast<uint32_t>(idleSec) > m_config.keepAliveTimeoutSec) {
-                    // Idle keep-alive connection — close
+                    idleSec > static_cast<int64_t>(m_config.keepAliveTimeoutSec)) {
                     toClose.push_back(sock);
                 } else if (conn->state == ConnectionState::Reading &&
                            !conn->recvBuffer.empty() &&
-                           static_cast<uint32_t>(idleSec) > m_config.incompleteRequestTimeoutSec) {
-                    // Incomplete request (Slowloris protection)
+                           idleSec > static_cast<int64_t>(m_config.incompleteRequestTimeoutSec)) {
                     m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
                     SS_LOG_WARN(LOG_CAT,
                         L"Closing connection from %hs:%u (incomplete request timeout)",
@@ -1027,22 +1193,31 @@ void HttpServerImpl::TimeoutLoop() {
 // Async Read
 // ============================================================================
 
-void HttpServerImpl::StartAsyncRead(Connection& conn) {
-    conn.readCtx->operation = IoOperation::Read;
-    std::memset(static_cast<OVERLAPPED*>(conn.readCtx.get()), 0, sizeof(OVERLAPPED));
-    conn.readCtx->wsaBuf.buf = reinterpret_cast<char*>(conn.readCtx->buffer.data());
-    conn.readCtx->wsaBuf.len = static_cast<ULONG>(conn.readCtx->buffer.size());
+void HttpServerImpl::StartAsyncRead(const std::shared_ptr<Connection>& conn) {
+    auto& ctx = *conn->readCtx;
+    ctx.operation = IoOperation::Read;
+    std::memset(static_cast<OVERLAPPED*>(&ctx), 0, sizeof(OVERLAPPED));
+    ctx.wsaBuf.buf = reinterpret_cast<char*>(ctx.buffer.data());
+    ctx.wsaBuf.len = static_cast<ULONG>(ctx.buffer.size());
+
+    // Self-reference must be set BEFORE WSARecv. If WSARecv succeeds (or
+    // returns WSA_IO_PENDING) the OS owns the OVERLAPPED until completion;
+    // the IOCP worker will move selfRef out then. If WSARecv fails
+    // synchronously with anything else there is no completion, so we must
+    // drop the selfRef here to avoid a permanent reference leak.
+    ctx.selfRef = conn;
 
     DWORD flags = 0;
     DWORD bytesRecv = 0;
-    int result = WSARecv(conn.socket, &conn.readCtx->wsaBuf, 1,
-        &bytesRecv, &flags, conn.readCtx.get(), nullptr);
+    int result = WSARecv(conn->socket, &ctx.wsaBuf, 1,
+        &bytesRecv, &flags, &ctx, nullptr);
 
     if (result == SOCKET_ERROR) {
-        int err = WSAGetLastError();
+        const int err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
+            ctx.selfRef.reset();
             SS_LOG_WARN(LOG_CAT, L"WSARecv failed: error=%d", err);
-            CloseConnection(conn.socket);
+            CloseConnection(conn->socket);
         }
     }
 }
@@ -1051,67 +1226,92 @@ void HttpServerImpl::StartAsyncRead(Connection& conn) {
 // OnReadComplete
 // ============================================================================
 
-void HttpServerImpl::OnReadComplete(Connection& conn, DWORD bytesTransferred) {
+void HttpServerImpl::OnReadComplete(const std::shared_ptr<Connection>& conn, DWORD bytesTransferred) {
     m_stats.bytesReceived.fetch_add(bytesTransferred, std::memory_order_relaxed);
 
+    // Take per-connection lock for the entire dispatch — Read and Write
+    // completions can run concurrently on different worker threads and
+    // both touch recvBuffer / sendQueue / state / sendInProgress.
+    std::unique_lock ioLock(conn->ioMutex);
+
     // Append received data to the connection's accumulator
-    conn.recvBuffer.insert(
-        conn.recvBuffer.end(),
-        conn.readCtx->buffer.data(),
-        conn.readCtx->buffer.data() + bytesTransferred);
+    conn->recvBuffer.insert(
+        conn->recvBuffer.end(),
+        conn->readCtx->buffer.data(),
+        conn->readCtx->buffer.data() + bytesTransferred);
 
-    // Try to parse a complete request from the accumulator
-    RequestParser parser(m_config);
-    HttpRequest request;
-    size_t consumed = 0;
-    std::string parseError;
+    // Try to parse as many complete pipelined requests as already buffered
+    // before posting a fresh WSARecv. Without this loop a client that
+    // pipelines two requests in one TCP segment would have its second
+    // request stall until further bytes arrived — eventually closed by
+    // the Slowloris timeout.
+    while (true) {
+        RequestParser parser(m_config);
+        HttpRequest request;
+        size_t consumed = 0;
+        std::string parseError;
 
-    auto result = parser.Parse(
-        conn.recvBuffer.data(), conn.recvBuffer.size(),
-        request, consumed, parseError);
+        const auto result = parser.Parse(
+            conn->recvBuffer.data(), conn->recvBuffer.size(),
+            request, consumed, parseError);
 
-    switch (result) {
-        case ParseResult::Complete: {
-            // Remove consumed bytes from buffer
-            conn.recvBuffer.erase(
-                conn.recvBuffer.begin(),
-                conn.recvBuffer.begin() + static_cast<ptrdiff_t>(consumed));
-            conn.requestCount++;
+        if (result == ParseResult::Complete) {
+            conn->recvBuffer.erase(
+                conn->recvBuffer.begin(),
+                conn->recvBuffer.begin() + static_cast<ptrdiff_t>(consumed));
+            conn->requestCount++;
 
-            request.remoteAddress = conn.remoteAddress;
-            request.remotePort = conn.remotePort;
-            conn.state = ConnectionState::Processing;
+            request.remoteAddress = conn->remoteAddress;
+            request.remotePort = conn->remotePort;
+            conn->state = ConnectionState::Processing;
 
             m_stats.totalRequests.fetch_add(1, std::memory_order_relaxed);
 
+            // ProcessRequest queues a response into sendQueue under the
+            // ioMutex via SendResponseLocked. Release-and-reacquire is
+            // unnecessary because handler invocation is itself serialised
+            // by the lock.
             ProcessRequest(conn, request);
-            break;
+
+            // If we asked to close after this response, do not parse any
+            // pipelined follow-up — the client gets one response and we
+            // close.
+            if (conn->closeAfterSend) break;
+
+            // Bound the loop by the keep-alive cap to prevent a malicious
+            // client from holding a worker thread indefinitely.
+            if (conn->requestCount >= m_config.maxKeepAliveRequests) break;
+
+            if (conn->recvBuffer.empty()) break;
+            // Else try to parse another already-buffered request.
+            continue;
         }
-        case ParseResult::Incomplete: {
-            // Need more data — post another read
-            if (conn.recvBuffer.size() > m_config.maxHeadersTotalSize + m_config.maxBodySize) {
-                // Safeguard: total accumulation exceeded
+
+        if (result == ParseResult::Incomplete) {
+            if (conn->recvBuffer.size() > m_config.maxHeadersTotalSize + m_config.maxBodySize) {
                 HttpResponse resp = HttpResponse::MakeError(
                     HttpStatus::PayloadTooLarge, "Request too large");
                 AddSecurityHeaders(resp);
-                SendResponse(conn, resp, false);
+                SendResponseLocked(*conn, resp, false);
                 return;
             }
+            // Need more data — post another read. Still under lock; the
+            // submission path itself is non-blocking.
             StartAsyncRead(conn);
-            break;
+            return;
         }
-        case ParseResult::Error: {
-            m_stats.parseErrors.fetch_add(1, std::memory_order_relaxed);
-            if (m_config.enableRequestLogging) {
-                SS_LOG_WARN(LOG_CAT, L"HTTP parse error from %hs:%u: %hs",
-                    conn.remoteAddress.c_str(), conn.remotePort, parseError.c_str());
-            }
-            HttpResponse resp = HttpResponse::MakeError(
-                HttpStatus::BadRequest, parseError);
-            AddSecurityHeaders(resp);
-            SendResponse(conn, resp, false);
-            break;
+
+        // ParseResult::Error
+        m_stats.parseErrors.fetch_add(1, std::memory_order_relaxed);
+        if (m_config.enableRequestLogging) {
+            SS_LOG_WARN(LOG_CAT, L"HTTP parse error from %hs:%u: %hs",
+                conn->remoteAddress.c_str(), conn->remotePort, parseError.c_str());
         }
+        HttpResponse resp = HttpResponse::MakeError(
+            HttpStatus::BadRequest, parseError);
+        AddSecurityHeaders(resp);
+        SendResponseLocked(*conn, resp, false);
+        return;
     }
 }
 
@@ -1119,15 +1319,15 @@ void HttpServerImpl::OnReadComplete(Connection& conn, DWORD bytesTransferred) {
 // Process Request (Route Dispatch)
 // ============================================================================
 
-void HttpServerImpl::ProcessRequest(Connection& conn, HttpRequest& request) {
+void HttpServerImpl::ProcessRequest(const std::shared_ptr<Connection>& conn, HttpRequest& request) {
     HttpResponse response;
 
     // Check if this is an SSE endpoint
     if (!m_sseEndpoint.empty() && request.path == m_sseEndpoint &&
         request.method == HttpMethod::GET) {
         // SSE connection — hold open
-        conn.isSSE = true;
-        conn.state = ConnectionState::Writing;
+        conn->isSSE = true;
+        conn->state = ConnectionState::Writing;
 
         // Send SSE headers
         std::string sseHeaders = "HTTP/1.1 200 OK\r\n"
@@ -1138,16 +1338,16 @@ void HttpServerImpl::ProcessRequest(Connection& conn, HttpRequest& request) {
             "\r\n";
 
         std::vector<uint8_t> data(sseHeaders.begin(), sseHeaders.end());
-        conn.sendQueue.push_back(std::move(data));
-        StartAsyncSend(conn);
+        conn->sendQueue.push_back(std::move(data));
+        StartAsyncSendLocked(conn);
 
         {
             std::unique_lock lock(m_sseMutex);
-            m_sseClients.push_back(conn.socket);
+            m_sseClients.push_back(conn->socket);
         }
 
         SS_LOG_INFO(LOG_CAT, L"SSE client connected from %hs:%u",
-            conn.remoteAddress.c_str(), conn.remotePort);
+            conn->remoteAddress.c_str(), conn->remotePort);
         return;
     }
 
@@ -1202,18 +1402,22 @@ void HttpServerImpl::ProcessRequest(Connection& conn, HttpRequest& request) {
             static_cast<uint16_t>(response.status));
     }
 
-    bool keepAlive = request.IsKeepAlive() && m_config.enableKeepAlive &&
-                     conn.requestCount < m_config.maxKeepAliveRequests;
-    SendResponse(conn, response, keepAlive);
+    const bool keepAlive = request.IsKeepAlive() && m_config.enableKeepAlive &&
+                           conn->requestCount < m_config.maxKeepAliveRequests;
+    SendResponseLocked(*conn, response, keepAlive);
 }
 
 // ============================================================================
 // Send Response
 // ============================================================================
 
-void HttpServerImpl::SendResponse(Connection& conn, HttpResponse& response, bool keepAlive) {
+void HttpServerImpl::SendResponseLocked(Connection& conn, HttpResponse& response, bool keepAlive) {
     if (!keepAlive) {
         response.SetHeader("Connection", "close");
+        // The previous code only set the header but kept reading from the
+        // socket after the response drained. Mark the connection so
+        // OnWriteComplete actually closes it once the queue empties.
+        conn.closeAfterSend = true;
     } else {
         response.SetHeader("Connection", "keep-alive");
         response.SetHeader("Keep-Alive",
@@ -1229,7 +1433,17 @@ void HttpServerImpl::SendResponse(Connection& conn, HttpResponse& response, bool
     conn.state = ConnectionState::Writing;
 
     if (!conn.sendInProgress) {
-        StartAsyncSend(conn);
+        // Need a shared_ptr to attach to the IoContext selfRef. Look up
+        // ourselves in the map under the connections lock.
+        std::shared_ptr<Connection> connPtr;
+        {
+            std::shared_lock lock(m_connectionsMutex);
+            auto it = m_connections.find(conn.socket);
+            if (it != m_connections.end()) connPtr = it->second;
+        }
+        if (connPtr) {
+            StartAsyncSendLocked(connPtr);
+        }
     }
 }
 
@@ -1237,40 +1451,39 @@ void HttpServerImpl::SendResponse(Connection& conn, HttpResponse& response, bool
 // Async Send
 // ============================================================================
 
-void HttpServerImpl::StartAsyncSend(Connection& conn) {
-    if (conn.sendQueue.empty()) {
-        conn.sendInProgress = false;
-        // Check if we should close or read more
-        if (conn.state == ConnectionState::Closing || !conn.isSSE) {
-            auto connectionHeader = std::string_view{};
-            // If the connection should close, do so
-            // For keep-alive, start reading next request
-            conn.state = ConnectionState::Reading;
-            StartAsyncRead(conn);
-        }
+void HttpServerImpl::StartAsyncSendLocked(const std::shared_ptr<Connection>& conn) {
+    if (conn->sendQueue.empty()) {
+        // Nothing to send — caller is responsible for what comes next
+        // (OnWriteComplete drives the post-send transition).
+        conn->sendInProgress = false;
         return;
     }
 
-    conn.sendInProgress = true;
-    auto& data = conn.sendQueue.front();
+    conn->sendInProgress = true;
+    auto& data = conn->sendQueue.front();
 
-    conn.writeCtx->operation = IoOperation::Write;
-    std::memset(static_cast<OVERLAPPED*>(conn.writeCtx.get()), 0, sizeof(OVERLAPPED));
-    conn.writeCtx->buffer = data; // copy for IOCP lifetime
-    conn.writeCtx->wsaBuf.buf = reinterpret_cast<char*>(conn.writeCtx->buffer.data());
-    conn.writeCtx->wsaBuf.len = static_cast<ULONG>(conn.writeCtx->buffer.size());
+    auto& ctx = *conn->writeCtx;
+    ctx.operation = IoOperation::Write;
+    std::memset(static_cast<OVERLAPPED*>(&ctx), 0, sizeof(OVERLAPPED));
+    // Copy out of the deque so the buffer remains stable until completion.
+    ctx.buffer = data;
+    ctx.wsaBuf.buf = reinterpret_cast<char*>(ctx.buffer.data());
+    ctx.wsaBuf.len = static_cast<ULONG>(ctx.buffer.size());
 
-    conn.sendQueue.pop_front();
+    conn->sendQueue.pop_front();
+
+    ctx.selfRef = conn;
 
     DWORD bytesSent = 0;
-    int result = WSASend(conn.socket, &conn.writeCtx->wsaBuf, 1,
-        &bytesSent, 0, conn.writeCtx.get(), nullptr);
+    int result = WSASend(conn->socket, &ctx.wsaBuf, 1,
+        &bytesSent, 0, &ctx, nullptr);
 
     if (result == SOCKET_ERROR) {
-        int err = WSAGetLastError();
+        const int err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
+            ctx.selfRef.reset();
             SS_LOG_WARN(LOG_CAT, L"WSASend failed: error=%d", err);
-            CloseConnection(conn.socket);
+            CloseConnection(conn->socket);
         }
     }
 }
@@ -1279,31 +1492,44 @@ void HttpServerImpl::StartAsyncSend(Connection& conn) {
 // OnWriteComplete
 // ============================================================================
 
-void HttpServerImpl::OnWriteComplete(Connection& conn, DWORD bytesTransferred) {
+void HttpServerImpl::OnWriteComplete(const std::shared_ptr<Connection>& conn, DWORD bytesTransferred) {
     (void)bytesTransferred;
 
-    if (!conn.sendQueue.empty()) {
-        // More data to send
-        StartAsyncSend(conn);
+    std::unique_lock ioLock(conn->ioMutex);
+
+    if (!conn->sendQueue.empty()) {
+        // More data to send.
+        StartAsyncSendLocked(conn);
         return;
     }
 
-    conn.sendInProgress = false;
+    conn->sendInProgress = false;
 
-    if (conn.isSSE) {
-        // SSE connections stay open — don't restart read
+    if (conn->isSSE) {
+        // SSE connections stay open — don't restart read.
         return;
     }
 
-    // Check Connection: close
-    conn.state = ConnectionState::KeepAlive;
-    if (conn.requestCount >= m_config.maxKeepAliveRequests) {
-        CloseConnection(conn.socket);
+    // Honour Connection: close (parse errors, PayloadTooLarge, explicit
+    // client request, request count cap).
+    if (conn->closeAfterSend ||
+        conn->requestCount >= m_config.maxKeepAliveRequests) {
+        ioLock.unlock();
+        CloseConnection(conn->socket);
         return;
     }
 
-    // Start reading next request
-    conn.state = ConnectionState::Reading;
+    // Keep-alive: post the next read. If recvBuffer already contains the
+    // start of a pipelined request the next OnReadComplete will pick it up
+    // — but to make sure no buffered data is forgotten when zero bytes
+    // arrive on the next WSARecv, parse what we already have first.
+    conn->state = ConnectionState::Reading;
+    if (!conn->recvBuffer.empty()) {
+        ioLock.unlock();
+        // Reuse the pipelined-parse path by simulating a 0-byte completion.
+        OnReadComplete(conn, 0);
+        return;
+    }
     StartAsyncRead(conn);
 }
 
@@ -1312,7 +1538,7 @@ void HttpServerImpl::OnWriteComplete(Connection& conn, DWORD bytesTransferred) {
 // ============================================================================
 
 void HttpServerImpl::CloseConnection(SOCKET sock) {
-    std::unique_ptr<Connection> conn;
+    std::shared_ptr<Connection> conn;
     {
         std::unique_lock lock(m_connectionsMutex);
         auto it = m_connections.find(sock);
@@ -1321,7 +1547,7 @@ void HttpServerImpl::CloseConnection(SOCKET sock) {
         m_connections.erase(it);
     }
 
-    // Remove from SSE clients if applicable
+    // Remove from SSE clients if applicable.
     if (conn->isSSE) {
         std::unique_lock lock(m_sseMutex);
         m_sseClients.erase(
@@ -1329,6 +1555,12 @@ void HttpServerImpl::CloseConnection(SOCKET sock) {
             m_sseClients.end());
     }
 
+    // closesocket() triggers cancellation of every pending overlapped on
+    // this socket; the cancellation completions flow through WorkerLoop,
+    // which adopts the IoContext's selfRef. The Connection (and its
+    // OVERLAPPED blocks) therefore stay alive until the kernel has signed
+    // off on every outstanding I/O — preventing a kernel UAF on the
+    // OVERLAPPED memory.
     shutdown(sock, SD_BOTH);
     closesocket(sock);
     m_stats.activeConnections.fetch_sub(1, std::memory_order_relaxed);
