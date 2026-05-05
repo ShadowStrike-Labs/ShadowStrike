@@ -194,8 +194,8 @@ private:
     void WorkerLoop();
     void EscalationLoop();
     void ProcessAlert(Alert& alert);
-    void DeliverToChannel(Alert& alert, DeliveryChannel channel);
-    void DeliverWebhook(Alert& alert, const WebhookConfiguration& wh);
+    [[nodiscard]] bool DeliverToChannel(Alert& alert, DeliveryChannel channel);
+    [[nodiscard]] bool DeliverWebhook(const Alert& alert, const WebhookConfiguration& wh);
     void DeliverDesktop(const Alert& alert);
     [[nodiscard]] bool DeliverSyslog(const Alert& alert);
     void DeliverSIEM(const Alert& alert);
@@ -707,8 +707,7 @@ bool AlertSystemImpl::TestWebhook(const std::string& id) {
     testAlert.source = "AlertSystem::TestWebhook";
     testAlert.createdTime = std::chrono::system_clock::now();
 
-    DeliverWebhook(testAlert, wh);
-    return true;
+    return DeliverWebhook(testAlert, wh);
 }
 
 std::vector<WebhookConfiguration> AlertSystemImpl::GetWebhooks() const {
@@ -1010,20 +1009,24 @@ void AlertSystemImpl::ProcessAlert(Alert& alert) {
     const auto channels = static_cast<uint32_t>(alert.deliveryChannels);
     bool anySuccess = false;
 
-    // Iterate each channel bit
+    // Iterate each channel bit. anySuccess MUST reflect actual delivery
+    // success — not merely that a channel handler was invoked. Otherwise
+    // the failure path (status=Failed + auto-retry) is never reached even
+    // when every channel returns an error.
     for (uint32_t bit = 0; bit < 14; ++bit) {
         const uint32_t mask = 1u << bit;
         if (!(channels & mask))
             continue;
 
         const auto channel = static_cast<DeliveryChannel>(mask);
-        DeliverToChannel(alert, channel);
+        const bool channelOk = DeliverToChannel(alert, channel);
 
         const auto chIdx = ChannelBitIndex(channel);
         if (chIdx < m_stats.byChannel.size())
             m_stats.byChannel[chIdx].fetch_add(1, std::memory_order_relaxed);
 
-        anySuccess = true;
+        if (channelOk)
+            anySuccess = true;
     }
 
     if (anySuccess) {
@@ -1061,7 +1064,7 @@ void AlertSystemImpl::ProcessAlert(Alert& alert) {
     }
 }
 
-void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
+bool AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
     const auto start = Clock::now();
     DeliveryResult result;
     result.alertId = alert.alertId;
@@ -1082,12 +1085,23 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
                     std::shared_lock lock(m_configMutex);
                     webhooks = m_config.webhooks;
                 }
+                bool anyOk = false;
+                bool anyAttempted = false;
                 for (const auto& wh : webhooks) {
                     if (!wh.enabled) continue;
                     if (wh.channelType != channel) continue;
-                    DeliverWebhook(alert, wh);
+                    anyAttempted = true;
+                    if (DeliverWebhook(alert, wh))
+                        anyOk = true;
                 }
-                result.success = true;
+                // No matching webhook configured is a configuration gap, not a
+                // delivery success — surface it as failure so retry/escalation
+                // policies can react and operators see actionable telemetry.
+                result.success = anyOk;
+                if (!anyAttempted)
+                    result.responseMessage = "No enabled webhook for channel";
+                else if (!anyOk)
+                    result.responseMessage = "All webhook deliveries failed";
                 break;
             }
 
@@ -1097,16 +1111,26 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
                     std::shared_lock lock(m_configMutex);
                     recipients = m_config.recipients;
                 }
+                bool anyOk = false;
+                bool anyAttempted = false;
                 for (const auto& r : recipients) {
                     if (!r.enabled || r.email.empty()) continue;
                     if (!(static_cast<uint32_t>(r.channels) &
                           static_cast<uint32_t>(DeliveryChannel::Email)))
                         continue;
+                    anyAttempted = true;
                     const auto body = FormatAlertEmail(alert);
-                    SendEmail(r.email, alert.subject, body, true);
+                    // SendEmail() increments m_stats.emailsSent on success.
+                    // Do NOT increment again here — that double-counted every
+                    // successful email and skewed dashboards/SLO metrics.
+                    if (SendEmail(r.email, alert.subject, body, true))
+                        anyOk = true;
                 }
-                result.success = true;
-                m_stats.emailsSent.fetch_add(1, std::memory_order_relaxed);
+                result.success = anyOk;
+                if (!anyAttempted)
+                    result.responseMessage = "No email-enabled recipient";
+                else if (!anyOk)
+                    result.responseMessage = "All email deliveries failed";
                 break;
             }
 
@@ -1117,11 +1141,18 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
 
             case DeliveryChannel::Syslog:
                 result.success = DeliverSyslog(alert);
+                if (!result.success)
+                    result.responseMessage = "Syslog TLS delivery failed";
                 break;
 
             case DeliveryChannel::SIEM:
                 DeliverSIEM(alert);
-                result.success = true;
+                // SIEM delegates to syslog and returns void; conservatively
+                // treat as success only if underlying syslog delivered.
+                // DeliverSIEM cast-discards the result, so we re-issue here.
+                result.success = DeliverSyslog(alert);
+                if (!result.success)
+                    result.responseMessage = "SIEM/syslog delivery failed";
                 break;
 
             case DeliveryChannel::Sound: {
@@ -1143,12 +1174,22 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
                     std::shared_lock lock(m_configMutex);
                     webhooks = m_config.webhooks;
                 }
+                bool anyOk = false;
+                bool anyAttempted = false;
                 for (const auto& wh : webhooks) {
-                    if (wh.enabled && wh.channelType == DeliveryChannel::SMS)
-                        DeliverWebhook(alert, wh);
+                    if (wh.enabled && wh.channelType == DeliveryChannel::SMS) {
+                        anyAttempted = true;
+                        if (DeliverWebhook(alert, wh))
+                            anyOk = true;
+                    }
                 }
-                result.success = true;
-                m_stats.smsSent.fetch_add(1, std::memory_order_relaxed);
+                result.success = anyOk;
+                if (anyOk)
+                    m_stats.smsSent.fetch_add(1, std::memory_order_relaxed);
+                if (!anyAttempted)
+                    result.responseMessage = "No SMS relay configured";
+                else if (!anyOk)
+                    result.responseMessage = "All SMS deliveries failed";
                 break;
             }
 
@@ -1168,9 +1209,11 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
         Clock::now() - start);
     result.durationMs = static_cast<uint32_t>(elapsed.count());
 
+    const bool ok = result.success;
     RecordDelivery(result);
 
-    // Notify delivery callback
+    // Notify delivery callback (snapshot-then-invoke to avoid holding the
+    // callback lock while user code runs).
     DeliveryCallback cb;
     {
         std::lock_guard lock(m_callbackMutex);
@@ -1178,11 +1221,17 @@ void AlertSystemImpl::DeliverToChannel(Alert& alert, DeliveryChannel channel) {
     }
     if (cb) {
         try { cb(result); }
-        catch (...) {}
+        catch (const std::exception& ex) {
+            Utils::Logger::Error("[AlertSystem] DeliveryCallback threw: {}", ex.what());
+        }
+        catch (...) {
+            Utils::Logger::Error("[AlertSystem] DeliveryCallback threw non-std exception");
+        }
     }
+    return ok;
 }
 
-void AlertSystemImpl::DeliverWebhook(Alert& alert, const WebhookConfiguration& wh) {
+bool AlertSystemImpl::DeliverWebhook(const Alert& alert, const WebhookConfiguration& wh) {
     std::string payload;
     if (!wh.payloadTemplate.empty()) {
         payload = wh.payloadTemplate;
@@ -1236,10 +1285,12 @@ void AlertSystemImpl::DeliverWebhook(Alert& alert, const WebhookConfiguration& w
     if (!Utils::NetworkUtils::HttpPost(url, postData, response, opts, &err)) {
         Utils::Logger::Error("[AlertSystem] Webhook '{}' failed: {}", wh.name,
                             WideToUtf8(err.message));
-        NotifyError("Webhook '" + wh.name + "' failed: " + WideToUtf8(err.message), static_cast<int>(err.win32));
-    } else {
-        m_stats.webhooksSent.fetch_add(1, std::memory_order_relaxed);
+        NotifyError("Webhook '" + wh.name + "' failed: " + WideToUtf8(err.message),
+                    static_cast<int>(err.win32));
+        return false;
     }
+    m_stats.webhooksSent.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 void AlertSystemImpl::DeliverDesktop(const Alert& alert) {
@@ -1284,7 +1335,12 @@ bool AlertSystemImpl::DeliverSyslog(const Alert& alert) {
         connectTimeoutSec = 5;
     }
 
-    static const int severityMap[] = { 6, 5, 4, 3, 2, 1 }; // Info..Emergency → 6..1
+    // RFC 5424 §6.2.1 severity codes: Emergency=0, Alert=1, Critical=2,
+    // Error=3, Warning=4, Notice=5, Informational=6, Debug=7.
+    // ShadowStrike severity ordering (Info..Emergency) maps as below.
+    // Note: index 5 (Emergency) MUST be 0 — not 1 — to comply with RFC 5424
+    // and ensure SIEMs route catastrophic events at the correct priority.
+    static const int severityMap[] = { 6, 5, 4, 3, 2, 0 }; // Info..Emergency
 
     const int syslogSeverity = (static_cast<size_t>(alert.severity) < 6)
         ? severityMap[static_cast<size_t>(alert.severity)] : 3;
