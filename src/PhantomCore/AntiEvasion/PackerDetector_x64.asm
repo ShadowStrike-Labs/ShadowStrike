@@ -34,29 +34,42 @@
 ; ============================================================================
 ; FUNCTIONS - SELF-MODIFYING CODE DETECTION
 ; ============================================================================
-; - CheckCodePageWritability: Test if code page is writable (SMC indicator)
-; - DetectCodeModification: Monitor code section for modifications
 ; - ScanForSMCPatterns: Scan for self-modifying code patterns
+;
+; NOTE: CheckCodePageWritability is intentionally NOT implemented in this
+; module. Page-protection state cannot be reliably inferred from assembly
+; without invoking Win32 (VirtualQuery). The C++ fallback in PackerDetector.cpp
+; (Fallback_CheckCodePageWritability) performs the proper query and is bound
+; via /ALTERNATENAME so an unresolved external is satisfied without a fault-
+; prone placeholder overriding the safe implementation.
 ;
 ; ============================================================================
 ; FUNCTIONS - DEBUG REGISTER MONITORING
 ; ============================================================================
-; - GetDebugRegistersForUnpacker: Read DR0-DR7 to detect unpacker monitoring
-; - CheckHardwareBreakpointTraps: Detect hardware breakpoint-based unpacking
+; - CheckHardwareBreakpointTraps: Decode an externally-supplied DR7 value
+;
+; NOTE: ReadDR0..ReadDR7 and GetDebugRegistersForUnpacker are intentionally
+; NOT implemented here. PhantomCoreLib is a user-mode (CPL3) static library,
+; and the MOV from a debug register is a privileged instruction; executing it
+; from user mode raises #GP, which surfaces as EXCEPTION_PRIV_INSTRUCTION and
+; (with no SEH frame around the calls) terminates the process. The safe C++
+; fallbacks (Fallback_ReadDR* / Fallback_GetDebugRegistersForUnpacker) return
+; zero and are bound via /ALTERNATENAME directives in PackerDetector.cpp.
+; A kernel-mode build is the appropriate place to read DR registers directly.
 ;
 ; ============================================================================
 ; FUNCTIONS - ANTI-UNPACKING DETECTION
 ; ============================================================================
 ; - DetectRDTSCAntiDebug: Detect RDTSC-based anti-debugging in unpacker
-; - DetectExceptionAntiDebug: Detect exception-based anti-debugging
-; - ScanForAntiDebugOpcodes: SIMD-accelerated anti-debug opcode scanning
+; - ScanForAntiDebugOpcodes: Anti-debug opcode scanner (semantics match the
+;   C++ fallback; flag bits 0-4 are INT2D / INT3 / RDTSC / CPUID / RDTSCP)
 ;
-; ============================================================================
-; FUNCTIONS - UNPACKER ANALYSIS
-; ============================================================================
-; - MeasureDecompressionLoop: Time decompression loop execution
-; - DetectPolymorphicDecryptor: Detect polymorphic decryption routines
-; - AnalyzeUnpackerControlFlow: Control flow analysis of unpacker
+; NOTE: ScanForXORDecryptionLoop and ScanForAPIHashingPattern are intentionally
+; NOT implemented here. The earlier asm implementations did not perform the
+; documented loop / DEC+JNZ / ADD|XOR lookahead, which produced a false
+; positive on every "xor reg,reg" zeroing idiom (and every ROL/ROR pair). The
+; C++ fallbacks in PackerDetector.cpp implement the contract correctly and
+; are bound via /ALTERNATENAME.
 ;
 ; CALLING CONVENTION: Microsoft x64 calling convention
 ; - First 4 args: RCX, RDX, R8, R9
@@ -76,15 +89,10 @@ PUBLIC DetectTimingAnomaly
 PUBLIC GetRDTSCValue
 PUBLIC GetRDTSCPValue
 
-; Debug register monitoring
-PUBLIC GetDebugRegistersForUnpacker
+; Debug register monitoring (DR-read primitives are deliberately NOT exported
+; from this user-mode module; see header comment above. CheckHardwareBreakpointTraps
+; only decodes a caller-supplied DR7 value and is safe at CPL3.)
 PUBLIC CheckHardwareBreakpointTraps
-PUBLIC ReadDR0
-PUBLIC ReadDR1
-PUBLIC ReadDR2
-PUBLIC ReadDR3
-PUBLIC ReadDR6
-PUBLIC ReadDR7
 
 ; Anti-unpacking detection
 PUBLIC DetectRDTSCAntiDebug
@@ -93,11 +101,9 @@ PUBLIC ScanForInt2DOpcode
 PUBLIC ScanForRDTSCOpcode
 PUBLIC ScanForCPUIDOpcode
 
-; Code analysis
-PUBLIC CheckCodePageWritability
+; Code analysis (CheckCodePageWritability, ScanForXORDecryptionLoop, and
+; ScanForAPIHashingPattern are intentionally NOT exported; see header.)
 PUBLIC ScanForSMCPatterns
-PUBLIC ScanForXORDecryptionLoop
-PUBLIC ScanForAPIHashingPattern
 
 ; SIMD-accelerated scanning
 PUBLIC SIMDScanForByte
@@ -346,82 +352,19 @@ DetectTimingAnomaly PROC
 DetectTimingAnomaly ENDP
 
 ; ==============================================================================
-; GetDebugRegistersForUnpacker
-; Read all debug registers to detect unpacker hardware breakpoint usage
+; GetDebugRegistersForUnpacker, ReadDR0..ReadDR7
 ;
-; Parameters:
-;   RCX = pointer to 8-element uint64_t array [DR0,DR1,DR2,DR3,DR6,DR7,0,0]
+; These helpers were previously implemented inline with `mov rax, drN`. From
+; user mode (CPL3) such a MOV is a privileged instruction and raises #GP,
+; which Windows surfaces as EXCEPTION_PRIV_INSTRUCTION. PhantomCoreLib is a
+; user-mode static library and the callers in PackerDetector.cpp do not wrap
+; the call sites in SEH, so each invocation would terminate the process.
 ;
-; Returns: RAX = 1 if successful, 0 if failed (access denied)
+; The exports are deliberately omitted from this module. The C++ side declares
+; /ALTERNATENAME aliases that bind every Read* and GetDebugRegistersForUnpacker
+; symbol to its safe fallback (returns 0 / writes zeroed array). A kernel-mode
+; build is the appropriate place to read DR registers directly via dr0..dr7.
 ; ==============================================================================
-GetDebugRegistersForUnpacker PROC
-    push rbx
-    
-    test rcx, rcx
-    jz @dr_fail
-    
-    ; Note: Reading DR0-DR7 requires ring 0 or debugger privileges
-    ; In user mode, this will cause #GP if not debugging
-    ; We use SEH to handle the exception gracefully
-    
-    ; Try to read debug registers
-    ; This is wrapped in SEH in the C++ caller
-    mov rax, dr0
-    mov [rcx], rax
-    mov rax, dr1
-    mov [rcx + 8], rax
-    mov rax, dr2
-    mov [rcx + 16], rax
-    mov rax, dr3
-    mov [rcx + 24], rax
-    mov rax, dr6
-    mov [rcx + 32], rax
-    mov rax, dr7
-    mov [rcx + 40], rax
-    
-    mov rax, 1
-    pop rbx
-    ret
-    
-@dr_fail:
-    xor rax, rax
-    pop rbx
-    ret
-GetDebugRegistersForUnpacker ENDP
-
-; ==============================================================================
-; Individual debug register accessors
-; These are safer for SEH wrapping
-; ==============================================================================
-ReadDR0 PROC
-    mov rax, dr0
-    ret
-ReadDR0 ENDP
-
-ReadDR1 PROC
-    mov rax, dr1
-    ret
-ReadDR1 ENDP
-
-ReadDR2 PROC
-    mov rax, dr2
-    ret
-ReadDR2 ENDP
-
-ReadDR3 PROC
-    mov rax, dr3
-    ret
-ReadDR3 ENDP
-
-ReadDR6 PROC
-    mov rax, dr6
-    ret
-ReadDR6 ENDP
-
-ReadDR7 PROC
-    mov rax, dr7
-    ret
-ReadDR7 ENDP
 
 ; ==============================================================================
 ; CheckHardwareBreakpointTraps
@@ -583,17 +526,21 @@ DetectRDTSCAntiDebug ENDP
 
 ; ==============================================================================
 ; ScanForAntiDebugOpcodes
-; SIMD-accelerated scan for anti-debugging opcodes in code
+; Scan a code buffer for anti-debugging opcodes.
+;
+; Flag-bit semantics MUST match Fallback_ScanForAntiDebugOpcodes in
+; PackerDetector.cpp; consumers index the same uint32_t result regardless of
+; whether the asm or fallback implementation is linked.
 ;
 ; Parameters:
 ;   RCX = pointer to code buffer
 ;   RDX = size of buffer
 ;   R8  = pointer to result flags (uint32_t)
-;         Bit 0: INT 2D found
-;         Bit 1: INT 3 found
-;         Bit 2: RDTSC found
-;         Bit 3: CPUID found
-;         Bit 4: IN/OUT (VM detect) found
+;         Bit 0 (0x01): INT 2D  (CD 2D)
+;         Bit 1 (0x02): INT 3   (CC)
+;         Bit 2 (0x04): RDTSC   (0F 31)
+;         Bit 3 (0x08): CPUID   (0F A2)
+;         Bit 4 (0x10): RDTSCP  (0F 01 F9)
 ;
 ; Returns: RAX = total count of anti-debug opcodes found
 ; ==============================================================================
@@ -608,7 +555,7 @@ ScanForAntiDebugOpcodes PROC
     
     mov rsi, rcx                ; Buffer
     mov r12, rdx                ; Size
-    mov r13, r8                 ; Result flags pointer
+    mov r13, r8                 ; Result flags pointer (may be NULL)
     
     test rsi, rsi
     jz @scan_fail
@@ -616,109 +563,95 @@ ScanForAntiDebugOpcodes PROC
     jz @scan_fail
     
     xor r14, r14                ; Total count
-    xor r15, r15                ; Flags
+    xor r15, r15                ; Flags accumulator
     
     xor rdi, rdi                ; Index
     
 @scan_loop:
     cmp rdi, r12
-    jge @scan_done
+    jae @scan_done
     
     movzx eax, byte ptr [rsi + rdi]
     
-    ; Check for INT instruction (0xCD)
-    cmp al, 0CDh
-    jne @not_int
-    
-    ; Check next byte for INT number
-    lea rcx, [rdi + 1]
-    cmp rcx, r12
-    jge @not_int
-    
-    movzx ebx, byte ptr [rsi + rdi + 1]
-    
-    ; INT 2D (anti-debug)
-    cmp bl, 2Dh
-    jne @check_int3_cd
-    or r15d, 1                  ; Set bit 0
-    inc r14
-    jmp @next_byte
-    
-@check_int3_cd:
-    ; INT 3 via CD 03
-    cmp bl, 03h
-    jne @next_byte
-    or r15d, 2                  ; Set bit 1
-    inc r14
-    jmp @next_byte
-    
-@not_int:
-    ; Check for single-byte INT 3 (0xCC)
+    ; ------------------------------------------------------------------
+    ; Single-byte INT 3 (0xCC)
+    ; ------------------------------------------------------------------
     cmp al, 0CCh
-    jne @not_int3
-    or r15d, 2                  ; Set bit 1
+    jne @check_cd
+    or r15d, 2
     inc r14
     jmp @next_byte
     
-@not_int3:
-    ; Check for RDTSC (0x0F 0x31)
-    cmp al, 0Fh
-    jne @not_0f
+    ; ------------------------------------------------------------------
+    ; Two-byte sequences starting with 0xCD (INT imm8)
+    ; INT 2D is the anti-debug primitive used historically.
+    ; ------------------------------------------------------------------
+@check_cd:
+    cmp al, 0CDh
+    jne @check_0f
     
+    ; Need one more byte for the imm8.
     lea rcx, [rdi + 1]
     cmp rcx, r12
-    jge @not_0f
+    jae @next_byte
+    
+    movzx ebx, byte ptr [rsi + rdi + 1]
+    cmp bl, 2Dh
+    jne @next_byte
+    or r15d, 1
+    inc r14
+    jmp @next_byte
+    
+    ; ------------------------------------------------------------------
+    ; Two- or three-byte sequences starting with 0x0F:
+    ;   RDTSC  = 0F 31
+    ;   CPUID  = 0F A2
+    ;   RDTSCP = 0F 01 F9
+    ; ------------------------------------------------------------------
+@check_0f:
+    cmp al, 0Fh
+    jne @next_byte
+    
+    ; Need at least one more byte.
+    lea rcx, [rdi + 1]
+    cmp rcx, r12
+    jae @next_byte
     
     movzx ebx, byte ptr [rsi + rdi + 1]
     
-    ; RDTSC
-    cmp bl, 31h
+    cmp bl, 31h                 ; RDTSC
     jne @check_cpuid
-    or r15d, 4                  ; Set bit 2
+    or r15d, 4
     inc r14
     jmp @next_byte
     
 @check_cpuid:
-    ; CPUID (0x0F 0xA2)
-    cmp bl, 0A2h
+    cmp bl, 0A2h                ; CPUID
+    jne @check_rdtscp
+    or r15d, 8
+    inc r14
+    jmp @next_byte
+    
+@check_rdtscp:
+    cmp bl, 01h                 ; possible RDTSCP prefix (0F 01 ...)
     jne @next_byte
-    or r15d, 8                  ; Set bit 3
+    
+    ; Need a third byte for the F9 escape.
+    lea rcx, [rdi + 2]
+    cmp rcx, r12
+    jae @next_byte
+    
+    movzx ebx, byte ptr [rsi + rdi + 2]
+    cmp bl, 0F9h
+    jne @next_byte
+    or r15d, 10h
     inc r14
-    jmp @next_byte
-    
-@not_0f:
-    ; Check for IN (0xEC, 0xED, 0xE4, 0xE5)
-    cmp al, 0ECh
-    je @found_io
-    cmp al, 0EDh
-    je @found_io
-    cmp al, 0E4h
-    je @found_io
-    cmp al, 0E5h
-    jne @check_out
-    
-@found_io:
-    or r15d, 10h                ; Set bit 4
-    inc r14
-    jmp @next_byte
-    
-@check_out:
-    ; Check for OUT (0xEE, 0xEF, 0xE6, 0xE7)
-    cmp al, 0EEh
-    je @found_io
-    cmp al, 0EFh
-    je @found_io
-    cmp al, 0E6h
-    je @found_io
-    cmp al, 0E7h
-    je @found_io
     
 @next_byte:
     inc rdi
     jmp @scan_loop
     
 @scan_done:
-    ; Store flags if pointer provided
     test r13, r13
     jz @no_flags
     mov [r13], r15d
@@ -728,6 +661,12 @@ ScanForAntiDebugOpcodes PROC
     jmp @scan_exit
     
 @scan_fail:
+    ; On failure path, still zero-out flags if a pointer was provided so the
+    ; caller never observes uninitialized bits.
+    test r13, r13
+    jz @scan_fail_no_flags
+    mov dword ptr [r13], 0
+@scan_fail_no_flags:
     xor rax, rax
     
 @scan_exit:
@@ -860,204 +799,28 @@ ScanForCPUIDOpcode ENDP
 
 ; ==============================================================================
 ; CheckCodePageWritability
-; Check if a code page is writable (self-modifying code indicator)
 ;
-; Parameters:
-;   RCX = address to check
-;
-; Returns: RAX = 1 if writable, 0 if not
+; Intentionally NOT implemented in assembly. Reliable detection of writable
+; code pages requires VirtualQuery (or NtQueryVirtualMemory). The previous
+; placeholder dereferenced the supplied pointer and unconditionally returned
+; zero, which (a) introduced an access-violation risk on a hostile pointer
+; and (b) shadowed the correct C++ fallback. The /ALTERNATENAME directive in
+; PackerDetector.cpp now binds the symbol to Fallback_CheckCodePageWritability,
+; which performs the proper Win32 query.
 ; ==============================================================================
-CheckCodePageWritability PROC
-    ; This checks by attempting to read the existing value
-    ; Actual writability test requires VirtualProtect in user mode
-    ; This is a placeholder that returns based on page alignment
-    
-    test rcx, rcx
-    jz @not_writable
-    
-    ; Check if we can read (basic validity check)
-    mov al, [rcx]
-    
-    ; In reality, need VirtualQuery to check PAGE_EXECUTE_READWRITE
-    ; Return 0 as we can't safely test writability from assembly
-    xor rax, rax
-    ret
-    
-@not_writable:
-    xor rax, rax
-    ret
-CheckCodePageWritability ENDP
 
 ; ==============================================================================
-; ScanForXORDecryptionLoop
-; Scan for XOR-based decryption loop pattern
-; Pattern: XOR [mem], reg/imm followed by loop/jnz
+; ScanForXORDecryptionLoop / ScanForAPIHashingPattern
 ;
-; Parameters:
-;   RCX = buffer
-;   RDX = size
-;
-; Returns: RAX = count of XOR decryption patterns found
+; Intentionally NOT implemented in assembly. The earlier asm did not perform
+; the documented "look ahead for LOOP / DEC+JNZ" or "look ahead for ADD/XOR"
+; window scans; it simply incremented the counter on every XOR-family or
+; ROL/ROR opcode. That produced a false positive on every "xor reg,reg"
+; zeroing idiom and on every double-rotate sequence in ordinary code. The
+; C++ fallbacks (Fallback_ScanForXORDecryptionLoop /
+; Fallback_ScanForAPIHashingPattern) implement the documented window-scan
+; semantics and are bound via /ALTERNATENAME.
 ; ==============================================================================
-ScanForXORDecryptionLoop PROC
-    push rbx
-    push rdi
-    push rsi
-    
-    mov rsi, rcx
-    mov rbx, rdx
-    
-    test rsi, rsi
-    jz @xor_fail
-    test rbx, rbx
-    jz @xor_fail
-    
-    xor rax, rax                ; Pattern count
-    xor rdi, rdi                ; Index
-    
-@xor_scan_loop:
-    lea rcx, [rdi + 2]
-    cmp rcx, rbx
-    jge @xor_done
-    
-    ; Look for XOR with memory operand (30-33 opcodes with ModRM)
-    movzx ecx, byte ptr [rsi + rdi]
-    
-    ; XOR r/m8, r8 (30)
-    cmp cl, 30h
-    je @found_xor_candidate
-    ; XOR r/m16/32/64, r16/32/64 (31)
-    cmp cl, 31h
-    je @found_xor_candidate
-    ; XOR r8, r/m8 (32)
-    cmp cl, 32h
-    je @found_xor_candidate
-    ; XOR r16/32/64, r/m16/32/64 (33)
-    cmp cl, 33h
-    je @found_xor_candidate
-    ; XOR r/m8, imm8 (80 /6)
-    cmp cl, 80h
-    jne @xor_next
-    
-    ; Check ModRM for /6 (XOR)
-    movzx edx, byte ptr [rsi + rdi + 1]
-    and dl, 38h                 ; Extract reg field
-    cmp dl, 30h                 ; /6 = 110 binary = 0x30
-    jne @xor_next
-    
-@found_xor_candidate:
-    ; Found XOR, look ahead for loop/jnz pattern
-    inc rax
-    
-@xor_next:
-    inc rdi
-    jmp @xor_scan_loop
-    
-@xor_done:
-    jmp @xor_exit
-    
-@xor_fail:
-    xor rax, rax
-    
-@xor_exit:
-    pop rsi
-    pop rdi
-    pop rbx
-    ret
-ScanForXORDecryptionLoop ENDP
-
-; ==============================================================================
-; ScanForAPIHashingPattern
-; Scan for API hashing pattern (ROL/ROR combined with ADD/XOR)
-; Common in shellcode and packed malware for dynamic API resolution
-;
-; Parameters:
-;   RCX = buffer
-;   RDX = size
-;
-; Returns: RAX = count of API hashing patterns found
-; ==============================================================================
-ScanForAPIHashingPattern PROC
-    push rbx
-    push rdi
-    push rsi
-    push r12
-    
-    mov rsi, rcx
-    mov rbx, rdx
-    
-    test rsi, rsi
-    jz @hash_fail
-    test rbx, rbx
-    jz @hash_fail
-    
-    xor rax, rax                ; Pattern count
-    xor rdi, rdi                ; Index
-    xor r12, r12                ; ROL/ROR count in window
-    
-@hash_scan_loop:
-    lea rcx, [rdi + 1]
-    cmp rcx, rbx
-    jge @hash_done
-    
-    movzx ecx, byte ptr [rsi + rdi]
-    
-    ; ROL r/m8, 1 (D0 /0)
-    cmp cl, 0D0h
-    je @check_rol
-    ; ROL r/m8, CL (D2 /0)
-    cmp cl, 0D2h
-    je @check_rol
-    ; ROL r/m16/32/64, 1 (D1 /0)
-    cmp cl, 0D1h
-    je @check_rol
-    ; ROL r/m16/32/64, CL (D3 /0)
-    cmp cl, 0D3h
-    je @check_rol
-    ; ROL r/m8, imm8 (C0 /0)
-    cmp cl, 0C0h
-    je @check_rol
-    ; ROL r/m16/32/64, imm8 (C1 /0)
-    cmp cl, 0C1h
-    jne @hash_next
-    
-@check_rol:
-    ; Verify it's ROL/ROR (reg field 0 or 1)
-    movzx edx, byte ptr [rsi + rdi + 1]
-    and dl, 38h
-    test dl, dl                 ; /0 = ROL
-    jz @is_rotate
-    cmp dl, 08h                 ; /1 = ROR
-    jne @hash_next
-    
-@is_rotate:
-    inc r12
-    
-    ; If we've seen multiple rotates, look for ADD/XOR nearby
-    cmp r12, 2
-    jl @hash_next
-    
-    ; Found pattern
-    inc rax
-    xor r12, r12
-    
-@hash_next:
-    inc rdi
-    jmp @hash_scan_loop
-    
-@hash_done:
-    jmp @hash_exit
-    
-@hash_fail:
-    xor rax, rax
-    
-@hash_exit:
-    pop r12
-    pop rsi
-    pop rdi
-    pop rbx
-    ret
-ScanForAPIHashingPattern ENDP
 
 ; ==============================================================================
 ; ScanForSMCPatterns
