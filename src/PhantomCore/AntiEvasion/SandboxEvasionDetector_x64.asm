@@ -1008,51 +1008,68 @@ GetRDTSCFrequency ENDP
 ;; Detects RDTSC emulation by checking for unrealistic values.
 ;; Some sandboxes return constant or sequentially increasing values.
 ;;
+;; Semantics MUST match Fallback_DetectRDTSCEmulation in SandboxEvasionDetector.cpp:
+;;   1. Take three consecutive RDTSC samples; if any two consecutive samples
+;;      are equal, the TSC is being emulated as a constant.
+;;   2. Otherwise compute delta1 = t2-t1, delta2 = t3-t2. If delta1 == delta2
+;;      and delta1 > 0, take a fourth sample and compute delta3 = t4-t3. Only
+;;      a TRIPLE match (delta3 == delta2) is reported as emulation - real
+;;      hardware exhibits jitter and a single delta tie alone is not a
+;;      sufficient signal.
+;;
 ;; Prototype: uint32_t DetectRDTSCEmulation(void);
 ;; Returns: 1 if emulation detected, 0 otherwise
 ;; =============================================================================
 DetectRDTSCEmulation PROC
     push    rbx
-    push    rcx
     push    rsi
     push    rdi
     push    r12
     push    r13
+    push    r14
     
     ;; Take 3 consecutive RDTSC readings
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    mov     r12, rax        ; First reading
+    mov     r12, rax        ; t1
     
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    mov     r13, rax        ; Second reading
+    mov     r13, rax        ; t2
     
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    mov     rsi, rax        ; Third reading
+    mov     r14, rax        ; t3
     
     ;; Check for constant values (clear emulation sign)
     cmp     r12, r13
     je      @EmulationDetected
-    cmp     r13, rsi
+    cmp     r13, r14
     je      @EmulationDetected
     
-    ;; Check for suspicious constant increment
+    ;; delta1 = t2 - t1, delta2 = t3 - t2
     mov     rdi, r13
-    sub     rdi, r12        ; delta1
-    mov     rbx, rsi
-    sub     rbx, r13        ; delta2
+    sub     rdi, r12        ; rdi = delta1
+    mov     rbx, r14
+    sub     rbx, r13        ; rbx = delta2
     
-    ;; If deltas are exactly equal, suspicious
+    ;; Real hardware exhibits jitter; only a TRIPLE match is actionable.
+    ;; First require delta1 == delta2 and delta1 > 0.
     cmp     rdi, rbx
     jne     @NotEmulated
+    test    rdi, rdi
+    jz      @NotEmulated
     
-    ;; But allow some tolerance - exact match 3 times is suspicious
-    ;; Additional check needed
+    ;; Take a fourth sample and check delta3 == delta2.
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    sub     rax, r14        ; rax = delta3 = t4 - t3
+    cmp     rax, rbx
+    je      @EmulationDetected
     
 @NotEmulated:
     xor     eax, eax
@@ -1062,11 +1079,11 @@ DetectRDTSCEmulation PROC
     mov     eax, 1
     
 @EmulReturn:
+    pop     r14
     pop     r13
     pop     r12
     pop     rdi
     pop     rsi
-    pop     rcx
     pop     rbx
     ret
 DetectRDTSCEmulation ENDP
