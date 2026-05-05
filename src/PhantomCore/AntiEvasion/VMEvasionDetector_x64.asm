@@ -138,8 +138,10 @@ CheckVMwareBackdoor ENDP
 ;
 ; extern "C" uint32_t CheckHyperVBackdoor() noexcept;
 ; ==============================================================================
-CheckHyperVBackdoor PROC
+CheckHyperVBackdoor PROC FRAME
     push rbx
+    .pushreg rbx
+    .endprolog
 
     ; First check if hypervisor is present
     mov eax, 1
@@ -189,10 +191,14 @@ CheckHyperVBackdoor ENDP
 ;                                       uint32_t* eax, uint32_t* ebx,
 ;                                       uint32_t* ecx, uint32_t* edx) noexcept;
 ; ==============================================================================
-GetExtendedCPUIDInfo PROC
+GetExtendedCPUIDInfo PROC FRAME
     push rbx
+    .pushreg rbx
     push rdi
+    .pushreg rdi
     push rsi
+    .pushreg rsi
+    .endprolog
 
     ; Save output pointers
     mov r10, r8                 ; pEax
@@ -261,6 +267,16 @@ GetExtendedCPUIDInfo ENDP
 ; Attempts to execute VMCALL instruction (Intel VT-x hypercall)
 ;
 ; Note: This WILL cause #UD exception on most systems. Caller MUST use SEH.
+;       The instruction is therefore wrapped at the C++ layer; the SEH unwind
+;       restores volatile register state from the saved CONTEXT and never
+;       observes mid-prolog state, so this PROC remains a leaf with no FRAME.
+;
+; Volatile-only register zeroing: the SDM specifies VMCALL takes no implicit
+; register inputs from non-root mode; we still zero EAX/ECX/EDX so that any
+; in-VM handler observes a deterministic input. EBX is non-volatile under the
+; Microsoft x64 ABI (RBX is callee-saved), so it MUST NOT be clobbered: a
+; successful VMCALL in a hypervisor that handles the unprivileged variant
+; would otherwise corrupt the caller's RBX without any save/restore.
 ;
 ; Returns:
 ;   RAX = 1 if VMCALL executed (likely in VM), 0 otherwise (never reached on exception)
@@ -269,7 +285,6 @@ GetExtendedCPUIDInfo ENDP
 ; ==============================================================================
 DetectVMCALL PROC
     xor eax, eax
-    xor ebx, ebx
     xor ecx, ecx
     xor edx, edx
 
@@ -287,6 +302,7 @@ DetectVMCALL ENDP
 ; Attempts to execute VMMCALL instruction (AMD-V hypercall)
 ;
 ; Note: This WILL cause #UD exception on most systems. Caller MUST use SEH.
+;       See DetectVMCALL above for the EBX (RBX non-volatile) ABI rationale.
 ;
 ; Returns:
 ;   RAX = 1 if VMMCALL executed (likely in AMD VM)
@@ -295,7 +311,6 @@ DetectVMCALL ENDP
 ; ==============================================================================
 DetectVMMCALL PROC
     xor eax, eax
-    xor ebx, ebx
     xor ecx, ecx
     xor edx, edx
 
@@ -315,8 +330,10 @@ DetectVMMCALL ENDP
 ;
 ; extern "C" uint32_t CheckCPUIDLeafRange() noexcept;
 ; ==============================================================================
-CheckCPUIDLeafRange PROC
+CheckCPUIDLeafRange PROC FRAME
     push rbx
+    .pushreg rbx
+    .endprolog
 
     ; First check if hypervisor bit is set
     mov eax, 1
