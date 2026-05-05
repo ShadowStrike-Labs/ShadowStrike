@@ -631,9 +631,12 @@ bool ServiceCommunicationImpl::Connect(const std::wstring& pipeName, uint32_t ti
         return false;
     }
 
-    // Set pipe to message mode
+    // Set pipe to byte-stream read mode. Failure is non-fatal — the default
+    // mode also works — but log the deviation so it can be diagnosed.
     DWORD mode = PIPE_READMODE_BYTE;
-    SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+    if (!SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr)) {
+        Utils::Logger::Warn("[ServiceComm] SetNamedPipeHandleState failed: {}", GetLastError());
+    }
 
     m_clientPipe = HandleGuard(hPipe);
     m_clientState.store(ConnectionState::Authenticating, std::memory_order_release);
@@ -726,6 +729,20 @@ bool ServiceCommunicationImpl::Connect(const std::wstring& pipeName, uint32_t ti
 
     auto hmacResponse = crypto.HMAC(challenge, std::span<const uint8_t>(psk.data(), psk.size()));
 
+    // The HMAC primitive must produce exactly HMAC_SIZE bytes; anything
+    // shorter would leave half of the wire response zero-filled, which the
+    // server's constant-time compare would then reject as a fake match if the
+    // PSK happened to map to all-zero output. Hard-fail rather than truncate.
+    if (hmacResponse.size() != ServiceCommConstants::HMAC_SIZE) {
+        Utils::Logger::Error("[ServiceComm] HMAC primitive returned {} bytes (expected {})",
+                             hmacResponse.size(), ServiceCommConstants::HMAC_SIZE);
+        crypto.SecureZero(psk.data(), psk.size());
+        m_clientPipe.Close();
+        m_clientState.store(ConnectionState::Disconnected, std::memory_order_release);
+        m_stats.connectionsFailed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
     // Send HandshakeResponse
     HandshakeResponseMessage response{};
     response.header.magic = ServiceCommConstants::PROTOCOL_MAGIC;
@@ -734,8 +751,9 @@ bool ServiceCommunicationImpl::Connect(const std::wstring& pipeName, uint32_t ti
     response.header.sequence = m_clientSequence.fetch_add(1, std::memory_order_relaxed);
     response.header.responseTo = challengeHdr.sequence;
     response.header.payloadLength = sizeof(HandshakeResponseMessage) - sizeof(MessageHeader);
-    memcpy(response.hmacResponse, hmacResponse.data(),
-           std::min(hmacResponse.size(), sizeof(response.hmacResponse)));
+    static_assert(sizeof(response.hmacResponse) == ServiceCommConstants::HMAC_SIZE,
+                  "HandshakeResponseMessage::hmacResponse must hold a full HMAC");
+    memcpy(response.hmacResponse, hmacResponse.data(), ServiceCommConstants::HMAC_SIZE);
     response.header.checksum = ComputeCrc32(
         reinterpret_cast<const uint8_t*>(&response) + sizeof(MessageHeader),
         response.header.payloadLength);
@@ -854,6 +872,16 @@ void ServiceCommunicationImpl::SendCommand(const std::string& cmd) {
 }
 
 bool ServiceCommunicationImpl::SendMessage(const ServiceMessage& msg) {
+    // Reject oversized payloads explicitly. Silently truncating would corrupt
+    // the receiver's view of the message and yield CRC/HMAC failures that look
+    // like wire tampering — much harder to diagnose than a clean refusal.
+    if (msg.payload.size() > ServiceCommConstants::MAX_MESSAGE_SIZE) {
+        Utils::Logger::Warn("[ServiceComm] SendMessage rejected: payload {} > MAX_MESSAGE_SIZE {}",
+                            msg.payload.size(), ServiceCommConstants::MAX_MESSAGE_SIZE);
+        m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
     if (!m_isService) {
         // Client mode: send on client pipe
         if (!m_clientPipe.IsValid()) return false;
@@ -863,8 +891,7 @@ bool ServiceCommunicationImpl::SendMessage(const ServiceMessage& msg) {
         hdr.type = msg.type;
         hdr.sequence = m_clientSequence.fetch_add(1, std::memory_order_relaxed);
         hdr.responseTo = msg.responseTo;
-        hdr.payloadLength = static_cast<uint32_t>(
-            std::min(msg.payload.size(), ServiceCommConstants::MAX_MESSAGE_SIZE));
+        hdr.payloadLength = static_cast<uint32_t>(msg.payload.size());
         hdr.checksum = ComputeCrc32(msg.payload.data(), hdr.payloadLength);
 
         return WriteMessage(m_clientPipe.h, m_clientWriteMutex, hdr,
@@ -878,6 +905,13 @@ bool ServiceCommunicationImpl::SendMessage(const ServiceMessage& msg) {
 
 bool ServiceCommunicationImpl::SendMessageToSession(const ServiceMessage& msg,
                                                      const std::string& sessionId) {
+    if (msg.payload.size() > ServiceCommConstants::MAX_MESSAGE_SIZE) {
+        Utils::Logger::Warn("[ServiceComm] SendMessageToSession rejected: payload {} > MAX",
+                            msg.payload.size());
+        m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
     std::shared_lock lock(m_clientsMutex);
     ConnectedClient* client = FindClient(sessionId);
     if (!client || !client->pipeHandle.IsValid()) return false;
@@ -888,8 +922,7 @@ bool ServiceCommunicationImpl::SendMessageToSession(const ServiceMessage& msg,
     hdr.type = msg.type;
     hdr.sequence = client->sequence.fetch_add(1, std::memory_order_relaxed);
     hdr.responseTo = msg.responseTo;
-    hdr.payloadLength = static_cast<uint32_t>(
-        std::min(msg.payload.size(), ServiceCommConstants::MAX_MESSAGE_SIZE));
+    hdr.payloadLength = static_cast<uint32_t>(msg.payload.size());
     hdr.checksum = ComputeCrc32(msg.payload.data(), hdr.payloadLength);
 
     return WritePreparedMessage(
@@ -905,8 +938,11 @@ bool ServiceCommunicationImpl::SendMessageToSession(const ServiceMessage& msg,
 
 std::optional<ServiceMessage> ServiceCommunicationImpl::SendRequest(
     const ServiceMessage& req, uint32_t timeoutMs) {
-    const uint32_t seq = m_isService ? 0 :
-        m_clientSequence.fetch_add(1, std::memory_order_relaxed);
+    // m_clientSequence is a per-process atomic — using it on both client and
+    // server sides ensures concurrent SendRequest() calls never collide on
+    // the m_pendingRequests key (the previous code used 0 on the server side,
+    // so any second concurrent request would overwrite the first's promise).
+    const uint32_t seq = m_clientSequence.fetch_add(1, std::memory_order_relaxed);
 
     auto pending = std::make_shared<PendingRequest>();
     pending->deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -935,6 +971,13 @@ std::optional<ServiceMessage> ServiceCommunicationImpl::SendRequest(
 }
 
 void ServiceCommunicationImpl::Broadcast(const ServiceMessage& msg) {
+    if (msg.payload.size() > ServiceCommConstants::MAX_MESSAGE_SIZE) {
+        Utils::Logger::Warn("[ServiceComm] Broadcast rejected: payload {} > MAX_MESSAGE_SIZE",
+                            msg.payload.size());
+        m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
     std::shared_lock lock(m_clientsMutex);
     for (auto& client : m_clients) {
         if (!client || !client->pipeHandle.IsValid() ||
@@ -946,8 +989,7 @@ void ServiceCommunicationImpl::Broadcast(const ServiceMessage& msg) {
         hdr.version = ServiceCommConstants::PROTOCOL_VERSION;
         hdr.type = msg.type;
         hdr.sequence = client->sequence.fetch_add(1, std::memory_order_relaxed);
-        hdr.payloadLength = static_cast<uint32_t>(
-            std::min(msg.payload.size(), ServiceCommConstants::MAX_MESSAGE_SIZE));
+        hdr.payloadLength = static_cast<uint32_t>(msg.payload.size());
         hdr.checksum = ComputeCrc32(msg.payload.data(), hdr.payloadLength);
 
         WritePreparedMessage(
@@ -2201,15 +2243,34 @@ void ServiceCommunicationImpl::HandleCommand(const std::string& sessionId,
         }
     }
 
-    // Send response
+    // Send response. Refuse to silently truncate an oversized handler reply —
+    // the client would receive a CRC-failing tail. Convert to a 'truncated'
+    // error response instead so the requester gets a clean failure signal.
+    std::vector<uint8_t> safeResponse;
+    bool wasTruncated = false;
+    if (response.size() > ServiceCommConstants::MAX_MESSAGE_SIZE) {
+        wasTruncated = true;
+        Utils::Logger::Warn("[ServiceComm] Command '{}' produced {} bytes (>{}); replacing with error",
+                            GetMessageTypeName(hdr.type), response.size(),
+                            ServiceCommConstants::MAX_MESSAGE_SIZE);
+        const std::string err =
+            "{\"error\":\"ResponseTooLarge\","
+            "\"message\":\"Handler response exceeds maximum message size\"}";
+        safeResponse.assign(err.begin(), err.end());
+    } else {
+        safeResponse = std::move(response);
+    }
+
     MessageHeader resp{};
     resp.magic = ServiceCommConstants::PROTOCOL_MAGIC;
     resp.version = ServiceCommConstants::PROTOCOL_VERSION;
-    resp.type = handled ? MessageType::ResponseOk : MessageType::ResponseError;
+    resp.type = (handled && !wasTruncated) ? MessageType::ResponseOk
+                                           : MessageType::ResponseError;
     resp.responseTo = hdr.sequence;
-    resp.payloadLength = static_cast<uint32_t>(
-        std::min(response.size(), ServiceCommConstants::MAX_MESSAGE_SIZE));
-    resp.checksum = response.empty() ? 0 : ComputeCrc32(response.data(), resp.payloadLength);
+    resp.payloadLength = static_cast<uint32_t>(safeResponse.size());
+    resp.checksum = safeResponse.empty()
+                  ? 0u
+                  : ComputeCrc32(safeResponse.data(), safeResponse.size());
 
     std::shared_lock lock(m_clientsMutex);
     ConnectedClient* client = FindClient(sessionId);
@@ -2219,7 +2280,7 @@ void ServiceCommunicationImpl::HandleCommand(const std::string& sessionId,
             client->pipeHandle.h,
             client->writeMutex,
             resp,
-            response.empty() ? nullptr : response.data(),
+            safeResponse.empty() ? nullptr : safeResponse.data(),
             resp.payloadLength,
             client->encryptionEstablished,
             std::span<const uint8_t>(client->sessionKey.data(), client->sessionKey.size()),
@@ -2785,8 +2846,18 @@ void ServiceMessage::SetPayloadString(const std::string& str) {
 }
 
 bool ServiceCommConfiguration::IsValid() const noexcept {
-    return !pipeName.empty() && maxClients > 0 && maxClients <= 256 &&
-           maxMessagesPerSecond > 0;
+    if (pipeName.empty()) return false;
+    if (maxClients == 0 || maxClients > 256) return false;
+    if (maxMessagesPerSecond == 0) return false;
+
+    // Reject pipe names containing control characters or absurd lengths —
+    // CreateNamedPipeW would either fail or produce a malformed namespace
+    // entry. Defence-in-depth against attacker-influenced configuration.
+    if (pipeName.size() > 256) return false;
+    for (wchar_t wc : pipeName) {
+        if (wc < 0x20 || wc == 0x7F) return false;
+    }
+    return true;
 }
 
 // ============================================================================
