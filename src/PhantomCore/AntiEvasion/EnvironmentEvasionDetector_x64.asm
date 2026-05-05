@@ -153,28 +153,20 @@ PUBLIC CheckSSE2Support
 ; - This is a definitive VM indicator used by all major hypervisors
 ; ==============================================================================
 CheckCPUIDHypervisorBit PROC
-    push    rbx
-    push    rcx
-    push    rdx
+    push    rbx                 ; RBX is the only non-volatile register
+                                ; CPUID clobbers; RCX/RDX are volatile.
 
-    ; Check if CPUID is supported by trying to flip ID bit in EFLAGS
-    pushfq
-    pop     rax
-    mov     rcx, rax
-    xor     rax, 200000h        ; Flip ID bit (bit 21)
-    push    rax
-    popfq
-    pushfq
-    pop     rax
-    xor     rax, rcx
-    jz      no_cpuid_support
+    ; CPUID is an architectural baseline on x86-64; no availability probe
+    ; is required.  The previous PUSHFQ / EFLAGS.ID toggle was both dead
+    ; (CPUID is mandatory in long mode) and unsafe: any unrelated flag bit
+    ; changing between the two PUSHFQ snapshots could collapse the XOR to
+    ; zero and produce a SILENT false negative from a hypervisor detector.
 
-    ; CPUID is supported, check for hypervisor bit
     mov     eax, 1              ; CPUID leaf 1
-    xor     ecx, ecx
+    xor     ecx, ecx            ; Sub-leaf 0
     cpuid
 
-    ; Check bit 31 of ECX (hypervisor present bit)
+    ; Hypervisor-present bit is ECX[31].
     bt      ecx, 31
     jc      hypervisor_found
 
@@ -183,14 +175,8 @@ CheckCPUIDHypervisorBit PROC
 
 hypervisor_found:
     mov     rax, 1
-    jmp     cleanup_hypervisor
-
-no_cpuid_support:
-    xor     rax, rax
 
 cleanup_hypervisor:
-    pop     rdx
-    pop     rcx
     pop     rbx
     ret
 CheckCPUIDHypervisorBit ENDP
