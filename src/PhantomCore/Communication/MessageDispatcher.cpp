@@ -37,7 +37,8 @@
 
 #include "../Utils/JSONUtils.hpp"
 
-#include <algorithm>#include <sstream>
+#include <algorithm>
+#include <sstream>
 #include <chrono>
 
 namespace {
@@ -84,7 +85,16 @@ public:
         : m_connection(connection) {
     }
 
-    ~MessageDispatcherImpl() = default;
+    ~MessageDispatcherImpl() {
+        // FIX [BUG #24]: Drain any in-flight async dispatch tasks before the
+        // PIMPL goes away. Without this, std::async-launched tasks that capture
+        // 'this' would race against destruction and dereference freed handler
+        // storage / m_connection on shutdown.
+        std::unique_lock lock(m_pendingMutex);
+        m_pendingCv.wait(lock, [this] {
+            return m_pendingAsync.load(std::memory_order_acquire) == 0;
+        });
+    }
 
     // Non-copyable
     MessageDispatcherImpl(const MessageDispatcherImpl&) = delete;
@@ -374,14 +384,32 @@ public:
 
         // Send reply if required
         if (needsReply) {
-            auto replyBuffer = SerializeVerdictReply(reply);
+            // FIX [BUG #25]: SerializeVerdictReply allocates a buffer sized
+            // by attacker-influenced threatName length and ReplyMessage may
+            // throw on transport failure. An uncaught std::bad_alloc /
+            // std::system_error here would propagate out of the dispatch
+            // worker and unwind the kernel-message receive loop. Contain the
+            // failure, count it, and return false so the worker stays alive.
+            try {
+                auto replyBuffer = SerializeVerdictReply(reply);
 
-            if (!m_connection.ReplyMessage(replyBuffer, header->messageId)) {
-                Utils::Logger::Warn("[MessageDispatcher] Failed to send reply for msg {}",
-                                   header->messageId);
+                if (!m_connection.ReplyMessage(replyBuffer, header->messageId)) {
+                    Utils::Logger::Warn("[MessageDispatcher] Failed to send reply for msg {}",
+                                       header->messageId);
+                    m_stats.replyErrors++;
+                } else {
+                    m_stats.repliesSent++;
+                }
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("[MessageDispatcher] Reply path exception for msg {}: {}",
+                                     header->messageId, e.what());
                 m_stats.replyErrors++;
-            } else {
-                m_stats.repliesSent++;
+                handled = false;
+            } catch (...) {
+                Utils::Logger::Error("[MessageDispatcher] Reply path unknown exception for msg {}",
+                                     header->messageId);
+                m_stats.replyErrors++;
+                handled = false;
             }
         }
 
@@ -399,9 +427,28 @@ public:
         // Copy buffer for async processing
         std::vector<uint8_t> bufferCopy(messageBuffer.begin(), messageBuffer.end());
 
-        return std::async(std::launch::async, [this, buffer = std::move(bufferCopy)]() {
-            return DispatchMessage(std::span<const uint8_t>(buffer));
-        });
+        // FIX [BUG #24]: Track pending async tasks so the destructor can
+        // drain them. The captured `this` would otherwise dangle if the
+        // dispatcher is torn down before the future is awaited.
+        m_pendingAsync.fetch_add(1, std::memory_order_acq_rel);
+
+        return std::async(std::launch::async,
+            [this, buffer = std::move(bufferCopy)]() {
+                bool result = false;
+                try {
+                    result = DispatchMessage(std::span<const uint8_t>(buffer));
+                } catch (...) {
+                    // Never let exceptions escape the async task — DispatchMessage
+                    // already swallows handler exceptions, but defend against
+                    // SerializeVerdictReply / std::bad_alloc on the reply path.
+                    result = false;
+                }
+                if (m_pendingAsync.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard lock(m_pendingMutex);
+                    m_pendingCv.notify_all();
+                }
+                return result;
+            });
     }
 
     //=========================================================================
@@ -554,10 +601,24 @@ public:
         const RegistryNotificationData* raw =
             reinterpret_cast<const RegistryNotificationData*>(data.data());
 
+        // FIX [BUG #26]: Cap variable-length data sizes BEFORE size_t addition.
+        // valueDataLength is uint32_t and on 32-bit platforms (or even on x64
+        // with multiple variable fields) summing it with key/value-name lengths
+        // can wrap before the bounds check below. Reject obviously-bogus inputs
+        // up front, well below MAX_MESSAGE_SIZE.
+        if (raw->keyPathLength > MAX_MESSAGE_SIZE ||
+            raw->valueNameLength > MAX_MESSAGE_SIZE ||
+            raw->valueDataLength > MAX_MESSAGE_SIZE) {
+            Utils::Logger::Warn("[MessageDispatcher] RegistryNotification field too large: "
+                               "key={} valueName={} valueData={}",
+                               raw->keyPathLength, raw->valueNameLength, raw->valueDataLength);
+            return std::nullopt;
+        }
+
         size_t requiredSize = sizeof(RegistryNotificationData) +
-                             (raw->keyPathLength * sizeof(wchar_t)) +
-                             (raw->valueNameLength * sizeof(wchar_t)) +
-                             raw->valueDataLength;
+                             (static_cast<size_t>(raw->keyPathLength) * sizeof(wchar_t)) +
+                             (static_cast<size_t>(raw->valueNameLength) * sizeof(wchar_t)) +
+                             static_cast<size_t>(raw->valueDataLength);
 
         if (data.size() < requiredSize) {
             return std::nullopt;
@@ -639,6 +700,13 @@ private:
 
     // Statistics
     MessageDispatcher::DispatchStatistics m_stats;
+
+    // FIX [BUG #24]: Async dispatch lifetime tracking. The destructor blocks
+    // until every task launched by DispatchMessageAsync has retired so that
+    // captured `this` and m_connection cannot be torn down underneath them.
+    std::atomic<uint32_t> m_pendingAsync{0};
+    std::mutex m_pendingMutex;
+    std::condition_variable m_pendingCv;
 };
 
 // ============================================================================
