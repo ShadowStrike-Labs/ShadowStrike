@@ -572,6 +572,15 @@ TimingMeasureSleep PROC
     
     mov     r12d, ecx       ; Save sleep duration
     
+    ;; INPUT VALIDATION: cap sleepMs at MAX_SLEEP_MS (5000) to match
+    ;; Fallback_TimingMeasureSleep semantics and prevent denial-of-service
+    ;; from callers passing INFINITE (0xFFFFFFFF) or other excessive values.
+    ;; Compared as uint32 with JA (above, unsigned).
+    cmp     r12d, 5000
+    jbe     @SleepValid
+    mov     r12d, 5000
+@SleepValid:
+    
     ;; Get start TSC
     xor     eax, eax
     cpuid
@@ -623,11 +632,16 @@ TimingDetectSleepAcceleration PROC
     
     mov     r12d, ecx       ; Save requested sleep
     
-    ;; SECURITY FIX: Validate input - reject zero or excessively large sleep
-    test    r12d, r12d
-    jz      @NoAccel        ; Zero sleep = return 0
-    cmp     r12d, 60000     ; Cap at 60 seconds (60000ms)
-    ja      @NoAccel        ; Too large = don't bother measuring
+    ;; INPUT VALIDATION: match Fallback_TimingDetectSleepAcceleration semantics
+    ;; - Reject sleepMs < 100 (acceleration measurement is noise-dominated below this)
+    ;; - Cap sleepMs at MAX_SLEEP_MS = 5000 (DoS prevention; matches Fallback)
+    ;; Both checks are unsigned (uint32_t input).
+    cmp     r12d, 100
+    jb      @NoAccel        ; Below floor: no acceleration reported
+    cmp     r12d, 5000
+    jbe     @SleepBoundOk
+    mov     r12d, 5000      ; Cap to Fallback's MAX_SLEEP_MS
+@SleepBoundOk:
     
     ;; Get start tick count
     call    QWORD PTR [__imp_GetTickCount64]
