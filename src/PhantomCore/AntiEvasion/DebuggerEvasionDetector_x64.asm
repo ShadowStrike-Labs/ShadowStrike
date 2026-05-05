@@ -404,8 +404,8 @@ int2d_timing_loop:
     
     ; Instructions that debuggers often intercept
     ; These trigger debug-related code paths
-    mov     rax, gs:[60h]       ; PEB access (often monitored)
-    mov     rax, [rax+2]        ; BeingDebugged field
+    mov     rax, gs:[60h]       ; TEB->ProcessEnvironmentBlock (PEB pointer)
+    mov     rax, [rax+2]        ; PEB+2 region (BeingDebugged byte)
     
     ; More instructions debuggers intercept
     xor     eax, eax
@@ -618,7 +618,7 @@ debug_timing_loop:
     xor     eax, eax
     cpuid
     
-    mov     rax, gs:[60h]       ; TEB access
+    mov     rax, gs:[60h]       ; TEB->ProcessEnvironmentBlock (PEB pointer)
     
     rdtscp
     shl     rdx, 32
@@ -858,6 +858,11 @@ CheckDebugRegistersIndirect PROC
     push    r12
     push    r13
     push    r14
+    sub     rsp, 20h            ; 32-byte aligned scratch buffer.
+                                ; Win64 has NO red zone: writing below RSP
+                                ; can be silently clobbered by interrupt /
+                                ; exception delivery, so the DR-trigger test
+                                ; loads/stores must live in allocated stack.
     
     xor     r13, r13            ; Accumulated delta
     xor     r14, r14            ; Baseline timing
@@ -896,9 +901,10 @@ dr_test_loop:
     or      rax, rdx
     mov     r12, rax
     
-    ; Operations that could trigger DR0-DR3 watchpoints
-    mov     rax, [rsp]          ; Stack read
-    mov     [rsp-8], rax        ; Stack write
+    ; Operations that could trigger DR0-DR3 watchpoints, all on the
+    ; allocated scratch slot (rsp..rsp+8) so we never write below RSP.
+    mov     rax, [rsp]          ; Stack read (allocated scratch)
+    mov     [rsp+8], rax        ; Stack write (allocated scratch)
     lea     rax, [rsp]          ; Address calculation
     mov     rax, [rax]          ; Indirect read
     
@@ -922,6 +928,7 @@ dr_test_loop:
     neg     rax
     
 dr_positive:
+    add     rsp, 20h
     pop     r14
     pop     r13
     pop     r12
@@ -943,14 +950,16 @@ CheckDebugRegistersIndirect ENDP
 ; ==============================================================================
 MeasureCPUIDRDTSCPair PROC
     push    rbx
+    push    r12                 ; R12 is non-volatile and survives CPUID
     
     ; First RDTSC to get start time
     xor     eax, eax
-    cpuid                       ; Serialize
+    cpuid                       ; Serialize (clobbers RAX/RBX/RCX/RDX)
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    mov     rcx, rax            ; Save start
+    mov     r12, rax            ; Save start in R12; RCX would be destroyed
+                                ; by the next CPUID, producing a garbage delta
     
     ; The measurement: CPUID followed by RDTSC
     xor     eax, eax
@@ -960,8 +969,9 @@ MeasureCPUIDRDTSCPair PROC
     or      rax, rdx
     
     ; End timing
-    sub     rax, rcx
+    sub     rax, r12
     
+    pop     r12
     pop     rbx
     ret
 MeasureCPUIDRDTSCPair ENDP
