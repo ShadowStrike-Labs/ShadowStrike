@@ -510,10 +510,20 @@ bool ReportGeneratorImpl::Initialize(const ReportConfiguration& config) {
     // Ensure output directories exist
     Utils::FileUtils::Error fsErr;
     if (!config.outputDirectory.empty()) {
-        Utils::FileUtils::CreateDirectories(config.outputDirectory.wstring(), &fsErr);
+        if (!Utils::FileUtils::CreateDirectories(config.outputDirectory.wstring(), &fsErr)) {
+            SS_LOG_ERROR(L"ReportGen", L"Initialize: failed to create output directory %ls (%hs)",
+                         config.outputDirectory.wstring().c_str(), fsErr.message.c_str());
+            m_status.store(ReportModuleStatus::Error, std::memory_order_release);
+            return false;
+        }
     }
     if (!config.archiveDirectory.empty()) {
-        Utils::FileUtils::CreateDirectories(config.archiveDirectory.wstring(), &fsErr);
+        if (!Utils::FileUtils::CreateDirectories(config.archiveDirectory.wstring(), &fsErr)) {
+            SS_LOG_ERROR(L"ReportGen", L"Initialize: failed to create archive directory %ls (%hs)",
+                         config.archiveDirectory.wstring().c_str(), fsErr.message.c_str());
+            m_status.store(ReportModuleStatus::Error, std::memory_order_release);
+            return false;
+        }
     }
 
     m_stats.Reset();
@@ -1028,8 +1038,8 @@ std::vector<ReportSection> ReportGeneratorImpl::BuildSections(
             threats.tableHeaders = {"Category", "Count"};
             for (const auto& [sev, count] : threatStats.bySeverity) {
                 threats.tableData.push_back({sev, std::to_string(count)});
+                threats.chartData.emplace(sev, static_cast<double>(count));
             }
-            threats.chartData.insert(threatStats.bySeverity.begin(), threatStats.bySeverity.end());
             sections.push_back(std::move(threats));
 
             ReportSection topThreats;
@@ -1457,7 +1467,11 @@ bool ReportGeneratorImpl::WriteReportFile(const fs::path& path, const std::strin
     Utils::FileUtils::Error fsErr;
     const auto parentDir = path.parent_path().wstring();
     if (!parentDir.empty()) {
-        Utils::FileUtils::CreateDirectories(parentDir, &fsErr);
+        if (!Utils::FileUtils::CreateDirectories(parentDir, &fsErr)) {
+            SS_LOG_WARN(L"ReportGen", L"WriteReportFile: failed to create parent directory %ls (%hs)",
+                        parentDir.c_str(), fsErr.message.c_str());
+            return false;
+        }
     }
 
     // Cap report size
@@ -1573,7 +1587,7 @@ bool ReportGeneratorImpl::LoadTemplates() {
             opts.maxDepth = 1;
             opts.followReparsePoints = false;
 
-            Utils::FileUtils::WalkDirectory(templateDir.wstring(), opts,
+            if (!Utils::FileUtils::WalkDirectory(templateDir.wstring(), opts,
                 [this](const std::wstring& path, const WIN32_FIND_DATAW& fd) -> bool {
                     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return true;
                     // Only load .html template files
@@ -1588,7 +1602,10 @@ bool ReportGeneratorImpl::LoadTemplates() {
                         m_templates.push_back(std::move(tmpl));
                     }
                     return true;
-                }, &fsErr);
+                }, &fsErr)) {
+                SS_LOG_WARN(L"ReportGen", L"LoadTemplates: failed to enumerate template directory %ls (%hs)",
+                            templateDir.wstring().c_str(), fsErr.message.c_str());
+            }
         }
     }
 
@@ -2013,7 +2030,7 @@ size_t ReportGeneratorImpl::CleanupArchives(uint32_t olderThanDays) {
 
     std::vector<std::wstring> toDelete;
 
-    Utils::FileUtils::WalkDirectory(archiveDir.wstring(), opts,
+    if (!Utils::FileUtils::WalkDirectory(archiveDir.wstring(), opts,
         [&](const std::wstring& path, const WIN32_FIND_DATAW& fd) -> bool {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return true;
             // Check modification time against cutoff
@@ -2030,7 +2047,11 @@ size_t ReportGeneratorImpl::CleanupArchives(uint32_t olderThanDays) {
                     toDelete.push_back(path);
             }
             return true;
-        }, &fsErr);
+        }, &fsErr)) {
+        SS_LOG_WARN(L"ReportGen", L"CleanupOldReports: failed to enumerate archive directory %ls (%hs)",
+                    archiveDir.wstring().c_str(), fsErr.message.c_str());
+        return 0;
+    }
 
     for (const auto& path : toDelete) {
         if (Utils::FileUtils::RemoveFile(path, &fsErr))
