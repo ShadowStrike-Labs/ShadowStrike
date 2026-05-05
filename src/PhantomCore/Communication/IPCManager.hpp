@@ -824,10 +824,17 @@ private:
     
     std::unique_ptr<IPCManagerImpl> m_impl;
     
-    // Core handles (m_hPort is atomic — accessed by multiple worker threads)
+    // Core handles (m_hPort/m_hPipe are atomic — accessed by multiple worker threads
+    // and by Stop()/Disconnect*() concurrently)
     std::atomic<HANDLE> m_hPort{nullptr};
-    HANDLE m_hPipe = nullptr;
+    std::atomic<HANDLE> m_hPipe{nullptr};
     HANDLE m_hIOCP = nullptr;
+
+    // Serializes ConnectFilterPort against itself: worker threads on a stale port
+    // may all attempt reconnect simultaneously. Without this mutex, the
+    // FilterConnectCommunicationPort race leaks port handles and can spawn
+    // multiple primary FilterConnection / ThreatIntelPusher instances.
+    mutable std::mutex m_connectMutex;
     
     // State
     std::atomic<bool> m_connected{false};

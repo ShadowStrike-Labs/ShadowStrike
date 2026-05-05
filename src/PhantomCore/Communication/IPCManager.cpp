@@ -419,6 +419,12 @@ IPCConfiguration IPCManager::GetConfiguration() const {
 // ============================================================================
 
 bool IPCManager::ConnectFilterPort() {
+    // FIX [BUG #17]: Serialize concurrent connect attempts. Multiple worker
+    // threads detecting a null m_hPort would otherwise race here, leaking
+    // FilterConnectCommunicationPort handles and constructing duplicate
+    // primary/push FilterConnection instances.
+    std::lock_guard<std::mutex> connectLock(m_connectMutex);
+
     if (m_hPort.load(std::memory_order_acquire) != nullptr) {
         Utils::Logger::Debug("[IPCManager] Filter port already connected");
         return true;
@@ -728,22 +734,38 @@ bool IPCManager::ConnectToPipe(const std::wstring& pipeName) {
 }
 
 void IPCManager::DisconnectPipe() {
-    if (m_hPipe != nullptr) {
-        FlushFileBuffers(m_hPipe);
-        DisconnectNamedPipe(m_hPipe);
-        CloseHandle(m_hPipe);
-        m_hPipe = nullptr;
+    // FIX [BUG #18]: Atomic exchange prevents racing Send/Disconnect from
+    // double-closing the pipe handle when Stop() runs concurrently with
+    // an in-flight SendCommand path.
+    HANDLE hOld = m_hPipe.exchange(nullptr, std::memory_order_acq_rel);
+    if (hOld != nullptr) {
+        FlushFileBuffers(hOld);
+        DisconnectNamedPipe(hOld);
+        CloseHandle(hOld);
         Utils::Logger::Info("[IPCManager] Pipe disconnected");
     }
 }
 
 bool IPCManager::SendPipeMessage(const void* data, size_t size) {
-    if (m_hPipe == nullptr) {
-        Utils::Logger::Error("[IPCManager] Cannot send - pipe not connected");
+    if (data == nullptr || size == 0) {
         return false;
     }
 
-    if (data == nullptr || size == 0) {
+    // FIX [BUG #19]: Cap outbound pipe writes at MAX_MESSAGE_SIZE. Without
+    // this, a malformed caller could pass a multi-gigabyte buffer that the
+    // peer's receive ring buffer is not sized for, dead-locking the pipe.
+    if (size > IPCConstants::MAX_MESSAGE_SIZE) {
+        Utils::Logger::Error("[IPCManager] SendPipeMessage rejected: {} > MAX_MESSAGE_SIZE ({})",
+                             size, IPCConstants::MAX_MESSAGE_SIZE);
+        m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // FIX [BUG #18]: Snapshot pipe handle once so a concurrent DisconnectPipe
+    // cannot close it between the null-check and the WriteFile call.
+    HANDLE hPipe = m_hPipe.load(std::memory_order_acquire);
+    if (hPipe == nullptr) {
+        Utils::Logger::Error("[IPCManager] Cannot send - pipe not connected");
         return false;
     }
 
@@ -756,7 +778,7 @@ bool IPCManager::SendPipeMessage(const void* data, size_t size) {
     }
 
     BOOL result = WriteFile(
-        m_hPipe,
+        hPipe,
         data,
         static_cast<DWORD>(size),
         &bytesWritten,
@@ -769,13 +791,13 @@ bool IPCManager::SendPipeMessage(const void* data, size_t size) {
             // Wait for completion
             DWORD waitResult = WaitForSingleObject(overlapped.hEvent, 5000);
             if (waitResult == WAIT_OBJECT_0) {
-                GetOverlappedResult(m_hPipe, &overlapped, &bytesWritten, FALSE);
+                GetOverlappedResult(hPipe, &overlapped, &bytesWritten, FALSE);
             } else {
                 // FIX [BUG #8]: After CancelIoEx, MUST drain with
                 // GetOverlappedResult(bWait=TRUE) before OVERLAPPED goes out
                 // of scope. Without this, the kernel may write to freed stack.
-                CancelIoEx(m_hPipe, &overlapped);
-                GetOverlappedResult(m_hPipe, &overlapped, &bytesWritten, TRUE);
+                CancelIoEx(hPipe, &overlapped);
+                GetOverlappedResult(hPipe, &overlapped, &bytesWritten, TRUE);
                 CloseHandle(overlapped.hEvent);
                 return false;
             }
@@ -845,12 +867,26 @@ bool IPCManager::CreateSharedMemory(const std::wstring& name, size_t size, bool 
         name.c_str()
     );
 
+    // FIX [BUG #21]: Detect named-mapping squatting BEFORE freeing pSD.
+    // If an attacker pre-created the mapping with a permissive DACL, our
+    // SECURITY_ATTRIBUTES are silently ignored — CreateFileMapping returns
+    // a handle to the existing object. ERROR_ALREADY_EXISTS reveals this.
+    DWORD mappingErr = (region.mappingHandle != nullptr) ? GetLastError() : ERROR_SUCCESS;
+
     if (pSD != nullptr) {
         LocalFree(pSD);
     }
 
     if (region.mappingHandle == nullptr) {
         Utils::Logger::Error("[IPCManager] CreateFileMapping failed: {}", GetLastError());
+        return false;
+    }
+
+    if (mappingErr == ERROR_ALREADY_EXISTS) {
+        Utils::Logger::Error("[IPCManager] Refusing to use pre-existing shared mapping '{}' "
+                             "(possible squatting attack)",
+                             Utils::StringUtils::ToNarrow(name));
+        CloseHandle(region.mappingHandle);
         return false;
     }
 
@@ -867,9 +903,37 @@ bool IPCManager::CreateSharedMemory(const std::wstring& name, size_t size, bool 
         return false;
     }
 
-    // Create signaling event
+    // Create signaling event with the same restricted DACL as the mapping.
+    // FIX [BUG #22]: Without an explicit SD the event inherits a default DACL
+    // that allows the interactive user to set/reset it, which would let any
+    // local process spoof "data ready" or starve consumers.
+    SECURITY_ATTRIBUTES eventSa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+    PSECURITY_DESCRIPTOR pEventSD = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1,
+            &pEventSD,
+            nullptr)) {
+        eventSa.lpSecurityDescriptor = pEventSD;
+    }
+
     std::wstring eventName = name + L"_Event";
-    region.eventHandle = CreateEventW(nullptr, FALSE, FALSE, eventName.c_str());
+    region.eventHandle = CreateEventW(&eventSa, FALSE, FALSE, eventName.c_str());
+    DWORD eventErr = (region.eventHandle != nullptr) ? GetLastError() : ERROR_SUCCESS;
+
+    if (pEventSD != nullptr) {
+        LocalFree(pEventSD);
+    }
+
+    if (region.eventHandle != nullptr && eventErr == ERROR_ALREADY_EXISTS) {
+        Utils::Logger::Error("[IPCManager] Refusing pre-existing event object '{}' "
+                             "(possible squatting attack)",
+                             Utils::StringUtils::ToNarrow(eventName));
+        CloseHandle(region.eventHandle);
+        UnmapViewOfFile(region.baseAddress);
+        CloseHandle(region.mappingHandle);
+        return false;
+    }
 
     m_sharedMemory[name] = std::move(region);
 
@@ -912,10 +976,29 @@ bool IPCManager::OpenSharedMemory(const std::wstring& name, bool writable) {
         return false;
     }
 
-    // Get size from mapping
-    MEMORY_BASIC_INFORMATION mbi;
+    // FIX [BUG #23]: VirtualQuery returns the size of the contiguously-committed
+    // region, which a hostile producer could grow far beyond what we expect.
+    // Cap against MAX_MAPPING_SIZE before storing so subsequent consumers cannot
+    // be tricked into reading past our ConfiguredSize.
+    constexpr size_t kMaxMappingSize = static_cast<size_t>(1) << 30;  // 1 GiB hard cap
+    MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(region.baseAddress, &mbi, sizeof(mbi))) {
+        if (mbi.RegionSize == 0 || mbi.RegionSize > kMaxMappingSize) {
+            Utils::Logger::Error("[IPCManager] OpenSharedMemory rejected '{}': region size {} "
+                                 "out of bounds",
+                                 Utils::StringUtils::ToNarrow(name),
+                                 static_cast<uint64_t>(mbi.RegionSize));
+            UnmapViewOfFile(region.baseAddress);
+            CloseHandle(region.mappingHandle);
+            return false;
+        }
         region.size = mbi.RegionSize;
+    } else {
+        Utils::Logger::Error("[IPCManager] VirtualQuery failed for '{}': {}",
+                             Utils::StringUtils::ToNarrow(name), GetLastError());
+        UnmapViewOfFile(region.baseAddress);
+        CloseHandle(region.mappingHandle);
+        return false;
     }
 
     // Open signaling event
@@ -1231,6 +1314,28 @@ void IPCManager::WorkerRoutine() {
         if (pAppHeader->Magic != SHADOWSTRIKE_MESSAGE_MAGIC) {
             Utils::Logger::Warn("[IPCManager] Invalid message magic: 0x{:08X}",
                                 pAppHeader->Magic);
+            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        // FIX [BUG #20]: Reject mismatched protocol versions.
+        // Without this check a downgraded/forged kernel header with stale
+        // semantics would be silently parsed against the current PODs.
+        if (pAppHeader->Version != SHADOWSTRIKE_PROTOCOL_VERSION) {
+            Utils::Logger::Warn("[IPCManager] Unsupported protocol version: {} (expected {})",
+                                static_cast<unsigned>(pAppHeader->Version),
+                                static_cast<unsigned>(SHADOWSTRIKE_PROTOCOL_VERSION));
+            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        // FIX [BUG #20]: Self-consistency check — TotalSize must equal the
+        // exact framed size (header + DataSize). Mismatch indicates a malformed
+        // or replayed frame and must be discarded before further dispatch.
+        if (pAppHeader->TotalSize != kAppHeaderSize + pAppHeader->DataSize) {
+            Utils::Logger::Warn("[IPCManager] TotalSize mismatch: total={} hdr+data={}",
+                                pAppHeader->TotalSize,
+                                static_cast<uint32_t>(kAppHeaderSize + pAppHeader->DataSize));
             m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
