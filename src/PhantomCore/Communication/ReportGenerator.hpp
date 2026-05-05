@@ -161,6 +161,14 @@ namespace ReportConstants {
     /// @brief Maximum items per report section
     inline constexpr size_t MAX_ITEMS_PER_SECTION = 10000;
 
+    /// @brief Maximum size (bytes) of an externally-supplied template file.
+    /// Caps memory consumption when ingesting attacker-controlled templates.
+    inline constexpr size_t MAX_TEMPLATE_SIZE_BYTES = 1ULL * 1024 * 1024;
+
+    /// @brief Maximum length of a configured directory path (defense-in-depth
+    /// against absurd / malicious values stored in configuration).
+    inline constexpr size_t MAX_CONFIG_PATH_LEN = 32767;
+
 }  // namespace ReportConstants
 
 // ============================================================================

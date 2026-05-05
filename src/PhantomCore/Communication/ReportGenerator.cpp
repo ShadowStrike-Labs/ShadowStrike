@@ -151,6 +151,199 @@ static std::string VectorToJsonStringArray(const std::vector<std::string>& v) {
     return j;
 }
 
+// ---------------------------------------------------------------------------
+// SIEM escaping helpers
+// ---------------------------------------------------------------------------
+//
+// Each SIEM ingestion format has its own delimiter set that MUST be escaped or
+// stripped from values originating in (potentially attacker-influenced) report
+// data. Without these escapes a crafted detection name, file path, or section
+// title can inject synthetic events into a SIEM pipeline (a recognised log /
+// SIEM-injection class of vulnerability). Renderers for CEF, LEEF and RFC 5424
+// structured data MUST route all untrusted values through these helpers.
+
+[[nodiscard]] static std::string CefEscape(const std::string& s) {
+    // ArcSight CEF spec: '\\', '|', '=' must be escaped in extension values;
+    // CR/LF/control chars terminate the record and must be stripped.
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char uc : s) {
+        switch (uc) {
+            case '\\': out += "\\\\"; break;
+            case '|':  out += "\\|";  break;
+            case '=':  out += "\\=";  break;
+            case '\r':
+            case '\n':
+            case '\t': out += ' ';    break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) {
+                    out += ' ';
+                } else {
+                    out += static_cast<char>(uc);
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] static std::string CefHeaderEscape(const std::string& s) {
+    // CEF header fields are pipe-delimited; escape only '\\' and '|'.
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (unsigned char uc : s) {
+        switch (uc) {
+            case '\\': out += "\\\\"; break;
+            case '|':  out += "\\|";  break;
+            case '\r':
+            case '\n':
+            case '\t': out += ' ';    break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) out += ' ';
+                else out += static_cast<char>(uc);
+                break;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] static std::string LeefEscape(const std::string& s) {
+    // LEEF 2.0 default delimiter is TAB ('\t'); '=' separates key/value.
+    // Strip TAB / CR / LF / control chars; backslash-escape '=' inside values.
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char uc : s) {
+        switch (uc) {
+            case '\\': out += "\\\\"; break;
+            case '=':  out += "\\=";  break;
+            case '\t':
+            case '\r':
+            case '\n': out += ' ';    break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) out += ' ';
+                else out += static_cast<char>(uc);
+                break;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] static std::string SyslogParamValueEscape(const std::string& s) {
+    // RFC 5424 PARAM-VALUE: must escape '"', '\\', ']'; strip newlines.
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char uc : s) {
+        switch (uc) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case ']':  out += "\\]";  break;
+            case '\r':
+            case '\n':
+            case '\t': out += ' ';    break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) out += ' ';
+                else out += static_cast<char>(uc);
+                break;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] static std::string SyslogMsgEscape(const std::string& s) {
+    // Free-form MSG body: only strip CR/LF so a malicious value cannot inject
+    // a synthetic syslog record into the downstream stream.
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char uc : s) {
+        if (uc == '\r' || uc == '\n') out += ' ';
+        else if (uc < 0x20 && uc != '\t') out += ' ';
+        else if (uc == 0x7F) out += ' ';
+        else out += static_cast<char>(uc);
+    }
+    return out;
+}
+
+[[nodiscard]] static std::string SyslogSdNameEscape(const std::string& s) {
+    // SD-NAME / PARAM-NAME: ASCII printable minus '=', SP, ']', '"'.
+    // Replace anything else with '_' so we never emit an invalid SD-ID.
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char uc : s) {
+        const bool ok = (uc >= 0x21 && uc <= 0x7E)
+                        && uc != '=' && uc != ']' && uc != '"';
+        out += ok ? static_cast<char>(uc) : '_';
+    }
+    if (out.empty()) out = "_";
+    return out;
+}
+
+[[nodiscard]] static std::string AsciiToLowerCopy(std::string s) noexcept {
+    for (char& c : s) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc >= 'A' && uc <= 'Z') c = static_cast<char>(uc + ('a' - 'A'));
+    }
+    return s;
+}
+
+// Filename sanitiser used when constructing on-disk report paths.
+// Beyond the usual Win32 reserved characters we also reject:
+//   * leading/trailing dots & whitespace (Windows strips these silently which
+//     can collapse "evil." onto an existing "evil" — a known privilege-edge
+//     attack);
+//   * control characters (0x01..0x1F, 0x7F);
+//   * the reserved DOS device basenames (CON, PRN, AUX, NUL, COMx, LPTx);
+// regardless of whether the input is currently attacker-reachable, the values
+// flowing into BuildOutputPath are derived from configuration / report type
+// and are therefore subject to defence-in-depth.
+[[nodiscard]] static std::string SanitizeReportFilename(std::string name) {
+    if (name.empty()) return "report";
+
+    // Cap length to a reasonable bound (NTFS allows 255, but leave headroom).
+    constexpr size_t kMaxFilenameLen = 200;
+    if (name.size() > kMaxFilenameLen) name.resize(kMaxFilenameLen);
+
+    for (char& c : name) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) { c = '_'; continue; }
+        switch (uc) {
+            case ' ': case '/': case '\\': case ':': case '*':
+            case '?':  case '"': case '<':  case '>': case '|':
+                c = '_';
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Strip leading dots / underscores so we never emit "..foo" or empty stem.
+    while (!name.empty() && (name.front() == '.' || name.front() == ' '))
+        name.erase(name.begin());
+    while (!name.empty() && (name.back() == ' ' || name.back() == '.'))
+        name.pop_back();
+    if (name.empty()) name = "report";
+
+    // Reject reserved DOS device names as the stem.
+    static constexpr std::string_view kReserved[] = {
+        "CON","PRN","AUX","NUL",
+        "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+    };
+    const auto dot = name.find('.');
+    const std::string stem = (dot == std::string::npos) ? name : name.substr(0, dot);
+    const std::string stemUpper = [&] {
+        std::string u = stem;
+        for (char& c : u) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            if (uc >= 'a' && uc <= 'z') c = static_cast<char>(uc - ('a' - 'A'));
+        }
+        return u;
+    }();
+    for (auto rsv : kReserved) {
+        if (stemUpper == rsv) { name.insert(name.begin(), '_'); break; }
+    }
+    return name;
+}
+
 // ============================================================================
 // PIMPL IMPLEMENTATION
 // ============================================================================
@@ -680,7 +873,7 @@ std::optional<fs::path> ReportGeneratorImpl::GenerateComplianceReport(
                     std::string(GetComplianceStandardName(std_));
     summary.order = 0;
 
-    uint32_t passed = 0, failed = 0;
+    uint64_t passed = 0, failed = 0;
     for (const auto& c : checks) {
         if (c.passed) ++passed; else ++failed;
     }
@@ -689,7 +882,7 @@ std::optional<fs::path> ReportGeneratorImpl::GenerateComplianceReport(
     summary.data["passed"] = std::to_string(passed);
     summary.data["failed"] = std::to_string(failed);
     summary.data["score"] = (passed + failed > 0)
-        ? std::to_string((passed * 100) / (passed + failed)) + "%"
+        ? std::to_string((passed * 100ULL) / (passed + failed)) + "%"
         : "N/A";
     summary.content = "Compliance assessment for " +
                       std::string(GetComplianceStandardName(std_));
@@ -1146,20 +1339,30 @@ std::string ReportGeneratorImpl::RenderCef(
     // CEF: Common Event Format
     // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
     std::string cef;
-    const std::string ver = ReportGenerator::GetVersionString();
+    const std::string ver = CefHeaderEscape(ReportGenerator::GetVersionString());
+    const std::string typeName = CefEscape(std::string(GetReportTypeName(meta.reportType)));
 
     for (const auto& sec : sections) {
         cef += "CEF:0|ShadowStrike|EDR|" + ver + "|" +
-               sec.sectionId + "|" + sec.title + "|5|";
+               CefHeaderEscape(sec.sectionId) + "|" +
+               CefHeaderEscape(sec.title) + "|5|";
 
-        // Extension: key=value pairs
-        cef += "rt=" + SystemTimeToIso8601(meta.generatedTime);
-        cef += " reportType=" + std::string(GetReportTypeName(meta.reportType));
+        // Extension: key=value pairs. Keys must be alphanumeric tokens, values
+        // are CEF-escaped to neutralise '|', '=', '\\', and control chars.
+        cef += "rt=" + CefEscape(SystemTimeToIso8601(meta.generatedTime));
+        cef += " reportType=" + typeName;
         for (const auto& [k, v] : sec.data) {
-            std::string safeK = k, safeV = v;
-            std::replace(safeK.begin(), safeK.end(), ' ', '_');
-            std::replace(safeV.begin(), safeV.end(), '=', '-');
-            cef += " " + safeK + "=" + safeV;
+            std::string safeK;
+            safeK.reserve(k.size());
+            for (unsigned char uc : k) {
+                if ((uc >= 'A' && uc <= 'Z') || (uc >= 'a' && uc <= 'z') ||
+                    (uc >= '0' && uc <= '9') || uc == '_')
+                    safeK += static_cast<char>(uc);
+                else
+                    safeK += '_';
+            }
+            if (safeK.empty()) safeK = "_";
+            cef += " " + safeK + "=" + CefEscape(v);
         }
         cef += "\n";
     }
@@ -1170,17 +1373,19 @@ std::string ReportGeneratorImpl::RenderLeef(
     const ReportMetadata& meta, const std::vector<ReportSection>& sections) {
 
     // LEEF: Log Event Extended Format
-    // LEEF:Version|Vendor|Product|ProductVersion|EventID|<delimiter>key=value
+    // LEEF:2.0|Vendor|Product|ProductVersion|EventID|<delimiter>key=value
     std::string leef;
-    const std::string ver = ReportGenerator::GetVersionString();
+    const std::string ver = LeefEscape(ReportGenerator::GetVersionString());
+    const std::string typeName = LeefEscape(std::string(GetReportTypeName(meta.reportType)));
 
     for (const auto& sec : sections) {
-        leef += "LEEF:2.0|ShadowStrike|EDR|" + ver + "|" + sec.sectionId + "|\t";
-        leef += "devTime=" + SystemTimeToIso8601(meta.generatedTime);
-        leef += "\treportType=" + std::string(GetReportTypeName(meta.reportType));
-        leef += "\tsectionTitle=" + sec.title;
+        leef += "LEEF:2.0|ShadowStrike|EDR|" + ver + "|" +
+                LeefEscape(sec.sectionId) + "|\t";
+        leef += "devTime=" + LeefEscape(SystemTimeToIso8601(meta.generatedTime));
+        leef += "\treportType=" + typeName;
+        leef += "\tsectionTitle=" + LeefEscape(sec.title);
         for (const auto& [k, v] : sec.data) {
-            leef += "\t" + k + "=" + v;
+            leef += "\t" + LeefEscape(k) + "=" + LeefEscape(v);
         }
         leef += "\n";
     }
@@ -1196,22 +1401,24 @@ std::string ReportGeneratorImpl::RenderSyslog(
     if (!GetComputerNameA(hostname, &hostnameLen)) {
         hostname[0] = '\0';
     }
-    const std::string hostnameStr(hostname);
+    const std::string hostnameStr = SyslogSdNameEscape(hostname);
 
     std::string syslog;
+    const std::string typeName =
+        SyslogParamValueEscape(std::string(GetReportTypeName(meta.reportType)));
+
     for (const auto& sec : sections) {
         // <134>1 = facility local0(16)*8 + severity info(6) = 134
         syslog += "<134>1 " + SystemTimeToIso8601(meta.generatedTime) + " ";
-
-        syslog += hostnameStr;
-
-        syslog += " ShadowStrikeEDR - " + sec.sectionId;
-        syslog += " [report@57483 type=\"" + std::string(GetReportTypeName(meta.reportType)) + "\"";
-        syslog += " title=\"" + sec.title + "\"";
+        syslog += hostnameStr.empty() ? std::string("-") : hostnameStr;
+        syslog += " ShadowStrikeEDR - " + SyslogSdNameEscape(sec.sectionId);
+        syslog += " [report@57483 type=\"" + typeName + "\"";
+        syslog += " title=\"" + SyslogParamValueEscape(sec.title) + "\"";
         for (const auto& [k, v] : sec.data) {
-            syslog += " " + k + "=\"" + v + "\"";
+            syslog += " " + SyslogSdNameEscape(k) +
+                      "=\"" + SyslogParamValueEscape(v) + "\"";
         }
-        syslog += "] " + sec.title + "\n";
+        syslog += "] " + SyslogMsgEscape(sec.title) + "\n";
     }
     return syslog;
 }
@@ -1240,12 +1447,7 @@ fs::path ReportGeneratorImpl::BuildOutputPath(ReportType type, ReportFormat form
 
     std::string filename = std::string(GetReportTypeName(type)) + "_" +
                            datePart + std::string(GetFormatExtension(format));
-    // Sanitize filename
-    for (char& c : filename) {
-        if (c == ' ' || c == '/' || c == '\\' || c == ':' || c == '*' ||
-            c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
-            c = '_';
-    }
+    filename = SanitizeReportFilename(std::move(filename));
 
     return dir / filename;
 }
@@ -1283,11 +1485,21 @@ void ReportGeneratorImpl::ArchiveReport(const ReportJob& job) {
         return;
 
     Utils::FileUtils::Error fsErr;
-    Utils::FileUtils::CreateDirectories(archiveDir.wstring(), &fsErr);
+    if (!Utils::FileUtils::CreateDirectories(archiveDir.wstring(), &fsErr)) {
+        SS_LOG_WARN(L"ReportGen", L"ArchiveReport: failed to create archive dir (%hs)",
+                    fsErr.message.c_str());
+        return;
+    }
 
-    // Archive is a metadata JSON sidecar file
-    const auto archivePath = archiveDir / (job.jobId + ".json");
-    Utils::FileUtils::WriteAllTextUtf8Atomic(archivePath.wstring(), job.ToJson(), &fsErr);
+    // jobId comes from GenerateId() (no path separators) but defence-in-depth:
+    // sanitise before joining onto archiveDir.
+    const std::string sanitisedId = SanitizeReportFilename(job.jobId);
+    const auto archivePath = archiveDir / (sanitisedId + ".json");
+    if (!Utils::FileUtils::WriteAllTextUtf8Atomic(archivePath.wstring(),
+                                                   job.ToJson(), &fsErr)) {
+        SS_LOG_WARN(L"ReportGen", L"ArchiveReport: failed to write %ls (%hs)",
+                    archivePath.wstring().c_str(), fsErr.message.c_str());
+    }
 }
 
 // ============================================================================
@@ -1403,31 +1615,99 @@ std::vector<ReportTemplate> ReportGeneratorImpl::GetTemplates(
 
 bool ReportGeneratorImpl::ImportTemplate(const fs::path& templatePath) {
     Utils::FileUtils::Error fsErr;
-    if (!Utils::FileUtils::Exists(templatePath.wstring(), &fsErr)) {
-        SS_LOG_ERROR(L"ReportGen", L"Template file not found: %s",
-                     WideToUtf8(templatePath.wstring()).c_str());
+
+    // Validate the source path is well-formed and not absurd in length before
+    // touching the filesystem. ReadAllTextUtf8 has no size cap of its own.
+    std::error_code canonicalEc;
+    fs::path canonicalSrc;
+    try {
+        canonicalSrc = fs::weakly_canonical(templatePath, canonicalEc);
+    } catch (...) {
+        canonicalEc = std::make_error_code(std::errc::invalid_argument);
+    }
+    if (canonicalEc) {
+        SS_LOG_ERROR(L"ReportGen", L"ImportTemplate: invalid path (%hs)",
+                     canonicalEc.message().c_str());
         return false;
     }
 
+    // Containment: caller-supplied templates must live inside the configured
+    // template directory. This prevents path-traversal / arbitrary-file ingest
+    // (e.g. importing an LSASS-readable secrets file as a "template").
+    fs::path templateRoot;
+    {
+        std::shared_lock lock(m_configMutex);
+        templateRoot = m_config.templateDirectory;
+    }
+    if (templateRoot.empty()) templateRoot = ReportConstants::DEFAULT_TEMPLATE_DIR;
+
+    std::error_code rootEc;
+    fs::path canonicalRoot = fs::weakly_canonical(templateRoot, rootEc);
+    if (rootEc) canonicalRoot = templateRoot;  // best-effort fallback
+
+    {
+        const std::wstring rootStr = canonicalRoot.wstring();
+        const std::wstring srcStr  = canonicalSrc.wstring();
+        if (rootStr.empty() ||
+            srcStr.size() < rootStr.size() ||
+            _wcsnicmp(srcStr.c_str(), rootStr.c_str(), rootStr.size()) != 0) {
+            SS_LOG_ERROR(L"ReportGen",
+                         L"ImportTemplate: refused path outside template root: %ls",
+                         srcStr.c_str());
+            return false;
+        }
+    }
+
+    if (!Utils::FileUtils::Exists(canonicalSrc.wstring(), &fsErr)) {
+        SS_LOG_ERROR(L"ReportGen", L"Template file not found: %ls",
+                     canonicalSrc.wstring().c_str());
+        return false;
+    }
+
+    // Cap by stat'd size before reading so an attacker-supplied multi-GB file
+    // cannot OOM the service. A second size check after ReadAllTextUtf8 guards
+    // against TOCTOU (size grew between stat and read).
+    Utils::FileUtils::FileStat st{};
+    if (Utils::FileUtils::Stat(canonicalSrc.wstring(), st, &fsErr)) {
+        if (st.size > ReportConstants::MAX_TEMPLATE_SIZE_BYTES) {
+            SS_LOG_ERROR(L"ReportGen",
+                         L"ImportTemplate: file exceeds %zu byte cap (%llu): %ls",
+                         ReportConstants::MAX_TEMPLATE_SIZE_BYTES,
+                         static_cast<unsigned long long>(st.size),
+                         canonicalSrc.wstring().c_str());
+            return false;
+        }
+    }
+
     std::string content;
-    if (!Utils::FileUtils::ReadAllTextUtf8(templatePath.wstring(), content, &fsErr)) {
-        SS_LOG_ERROR(L"ReportGen", L"Failed to read template: %s",
-                     WideToUtf8(templatePath.wstring()).c_str());
+    if (!Utils::FileUtils::ReadAllTextUtf8(canonicalSrc.wstring(), content, &fsErr)) {
+        SS_LOG_ERROR(L"ReportGen", L"Failed to read template: %ls",
+                     canonicalSrc.wstring().c_str());
+        return false;
+    }
+    if (content.size() > ReportConstants::MAX_TEMPLATE_SIZE_BYTES) {
+        SS_LOG_ERROR(L"ReportGen",
+                     L"ImportTemplate: content exceeds %zu byte cap after read",
+                     ReportConstants::MAX_TEMPLATE_SIZE_BYTES);
         return false;
     }
 
     ReportTemplate tmpl;
     tmpl.templateId = GenerateId("TMPL");
-    tmpl.templatePath = templatePath;
-    tmpl.name = WideToUtf8(templatePath.stem().wstring());
+    tmpl.templatePath = canonicalSrc;
+    tmpl.name = WideToUtf8(canonicalSrc.stem().wstring());
     tmpl.reportType = ReportType::Custom;
     tmpl.isBuiltIn = false;
     tmpl.supportedFormats = {ReportFormat::HTML};
 
-    std::unique_lock lock(m_templatesMutex);
-    m_templates.push_back(std::move(tmpl));
+    const std::string nameForLog = tmpl.name;  // capture before move
 
-    SS_LOG_INFO(L"ReportGen", L"Template imported: %s", tmpl.name.c_str());
+    {
+        std::unique_lock lock(m_templatesMutex);
+        m_templates.push_back(std::move(tmpl));
+    }
+
+    SS_LOG_INFO(L"ReportGen", L"Template imported: %hs", nameForLog.c_str());
     return true;
 }
 
@@ -1546,7 +1826,9 @@ ThreatStatistics ReportGeneratorImpl::GetThreatStatistics(const TimeRange& range
         stats.totalDetections = entries.size();
 
         for (const auto& entry : entries) {
-            std::string narrow = ShadowStrike::Utils::StringUtils::ToNarrow(entry.message);
+            const std::string narrow =
+                ShadowStrike::Utils::StringUtils::ToNarrow(entry.message);
+            const std::string narrowLower = AsciiToLowerCopy(narrow);
 
             // Classify by severity
             if (entry.level == ShadowStrike::Database::LogDB::LogLevel::Fatal) {
@@ -1555,15 +1837,12 @@ ThreatStatistics ReportGeneratorImpl::GetThreatStatistics(const TimeRange& range
                 stats.bySeverity["High"]++;
             }
 
-            // Classify by type keywords
-            if (narrow.find("malware") != std::string::npos ||
-                narrow.find("Malware") != std::string::npos) {
+            // Classify by type keywords (case-insensitive single pass)
+            if (narrowLower.find("malware") != std::string::npos) {
                 stats.byType["Malware"]++;
-            } else if (narrow.find("exploit") != std::string::npos ||
-                       narrow.find("Exploit") != std::string::npos) {
+            } else if (narrowLower.find("exploit") != std::string::npos) {
                 stats.byType["Exploit"]++;
-            } else if (narrow.find("PUA") != std::string::npos ||
-                       narrow.find("pua") != std::string::npos) {
+            } else if (narrowLower.find("pua") != std::string::npos) {
                 stats.byType["PUA"]++;
             } else {
                 stats.byType["Other"]++;
@@ -2191,19 +2470,28 @@ bool ReportConfiguration::IsValid() const noexcept {
     if (maxReportSizeMB == 0 || maxReportSizeMB > 1024 || retentionDays == 0)
         return false;
 
-    auto hasTraversal = [](const fs::path& p) noexcept -> bool {
+    // Path validation: reject obviously malicious configuration values.
+    // ".." appearing as a *path component* is rejected (substring matching
+    // would falsely trip on legitimate stems like "....bar"). UNC and
+    // long-path prefixes are accepted (legitimate enterprise scenarios).
+    auto pathLooksHostile = [](const fs::path& p) noexcept -> bool {
         try {
+            if (p.empty()) return false;
             const std::wstring ws = p.wstring();
-            return ws.find(L"..") != std::wstring::npos;
+            if (ws.size() > ReportConstants::MAX_CONFIG_PATH_LEN) return true;
+            for (wchar_t wc : ws) {
+                if (wc < 0x20 && wc != L'\t') return true;  // control chars
+            }
+            for (const auto& part : p) {
+                if (part == L"..") return true;
+            }
+            return false;
         } catch (...) { return true; }
     };
 
-    if (!outputDirectory.empty() && hasTraversal(outputDirectory))
-        return false;
-    if (!archiveDirectory.empty() && hasTraversal(archiveDirectory))
-        return false;
-    if (!templateDirectory.empty() && hasTraversal(templateDirectory))
-        return false;
+    if (!outputDirectory.empty()   && pathLooksHostile(outputDirectory))   return false;
+    if (!archiveDirectory.empty()  && pathLooksHostile(archiveDirectory))  return false;
+    if (!templateDirectory.empty() && pathLooksHostile(templateDirectory)) return false;
 
     return true;
 }
