@@ -2303,7 +2303,7 @@ public:
      * @param data PE file data.
      * @return Import analysis result.
      */
-    [[nodiscard]] ImportAnalysis AnalyzeImports(std::span<const uint8_t> data);
+    [[nodiscard]] ImportAnalysis AnalyzeImports(std::span<const uint8_t> data) const;
 
     /**
      * @brief Verify digital signature.
@@ -2556,7 +2556,25 @@ private:
     /**
      * @brief Classify imported function.
      */
-    void ClassifyImport(ImportedFunction& func);
+    void ClassifyImport(ImportedFunction& func) const;
+
+    /**
+     * @brief Internal analysis driver.
+     *
+     * Runs the buffer-based analysis pipeline using a caller-supplied configuration
+     * snapshot and HashStore pointer. The shared mutex must NOT be held by the caller
+     * — this routine is lock-free with respect to m_impl->m_mutex and is the single
+     * place where heavy analysis sub-routines (DetectPacker, AnalyzeImports, etc.)
+     * are invoked. Centralizing the snapshot here prevents the recursive
+     * std::shared_mutex acquisition pattern that previously made AnalyzeFile
+     * unsafe under MSVC's STL.
+     */
+    [[nodiscard]] HeuristicResult AnalyzeBufferInternal(
+        const std::wstring& filePath,
+        std::span<const uint8_t> data,
+        const HeuristicAnalyzerConfig& cfg,
+        HashStore::HashStore* hashStore,
+        std::chrono::steady_clock::time_point startTime);
 
     /**
      * @brief Aggregate scores into final result.
