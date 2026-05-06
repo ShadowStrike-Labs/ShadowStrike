@@ -39,7 +39,10 @@ namespace Config {
 
 namespace {
 
-[[nodiscard]] std::wstring NarrowToWide(const std::string& narrow) noexcept {
+// Note: these helpers allocate std::wstring/std::string and may therefore
+// throw std::bad_alloc. They are intentionally NOT marked noexcept; the
+// callers handle exceptions either explicitly or via try/catch boundaries.
+[[nodiscard]] std::wstring NarrowToWide(const std::string& narrow) {
     if (narrow.empty()) return {};
     const int needed = ::MultiByteToWideChar(
         CP_UTF8, 0, narrow.data(), static_cast<int>(narrow.size()), nullptr, 0);
@@ -50,7 +53,7 @@ namespace {
     return wide;
 }
 
-[[nodiscard]] std::string WideToNarrow(const std::wstring& wide) noexcept {
+[[nodiscard]] std::string WideToNarrow(const std::wstring& wide) {
     if (wide.empty()) return {};
     const int needed = ::WideCharToMultiByte(
         CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
@@ -695,7 +698,12 @@ ProductTierManager::~ProductTierManager() noexcept {
 // ============================================================================
 
 bool ProductTierManager::Initialize(const std::wstring& /*configDbPath*/) noexcept {
-    if (m_impl->initialized.load(std::memory_order_acquire)) {
+    // Atomically claim ownership of the initialization slot. Two concurrent
+    // Initialize() calls would otherwise both observe the load=false branch
+    // and race through LoadLicenseFromDb / state mutation in parallel.
+    bool expected = false;
+    if (!m_impl->initialized.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         SS_LOG_WARN(L"ProductTier",
             L"ProductTierManager already initialized");
         return true;
@@ -707,10 +715,14 @@ bool ProductTierManager::Initialize(const std::wstring& /*configDbPath*/) noexce
         TierConstants::VERSION_MINOR,
         TierConstants::VERSION_PATCH);
 
-    // Load license from persistent storage
-    m_impl->LoadLicenseFromDb();
-
-    m_impl->initialized.store(true, std::memory_order_release);
+    // Load license from persistent storage. LoadLicenseFromDb mutates
+    // licenseStatus / licenseInfo / currentTier / featureFlags, which other
+    // public APIs read under m_impl->mutex; take the writer lock to keep
+    // those readers consistent.
+    {
+        std::unique_lock lock(m_impl->mutex);
+        m_impl->LoadLicenseFromDb();
+    }
 
     SS_LOG_INFO(L"ProductTier",
         L"ProductTierManager initialized — tier: %s (%zu features enabled)",
@@ -869,17 +881,22 @@ std::vector<FeatureCategory> ProductTierManager::GetDisabledFeatures() const noe
 // ============================================================================
 
 bool ProductTierManager::LoadLicense(const std::wstring& licensePath) noexcept {
-    std::unique_lock lock(m_impl->mutex);
-
     m_impl->stats.licenseValidations.fetch_add(1, std::memory_order_relaxed);
 
-    // Read license file
+    // Read the license file WITHOUT holding m_impl->mutex. Two concerns:
+    //   (1) std::shared_mutex is non-recursive — taking the writer lock here
+    //       and then calling ActivateLicense (which itself acquires the same
+    //       writer lock) deadlocks every signed-license boot sequence.
+    //   (2) Even if recursion were legal, holding the writer lock during disk
+    //       I/O serializes every concurrent ValidateLicense / IsFeatureEnabled
+    //       reader for the duration of a potentially slow filesystem read.
     std::string fileContent;
     try {
         Utils::FileUtils::Error fileErr;
         if (!Utils::FileUtils::ReadAllTextUtf8(licensePath, fileContent, &fileErr)) {
             SS_LOG_ERROR(L"ProductTier",
                 L"Failed to read license file: %s", licensePath.c_str());
+            std::unique_lock lock(m_impl->mutex);
             m_impl->licenseStatus = LicenseStatus::NotFound;
             m_impl->stats.licenseFailures.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -888,6 +905,7 @@ bool ProductTierManager::LoadLicense(const std::wstring& licensePath) noexcept {
         SS_LOG_ERROR(L"ProductTier",
             L"Exception reading license file: %s",
             NarrowToWide(e.what()).c_str());
+        std::unique_lock lock(m_impl->mutex);
         m_impl->licenseStatus = LicenseStatus::NotFound;
         m_impl->stats.licenseFailures.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -898,6 +916,7 @@ bool ProductTierManager::LoadLicense(const std::wstring& licensePath) noexcept {
         SS_LOG_ERROR(L"ProductTier",
             L"License file too large: %zu bytes (max %zu)",
             fileContent.size(), kMaxLicenseFileSize);
+        std::unique_lock lock(m_impl->mutex);
         m_impl->licenseStatus = LicenseStatus::Invalid;
         m_impl->stats.licenseFailures.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -910,7 +929,7 @@ bool ProductTierManager::LoadLicense(const std::wstring& licensePath) noexcept {
         fileContent.pop_back();
     }
 
-    // Activate using the file content as a license key
+    // ActivateLicense takes the writer lock itself.
     return ActivateLicense(fileContent);
 }
 
