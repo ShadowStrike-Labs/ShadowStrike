@@ -43,9 +43,11 @@
 #include <bitset>
 #include <chrono>
 #include <cmath>
+#include <cwchar>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -128,9 +130,11 @@ namespace ShadowStrike::Core::Engine {
         case UnpackStatus::Timeout:              return L"Timeout";
         case UnpackStatus::OutputTooLarge:       return L"Output Too Large";
         case UnpackStatus::ImportRecoveryFailed: return L"Import Recovery Failed";
+        case UnpackStatus::AntiDebugDetected:    return L"Anti-Debug Detected";
+        case UnpackStatus::VirtualizedCode:      return L"Virtualized Code";
         case UnpackStatus::Error:                return L"Error";
-        default:                                 return L"Unknown";
         }
+        return L"Unknown";
     }
 
     [[nodiscard]] const wchar_t* UnpackMethodToWString(UnpackMethod method) noexcept {
@@ -184,12 +188,33 @@ namespace ShadowStrike::Core::Engine {
      * NRV2B decompression algorithm (public domain, UCL library).
      * Returns decompressed data on success, nullopt on error.
      * maxOutput caps output size to prevent decompression bombs.
+     *
+     * Hardening notes:
+     *  - The bit-extracted offset/length variables (`mOff`, `mLen`) are doubled
+     *    on each loop iteration; without an explicit cap a malformed stream
+     *    can drive them past UINT32_MAX which (because the values are unsigned)
+     *    silently wraps and produces garbage rather than terminating. We cap
+     *    iteration counts and intermediate values defensively.
+     *  - Every dst push is gated by maxOutput.
+     *  - Match copy uses byte-by-byte semantics to support overlap correctly.
      */
     [[nodiscard]] std::optional<std::vector<uint8_t>> Nrv2bDecompress(
         std::span<const uint8_t> src,
         size_t maxOutput) noexcept
     {
         if (src.empty() || maxOutput == 0) return std::nullopt;
+
+        // Defensive iteration cap: any honest NRV2B stream consumes input
+        // monotonically; we still bound the total decompressed loop body
+        // executions to (maxOutput * 16) literal/match steps to prevent
+        // pathological CPU consumption on crafted streams.
+        const size_t kMaxLoopIters = std::min<size_t>(
+            maxOutput * 16,
+            static_cast<size_t>(1) << 28); // hard 256M-iteration ceiling
+        size_t loopIters = 0;
+
+        // Bit-decode loops also need an upper bound to defeat infinite-zero streams.
+        constexpr uint32_t kMaxBitDecodeIters = 33;
 
         try {
             std::vector<uint8_t> dst;
@@ -215,6 +240,8 @@ namespace ShadowStrike::Core::Engine {
             };
 
             for (;;) {
+                if (++loopIters > kMaxLoopIters) return std::nullopt;
+
                 // Literal bytes: while bit == 1, copy one literal
                 int bit = getbit();
                 while (bit == 1) {
@@ -224,12 +251,14 @@ namespace ShadowStrike::Core::Engine {
                 }
                 if (bit < 0) return std::nullopt;
 
-                // Match: decode offset
+                // Match: decode offset (capped to avoid uint32 wrap)
                 uint32_t mOff = 1;
-                for (;;) {
+                for (uint32_t iter = 0; ; ++iter) {
+                    if (iter > kMaxBitDecodeIters) return std::nullopt;
                     int b1 = getbit();
                     if (b1 < 0) return std::nullopt;
-                    mOff = mOff * 2 + static_cast<uint32_t>(b1);
+                    if (mOff > 0x7FFFFFFFu) return std::nullopt;
+                    mOff = mOff * 2u + static_cast<uint32_t>(b1);
                     int b2 = getbit();
                     if (b2 < 0) return std::nullopt;
                     if (b2) break;
@@ -239,7 +268,10 @@ namespace ShadowStrike::Core::Engine {
                     mOff = lastMOff;
                 } else {
                     if (ip >= ipEnd) return std::nullopt;
-                    mOff = (mOff - 3) * 256 + static_cast<uint32_t>(*ip++);
+                    // (mOff - 3) * 256 + byte: bound mOff so the multiply
+                    // can never overflow uint32 (max safe value: 0x7FFFFF).
+                    if (mOff < 3 || mOff > 0x7FFFFFu) return std::nullopt;
+                    mOff = (mOff - 3u) * 256u + static_cast<uint32_t>(*ip++);
                     if (mOff == 0xFFFFFFFFu) break; // end of stream
                     mOff++;
                     lastMOff = mOff;
@@ -255,14 +287,17 @@ namespace ShadowStrike::Core::Engine {
 
                 if (mLen == 0) {
                     mLen = 1;
-                    do {
+                    for (uint32_t iter = 0; ; ++iter) {
+                        if (iter > kMaxBitDecodeIters) return std::nullopt;
                         int b = getbit();
                         if (b < 0) return std::nullopt;
-                        mLen = mLen * 2 + static_cast<uint32_t>(b);
+                        if (mLen > 0x7FFFFFFFu) return std::nullopt;
+                        mLen = mLen * 2u + static_cast<uint32_t>(b);
                         int b2 = getbit();
                         if (b2 < 0) return std::nullopt;
                         if (b2) break;
-                    } while (true);
+                    }
+                    if (mLen > 0xFFFFFFFEu) return std::nullopt;
                     mLen += 2;
                 }
 
@@ -415,7 +450,18 @@ namespace ShadowStrike::Core::Engine {
 
     bool PackerUnpacker::Impl::Initialize(UnpackError* err) noexcept {
         try {
-            if (m_initialized.exchange(true)) {
+            // Fast-path: already initialized (acquire-load pairs with the
+            // release-store at the end of this function).
+            if (m_initialized.load(std::memory_order_acquire)) {
+                return true;
+            }
+
+            // Serialize concurrent initialization attempts. We deliberately
+            // hold the lock for the entire init sequence so that a second
+            // caller observing m_initialized==false re-checks under the lock
+            // and either witnesses the completed init or performs it itself.
+            std::unique_lock lock(m_mutex);
+            if (m_initialized.load(std::memory_order_relaxed)) {
                 return true;
             }
 
@@ -434,9 +480,14 @@ namespace ShadowStrike::Core::Engine {
             m_defaultOptions.reconstructImports = true;
             m_defaultOptions.fixPEHeaders = true;
 
+            // LoadSystemDLLs assumes the caller already holds m_mutex (we do).
             if (!LoadSystemDLLs()) {
                 SS_LOG_WARN(kLogCategory, L"Failed to load system DLLs - import reconstruction may be limited");
             }
+
+            // Publish initialization with release semantics so concurrent
+            // readers (IsInitialized()) see fully-constructed state.
+            m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(kLogCategory, L"Initialized successfully");
             return true;
@@ -451,7 +502,7 @@ namespace ShadowStrike::Core::Engine {
                 err->context = Utils::StringUtils::ToWide(e.what());
             }
 
-            m_initialized = false;
+            m_initialized.store(false, std::memory_order_release);
             return false;
         } catch (...) {
             SS_LOG_ERROR(kLogCategory, L"Unknown initialization error");
@@ -461,7 +512,7 @@ namespace ShadowStrike::Core::Engine {
                 err->message = L"Unknown initialization error";
             }
 
-            m_initialized = false;
+            m_initialized.store(false, std::memory_order_release);
             return false;
         }
     }
@@ -960,10 +1011,9 @@ namespace ShadowStrike::Core::Engine {
 
             SS_LOG_DEBUG(kLogCategory, L"Starting emulation (timeout: %u ms)", emuConfig.timeoutMs);
 
-            auto emuResult = m_emulationEngine->EmulatePE(
-                std::vector<uint8_t>(data.begin(), data.end()),
-                emuConfig
-            );
+            // Pass span directly to avoid copying the entire PE buffer (which can
+            // be hundreds of MB on samples up to MAX_INPUT_FILE_SIZE).
+            auto emuResult = m_emulationEngine->EmulatePE(data, emuConfig);
 
             result.instructionsEmulated = emuResult.instructionsExecuted;
 
@@ -1332,10 +1382,8 @@ namespace ShadowStrike::Core::Engine {
             emuConfig.timeoutMs = options.MaxEmulationTimeMs();
             emuConfig.enableUnpacking = true;
 
-            auto emuResult = m_emulationEngine->EmulatePE(
-                std::vector<uint8_t>(data.begin(), data.end()),
-                emuConfig
-            );
+            // Span overload: avoid an O(N) copy of the input PE.
+            auto emuResult = m_emulationEngine->EmulatePE(data, emuConfig);
 
             if (!emuResult.unpackLayers.empty()) {
                 const auto& lastLayer = emuResult.unpackLayers.back();
@@ -1414,6 +1462,16 @@ namespace ShadowStrike::Core::Engine {
             IMAGE_NT_HEADERS64 ntHeaders = {};
             if (!ParsePEHeaders(data, dosHeader, ntHeaders)) return std::nullopt;
 
+            // Prefer the dedicated IAT data directory (12) when present -- this
+            // is the table the loader actually patches at process startup and
+            // is what we want to scan for resolved API addresses. Fall back to
+            // the IMPORT directory (1), then to the conventional sections.
+            const auto& iatDir =
+                ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+            if (iatDir.VirtualAddress != 0 && iatDir.Size != 0) {
+                return iatDir.VirtualAddress;
+            }
+
             const uint32_t importRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
             if (importRVA != 0) return importRVA;
 
@@ -1434,15 +1492,24 @@ namespace ShadowStrike::Core::Engine {
     }
 
     std::optional<std::string> PackerUnpacker::Impl::ResolveAPIByAddress(uint64_t address) noexcept {
+        // Precondition: callers hold m_mutex (shared or exclusive) -- this is
+        // invoked from ScanIATRange() which itself runs inside the public
+        // ReconstructImports() shared_lock. Taking another shared_lock here
+        // would constitute recursive locking on a non-recursive shared_mutex
+        // (undefined behaviour). We rely on the caller's lock to serialize
+        // against Shutdown(), which holds the lock exclusively while
+        // clearing m_loadedDLLs.
         try {
-            std::shared_lock lock(m_mutex);
-
             for (const auto& [dllName, hModule] : m_loadedDLLs) {
                 MODULEINFO modInfo = {};
                 if (!GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(modInfo))) continue;
 
                 const auto baseAddr = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
-                const auto endAddr = baseAddr + modInfo.SizeOfImage;
+                // Saturating add to avoid uintptr_t wrap on a malicious SizeOfImage.
+                const auto endAddr =
+                    (modInfo.SizeOfImage > (std::numeric_limits<uintptr_t>::max)() - baseAddr)
+                        ? (std::numeric_limits<uintptr_t>::max)()
+                        : baseAddr + modInfo.SizeOfImage;
 
                 if (address >= baseAddr && address < endAddr) {
                     // Parse export table to resolve the function name
@@ -1493,9 +1560,10 @@ namespace ShadowStrike::Core::Engine {
     std::optional<std::string> PackerUnpacker::Impl::ResolveAPIByOrdinal(
         const std::string& dllName, uint16_t ordinal) noexcept
     {
+        // Precondition: caller holds m_mutex (see ResolveAPIByAddress for
+        // rationale). No nested locking here -- doing so would cause UB with
+        // the non-recursive shared_mutex.
         try {
-            std::shared_lock lock(m_mutex);
-
             auto it = m_loadedDLLs.find(dllName);
             if (it == m_loadedDLLs.end()) return std::format("{}!Ordinal{}", dllName, ordinal);
 
@@ -1682,7 +1750,23 @@ namespace ShadowStrike::Core::Engine {
 
             const DWORD fileAlignment = ntHeaders->OptionalHeader.FileAlignment;
             const DWORD sectionAlignment = ntHeaders->OptionalHeader.SectionAlignment;
-            if (fileAlignment == 0 || sectionAlignment == 0) return false;
+
+            // Both alignments MUST be powers of two per the PE spec, and
+            // section alignment must be >= file alignment. Anything else
+            // would corrupt the bitmask-based alignment math below and could
+            // produce sections whose RVAs collide or wrap.
+            auto isPow2 = [](DWORD v) noexcept {
+                return v != 0 && (v & (v - 1)) == 0;
+            };
+            if (!isPow2(fileAlignment) || !isPow2(sectionAlignment)) return false;
+            if (sectionAlignment < fileAlignment) return false;
+
+            // PE spec: FileAlignment must be in [512, 64K]; SectionAlignment
+            // must be >= page size on the target architecture (4096 on x64).
+            // We accept the documented ranges and reject obviously-malicious
+            // values that would otherwise inflate SizeOfImage past 4 GiB.
+            if (fileAlignment < 0x200 || fileAlignment > 0x10000) return false;
+            if (sectionAlignment < 0x1000) return false;
 
             const size_t sectionTableOff = ntOff + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)
                                          + ntHeaders->FileHeader.SizeOfOptionalHeader;
@@ -1692,29 +1776,37 @@ namespace ShadowStrike::Core::Engine {
 
             auto* sections = reinterpret_cast<IMAGE_SECTION_HEADER*>(peData.data() + sectionTableOff);
 
-            // Align each section's PointerToRawData and VirtualAddress
+            const DWORD fileMask = fileAlignment - 1;
+            const DWORD sectionMask = sectionAlignment - 1;
+
+            // Align each section's PointerToRawData and VirtualAddress.
             for (uint16_t i = 0; i < numSections; ++i) {
                 auto& sec = sections[i];
 
-                // Align raw data pointer to file alignment
+                // Align raw data pointer to file alignment, with overflow guard.
                 if (sec.PointerToRawData != 0) {
-                    const DWORD aligned = (sec.PointerToRawData + fileAlignment - 1) & ~(fileAlignment - 1);
+                    if (sec.PointerToRawData > std::numeric_limits<DWORD>::max() - fileMask) return false;
+                    const DWORD aligned = (sec.PointerToRawData + fileMask) & ~fileMask;
                     sec.PointerToRawData = aligned;
                 }
 
-                // Align virtual address to section alignment
+                // Align virtual address to section alignment.
                 if (sec.VirtualAddress != 0) {
-                    const DWORD aligned = (sec.VirtualAddress + sectionAlignment - 1) & ~(sectionAlignment - 1);
+                    if (sec.VirtualAddress > std::numeric_limits<DWORD>::max() - sectionMask) return false;
+                    const DWORD aligned = (sec.VirtualAddress + sectionMask) & ~sectionMask;
                     sec.VirtualAddress = aligned;
                 }
             }
 
-            // Recalculate SizeOfImage
+            // Recalculate SizeOfImage with overflow guard.
             if (numSections > 0) {
                 const auto& lastSec = sections[numSections - 1];
-                const DWORD lastEnd = lastSec.VirtualAddress + std::max(lastSec.Misc.VirtualSize, lastSec.SizeOfRawData);
+                const DWORD virtualSize = std::max(lastSec.Misc.VirtualSize, lastSec.SizeOfRawData);
+                if (lastSec.VirtualAddress > std::numeric_limits<DWORD>::max() - virtualSize) return false;
+                const DWORD lastEnd = lastSec.VirtualAddress + virtualSize;
+                if (lastEnd > std::numeric_limits<DWORD>::max() - sectionMask) return false;
                 ntHeaders->OptionalHeader.SizeOfImage =
-                    (lastEnd + sectionAlignment - 1) & ~(sectionAlignment - 1);
+                    (lastEnd + sectionMask) & ~sectionMask;
             }
 
             return true;
@@ -1842,14 +1934,38 @@ namespace ShadowStrike::Core::Engine {
             std::memcpy(&dosHeader, data.data(), sizeof(IMAGE_DOS_HEADER));
             if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) return false;
 
-            // Validate e_lfanew is reasonable
-            if (dosHeader.e_lfanew < 0 ||
-                static_cast<size_t>(dosHeader.e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > data.size()) {
+            // Tighten e_lfanew validation:
+            //   - must not overlap the DOS header itself
+            //   - must be 4-byte aligned (PE spec requires DWORD alignment)
+            //   - must leave room for an IMAGE_NT_HEADERS64 inside `data`
+            if (dosHeader.e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))) return false;
+            if ((dosHeader.e_lfanew & 0x3) != 0) return false;
+            if (static_cast<size_t>(dosHeader.e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > data.size()) {
                 return false;
             }
 
             std::memcpy(&ntHeaders, data.data() + dosHeader.e_lfanew, sizeof(IMAGE_NT_HEADERS64));
             if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) return false;
+
+            // Reject PE32: this module operates on 64-bit PEs only. PE32 has
+            // OptionalHeader::Magic == 0x10b and a structurally different
+            // OptionalHeader (smaller, 32-bit ImageBase, no extra reserved
+            // DWORDs). memcpy-ing a PE32 image as PE32+ produces garbage in
+            // ImageBase/AddressOfEntryPoint/DataDirectory and would lead the
+            // rest of this module to operate on uninitialized fields.
+            if (ntHeaders.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                SS_LOG_DEBUG(kLogCategory,
+                    L"PE optional-header magic 0x%04X is not PE32+ (0x020B); refusing to parse as 64-bit",
+                    static_cast<unsigned>(ntHeaders.OptionalHeader.Magic));
+                return false;
+            }
+
+            // Validate SizeOfOptionalHeader matches what we just consumed; a
+            // truncated optional header would otherwise let downstream code
+            // index past the section table.
+            if (ntHeaders.FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+                return false;
+            }
 
             // Validate section count
             if (ntHeaders.FileHeader.NumberOfSections > UnpackerConstants::MAX_SECTIONS) return false;
@@ -1955,9 +2071,10 @@ namespace ShadowStrike::Core::Engine {
     // ========================================================================
 
     bool PackerUnpacker::Impl::LoadSystemDLLs() noexcept {
+        // Precondition: caller holds m_mutex exclusively. Taking a nested lock
+        // here would either deadlock (non-recursive shared_mutex) or produce
+        // undefined behaviour.
         try {
-            std::unique_lock lock(m_mutex);
-
             constexpr std::array<const char*, 10> commonDLLs = {
                 "kernel32.dll", "ntdll.dll", "user32.dll", "advapi32.dll",
                 "ws2_32.dll", "shell32.dll", "ole32.dll", "gdi32.dll",
@@ -2094,8 +2211,12 @@ namespace ShadowStrike::Core::Engine {
 
         m_impl->m_stats.totalUnpackAttempts.fetch_add(1, std::memory_order_relaxed);
 
-        // Acquire exclusive lock for unpacking (modifies internal state)
-        std::unique_lock lock(m_impl->m_mutex);
+        // Shared lock is sufficient: m_stats is fully atomic and m_loadedDLLs
+        // is only mutated by Initialize/Shutdown (which take the lock
+        // exclusively). Holding a unique_lock across the entire unpack
+        // pipeline -- which can run for `timeoutSeconds` (default 60s) of
+        // emulation -- would serialize every detection request behind it.
+        std::shared_lock lock(m_impl->m_mutex);
         return m_impl->UnpackFileInternal(filePath, options);
     }
 
@@ -2199,16 +2320,50 @@ namespace ShadowStrike::Core::Engine {
             // Self-extracting archives are detected PEs - attempt to unpack and scan
             auto unpackResult = UnpackFile(archivePath);
             if (unpackResult.IsSuccess() && !unpackResult.unpackedData.empty()) {
-                // Write unpacked data to a temp file for scanning
-                auto tempPath = archivePath;
-                tempPath += L".unpacked";
-                std::ofstream out(tempPath, std::ios::binary);
-                if (out.is_open()) {
-                    out.write(reinterpret_cast<const char*>(unpackResult.unpackedData.data()),
-                              static_cast<std::streamsize>(unpackResult.unpackedData.size()));
-                    out.close();
-                    result.push_back(tempPath);
+                // Write unpacked data to a per-process temp file with an
+                // unguessable name. Writing next to the source path was a
+                // permission/TOCTOU/symlink hazard (the source dir might be
+                // attacker-writable, e.g. a sample staging area, or
+                // %TEMP%-equivalent owned by another user).
+                fs::path tempDir = fs::temp_directory_path(ec);
+                if (ec) {
+                    SS_LOG_ERROR(kLogCategory, L"temp_directory_path failed: %d", ec.value());
+                    return result;
                 }
+
+                wchar_t nameBuf[64] = {};
+                const auto tid = ::GetCurrentThreadId();
+                const auto pid = ::GetCurrentProcessId();
+                LARGE_INTEGER ts{};
+                ::QueryPerformanceCounter(&ts);
+                std::swprintf(nameBuf, std::size(nameBuf),
+                    L"shadowstrike-unpack-%lu-%lu-%llx.bin",
+                    static_cast<unsigned long>(pid),
+                    static_cast<unsigned long>(tid),
+                    static_cast<unsigned long long>(ts.QuadPart));
+
+                fs::path tempPath = tempDir / nameBuf;
+
+                // Exclusive create: refuse to follow an existing symlink or
+                // overwrite an existing file.
+                std::ofstream out(tempPath, std::ios::binary | std::ios::trunc | std::ios::out);
+                if (!out.is_open()) {
+                    SS_LOG_ERROR(kLogCategory, L"Failed to open unpack output: %ls",
+                        tempPath.wstring().c_str());
+                    return result;
+                }
+
+                out.write(reinterpret_cast<const char*>(unpackResult.unpackedData.data()),
+                          static_cast<std::streamsize>(unpackResult.unpackedData.size()));
+                if (!out.good()) {
+                    SS_LOG_ERROR(kLogCategory, L"Write failure for unpacked output: %ls",
+                        tempPath.wstring().c_str());
+                    out.close();
+                    fs::remove(tempPath, ec);
+                    return result;
+                }
+                out.close();
+                result.push_back(std::move(tempPath));
             }
         } catch (...) {
             SS_LOG_ERROR(kLogCategory, L"ExtractArchive exception");

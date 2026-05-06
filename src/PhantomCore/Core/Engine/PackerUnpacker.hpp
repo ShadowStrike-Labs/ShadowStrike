@@ -82,7 +82,11 @@
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/CompressionUtils.hpp"
-#include "../../PatternStore/PatternStore.hpp"
+// Note: PatternStore is intentionally not pulled in here — packer detection
+// uses its own self-contained byte-pattern table (see PackerSignatures in the
+// translation unit). Avoiding the heavyweight PatternStore include keeps the
+// public header lean and prevents a circular dependency through the
+// SignatureStore→Engine include graph.
 
 // ============================================================================
 // FORWARD DECLARATIONS
