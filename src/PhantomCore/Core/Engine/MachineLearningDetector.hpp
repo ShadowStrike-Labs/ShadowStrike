@@ -128,10 +128,6 @@
 // FORWARD DECLARATIONS
 // ============================================================================
 
-namespace ShadowStrike::Core::Engine {
-    class MachineLearningDetectorImpl;
-}
-
 namespace ShadowStrike {
 namespace Core {
 namespace Engine {
@@ -151,18 +147,33 @@ namespace MLConstants {
     
     /// @brief Maximum feature vector size
     inline constexpr size_t MAX_FEATURE_VECTOR_SIZE = 4096;
-    
+
     /// @brief Maximum models in ensemble
     inline constexpr size_t MAX_ENSEMBLE_MODELS = 16;
-    
+
     /// @brief Batch inference size
     inline constexpr size_t DEFAULT_BATCH_SIZE = 32;
-    
+
     /// @brief Feature cache size
     inline constexpr size_t FEATURE_CACHE_SIZE = 10000;
-    
+
     /// @brief Model timeout (milliseconds)
     inline constexpr uint32_t MODEL_TIMEOUT_MS = 5000;
+
+    /// @brief Maximum input file size accepted for ML inference (DoS guard).
+    /// @details Aligned with PhantomCortex / FeatureExtractor MAX_PE_FILE_SIZE
+    ///          (256 MiB). Files exceeding this are rejected before any
+    ///          read/hash/inference work is performed.
+    inline constexpr uint64_t MAX_INPUT_FILE_SIZE = 256ULL * 1024ULL * 1024ULL;
+
+    /// @brief Maximum number of file-byte cache entries.
+    inline constexpr size_t MAX_BYTES_CACHE_ENTRIES = 64;
+
+    /// @brief Maximum total bytes retained across the file-byte cache (DoS guard).
+    inline constexpr uint64_t MAX_BYTES_CACHE_TOTAL = 128ULL * 1024ULL * 1024ULL;
+
+    /// @brief Maximum batch request size (defense against unbounded async work).
+    inline constexpr size_t MAX_BATCH_REQUEST_SIZE = 4096;
 
 }  // namespace MLConstants
 
@@ -765,6 +776,10 @@ public:
 private:
     MachineLearningDetector();
     ~MachineLearningDetector();
+
+    // Internal implementation that takes an explicit threshold.
+    // Callers MUST NOT hold the implementation mutex.
+    [[nodiscard]] PredictionResult AnalyzeImpl(const fs::path& filePath, float threshold);
 
     // PIMPL - ALL implementation details in Impl class for ABI stability
     struct Impl;

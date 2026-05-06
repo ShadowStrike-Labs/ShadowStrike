@@ -72,6 +72,7 @@
 #include <map>
 #include <set>
 #include <deque>
+#include <thread>
 #include <Windows.h>
 
 namespace ShadowStrike {
@@ -273,7 +274,7 @@ struct MachineLearningDetector::Impl {
     };
     std::unordered_map<std::string, CachedBytes> m_fileBytesCache;
     mutable std::mutex m_fileBytesCacheMutex;
-    static constexpr size_t MAX_BYTES_CACHE_ENTRIES = 256;
+    uint64_t m_fileBytesCacheTotalBytes{0};
 
     // Statistics
     MLStatistics m_statistics;
@@ -377,9 +378,10 @@ struct MachineLearningDetector::Impl {
     // ----------------------------------------------------------------
     // Helper: Convert AI::CortexVerdict → PredictionResult
     // ----------------------------------------------------------------
+    // Note: not noexcept — uses std::map::operator[] which may throw bad_alloc.
     [[nodiscard]] static PredictionResult ConvertVerdict(
         const AI::CortexVerdict& verdict,
-        float threshold) noexcept
+        float threshold)
     {
         PredictionResult result;
         result.confidence = verdict.confidence;
@@ -440,19 +442,43 @@ struct MachineLearningDetector::Impl {
     // Helper: Cache raw file bytes so Analyze(features) can retrieve them
     // ----------------------------------------------------------------
     void CacheFileBytes(const std::string& hash, const std::vector<uint8_t>& data) {
+        if (hash.empty()) {
+            return;
+        }
+        // Reject oversized entries individually — bounded memory growth.
+        if (data.size() > MLConstants::MAX_BYTES_CACHE_TOTAL) {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(m_fileBytesCacheMutex);
 
-        if (m_fileBytesCache.size() >= MAX_BYTES_CACHE_ENTRIES) {
+        // If hash is already cached, refresh in place (size accounting follows).
+        if (auto existing = m_fileBytesCache.find(hash); existing != m_fileBytesCache.end()) {
+            m_fileBytesCacheTotalBytes -= existing->second.data.size();
+            existing->second.data = data;
+            existing->second.timestamp = std::chrono::system_clock::now();
+            m_fileBytesCacheTotalBytes += data.size();
+            return;
+        }
+
+        // Evict oldest entries until both per-count and per-byte caps are satisfied.
+        const auto needsEvict = [&]() {
+            return m_fileBytesCache.size() >= MLConstants::MAX_BYTES_CACHE_ENTRIES ||
+                   m_fileBytesCacheTotalBytes + data.size() > MLConstants::MAX_BYTES_CACHE_TOTAL;
+        };
+        while (!m_fileBytesCache.empty() && needsEvict()) {
             auto oldest = m_fileBytesCache.begin();
             for (auto it = m_fileBytesCache.begin(); it != m_fileBytesCache.end(); ++it) {
                 if (it->second.timestamp < oldest->second.timestamp) {
                     oldest = it;
                 }
             }
+            m_fileBytesCacheTotalBytes -= oldest->second.data.size();
             m_fileBytesCache.erase(oldest);
         }
 
         m_fileBytesCache[hash] = {data, std::chrono::system_clock::now()};
+        m_fileBytesCacheTotalBytes += data.size();
     }
 
     [[nodiscard]] std::optional<std::vector<uint8_t>> GetCachedFileBytes(const std::string& hash) const {
@@ -480,8 +506,79 @@ struct MachineLearningDetector::Impl {
         return elapsed < m_config.cacheTtlSeconds;
     }
 
+    // ----------------------------------------------------------------
+    // Helper: Compute SHA-256 hex of a byte buffer with full error handling.
+    // Returns empty string on hasher failure (caller decides policy).
+    // ----------------------------------------------------------------
+    [[nodiscard]] static std::string ComputeSha256Hex(const uint8_t* data, size_t size) {
+        std::string hex;
+        if (data == nullptr || size == 0) {
+            return hex;
+        }
+        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+        if (!hasher.Init()) {
+            SS_LOG_WARN(L"MachineLearning", L"Hasher Init failed");
+            return {};
+        }
+        if (!hasher.Update(data, size)) {
+            SS_LOG_WARN(L"MachineLearning", L"Hasher Update failed");
+            return {};
+        }
+        if (!hasher.FinalHex(hex)) {
+            SS_LOG_WARN(L"MachineLearning", L"Hasher FinalHex failed");
+            return {};
+        }
+        return hex;
+    }
+
+    // ----------------------------------------------------------------
+    // Enforce LRU cap on prediction cache. Caller MUST already hold
+    // m_predictionCacheMutex exclusively.
+    // ----------------------------------------------------------------
+    void EnforcePredictionCacheLimitNoLock() {
+        if (m_predictionCache.size() <= m_config.maxCacheEntries) {
+            return;
+        }
+        std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> items;
+        items.reserve(m_predictionCache.size());
+        for (const auto& [hash, cached] : m_predictionCache) {
+            items.emplace_back(hash, cached.timestamp);
+        }
+        std::sort(items.begin(), items.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+        const size_t excess = m_predictionCache.size() - m_config.maxCacheEntries;
+        const size_t toRemove = excess + (m_predictionCache.size() / 8);  // shed an extra 12.5%
+        for (size_t i = 0; i < toRemove && i < items.size(); ++i) {
+            m_predictionCache.erase(items[i].first);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Enforce LRU cap on feature cache. Caller MUST already hold
+    // m_featureCacheMutex exclusively.
+    // ----------------------------------------------------------------
+    void EnforceFeatureCacheLimitNoLock() {
+        const size_t cap = std::max<size_t>(m_config.maxCacheEntries, 1);
+        if (m_featureCache.size() <= cap) {
+            return;
+        }
+        std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> items;
+        items.reserve(m_featureCache.size());
+        for (const auto& [hash, cached] : m_featureCache) {
+            items.emplace_back(hash, cached.timestamp);
+        }
+        std::sort(items.begin(), items.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+        const size_t excess = m_featureCache.size() - cap;
+        const size_t toRemove = excess + (m_featureCache.size() / 8);
+        for (size_t i = 0; i < toRemove && i < items.size(); ++i) {
+            m_featureCache.erase(items[i].first);
+        }
+    }
+
     void ClearExpiredCaches() {
         const auto now = std::chrono::system_clock::now();
+        const auto ttlSeconds = m_config.cacheTtlSeconds;
 
         // Clear expired prediction cache
         {
@@ -491,31 +588,13 @@ struct MachineLearningDetector::Impl {
                     now - it->second.timestamp
                 ).count();
 
-                if (elapsed >= m_config.cacheTtlSeconds) {
+                if (elapsed >= static_cast<int64_t>(ttlSeconds)) {
                     it = m_predictionCache.erase(it);
                 } else {
                     ++it;
                 }
             }
-
-            // Enforce max cache size (LRU)
-            if (m_predictionCache.size() > m_config.maxCacheEntries) {
-                // Simple approach: clear oldest 25%
-                std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> items;
-                items.reserve(m_predictionCache.size());
-
-                for (const auto& [hash, cached] : m_predictionCache) {
-                    items.push_back({hash, cached.timestamp});
-                }
-
-                std::sort(items.begin(), items.end(),
-                         [](const auto& a, const auto& b) { return a.second < b.second; });
-
-                size_t toRemove = m_predictionCache.size() / 4;
-                for (size_t i = 0; i < toRemove && i < items.size(); ++i) {
-                    m_predictionCache.erase(items[i].first);
-                }
-            }
+            EnforcePredictionCacheLimitNoLock();
         }
 
         // Clear expired feature cache
@@ -526,15 +605,16 @@ struct MachineLearningDetector::Impl {
                     now - it->second.timestamp
                 ).count();
 
-                if (elapsed >= m_config.cacheTtlSeconds) {
+                if (elapsed >= static_cast<int64_t>(ttlSeconds)) {
                     it = m_featureCache.erase(it);
                 } else {
                     ++it;
                 }
             }
+            EnforceFeatureCacheLimitNoLock();
         }
 
-        // Clear expired file bytes cache
+        // Clear expired file bytes cache (with byte accounting)
         {
             std::lock_guard<std::mutex> lock(m_fileBytesCacheMutex);
             for (auto it = m_fileBytesCache.begin(); it != m_fileBytesCache.end();) {
@@ -542,7 +622,8 @@ struct MachineLearningDetector::Impl {
                     now - it->second.timestamp
                 ).count();
 
-                if (elapsed >= m_config.cacheTtlSeconds) {
+                if (elapsed >= static_cast<int64_t>(ttlSeconds)) {
+                    m_fileBytesCacheTotalBytes -= it->second.data.size();
                     it = m_fileBytesCache.erase(it);
                 } else {
                     ++it;
@@ -601,8 +682,11 @@ bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& con
         }
 
         if (!config.enabled) {
-            SS_LOG_INFO(L"MachineLearning", L"Disabled via configuration");
-            return false;
+            SS_LOG_INFO(L"MachineLearning",
+                        L"Disabled via configuration; detector remains uninitialized");
+            // Disabled-by-config is an explicit, valid state — caller should not
+            // treat it as an initialization error.
+            return true;
         }
 
         // Initialize external stores
@@ -624,10 +708,15 @@ bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& con
         if (config.useEnsemble) {
             for (const auto& modelConfig : config.ensembleModels) {
                 if (modelConfig.IsValid()) {
-                    LoadModel(modelConfig);
+                    if (!LoadModel(modelConfig)) {
+                        SS_LOG_WARN(L"MachineLearning",
+                                    L"Ensemble entry %ls failed to load; continuing with remaining models",
+                                    Utils::StringUtils::ToWide(modelConfig.modelName).c_str());
+                    }
                 }
             }
 
+            std::shared_lock<std::shared_mutex> ml(m_impl->m_modelsMutex);
             if (m_impl->m_loadedModels.empty()) {
                 SS_LOG_ERROR(L"MachineLearning", L"No ensemble models loaded");
                 return false;
@@ -685,6 +774,7 @@ void MachineLearningDetector::Shutdown() {
         {
             std::lock_guard<std::mutex> cacheLock(m_impl->m_fileBytesCacheMutex);
             m_impl->m_fileBytesCache.clear();
+            m_impl->m_fileBytesCacheTotalBytes = 0;
         }
 
         // Release external stores
@@ -718,10 +808,16 @@ MLDetectorStatus MachineLearningDetector::GetStatus() const noexcept {
 // ============================================================================
 
 PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
+    const float threshold = m_impl->m_defaultThreshold.load(std::memory_order_relaxed);
+    return AnalyzeImpl(filePath, threshold);
+}
+
+PredictionResult MachineLearningDetector::AnalyzeImpl(const fs::path& filePath, float threshold) {
     const auto startTime = Clock::now();
     m_impl->m_statistics.totalPredictions.fetch_add(1, std::memory_order_relaxed);
 
     PredictionResult result;
+    PredictionCallback callbackCopy;  // captured under lock, invoked outside
 
     try {
         std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
@@ -731,9 +827,23 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             return result;
         }
 
-        // Validate file exists
-        if (!fs::exists(filePath)) {
+        // Validate file exists and reject oversized inputs before any read/hash work.
+        std::error_code ec;
+        if (!fs::exists(filePath, ec) || ec) {
             SS_LOG_WARN(L"MachineLearning", L"File not found - %ls", filePath.wstring().c_str());
+            return result;
+        }
+        const auto rawSize = fs::file_size(filePath, ec);
+        if (ec) {
+            SS_LOG_WARN(L"MachineLearning", L"file_size query failed - %ls", filePath.wstring().c_str());
+            return result;
+        }
+        if (rawSize == 0 || rawSize > MLConstants::MAX_INPUT_FILE_SIZE) {
+            SS_LOG_WARN(L"MachineLearning",
+                        L"Rejecting file: size %llu outside accepted range (1..%llu) - %ls",
+                        static_cast<unsigned long long>(rawSize),
+                        static_cast<unsigned long long>(MLConstants::MAX_INPUT_FILE_SIZE),
+                        filePath.wstring().c_str());
             return result;
         }
 
@@ -743,13 +853,24 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             SS_LOG_WARN(L"MachineLearning", L"Failed to read file - %ls", filePath.wstring().c_str());
             return result;
         }
+        // Re-check size post-read in case of TOCTOU growth (file replaced between
+        // file_size and ReadAllBytes); rawBytes.size() is the authoritative bound.
+        if (rawBytes.size() > MLConstants::MAX_INPUT_FILE_SIZE) {
+            SS_LOG_WARN(L"MachineLearning",
+                        L"Post-read size %zu exceeds cap; aborting - %ls",
+                        rawBytes.size(), filePath.wstring().c_str());
+            return result;
+        }
         std::vector<uint8_t> fileData(reinterpret_cast<const uint8_t*>(rawBytes.data()),
                                       reinterpret_cast<const uint8_t*>(rawBytes.data()) + rawBytes.size());
 
-        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
-        std::string fileHash;
-        if (hasher.Init() && hasher.Update(fileData.data(), fileData.size())) {
-            hasher.FinalHex(fileHash);
+        const std::string fileHash = Impl::ComputeSha256Hex(fileData.data(), fileData.size());
+        if (fileHash.empty()) {
+            // Hash failure — proceed without cache reuse but log and continue;
+            // never silently consume the failure.
+            SS_LOG_WARN(L"MachineLearning",
+                        L"SHA-256 unavailable for input; bypassing cache - %ls",
+                        filePath.wstring().c_str());
         }
 
         // Check whitelist
@@ -765,21 +886,30 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             }
         }
 
-        // Check prediction cache
-        if (m_impl->m_config.enableCaching && m_impl->IsPredictionCacheValid(fileHash)) {
+        // Check prediction cache (only if hash succeeded)
+        if (!fileHash.empty() && m_impl->m_config.enableCaching) {
             std::lock_guard<std::mutex> cacheLock(m_impl->m_predictionCacheMutex);
             auto it = m_impl->m_predictionCache.find(fileHash);
             if (it != m_impl->m_predictionCache.end()) {
-                m_impl->m_statistics.cacheHits.fetch_add(1, std::memory_order_relaxed);
-                result = it->second.result;
-                result.fromCache = true;
-                SS_LOG_INFO(L"MachineLearning", L"Cache hit - %ls", filePath.wstring().c_str());
-                return result;
+                const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now() - it->second.timestamp).count();
+                if (elapsed < static_cast<int64_t>(m_impl->m_config.cacheTtlSeconds)) {
+                    m_impl->m_statistics.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    result = it->second.result;
+                    result.fromCache = true;
+                    callbackCopy = m_impl->m_predictionCallback;
+                    SS_LOG_INFO(L"MachineLearning", L"Cache hit - %ls", filePath.wstring().c_str());
+                    lock.unlock();
+                    if (callbackCopy) {
+                        callbackCopy(filePath, result);
+                    }
+                    return result;
+                }
             }
         }
         m_impl->m_statistics.cacheMisses.fetch_add(1, std::memory_order_relaxed);
 
-        // Cache file bytes for the features-based path
+        // Cache file bytes for the features-based path (no-op if hash empty)
         m_impl->CacheFileBytes(fileHash, fileData);
 
         // Delegate to PhantomCortex for real ONNX inference
@@ -788,7 +918,6 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             auto cortexVerdict = cortex.AnalyzeFile(
                 std::span<const uint8_t>(fileData.data(), fileData.size()));
 
-            float threshold = m_impl->m_defaultThreshold.load(std::memory_order_relaxed);
             result = Impl::ConvertVerdict(cortexVerdict, threshold);
 
             m_impl->m_statistics.modelInferences.fetch_add(1, std::memory_order_relaxed);
@@ -796,17 +925,26 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             SS_LOG_WARN(L"MachineLearning", L"PhantomCortex not operational, extracting features for fallback");
             auto features = ExtractFeatures(filePath);
             features.fileHash = fileHash;
+            // NOTE: Analyze(features) intentionally does NOT re-acquire m_mutex —
+            // it operates on independently synchronized atomics + per-cache mutexes.
+            // This avoids recursive shared_lock UB on MSVC's SRWLock-backed
+            // std::shared_mutex.
             result = Analyze(features);
+            // Honor caller-supplied threshold: Analyze(features) uses the default
+            // threshold internally, so reapply the explicit threshold here.
+            result.thresholdUsed = threshold;
+            result.isMalicious = (result.probability >= threshold);
         }
 
-        // Cache result
-        if (m_impl->m_config.enableCaching) {
+        // Cache result (only if hash succeeded)
+        bool needsMaintenance = false;
+        if (!fileHash.empty() && m_impl->m_config.enableCaching) {
             std::lock_guard<std::mutex> cacheLock(m_impl->m_predictionCacheMutex);
             m_impl->m_predictionCache[fileHash] = {result, std::chrono::system_clock::now()};
-
-            if (m_impl->m_predictionCache.size() % 100 == 0) {
-                m_impl->ClearExpiredCaches();
-            }
+            // Hard cap enforced inline; periodic full sweep is triggered AFTER the
+            // cache lock is dropped to avoid recursive locking.
+            m_impl->EnforcePredictionCacheLimitNoLock();
+            needsMaintenance = (m_impl->m_predictionCache.size() % 100 == 0);
         }
 
         // Update statistics
@@ -820,14 +958,23 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             m_impl->m_statistics.benignClassifications.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Invoke callback
-        if (m_impl->m_predictionCallback) {
-            m_impl->m_predictionCallback(filePath, result);
+        // Snapshot callback under the shared lock; invoke it AFTER releasing
+        // the lock so user code cannot re-enter the detector under-lock.
+        callbackCopy = m_impl->m_predictionCallback;
+        lock.unlock();
+
+        if (needsMaintenance) {
+            m_impl->ClearExpiredCaches();
+        }
+        if (callbackCopy) {
+            callbackCopy(filePath, result);
         }
 
-        SS_LOG_INFO(L"MachineLearning", L"Analysis complete - %ls (malicious: %d, prob: %.2f%%, time: %lldus)",
-                      filePath.wstring().c_str(), result.isMalicious ? 1 : 0,
-                      static_cast<double>(result.probability * 100.0f), durationUs);
+        SS_LOG_INFO(L"MachineLearning",
+                    L"Analysis complete - %ls (malicious: %d, prob: %.2f%%, time: %lldus)",
+                    filePath.wstring().c_str(), result.isMalicious ? 1 : 0,
+                    static_cast<double>(result.probability * 100.0f),
+                    static_cast<long long>(durationUs));
 
         return result;
 
@@ -866,7 +1013,20 @@ PredictionResult MachineLearningDetector::Analyze(const ExtractedFeatures& featu
     PredictionResult result;
 
     try {
-        std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
+        // NOTE: This overload deliberately does NOT acquire m_mutex.
+        //   - It is invoked re-entrantly from AnalyzeImpl(filePath) which already
+        //     holds m_mutex shared; recursively re-entering shared_lock on
+        //     std::shared_mutex is undefined behavior on MSVC's SRWLock backing.
+        //   - All state touched here is independently synchronized:
+        //       * m_initialized / m_defaultThreshold / m_statistics.* are atomics
+        //       * m_fileBytesCache is guarded by its own mutex
+        //       * AI::PhantomCortex::Instance() is internally synchronized
+        //   - m_config is only mutated under exclusive m_mutex by SetConfiguration,
+        //     and is not read in this function.
+        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_WARN(L"MachineLearning", L"Not initialized");
+            return result;
+        }
 
         if (features.features.empty()) {
             SS_LOG_WARN(L"MachineLearning", L"Empty feature vector");
@@ -981,19 +1141,10 @@ PredictionResult MachineLearningDetector::AnalyzeWithThreshold(
     const fs::path& filePath,
     float threshold)
 {
-    // Save current threshold
-    float originalThreshold = m_impl->m_defaultThreshold.load(std::memory_order_relaxed);
-
-    // Set custom threshold
-    m_impl->m_defaultThreshold.store(threshold, std::memory_order_relaxed);
-
-    // Analyze
-    auto result = Analyze(filePath);
-
-    // Restore original threshold
-    m_impl->m_defaultThreshold.store(originalThreshold, std::memory_order_relaxed);
-
-    return result;
+    // Threshold is propagated explicitly through AnalyzeImpl — never mutate
+    // m_defaultThreshold (would race with concurrent Analyze callers).
+    const float clamped = std::clamp(threshold, 0.0f, 1.0f);
+    return AnalyzeImpl(filePath, clamped);
 }
 
 // ============================================================================
@@ -1004,11 +1155,20 @@ std::vector<std::pair<fs::path, PredictionResult>> MachineLearningDetector::Anal
     const std::vector<fs::path>& filePaths)
 {
     std::vector<std::pair<fs::path, PredictionResult>> results;
-    results.reserve(filePaths.size());
 
-    for (const auto& path : filePaths) {
-        auto result = Analyze(path);
-        results.push_back({path, std::move(result)});
+    if (filePaths.size() > MLConstants::MAX_BATCH_REQUEST_SIZE) {
+        SS_LOG_WARN(L"MachineLearning",
+                    L"Batch request size %zu exceeds cap %llu; truncating",
+                    filePaths.size(),
+                    static_cast<unsigned long long>(MLConstants::MAX_BATCH_REQUEST_SIZE));
+    }
+
+    const size_t limit = std::min<size_t>(filePaths.size(), MLConstants::MAX_BATCH_REQUEST_SIZE);
+    results.reserve(limit);
+
+    for (size_t i = 0; i < limit; ++i) {
+        auto result = Analyze(filePaths[i]);
+        results.emplace_back(filePaths[i], std::move(result));
     }
 
     return results;
@@ -1018,14 +1178,42 @@ void MachineLearningDetector::AnalyzeBatchAsync(
     const BatchPredictionRequest& request,
     BatchPredictionCallback callback)
 {
-    // Simple async implementation using std::async
-    // Real implementation would use thread pool
-    auto future = std::async(std::launch::async, [this, request, callback]() {
-        auto results = AnalyzeBatch(request.filePaths);
-        if (callback) {
-            callback(results);
-        }
-    });
+    // std::async with std::launch::async returns a future whose destructor blocks
+    // until the task completes — that is NOT asynchronous. Use a detached worker
+    // thread instead. Capturing `this` is sound: MachineLearningDetector is a
+    // Meyers singleton with program-duration lifetime.
+    if (request.filePaths.size() > MLConstants::MAX_BATCH_REQUEST_SIZE) {
+        SS_LOG_WARN(L"MachineLearning",
+                    L"Async batch request size %zu exceeds cap %llu; truncating",
+                    request.filePaths.size(),
+                    static_cast<unsigned long long>(MLConstants::MAX_BATCH_REQUEST_SIZE));
+    }
+
+    BatchPredictionRequest bounded = request;
+    if (bounded.filePaths.size() > MLConstants::MAX_BATCH_REQUEST_SIZE) {
+        bounded.filePaths.resize(MLConstants::MAX_BATCH_REQUEST_SIZE);
+    }
+
+    try {
+        std::thread worker([this, req = std::move(bounded), cb = std::move(callback)]() {
+            try {
+                auto results = AnalyzeBatch(req.filePaths);
+                if (cb) {
+                    cb(results);
+                }
+            } catch (const std::exception& e) {
+                m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_ERROR(L"MachineLearning", L"Async batch failed - %ls",
+                             Utils::StringUtils::ToWide(e.what()).c_str());
+            }
+        });
+        worker.detach();
+    } catch (const std::system_error& e) {
+        m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_ERROR(L"MachineLearning",
+                     L"Failed to spawn async batch worker - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
+    }
 }
 
 // ============================================================================
@@ -1085,8 +1273,18 @@ EnsemblePrediction MachineLearningDetector::AnalyzeWithEnsemble(const ExtractedF
             ensembleResult.finalResult = Impl::ConvertVerdict(finalV, threshold);
             ensembleResult.finalResult.modelName = "PhantomCortex-Ensemble";
 
-            // Convert per-model verdicts
+            // Convert per-model verdicts. The CortexEnsembleVerdict.modelVerdicts
+            // field is a fixed-size std::array<CortexVerdict, MODEL_COUNT>; entries
+            // for unused/unloaded models are default-initialized. Skip those so
+            // we do not surface phantom Benign/0-confidence results to the caller.
             for (const auto& mv : cortexEnsemble.modelVerdicts) {
+                const bool isPlaceholder = (mv.confidence == 0.0f) &&
+                                           (mv.inferenceTime.count() == 0) &&
+                                           (mv.verdict == AI::ThreatVerdict::Benign) &&
+                                           mv.details.empty();
+                if (isPlaceholder) {
+                    continue;
+                }
                 auto converted = Impl::ConvertVerdict(mv, threshold);
                 ensembleResult.modelResults.push_back(std::move(converted));
             }
@@ -1130,25 +1328,45 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const fs::path& fileP
     ExtractedFeatures result;
 
     try {
+        std::error_code ec;
+        if (!fs::exists(filePath, ec) || ec) {
+            return result;
+        }
+        const auto rawSize = fs::file_size(filePath, ec);
+        if (ec || rawSize == 0 || rawSize > MLConstants::MAX_INPUT_FILE_SIZE) {
+            SS_LOG_WARN(L"MachineLearning",
+                        L"ExtractFeatures rejecting file: size %llu outside accepted range - %ls",
+                        static_cast<unsigned long long>(rawSize),
+                        filePath.wstring().c_str());
+            return result;
+        }
+
         std::vector<std::byte> rawBytes;
         if (!Utils::FileUtils::ReadAllBytes(filePath.wstring(), rawBytes) || rawBytes.empty()) {
+            return result;
+        }
+        if (rawBytes.size() > MLConstants::MAX_INPUT_FILE_SIZE) {
+            SS_LOG_WARN(L"MachineLearning",
+                        L"ExtractFeatures post-read size %zu exceeds cap; aborting",
+                        rawBytes.size());
             return result;
         }
         std::vector<uint8_t> fileData(reinterpret_cast<const uint8_t*>(rawBytes.data()),
                                       reinterpret_cast<const uint8_t*>(rawBytes.data()) + rawBytes.size());
 
-        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
-        std::string fileHash;
-        if (hasher.Init() && hasher.Update(fileData.data(), fileData.size())) {
-            hasher.FinalHex(fileHash);
+        const std::string fileHash = Impl::ComputeSha256Hex(fileData.data(), fileData.size());
+        if (fileHash.empty()) {
+            SS_LOG_WARN(L"MachineLearning",
+                        L"ExtractFeatures: SHA-256 unavailable; bypassing cache - %ls",
+                        filePath.wstring().c_str());
         }
         result.fileHash = fileHash;
 
         // Cache the raw bytes for later PhantomCortex inference
         m_impl->CacheFileBytes(fileHash, fileData);
 
-        // Check feature cache
-        if (m_impl->m_config.enableCaching) {
+        // Check feature cache (only when we have a valid hash key)
+        if (!fileHash.empty() && m_impl->m_config.enableCaching) {
             std::lock_guard<std::mutex> lock(m_impl->m_featureCacheMutex);
             auto it = m_impl->m_featureCache.find(fileHash);
             if (it != m_impl->m_featureCache.end()) {
@@ -1158,7 +1376,11 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const fs::path& fileP
 
         // Delegate to PhantomCortex FeatureExtractor for real EMBER-aligned features
         auto& featureExtractor = AI::FeatureExtractor::Instance();
-        featureExtractor.Initialize();
+        if (!featureExtractor.Initialize()) {
+            SS_LOG_WARN(L"MachineLearning",
+                        L"FeatureExtractor initialization failed; aborting feature extraction");
+            return result;
+        }
 
         auto peFeatures = featureExtractor.ExtractPEFeatures(
             std::span<const uint8_t>(fileData.data(), fileData.size()));
@@ -1187,10 +1409,11 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const fs::path& fileP
             result.fileHash = fileHash;
         }
 
-        // Cache features
-        if (m_impl->m_config.enableCaching) {
+        // Cache features (with bounded LRU eviction)
+        if (!fileHash.empty() && m_impl->m_config.enableCaching) {
             std::lock_guard<std::mutex> lock(m_impl->m_featureCacheMutex);
             m_impl->m_featureCache[fileHash] = {result, std::chrono::system_clock::now()};
+            m_impl->EnforceFeatureCacheLimitNoLock();
         }
 
         const auto endTime = Clock::now();
@@ -1219,10 +1442,13 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const FileSystem::Exe
             auto cachedBytes = m_impl->GetCachedFileBytes(info.sha256Hex);
             if (cachedBytes.has_value()) {
                 auto& fe = AI::FeatureExtractor::Instance();
-                fe.Initialize();
-                auto peFeatures = fe.ExtractPEFeatures(
-                    std::span<const uint8_t>(cachedBytes->data(), cachedBytes->size()));
-                if (peFeatures.has_value()) {
+                if (!fe.Initialize()) {
+                    SS_LOG_WARN(L"MachineLearning",
+                                L"FeatureExtractor initialization failed in ExecutableInfo path");
+                } else {
+                    auto peFeatures = fe.ExtractPEFeatures(
+                        std::span<const uint8_t>(cachedBytes->data(), cachedBytes->size()));
+                    if (peFeatures.has_value()) {
                     result.features = std::move(peFeatures.value());
                     result.featureNames = m_impl->m_featureNames;
                     result.fileHash = info.sha256Hex;
@@ -1241,6 +1467,7 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const FileSystem::Exe
                     SS_LOG_INFO(L"MachineLearning", L"Extracted %zu features via FeatureExtractor",
                                   result.features.size());
                     return result;
+                }
                 }
             }
         }
@@ -1411,13 +1638,20 @@ bool MachineLearningDetector::LoadModel(const ModelConfig& config) {
 
         m_impl->m_loadedModels[config.modelName] = std::move(loadedModel);
 
+        // Snapshot callback target and metadata WHILE the lock is held, then
+        // drop the lock before invoking user code. Holding m_modelsMutex during
+        // a callback would deadlock if the callback re-enters any model API.
+        ModelUpdateCallback cb = m_impl->m_modelUpdateCallback;
+        ModelInfo infoCopy = m_impl->m_loadedModels[config.modelName].info;
+
         SS_LOG_INFO(L"MachineLearning", L"Model loaded - %ls (PhantomCortex operational: %d)",
                       Utils::StringUtils::ToWide(config.modelName).c_str(),
                       cortex.IsOperational() ? 1 : 0);
 
-        // Invoke callback
-        if (m_impl->m_modelUpdateCallback) {
-            m_impl->m_modelUpdateCallback(m_impl->m_loadedModels[config.modelName].info);
+        lock.unlock();
+
+        if (cb) {
+            cb(infoCopy);
         }
 
         return true;
@@ -1478,8 +1712,15 @@ std::vector<ModelInfo> MachineLearningDetector::GetLoadedModels() const {
 }
 
 bool MachineLearningDetector::UpdateModel(const ModelConfig& newConfig) {
-    // Hot swap: unload old, load new
-    UnloadModel(newConfig.modelName);
+    // Hot swap: unload old, load new. UnloadModel may legitimately return false
+    // if the model was not previously loaded — that is not a hard error here,
+    // but we MUST observe its return rather than discarding the [[nodiscard]].
+    const bool unloaded = UnloadModel(newConfig.modelName);
+    if (!unloaded) {
+        SS_LOG_INFO(L"MachineLearning",
+                    L"UpdateModel: prior instance of %ls was not loaded; proceeding to load new model",
+                    Utils::StringUtils::ToWide(newConfig.modelName).c_str());
+    }
     return LoadModel(newConfig);
 }
 
@@ -1623,6 +1864,12 @@ void MachineLearningDetector::ClearCache() {
     {
         std::lock_guard<std::mutex> lock(m_impl->m_featureCacheMutex);
         m_impl->m_featureCache.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_impl->m_fileBytesCacheMutex);
+        m_impl->m_fileBytesCache.clear();
+        m_impl->m_fileBytesCacheTotalBytes = 0;
     }
 
     SS_LOG_INFO(L"MachineLearning", L"Cache cleared");
