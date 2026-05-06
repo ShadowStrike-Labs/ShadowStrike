@@ -649,17 +649,30 @@ bool PolicyManager::ApplyPolicy(const Policy& policy) {
         return false;
     }
 
+    // Reject application once the manager is no longer in a state that can
+    // safely accept new policies. Without this guard, a late ApplyPolicy
+    // racing against Shutdown could observe a freshly-cleared policy table
+    // and re-populate it after the shutdown sequence had already drained
+    // subscribers, leaving orphan policies in the next session.
+    {
+        std::shared_lock statusLock(m_mutex);
+        if (!m_impl ||
+            (m_impl->m_status != PolicyStatus::Running &&
+             m_impl->m_status != PolicyStatus::Initializing)) {
+            SS_LOG_WARN(L"Policy",
+                L"ApplyPolicy rejected: manager not running (id=%hs)", policy.id.c_str());
+            return false;
+        }
+    }
+
     // Signature verification for signed policies — fail-closed
     if (!policy.signature.empty()) {
         SS_LOG_INFO(L"Policy", L"Verifying signature for policy id=%hs", policy.id.c_str());
 
-        // Serialize policy payload (everything except signature) for verification
-        Policy verifyPolicy = policy;
-        verifyPolicy.signature.clear();
-        const std::string payload = verifyPolicy.ToJson();
-
-        // Signature verification requires a loaded public key from the management server.
-        // Without the server's public key material, we cannot verify — reject to fail closed.
+        // Signature verification requires a loaded public key from the management
+        // server. Without the server's public key material, we cannot verify —
+        // reject to fail closed. The signed payload is intentionally not
+        // serialized here because no verifier consumes it.
         SS_LOG_ERROR(L"Policy", L"Policy id=%hs has signature but no trust store key configured; "
                     L"rejecting signed policy (fail-closed)", policy.id.c_str());
         return false;
@@ -1126,10 +1139,23 @@ PolicySyncResult PolicyManager::SyncWithServer() {
 
     SS_LOG_INFO(L"Policy", L"SyncWithServer: loading policies from offline cache");
 
+    // Snapshot config under shared lock so a concurrent UpdateConfig() cannot
+    // race against our reads of m_config.enableOfflineCache and
+    // m_config.offlineCachePath. We must not hold the lock for the actual
+    // I/O (file read + parse) since that would block readers and would also
+    // create lock-ordering hazards with ApplyPolicy below.
+    bool offlineCacheEnabled = false;
+    std::filesystem::path offlineCachePath;
+    {
+        std::shared_lock lock(m_mutex);
+        offlineCacheEnabled = m_impl->m_config.enableOfflineCache;
+        offlineCachePath    = m_impl->m_config.offlineCachePath;
+    }
+
     // In this implementation, sync loads from offline cache.
     // Actual server communication would be implemented in the Communication layer.
-    if (m_impl->m_config.enableOfflineCache && !m_impl->m_config.offlineCachePath.empty()) {
-        const auto cachePath = m_impl->m_config.offlineCachePath.wstring();
+    if (offlineCacheEnabled && !offlineCachePath.empty()) {
+        const auto cachePath = offlineCachePath.wstring();
         std::string content;
         Utils::FileUtils::Error fileErr;
 
@@ -1423,9 +1449,39 @@ void PolicyManager::ResetStatistics() {
 bool PolicyManager::SelfTest() {
     SS_LOG_INFO(L"Policy", L"PolicyManager self-test starting");
 
+    // Build a uniquely-named test policy id so we cannot collide with — or
+    // accidentally erase — a real production policy that happens to share a
+    // human-friendly name. Combining process id + high-resolution clock +
+    // a per-process counter is sufficient to keep the synthetic id out of
+    // any sensible operator namespace.
+    static std::atomic<uint64_t> selfTestSequence{0};
+    const auto seq = selfTestSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::string testId;
+    try {
+        testId = "__shadowstrike_selftest__"
+            "_pid"  + std::to_string(static_cast<uint64_t>(::GetCurrentProcessId())) +
+            "_t"    + std::to_string(static_cast<uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count())) +
+            "_seq"  + std::to_string(seq);
+    } catch (...) {
+        SS_LOG_ERROR(L"Policy", L"SelfTest: failed to compose synthetic policy id");
+        return false;
+    }
+
+    // Cleanup must run on every exit path — including early returns and
+    // unexpected exceptions — so the synthetic policy never lingers in the
+    // active policy table.
+    struct ScopeGuard {
+        std::function<void()> fn;
+        ~ScopeGuard() { if (fn) fn(); }
+    };
+    ScopeGuard cleanup{[this, &testId]() noexcept {
+        try { (void)RemovePolicy(testId); } catch (...) {}
+    }};
+
     // Validate that basic operations work without crashing
     Policy testPolicy;
-    testPolicy.id = "__selftest__";
+    testPolicy.id = testId;
     testPolicy.name = "SelfTest Policy";
     testPolicy.type = PolicyType::Custom;
     testPolicy.enforcement = EnforcementLevel::Advisory;
@@ -1459,17 +1515,20 @@ bool PolicyManager::SelfTest() {
         return false;
     }
 
-    auto retrieved = GetPolicy("__selftest__");
+    auto retrieved = GetPolicy(testId);
     if (!retrieved.has_value()) {
         SS_LOG_ERROR(L"Policy", L"SelfTest: GetPolicy returned nullopt");
-        (void)RemovePolicy("__selftest__");
         return false;
     }
 
-    if (!RemovePolicy("__selftest__")) {
+    if (!RemovePolicy(testId)) {
         SS_LOG_ERROR(L"Policy", L"SelfTest: RemovePolicy failed");
         return false;
     }
+
+    // Successful explicit remove already happened — disarm the guard so its
+    // best-effort cleanup does not log a spurious warning later.
+    cleanup.fn = nullptr;
 
     SS_LOG_INFO(L"Policy", L"PolicyManager self-test passed");
     return true;
