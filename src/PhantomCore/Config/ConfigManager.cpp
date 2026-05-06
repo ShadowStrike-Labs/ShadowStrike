@@ -27,7 +27,9 @@
 #include <thread>
 #include <charconv>
 #include <cstring>
+#include <iomanip>
 #include <limits>
+#include <set>
 
 namespace ShadowStrike {
 namespace Config {
@@ -38,7 +40,10 @@ namespace Config {
 
 namespace {
 
-[[nodiscard]] std::wstring NarrowToWide(const std::string& narrow) noexcept {
+// Note: these helpers allocate std::wstring/std::string and therefore may
+// throw std::bad_alloc. They are intentionally NOT marked noexcept; callers
+// in the file already operate inside try/catch boundaries or under lock.
+[[nodiscard]] std::wstring NarrowToWide(const std::string& narrow) {
     if (narrow.empty()) return {};
     const int needed = ::MultiByteToWideChar(
         CP_UTF8, 0, narrow.data(), static_cast<int>(narrow.size()), nullptr, 0);
@@ -49,7 +54,7 @@ namespace {
     return wide;
 }
 
-[[nodiscard]] std::string WideToNarrow(const std::wstring& wide) noexcept {
+[[nodiscard]] std::string WideToNarrow(const std::wstring& wide) {
     if (wide.empty()) return {};
     const int needed = ::WideCharToMultiByte(
         CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
@@ -244,6 +249,64 @@ public:
         }
     }
 
+    // Snapshot the resolved (effective) value of every key currently present
+    // in any layer. Caller MUST hold m_mutex (any mode).
+    [[nodiscard]] std::map<std::string, ConfigValue> SnapshotResolved() const {
+        std::set<std::string> keys;
+        for (const auto& layer : m_layers) {
+            for (const auto& [k, _] : layer) keys.insert(k);
+        }
+        std::map<std::string, ConfigValue> result;
+        for (const auto& k : keys) {
+            ConfigValue v = ResolveValue(k);
+            if (!std::holds_alternative<std::monostate>(v)) {
+                result.emplace(k, std::move(v));
+            }
+        }
+        return result;
+    }
+
+    // Diff a previously captured resolved snapshot against current state and
+    // build PendingCallbacks for every key whose effective value changed.
+    // Caller MUST hold m_mutex (unique). Callbacks must be fired AFTER unlock.
+    [[nodiscard]] std::vector<PendingCallbacks> DiffResolvedAndCollect(
+        const std::map<std::string, ConfigValue>& oldResolved,
+        ChangeReason reason,
+        const std::string& source) {
+        std::vector<PendingCallbacks> result;
+
+        std::set<std::string> allKeys;
+        for (const auto& [k, _] : oldResolved) allKeys.insert(k);
+        for (const auto& layer : m_layers) {
+            for (const auto& [k, _] : layer) allKeys.insert(k);
+        }
+
+        for (const auto& key : allKeys) {
+            ConfigValue newVal = ResolveValue(key);
+            ConfigValue oldVal{std::monostate{}};
+            auto it = oldResolved.find(key);
+            if (it != oldResolved.end()) oldVal = it->second;
+
+            bool changed = (oldVal.index() != newVal.index());
+            if (!changed) {
+                changed = (ConfigValueToString(oldVal) !=
+                           ConfigValueToString(newVal));
+            }
+            if (!changed) continue;
+
+            ConfigChangeEvent event;
+            event.key = key;
+            event.oldValue = std::move(oldVal);
+            event.newValue = std::move(newVal);
+            event.layer = ResolveEffectiveLayer(key);
+            event.reason = reason;
+            event.timestamp = std::chrono::system_clock::now();
+            event.source = source;
+            result.push_back(CollectCallbacks(event));
+        }
+        return result;
+    }
+
     // ========================================================================
     // Fire Change Callbacks (legacy - only safe to call without holding m_mutex)
     // ========================================================================
@@ -290,6 +353,22 @@ public:
         std::wstring wideKey = NarrowToWide(key);
         db.Set(wideKey, dbVal.value(), Database::ConfigurationDB::ConfigScope::Global,
                L"ConfigManager", L"");
+    }
+
+    // Remove a key from the persistent ConfigurationDB. Best-effort: errors
+    // are logged but do not propagate, mirroring PersistToDb's behaviour.
+    void RemoveFromDb(const std::string& key, std::wstring_view reason) {
+        try {
+            auto& db = Database::ConfigurationDB::Instance();
+            if (!db.IsInitialized()) return;
+
+            std::wstring wideKey = NarrowToWide(key);
+            (void)db.Remove(wideKey, L"ConfigManager", reason, nullptr);
+        } catch (...) {
+            SS_LOG_ERROR(L"Config",
+                L"Exception while removing key '%hs' from ConfigurationDB",
+                key.c_str());
+        }
     }
 
     // ========================================================================
@@ -361,7 +440,7 @@ public:
         // Support new DPAPI format
         static constexpr std::string_view kDpapiPrefix = "\x01""DPAPI:";
         if (strVal->size() > kDpapiPrefix.size() &&
-            strVal->substr(0, kDpapiPrefix.size()) == kDpapiPrefix) {
+            std::string_view(*strVal).starts_with(kDpapiPrefix)) {
             try {
                 auto& crypto = Security::CryptoManager::Instance();
                 const size_t blobOffset = kDpapiPrefix.size();
@@ -388,7 +467,7 @@ public:
         // key-alongside-ciphertext scheme. Log and return opaque value.
         static constexpr std::string_view kLegacyPrefix = "\x01""ENC:";
         if (strVal->size() > kLegacyPrefix.size() &&
-            strVal->substr(0, kLegacyPrefix.size()) == kLegacyPrefix) {
+            std::string_view(*strVal).starts_with(kLegacyPrefix)) {
             SS_LOG_WARN(L"Config",
                 L"Legacy ENC-format sensitive value detected — "
                 L"re-encrypt with DPAPI by re-setting the value");
@@ -550,6 +629,14 @@ bool ConfigManager::Initialize(const ConfigManagerConfiguration& config) {
     m_impl->m_metadata.clear();
     m_impl->m_stats = ConfigStatistics{};
     m_impl->m_stats.startTime = Clock::now();
+
+    // Drop subscriber state from any prior init/Shutdown cycle. Stale
+    // callbacks/validators captured by the previous owner could otherwise
+    // fire against the new configuration set with surprising results.
+    m_impl->m_globalCallbacks.clear();
+    m_impl->m_keyCallbacks.clear();
+    m_impl->m_validators.clear();
+    m_impl->m_errorCallback = nullptr;
 
     SS_LOG_INFO(L"Config", L"Initializing ConfigManager v%u.%u.%u",
                 ConfigConstants::VERSION_MAJOR,
@@ -837,6 +924,7 @@ bool ConfigManager::DeleteValue(const std::string& key, ConfigLayer layer) {
     if (key.empty() || static_cast<uint8_t>(layer) > 6) return false;
 
     ConfigManagerImpl::PendingCallbacks pending;
+    bool persisted = false;
     {
         std::unique_lock lock(m_impl->m_mutex);
         auto& layerMap = m_impl->m_layers[static_cast<size_t>(layer)];
@@ -855,12 +943,22 @@ bool ConfigManager::DeleteValue(const std::string& key, ConfigLayer layer) {
         event.timestamp = std::chrono::system_clock::now();
         event.source = "DeleteValue";
         pending = m_impl->CollectCallbacks(event);
+
+        // Persist the deletion. Only User/System writes are pushed to the DB
+        // by PersistToDb; mirror the same scope for symmetry so a deleted
+        // value does not silently re-materialize on the next hot-reload or
+        // process restart.
+        if (layer == ConfigLayer::User || layer == ConfigLayer::System) {
+            m_impl->RemoveFromDb(key, L"DeleteValue");
+            persisted = true;
+        }
     }
 
     ConfigManagerImpl::FirePendingCallbacks(pending);
 
-    SS_LOG_DEBUG(L"Config", L"Deleted key '%hs' from layer %hs",
-                 key.c_str(), std::string(GetConfigLayerName(layer)).c_str());
+    SS_LOG_DEBUG(L"Config", L"Deleted key '%hs' from layer %hs (persistedToDb=%d)",
+                 key.c_str(), std::string(GetConfigLayerName(layer)).c_str(),
+                 persisted ? 1 : 0);
     return true;
 }
 
@@ -934,11 +1032,12 @@ bool ConfigManager::SetMultipleValues(
             }
         }
 
-        // All validation passed — apply atomically
+        // Pre-encrypt every sensitive value BEFORE mutating any layer state.
+        // This preserves the documented "atomic batch" contract: a single
+        // encryption failure must abort the whole batch instead of leaving
+        // half the keys written and the rest skipped.
+        std::map<std::string, ConfigValue> staged;
         for (const auto& [key, value] : values) {
-            m_impl->m_stats.totalWrites.fetch_add(1, std::memory_order_relaxed);
-            ConfigValue oldValue = m_impl->ResolveValue(key);
-
             ConfigValue storeValue = value;
             auto metaIt = m_impl->m_metadata.find(key);
             if (metaIt != m_impl->m_metadata.end() && metaIt->second.isSensitive &&
@@ -946,12 +1045,20 @@ bool ConfigManager::SetMultipleValues(
                 storeValue = m_impl->EncryptSensitiveValue(value);
                 if (std::holds_alternative<std::monostate>(storeValue)) {
                     SS_LOG_ERROR(L"Config",
-                        L"SetMultipleValues: encryption failed for '%hs'", key.c_str());
-                    continue;
+                        L"SetMultipleValues: encryption failed for '%hs' — aborting batch",
+                        key.c_str());
+                    return false;
                 }
             }
+            staged.emplace(key, std::move(storeValue));
+        }
 
-            m_impl->m_layers[static_cast<size_t>(layer)][key] = storeValue;
+        // All validation + encryption passed — apply atomically
+        for (const auto& [key, value] : values) {
+            m_impl->m_stats.totalWrites.fetch_add(1, std::memory_order_relaxed);
+            ConfigValue oldValue = m_impl->ResolveValue(key);
+
+            m_impl->m_layers[static_cast<size_t>(layer)][key] = staged.at(key);
 
             if (layer == ConfigLayer::User || layer == ConfigLayer::System) {
                 m_impl->PersistToDb(key, value);
@@ -1029,27 +1136,53 @@ std::vector<std::string> ConfigManager::GetCategories() const {
 void ConfigManager::Reload() {
     SS_LOG_INFO(L"Config", L"Manual reload requested");
 
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_status.store(ConfigStatus::Reloading, std::memory_order_release);
-    m_impl->LoadFromDb();
-    m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
-    m_impl->m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
+    std::vector<ConfigManagerImpl::PendingCallbacks> pendingList;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        m_impl->m_status.store(ConfigStatus::Reloading, std::memory_order_release);
+
+        auto oldResolved = m_impl->SnapshotResolved();
+        m_impl->LoadFromDb();
+        pendingList = m_impl->DiffResolvedAndCollect(
+            oldResolved, ChangeReason::HotReload, "Reload");
+
+        m_impl->m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
+    }
+
+    // Fire callbacks OUTSIDE the lock so subscribers may safely call back
+    // into ConfigManager.
+    for (const auto& pending : pendingList) {
+        ConfigManagerImpl::FirePendingCallbacks(pending);
+    }
 }
 
 void ConfigManager::ForceReload() {
     SS_LOG_INFO(L"Config", L"Force reload requested — clearing all layers");
 
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_status.store(ConfigStatus::Reloading, std::memory_order_release);
+    std::vector<ConfigManagerImpl::PendingCallbacks> pendingList;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        m_impl->m_status.store(ConfigStatus::Reloading, std::memory_order_release);
 
-    // Clear all layers and re-load from DB
-    for (auto& layer : m_impl->m_layers) {
-        layer.clear();
+        auto oldResolved = m_impl->SnapshotResolved();
+
+        // Clear all layers and re-load from DB
+        for (auto& layer : m_impl->m_layers) {
+            layer.clear();
+        }
+        m_impl->LoadFromDb();
+
+        pendingList = m_impl->DiffResolvedAndCollect(
+            oldResolved, ChangeReason::HotReload, "ForceReload");
+
+        m_impl->m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
     }
 
-    m_impl->LoadFromDb();
-    m_impl->m_status.store(ConfigStatus::Running, std::memory_order_release);
-    m_impl->m_stats.hotReloads.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& pending : pendingList) {
+        ConfigManagerImpl::FirePendingCallbacks(pending);
+    }
 }
 
 void ConfigManager::SetHotReloadEnabled(bool enabled) {
@@ -1399,9 +1532,14 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
         }
 
         const auto& values = root["values"];
+        size_t successCount = 0;
+        size_t failureCount = 0;
         for (auto it = values.begin(); it != values.end(); ++it) {
             std::string key = it.key();
-            if (key.empty() || key.size() > ConfigConstants::MAX_KEY_LENGTH) continue;
+            if (key.empty() || key.size() > ConfigConstants::MAX_KEY_LENGTH) {
+                ++failureCount;
+                continue;
+            }
 
             ConfigValue cv;
             const auto& entry = it.value();
@@ -1441,13 +1579,25 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
                 cv = ConfigValue{entry.dump()};
             }
 
-            (void)SetRawValue(key, cv, targetLayer);
+            if (SetRawValue(key, cv, targetLayer)) {
+                ++successCount;
+            } else {
+                ++failureCount;
+                SS_LOG_WARN(L"Config",
+                    L"ImportFromJson: SetRawValue rejected key '%hs'", key.c_str());
+            }
         }
 
-        SS_LOG_INFO(L"Config", L"Imported %zu keys from JSON into layer %hs",
-                     values.size(),
-                     std::string(GetConfigLayerName(targetLayer)).c_str());
-        return true;
+        SS_LOG_INFO(L"Config",
+            L"Imported %zu of %zu keys from JSON into layer %hs (%zu rejected)",
+            successCount, values.size(),
+            std::string(GetConfigLayerName(targetLayer)).c_str(),
+            failureCount);
+
+        // Treat an all-or-nothing JSON document with zero successful writes
+        // as a hard import failure so callers can distinguish "applied" from
+        // "silently ignored".
+        return successCount > 0 || values.size() == 0;
     } catch (...) {
         SS_LOG_ERROR(L"Config", L"Exception during ImportFromJson");
         return false;
@@ -1580,17 +1730,24 @@ bool ConfigManager::ResetKeyToDefault(const std::string& key) {
     {
         std::unique_lock lock(m_impl->m_mutex);
 
+        ConfigValue oldResolved = m_impl->ResolveValue(key);
+
         // Remove from all layers except Default
         for (int i = 1; i <= 6; ++i) {
             m_impl->m_layers[static_cast<size_t>(i)].erase(key);
         }
 
-        // Collect callback
-        ConfigValue resolved = m_impl->ResolveValue(key);
+        // Persist the reset. PersistToDb pushes User/System writes into the
+        // ConfigurationDB; without this Remove the persisted user override
+        // would re-materialize on the next hot-reload or restart and silently
+        // un-do the reset.
+        m_impl->RemoveFromDb(key, L"ResetKeyToDefault");
+
+        ConfigValue newResolved = m_impl->ResolveValue(key);
         ConfigChangeEvent event;
         event.key = key;
-        event.oldValue = ConfigValue{std::monostate{}};
-        event.newValue = resolved;
+        event.oldValue = std::move(oldResolved);
+        event.newValue = newResolved;
         event.layer = ConfigLayer::Default;
         event.reason = ChangeReason::Reset;
         event.timestamp = std::chrono::system_clock::now();
@@ -1682,9 +1839,27 @@ void ConfigManager::ResetStatistics() {
 bool ConfigManager::SelfTest() {
     SS_LOG_INFO(L"Config", L"Running ConfigManager self-test");
 
+    // Test basic set/get cycle. The cleanup MUST run even on exception so a
+    // failed self-test never leaves the synthetic test key inside the live
+    // Session layer where it could leak into ExportToJson, snapshot/restore,
+    // or hot-reload diffs.
+    const std::string testKey = "__selftest__internal__";
+
+    auto eraseTestKey = [this, &testKey]() noexcept {
+        try {
+            std::unique_lock lock(m_impl->m_mutex);
+            m_impl->m_layers[static_cast<size_t>(ConfigLayer::Session)].erase(testKey);
+        } catch (...) {
+            // Cleanup is best-effort; the self-test result is what callers see.
+        }
+    };
+
+    struct ScopeGuard {
+        std::function<void()> fn;
+        ~ScopeGuard() { if (fn) fn(); }
+    } guard{eraseTestKey};
+
     try {
-        // Test basic set/get cycle
-        const std::string testKey = "__selftest__internal__";
         ConfigValue testVal{std::string("selftest_value")};
 
         {
@@ -1700,12 +1875,6 @@ bool ConfigManager::SelfTest() {
                 SS_LOG_ERROR(L"Config", L"Self-test FAILED: get/set mismatch");
                 return false;
             }
-        }
-
-        // Cleanup
-        {
-            std::unique_lock lock(m_impl->m_mutex);
-            m_impl->m_layers[static_cast<size_t>(ConfigLayer::Session)].erase(testKey);
         }
 
         SS_LOG_INFO(L"Config", L"Self-test PASSED");
@@ -1938,7 +2107,11 @@ std::string ConfigValueToString(const ConfigValue& value) {
     }
     if (const auto* v = std::get_if<double>(&value)) {
         std::ostringstream oss;
-        oss << *v;
+        // Use max_digits10 so a round-trip serialize/parse preserves the
+        // exact bit pattern. Otherwise ostream's default 6-digit precision
+        // produces false-positive "changed" detections in the hot-reload
+        // diff and lossy persistence in JSON exports.
+        oss << std::setprecision(std::numeric_limits<double>::max_digits10) << *v;
         return oss.str();
     }
     if (const auto* v = std::get_if<std::string>(&value)) {
