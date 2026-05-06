@@ -46,7 +46,9 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
+#include <limits>
 
 namespace ShadowStrike {
 namespace Core {
@@ -55,6 +57,45 @@ namespace Engine {
 // ============================================================================
 // Internal Helpers
 // ============================================================================
+
+namespace {
+
+// Per-process bounded-collection caps. These prevent a hostile process from
+// driving unbounded growth of evidence containers via event flooding. Caps
+// must be high enough to preserve forensic value while small enough to
+// guarantee O(1) state size regardless of attacker behaviour.
+constexpr size_t kMaxTargetedProcessIds   = 1024;   // injection victim PIDs
+constexpr size_t kMaxInjectedDlls         = 256;    // unique DLL paths injected
+constexpr size_t kMaxRemoteAllocations    = 1024;   // (pid, addr) pairs
+constexpr size_t kMaxPersistenceLocations = 256;    // registry/path persistence sites
+constexpr size_t kMaxCreatedServices      = 128;    // service names created
+constexpr size_t kMaxCreatedTasks         = 128;    // scheduled tasks created
+constexpr size_t kMaxContactedDomains     = 2048;   // distinct DNS targets
+constexpr size_t kMaxContactedIPs         = 4096;   // distinct IP targets
+
+// Cap a single network upload at 16 GiB to prevent a malicious or malformed
+// event from saturating outboundBytes (uint64_t) toward overflow. 16 GiB is
+// far above any legitimate single-event transfer that would still need
+// behavioural scoring.
+constexpr uint64_t kMaxBytesSentPerEvent = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+
+template <typename Vec, typename T>
+void BoundedPushBack(Vec& v, T&& value, size_t cap) {
+    if (v.size() >= cap) {
+        v.erase(v.begin()); // drop oldest, FIFO eviction
+    }
+    v.push_back(std::forward<T>(value));
+}
+
+template <typename Set, typename T>
+void BoundedSetInsert(Set& s, T&& value, size_t cap) {
+    if (s.size() >= cap && s.find(value) == s.end()) {
+        return; // refuse new entries once cap is hit (sets have no FIFO order)
+    }
+    s.insert(std::forward<T>(value));
+}
+
+} // namespace
 
 static std::wstring ToLowerCase(std::wstring_view input) {
     std::wstring result(input);
@@ -170,9 +211,15 @@ struct BehaviorAnalyzer::Impl {
             L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths"
         };
 
+        // Credential-bearing processes only. svchost.exe / services.exe /
+        // wininit.exe are intentionally excluded: they are routinely opened
+        // by legitimate management tooling (Task Manager, perfmon, WMI
+        // providers) and produced significant false-positive volume against
+        // credential-theft scoring. csrss.exe and winlogon.exe are retained
+        // because PROCESS_VM_READ on them is genuinely abnormal outside
+        // attacker activity. lsass.exe and lsaiso.exe are the primary targets.
         m_credentialTargets = {
-            L"lsass.exe", L"csrss.exe", L"winlogon.exe", L"services.exe",
-            L"svchost.exe", L"wininit.exe", L"lsaiso.exe"
+            L"lsass.exe", L"lsaiso.exe", L"csrss.exe", L"winlogon.exe"
         };
 
         m_ransomNotePatterns = {
@@ -420,6 +467,13 @@ std::optional<BehaviorVerdict> BehaviorAnalyzer::ProcessEvent(const BehaviorEven
             }
 
             auto& state = GetOrCreateState(enrichedEvent.processId, enrichedEvent);
+
+            // Score decay must run BEFORE lastUpdateTime is overwritten —
+            // otherwise the elapsed delta would be zero and decay would be
+            // dead code. ApplyScoreDecay reads state.lastUpdateTime as the
+            // prior update; it is updated below.
+            ApplyScoreDecay(state, config);
+
             state.lastUpdateTime = std::chrono::steady_clock::now();
             state.totalEventsProcessed++;
 
@@ -428,9 +482,6 @@ std::optional<BehaviorVerdict> BehaviorAnalyzer::ProcessEvent(const BehaviorEven
             if (state.recentEvents.size() > config.maxEventsPerProcess) {
                 state.recentEvents.pop_front();
             }
-
-            // Apply score decay before adding new score (pass config snapshot to avoid lock-order violation)
-            ApplyScoreDecay(state, config);
 
             // Route to specialized detection engines based on event category
             switch (enrichedEvent.category) {
@@ -519,16 +570,21 @@ std::optional<BehaviorVerdict> BehaviorAnalyzer::ProcessEvent(const BehaviorEven
                 AddMitreMapping(state, enrichedEvent.matchedPattern);
             }
 
-            // Check thresholds for verdict generation
-            verdict = CheckThresholds(state, enrichedEvent);
+            // Check thresholds for verdict generation (pass snapshotted config
+            // to avoid re-acquiring m_configMutex while holding m_statesMutex,
+            // which would invert the documented config→states lock order).
+            verdict = CheckThresholds(state, enrichedEvent, config);
 
-            // Update tracked process count
-            m_impl->m_stats.trackedProcesses.store(m_impl->m_processStates.size(),
-                                                    std::memory_order_relaxed);
-            auto peak = m_impl->m_stats.peakTrackedProcesses.load(std::memory_order_relaxed);
-            if (m_impl->m_processStates.size() > peak) {
-                m_impl->m_stats.peakTrackedProcesses.store(m_impl->m_processStates.size(),
-                                                            std::memory_order_relaxed);
+            // Update tracked process count and peak (CAS loop — naive
+            // load/compare/store races between threads and can lose updates).
+            const size_t newSize = m_impl->m_processStates.size();
+            m_impl->m_stats.trackedProcesses.store(newSize, std::memory_order_relaxed);
+            size_t prevPeak = m_impl->m_stats.peakTrackedProcesses.load(std::memory_order_relaxed);
+            while (newSize > prevPeak &&
+                   !m_impl->m_stats.peakTrackedProcesses.compare_exchange_weak(
+                       prevPeak, newSize,
+                       std::memory_order_relaxed, std::memory_order_relaxed)) {
+                // prevPeak is reloaded by compare_exchange_weak on failure
             }
         }
         // stateLock released here
@@ -557,21 +613,27 @@ std::optional<BehaviorVerdict> BehaviorAnalyzer::ProcessEvent(const BehaviorEven
             }
         }
 
-        // Periodic cleanup (atomic time_point to avoid data race)
+        // Periodic cleanup. CAS the timestamp so only ONE thread crossing the
+        // interval boundary submits the cleanup task — a relaxed
+        // load+compare+store pair lets two concurrent ProcessEvent calls both
+        // observe "stale" and both submit cleanup, doubling work.
         auto now = std::chrono::steady_clock::now();
+        int64_t lastCleanupRep = m_impl->m_lastCleanupTimeRep.load(std::memory_order_relaxed);
         auto lastCleanup = std::chrono::steady_clock::time_point(
-            std::chrono::steady_clock::duration(
-                m_impl->m_lastCleanupTimeRep.load(std::memory_order_relaxed)));
+            std::chrono::steady_clock::duration(lastCleanupRep));
         if (now - lastCleanup > BehaviorConstants::CLEANUP_INTERVAL) {
-            m_impl->m_lastCleanupTimeRep.store(
-                now.time_since_epoch().count(), std::memory_order_relaxed);
-            if (m_impl->m_threadPool) {
-                try {
-                    (void)m_impl->m_threadPool->Submit(
-                        [this](const Utils::TaskContext&) { PerformCleanup(); },
-                        Utils::TaskPriority::Low, "BA-Cleanup");
-                } catch (...) {
-                    PerformCleanup();
+            const int64_t newRep = now.time_since_epoch().count();
+            if (m_impl->m_lastCleanupTimeRep.compare_exchange_strong(
+                    lastCleanupRep, newRep,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                if (m_impl->m_threadPool) {
+                    try {
+                        (void)m_impl->m_threadPool->Submit(
+                            [this](const Utils::TaskContext&) { PerformCleanup(); },
+                            Utils::TaskPriority::Low, "BA-Cleanup");
+                    } catch (...) {
+                        PerformCleanup();
+                    }
                 }
             }
         }
@@ -871,7 +933,8 @@ void BehaviorAnalyzer::UpdateInjectionScore(
         case BehaviorEventType::ThreadRemoteCreate:
             state.remoteThreadCount++;
             if (event.targetProcessId != 0) {
-                state.targetedProcessIds.insert(event.targetProcessId);
+                BoundedSetInsert(state.targetedProcessIds,
+                                 event.targetProcessId, kMaxTargetedProcessIds);
             }
             scoreAdd += BehaviorConstants::REMOTE_THREAD_SCORE;
             AddMitreMapping(state, BehaviorPatternType::InjectionRemoteThread);
@@ -880,7 +943,11 @@ void BehaviorAnalyzer::UpdateInjectionScore(
 
         case BehaviorEventType::MemoryRemoteAllocate:
             if (event.targetProcessId != 0) {
-                state.targetedProcessIds.insert(event.targetProcessId);
+                BoundedSetInsert(state.targetedProcessIds,
+                                 event.targetProcessId, kMaxTargetedProcessIds);
+                if (state.remoteAllocations.size() >= kMaxRemoteAllocations) {
+                    state.remoteAllocations.erase(state.remoteAllocations.begin());
+                }
                 state.remoteAllocations.emplace_back(event.targetProcessId, event.targetAddress);
             }
             scoreAdd += BehaviorConstants::REMOTE_ALLOC_SCORE;
@@ -889,7 +956,8 @@ void BehaviorAnalyzer::UpdateInjectionScore(
         case BehaviorEventType::MemoryRemoteWrite:
             state.crossProcessWrites++;
             if (event.targetProcessId != 0) {
-                state.targetedProcessIds.insert(event.targetProcessId);
+                BoundedSetInsert(state.targetedProcessIds,
+                                 event.targetProcessId, kMaxTargetedProcessIds);
             }
             scoreAdd += BehaviorConstants::WRITE_PROCESS_MEMORY_SCORE;
             break;
@@ -904,7 +972,7 @@ void BehaviorAnalyzer::UpdateInjectionScore(
             scoreAdd += BehaviorConstants::DLL_INJECTION_SCORE;
             AddMitreMapping(state, BehaviorPatternType::InjectionDLL);
             if (!event.targetPath.empty()) {
-                state.injectedDLLs.push_back(event.targetPath);
+                BoundedPushBack(state.injectedDLLs, event.targetPath, kMaxInjectedDlls);
             }
             m_impl->m_stats.injectionDetections.fetch_add(1, std::memory_order_relaxed);
             break;
@@ -973,7 +1041,8 @@ void BehaviorAnalyzer::UpdatePersistenceScore(
         case BehaviorEventType::RegistryCreateKey: {
             if (IsPersistenceRegistryPath(event.targetPath)) {
                 scoreAdd += BehaviorConstants::REG_RUN_KEY_SCORE;
-                state.persistenceLocations.push_back(event.targetPath);
+                BoundedPushBack(state.persistenceLocations,
+                                event.targetPath, kMaxPersistenceLocations);
                 AddMitreMapping(state, BehaviorPatternType::PersistenceRunKey);
                 m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
 
@@ -1002,12 +1071,24 @@ void BehaviorAnalyzer::UpdatePersistenceScore(
                     if (static_cast<uint16_t>(persistType) != 0) {
                         // Detector recognized this as a persistence location — get full analysis.
                         // Convert valueData to wstring for string-typed registry values.
+                        // std::vector<uint8_t>::data() guarantees only uint8_t
+                        // alignment; reinterpret_cast<const wchar_t*> on it is
+                        // undefined behaviour on strict-alignment platforms.
+                        // memcpy through an aligned wchar_t buffer is the
+                        // correct portable approach.
                         std::wstring dataStr;
                         if ((event.valueType == REG_SZ || event.valueType == REG_EXPAND_SZ)
                             && event.valueData.size() >= sizeof(wchar_t)) {
-                            dataStr.assign(
-                                reinterpret_cast<const wchar_t*>(event.valueData.data()),
-                                event.valueData.size() / sizeof(wchar_t));
+                            // Truncate any trailing odd byte — REG_SZ values
+                            // must be a whole number of wchar_t code units.
+                            const size_t wcharBytes =
+                                (event.valueData.size() / sizeof(wchar_t)) * sizeof(wchar_t);
+                            // Cap conversion at 64 KiB to bound allocation
+                            // against malicious oversized REG_SZ payloads.
+                            constexpr size_t kMaxRegSzBytes = 64 * 1024;
+                            const size_t copyBytes = std::min<size_t>(wcharBytes, kMaxRegSzBytes);
+                            dataStr.resize(copyBytes / sizeof(wchar_t));
+                            std::memcpy(dataStr.data(), event.valueData.data(), copyBytes);
                             // Strip trailing null
                             while (!dataStr.empty() && dataStr.back() == L'\0')
                                 dataStr.pop_back();
@@ -1036,14 +1117,14 @@ void BehaviorAnalyzer::UpdatePersistenceScore(
 
         case BehaviorEventType::TaskCreate:
             scoreAdd += BehaviorConstants::SCHEDULED_TASK_SCORE;
-            state.createdTasks.push_back(event.targetPath);
+            BoundedPushBack(state.createdTasks, event.targetPath, kMaxCreatedTasks);
             AddMitreMapping(state, BehaviorPatternType::PersistenceScheduledTask);
             m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
             break;
 
         case BehaviorEventType::ServiceInstall:
             scoreAdd += BehaviorConstants::SERVICE_INSTALL_SCORE;
-            state.createdServices.push_back(event.targetPath);
+            BoundedPushBack(state.createdServices, event.targetPath, kMaxCreatedServices);
             AddMitreMapping(state, BehaviorPatternType::PersistenceService);
             m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
             break;
@@ -1209,10 +1290,21 @@ void BehaviorAnalyzer::UpdateExfiltrationScore(
     switch (event.eventType) {
         case BehaviorEventType::NetworkSend:
         case BehaviorEventType::NetworkUpload: {
-            state.outboundBytes += event.bytesSent;
+            // Defensively cap a single-event byte count. A malformed or
+            // hostile event with bytesSent close to UINT64_MAX would push
+            // outboundBytes past every threshold (and could overflow under
+            // sustained flooding). 16 GiB is well above any legitimate
+            // single transfer that still warrants behavioural scoring.
+            const uint64_t bytes = std::min<uint64_t>(event.bytesSent, kMaxBytesSentPerEvent);
+            // Saturating add into outboundBytes (uint64_t) — refuse to wrap.
+            if (state.outboundBytes > std::numeric_limits<uint64_t>::max() - bytes) {
+                state.outboundBytes = std::numeric_limits<uint64_t>::max();
+            } else {
+                state.outboundBytes += bytes;
+            }
 
             // Large single transfer (>10MB)
-            if (event.bytesSent > 10 * 1024 * 1024) {
+            if (bytes > 10 * 1024 * 1024) {
                 scoreAdd += 10.0;
                 AddMitreMapping(state, BehaviorPatternType::ExfilLargeTransfer);
             }
@@ -1329,10 +1421,11 @@ void BehaviorAnalyzer::UpdateC2Score(
 
         // Track contacted destinations
         if (!event.remoteIP.empty()) {
-            state.contactedIPs.insert(event.remoteIP);
+            BoundedSetInsert(state.contactedIPs, event.remoteIP, kMaxContactedIPs);
         }
         if (!event.remoteHostname.empty()) {
-            state.contactedDomains.insert(event.remoteHostname);
+            BoundedSetInsert(state.contactedDomains,
+                             event.remoteHostname, kMaxContactedDomains);
         }
 
         // ThreatIntel lookup for network destinations
@@ -1454,12 +1547,27 @@ std::optional<BehaviorVerdict> BehaviorAnalyzer::CheckThresholds(
         std::shared_lock cfgLock(m_impl->m_configMutex);
         config = m_impl->m_config;
     }
+    return CheckThresholds(state, event, config);
+}
 
-    // Determine verdict type based on score
+std::optional<BehaviorVerdict> BehaviorAnalyzer::CheckThresholds(
+    ProcessBehaviorState& state, const BehaviorEvent& event,
+    const BehaviorAnalyzerConfig& config)
+{
+    // Apply per-process score modifier — set via SetProcessScoreModifier and
+    // documented as a threshold-only adjustment (NOT cumulated into
+    // maliceScore each event). Effective score is clamped into the legal
+    // range so a hostile or misconfigured modifier cannot wrap or bypass the
+    // verdict ladder.
+    const double effectiveScore = std::clamp(
+        state.maliceScore + state.baseScoreModifier,
+        0.0, BehaviorConstants::MAX_MALICE_SCORE);
+
+    // Determine verdict type based on effective score
     BehaviorVerdictType newVerdict = BehaviorVerdictType::Clean;
     RecommendedAction action = RecommendedAction::None;
 
-    if (state.maliceScore >= config.criticalThreshold) {
+    if (effectiveScore >= config.criticalThreshold) {
         newVerdict = BehaviorVerdictType::ConfirmedThreat;
         action = RecommendedAction::Terminate;
 
@@ -1475,15 +1583,15 @@ std::optional<BehaviorVerdict> BehaviorAnalyzer::CheckThresholds(
             action = RecommendedAction::IsolateEndpoint;
         }
     }
-    else if (state.maliceScore >= config.blockThreshold) {
+    else if (effectiveScore >= config.blockThreshold) {
         newVerdict = BehaviorVerdictType::Malicious;
         action = RecommendedAction::Suspend;
     }
-    else if (state.maliceScore >= config.alertThreshold) {
+    else if (effectiveScore >= config.alertThreshold) {
         newVerdict = BehaviorVerdictType::Suspicious;
         action = RecommendedAction::Alert;
     }
-    else if (state.maliceScore >= config.warningThreshold) {
+    else if (effectiveScore >= config.warningThreshold) {
         newVerdict = BehaviorVerdictType::Suspicious;
         action = RecommendedAction::Log;
     }
@@ -1641,7 +1749,13 @@ void BehaviorAnalyzer::CorrelateWithAttackChains(
         if (event.targetProcessId != 0) {
             for (auto pid : chain.involvedProcessIds) {
                 if (pid == event.targetProcessId) {
-                    chain.involvedProcessIds.push_back(event.processId);
+                    // Avoid duplicating event.processId — chain may have
+                    // already been extended with this PID by an earlier event.
+                    if (std::find(chain.involvedProcessIds.begin(),
+                                  chain.involvedProcessIds.end(),
+                                  event.processId) == chain.involvedProcessIds.end()) {
+                        chain.involvedProcessIds.push_back(event.processId);
+                    }
                     chain.events.push_back(event);
                     chain.lastUpdateTime = std::chrono::system_clock::now();
                     foundExisting = true;

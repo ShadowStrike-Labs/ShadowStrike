@@ -2269,6 +2269,18 @@ private:
     std::optional<BehaviorVerdict> CheckThresholds(ProcessBehaviorState& state, const BehaviorEvent& event);
 
     /**
+     * @brief Threshold check using a pre-snapshotted configuration.
+     *
+     * Used by ProcessEvent's hot path to avoid re-acquiring m_configMutex
+     * while m_statesMutex is held exclusively, which would invert the
+     * documented config→states lock order under writer-priority shared_mutex
+     * semantics and risk deadlock with concurrent UpdateConfig writers.
+     */
+    std::optional<BehaviorVerdict> CheckThresholds(ProcessBehaviorState& state,
+                                                   const BehaviorEvent& event,
+                                                   const BehaviorAnalyzerConfig& config);
+
+    /**
      * @brief Correlate event with attack chains.
      */
     void CorrelateWithAttackChains(const BehaviorEvent& event, ProcessBehaviorState& state);
