@@ -124,6 +124,17 @@ namespace ShadowStrike::Core::Engine {
         /// Maximum normalization cache entries before eviction
         constexpr size_t kMaxCacheEntries = 4096;
 
+        /// Maximum per-entry payload size eligible for the normalization
+        /// cache. Inputs larger than this are still normalized but their
+        /// output is not retained, to bound worst-case cache memory usage.
+        /// Worst-case cache memory: kMaxCacheEntries * kMaxCacheEntryBytes
+        /// = 4096 * 1 MiB = 4 GiB upper bound (typical usage <50 MiB).
+        constexpr size_t kMaxCacheEntryBytes = 1ULL * 1024ULL * 1024ULL;
+
+        /// Maximum concurrent in-flight async analyses. Hardens against
+        /// thread-exhaustion DoS via repeated AnalyzeAsync invocations.
+        constexpr uint32_t kMaxAsyncInFlight = 32;
+
         /// Heuristic engine score threshold for Custom classification
         constexpr int kHeuristicScoreThreshold = 50;
 
@@ -200,10 +211,15 @@ namespace ShadowStrike::Core::Engine {
         // ====================================================================
 
         mutable std::shared_mutex m_mutex;
+        mutable std::mutex             m_initMutex;        ///< Serializes Initialize/Shutdown
         std::atomic<bool>              m_initialized{false};
         std::atomic<PolyDetectorStatus> m_status{PolyDetectorStatus::Uninitialized};
         PolymorphicConfiguration       m_config;
         PolyStatistics                 m_stats;
+
+        /// Tracks the number of in-flight async analyses to bound concurrency
+        /// and to allow Shutdown() to wait for outstanding work to drain.
+        std::atomic<uint32_t>          m_asyncInFlight{0};
 
         // Engine signature patterns
         struct EnginePattern {
@@ -353,7 +369,11 @@ namespace ShadowStrike::Core::Engine {
 
     bool PolymorphicDetectorImpl::Initialize(const PolymorphicConfiguration& config) noexcept {
         try {
-            if (m_initialized.exchange(true)) {
+            // Serialize Initialize against concurrent Initialize/Shutdown so
+            // no caller observes a half-constructed detector.
+            std::lock_guard<std::mutex> initGuard(m_initMutex);
+
+            if (m_initialized.load(std::memory_order_acquire)) {
                 return true;
             }
 
@@ -364,6 +384,9 @@ namespace ShadowStrike::Core::Engine {
             {
                 std::unique_lock lock(m_mutex);
                 m_config = config;
+                // m_stats.startTime is non-atomic — must be written under
+                // a lock that excludes any other writer/reader.
+                m_stats.startTime = Clock::now();
             }
 
             InitializeEnginePatterns();
@@ -373,7 +396,9 @@ namespace ShadowStrike::Core::Engine {
                 m_enginePatterns.size(), m_junkPatterns.size());
 
             m_status.store(PolyDetectorStatus::Running, std::memory_order_release);
-            m_stats.startTime = Clock::now();
+            // Publish the "initialized" flag last so any concurrent observer
+            // that sees true is guaranteed to see fully-populated state.
+            m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(kLogCategory, L"Initialized successfully");
             return true;
@@ -395,12 +420,30 @@ namespace ShadowStrike::Core::Engine {
 
     void PolymorphicDetectorImpl::Shutdown() noexcept {
         try {
-            if (!m_initialized.exchange(false)) {
+            std::lock_guard<std::mutex> initGuard(m_initMutex);
+
+            if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
                 return;
             }
 
             m_status.store(PolyDetectorStatus::Stopping, std::memory_order_release);
             SS_LOG_INFO(kLogCategory, L"Shutting down...");
+
+            // Drain in-flight async analyses before tearing down state to
+            // eliminate any use-after-free window for detached worker
+            // threads. Bounded wait (kMaxAsyncInFlight is small).
+            constexpr auto kDrainTimeout  = std::chrono::seconds(10);
+            constexpr auto kDrainPollStep = std::chrono::milliseconds(5);
+            const auto drainDeadline = Clock::now() + kDrainTimeout;
+            while (m_asyncInFlight.load(std::memory_order_acquire) > 0) {
+                if (Clock::now() >= drainDeadline) {
+                    SS_LOG_WARN(kLogCategory,
+                        L"Async drain timeout, %u worker(s) still in flight",
+                        m_asyncInFlight.load(std::memory_order_relaxed));
+                    break;
+                }
+                std::this_thread::sleep_for(kDrainPollStep);
+            }
 
             {
                 std::unique_lock lock(m_mutex);
@@ -654,18 +697,25 @@ namespace ShadowStrike::Core::Engine {
 
             const auto startTime = Clock::now();
 
-            // Build cache key: FNV-1a hash of code + level
+            // Build cache key: SHA-256 hex of input + level. SHA-256 is
+            // collision-resistant and the only hash here we trust as a key.
+            // If hashing fails (BCrypt unavailable etc.) we skip caching.
             std::string cacheKey;
-            {
-                Utils::HashUtils::ComputeHex(
-                    Utils::HashUtils::Algorithm::SHA256,
-                    code.data(), code.size(), cacheKey);
-                cacheKey += '_';
-                cacheKey += std::to_string(static_cast<int>(level));
+            bool cacheable = (code.size() <= kMaxCacheEntryBytes);
+            if (cacheable) {
+                if (!Utils::HashUtils::ComputeHex(
+                        Utils::HashUtils::Algorithm::SHA256,
+                        code.data(), code.size(), cacheKey)) {
+                    cacheable = false;
+                    cacheKey.clear();
+                } else {
+                    cacheKey += '_';
+                    cacheKey += std::to_string(static_cast<int>(level));
+                }
             }
 
             // Check cache (read lock)
-            {
+            if (cacheable) {
                 std::shared_lock cacheLock(m_cacheMutex);
                 auto it = m_normCache.find(cacheKey);
                 if (it != m_normCache.end()) {
@@ -727,8 +777,8 @@ namespace ShadowStrike::Core::Engine {
 
             m_stats.junkCodeRemoved.fetch_add(totalRemoved, std::memory_order_relaxed);
 
-            // Update cache (write lock)
-            {
+            // Update cache (write lock) — only when input was cacheable.
+            if (cacheable) {
                 std::unique_lock cacheLock(m_cacheMutex);
                 if (m_normCache.size() >= kMaxCacheEntries) {
                     EvictStaleCacheEntries();
@@ -736,7 +786,7 @@ namespace ShadowStrike::Core::Engine {
                 NormCacheEntry entry;
                 entry.normalizedCode = result.normalizedCode;
                 entry.timestamp = Clock::now();
-                m_normCache[cacheKey] = std::move(entry);
+                m_normCache[std::move(cacheKey)] = std::move(entry);
             }
 
             const auto endTime = Clock::now();
@@ -898,13 +948,18 @@ namespace ShadowStrike::Core::Engine {
                     continue;
                 }
 
-                // SUB reg, -imm8 (83 /5 xx) → canonical ADD reg, imm8
+                // SUB reg, imm8 (83 /5 xx) → canonical ADD reg, -imm8.
+                // Safe negation via two's-complement on unsigned domain to
+                // avoid UB when imm == INT8_MIN (signed overflow on `-imm`).
                 if (i + 2 < code.size() &&
                     code[i] == 0x83 && (code[i + 1] & 0x38) == 0x28) {
-                    uint8_t imm = code[i + 2];
+                    const uint8_t imm = code[i + 2];
+                    const uint8_t neg = static_cast<uint8_t>(
+                        (0u - static_cast<unsigned>(imm)) & 0xFFu);
                     result.push_back(0x83);
-                    result.push_back((code[i + 1] & 0xC7) | 0x00); // ADD /0
-                    result.push_back(static_cast<uint8_t>(-static_cast<int8_t>(imm)));
+                    result.push_back(static_cast<uint8_t>(
+                        (code[i + 1] & 0xC7) | 0x00)); // ADD /0
+                    result.push_back(neg);
                     i += 2;
                     continue;
                 }
@@ -1029,24 +1084,31 @@ namespace ShadowStrike::Core::Engine {
                 }
             }
 
-            // Pass 2: Collapse short JMP chains (JMP A → JMP B becomes JMP B)
-            for (size_t i = 0; i + 1 < simplified.size(); ++i) {
-                if (simplified[i] != 0xEB) continue;
+            // Pass 2: Collapse short JMP chains (JMP A → JMP B becomes JMP B).
+            // All target arithmetic must run in signed (ptrdiff_t) space —
+            // a naive `static_cast<size_t>(int8_t)` of a negative rel8 wraps
+            // to a huge value and can produce an OOB read on `simplified[target]`.
+            for (ptrdiff_t i = 0; i + 1 < static_cast<ptrdiff_t>(simplified.size()); ++i) {
+                if (simplified[static_cast<size_t>(i)] != 0xEB) continue;
 
-                int8_t rel8 = static_cast<int8_t>(simplified[i + 1]);
-                size_t target = i + 2 + static_cast<size_t>(rel8);
+                const int8_t rel8 = static_cast<int8_t>(
+                    simplified[static_cast<size_t>(i + 1)]);
+                const ptrdiff_t target = i + 2 + static_cast<ptrdiff_t>(rel8);
+                const ptrdiff_t simSize = static_cast<ptrdiff_t>(simplified.size());
 
-                // If target is another JMP short, collapse
-                if (target + 1 < simplified.size() && simplified[target] == 0xEB) {
-                    int8_t rel8_2 = static_cast<int8_t>(simplified[target + 1]);
-                    // New target: from target+2 + rel8_2, adjust relative to i+2
-                    ptrdiff_t newTarget =
-                        static_cast<ptrdiff_t>(target) + 2 + rel8_2 -
-                        static_cast<ptrdiff_t>(i) - 2;
+                // Reject negative or out-of-range targets BEFORE any indexed read.
+                if (target < 0 || target + 1 >= simSize) continue;
 
-                    if (newTarget >= -128 && newTarget <= 127) {
-                        simplified[i + 1] = static_cast<uint8_t>(static_cast<int8_t>(newTarget));
-                    }
+                if (simplified[static_cast<size_t>(target)] != 0xEB) continue;
+
+                const int8_t rel8_2 = static_cast<int8_t>(
+                    simplified[static_cast<size_t>(target + 1)]);
+                const ptrdiff_t newTarget =
+                    target + 2 + static_cast<ptrdiff_t>(rel8_2) - (i + 2);
+
+                if (newTarget >= -128 && newTarget <= 127) {
+                    simplified[static_cast<size_t>(i + 1)] =
+                        static_cast<uint8_t>(static_cast<int8_t>(newTarget));
                 }
             }
 
@@ -1538,11 +1600,21 @@ namespace ShadowStrike::Core::Engine {
                 m_stats.fuzzyMatches.fetch_add(
                     matches.size(), std::memory_order_relaxed);
 
-                // Notify callback
-                std::shared_lock cbLock(m_callbackMutex);
-                if (m_fuzzyMatchCallback) {
+                // Snapshot the callback under the shared lock then invoke it
+                // OUTSIDE the lock to avoid deadlock if the callback itself
+                // (or any code it invokes) calls UnregisterCallbacks() which
+                // acquires the same mutex exclusively.
+                FuzzyMatchCallback cbCopy;
+                {
+                    std::shared_lock cbLock(m_callbackMutex);
+                    cbCopy = m_fuzzyMatchCallback;
+                }
+                if (cbCopy) {
                     for (const auto& m : matches) {
-                        try { m_fuzzyMatchCallback(m); } catch (...) {}
+                        try { cbCopy(m); } catch (...) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"Fuzzy-match callback threw");
+                        }
                     }
                 }
             }
@@ -1589,7 +1661,11 @@ namespace ShadowStrike::Core::Engine {
                 std::min<size_t>(data.size(), UINT_MAX)));
             tlsh.final();
 
-            return tlsh.getHash();
+            // tlsh.getHash() returns const char* and may be NULL when the
+            // implementation has insufficient input variance. Constructing
+            // std::string from NULL is UB.
+            const char* hash = tlsh.getHash();
+            return (hash != nullptr) ? std::string(hash) : std::string{};
         } catch (...) {
             SS_LOG_ERROR(kLogCategory, L"Exception during TLSH calculation");
             return {};
@@ -1777,9 +1853,16 @@ namespace ShadowStrike::Core::Engine {
 
     void PolymorphicDetectorImpl::NotifyError(const std::string& msg, int code) noexcept {
         try {
-            std::shared_lock cbLock(m_callbackMutex);
-            if (m_errorCallback) {
-                m_errorCallback(msg, code);
+            // Snapshot then release the lock before invoking the callback —
+            // the callback may legally call UnregisterCallbacks() which
+            // acquires m_callbackMutex exclusively, deadlocking otherwise.
+            ErrorCallback cbCopy;
+            {
+                std::shared_lock cbLock(m_callbackMutex);
+                cbCopy = m_errorCallback;
+            }
+            if (cbCopy) {
+                try { cbCopy(msg, code); } catch (...) {}
             }
         } catch (...) {}
     }
@@ -1932,20 +2015,47 @@ namespace ShadowStrike::Core::Engine {
             return;
         }
 
-        // Copy data for the async thread
+        // Bound concurrency to defend against thread-exhaustion DoS via a
+        // flood of AnalyzeAsync() calls. Reject when at capacity rather
+        // than silently queuing — caller learns the result immediately.
+        const uint32_t inflight =
+            m_impl->m_asyncInFlight.load(std::memory_order_acquire);
+        if (inflight >= kMaxAsyncInFlight) {
+            SS_LOG_WARN(kLogCategory,
+                L"AnalyzeAsync rejected: %u in-flight (cap %u)",
+                inflight, kMaxAsyncInFlight);
+            try { callback(PolyResult{}); } catch (...) {}
+            return;
+        }
+
         auto codeCopy = std::make_shared<std::vector<uint8_t>>(code.begin(), code.end());
         auto optsCopy = options;
         auto implPtr  = m_impl.get();
 
-        std::thread([codeCopy, callback, optsCopy, implPtr]() {
-            try {
-                auto result = implPtr->AnalyzeInternal(*codeCopy, optsCopy);
-                callback(result);
-            } catch (...) {
-                SS_LOG_ERROR(kLogCategory, L"Async analysis thread exception");
-                callback(PolyResult{});
-            }
-        }).detach();
+        // Increment BEFORE spawning so Shutdown() observes the in-flight
+        // worker even if the OS schedules the new thread later.
+        m_impl->m_asyncInFlight.fetch_add(1, std::memory_order_acq_rel);
+
+        try {
+            std::thread([codeCopy, callback, optsCopy, implPtr]() {
+                try {
+                    auto result = implPtr->AnalyzeInternal(*codeCopy, optsCopy);
+                    try { callback(result); } catch (...) {
+                        SS_LOG_ERROR(kLogCategory, L"Async callback threw");
+                    }
+                } catch (...) {
+                    SS_LOG_ERROR(kLogCategory, L"Async analysis thread exception");
+                    try { callback(PolyResult{}); } catch (...) {}
+                }
+                implPtr->m_asyncInFlight.fetch_sub(1, std::memory_order_acq_rel);
+            }).detach();
+        } catch (...) {
+            // std::thread ctor can throw resource_unavailable_try_again.
+            // Roll back the counter and surface failure to the caller.
+            m_impl->m_asyncInFlight.fetch_sub(1, std::memory_order_acq_rel);
+            SS_LOG_ERROR(kLogCategory, L"Failed to spawn async analysis thread");
+            try { callback(PolyResult{}); } catch (...) {}
+        }
     }
 
     // ========================================================================
@@ -2117,6 +2227,10 @@ namespace ShadowStrike::Core::Engine {
 
     void PolymorphicDetector::ResetStatistics() {
         if (m_impl) {
+            // PolyStatistics::startTime is a non-atomic TimePoint; the
+            // counters are atomic. Take the impl write-lock so concurrent
+            // readers/writers of startTime never observe a torn value.
+            std::unique_lock lock(m_impl->m_mutex);
             m_impl->m_stats.Reset();
         }
     }
