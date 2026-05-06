@@ -387,21 +387,28 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(const std::wstring& filePath) {
     result.filePath = filePath;
     result.timestamp = std::chrono::system_clock::now();
 
-    try {
+    // Snapshot config and external store pointers under a brief shared lock,
+    // then release before invoking sub-analyses.  This avoids the previously
+    // pervasive recursive std::shared_mutex acquisition (UB on MSVC's STL).
+    HeuristicAnalyzerConfig cfg;
+    HashStore::HashStore* hashStore = nullptr;
+    {
         std::shared_lock lock(m_impl->m_mutex);
-
         if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
             result.errorMessage = "HeuristicAnalyzer not initialized";
             SS_LOG_WARN(L"HeuristicAnalyzer", L"AnalyzeFile called before initialization");
             return result;
         }
+        cfg = m_impl->m_config;
+        hashStore = m_impl->m_hashStore;
+    }
 
-        // Validate path is non-empty
-        if (filePath.empty()) {
-            result.errorMessage = "Empty file path";
-            return result;
-        }
+    if (filePath.empty()) {
+        result.errorMessage = "Empty file path";
+        return result;
+    }
 
+    try {
         // Read entire file (FileUtils caps at MAX_READ_FILE_SIZE internally)
         std::vector<std::byte> rawData;
         if (!Utils::FileUtils::ReadAllBytes(filePath, rawData)) {
@@ -416,8 +423,7 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(const std::wstring& filePath) {
             return result;
         }
 
-        // Enforce our own max file size
-        if (rawData.size() > m_impl->m_config.maxFileSize) {
+        if (rawData.size() > cfg.maxFileSize) {
             result.errorMessage = "File exceeds maximum analysis size";
             m_impl->m_statistics.analysisFailures.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_WARN(L"HeuristicAnalyzer", L"File too large for analysis: %ls (%zu bytes)",
@@ -427,11 +433,10 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(const std::wstring& filePath) {
 
         result.fileSize = rawData.size();
 
-        // Reinterpret as uint8_t span for analysis
         std::span<const uint8_t> data(
             reinterpret_cast<const uint8_t*>(rawData.data()), rawData.size());
 
-        return AnalyzeFile(filePath, data);
+        return AnalyzeBufferInternal(filePath, data, cfg, hashStore, startTime);
 
     } catch (const std::exception& e) {
         result.errorMessage = e.what();
@@ -460,64 +465,92 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(
     result.fileSize = data.size();
     result.timestamp = std::chrono::system_clock::now();
 
-    try {
+    HeuristicAnalyzerConfig cfg;
+    HashStore::HashStore* hashStore = nullptr;
+    {
         std::shared_lock lock(m_impl->m_mutex);
+        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+            result.errorMessage = "HeuristicAnalyzer not initialized";
+            return result;
+        }
+        cfg = m_impl->m_config;
+        hashStore = m_impl->m_hashStore;
+    }
 
+    return AnalyzeBufferInternal(filePath, data, cfg, hashStore, startTime);
+}
+
+HeuristicResult HeuristicAnalyzer::AnalyzeBufferInternal(
+    const std::wstring& filePath,
+    std::span<const uint8_t> data,
+    const HeuristicAnalyzerConfig& cfg,
+    HashStore::HashStore* hashStore,
+    std::chrono::steady_clock::time_point startTime)
+{
+    HeuristicResult result;
+    result.filePath = filePath;
+    result.fileSize = data.size();
+    result.timestamp = std::chrono::system_clock::now();
+
+    try {
         if (data.empty()) {
             result.errorMessage = "Empty buffer";
             return result;
         }
 
-        // Enforce max size
-        if (data.size() > m_impl->m_config.maxFileSize) {
+        if (data.size() > cfg.maxFileSize) {
             result.errorMessage = "Buffer exceeds maximum analysis size";
             return result;
         }
 
         // Compute file hashes
         {
+            std::string tmp;
             Utils::HashUtils::Hasher sha256Hasher(Utils::HashUtils::Algorithm::SHA256);
             if (sha256Hasher.Init() && sha256Hasher.Update(data.data(), data.size())) {
-                sha256Hasher.FinalHex(result.sha256, false);
+                if (sha256Hasher.FinalHex(tmp, false)) {
+                    result.sha256 = std::move(tmp);
+                }
             }
+            tmp.clear();
             Utils::HashUtils::Hasher sha1Hasher(Utils::HashUtils::Algorithm::SHA1);
             if (sha1Hasher.Init() && sha1Hasher.Update(data.data(), data.size())) {
-                sha1Hasher.FinalHex(result.sha1, false);
+                if (sha1Hasher.FinalHex(tmp, false)) {
+                    result.sha1 = std::move(tmp);
+                }
             }
+            tmp.clear();
             Utils::HashUtils::Hasher md5Hasher(Utils::HashUtils::Algorithm::MD5);
             if (md5Hasher.Init() && md5Hasher.Update(data.data(), data.size())) {
-                md5Hasher.FinalHex(result.md5, false);
+                if (md5Hasher.FinalHex(tmp, false)) {
+                    result.md5 = std::move(tmp);
+                }
             }
         }
 
-        // Detect file type
         result.fileType = DetectFileType(data);
         if (result.fileType == FileType::Unknown && !filePath.empty()) {
             result.fileType = DetectFileType(filePath);
         }
 
-        // Track file type stats
         auto typeIdx = static_cast<size_t>(result.fileType);
         if (typeIdx < m_impl->m_statistics.filesByType.size()) {
             m_impl->m_statistics.filesByType[typeIdx].fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Route to type-specific analyzer
         switch (result.fileType) {
             case FileType::PE32:
             case FileType::PE64:
             case FileType::DLL:
             case FileType::SYS:
             {
-                if (m_impl->m_config.enablePEAnalysis) {
+                if (cfg.enablePEAnalysis) {
                     auto pe = AnalyzePE(data);
                     result.peAnalysis = pe;
 
-                    // Compute PE risk score from anomalies
                     double peScore = pe.riskScore;
 
-                    // Packer detection
-                    if (m_impl->m_config.enablePackerDetection) {
+                    if (cfg.enablePackerDetection) {
                         result.packerDetection = DetectPacker(data);
                         if (result.packerDetection.isPacked) {
                             m_impl->m_statistics.packedFiles.fetch_add(1, std::memory_order_relaxed);
@@ -525,21 +558,18 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(
                         }
                     }
 
-                    // Import analysis
-                    if (m_impl->m_config.enableImportAnalysis) {
+                    if (cfg.enableImportAnalysis) {
                         auto imports = AnalyzeImports(data);
                         result.peAnalysis->imports = imports;
                         peScore += imports.riskScore;
                     }
 
-                    // String analysis
-                    if (m_impl->m_config.enableStringAnalysis) {
+                    if (cfg.enableStringAnalysis) {
                         result.stringAnalysis = AnalyzeStrings(data);
                         peScore += result.stringAnalysis.riskScore;
                     }
 
-                    // Certificate validation
-                    if (m_impl->m_config.enableCertificateAnalysis && !filePath.empty()) {
+                    if (cfg.enableCertificateAnalysis && !filePath.empty()) {
                         result.peAnalysis->certificate = VerifySignature(filePath);
                         peScore += result.peAnalysis->certificate.riskScore;
                     }
@@ -551,7 +581,7 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(
 
             case FileType::Script:
             {
-                if (m_impl->m_config.enableScriptAnalysis) {
+                if (cfg.enableScriptAnalysis) {
                     auto script = AnalyzeScript(data);
                     result.scriptAnalysis = script;
                     result.riskScore = std::min(script.riskScore, HeuristicConstants::MAX_RISK_SCORE);
@@ -561,13 +591,12 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(
 
             default:
             {
-                // Generic entropy + string analysis
                 double score = 0.0;
                 double entropy = CalculateEntropy(data);
-                if (entropy > m_impl->m_config.highEntropyThreshold) {
+                if (entropy > cfg.highEntropyThreshold) {
                     score += entropy * HeuristicConstants::ENTROPY_WEIGHT;
                 }
-                if (m_impl->m_config.enableStringAnalysis) {
+                if (cfg.enableStringAnalysis) {
                     result.stringAnalysis = AnalyzeStrings(data);
                     score += result.stringAnalysis.riskScore;
                 }
@@ -576,30 +605,36 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(
             }
         }
 
-        // Fuzzy matching
-        if (m_impl->m_config.enableFuzzyMatching && m_impl->m_hashStore && !result.sha256.empty()) {
-            result.fuzzyMatch = QueryFuzzyMatch(result.sha256, "", "");
-            if (result.fuzzyMatch.hasMatch) {
-                m_impl->m_statistics.fuzzyMatches.fetch_add(1, std::memory_order_relaxed);
-                result.riskScore = std::min(
-                    result.riskScore + result.fuzzyMatch.riskScore,
-                    HeuristicConstants::MAX_RISK_SCORE);
+        // Fuzzy matching: only invoke when a real CTPH/TLSH fuzzy hash is
+        // available. SHA-256 cannot be fuzzy-matched — feeding it into
+        // HashStore::FuzzyMatch is semantically meaningless and was a
+        // pre-existing bug. Until ssdeep/TLSH hashes are computed
+        // (CalculateFuzzyHash / CalculateTLSH currently return empty),
+        // this branch is intentionally skipped.
+        if (cfg.enableFuzzyMatching && hashStore && !result.sha256.empty()) {
+            std::string fuzzyHash = CalculateFuzzyHash(data);
+            std::string tlsh = CalculateTLSH(data);
+            if (!fuzzyHash.empty() || !tlsh.empty()) {
+                result.fuzzyMatch = QueryFuzzyMatch(fuzzyHash, tlsh, "");
+                if (result.fuzzyMatch.hasMatch) {
+                    m_impl->m_statistics.fuzzyMatches.fetch_add(1, std::memory_order_relaxed);
+                    result.riskScore = std::min(
+                        result.riskScore + result.fuzzyMatch.riskScore,
+                        HeuristicConstants::MAX_RISK_SCORE);
+                }
             }
         }
 
-        // Aggregate scores and generate verdict
         AggregateScores(result);
         GenerateThreatName(result);
 
         result.analysisComplete = true;
 
-        // Duration
         const auto endTime = std::chrono::steady_clock::now();
         result.analysisDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
         m_impl->m_statistics.totalBytesAnalyzed.fetch_add(data.size(), std::memory_order_relaxed);
 
-        // Update verdict stats
         if (result.isMalicious) {
             m_impl->m_statistics.maliciousFiles.fetch_add(1, std::memory_order_relaxed);
         } else if (result.isSuspicious) {
@@ -608,12 +643,16 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(
             m_impl->m_statistics.cleanFiles.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Update average analysis time
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
-        auto totalFiles = m_impl->m_statistics.totalFilesAnalyzed.load(std::memory_order_relaxed);
+        // Update running average analysis time using the canonical
+        //   newAvg = (prevAvg * (n-1) + sample) / n
+        // formulation. The prior expression underflowed when sample < prevAvg
+        // because uint64_t(sample) - prevAvg wraps around.
+        const auto us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count());
+        const auto totalFiles = m_impl->m_statistics.totalFilesAnalyzed.load(std::memory_order_relaxed);
         if (totalFiles > 0) {
-            auto prevAvg = m_impl->m_statistics.avgAnalysisTimeUs.load(std::memory_order_relaxed);
-            auto newAvg = prevAvg + (static_cast<uint64_t>(us) - prevAvg) / totalFiles;
+            const auto prevAvg = m_impl->m_statistics.avgAnalysisTimeUs.load(std::memory_order_relaxed);
+            const auto newAvg = (prevAvg * (totalFiles - 1) + us) / totalFiles;
             m_impl->m_statistics.avgAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
         }
 
@@ -641,8 +680,7 @@ bool HeuristicAnalyzer::AnalyzeFileAsync(
     }
 
     if (m_impl->m_threadPool) {
-        // Dispatch to thread pool for asynchronous processing
-        m_impl->m_threadPool->Submit([this, filePath, callback](const Utils::TaskContext&) {
+        (void)m_impl->m_threadPool->Submit([this, filePath, callback](const Utils::TaskContext&) {
             try {
                 auto result = AnalyzeFile(filePath);
                 callback(result);
@@ -664,18 +702,64 @@ bool HeuristicAnalyzer::AnalyzeFileAsync(
 }
 
 HeuristicResult HeuristicAnalyzer::QuickScan(const std::wstring& filePath) {
-    // Use fast-scan config
-    auto savedConfig = m_impl->m_config;
-    m_impl->m_config.enableCodeAnalysis = false;
-    m_impl->m_config.enableStringAnalysis = false;
-    m_impl->m_config.enableResourceAnalysis = false;
-    m_impl->m_config.enableFuzzyMatching = false;
-    m_impl->m_config.timeoutSeconds = 10;
+    const auto startTime = std::chrono::steady_clock::now();
+    m_impl->m_statistics.totalFilesAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
-    auto result = AnalyzeFile(filePath);
+    HeuristicResult result;
+    result.filePath = filePath;
+    result.timestamp = std::chrono::system_clock::now();
 
-    m_impl->m_config = savedConfig;
-    return result;
+    // Snapshot global config + stores under a brief shared lock; mutate the
+    // local copy only.  The previous implementation mutated m_impl->m_config
+    // in-place without any synchronization, racing with concurrent analyses
+    // and concurrent UpdateConfig calls.
+    HeuristicAnalyzerConfig cfg;
+    HashStore::HashStore* hashStore = nullptr;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+            result.errorMessage = "HeuristicAnalyzer not initialized";
+            return result;
+        }
+        cfg = m_impl->m_config;
+        hashStore = m_impl->m_hashStore;
+    }
+
+    cfg.enableCodeAnalysis = false;
+    cfg.enableStringAnalysis = false;
+    cfg.enableResourceAnalysis = false;
+    cfg.enableFuzzyMatching = false;
+    cfg.timeoutSeconds = 10;
+
+    if (filePath.empty()) {
+        result.errorMessage = "Empty file path";
+        return result;
+    }
+
+    try {
+        std::vector<std::byte> rawData;
+        if (!Utils::FileUtils::ReadAllBytes(filePath, rawData)) {
+            result.errorMessage = "Failed to read file";
+            m_impl->m_statistics.analysisFailures.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+        if (rawData.empty()) {
+            result.errorMessage = "File is empty";
+            return result;
+        }
+        if (rawData.size() > cfg.maxFileSize) {
+            result.errorMessage = "File exceeds maximum analysis size";
+            m_impl->m_statistics.analysisFailures.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+        std::span<const uint8_t> data(
+            reinterpret_cast<const uint8_t*>(rawData.data()), rawData.size());
+        return AnalyzeBufferInternal(filePath, data, cfg, hashStore, startTime);
+    } catch (const std::exception& e) {
+        result.errorMessage = e.what();
+        m_impl->m_statistics.analysisFailures.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
 }
 // ============================================================================
 // PE Analysis
@@ -710,11 +794,10 @@ PEAnalysis HeuristicAnalyzer::AnalyzePE(std::span<const uint8_t> data) {
     // --- Map sections from PEParser (plus HA-specific entropy/hash analysis) ---
     PopulateSections(parser, peInfo, data, pe);
 
-    // --- Suspicious import scanning (raw-byte API name search) ---
-    // This is NOT the same as PEParser's IAT walk; HeuristicAnalyzer scans for
-    // suspicious API name strings in the raw binary to detect API usage even
-    // in packed/obfuscated files where the import table may be destroyed.
-    ParseImports(data, pe);
+    // Suspicious import scanning is invoked at the top-level analysis
+    // pipeline (AnalyzeBufferInternal) when import analysis is enabled.
+    // We deliberately do NOT call ParseImports here to avoid scanning the
+    // entire buffer twice for every PE file.
 
     // --- Export anomaly detection ---
     if (pe.isDLL && !peInfo.dataDirectories[PEParser::DataDirectory::EXPORT].present) {
@@ -953,8 +1036,13 @@ void HeuristicAnalyzer::PopulateRichHeader(
                 static_cast<uint32_t>(entry.productId),
                 entry.useCount);
         }
-    } else {
-        pe.anomalies.push_back(PEAnomaly::RichHeaderStripped);
+        // Only flag tampering when a Rich header was present but its
+        // checksum failed to validate.  Binaries produced by non-MSVC
+        // toolchains (gcc/clang/MASM) legitimately have no Rich header
+        // and must not be penalized.
+        if (richInfo.present && !richInfo.checksumValid) {
+            pe.anomalies.push_back(PEAnomaly::RichHeaderStripped);
+        }
     }
 }
 
@@ -1090,7 +1178,7 @@ void HeuristicAnalyzer::DetectPEAnomalies(std::span<const uint8_t> /*data*/, PEA
 // Import Analysis (Public)
 // ============================================================================
 
-ImportAnalysis HeuristicAnalyzer::AnalyzeImports(std::span<const uint8_t> data) {
+ImportAnalysis HeuristicAnalyzer::AnalyzeImports(std::span<const uint8_t> data) const {
     ImportAnalysis result;
 
     try {
@@ -1102,7 +1190,8 @@ ImportAnalysis HeuristicAnalyzer::AnalyzeImports(std::span<const uint8_t> data) 
 
         const size_t optStart = static_cast<size_t>(dos->e_lfanew) + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
         if (optStart + sizeof(WORD) > data.size()) return result;
-        auto magic = *reinterpret_cast<const WORD*>(data.data() + optStart);
+        WORD magic = 0;
+        std::memcpy(&magic, data.data() + optStart, sizeof(WORD));
 
         DWORD importRVA = 0;
         DWORD importSize = 0;
@@ -1122,6 +1211,7 @@ ImportAnalysis HeuristicAnalyzer::AnalyzeImports(std::span<const uint8_t> data) 
                 importSize = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
             }
         }
+        (void)importSize;
 
         if (importRVA == 0) {
             result.hasNoImports = true;
@@ -1129,54 +1219,60 @@ ImportAnalysis HeuristicAnalyzer::AnalyzeImports(std::span<const uint8_t> data) 
             return result;
         }
 
-        // Scan the raw file for import function names from our suspicious set.
-        // Full IAT parsing requires RVA-to-file-offset conversion which depends
-        // on section layouts; we perform a conservative raw-byte search that
-        // catches the ASCII import names embedded in the file.  This avoids
-        // the complexity of RVA mapping while still detecting the APIs.
+        // Cap the raw-byte search range to avoid pathological O(N*M*F) cost on
+        // very large files.  The PE import name strings live in IAT-adjacent
+        // sections which are almost always within the first ~64 MiB.
+        constexpr size_t kMaxImportScanBytes = 64ull * 1024ull * 1024ull;
+        const size_t scanLen = std::min<size_t>(data.size(), kMaxImportScanBytes);
+
         bool hasLoadLib = false;
         bool hasGetProc = false;
 
+        // Word-boundary helper: an ASCII byte is part of an identifier only if
+        // it is alphanumeric or '_'.  The previous "'A'..'z'" range incorrectly
+        // included the punctuation block 0x5B..0x60 ([\]^_`).
+        auto isIdentByte = [](uint8_t b) noexcept -> bool {
+            return (b >= 'A' && b <= 'Z') ||
+                   (b >= 'a' && b <= 'z') ||
+                   (b >= '0' && b <= '9') ||
+                   b == '_';
+        };
+
         for (const auto& [funcName, cat] : m_impl->m_importCategoryMap) {
-            // Search in raw data (import names are ASCII)
             const auto* needle = reinterpret_cast<const uint8_t*>(funcName.c_str());
             const size_t needleLen = funcName.size();
 
-            if (needleLen == 0 || needleLen > data.size()) continue;
+            if (needleLen == 0 || needleLen > scanLen) continue;
 
-            for (size_t off = 0; off + needleLen <= data.size(); ++off) {
-                if (std::memcmp(data.data() + off, needle, needleLen) == 0) {
-                    // Verify it is null-terminated or followed by non-alpha
-                    // to avoid false positives from substrings
-                    if (off + needleLen < data.size()) {
-                        uint8_t next = data[off + needleLen];
-                        if (next >= 'A' && next <= 'z') continue;
-                    }
+            for (size_t off = 0; off + needleLen <= scanLen; ++off) {
+                if (std::memcmp(data.data() + off, needle, needleLen) != 0) continue;
 
-                    ImportedFunction func;
-                    func.functionName = funcName;
-                    func.category = cat;
-                    func.riskScore = 3.0;
+                // Verify word boundaries on both sides so substrings such as
+                // "SafeCreateRemoteThreadShim" do not yield a false positive.
+                if (off > 0 && isIdentByte(data[off - 1])) continue;
+                if (off + needleLen < scanLen && isIdentByte(data[off + needleLen])) continue;
 
-                    ClassifyImport(func);
-                    result.suspiciousFunctions.push_back(func);
-                    result.functions.push_back(std::move(func));
-                    result.suspiciousCount++;
-                    result.detectedCategories.insert(cat);
+                ImportedFunction func;
+                func.functionName = funcName;
+                func.category = cat;
+                func.riskScore = 3.0;
 
-                    if (funcName.find("LoadLibrary") != std::string::npos) hasLoadLib = true;
-                    if (funcName == "GetProcAddress") hasGetProc = true;
-                    break; // found this func, move to next
-                }
+                ClassifyImport(func);
+                result.suspiciousFunctions.push_back(func);
+                result.functions.push_back(std::move(func));
+                result.suspiciousCount++;
+                result.detectedCategories.insert(cat);
+
+                if (funcName.find("LoadLibrary") != std::string::npos) hasLoadLib = true;
+                if (funcName == "GetProcAddress") hasGetProc = true;
+                break;
             }
 
-            // Cap search to avoid runaway
             if (result.suspiciousCount > HeuristicConstants::MAX_NORMAL_IMPORTS) break;
         }
 
         result.hasDynamicLoading = hasLoadLib && hasGetProc;
 
-        // Score imports
         if (result.suspiciousCount > 5) {
             result.riskScore += HeuristicConstants::MAX_IMPORT_SCORE;
         } else {
@@ -1193,7 +1289,7 @@ ImportAnalysis HeuristicAnalyzer::AnalyzeImports(std::span<const uint8_t> data) 
     return result;
 }
 
-void HeuristicAnalyzer::ClassifyImport(ImportedFunction& func) {
+void HeuristicAnalyzer::ClassifyImport(ImportedFunction& func) const {
     // Already classified during search; compute risk score per category
     switch (func.category) {
         case SuspiciousAPICategory::CodeInjection:
@@ -1369,12 +1465,12 @@ StringAnalysis HeuristicAnalyzer::AnalyzeStrings(std::span<const uint8_t> data) 
 void HeuristicAnalyzer::CalculateSectionHashes(std::span<const uint8_t> data, SectionAnalysis& section) {
     Utils::HashUtils::Hasher md5h(Utils::HashUtils::Algorithm::MD5);
     if (md5h.Init() && md5h.Update(data.data(), data.size())) {
-        md5h.FinalHex(section.md5, false);
+        (void)md5h.FinalHex(section.md5, false);
     }
 
     Utils::HashUtils::Hasher sha256h(Utils::HashUtils::Algorithm::SHA256);
     if (sha256h.Init() && sha256h.Update(data.data(), data.size())) {
-        sha256h.FinalHex(section.sha256, false);
+        (void)sha256h.FinalHex(section.sha256, false);
     }
 }
 // ============================================================================
@@ -1416,8 +1512,10 @@ PackerDetection HeuristicAnalyzer::DetectPacker(std::span<const uint8_t> data) {
 
         auto sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(data.data() + sectionStart);
 
-        // Read lock for packer signatures
-        std::shared_lock lock(m_impl->m_mutex);
+        // m_packerSignatures is populated once in Impl::Impl() and is never
+        // mutated thereafter, so no synchronization is required for read-only
+        // access. Acquiring m_impl->m_mutex here would re-enter the same
+        // std::shared_mutex from the analysis pipeline (UB on MSVC's STL).
 
         for (WORD i = 0; i < numSections; ++i) {
             std::string name(
@@ -1615,7 +1713,7 @@ bool HeuristicAnalyzer::IsLikelyEncrypted(std::span<const uint8_t> data) const {
 
 std::string HeuristicAnalyzer::CalculateImpHash(std::span<const uint8_t> data) const {
     // ImpHash: MD5 of sorted, lowercased "dll.function" import list
-    auto imports = const_cast<HeuristicAnalyzer*>(this)->AnalyzeImports(data);
+    auto imports = AnalyzeImports(data);
     if (imports.functions.empty()) return {};
 
     std::vector<std::string> entries;
@@ -1675,7 +1773,9 @@ FileType HeuristicAnalyzer::DetectFileType(std::span<const uint8_t> data) const 
                 auto sig = *reinterpret_cast<const DWORD*>(data.data() + off);
                 if (sig == IMAGE_NT_SIGNATURE) {
                     auto machine = *reinterpret_cast<const WORD*>(data.data() + off + 4);
-                    if (machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_IA64) {
+                    if (machine == IMAGE_FILE_MACHINE_AMD64 ||
+                        machine == IMAGE_FILE_MACHINE_IA64 ||
+                        machine == IMAGE_FILE_MACHINE_ARM64) {
                         return FileType::PE64;
                     }
                     return FileType::PE32;
@@ -1849,34 +1949,46 @@ FuzzyMatchResult HeuristicAnalyzer::QueryFuzzyMatch(
     const std::string& impHash)
 {
     FuzzyMatchResult result;
-
-    std::shared_lock lock(m_impl->m_mutex);
-
-    if (!m_impl->m_hashStore) return result;
-
     result.fuzzyHash = fuzzyHash;
     result.tlsh = tlsh;
     result.impHash = impHash;
 
+    // The HashStore::FuzzyMatch contract operates on context-triggered
+    // piecewise hashes (e.g. ssdeep / TLSH).  A SHA-256 has no fuzzy
+    // semantics — the previous code path fed SHA-256 hex into a HashValue
+    // and asked for fuzzy similarity, which always degenerated to byte-
+    // for-byte equality (i.e. the answer is always "no match" except for
+    // bit-identical files, in which case the exact-hash path already
+    // catches it).  Until a real CTPH/TLSH implementation lands, we only
+    // dispatch to HashStore when at least one fuzzy-capable hash is
+    // present.
+    if (fuzzyHash.empty() && tlsh.empty()) {
+        return result;
+    }
+
+    HashStore::HashStore* hashStore = nullptr;
+    uint32_t threshold = 80;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        hashStore = m_impl->m_hashStore;
+        threshold = static_cast<uint32_t>(m_impl->m_config.fuzzyMinSimilarity);
+    }
+    if (!hashStore) return result;
+
     try {
-        // Build a HashValue from the SHA-256 hex string for fuzzy lookup
+        // Prefer TLSH when available (35-byte canonical digest), otherwise
+        // fall back to ssdeep / CTPH which is variable-length text.
         SignatureStore::HashValue hv{};
-        hv.type = SignatureStore::HashType::SHA256;
-        hv.length = 32;
+        const std::string& src = !tlsh.empty() ? tlsh : fuzzyHash;
+        hv.type = !tlsh.empty() ? SignatureStore::HashType::TLSH
+                                : SignatureStore::HashType::FUZZY;
+        const size_t copyLen = std::min(src.size(), hv.data.size());
+        std::memcpy(hv.data.data(),
+                    reinterpret_cast<const uint8_t*>(src.data()),
+                    copyLen);
+        hv.length = static_cast<uint8_t>(copyLen);
 
-        auto hexVal = [](char c) -> uint8_t {
-            if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-            if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-            if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
-            return 0;
-        };
-        for (size_t i = 0; i + 1 < fuzzyHash.size() && i / 2 < hv.data.size(); i += 2) {
-            hv.data[i / 2] = static_cast<uint8_t>((hexVal(fuzzyHash[i]) << 4) | hexVal(fuzzyHash[i + 1]));
-        }
-
-        auto matches = m_impl->m_hashStore->FuzzyMatch(
-            hv, static_cast<uint32_t>(m_impl->m_config.fuzzyMinSimilarity));
-
+        auto matches = hashStore->FuzzyMatch(hv, threshold);
         if (!matches.empty()) {
             result.hasMatch = true;
             result.matchConfidence = static_cast<double>(matches[0].similarity);
@@ -2226,17 +2338,105 @@ bool IsSuspiciousSectionName(const std::string& name) noexcept {
     return false;
 }
 
+namespace {
+
+// Static lookup table mapping well-known suspicious Windows APIs to their
+// behavioural category.  This mirrors Impl::InitializeSuspiciousImports so
+// that the free utility functions IsSuspiciousImport/GetAPICategory can
+// answer per-name questions without instantiating the analyzer or scanning
+// arbitrary buffers.  Keep this list in sync with that initializer.
+const std::unordered_map<std::string, SuspiciousAPICategory>& SuspiciousAPILookup() {
+    static const std::unordered_map<std::string, SuspiciousAPICategory> table = {
+        // Process manipulation
+        {"CreateRemoteThread",          SuspiciousAPICategory::ProcessManipulation},
+        {"CreateRemoteThreadEx",        SuspiciousAPICategory::ProcessManipulation},
+        {"WriteProcessMemory",          SuspiciousAPICategory::ProcessManipulation},
+        {"ReadProcessMemory",           SuspiciousAPICategory::ProcessManipulation},
+        {"SetThreadContext",            SuspiciousAPICategory::ProcessManipulation},
+        // Memory operations
+        {"VirtualAllocEx",              SuspiciousAPICategory::MemoryOperations},
+        {"VirtualProtectEx",            SuspiciousAPICategory::MemoryOperations},
+        {"VirtualProtect",              SuspiciousAPICategory::MemoryOperations},
+        {"VirtualAlloc",                SuspiciousAPICategory::MemoryOperations},
+        // Code injection
+        {"QueueUserAPC",                SuspiciousAPICategory::CodeInjection},
+        {"NtQueueApcThread",            SuspiciousAPICategory::CodeInjection},
+        {"NtCreateThreadEx",            SuspiciousAPICategory::CodeInjection},
+        {"RtlCreateUserThread",         SuspiciousAPICategory::CodeInjection},
+        // Dynamic loading
+        {"LoadLibraryA",                SuspiciousAPICategory::DynamicCode},
+        {"LoadLibraryW",                SuspiciousAPICategory::DynamicCode},
+        {"LoadLibraryExA",              SuspiciousAPICategory::DynamicCode},
+        {"LoadLibraryExW",              SuspiciousAPICategory::DynamicCode},
+        {"GetProcAddress",              SuspiciousAPICategory::DynamicCode},
+        // Anti-debug
+        {"IsDebuggerPresent",           SuspiciousAPICategory::AntiDebug},
+        {"CheckRemoteDebuggerPresent",  SuspiciousAPICategory::AntiDebug},
+        {"NtQueryInformationProcess",   SuspiciousAPICategory::AntiDebug},
+        {"OutputDebugStringA",          SuspiciousAPICategory::AntiDebug},
+        // Registry
+        {"RegSetValueExA",              SuspiciousAPICategory::RegistryOperations},
+        {"RegSetValueExW",              SuspiciousAPICategory::RegistryOperations},
+        {"RegCreateKeyExA",             SuspiciousAPICategory::RegistryOperations},
+        {"RegCreateKeyExW",             SuspiciousAPICategory::RegistryOperations},
+        // Service operations
+        {"CreateServiceA",              SuspiciousAPICategory::ServiceOperations},
+        {"CreateServiceW",              SuspiciousAPICategory::ServiceOperations},
+        {"ChangeServiceConfigA",        SuspiciousAPICategory::ServiceOperations},
+        {"ChangeServiceConfigW",        SuspiciousAPICategory::ServiceOperations},
+        // Input capture
+        {"SetWindowsHookExA",           SuspiciousAPICategory::InputCapture},
+        {"SetWindowsHookExW",           SuspiciousAPICategory::InputCapture},
+        {"GetAsyncKeyState",            SuspiciousAPICategory::InputCapture},
+        {"GetKeyState",                 SuspiciousAPICategory::InputCapture},
+        // Network
+        {"InternetOpenA",               SuspiciousAPICategory::NetworkOperations},
+        {"InternetOpenW",               SuspiciousAPICategory::NetworkOperations},
+        {"InternetConnectA",            SuspiciousAPICategory::NetworkOperations},
+        {"InternetConnectW",            SuspiciousAPICategory::NetworkOperations},
+        {"HttpSendRequestA",            SuspiciousAPICategory::NetworkOperations},
+        {"HttpSendRequestW",            SuspiciousAPICategory::NetworkOperations},
+        {"URLDownloadToFileA",          SuspiciousAPICategory::NetworkOperations},
+        {"URLDownloadToFileW",          SuspiciousAPICategory::NetworkOperations},
+        // Crypto
+        {"CryptEncrypt",                SuspiciousAPICategory::CryptoOperations},
+        {"CryptDecrypt",                SuspiciousAPICategory::CryptoOperations},
+        {"CryptDeriveKey",              SuspiciousAPICategory::CryptoOperations},
+        {"CryptGenKey",                 SuspiciousAPICategory::CryptoOperations},
+        // Privilege escalation
+        {"AdjustTokenPrivileges",       SuspiciousAPICategory::PrivilegeEscalation},
+        {"OpenProcessToken",            SuspiciousAPICategory::PrivilegeEscalation},
+        {"ImpersonateLoggedOnUser",     SuspiciousAPICategory::PrivilegeEscalation},
+        // Screen capture
+        {"BitBlt",                      SuspiciousAPICategory::ScreenCapture},
+        {"GetDC",                       SuspiciousAPICategory::ScreenCapture},
+        // Credential access
+        {"CredReadA",                   SuspiciousAPICategory::CredentialAccess},
+        {"CredReadW",                   SuspiciousAPICategory::CredentialAccess},
+        // Shell
+        {"ShellExecuteA",               SuspiciousAPICategory::Shell},
+        {"ShellExecuteW",               SuspiciousAPICategory::Shell},
+        {"ShellExecuteExA",             SuspiciousAPICategory::Shell},
+        {"ShellExecuteExW",             SuspiciousAPICategory::Shell},
+        // COM
+        {"CoCreateInstance",            SuspiciousAPICategory::COM},
+    };
+    return table;
+}
+
+} // namespace
+
 bool IsSuspiciousImport(const std::string& /*dllName*/, const std::string& funcName) noexcept {
-    return HeuristicAnalyzer::Instance().AnalyzeImports({}).suspiciousCount > 0 ||
-           funcName.find("CreateRemoteThread") != std::string::npos;
+    if (funcName.empty()) return false;
+    const auto& table = SuspiciousAPILookup();
+    return table.find(funcName) != table.end();
 }
 
 SuspiciousAPICategory GetAPICategory(const std::string& funcName) noexcept {
-    // Simple lookup via the instance's import map
-    auto& analyzer = HeuristicAnalyzer::Instance();
-    // This is a best-effort lookup
-    (void)funcName;
-    return SuspiciousAPICategory::None;
+    if (funcName.empty()) return SuspiciousAPICategory::None;
+    const auto& table = SuspiciousAPILookup();
+    auto it = table.find(funcName);
+    return it != table.end() ? it->second : SuspiciousAPICategory::None;
 }
 
 bool IsPotentialIOC(const std::string& str) noexcept {
