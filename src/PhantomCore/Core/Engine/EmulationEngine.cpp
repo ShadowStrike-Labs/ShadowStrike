@@ -46,22 +46,17 @@ constexpr const wchar_t* kLogCategory = L"EmulationEngine";
     return Utils::StringUtils::ToWide(value);
 }
 
+// Snapshot atomic statistics into a copy-stable structure. Delegates to the
+// type's own copy constructor which performs lock-free atomic loads.
 [[nodiscard]] EmulationStats SnapshotStats(const EmulationStats& stats) {
-    EmulationStats snapshot;
-    snapshot.totalSessions.store(stats.totalSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.successfulCompletions.store(stats.successfulCompletions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.timeouts.store(stats.timeouts.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.errors.store(stats.errors.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.malwareDetections.store(stats.malwareDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.successfulUnpacks.store(stats.successfulUnpacks.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.totalInstructions.store(stats.totalInstructions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.totalAPICalls.store(stats.totalAPICalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.totalFilesCaptured.store(stats.totalFilesCaptured.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.activeSessions.store(stats.activeSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.avgEmulationTimeUs.store(stats.avgEmulationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    snapshot.phantomEmulatorAvailable = stats.phantomEmulatorAvailable;
-    return snapshot;
+    return stats;
 }
+
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+constexpr bool kPhantomEmulatorAvailable = true;
+#else
+constexpr bool kPhantomEmulatorAvailable = false;
+#endif
 
 [[nodiscard]] std::optional<APICallRecord> HighestSeverityAPI(const std::vector<APICallRecord>& calls) {
     if (calls.empty()) {
@@ -117,8 +112,20 @@ public:
 #endif
     };
 
-    std::unordered_map<uint64_t, std::unique_ptr<ActiveSession>> m_sessions;
+    // DESIGN: ActiveSession is held by shared_ptr so that worker threads
+    // executing an emulation can keep their session alive even if Shutdown()
+    // or TerminateAllSessions() concurrently clears the registry. The map is
+    // the owner; raw pointers handed out under the mutex would be a use-after
+    // -free primitive (Tier 1 / Tier 4 finding: lifetime races on session ptr).
+    std::unordered_map<uint64_t, std::shared_ptr<ActiveSession>> m_sessions;
     std::atomic<uint64_t> m_nextSessionId{ 1 };
+
+    // Retained futures from fire-and-forget thread-pool submissions. The
+    // ThreadPool::Submit return value is [[nodiscard]] (C4834) and dropping
+    // it on the floor would silently swallow scheduling-time exceptions and
+    // emit warnings. We park the futures here and prune completed ones on
+    // each new submission to keep the vector bounded.
+    std::vector<std::shared_future<uint64_t>> m_pendingTasks;
 
     struct CallbackStore {
         std::unordered_map<uint64_t, APICallCallback> apiCallbacks;
@@ -147,9 +154,10 @@ public:
 
     uint64_t CreateSession(const EmulationConfig& config) noexcept;
     void RemoveSession(uint64_t sessionId, bool revertCreate = false) noexcept;
-    ActiveSession* GetSessionEntry(uint64_t sessionId) noexcept;
+    std::shared_ptr<ActiveSession> GetSessionEntry(uint64_t sessionId) noexcept;
     void FinalizeSession(uint64_t sessionId, const EmulationResult& result) noexcept;
     void UpdateAverageTime(uint64_t emulationTimeUs) noexcept;
+    void TrackPendingTask(std::shared_future<uint64_t> fut);
     EmulationResult RunPE(std::span<const uint8_t> data, const EmulationConfig& config, uint64_t sessionId) noexcept;
     EmulationResult RunShellcode(std::span<const uint8_t> data, bool is64, const EmulationConfig& config, uint64_t sessionId) noexcept;
     EmulationResult RunBuffer(std::span<const uint8_t> data, uint64_t base, uint64_t entry, EmulationArch arch, const EmulationConfig& config, uint64_t sessionId) noexcept;
@@ -166,30 +174,39 @@ bool EmulationEngine::Impl::Initialize(std::shared_ptr<Utils::ThreadPool> tp,
             return false;
         }
 
-        if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
+        // DESIGN: Initialize must be atomic from observers' perspective; the
+        // previous implementation used m_initialized.exchange() *before*
+        // populating m_threadPool / store pointers, which left a window in
+        // which a second thread could observe initialized==true while
+        // m_threadPool was still null and proceed to dereference it
+        // (Tier 1 finding: data race / NPD on parallel init).
+        std::unique_lock lock(m_mutex);
+        if (m_initialized.load(std::memory_order_acquire)) {
             return true;
         }
 
-        {
-            std::unique_lock lock(m_mutex);
-            m_threadPool = std::move(tp);
-            m_signatureStore = ss;
-            m_patternStore = ps;
-            m_hashStore = hs;
-            m_threatIntel = ti;
-            m_defaultConfig = EmulationConfig::CreateDefault();
-            m_stats.phantomEmulatorAvailable = true;
-        }
+        m_threadPool = std::move(tp);
+        m_signatureStore = ss;
+        m_patternStore = ps;
+        m_hashStore = hs;
+        m_threatIntel = ti;
+        m_defaultConfig = EmulationConfig::CreateDefault();
+        m_stats.phantomEmulatorAvailable = kPhantomEmulatorAvailable;
 
-        SS_LOG_INFO(kLogCategory, L"Initialized with PhantomEmulator backend");
+        // Publish state last; release-store pairs with the acquire-load above
+        // and with m_initialized.load(acquire) on the hot path.
+        m_initialized.store(true, std::memory_order_release);
+
+        SS_LOG_INFO(kLogCategory,
+                    kPhantomEmulatorAvailable
+                        ? L"Initialized with PhantomEmulator backend"
+                        : L"Initialized without PhantomEmulator (stub mode)");
         return true;
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(kLogCategory, L"Initialize exception: %ls", ToWide(ex.what()).c_str());
-        m_initialized.store(false, std::memory_order_release);
         return false;
     } catch (...) {
         SS_LOG_ERROR(kLogCategory, L"Initialize exception: unknown error");
-        m_initialized.store(false, std::memory_order_release);
         return false;
     }
 }
@@ -201,12 +218,19 @@ void EmulationEngine::Impl::Shutdown() noexcept {
         }
 
         // Phase 1: Signal every active session to abort under exclusive lock.
-        // Holding the lock prevents new sessions from being inserted while we
-        // iterate, and avoids dangling-pointer races with concurrent RemoveSession.
+        // We retain shared_ptr copies so that worker threads still mid-execution
+        // can finish on their own ActiveSession instances even after we clear
+        // the registry (Tier 1 / Tier 4 finding: lifetime races on session ptr).
+        std::vector<std::shared_ptr<ActiveSession>> activeSnapshot;
+        std::vector<std::shared_future<uint64_t>> pendingDrain;
         {
             std::unique_lock lock(m_mutex);
+            activeSnapshot.reserve(m_sessions.size());
             for (auto& [id, session] : m_sessions) {
                 (void)id;
+                if (!session) {
+                    continue;
+                }
                 session->shouldStop.store(true, std::memory_order_release);
                 session->state.store(EmulationState::Terminated, std::memory_order_release);
 #ifdef PHANTOM_EMULATOR_AVAILABLE
@@ -214,12 +238,28 @@ void EmulationEngine::Impl::Shutdown() noexcept {
                     session->phantomSession->RequestAbort();
                 }
 #endif
+                activeSnapshot.push_back(session);
             }
+            pendingDrain = std::move(m_pendingTasks);
+            m_pendingTasks.clear();
         }
 
         // Phase 2: Drain the thread pool OUTSIDE the mutex so worker threads
         // that acquire the mutex (FinalizeSession, RemoveSession) can complete
-        // without deadlocking.
+        // without deadlocking. Wait on every pending future so async tasks
+        // observe shouldStop and exit cleanly.
+        for (auto& fut : pendingDrain) {
+            if (fut.valid()) {
+                try {
+                    fut.wait();
+                } catch (...) {
+                    // Future-side exceptions have already been logged in the
+                    // task; swallow here to keep Shutdown noexcept-safe.
+                }
+            }
+        }
+        pendingDrain.clear();
+
         std::shared_ptr<Utils::ThreadPool> pool;
         {
             std::unique_lock lock(m_mutex);
@@ -227,7 +267,10 @@ void EmulationEngine::Impl::Shutdown() noexcept {
         }
         pool.reset();
 
-        // Phase 3: Clear remaining state under exclusive lock.
+        // Phase 3: Clear remaining state under exclusive lock. Worker threads
+        // that still own a shared_ptr keep their ActiveSession alive past
+        // erase(); they will simply not find themselves in m_sessions on the
+        // next GetSessionEntry call and bail.
         {
             std::unique_lock lock(m_mutex);
             m_sessions.clear();
@@ -237,6 +280,8 @@ void EmulationEngine::Impl::Shutdown() noexcept {
             m_threatIntel = nullptr;
             m_stats.activeSessions.store(0, std::memory_order_relaxed);
         }
+
+        activeSnapshot.clear();
 
         SS_LOG_INFO(kLogCategory, L"Shutdown complete");
     } catch (...) {
@@ -254,7 +299,7 @@ uint64_t EmulationEngine::Impl::CreateSession(const EmulationConfig& config) noe
             return 0;
         }
 
-        auto session = std::make_unique<ActiveSession>();
+        auto session = std::make_shared<ActiveSession>();
         const uint64_t sessionId = m_nextSessionId.fetch_add(1, std::memory_order_relaxed);
         session->sessionId = sessionId;
         session->config = config;
@@ -275,23 +320,53 @@ uint64_t EmulationEngine::Impl::CreateSession(const EmulationConfig& config) noe
 }
 
 void EmulationEngine::Impl::RemoveSession(uint64_t sessionId, bool revertCreate) noexcept {
-    std::unique_lock lock(m_mutex);
-    const auto erased = m_sessions.erase(sessionId);
-    lock.unlock();
+    std::shared_ptr<ActiveSession> evicted;
+    {
+        std::unique_lock lock(m_mutex);
+        const auto it = m_sessions.find(sessionId);
+        if (it == m_sessions.end()) {
+            return;
+        }
+        evicted = std::move(it->second);
+        m_sessions.erase(it);
+    }
 
-    if (revertCreate && erased > 0) {
+    if (revertCreate) {
         m_stats.totalSessions.fetch_sub(1, std::memory_order_relaxed);
         m_stats.activeSessions.fetch_sub(1, std::memory_order_relaxed);
     }
+    // 'evicted' shared_ptr is released here; if a worker thread still holds a
+    // copy, the ActiveSession survives until that worker is done.
 }
 
-EmulationEngine::Impl::ActiveSession* EmulationEngine::Impl::GetSessionEntry(uint64_t sessionId) noexcept {
+std::shared_ptr<EmulationEngine::Impl::ActiveSession>
+EmulationEngine::Impl::GetSessionEntry(uint64_t sessionId) noexcept {
     std::shared_lock lock(m_mutex);
     const auto it = m_sessions.find(sessionId);
-    return it != m_sessions.end() ? it->second.get() : nullptr;
+    return it != m_sessions.end() ? it->second : nullptr;
+}
+
+void EmulationEngine::Impl::TrackPendingTask(std::shared_future<uint64_t> fut) {
+    if (!fut.valid()) {
+        return;
+    }
+    std::unique_lock lock(m_mutex);
+    // Bound the parked-futures vector by pruning any that have already
+    // completed; this keeps memory usage flat under a steady-state of async
+    // submissions without requiring a separate reaper thread.
+    std::erase_if(m_pendingTasks, [](const std::shared_future<uint64_t>& f) {
+        using namespace std::chrono_literals;
+        return !f.valid() || f.wait_for(0s) == std::future_status::ready;
+    });
+    m_pendingTasks.push_back(std::move(fut));
 }
 
 void EmulationEngine::Impl::UpdateAverageTime(uint64_t emulationTimeUs) noexcept {
+    // FinalizeSession increments exactly one of {successfulCompletions,
+    // timeouts, errors} BEFORE invoking us, so completedTotal is the count
+    // INCLUDING the current emulation. Use it directly as the running-mean
+    // denominator (Tier 1 finding: previous code used completedTotal+1 and
+    // had a dead-zero branch that could never trigger).
     const uint64_t completedTotal =
         m_stats.successfulCompletions.load(std::memory_order_relaxed) +
         m_stats.timeouts.load(std::memory_order_relaxed) +
@@ -302,18 +377,18 @@ void EmulationEngine::Impl::UpdateAverageTime(uint64_t emulationTimeUs) noexcept
     }
 
     const uint64_t previous = m_stats.avgEmulationTimeUs.load(std::memory_order_relaxed);
-    // Incremental mean: avg_n = avg_{n-1} + (x_n - avg_{n-1}) / n
+    // Incremental mean: avg_n = avg_{n-1} + (x_n - avg_{n-1}) / n.
     // Signed delta avoids unsigned wrap-around ambiguity.
     const auto delta = static_cast<int64_t>(emulationTimeUs) - static_cast<int64_t>(previous);
-    const auto adjustment = delta / static_cast<int64_t>(completedTotal + 1);
+    const auto adjustment = delta / static_cast<int64_t>(completedTotal);
     const uint64_t updated = static_cast<uint64_t>(static_cast<int64_t>(previous) + adjustment);
     m_stats.avgEmulationTimeUs.store(updated, std::memory_order_relaxed);
 }
 
 void EmulationEngine::Impl::FinalizeSession(uint64_t sessionId, const EmulationResult& result) noexcept {
-    if (auto* session = GetSessionEntry(sessionId)) {
+    if (auto session = GetSessionEntry(sessionId)) {
         session->instructionCount.store(result.instructionsExecuted, std::memory_order_relaxed);
-        session->apiCallCount.store(result.apiCallCount, std::memory_order_relaxed);
+        session->apiCallCount.store(static_cast<size_t>(result.apiCallCount), std::memory_order_relaxed);
         session->state.store(result.state, std::memory_order_relaxed);
     }
 
@@ -322,11 +397,17 @@ void EmulationEngine::Impl::FinalizeSession(uint64_t sessionId, const EmulationR
     if (result.exitReason == EmulationExitReason::Timeout || result.state == EmulationState::Timeout) {
         m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
     } else if (result.state == EmulationState::Error ||
+               result.state == EmulationState::Terminated ||
                result.exitReason == EmulationExitReason::InternalError ||
                result.exitReason == EmulationExitReason::Exception ||
                result.exitReason == EmulationExitReason::InvalidInstruction ||
                result.exitReason == EmulationExitReason::AccessViolation ||
-               result.exitReason == EmulationExitReason::PrivilegedInstruction) {
+               result.exitReason == EmulationExitReason::PrivilegedInstruction ||
+               result.exitReason == EmulationExitReason::UserTerminated) {
+        // DESIGN: User-terminated and aborted sessions are not "successful
+        // completions" (Tier 1 finding: previous code mis-credited them as
+        // success and inflated the success rate metric). Bucket them into
+        // 'errors' so reporting reflects actual healthy completions.
         m_stats.errors.fetch_add(1, std::memory_order_relaxed);
     } else {
         m_stats.successfulCompletions.fetch_add(1, std::memory_order_relaxed);
@@ -492,13 +573,24 @@ EmulationResult EmulationEngine::Impl::RunPE(std::span<const uint8_t> data,
                                              const EmulationConfig& config,
                                              uint64_t sessionId) noexcept {
     EmulationResult result;
-    const uint64_t sid = sessionId != 0 ? sessionId : CreateSession(config);
+    const bool sessionWasCallerOwned = (sessionId != 0);
+    const uint64_t sid = sessionWasCallerOwned ? sessionId : CreateSession(config);
     if (sid == 0) {
         return BuildInputErrorResult(0, L"Failed to create emulation session", EmulationArch::X64);
     }
 
-    auto* active = GetSessionEntry(sid);
+    auto active = GetSessionEntry(sid);
     if (!active) {
+        // Session was created/handed-in but no longer exists in the registry.
+        // Roll the activeSessions/totalSessions counters back; the previous
+        // implementation leaked both the session counter and the slot.
+        if (!sessionWasCallerOwned) {
+            // We allocated; nothing was stored externally — counters stay
+            // accurate via RemoveSession path. (Defensive: should be
+            // unreachable since we just inserted under the same map.)
+        } else {
+            m_stats.activeSessions.fetch_sub(1, std::memory_order_relaxed);
+        }
         return BuildInputErrorResult(sid, L"Failed to locate emulation session", EmulationArch::X64);
     }
 
@@ -580,8 +672,11 @@ EmulationResult EmulationEngine::Impl::RunShellcode(std::span<const uint8_t> dat
         return BuildInputErrorResult(0, L"Failed to create emulation session", effectiveConfig.targetArch);
     }
 
-    auto* active = GetSessionEntry(sid);
+    auto active = GetSessionEntry(sid);
     if (!active) {
+        if (sessionId != 0) {
+            m_stats.activeSessions.fetch_sub(1, std::memory_order_relaxed);
+        }
         return BuildInputErrorResult(sid, L"Failed to locate emulation session", effectiveConfig.targetArch);
     }
 
@@ -666,8 +761,11 @@ EmulationResult EmulationEngine::Impl::RunBuffer(std::span<const uint8_t> data,
         return BuildInputErrorResult(0, L"Failed to create emulation session", arch);
     }
 
-    auto* active = GetSessionEntry(sid);
+    auto active = GetSessionEntry(sid);
     if (!active) {
+        if (sessionId != 0) {
+            m_stats.activeSessions.fetch_sub(1, std::memory_order_relaxed);
+        }
         return BuildInputErrorResult(sid, L"Failed to locate emulation session", arch);
     }
 
@@ -883,7 +981,7 @@ uint64_t EmulationEngine::EmulatePEAsync(std::vector<uint8_t> fileData,
 
     try {
         auto* implPtr = m_impl.get();
-        m_impl->m_threadPool->Submit(
+        auto fut = m_impl->m_threadPool->Submit(
             [implPtr, fileData = std::move(fileData), config, callback = std::move(callback), sessionId](const Utils::TaskContext&) mutable {
                 auto result = implPtr->RunPE(std::span<const uint8_t>(fileData), config, sessionId);
                 result.sessionId = sessionId;
@@ -894,6 +992,7 @@ uint64_t EmulationEngine::EmulatePEAsync(std::vector<uint8_t> fileData,
             },
             Utils::TaskPriority::Normal,
             "EmulatePEAsync");
+        m_impl->TrackPendingTask(std::move(fut));
         return sessionId;
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(kLogCategory, L"EmulatePEAsync submit failed: %ls", ToWide(ex.what()).c_str());
@@ -949,7 +1048,7 @@ uint64_t EmulationEngine::EmulateShellcodeAsync(std::vector<uint8_t> code,
 
     try {
         auto* implPtr = m_impl.get();
-        m_impl->m_threadPool->Submit(
+        auto fut = m_impl->m_threadPool->Submit(
             [implPtr, code = std::move(code), is64Bit, config = effectiveConfig, callback = std::move(callback), sessionId](const Utils::TaskContext&) mutable {
                 auto result = implPtr->RunShellcode(std::span<const uint8_t>(code), is64Bit, config, sessionId);
                 result.sessionId = sessionId;
@@ -960,6 +1059,7 @@ uint64_t EmulationEngine::EmulateShellcodeAsync(std::vector<uint8_t> code,
             },
             Utils::TaskPriority::Normal,
             "EmulateShellcodeAsync");
+        m_impl->TrackPendingTask(std::move(fut));
         return sessionId;
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(kLogCategory, L"EmulateShellcodeAsync submit failed: %ls", ToWide(ex.what()).c_str());
@@ -1041,7 +1141,7 @@ bool EmulationEngine::TerminateSession(uint64_t sessionId) {
         return false;
     }
 
-    auto* session = m_impl->GetSessionEntry(sessionId);
+    auto session = m_impl->GetSessionEntry(sessionId);
     if (!session) {
         return false;
     }
@@ -1081,7 +1181,7 @@ bool EmulationEngine::PauseSession(uint64_t sessionId) {
         return false;
     }
 
-    auto* session = m_impl->GetSessionEntry(sessionId);
+    auto session = m_impl->GetSessionEntry(sessionId);
     if (!session) {
         SS_LOG_WARN(kLogCategory, L"PauseSession: session %llu not found",
                     static_cast<unsigned long long>(sessionId));
@@ -1102,7 +1202,7 @@ bool EmulationEngine::ResumeSession(uint64_t sessionId) {
         return false;
     }
 
-    auto* session = m_impl->GetSessionEntry(sessionId);
+    auto session = m_impl->GetSessionEntry(sessionId);
     if (!session) {
         SS_LOG_WARN(kLogCategory, L"ResumeSession: session %llu not found",
                     static_cast<unsigned long long>(sessionId));
@@ -1209,7 +1309,7 @@ EmulationStats EmulationEngine::GetStats() const {
 void EmulationEngine::ResetStats() {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        m_impl->m_stats.phantomEmulatorAvailable = true;
+        m_impl->m_stats.phantomEmulatorAvailable = kPhantomEmulatorAvailable;
     }
 }
 
@@ -1309,9 +1409,16 @@ bool IsPELikelyPacked(std::span<const uint8_t> peData) noexcept {
     }
 
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(peData.data());
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
-        dos->e_lfanew <= 0 ||
-        static_cast<size_t>(dos->e_lfanew) + sizeof(uint32_t) > peData.size()) {
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+        return false;
+    }
+    // Overflow-safe bounds check: e_lfanew is LONG (signed 32-bit) but a
+    // hostile DOS header could craft a value that, when widened and added
+    // to sizeof(uint32_t), wraps on 32-bit size_t. Compare via subtraction
+    // against the buffer size instead.
+    const auto e_lfanew = static_cast<size_t>(dos->e_lfanew);
+    if (e_lfanew > peData.size() ||
+        peData.size() - e_lfanew < sizeof(uint32_t)) {
         return false;
     }
 

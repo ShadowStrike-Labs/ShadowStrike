@@ -1732,8 +1732,11 @@ struct EmulationStats {
     /// @brief Average emulation time (microseconds)
     std::atomic<uint64_t> avgEmulationTimeUs{ 0 };
     
-    /// @brief PhantomEmulator backend available (always true)
-    bool phantomEmulatorAvailable = true;
+    /// @brief PhantomEmulator backend available (set by Initialize() based on
+    /// the PHANTOM_EMULATOR_AVAILABLE compile-time flag; defaults to false so
+    /// stats observed before initialisation never falsely advertise the
+    /// backend as present).
+    bool phantomEmulatorAvailable = false;
 
     EmulationStats() = default;
 
