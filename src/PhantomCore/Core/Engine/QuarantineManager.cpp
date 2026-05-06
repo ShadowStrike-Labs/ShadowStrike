@@ -53,6 +53,7 @@
 #include <fstream>
 #include <filesystem>
 #include <random>
+#include <unordered_set>
 
 // ============================================================================
 // WINDOWS SPECIFIC INCLUDES
@@ -72,6 +73,27 @@ namespace Engine {
 using namespace std::chrono;
 using namespace Utils;
 namespace fs = std::filesystem;
+
+// ============================================================================
+// ON-DISK QUARANTINE FILE HEADER (packed POD, written verbatim).
+// SECURITY: bound as Additional Authenticated Data (AAD) into AES-256-GCM so
+// any tamper of magic / version / flags / originalSize / IV is detected via
+// authentication-tag mismatch on decrypt. Layout MUST remain stable for ABI
+// compatibility with previously written .ssqf files.
+// Layout:  magic(4) | version(2) | flags(2) | originalSize(8) | iv(GCM_IV_SIZE)
+// ============================================================================
+#pragma pack(push, 1)
+struct QuarantineFileHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t flags;
+    uint64_t originalSize;
+    uint8_t  iv[QuarantineConstants::GCM_IV_SIZE];
+};
+#pragma pack(pop)
+static_assert(sizeof(QuarantineFileHeader) ==
+              4 + 2 + 2 + 8 + QuarantineConstants::GCM_IV_SIZE,
+              "QuarantineFileHeader must be packed and layout-stable");
 
 // ============================================================================
 // INTERNAL SYSTEM UTILITY WRAPPERS
@@ -557,8 +579,9 @@ public:
             m_remediationCallbacks.clear();
         }
 
-        // Securely wipe encryption key (fill(0) can be optimized away)
-        RtlSecureZeroMemory(m_masterKey.data(), m_masterKey.size());
+        // Securely wipe encryption key (use project helper that resists
+        // optimizer elision; see CryptoUtils::SecureWipeMemory).
+        CryptoUtils::SecureWipeMemory(m_masterKey.data(), m_masterKey.size());
 
         m_initialized.store(false, std::memory_order_release);
         SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager::Impl: Shutdown complete");
@@ -604,9 +627,9 @@ public:
                 m_masterKey.size()
             );
 
-            // Securely wipe intermediate key material
-            RtlSecureZeroMemory(keyMaterial.data(), keyMaterial.size());
-            RtlSecureZeroMemory(salt.data(), salt.size());
+            // Securely wipe intermediate key material (project helper)
+            CryptoUtils::SecureWipeMemory(keyMaterial.data(), keyMaterial.size());
+            CryptoUtils::SecureWipeMemory(salt.data(), salt.size());
 
             if (!derived) {
                 throw std::runtime_error("PBKDF2 key derivation failed");
@@ -718,16 +741,15 @@ public:
 
     [[nodiscard]] std::vector<uint8_t> EncryptContent(
         std::span<const uint8_t> data,
-        std::array<uint8_t, QuarantineConstants::GCM_IV_SIZE>& iv
+        std::span<const uint8_t> aad,
+        const std::array<uint8_t, QuarantineConstants::GCM_IV_SIZE>& iv
     ) {
         try {
-            // Generate cryptographically secure random IV
-            CryptoUtils::SecureRandom rng;
-            if (!rng.Generate(iv.data(), iv.size())) {
-                throw std::runtime_error("Failed to generate cryptographic IV");
-            }
-
-            // Encrypt with AES-256-GCM using SymmetricCipher
+            // Encrypt with AES-256-GCM using SymmetricCipher.
+            // SECURITY: caller must supply a fresh, cryptographically random IV
+            // and bind the on-disk header as Additional Authenticated Data (AAD)
+            // so any tamper of magic/version/flags/originalSize/IV is detected
+            // at decrypt time via tag mismatch.
             CryptoUtils::SymmetricCipher cipher(CryptoUtils::SymmetricAlgorithm::AES_256_GCM);
 
             if (!cipher.SetKey(m_masterKey.data(), m_masterKey.size())) {
@@ -742,7 +764,7 @@ public:
             std::vector<uint8_t> tag;
 
             if (!cipher.EncryptAEAD(data.data(), data.size(),
-                                    nullptr, 0,
+                                    aad.data(), aad.size(),
                                     encrypted, tag))
             {
                 throw std::runtime_error("AES-256-GCM encryption failed");
@@ -751,7 +773,9 @@ public:
             // Append authentication tag to ciphertext
             encrypted.insert(encrypted.end(), tag.begin(), tag.end());
 
-            SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Content encrypted (%zu bytes -> %zu bytes)", data.size(), encrypted.size());
+            SS_LOG_DEBUG(L"QuarantineManager",
+                L"QuarantineManager: Content encrypted (%zu bytes -> %zu bytes, aad=%zu)",
+                data.size(), encrypted.size(), aad.size());
 
             return encrypted;
 
@@ -763,6 +787,7 @@ public:
 
     [[nodiscard]] std::vector<uint8_t> DecryptContent(
         std::span<const uint8_t> data,
+        std::span<const uint8_t> aad,
         const std::array<uint8_t, QuarantineConstants::GCM_IV_SIZE>& iv
     ) {
         try {
@@ -774,7 +799,10 @@ public:
             size_t ciphertextSize = data.size() - QuarantineConstants::GCM_TAG_SIZE;
             const uint8_t* tagPtr = data.data() + ciphertextSize;
 
-            // Decrypt with AES-256-GCM using SymmetricCipher
+            // Decrypt with AES-256-GCM using SymmetricCipher.
+            // SECURITY: AAD must exactly match what was used at encrypt time
+            // (the on-disk header bytes); any drift in magic/version/flags/
+            // originalSize/IV will fail authentication.
             CryptoUtils::SymmetricCipher cipher(CryptoUtils::SymmetricAlgorithm::AES_256_GCM);
 
             if (!cipher.SetKey(m_masterKey.data(), m_masterKey.size())) {
@@ -789,7 +817,7 @@ public:
 
             if (!cipher.DecryptAEAD(
                     data.data(), ciphertextSize,
-                    nullptr, 0,
+                    aad.data(), aad.size(),
                     tagPtr, QuarantineConstants::GCM_TAG_SIZE,
                     decrypted))
             {
@@ -822,7 +850,8 @@ public:
 
             DWORD dwError = RmStartSession(&dwSession, 0, szSessionKey);
             if (dwError != ERROR_SUCCESS) {
-                SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: RmStartSession failed: %ls", dwError);
+                SS_LOG_WARN(L"QuarantineManager",
+                    L"QuarantineManager: RmStartSession failed: %lu", dwError);
                 return processes;
             }
 
@@ -831,16 +860,44 @@ public:
             dwError = RmRegisterResources(dwSession, 1, &pszFile, 0, nullptr, 0, nullptr);
 
             if (dwError == ERROR_SUCCESS) {
+                // SECURITY: dynamic buffer with retry on ERROR_MORE_DATA so we
+                // never silently truncate the locking-process list (truncation
+                // would let a malicious process keep its handle open and evade
+                // termination). Cap iterations to prevent unbounded growth.
+                std::vector<RM_PROCESS_INFO> rgpi;
                 UINT nProcInfoNeeded = 0;
-                UINT nProcInfo = 10;
+                UINT nProcInfo = 0;
                 DWORD dwReason = 0;
-                RM_PROCESS_INFO rgpi[10];
 
-                dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo,
-                                   rgpi, &dwReason);
+                constexpr UINT kInitialSlots = 16;
+                constexpr UINT kMaxSlots     = 4096;
+                rgpi.resize(kInitialSlots);
+                nProcInfo = static_cast<UINT>(rgpi.size());
+
+                for (int attempt = 0; attempt < 4; ++attempt) {
+                    nProcInfoNeeded = 0;
+                    nProcInfo = static_cast<UINT>(rgpi.size());
+                    dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo,
+                                        rgpi.data(), &dwReason);
+
+                    if (dwError != ERROR_MORE_DATA) {
+                        break;
+                    }
+
+                    UINT grow = std::max<UINT>(nProcInfoNeeded, nProcInfo * 2);
+                    if (grow > kMaxSlots) {
+                        SS_LOG_WARN(L"QuarantineManager",
+                            L"QuarantineManager: RmGetList capping at %u slots (needed=%u)",
+                            kMaxSlots, nProcInfoNeeded);
+                        grow = kMaxSlots;
+                    }
+                    rgpi.resize(grow);
+                }
 
                 if (dwError == ERROR_SUCCESS || dwError == ERROR_MORE_DATA) {
-                    for (UINT i = 0; i < nProcInfo; i++) {
+                    UINT count = std::min<UINT>(nProcInfo, static_cast<UINT>(rgpi.size()));
+                    processes.reserve(count);
+                    for (UINT i = 0; i < count; i++) {
                         LockingProcess proc{};
                         proc.processId = rgpi[i].Process.dwProcessId;
                         proc.processName = rgpi[i].strAppName;
@@ -849,10 +906,15 @@ public:
                                                 !CanTerminateProcess(proc.processId));
                         proc.canTerminate = CanTerminateProcess(proc.processId);
 
-                        processes.push_back(proc);
+                        processes.push_back(std::move(proc));
                     }
 
-                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Found %zu locking processes", processes.size());
+                    SS_LOG_INFO(L"QuarantineManager",
+                        L"QuarantineManager: Found %zu locking processes",
+                        processes.size());
+                } else {
+                    SS_LOG_WARN(L"QuarantineManager",
+                        L"QuarantineManager: RmGetList failed: %lu", dwError);
                 }
             }
 
@@ -876,12 +938,23 @@ public:
 
             for (auto& proc : processes) {
                 if (!proc.canTerminate) {
-                    SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Cannot terminate system process: %ls (PID %u)", proc.processName.c_str(), proc.processId);
+                    SS_LOG_WARN(L"QuarantineManager",
+                        L"QuarantineManager: Cannot terminate system process: %ls (PID %u)",
+                        proc.processName.c_str(), proc.processId);
                     continue;
                 }
 
-                if (!m_config.autoTerminateProcesses) {
-                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Auto-terminate disabled, skipping PID %ls",
+                // SECURITY: read auto-terminate flag under config lock; the
+                // caller of this method already holds m_operationMutex but
+                // SetConfig may run on another thread.
+                bool autoTerminate = false;
+                {
+                    std::shared_lock cfgLock(m_configMutex);
+                    autoTerminate = m_config.autoTerminateProcesses;
+                }
+                if (!autoTerminate) {
+                    SS_LOG_INFO(L"QuarantineManager",
+                        L"QuarantineManager: Auto-terminate disabled, skipping PID %u",
                         proc.processId);
                     continue;
                 }
@@ -1022,17 +1095,44 @@ public:
         }
     }
 
-    [[nodiscard]] std::wstring GenerateQuarantinePath(const std::wstring& originalPath) {
+    [[nodiscard]] std::wstring GenerateQuarantinePath(const std::wstring& /*originalPath*/) {
         try {
-            // Generate unique filename based on hash + timestamp
-            auto timestamp = system_clock::now().time_since_epoch().count();
-            auto filename = std::format(L"Q{:016X}.ssqf", timestamp);
+            // Generate unique filename: high-resolution timestamp + per-process
+            // monotonic counter + 64-bit cryptographically random suffix.
+            // SECURITY: timestamp alone collides under concurrent quarantine on
+            // coarse clocks; we add a CSPRNG suffix to make accidental and
+            // adversarial collisions infeasible.
+            static std::atomic<uint64_t> s_counter{0};
+            const uint64_t timestamp = static_cast<uint64_t>(
+                system_clock::now().time_since_epoch().count());
+            const uint64_t counter = s_counter.fetch_add(1, std::memory_order_relaxed);
+
+            uint64_t random = 0;
+            CryptoUtils::SecureRandom rng;
+            if (!rng.Generate(reinterpret_cast<uint8_t*>(&random), sizeof(random))) {
+                // Hard-fail if entropy is unavailable rather than silently
+                // emitting a predictable filename.
+                throw std::runtime_error("SecureRandom failed for quarantine path");
+            }
+
+            auto filename = std::format(L"Q{:016X}{:016X}{:016X}.ssqf",
+                timestamp, counter, random);
 
             return (fs::path(m_config.vaultPath) / filename).wstring();
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GenerateQuarantinePath failed: %S", e.what());
-            return (fs::path(m_config.vaultPath) / L"unknown.ssqf").wstring();
+            SS_LOG_ERROR(L"QuarantineManager",
+                L"QuarantineManager: GenerateQuarantinePath failed: %S", e.what());
+            // Fall through to a deterministic but unique-per-call path so we
+            // never overwrite an existing quarantine file.
+            const uint64_t fallback =
+                static_cast<uint64_t>(system_clock::now().time_since_epoch().count());
+            try {
+                auto filename = std::format(L"Qfallback{:016X}.ssqf", fallback);
+                return (fs::path(m_config.vaultPath) / filename).wstring();
+            } catch (...) {
+                return (fs::path(m_config.vaultPath) / L"unknown.ssqf").wstring();
+            }
         }
     }
 };
@@ -1206,9 +1306,10 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         auto& flm = ShadowStrike::Core::FileSystem::FileLockManager::Instance();
         auto lockInfo = flm.GetLockInfo(request.filePath);
         if (lockInfo.threatAssessment.requiresImmediateAction) {
-            SS_LOG_WARN(L"QuarantineManager", L"FileLockManager: HIGH threat score %.1f on %s (pattern=%u)",
-                lockInfo.threatAssessment.overallThreatScore, request.filePath.c_str(),
-                static_cast<unsigned>(lockInfo.threatAssessment.dominantPattern));
+        SS_LOG_WARN(L"QuarantineManager",
+            L"FileLockManager: HIGH threat score %.1f on %ls (pattern=%u)",
+            lockInfo.threatAssessment.overallThreatScore, request.filePath.c_str(),
+            static_cast<unsigned>(lockInfo.threatAssessment.dominantPattern));
         }
 
         // Merge FileLockManager handle-level owners not found by RM
@@ -1218,10 +1319,17 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                 if (lp.processId == flmOwner.pid) { found = true; break; }
             }
             if (!found && flmOwner.pid != 0) {
-                LockingProcess lp;
+                LockingProcess lp{};
                 lp.processId = flmOwner.pid;
                 lp.processName = flmOwner.processName;
                 lp.processPath = flmOwner.processPath;
+                // Compute terminability + system-process classification the
+                // same way RM-derived entries do; otherwise default values
+                // would let us either spare a hostile process or attempt to
+                // kill csrss/lsass.
+                lp.isSystemProcess = (lp.processId == 0 || lp.processId == 4 ||
+                                      !CanTerminateProcess(lp.processId));
+                lp.canTerminate = CanTerminateProcess(lp.processId);
                 lockingProcesses.push_back(std::move(lp));
             }
         }
@@ -1269,8 +1377,11 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         if (m_impl->m_config.maxVaultSize > 0) {
             uint64_t currentSize = m_impl->m_stats.currentVaultSize.load(std::memory_order_relaxed);
             if (currentSize + fileSize > m_impl->m_config.maxVaultSize) {
-                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Vault size limit exceeded ({} + {} > %ls)",
-                    currentSize, fileSize, m_impl->m_config.maxVaultSize);
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Vault size limit exceeded (%llu + %llu > %llu)",
+                    static_cast<unsigned long long>(currentSize),
+                    static_cast<unsigned long long>(fileSize),
+                    static_cast<unsigned long long>(m_impl->m_config.maxVaultSize));
                 result.status = QuarantineStatus::StorageFull;
                 result.message = L"Vault size limit exceeded";
                 return result;
@@ -1292,12 +1403,14 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
             }
 
             file.seekg(0, std::ios::end);
-            auto reportedSize = file.tellg();
+            const std::streamoff endPos = static_cast<std::streamoff>(file.tellg());
             file.seekg(0, std::ios::beg);
 
-            // Validate actual stream size against configured limit
-            if (reportedSize < 0 ||
-                static_cast<uint64_t>(reportedSize) > m_impl->m_config.maxFileSize)
+            // SECURITY: tellg() returns -1 on error; an unguarded cast to
+            // unsigned would yield SIZE_MAX and crash on the subsequent
+            // resize(). Reject any negative or out-of-range size.
+            if (endPos < 0 ||
+                static_cast<uint64_t>(endPos) > m_impl->m_config.maxFileSize)
             {
                 SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: File size validation failed on read");
                 result.status = QuarantineStatus::FileTooLarge;
@@ -1305,43 +1418,86 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                 return result;
             }
 
-            size_t size = static_cast<size_t>(reportedSize);
+            size_t size = static_cast<size_t>(endPos);
             fileContent.resize(size);
-            file.read(reinterpret_cast<char*>(fileContent.data()), size);
+            if (size > 0) {
+                file.read(reinterpret_cast<char*>(fileContent.data()), size);
+                if (static_cast<size_t>(file.gcount()) != size) {
+                    SS_LOG_ERROR(L"QuarantineManager",
+                        L"QuarantineManager: Short read (%zu of %zu bytes)",
+                        static_cast<size_t>(file.gcount()), size);
+                    result.status = QuarantineStatus::AccessDenied;
+                    result.message = L"Short read from source file";
+                    return result;
+                }
+            }
 
         } catch (const std::exception& e) {
             // SECURITY: Clear any potentially sensitive data that was read
             CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
-            
-            SS_LOG_ERROR(L"QuarantineManager", L"File read failed: %ls", 
-                StringUtils::ToWide(e.what()).c_str());
+
+            SS_LOG_ERROR(L"QuarantineManager", L"File read failed: %S", e.what());
             result.status = QuarantineStatus::AccessDenied;
             result.message = L"Failed to read file";
             return result;
         }
 
         // ====================================================================
-        // STAGE 5: ENCRYPTION
+        // STAGE 5: HEADER BUILD + ENCRYPTION
         // ====================================================================
+        // SECURITY: capture the plaintext size BEFORE any wipe — historical
+        // bug recorded `entry.originalSize = fileContent.size()` after the
+        // SecureWipeMemory + clear() call below, leaving every entry with
+        // originalSize == 0 (silent metadata loss + broken integrity audits).
+        const uint64_t originalPlainSize = static_cast<uint64_t>(fileContent.size());
 
-        std::vector<uint8_t> encryptedContent = fileContent; // Copy for non-encrypted mode
         std::array<uint8_t, QuarantineConstants::GCM_IV_SIZE> iv{};
         QuarantineFlags contentFlags = QuarantineFlags::None;
 
         if (m_impl->m_config.encryptFiles) {
-            try {
-                encryptedContent = m_impl->EncryptContent(fileContent, iv);
-                contentFlags = contentFlags | QuarantineFlags::Encrypted;
-            } catch (const std::exception& e) {
-                // SECURITY: Clear sensitive plaintext data before returning
+            // Generate a fresh, cryptographically random IV before building
+            // the header so the IV can be bound as AAD.
+            CryptoUtils::SecureRandom rng;
+            if (!rng.Generate(iv.data(), iv.size())) {
                 CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
-                
-                SS_LOG_ERROR(L"QuarantineManager", L"Encryption failed: %ls", 
-                    StringUtils::ToWide(e.what()).c_str());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: SecureRandom failed for IV");
+                result.status = QuarantineStatus::EncryptionFailed;
+                result.message = L"Cryptographic IV generation failed";
+                return result;
+            }
+            contentFlags = contentFlags | QuarantineFlags::Encrypted;
+        }
+
+        // Build packed on-disk header. This exact byte sequence is bound as
+        // AEAD AAD on encrypt, and re-bound on decrypt; any tamper of any
+        // field — including IV swap, originalSize lie, or version downgrade —
+        // will fail authentication.
+        QuarantineFileHeader header{};
+        header.magic        = QuarantineConstants::QUARANTINE_MAGIC;
+        header.version      = QuarantineConstants::QUARANTINE_VERSION;
+        header.flags        = static_cast<uint16_t>(contentFlags);
+        header.originalSize = originalPlainSize;
+        std::memcpy(header.iv, iv.data(), iv.size());
+        const std::span<const uint8_t> headerAad{
+            reinterpret_cast<const uint8_t*>(&header), sizeof(header)};
+
+        std::vector<uint8_t> encryptedContent;
+        if (m_impl->m_config.encryptFiles) {
+            try {
+                encryptedContent = m_impl->EncryptContent(fileContent, headerAad, iv);
+            } catch (const std::exception& e) {
+                CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
+                SS_LOG_ERROR(L"QuarantineManager", L"Encryption failed: %S", e.what());
                 result.status = QuarantineStatus::EncryptionFailed;
                 result.message = L"Encryption failed";
                 return result;
             }
+        } else {
+            // No copy in the non-encrypted path: move plaintext into the
+            // ciphertext buffer; the explicit wipe loop below operates on the
+            // moved-from vector's freshly resized backing store, so we wipe
+            // the encryptedContent buffer instead just before clearing it.
+            encryptedContent = std::move(fileContent);
         }
 
         // ====================================================================
@@ -1350,6 +1506,10 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
 
         auto quarantinePath = m_impl->GenerateQuarantinePath(request.filePath);
         result.quarantinePath = quarantinePath;
+
+        // Track on-disk size for statistics. Captured inside the write block
+        // before buffers are wiped/cleared.
+        uint64_t quarantineDiskSize = 0;
 
         try {
             std::ofstream outFile(quarantinePath, std::ios::binary);
@@ -1360,29 +1520,44 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                 return result;
             }
 
-            // Write file format header
-            uint32_t magic = QuarantineConstants::QUARANTINE_MAGIC;
-            uint16_t version = QuarantineConstants::QUARANTINE_VERSION;
-            uint16_t flags = static_cast<uint16_t>(contentFlags);
-            uint64_t originalSize = fileContent.size();
-
-            outFile.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-            outFile.write(reinterpret_cast<const char*>(&version), sizeof(version));
-            outFile.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
-            outFile.write(reinterpret_cast<const char*>(&originalSize), sizeof(originalSize));
-
-            // Write IV
-            outFile.write(reinterpret_cast<const char*>(iv.data()), iv.size());
-
-            // Write encrypted content
+            // Write packed header (bound earlier as AAD) followed by the
+            // ciphertext (with appended GCM tag, when encryption is enabled).
+            outFile.write(reinterpret_cast<const char*>(&header), sizeof(header));
             outFile.write(reinterpret_cast<const char*>(encryptedContent.data()),
                          encryptedContent.size());
 
             outFile.close();
+            if (!outFile) {
+                std::error_code rmEc;
+                fs::remove(quarantinePath, rmEc);
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Failed to flush quarantine file (%ls)",
+                    quarantinePath.c_str());
+                result.status = QuarantineStatus::StorageFull;
+                result.message = L"Failed to flush quarantine file";
+                return result;
+            }
 
-            // Securely wipe plaintext from memory after successful vault write
-            CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
-            fileContent.clear();
+            // Securely wipe plaintext from memory after successful vault write.
+            // Record the on-disk byte count BEFORE clearing the buffer so the
+            // vault-size statistic reflects what was actually written (header
+            // + ciphertext + GCM tag), and so that DeleteFile can later
+            // reclaim the right amount via filesystem::file_size().
+            quarantineDiskSize = static_cast<uint64_t>(sizeof(header)) +
+                                 static_cast<uint64_t>(encryptedContent.size());
+
+            // In the non-encrypted path we moved fileContent → encryptedContent;
+            // wipe the surviving buffer that still holds the plaintext.
+            if (!m_impl->m_config.encryptFiles) {
+                CryptoUtils::SecureWipeMemory(encryptedContent.data(),
+                                              encryptedContent.size());
+                encryptedContent.clear();
+                encryptedContent.shrink_to_fit();
+            } else {
+                CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
+                fileContent.clear();
+                fileContent.shrink_to_fit();
+            }
 
             SS_LOG_INFO(L"QuarantineManager", L"File written to vault: %ls",
                 quarantinePath.c_str());
@@ -1390,9 +1565,9 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         } catch (const std::exception& e) {
             // SECURITY: Clear sensitive data on vault write failure
             CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
-            
-            SS_LOG_ERROR(L"QuarantineManager", L"Vault write failed: %ls", 
-                StringUtils::ToWide(e.what()).c_str());
+            CryptoUtils::SecureWipeMemory(encryptedContent.data(), encryptedContent.size());
+
+            SS_LOG_ERROR(L"QuarantineManager", L"Vault write failed: %S", e.what());
             result.status = QuarantineStatus::StorageFull;
             result.message = L"Failed to write quarantine file";
             return result;
@@ -1408,8 +1583,9 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                 if (!FileUtils::SecureEraseFile(request.filePath,
                         FileUtils::SecureEraseMode::TriplePass, &fErr))
                 {
-                    SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Secure erase failed (%ls), falling back to standard delete",
-                        fErr.message);
+                    SS_LOG_WARN(L"QuarantineManager",
+                        L"QuarantineManager: Secure erase failed (%S), falling back to standard delete",
+                        fErr.message.c_str());
                     fs::remove(request.filePath, ec);
                     if (ec) {
                         SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Fallback delete also failed: %S", ec.message().c_str());
@@ -1445,7 +1621,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         entry.flags = contentFlags;
         entry.originalPath = request.filePath;
         entry.fileName = metadata.fileName;
-        entry.originalSize = fileContent.size();
+        entry.originalSize = originalPlainSize;
         entry.metadata = metadata;
         entry.hashes = hashes;
         entry.threatName = request.threatName;
@@ -1489,7 +1665,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         m_impl->m_stats.totalQuarantined.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_stats.activeEntries.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_stats.currentVaultSize.fetch_add(
-            encryptedContent.size(), std::memory_order_relaxed
+            quarantineDiskSize, std::memory_order_relaxed
         );
 
         // ====================================================================
@@ -1583,7 +1759,9 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
         // Serialize restore operations against concurrent quarantine/delete
         std::lock_guard opLock(m_impl->m_operationMutex);
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Restore request for entry ID: %ls", request.entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Restore request for entry ID: %llu",
+            static_cast<unsigned long long>(request.entryId));
 
         result.entryId = request.entryId;
 
@@ -1596,8 +1774,6 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
                 return result;
             }
         }
-
-        result.entryId = request.entryId;
 
         // ====================================================================
         // STAGE 1: ENTRY LOOKUP
@@ -1636,44 +1812,124 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
                 return result;
             }
 
-            // Read header
-            uint32_t magic = 0;
-            uint16_t version = 0;
-            uint16_t flags = 0;
-            uint64_t originalSize = 0;
+            // Read packed on-disk header in one shot (matches the layout
+            // written by QuarantineFile()'s STAGE 5/6).
+            QuarantineFileHeader header{};
             std::array<uint8_t, QuarantineConstants::GCM_IV_SIZE> iv{};
 
-            inFile.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-            inFile.read(reinterpret_cast<char*>(&version), sizeof(version));
-            inFile.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-            inFile.read(reinterpret_cast<char*>(&originalSize), sizeof(originalSize));
-            inFile.read(reinterpret_cast<char*>(iv.data()), iv.size());
+            inFile.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (!inFile || static_cast<size_t>(inFile.gcount()) != sizeof(header)) {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Quarantine file truncated (header)");
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Truncated quarantine header";
+                return result;
+            }
 
-            // Verify magic number
-            if (magic != QuarantineConstants::QUARANTINE_MAGIC) {
+            // Verify magic / version / flags / size constraints. SECURITY:
+            // any mismatch here indicates a corrupt or hostile file; refuse
+            // to decrypt rather than feed untrusted bytes to AES-GCM.
+            if (header.magic != QuarantineConstants::QUARANTINE_MAGIC) {
                 SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Invalid quarantine file format");
                 result.status = QuarantineStatus::IntegrityFailed;
                 result.message = L"Invalid file format";
                 return result;
             }
+            if (header.version != QuarantineConstants::QUARANTINE_VERSION) {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Unsupported quarantine version: %u",
+                    static_cast<unsigned>(header.version));
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Unsupported quarantine version";
+                return result;
+            }
+            const uint16_t kAllowedFlags =
+                static_cast<uint16_t>(QuarantineFlags::Encrypted);
+            if ((header.flags & ~kAllowedFlags) != 0) {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Unknown quarantine flags: 0x%04X",
+                    static_cast<unsigned>(header.flags));
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Unknown quarantine flags";
+                return result;
+            }
+            if (header.originalSize > m_impl->m_config.maxFileSize) {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Header originalSize exceeds limit (%llu > %llu)",
+                    static_cast<unsigned long long>(header.originalSize),
+                    static_cast<unsigned long long>(m_impl->m_config.maxFileSize));
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Header size exceeds limit";
+                return result;
+            }
+            std::memcpy(iv.data(), header.iv, iv.size());
 
-            // Read encrypted content
-            std::vector<uint8_t> encryptedContent;
+            // Determine ciphertext length from total file size minus header.
+            // SECURITY: tellg() may return -1 (cast-to-unsigned underflow);
+            // also cap encryptedSize against maxFileSize + GCM tag to prevent
+            // a malicious header from forcing a multi-GiB resize() (DoS).
             inFile.seekg(0, std::ios::end);
-            size_t totalSize = inFile.tellg();
-            size_t headerSize = sizeof(magic) + sizeof(version) + sizeof(flags) +
-                               sizeof(originalSize) + iv.size();
-            size_t encryptedSize = totalSize - headerSize;
+            const std::streamoff endPos = static_cast<std::streamoff>(inFile.tellg());
+            constexpr std::streamoff kHeaderBytes =
+                static_cast<std::streamoff>(sizeof(QuarantineFileHeader));
+            if (endPos < kHeaderBytes) {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Quarantine file shorter than header");
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Truncated quarantine file";
+                return result;
+            }
+            const uint64_t encryptedSize64 =
+                static_cast<uint64_t>(endPos - kHeaderBytes);
+            const uint64_t kMaxEncrypted =
+                m_impl->m_config.maxFileSize +
+                static_cast<uint64_t>(QuarantineConstants::GCM_TAG_SIZE);
+            if (encryptedSize64 > kMaxEncrypted ||
+                encryptedSize64 > std::numeric_limits<size_t>::max())
+            {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Encrypted payload exceeds limit (%llu > %llu)",
+                    static_cast<unsigned long long>(encryptedSize64),
+                    static_cast<unsigned long long>(kMaxEncrypted));
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Encrypted payload exceeds limit";
+                return result;
+            }
+            const size_t encryptedSize = static_cast<size_t>(encryptedSize64);
 
-            inFile.seekg(headerSize, std::ios::beg);
+            std::vector<uint8_t> encryptedContent;
             encryptedContent.resize(encryptedSize);
-            inFile.read(reinterpret_cast<char*>(encryptedContent.data()), encryptedSize);
+            inFile.seekg(kHeaderBytes, std::ios::beg);
+            if (encryptedSize > 0) {
+                inFile.read(reinterpret_cast<char*>(encryptedContent.data()), encryptedSize);
+                if (static_cast<size_t>(inFile.gcount()) != encryptedSize) {
+                    SS_LOG_ERROR(L"QuarantineManager",
+                        L"QuarantineManager: Short read on encrypted payload");
+                    result.status = QuarantineStatus::IntegrityFailed;
+                    result.message = L"Short read on encrypted payload";
+                    return result;
+                }
+            }
 
-            // Decrypt
-            if (m_impl->m_config.encryptFiles) {
-                fileContent = m_impl->DecryptContent(encryptedContent, iv);
+            // Decrypt. Bind the exact same header bytes as AAD that were
+            // bound at quarantine time; any tamper is rejected here.
+            const std::span<const uint8_t> headerAad{
+                reinterpret_cast<const uint8_t*>(&header), sizeof(header)};
+            if ((header.flags & static_cast<uint16_t>(QuarantineFlags::Encrypted)) != 0) {
+                fileContent = m_impl->DecryptContent(encryptedContent, headerAad, iv);
             } else {
-                fileContent = encryptedContent;
+                fileContent = std::move(encryptedContent);
+            }
+
+            // Sanity: decrypted size must match the AAD-bound originalSize.
+            if (fileContent.size() != header.originalSize) {
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"QuarantineManager: Decrypted size %zu does not match header %llu",
+                    fileContent.size(),
+                    static_cast<unsigned long long>(header.originalSize));
+                result.status = QuarantineStatus::IntegrityFailed;
+                result.message = L"Decrypted size mismatch";
+                return result;
             }
 
             SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: File decrypted, size: %zu", fileContent.size());
@@ -1704,8 +1960,9 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
 
             if (restoredHash != entry.hashes.sha256) {
                 SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Integrity check failed");
-                SS_LOG_ERROR(L"QuarantineManager", L"Expected: {}, Got: %ls",
-                    entry.hashes.sha256, restoredHash);
+                SS_LOG_ERROR(L"QuarantineManager",
+                    L"Expected: %S, Got: %S",
+                    entry.hashes.sha256.c_str(), restoredHash.c_str());
                 result.status = QuarantineStatus::IntegrityFailed;
                 result.message = L"Hash mismatch - file corrupted";
                 return result;
@@ -1786,7 +2043,9 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
         result.status = QuarantineStatus::Success;
         result.message = L"File restored successfully";
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Restore complete - Entry ID: %ls", entry.entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Restore complete - Entry ID: %llu",
+            static_cast<unsigned long long>(entry.entryId));
 
         // Invoke callbacks
         m_impl->InvokeRestoreCallbacks(result);
@@ -1858,9 +2117,20 @@ bool QuarantineManager::DeleteFile(uint64_t entryId, bool secureWipe) {
         auto entry = *entryOpt;
         bool wasActive = (entry.state == QuarantineState::Active);
 
+        // Capture on-disk size BEFORE removal so we can subtract it from
+        // currentVaultSize. Without this, repeated quarantine/delete cycles
+        // would let the gauge grow without bound and falsely trip the
+        // maxVaultSize ceiling. file_size() is only valid before removal.
+        uint64_t reclaimedSize = 0;
+
         // Delete quarantine file
         std::error_code ec;
         if (fs::exists(entry.quarantinePath, ec)) {
+            std::error_code sizeEc;
+            const auto sizeOnDisk = fs::file_size(entry.quarantinePath, sizeEc);
+            if (!sizeEc) {
+                reclaimedSize = static_cast<uint64_t>(sizeOnDisk);
+            }
             if (secureWipe) {
                 FileUtils::Error fErr{};
                 if (!FileUtils::SecureEraseFile(entry.quarantinePath,
@@ -1898,8 +2168,22 @@ bool QuarantineManager::DeleteFile(uint64_t entryId, bool secureWipe) {
         if (wasActive) {
             m_impl->m_stats.activeEntries.fetch_sub(1, std::memory_order_relaxed);
         }
+        if (reclaimedSize > 0) {
+            // Saturating subtract: never underflow the unsigned counter.
+            uint64_t prev = m_impl->m_stats.currentVaultSize.load(std::memory_order_relaxed);
+            while (true) {
+                uint64_t next = (prev > reclaimedSize) ? (prev - reclaimedSize) : 0;
+                if (m_impl->m_stats.currentVaultSize.compare_exchange_weak(
+                        prev, next, std::memory_order_relaxed))
+                {
+                    break;
+                }
+            }
+        }
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Entry deleted: %ls", entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Entry deleted: %llu",
+            static_cast<unsigned long long>(entryId));
         return true;
 
     } catch (const std::exception& e) {
@@ -1937,7 +2221,8 @@ size_t QuarantineManager::DeleteExpiredEntries() {
         }
 
         m_impl->m_stats.expiredDeleted.fetch_add(deleted, std::memory_order_relaxed);
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Deleted %ls expired entries", deleted);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Deleted %zu expired entries", deleted);
 
         return deleted;
 
@@ -1960,7 +2245,7 @@ size_t QuarantineManager::DeleteAllEntries() {
             }
         }
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Deleted %ls entries", deleted);
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Deleted %zu entries", deleted);
         return deleted;
 
     } catch (const std::exception& e) {
@@ -2088,7 +2373,12 @@ size_t QuarantineManager::GetEntryCount(std::optional<QuarantineState> state) co
 }
 
 bool QuarantineManager::IsQuarantined(const std::string& hash) const {
-    return GetEntryByHash(hash).has_value();
+    // SECURITY: must filter by Active state — historical bug returned true
+    // for already-restored or already-deleted entries, which prevented us
+    // from re-quarantining a recurring threat (the same hash had a stale
+    // Restored row in the database).
+    auto entry = GetEntryByHash(hash);
+    return entry.has_value() && entry->state == QuarantineState::Active;
 }
 
 // ============================================================================
@@ -2124,12 +2414,16 @@ std::vector<RemediationAction> QuarantineManager::RemediateArtifacts(uint64_t en
     try {
         auto entryOpt = GetEntry(entryId);
         if (!entryOpt) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Entry not found for remediation: %ls", entryId);
+            SS_LOG_ERROR(L"QuarantineManager",
+            L"QuarantineManager: Entry not found for remediation: %llu",
+            static_cast<unsigned long long>(entryId));
             return actions;
         }
 
         auto& entry = *entryOpt;
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Remediating artifacts for entry %ls", entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Remediating artifacts for entry %llu",
+            static_cast<unsigned long long>(entryId));
 
         // Remediate related registry keys if configured
         if (m_impl->m_config.cleanRegistry) {
@@ -2157,13 +2451,52 @@ std::vector<RemediationAction> QuarantineManager::RemediateArtifacts(uint64_t en
                             RegistryUtils::RegistryKey key;
                             RegistryUtils::Error regErr{};
                             RegistryUtils::OpenOptions opts{};
-                            opts.access = KEY_SET_VALUE;
+                            opts.access = KEY_QUERY_VALUE | KEY_SET_VALUE;
                             if (key.Open(HKEY_LOCAL_MACHINE, regKey.target,
                                          opts, &regErr))
                             {
+                                // SECURITY: capture the original value's type
+                                // and bytes BEFORE deletion so RollbackRemediation
+                                // can faithfully restore it. Without this the
+                                // rollback path is a no-op and any false-positive
+                                // remediation is permanent.
+                                HKEY rawKey = key.Handle();
+                                DWORD valType = 0;
+                                DWORD valSize = 0;
+                                LSTATUS qstat = RegQueryValueExW(
+                                    rawKey, regKey.additionalTarget.c_str(),
+                                    nullptr, &valType, nullptr, &valSize);
+                                // Hard cap to defeat hostile or pathological
+                                // values that would force a huge allocation.
+                                // Run-key strings are tiny; legitimate REG_BINARY
+                                // values rarely exceed a few KiB. 1 MiB is
+                                // generous and defensible.
+                                constexpr DWORD kMaxRegValueBytes = 1u << 20;
+                                if (qstat == ERROR_SUCCESS &&
+                                    valSize <= kMaxRegValueBytes)
+                                {
+                                    action.originalValue.resize(
+                                        sizeof(uint32_t) + static_cast<size_t>(valSize));
+                                    const uint32_t typeLE = static_cast<uint32_t>(valType);
+                                    std::memcpy(action.originalValue.data(), &typeLE,
+                                                sizeof(typeLE));
+                                    DWORD readSize = valSize;
+                                    qstat = RegQueryValueExW(
+                                        rawKey, regKey.additionalTarget.c_str(),
+                                        nullptr, &valType,
+                                        action.originalValue.data() + sizeof(uint32_t),
+                                        &readSize);
+                                    if (qstat != ERROR_SUCCESS) {
+                                        // Capture failed — discard partial bytes
+                                        // rather than risk a malformed rollback.
+                                        action.originalValue.clear();
+                                    }
+                                }
+
                                 action.success = key.DeleteValue(regKey.additionalTarget, &regErr);
                                 if (!action.success) {
                                     action.errorMessage = regErr.message;
+                                    action.originalValue.clear();
                                 }
                             } else {
                                 action.success = false;
@@ -2203,14 +2536,18 @@ bool QuarantineManager::RollbackRemediation(uint64_t entryId) {
     try {
         auto entryOpt = GetEntry(entryId);
         if (!entryOpt) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Entry not found for rollback: %ls", entryId);
+            SS_LOG_ERROR(L"QuarantineManager",
+            L"QuarantineManager: Entry not found for rollback: %llu",
+            static_cast<unsigned long long>(entryId));
             return false;
         }
 
         auto& entry = *entryOpt;
         bool allSuccess = true;
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Rolling back remediation for entry %ls", entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Rolling back remediation for entry %llu",
+            static_cast<unsigned long long>(entryId));
 
         for (auto it = entry.remediationActions.rbegin();
              it != entry.remediationActions.rend(); ++it)
@@ -2219,9 +2556,51 @@ bool QuarantineManager::RollbackRemediation(uint64_t entryId) {
 
             try {
                 if (it->type == RemediationType::DeleteRegistryValue &&
-                    !it->originalValue.empty())
+                    it->originalValue.size() >= sizeof(uint32_t))
                 {
-                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Rollback registry value: %ls", it->target.c_str());
+                    // Layout written in RemediateArtifacts:
+                    //   [0..3]   uint32_t little-endian REG_* type
+                    //   [4..N-1] raw value bytes
+                    uint32_t typeLE = 0;
+                    std::memcpy(&typeLE, it->originalValue.data(), sizeof(typeLE));
+                    const DWORD valType = static_cast<DWORD>(typeLE);
+                    const uint8_t* dataPtr =
+                        it->originalValue.data() + sizeof(uint32_t);
+                    const DWORD dataSize = static_cast<DWORD>(
+                        it->originalValue.size() - sizeof(uint32_t));
+
+                    RegistryUtils::RegistryKey key;
+                    RegistryUtils::Error regErr{};
+                    RegistryUtils::OpenOptions opts{};
+                    opts.access = KEY_SET_VALUE;
+                    if (key.Open(HKEY_LOCAL_MACHINE, it->target, opts, &regErr)) {
+                        // Direct Win32 set is required to faithfully restore
+                        // the captured REG_* type (RegistryUtils' typed
+                        // writers would lose this fidelity for, e.g.,
+                        // REG_EXPAND_SZ vs REG_SZ).
+                        LSTATUS sstat = RegSetValueExW(
+                            key.Handle(),
+                            it->additionalTarget.c_str(),
+                            0, valType, dataPtr, dataSize);
+                        if (sstat == ERROR_SUCCESS) {
+                            SS_LOG_INFO(L"QuarantineManager",
+                                L"QuarantineManager: Rollback registry value: %ls\\%ls (type=%lu, size=%lu)",
+                                it->target.c_str(), it->additionalTarget.c_str(),
+                                static_cast<unsigned long>(valType),
+                                static_cast<unsigned long>(dataSize));
+                        } else {
+                            SS_LOG_WARN(L"QuarantineManager",
+                                L"QuarantineManager: RegSetValueExW failed (status=%ld) for %ls\\%ls",
+                                static_cast<long>(sstat),
+                                it->target.c_str(), it->additionalTarget.c_str());
+                            allSuccess = false;
+                        }
+                    } else {
+                        SS_LOG_WARN(L"QuarantineManager",
+                            L"QuarantineManager: Cannot reopen registry key for rollback: %ls",
+                            it->target.c_str());
+                        allSuccess = false;
+                    }
                 }
                 // Additional rollback types handled as implemented
             } catch (const std::exception& e) {
@@ -2230,8 +2609,10 @@ bool QuarantineManager::RollbackRemediation(uint64_t entryId) {
             }
         }
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Rollback {} for entry %ls",
-            allSuccess ? "complete" : "partial", entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Rollback %S for entry %llu",
+            allSuccess ? "complete" : "partial",
+            static_cast<unsigned long long>(entryId));
         return allSuccess;
 
     } catch (const std::exception& e) {
@@ -2252,7 +2633,9 @@ bool QuarantineManager::AddRemediationAction(
     try {
         auto entryOpt = GetEntry(entryId);
         if (!entryOpt) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Entry not found: %ls", entryId);
+            SS_LOG_ERROR(L"QuarantineManager",
+                L"QuarantineManager: Entry not found: %llu",
+                static_cast<unsigned long long>(entryId));
             return false;
         }
 
@@ -2265,7 +2648,9 @@ bool QuarantineManager::AddRemediationAction(
         }
 
         m_impl->UpdateCache(entry);
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Added remediation action for entry %ls", entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Added remediation action for entry %llu",
+            static_cast<unsigned long long>(entryId));
         return true;
 
     } catch (const std::exception& e) {
@@ -2296,7 +2681,9 @@ bool QuarantineManager::ExtractForAnalysis(
 
         auto entryOpt = GetEntry(entryId);
         if (!entryOpt) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Entry not found for extraction: %ls", entryId);
+            SS_LOG_ERROR(L"QuarantineManager",
+                L"QuarantineManager: Entry not found for extraction: %llu",
+                static_cast<unsigned long long>(entryId));
             return false;
         }
 
@@ -2343,7 +2730,9 @@ std::string QuarantineManager::SubmitSample(uint64_t entryId) {
 
         auto entryOpt = GetEntry(entryId);
         if (!entryOpt) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Entry not found for submission: %ls", entryId);
+            SS_LOG_ERROR(L"QuarantineManager",
+                L"QuarantineManager: Entry not found for submission: %llu",
+                static_cast<unsigned long long>(entryId));
             return "";
         }
 
@@ -2361,8 +2750,10 @@ std::string QuarantineManager::SubmitSample(uint64_t entryId) {
 
         m_impl->m_stats.samplesSubmitted.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Sample queued for submission: {} (entry %ls)",
-            submissionId, entryId);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Sample queued for submission: %S (entry %llu)",
+            submissionId.c_str(),
+            static_cast<unsigned long long>(entryId));
         return submissionId;
 
     } catch (const std::exception& e) {
@@ -2385,7 +2776,9 @@ std::wstring QuarantineManager::PreserveEvidence(uint64_t entryId) {
 
         auto entryOpt = GetEntry(entryId);
         if (!entryOpt) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Entry not found for evidence: %ls", entryId);
+            SS_LOG_ERROR(L"QuarantineManager",
+                L"QuarantineManager: Entry not found for evidence: %llu",
+                static_cast<unsigned long long>(entryId));
             return L"";
         }
 
@@ -2540,7 +2933,9 @@ size_t QuarantineManager::ImportDatabase(const std::wstring& filePath) {
 
         // Cap count to prevent memory exhaustion
         if (count > QuarantineConstants::MAX_QUARANTINE_ENTRIES) {
-            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Import count %ls exceeds max entries", count);
+            SS_LOG_ERROR(L"QuarantineManager",
+                L"QuarantineManager: Import count %llu exceeds max entries",
+                static_cast<unsigned long long>(count));
             return 0;
         }
 
@@ -2664,6 +3059,23 @@ uint64_t QuarantineManager::CompactVault() {
             return 0;
         }
 
+        // Snapshot tracked paths ONCE (the loop runs over O(n) directory
+        // entries; the previous code re-queried the database for every file
+        // and walked an O(n) vector inside the loop → O(n²) DB load on a
+        // hot maintenance path). Build a hash set keyed by canonical wide
+        // path so the inner check is O(1).
+        std::unordered_set<std::wstring> trackedPaths;
+        {
+            auto entries = GetActiveEntries();
+            trackedPaths.reserve(entries.size());
+            for (const auto& entry : entries) {
+                std::error_code canonEc;
+                auto canon = fs::weakly_canonical(entry.quarantinePath, canonEc);
+                trackedPaths.insert(
+                    (canonEc ? fs::path(entry.quarantinePath) : canon).wstring());
+            }
+        }
+
         // Find orphaned .ssqf files not tracked in the database
         for (const auto& dirEntry : fs::directory_iterator(vaultPath, ec)) {
             if (!dirEntry.is_regular_file()) continue;
@@ -2671,24 +3083,21 @@ uint64_t QuarantineManager::CompactVault() {
             auto ext = dirEntry.path().extension().wstring();
             if (ext != QuarantineConstants::QUARANTINE_EXTENSION) continue;
 
-            // Check if this file is tracked in the DB by scanning active entries
-            bool tracked = false;
-            auto entries = GetActiveEntries();
-            for (const auto& entry : entries) {
-                if (fs::equivalent(entry.quarantinePath, dirEntry.path(), ec)) {
-                    tracked = true;
-                    break;
-                }
-            }
+            std::error_code canonEc;
+            auto canonPath = fs::weakly_canonical(dirEntry.path(), canonEc);
+            const std::wstring key =
+                (canonEc ? dirEntry.path() : canonPath).wstring();
 
-            if (!tracked) {
-                auto fileSize = dirEntry.file_size(ec);
+            if (trackedPaths.find(key) != trackedPaths.end()) continue;
+
+            auto fileSize = dirEntry.file_size(ec);
+            if (!ec) {
+                fs::remove(dirEntry.path(), ec);
                 if (!ec) {
-                    fs::remove(dirEntry.path(), ec);
-                    if (!ec) {
-                        reclaimed += fileSize;
-                        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Removed orphaned file: %ls", dirEntry.path().wstring().c_str());
-                    }
+                    reclaimed += fileSize;
+                    SS_LOG_INFO(L"QuarantineManager",
+                        L"QuarantineManager: Removed orphaned file: %ls",
+                        dirEntry.path().wstring().c_str());
                 }
             }
         }
@@ -2699,7 +3108,9 @@ uint64_t QuarantineManager::CompactVault() {
                 std::memory_order_relaxed);
         }
 
-        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Vault compaction complete - %ls bytes reclaimed", reclaimed);
+        SS_LOG_INFO(L"QuarantineManager",
+            L"QuarantineManager: Vault compaction complete - %llu bytes reclaimed",
+            static_cast<unsigned long long>(reclaimed));
         return reclaimed;
 
     } catch (const std::exception& e) {
@@ -2836,7 +3247,16 @@ void QuarantineManager::ResetStats() {
 // ============================================================================
 
 void QuarantineManager::SetQuarantineDB(Database::QuarantineDB* db) {
+    // SECURITY: this transfers raw-pointer ownership into a unique_ptr.
+    // The caller MUST relinquish ownership of `db`; we will free it on
+    // shutdown. Passing the same pointer twice, or freeing it elsewhere,
+    // is a use-after-free.
     if (!m_impl) return;
+    if (db == nullptr) {
+        SS_LOG_ERROR(L"QuarantineManager",
+            L"QuarantineManager: SetQuarantineDB called with null database");
+        return;
+    }
 
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_database.reset(db);
