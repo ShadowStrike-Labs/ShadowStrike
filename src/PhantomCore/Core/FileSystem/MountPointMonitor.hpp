@@ -233,7 +233,7 @@ struct alignas(128) DriveInfo {
  * @struct MountEventInfo
  * @brief Information about a mount event.
  */
-struct alignas(64) MountEventInfo {
+struct MountEventInfo {
     MountEvent event{ MountEvent::DriveArrival };
     std::wstring path;
     DriveInfo driveInfo;
