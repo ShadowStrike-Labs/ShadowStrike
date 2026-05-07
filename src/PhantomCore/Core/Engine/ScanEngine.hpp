@@ -155,13 +155,14 @@
 #include <functional>
 #include <chrono>
 #include <set>
+#include <algorithm>
 
 namespace ShadowStrike {
 namespace Core {
 namespace Engine {
 
 // Forward declarations
-class ScanJob;
+struct ScanJob;
 struct ScanReport;
 struct BatchScanResult;
 struct DirectoryScanResult;
