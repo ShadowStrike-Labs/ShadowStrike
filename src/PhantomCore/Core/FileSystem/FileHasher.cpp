@@ -40,6 +40,7 @@
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
+#include "../../Utils/Base64Utils.hpp"
 
 // FuzzyHasher: CTPH engine for fuzzy hash computation and comparison
 #include "../../FuzzyHasher/FuzzyHasher.hpp"
@@ -105,43 +106,83 @@ namespace fs = std::filesystem;
     }
 }
 
+// Reject reparse points / symbolic links to defeat TOCTOU redirection attacks
+// on monitored paths (CWE-59). Returns true if the entry is a regular file
+// that we are willing to read.
+[[nodiscard]] static bool IsSafeRegularFile(const std::wstring& filePath) noexcept {
+#ifdef _WIN32
+    const DWORD attrs = ::GetFileAttributesW(filePath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) return false;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return false;
+    if (attrs & FILE_ATTRIBUTE_DEVICE) return false;
+    return true;
+#else
+    std::error_code ec;
+    return fs::is_regular_file(filePath, ec) && !ec;
+#endif
+}
+
 [[nodiscard]] bool IsPEFile(const std::wstring& filePath) noexcept {
     try {
+        if (!IsSafeRegularFile(filePath)) return false;
+
+        // Open with FILE_FLAG_OPEN_REPARSE_POINT to refuse symlink redirection,
+        // and with broad share modes so we don't disturb other readers.
+#ifdef _WIN32
+        HANDLE raw = ::CreateFileW(
+            filePath.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr);
+        if (raw == INVALID_HANDLE_VALUE) return false;
+        struct HCloser { HANDLE h; ~HCloser() noexcept { if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h); } } closer{ raw };
+
+        // Reject reparse points after the open (defense-in-depth)
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!::GetFileInformationByHandle(raw, &info)) return false;
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) return false;
+
+        uint8_t header[64] = {};
+        DWORD read = 0;
+        if (!::ReadFile(raw, header, sizeof(header), &read, nullptr) || read < 64) {
+            return false;
+        }
+
+        if (header[0] != 'M' || header[1] != 'Z') return false;
+
+        // PE offset stored at 0x3C (validated to lie in a sane range)
+        uint32_t peOffset = 0;
+        std::memcpy(&peOffset, header + 0x3C, sizeof(peOffset));
+        if (peOffset < 0x40 || peOffset > 4096) return false;
+
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(peOffset);
+        if (!::SetFilePointerEx(raw, pos, nullptr, FILE_BEGIN)) return false;
+
+        uint8_t peSig[4] = {};
+        DWORD readSig = 0;
+        if (!::ReadFile(raw, peSig, sizeof(peSig), &readSig, nullptr) || readSig != 4) {
+            return false;
+        }
+
+        return (peSig[0] == 'P' && peSig[1] == 'E' && peSig[2] == 0 && peSig[3] == 0);
+#else
         std::ifstream file(filePath, std::ios::binary);
         if (!file) return false;
-
-        // Check DOS signature (MZ)
-        char dosSignature[2];
-        file.read(dosSignature, 2);
-        if (!file || dosSignature[0] != 'M' || dosSignature[1] != 'Z') {
-            return false;
-        }
-
-        // Read PE offset from DOS header at offset 0x3C
+        char dos[2]; file.read(dos, 2);
+        if (!file || dos[0] != 'M' || dos[1] != 'Z') return false;
         file.seekg(0x3C, std::ios::beg);
-        if (!file) return false;
-
         uint32_t peOffset = 0;
         file.read(reinterpret_cast<char*>(&peOffset), 4);
-        if (!file) return false;
-
-        // Validate PE offset: must be >= 0x40 (after DOS header) and < 4KB
-        // to prevent seeking to attacker-controlled offsets in malformed files
-        if (peOffset < 0x40 || peOffset > 4096) {
-            return false;
-        }
-
-        // Check PE signature
+        if (!file || peOffset < 0x40 || peOffset > 4096) return false;
         file.seekg(peOffset, std::ios::beg);
-        if (!file) return false;
-
-        char peSignature[4];
-        file.read(peSignature, 4);
-        if (!file) return false;
-
-        return (peSignature[0] == 'P' && peSignature[1] == 'E' &&
-                peSignature[2] == 0 && peSignature[3] == 0);
-
+        char sig[4]; file.read(sig, 4);
+        return file && sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0;
+#endif
     } catch (...) {
         return false;
     }
@@ -785,11 +826,19 @@ public:
                     m_stats.md5Computed.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_DEBUG(L"FileHasher", L"FileHasher: MD5 = %hs", result.md5Hex.c_str());
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("MD5: unexpected digest size " + std::to_string(hashBytes.size()));
+                    SS_LOG_ERROR(L"FileHasher", L"FileHasher: MD5 unexpected size %zu", hashBytes.size());
                 }
             } else {
-                SS_LOG_WARN(L"FileHasher", L"FileHasher: MD5 computation failed");
+                result.hasErrors = true;
+                result.errors.emplace_back("MD5 (win32=" + std::to_string(err.win32) + ", ntstatus=" + std::to_string(static_cast<long>(err.ntstatus)) + ")");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: MD5 computation failed (win32=%lu, ntstatus=0x%08lX)", static_cast<unsigned long>(err.win32), static_cast<unsigned long>(err.ntstatus));
             }
         } catch (const std::exception& e) {
+            result.hasErrors = true;
+            result.errors.emplace_back(std::string{ "MD5 exception: " } + e.what());
             SS_LOG_ERROR(L"FileHasher", L"FileHasher: MD5 exception: %hs", e.what());
         }
     }
@@ -808,9 +857,19 @@ public:
                     m_stats.sha1Computed.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA1 = %hs", result.sha1Hex.c_str());
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA1: unexpected digest size " + std::to_string(hashBytes.size()));
+                    SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA1 unexpected size %zu", hashBytes.size());
                 }
+            } else {
+                result.hasErrors = true;
+                result.errors.emplace_back("SHA1 (win32=" + std::to_string(err.win32) + ", ntstatus=" + std::to_string(static_cast<long>(err.ntstatus)) + ")");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: SHA1 computation failed (win32=%lu, ntstatus=0x%08lX)", static_cast<unsigned long>(err.win32), static_cast<unsigned long>(err.ntstatus));
             }
         } catch (const std::exception& e) {
+            result.hasErrors = true;
+            result.errors.emplace_back(std::string{ "SHA1 exception: " } + e.what());
             SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA1 exception: %hs", e.what());
         }
     }
@@ -829,9 +888,19 @@ public:
                     m_stats.sha256Computed.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA256 = %hs", result.sha256Hex.c_str());
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA256: unexpected digest size " + std::to_string(hashBytes.size()));
+                    SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA256 unexpected size %zu", hashBytes.size());
                 }
+            } else {
+                result.hasErrors = true;
+                result.errors.emplace_back("SHA256 (win32=" + std::to_string(err.win32) + ", ntstatus=" + std::to_string(static_cast<long>(err.ntstatus)) + ")");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: SHA256 computation failed (win32=%lu, ntstatus=0x%08lX)", static_cast<unsigned long>(err.win32), static_cast<unsigned long>(err.ntstatus));
             }
         } catch (const std::exception& e) {
+            result.hasErrors = true;
+            result.errors.emplace_back(std::string{ "SHA256 exception: " } + e.what());
             SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA256 exception: %hs", e.what());
         }
     }
@@ -850,9 +919,19 @@ public:
                     m_stats.sha512Computed.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA512 = %hs...", result.sha512Hex.substr(0, 32).c_str());
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA512: unexpected digest size " + std::to_string(hashBytes.size()));
+                    SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA512 unexpected size %zu", hashBytes.size());
                 }
+            } else {
+                result.hasErrors = true;
+                result.errors.emplace_back("SHA512 (win32=" + std::to_string(err.win32) + ", ntstatus=" + std::to_string(static_cast<long>(err.ntstatus)) + ")");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: SHA512 computation failed (win32=%lu, ntstatus=0x%08lX)", static_cast<unsigned long>(err.win32), static_cast<unsigned long>(err.ntstatus));
             }
         } catch (const std::exception& e) {
+            result.hasErrors = true;
+            result.errors.emplace_back(std::string{ "SHA512 exception: " } + e.what());
             SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA512 exception: %hs", e.what());
         }
     }
@@ -870,9 +949,19 @@ public:
                     result.hasSHA3_256 = true;
 
                     SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA3-256 = %hs", result.sha3_256Hex.c_str());
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA3-256: unexpected digest size " + std::to_string(hashBytes.size()));
+                    SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA3-256 unexpected size %zu", hashBytes.size());
                 }
+            } else {
+                result.hasErrors = true;
+                result.errors.emplace_back("SHA3-256 (win32=" + std::to_string(err.win32) + ", ntstatus=" + std::to_string(static_cast<long>(err.ntstatus)) + ")");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: SHA3-256 computation failed (win32=%lu, ntstatus=0x%08lX)", static_cast<unsigned long>(err.win32), static_cast<unsigned long>(err.ntstatus));
             }
         } catch (const std::exception& e) {
+            result.hasErrors = true;
+            result.errors.emplace_back(std::string{ "SHA3-256 exception: " } + e.what());
             SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA3-256 exception: %hs", e.what());
         }
     }
@@ -973,45 +1062,77 @@ public:
             // Compute cryptographic hashes
             if (HasFlag(algorithms, HashAlgorithm::MD5)) {
                 std::vector<uint8_t> hashBytes;
-                HashUtils::Compute(HashUtils::Algorithm::MD5,
-                                 buffer.data(), buffer.size(), hashBytes);
-                if (hashBytes.size() == 16) {
-                    std::copy(hashBytes.begin(), hashBytes.end(), result.md5.begin());
-                    result.md5Hex = HashUtils::ToHexLower(hashBytes);
-                    result.hasMD5 = true;
+                HashUtils::Error err;
+                if (HashUtils::Compute(HashUtils::Algorithm::MD5,
+                                       buffer.data(), buffer.size(), hashBytes, &err)) {
+                    if (hashBytes.size() == 16) {
+                        std::copy(hashBytes.begin(), hashBytes.end(), result.md5.begin());
+                        result.md5Hex = HashUtils::ToHexLower(hashBytes);
+                        result.hasMD5 = true;
+                    } else {
+                        result.hasErrors = true;
+                        result.errors.emplace_back("MD5 buffer: unexpected digest size " + std::to_string(hashBytes.size()));
+                    }
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("MD5 buffer (win32=" + std::to_string(err.win32) + ")");
                 }
             }
 
             if (HasFlag(algorithms, HashAlgorithm::SHA1)) {
                 std::vector<uint8_t> hashBytes;
-                HashUtils::Compute(HashUtils::Algorithm::SHA1,
-                                 buffer.data(), buffer.size(), hashBytes);
-                if (hashBytes.size() == 20) {
-                    std::copy(hashBytes.begin(), hashBytes.end(), result.sha1.begin());
-                    result.sha1Hex = HashUtils::ToHexLower(hashBytes);
-                    result.hasSHA1 = true;
+                HashUtils::Error err;
+                if (HashUtils::Compute(HashUtils::Algorithm::SHA1,
+                                       buffer.data(), buffer.size(), hashBytes, &err)) {
+                    if (hashBytes.size() == 20) {
+                        std::copy(hashBytes.begin(), hashBytes.end(), result.sha1.begin());
+                        result.sha1Hex = HashUtils::ToHexLower(hashBytes);
+                        result.hasSHA1 = true;
+                    } else {
+                        result.hasErrors = true;
+                        result.errors.emplace_back("SHA1 buffer: unexpected digest size " + std::to_string(hashBytes.size()));
+                    }
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA1 buffer (win32=" + std::to_string(err.win32) + ")");
                 }
             }
 
             if (HasFlag(algorithms, HashAlgorithm::SHA256)) {
                 std::vector<uint8_t> hashBytes;
-                HashUtils::Compute(HashUtils::Algorithm::SHA256,
-                                 buffer.data(), buffer.size(), hashBytes);
-                if (hashBytes.size() == 32) {
-                    std::copy(hashBytes.begin(), hashBytes.end(), result.sha256.begin());
-                    result.sha256Hex = HashUtils::ToHexLower(hashBytes);
-                    result.hasSHA256 = true;
+                HashUtils::Error err;
+                if (HashUtils::Compute(HashUtils::Algorithm::SHA256,
+                                       buffer.data(), buffer.size(), hashBytes, &err)) {
+                    if (hashBytes.size() == 32) {
+                        std::copy(hashBytes.begin(), hashBytes.end(), result.sha256.begin());
+                        result.sha256Hex = HashUtils::ToHexLower(hashBytes);
+                        result.hasSHA256 = true;
+                    } else {
+                        result.hasErrors = true;
+                        result.errors.emplace_back("SHA256 buffer: unexpected digest size " + std::to_string(hashBytes.size()));
+                    }
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA256 buffer (win32=" + std::to_string(err.win32) + ")");
                 }
             }
 
             if (HasFlag(algorithms, HashAlgorithm::SHA512)) {
                 std::vector<uint8_t> hashBytes;
-                HashUtils::Compute(HashUtils::Algorithm::SHA512,
-                                 buffer.data(), buffer.size(), hashBytes);
-                if (hashBytes.size() == 64) {
-                    std::copy(hashBytes.begin(), hashBytes.end(), result.sha512.begin());
-                    result.sha512Hex = HashUtils::ToHexLower(hashBytes);
-                    result.hasSHA512 = true;
+                HashUtils::Error err;
+                if (HashUtils::Compute(HashUtils::Algorithm::SHA512,
+                                       buffer.data(), buffer.size(), hashBytes, &err)) {
+                    if (hashBytes.size() == 64) {
+                        std::copy(hashBytes.begin(), hashBytes.end(), result.sha512.begin());
+                        result.sha512Hex = HashUtils::ToHexLower(hashBytes);
+                        result.hasSHA512 = true;
+                    } else {
+                        result.hasErrors = true;
+                        result.errors.emplace_back("SHA512 buffer: unexpected digest size " + std::to_string(hashBytes.size()));
+                    }
+                } else {
+                    result.hasErrors = true;
+                    result.errors.emplace_back("SHA512 buffer (win32=" + std::to_string(err.win32) + ")");
                 }
             }
 
@@ -1094,13 +1215,16 @@ public:
             );
 
             if (score < 0) {
-                SS_LOG_WARN(L"FileHasher", L"FileHasher: FuzzyHasher::Compare returned error (-1) — ");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: FuzzyHasher::Compare returned error sentinel (-1)");
                 return 0.0;
             }
 
-            // Normalize the 0-100 integer score to the [0.0, 1.0] double range
-            // used by the HashComparison::fuzzySimilarity field.
-            return static_cast<double>(score) / 100.0;
+            // FuzzyHasher::Compare returns an integer score in [0, 100].
+            // HashComparison::fuzzySimilarity is documented as [0.0, 100.0]
+            // (HashComparison::IsSimilar threshold is 50.0, FindBestMatch
+            //  default minSimilarity is 50.0). Returning the raw value
+            //  preserves that contract; do NOT divide by 100 here.
+            return static_cast<double>(score);
 
         } catch (...) {
             return 0.0;
@@ -1138,18 +1262,31 @@ public:
                 return "";
             }
 
-            std::vector<uint8_t> hashBytes;
+            // Map the (potentially composite) HashAlgorithm bitmask to a single
+            // crypto algorithm. We MUST select the strongest algorithm requested,
+            // otherwise composite values like HashAlgorithm::Standard
+            // (MD5|SHA1|SHA256) would silently degrade to MD5 — a security
+            // regression for header-anchored detection.
             HashUtils::Algorithm algo = HashUtils::Algorithm::SHA256;
 
-            if (HasFlag(algorithm, HashAlgorithm::MD5)) {
-                algo = HashUtils::Algorithm::MD5;
-            } else if (HasFlag(algorithm, HashAlgorithm::SHA1)) {
-                algo = HashUtils::Algorithm::SHA1;
+            if (HasFlag(algorithm, HashAlgorithm::SHA512)) {
+                algo = HashUtils::Algorithm::SHA512;
+            } else if (HasFlag(algorithm, HashAlgorithm::SHA3_256)) {
+                algo = HashUtils::Algorithm::SHA3_256;
             } else if (HasFlag(algorithm, HashAlgorithm::SHA256)) {
                 algo = HashUtils::Algorithm::SHA256;
+            } else if (HasFlag(algorithm, HashAlgorithm::SHA1)) {
+                algo = HashUtils::Algorithm::SHA1;
+            } else if (HasFlag(algorithm, HashAlgorithm::MD5)) {
+                algo = HashUtils::Algorithm::MD5;
             }
 
-            HashUtils::Compute(algo, headerData.data(), headerData.size(), hashBytes);
+            std::vector<uint8_t> hashBytes;
+            HashUtils::Error err;
+            if (!HashUtils::Compute(algo, headerData.data(), headerData.size(), hashBytes, &err)) {
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: header hash compute failed (win32=%lu, ntstatus=0x%08lX)", static_cast<unsigned long>(err.win32), static_cast<unsigned long>(err.ntstatus));
+                return "";
+            }
             return HashUtils::ToHexLower(hashBytes);
 
         } catch (const std::exception& e) {
@@ -1368,7 +1505,21 @@ std::vector<FileHashes> FileHasher::ComputeBatch(
         return {};
     }
 
-    return m_impl->ComputeBatchImpl(filePaths, algorithms);
+    auto results = m_impl->ComputeBatchImpl(filePaths, algorithms);
+
+    // Surface batch progress to the caller (one terminal callback) so
+    // long-running batches can be observed even when the impl path is
+    // synchronous. Per-file streaming progress is handled by the impl.
+    if (progressCallback) {
+        try {
+            const size_t total = filePaths.size();
+            progressCallback(total, total);
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: Batch progress callback exception: %hs", e.what());
+        }
+    }
+
+    return results;
 }
 
 // ============================================================================
@@ -1460,6 +1611,8 @@ std::unordered_map<std::string, std::string> FileHasher::ComputeSectionHashes(
     const std::wstring& filePath,
     HashAlgorithm algorithm
 ) {
+    (void)filePath;
+    (void)algorithm;
     // PE section parsing requires PEParser integration.
     // Returns empty map until PEParser provides section offsets/sizes.
     SS_LOG_DEBUG(L"FileHasher",
@@ -1655,7 +1808,7 @@ bool FileHasher::SelfTest() {
 
         // Test 3: Statistics
         {
-            auto stats = GetStatistics();
+            [[maybe_unused]] auto stats = GetStatistics();
             // Just verify we can get stats without crashing
         }
 
@@ -1723,9 +1876,17 @@ std::string FileHasher::ToHexString(
             return HashUtils::ToHexLower(hash.data(), hash.size());
         case HashFormat::HexUpper:
             return HashUtils::ToHexUpper(hash.data(), hash.size());
-        case HashFormat::Base64:
-            // Delegate to Base64Utils if available; fallback to hex
+        case HashFormat::Base64: {
+            std::string b64;
+            if (Utils::Base64Encode(hash.data(), hash.size(), b64)) {
+                return b64;
+            }
+            // Encoding failure should never happen for in-memory digests, but
+            // fall back to hex rather than silently returning an empty string.
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: Base64Encode failed for %zu-byte digest",
+                         hash.size());
             return HashUtils::ToHexLower(hash.data(), hash.size());
+        }
         case HashFormat::Raw:
             return std::string(reinterpret_cast<const char*>(hash.data()), hash.size());
         default:
