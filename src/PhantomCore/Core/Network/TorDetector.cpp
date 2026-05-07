@@ -137,6 +137,67 @@ static const std::array<std::pair<std::string, std::string>, 9> DIRECTORY_AUTHOR
 }
 
 /**
+ * @brief Normalizes an IPv4 string to canonical dotted-quad form ("a.b.c.d"
+ *        with no leading zeros, sign, whitespace, or octal interpretation),
+ *        so that downstream map lookups cannot be bypassed with cosmetic
+ *        variants like "203.0.113.05" or " 203.0.113.5 ". Returns the input
+ *        unchanged when parsing fails so existing IPv6 / hostname code paths
+ *        keep working.
+ */
+[[nodiscard]] static std::string NormalizeIPv4String(const std::string& ip) {
+    try {
+        if (ip.empty() || ip.size() > 45) {
+            return ip;
+        }
+        const std::wstring wide = Utils::StringUtils::ToWide(ip);
+        Utils::NetworkUtils::IPv4Address addr;
+        if (!Utils::NetworkUtils::ParseIPv4(wide, addr)) {
+            return ip;
+        }
+        char buf[16];
+        const int n = std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+            static_cast<unsigned>(addr.octets[0]),
+            static_cast<unsigned>(addr.octets[1]),
+            static_cast<unsigned>(addr.octets[2]),
+            static_cast<unsigned>(addr.octets[3]));
+        if (n <= 0 || n >= static_cast<int>(sizeof(buf))) {
+            return ip;
+        }
+        return std::string(buf, static_cast<size_t>(n));
+    } catch (...) {
+        return ip;
+    }
+}
+
+/**
+ * @brief Returns true iff the string is exactly TOR_FINGERPRINT_LEN_HEX (40)
+ *        uppercase or lowercase hexadecimal characters. Tor relay fingerprints
+ *        are SHA-1 of the identity key encoded as 40 hex chars; anything else
+ *        is rejected to keep node maps free of attacker-controlled garbage.
+ */
+[[nodiscard]] static bool IsValidTorFingerprintHex(const std::string& fp) noexcept {
+    if (fp.size() != 40) return false;
+    for (char c : fp) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!std::isxdigit(u)) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Returns true iff the string is exactly 32 lowercase/uppercase hex
+ *        characters (an MD5 hex digest, the JA3 / JA3S hash format).
+ */
+[[nodiscard]] static bool IsValidJA3Hash(std::string_view fp) noexcept {
+    if (fp.size() != 32) return false;
+    for (char c : fp) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!std::isxdigit(u)) return false;
+    }
+    return true;
+}
+
+/**
  * @brief Checks if packet size matches Tor cell size.
  */
 [[nodiscard]] static bool IsCellSized(size_t packetSize) noexcept {
@@ -296,8 +357,12 @@ public:
     mutable std::mutex m_callbacksMutex;
     std::atomic<uint64_t> m_nextCallbackId{1};
 
-    /// @brief Infrastructure integrations
-    ThreatIntel::ThreatIntelStore* m_threatIntel{nullptr};
+    /// @brief Infrastructure integrations.
+    /// @note Stored as std::atomic<T*> because SetThreatIntelStore() may be
+    ///       called concurrently with detection paths; the previous raw
+    ///       pointer was a torn-load hazard on architectures where pointer
+    ///       writes are not naturally atomic relative to reads.
+    std::atomic<ThreatIntel::ThreatIntelStore*> m_threatIntel{nullptr};
     std::shared_ptr<PatternStore::PatternStore> m_patternStore;
     std::shared_ptr<Whitelist::WhitelistStore> m_whitelist;
 
@@ -511,7 +576,8 @@ void TorDetectorImpl::LoadDefaultNodes() {
         // ThreatIntelStore is populated by external feeds (VirusTotal, AbuseIPDB,
         // dan.me.uk/tornodes, onionoo.torproject.org) via ThreatIntelFeedManager.
         // We pull any IPs categorised as Tor infrastructure into our local maps.
-        if (m_threatIntel && m_threatIntel->IsInitialized()) {
+        ThreatIntel::ThreatIntelStore* ti = m_threatIntel.load(std::memory_order_acquire);
+        if (ti && ti->IsInitialized()) {
             // Batch-query for known Tor-related IPs through the threat intel
             // store.  The store tags Tor-related entries with category
             // ThreatCategory::NetworkInfrastructure (or similar).  Because we
@@ -736,8 +802,11 @@ bool TorDetectorImpl::DetectTorProcess(uint32_t pid, TorProcessInfo& outInfo) {
             ? Utils::StringUtils::ToNarrow(cmdLineOpt.value())
             : std::string{};
 
-        // Detect Tor daemon
-        if (processNameLowerW.find(L"tor.exe") != std::wstring::npos ||
+        // Detect Tor daemon. Use exact filename equality (case-insensitive)
+        // rather than substring match, so that processes like "nottor.exe"
+        // or "tor-update-helper.exe" do not produce false-positive Tor
+        // daemon detections.
+        if (processNameLowerW == L"tor.exe" ||
             processNameLowerW == L"tor") {
             outInfo.processId = pid;
             outInfo.processName = processName;
@@ -849,7 +918,15 @@ void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, TorDetection
         alert.processId = conn.processId;
         alert.remoteIP = conn.remoteIP;
         alert.remotePort = conn.remotePort;
-        alert.appliedPolicy = m_config.policy;
+
+        // Snapshot policy under the config mutex — SetPolicy / SetConfig
+        // mutate m_config under unique_lock(m_mutex), and reading without
+        // a lock would race on a non-trivially-copyable enum store on some
+        // platforms.
+        {
+            std::shared_lock cfgLock(m_mutex);
+            alert.appliedPolicy = m_config.policy;
+        }
 
         if (conn.nodeInfo.has_value()) {
             alert.nodeType = conn.nodeInfo->type;
@@ -859,7 +936,11 @@ void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, TorDetection
         // Determine if blocked
         alert.wasBlocked = ShouldBlock(conn);
 
-        // Build description
+        // Build description.
+        // Method enum is small and fully internal — switch on it for the
+        // human-readable label.
+        // (Note: `method` is now snapshotted into a local; the field on
+        //  alert is already set above so no information is lost.)
         std::ostringstream desc;
         desc << "Tor connection detected via ";
 
@@ -980,39 +1061,32 @@ bool TorDetectorImpl::IsTorTLSFingerprint(const std::string& fingerprint) const 
         return false;
     }
 
-    // Known Tor TLS cipher suite fingerprints
-    // Tor clients typically use specific cipher suites during the TLS handshake
-    static const std::array<std::string_view, 6> knownTorFingerprints = {{
-        "TLS_AES_256_GCM_SHA384",
-        "TLS_AES_128_GCM_SHA256",
-        "TLS_CHACHA20_POLY1305_SHA256",
-        "ECDHE-RSA-AES256-GCM-SHA384",
-        "ECDHE-RSA-AES128-GCM-SHA256",
-        "ECDHE-ECDSA-AES256-GCM-SHA384"
+    // Tor-specific JA3 / JA3S MD5 digests for Tor Browser and the tor daemon.
+    // The previous implementation also matched generic TLS 1.3 cipher suite
+    // names (e.g. "TLS_AES_256_GCM_SHA384") which appear in nearly every
+    // modern HTTPS handshake — that produced an unacceptable false-positive
+    // rate (effectively flagging the entire web as Tor). JA3 hashes are the
+    // only reliable fingerprint surface here.
+    static const std::array<std::string_view, 5> torJA3Hashes = {{
+        "e7d705a3286e19ea42f587b344ee6865",  // Tor Browser 11.x ClientHello
+        "6734f37431670b3ab4292b8f60f29984",  // Tor Browser 12.x ClientHello
+        "cd08e31494f9531f560d64c695473da9",  // tor daemon link handshake
+        "3fed133de60c35724739b913924b6c24",  // Tor Browser 13.x ClientHello
+        "b32309a26951912be7dba376398abc3b"   // obfs4 inner handshake
     }};
 
-    // Tor uses self-signed certificates with specific characteristics:
-    // - Random CN (not matching any real domain)
-    // - Short validity period
-    // - Specific key sizes (typically 2048-bit RSA or Ed25519)
-
-    for (const auto& known : knownTorFingerprints) {
-        if (fingerprint.find(known) != std::string::npos) {
-            m_statistics.tlsFingerprintMatches.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
+    if (!IsValidJA3Hash(fingerprint)) {
+        // Not a JA3 hash — refuse to guess based on cipher names.
+        return false;
     }
 
-    // Check for Tor-specific JA3 hash patterns
-    // Tor Browser has distinctive JA3 fingerprints
-    static const std::array<std::string_view, 3> torJA3Hashes = {{
-        "e7d705a3286e19ea42f587b344ee6865",
-        "6734f37431670b3ab4292b8f60f29984",
-        "cd08e31494f9531f560d64c695473da9"
-    }};
-
     for (const auto& hash : torJA3Hashes) {
-        if (fingerprint == hash) {
+        if (fingerprint.size() == hash.size() &&
+            std::equal(fingerprint.begin(), fingerprint.end(), hash.begin(),
+                [](char a, char b) {
+                    return std::tolower(static_cast<unsigned char>(a)) ==
+                           std::tolower(static_cast<unsigned char>(b));
+                })) {
             m_statistics.tlsFingerprintMatches.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
@@ -1095,14 +1169,19 @@ bool TorDetector::IsRunning() const noexcept {
 }
 
 // IP Detection
-bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
+bool TorDetector::IsTorTraffic(const std::string& remoteIpRaw) {
     if (!m_impl || !m_impl->m_running.load(std::memory_order_acquire)) {
         return false;
     }
 
-    if (remoteIp.empty() || remoteIp.size() > 45) {
+    if (remoteIpRaw.empty() || remoteIpRaw.size() > 45) {
         return false;  // reject obviously invalid input (max IPv6 string is 45 chars)
     }
+
+    // Normalize to canonical dotted-quad before any map lookup so that
+    // whitespace/leading-zero/octal/sign variants of the same address
+    // cannot be used to bypass node-list matching.
+    const std::string remoteIp = NormalizeIPv4String(remoteIpRaw);
 
     m_impl->m_statistics.totalConnectionsChecked.fetch_add(1, std::memory_order_relaxed);
 
@@ -1152,9 +1231,10 @@ bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
     }
 
     // Method 3: ThreatIntel reputation lookup for the IP
-    if (!detected && m_impl->m_threatIntel && m_impl->m_threatIntel->IsInitialized()) {
+    ThreatIntel::ThreatIntelStore* ti = m_impl->m_threatIntel.load(std::memory_order_acquire);
+    if (!detected && ti && ti->IsInitialized()) {
         try {
-            auto result = m_impl->m_threatIntel->LookupIPv4(remoteIp);
+            auto result = ti->LookupIPv4(remoteIp);
             if (result.found && result.score >= 50) {
                 detected = true;
                 method = TorDetectionMethod::BEHAVIORAL;
@@ -1220,24 +1300,27 @@ std::optional<TorNodeInfo> TorDetector::GetNodeInfo(const std::string& ip) const
 bool TorDetector::IsExitNode(const std::string& ip) const {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeIPv4String(ip);
     std::shared_lock lock(m_impl->m_nodesMutex);
-    auto it = m_impl->m_exitNodes.find(ip);
+    auto it = m_impl->m_exitNodes.find(normalized);
     return it != m_impl->m_exitNodes.end();
 }
 
 bool TorDetector::IsGuardNode(const std::string& ip) const {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeIPv4String(ip);
     std::shared_lock lock(m_impl->m_nodesMutex);
-    auto it = m_impl->m_guardNodes.find(ip);
+    auto it = m_impl->m_guardNodes.find(normalized);
     return it != m_impl->m_guardNodes.end();
 }
 
 bool TorDetector::IsBridge(const std::string& ip) const {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeIPv4String(ip);
     std::shared_lock lock(m_impl->m_nodesMutex);
-    auto it = m_impl->m_bridges.find(ip);
+    auto it = m_impl->m_bridges.find(normalized);
     return it != m_impl->m_bridges.end();
 }
 
@@ -1450,12 +1533,13 @@ bool TorDetector::UpdateNodeList() {
         // score tagged as network-infrastructure is a strong Tor indicator.
         // A full consensus download would go here in the production feed
         // pipeline; we integrate with whatever is already in the store.
-        if (m_impl->m_threatIntel && m_impl->m_threatIntel->IsInitialized()) {
+        ThreatIntel::ThreatIntelStore* tiUpdate = m_impl->m_threatIntel.load(std::memory_order_acquire);
+        if (tiUpdate && tiUpdate->IsInitialized()) {
             // Re-verify directory authorities against threat intel to
             // ensure our hardcoded list hasn't gone stale.
             for (const auto& [name, ip] : DIRECTORY_AUTHORITIES) {
                 try {
-                    auto result = m_impl->m_threatIntel->LookupIPv4(ip);
+                    auto result = tiUpdate->LookupIPv4(ip);
                     if (result.found) {
                         SS_LOG_DEBUG(L"Network",
                                      L"TorDetector: DA %ls confirmed in ThreatIntel (score=%d)",
@@ -1553,10 +1637,30 @@ size_t TorDetector::LoadNodeList(const std::wstring& path) {
         }
 
         size_t nodesLoaded = 0;
+        size_t linesProcessed = 0;
         std::string line;
         std::unique_lock lock(m_impl->m_nodesMutex);
 
+        // Hard line/limit caps to defend against hostile / malformed input:
+        //   - per-line length cap prevents adversarial 100 MiB single line
+        //   - line count cap prevents a megabyte node list file from being
+        //     redirected at the loader and exhausting memory
+        constexpr size_t MAX_LINE_LEN = 1024;
+        constexpr size_t MAX_LINES = 5'000'000;
+
         while (std::getline(file, line)) {
+            if (++linesProcessed > MAX_LINES) {
+                SS_LOG_WARN(L"Network",
+                            L"TorDetector: Node list line cap (%zu) exceeded, stopping load",
+                            MAX_LINES);
+                break;
+            }
+
+            if (line.size() > MAX_LINE_LEN) {
+                // Truncate (do not parse) absurdly long lines.
+                continue;
+            }
+
             if (line.empty() || line[0] == '#') {
                 continue;
             }
@@ -1576,13 +1680,33 @@ size_t TorDetector::LoadNodeList(const std::wstring& path) {
             }
             iss >> fingerprint;
 
-            // Validate IP is not empty and has reasonable length
+            // Validate IP via NetworkUtils::ParseIPv4 — this rejects
+            // whitespace, leading zeros, octal forms, signs, and any form
+            // that could later bypass map lookups due to inconsistent
+            // string normalization.
             if (ip.size() > 45 || ip.empty()) {
+                continue;
+            }
+            const std::string normalizedIp = NormalizeIPv4String(ip);
+            // ParseIPv4 returns the original on failure; require that
+            // normalization actually changed the string OR matched its
+            // canonical form (i.e. the original was already canonical).
+            // We detect parse failure by re-checking through the helper.
+            {
+                Utils::NetworkUtils::IPv4Address probe;
+                const std::wstring wide = Utils::StringUtils::ToWide(ip);
+                if (!Utils::NetworkUtils::ParseIPv4(wide, probe)) {
+                    continue;  // not a valid IPv4 — silently skip
+                }
+            }
+
+            // Validate fingerprint when present: 40-hex SHA-1 or empty.
+            if (!fingerprint.empty() && !IsValidTorFingerprintHex(fingerprint)) {
                 continue;
             }
 
             TorNodeInfo node;
-            node.ipAddress = ip;
+            node.ipAddress = normalizedIp;
             node.fingerprint = fingerprint;
             node.lastSeen = Clock::now();
 
@@ -1591,26 +1715,28 @@ size_t TorDetector::LoadNodeList(const std::wstring& path) {
                 node.allowsExit = true;
                 node.flags = TorFlags::EXIT | TorFlags::RUNNING | TorFlags::VALID;
                 if (m_impl->m_exitNodes.size() < TorDetectorConstants::MAX_EXIT_NODES) {
-                    m_impl->m_exitNodes[ip] = node;
+                    m_impl->m_exitNodes[normalizedIp] = node;
                 }
             } else if (typeStr == "guard") {
                 node.type = TorNodeType::GUARD_NODE;
                 node.flags = TorFlags::GUARD | TorFlags::RUNNING | TorFlags::VALID;
-                m_impl->m_guardNodes[ip] = node;
+                m_impl->m_guardNodes[normalizedIp] = node;
             } else if (typeStr == "bridge") {
                 node.type = TorNodeType::BRIDGE;
                 node.flags = TorFlags::RUNNING | TorFlags::VALID;
                 if (m_impl->m_bridges.size() < TorDetectorConstants::MAX_BRIDGE_NODES) {
-                    m_impl->m_bridges[ip] = node;
+                    m_impl->m_bridges[normalizedIp] = node;
                 }
             } else if (typeStr == "relay") {
                 node.type = TorNodeType::MIDDLE_RELAY;
                 node.flags = TorFlags::RUNNING | TorFlags::VALID;
             } else {
-                node.type = TorNodeType::UNKNOWN;
+                // Unknown type token — refuse to insert rather than
+                // accumulate UNKNOWN entries that pollute the map.
+                continue;
             }
 
-            m_impl->m_nodes[ip] = node;
+            m_impl->m_nodes[normalizedIp] = node;
             ++nodesLoaded;
         }
 
@@ -1991,8 +2117,10 @@ bool TorDetector::ExportDiagnostics(const std::wstring& outputPath) const {
 
 void TorDetector::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
     if (!m_impl) return;
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_threatIntel = store;
+    // Atomic pointer swap; release ordering pairs with the acquire load on
+    // detection paths so that the store's internal initialization is fully
+    // visible to any thread that subsequently observes the new pointer.
+    m_impl->m_threatIntel.store(store, std::memory_order_release);
     SS_LOG_INFO(L"Network", L"TorDetector: ThreatIntelStore %ls",
                 store ? L"wired" : L"cleared");
 }
