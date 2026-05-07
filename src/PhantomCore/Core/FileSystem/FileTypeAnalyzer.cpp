@@ -52,6 +52,7 @@
 
 // Standard library
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <fstream>
@@ -67,6 +68,38 @@ namespace FileSystem {
 // ============================================================================
 
 namespace {
+
+// Hard upper bound on a single magic-pattern length read from a custom
+// signature file. Keeps a tampered/oversize entry from blowing past the
+// 64KB header budget or wasting analyzer-side memory.
+constexpr size_t kMaxLoadedPatternLen = 256;
+
+// Cap on bytes copied out of a shebang line. Defends against
+// pathological /tmp/#! files that contain no newline byte for many KB.
+constexpr size_t kMaxShebangLen = 256;
+
+// Cap how many bytes of a path we will surface into a log line. A long
+// or hostile path must never inflate or fragment a log record.
+constexpr size_t kMaxLoggedPathLen = 512;
+
+// Sanitize a narrow string for log emission: strip CR/LF/NUL/other control
+// bytes and bound the length. Defends against log-injection (CWE-117) when
+// the source is an attacker-controlled path or file content.
+std::string SanitizeForLog(std::string_view in,
+                           size_t maxLen = kMaxLoggedPathLen) {
+    std::string out;
+    out.reserve(std::min(in.size(), maxLen));
+    for (char ch : in) {
+        if (out.size() >= maxLen) break;
+        const unsigned char uc = static_cast<unsigned char>(ch);
+        if (uc < 0x20 || uc == 0x7F) {
+            out.push_back('?');
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
 
 /**
  * @brief Checks if buffer matches pattern with optional mask.
@@ -213,6 +246,15 @@ struct FileHeaderResult {
  */
 FileHeaderResult ReadFileHeader(std::wstring_view filePath, size_t maxHeaderBytes) {
     FileHeaderResult result;
+
+    // Hard cap on read size — even if the caller passes a maliciously large
+    // value (or a corrupted config), never allocate more than MAX_HEADER_SIZE.
+    if (maxHeaderBytes > FileTypeAnalyzerConstants::MAX_HEADER_SIZE) {
+        maxHeaderBytes = FileTypeAnalyzerConstants::MAX_HEADER_SIZE;
+    }
+    if (maxHeaderBytes < FileTypeAnalyzerConstants::MIN_HEADER_SIZE) {
+        maxHeaderBytes = FileTypeAnalyzerConstants::MIN_HEADER_SIZE;
+    }
 
     HANDLE hFile = ::CreateFileW(
         std::wstring(filePath).c_str(),
@@ -1314,16 +1356,27 @@ public:
 
             m_config = config;
 
+            // Clamp caller-supplied headerSize to the documented bounds.
+            // A negative-cast / SIZE_MAX value would otherwise survive into
+            // ReadFileHeader and (post-clamp there) waste memory.
+            if (m_config.headerSize > FileTypeAnalyzerConstants::MAX_HEADER_SIZE) {
+                m_config.headerSize = FileTypeAnalyzerConstants::MAX_HEADER_SIZE;
+            }
+            if (m_config.headerSize < FileTypeAnalyzerConstants::MIN_HEADER_SIZE) {
+                m_config.headerSize = FileTypeAnalyzerConstants::MIN_HEADER_SIZE;
+            }
+
             // Load built-in signatures
             m_signatures = MagicDB::g_signatures;
 
             SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Loaded %zu built-in signatures", m_signatures.size());
 
-            m_initialized = true;
+            m_initialized.store(true, std::memory_order_release);
             SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
+            m_initialized.store(false, std::memory_order_release);
             SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Initialization failed: %hs", e.what());
             return false;
         }
@@ -1331,7 +1384,9 @@ public:
 
     void Shutdown() noexcept {
         std::unique_lock lock(m_mutex);
-        m_initialized = false;
+        m_initialized.store(false, std::memory_order_release);
+        m_signatures.clear();
+        m_signatures.shrink_to_fit();
         SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Shutdown complete");
     }
 
@@ -1449,7 +1504,11 @@ public:
 
             m_stats.filesAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
-            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Analyzed %hs - Format: %u, Category: %hs, Risk: %u", Utils::StringUtils::ToNarrow(filePath).c_str(), static_cast<int>(info.format), GetCategoryName(info.category), static_cast<int>(info.riskLevel));
+            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Analyzed %hs - Format: %u, Category: %hs, Risk: %u",
+                SanitizeForLog(Utils::StringUtils::ToNarrow(filePath)).c_str(),
+                static_cast<int>(info.format),
+                GetCategoryName(info.category),
+                static_cast<int>(info.riskLevel));
 
             return info;
 
@@ -1613,14 +1672,23 @@ public:
         if (buffer.size() >= 2 && buffer[0] == '#' && buffer[1] == '!') {
             indicators.hasShebang = true;
 
-            // Extract shebang line
+            // Extract shebang line — bound by buffer size, the literal LF
+            // terminator, AND a hard kMaxShebangLen cap. The original loop
+            // condition `endPos < 256` was an off-by-one: when buffer.size()
+            // exceeded 256 with no LF, endPos hit 256 *and then exited*,
+            // but the substring construction below would still try to copy
+            // (256 - 2) = 254 bytes — fine, but the cap was implicit.
+            // Make the cap explicit and survivable.
+            const size_t kHardCap = std::min(buffer.size(), kMaxShebangLen + 2);
             size_t endPos = 2;
-            while (endPos < buffer.size() && buffer[endPos] != '\n' && endPos < 256) {
-                endPos++;
+            while (endPos < kHardCap && buffer[endPos] != '\n' && buffer[endPos] != '\r') {
+                ++endPos;
             }
 
-            std::string shebang(reinterpret_cast<const char*>(buffer.data() + 2), endPos - 2);
-            indicators.shebangInterpreter = shebang;
+            // endPos in [2, kHardCap]; (endPos - 2) is bounded and well-defined.
+            std::string shebang(reinterpret_cast<const char*>(buffer.data() + 2),
+                                endPos - 2);
+            indicators.shebangInterpreter = SanitizeForLog(shebang, kMaxShebangLen);
         }
 
         // Check if it's text content
@@ -1779,6 +1847,35 @@ public:
     // ========================================================================
 
     bool AddSignature(const MagicSignature& signature) {
+        // Reject empty/oversize patterns and unreachable offsets up front.
+        // A signature whose offset+len exceeds the maximum read window can
+        // never match in production, so storing it just wastes scan time
+        // and inflates m_signatures toward MAX_SIGNATURES.
+        if (signature.pattern.empty()) {
+            SS_LOG_WARN(L"FileTypeAnalyzer",
+                L"FileTypeAnalyzer::AddSignature: empty pattern rejected");
+            return false;
+        }
+        if (signature.pattern.size() > kMaxLoadedPatternLen) {
+            SS_LOG_WARN(L"FileTypeAnalyzer",
+                L"FileTypeAnalyzer::AddSignature: pattern too long (%zu)",
+                signature.pattern.size());
+            return false;
+        }
+        if (!signature.mask.empty() &&
+            signature.mask.size() != signature.pattern.size()) {
+            SS_LOG_WARN(L"FileTypeAnalyzer",
+                L"FileTypeAnalyzer::AddSignature: mask/pattern size mismatch");
+            return false;
+        }
+        if (signature.offset > FileTypeAnalyzerConstants::MAX_HEADER_SIZE ||
+            static_cast<size_t>(signature.offset) + signature.pattern.size() >
+                FileTypeAnalyzerConstants::MAX_HEADER_SIZE) {
+            SS_LOG_WARN(L"FileTypeAnalyzer",
+                L"FileTypeAnalyzer::AddSignature: offset/length exceeds MAX_HEADER_SIZE");
+            return false;
+        }
+
         std::unique_lock lock(m_mutex);
 
         if (m_signatures.size() >= FileTypeAnalyzerConstants::MAX_SIGNATURES) {
@@ -1798,7 +1895,7 @@ public:
         if (!JSON::LoadFromFile(signaturePath, root, &parseErr)) {
             SS_LOG_ERROR(L"FileTypeAnalyzer",
                 L"FileTypeAnalyzer: Failed to load signature file: %hs",
-                parseErr.message.c_str());
+                SanitizeForLog(parseErr.message).c_str());
             return 0;
         }
 
@@ -1808,25 +1905,59 @@ public:
             return 0;
         }
 
+        // Hard cap on the number of entries we will even attempt to parse.
+        // The on-disk file is treated as untrusted: a hostile or corrupted
+        // file must not be able to push us past MAX_SIGNATURES via repeated
+        // attempts, nor exhaust CPU on a million-entry array.
+        const size_t kMaxEntriesToProcess =
+            FileTypeAnalyzerConstants::MAX_SIGNATURES;
+
         size_t loaded = 0;
+        size_t processed = 0;
         for (const auto& entry : root) {
+            if (processed++ >= kMaxEntriesToProcess) {
+                SS_LOG_WARN(L"FileTypeAnalyzer",
+                    L"FileTypeAnalyzer: Signature file truncated at %zu entries",
+                    kMaxEntriesToProcess);
+                break;
+            }
             try {
                 MagicSignature sig;
 
                 std::string desc;
                 if (JSON::Get<std::string>(entry, "name", desc)) {
-                    sig.description = desc;
+                    // Bound description length and strip control bytes;
+                    // this string is logged on warn paths below.
+                    sig.description = SanitizeForLog(desc, 256);
                 }
 
                 sig.offset = JSON::GetOr<uint32_t>(entry, "offset", 0);
+                if (sig.offset > FileTypeAnalyzerConstants::MAX_HEADER_SIZE) {
+                    continue;
+                }
 
                 int categoryInt = JSON::GetOr<int>(entry, "category", 0);
-                sig.format = static_cast<FileFormat>(categoryInt);
+                // FileFormat is a uint16_t enum; clamp negative / out-of-range
+                // values to Unknown rather than reinterpret-casting them.
+                if (categoryInt < 0 || categoryInt > 0xFFFF) {
+                    continue;
+                }
+                sig.format = static_cast<FileFormat>(
+                    static_cast<uint16_t>(categoryInt));
 
                 // Parse hex pattern string into byte vector
                 std::string hexPattern;
                 if (JSON::Get<std::string>(entry, "pattern", hexPattern)) {
+                    // Reject odd-length / oversize hex strings up front.
+                    if (hexPattern.size() % 2 != 0 ||
+                        hexPattern.size() / 2 > kMaxLoadedPatternLen) {
+                        SS_LOG_WARN(L"FileTypeAnalyzer",
+                            L"FileTypeAnalyzer: Pattern length invalid for '%hs'",
+                            sig.description.c_str());
+                        continue;
+                    }
                     sig.pattern.reserve(hexPattern.size() / 2);
+                    bool patternOk = true;
                     for (size_t i = 0; i + 1 < hexPattern.size(); i += 2) {
                         unsigned int byte = 0;
                         auto [ptr, ec] = std::from_chars(
@@ -1834,11 +1965,14 @@ public:
                             byte, 16);
                         if (ec != std::errc{}) {
                             SS_LOG_WARN(L"FileTypeAnalyzer",
-                                L"FileTypeAnalyzer: Invalid hex in pattern for '%hs'", desc.c_str());
+                                L"FileTypeAnalyzer: Invalid hex in pattern for '%hs'",
+                                sig.description.c_str());
+                            patternOk = false;
                             break;
                         }
                         sig.pattern.push_back(static_cast<uint8_t>(byte));
                     }
+                    if (!patternOk) continue;
                 }
 
                 if (sig.pattern.empty()) {
@@ -1851,7 +1985,8 @@ public:
             }
             catch (const std::exception& e) {
                 SS_LOG_WARN(L"FileTypeAnalyzer",
-                    L"FileTypeAnalyzer: Skipped malformed signature entry: %hs", e.what());
+                    L"FileTypeAnalyzer: Skipped malformed signature entry: %hs",
+                    SanitizeForLog(e.what()).c_str());
             }
         }
 
@@ -2099,11 +2234,20 @@ private:
     }
 
     bool HasRTLOverrideImpl(std::wstring_view filename) const {
-        // Check for bidirectional control characters used in evasion attacks
+        // Check for bidirectional control characters used in evasion attacks.
+        // U+202A..U+202E: LRE, RLE, PDF, LRO, RLO   (legacy bidi formatting)
+        // U+2066..U+2069: LRI, RLI, FSI, PDI        (isolate-bidi formatting)
+        // U+200E, U+200F: LRM, RLM                  (directional marks)
+        // U+061C        : ALM                       (Arabic letter mark)
+        // U+200B..U+200D: ZWSP, ZWNJ, ZWJ           (zero-width chars used in homoglyph attacks)
+        // U+FEFF        : BOM / zero-width no-break space
         for (const wchar_t ch : filename) {
-            if (ch >= 0x202A && ch <= 0x202E) return true;  // LRE, RLE, PDF, LRO, RLO
-            if (ch >= 0x2066 && ch <= 0x2069) return true;  // LRI, RLI, FSI, PDI
-            if (ch == 0x200E || ch == 0x200F) return true;  // LRM, RLM
+            if (ch >= 0x202A && ch <= 0x202E) return true;
+            if (ch >= 0x2066 && ch <= 0x2069) return true;
+            if (ch == 0x200E || ch == 0x200F) return true;
+            if (ch == 0x061C)                 return true;
+            if (ch >= 0x200B && ch <= 0x200D) return true;
+            if (ch == 0xFEFF)                 return true;
         }
         return false;
     }
@@ -2158,7 +2302,7 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
     FileTypeAnalyzerConfig m_config;
     std::vector<MagicSignature> m_signatures;
     mutable FileTypeAnalyzerStatistics m_stats;
