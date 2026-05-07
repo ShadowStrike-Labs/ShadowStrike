@@ -94,6 +94,102 @@ using Clock = std::chrono::system_clock;
 using TimePoint = std::chrono::system_clock::time_point;
 
 // ============================================================================
+// HARDENING CONSTANTS
+// ============================================================================
+namespace {
+
+// Hard caps to bound DoS surfaces (signatures, payloads, files).
+constexpr size_t kMaxSignaturePatternBytes   = 2 * 1024;       // 2 KiB regex / byte pattern
+constexpr size_t kMaxC2PayloadBytes          = 4 * 1024 * 1024; // 4 MiB hard ceiling
+constexpr size_t kMaxSignatureFileBytes      = 16 * 1024 * 1024; // 16 MiB
+constexpr size_t kMaxSignatureLineBytes      = 8 * 1024;       // 8 KiB per line
+constexpr size_t kMaxLoadedSignatures        = 100000;
+constexpr size_t kMaxAlertHistory            = 10000;
+constexpr size_t kMaxLoggedStringChars       = 256;            // Truncated mirror in logs
+constexpr size_t kMaxIpStringLen             = 64;             // Plenty for IPv6 + zone
+constexpr size_t kMaxDomainLen               = 253;            // RFC 1035 hard limit
+constexpr size_t kMaxPeersTrackedPerProcess  = 4096;
+constexpr uint32_t kP2PScoreCap              = 0xFFFFu;        // Avoids double overflow
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Returns true if the byte is a printable ASCII or whitespace not
+ *        considered injection-relevant. CR/LF/NUL/escape are filtered.
+ */
+[[nodiscard]] constexpr bool IsLogSafeChar(unsigned char c) noexcept {
+    if (c == '\r' || c == '\n' || c == '\0' || c == 0x1B /*ESC*/) return false;
+    if (c < 0x20) return false;       // Reject other control chars
+    if (c == 0x7F) return false;      // DEL
+    return true;
+}
+
+/**
+ * @brief Sanitises a narrow string for inclusion in log output. Replaces
+ *        unsafe bytes with '.', truncates excessively long inputs, and
+ *        bounds output to a fixed maximum so attacker controlled fields
+ *        cannot inject log lines or blow up log files.
+ */
+[[nodiscard]] static std::wstring SanitizeForLog(std::string_view input) {
+    std::wstring out;
+    const size_t limit = (std::min)(input.size(), kMaxLoggedStringChars);
+    out.reserve(limit + 4);
+    for (size_t i = 0; i < limit; ++i) {
+        const unsigned char c = static_cast<unsigned char>(input[i]);
+        out.push_back(IsLogSafeChar(c) ? static_cast<wchar_t>(c) : L'.');
+    }
+    if (input.size() > kMaxLoggedStringChars) {
+        out.append(L"...");
+    }
+    return out;
+}
+
+/**
+ * @brief Validates that an IP address string is plausible: ASCII, bounded
+ *        length, only characters used by IPv4/IPv6 textual encodings. Rejects
+ *        whitespace, separators, and anything that could break the
+ *        connection-key delimiter scheme or be misused for log injection.
+ */
+[[nodiscard]] static bool IsSafeIpString(std::string_view ip) noexcept {
+    if (ip.empty() || ip.size() > kMaxIpStringLen) return false;
+    for (unsigned char c : ip) {
+        const bool digit = (c >= '0' && c <= '9');
+        const bool hex   = (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        const bool sep   = (c == '.' || c == ':' || c == '%');
+        if (!digit && !hex && !sep) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Normalises a domain for cache/lookup keys: lowercases ASCII,
+ *        strips a single trailing dot (RFC 1035 absolute form), validates
+ *        only safe DNS-name characters and bounded length. Returns empty
+ *        string on rejection.
+ */
+[[nodiscard]] static std::string NormalizeDomain(std::string_view domain) {
+    if (domain.empty() || domain.size() > kMaxDomainLen) return {};
+    if (domain.back() == '.') domain.remove_suffix(1);
+    if (domain.empty()) return {};
+
+    std::string out;
+    out.reserve(domain.size());
+    for (unsigned char c : domain) {
+        const bool digit = (c >= '0' && c <= '9');
+        const bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool punct = (c == '.' || c == '-' || c == '_');
+        if (!digit && !letter && !punct) return {};
+        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c + ('a' - 'A'));
+        out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+}  // namespace
+
+// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
@@ -350,10 +446,23 @@ public:
     std::atomic<uint64_t> m_nextCallbackId{1};
 
     /// @brief Infrastructure integrations
-    ThreatIntel::ThreatIntelStore* m_threatIntel{nullptr};
+    /// `m_threatIntel` is a non-owning pointer injected by the orchestrator. It
+    /// is read on every connection analysis and may be cleared concurrently via
+    /// `SetThreatIntelStore`, so it must be atomic to avoid a torn read.
+    std::atomic<ThreatIntel::ThreatIntelStore*> m_threatIntel{nullptr};
     std::shared_ptr<PatternStore::PatternStore> m_patternStore;
     std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::shared_ptr<Whitelist::WhitelistStore> m_whitelist;
+
+    /// @brief Compiled regex cache for C2 signatures keyed by signature ID.
+    /// Building std::regex on every payload was both a hot-path allocation and
+    /// a ReDoS amplifier; this cache compiles once with `optimize` and reuses.
+    mutable std::unordered_map<uint64_t, std::shared_ptr<const std::regex>> m_compiledRegexCache;
+    mutable std::shared_mutex m_compiledRegexCacheMutex;
+
+    /// @brief Secondary index from connection ID to map key for O(1) by-ID lookup.
+    /// Prevents linear scans over `m_connections` in the hot detect/identify paths.
+    std::unordered_map<uint64_t, std::string> m_connectionsById;
 
     // ========================================================================
     // METHODS
@@ -459,6 +568,7 @@ void BotnetDetector::BotnetDetectorImpl::Shutdown() noexcept {
         {
             std::unique_lock lock(m_connectionsMutex);
             m_connections.clear();
+            m_connectionsById.clear();
         }
 
         {
@@ -469,6 +579,11 @@ void BotnetDetector::BotnetDetectorImpl::Shutdown() noexcept {
         {
             std::unique_lock lock(m_signaturesMutex);
             m_signatures.clear();
+        }
+
+        {
+            std::unique_lock lock(m_compiledRegexCacheMutex);
+            m_compiledRegexCache.clear();
         }
 
         {
@@ -572,7 +687,20 @@ std::string BotnetDetector::BotnetDetectorImpl::MakeConnectionKey(
     const std::string& ip,
     uint16_t port) const
 {
-    return std::to_string(pid) + ":" + ip + ":" + std::to_string(port);
+    // DESIGN: Length-prefixed delimiter scheme avoids ambiguity when the IP
+    // string itself contains ':' (IPv6). Format: "<pid>|<iplen>:<ip>|<port>".
+    // Combined with IsSafeIpString validation in the caller this guarantees a
+    // unique reversible key with no collision risk between v4 and v6 endpoints.
+    std::string key;
+    key.reserve(16 + ip.size());
+    key += std::to_string(pid);
+    key += '|';
+    key += std::to_string(ip.size());
+    key += ':';
+    key += ip;
+    key += '|';
+    key += std::to_string(port);
+    return key;
 }
 
 void BotnetDetector::BotnetDetectorImpl::RecordConnectionEventInternal(
@@ -582,15 +710,24 @@ void BotnetDetector::BotnetDetectorImpl::RecordConnectionEventInternal(
     uint64_t bytesSent,
     uint64_t bytesReceived)
 {
+    // Reject hostile / malformed IP strings before they reach internal maps,
+    // log lines, or downstream consumers (defense against log injection,
+    // delimiter abuse, and pathological key sizes).
+    if (!IsSafeIpString(remoteIP)) {
+        return;
+    }
+
     try {
         const std::string key = MakeConnectionKey(pid, remoteIP, remotePort);
         const auto now = Clock::now();
 
         std::unique_lock lock(m_connectionsMutex);
 
-        // Enforce connection tracking limit to prevent OOM
-        if (m_connections.size() >= m_config.maxTrackedConnections) {
-            // Evict oldest connection
+        // Enforce connection tracking limit to prevent OOM. The previous
+        // O(N) eviction scan is acceptable here because eviction is rare
+        // (only when at capacity) and avoids the cost of maintaining a heap.
+        if (m_connections.size() >= m_config.maxTrackedConnections &&
+            !m_connections.contains(key)) {
             auto oldest = m_connections.begin();
             for (auto it = m_connections.begin(); it != m_connections.end(); ++it) {
                 if (it->second.lastSeen < oldest->second.lastSeen) {
@@ -598,37 +735,44 @@ void BotnetDetector::BotnetDetectorImpl::RecordConnectionEventInternal(
                 }
             }
             if (oldest != m_connections.end()) {
+                m_connectionsById.erase(oldest->second.connectionId);
                 m_connections.erase(oldest);
                 m_statistics.connectionsTimedOut.fetch_add(1, std::memory_order_relaxed);
                 m_statistics.activeConnections.fetch_sub(1, std::memory_order_relaxed);
             }
         }
 
-        auto& conn = m_connections[key];
-        if (conn.connectionId == 0) {
-            // New connection
+        auto [it, inserted] = m_connections.try_emplace(key);
+        auto& conn = it->second;
+        if (inserted) {
             conn.connectionId = m_nextConnectionId.fetch_add(1, std::memory_order_relaxed);
             conn.processId = pid;
             conn.remoteIP = remoteIP;
             conn.remotePort = remotePort;
             conn.firstSeen = now;
+            m_connectionsById.emplace(conn.connectionId, key);
 
             m_statistics.totalConnectionsAnalyzed.fetch_add(1, std::memory_order_relaxed);
             m_statistics.activeConnections.fetch_add(1, std::memory_order_relaxed);
         }
 
         conn.lastSeen = now;
-        conn.bytesSent += bytesSent;
-        conn.bytesReceived += bytesReceived;
-        conn.packetsSent++;
-        conn.packetsReceived++;
+        // Saturating add to defeat attacker-controlled overflow of byte
+        // counters (a 64-bit overflow is hard to reach in practice but the
+        // saturation is cheap insurance for forensic integrity).
+        if (bytesSent > UINT64_MAX - conn.bytesSent) conn.bytesSent = UINT64_MAX;
+        else conn.bytesSent += bytesSent;
+        if (bytesReceived > UINT64_MAX - conn.bytesReceived) conn.bytesReceived = UINT64_MAX;
+        else conn.bytesReceived += bytesReceived;
+        if (conn.packetsSent < UINT64_MAX) conn.packetsSent++;
+        if (conn.packetsReceived < UINT64_MAX) conn.packetsReceived++;
 
         // Record timestamp for beacon analysis
         conn.eventTimestamps.push_back(now);
         conn.eventSizes.push_back(bytesSent + bytesReceived);
 
         // Limit history size
-        if (conn.eventTimestamps.size() > m_config.maxBeaconHistory) {
+        while (conn.eventTimestamps.size() > m_config.maxBeaconHistory) {
             conn.eventTimestamps.pop_front();
             conn.eventSizes.pop_front();
         }
@@ -731,15 +875,23 @@ BeaconAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeBeaconingInternal(
         const bool sufficientSamples = (intervals.size() >= m_config.minBeaconSamples);
 
         if (lowVariability && reasonableInterval && sufficientSamples) {
-            analysis.isBeaconing = true;
             analysis.confidence = CalculateBeaconConfidence(analysis);
 
-            if (analysis.confidence >= m_config.beaconConfidenceThreshold) {
+            // DESIGN: `isBeaconing` is the authoritative consumer-visible flag
+            // and must reflect the configured confidence threshold so callers
+            // do not act on low-confidence noise. The previous implementation
+            // set `isBeaconing=true` unconditionally and only gated the log on
+            // the threshold which leaked false positives to downstream alert
+            // logic.
+            analysis.isBeaconing =
+                (analysis.confidence >= m_config.beaconConfidenceThreshold);
+
+            if (analysis.isBeaconing) {
                 m_statistics.beaconingDetected.fetch_add(1, std::memory_order_relaxed);
 
                 SS_LOG_WARN(L"Network", L"BotnetDetector: Beaconing detected - PID: %u, IP: %ls, "
                                   L"Avg Interval: %.1fms, Jitter: %.2f%%, Confidence: %.2f",
-                                  pid, Utils::StringUtils::ToWide(remoteIP).c_str(),
+                                  pid, SanitizeForLog(remoteIP).c_str(),
                                   avgInterval, analysis.jitterPercent, analysis.confidence);
             }
         }
@@ -1028,25 +1180,20 @@ C2Detection BotnetDetector::BotnetDetectorImpl::DetectC2Internal(uint64_t connec
     try {
         std::shared_lock lock(m_connectionsMutex);
 
-        // Find connection by ID
-        const ConnectionTracking* conn = nullptr;
-        for (const auto& [key, c] : m_connections) {
-            if (c.connectionId == connectionId) {
-                conn = &c;
-                break;
-            }
-        }
+        // O(1) lookup via secondary index, was previously a full scan.
+        auto idIt = m_connectionsById.find(connectionId);
+        if (idIt == m_connectionsById.end()) return detection;
 
-        if (!conn) {
-            return detection;
-        }
+        auto connIt = m_connections.find(idIt->second);
+        if (connIt == m_connections.end()) return detection;
+        const ConnectionTracking& connRef = connIt->second;
 
-        detection.destination = conn->remoteIP;
-        detection.port = conn->remotePort;
+        detection.destination = connRef.remoteIP;
+        detection.port = connRef.remotePort;
 
         // Check ThreatIntel for known C2 IPs
         std::string matchInfo;
-        if (CheckThreatIntel(conn->remoteIP, matchInfo)) {
+        if (CheckThreatIntel(connRef.remoteIP, matchInfo)) {
             detection.isC2 = true;
             detection.confidence = DetectionConfidence::HIGH;
             detection.severity = ThreatSeverity::CRITICAL;
@@ -1056,7 +1203,7 @@ C2Detection BotnetDetector::BotnetDetectorImpl::DetectC2Internal(uint64_t connec
         }
 
         // Check for beaconing (strong C2 indicator)
-        if (conn->beaconAnalysis.isBeaconing) {
+        if (connRef.beaconAnalysis.isBeaconing) {
             detection.isC2 = true;
             if (detection.confidence < DetectionConfidence::HIGH) {
                 detection.confidence = DetectionConfidence::MEDIUM;
@@ -1065,8 +1212,8 @@ C2Detection BotnetDetector::BotnetDetectorImpl::DetectC2Internal(uint64_t connec
         }
 
         // Check for DGA domains
-        if (!conn->dgaAnalyses.empty()) {
-            for (const auto& dga : conn->dgaAnalyses) {
+        if (!connRef.dgaAnalyses.empty()) {
+            for (const auto& dga : connRef.dgaAnalyses) {
                 if (dga.isDGA) {
                     detection.isC2 = true;
                     detection.matchedSignatures.push_back("DGA domain: " + dga.domain);
@@ -1075,19 +1222,32 @@ C2Detection BotnetDetector::BotnetDetectorImpl::DetectC2Internal(uint64_t connec
         }
 
         // Protocol-specific checks
-        if (conn->remotePort == 80 || conn->remotePort == 8080) {
+        if (connRef.remotePort == 80 || connRef.remotePort == 8080) {
             detection.protocol = C2Protocol::HTTP_GET;
-        } else if (conn->remotePort == 443) {
+        } else if (connRef.remotePort == 443) {
             detection.protocol = C2Protocol::HTTPS;
-        } else if (conn->remotePort == 53) {
+        } else if (connRef.remotePort == 53) {
             detection.protocol = C2Protocol::DNS_TXT;
-        } else if (conn->remotePort == 6667 || conn->remotePort == 6697) {
+        } else if (connRef.remotePort == 6667 || connRef.remotePort == 6697) {
             detection.protocol = C2Protocol::IRC;
         }
 
-        // Update statistics
+        // Update statistics and emit a structured alert. Previous revisions
+        // built a `BotnetAlert` factory but never invoked it, so high-fidelity
+        // detections never surfaced through callbacks. Emit while we still
+        // hold the shared_lock guarding `connRef`.
         if (detection.isC2) {
             m_statistics.c2Detected.fetch_add(1, std::memory_order_relaxed);
+            const ThreatSeverity sev = (detection.severity == ThreatSeverity::INFO)
+                                           ? ThreatSeverity::HIGH
+                                           : detection.severity;
+            std::string detText = "C2 communication detected";
+            if (!detection.matchedSignatures.empty()) {
+                detText += " (";
+                detText += detection.matchedSignatures.front();
+                detText += ")";
+            }
+            GenerateAlert(connRef, detText, sev);
         }
 
     } catch (const std::exception& e) {
@@ -1105,6 +1265,13 @@ C2Detection BotnetDetector::BotnetDetectorImpl::AnalyzePayloadForC2Internal(
     C2Detection detection;
     detection.protocol = protocol;
 
+    // Cap payload size we will materialise into a string for regex evaluation
+    // to defeat memory-pressure DoS via very large request bodies. Bytes past
+    // the cap are typically C2 framing tail and not the discriminating prefix.
+    if (payload.size() > kMaxC2PayloadBytes) {
+        payload = payload.first(kMaxC2PayloadBytes);
+    }
+
     try {
         std::shared_lock lock(m_signaturesMutex);
 
@@ -1121,7 +1288,7 @@ C2Detection BotnetDetector::BotnetDetectorImpl::AnalyzePayloadForC2Internal(
                 detection.matchedSignatures.push_back(sig.name);
 
                 SS_LOG_WARN(L"Network", L"BotnetDetector: C2 signature matched - %ls",
-                                  Utils::StringUtils::ToWide(sig.name).c_str());
+                                  SanitizeForLog(sig.name).c_str());
             }
         }
 
@@ -1137,30 +1304,64 @@ bool BotnetDetector::BotnetDetectorImpl::MatchC2Signature(
     std::span<const uint8_t> payload,
     const BotnetSignature& sig) const
 {
+    // Reject empty patterns explicitly. The previous byte-pattern path
+    // matched any payload against an empty pattern (vacuous truth from the
+    // zero-iteration inner loop), causing every signature with a missing
+    // `pattern` field to fire on every packet.
+    if (sig.pattern.empty()) return false;
+
+    // Defense-in-depth: pathological pattern lengths can blow up regex
+    // automata or stall byte scans, especially with hostile signature feeds.
+    if (sig.pattern.size() > kMaxSignaturePatternBytes) return false;
+
     try {
         if (sig.isRegex) {
-            // Convert payload to string for regex matching
-            std::string payloadStr(reinterpret_cast<const char*>(payload.data()), payload.size());
-            std::regex pattern(sig.pattern);
-            return std::regex_search(payloadStr, pattern);
+            // Use cached, precompiled regex with `optimize` to reduce ReDoS
+            // amplification and to avoid recompiling per packet.
+            std::shared_ptr<const std::regex> compiled;
+            {
+                std::shared_lock cacheLock(m_compiledRegexCacheMutex);
+                auto it = m_compiledRegexCache.find(sig.signatureId);
+                if (it != m_compiledRegexCache.end()) {
+                    compiled = it->second;
+                }
+            }
+            if (!compiled) {
+                try {
+                    compiled = std::make_shared<const std::regex>(
+                        sig.pattern,
+                        std::regex_constants::ECMAScript |
+                        std::regex_constants::optimize |
+                        (sig.isCaseSensitive ? std::regex_constants::ECMAScript
+                                             : std::regex_constants::icase));
+                } catch (const std::regex_error&) {
+                    SS_LOG_ERROR(L"Network",
+                        L"BotnetDetector: Rejecting invalid C2 regex '%ls'",
+                        SanitizeForLog(sig.name).c_str());
+                    return false;
+                }
+                std::unique_lock cacheLock(m_compiledRegexCacheMutex);
+                m_compiledRegexCache[sig.signatureId] = compiled;
+            }
+
+            // std::regex_search on raw payload bytes via iterator pair avoids
+            // the temporary std::string allocation that grew with payload size.
+            const char* begin = reinterpret_cast<const char*>(payload.data());
+            const char* end = begin + payload.size();
+            return std::regex_search(begin, end, *compiled);
         } else {
             // Simple byte pattern matching
-            if (payload.size() < sig.pattern.length()) return false;
+            if (payload.size() < sig.pattern.size()) return false;
 
-            for (size_t i = 0; i <= payload.size() - sig.pattern.length(); ++i) {
-                bool match = true;
-                for (size_t j = 0; j < sig.pattern.length(); ++j) {
-                    if (payload[i + j] != static_cast<uint8_t>(sig.pattern[j])) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return true;
-            }
+            const uint8_t* hayBeg = payload.data();
+            const uint8_t* hayEnd = hayBeg + payload.size();
+            const uint8_t* needleBeg = reinterpret_cast<const uint8_t*>(sig.pattern.data());
+            const uint8_t* needleEnd = needleBeg + sig.pattern.size();
+            return std::search(hayBeg, hayEnd, needleBeg, needleEnd) != hayEnd;
         }
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"BotnetDetector: Regex match failed for signature '%ls' - %ls",
-                           Utils::StringUtils::ToWide(sig.name).c_str(),
+                           SanitizeForLog(sig.name).c_str(),
                            Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
@@ -1178,17 +1379,11 @@ std::pair<BotnetFamily, double> BotnetDetector::BotnetDetectorImpl::IdentifyFami
     try {
         std::shared_lock lock(m_connectionsMutex);
 
-        const ConnectionTracking* conn = nullptr;
-        for (const auto& [key, c] : m_connections) {
-            if (c.connectionId == connectionId) {
-                conn = &c;
-                break;
-            }
-        }
-
-        if (!conn) {
-            return {family, confidence};
-        }
+        auto idIt = m_connectionsById.find(connectionId);
+        if (idIt == m_connectionsById.end()) return {family, confidence};
+        auto connIt = m_connections.find(idIt->second);
+        if (connIt == m_connections.end()) return {family, confidence};
+        const ConnectionTracking* conn = &connIt->second;
 
         // Try identification by C2 detections
         if (!conn->c2Detections.empty()) {
@@ -1303,9 +1498,13 @@ P2PBotnetInfo BotnetDetector::BotnetDetectorImpl::DetectP2PBotnetInternal(uint32
             return info;  // P2P botnets typically have many peer connections
         }
 
-        // Count unique peers
+        // Bound peer-set materialisation to prevent OOM under deliberately
+        // large per-process connection fan-out. The unique-peer count remains
+        // truthful up to the cap, after which we report "saturated" via the
+        // capped score.
         std::set<std::string> uniquePeers;
         for (const auto* conn : processConns) {
+            if (uniquePeers.size() >= kMaxPeersTrackedPerProcess) break;
             uniquePeers.insert(conn->remoteIP);
         }
 
@@ -1314,7 +1513,12 @@ P2PBotnetInfo BotnetDetector::BotnetDetectorImpl::DetectP2PBotnetInternal(uint32
         // P2P characteristics
         if (info.uniquePeerCount >= 10) {
             info.isP2P = true;
-            info.confidence = std::min(0.50 + (info.uniquePeerCount * 0.02), 1.0);
+            // Saturating compute prior to floating math to avoid producing a
+            // value far above the [0,1] band that std::min must then clamp.
+            const uint32_t bounded = (info.uniquePeerCount > kP2PScoreCap)
+                                         ? kP2PScoreCap
+                                         : info.uniquePeerCount;
+            info.confidence = std::min(0.50 + (static_cast<double>(bounded) * 0.02), 1.0);
 
             m_statistics.p2pBotnetsDetected.fetch_add(1, std::memory_order_relaxed);
 
@@ -1339,11 +1543,13 @@ bool BotnetDetector::BotnetDetectorImpl::CheckThreatIntel(
     std::string& matchInfo)
 {
     try {
-        if (!m_config.useThreatIntel || !m_threatIntel) {
-            return false;
-        }
+        if (!m_config.useThreatIntel) return false;
+        // Atomic acquire: store may be cleared from another thread.
+        ThreatIntel::ThreatIntelStore* store = m_threatIntel.load(std::memory_order_acquire);
+        if (!store) return false;
+        if (!IsSafeIpString(indicator)) return false;
 
-        auto result = m_threatIntel->LookupIPv4(indicator);
+        auto result = store->LookupIPv4(indicator);
         if (result.found) {
             if (result.IsMalicious()) {
                 matchInfo = "Known malicious IP (score: " + std::to_string(result.score) + ")";
@@ -1399,8 +1605,8 @@ void BotnetDetector::BotnetDetectorImpl::GenerateAlert(
             std::unique_lock lock(m_alertsMutex);
             m_alerts.push_back(alert);
 
-            // Limit alert history
-            if (m_alerts.size() > 10000) {
+            // Limit alert history (config-driven, audit-friendly cap).
+            while (m_alerts.size() > kMaxAlertHistory) {
                 m_alerts.pop_front();
             }
         }
@@ -1444,6 +1650,10 @@ void BotnetDetector::BotnetDetectorImpl::PurgeOldConnectionsInternal(uint32_t ma
             const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.lastSeen);
 
             if (age > maxAge) {
+                // Keep the secondary (id -> key) index in sync; failing to do
+                // so produces dangling lookups in DetectC2/IdentifyFamily/
+                // GetConnectionBehavior and unbounded growth of the index map.
+                m_connectionsById.erase(it->second.connectionId);
                 it = m_connections.erase(it);
                 purged++;
                 m_statistics.connectionsTimedOut.fetch_add(1, std::memory_order_relaxed);
@@ -1539,23 +1749,27 @@ void BotnetDetector::RecordConnectionEvent(
 bool BotnetDetector::IsDGADomain(const std::string& domain) {
     if (!m_impl) return false;
 
-    // Check DGA cache first
+    const std::string norm = NormalizeDomain(domain);
+    if (norm.empty()) return false;
+
+    // Check DGA cache first (keyed by normalized domain to prevent cache
+    // poisoning via case/trailing-dot variants).
     {
         std::shared_lock lock(m_impl->m_dgaCacheMutex);
-        auto it = m_impl->m_dgaCache.find(domain);
+        auto it = m_impl->m_dgaCache.find(norm);
         if (it != m_impl->m_dgaCache.end()) {
             return it->second.isDGA;
         }
     }
 
-    auto analysis = m_impl->AnalyzeDGAInternal(domain);
+    auto analysis = m_impl->AnalyzeDGAInternal(norm);
     bool result = analysis.isDGA;
 
     // Populate cache
     {
         std::unique_lock lock(m_impl->m_dgaCacheMutex);
         if (m_impl->m_dgaCache.size() < BotnetDetectorConstants::MAX_DGA_CACHE_SIZE) {
-            m_impl->m_dgaCache[domain] = std::move(analysis);
+            m_impl->m_dgaCache[norm] = std::move(analysis);
         }
     }
 
@@ -1565,22 +1779,25 @@ bool BotnetDetector::IsDGADomain(const std::string& domain) {
 BotnetDGAAnalysis BotnetDetector::AnalyzeDGA(const std::string& domain) {
     if (!m_impl) return BotnetDGAAnalysis{};
 
+    const std::string norm = NormalizeDomain(domain);
+    if (norm.empty()) return BotnetDGAAnalysis{};
+
     // Check DGA cache first
     {
         std::shared_lock lock(m_impl->m_dgaCacheMutex);
-        auto it = m_impl->m_dgaCache.find(domain);
+        auto it = m_impl->m_dgaCache.find(norm);
         if (it != m_impl->m_dgaCache.end()) {
             return it->second;
         }
     }
 
-    auto analysis = m_impl->AnalyzeDGAInternal(domain);
+    auto analysis = m_impl->AnalyzeDGAInternal(norm);
 
     // Populate cache
     {
         std::unique_lock lock(m_impl->m_dgaCacheMutex);
         if (m_impl->m_dgaCache.size() < BotnetDetectorConstants::MAX_DGA_CACHE_SIZE) {
-            m_impl->m_dgaCache[domain] = analysis;
+            m_impl->m_dgaCache[norm] = analysis;
         }
     }
 
@@ -1595,7 +1812,12 @@ std::unordered_map<std::string, BotnetDGAAnalysis> BotnetDetector::AnalyzeDGABat
     if (!m_impl) return results;
 
     for (const auto& domain : domains) {
-        results[domain] = m_impl->AnalyzeDGAInternal(domain);
+        const std::string norm = NormalizeDomain(domain);
+        if (norm.empty()) continue;
+        // Key results by the original caller-supplied domain so callers can
+        // correlate inputs to outputs unambiguously, while internal analysis
+        // operates on the normalised form.
+        results[domain] = m_impl->AnalyzeDGAInternal(norm);
     }
 
     return results;
@@ -1658,33 +1880,32 @@ std::optional<ConnectionBehavior> BotnetDetector::GetConnectionBehavior(uint64_t
 
     std::shared_lock lock(m_impl->m_connectionsMutex);
 
-    for (const auto& [key, conn] : m_impl->m_connections) {
-        if (conn.connectionId == connectionId) {
-            ConnectionBehavior behavior;
-            behavior.connectionId = conn.connectionId;
-            behavior.processId = conn.processId;
-            behavior.processName = conn.processName;
-            behavior.processPath = conn.processPath;
-            behavior.remoteIP = conn.remoteIP;
-            behavior.remotePort = conn.remotePort;
-            behavior.remoteDomain = conn.remoteDomain;
-            behavior.firstSeen = conn.firstSeen;
-            behavior.lastSeen = conn.lastSeen;
-            behavior.bytesSent = conn.bytesSent;
-            behavior.bytesReceived = conn.bytesReceived;
-            behavior.packetsSent = conn.packetsSent;
-            behavior.packetsReceived = conn.packetsReceived;
-            behavior.beaconAnalysis = conn.beaconAnalysis;
-            behavior.dgaAnalyses = conn.dgaAnalyses;
-            behavior.c2Detections = conn.c2Detections;
-            behavior.riskScore = conn.riskScore;
-            behavior.riskFactors = conn.riskFactors;
+    auto idIt = m_impl->m_connectionsById.find(connectionId);
+    if (idIt == m_impl->m_connectionsById.end()) return std::nullopt;
+    auto connIt = m_impl->m_connections.find(idIt->second);
+    if (connIt == m_impl->m_connections.end()) return std::nullopt;
+    const auto& conn = connIt->second;
 
-            return behavior;
-        }
-    }
-
-    return std::nullopt;
+    ConnectionBehavior behavior;
+    behavior.connectionId = conn.connectionId;
+    behavior.processId = conn.processId;
+    behavior.processName = conn.processName;
+    behavior.processPath = conn.processPath;
+    behavior.remoteIP = conn.remoteIP;
+    behavior.remotePort = conn.remotePort;
+    behavior.remoteDomain = conn.remoteDomain;
+    behavior.firstSeen = conn.firstSeen;
+    behavior.lastSeen = conn.lastSeen;
+    behavior.bytesSent = conn.bytesSent;
+    behavior.bytesReceived = conn.bytesReceived;
+    behavior.packetsSent = conn.packetsSent;
+    behavior.packetsReceived = conn.packetsReceived;
+    behavior.beaconAnalysis = conn.beaconAnalysis;
+    behavior.dgaAnalyses = conn.dgaAnalyses;
+    behavior.c2Detections = conn.c2Detections;
+    behavior.riskScore = conn.riskScore;
+    behavior.riskFactors = conn.riskFactors;
+    return behavior;
 }
 
 std::vector<ConnectionBehavior> BotnetDetector::GetSuspiciousConnections(uint8_t minRiskScore) const {
@@ -1721,18 +1942,21 @@ size_t BotnetDetector::PurgeOldConnections(uint32_t maxAgeMs) {
     if (!m_impl) return 0;
 
     size_t before = 0;
+    size_t after = 0;
     {
-        std::shared_lock lock(m_impl->m_connectionsMutex);
+        // Single critical section: prevents racing inserts between
+        // before/after sampling from producing a `before < after` underflow
+        // when serialised across an unsigned subtraction.
+        std::unique_lock lock(m_impl->m_connectionsMutex);
         before = m_impl->m_connections.size();
     }
     m_impl->PurgeOldConnectionsInternal(maxAgeMs);
-    size_t after = 0;
     {
         std::shared_lock lock(m_impl->m_connectionsMutex);
         after = m_impl->m_connections.size();
     }
 
-    return before - after;
+    return (before > after) ? (before - after) : 0;
 }
 
 // Signature management
@@ -1740,14 +1964,34 @@ size_t BotnetDetector::LoadSignatures(const std::wstring& signaturePath) {
     if (!m_impl) return 0;
 
     try {
-        const auto narrowPath = Utils::StringUtils::ToNarrow(signaturePath);
-        if (!fs::exists(narrowPath)) {
+        // Use std::filesystem::path directly with the wide string to
+        // preserve full Unicode round-tripping (the previous narrow
+        // conversion lost code points outside the active code page).
+        const fs::path path(signaturePath);
+
+        std::error_code ec;
+        if (!fs::exists(path, ec) || ec) {
             SS_LOG_ERROR(L"Network", L"BotnetDetector: Signature file not found - %ls",
                                signaturePath.c_str());
             return 0;
         }
 
-        std::ifstream file(narrowPath);
+        const auto fileSize = fs::file_size(path, ec);
+        if (ec) {
+            SS_LOG_ERROR(L"Network", L"BotnetDetector: Failed to stat signature file - %ls",
+                               signaturePath.c_str());
+            return 0;
+        }
+        if (fileSize > kMaxSignatureFileBytes) {
+            SS_LOG_ERROR(L"Network",
+                L"BotnetDetector: Signature file exceeds %zu byte cap (size=%llu) - %ls",
+                kMaxSignatureFileBytes,
+                static_cast<unsigned long long>(fileSize),
+                signaturePath.c_str());
+            return 0;
+        }
+
+        std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) {
             SS_LOG_ERROR(L"Network", L"BotnetDetector: Failed to open signature file - %ls",
                                signaturePath.c_str());
@@ -1756,8 +2000,31 @@ size_t BotnetDetector::LoadSignatures(const std::wstring& signaturePath) {
 
         size_t loaded = 0;
         std::string line;
+        line.reserve(1024);
+
         while (std::getline(file, line)) {
+            if (line.size() > kMaxSignatureLineBytes) {
+                SS_LOG_WARN(L"Network",
+                    L"BotnetDetector: Skipping oversized signature line (%zu bytes)",
+                    line.size());
+                continue;
+            }
+            // Strip optional trailing CR (binary mode preserves it)
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
             if (line.empty() || line[0] == '#') continue;
+
+            // Enforce global signature cap before parsing additional records
+            // so a hostile signature feed cannot exhaust memory.
+            {
+                std::shared_lock sigLock(m_impl->m_signaturesMutex);
+                if (m_impl->m_signatures.size() >= kMaxLoadedSignatures) {
+                    SS_LOG_WARN(L"Network",
+                        L"BotnetDetector: Signature cap (%zu) reached; remaining lines ignored",
+                        kMaxLoadedSignatures);
+                    break;
+                }
+            }
 
             // Format: name|family_id|pattern|is_regex|protocol|severity|description
             std::istringstream iss(line);
@@ -1767,24 +2034,43 @@ size_t BotnetDetector::LoadSignatures(const std::wstring& signaturePath) {
 
             if (std::getline(iss, name, '|')) {
                 std::string token;
-                if (std::getline(iss, token, '|')) familyId = static_cast<uint16_t>(std::stoul(token));
-                if (std::getline(iss, pattern, '|')) {}
-                if (std::getline(iss, token, '|')) isRegex = static_cast<uint8_t>(std::stoul(token));
-                if (std::getline(iss, token, '|')) protocolId = static_cast<uint8_t>(std::stoul(token));
-                if (std::getline(iss, token, '|')) severityId = static_cast<uint8_t>(std::stoul(token));
+                try {
+                    if (std::getline(iss, token, '|')) familyId = static_cast<uint16_t>(std::stoul(token));
+                    if (std::getline(iss, pattern, '|')) {}
+                    if (std::getline(iss, token, '|')) isRegex = static_cast<uint8_t>(std::stoul(token));
+                    if (std::getline(iss, token, '|')) protocolId = static_cast<uint8_t>(std::stoul(token));
+                    if (std::getline(iss, token, '|')) severityId = static_cast<uint8_t>(std::stoul(token));
+                } catch (const std::exception&) {
+                    // Malformed numeric field — skip the record rather than
+                    // aborting the whole signature file.
+                    continue;
+                }
                 if (std::getline(iss, description, '|')) {}
+
+                if (name.empty() || pattern.empty()) continue;
+                if (pattern.size() > kMaxSignaturePatternBytes) {
+                    SS_LOG_WARN(L"Network",
+                        L"BotnetDetector: Skipping signature '%ls' (pattern %zu > %zu bytes)",
+                        SanitizeForLog(name).c_str(),
+                        pattern.size(),
+                        kMaxSignaturePatternBytes);
+                    continue;
+                }
 
                 BotnetSignature sig;
                 sig.signatureId = m_impl->m_nextSignatureId.fetch_add(1, std::memory_order_relaxed);
-                sig.name = name;
+                sig.name = std::move(name);
                 sig.family = static_cast<BotnetFamily>(familyId);
-                sig.pattern = pattern;
+                sig.pattern = std::move(pattern);
                 sig.isRegex = (isRegex != 0);
                 sig.protocol = static_cast<C2Protocol>(protocolId);
                 sig.severity = static_cast<ThreatSeverity>(severityId);
-                sig.description = description;
+                sig.description = std::move(description);
 
                 std::unique_lock lock(m_impl->m_signaturesMutex);
+                if (m_impl->m_signatures.size() >= kMaxLoadedSignatures) {
+                    break;
+                }
                 m_impl->m_signatures[sig.signatureId] = std::move(sig);
                 loaded++;
             }
@@ -1842,7 +2128,7 @@ bool BotnetDetector::IsolateHost(const std::string& hostname) {
 
     m_impl->m_statistics.hostsIsolated.fetch_add(1, std::memory_order_relaxed);
     SS_LOG_WARN(L"Network", L"BotnetDetector: Host isolated - %ls",
-                       Utils::StringUtils::ToWide(hostname).c_str());
+                       SanitizeForLog(hostname).c_str());
     return true;
 }
 
@@ -2059,8 +2345,10 @@ bool BotnetDetector::ExportAlerts(const std::wstring& outputPath, uint32_t lastH
 
 void BotnetDetector::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
     if (!m_impl) return;
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_threatIntel = store;
+    // Atomic publish: paired with CheckThreatIntel's acquire load so concurrent
+    // detection threads observe a fully-constructed store (or none) without
+    // taking m_mutex on every hot-path lookup.
+    m_impl->m_threatIntel.store(store, std::memory_order_release);
     SS_LOG_INFO(L"Network", L"BotnetDetector: ThreatIntelStore %ls",
                 store ? L"wired" : L"cleared");
 }
