@@ -78,6 +78,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <iomanip>
 #include <thread>
@@ -169,23 +170,100 @@ namespace {
     return str.find('\0') != std::string_view::npos;
 }
 
-// Checks if a string looks like an IPv4 address (digits and dots only).
+// Checks for any control character (0x00..0x1F or 0x7F) or whitespace that must
+// not appear in a well-formed URL. CR/LF in particular enables HTTP request
+// smuggling and log injection. RFC 3986 forbids all of these in URI strings.
+[[nodiscard]] static bool ContainsControlOrSpace(std::string_view str) noexcept {
+    for (unsigned char c : str) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '\t') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Sanitize an arbitrary string for safe inclusion in log messages. Strips
+// control characters (CR/LF/NUL/...) that could be used for log injection,
+// and caps length to avoid log-storage exhaustion. Output is ASCII-only;
+// non-ASCII bytes are escaped as '?'. Caller-supplied URL/domain MUST be
+// passed through this function before logging via SS_LOG_*.
+[[nodiscard]] static std::string SanitizeForLog(std::string_view input) {
+    constexpr size_t kMaxLogLen = 256;
+    std::string out;
+    const size_t n = std::min(input.size(), kMaxLogLen);
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(input[i]);
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back('.');
+        } else if (c >= 0x80) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    if (input.size() > kMaxLogLen) {
+        out.append("...");
+    }
+    return out;
+}
+
+// Strict decimal port parser. Returns std::nullopt for empty input,
+// for any non-digit character, or for values outside [0, 65535].
+// Unlike std::stoi, it does not accept leading whitespace, '+'/'-',
+// or trailing garbage -- all of which are common parser-confusion vectors.
+[[nodiscard]] static std::optional<uint16_t> ParseStrictPort(std::string_view s) noexcept {
+    if (s.empty() || s.size() > 5) {
+        return std::nullopt;
+    }
+    uint32_t value = 0;
+    for (char ch : s) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+        value = value * 10u + static_cast<uint32_t>(ch - '0');
+        if (value > 65535u) {
+            return std::nullopt;
+        }
+    }
+    return static_cast<uint16_t>(value);
+}
+
+// Checks if a string looks like an IPv4 address (digits and dots, with each
+// octet in [0,255]). Reject leading zeros that could indicate octal encoding.
 [[nodiscard]] static bool IsIPv4Address(std::string_view host) noexcept {
     if (host.empty() || host.size() > 15) return false;
     int dotCount = 0;
     int digitRun = 0;
+    uint32_t octet = 0;
+    bool firstDigitInOctet = true;
+    bool octetHasLeadingZero = false;
     for (char c : host) {
         if (c == '.') {
             if (digitRun == 0 || digitRun > 3) return false;
+            // Reject "01.2.3.4" style which can be interpreted as octal by
+            // some resolvers and used to bypass IP-based blocklists.
+            if (octetHasLeadingZero && digitRun > 1) return false;
+            if (octet > 255u) return false;
             dotCount++;
             digitRun = 0;
-        } else if (std::isdigit(static_cast<unsigned char>(c))) {
+            octet = 0;
+            firstDigitInOctet = true;
+            octetHasLeadingZero = false;
+        } else if (c >= '0' && c <= '9') {
+            if (firstDigitInOctet && c == '0') {
+                octetHasLeadingZero = true;
+            }
+            firstDigitInOctet = false;
+            octet = octet * 10u + static_cast<uint32_t>(c - '0');
             digitRun++;
+            if (digitRun > 3 || octet > 255u) return false;
         } else {
             return false;
         }
     }
-    return dotCount == 3 && digitRun > 0 && digitRun <= 3;
+    if (octetHasLeadingZero && digitRun > 1) return false;
+    return dotCount == 3 && digitRun > 0 && digitRun <= 3 && octet <= 255u;
 }
 
 // Checks if an IPv4 address is in a private/reserved range.
@@ -238,39 +316,62 @@ namespace {
     return false;
 }
 
-[[nodiscard]] static double CalculateLevenshteinDistance(
-    const std::string& s1,
-    const std::string& s2) {
+// Bounded Levenshtein distance using a two-row DP rolling buffer.
+// Memory complexity is O(min(m,n)) instead of O(m*n) and inputs are capped to
+// kMaxLen to make the cost deterministic on attacker-controlled input.
+// Returns the integer distance, or kSentinelTooLong if either input exceeds
+// the cap (callers should treat that as "not similar").
+inline constexpr size_t kLevenshteinMaxLen = 128;
+inline constexpr size_t kLevenshteinSentinelTooLong =
+    (std::numeric_limits<size_t>::max)();
+
+[[nodiscard]] static size_t CalculateLevenshteinDistance(
+    std::string_view s1,
+    std::string_view s2) noexcept {
+
+    if (s1.size() > kLevenshteinMaxLen || s2.size() > kLevenshteinMaxLen) {
+        return kLevenshteinSentinelTooLong;
+    }
 
     const size_t m = s1.size();
     const size_t n = s2.size();
+    if (m == 0) return n;
+    if (n == 0) return m;
 
-    if (m == 0) return static_cast<double>(n);
-    if (n == 0) return static_cast<double>(m);
-
-    std::vector<std::vector<size_t>> dp(m + 1, std::vector<size_t>(n + 1));
-
-    for (size_t i = 0; i <= m; ++i) dp[i][0] = i;
-    for (size_t j = 0; j <= n; ++j) dp[0][j] = j;
-
-    for (size_t i = 1; i <= m; ++i) {
-        for (size_t j = 1; j <= n; ++j) {
-            if (s1[i - 1] == s2[j - 1]) {
-                dp[i][j] = dp[i - 1][j - 1];
-            } else {
-                dp[i][j] = 1 + std::min({dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]});
-            }
-        }
+    // Always iterate over the shorter dimension to bound memory.
+    if (m < n) {
+        return CalculateLevenshteinDistance(s2, s1);
     }
 
-    return static_cast<double>(dp[m][n]);
+    // Two rolling rows of length n+1. n <= kLevenshteinMaxLen so this is O(128).
+    std::array<size_t, kLevenshteinMaxLen + 1> prev{};
+    std::array<size_t, kLevenshteinMaxLen + 1> curr{};
+    for (size_t j = 0; j <= n; ++j) {
+        prev[j] = j;
+    }
+
+    for (size_t i = 1; i <= m; ++i) {
+        curr[0] = i;
+        for (size_t j = 1; j <= n; ++j) {
+            const size_t cost = (s1[i - 1] == s2[j - 1]) ? 0u : 1u;
+            curr[j] = (std::min)(
+                (std::min)(curr[j - 1] + 1u, prev[j] + 1u),
+                prev[j - 1] + cost);
+        }
+        std::swap(prev, curr);
+    }
+    return prev[n];
 }
 
-[[nodiscard]] static double CalculateSimilarity(const std::string& s1, const std::string& s2) {
-    double distance = CalculateLevenshteinDistance(s1, s2);
-    size_t maxLen = std::max(s1.length(), s2.length());
+[[nodiscard]] static double CalculateSimilarity(std::string_view s1,
+                                                std::string_view s2) noexcept {
+    const size_t distance = CalculateLevenshteinDistance(s1, s2);
+    if (distance == kLevenshteinSentinelTooLong) {
+        return 0.0;
+    }
+    const size_t maxLen = (std::max)(s1.size(), s2.size());
     if (maxLen == 0) return 1.0;
-    return 1.0 - (distance / maxLen);
+    return 1.0 - (static_cast<double>(distance) / static_cast<double>(maxLen));
 }
 
 [[nodiscard]] static bool ContainsBrandKeyword(const std::string& domain) {
@@ -650,11 +751,17 @@ public:
 
             m_stats.totalURLsAnalyzed++;
 
-            // Input validation
+            // Input validation -- length cap (DoS / overflow protection).
+            // Over-cap or empty inputs are rejected with an explicit BLOCK
+            // verdict so callers can distinguish from "unknown".
             if (url.empty() || url.length() > URLAnalyzerConstants::MAX_URL_LENGTH) {
-                verdict.category = URLCategory::UNKNOWN;
+                verdict.isBlocked = true;
+                verdict.category = URLCategory::SUSPICIOUS;
+                verdict.severity = VerdictSeverity::HIGH;
                 verdict.recommendedAction = URLFilterAction::BLOCK;
+                verdict.threatName = url.empty() ? "URL.Empty" : "URL.OverLengthLimit";
                 m_stats.parseErrors++;
+                m_stats.urlsBlocked++;
                 return verdict;
             }
 
@@ -670,9 +777,41 @@ public:
                 return verdict;
             }
 
+            // Reject URLs containing CR/LF/control chars/whitespace.
+            // CRLF in a URL enables HTTP request smuggling, log injection,
+            // and header splitting.  RFC 3986 forbids these characters.
+            if (ContainsControlOrSpace(url)) {
+                SS_LOG_WARN(L"Network",
+                    L"ScanURL - Rejected URL containing control/whitespace characters");
+                verdict.isBlocked = true;
+                verdict.category = URLCategory::SUSPICIOUS;
+                verdict.severity = VerdictSeverity::HIGH;
+                verdict.recommendedAction = URLFilterAction::BLOCK;
+                verdict.threatName = "URL.ControlChars";
+                m_stats.urlsBlocked++;
+                return verdict;
+            }
+
+            // Parse URL up-front so the cache key is the *post-normalised*
+            // form. Caching the raw input would let an attacker bypass a
+            // verdict by varying case, default-port, or trailing slashes
+            // (cache poisoning).
+            ParsedURL parsed = ParseURL(url);
+            if (!parsed.isValid) {
+                verdict.category = URLCategory::UNKNOWN;
+                verdict.recommendedAction = URLFilterAction::BLOCK;
+                m_stats.parseErrors++;
+                return verdict;
+            }
+
+            // Cache key derived from normalised URL (falls back to raw URL
+            // only for schemes that produce no normalised form, e.g. mailto:).
+            const std::string cacheKey = parsed.normalizedUrl.empty()
+                ? url : parsed.normalizedUrl;
+
             // Check cache first (cache has its own lock)
             if (configSnapshot.enableCaching) {
-                auto cached = GetFromCache(url);
+                auto cached = GetFromCache(cacheKey);
                 if (cached.has_value()) {
                     m_stats.cacheHits++;
                     verdict = cached.value();
@@ -682,15 +821,6 @@ public:
                 m_stats.cacheMisses++;
             }
 
-            // Parse URL
-            ParsedURL parsed = ParseURL(url);
-            if (!parsed.isValid) {
-                verdict.category = URLCategory::UNKNOWN;
-                verdict.recommendedAction = URLFilterAction::BLOCK;
-                m_stats.parseErrors++;
-                return verdict;
-            }
-
             // Check whitelist/blacklist under read lock.
             // NOTE: We must NOT write to the cache under a shared_lock --
             // that would cause a data race.  Instead, we defer caching
@@ -698,14 +828,17 @@ public:
             {
                 std::shared_lock lock(m_mutex);
 
-                if (IsWhitelistedInternal(parsed.hostNormalized)) {
+                if (IsWhitelistedHostOrParent(parsed.hostNormalized,
+                        configSnapshot.whitelistSubdomains)) {
                     verdict.category = URLCategory::SAFE;
                     verdict.severity = VerdictSeverity::CLEAN;
                     verdict.recommendedAction = URLFilterAction::ALLOW;
                     verdict.detectionMethod = DetectionMethod::UNKNOWN;
                     // Cache after releasing the shared lock
                     lock.unlock();
-                    CacheVerdict(url, verdict);
+                    if (configSnapshot.enableCaching) {
+                        CacheVerdict(cacheKey, verdict);
+                    }
                     m_stats.urlsAllowed++;
                     return verdict;
                 }
@@ -719,7 +852,9 @@ public:
                     verdict.threatName = GetBlacklistThreat(parsed.hostNormalized);
                     // Cache after releasing the shared lock
                     lock.unlock();
-                    CacheVerdict(url, verdict);
+                    if (configSnapshot.enableCaching) {
+                        CacheVerdict(cacheKey, verdict);
+                    }
                     m_stats.urlsBlocked++;
                     return verdict;
                 }
@@ -775,8 +910,10 @@ public:
                 m_stats.urlsAllowed++;
             }
 
-            // Cache result (exclusive lock inside)
-            CacheVerdict(url, verdict);
+            // Cache result (exclusive lock inside) -- normalised key.
+            if (configSnapshot.enableCaching) {
+                CacheVerdict(cacheKey, verdict);
+            }
 
             // Snapshot callbacks under lock, invoke outside lock
             NotifyAnalysis(url, verdict);
@@ -863,6 +1000,19 @@ public:
                 return f.valid() &&
                        f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
             });
+            // Cap the queue at MAX_PENDING_ASYNC.  An unbounded queue is a
+            // straightforward DoS: a hostile caller can spawn ScanURLAsync
+            // faster than scans complete and exhaust memory / threads.
+            // When at capacity we drop the oldest pending entry (its future
+            // destructor waits for completion, so we do not abandon work --
+            // we simply pace the producer).
+            constexpr size_t MAX_PENDING_ASYNC = 1024;
+            if (m_pendingFutures.size() >= MAX_PENDING_ASYNC) {
+                SS_LOG_WARN(L"Network",
+                    L"ScanURLAsync - pending queue full (%zu); blocking on oldest",
+                    m_pendingFutures.size());
+                m_pendingFutures.erase(m_pendingFutures.begin());
+            }
             m_pendingFutures.push_back(std::move(fut));
         }
     }
@@ -872,7 +1022,26 @@ public:
     // ========================================================================
 
     [[nodiscard]] URLVerdict ScanDomain(const std::string& domain) {
-        // Construct a minimal URL for analysis
+        // Build a synthetic URL for analysis.  The domain MUST NOT contain
+        // characters that would alter URL structure when concatenated --
+        // otherwise an attacker controlling the domain string could inject
+        // a path/query/fragment or a second authority component.
+        URLVerdict verdict;
+        verdict.analyzedUrl = domain;
+
+        if (domain.empty() ||
+            domain.size() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH ||
+            ContainsNullByte(domain) ||
+            ContainsControlOrSpace(domain) ||
+            domain.find_first_of("/\\?#@") != std::string::npos) {
+            verdict.isBlocked = true;
+            verdict.category = URLCategory::SUSPICIOUS;
+            verdict.severity = VerdictSeverity::HIGH;
+            verdict.recommendedAction = URLFilterAction::BLOCK;
+            verdict.threatName = "Domain.Malformed";
+            m_stats.parseErrors++;
+            return verdict;
+        }
         std::string url = "http://" + domain + "/";
         return ScanURL(url);
     }
@@ -882,11 +1051,31 @@ public:
         DomainVerdict verdict;
 
         try {
+            // Input validation -- reject empty / oversized / NUL-tainted /
+            // control-char input before any further processing.  Without
+            // these checks an attacker could feed a 4GB string or one
+            // containing CR/LF for log injection in callees.
+            if (domain.empty() ||
+                domain.size() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH ||
+                ContainsNullByte(domain) ||
+                ContainsControlOrSpace(domain)) {
+                verdict.isBlocked = true;
+                verdict.category = URLCategory::SUSPICIOUS;
+                verdict.threatName = "Domain.Malformed";
+                verdict.confidenceScore = 100;
+                verdict.reputationScore = 0;
+                m_stats.parseErrors++;
+                auto endTime = std::chrono::steady_clock::now();
+                verdict.analysisTime = std::chrono::duration_cast<std::chrono::microseconds>(
+                    endTime - startTime);
+                return verdict;
+            }
+
             m_stats.totalDomainsAnalyzed++;
 
             // Snapshot the config and resolve subsystem pointer under lock.
             // Also perform whitelist/blacklist checks while we hold the lock
-            // (IsWhitelistedInternal/IsBlacklistedInternal read shared state).
+            // (IsWhitelisted*/IsBlacklistedInternal read shared state).
             URLAnalyzerConfig configSnapshot;
             ShadowStrike::ThreatIntel::ThreatIntelLookup* threatIntelPtr = nullptr;
             bool isWhitelisted = false;
@@ -898,7 +1087,8 @@ public:
                 std::shared_lock lock(m_mutex);
                 configSnapshot = m_config;
                 threatIntelPtr = m_threatIntelLookup;
-                isWhitelisted = IsWhitelistedInternal(normalizedDomain);
+                isWhitelisted = IsWhitelistedHostOrParent(normalizedDomain,
+                    configSnapshot.whitelistSubdomains);
                 if (!isWhitelisted) {
                     isBlacklisted = IsBlacklistedInternal(normalizedDomain);
                     if (isBlacklisted) {
@@ -931,9 +1121,10 @@ public:
                 return verdict;
             }
 
-            // DGA detection
+            // DGA detection (use normalised lowercase domain so mixed-case
+            // input is analysed consistently).
             if (configSnapshot.enableDGADetection) {
-                auto [score, family] = GetDGAScoreInternal(domain, configSnapshot);
+                auto [score, family] = GetDGAScoreInternal(normalizedDomain, configSnapshot);
                 verdict.isDGA = (score >= configSnapshot.dgaThreshold);
                 verdict.dgaFamily = family;
 
@@ -945,11 +1136,11 @@ public:
                 }
             }
 
-            // Reputation check via ThreatIntelLookup
+            // Reputation check via ThreatIntelLookup (use normalised domain).
             if (threatIntelPtr) {
                 try {
                     if (threatIntelPtr->IsInitialized()) {
-                        auto result = threatIntelPtr->LookupDomain(domain);
+                        auto result = threatIntelPtr->LookupDomain(normalizedDomain);
                         if (result.found) {
                             verdict.reputationScore = static_cast<uint8_t>(
                                 100 - std::min<uint8_t>(result.threatScore, 100));
@@ -1244,8 +1435,23 @@ public:
                 return parsed;
             }
 
+            // Hard length cap to bound parser cost on attacker input.
+            if (url.size() > URLAnalyzerConstants::MAX_URL_LENGTH) {
+                parsed.isValid = false;
+                return parsed;
+            }
+
             // Reject embedded null bytes early
             if (ContainsNullByte(std::string_view(url.data(), url.size()))) {
+                parsed.isValid = false;
+                return parsed;
+            }
+
+            // Reject control characters (CR/LF/TAB/etc.) anywhere in URL.
+            // RFC 3986 forbids these and they are common log/HTTP smuggling
+            // vectors.  We tolerate a single trailing newline that crept in
+            // from line-oriented input formats by trimming below.
+            if (ContainsControlOrSpace(url)) {
                 parsed.isValid = false;
                 return parsed;
             }
@@ -1350,20 +1556,29 @@ public:
                 remaining.substr(0, authorityEnd) : remaining;
 
             if (!hostPort.empty() && hostPort.front() == '[') {
-                // IPv6 bracket notation: [::1]:port
+                // IPv6 bracket notation: [::1]:port (zone-id [::1%eth0]
+                // is rejected; we strip anything after '%' which is not a
+                // valid identifier in a URL host).
                 size_t bracketEnd = hostPort.find(']');
                 if (bracketEnd != std::string::npos) {
                     parsed.host = hostPort.substr(1, bracketEnd - 1);
+                    // Reject zone identifiers in URL hosts (RFC 6874 requires
+                    // them to be percent-encoded; raw '%' here is invalid).
+                    if (parsed.host.find('%') != std::string::npos) {
+                        parsed.isValid = false;
+                        return parsed;
+                    }
                     parsed.isIPv6 = true;
                     parsed.isIP = true;
                     if (bracketEnd + 1 < hostPort.size() && hostPort[bracketEnd + 1] == ':') {
-                        try {
-                            parsed.port = static_cast<uint16_t>(
-                                std::stoi(hostPort.substr(bracketEnd + 2)));
-                            parsed.hasPort = true;
-                        } catch (...) {
-                            parsed.port = parsed.defaultPort;
+                        auto portOpt = ParseStrictPort(
+                            std::string_view(hostPort).substr(bracketEnd + 2));
+                        if (!portOpt.has_value()) {
+                            parsed.isValid = false;
+                            return parsed;
                         }
+                        parsed.port = *portOpt;
+                        parsed.hasPort = true;
                     } else {
                         parsed.port = parsed.defaultPort;
                     }
@@ -1375,13 +1590,14 @@ public:
                 size_t colonPos = hostPort.find(':');
                 if (colonPos != std::string::npos) {
                     parsed.host = hostPort.substr(0, colonPos);
-                    try {
-                        parsed.port = static_cast<uint16_t>(
-                            std::stoi(hostPort.substr(colonPos + 1)));
-                        parsed.hasPort = true;
-                    } catch (...) {
-                        parsed.port = parsed.defaultPort;
+                    auto portOpt = ParseStrictPort(
+                        std::string_view(hostPort).substr(colonPos + 1));
+                    if (!portOpt.has_value()) {
+                        parsed.isValid = false;
+                        return parsed;
                     }
+                    parsed.port = *portOpt;
+                    parsed.hasPort = true;
                 } else {
                     parsed.host = hostPort;
                     parsed.port = parsed.defaultPort;
@@ -1392,6 +1608,27 @@ public:
             if (parsed.host.length() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH) {
                 parsed.isValid = false;
                 return parsed;
+            }
+
+            // Validate host character set. For non-IPv6 hosts only allow
+            // letters, digits, '-', '.', '_' (the last is technically out of
+            // RFC but is common in real-world DNS) and high-bit bytes from
+            // raw IDN input -- the IDN/punycode pass below converts those.
+            // Reject embedded slashes, backslashes, '@' (a second userinfo
+            // separator that can be used for authority confusion attacks)
+            // and any other delimiter that would re-enter the URL grammar.
+            if (!parsed.isIPv6) {
+                for (unsigned char c : parsed.host) {
+                    if (c == '/' || c == '\\' || c == '?' || c == '#' ||
+                        c == '@' || c == '[' || c == ']' || c == ':') {
+                        parsed.isValid = false;
+                        return parsed;
+                    }
+                    if (c < 0x20 || c == 0x7F) {
+                        parsed.isValid = false;
+                        return parsed;
+                    }
+                }
             }
 
             parsed.hostNormalized = NarrowToLower(parsed.host);
@@ -1481,7 +1718,21 @@ public:
             parsed.hasLongPath = (parsed.path.length() > URLAnalyzerConstants::MAX_PATH_LENGTH);
             parsed.hasExcessiveSubdomains = (parsed.labels.size() > 5);
 
-            parsed.normalizedUrl = parsed.schemeString + "://" + parsed.hostNormalized + parsed.path;
+            parsed.normalizedUrl = parsed.schemeString + "://";
+            if (parsed.isIPv6) {
+                parsed.normalizedUrl += "[";
+                parsed.normalizedUrl += parsed.hostNormalized;
+                parsed.normalizedUrl += "]";
+            } else {
+                parsed.normalizedUrl += parsed.hostNormalized;
+            }
+            // Collapse default ports so that "http://x" and "http://x:80"
+            // hash to the same cache key (cache-poisoning hardening).
+            if (parsed.hasPort && parsed.port != parsed.defaultPort) {
+                parsed.normalizedUrl += ":";
+                parsed.normalizedUrl += std::to_string(static_cast<unsigned>(parsed.port));
+            }
+            parsed.normalizedUrl += parsed.path;
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"ParseURL - Exception: %hs", e.what());
@@ -1645,6 +1896,15 @@ public:
     // ========================================================================
 
     bool AddToWhitelist(const std::string& domain, bool includeSubdomains) {
+        // Validate before taking the lock so we don't poison the set.
+        if (domain.empty() ||
+            domain.size() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH ||
+            ContainsNullByte(domain) ||
+            ContainsControlOrSpace(domain)) {
+            SS_LOG_WARN(L"Network", L"AddToWhitelist - rejected malformed domain (len=%zu)",
+                domain.size());
+            return false;
+        }
         std::unique_lock lock(m_mutex);
 
         try {
@@ -1652,7 +1912,7 @@ public:
             m_whitelist.insert(normalized);
 
             SS_LOG_INFO(L"Network", L"Added to URL whitelist: %hs (subdomains=%d)",
-                normalized.c_str(), static_cast<int>(includeSubdomains));
+                SanitizeForLog(normalized).c_str(), static_cast<int>(includeSubdomains));
             return true;
 
         } catch (const std::exception& e) {
@@ -1662,6 +1922,12 @@ public:
     }
 
     bool RemoveFromWhitelist(const std::string& domain) {
+        if (domain.empty() ||
+            domain.size() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH ||
+            ContainsNullByte(domain) ||
+            ContainsControlOrSpace(domain)) {
+            return false;
+        }
         std::unique_lock lock(m_mutex);
 
         try {
@@ -1669,7 +1935,8 @@ public:
             bool removed = m_whitelist.erase(normalized) > 0;
 
             if (removed) {
-                SS_LOG_INFO(L"Network", L"Removed from URL whitelist: %hs", normalized.c_str());
+                SS_LOG_INFO(L"Network", L"Removed from URL whitelist: %hs",
+                    SanitizeForLog(normalized).c_str());
             }
 
             return removed;
@@ -1681,6 +1948,14 @@ public:
     }
 
     bool AddToBlacklist(const std::string& domain, std::string_view threatName) {
+        if (domain.empty() ||
+            domain.size() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH ||
+            ContainsNullByte(domain) ||
+            ContainsControlOrSpace(domain)) {
+            SS_LOG_WARN(L"Network", L"AddToBlacklist - rejected malformed domain (len=%zu)",
+                domain.size());
+            return false;
+        }
         std::unique_lock lock(m_mutex);
 
         try {
@@ -1688,7 +1963,8 @@ public:
             m_blacklist[normalized] = std::string(threatName);
 
             SS_LOG_WARN(L"Network", L"Added to URL blacklist: %hs (threat: %hs)",
-                normalized.c_str(), std::string(threatName).c_str());
+                SanitizeForLog(normalized).c_str(),
+                SanitizeForLog(std::string(threatName)).c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -1698,6 +1974,12 @@ public:
     }
 
     bool RemoveFromBlacklist(const std::string& domain) {
+        if (domain.empty() ||
+            domain.size() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH ||
+            ContainsNullByte(domain) ||
+            ContainsControlOrSpace(domain)) {
+            return false;
+        }
         std::unique_lock lock(m_mutex);
 
         try {
@@ -1705,7 +1987,8 @@ public:
             bool removed = m_blacklist.erase(normalized) > 0;
 
             if (removed) {
-                SS_LOG_INFO(L"Network", L"Removed from URL blacklist: %hs", normalized.c_str());
+                SS_LOG_INFO(L"Network", L"Removed from URL blacklist: %hs",
+                    SanitizeForLog(normalized).c_str());
             }
 
             return removed;
@@ -1720,10 +2003,35 @@ public:
         return m_whitelist.find(domain) != m_whitelist.end();
     }
 
+    // Whitelist match that walks up the label chain to honour the
+    // `whitelistSubdomains` policy.  When enabled, "a.b.example.com" matches
+    // a whitelist entry of "example.com".  The walk is bounded by
+    // MAX_LABELS to keep cost deterministic on attacker-controlled input.
+    [[nodiscard]] bool IsWhitelistedHostOrParent(const std::string& domain,
+                                                 bool includeSubdomains) const {
+        if (m_whitelist.empty()) return false;
+        if (m_whitelist.find(domain) != m_whitelist.end()) return true;
+        if (!includeSubdomains) return false;
+
+        std::string_view cursor(domain);
+        size_t hops = 0;
+        while (hops < URLAnalyzerConstants::MAX_LABELS) {
+            const size_t dot = cursor.find('.');
+            if (dot == std::string_view::npos) break;
+            cursor.remove_prefix(dot + 1);
+            if (cursor.empty()) break;
+            if (m_whitelist.find(std::string(cursor)) != m_whitelist.end()) {
+                return true;
+            }
+            ++hops;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool IsWhitelisted(const std::string& domain) const {
         std::shared_lock lock(m_mutex);
         std::string normalized = NarrowToLower(domain);
-        return IsWhitelistedInternal(normalized);
+        return IsWhitelistedHostOrParent(normalized, m_config.whitelistSubdomains);
     }
 
     [[nodiscard]] bool IsBlacklistedInternal(const std::string& domain) const {
@@ -1828,12 +2136,28 @@ public:
     }
 
     [[nodiscard]] std::optional<URLVerdict> QueryCache(const std::string& url) const {
-        return GetFromCache(url);
+        // Re-derive the same normalised cache key that ScanURL uses; raw
+        // URLs are never written to the cache so a raw lookup would always
+        // miss (and previously could be poisoned by mismatched keys).
+        ParsedURL parsed = ParseURL(url);
+        const std::string& key =
+            (parsed.isValid && !parsed.normalizedUrl.empty()) ? parsed.normalizedUrl : url;
+        return GetFromCache(key);
     }
 
     void InvalidateCache(const std::string& url) {
+        ParsedURL parsed = ParseURL(url);
+        const std::string& key =
+            (parsed.isValid && !parsed.normalizedUrl.empty()) ? parsed.normalizedUrl : url;
         std::unique_lock lock(m_mutex);
-        m_cache.erase(url);
+        if (m_cache.erase(key) > 0) {
+            // Keep the published statistic in step with the underlying map.
+            // Without this, repeated invalidations make cacheSize drift away
+            // from m_cache.size() which other components rely on.
+            const size_t newSize = m_cache.size();
+            m_stats.cacheSize.store(static_cast<uint32_t>(newSize),
+                std::memory_order_relaxed);
+        }
     }
 
     void ClearCache() {
@@ -1853,6 +2177,7 @@ public:
     // ========================================================================
 
     [[nodiscard]] uint64_t RegisterAnalysisCallback(URLAnalysisCallback callback) {
+        if (!callback) return 0;
         std::unique_lock lock(m_mutex);
         uint64_t id = ++m_nextCallbackId;
         m_analysisCallbacks[id] = std::move(callback);
@@ -1860,6 +2185,7 @@ public:
     }
 
     [[nodiscard]] uint64_t RegisterThreatCallback(URLThreatCallback callback) {
+        if (!callback) return 0;
         std::unique_lock lock(m_mutex);
         uint64_t id = ++m_nextCallbackId;
         m_threatCallbacks[id] = std::move(callback);
@@ -1867,6 +2193,7 @@ public:
     }
 
     [[nodiscard]] uint64_t RegisterPhishingCallback(PhishingCallback callback) {
+        if (!callback) return 0;
         std::unique_lock lock(m_mutex);
         uint64_t id = ++m_nextCallbackId;
         m_phishingCallbacks[id] = std::move(callback);
@@ -1874,6 +2201,7 @@ public:
     }
 
     [[nodiscard]] uint64_t RegisterDGACallback(DGACallback callback) {
+        if (!callback) return 0;
         std::unique_lock lock(m_mutex);
         uint64_t id = ++m_nextCallbackId;
         m_dgaCallbacks[id] = std::move(callback);
@@ -2421,10 +2749,25 @@ private:
             uint64_t queries = m_stats.totalURLsAnalyzed.load(std::memory_order_relaxed);
             if (queries == 0) return;  // Guard division by zero
 
-            // Update running average (atomic CAS loop for correctness)
+            // Update running average using the incremental form
+            //   newAvg = oldAvg + (latency - oldAvg) / queries
+            // which avoids the overflow that the multiplicative form
+            // (oldAvg * (queries-1) + latency) suffers once the analysed
+            // count is large.  Implemented as a CAS loop so concurrent
+            // writers cannot lose an update.
             uint64_t currentAvg = m_stats.avgAnalysisTimeUs.load(std::memory_order_relaxed);
-            uint64_t newAvg = ((currentAvg * (queries - 1)) + latencyUs) / queries;
-            m_stats.avgAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
+            for (;;) {
+                uint64_t newAvg;
+                if (latencyUs >= currentAvg) {
+                    newAvg = currentAvg + (latencyUs - currentAvg) / queries;
+                } else {
+                    newAvg = currentAvg - (currentAvg - latencyUs) / queries;
+                }
+                if (m_stats.avgAnalysisTimeUs.compare_exchange_weak(
+                        currentAvg, newAvg, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
 
             // Update max (CAS loop to handle concurrent updates)
             uint64_t currentMax = m_stats.maxAnalysisTimeUs.load(std::memory_order_relaxed);
