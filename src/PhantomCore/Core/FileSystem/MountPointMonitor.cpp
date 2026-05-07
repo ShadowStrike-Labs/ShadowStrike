@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -141,6 +141,28 @@ private:
 
 [[nodiscard]] constexpr wchar_t NormalizeDriveLetter(wchar_t c) noexcept {
     return (c >= L'a' && c <= L'z') ? static_cast<wchar_t>(c - L'a' + L'A') : c;
+}
+
+// Sanitize untrusted ASCII text (e.g. std::exception::what()) for safe inclusion
+// in a log line. Strips CR/LF/control bytes and high-bit bytes, capping length
+// at 256. Used everywhere e.what() flows into SS_LOG_*.
+[[nodiscard]] inline std::string SanitizeForLog(const char* s,
+                                                size_t maxLen = 256) noexcept {
+    std::string out;
+    if (s == nullptr) return out;
+    out.reserve(std::min<size_t>(maxLen, 256));
+    for (size_t i = 0; i < maxLen; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0) break;
+        if (c == '\r' || c == '\n' || c == '\t') {
+            out.push_back(' ');
+        } else if (c < 0x20 || c == 0x7F || c >= 0x80) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
 }
 
 /// Detect if a volume is backed by a virtual disk (VHD/VHDX/ISO)
@@ -329,6 +351,38 @@ struct MountPointMonitor::Impl {
         StopMonitoring();
     }
 
+    // ------------------------------------------------------------------
+    // StopLocked: full Stop() body without re-acquiring m_mutex.
+    // Caller MUST already hold m_mutex (unique). Used by both
+    // MountPointMonitor::Stop() (locks then calls) and
+    // MountPointMonitor::Shutdown() (already holds the lock). This
+    // closes the Start()/Stop() race where Stop()'s naked CAS could
+    // observe the in-progress Start() that has already flipped
+    // m_running but not yet finished CreateThread, leaving the
+    // monitor with m_running == false but a live thread handle.
+    // ------------------------------------------------------------------
+    void StopLocked() noexcept {
+        bool expected = true;
+        if (!m_running.compare_exchange_strong(expected, false,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return;
+        }
+        try {
+            m_status.store(MountPointMonitorStatus::Stopping,
+                           std::memory_order_release);
+            StopMonitoring();
+            m_status.store(MountPointMonitorStatus::Stopped,
+                           std::memory_order_release);
+        } catch (...) {
+            // StopMonitoring is internally noexcept-safe; swallow any
+            // unexpected exception to honor the noexcept contract of
+            // the public Stop()/Shutdown() entrypoints.
+            m_status.store(MountPointMonitorStatus::Error,
+                           std::memory_order_release);
+        }
+    }
+
     void StopMonitoring() {
         if (m_hStopEvent) {
             SetEvent(m_hStopEvent);
@@ -345,9 +399,18 @@ struct MountPointMonitor::Impl {
             m_hDeviceNotify = nullptr;
         }
 
+        // m_hMessageWindow is destroyed by the monitor thread itself
+        // (DestroyWindow must run on the creating thread). After
+        // WaitForSingleObject above the thread has exited and has
+        // already nulled m_hMessageWindow / unregistered the class.
+        // The check below is a defensive fallback only — if the thread
+        // exited abnormally before the cleanup block we still attempt a
+        // best-effort destroy.
         if (m_hMessageWindow) {
             DestroyWindow(m_hMessageWindow);
             m_hMessageWindow = nullptr;
+            ::UnregisterClassW(L"ShadowStrikeMountPointMonitor",
+                               ::GetModuleHandleW(nullptr));
         }
 
         if (m_hStopEvent) {
@@ -449,7 +512,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Failed to get volume info for %c - %ls",
-                         driveLetter, Utils::StringUtils::ToWide(e.what()).c_str());
+                         driveLetter, Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
             return false;
         }
     }
@@ -576,7 +639,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"USB device info retrieval failed for %c - %ls",
-                         driveLetter, Utils::StringUtils::ToWide(e.what()).c_str());
+                         driveLetter, Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
             return false;
         }
     }
@@ -620,7 +683,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Threat detection failed - %ls",
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
             // Fail closed: treat detection failure as suspicious
             return DeviceThreatType::PolicyViolation;
         }
@@ -658,7 +721,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Policy determination failed - %ls",
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
             // Fail closed: block on policy determination failure
             return DevicePolicy::BlockAndAlert;
         }
@@ -690,7 +753,7 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Autorun blocking failed for %c - %ls",
                          NormalizeDriveLetter(driveLetter),
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         }
     }
 
@@ -766,7 +829,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Device history update failed - %ls",
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         }
     }
 
@@ -902,7 +965,7 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_ERROR(L"MountPointMonitor", L"Drive arrival processing failed - %ls",
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         }
     }
 
@@ -958,7 +1021,7 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_ERROR(L"MountPointMonitor", L"Drive removal processing failed - %ls",
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         }
     }
 
@@ -1086,7 +1149,14 @@ struct MountPointMonitor::Impl {
                 // WAIT_OBJECT_0+1 = new messages, WAIT_TIMEOUT = poll interval
             }
 
-            // Unregister the window class before thread exit
+            // Message loop exited — destroy the window in the thread that
+            // owns it (DestroyWindow is documented to require the creating
+            // thread). UnregisterClassW must follow window destruction or
+            // it fails with ERROR_CLASS_HAS_WINDOWS.
+            if (pThis->m_hMessageWindow) {
+                ::DestroyWindow(pThis->m_hMessageWindow);
+                pThis->m_hMessageWindow = nullptr;
+            }
             ::UnregisterClassW(L"ShadowStrikeMountPointMonitor",
                                ::GetModuleHandleW(nullptr));
 
@@ -1094,7 +1164,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Monitor thread failed - %ls",
-                         Utils::StringUtils::ToWide(e.what()).c_str());
+                         Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
             return 1;
         }
     }
@@ -1169,7 +1239,7 @@ bool MountPointMonitor::Initialize(const MountPointMonitorConfig& config) {
     } catch (const std::exception& e) {
         m_impl->m_status.store(MountPointMonitorStatus::Error, std::memory_order_release);
         SS_LOG_ERROR(L"MountPointMonitor", L"Initialization failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         return false;
     }
 }
@@ -1182,8 +1252,10 @@ void MountPointMonitor::Shutdown() noexcept {
     }
 
     try {
-        // Stop monitoring first
-        Stop();
+        // Stop monitoring first (we already hold m_mutex; use the
+        // lock-free private helper to avoid recursive acquisition,
+        // which is undefined behavior on std::shared_mutex).
+        m_impl->StopLocked();
 
         // Clear all data
         {
@@ -1217,7 +1289,7 @@ void MountPointMonitor::Shutdown() noexcept {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MountPointMonitor", L"Shutdown error - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
     }
 }
 
@@ -1270,31 +1342,26 @@ bool MountPointMonitor::Start() {
     } catch (const std::exception& e) {
         m_impl->m_status.store(MountPointMonitorStatus::Error, std::memory_order_release);
         SS_LOG_ERROR(L"MountPointMonitor", L"Start failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         return false;
     }
 }
 
 void MountPointMonitor::Stop() noexcept {
-    // Atomic CAS: only one thread enters StopMonitoring to prevent double-close
-    bool expected = true;
-    if (!m_impl->m_running.compare_exchange_strong(expected, false,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return;
-    }
-
+    // Acquire the same mutex as Start() to close the Start()/Stop()
+    // race: without this, a Stop() running concurrently with an
+    // in-progress Start() could observe m_running == true after
+    // Start() flipped it, CAS it back to false, and return — leaving
+    // Start() to continue on into CreateThread() with m_running == false.
+    // The newly created thread would then exit its main loop on the
+    // first iteration, and the caller would observe a "successful"
+    // Start with no live monitor.
     try {
-        m_impl->m_status.store(MountPointMonitorStatus::Stopping, std::memory_order_release);
-
-        m_impl->StopMonitoring();
-
-        m_impl->m_status.store(MountPointMonitorStatus::Stopped, std::memory_order_release);
-
-        SS_LOG_INFO(L"MountPointMonitor", L"Stopped");
-
-    } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"MountPointMonitor", L"Stop error - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+        std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
+        m_impl->StopLocked();
+    } catch (...) {
+        // unique_lock construction can theoretically throw on
+        // resource exhaustion; swallow to honor the noexcept contract.
     }
 }
 
@@ -1404,7 +1471,7 @@ void MountPointMonitor::RefreshDriveList() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MountPointMonitor", L"Drive list refresh failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
     }
 }
 
@@ -1533,7 +1600,7 @@ bool MountPointMonitor::EjectDrive(wchar_t driveLetter) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MountPointMonitor", L"Eject failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         return false;
     }
 }
@@ -1584,7 +1651,7 @@ bool MountPointMonitor::BlockDrive(wchar_t driveLetter) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MountPointMonitor", L"Block drive failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         return false;
     }
 }
@@ -1641,7 +1708,7 @@ bool MountPointMonitor::SetReadOnly(wchar_t driveLetter, bool readOnly) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MountPointMonitor", L"Set read-only failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         return false;
     }
 }
@@ -1729,7 +1796,7 @@ bool MountPointMonitor::SelfTest() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MountPointMonitor", L"Self-test failed - %ls",
-                     Utils::StringUtils::ToWide(e.what()).c_str());
+                     Utils::StringUtils::ToWide(SanitizeForLog(e.what())).c_str());
         return false;
     }
 }
