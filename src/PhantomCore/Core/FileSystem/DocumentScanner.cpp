@@ -184,6 +184,58 @@ namespace {
     constexpr uint8_t CAB_MAGIC[] = { 0x4D, 0x53, 0x43, 0x46 }; // MSCF
     constexpr uint8_t RAR_MAGIC[] = { 0x52, 0x61, 0x72, 0x21 }; // Rar!
 
+    // ========================================================================
+    // Aliasing-safe little-endian readers for CFB / OLE on-disk structures.
+    // The CFB on-disk format is little-endian. Using std::memcpy avoids
+    // strict-aliasing UB and tolerates unaligned access on architectures
+    // that would otherwise trap.
+    // ========================================================================
+    [[nodiscard]] inline uint16_t ReadLE16(const uint8_t* p) noexcept {
+        uint16_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    [[nodiscard]] inline uint32_t ReadLE32(const uint8_t* p) noexcept {
+        uint32_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+
+    // ========================================================================
+    // Log-sanitization helper: strips C0/C1/DEL control chars from caller-
+    // controlled paths and metadata strings so a crafted filename cannot
+    // forge log lines. Caps at 512 wchars.
+    // ========================================================================
+    [[nodiscard]] inline std::wstring SanitizeForLog(std::wstring_view in) {
+        constexpr size_t kCap = 512;
+        std::wstring out;
+        out.reserve(std::min(in.size(), kCap));
+        for (wchar_t c : in) {
+            if (out.size() >= kCap) { out.append(L"..."); break; }
+            const auto u = static_cast<uint32_t>(c);
+            if (u < 0x20u || u == 0x7Fu || (u >= 0x80u && u < 0xA0u)) {
+                out.push_back(L'?');
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+    [[nodiscard]] inline std::string SanitizeForLog(std::string_view in) {
+        constexpr size_t kCap = 512;
+        std::string out;
+        out.reserve(std::min(in.size(), kCap));
+        for (unsigned char uc : in) {
+            if (out.size() >= kCap) { out.append("..."); break; }
+            if (uc < 0x20u || uc == 0x7Fu || (uc >= 0x80u && uc < 0xA0u)) {
+                out.push_back('?');
+            } else {
+                out.push_back(static_cast<char>(uc));
+            }
+        }
+        return out;
+    }
+
 } // anonymous namespace
 
 // ============================================================================
@@ -210,13 +262,39 @@ public:
 
         try {
             m_config = config;
+            if (config.maxMacroSize == 0 ||
+                config.maxMacroSize > 256u * 1024u * 1024u) {
+                SS_LOG_ERROR(L"DocumentScanner",
+                    L"Initialize rejected: maxMacroSize=%zu out of range",
+                    config.maxMacroSize);
+                return false;
+            }
+            if (config.maxEmbeddedFiles == 0 || config.maxEmbeddedFiles > 100000) {
+                SS_LOG_ERROR(L"DocumentScanner",
+                    L"Initialize rejected: maxEmbeddedFiles=%zu out of range",
+                    config.maxEmbeddedFiles);
+                return false;
+            }
+            if (config.maxRecursionDepth == 0 || config.maxRecursionDepth > 32) {
+                SS_LOG_ERROR(L"DocumentScanner",
+                    L"Initialize rejected: maxRecursionDepth=%u out of range",
+                    config.maxRecursionDepth);
+                return false;
+            }
+            if (config.aiConfidenceThreshold < 0.0f || config.aiConfidenceThreshold > 1.0f) {
+                SS_LOG_ERROR(L"DocumentScanner",
+                    L"Initialize rejected: aiConfidenceThreshold=%.3f out of range",
+                    static_cast<double>(config.aiConfidenceThreshold));
+                return false;
+            }
+
             if (!m_hashStore) {
                 m_hashStore = std::make_shared<HashStore::HashStore>();
             }
             if (!m_patternStore) {
                 m_patternStore = std::make_shared<PatternStore::PatternStore>();
             }
-            m_initialized = true;
+            m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner initialized (macros=%d, ole=%d, pdf=%d, cve=%d)", config.analyzeMacros, config.analyzeOLEObjects, config.analyzePDFJavaScript, config.detectCVEs);
 
@@ -234,7 +312,7 @@ public:
         try {
             m_progressCallback = nullptr;
             m_threatCallback = nullptr;
-            m_initialized = false;
+            m_initialized.store(false, std::memory_order_release);
 
             SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner shutdown complete");
 
@@ -255,8 +333,8 @@ public:
         result.filePath = filePath;
         result.scanTime = std::chrono::system_clock::now();
 
-        // Initialized check
-        if (!m_initialized) {
+        // Initialized check (atomic acquire — pairs with Initialize's release)
+        if (!m_initialized.load(std::memory_order_acquire)) {
             SS_LOG_ERROR(L"DocumentScanner", L"Scan called before initialization");
             result.verdict = ScanVerdict::Error;
             result.errors.push_back("DocumentScanner not initialized");
@@ -647,21 +725,21 @@ public:
             if (!std::equal(std::begin(OLE_SIGNATURE), std::end(OLE_SIGNATURE), header.begin()))
                 return objects;
 
-            const uint16_t majorVersion = *reinterpret_cast<const uint16_t*>(&header[0x1A]);
-            const uint16_t sectorSizePow = *reinterpret_cast<const uint16_t*>(&header[0x1E]);
+            const uint16_t majorVersion = ReadLE16(&header[0x1A]);
+            const uint16_t sectorSizePow = ReadLE16(&header[0x1E]);
             if (sectorSizePow < 7 || sectorSizePow > 16) return objects;
             const uint32_t sectorSize = 1u << sectorSizePow;
 
-            const uint16_t miniSectorSizePow = *reinterpret_cast<const uint16_t*>(&header[0x20]);
+            const uint16_t miniSectorSizePow = ReadLE16(&header[0x20]);
             if (miniSectorSizePow > 16) return objects;
             const uint32_t miniSectorSize = 1u << miniSectorSizePow;
 
-            const uint32_t fatSectorsCount = *reinterpret_cast<const uint32_t*>(&header[0x2C]);
-            const uint32_t firstDirSect = *reinterpret_cast<const uint32_t*>(&header[0x30]);
-            const uint32_t firstMiniFATSect = *reinterpret_cast<const uint32_t*>(&header[0x3C]);
-            const uint32_t numMiniFATSects = *reinterpret_cast<const uint32_t*>(&header[0x40]);
-            const uint32_t firstDIFATSect = *reinterpret_cast<const uint32_t*>(&header[0x44]);
-            const uint32_t numDIFATSects = *reinterpret_cast<const uint32_t*>(&header[0x48]);
+            const uint32_t fatSectorsCount = ReadLE32(&header[0x2C]);
+            const uint32_t firstDirSect = ReadLE32(&header[0x30]);
+            const uint32_t firstMiniFATSect = ReadLE32(&header[0x3C]);
+            const uint32_t numMiniFATSects = ReadLE32(&header[0x40]);
+            const uint32_t firstDIFATSect = ReadLE32(&header[0x44]);
+            const uint32_t numDIFATSects = ReadLE32(&header[0x48]);
 
             if (firstDirSect == 0xFFFFFFFE) return objects;
             if (fatSectorsCount > 10000) return objects;
@@ -673,7 +751,7 @@ public:
             std::vector<uint32_t> fatSectorIds;
             fatSectorIds.reserve(std::min(fatSectorsCount, 109u));
             for (uint32_t fi = 0; fi < std::min(fatSectorsCount, 109u); ++fi) {
-                const uint32_t id = *reinterpret_cast<const uint32_t*>(&header[0x4C + fi * 4]);
+                const uint32_t id = ReadLE32(&header[0x4C + fi * 4]);
                 if (id == 0xFFFFFFFE || id == 0xFFFFFFFF) break;
                 fatSectorIds.push_back(id);
             }
@@ -694,12 +772,12 @@ public:
 
                     const uint32_t entriesInSect = sectorSize / 4 - 1;
                     for (uint32_t j = 0; j < entriesInSect && fatSectorIds.size() < fatSectorsCount; ++j) {
-                        const uint32_t id = *reinterpret_cast<const uint32_t*>(&difatData[j * 4]);
+                        const uint32_t id = ReadLE32(&difatData[j * 4]);
                         if (id == 0xFFFFFFFE || id == 0xFFFFFFFF) break;
                         fatSectorIds.push_back(id);
                     }
 
-                    difatSect = *reinterpret_cast<const uint32_t*>(&difatData[entriesInSect * 4]);
+                    difatSect = ReadLE32(&difatData[entriesInSect * 4]);
                     ++difatCount;
                 }
             }
@@ -719,7 +797,7 @@ public:
                 if (!file) break;
 
                 for (uint32_t j = 0; j < entriesPerSector; ++j) {
-                    fat.push_back(*reinterpret_cast<const uint32_t*>(&fatSectData[j * 4]));
+                    fat.push_back(ReadLE32(&fatSectData[j * 4]));
                 }
             }
 
@@ -744,7 +822,7 @@ public:
                     if (!file) break;
 
                     for (uint32_t j = 0; j < entriesPerSector; ++j) {
-                        miniFat.push_back(*reinterpret_cast<const uint32_t*>(&mfData[j * 4]));
+                        miniFat.push_back(ReadLE32(&mfData[j * 4]));
                     }
 
                     mfSect = fat[mfSect];
@@ -793,19 +871,19 @@ public:
 
                     if (objectType == 0) { dirEntriesRead++; continue; }
 
-                    const uint16_t nameSize = *reinterpret_cast<const uint16_t*>(&entry[0x40]);
+                    const uint16_t nameSize = ReadLE16(&entry[0x40]);
                     if (nameSize == 0 || nameSize > 64) { dirEntriesRead++; continue; }
 
                     CFBDirEntry de{};
                     de.objectType = objectType;
                     std::memcpy(de.clsid, &entry[0x50], 16);
-                    de.startSector = *reinterpret_cast<const uint32_t*>(&entry[0x74]);
-                    de.streamSize = *reinterpret_cast<const uint32_t*>(&entry[0x78]);
+                    de.startSector = ReadLE32(&entry[0x74]);
+                    de.streamSize = ReadLE32(&entry[0x78]);
                     if (majorVersion >= 4) {
                         de.streamSize |= static_cast<uint64_t>(
-                            *reinterpret_cast<const uint32_t*>(&entry[0x7C])) << 32;
+                            ReadLE32(&entry[0x7C])) << 32;
                     }
-                    de.childId = *reinterpret_cast<const uint32_t*>(&entry[0x4C]);
+                    de.childId = ReadLE32(&entry[0x4C]);
 
                     de.wname = std::wstring(reinterpret_cast<const wchar_t*>(entry), nameSize / 2);
                     while (!de.wname.empty() && de.wname.back() == L'\0') de.wname.pop_back();
@@ -1106,8 +1184,14 @@ public:
 
                 // Parse object ID
                 uint32_t objId = 0;
-                auto [ptr, ec] = std::from_chars(content.data() + numStart, 
-                    content.data() + content.find(' ', numStart), objId);
+                const size_t spaceAfterNum = content.find(' ', numStart);
+                if (spaceAfterNum == std::string::npos || spaceAfterNum <= numStart) {
+                    continue;
+                }
+                auto [ptr, ec] = std::from_chars(
+                    content.data() + numStart,
+                    content.data() + spaceAfterNum,
+                    objId);
                 if (ec != std::errc{}) { continue; }
 
                 // Find endobj
@@ -1189,13 +1273,24 @@ public:
         result.filePath = filePath;
 
         try {
-            // Read file content
+            // Read file content (capped to MAX_DOCUMENT_SIZE to prevent DoS)
+            std::error_code ec;
+            const auto rawSize = fs::file_size(filePath, ec);
+            if (ec) return result;
+            if (rawSize == 0 || rawSize > MAX_DOCUMENT_SIZE) {
+                SS_LOG_WARN(L"DocumentScanner",
+                    L"ExtractIOCs - file too large or empty: %llu bytes",
+                    static_cast<unsigned long long>(rawSize));
+                return result;
+            }
+
             std::ifstream file(filePath, std::ios::binary);
             if (!file) return result;
 
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string content = buffer.str();
+            std::string content;
+            content.resize(static_cast<size_t>(rawSize));
+            file.read(content.data(), static_cast<std::streamsize>(rawSize));
+            content.resize(static_cast<size_t>(file.gcount()));
 
             ExtractIOCsFromContent(content, result);
 
@@ -1241,7 +1336,7 @@ public:
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
-        return m_initialized;
+        return m_initialized.load(std::memory_order_acquire);
     }
 
     void ResetStatistics() noexcept {
@@ -1432,6 +1527,13 @@ private:
                 if (result.hasMacros) {
                     m_stats.macrosDetected.fetch_add(1, std::memory_order_relaxed);
 
+                    // Run AnalyzeMacroCode on each extracted module — without
+                    // this the legacy code path left riskLevel = None and no
+                    // macro threats were ever surfaced from binary OLE files.
+                    for (auto& macro : result.macros) {
+                        AnalyzeMacroCode(macro);
+                    }
+
                     for (const auto& macro : result.macros) {
                         if (macro.riskLevel > result.highestMacroRisk) {
                             result.highestMacroRisk = macro.riskLevel;
@@ -1563,12 +1665,25 @@ private:
                            const DocumentScannerConfig& config,
                            DocumentScanResult& result) {
         try {
+            // RTF body cap: refuse to slurp files > MAX_DOCUMENT_SIZE.
+            std::error_code ec;
+            const auto rawSize = fs::file_size(filePath, ec);
+            if (ec || rawSize == 0 || rawSize > MAX_DOCUMENT_SIZE) {
+                if (rawSize > MAX_DOCUMENT_SIZE) {
+                    SS_LOG_WARN(L"DocumentScanner",
+                        L"AnalyzeRTFDocument - file too large: %llu bytes",
+                        static_cast<unsigned long long>(rawSize));
+                }
+                return;
+            }
+
             std::ifstream file(filePath, std::ios::binary);
             if (!file) return;
 
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string content = buffer.str();
+            std::string content;
+            content.resize(static_cast<size_t>(rawSize));
+            file.read(content.data(), static_cast<std::streamsize>(rawSize));
+            content.resize(static_cast<size_t>(file.gcount()));
 
             // Check for OLE objects in RTF
             if (content.find("\\objdata") != std::string::npos) {
@@ -2173,21 +2288,21 @@ private:
 
         // Read UserType (length-prefixed ANSI string) — skip it
         if (offset + 4 > data.size()) return "";
-        const uint32_t userTypeLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        const uint32_t userTypeLen = ReadLE32(&data[offset]);
         offset += 4;
         if (userTypeLen > 0x10000 || offset + userTypeLen > data.size()) return "";
         offset += userTypeLen;
 
         // Read ClipboardFormat (length-prefixed ANSI string) — skip it
         if (offset + 4 > data.size()) return "";
-        const uint32_t clipFmtLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        const uint32_t clipFmtLen = ReadLE32(&data[offset]);
         offset += 4;
         if (clipFmtLen > 0x10000 || offset + clipFmtLen > data.size()) return "";
         offset += clipFmtLen;
 
         // Read ProgID (length-prefixed ANSI string)
         if (offset + 4 > data.size()) return "";
-        const uint32_t progIdLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        const uint32_t progIdLen = ReadLE32(&data[offset]);
         offset += 4;
         if (progIdLen == 0 || progIdLen > 256 || offset + progIdLen > data.size()) return "";
 
@@ -2239,7 +2354,7 @@ private:
 
         // Read embedded data length (4 bytes LE)
         if (offset + 4 > data.size()) return {path, payload};
-        const uint32_t dataLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        const uint32_t dataLen = ReadLE32(&data[offset]);
         offset += 4;
 
         if (dataLen == 0 || dataLen > MAX_OLE_OBJECT_DATA) return {path, payload};
@@ -2273,23 +2388,23 @@ private:
             }
 
             // Parse sector size: 2^header[0x1E] (typically 512 for v3, 4096 for v4)
-            const uint16_t sectorSizePow = *reinterpret_cast<const uint16_t*>(&header[0x1E]);
+            const uint16_t sectorSizePow = ReadLE16(&header[0x1E]);
             if (sectorSizePow < 7 || sectorSizePow > 16) return streams; // Sanity check
             const uint32_t sectorSize = 1u << sectorSizePow;
 
             // First directory sector SECT (at offset 0x30)
-            const uint32_t firstDirSect = *reinterpret_cast<const uint32_t*>(&header[0x30]);
+            const uint32_t firstDirSect = ReadLE32(&header[0x30]);
             if (firstDirSect == 0xFFFFFFFE) return streams; // ENDOFCHAIN
 
             // Read FAT sectors from DIFAT in header (109 entries at offset 0x4C)
-            const uint32_t fatSectors = *reinterpret_cast<const uint32_t*>(&header[0x2C]);
+            const uint32_t fatSectors = ReadLE32(&header[0x2C]);
             if (fatSectors > 10000) return streams; // Cap for safety
 
             // Build FAT table
             std::vector<uint32_t> fat;
             const uint32_t entriesPerSector = sectorSize / 4;
             for (uint32_t fi = 0; fi < std::min(fatSectors, 109u); ++fi) {
-                uint32_t fatSectId = *reinterpret_cast<const uint32_t*>(&header[0x4C + fi * 4]);
+                uint32_t fatSectId = ReadLE32(&header[0x4C + fi * 4]);
                 if (fatSectId == 0xFFFFFFFE || fatSectId == 0xFFFFFFFF) break;
 
                 std::vector<uint8_t> fatSectData(sectorSize);
@@ -2298,7 +2413,7 @@ private:
                 if (!file) break;
 
                 for (uint32_t j = 0; j < entriesPerSector; ++j) {
-                    fat.push_back(*reinterpret_cast<const uint32_t*>(&fatSectData[j * 4]));
+                    fat.push_back(ReadLE32(&fatSectData[j * 4]));
                 }
             }
 
@@ -2324,12 +2439,12 @@ private:
                     if (objectType == 0) continue;
 
                     // Read name (UTF-16LE, 64 bytes max)
-                    const uint16_t nameSize = *reinterpret_cast<const uint16_t*>(&entry[0x40]);
+                    const uint16_t nameSize = ReadLE16(&entry[0x40]);
                     if (nameSize == 0 || nameSize > 64) { dirEntriesRead++; continue; }
 
                     std::wstring wname(reinterpret_cast<const wchar_t*>(entry), nameSize / 2);
-                    // Remove null terminator
-                    while (!wname.empty() && wname.back() == L'\\0') wname.pop_back();
+                    // Remove trailing UTF-16 NUL terminator(s).
+                    while (!wname.empty() && wname.back() == L'\0') wname.pop_back();
 
                     std::string name = StringUtils::ToNarrow(wname);
                     if (!name.empty()) {
@@ -2382,12 +2497,24 @@ private:
 
     void CheckForDDE(const std::wstring& filePath, DocumentScanResult& result) {
         try {
+            // Only inspect the first chunk of the file: DDE markers in legacy
+            // Office docs are concentrated in the document body, not in the
+            // tail. Reading the entire file would be a DoS vector.
+            constexpr size_t kDDEScanCap = 16ull * 1024ull * 1024ull; // 16 MB
+
+            std::error_code ec;
+            const auto rawSize = fs::file_size(filePath, ec);
+            if (ec || rawSize == 0) return;
+            const size_t toRead = static_cast<size_t>(std::min<uint64_t>(
+                static_cast<uint64_t>(rawSize), kDDEScanCap));
+
             std::ifstream file(filePath, std::ios::binary);
             if (!file) return;
 
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string content = buffer.str();
+            std::string content;
+            content.resize(toRead);
+            file.read(content.data(), static_cast<std::streamsize>(toRead));
+            content.resize(static_cast<size_t>(file.gcount()));
 
             // Look for DDE patterns
             if (content.find("DDE") != std::string::npos ||
@@ -2672,9 +2799,10 @@ private:
         try {
             // Manual URL extraction — no std::regex (ReDoS-safe, production performance)
             const size_t len = content.size();
+            if (len < 8) return;
             size_t i = 0;
 
-            while (i < len - 8) {
+            while (i + 8 <= len) {
                 bool isUrl = false;
                 size_t urlStart = i;
 
@@ -2970,7 +3098,7 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
 
     DocumentScannerConfig m_config;
     DocumentScannerStatistics m_stats;
