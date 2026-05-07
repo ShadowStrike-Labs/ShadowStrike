@@ -39,6 +39,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -68,14 +69,29 @@ namespace {
 
 constexpr const wchar_t* kLogCategory = L"ZeroDayDetector";
 
+// Hard upper bounds on attacker-influenced inputs.  Excessive sizes are clamped
+// rather than rejected so that legitimate large modules are still partially
+// analysed; the cap exists purely to bound CPU/RAM consumption.
+constexpr size_t kMaxStackDumpFrames        = 1u << 16;     // 65 536 frames
+constexpr size_t kMaxModuleRangesEntries    = 1u << 12;     // 4 096 modules
+constexpr size_t kMaxAllocationsToAnalyse   = 1u << 16;
+constexpr size_t kMaxFindGadgetsBytes       = 16u * 1024u * 1024u;
+constexpr size_t kMaxGadgetsReturned        = 4096;
+constexpr size_t kMaxCveDatabaseEntries     = 1024;
+constexpr size_t kMaxShellcodePatterns      = 256;
+
 [[nodiscard]] std::wstring ToWide(std::string_view v) noexcept {
     try { return Utils::StringUtils::ToWide(v); }
     catch (...) { return L"<conversion failed>"; }
 }
 
-[[nodiscard]] uint32_t ReadU32Safe(const void* src) noexcept {
+// SAL-annotated, alignment-safe little-endian 32-bit fetch.  Used in lieu of
+// raw pointer dereferences to avoid strict-aliasing UB and unaligned access.
+[[nodiscard]] uint32_t ReadU32Safe(_In_reads_bytes_(sizeof(uint32_t)) const void* src) noexcept {
     uint32_t val = 0;
-    std::memcpy(&val, src, sizeof(val));
+    if (src != nullptr) {
+        std::memcpy(&val, src, sizeof(val));
+    }
     return val;
 }
 
@@ -190,8 +206,18 @@ void ZeroDayDetector::Impl::InitializePatterns() noexcept {
         m_shellcodePatterns.push_back({{0x68, 0x33, 0x32, 0x00, 0x00, 0x68, 0x77, 0x73, 0x32, 0x5F},
             ShellcodeType::Downloader, "Download-and-execute (ws2_32 push)", 0.82f});
 
+        // Defensive cap — should never be exceeded with the seed set above but
+        // protects against accidental over-population in future revisions.
+        if (m_shellcodePatterns.size() > kMaxShellcodePatterns) {
+            m_shellcodePatterns.resize(kMaxShellcodePatterns);
+        }
+
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(kLogCategory, L"OOM during shellcode pattern initialization");
+        m_shellcodePatterns.clear();
     } catch (...) {
         SS_LOG_ERROR(kLogCategory, L"Exception during pattern initialization");
+        m_shellcodePatterns.clear();
     }
 }
 
@@ -215,24 +241,39 @@ void ZeroDayDetector::Impl::InitializeCVEDatabase() noexcept {
         m_cveDatabase.push_back({"CVE-2022-30190", "Follina - MSDT RCE",
             ExploitType::ArbitraryWrite, {0x6D, 0x73, 0x2D, 0x6D, 0x73, 0x64, 0x74}, 7.8f, "Windows MSDT"});
 
+        if (m_cveDatabase.size() > kMaxCveDatabaseEntries) {
+            m_cveDatabase.resize(kMaxCveDatabaseEntries);
+        }
+
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(kLogCategory, L"OOM during CVE database initialization");
+        m_cveDatabase.clear();
     } catch (...) {
         SS_LOG_ERROR(kLogCategory, L"Exception during CVE database initialization");
+        m_cveDatabase.clear();
     }
 }
 
 void ZeroDayDetector::Impl::InitializeMITRE() noexcept {
-    m_mitreTechniques = {
-        {"T1055",    "Process Injection"},
-        {"T1055.012","Process Hollowing"},
-        {"T1059",    "Command and Scripting Interpreter"},
-        {"T1068",    "Exploitation for Privilege Escalation"},
-        {"T1189",    "Drive-by Compromise"},
-        {"T1203",    "Exploitation for Client Execution"},
-        {"T1210",    "Exploitation of Remote Services"},
-        {"T1211",    "Exploitation for Defense Evasion"},
-        {"T1212",    "Exploitation for Credential Access"},
-        {"T1574",    "Hijack Execution Flow"},
-    };
+    // Map insertion can throw std::bad_alloc; the original `noexcept`
+    // declaration would have triggered std::terminate on OOM.
+    try {
+        m_mitreTechniques = {
+            {"T1055",    "Process Injection"},
+            {"T1055.012","Process Hollowing"},
+            {"T1059",    "Command and Scripting Interpreter"},
+            {"T1068",    "Exploitation for Privilege Escalation"},
+            {"T1189",    "Drive-by Compromise"},
+            {"T1203",    "Exploitation for Client Execution"},
+            {"T1210",    "Exploitation of Remote Services"},
+            {"T1211",    "Exploitation for Defense Evasion"},
+            {"T1212",    "Exploitation for Credential Access"},
+            {"T1574",    "Hijack Execution Flow"},
+        };
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"Exception during MITRE technique initialization");
+        m_mitreTechniques.clear();
+    }
 }
 
 // ============================================================================
@@ -525,6 +566,12 @@ std::optional<ROPChainInfo> ZeroDayDetector::Impl::DetectROPChainInternal(
     try {
         if (addresses.empty() || moduleRanges.empty()) return std::nullopt;
 
+        // Defensive cap — public callers already clamp, but the internal
+        // helper may be reached from other code paths in the future.
+        if (addresses.size() > kMaxStackDumpFrames) {
+            addresses = addresses.subspan(0, kMaxStackDumpFrames);
+        }
+
         ROPChainInfo info;
         info.startAddress = static_cast<uint64_t>(addresses[0]);
         size_t inModuleCount = 0;
@@ -535,21 +582,22 @@ std::optional<ROPChainInfo> ZeroDayDetector::Impl::DetectROPChainInternal(
                 ++inModuleCount;
                 ROPGadget g;
                 g.address     = static_cast<uint64_t>(addr);
-                g.module      = modName;
+                g.module      = std::move(modName);
                 g.type        = GadgetType::Unknown;
-                g.disassembly = "addr-in-" + modName;
+                g.disassembly = "addr-in-module";
                 info.gadgets.push_back(std::move(g));
             }
         }
 
-        const double ratio = static_cast<double>(inModuleCount) / static_cast<double>(addresses.size());
+        const double ratio = static_cast<double>(inModuleCount) /
+                             static_cast<double>(addresses.size());
         if (ratio < 0.5 || inModuleCount < ZeroDayConstants::ROP_CHAIN_THRESHOLD)
             return std::nullopt;
 
         std::unordered_set<std::string> uniqueModules;
         for (const auto& g : info.gadgets) uniqueModules.insert(g.module);
 
-        if (uniqueModules.size() >= 3)     info.purpose = "Cross-module ROP chain";
+        if (uniqueModules.size() >= 3)      info.purpose = "Cross-module ROP chain";
         else if (uniqueModules.size() == 1) info.purpose = "Single-module gadget chain";
         else                                info.purpose = "ROP chain";
 
@@ -575,43 +623,58 @@ std::optional<HeapSprayInfo> ZeroDayDetector::Impl::DetectHeapSprayInternal(
     try {
         if (allocations.size() < 10) return std::nullopt;
 
+        // Bound attacker-controlled allocation list size before further work.
+        const size_t allocCount =
+            (std::min)(allocations.size(), kMaxAllocationsToAnalyse);
+
         HeapSprayInfo info;
-        info.allocationCount = allocations.size();
+        info.allocationCount = allocCount;
 
         std::unordered_map<size_t, uint32_t> sizeHist;
         sizeHist.reserve(32);
 
-        for (const auto& [addr, sz] : allocations) {
-            info.totalSize += sz;
+        // Saturating accumulator to defeat integer-overflow on totalSize.
+        size_t totalSize = 0;
+        for (size_t i = 0; i < allocCount; ++i) {
+            const size_t sz = allocations[i].second;
+            if (sz > (SIZE_MAX - totalSize)) {
+                totalSize = SIZE_MAX;
+            } else {
+                totalSize += sz;
+            }
             sizeHist[sz]++;
         }
+        info.totalSize = totalSize;
 
-        size_t dominantSize = 0;
+        size_t   dominantSize  = 0;
         uint32_t dominantCount = 0;
         for (const auto& [sz, cnt] : sizeHist) {
             if (cnt > dominantCount) { dominantCount = cnt; dominantSize = sz; }
         }
 
-        const bool sizeUniform = (dominantCount >= allocations.size() / 2);
+        const bool sizeUniform = (dominantCount >= static_cast<uint32_t>(allocCount / 2));
         const bool highCount   = (info.allocationCount >= ZeroDayConstants::HEAP_SPRAY_THRESHOLD);
         const bool largeTotal  = (info.totalSize >= 10ULL * 1024 * 1024);
 
         if (!sizeUniform || (!highCount && !largeTotal)) return std::nullopt;
 
-        // Analyze address spacing
-        if (allocations.size() >= 3) {
+        // Analyse address spacing for evenly-strided spray allocations.
+        if (allocCount >= 3) {
             std::vector<uintptr_t> addrs;
-            addrs.reserve(allocations.size());
-            for (const auto& [a, _] : allocations) addrs.push_back(a);
+            addrs.reserve(allocCount);
+            for (size_t i = 0; i < allocCount; ++i) {
+                addrs.push_back(allocations[i].first);
+            }
             std::sort(addrs.begin(), addrs.end());
 
             std::unordered_map<uintptr_t, uint32_t> deltaHist;
             for (size_t i = 1; i < addrs.size(); ++i) {
-                uintptr_t delta = addrs[i] - addrs[i-1];
+                const uintptr_t delta = addrs[i] - addrs[i-1];
                 if (delta > 0) deltaHist[delta]++;
             }
 
             for (const auto& [delta, cnt] : deltaHist) {
+                (void)delta;
                 if (cnt >= addrs.size() / 3 && dominantSize >= 4) {
                     const uint8_t fb = static_cast<uint8_t>((dominantSize >> 8) & 0xFF);
                     info.pattern = {fb, fb, fb, fb};
@@ -621,13 +684,15 @@ std::optional<HeapSprayInfo> ZeroDayDetector::Impl::DetectHeapSprayInternal(
             }
         }
 
-        // Check for known spray target addresses
-        static const uint32_t kSprayValues[] = {0x0C0C0C0Cu, 0x0D0D0D0Du, 0x0E0E0E0Eu, 0x0A0A0A0Au};
-        for (const auto& [addr, _] : allocations) {
-            for (uint32_t sv : kSprayValues) {
-                if ((addr & 0xFFFFFFFF) == sv) {
+        // Check for canonical heap-spray landing addresses (0x0c0c0c0c, etc.).
+        static constexpr uint32_t kSprayValues[] =
+            {0x0C0C0C0Cu, 0x0D0D0D0Du, 0x0E0E0E0Eu, 0x0A0A0A0Au};
+        for (size_t i = 0; i < allocCount; ++i) {
+            const uintptr_t addr = allocations[i].first;
+            for (const uint32_t sv : kSprayValues) {
+                if ((static_cast<uint32_t>(addr & 0xFFFFFFFFu)) == sv) {
                     info.sprayValue = sv;
-                    const uint8_t fb = static_cast<uint8_t>(sv & 0xFF);
+                    const uint8_t fb = static_cast<uint8_t>(sv & 0xFFu);
                     info.pattern = {fb, fb, fb, fb};
                 }
             }
@@ -655,28 +720,44 @@ std::optional<MemoryCorruptionInfo> ZeroDayDetector::Impl::DetectMemoryCorruptio
         MemoryCorruptionInfo info;
         int indicators = 0;
 
-        // Detect arbitrary write primitive clusters
+        // Detect arbitrary-write primitive clusters: sequences of memory-write
+        // opcodes packed within ~20 bytes are a strong proxy for a memory
+        // corruption gadget.  The previous loop reset writeCluster to 1 for
+        // *every* non-adjacent hit, which silently dropped real cluster
+        // counts; we accumulate properly with an explicit "first hit" branch
+        // and report the longest observed run.
         {
-            int writeCluster = 0, maxCluster = 0;
-            size_t prevPos = 0;
+            int    writeCluster = 0;
+            int    maxCluster   = 0;
+            bool   havePrev     = false;
+            size_t prevPos      = 0;
 
-            for (size_t i = 0; i + 6 < buffer.size(); ++i) {
+            const size_t end = (buffer.size() >= 6u) ? (buffer.size() - 6u) : 0u;
+            for (size_t i = 0; i < end; ++i) {
                 bool isWrite = false;
-                // MOV [reg+disp32], imm32
-                if (buffer[i] == 0xC7 && (buffer[i+1] & 0xC0) != 0xC0 &&
-                    (buffer[i+1] & 0x07) <= 0x07)
+                // MOV r/m32, imm32 — modr/m must encode memory (mod != 11).
+                if (buffer[i] == 0xC7 && (buffer[i+1] & 0xC0) != 0xC0) {
                     isWrite = true;
-                // MOV [reg], reg (only reg-indirect, not reg-to-reg)
-                if (buffer[i] == 0x89 && (buffer[i+1] & 0xC0) == 0x00)
-                    isWrite = true;
-
-                if (isWrite) {
-                    if (prevPos > 0 && (i - prevPos) < 20) ++writeCluster;
-                    else { maxCluster = (std::max)(maxCluster, writeCluster); writeCluster = 1; }
-                    prevPos = i;
                 }
+                // MOV r/m32, r32 with mod==00 (register-indirect, no disp).
+                if (buffer[i] == 0x89 && (buffer[i+1] & 0xC0) == 0x00) {
+                    isWrite = true;
+                }
+
+                if (!isWrite) continue;
+
+                if (!havePrev) {
+                    writeCluster = 1;
+                    havePrev     = true;
+                } else if ((i - prevPos) < 20u) {
+                    if (writeCluster < INT_MAX) ++writeCluster;
+                } else {
+                    if (writeCluster > maxCluster) maxCluster = writeCluster;
+                    writeCluster = 1;
+                }
+                prevPos = i;
             }
-            maxCluster = (std::max)(maxCluster, writeCluster);
+            if (writeCluster > maxCluster) maxCluster = writeCluster;
 
             if (maxCluster >= 4) {
                 info.corruptionType     = "Arbitrary Write Primitive";
@@ -685,14 +766,17 @@ std::optional<MemoryCorruptionInfo> ZeroDayDetector::Impl::DetectMemoryCorruptio
             }
         }
 
-        // Detect OOB read patterns
+        // Detect OOB read patterns: REX.W MOV r64, [r/m + disp32] with very
+        // large displacements is a heavy hint for unbounded reads.
         {
             int oobReads = 0;
-            for (size_t i = 0; i + 6 < buffer.size(); ++i) {
-                if (buffer[i] == 0x48 && buffer[i+1] == 0x8B &&
-                    (buffer[i+2] & 0xC0) == 0x80 && i + 6 < buffer.size())
+            const size_t end = (buffer.size() >= 7u) ? (buffer.size() - 7u) : 0u;
+            for (size_t i = 0; i < end; ++i) {
+                if (buffer[i]   == 0x48 &&
+                    buffer[i+1] == 0x8B &&
+                    (buffer[i+2] & 0xC0) == 0x80)
                 {
-                    uint32_t disp = ReadU32Safe(&buffer[i+3]);
+                    const uint32_t disp = ReadU32Safe(&buffer[i+3]);
                     if (disp > 0x10000) ++oobReads;
                 }
             }
@@ -727,10 +811,27 @@ std::vector<CVEMatch> ZeroDayDetector::Impl::CorrelateCVEs(
 {
     std::vector<CVEMatch> matches;
     try {
+        // SECURITY: do not produce CVE matches purely on cosmetic byte
+        // patterns ("MSHTML", "ms-msdt", ...) — those would fire on benign
+        // documents and inflate the alert pipeline.  A pattern-only match is
+        // accepted ONLY when at least one corroborating exploit indicator
+        // (shellcode / ROP / heap-spray / corruption / non-Unknown type)
+        // exists.  Pure type matches without a pattern hit are reported only
+        // when the result already has corroborating evidence.
+        const bool hasCorroborating =
+            result.shellcodeInfo.has_value() || result.ropChainInfo.has_value() ||
+            result.heapSprayInfo.has_value() || result.corruptionInfo.has_value() ||
+            result.type != ExploitType::Unknown;
+
         for (const auto& cve : m_cveDatabase) {
-            bool typeMatch    = (result.type == cve.exploitType);
-            bool patternMatch = (!buffer.empty() && MatchCVEPattern(cve, buffer));
+            const bool typeMatch    = (result.type == cve.exploitType);
+            const bool patternMatch = (!buffer.empty() && MatchCVEPattern(cve, buffer));
+
             if (!typeMatch && !patternMatch) continue;
+            if (!hasCorroborating)            continue;
+            // Additionally require pattern match when type does not align;
+            // a bare type match is not specific enough to attribute a CVE.
+            if (!patternMatch)                 continue;
 
             CVEMatch m;
             m.cveId           = cve.cveId;
@@ -739,9 +840,8 @@ std::vector<CVEMatch> ZeroDayDetector::Impl::CorrelateCVEs(
             m.affectedProduct = cve.affectedProduct;
             m.matchedPattern  = cve.cveId + " pattern";
 
-            if (typeMatch && patternMatch) m.confidence = 0.90f;
-            else if (patternMatch)         m.confidence = 0.75f;
-            else                           m.confidence = 0.50f;
+            if (typeMatch && patternMatch) m.confidence = 0.85f;
+            else                            m.confidence = 0.55f;
 
             matches.push_back(std::move(m));
         }
@@ -819,17 +919,44 @@ DetectionConfidence ZeroDayDetector::Impl::CalculateConfidence(const ZeroDayResu
 // ============================================================================
 
 void ZeroDayDetector::Impl::NotifyDetection(const ZeroDayResult& result) noexcept {
+    // SECURITY: invoking user callbacks while holding m_mutex is a deadlock
+    // hazard — a callback that calls Register/Unregister must take the
+    // unique lock.  Therefore we copy the std::function under a shared lock
+    // and dispatch outside the lock.
+    ZeroDayDetectionCallback cb;
     try {
         std::shared_lock lock(m_mutex);
-        if (m_detectionCallback) m_detectionCallback(result);
-    } catch (...) { SS_LOG_ERROR(kLogCategory, L"Exception in detection callback"); }
+        cb = m_detectionCallback;
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"Exception capturing detection callback");
+        return;
+    }
+
+    if (!cb) return;
+
+    try {
+        cb(result);
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"Detection callback threw an exception");
+    }
 }
 
 void ZeroDayDetector::Impl::NotifyError(const std::string& msg, int code) noexcept {
+    ErrorCallback cb;
     try {
         std::shared_lock lock(m_mutex);
-        if (m_errorCallback) m_errorCallback(msg, code);
-    } catch (...) {}
+        cb = m_errorCallback;
+    } catch (...) {
+        return;
+    }
+
+    if (!cb) return;
+
+    try {
+        cb(msg, code);
+    } catch (...) {
+        // Suppress: error callback is best-effort.
+    }
 }
 
 // ============================================================================
@@ -849,52 +976,72 @@ ZeroDayDetector::~ZeroDayDetector() { if (m_impl) Shutdown(); }
 
 bool ZeroDayDetector::Initialize(const ZeroDayConfiguration& config) {
     if (!m_impl) return false;
-    if (m_impl->m_initialized.exchange(true)) {
-        SS_LOG_WARN(kLogCategory, L"Already initialized");
-        return true;
+
+    // Use status as a one-shot CAS gate: only the thread that flips
+    // Uninitialized -> Initializing performs initialization.  This avoids the
+    // race where m_initialized was eagerly set true before patterns/CVE data
+    // were populated, which let concurrent AnalyzeBuffer callers run against
+    // empty pattern stores.
+    ZeroDayStatus expected = ZeroDayStatus::Uninitialized;
+    if (!m_impl->m_status.compare_exchange_strong(
+            expected, ZeroDayStatus::Initializing,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        if (expected == ZeroDayStatus::Running) {
+            SS_LOG_WARN(kLogCategory, L"Already initialized");
+            return true;
+        }
+        SS_LOG_ERROR(kLogCategory, L"Initialize called from unexpected state (%u)",
+            static_cast<unsigned>(expected));
+        return false;
     }
+
+    if (!config.IsValid()) {
+        SS_LOG_ERROR(kLogCategory, L"Invalid configuration");
+        m_impl->m_status.store(ZeroDayStatus::Error, std::memory_order_release);
+        return false;
+    }
+
     try {
-        m_impl->m_status.store(ZeroDayStatus::Initializing, std::memory_order_release);
-        if (!config.IsValid()) {
-            SS_LOG_ERROR(kLogCategory, L"Invalid configuration");
-            m_impl->m_initialized.store(false, std::memory_order_release);
-            m_impl->m_status.store(ZeroDayStatus::Error, std::memory_order_release);
-            return false;
-        }
-        {
-            std::unique_lock lock(m_impl->m_mutex);
-            m_impl->m_config = config;
-            m_impl->m_stats  = ZeroDayStatistics{};
-        }
+        // All mutation of pattern/CVE/MITRE caches happens under the unique
+        // lock so that any concurrent reader (DetectShellcodeInternal, etc.)
+        // observes a fully constructed snapshot.
+        std::unique_lock lock(m_impl->m_mutex);
+        m_impl->m_config = config;
+        m_impl->m_stats.Reset();
         m_impl->InitializePatterns();
         m_impl->InitializeCVEDatabase();
         m_impl->InitializeMITRE();
-        m_impl->m_status.store(ZeroDayStatus::Running, std::memory_order_release);
-        SS_LOG_INFO(kLogCategory, L"Initialized with %zu shellcode patterns, %zu CVE entries",
-            m_impl->m_shellcodePatterns.size(), m_impl->m_cveDatabase.size());
-        return true;
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(kLogCategory, L"Init failed: %ls", ToWide(ex.what()).c_str());
-        m_impl->m_initialized.store(false, std::memory_order_release);
         m_impl->m_status.store(ZeroDayStatus::Error, std::memory_order_release);
         return false;
     } catch (...) {
         SS_LOG_FATAL(kLogCategory, L"Unknown init error");
-        m_impl->m_initialized.store(false, std::memory_order_release);
         m_impl->m_status.store(ZeroDayStatus::Error, std::memory_order_release);
         return false;
     }
+
+    // Publish: order matters - status flip then m_initialized so observers
+    // that test IsInitialized() see Running too.
+    m_impl->m_status.store(ZeroDayStatus::Running, std::memory_order_release);
+    m_impl->m_initialized.store(true, std::memory_order_release);
+
+    SS_LOG_INFO(kLogCategory, L"Initialized with %zu shellcode patterns, %zu CVE entries",
+        m_impl->m_shellcodePatterns.size(), m_impl->m_cveDatabase.size());
+    return true;
 }
 
 void ZeroDayDetector::Shutdown() {
     if (!m_impl) return;
-    if (!m_impl->m_initialized.exchange(false)) return;
+    if (!m_impl->m_initialized.exchange(false, std::memory_order_acq_rel)) return;
     try {
         m_impl->m_status.store(ZeroDayStatus::Stopping, std::memory_order_release);
         {
             std::unique_lock lock(m_impl->m_mutex);
             m_impl->m_shellcodePatterns.clear();
             m_impl->m_cveDatabase.clear();
+            m_impl->m_mitreTechniques.clear();
             m_impl->m_detectionCallback = nullptr;
             m_impl->m_errorCallback     = nullptr;
         }
@@ -1002,28 +1149,72 @@ ZeroDayResult ZeroDayDetector::AnalyzeFile(
     try {
         if (!IsInitialized()) return result;
 
+        // Reject empty paths early.
+        if (filePath.empty()) {
+            SS_LOG_WARN(kLogCategory, L"AnalyzeFile: empty path");
+            return result;
+        }
+
         std::error_code ec;
-        if (!fs::exists(filePath, ec) || ec) {
+
+        // SECURITY: validate filesystem entity is a regular file.  Following a
+        // junction or device handle from an unprivileged caller would expose
+        // the service to TOCTOU and DoS (e.g. /dev/zero-equivalents).  We
+        // resolve symlinks via status() (not symlink_status()) so junctions
+        // landing on a regular file remain analysable, but pipes / devices
+        // are rejected outright.
+        const auto st = fs::status(filePath, ec);
+        if (ec) {
+            SS_LOG_ERROR(kLogCategory, L"AnalyzeFile: status() failed (%d): %ls",
+                ec.value(), filePath.wstring().c_str());
+            return result;
+        }
+        if (!fs::exists(st)) {
             SS_LOG_ERROR(kLogCategory, L"File not found: %ls", filePath.wstring().c_str());
             return result;
         }
+        if (!fs::is_regular_file(st)) {
+            SS_LOG_WARN(kLogCategory, L"AnalyzeFile: not a regular file: %ls",
+                filePath.wstring().c_str());
+            return result;
+        }
+
         const auto fileSize = fs::file_size(filePath, ec);
-        if (ec || fileSize == 0 || fileSize > ZeroDayConstants::MAX_BUFFER_SIZE) {
+        if (ec || fileSize == 0) {
             SS_LOG_WARN(kLogCategory, L"File size issue (%llu): %ls",
                 static_cast<unsigned long long>(fileSize), filePath.wstring().c_str());
             return result;
         }
+
+        // Clamp to MAX_BUFFER_SIZE rather than refusing to scan large files —
+        // a malicious actor would simply pad payloads beyond the limit.
+        const size_t toRead = (fileSize > ZeroDayConstants::MAX_BUFFER_SIZE)
+            ? ZeroDayConstants::MAX_BUFFER_SIZE
+            : static_cast<size_t>(fileSize);
 
         std::ifstream ifs(filePath, std::ios::binary);
         if (!ifs.is_open()) {
             SS_LOG_ERROR(kLogCategory, L"Cannot open: %ls", filePath.wstring().c_str());
             return result;
         }
-        std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
-        ifs.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(fileSize));
-        if (!ifs) {
-            SS_LOG_ERROR(kLogCategory, L"Read failed: %ls", filePath.wstring().c_str());
+
+        std::vector<uint8_t> buf;
+        try {
+            buf.resize(toRead);
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(kLogCategory, L"AnalyzeFile: OOM allocating %zu bytes", toRead);
             return result;
+        }
+
+        ifs.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(toRead));
+        const auto actuallyRead = static_cast<size_t>(ifs.gcount());
+        if (actuallyRead == 0) {
+            SS_LOG_ERROR(kLogCategory, L"Read returned zero bytes: %ls", filePath.wstring().c_str());
+            return result;
+        }
+        if (actuallyRead < toRead) {
+            // Short read is acceptable — analyse what we got.
+            buf.resize(actuallyRead);
         }
         return AnalyzeBuffer(std::span<const uint8_t>(buf), options);
 
@@ -1053,6 +1244,16 @@ ZeroDayResult ZeroDayDetector::AnalyzeStack(
     const auto t0 = Clock::now();
     try {
         if (!IsInitialized() || stackDump.empty()) return result;
+
+        // Bound attacker-influenced inputs to keep ROP detection cost capped.
+        if (stackDump.size() > kMaxStackDumpFrames) {
+            stackDump = stackDump.subspan(0, kMaxStackDumpFrames);
+        }
+        if (moduleRanges.size() > kMaxModuleRangesEntries) {
+            SS_LOG_WARN(kLogCategory, L"AnalyzeStack: moduleRanges too large (%zu) — refusing",
+                moduleRanges.size());
+            return result;
+        }
 
         std::shared_lock lock(m_impl->m_mutex);
 
@@ -1126,8 +1327,16 @@ std::vector<ROPGadget> ZeroDayDetector::FindGadgets(
     std::vector<ROPGadget> gadgets;
     if (!IsInitialized() || moduleData.size() < 2) return gadgets;
 
-    const size_t scanSize = (std::min)(moduleData.size(), ZeroDayConstants::MAX_BUFFER_SIZE);
-    gadgets.reserve(64);
+    // Bound the scan window — caller-provided modules can legitimately be
+    // very large (>100MB for native loaders); the gadget identifier is O(N*6)
+    // and we intentionally limit it to keep p99 latency bounded.
+    const size_t scanSize = (std::min)(moduleData.size(), kMaxFindGadgetsBytes);
+
+    try {
+        gadgets.reserve(64);
+    } catch (const std::bad_alloc&) {
+        return gadgets;
+    }
 
     for (size_t i = 1; i < scanSize; ++i) {
         if (moduleData[i] != 0xC3) continue;
@@ -1136,9 +1345,16 @@ std::vector<ROPGadget> ZeroDayDetector::FindGadgets(
             const size_t start = i - back;
             auto g = m_impl->IdentifyGadgetBytes(
                 baseAddress + start, moduleData.subspan(start, back + 1), "scan");
-            if (g.type != GadgetType::Unknown) { gadgets.push_back(std::move(g)); break; }
+            if (g.type != GadgetType::Unknown) {
+                try {
+                    gadgets.push_back(std::move(g));
+                } catch (const std::bad_alloc&) {
+                    return gadgets;
+                }
+                break;
+            }
         }
-        if (gadgets.size() >= 4096) break;
+        if (gadgets.size() >= kMaxGadgetsReturned) break;
     }
     return gadgets;
 }
