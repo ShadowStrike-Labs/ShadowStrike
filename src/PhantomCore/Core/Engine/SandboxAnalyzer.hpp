@@ -127,6 +127,17 @@ namespace ShadowStrike {
 namespace Core {
 namespace Engine {
 
+// ----------------------------------------------------------------------------
+// Forward declarations to keep the public ABI / header dependency surface low.
+// ----------------------------------------------------------------------------
+} // namespace Engine
+} // namespace Core
+namespace ThreatIntel {
+class ThreatIntelIndex;
+}
+namespace Core {
+namespace Engine {
+
 // ============================================================================
 // COMPILE-TIME CONSTANTS
 // ============================================================================
@@ -491,6 +502,15 @@ struct SandboxAnalyzerConfiguration {
     fs::path reportStoragePath;
     uint16_t agentPort = 8443;
     bool cleanupAfterAnalysis = true;
+
+    /**
+     * @brief Optional non-owning threat-intelligence index used to correlate
+     *        observed IOCs (file hashes, domains, IPs) with known indicators.
+     *
+     * The pointee must outlive the SandboxAnalyzer instance. May be nullptr,
+     * in which case correlation is silently skipped.
+     */
+    ThreatIntel::ThreatIntelIndex* threatIntel = nullptr;
 
     [[nodiscard]] bool IsValid() const noexcept;
 };
