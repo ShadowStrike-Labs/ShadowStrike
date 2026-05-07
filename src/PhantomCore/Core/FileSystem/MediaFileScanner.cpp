@@ -93,6 +93,33 @@ namespace MagicNumbers {
 // PORTABLE SAFE INTEGER READERS (no unaligned access UB)
 // ============================================================================
 
+// Sanitize an arbitrary char buffer for use in a log message:
+// strips CR/LF and other control characters that could corrupt the log
+// stream or be used for log injection. Always returns a bounded ASCII-only
+// copy. Used to wrap exception::what() and any other untrusted text that
+// flows into SS_LOG_*.
+[[nodiscard]] inline std::string SanitizeForLog(const char* s,
+                                                size_t maxLen = 256) noexcept {
+    std::string out;
+    if (s == nullptr) return out;
+    out.reserve(std::min<size_t>(maxLen, 256));
+    for (size_t i = 0; i < maxLen; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0) break;
+        if (c == '\r' || c == '\n' || c == '\t') {
+            out.push_back(' ');
+        } else if (c < 0x20 || c == 0x7F) {
+            out.push_back('?');
+        } else if (c >= 0x80) {
+            // Drop high-bit bytes — log target uses %hs (ASCII-only path).
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
 namespace SafeRead {
     [[nodiscard]] inline constexpr uint16_t U16BE(const uint8_t* p) noexcept {
         return static_cast<uint16_t>(
@@ -243,7 +270,7 @@ public:
             SS_LOG_INFO(L"MediaFileScanner", L"Initialization complete");
             return true;
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"MediaFileScanner", L"Initialization failed: %hs", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"Initialization failed: %hs", SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -284,7 +311,7 @@ public:
             }
             return data;
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"MediaFileScanner", L"ReadFileCapped exception: %hs", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"ReadFileCapped exception: %hs", SanitizeForLog(e.what()).c_str());
             return {};
         }
     }
@@ -301,7 +328,7 @@ public:
             data.resize(static_cast<size_t>(file.gcount()));
             return data;
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"MediaFileScanner", L"ReadFileHeader exception: %hs", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"ReadFileHeader exception: %hs", SanitizeForLog(e.what()).c_str());
             return {};
         }
     }
@@ -409,7 +436,7 @@ public:
             }
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Format validation exception: %hs", e.what());
+                L"Format validation exception: %hs", SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -695,7 +722,7 @@ public:
             return result;
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Scan exception: %hs", e.what());
+                L"Scan exception: %hs", SanitizeForLog(e.what()).c_str());
             result.scanDuration = duration_cast<milliseconds>(
                 steady_clock::now() - scanStart);
             return result;
@@ -729,7 +756,7 @@ public:
             }
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Steganography analysis exception: %hs", e.what());
+                L"Steganography analysis exception: %hs", SanitizeForLog(e.what()).c_str());
         }
         return best;
     }
@@ -800,7 +827,7 @@ public:
             return result;
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"LSB analysis exception: %hs", e.what());
+                L"LSB analysis exception: %hs", SanitizeForLog(e.what()).c_str());
             return result;
         }
     }
@@ -837,7 +864,7 @@ public:
             return result;
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"EOF stego analysis exception: %hs", e.what());
+                L"EOF stego analysis exception: %hs", SanitizeForLog(e.what()).c_str());
             return result;
         }
     }
@@ -900,7 +927,7 @@ public:
             return result;
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Metadata stego analysis exception: %hs", e.what());
+                L"Metadata stego analysis exception: %hs", SanitizeForLog(e.what()).c_str());
             return result;
         }
     }
@@ -978,7 +1005,7 @@ public:
             return result;
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"DCT stego analysis exception: %hs", e.what());
+                L"DCT stego analysis exception: %hs", SanitizeForLog(e.what()).c_str());
             return result;
         }
     }
@@ -1000,7 +1027,7 @@ public:
             }
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Metadata extraction exception: %hs", e.what());
+                L"Metadata extraction exception: %hs", SanitizeForLog(e.what()).c_str());
             return {};
         }
     }
@@ -1068,9 +1095,14 @@ public:
             if (count > 0 && valueSize / count != typeSizes[type]) continue;
             if (valueSize > 1024 * 1024) continue;
 
+            // Inline values: data is stored directly in the entry's 4-byte
+            // value field at tiff-relative offset eOff+8. readers expect
+            // tiff-relative offsets, so we use eOff+8 directly (DO NOT
+            // subtract tiffStart — eOff is already tiff-relative).
+            // External values: the field contains a tiff-relative offset.
             uint32_t valOff;
             if (valueSize <= 4) {
-                valOff = static_cast<uint32_t>(eOff + 8 - reader.tiffStart);
+                valOff = static_cast<uint32_t>(eOff + 8);
             } else {
                 valOff = reader.u32(static_cast<uint32_t>(eOff + 8));
             }
@@ -1339,7 +1371,7 @@ public:
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Exploit detection exception: %hs", e.what());
+                L"Exploit detection exception: %hs", SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -1496,10 +1528,23 @@ public:
             }
         }
 
-        // HTA disguised as image
+        // HTA disguised as image. The "mshta" probe is constrained to
+        // contexts that imply executable invocation — the bare substring
+        // is too prone to false positives in benign text (e.g. a filename
+        // fragment such as "ymshtaging").
+        auto containsMshtaInvocation = [&content]() noexcept -> bool {
+            static constexpr const char* kInvocations[] = {
+                "mshta.exe", "mshta ", "mshta\t",
+                "mshta\"", "mshta'", "mshta:", "mshta\\"
+            };
+            for (const auto* p : kInvocations) {
+                if (content.find(p) != std::string::npos) return true;
+            }
+            return false;
+        };
         if (content.find("<HTA:APPLICATION") != std::string::npos ||
             content.find("<hta:application") != std::string::npos ||
-            content.find("mshta") != std::string::npos) {
+            containsMshtaInvocation()) {
             MediaThreat threat{};
             threat.type = MediaThreatType::ScriptInjection;
             threat.severity = 10;
@@ -1718,7 +1763,7 @@ public:
                 L"Appended data: %zu bytes after content end", appSize);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"Appended data analysis exception: %hs", e.what());
+                L"Appended data analysis exception: %hs", SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -1805,7 +1850,7 @@ public:
             return {};
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MediaFileScanner",
-                L"ExtractAppendedData exception: %hs", e.what());
+                L"ExtractAppendedData exception: %hs", SanitizeForLog(e.what()).c_str());
             return {};
         }
     }
