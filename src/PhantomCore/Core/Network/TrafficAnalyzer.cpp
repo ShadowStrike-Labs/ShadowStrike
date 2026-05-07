@@ -844,8 +844,10 @@ public:
      *        Caller must guarantee the pointer outlives TrafficAnalyzer.
      */
     void SetThreatIntelLookup(ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept {
-        std::unique_lock lock(m_mutex);
-        m_threatIntelLookup = lookup;
+        // Atomic pointer publish; release ordering pairs with the acquire
+        // load on detection paths so the lookup table's internal state is
+        // fully visible after the swap.
+        m_threatIntelLookup.store(lookup, std::memory_order_release);
         if (lookup) {
             SS_LOG_INFO(L"Network", L"TrafficAnalyzer: ThreatIntel subsystem wired");
         }
@@ -856,8 +858,7 @@ public:
      *        Caller must guarantee the pointer outlives TrafficAnalyzer.
      */
     void SetSignatureStore(ShadowStrike::SignatureStore::SignatureStore* store) noexcept {
-        std::unique_lock lock(m_mutex);
-        m_signatureStore = store;
+        m_signatureStore.store(store, std::memory_order_release);
         if (store) {
             SS_LOG_INFO(L"Network", L"TrafficAnalyzer: SignatureStore subsystem wired");
         }
@@ -1269,7 +1270,8 @@ public:
 
         // Also check via ThreatIntel hash lookup if available
         try {
-            auto& threatIntel = m_threatIntelLookup;
+            ShadowStrike::ThreatIntel::ThreatIntelLookup* threatIntel =
+                m_threatIntelLookup.load(std::memory_order_acquire);
             if (threatIntel && threatIntel->IsInitialized()) {
                 auto result = threatIntel->LookupHash(ja3Hash);
                 if (result.IsMalicious()) {
@@ -1346,7 +1348,8 @@ public:
         // Pattern/signature matching via SignatureStore
         if (m_config.enableSignatureScanning) {
             try {
-                auto& sigStore = m_signatureStore;
+                ShadowStrike::SignatureStore::SignatureStore* sigStore =
+                    m_signatureStore.load(std::memory_order_acquire);
                 if (sigStore && sigStore->IsInitialized()) {
                     const size_t scanLen = std::min(payload.size(), m_config.maxPayloadScan);
                     ShadowStrike::SignatureStore::ScanOptions opts;
@@ -1583,21 +1586,28 @@ private:
                 reverseKey.protocol = result.packet.protocol;
                 reverseKey.isIPv6 = result.packet.isIPv6;
 
-                // First: try to FIND existing stream in either direction (no creation)
-                auto streamIdOpt = m_streamManager->FindStream(key);
+                // Find-or-create the stream under m_streamLookupMutex so that
+                // two concurrent packets belonging to the same flow (one in
+                // each direction) cannot race to CreateStream() and produce
+                // two distinct stream IDs for the same conversation.
+                std::optional<uint64_t> streamIdOpt;
                 bool isServerDirection = false;
+                {
+                    std::lock_guard lookupGuard(m_streamLookupMutex);
 
-                if (!streamIdOpt) {
-                    // Check reverse direction (we are the server / reply side)
-                    streamIdOpt = m_streamManager->FindStream(reverseKey);
-                    if (streamIdOpt) {
-                        isServerDirection = true;
+                    streamIdOpt = m_streamManager->FindStream(key);
+                    if (!streamIdOpt) {
+                        // Check reverse direction (we are the server / reply side)
+                        streamIdOpt = m_streamManager->FindStream(reverseKey);
+                        if (streamIdOpt) {
+                            isServerDirection = true;
+                        }
                     }
-                }
 
-                // If no existing stream in either direction, create one
-                if (!streamIdOpt) {
-                    streamIdOpt = m_streamManager->CreateStream(key);
+                    // If no existing stream in either direction, create one.
+                    if (!streamIdOpt) {
+                        streamIdOpt = m_streamManager->CreateStream(key);
+                    }
                 }
 
                 if (streamIdOpt) {
@@ -1719,7 +1729,11 @@ private:
                                         m_stats.maliciousJA3.fetch_add(1, std::memory_order_relaxed);
                                         m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                                        SS_LOG_FATAL(L"Network",
+                                        // Per repo logging policy SS_LOG_FATAL is reserved for
+                                        // process-fatal events; a single malicious JA3 match is a
+                                        // detection event that downstream policy handles, so log
+                                        // at WARN.
+                                        SS_LOG_WARN(L"Network",
                                             L"TrafficAnalyzer: Malicious JA3 detected: %hs (stream %llu)",
                                             ja3.hash.c_str(),
                                             static_cast<unsigned long long>(result.streamId));
@@ -1845,6 +1859,70 @@ private:
             std::copy_n(packet.begin() + offset + 24, 16, info.dstIP.begin());
 
             offset += 40;
+
+            // Walk the IPv6 extension-header chain so that the final
+            // `info.protocol` is the L4 protocol (TCP/UDP/ICMPv6/...) and
+            // `offset` points at the L4 header. Without this, packets that
+            // legitimately carry Hop-by-Hop / Routing / Fragment / Destination
+            // Options / AH headers (RFC 8200) leave protocol set to the
+            // extension-header number; the transport-layer parser below
+            // then leaves srcPort/dstPort = 0, which causes unrelated flows
+            // to collide on the same stream key.
+            constexpr int MAX_IPV6_EXT_HDRS = 8;
+            for (int i = 0; i < MAX_IPV6_EXT_HDRS; ++i) {
+                const uint8_t nextHdr = info.protocol;
+                bool isExt = false;
+                size_t extLen = 0;
+
+                switch (nextHdr) {
+                    case 0:    // Hop-by-Hop
+                    case 43:   // Routing
+                    case 60:   // Destination Options
+                    case 51: { // Authentication Header
+                        if (offset + 2 > packet.size()) return false;
+                        const uint8_t hdrExtLen = packet[offset + 1];
+                        // For AH, length is in 4-byte units; for the
+                        // others, in 8-byte units (with +1 implicit).
+                        extLen = (nextHdr == 51)
+                            ? (static_cast<size_t>(hdrExtLen + 2) * 4)
+                            : (static_cast<size_t>(hdrExtLen + 1) * 8);
+                        isExt = true;
+                        break;
+                    }
+                    case 44: { // Fragment header — fixed 8 bytes.
+                        if (offset + 8 > packet.size()) return false;
+                        extLen = 8;
+                        isExt = true;
+                        // For non-first fragments we cannot extract ports;
+                        // bail out cleanly so the caller knows the flow is
+                        // a fragment continuation.
+                        if ((packet[offset + 2] & 0xF8) != 0 ||
+                            (packet[offset + 3] != 0)) {
+                            info.protocol = packet[offset];
+                            offset += extLen;
+                            // Do not attempt to parse L4 from a fragment.
+                            info.payloadOffset = offset;
+                            info.payloadLength = packet.size() - offset;
+                            info.payload = packet.subspan(offset);
+                            info.isValid = true;
+                            return true;
+                        }
+                        break;
+                    }
+                    case 59:   // No Next Header
+                        info.payloadOffset = offset;
+                        info.payloadLength = 0;
+                        info.isValid = true;
+                        return true;
+                    default:
+                        break;
+                }
+
+                if (!isExt) break;
+                if (offset + extLen > packet.size()) return false;
+                info.protocol = packet[offset];
+                offset += extLen;
+            }
         } else {
             info.parseError = "Unsupported ether type";
             return false;
@@ -1937,9 +2015,23 @@ private:
     }
 
     void UpdateAnalysisTimeStats(uint64_t timeUs) {
-        const uint64_t currentAvg = m_stats.avgAnalysisTimeUs.load(std::memory_order_relaxed);
-        const uint64_t newAvg = (currentAvg + timeUs) / 2;
-        m_stats.avgAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
+        // Exponentially-weighted moving average updated via CAS.
+        // The previous read-modify-write was racy: two concurrent updates
+        // would overwrite each other's contribution and skew the average
+        // arbitrarily under load.
+        uint64_t currentAvg = m_stats.avgAnalysisTimeUs.load(std::memory_order_relaxed);
+        for (;;) {
+            const uint64_t newAvg = (currentAvg == 0)
+                ? timeUs
+                : (currentAvg + timeUs) / 2;
+            if (m_stats.avgAnalysisTimeUs.compare_exchange_weak(
+                    currentAvg, newAvg,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+            // currentAvg refreshed by CAS failure; retry.
+        }
 
         uint64_t currentMax = m_stats.maxAnalysisTimeUs.load(std::memory_order_relaxed);
         while (timeUs > currentMax) {
@@ -2118,14 +2210,37 @@ private:
                 sniOff += 2;
 
                 if (nameType == 0 && nameLen > 0 && nameLen <= 255 && sniOff + nameLen <= offset + extLen) {
-                    std::string sni(reinterpret_cast<const char*>(&payload[sniOff]), nameLen);
-
-                    m_streamManager->UpdateStream(streamId, [&](StreamInfo& s) {
-                        if (!s.tlsInfo) {
-                            s.tlsInfo = TrafficAnalyzerTLSInfo{};
+                    // Sanitize SNI: it is parsed from attacker-controlled
+                    // bytes and ends up in stream metadata that is logged
+                    // and shown in alerts. Allow only the RFC 1035 hostname
+                    // character set plus IDNA punycode prefix; reject the
+                    // entire SNI (rather than partially copy) if a
+                    // disallowed byte appears, so we don't smuggle log /
+                    // UI control characters into downstream consumers.
+                    bool sniValid = true;
+                    for (size_t i = 0; i < static_cast<size_t>(nameLen); ++i) {
+                        const unsigned char c = payload[sniOff + i];
+                        const bool ok =
+                            (c >= 'a' && c <= 'z') ||
+                            (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') ||
+                            c == '.' || c == '-' || c == '_' || c == ':';
+                        if (!ok) {
+                            sniValid = false;
+                            break;
                         }
-                        s.tlsInfo->sni = std::move(sni);
-                    });
+                    }
+
+                    if (sniValid) {
+                        std::string sni(reinterpret_cast<const char*>(&payload[sniOff]), nameLen);
+
+                        m_streamManager->UpdateStream(streamId, [&](StreamInfo& s) {
+                            if (!s.tlsInfo) {
+                                s.tlsInfo = TrafficAnalyzerTLSInfo{};
+                            }
+                            s.tlsInfo->sni = std::move(sni);
+                        });
+                    }
                 }
                 return;
             }
@@ -2274,8 +2389,12 @@ private:
     std::unique_ptr<CallbackManager> m_callbackManager;
 
     // External subsystem references (non-owning, set during init)
-    ShadowStrike::ThreatIntel::ThreatIntelLookup* m_threatIntelLookup{ nullptr };
-    ShadowStrike::SignatureStore::SignatureStore* m_signatureStore{ nullptr };
+    std::atomic<ShadowStrike::ThreatIntel::ThreatIntelLookup*> m_threatIntelLookup{ nullptr };
+    std::atomic<ShadowStrike::SignatureStore::SignatureStore*> m_signatureStore{ nullptr };
+    /// @brief Serializes the find-then-create stream lookup so that
+    ///        concurrent threads cannot create two distinct stream IDs
+    ///        for the same flow (one keyed forward, one keyed reverse).
+    mutable std::mutex m_streamLookupMutex;
 
     // Statistics
     mutable TrafficAnalyzerStatistics m_stats;
