@@ -808,7 +808,7 @@ struct alignas(256) StreamInfo {
  * @struct AnalysisResult
  * @brief Result from packet analysis.
  */
-struct alignas(128) AnalysisResult {
+struct AnalysisResult {
     // Packet info
     PacketInfo packet;
     uint64_t streamId{ 0 };
