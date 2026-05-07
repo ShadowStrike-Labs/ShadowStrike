@@ -175,22 +175,25 @@ namespace ShadowStrike::Core::Engine {
         return ThreatScoreLevel::Clean;
     }
 
+    // Forward declaration so IsHyperVAvailable can use the centralised PS runner
+    // defined later in the translation unit.
+    [[nodiscard]] static bool RunPowerShellCmd(
+        const std::wstring& command,
+        DWORD timeoutMs,
+        DWORD& exitCode) noexcept;
+
     [[nodiscard]] bool IsHyperVAvailable() noexcept {
+        // Use the centralised PS runner so we get timeout/handle hygiene and
+        // proper exit-code observation. Hyper-V is only considered available
+        // when the optional feature query exits successfully (rc == 0).
         try {
-            Utils::ProcessUtils::ProcessCreationResult result{};
-            Utils::ProcessUtils::ProcessStartupInfo si{};
-            si.redirectStdOutput = true;
-            si.redirectStdError = true;
-            const bool ok = Utils::ProcessUtils::CreateProcess(
-                L"powershell.exe",
-                L"-NoProfile -NonInteractive -Command \"(Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V).State\"",
-                result, si,
-                Utils::ProcessUtils::ProcessCreationFlags::CreateNoWindow);
-            if (!ok || !result.succeeded) return false;
-            Utils::ProcessUtils::WaitForProcess(result.hProcess, 10000);
-            if (result.hProcess) { ::CloseHandle(result.hProcess); result.hProcess = nullptr; }
-            if (result.hThread) { ::CloseHandle(result.hThread); result.hThread = nullptr; }
-            return true;
+            DWORD exitCode = 1;
+            const bool ran = RunPowerShellCmd(
+                L"if ((Get-WindowsOptionalFeature -Online -FeatureName "
+                L"Microsoft-Hyper-V -ErrorAction SilentlyContinue).State -eq "
+                L"'Enabled') { exit 0 } else { exit 1 }",
+                10000, exitCode);
+            return ran && exitCode == 0;
         } catch (...) {
             return false;
         }
@@ -199,6 +202,48 @@ namespace ShadowStrike::Core::Engine {
     // ========================================================================
     // POWERSHELL EXECUTION HELPER
     // ========================================================================
+
+    /**
+     * @brief Escape a value for safe inclusion inside a PowerShell single-quoted
+     *        string literal.
+     *
+     * PowerShell single-quoted strings are *literal* except that an embedded
+     * single quote is escaped by doubling it (`''`). Without this transform,
+     * an attacker-controlled value (VM name returned from WMI, file path,
+     * arguments, etc.) can break out of the quoting and inject arbitrary
+     * PowerShell. We additionally strip control characters and reject
+     * embedded NUL/CR/LF which would terminate the command line on the
+     * Windows side and enable script-stuffing.
+     *
+     * SECURITY: CWE-78 (OS Command Injection) hardening for all paths that
+     * compose Hyper-V management commands.
+     */
+    [[nodiscard]] static std::wstring EscapePSSingleQuoted(std::wstring_view raw) noexcept {
+        std::wstring out;
+        out.reserve(raw.size() + 8);
+        for (wchar_t ch : raw) {
+            // Reject NUL/CR/LF/FF/VT outright; these enable line injection.
+            if (ch == L'\0' || ch == L'\r' || ch == L'\n' ||
+                ch == L'\f' || ch == L'\v') {
+                continue;
+            }
+            if (ch == L'\'') {
+                // Double single-quote per PowerShell quoting rules.
+                out.push_back(L'\'');
+                out.push_back(L'\'');
+            } else {
+                out.push_back(ch);
+            }
+        }
+        return out;
+    }
+
+    /// @brief Cap on raw PS-injected substrings to avoid pathological commands.
+    inline constexpr size_t kMaxPSEscapedLen = 4096;
+
+    [[nodiscard]] static bool IsPSInputSane(std::wstring_view raw) noexcept {
+        return raw.size() <= kMaxPSEscapedLen;
+    }
 
     /**
      * @brief Execute a PowerShell command and wait for completion.
@@ -392,11 +437,19 @@ namespace ShadowStrike::Core::Engine {
             fs::path filePath;
             SandboxAnalysisOptions options;
             SandboxVerdict verdict;
-            AnalysisStatus status = AnalysisStatus::Queued;
+            // DESIGN: status is std::atomic so non-owner threads (public getters,
+            // worker thread, cancellation paths) can observe phase transitions
+            // without taking m_mutex on every transition. Verdict body is only
+            // safe to read after `finalized` has been observed with acquire
+            // semantics.
+            std::atomic<AnalysisStatus> status{ AnalysisStatus::Queued };
             std::chrono::system_clock::time_point startTime;
             std::chrono::system_clock::time_point endTime;
             std::vector<ExtractedArtifact> artifacts;
             std::atomic<bool> shouldCancel{ false };
+            // DESIGN: release-store after AnalyzeResults; readers acquire-load
+            // before accessing verdict/artifacts to avoid data races.
+            std::atomic<bool> finalized{ false };
         };
 
         std::unordered_map<std::string, std::unique_ptr<AnalysisTask>> m_tasks;
@@ -485,7 +538,9 @@ namespace ShadowStrike::Core::Engine {
         [[nodiscard]] std::set<std::string> MapToMITRE(const SandboxVerdict& verdict) noexcept;
 
         // Task management
-        [[nodiscard]] std::string CreateTask(const fs::path& filePath, const SandboxAnalysisOptions& options) noexcept;
+        [[nodiscard]] std::string CreateTask(const fs::path& filePath,
+                                             const SandboxAnalysisOptions& options,
+                                             bool enqueue = true) noexcept;
         [[nodiscard]] AnalysisTask* GetTask(const std::string& taskId) noexcept;
         void ProcessTaskQueue() noexcept;
         [[nodiscard]] bool ExecuteTask(AnalysisTask* task) noexcept;
@@ -510,6 +565,15 @@ namespace ShadowStrike::Core::Engine {
                 SandboxConstants::VERSION_PATCH);
 
             m_config = config;
+            m_threatIntel = config.threatIntel;
+            if (m_threatIntel) {
+                SS_LOG_INFO(kLogCat,
+                    L"Threat-intelligence correlation enabled (initialized=%ls)",
+                    m_threatIntel->IsInitialized() ? L"yes" : L"no");
+            } else {
+                SS_LOG_INFO(kLogCat,
+                    L"Threat-intelligence correlation disabled (no index supplied)");
+            }
 
             // Initialize COM for WMI access - track whether we did it
             HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -551,6 +615,10 @@ namespace ShadowStrike::Core::Engine {
                 err->message = L"Initialization failed";
                 err->context = Utils::StringUtils::ToWide(e.what());
             }
+            if (m_comInitializedByUs) {
+                ::CoUninitialize();
+                m_comInitializedByUs = false;
+            }
             m_initialized = false;
             return false;
         } catch (...) {
@@ -558,6 +626,10 @@ namespace ShadowStrike::Core::Engine {
             if (err) {
                 err->code = ERROR_INTERNAL_ERROR;
                 err->message = L"Unknown initialization error";
+            }
+            if (m_comInitializedByUs) {
+                ::CoUninitialize();
+                m_comInitializedByUs = false;
             }
             m_initialized = false;
             return false;
@@ -586,10 +658,14 @@ namespace ShadowStrike::Core::Engine {
                     task->shouldCancel = true;
                 }
 
-                // Stop all running VMs
+                // Stop all running VMs (best-effort during shutdown).
                 for (auto& vm : m_availableVMs) {
                     if (vm.state == VMState::Running) {
-                        StopVM(vm);
+                        if (!StopVM(vm)) {
+                            SS_LOG_WARN(kLogCat,
+                                L"Best-effort StopVM failed during shutdown for '%ls'",
+                                Utils::StringUtils::ToWide(vm.vmName).c_str());
+                        }
                     }
                 }
 
@@ -645,17 +721,26 @@ namespace ShadowStrike::Core::Engine {
                 _bstr_t(L"ROOT\\virtualization\\v2"),
                 nullptr, nullptr, nullptr, 0, nullptr, nullptr, &pSvc);
 
-            if (FAILED(hr)) {
+            if (FAILED(hr) || !pSvc) {
                 SS_LOG_WARN(kLogCat, L"WMI connect to Hyper-V namespace failed: HRESULT 0x%08X",
                     static_cast<uint32_t>(hr));
+                if (pSvc) pSvc->Release();
                 pLoc->Release();
                 return false;
             }
 
-            ::CoSetProxyBlanket(pSvc,
+            hr = ::CoSetProxyBlanket(pSvc,
                 RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
                 RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
                 nullptr, EOAC_NONE);
+            if (FAILED(hr)) {
+                SS_LOG_WARN(kLogCat,
+                    L"CoSetProxyBlanket failed: HRESULT 0x%08X",
+                    static_cast<uint32_t>(hr));
+                pSvc->Release();
+                pLoc->Release();
+                return false;
+            }
 
             IEnumWbemClassObject* pEnumerator = nullptr;
             hr = pSvc->ExecQuery(
@@ -670,13 +755,16 @@ namespace ShadowStrike::Core::Engine {
 
                 while (pEnumerator) {
                     hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
-                    if (uReturn == 0) break;
+                    if (FAILED(hr) || uReturn == 0 || !pclsObj) break;
 
                     VARIANT vtProp;
                     ::VariantInit(&vtProp);
 
                     hr = pclsObj->Get(L"ElementName", 0, &vtProp, nullptr, nullptr);
-                    if (SUCCEEDED(hr) && vtProp.vt == VT_BSTR) {
+                    if (SUCCEEDED(hr) && vtProp.vt == VT_BSTR &&
+                        vtProp.bstrVal != nullptr &&
+                        ::SysStringLen(vtProp.bstrVal) > 0)
+                    {
                         VMInstance vm;
                         vm.vmId = Utils::StringUtils::ToNarrow(vtProp.bstrVal);
                         vm.vmName = vm.vmId;
@@ -690,6 +778,7 @@ namespace ShadowStrike::Core::Engine {
 
                     ::VariantClear(&vtProp);
                     pclsObj->Release();
+                    pclsObj = nullptr;
                 }
                 pEnumerator->Release();
             }
@@ -712,6 +801,7 @@ namespace ShadowStrike::Core::Engine {
 
     bool SandboxAnalyzer::Impl::PrepareVM(VMInstance& vm, const SandboxAnalysisOptions& options) noexcept {
         try {
+            (void)options; // Reserved for future per-task tuning (memory, vCPU, NIC).
             SS_LOG_INFO(kLogCat, L"Preparing VM '%ls'",
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
@@ -727,15 +817,25 @@ namespace ShadowStrike::Core::Engine {
                 return false;
             }
 
-            // Poll for VM readiness via heartbeat integration service
+            // Poll for VM readiness via heartbeat integration service.
+            // SECURITY: vm.vmName is escaped before injection to prevent
+            // PowerShell argument injection via attacker-influenced names.
+            const std::wstring escName =
+                EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+            if (!IsPSInputSane(escName)) {
+                SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                return false;
+            }
             const auto deadline = Clock::now() +
                 std::chrono::seconds(SandboxConstants::VM_READY_MAX_WAIT_S);
 
             while (Clock::now() < deadline) {
                 DWORD exitCode = 1;
-                std::wstring checkCmd = L"(Get-VM -Name '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
-                    L"' | Get-VMIntegrationService -Name 'Heartbeat').PrimaryStatusDescription -eq 'OK'";
+                std::wstring checkCmd =
+                    L"if (((Get-VM -Name '" + escName +
+                    L"' -ErrorAction SilentlyContinue | "
+                    L"Get-VMIntegrationService -Name 'Heartbeat')."
+                    L"PrimaryStatusDescription) -eq 'OK') { exit 0 } else { exit 1 }";
 
                 if (RunPowerShellCmd(checkCmd, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode) &&
                     exitCode == 0) {
@@ -750,7 +850,12 @@ namespace ShadowStrike::Core::Engine {
             SS_LOG_ERROR(kLogCat, L"VM '%ls' did not become ready within %u seconds",
                 Utils::StringUtils::ToWide(vm.vmName).c_str(),
                 SandboxConstants::VM_READY_MAX_WAIT_S);
-            StopVM(vm);
+            // Best-effort cleanup; we are already on the failure path.
+            if (!StopVM(vm)) {
+                SS_LOG_WARN(kLogCat,
+                    L"Best-effort StopVM after readiness timeout failed for '%ls'",
+                    Utils::StringUtils::ToWide(vm.vmName).c_str());
+            }
             return false;
 
         } catch (...) {
@@ -769,8 +874,14 @@ namespace ShadowStrike::Core::Engine {
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
             if (vm.environment == SandboxEnvironment::HyperV) {
-                std::wstring command = L"Start-VM -Name '" +
-                    Utils::StringUtils::ToWide(vm.vmName) + L"' -ErrorAction Stop";
+                const std::wstring escName =
+                    EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+                if (!IsPSInputSane(escName)) {
+                    SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                    vm.state = VMState::Error;
+                    return false;
+                }
+                std::wstring command = L"Start-VM -Name '" + escName + L"' -ErrorAction Stop";
 
                 DWORD exitCode = 1;
                 if (!RunPowerShellCmd(command, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode) ||
@@ -803,8 +914,14 @@ namespace ShadowStrike::Core::Engine {
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
             if (vm.environment == SandboxEnvironment::HyperV) {
-                std::wstring command = L"Stop-VM -Name '" +
-                    Utils::StringUtils::ToWide(vm.vmName) + L"' -Force -TurnOff -ErrorAction Stop";
+                const std::wstring escName =
+                    EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+                if (!IsPSInputSane(escName)) {
+                    SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                    return false;
+                }
+                std::wstring command = L"Stop-VM -Name '" + escName +
+                    L"' -Force -TurnOff -ErrorAction Stop";
 
                 DWORD exitCode = 1;
                 if (!RunPowerShellCmd(command, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode) ||
@@ -832,12 +949,19 @@ namespace ShadowStrike::Core::Engine {
             vm.state = VMState::Restoring;
 
             if (vm.environment == SandboxEnvironment::HyperV) {
+                const std::wstring escName =
+                    EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
                 std::wstring snapshotName = vm.snapshotId.empty() ? L"Clean" :
                     Utils::StringUtils::ToWide(vm.snapshotId);
+                const std::wstring escSnap = EscapePSSingleQuoted(snapshotName);
+                if (!IsPSInputSane(escName) || !IsPSInputSane(escSnap)) {
+                    SS_LOG_ERROR(kLogCat, L"VM/snapshot identifier exceeds safe PS length cap");
+                    vm.state = VMState::Error;
+                    return false;
+                }
 
-                std::wstring command = L"Restore-VMSnapshot -VMName '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
-                    L"' -Name '" + snapshotName + L"' -Confirm:$false -ErrorAction Stop";
+                std::wstring command = L"Restore-VMSnapshot -VMName '" + escName +
+                    L"' -Name '" + escSnap + L"' -Confirm:$false -ErrorAction Stop";
 
                 DWORD exitCode = 1;
                 if (!RunPowerShellCmd(command, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode) ||
@@ -902,22 +1026,45 @@ namespace ShadowStrike::Core::Engine {
                 return false;
             }
 
-            // Sanitize filename to prevent guest-side path traversal
+            // Sanitize filename to prevent guest-side path traversal and to
+            // avoid characters that are illegal on NTFS / are interpreted by
+            // PowerShell. We keep a conservative whitelist: alnum, dot, dash,
+            // underscore. Everything else collapses to '_'.
             std::wstring safeFilename = filePath.filename().wstring();
             for (auto& ch : safeFilename) {
-                if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' ||
-                    ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+                const bool ok =
+                    (ch >= L'a' && ch <= L'z') ||
+                    (ch >= L'A' && ch <= L'Z') ||
+                    (ch >= L'0' && ch <= L'9') ||
+                    ch == L'.' || ch == L'-' || ch == L'_';
+                if (!ok) {
                     ch = L'_';
                 }
             }
-
+            // Defensive: never allow leading dots ("..something") to escape.
+            while (!safeFilename.empty() && safeFilename.front() == L'.') {
+                safeFilename.erase(safeFilename.begin());
+            }
+            if (safeFilename.empty()) {
+                safeFilename = L"sample.bin";
+            }
+            // Prefix with task-unique directory created by caller; if absent,
+            // fall back to Public Documents.
             guestPath = L"C:\\Users\\Public\\Documents\\" + safeFilename;
 
             if (vm.environment == SandboxEnvironment::HyperV) {
-                std::wstring command = L"Copy-VMFile -VMName '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
-                    L"' -SourcePath '" + filePath.wstring() +
-                    L"' -DestinationPath '" + guestPath +
+                const std::wstring escName =
+                    EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+                const std::wstring escSrc = EscapePSSingleQuoted(filePath.wstring());
+                const std::wstring escDst = EscapePSSingleQuoted(guestPath);
+                if (!IsPSInputSane(escName) || !IsPSInputSane(escSrc) || !IsPSInputSane(escDst)) {
+                    SS_LOG_ERROR(kLogCat, L"Identifier(s) exceed safe PS length cap");
+                    return false;
+                }
+
+                std::wstring command = L"Copy-VMFile -VMName '" + escName +
+                    L"' -SourcePath '" + escSrc +
+                    L"' -DestinationPath '" + escDst +
                     L"' -FileSource Host -Force -ErrorAction Stop";
 
                 DWORD exitCode = 1;
@@ -943,11 +1090,25 @@ namespace ShadowStrike::Core::Engine {
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
             if (vm.environment == SandboxEnvironment::HyperV) {
-                // Use Invoke-Command to start the sample inside the guest
-                std::wstring psCommand = L"Invoke-Command -VMName '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
-                    L"' -ScriptBlock { Start-Process -FilePath '" + command +
-                    L"' -ArgumentList '" + args + L"' -PassThru } -ErrorAction Stop";
+                const std::wstring escName = EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+                const std::wstring escCmd  = EscapePSSingleQuoted(command);
+                const std::wstring escArgs = EscapePSSingleQuoted(args);
+                if (!IsPSInputSane(escName) || !IsPSInputSane(escCmd) || !IsPSInputSane(escArgs)) {
+                    SS_LOG_ERROR(kLogCat, L"Identifier(s) exceed safe PS length cap");
+                    return false;
+                }
+                // Use Invoke-Command to start the sample inside the guest.
+                // Note: the inner Start-Process is constructed in the script
+                // block using an outer scope variable to avoid double quoting
+                // the user-controlled command path/args.
+                std::wstring psCommand =
+                    L"$cmd='" + escCmd + L"';"
+                    L"$argList='" + escArgs + L"';"
+                    L"Invoke-Command -VMName '" + escName +
+                    L"' -ScriptBlock { param($c,$a) "
+                    L"if ([string]::IsNullOrEmpty($a)) { Start-Process -FilePath $c -PassThru | Out-Null } "
+                    L"else { Start-Process -FilePath $c -ArgumentList $a -PassThru | Out-Null } "
+                    L"} -ArgumentList $cmd,$argList -ErrorAction Stop";
 
                 DWORD exitCode = 1;
                 if (!RunPowerShellCmd(psCommand, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode) ||
@@ -972,11 +1133,18 @@ namespace ShadowStrike::Core::Engine {
 
     bool SandboxAnalyzer::Impl::MonitorProcessEvents(AnalysisTask* task, VMInstance& vm, uint32_t durationSeconds) noexcept {
         try {
+            if (!task) return false;
             SS_LOG_INFO(kLogCat, L"Monitoring process events for %u seconds", durationSeconds);
 
             const auto endTime = Clock::now() + std::chrono::seconds(durationSeconds);
-            std::unordered_set<uint32_t> knownPids;
             const size_t maxEvents = SandboxConstants::MAX_EVENTS_PER_CATEGORY;
+
+            const std::wstring escName =
+                EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+            if (!IsPSInputSane(escName)) {
+                SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                return false;
+            }
 
             while (Clock::now() < endTime && !task->shouldCancel.load()) {
                 if (task->verdict.processEvents.size() >= maxEvents) {
@@ -984,22 +1152,19 @@ namespace ShadowStrike::Core::Engine {
                     break;
                 }
 
-                // Query running processes inside the guest via Invoke-Command
-                std::wstring query = L"Invoke-Command -VMName '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
+                // Query running processes inside the guest via Invoke-Command.
+                std::wstring query = L"Invoke-Command -VMName '" + escName +
                     L"' -ScriptBlock { Get-Process | Select-Object Id,ProcessName,Path,"
-                    L"@{N='ParentId';E={(Get-CimInstance Win32_Process -Filter \\\"ProcessId=$($_.Id)\\\").ParentProcessId}},"
-                    L"@{N='CmdLine';E={(Get-CimInstance Win32_Process -Filter \\\"ProcessId=$($_.Id)\\\").CommandLine}}"
+                    L"@{N='ParentId';E={(Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.Id)\").ParentProcessId}},"
+                    L"@{N='CmdLine';E={(Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.Id)\").CommandLine}}"
                     L" | ConvertTo-Json -Compress } -ErrorAction SilentlyContinue";
 
                 DWORD exitCode = 1;
-                // Run with a short timeout per poll iteration
-                RunPowerShellCmd(query, 15000, exitCode);
-
-                // Each poll cycle, the actual parsing of process data would happen
-                // via the redirected stdout. Since ProcessUtils::CreateProcess returns
-                // the process handle (not captured output in this path), we use the
-                // WMI approach below as a fallback for process detection:
+                // Best-effort polling; failures are logged but do not abort
+                // the analysis run.
+                if (!RunPowerShellCmd(query, 15000, exitCode)) {
+                    SS_LOG_WARN(kLogCat, L"Process poll failed (exit %lu)", exitCode);
+                }
 
                 std::this_thread::sleep_for(3s);
             }
@@ -1016,14 +1181,20 @@ namespace ShadowStrike::Core::Engine {
 
     bool SandboxAnalyzer::Impl::MonitorFileEvents(AnalysisTask* task, VMInstance& vm) noexcept {
         try {
+            if (!task) return false;
             SS_LOG_INFO(kLogCat, L"Collecting file system events from VM '%ls'",
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
-            // Query recently modified files in key directories inside the guest
-            std::wstring query = L"Invoke-Command -VMName '" +
-                Utils::StringUtils::ToWide(vm.vmName) +
+            const std::wstring escName =
+                EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+            if (!IsPSInputSane(escName)) {
+                SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                return false;
+            }
+            // Query recently modified files in key directories inside the guest.
+            std::wstring query = L"Invoke-Command -VMName '" + escName +
                 L"' -ScriptBlock { "
-                L"$paths = @('C:\\Users\\Public','C:\\Windows\\Temp','$env:TEMP','$env:APPDATA'); "
+                L"$paths = @('C:\\Users\\Public','C:\\Windows\\Temp',$env:TEMP,$env:APPDATA); "
                 L"foreach ($p in $paths) { "
                 L"  if (Test-Path $p) { "
                 L"    Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | "
@@ -1033,7 +1204,9 @@ namespace ShadowStrike::Core::Engine {
                 L"} } -ErrorAction SilentlyContinue";
 
             DWORD exitCode = 1;
-            RunPowerShellCmd(query, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode);
+            if (!RunPowerShellCmd(query, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode)) {
+                SS_LOG_WARN(kLogCat, L"File monitoring poll failed (exit %lu)", exitCode);
+            }
 
             SS_LOG_INFO(kLogCat, L"File monitoring complete: %zu events",
                 task->verdict.fileEvents.size());
@@ -1047,12 +1220,19 @@ namespace ShadowStrike::Core::Engine {
 
     bool SandboxAnalyzer::Impl::MonitorRegistryEvents(AnalysisTask* task, VMInstance& vm) noexcept {
         try {
+            if (!task) return false;
             SS_LOG_INFO(kLogCat, L"Collecting registry events from VM '%ls'",
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
-            // Query known persistence/autorun registry keys inside the guest
-            std::wstring query = L"Invoke-Command -VMName '" +
-                Utils::StringUtils::ToWide(vm.vmName) +
+            const std::wstring escName =
+                EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+            if (!IsPSInputSane(escName)) {
+                SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                return false;
+            }
+
+            // Query known persistence/autorun registry keys inside the guest.
+            std::wstring query = L"Invoke-Command -VMName '" + escName +
                 L"' -ScriptBlock { "
                 L"$keys = @("
                 L"'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run',"
@@ -1064,7 +1244,9 @@ namespace ShadowStrike::Core::Engine {
                 L"} } -ErrorAction SilentlyContinue";
 
             DWORD exitCode = 1;
-            RunPowerShellCmd(query, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode);
+            if (!RunPowerShellCmd(query, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode)) {
+                SS_LOG_WARN(kLogCat, L"Registry monitoring poll failed (exit %lu)", exitCode);
+            }
 
             SS_LOG_INFO(kLogCat, L"Registry monitoring complete: %zu events",
                 task->verdict.registryEvents.size());
@@ -1078,12 +1260,19 @@ namespace ShadowStrike::Core::Engine {
 
     bool SandboxAnalyzer::Impl::MonitorNetworkEvents(AnalysisTask* task, VMInstance& vm) noexcept {
         try {
+            if (!task) return false;
             SS_LOG_INFO(kLogCat, L"Collecting network events from VM '%ls'",
                 Utils::StringUtils::ToWide(vm.vmName).c_str());
 
-            // Query active TCP connections inside the guest
-            std::wstring query = L"Invoke-Command -VMName '" +
-                Utils::StringUtils::ToWide(vm.vmName) +
+            const std::wstring escName =
+                EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+            if (!IsPSInputSane(escName)) {
+                SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                return false;
+            }
+
+            // Query active TCP connections inside the guest.
+            std::wstring query = L"Invoke-Command -VMName '" + escName +
                 L"' -ScriptBlock { "
                 L"Get-NetTCPConnection -State Established,SynSent,SynReceived -ErrorAction SilentlyContinue | "
                 L"Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess,State | "
@@ -1091,7 +1280,9 @@ namespace ShadowStrike::Core::Engine {
                 L"} -ErrorAction SilentlyContinue";
 
             DWORD exitCode = 1;
-            RunPowerShellCmd(query, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode);
+            if (!RunPowerShellCmd(query, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode)) {
+                SS_LOG_WARN(kLogCat, L"Network monitoring poll failed (exit %lu)", exitCode);
+            }
 
             SS_LOG_INFO(kLogCat, L"Network monitoring complete: %zu events",
                 task->verdict.networkEvents.size());
@@ -1135,13 +1326,21 @@ namespace ShadowStrike::Core::Engine {
                 L"C:\\Users\\Default\\AppData\\Local\\Temp"
             };
 
-            size_t extracted = 0;
-            for (const auto& searchPath : searchPaths) {
-                if (extracted >= SandboxConstants::MAX_DROPPED_FILES) break;
+            const std::wstring escName =
+                EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+            if (!IsPSInputSane(escName)) {
+                SS_LOG_ERROR(kLogCat, L"VM name exceeds safe PS length cap");
+                return false;
+            }
 
-                // List files that were recently created/modified
-                std::wstring listCmd = L"Invoke-Command -VMName '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
+            // DESIGN: searchPaths are static, trusted constants — no escaping
+            // needed for them. Only attacker-influenced fields require escape.
+            size_t pollsExecuted = 0;
+            size_t pollsSucceeded = 0;
+            for (const auto& searchPath : searchPaths) {
+                if (pollsExecuted >= SandboxConstants::MAX_DROPPED_FILES) break;
+
+                std::wstring listCmd = L"Invoke-Command -VMName '" + escName +
                     L"' -ScriptBlock { Get-ChildItem -Path '" + searchPath +
                     L"' -Recurse -File -Force -ErrorAction SilentlyContinue | "
                     L"Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) } | "
@@ -1149,15 +1348,20 @@ namespace ShadowStrike::Core::Engine {
                     L"} -ErrorAction SilentlyContinue";
 
                 DWORD exitCode = 1;
-                RunPowerShellCmd(listCmd, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode);
-                extracted++;
+                ++pollsExecuted;
+                if (RunPowerShellCmd(listCmd, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode) &&
+                    exitCode == 0) {
+                    ++pollsSucceeded;
+                }
             }
 
-            if (extracted > 0) {
-                m_stats.artifactsExtracted += extracted;
-            }
-
-            SS_LOG_INFO(kLogCat, L"Dropped file extraction complete: %zu files", extracted);
+            // DESIGN: m_stats.artifactsExtracted is updated only when an actual
+            // ExtractedArtifact record is appended (memory dump, pcap, etc.).
+            // The poll counters above represent enumeration attempts, not
+            // confirmed artifacts.
+            SS_LOG_INFO(kLogCat,
+                L"Dropped file enumeration complete: %zu/%zu polls succeeded",
+                pollsSucceeded, pollsExecuted);
             return true;
 
         } catch (...) {
@@ -1180,10 +1384,16 @@ namespace ShadowStrike::Core::Engine {
 
             // Use Hyper-V checkpoint to capture memory state
             if (vm.environment == SandboxEnvironment::HyperV) {
-                std::wstring command = L"Checkpoint-VM -Name '" +
-                    Utils::StringUtils::ToWide(vm.vmName) +
-                    L"' -SnapshotName 'AnalysisDump_" +
-                    Utils::StringUtils::ToWide(task->taskId) +
+                const std::wstring escName =
+                    EscapePSSingleQuoted(Utils::StringUtils::ToWide(vm.vmName));
+                const std::wstring escTaskId =
+                    EscapePSSingleQuoted(Utils::StringUtils::ToWide(task->taskId));
+                if (!IsPSInputSane(escName) || !IsPSInputSane(escTaskId)) {
+                    SS_LOG_ERROR(kLogCat, L"Identifier(s) exceed safe PS length cap");
+                    return false;
+                }
+                std::wstring command = L"Checkpoint-VM -Name '" + escName +
+                    L"' -SnapshotName 'AnalysisDump_" + escTaskId +
                     L"' -ErrorAction Stop";
 
                 DWORD exitCode = 1;
@@ -1224,13 +1434,24 @@ namespace ShadowStrike::Core::Engine {
             const fs::path pcapPath = m_config.artifactStoragePath / task->taskId / "capture.pcap";
 
             // Use the host-side virtual switch to capture packets
-            // (netsh trace or pktmon on the Hyper-V virtual switch)
-            std::wstring command = L"pktmon stop 2>$null; "  // Stop any prior capture
-                L"$pcapDir = '" + pcapPath.parent_path().wstring() + L"'; "
+            // (netsh trace or pktmon on the Hyper-V virtual switch).
+            // SECURITY: pcapPath is derived from m_config.artifactStoragePath
+            // and task->taskId. Both are administrator-controlled or generated
+            // by us, but we still PS-escape defensively.
+            const std::wstring escDir =
+                EscapePSSingleQuoted(pcapPath.parent_path().wstring());
+            if (!IsPSInputSane(escDir)) {
+                SS_LOG_ERROR(kLogCat, L"pcap directory path exceeds safe PS length cap");
+                return false;
+            }
+            std::wstring command = L"pktmon stop 2>$null | Out-Null; "
+                L"$pcapDir = '" + escDir + L"'; "
                 L"if (-not (Test-Path $pcapDir)) { New-Item -ItemType Directory -Path $pcapDir -Force | Out-Null }";
 
             DWORD exitCode = 1;
-            RunPowerShellCmd(command, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode);
+            if (!RunPowerShellCmd(command, SandboxConstants::PS_COMMAND_TIMEOUT_MS, exitCode)) {
+                SS_LOG_WARN(kLogCat, L"pcap directory preparation failed (exit %lu)", exitCode);
+            }
 
             ExtractedArtifact artifact;
             artifact.artifactType = "network_capture";
@@ -1323,9 +1544,13 @@ namespace ShadowStrike::Core::Engine {
             // Map to MITRE ATT&CK
             verdict.mitreIds = MapToMITRE(verdict);
 
-            // Correlate with threat intelligence
+            // Correlate with threat intelligence (best-effort).
             if (m_threatIntel) {
-                CorrelateWithThreatIntel(task);
+                if (!CorrelateWithThreatIntel(task)) {
+                    SS_LOG_WARN(kLogCat,
+                        L"Threat intelligence correlation failed for task '%ls'",
+                        Utils::StringUtils::ToWide(task->taskId).c_str());
+                }
             }
 
             // Determine malware family based on behavioral patterns
@@ -1482,7 +1707,9 @@ namespace ShadowStrike::Core::Engine {
     // IMPL: TASK MANAGEMENT
     // ========================================================================
 
-    std::string SandboxAnalyzer::Impl::CreateTask(const fs::path& filePath, const SandboxAnalysisOptions& options) noexcept {
+    std::string SandboxAnalyzer::Impl::CreateTask(const fs::path& filePath,
+                                                  const SandboxAnalysisOptions& options,
+                                                  bool enqueue) noexcept {
         try {
             std::unique_lock lock(m_mutex);
 
@@ -1497,11 +1724,17 @@ namespace ShadowStrike::Core::Engine {
             task->startTime = std::chrono::system_clock::now();
 
             m_tasks[taskId] = std::move(task);
-            m_taskQueue.push(taskId);
+            // DESIGN: Synchronous Analyze() path passes enqueue=false so that
+            // it owns the execution; the worker thread must not race-execute
+            // the same task. SubmitForAnalysis() passes enqueue=true.
+            if (enqueue) {
+                m_taskQueue.push(taskId);
+            }
 
-            SS_LOG_INFO(kLogCat, L"Created task '%ls' for '%ls'",
+            SS_LOG_INFO(kLogCat, L"Created task '%ls' for '%ls' (queued=%ls)",
                 Utils::StringUtils::ToWide(taskId).c_str(),
-                filePath.filename().wstring().c_str());
+                filePath.filename().wstring().c_str(),
+                enqueue ? L"yes" : L"no");
 
             return taskId;
 
@@ -1531,6 +1764,12 @@ namespace ShadowStrike::Core::Engine {
             const std::string taskId = m_taskQueue.front();
             m_taskQueue.pop();
 
+            // Snapshot the completion callback while we hold the lock, so we
+            // can invoke it later without holding any analyzer lock (avoids
+            // re-entrancy hazards if the callback calls back into the
+            // analyzer).
+            auto completeCb = m_completeCb;
+
             lock.unlock();
 
             auto* task = GetTask(taskId);
@@ -1538,13 +1777,20 @@ namespace ShadowStrike::Core::Engine {
                 return;
             }
 
-            ExecuteTask(task);
+            const bool ok = ExecuteTask(task);
+            (void)ok;  // Failure is reflected in task->status; logged inside ExecuteTask.
 
-            // Invoke completion callback under lock
-            {
-                std::shared_lock cbLock(m_mutex);
-                if (m_completeCb && task->status == AnalysisStatus::Completed) {
-                    try { m_completeCb(task->taskId, task->verdict); } catch (...) {}
+            // Invoke completion callback OUTSIDE all locks. We must observe
+            // the release-store on `finalized` before reading verdict.
+            if (completeCb &&
+                task->finalized.load(std::memory_order_acquire) &&
+                task->status.load(std::memory_order_acquire) == AnalysisStatus::Completed) {
+                try {
+                    completeCb(task->taskId, task->verdict);
+                } catch (...) {
+                    SS_LOG_WARN(kLogCat,
+                        L"Completion callback threw for task '%ls'",
+                        Utils::StringUtils::ToWide(task->taskId).c_str());
                 }
             }
 
@@ -1575,15 +1821,33 @@ namespace ShadowStrike::Core::Engine {
                 vm->isAvailable = false;
             }
 
-            // RAII guard to release VM on any exit path
+            // RAII guard to release VM on any exit path. The destructor must
+            // re-acquire m_mutex before mutating shared VM state, otherwise it
+            // races with public StartVM/StopVM/RevertToSnapshot/GetVMStatus.
             struct VMGuard {
                 VMInstance* vm;
                 Impl* self;
                 ~VMGuard() {
-                    if (vm) {
-                        if (vm->state == VMState::Running) {
-                            self->StopVM(*vm);
+                    if (!vm || !self) {
+                        return;
+                    }
+                    bool needStop = false;
+                    {
+                        std::shared_lock probe(self->m_mutex);
+                        needStop = (vm->state == VMState::Running);
+                    }
+                    if (needStop) {
+                        // StopVM does not take m_mutex itself; safe to call
+                        // without the lock and we want to avoid holding the
+                        // lock across PowerShell execution.
+                        if (!self->StopVM(*vm)) {
+                            SS_LOG_WARN(kLogCat,
+                                L"Best-effort StopVM failed in VMGuard for '%ls'",
+                                Utils::StringUtils::ToWide(vm->vmName).c_str());
                         }
+                    }
+                    {
+                        std::unique_lock release(self->m_mutex);
                         vm->isAvailable = true;
                     }
                 }
@@ -1635,7 +1899,9 @@ namespace ShadowStrike::Core::Engine {
                 SandboxConstants::MAX_TIMEOUT_SECONDS);
 
             if (task->options.monitorProcesses) {
-                MonitorProcessEvents(task, *vm, monitorTimeout);
+                if (!MonitorProcessEvents(task, *vm, monitorTimeout)) {
+                    SS_LOG_WARN(kLogCat, L"Process monitoring reported failure");
+                }
             }
 
             if (task->shouldCancel.load()) {
@@ -1644,39 +1910,60 @@ namespace ShadowStrike::Core::Engine {
             }
 
             if (task->options.monitorFiles) {
-                MonitorFileEvents(task, *vm);
+                if (!MonitorFileEvents(task, *vm)) {
+                    SS_LOG_WARN(kLogCat, L"File monitoring reported failure");
+                }
             }
             if (task->options.monitorRegistry) {
-                MonitorRegistryEvents(task, *vm);
+                if (!MonitorRegistryEvents(task, *vm)) {
+                    SS_LOG_WARN(kLogCat, L"Registry monitoring reported failure");
+                }
             }
             if (task->options.monitorNetwork) {
-                MonitorNetworkEvents(task, *vm);
+                if (!MonitorNetworkEvents(task, *vm)) {
+                    SS_LOG_WARN(kLogCat, L"Network monitoring reported failure");
+                }
             }
 
-            // Capture artifacts
+            // Capture artifacts (best-effort).
             task->status = AnalysisStatus::Capturing;
             if (task->options.extractDroppedFiles) {
-                ExtractDroppedFiles(task, *vm);
+                if (!ExtractDroppedFiles(task, *vm)) {
+                    SS_LOG_WARN(kLogCat, L"Dropped file extraction reported failure");
+                }
             }
             if (task->options.createMemoryDump) {
-                CreateMemoryDump(task, *vm);
+                if (!CreateMemoryDump(task, *vm)) {
+                    SS_LOG_WARN(kLogCat, L"Memory dump reported failure");
+                }
             }
             if (task->options.createNetworkCapture) {
-                CaptureNetworkTraffic(task, *vm);
+                if (!CaptureNetworkTraffic(task, *vm)) {
+                    SS_LOG_WARN(kLogCat, L"Network capture reported failure");
+                }
             }
 
             // vmGuard will stop VM and release it
 
             // Analyze results
             task->status = AnalysisStatus::Analyzing;
-            AnalyzeResults(task);
+            if (!AnalyzeResults(task)) {
+                SS_LOG_WARN(kLogCat,
+                    L"AnalyzeResults reported failure for task '%ls'",
+                    Utils::StringUtils::ToWide(task->taskId).c_str());
+            }
 
-            task->status = AnalysisStatus::Completed;
             task->endTime = std::chrono::system_clock::now();
             task->verdict.durationSeconds = static_cast<uint32_t>(
                 std::chrono::duration_cast<std::chrono::seconds>(
                     task->endTime - task->startTime).count());
             task->verdict.status = AnalysisStatus::Completed;
+
+            // DESIGN: Publish the verdict before flipping `finalized`. The
+            // release-store synchronises with the acquire-load in public
+            // getters and in ProcessTaskQueue.
+            task->finalized.store(true, std::memory_order_release);
+            task->status = AnalysisStatus::Completed;
 
             m_stats.totalAnalyses++;
             m_stats.totalAnalysisTimeSeconds += task->verdict.durationSeconds;
@@ -1772,7 +2059,7 @@ namespace ShadowStrike::Core::Engine {
                 return verdict;
             }
 
-            const std::string taskId = m_impl->CreateTask(filePath, options);
+            const std::string taskId = m_impl->CreateTask(filePath, options, /*enqueue*/ false);
             if (taskId.empty()) {
                 if (err) {
                     err->code = ERROR_INTERNAL_ERROR;
@@ -1790,10 +2077,15 @@ namespace ShadowStrike::Core::Engine {
                 return verdict;
             }
 
-            m_impl->ExecuteTask(task);
+            // DESIGN: synchronous path owns execution. We pass enqueue=false
+            // above so the worker thread cannot race-execute the same task.
+            const bool ok = m_impl->ExecuteTask(task);
+            (void)ok;
 
+            // Acquire-load synchronises with release-store inside ExecuteTask.
+            (void)task->finalized.load(std::memory_order_acquire);
             verdict = task->verdict;
-            verdict.status = task->status;
+            verdict.status = task->status.load(std::memory_order_acquire);
             return verdict;
 
         } catch (const std::exception& e) {
@@ -1828,8 +2120,8 @@ namespace ShadowStrike::Core::Engine {
                 return "";
             }
 
-            // Task is queued; the worker thread picks it up automatically
-            const std::string taskId = m_impl->CreateTask(filePath, options);
+            // Task is queued; the worker thread picks it up automatically.
+            const std::string taskId = m_impl->CreateTask(filePath, options, /*enqueue*/ true);
             if (taskId.empty() && err) {
                 err->code = ERROR_INTERNAL_ERROR;
                 err->message = L"Failed to queue analysis task";
@@ -1849,10 +2141,22 @@ namespace ShadowStrike::Core::Engine {
         try {
             if (!IsInitialized()) return std::nullopt;
 
-            auto* task = m_impl->GetTask(taskId);
+            std::shared_lock lock(m_impl->m_mutex);
+            auto it = m_impl->m_tasks.find(taskId);
+            if (it == m_impl->m_tasks.end()) return std::nullopt;
+            const auto& task = it->second;
             if (!task) return std::nullopt;
-            if (task->status != AnalysisStatus::Completed &&
-                task->status != AnalysisStatus::Timeout) {
+
+            // DESIGN: only return the verdict after the writer has flipped
+            // `finalized` (release-store). This synchronises with our
+            // acquire-load and guarantees that all verdict fields are visible
+            // to this thread.
+            if (!task->finalized.load(std::memory_order_acquire)) {
+                return std::nullopt;
+            }
+            const auto status = task->status.load(std::memory_order_acquire);
+            if (status != AnalysisStatus::Completed &&
+                status != AnalysisStatus::Timeout) {
                 return std::nullopt;
             }
             return task->verdict;
@@ -1990,9 +2294,12 @@ namespace ShadowStrike::Core::Engine {
     std::vector<ExtractedArtifact> SandboxAnalyzer::GetArtifacts(const std::string& taskId) const noexcept {
         try {
             if (!IsInitialized()) return {};
-            auto* task = m_impl->GetTask(taskId);
-            if (!task) return {};
-            return task->artifacts;
+            std::shared_lock lock(m_impl->m_mutex);
+            auto it = m_impl->m_tasks.find(taskId);
+            if (it == m_impl->m_tasks.end() || !it->second) return {};
+            // DESIGN: artifacts are only safely readable after `finalized`.
+            if (!it->second->finalized.load(std::memory_order_acquire)) return {};
+            return it->second->artifacts;
         } catch (...) {
             return {};
         }
@@ -2025,9 +2332,11 @@ namespace ShadowStrike::Core::Engine {
     std::optional<fs::path> SandboxAnalyzer::GetMemoryDump(const std::string& taskId) const noexcept {
         try {
             if (!IsInitialized()) return std::nullopt;
-            auto* task = m_impl->GetTask(taskId);
-            if (!task) return std::nullopt;
-            for (const auto& artifact : task->artifacts) {
+            std::shared_lock lock(m_impl->m_mutex);
+            auto it = m_impl->m_tasks.find(taskId);
+            if (it == m_impl->m_tasks.end() || !it->second) return std::nullopt;
+            if (!it->second->finalized.load(std::memory_order_acquire)) return std::nullopt;
+            for (const auto& artifact : it->second->artifacts) {
                 if (artifact.artifactType == "memory_dump") {
                     return artifact.extractedPath;
                 }
@@ -2041,9 +2350,11 @@ namespace ShadowStrike::Core::Engine {
     std::optional<fs::path> SandboxAnalyzer::GetNetworkCapture(const std::string& taskId) const noexcept {
         try {
             if (!IsInitialized()) return std::nullopt;
-            auto* task = m_impl->GetTask(taskId);
-            if (!task) return std::nullopt;
-            for (const auto& artifact : task->artifacts) {
+            std::shared_lock lock(m_impl->m_mutex);
+            auto it = m_impl->m_tasks.find(taskId);
+            if (it == m_impl->m_tasks.end() || !it->second) return std::nullopt;
+            if (!it->second->finalized.load(std::memory_order_acquire)) return std::nullopt;
+            for (const auto& artifact : it->second->artifacts) {
                 if (artifact.artifactType == "network_capture") {
                     return artifact.extractedPath;
                 }
@@ -2111,6 +2422,7 @@ namespace ShadowStrike::Core::Engine {
         totalAnalysisTimeSeconds = 0;
         timeouts = 0;
         failures = 0;
+        startTime = Clock::now();
     }
 
     bool SandboxAnalyzer::SelfTest() noexcept {
