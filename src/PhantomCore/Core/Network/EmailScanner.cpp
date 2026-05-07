@@ -67,6 +67,14 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <condition_variable>
+#include <thread>
+#include <mutex>
+#include <random>
+
+#include <Windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 namespace ShadowStrike {
 namespace Core {
@@ -94,15 +102,27 @@ std::vector<uint8_t> Base64Decode(std::string_view input) {
 }
 
 /**
- * @brief Quoted-Printable decoding.
+ * @brief Quoted-Printable decoding (RFC 2045 §6.7) — bounded, locale-independent.
+ *
+ * Decodes "=XX" hex escapes only when both characters are hex digits, so an
+ * attacker cannot smuggle arbitrary bytes via locale-dependent strtol parsing
+ * of high-bit input. Soft line breaks (=CRLF, =LF) are silently dropped.
  */
 std::string QuotedPrintableDecode(std::string_view input) {
+    static constexpr auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
     std::string result;
     result.reserve(input.size());
 
-    for (size_t i = 0; i < input.size(); ++i) {
-        if (input[i] == '=' && i + 2 < input.size()) {
-            // Soft line break
+    const size_t n = input.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (input[i] == '=' && i + 2 < n) {
+            // Soft line break: "=\r\n" or "=\n"
             if (input[i + 1] == '\r' && input[i + 2] == '\n') {
                 i += 2;
                 continue;
@@ -112,17 +132,20 @@ std::string QuotedPrintableDecode(std::string_view input) {
                 continue;
             }
 
-            // Hex encoded character
-            const char hex[3] = { input[i + 1], input[i + 2], '\0' };
-            char* end;
-            const long val = std::strtol(hex, &end, 16);
-            if (end == hex + 2) {
-                result += static_cast<char>(val);
+            const int hi = hexVal(input[i + 1]);
+            const int lo = hexVal(input[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                result.push_back(static_cast<char>((hi << 4) | lo));
                 i += 2;
                 continue;
             }
+            // Malformed escape — emit '=' literally as RFC permits.
+        } else if (input[i] == '=' && i + 1 == n - 1 && input[i + 1] == '\n') {
+            // Trailing soft break with bare LF at very end
+            ++i;
+            continue;
         }
-        result += input[i];
+        result.push_back(input[i]);
     }
 
     return result;
@@ -140,6 +163,77 @@ constexpr size_t kMaxArchiveExtractionSize = 64 * 1024 * 1024;  // 64 MB
 constexpr size_t kMaxSingleAttachmentSize  = 128 * 1024 * 1024; // 128 MB
 constexpr size_t kMaxHeaderLineLength      = 8192;
 constexpr size_t kMaxEncodedWordLength     = 2048;
+
+// Hard caps to prevent header parsing DoS
+constexpr size_t kMaxHeaderTotalSize       = 256 * 1024;        // 256 KB total headers
+constexpr size_t kMaxHeaderCount           = 1000;              // Max distinct header lines
+constexpr size_t kMaxHeaderValueLength     = 16 * 1024;         // 16 KB per header value
+constexpr size_t kMaxReceivedHeaders       = 64;                // Cap traceroute headers
+constexpr size_t kMaxRecipientsPerField    = 1000;              // Cap To/Cc/Bcc lists
+
+// Session DoS protection
+constexpr size_t kSessionBufferHardCap     = 100ULL * 1024 * 1024; // 100 MB / session buffer
+constexpr size_t kAddressParseInputLimit   = 4096;                  // Per-address parse cap
+
+// Body parsing caps
+constexpr size_t kMaxBodyTextRetained      = 4ULL * 1024 * 1024;   // 4 MB plain/html retained
+
+/**
+ * @brief Sanitize attacker-controlled strings before logging or alert routing.
+ *
+ * Strips ASCII control characters (CR, LF, NUL, TAB, ESC, etc.) that would
+ * otherwise enable log-line injection (CWE-117) and forensic-trail forgery
+ * when an attacker controls Message-ID, Subject, From, or filename fields.
+ * Replaces dangerous characters with '?', truncates the result to a hard
+ * cap so a malicious 4 GB header cannot cause logger pressure, and is
+ * always-noexcept so it is safe inside catch blocks and shutdown paths.
+ */
+[[nodiscard]] std::string SanitizeForLog(std::string_view input, size_t maxLen = 256) noexcept {
+    std::string out;
+    const size_t n = (input.size() < maxLen) ? input.size() : maxLen;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(input[i]);
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    if (input.size() > maxLen) {
+        out.append("...");
+    }
+    return out;
+}
+
+/**
+ * @brief Generate a cryptographically random hex token for unique temp file names.
+ *
+ * Backed by BCryptGenRandom (CNG); avoids predictable-name symlink races
+ * (CWE-377) and process-address leakage in temp paths.
+ */
+[[nodiscard]] std::wstring GenerateRandomToken(size_t bytes = 16) noexcept {
+    std::vector<uint8_t> raw(bytes, 0u);
+    NTSTATUS st = ::BCryptGenRandom(nullptr, raw.data(), static_cast<ULONG>(raw.size()),
+                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (st != 0 /* STATUS_SUCCESS */) {
+        // Fallback: time-mixed counter (not cryptographic, but namespaces collisions).
+        static std::atomic<uint64_t> counter{ 0 };
+        const uint64_t t = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const uint64_t mix = t ^ counter.fetch_add(1u, std::memory_order_relaxed);
+        for (size_t i = 0; i < raw.size(); ++i) {
+            raw[i] = static_cast<uint8_t>((mix >> ((i * 8u) % 64u)) & 0xFFu);
+        }
+    }
+    static const wchar_t kHex[] = L"0123456789abcdef";
+    std::wstring out(raw.size() * 2u, L'0');
+    for (size_t i = 0; i < raw.size(); ++i) {
+        out[i * 2u]     = kHex[(raw[i] >> 4) & 0x0Fu];
+        out[i * 2u + 1] = kHex[raw[i]        & 0x0Fu];
+    }
+    return out;
+}
 
 // Dangerous archive extensions for risk elevation
 static const std::array<std::string_view, 14> kDangerousArchiveExtensions = {
@@ -199,17 +293,22 @@ std::string DecodeRFC2047EncodedWord(const std::string& input) {
             result.append(reinterpret_cast<const char*>(decoded.data()), decoded.size());
         } else if (encoding == 'Q' || encoding == 'q') {
             // Q-encoding: like quoted-printable but underscore = space
+            static constexpr auto qHexVal = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
             std::string qDecoded;
             qDecoded.reserve(encodedText.size());
             for (size_t i = 0; i < encodedText.size(); ++i) {
                 if (encodedText[i] == '_') {
                     qDecoded += ' ';
                 } else if (encodedText[i] == '=' && i + 2 < encodedText.size()) {
-                    const char hex[3] = { encodedText[i + 1], encodedText[i + 2], '\0' };
-                    char* end;
-                    long val = std::strtol(hex, &end, 16);
-                    if (end == hex + 2) {
-                        qDecoded += static_cast<char>(val);
+                    const int hi = qHexVal(encodedText[i + 1]);
+                    const int lo = qHexVal(encodedText[i + 2]);
+                    if (hi >= 0 && lo >= 0) {
+                        qDecoded += static_cast<char>((hi << 4) | lo);
                         i += 2;
                     } else {
                         qDecoded += encodedText[i];
@@ -288,16 +387,21 @@ std::string ExtractMIMEParameter(const std::string& headerValue, const std::stri
 
         if (secondQuote != std::string::npos) {
             std::string percentEncoded = extVal.substr(secondQuote + 1);
-            // Percent-decode
+            // Percent-decode (RFC 5987) — locale-independent hex parsing.
+            static constexpr auto pctHex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
             std::string decoded;
             decoded.reserve(percentEncoded.size());
             for (size_t i = 0; i < percentEncoded.size(); ++i) {
                 if (percentEncoded[i] == '%' && i + 2 < percentEncoded.size()) {
-                    const char hex[3] = { percentEncoded[i + 1], percentEncoded[i + 2], '\0' };
-                    char* hexEnd;
-                    long val = std::strtol(hex, &hexEnd, 16);
-                    if (hexEnd == hex + 2) {
-                        decoded += static_cast<char>(val);
+                    const int hi = pctHex(percentEncoded[i + 1]);
+                    const int lo = pctHex(percentEncoded[i + 2]);
+                    if (hi >= 0 && lo >= 0) {
+                        decoded += static_cast<char>((hi << 4) | lo);
                         i += 2;
                         continue;
                     }
@@ -357,9 +461,18 @@ bool IsDangerousExtension(const std::string& filename) {
 
 /**
  * @brief Extract email address from RFC 5322 format.
+ *
+ * Hardened against ReDoS via input length cap and locale-stable normalization.
+ * Treats inputs above kAddressParseInputLimit as invalid (would otherwise
+ * trigger catastrophic backtracking in the regex engine on a malicious
+ * 1 MB Display-Name).
  */
 EmailAddress ParseEmailAddress(const std::string& input) {
     EmailAddress addr;
+
+    if (input.empty() || input.size() > kAddressParseInputLimit) {
+        return addr;
+    }
 
     // Pattern: "Display Name" <local@domain> or local@domain
     static const std::regex emailRegex(
@@ -367,35 +480,46 @@ EmailAddress ParseEmailAddress(const std::string& input) {
     );
 
     std::smatch match;
-    if (std::regex_search(input, match, emailRegex)) {
-        addr.displayName = match[1].str();
-        addr.localPart = match[2].str();
-        addr.domain = match[3].str();
-        addr.fullAddress = addr.localPart + "@" + addr.domain;
-        addr.isValid = true;
+    try {
+        if (std::regex_search(input, match, emailRegex)) {
+            addr.displayName = match[1].str();
+            addr.localPart = match[2].str();
+            addr.domain = match[3].str();
+            addr.fullAddress = addr.localPart + "@" + addr.domain;
+            addr.isValid = true;
 
-        // Trim display name
-        if (!addr.displayName.empty()) {
-            addr.displayName.erase(0, addr.displayName.find_first_not_of(" \t\""));
-            addr.displayName.erase(addr.displayName.find_last_not_of(" \t\"") + 1);
-        }
+            // Trim display name
+            if (!addr.displayName.empty()) {
+                addr.displayName.erase(0, addr.displayName.find_first_not_of(" \t\""));
+                const auto endPos = addr.displayName.find_last_not_of(" \t\"");
+                if (endPos != std::string::npos) {
+                    addr.displayName.erase(endPos + 1);
+                } else {
+                    addr.displayName.clear();
+                }
+            }
 
-        // Check domain validity
-        addr.isDomainValid = !addr.domain.empty() && addr.domain.find('.') != std::string::npos;
+            // Check domain validity
+            addr.isDomainValid = !addr.domain.empty() && addr.domain.find('.') != std::string::npos;
 
-        // Check display name mismatch (phishing indicator)
-        if (!addr.displayName.empty()) {
-            std::string lowerDisplay = addr.displayName;
-            std::string lowerDomain = addr.domain;
-            std::transform(lowerDisplay.begin(), lowerDisplay.end(), lowerDisplay.begin(), ::tolower);
-            std::transform(lowerDomain.begin(), lowerDomain.end(), lowerDomain.begin(), ::tolower);
+            // Check display name mismatch (phishing indicator) using ASCII-safe lowering.
+            if (!addr.displayName.empty()) {
+                std::string lowerDisplay = addr.displayName;
+                std::string lowerDomain  = addr.domain;
+                std::transform(lowerDisplay.begin(), lowerDisplay.end(), lowerDisplay.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                std::transform(lowerDomain.begin(), lowerDomain.end(), lowerDomain.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
-            // If display name looks like an email but doesn't match
-            if (lowerDisplay.find('@') != std::string::npos &&
-                lowerDisplay.find(lowerDomain) == std::string::npos) {
-                addr.hasDisplayNameMismatch = true;
+                if (lowerDisplay.find('@') != std::string::npos &&
+                    lowerDisplay.find(lowerDomain) == std::string::npos) {
+                    addr.hasDisplayNameMismatch = true;
+                }
             }
         }
+    } catch (const std::regex_error&) {
+        // Defensive: regex implementations may throw on pathological input.
+        addr = EmailAddress{};
     }
 
     return addr;
@@ -880,6 +1004,34 @@ public:
 
             m_config = config;
 
+            // Validate configuration bounds — defensive against caller error.
+            if (m_config.workerThreads == 0) {
+                m_config.workerThreads = 1;
+            }
+            if (m_config.workerThreads > 64) {
+                m_config.workerThreads = 64;
+            }
+            if (m_config.maxActiveSessionsCount == 0) {
+                m_config.maxActiveSessionsCount = 1;
+            }
+            if (m_config.maxActiveSessionsCount > EmailScannerConstants::MAX_ACTIVE_SESSIONS) {
+                m_config.maxActiveSessionsCount = EmailScannerConstants::MAX_ACTIVE_SESSIONS;
+            }
+            if (m_config.sessionTimeoutMs == 0) {
+                m_config.sessionTimeoutMs = EmailScannerConstants::SESSION_TIMEOUT_MS;
+            }
+            if (m_config.maxAttachmentSize == 0 ||
+                m_config.maxAttachmentSize > kMaxSingleAttachmentSize) {
+                m_config.maxAttachmentSize = kMaxSingleAttachmentSize;
+            }
+            if (m_config.maxArchiveDepth > 32) {
+                m_config.maxArchiveDepth = 32;
+            }
+            if (m_config.maxURLsToScan == 0 ||
+                m_config.maxURLsToScan > EmailScannerConstants::MAX_URLS_PER_EMAIL) {
+                m_config.maxURLsToScan = EmailScannerConstants::MAX_URLS_PER_EMAIL;
+            }
+
             // Initialize callback manager
             m_callbackManager = std::make_unique<CallbackManager>();
 
@@ -891,6 +1043,27 @@ public:
 
             if (!FileSystem::ExecutableAnalyzer::Instance().Initialize()) {
                 SS_LOG_WARN(L"Network", L"EmailScanner: ExecutableAnalyzer initialization warning");
+            }
+
+            // Seed whitelist sets from configuration. Senders are normalized to
+            // lowercase local@domain; standalone domains are kept in a dedicated
+            // set so IsWhitelisted() can match by domain without colliding with
+            // user@domain entries.
+            {
+                std::unique_lock wlock(m_whitelistMutex);
+                m_whitelist.clear();
+                m_whitelistDomains.clear();
+                for (const auto& entry : m_config.whitelistedSenders) {
+                    if (entry.empty()) continue;
+                    m_whitelist.insert(NormalizeEmail(entry));
+                }
+                for (const auto& dom : m_config.whitelistedDomains) {
+                    if (dom.empty()) continue;
+                    std::string d = dom;
+                    std::transform(d.begin(), d.end(), d.begin(),
+                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                    m_whitelistDomains.insert(std::move(d));
+                }
             }
 
             m_initialized = true;
@@ -974,7 +1147,7 @@ public:
 
     void FeedPacket(std::span<const uint8_t> data, const std::string& srcIP,
                    uint16_t srcPort, const std::string& dstIP, uint16_t dstPort) {
-        if (!m_running || data.empty()) {
+        if (!m_running.load(std::memory_order_acquire) || data.empty()) {
             return;
         }
 
@@ -1002,43 +1175,89 @@ public:
                 return;
             }
 
-            // Create or update session
+            // Build a stable canonical session key.
             const std::string sessionKey = srcIP + ":" + std::to_string(srcPort) + "-" +
                                           dstIP + ":" + std::to_string(dstPort);
 
-            std::unique_lock lock(m_sessionMutex);
-            auto it = m_sessionMap.find(sessionKey);
-            if (it == m_sessionMap.end()) {
-                // New session
-                const uint64_t sessionId = m_nextSessionId++;
-                EmailSession session;
-                session.sessionId = sessionId;
-                session.protocol = protocol;
-                session.clientIP = srcIP;
-                session.clientPort = srcPort;
-                session.serverIP = dstIP;
-                session.serverPort = dstPort;
-                session.startTime = std::chrono::system_clock::now();
-                session.lastActivity = session.startTime;
+            // ----- Critical section #1: append to session buffer -----
+            // We do NOT call ScanEmail under m_sessionMutex because email
+            // scanning is CPU- and I/O-heavy (regex, hashing, archive
+            // extraction) and would otherwise serialize the entire session
+            // table. Instead we extract framed messages here, drop the lock,
+            // then scan the framed payload.
+            std::vector<std::vector<uint8_t>> framedMessages;
+            EmailProtocol framedProto = protocol;
 
-                m_sessions[sessionId] = session;
-                m_sessionMap[sessionKey] = sessionId;
-                m_stats.totalSessions.fetch_add(1, std::memory_order_relaxed);
-                m_stats.activeSessions.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::unique_lock lock(m_sessionMutex);
 
-                it = m_sessionMap.find(sessionKey);
+                auto it = m_sessionMap.find(sessionKey);
+                if (it == m_sessionMap.end()) {
+                    // Reject new sessions if the active table is at capacity.
+                    if (m_sessions.size() >= m_config.maxActiveSessionsCount) {
+                        SS_LOG_WARN(L"Network",
+                            L"EmailScanner::FeedPacket: active session cap reached (%zu); dropping new flow",
+                            m_sessions.size());
+                        return;
+                    }
+
+                    const uint64_t sessionId = m_nextSessionId.fetch_add(1u, std::memory_order_relaxed);
+                    EmailSession session;
+                    session.sessionId   = sessionId;
+                    session.protocol    = protocol;
+                    session.clientIP    = srcIP;
+                    session.clientPort  = srcPort;
+                    session.serverIP    = dstIP;
+                    session.serverPort  = dstPort;
+                    session.startTime   = std::chrono::system_clock::now();
+                    session.lastActivity = session.startTime;
+
+                    m_sessions.emplace(sessionId, std::move(session));
+                    auto inserted = m_sessionMap.emplace(sessionKey, sessionId);
+                    it = inserted.first;
+                    m_stats.totalSessions.fetch_add(1, std::memory_order_relaxed);
+                    m_stats.activeSessions.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                const uint64_t sessionId = it->second;
+                auto sessIt = m_sessions.find(sessionId);
+                if (sessIt == m_sessions.end()) {
+                    // Stale map entry — drop and bail.
+                    m_sessionMap.erase(it);
+                    return;
+                }
+                EmailSession& session = sessIt->second;
+
+                // DoS guard: cap per-session reassembly buffer.
+                const size_t hardCap = (std::min)(kSessionBufferHardCap,
+                    static_cast<size_t>(EmailScannerConstants::MAX_EMAIL_SIZE) * 4u);
+                if (session.buffer.size() + data.size() > hardCap) {
+                    SS_LOG_WARN(L"Network",
+                        L"EmailScanner::FeedPacket: session %llu buffer cap exceeded; resetting",
+                        static_cast<unsigned long long>(session.sessionId));
+                    session.buffer.clear();
+                    session.buffer.shrink_to_fit();
+                    if (data.size() > hardCap) {
+                        return;
+                    }
+                }
+
+                session.buffer.insert(session.buffer.end(), data.begin(), data.end());
+                session.lastActivity = std::chrono::system_clock::now();
+                session.bytesTransferred += data.size();
+
+                // Frame any complete messages out of the session buffer; the
+                // returned blobs are owned and can be scanned without the lock.
+                framedProto = session.protocol;
+                framedMessages = ExtractFramedMessages(session);
             }
 
-            const uint64_t sessionId = it->second;
-            auto& session = m_sessions[sessionId];
-
-            // Append data to session buffer
-            session.buffer.insert(session.buffer.end(), data.begin(), data.end());
-            session.lastActivity = std::chrono::system_clock::now();
-            session.bytesTransferred += data.size();
-
-            // Try to parse complete email
-            ProcessSessionBuffer(session);
+            // ----- Outside the lock: scan each framed message. -----
+            for (auto& blob : framedMessages) {
+                std::span<const uint8_t> view(blob.data(), blob.size());
+                auto analysis    = ScanEmail(view);
+                analysis.protocol = framedProto;
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"EmailScanner::FeedPacket: %hs", e.what());
@@ -1153,7 +1372,7 @@ public:
             // Invoke callbacks
             m_callbackManager->InvokeAnalysis(analysis);
 
-            SS_LOG_INFO(L"Network", L"EmailScanner: Scanned email %hs - Score: %u, Result: %d, Action: %d", analysis.messageId.c_str(), static_cast<unsigned>(analysis.threatScore), static_cast<int>(analysis.result), static_cast<int>(analysis.action));
+            SS_LOG_INFO(L"Network", L"EmailScanner: Scanned email %hs - Score: %u, Result: %d, Action: %d", SanitizeForLog(analysis.messageId).c_str(), static_cast<unsigned>(analysis.threatScore), static_cast<int>(analysis.result), static_cast<int>(analysis.action));
 
             return analysis;
 
@@ -1272,26 +1491,33 @@ public:
             return results;
         }
 
-        // Use a unique temp name to avoid collisions
-        auto tempPath = tempDir / (L"ss_email_archive_" +
-            std::to_wstring(std::hash<std::string>{}(filename)) +
-            L"_" + std::to_wstring(reinterpret_cast<uintptr_t>(archiveData.data())) +
-            L".tmp");
+        // Build a unique, unpredictable temp path. Using a CNG-random token
+        // (rather than addresses or hashes of attacker-controlled data)
+        // defeats symlink/junction TOCTOU on shared temp directories.
+        std::filesystem::path tempPath;
+        HANDLE tempHandle = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const std::wstring token = GenerateRandomToken(16);
+            tempPath = tempDir / (L"ss_email_arch_" + token + L".tmp");
 
-        // RAII cleanup for temp file
-        struct TempFileGuard {
-            std::filesystem::path path;
-            ~TempFileGuard() {
-                std::error_code ignored;
-                std::filesystem::remove(path, ignored);
+            // CREATE_NEW: fail if file exists (no overwrite of attacker-placed file).
+            // FILE_FLAG_OPEN_REPARSE_POINT: do not follow symlinks/junctions.
+            tempHandle = ::CreateFileW(
+                tempPath.c_str(),
+                GENERIC_WRITE,
+                0, // no sharing — exclusive
+                nullptr,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                nullptr);
+            if (tempHandle != INVALID_HANDLE_VALUE) {
+                break;
             }
-        } tempGuard{ tempPath };
-
-        {
-            std::ofstream ofs(tempPath, std::ios::binary | std::ios::trunc);
-            if (!ofs.is_open()) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) {
                 SS_LOG_ERROR(L"Network",
-                    L"EmailScanner::ScanArchive: failed to create temp file for archive extraction");
+                    L"EmailScanner::ScanArchive: CreateFileW failed (Win32=%lu)",
+                    static_cast<unsigned long>(err));
                 AttachmentInfo info;
                 info.filename  = filename;
                 info.isArchive = true;
@@ -1300,8 +1526,60 @@ public:
                 results.push_back(std::move(info));
                 return results;
             }
-            ofs.write(reinterpret_cast<const char*>(archiveData.data()),
-                      static_cast<std::streamsize>(archiveData.size()));
+        }
+        if (tempHandle == INVALID_HANDLE_VALUE) {
+            SS_LOG_ERROR(L"Network",
+                L"EmailScanner::ScanArchive: exhausted unique temp path attempts");
+            AttachmentInfo info;
+            info.filename  = filename;
+            info.isArchive = true;
+            info.size      = archiveData.size();
+            info.riskLevel = AttachmentRisk::MEDIUM;
+            results.push_back(std::move(info));
+            return results;
+        }
+
+        // RAII cleanup: close handle, then delete the file.
+        struct TempFileGuard {
+            HANDLE handle;
+            std::filesystem::path path;
+            ~TempFileGuard() {
+                if (handle != INVALID_HANDLE_VALUE) {
+                    ::CloseHandle(handle);
+                }
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+            }
+        } tempGuard{ tempHandle, tempPath };
+
+        {
+            const uint8_t* p = archiveData.data();
+            size_t remaining = archiveData.size();
+            while (remaining > 0) {
+                const DWORD chunk = static_cast<DWORD>(
+                    (std::min<size_t>)(remaining, static_cast<size_t>(1u << 20)));
+                DWORD written = 0;
+                if (!::WriteFile(tempHandle, p, chunk, &written, nullptr) ||
+                    written != chunk) {
+                    SS_LOG_ERROR(L"Network",
+                        L"EmailScanner::ScanArchive: WriteFile failed (Win32=%lu)",
+                        static_cast<unsigned long>(::GetLastError()));
+                    AttachmentInfo info;
+                    info.filename  = filename;
+                    info.isArchive = true;
+                    info.size      = archiveData.size();
+                    info.riskLevel = AttachmentRisk::MEDIUM;
+                    results.push_back(std::move(info));
+                    return results;
+                }
+                p         += chunk;
+                remaining -= chunk;
+            }
+            // Flush so ArchiveExtractor (which opens by path) sees the bytes.
+            ::FlushFileBuffers(tempHandle);
+            // Close write handle now; keep RAII guard for delete on scope exit.
+            ::CloseHandle(tempHandle);
+            tempGuard.handle = INVALID_HANDLE_VALUE;
         }
 
         // List contents with security limits
@@ -1326,8 +1604,10 @@ public:
             size_t scriptCount       = 0;
 
             for (const auto& entry : entries) {
-                // Convert entry path to narrow string for analysis
-                std::string entryName(entry.path.begin(), entry.path.end());
+                // Convert entry path to narrow string for analysis. Use the
+                // shared UTF-8 narrowing helper rather than a byte copy so
+                // non-ASCII filenames survive intact for downstream checks.
+                std::string entryName = Utils::StringUtils::ToNarrow(entry.path);
 
                 if (entry.isPE) {
                     ++executableCount;
@@ -1351,7 +1631,7 @@ public:
                     archiveInfo.riskLevel = AttachmentRisk::HIGH;
                     SS_LOG_WARN(L"Network",
                         L"EmailScanner::ScanArchive: suspicious compression ratio %.1f in %hs",
-                        entry.compressionRatio, entryName.c_str());
+                        entry.compressionRatio, SanitizeForLog(entryName).c_str());
                 }
 
                 // Check security flags
@@ -1369,7 +1649,7 @@ public:
 
             SS_LOG_INFO(L"Network",
                 L"EmailScanner::ScanArchive: %hs contains %zu entries (%zu executables, %zu scripts)",
-                filename.c_str(), entries.size(), executableCount, scriptCount);
+                SanitizeForLog(filename).c_str(), entries.size(), executableCount, scriptCount);
 
             results.push_back(std::move(archiveInfo));
         } catch (const std::exception& e) {
@@ -1449,19 +1729,62 @@ public:
     // ========================================================================
 
     bool AddToWhitelist(const std::string& sender) {
+        if (sender.empty() || sender.size() > kAddressParseInputLimit) {
+            return false;
+        }
         std::unique_lock lock(m_whitelistMutex);
+        // If the input is a bare domain (no '@'), record it as a domain whitelist entry.
+        if (sender.find('@') == std::string::npos) {
+            std::string d = sender;
+            std::transform(d.begin(), d.end(), d.begin(),
+                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            auto [it, inserted] = m_whitelistDomains.insert(std::move(d));
+            (void)it;
+            return inserted;
+        }
         auto [it, inserted] = m_whitelist.insert(NormalizeEmail(sender));
+        (void)it;
         return inserted;
     }
 
     bool RemoveFromWhitelist(const std::string& sender) {
+        if (sender.empty() || sender.size() > kAddressParseInputLimit) {
+            return false;
+        }
         std::unique_lock lock(m_whitelistMutex);
+        if (sender.find('@') == std::string::npos) {
+            std::string d = sender;
+            std::transform(d.begin(), d.end(), d.begin(),
+                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            return m_whitelistDomains.erase(d) > 0;
+        }
         return m_whitelist.erase(NormalizeEmail(sender)) > 0;
     }
 
     bool IsWhitelisted(const std::string& sender) const {
+        if (sender.empty() || sender.size() > kAddressParseInputLimit) {
+            return false;
+        }
         std::shared_lock lock(m_whitelistMutex);
-        return m_whitelist.contains(NormalizeEmail(sender));
+        if (m_whitelist.contains(NormalizeEmail(sender))) {
+            return true;
+        }
+        // Also accept whitelisted domains so org-wide trust lists work.
+        const auto atPos = sender.find('@');
+        if (atPos != std::string::npos && atPos + 1 < sender.size()) {
+            std::string domain = sender.substr(atPos + 1);
+            // Strip trailing '>' if input is "<a@b>".
+            while (!domain.empty() && (domain.back() == '>' || domain.back() == ' ' ||
+                                       domain.back() == '\t' || domain.back() == '\r')) {
+                domain.pop_back();
+            }
+            std::transform(domain.begin(), domain.end(), domain.begin(),
+                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            if (m_whitelistDomains.contains(domain)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ========================================================================
@@ -1593,132 +1916,160 @@ private:
         }
     }
 
-    void ProcessSessionBuffer(EmailSession& session) {
-        if (session.buffer.empty()) return;
+    /**
+     * @brief Frame complete RFC 5321/3501 messages out of a session reassembly buffer.
+     *
+     * Returns owned byte vectors so the caller can drop the session lock
+     * before invoking the (heavy) scanner. The caller-owned buffer is
+     * advanced past every framed message that is returned. The function is
+     * bounded: it never returns more than kMaxMIMEPartCount messages per call,
+     * caps individual literal sizes, and refuses to allocate copies larger
+     * than EmailScannerConstants::MAX_EMAIL_SIZE.
+     */
+    std::vector<std::vector<uint8_t>> ExtractFramedMessages(EmailSession& session) {
+        std::vector<std::vector<uint8_t>> framed;
+        if (session.buffer.empty()) {
+            return framed;
+        }
 
-        std::string bufferStr(session.buffer.begin(), session.buffer.end());
+        const auto* base = session.buffer.data();
+        const size_t bufSize = session.buffer.size();
 
-        if (session.protocol == EmailProtocol::SMTP) {
-            // SMTP: DATA content terminated by CRLF.CRLF (RFC 5321 §4.1.1.4)
-            // The termination sequence is \r\n.\r\n
-            size_t dataPos = bufferStr.find("\r\n.\r\n");
-            if (dataPos != std::string::npos) {
-                std::span<const uint8_t> emailData(session.buffer.data(), dataPos);
-
-                auto analysis = ScanEmail(emailData);
-                analysis.protocol = session.protocol;
-
-                // Remove dot-stuffing (RFC 5321 §4.5.2): lines starting with ".."
-                // have the leading dot removed by the receiver
+        auto consume = [&](size_t consumeBytes) {
+            if (consumeBytes >= session.buffer.size()) {
+                session.buffer.clear();
+                session.buffer.shrink_to_fit();
+            } else {
                 session.buffer.erase(session.buffer.begin(),
-                                     session.buffer.begin() + static_cast<ptrdiff_t>(dataPos + 5));
-                session.emailsProcessed++;
+                                     session.buffer.begin() + static_cast<ptrdiff_t>(consumeBytes));
             }
-        } else if (session.protocol == EmailProtocol::POP3) {
-            // POP3 RETR response: +OK ... followed by message terminated by CRLF.CRLF
-            // Skip the +OK status line if present
-            size_t msgStart = 0;
-            if (bufferStr.starts_with("+OK")) {
-                size_t lineEnd = bufferStr.find("\r\n");
-                if (lineEnd != std::string::npos) {
-                    msgStart = lineEnd + 2;
-                } else {
-                    return; // Incomplete +OK line
+        };
+
+        auto findCRLFDotCRLF = [](const uint8_t* data, size_t len, size_t startOffset) -> size_t {
+            if (len < 5 || startOffset + 5 > len) return SIZE_MAX;
+            for (size_t i = startOffset; i + 5 <= len; ++i) {
+                if (data[i]   == '\r' && data[i+1] == '\n' &&
+                    data[i+2] == '.'  && data[i+3] == '\r' && data[i+4] == '\n') {
+                    return i;
                 }
             }
+            return SIZE_MAX;
+        };
 
-            size_t dataPos = bufferStr.find("\r\n.\r\n", msgStart);
-            if (dataPos != std::string::npos) {
-                std::span<const uint8_t> emailData(
-                    session.buffer.data() + msgStart, dataPos - msgStart);
-
-                auto analysis = ScanEmail(emailData);
-                analysis.protocol = session.protocol;
-
-                session.buffer.erase(session.buffer.begin(),
-                                     session.buffer.begin() + static_cast<ptrdiff_t>(dataPos + 5));
-                session.emailsProcessed++;
+        auto enqueueIfBounded = [&](const uint8_t* p, size_t len) -> bool {
+            if (len == 0 || len > EmailScannerConstants::MAX_EMAIL_SIZE) {
+                if (len > EmailScannerConstants::MAX_EMAIL_SIZE) {
+                    SS_LOG_WARN(L"Network",
+                        L"EmailScanner: framed message exceeds MAX_EMAIL_SIZE (%zu); dropping",
+                        len);
+                }
+                return false;
             }
-        } else if (session.protocol == EmailProtocol::IMAP) {
-            // IMAP FETCH response: look for BODY[] or RFC822 literal {size}\r\n
-            // Literal format: {<size>}\r\n followed by exactly <size> bytes
-            size_t literalPos = bufferStr.find('{');
-            while (literalPos != std::string::npos) {
-                size_t closePos = bufferStr.find('}', literalPos);
-                if (closePos == std::string::npos) break;
+            framed.emplace_back(p, p + len);
+            return true;
+        };
 
-                std::string sizeStr = bufferStr.substr(literalPos + 1, closePos - literalPos - 1);
-                // Validate numeric
-                bool isNumeric = !sizeStr.empty();
-                for (char c : sizeStr) {
-                    if (!std::isdigit(static_cast<unsigned char>(c))) {
-                        isNumeric = false;
+        if (session.protocol == EmailProtocol::SMTP ||
+            session.protocol == EmailProtocol::SMTPS ||
+            session.protocol == EmailProtocol::UNKNOWN) {
+            // SMTP DATA framing: message ends at "\r\n.\r\n".
+            const size_t dataPos = findCRLFDotCRLF(base, bufSize, 0u);
+            if (dataPos != SIZE_MAX) {
+                if (enqueueIfBounded(base, dataPos)) {
+                    session.emailsProcessed++;
+                }
+                consume(dataPos + 5u);
+            }
+        } else if (session.protocol == EmailProtocol::POP3 ||
+                   session.protocol == EmailProtocol::POP3S) {
+            size_t msgStart = 0;
+            // Skip leading "+OK ...\r\n" status if present.
+            if (bufSize >= 3 && std::memcmp(base, "+OK", 3u) == 0) {
+                size_t lineEnd = SIZE_MAX;
+                for (size_t i = 0; i + 1 < bufSize; ++i) {
+                    if (base[i] == '\r' && base[i+1] == '\n') {
+                        lineEnd = i;
                         break;
                     }
                 }
-
-                if (!isNumeric) {
-                    literalPos = bufferStr.find('{', closePos);
-                    continue;
+                if (lineEnd == SIZE_MAX) {
+                    return framed; // wait for more
                 }
-
-                size_t literalSize = 0;
-                try {
-                    literalSize = std::stoull(sizeStr);
-                } catch (...) {
-                    literalPos = bufferStr.find('{', closePos);
-                    continue;
-                }
-
-                // Cap literal size
-                if (literalSize > kMaxSingleAttachmentSize) {
-                    SS_LOG_WARN(L"Network",
-                        L"EmailScanner::ProcessSessionBuffer: IMAP literal too large (%zu), skipping",
-                        literalSize);
-                    literalPos = bufferStr.find('{', closePos);
-                    continue;
-                }
-
-                // Look for CRLF after }
-                size_t dataStart = closePos + 1;
-                if (dataStart + 1 < bufferStr.size() &&
-                    bufferStr[dataStart] == '\r' && bufferStr[dataStart + 1] == '\n') {
-                    dataStart += 2;
-                } else {
-                    break; // Incomplete
-                }
-
-                // Check if we have enough data
-                if (dataStart + literalSize <= bufferStr.size()) {
-                    std::span<const uint8_t> emailData(
-                        session.buffer.data() + dataStart, literalSize);
-
-                    auto analysis = ScanEmail(emailData);
-                    analysis.protocol = session.protocol;
-
-                    size_t consumed = dataStart + literalSize;
-                    session.buffer.erase(session.buffer.begin(),
-                                         session.buffer.begin() + static_cast<ptrdiff_t>(consumed));
-                    session.emailsProcessed++;
-                    break; // Process one email per call
-                } else {
-                    break; // Not enough data yet
-                }
+                msgStart = lineEnd + 2u;
             }
-        } else {
-            // Unknown protocol — fallback to SMTP-style termination
-            size_t dataPos = bufferStr.find("\r\n.\r\n");
-            if (dataPos != std::string::npos) {
-                std::span<const uint8_t> emailData(session.buffer.data(), dataPos);
+            const size_t dataPos = findCRLFDotCRLF(base, bufSize, msgStart);
+            if (dataPos != SIZE_MAX) {
+                if (enqueueIfBounded(base + msgStart, dataPos - msgStart)) {
+                    session.emailsProcessed++;
+                }
+                consume(dataPos + 5u);
+            }
+        } else if (session.protocol == EmailProtocol::IMAP ||
+                   session.protocol == EmailProtocol::IMAPS) {
+            // IMAP literals: "{<size>}\r\n<size bytes>".
+            size_t scan = 0;
+            while (scan < bufSize) {
+                // Locate '{' candidate.
+                const uint8_t* lbrace = static_cast<const uint8_t*>(
+                    std::memchr(base + scan, '{', bufSize - scan));
+                if (!lbrace) break;
+                size_t lpos = static_cast<size_t>(lbrace - base);
 
-                auto analysis = ScanEmail(emailData);
-                analysis.protocol = session.protocol;
+                // Find matching '}'.
+                const uint8_t* rbrace = static_cast<const uint8_t*>(
+                    std::memchr(base + lpos + 1, '}', bufSize - (lpos + 1)));
+                if (!rbrace) break;
+                size_t rpos = static_cast<size_t>(rbrace - base);
 
-                session.buffer.erase(session.buffer.begin(),
-                                     session.buffer.begin() + static_cast<ptrdiff_t>(dataPos + 5));
-                session.emailsProcessed++;
+                // Validate size token is purely digits and bounded.
+                if (rpos - lpos - 1 == 0 || rpos - lpos - 1 > 16) {
+                    scan = rpos + 1;
+                    continue;
+                }
+                bool numeric = true;
+                size_t literalSize = 0;
+                for (size_t i = lpos + 1; i < rpos; ++i) {
+                    const uint8_t d = base[i];
+                    if (d < '0' || d > '9') { numeric = false; break; }
+                    // Build with overflow guard.
+                    if (literalSize > (SIZE_MAX - (d - '0')) / 10u) {
+                        numeric = false;
+                        break;
+                    }
+                    literalSize = literalSize * 10u + static_cast<size_t>(d - '0');
+                }
+                if (!numeric) {
+                    scan = rpos + 1;
+                    continue;
+                }
+                if (literalSize > EmailScannerConstants::MAX_EMAIL_SIZE) {
+                    SS_LOG_WARN(L"Network",
+                        L"EmailScanner: IMAP literal too large (%zu); skipping",
+                        literalSize);
+                    scan = rpos + 1;
+                    continue;
+                }
+
+                // Require CRLF after '}'.
+                if (rpos + 2u >= bufSize) break; // need more bytes
+                if (base[rpos + 1] != '\r' || base[rpos + 2] != '\n') {
+                    scan = rpos + 1;
+                    continue;
+                }
+                const size_t dataStart = rpos + 3u;
+                if (dataStart + literalSize > bufSize) {
+                    return framed; // wait for more
+                }
+
+                if (enqueueIfBounded(base + dataStart, literalSize)) {
+                    session.emailsProcessed++;
+                }
+                consume(dataStart + literalSize);
+                break; // one message per call to avoid CPU starvation
             }
         }
+
+        return framed;
     }
 
     std::pair<size_t, std::span<const uint8_t>> ExtractHeaders(std::span<const uint8_t> emailData) {
@@ -1740,24 +2091,43 @@ private:
         EmailHeader header;
 
         try {
-            std::string headerText(reinterpret_cast<const char*>(headerData.data()), headerData.size());
+            // Hard cap: refuse to parse pathologically large header sections.
+            // RFC 5322 implementations universally allow rejecting these.
+            const size_t headerSize = (std::min<size_t>)(headerData.size(), kMaxHeaderTotalSize);
+            std::string headerText(reinterpret_cast<const char*>(headerData.data()), headerSize);
             std::istringstream stream(headerText);
             std::string line;
             std::string currentHeader;
             std::string currentValue;
+            size_t headerCount = 0;
 
             auto processHeader = [&]() {
                 if (currentHeader.empty()) return;
 
+                // Cap the value size — arbitrarily long values are a DoS vector.
+                if (currentValue.size() > kMaxHeaderValueLength) {
+                    currentValue.resize(kMaxHeaderValueLength);
+                }
+
                 std::string lowerHeader = currentHeader;
-                std::transform(lowerHeader.begin(), lowerHeader.end(), lowerHeader.begin(), ::tolower);
+                std::transform(lowerHeader.begin(), lowerHeader.end(), lowerHeader.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+                ++headerCount;
+                if (headerCount > kMaxHeaderCount) {
+                    return;
+                }
 
                 if (lowerHeader == "from") {
                     header.from = ParseEmailAddress(currentValue);
                 } else if (lowerHeader == "to") {
-                    header.to.push_back(ParseEmailAddress(currentValue));
+                    if (header.to.size() < kMaxRecipientsPerField) {
+                        header.to.push_back(ParseEmailAddress(currentValue));
+                    }
                 } else if (lowerHeader == "cc") {
-                    header.cc.push_back(ParseEmailAddress(currentValue));
+                    if (header.cc.size() < kMaxRecipientsPerField) {
+                        header.cc.push_back(ParseEmailAddress(currentValue));
+                    }
                 } else if (lowerHeader == "subject") {
                     header.subject = currentValue;
                     header.decodedSubject = currentValue; // Simplified
@@ -1770,7 +2140,9 @@ private:
                 } else if (lowerHeader == "return-path") {
                     header.returnPath = currentValue;
                 } else if (lowerHeader == "received") {
-                    header.receivedHeaders.push_back(currentValue);
+                    if (header.receivedHeaders.size() < kMaxReceivedHeaders) {
+                        header.receivedHeaders.push_back(currentValue);
+                    }
                 } else if (lowerHeader == "authentication-results") {
                     header.authenticationResults = currentValue;
                 } else if (lowerHeader == "dkim-signature") {
@@ -1782,12 +2154,20 @@ private:
                 } else if (lowerHeader == "content-type") {
                     header.contentType = currentValue;
                 } else {
-                    header.customHeaders[currentHeader] = currentValue;
+                    if (header.customHeaders.size() < kMaxHeaderCount) {
+                        header.customHeaders[currentHeader] = currentValue;
+                    }
                 }
             };
 
             while (std::getline(stream, line)) {
                 if (line.empty() || line == "\r") break;
+
+                // Per-line length cap — RFC 5322 §2.1.1 recommends 998 octets;
+                // we accept up to kMaxHeaderLineLength then truncate.
+                if (line.size() > kMaxHeaderLineLength) {
+                    line.resize(kMaxHeaderLineLength);
+                }
 
                 // Remove CR if present
                 if (!line.empty() && line.back() == '\r') {
@@ -1796,19 +2176,34 @@ private:
 
                 // Check for header continuation (starts with space or tab)
                 if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
-                    currentValue += " " + line.substr(1);
+                    if (currentValue.size() < kMaxHeaderValueLength) {
+                        currentValue += " ";
+                        currentValue.append(line, 1,
+                            (std::min<size_t>)(line.size() - 1,
+                                kMaxHeaderValueLength - currentValue.size()));
+                    }
                 } else {
                     // Process previous header
                     processHeader();
 
+                    if (headerCount >= kMaxHeaderCount) {
+                        SS_LOG_WARN(L"Network",
+                            L"EmailScanner::ParseHeadersImpl: header count cap reached (%zu); truncating",
+                            headerCount);
+                        break;
+                    }
+
                     // Parse new header
                     size_t colonPos = line.find(':');
-                    if (colonPos != std::string::npos) {
+                    if (colonPos != std::string::npos && colonPos > 0) {
                         currentHeader = line.substr(0, colonPos);
                         currentValue = line.substr(colonPos + 1);
 
                         // Trim leading whitespace from value
                         currentValue.erase(0, currentValue.find_first_not_of(" \t"));
+                    } else {
+                        currentHeader.clear();
+                        currentValue.clear();
                     }
                 }
             }
@@ -2268,7 +2663,7 @@ private:
         }
 
         // Check for IP addresses in domain
-        std::regex ipRegex(R"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})");
+        static const std::regex ipRegex(R"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})");
         if (std::regex_search(info.domain, ipRegex)) {
             info.phishingScore += 0.2;
         }
@@ -2412,7 +2807,8 @@ private:
             }
 
             // Excessive caps
-            size_t capsCount = std::count_if(combinedContent.begin(), combinedContent.end(), ::isupper);
+            size_t capsCount = std::count_if(combinedContent.begin(), combinedContent.end(),
+                [](char c) { return std::isupper(static_cast<unsigned char>(c)) != 0; });
             if (combinedContent.length() > 0) {
                 double capsRatio = static_cast<double>(capsCount) / combinedContent.length();
                 if (capsRatio > 0.5) {
@@ -2794,6 +3190,7 @@ private:
 
     // Whitelist
     std::unordered_set<std::string> m_whitelist;
+    std::unordered_set<std::string> m_whitelistDomains;
 
     // Callbacks
     std::unique_ptr<CallbackManager> m_callbackManager;
