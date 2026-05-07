@@ -131,7 +131,19 @@ namespace {
     // Maximum concurrent async reputation checks to prevent resource exhaustion
     constexpr size_t MAX_CONCURRENT_ASYNC_CHECKS = 64;
 
-    // Microsoft known publishers
+    // Hard caps on local whitelist/blacklist/trust databases to prevent unbounded
+    // memory growth from a hostile or buggy caller repeatedly invoking Add*().
+    constexpr size_t MAX_LOCAL_LIST_ENTRIES = 5'000'000;
+    constexpr size_t MAX_TRUSTED_CERT_ENTRIES = 1'000'000;
+
+    // Caps on caller-supplied free-form strings stored or logged. Anything longer
+    // is truncated before being persisted into reasons / threat names.
+    constexpr size_t MAX_REASON_LEN = 512;
+    constexpr size_t MAX_THREAT_NAME_LEN = 256;
+    constexpr size_t MAX_REASONS_PER_RESULT = 64;
+    constexpr size_t MAX_LOG_FIELD_LEN = 256;
+
+    // Microsoft known publishers (exact full-string match required).
     const std::unordered_set<std::wstring> MICROSOFT_PUBLISHERS = {
         L"Microsoft Corporation",
         L"Microsoft Windows",
@@ -139,7 +151,7 @@ namespace {
         L"Microsoft Windows Hardware Compatibility Publisher"
     };
 
-    // Known trusted publishers
+    // Known trusted publishers (exact full-string match required).
     const std::unordered_set<std::wstring> TRUSTED_PUBLISHERS = {
         L"Adobe Systems Incorporated",
         L"Google LLC",
@@ -150,6 +162,108 @@ namespace {
         L"NVIDIA Corporation",
         L"VMware, Inc."
     };
+
+    // ------------------------------------------------------------------
+    // Input validation / canonicalization helpers.
+    // ------------------------------------------------------------------
+
+    [[nodiscard]] inline bool IsValidSha256Hex(std::string_view s) noexcept {
+        if (s.size() != 64) return false;
+        for (char c : s) {
+            if (!((c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] inline bool IsValidSha1Hex(std::string_view s) noexcept {
+        if (s.size() != 40) return false;
+        for (char c : s) {
+            if (!((c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] inline bool IsValidMd5Hex(std::string_view s) noexcept {
+        if (s.size() != 32) return false;
+        for (char c : s) {
+            if (!((c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Canonicalize hex hashes to lowercase. Avoids cache/whitelist/blacklist
+    // bypass via case-mismatch: HashStore and most threat-intel feeds emit
+    // lowercase hex; we normalize all inputs before any insertion or lookup.
+    [[nodiscard]] inline std::string NormalizeHash(std::string_view s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if (c >= 'A' && c <= 'F') {
+                out.push_back(static_cast<char>(c - 'A' + 'a'));
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    // Thumbprints are persisted as uppercase hex internally to match the
+    // representation produced by GetCertificateReputation (snprintf "%02X").
+    [[nodiscard]] inline std::string NormalizeThumbprint(std::string_view s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if (c == ' ' || c == ':') continue; // tolerate user formatting
+            if (c >= 'a' && c <= 'f') {
+                out.push_back(static_cast<char>(c - 'a' + 'A'));
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    // Strip CR/LF/control chars and cap length. Used for any caller-supplied
+    // text that ends up in logs (CWE-117) or the user-facing reasons vector.
+    [[nodiscard]] inline std::string SanitizeText(std::string_view s, size_t maxLen) {
+        std::string out;
+        out.reserve(std::min(s.size(), maxLen));
+        for (char c : s) {
+            if (out.size() >= maxLen) break;
+            unsigned char uc = static_cast<unsigned char>(c);
+            // Drop ASCII control characters (including CR/LF/TAB) which would
+            // allow log forging or break downstream JSON serialization.
+            if (uc < 0x20 || uc == 0x7F) {
+                out.push_back('?');
+            } else {
+                out.push_back(c);
+            }
+        }
+        if (s.size() > maxLen) {
+            // Truncation marker (kept ASCII to stay 7-bit safe in logs)
+            out.append("...");
+        }
+        return out;
+    }
+
+    // Truncated short hash (first 16 hex chars) for log correlation.
+    // Always returns a stable owned string to avoid c_str() lifetime traps.
+    [[nodiscard]] inline std::string ShortHash(std::string_view s) {
+        if (s.size() <= 16) return std::string(s);
+        return std::string(s.substr(0, 16));
+    }
 
 } // anonymous namespace
 
@@ -209,7 +323,7 @@ public:
         try {
             m_config = config;
             m_shuttingDown.store(false, std::memory_order_release);
-            m_initialized = true;
+            m_initialized.store(true, std::memory_order_release);
 
             // Initialize cloud connectivity check
             if (config.defaultMode != QueryMode::LocalOnly) {
@@ -225,34 +339,43 @@ public:
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"FileReputation initialization failed: %hs", e.what());
+            m_initialized.store(false, std::memory_order_release);
             return false;
         }
     }
 
     void Shutdown() noexcept {
-        std::unique_lock lock(m_mutex);
-
         try {
-            m_initialized = false;
-
-            // Signal async threads to not start new work
+            // Mark not-initialized first so new query callers exit fast, and
+            // signal any in-flight async workers to abandon further work.
+            m_initialized.store(false, std::memory_order_release);
             m_shuttingDown.store(true, std::memory_order_release);
 
-            // Clear callbacks
-            m_unknownFileCallbacks.clear();
+            // Drop callbacks under exclusive lock. Do NOT hold the main mutex
+            // while waiting on async workers — they take the same mutex and
+            // would deadlock.
+            {
+                std::unique_lock lock(m_mutex);
+                m_unknownFileCallbacks.clear();
+            }
 
-            // Wait for outstanding async operations
-            lock.unlock();
+            // Wait for outstanding async operations to drain.
             {
                 std::unique_lock asyncLock(m_asyncMutex);
                 m_asyncCv.wait(asyncLock, [this]() {
                     return m_activeAsyncCount.load(std::memory_order_acquire) == 0;
                 });
             }
-            lock.lock();
 
-            // Clear cache
-            m_cache.clear();
+            // Clear cache and local databases under the main lock.
+            {
+                std::unique_lock lock(m_mutex);
+                m_cache.clear();
+                m_localWhitelist.clear();
+                m_localBlacklist.clear();
+                m_trustedCertificates.clear();
+                m_untrustedCertificates.clear();
+            }
 
             SS_LOG_INFO(L"FileReputation", L"FileReputation shutdown complete");
 
@@ -271,7 +394,7 @@ public:
         result.queryTime = std::chrono::system_clock::now();
 
         try {
-            if (!m_initialized) {
+            if (!m_initialized.load(std::memory_order_acquire)) {
                 SS_LOG_ERROR(L"FileReputation", L"CheckFile called before Initialize");
                 result.level = ReputationLevel::Unknown;
                 result.recommendation = "Investigate";
@@ -294,7 +417,7 @@ public:
             // FileHasher handles missing files gracefully.
             auto& hasher = FileHasher::Instance();
             result.sha256 = hasher.ComputeSHA256(filePath);
-            if (result.sha256.empty()) {
+            if (result.sha256.empty() || !IsValidSha256Hex(result.sha256)) {
                 SS_LOG_WARN(L"FileReputation", L"CheckFile - Hash computation failed: %ls",
                     filePath.c_str());
                 result.level = ReputationLevel::Unknown;
@@ -302,8 +425,20 @@ public:
                 result.reasons.push_back("File inaccessible or hash computation failed");
                 return result;
             }
+            // Canonicalize to lowercase for consistent cache/whitelist/blacklist keys.
+            result.sha256 = NormalizeHash(result.sha256);
             result.sha1 = hasher.ComputeSHA1(filePath);
-            result.md5 = hasher.ComputeMD5(filePath);
+            result.md5  = hasher.ComputeMD5(filePath);
+            if (!result.sha1.empty() && IsValidSha1Hex(result.sha1)) {
+                result.sha1 = NormalizeHash(result.sha1);
+            } else {
+                result.sha1.clear();
+            }
+            if (!result.md5.empty() && IsValidMd5Hex(result.md5)) {
+                result.md5 = NormalizeHash(result.md5);
+            } else {
+                result.md5.clear();
+            }
 
             // Build query
             ReputationQuery query;
@@ -320,7 +455,11 @@ public:
             SS_LOG_ERROR(L"FileReputation", L"CheckFile - Exception: %hs", e.what());
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
-            result.reasons.push_back(std::string("Error: ") + e.what());
+            // Sanitize and bound the surfaced reason — the raw exception
+            // message can carry attacker-influenced bytes (e.g. paths) and
+            // is bubbled up to the dashboard / alert pipeline.
+            result.reasons.push_back(
+                "Error: " + SanitizeText(e.what(), MAX_REASON_LEN));
         }
 
         auto endTime = std::chrono::steady_clock::now();
@@ -333,7 +472,7 @@ public:
     }
 
     [[nodiscard]] ReputationResult CheckHash(std::string_view sha256, QueryMode mode) {
-        if (!m_initialized) {
+        if (!m_initialized.load(std::memory_order_acquire)) {
             ReputationResult result;
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
@@ -341,8 +480,18 @@ public:
             return result;
         }
 
+        // Validate input — refuse malformed hashes outright. A non-canonical
+        // hash would otherwise contaminate caches and lookup tables.
+        if (!IsValidSha256Hex(sha256)) {
+            ReputationResult result;
+            result.level = ReputationLevel::Unknown;
+            result.recommendation = "Investigate";
+            result.reasons.push_back("Invalid SHA-256 hash format");
+            return result;
+        }
+
         ReputationQuery query;
-        query.sha256 = std::string(sha256);
+        query.sha256 = NormalizeHash(sha256);
         query.mode = mode;
 
         m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
@@ -353,7 +502,7 @@ public:
                                                std::string_view sha1,
                                                std::string_view md5,
                                                QueryMode mode) {
-        if (!m_initialized) {
+        if (!m_initialized.load(std::memory_order_acquire)) {
             ReputationResult result;
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
@@ -361,10 +510,25 @@ public:
             return result;
         }
 
+        // SHA-256 is required for cache keying and authoritative lookup.
+        // SHA-1/MD5 are optional secondary identifiers — only adopt them
+        // when they parse as valid hex of the expected length.
+        if (!IsValidSha256Hex(sha256)) {
+            ReputationResult result;
+            result.level = ReputationLevel::Unknown;
+            result.recommendation = "Investigate";
+            result.reasons.push_back("Invalid SHA-256 hash format");
+            return result;
+        }
+
         ReputationQuery query;
-        query.sha256 = std::string(sha256);
-        query.sha1 = std::string(sha1);
-        query.md5 = std::string(md5);
+        query.sha256 = NormalizeHash(sha256);
+        if (IsValidSha1Hex(sha1)) {
+            query.sha1 = NormalizeHash(sha1);
+        }
+        if (IsValidMd5Hex(md5)) {
+            query.md5 = NormalizeHash(md5);
+        }
         query.mode = mode;
 
         m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
@@ -372,7 +536,7 @@ public:
     }
 
     [[nodiscard]] ReputationResult Query(const ReputationQuery& query) {
-        if (!m_initialized) {
+        if (!m_initialized.load(std::memory_order_acquire)) {
             ReputationResult result;
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
@@ -380,8 +544,34 @@ public:
             return result;
         }
 
+        // Defensive normalization: caller-supplied query may carry mixed-case
+        // or invalid hashes. Build a canonicalized copy before dispatching to
+        // QueryInternal so cache keys remain consistent.
+        ReputationQuery sanitized = query;
+        if (!sanitized.sha256.empty()) {
+            if (IsValidSha256Hex(sanitized.sha256)) {
+                sanitized.sha256 = NormalizeHash(sanitized.sha256);
+            } else {
+                sanitized.sha256.clear();
+            }
+        }
+        if (!sanitized.sha1.empty()) {
+            if (IsValidSha1Hex(sanitized.sha1)) {
+                sanitized.sha1 = NormalizeHash(sanitized.sha1);
+            } else {
+                sanitized.sha1.clear();
+            }
+        }
+        if (!sanitized.md5.empty()) {
+            if (IsValidMd5Hex(sanitized.md5)) {
+                sanitized.md5 = NormalizeHash(sanitized.md5);
+            } else {
+                sanitized.md5.clear();
+            }
+        }
+
         m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
-        return QueryInternal(query);
+        return QueryInternal(sanitized);
     }
 
     void CheckFileAsync(const std::wstring& filePath, ReputationCallback callback) {
@@ -460,19 +650,34 @@ public:
     // ========================================================================
 
     bool AddToWhitelist(std::string_view sha256, std::string_view reason) {
+        if (!IsValidSha256Hex(sha256)) {
+            SS_LOG_WARN(L"FileReputation",
+                L"AddToWhitelist rejected: invalid SHA-256 format");
+            return false;
+        }
+        const std::string key = NormalizeHash(sha256);
+        const std::string safeReason = SanitizeText(reason, MAX_REASON_LEN);
+
         std::unique_lock lock(m_mutex);
 
         try {
-            if (sha256.empty()) return false;
+            // DoS guard: cap memory growth from repeated administrative inserts.
+            if (m_localWhitelist.size() >= MAX_LOCAL_LIST_ENTRIES &&
+                m_localWhitelist.find(key) == m_localWhitelist.end()) {
+                SS_LOG_WARN(L"FileReputation",
+                    L"AddToWhitelist - capacity limit reached (%zu)",
+                    static_cast<size_t>(MAX_LOCAL_LIST_ENTRIES));
+                return false;
+            }
 
-            m_localWhitelist.insert(std::string(sha256));
+            m_localWhitelist.insert(key);
 
             SS_LOG_INFO(L"FileReputation", L"Added to whitelist: %hs (reason: %hs)",
-                std::string(sha256).substr(0, 16).c_str(),
-                std::string(reason).c_str());
+                ShortHash(key).c_str(),
+                safeReason.c_str());
 
-            // Invalidate cache entry
-            m_cache.erase(std::string(sha256));
+            // Invalidate cache entry — verdict has changed
+            m_cache.erase(key);
 
             return true;
 
@@ -483,16 +688,17 @@ public:
     }
 
     bool RemoveFromWhitelist(std::string_view sha256) {
+        if (!IsValidSha256Hex(sha256)) return false;
+        const std::string key = NormalizeHash(sha256);
+
         std::unique_lock lock(m_mutex);
 
         try {
-            if (sha256.empty()) return false;
-
-            auto removed = m_localWhitelist.erase(std::string(sha256)) > 0;
+            auto removed = m_localWhitelist.erase(key) > 0;
             if (removed) {
-                m_cache.erase(std::string(sha256));
+                m_cache.erase(key);
                 SS_LOG_INFO(L"FileReputation", L"Removed from whitelist: %hs",
-                    std::string(sha256).substr(0, 16).c_str());
+                    ShortHash(key).c_str());
             }
 
             return removed;
@@ -504,19 +710,33 @@ public:
     }
 
     bool AddToBlacklist(std::string_view sha256, std::string_view threatName) {
+        if (!IsValidSha256Hex(sha256)) {
+            SS_LOG_WARN(L"FileReputation",
+                L"AddToBlacklist rejected: invalid SHA-256 format");
+            return false;
+        }
+        const std::string key = NormalizeHash(sha256);
+        const std::string safeThreat = SanitizeText(threatName, MAX_THREAT_NAME_LEN);
+
         std::unique_lock lock(m_mutex);
 
         try {
-            if (sha256.empty()) return false;
+            if (m_localBlacklist.size() >= MAX_LOCAL_LIST_ENTRIES &&
+                m_localBlacklist.find(key) == m_localBlacklist.end()) {
+                SS_LOG_WARN(L"FileReputation",
+                    L"AddToBlacklist - capacity limit reached (%zu)",
+                    static_cast<size_t>(MAX_LOCAL_LIST_ENTRIES));
+                return false;
+            }
 
-            m_localBlacklist[std::string(sha256)] = std::string(threatName);
+            m_localBlacklist[key] = safeThreat;
 
             SS_LOG_FATAL(L"FileReputation", L"Added to blacklist: %hs (threat: %hs)",
-                std::string(sha256).substr(0, 16).c_str(),
-                std::string(threatName).c_str());
+                ShortHash(key).c_str(),
+                safeThreat.c_str());
 
-            // Invalidate cache entry
-            m_cache.erase(std::string(sha256));
+            // Invalidate cache entry — verdict has changed
+            m_cache.erase(key);
 
             return true;
 
@@ -527,16 +747,17 @@ public:
     }
 
     bool RemoveFromBlacklist(std::string_view sha256) {
+        if (!IsValidSha256Hex(sha256)) return false;
+        const std::string key = NormalizeHash(sha256);
+
         std::unique_lock lock(m_mutex);
 
         try {
-            if (sha256.empty()) return false;
-
-            auto removed = m_localBlacklist.erase(std::string(sha256)) > 0;
+            auto removed = m_localBlacklist.erase(key) > 0;
             if (removed) {
-                m_cache.erase(std::string(sha256));
+                m_cache.erase(key);
                 SS_LOG_INFO(L"FileReputation", L"Removed from blacklist: %hs",
-                    std::string(sha256).substr(0, 16).c_str());
+                    ShortHash(key).c_str());
             }
 
             return removed;
@@ -548,13 +769,17 @@ public:
     }
 
     [[nodiscard]] bool IsWhitelisted(std::string_view sha256) const {
+        if (!IsValidSha256Hex(sha256)) return false;
+        const std::string key = NormalizeHash(sha256);
         std::shared_lock lock(m_mutex);
-        return m_localWhitelist.find(std::string(sha256)) != m_localWhitelist.end();
+        return m_localWhitelist.find(key) != m_localWhitelist.end();
     }
 
     [[nodiscard]] bool IsBlacklisted(std::string_view sha256) const {
+        if (!IsValidSha256Hex(sha256)) return false;
+        const std::string key = NormalizeHash(sha256);
         std::shared_lock lock(m_mutex);
-        return m_localBlacklist.find(std::string(sha256)) != m_localBlacklist.end();
+        return m_localBlacklist.find(key) != m_localBlacklist.end();
     }
 
     // ========================================================================
@@ -700,17 +925,22 @@ public:
     }
 
     [[nodiscard]] TrustLevel GetCertificateTrust(std::string_view thumbprint) const {
+        if (thumbprint.empty()) return TrustLevel::Unknown;
+        const std::string key = NormalizeThumbprint(thumbprint);
+
         std::shared_lock lock(m_mutex);
 
         try {
-            auto it = m_trustedCertificates.find(std::string(thumbprint));
-            if (it != m_trustedCertificates.end()) {
-                return TrustLevel::UserTrust;
-            }
-
-            auto untrusted = m_untrustedCertificates.find(std::string(thumbprint));
+            // Untrusted takes precedence over trusted to ensure revocations
+            // win over stale trust entries.
+            auto untrusted = m_untrustedCertificates.find(key);
             if (untrusted != m_untrustedCertificates.end()) {
                 return TrustLevel::Untrusted;
+            }
+
+            auto it = m_trustedCertificates.find(key);
+            if (it != m_trustedCertificates.end()) {
+                return TrustLevel::UserTrust;
             }
 
         } catch (const std::exception& e) {
@@ -721,13 +951,23 @@ public:
     }
 
     bool AddTrustedCertificate(std::string_view thumbprint, std::string_view reason) {
+        if (thumbprint.empty()) return false;
+        const std::string key = NormalizeThumbprint(thumbprint);
+        const std::string safeReason = SanitizeText(reason, MAX_REASON_LEN);
+
         std::unique_lock lock(m_mutex);
 
         try {
-            m_trustedCertificates[std::string(thumbprint)] = std::string(reason);
+            if (m_trustedCertificates.size() >= MAX_TRUSTED_CERT_ENTRIES &&
+                m_trustedCertificates.find(key) == m_trustedCertificates.end()) {
+                SS_LOG_WARN(L"FileReputation",
+                    L"AddTrustedCertificate - capacity limit reached");
+                return false;
+            }
+            m_trustedCertificates[key] = safeReason;
             SS_LOG_INFO(L"FileReputation", L"Added trusted certificate: %hs (reason: %hs)",
-                std::string(thumbprint).c_str(),
-                std::string(reason).c_str());
+                key.c_str(),
+                safeReason.c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -737,13 +977,23 @@ public:
     }
 
     bool AddUntrustedCertificate(std::string_view thumbprint, std::string_view reason) {
+        if (thumbprint.empty()) return false;
+        const std::string key = NormalizeThumbprint(thumbprint);
+        const std::string safeReason = SanitizeText(reason, MAX_REASON_LEN);
+
         std::unique_lock lock(m_mutex);
 
         try {
-            m_untrustedCertificates[std::string(thumbprint)] = std::string(reason);
+            if (m_untrustedCertificates.size() >= MAX_TRUSTED_CERT_ENTRIES &&
+                m_untrustedCertificates.find(key) == m_untrustedCertificates.end()) {
+                SS_LOG_WARN(L"FileReputation",
+                    L"AddUntrustedCertificate - capacity limit reached");
+                return false;
+            }
+            m_untrustedCertificates[key] = safeReason;
             SS_LOG_WARN(L"FileReputation", L"Added untrusted certificate: %hs (reason: %hs)",
-                std::string(thumbprint).c_str(),
-                std::string(reason).c_str());
+                key.c_str(),
+                safeReason.c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -984,7 +1234,12 @@ public:
                 }
 
                 std::string sha256 = e.value("sha256", "");
-                if (sha256.empty() || sha256.size() != 64) continue;
+                // Reject anything that is not a strict 64-char lowercase hex
+                // SHA-256. Treat the on-disk cache file as untrusted input;
+                // a tampered file must NOT be able to inject arbitrary keys
+                // into m_cache or surface attacker-controlled threat names.
+                if (!IsValidSha256Hex(sha256)) continue;
+                sha256 = NormalizeHash(sha256);
 
                 // Check expiry — skip entries that have already expired
                 int64_t expiryEpoch = e.value("expiry_epoch_s", int64_t(0));
@@ -1000,9 +1255,14 @@ public:
                 entry.result.isSuspicious   = e.value("suspicious", false);
                 entry.result.isBlacklisted  = e.value("blacklisted", false);
                 entry.result.isWhitelisted  = e.value("whitelisted", false);
-                entry.result.threatName     = e.value("threat_name", "");
-                entry.result.malwareFamily  = e.value("malware_family", "");
-                entry.result.recommendation = e.value("recommendation", "");
+                // Defensive sanitization: cache file bytes can contain control
+                // characters or excessive lengths if tampered with on disk.
+                entry.result.threatName     = SanitizeText(
+                    e.value("threat_name", ""), MAX_THREAT_NAME_LEN);
+                entry.result.malwareFamily  = SanitizeText(
+                    e.value("malware_family", ""), MAX_THREAT_NAME_LEN);
+                entry.result.recommendation = SanitizeText(
+                    e.value("recommendation", ""), MAX_REASON_LEN);
                 entry.result.fromCache      = true;
 
                 int64_t insertEpoch = e.value("insert_epoch_s", int64_t(0));
@@ -1832,6 +2092,14 @@ private:
                 result.primarySource = result.contributingSources[0];
             }
 
+            // Final DoS guard: cap how many reason strings can be surfaced.
+            // Prevents an attacker who induces many sub-detections from
+            // ballooning result.reasons into an unbounded vector that gets
+            // copied into every cache entry / event payload.
+            if (result.reasons.size() > MAX_REASONS_PER_RESULT) {
+                result.reasons.resize(MAX_REASONS_PER_RESULT);
+            }
+
             SS_LOG_DEBUG(L"FileReputation", L"Final reputation: level=%u score=%d confidence=%.2f",
                 static_cast<unsigned>(result.level),
                 static_cast<int>(result.score),
@@ -1851,7 +2119,13 @@ private:
 
         auto it = m_cache.find(sha256);
         if (it != m_cache.end()) {
-            // Check expiration
+            // Defense-in-depth: refuse to serve a cache entry whose stored
+            // SHA-256 disagrees with its key. This blocks cache poisoning
+            // by a malformed PreloadCache file or misuse of CacheResult.
+            if (it->second.result.sha256 != sha256) {
+                return std::nullopt;
+            }
+            // Check expiration (TTL enforcement)
             if (!it->second.IsExpired()) {
                 it->second.hitCount.fetch_add(1, std::memory_order_relaxed);
                 return it->second.result;
@@ -1865,6 +2139,10 @@ private:
     }
 
     void CacheResult(const ReputationResult& result, CachePolicy policy) {
+        // Reject inserts with malformed/empty hash up front — never cache
+        // anything that can't be safely keyed.
+        if (result.sha256.empty() || !IsValidSha256Hex(result.sha256)) return;
+
         std::unique_lock lock(m_mutex);
 
         try {
@@ -1891,19 +2169,37 @@ private:
                     break;
             }
 
-            if (!shouldCache || result.sha256.empty()) return;
+            if (!shouldCache) return;
 
-            // Check cache size limit
-            if (m_cache.size() >= m_config.maxCacheSize) {
-                EvictOldestCacheEntry();
+            // A configured cache size of zero disables caching entirely;
+            // otherwise enforce the LRU-style eviction below.
+            if (m_config.maxCacheSize == 0) return;
+
+            // Check cache size limit; evict the oldest until we have headroom.
+            // Bound the loop iteration count so a corrupted m_cache cannot
+            // cause an unbounded eviction storm.
+            for (size_t guard = 0;
+                 m_cache.size() >= m_config.maxCacheSize && guard <= m_config.maxCacheSize;
+                 ++guard) {
+                if (!EvictOldestCacheEntry()) break;
             }
 
             // Create cache entry
             CacheEntry entry;
             entry.result = result;
+            // The cached entry MUST be keyed by its own sha256 — this is
+            // verified by GetFromCache on every hit.
+            entry.result.sha256 = result.sha256;
             entry.insertTime = std::chrono::system_clock::now();
+            // Bound cacheTTLHours to a sane maximum (10 years) — prevents
+            // signed-integer overflow inside std::chrono::hours arithmetic
+            // for hostile/garbage configs while keeping legitimate large
+            // values usable.
+            constexpr uint32_t kMaxCacheTtlHours = 24u * 365u * 10u;
+            const uint32_t ttlHours = std::min<uint32_t>(
+                m_config.cacheTTLHours, kMaxCacheTtlHours);
             entry.expiryTime = entry.insertTime +
-                std::chrono::hours(m_config.cacheTTLHours);
+                std::chrono::hours(ttlHours);
 
             m_cache[result.sha256] = std::move(entry);
 
@@ -1912,11 +2208,11 @@ private:
         }
     }
 
-    void EvictOldestCacheEntry() {
+    bool EvictOldestCacheEntry() {
         // Evict the entry with the oldest insert time (approximation of LRU).
         // Full LRU would require a linked-list overlay; this is acceptable for
         // a cache that rarely hits the size limit due to TTL expiration.
-        if (m_cache.empty()) return;
+        if (m_cache.empty()) return false;
 
         auto oldest = m_cache.begin();
         auto oldestTime = oldest->second.insertTime;
@@ -1929,6 +2225,7 @@ private:
         }
 
         m_cache.erase(oldest);
+        return true;
     }
 
     // ========================================================================
@@ -2032,21 +2329,16 @@ private:
     // ========================================================================
 
     [[nodiscard]] bool IsMicrosoftSigner(const std::wstring& signerName) const noexcept {
-        for (const auto& msPublisher : MICROSOFT_PUBLISHERS) {
-            if (signerName.find(msPublisher) != std::wstring::npos) {
-                return true;
-            }
-        }
-        return false;
+        // Exact full-string match only — substring matching would let an
+        // attacker spoof reputation by issuing a certificate to e.g.
+        // "Evil Microsoft Corporation Inc." which would otherwise match
+        // "Microsoft Corporation" via std::wstring::find.
+        return MICROSOFT_PUBLISHERS.count(signerName) != 0;
     }
 
     [[nodiscard]] bool IsTrustedPublisher(const std::wstring& signerName) const noexcept {
-        for (const auto& publisher : TRUSTED_PUBLISHERS) {
-            if (signerName.find(publisher) != std::wstring::npos) {
-                return true;
-            }
-        }
-        return false;
+        // Exact full-string match only (see IsMicrosoftSigner).
+        return TRUSTED_PUBLISHERS.count(signerName) != 0;
     }
 
     void NotifyUnknownFile(const std::wstring& filePath, const std::string& hash) {
@@ -2100,7 +2392,7 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
 
     FileReputationConfig m_config;
     FileReputationStatistics m_stats;
