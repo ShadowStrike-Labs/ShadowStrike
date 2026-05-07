@@ -101,7 +101,7 @@ struct ScanJob {
     uint64_t jobId = 0;
     DirectoryScanRequest request;
     ScanPriority priority = ScanPriority::Normal;
-    ScanJobState state = ScanJobState::Queued;
+    std::atomic<ScanJobState> state{ScanJobState::Queued};
 
     ScanProgress progress;
     DirectoryScanResult result;
@@ -316,8 +316,8 @@ public:
 
             // Initialize SignatureStore (YARA + Patterns + Hashes)
             if (!m_config.signatureDbPath.empty()) {
-                SS_LOG_INFO(L"ScanEngine", L"Initializing SignatureStore at  %ls",
-                    StringUtils::ToNarrow(m_config.signatureDbPath));
+                SS_LOG_INFO(L"ScanEngine", L"Initializing SignatureStore at %hs",
+                    StringUtils::ToNarrow(m_config.signatureDbPath).c_str());
 
                 m_signatureStore = std::make_unique<SignatureStore::SignatureStore>();
 
@@ -333,8 +333,8 @@ public:
 
             // Initialize WhitelistStore (Bloom Filter + Trie + Certificates)
             if (!m_config.whitelistDbPath.empty()) {
-                SS_LOG_INFO(L"ScanEngine", L"Initializing WhitelistStore at  %ls",
-                    StringUtils::ToNarrow(m_config.whitelistDbPath));
+                SS_LOG_INFO(L"ScanEngine", L"Initializing WhitelistStore at %hs",
+                    StringUtils::ToNarrow(m_config.whitelistDbPath).c_str());
 
                 m_whitelistStore = std::make_unique<Whitelist::WhitelistStore>();
 
@@ -351,8 +351,8 @@ public:
 
             // Initialize ThreatIntelDatabase (Memory-mapped threat intel)
             if (!m_config.threatIntelDbPath.empty()) {
-                SS_LOG_INFO(L"ScanEngine", L"Initializing ThreatIntelDatabase at  %ls",
-                    StringUtils::ToNarrow(m_config.threatIntelDbPath));
+                SS_LOG_INFO(L"ScanEngine", L"Initializing ThreatIntelDatabase at %hs",
+                    StringUtils::ToNarrow(m_config.threatIntelDbPath).c_str());
 
                 m_threatIntelDB = std::make_unique<ThreatIntel::ThreatIntelDatabase>();
 
@@ -557,7 +557,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ScanEngine::Impl: Initialization exception", L" %ls", e.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -712,7 +712,7 @@ public:
         it->second.hitCount++;
         m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_DEBUG(L"ScanEngine", L"Cache hit for hash  %ls", hash.substr(0, 16));
+        SS_LOG_DEBUG(L"ScanEngine", L"Cache hit for hash %hs", hash.substr(0, 16).c_str());
         return it->second.result;
     }
 
@@ -840,7 +840,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"ScanEngine: Detection callback exception", L" %ls", e.what());
+                SS_LOG_ERROR(L"ScanEngine", L"Detection callback exception: %hs", e.what());
             }
         }
     }
@@ -852,7 +852,7 @@ public:
             try {
                 callback(stats);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"ScanEngine: Complete callback exception", L" %ls", e.what());
+                SS_LOG_ERROR(L"ScanEngine", L"Complete callback exception: %hs", e.what());
             }
         }
     }
@@ -864,7 +864,7 @@ public:
             try {
                 callback(error, errorCode);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"ScanEngine: Error callback exception", L" %ls", e.what());
+                SS_LOG_ERROR(L"ScanEngine", L"Error callback exception: %hs", e.what());
             }
         }
     }
@@ -892,7 +892,7 @@ public:
 
     void PerformCloudUpload(const CloudSubmissionRequest& request) {
         try {
-            SS_LOG_INFO(L"ScanEngine", L"Performing cloud upload for  %ls", request.submissionId);
+            SS_LOG_INFO(L"ScanEngine", L"Performing cloud upload for %hs", request.submissionId.c_str());
             
             // Simulate cloud upload process
             // In real implementation, this would:
@@ -903,11 +903,11 @@ public:
             
             std::this_thread::sleep_for(std::chrono::seconds(2)); // Simulate upload time
             
-            SS_LOG_INFO(L"ScanEngine", L"Cloud upload completed for  %ls", request.submissionId);
+            SS_LOG_INFO(L"ScanEngine", L"Cloud upload completed for %hs", request.submissionId.c_str());
             
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ScanEngine: Cloud upload failed for {}", L" %ls", 
-                         request.submissionId, e.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Cloud upload failed for %hs: %hs",
+                         request.submissionId.c_str(), e.what());
             throw;
         }
     }
@@ -997,8 +997,8 @@ EngineResult ScanEngine::ScanFile(
         // Update statistics
         m_impl->m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_INFO(L"ScanEngine: Scanning file: {} (Type", L" %ls)",
-            StringUtils::ToNarrow(filePath),
+        SS_LOG_INFO(L"ScanEngine", L"Scanning file: %hs (Type %d)",
+            StringUtils::ToNarrow(filePath).c_str(),
             static_cast<int>(context.type));
 
         // ====================================================================
@@ -1023,8 +1023,8 @@ EngineResult ScanEngine::ScanFile(
         // Check file existence
         std::error_code ec;
         if (!fs::exists(filePath, ec)) {
-            SS_LOG_WARN(L"ScanEngine: File not found", L" %ls",
-                StringUtils::ToNarrow(filePath));
+            SS_LOG_WARN(L"ScanEngine", L"File not found: %hs",
+                StringUtils::ToNarrow(filePath).c_str());
             result.verdict = ScanVerdict::Error;
             return result;
         }
@@ -1034,7 +1034,7 @@ EngineResult ScanEngine::ScanFile(
         try {
             fileSize = fs::file_size(filePath, ec);
             if (ec) {
-                SS_LOG_WARN(L"ScanEngine: Cannot get file size", L" %ls", ec.message());
+                SS_LOG_WARN(L"ScanEngine", L"Cannot get file size: %hs", ec.message().c_str());
                 result.verdict = ScanVerdict::Error;
                 return result;
             }
@@ -1046,7 +1046,7 @@ EngineResult ScanEngine::ScanFile(
 
         if (context.type == ScanType::RealTime &&
             fileSize > m_impl->m_config.maxFileSizeRealTime) {
-            SS_LOG_INFO(L"ScanEngine: File too large for real-time scan", L" %ls bytes", fileSize);
+            SS_LOG_INFO(L"ScanEngine", L"File too large for real-time scan: %llu bytes", static_cast<unsigned long long>(fileSize));
             result.verdict = ScanVerdict::Clean;
             return result;
         }
@@ -1070,10 +1070,10 @@ EngineResult ScanEngine::ScanFile(
             fileHash = HashUtils::ToHexLower(hashBytes);
             result.sha256 = fileHash;
 
-            SS_LOG_DEBUG(L"ScanEngine: File hash computed", L" %ls", fileHash);
+            SS_LOG_DEBUG(L"ScanEngine", L"File hash computed: %hs", fileHash.c_str());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ScanEngine: Hash computation failed", L" %ls", e.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Hash computation failed: %hs", e.what());
             result.verdict = ScanVerdict::Error;
             return result;
         }
@@ -1083,7 +1083,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (auto cachedResult = m_impl->CheckCache(fileHash)) {
-            SS_LOG_INFO(L"ScanEngine: Returning cached result (Verdict", L" %ls)",
+            SS_LOG_INFO(L"ScanEngine", L"Returning cached result (Verdict %d)",
                 static_cast<int>(cachedResult->verdict));
 
             // Update timing
@@ -1265,11 +1265,13 @@ EngineResult ScanEngine::ScanFile(
             bool tiFound = m_impl->m_threatIntelDB->HasEntry(fileHash, ThreatIntel::IOCType::FileHash);
 
             if (tiFound) {
-                result.verdict = ScanVerdict::Suspicious;
-                result.threatName = "ThreatIntel.Match";
-                result.severity = SignatureStore::ThreatLevel::Medium;
-                result.detectionSource = "ThreatIntel";
-                result.sha256 = fileHash;
+                if (result.verdict == ScanVerdict::Clean) {
+                    result.verdict = ScanVerdict::Suspicious;
+                    result.threatName = "ThreatIntel.Match";
+                    result.severity = SignatureStore::ThreatLevel::Medium;
+                    result.detectionSource = "ThreatIntel";
+                    result.sha256 = fileHash;
+                }
 
                 SS_LOG_INFO(L"ScanEngine", L"Threat intelligence match for hash: %ls",
                     StringUtils::ToWide(fileHash.substr(0, 16)).c_str());
@@ -1303,17 +1305,23 @@ EngineResult ScanEngine::ScanFile(
                 }
 
                 auto fileSize = file.tellg();
+                if (fileSize < 0) {
+                    SS_LOG_WARN(L"ScanEngine", L"tellg() failed for file");
+                    result.verdict = ScanVerdict::Error;
+                    return result;
+                }
                 file.seekg(0, std::ios::beg);
 
                 // Limit buffer size for very large files
                 constexpr size_t MAX_SCAN_SIZE = 100 * 1024 * 1024; // 100MB
-                size_t readSize = std::min<size_t>(fileSize, MAX_SCAN_SIZE);
+                size_t readSize = std::min<size_t>(
+                    static_cast<size_t>(fileSize), MAX_SCAN_SIZE);
 
                 fileBuffer.resize(readSize);
                 file.read(reinterpret_cast<char*>(fileBuffer.data()), readSize);
 
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"ScanEngine: File read exception", L" %ls", e.what());
+                SS_LOG_ERROR(L"ScanEngine", L"File read exception: %hs", e.what());
                 result.verdict = ScanVerdict::Error;
                 return result;
             }
@@ -1787,9 +1795,9 @@ EngineResult ScanEngine::ScanFile(
                 result.detectionSource = "Heuristic";
                 result.sha256 = fileHash;
 
-                SS_LOG_INFO(L"ScanEngine", L"Heuristic detection - Score: {:.1f}, Name: %ls",
-                    heuristicResult.riskScore,
-                    StringUtils::ToNarrow(heuristicResult.threatName));
+                SS_LOG_INFO(L"ScanEngine", L"Heuristic detection - Score: %.1f, Name: %hs",
+                    static_cast<double>(heuristicResult.riskScore),
+                    StringUtils::ToNarrow(heuristicResult.threatName).c_str());
 
                 // Invoke detection callbacks
                 m_impl->InvokeDetectionCallbacks(result);
@@ -2064,10 +2072,12 @@ EngineResult ScanEngine::ScanFile(
                 std::ifstream emuFile(filePath, std::ios::binary | std::ios::ate);
                 if (emuFile) {
                     auto emuFileSize = emuFile.tellg();
+                    if (emuFileSize >= 0) {
                     emuFile.seekg(0, std::ios::beg);
 
                     constexpr size_t MAX_EMU_SIZE = 50 * 1024 * 1024; // 50MB limit
-                    size_t emuReadSize = std::min<size_t>(emuFileSize, MAX_EMU_SIZE);
+                    size_t emuReadSize = std::min<size_t>(
+                        static_cast<size_t>(emuFileSize), MAX_EMU_SIZE);
 
                     std::vector<uint8_t> emuBuffer(emuReadSize);
                     emuFile.read(reinterpret_cast<char*>(emuBuffer.data()), emuReadSize);
@@ -2096,9 +2106,10 @@ EngineResult ScanEngine::ScanFile(
                         m_impl->InvokeDetectionCallbacks(result);
                         goto finalize_scan;
                     }
+                    } // end if (emuFileSize >= 0)
                 }
             } catch (const std::exception& emuEx) {
-                SS_LOG_ERROR(L"ScanEngine", L"Emulation exception: %ls", emuEx.what());
+                SS_LOG_ERROR(L"ScanEngine", L"Emulation exception: %hs", emuEx.what());
             }
 
             const auto stage8End = steady_clock::now();
@@ -2160,11 +2171,17 @@ EngineResult ScanEngine::ScanFile(
                         {
                             std::ifstream ifs(filePath, std::ios::binary | std::ios::ate);
                             if (ifs.good()) {
-                                const auto sz = static_cast<size_t>(ifs.tellg());
-                                fileBuffer.resize(sz);
-                                ifs.seekg(0);
-                                ifs.read(reinterpret_cast<char*>(fileBuffer.data()),
-                                         static_cast<std::streamsize>(sz));
+                                const auto rawSz = ifs.tellg();
+                                if (rawSz < 0) {
+                                    SS_LOG_WARN(L"ScanEngine",
+                                        L"tellg() failed reading file for ML; skipping ML analysis");
+                                } else {
+                                    const auto sz = static_cast<size_t>(rawSz);
+                                    fileBuffer.resize(sz);
+                                    ifs.seekg(0);
+                                    ifs.read(reinterpret_cast<char*>(fileBuffer.data()),
+                                             static_cast<std::streamsize>(sz));
+                                }
                             }
                         }
 
@@ -2386,7 +2403,7 @@ EngineResult ScanEngine::ScanFile(
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Scan exception: %hs", e.what());
         m_impl->InvokeErrorCallbacks(
             std::format(L"Scan exception: {}",
                 StringUtils::ToWide(e.what())),
@@ -2453,7 +2470,7 @@ BatchScanResult ScanEngine::ScanBatch(
     }
 
     try {
-        SS_LOG_INFO(L"ScanEngine", L"Starting batch scan of  %ls files",
+        SS_LOG_INFO(L"ScanEngine", L"Starting batch scan of %zu files",
             request.filePaths.size());
 
         batchResult.results.reserve(request.filePaths.size());
@@ -2486,7 +2503,10 @@ BatchScanResult ScanEngine::ScanBatch(
                     stats.filesSuspicious++;
                 }
                 std::error_code fsSizeEc;
-                stats.totalBytesScanned += fs::file_size(fs::path(filePath), fsSizeEc);
+                const auto fsz = fs::file_size(fs::path(filePath), fsSizeEc);
+                if (!fsSizeEc) {
+                    stats.totalBytesScanned += fsz;
+                }
             }
 
             completed.fetch_add(1, std::memory_order_relaxed);
@@ -2496,7 +2516,10 @@ BatchScanResult ScanEngine::ScanBatch(
                 ScanProgress progress{};
                 progress.filesScanned = completed.load();
                 progress.totalFiles = totalFiles;
-                progress.percentComplete = (progress.filesScanned * 100.0f) / totalFiles;
+                progress.percentComplete = (totalFiles > 0)
+                    ? (static_cast<float>(progress.filesScanned) * 100.0f)
+                          / static_cast<float>(totalFiles)
+                    : 0.0f;
                 progress.currentFile = filePath;
                 progress.elapsed = duration_cast<milliseconds>(
                     steady_clock::now() - batchStart
@@ -2543,13 +2566,16 @@ BatchScanResult ScanEngine::ScanBatch(
             steady_clock::now() - batchStart
         );
 
-        SS_LOG_INFO(L"ScanEngine", L"Batch scan complete -  %ls files scanned, %ls infected in {} ms",
-            stats.filesScanned, stats.filesInfected, batchResult.totalDuration.count());
+        SS_LOG_INFO(L"ScanEngine",
+            L"Batch scan complete - %llu files scanned, %llu infected in %lld ms",
+            static_cast<unsigned long long>(stats.filesScanned),
+            static_cast<unsigned long long>(stats.filesInfected),
+            static_cast<long long>(batchResult.totalDuration.count()));
 
         return batchResult;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Batch scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Batch scan exception: %hs", e.what());
         return batchResult;
     }
 }
@@ -2580,8 +2606,8 @@ DirectoryScanResult ScanEngine::ScanDirectory(
     }
 
     try {
-        SS_LOG_INFO(L"ScanEngine: Starting directory scan", L" %ls",
-            StringUtils::ToNarrow(request.rootPath));
+        SS_LOG_INFO(L"ScanEngine", L"Starting directory scan: %hs",
+            StringUtils::ToNarrow(request.rootPath).c_str());
 
         dirResult.rootPath = request.rootPath;
 
@@ -2595,7 +2621,7 @@ DirectoryScanResult ScanEngine::ScanDirectory(
             try {
                 for (const auto& entry : fs::directory_iterator(root, ec)) {
                     if (ec) {
-                        SS_LOG_WARN(L"Directory iteration error", L" %ls", ec.message());
+                        SS_LOG_WARN(L"ScanEngine", L"Directory iteration error: %hs", ec.message().c_str());
                         continue;
                     }
 
@@ -2663,14 +2689,14 @@ DirectoryScanResult ScanEngine::ScanDirectory(
                     }
                 }
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Error collecting files", L" %ls", e.what());
+                SS_LOG_ERROR(L"ScanEngine", L"Error collecting files: %hs", e.what());
             }
         };
 
         // Collect all files
         collectFiles(request.rootPath, 0);
 
-        SS_LOG_INFO(L"ScanEngine", L"Collected  %ls files to scan", filesToScan.size());
+        SS_LOG_INFO(L"ScanEngine", L"Collected %zu files to scan", filesToScan.size());
 
         // Create batch scan request
         BatchScanRequest batchReq{};
@@ -2689,8 +2715,10 @@ DirectoryScanResult ScanEngine::ScanDirectory(
             steady_clock::now() - scanStart
         );
 
-        SS_LOG_INFO(L"ScanEngine", L"Directory scan complete - {} files scanned in  %ls ms",
-            dirResult.statistics.filesScanned, dirResult.totalDuration.count());
+        SS_LOG_INFO(L"ScanEngine",
+            L"Directory scan complete - %llu files scanned in %lld ms",
+            static_cast<unsigned long long>(dirResult.statistics.filesScanned),
+            static_cast<long long>(dirResult.totalDuration.count()));
 
         // Invoke completion callbacks
         m_impl->InvokeCompleteCallbacks(dirResult.statistics);
@@ -2698,7 +2726,7 @@ DirectoryScanResult ScanEngine::ScanDirectory(
         return dirResult;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Directory scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Directory scan exception: %hs", e.what());
         m_impl->InvokeErrorCallbacks(
             std::format(L"Directory scan error: {}",
                 StringUtils::ToWide(e.what())),
@@ -2816,7 +2844,7 @@ EngineResult ScanEngine::ScanMemory(
     try {
         m_impl->m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_INFO(L"ScanEngine", L"Scanning memory buffer ( %ls bytes)", buffer.size());
+        SS_LOG_INFO(L"ScanEngine", L"Scanning memory buffer (%zu bytes)", buffer.size());
 
         // Validate buffer
         if (buffer.empty()) {
@@ -2829,12 +2857,16 @@ EngineResult ScanEngine::ScanMemory(
         std::string bufferHash;
         try {
             std::vector<uint8_t> hashBytes;
-            HashUtils::Compute(HashUtils::Algorithm::SHA256,
-                             buffer.data(), buffer.size(), hashBytes);
+            if (!HashUtils::Compute(HashUtils::Algorithm::SHA256,
+                                    buffer.data(), buffer.size(), hashBytes)) {
+                SS_LOG_ERROR(L"ScanEngine", L"Buffer hash computation returned failure");
+                result.verdict = ScanVerdict::Error;
+                return result;
+            }
             bufferHash = HashUtils::ToHexLower(hashBytes);
             result.sha256 = bufferHash;
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ScanEngine: Buffer hash computation failed", L" %ls", e.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Buffer hash computation failed: %hs", e.what());
             result.verdict = ScanVerdict::Error;
             return result;
         }
@@ -2894,7 +2926,7 @@ EngineResult ScanEngine::ScanMemory(
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Memory scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Memory scan exception: %hs", e.what());
         result.verdict = ScanVerdict::Error;
         return result;
     }
@@ -2912,7 +2944,7 @@ EngineResult ScanEngine::ScanProcess(
     }
 
     try {
-        SS_LOG_INFO(L"ScanEngine", L"Scanning process  %ls", pid);
+        SS_LOG_INFO(L"ScanEngine", L"Scanning process %u", pid);
         m_impl->m_stats.processesScanned.fetch_add(1, std::memory_order_relaxed);
 
         // Get process executable path
@@ -2930,7 +2962,7 @@ EngineResult ScanEngine::ScanProcess(
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Process scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Process scan exception: %hs", e.what());
         result.verdict = ScanVerdict::Error;
         return result;
     }
@@ -2970,17 +3002,20 @@ std::vector<EngineResult> ScanEngine::ScanAllProcesses(
                 ScanProgress progress{};
                 progress.filesScanned = scanned;
                 progress.totalFiles = processes.size();
-                progress.percentComplete = (scanned * 100.0f) / processes.size();
+                progress.percentComplete = (!processes.empty())
+                    ? (static_cast<float>(scanned) * 100.0f)
+                          / static_cast<float>(processes.size())
+                    : 0.0f;
                 progressCallback(progress);
             }
         }
 
-        SS_LOG_INFO(L"ScanEngine", L"Process scan complete -  %ls processes scanned", scanned);
+        SS_LOG_INFO(L"ScanEngine", L"Process scan complete - %llu processes scanned", static_cast<unsigned long long>(scanned));
 
         return results;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: ScanAllProcesses exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"ScanAllProcesses exception: %hs", e.what());
         return results;
     }
 }
@@ -3011,7 +3046,7 @@ EngineResult ScanEngine::ScanProcessMemoryDeep(
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Deep memory scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Deep memory scan exception: %hs", e.what());
         result.verdict = ScanVerdict::Error;
         return result;
     }
@@ -3203,7 +3238,7 @@ EngineResult ScanEngine::ScanBootSector() {
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Boot sector scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Boot sector scan exception: %hs", e.what());
         result.verdict = ScanVerdict::Error;
         return result;
     }
@@ -3234,7 +3269,7 @@ std::vector<EngineResult> ScanEngine::ScanForRootkits(
         return results;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Rootkit scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Rootkit scan exception: %hs", e.what());
         return results;
     }
 }
@@ -3262,7 +3297,7 @@ EngineResult ScanEngine::ScanUEFI() {
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: UEFI scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"UEFI scan exception: %hs", e.what());
         result.verdict = ScanVerdict::Error;
         return result;
     }
@@ -3286,7 +3321,7 @@ uint64_t ScanEngine::CreateScanJob(
         job->jobId = m_impl->m_nextJobId.fetch_add(1, std::memory_order_relaxed);
         job->request = request;
         job->priority = priority;
-        job->state = ScanJobState::Queued;
+        job->state.store(ScanJobState::Queued, std::memory_order_release);
         job->startTime = steady_clock::now();
 
         {
@@ -3294,29 +3329,49 @@ uint64_t ScanEngine::CreateScanJob(
             m_impl->m_scanJobs[job->jobId] = job;
         }
 
-        SS_LOG_INFO(L"ScanEngine", L"Created scan job {} with priority  %ls",
-            job->jobId, static_cast<int>(priority));
+        SS_LOG_INFO(L"ScanEngine", L"Created scan job %llu with priority %d",
+            static_cast<unsigned long long>(job->jobId), static_cast<int>(priority));
 
-        // Launch job asynchronously
+        // Launch job on the engine thread pool. Storing the future is
+        // critical: a discarded std::async future blocks in its destructor,
+        // which would silently serialize all "asynchronous" job creations.
         if (m_impl->m_threadPool) {
-            std::async(std::launch::async, [this, job]() {
-                job->state = ScanJobState::Running;
+            auto fut = m_impl->m_threadPool->Submit(
+                [this, job](const Utils::TaskContext&) {
+                    job->state.store(ScanJobState::Running, std::memory_order_release);
 
-                try {
-                    job->result = ScanDirectory(job->request, job->progressCallback);
-                    job->state = ScanJobState::Completed;
-                    job->endTime = steady_clock::now();
-                } catch (const std::exception& e) {
-                    SS_LOG_ERROR(L"ScanEngine: Job {} failed", L" %ls", job->jobId, e.what());
-                    job->state = ScanJobState::Failed;
-                }
-            });
+                    try {
+                        job->result = ScanDirectory(job->request, job->progressCallback);
+                        job->state.store(ScanJobState::Completed, std::memory_order_release);
+                        job->endTime = steady_clock::now();
+                    } catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"ScanEngine",
+                            L"Job %llu failed: %hs",
+                            static_cast<unsigned long long>(job->jobId), e.what());
+                        job->state.store(ScanJobState::Failed, std::memory_order_release);
+                    }
+                });
+            (void)fut;
+        } else {
+            // No thread pool available; downgrade gracefully to synchronous
+            // execution so the caller still gets a deterministic result.
+            try {
+                job->state.store(ScanJobState::Running, std::memory_order_release);
+                job->result = ScanDirectory(job->request, job->progressCallback);
+                job->state.store(ScanJobState::Completed, std::memory_order_release);
+                job->endTime = steady_clock::now();
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"ScanEngine",
+                    L"Job %llu failed (sync fallback): %hs",
+                    static_cast<unsigned long long>(job->jobId), e.what());
+                job->state.store(ScanJobState::Failed, std::memory_order_release);
+            }
         }
 
         return job->jobId;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: CreateScanJob exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"CreateScanJob exception: %hs", e.what());
         return 0;
     }
 }
@@ -3354,7 +3409,7 @@ bool ScanEngine::PauseJob(uint64_t jobId) {
     if (it->second->state == ScanJobState::Running) {
         it->second->pauseRequested.store(true, std::memory_order_release);
         it->second->state = ScanJobState::Paused;
-        SS_LOG_INFO(L"ScanEngine", L"Job  %ls paused", jobId);
+        SS_LOG_INFO(L"ScanEngine", L"Job %llu paused", static_cast<unsigned long long>(jobId));
         return true;
     }
 
@@ -3372,7 +3427,7 @@ bool ScanEngine::ResumeJob(uint64_t jobId) {
     if (it->second->state == ScanJobState::Paused) {
         it->second->pauseRequested.store(false, std::memory_order_release);
         it->second->state = ScanJobState::Running;
-        SS_LOG_INFO(L"ScanEngine", L"Job  %ls resumed", jobId);
+        SS_LOG_INFO(L"ScanEngine", L"Job %llu resumed", static_cast<unsigned long long>(jobId));
         return true;
     }
 
@@ -3389,7 +3444,7 @@ bool ScanEngine::CancelJob(uint64_t jobId) {
 
     it->second->cancelRequested.store(true, std::memory_order_release);
     it->second->state = ScanJobState::Cancelled;
-    SS_LOG_INFO(L"ScanEngine", L"Job  %ls cancelled", jobId);
+    SS_LOG_INFO(L"ScanEngine", L"Job %llu cancelled", static_cast<unsigned long long>(jobId));
     return true;
 }
 
@@ -3429,7 +3484,7 @@ void ScanEngine::CancelAllJobs() {
         if (job->state == ScanJobState::Running ||
             job->state == ScanJobState::Queued) {
             job->cancelRequested.store(true, std::memory_order_release);
-            job->state = ScanJobState::Cancelled;
+            job->state.store(ScanJobState::Cancelled, std::memory_order_release);
         }
     }
 
@@ -3443,8 +3498,8 @@ void ScanEngine::CancelAllJobs() {
 void ScanEngine::AddExclusion(const ExclusionRule& rule) {
     std::unique_lock lock(m_impl->m_exclusionMutex);
     m_impl->m_exclusions.push_back(rule);
-    SS_LOG_INFO(L"ScanEngine: Added exclusion rule", L" %ls",
-        StringUtils::ToNarrow(rule.pattern));
+    SS_LOG_INFO(L"ScanEngine", L"Added exclusion rule: %hs",
+        StringUtils::ToNarrow(rule.pattern).c_str());
 }
 
 bool ScanEngine::RemoveExclusion(size_t index) {
@@ -3455,7 +3510,7 @@ bool ScanEngine::RemoveExclusion(size_t index) {
     }
 
     m_impl->m_exclusions.erase(m_impl->m_exclusions.begin() + index);
-    SS_LOG_INFO(L"ScanEngine", L"Removed exclusion rule at index  %ls", index);
+    SS_LOG_INFO(L"ScanEngine", L"Removed exclusion rule at index %zu", index);
     return true;
 }
 
@@ -3486,7 +3541,7 @@ uint64_t ScanEngine::RegisterDetectionCallback(ScanDetectionCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_detectionCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"ScanEngine", L"Registered detection callback  %ls", id);
+    SS_LOG_DEBUG(L"ScanEngine", L"Registered detection callback %llu", static_cast<unsigned long long>(id));
     return id;
 }
 
@@ -3495,7 +3550,7 @@ bool ScanEngine::UnregisterDetectionCallback(uint64_t callbackId) {
 
     auto erased = m_impl->m_detectionCallbacks.erase(callbackId);
     if (erased > 0) {
-        SS_LOG_DEBUG(L"ScanEngine", L"Unregistered detection callback  %ls", callbackId);
+        SS_LOG_DEBUG(L"ScanEngine", L"Unregistered detection callback %llu", static_cast<unsigned long long>(callbackId));
         return true;
     }
 
@@ -3510,7 +3565,7 @@ uint64_t ScanEngine::RegisterCompleteCallback(ScanCompleteCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_completeCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"ScanEngine", L"Registered complete callback  %ls", id);
+    SS_LOG_DEBUG(L"ScanEngine", L"Registered complete callback %llu", static_cast<unsigned long long>(id));
     return id;
 }
 
@@ -3519,7 +3574,7 @@ bool ScanEngine::UnregisterCompleteCallback(uint64_t callbackId) {
 
     auto erased = m_impl->m_completeCallbacks.erase(callbackId);
     if (erased > 0) {
-        SS_LOG_DEBUG(L"ScanEngine", L"Unregistered complete callback  %ls", callbackId);
+        SS_LOG_DEBUG(L"ScanEngine", L"Unregistered complete callback %llu", static_cast<unsigned long long>(callbackId));
         return true;
     }
 
@@ -3534,7 +3589,7 @@ uint64_t ScanEngine::RegisterErrorCallback(ScanErrorCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_errorCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"ScanEngine", L"Registered error callback  %ls", id);
+    SS_LOG_DEBUG(L"ScanEngine", L"Registered error callback %llu", static_cast<unsigned long long>(id));
     return id;
 }
 
@@ -3543,7 +3598,7 @@ bool ScanEngine::UnregisterErrorCallback(uint64_t callbackId) {
 
     auto erased = m_impl->m_errorCallbacks.erase(callbackId);
     if (erased > 0) {
-        SS_LOG_DEBUG(L"ScanEngine", L"Unregistered error callback  %ls", callbackId);
+        SS_LOG_DEBUG(L"ScanEngine", L"Unregistered error callback %llu", static_cast<unsigned long long>(callbackId));
         return true;
     }
 
@@ -3609,7 +3664,7 @@ bool ScanEngine::ReloadDatabases() {
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Reload exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Reload exception: %hs", e.what());
         return false;
     }
 }
@@ -3633,7 +3688,7 @@ EngineConfig ScanEngine::GetConfig() const {
 void ScanEngine::WarmCache(const std::vector<std::wstring>& commonPaths) {
     if (!IsInitialized()) return;
 
-    SS_LOG_INFO(L"ScanEngine", L"Warming cache with  %ls paths", commonPaths.size());
+    SS_LOG_INFO(L"ScanEngine", L"Warming cache with %zu paths", commonPaths.size());
 
     ScanContext context{};
     context.type = ScanType::OnDemand;
@@ -3642,7 +3697,7 @@ void ScanEngine::WarmCache(const std::vector<std::wstring>& commonPaths) {
     for (const auto& path : commonPaths) {
         try {
             if (fs::exists(path)) {
-                ScanFile(path, context);
+                (void)ScanFile(path, context);
             }
         } catch (...) {
             // Ignore errors during cache warming
@@ -3692,7 +3747,7 @@ void ScanEngine::OptimizeForWorkload(ScanProfile profile) {
             break;
     }
 
-    SS_LOG_INFO(L"ScanEngine", L"Optimized for  %ls profile", static_cast<int>(profile));
+    SS_LOG_INFO(L"ScanEngine", L"Optimized for profile %d", static_cast<int>(profile));
 }
 
 ScanEngine::Stats ScanEngine::GetStatistics() const {
@@ -3839,7 +3894,7 @@ bool ScanEngine::SelfTest() {
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Self-test exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Self-test exception: %hs", e.what());
         return false;
     }
 }
@@ -3872,8 +3927,8 @@ std::string ScanEngine::SubmitSampleToCloud(
     }
 
     try {
-        SS_LOG_INFO(L"ScanEngine: Submitting sample to cloud", L" %ls",
-            StringUtils::ToNarrow(filePath));
+        SS_LOG_INFO(L"ScanEngine", L"Submitting sample to cloud: %hs",
+            StringUtils::ToNarrow(filePath).c_str());
 
         // Generate submission ID
         auto submissionId = "CLOUD-" + localResult.sha256 + "-" + 
@@ -3894,9 +3949,11 @@ std::string ScanEngine::SubmitSampleToCloud(
             auto fileSize = fileStream.tellg();
             fileStream.seekg(0, std::ios::beg);
 
-            constexpr size_t MAX_CLOUD_UPLOAD_SIZE = 256 * 1024 * 1024; // 256MB
-            if (fileSize > MAX_CLOUD_UPLOAD_SIZE) {
-                SS_LOG_WARN(L"ScanEngine: File too large for cloud submission", L" %ls bytes", fileSize);
+            constexpr std::streamoff MAX_CLOUD_UPLOAD_SIZE = 256LL * 1024 * 1024; // 256MB
+            if (fileSize < 0 || fileSize > MAX_CLOUD_UPLOAD_SIZE) {
+                SS_LOG_WARN(L"ScanEngine",
+                    L"File too large (or invalid size) for cloud submission: %lld bytes",
+                    static_cast<long long>(fileSize));
                 return "";
             }
 
@@ -3915,15 +3972,15 @@ std::string ScanEngine::SubmitSampleToCloud(
                 m_impl->m_pendingSubmissions[submissionId] = request;
             }
 
-            SS_LOG_INFO(L"ScanEngine: Cloud submission queued: {} (size", L" %ls bytes)", 
-                         submissionId, fileSize);
+            SS_LOG_INFO(L"ScanEngine", L"Cloud submission queued: %hs (size %lld bytes)",
+                         submissionId.c_str(), static_cast<long long>(fileSize));
 
             // Submit asynchronously to avoid blocking
             auto cloudFuture = m_impl->m_threadPool->Submit([impl = m_impl.get(), request](const Utils::TaskContext&) {
                 try {
                     impl->PerformCloudUpload(request);
                 } catch (const std::exception& e) {
-                    SS_LOG_ERROR(L"ScanEngine: Cloud upload failed", L" %ls", e.what());
+                    SS_LOG_ERROR(L"ScanEngine", L"Cloud upload failed: %hs", e.what());
                     std::lock_guard<std::mutex> lock(impl->m_pendingSubmissionsMutex);
                     impl->m_pendingSubmissions.erase(request.submissionId);
                 }
@@ -3931,14 +3988,14 @@ std::string ScanEngine::SubmitSampleToCloud(
             (void)cloudFuture;
 
         } catch (const std::exception& uploadEx) {
-            SS_LOG_ERROR(L"ScanEngine: Cloud upload preparation failed", L" %ls", uploadEx.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Cloud upload preparation failed: %hs", uploadEx.what());
             return "";
         }
 
         return submissionId;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Cloud submission exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Cloud submission exception: %hs", e.what());
         return "";
     }
 }
@@ -3952,7 +4009,7 @@ std::optional<EngineResult> ScanEngine::GetCloudResult(
 
     try {
         // Query cloud API for results
-        SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud results for  %ls", submissionId);
+        SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud results for %hs", submissionId.c_str());
 
         // Check if submission exists in our tracking
         Impl::CloudSubmissionRequest submission{};
@@ -3960,7 +4017,7 @@ std::optional<EngineResult> ScanEngine::GetCloudResult(
             std::lock_guard<std::mutex> lock(m_impl->m_pendingSubmissionsMutex);
             auto it = m_impl->m_pendingSubmissions.find(submissionId);
             if (it == m_impl->m_pendingSubmissions.end()) {
-                SS_LOG_DEBUG(L"ScanEngine: Submission ID not found", L" %ls", submissionId);
+                SS_LOG_DEBUG(L"ScanEngine", L"Submission ID not found: %hs", submissionId.c_str());
                 return std::nullopt;
             }
             submission = it->second;
@@ -4007,20 +4064,20 @@ std::optional<EngineResult> ScanEngine::GetCloudResult(
                 m_impl->m_pendingSubmissions.erase(submissionId);
             }
 
-            SS_LOG_INFO(L"ScanEngine: Cloud analysis complete", L"{} -  %ls", 
-                        submissionId, cloudResult.verdict);
+            SS_LOG_INFO(L"ScanEngine", L"Cloud analysis complete: %hs - %hs",
+                        submissionId.c_str(), cloudResult.verdict.c_str());
 
             return result;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ScanEngine: Cloud API query failed", L" %ls", e.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Cloud API query failed: %hs", e.what());
             return std::nullopt;
         }
 
         return std::nullopt;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Cloud result query exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Cloud result query exception: %hs", e.what());
         return std::nullopt;
     }
 }
@@ -4033,22 +4090,22 @@ std::optional<EngineResult> ScanEngine::QueryCloudReputation(
     }
 
     try {
-        SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud reputation for hash  %ls",
-            hash.substr(0, 16));
+        SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud reputation for hash %hs",
+            hash.substr(0, 16).c_str());
 
         // Query cloud reputation service
-        SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud reputation for hash  %ls", hash.substr(0, 16));
+        SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud reputation for hash %hs", hash.substr(0, 16).c_str());
 
         // Input validation
         if (hash.length() != 64) {
-            SS_LOG_WARN(L"ScanEngine: Invalid SHA256 hash length", L" %ls", hash.length());
+            SS_LOG_WARN(L"ScanEngine", L"Invalid SHA256 hash length: %zu", hash.length());
             return std::nullopt;
         }
 
         // Check cache first
         std::string cacheKey = "CLOUD_REP_" + hash;
         if (auto cached = m_impl->CheckCache(cacheKey)) {
-            SS_LOG_DEBUG(L"ScanEngine", L"Cloud reputation cache hit for  %ls", hash.substr(0, 16));
+            SS_LOG_DEBUG(L"ScanEngine", L"Cloud reputation cache hit for %hs", hash.substr(0, 16).c_str());
             return cached;
         }
 
@@ -4104,20 +4161,22 @@ std::optional<EngineResult> ScanEngine::QueryCloudReputation(
             // Cache the result
             m_impl->UpdateCache(cacheKey, engineResult);
 
-            SS_LOG_INFO(L"ScanEngine: Cloud reputation query complete", L"{} - {}/ %ls flagged", 
-                        hash.substr(0, 16), result.positiveDetections, result.totalEngines);
+            SS_LOG_INFO(L"ScanEngine", L"Cloud reputation query complete: %hs - %u/%u flagged",
+                        hash.substr(0, 16).c_str(),
+                        static_cast<unsigned>(result.positiveDetections),
+                        static_cast<unsigned>(result.totalEngines));
 
             return engineResult;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ScanEngine: Cloud reputation query failed", L" %ls", e.what());
+            SS_LOG_ERROR(L"ScanEngine", L"Cloud reputation query failed: %hs", e.what());
             return std::nullopt;
         }
 
         return std::nullopt;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Cloud reputation query exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Cloud reputation query exception: %hs", e.what());
         return std::nullopt;
     }
 }
@@ -4158,7 +4217,7 @@ std::wstring ScanEngine::GenerateReport(
         return report;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Report generation exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Report generation exception: %hs", e.what());
         return L"Report generation failed";
     }
 }
@@ -4169,8 +4228,8 @@ bool ScanEngine::ExportReport(
     const std::string& format
 ) {
     try {
-        SS_LOG_INFO(L"ScanEngine: Exporting report to {} (format", L" %ls)",
-            StringUtils::ToNarrow(outputPath), format);
+        SS_LOG_INFO(L"ScanEngine", L"Exporting report to %hs (format %hs)",
+            StringUtils::ToNarrow(outputPath).c_str(), format.c_str());
 
         std::wofstream file(outputPath);
         if (!file) {
@@ -4330,7 +4389,7 @@ bool ScanEngine::ExportReport(
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Report export exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Report export exception: %hs", e.what());
         return false;
     }
 }
