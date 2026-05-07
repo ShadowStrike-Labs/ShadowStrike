@@ -70,6 +70,7 @@
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
 #include "../../Utils/Logger.hpp"
+#include "../../Utils/HashUtils.hpp"
 #include "../../Utils/NetworkUtils.hpp"
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
@@ -91,6 +92,7 @@
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <algorithm>
+#include <cstring>
 #include <thread>
 #include <chrono>
 #include <cmath>
@@ -180,12 +182,12 @@ bool InfoHash::operator==(const InfoHash& other) const noexcept {
 }
 
 size_t InfoHash::Hash::operator()(const InfoHash& ih) const noexcept {
-    // Use first 8 bytes as hash seed
-    size_t h = 0;
-    for (size_t i = 0; i < std::min(size_t(8), ih.hash.size()); ++i) {
-        h = (h << 8) | ih.hash[i];
-    }
-    return h;
+    // FNV-1a over the full 20-byte SHA-1 infohash. The previous implementation
+    // packed only the first 8 bytes which let an attacker craft many infohashes
+    // that collide in the unordered_map bucket — a hash-table DoS vector when
+    // arbitrary peers can announce on the swarm.
+    return static_cast<size_t>(
+        Utils::HashUtils::Fnv1a64(ih.hash.data(), ih.hash.size()));
 }
 
 // ============================================================================
@@ -202,26 +204,39 @@ size_t InfoHash::Hash::operator()(const InfoHash& ih) const noexcept {
 }
 
 [[nodiscard]] static std::optional<std::array<uint8_t, 20>> HexToInfoHash(const std::string& hex) {
+    // Strict 40-char canonical hex. The previous std::stoi-based parser
+    // accepted whitespace/sign prefixes inside each 2-char window, allowing
+    // the same logical hash to be expressed as multiple distinct strings
+    // (e.g. " 1A", "+5") — a cache-poisoning / dedupe-bypass vector for
+    // the malicious-hash store and swarm tracker.
     if (hex.length() != 40) return std::nullopt;
 
+    auto fromHex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+
     std::array<uint8_t, 20> hash{};
-    try {
-        for (size_t i = 0; i < 20; ++i) {
-            hash[i] = static_cast<uint8_t>(
-                std::stoi(hex.substr(i * 2, 2), nullptr, 16)
-            );
-        }
-        return hash;
-    } catch (...) {
-        return std::nullopt;
+    for (size_t i = 0; i < 20; ++i) {
+        const int hi = fromHex(hex[i * 2]);
+        const int lo = fromHex(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return std::nullopt;
+        hash[i] = static_cast<uint8_t>((hi << 4) | lo);
     }
+    return hash;
 }
 
 [[nodiscard]] static P2PApplication IdentifyClient(const std::string& peerIdStr) {
+    // BitTorrent peer IDs are 20 raw bytes — they may contain NUL or other
+    // control characters. Compare the prefix as raw bytes via memcmp so the
+    // detection cannot be evaded by embedding NUL inside the slot.
     if (peerIdStr.length() < 3) return P2PApplication::UNKNOWN;
 
     for (const auto& client : CLIENT_PREFIXES) {
-        if (peerIdStr.find(client.prefix) == 0) {
+        if (client.prefix.size() <= peerIdStr.size() &&
+            std::memcmp(peerIdStr.data(), client.prefix.data(), client.prefix.size()) == 0) {
             return client.app;
         }
     }
@@ -231,15 +246,17 @@ size_t InfoHash::Hash::operator()(const InfoHash& ih) const noexcept {
 
 [[nodiscard]] static std::string ExtractClientVersion(const std::string& peerIdStr) {
     // Example: "-qB4250-" -> "4.2.5.0"
+    // Peer ID is 20 raw bytes. Use byte-level access (unsigned char) so a
+    // negative char value cannot trip std::isdigit's UB when compiled with
+    // signed-char defaults.
     if (peerIdStr.length() < 8) return "Unknown";
 
     try {
-        // Most clients use format: -XXYYYY- where XX is client, YYYY is version
-        std::string versionPart = peerIdStr.substr(3, 4);
         std::string version;
-        for (char c : versionPart) {
-            if (std::isdigit(c)) {
-                version += c;
+        for (size_t i = 3; i < 7 && i < peerIdStr.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(peerIdStr[i]);
+            if (c >= '0' && c <= '9') {
+                version += static_cast<char>(c);
                 version += '.';
             }
         }
@@ -598,16 +615,20 @@ public:
             }
 
             // uTP — verify version nibble (low nibble of byte 0) is 1,
-            // type nibble is valid, and extension byte (byte 1) is 0-2
-            // to reduce false positives on non-P2P traffic
+            // type nibble is one of the documented values, and extension byte
+            // (byte 1) is 0-2 to reduce false positives on non-P2P traffic.
+            // (Earlier code compared `type >= UTP_ST_DATA` with UTP_ST_DATA == 0,
+            // which is a tautology on uint8_t and triggered MSVC C4296.)
             if (packet.size() >= 20) {
                 uint8_t ver_type = packet[0];
                 uint8_t version = ver_type & 0x0F;
                 uint8_t type = ver_type & UTP_TYPE_MASK;
                 uint8_t extension = packet[1];
-                if (version == UTP_VERSION_1 &&
-                    type >= UTP_ST_DATA && type <= UTP_ST_SYN &&
-                    extension <= 2) {
+                const bool typeValid =
+                    (type == UTP_ST_DATA) || (type == UTP_ST_FIN) ||
+                    (type == UTP_ST_STATE) || (type == UTP_ST_RESET) ||
+                    (type == UTP_ST_SYN);
+                if (version == UTP_VERSION_1 && typeValid && extension <= 2) {
                     // Additional validation: uTP connection_id at bytes 2-3
                     // and timestamp at bytes 4-7 should not all be zero
                     uint16_t connId = (static_cast<uint16_t>(packet[2]) << 8) | packet[3];
@@ -621,17 +642,29 @@ public:
                 }
             }
 
-            // eMule TCP
+            // eMule TCP packet header: [0xE3] [size:4 LE] [opcode:1] [...]
+            // We require the declared packet length to be at least 1 (opcode)
+            // and not absurdly large (eMule frames cap at 1 MiB in practice),
+            // otherwise the single magic byte 0xE3 produced massive false
+            // positives across unrelated TCP traffic.
             if (packet.size() >= 6 && packet[0] == EMULE_PROTOCOL_TCP[0]) {
-                return P2PProtocol::EMULE_TCP;
+                const uint32_t emuleLen =
+                    static_cast<uint32_t>(packet[1]) |
+                    (static_cast<uint32_t>(packet[2]) << 8) |
+                    (static_cast<uint32_t>(packet[3]) << 16) |
+                    (static_cast<uint32_t>(packet[4]) << 24);
+                if (emuleLen >= 1 && emuleLen <= (1u << 20)) {
+                    return P2PProtocol::EMULE_TCP;
+                }
             }
 
-            // eMule UDP / Kademlia
-            if (packet.size() >= 2 && packet[0] == EMULE_PROTOCOL_UDP[0]) {
+            // eMule UDP / Kademlia: require at least header + opcode and a
+            // payload byte before declaring a match.
+            if (packet.size() >= 3 && packet[0] == EMULE_PROTOCOL_UDP[0]) {
                 return P2PProtocol::EMULE_UDP;
             }
 
-            if (packet.size() >= 2 && packet[0] == KADEMLIA_MAGIC[0]) {
+            if (packet.size() >= 3 && packet[0] == KADEMLIA_MAGIC[0]) {
                 return P2PProtocol::KADEMLIA;
             }
 
@@ -757,10 +790,28 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            m_maliciousHashes[infoHash] = reason;
+            // Sanitize reason for log injection (CRLF) and clamp size.
+            // The reason originates from external feeds / orchestrator and
+            // is logged below; raw newlines would let an attacker forge
+            // additional log lines.
+            std::string safeReason;
+            safeReason.reserve(std::min<size_t>(reason.size(), 256));
+            for (size_t i = 0; i < reason.size() && safeReason.size() < 256; ++i) {
+                const unsigned char c = static_cast<unsigned char>(reason[i]);
+                if (c == '\r' || c == '\n' || c == '\t') {
+                    safeReason += ' ';
+                } else if (c < 0x20 || c == 0x7F) {
+                    safeReason += '?';
+                } else {
+                    safeReason += static_cast<char>(c);
+                }
+            }
 
-            SS_LOG_FATAL(L"Network", L"Marked infohash as malicious: %hs (reason: %hs)",
-                infoHash.hexString.c_str(), reason.c_str());
+            m_maliciousHashes[infoHash] = safeReason;
+
+            // This is informational policy data, not a fatal error — use INFO.
+            SS_LOG_INFO(L"Network", L"Marked infohash as malicious: %hs (reason: %hs)",
+                infoHash.hexString.c_str(), safeReason.c_str());
 
             m_stats.maliciousTorrents++;
 
@@ -826,7 +877,8 @@ public:
 
                 // Update or create connection
                 auto& conn = m_connections[connectionId];
-                if (conn.connectionId == 0) {
+                const bool isNewConnection = (conn.connectionId == 0);
+                if (isNewConnection) {
                     conn.connectionId = connectionId;
                     conn.startTime = std::chrono::system_clock::now();
                 }
@@ -834,6 +886,14 @@ public:
                 conn.protocol = protocol;
                 conn.lastActivity = std::chrono::system_clock::now();
                 conn.bytesReceived += packet.size();
+
+                // Wire packet bytes into the global download counter.
+                // Bandwidth-direction is not knowable at this layer (TrafficAnalyzer
+                // only knows it received bytes from the wire), so account every
+                // captured packet to bytesDownloaded — the upload counter is
+                // updated by the policy/throttle path when send-side data is seen.
+                m_stats.bytesDownloaded.fetch_add(packet.size(),
+                    std::memory_order_relaxed);
 
                 // If this connection belongs to a blocked process, mark and skip
                 if (conn.processId != 0 && m_blockedProcesses.count(conn.processId) > 0) {
@@ -868,8 +928,13 @@ public:
                     }
                 }
 
-                // Update statistics
-                m_stats.p2pConnectionsDetected++;
+                // Update statistics — count *new* P2P connections only.
+                // The prior code incremented this every single packet, so a
+                // single long-lived torrent could inflate the metric into the
+                // millions and mask real fan-out detections downstream.
+                if (isNewConnection) {
+                    m_stats.p2pConnectionsDetected++;
+                }
                 UpdateProtocolStats(protocol);
 
                 // Update per-application statistics
@@ -1176,13 +1241,16 @@ private:
         SS_LOG_INFO(L"Network", L"P2PMonitor: Monitoring thread started");
 
         try {
-            while (m_running.load(std::memory_order_relaxed)) {
+            // Acquire ordering pairs with the release performed in Stop()
+            // when m_running is set to false, ensuring the loop observes the
+            // shutdown signal promptly without missing any prior writes.
+            while (m_running.load(std::memory_order_acquire)) {
                 // Sleep in short increments to allow responsive shutdown
-                for (int i = 0; i < 50 && m_running.load(std::memory_order_relaxed); ++i) {
+                for (int i = 0; i < 50 && m_running.load(std::memory_order_acquire); ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
 
-                if (!m_running.load(std::memory_order_relaxed)) break;
+                if (!m_running.load(std::memory_order_acquire)) break;
 
                 // Cleanup stale connections
                 CleanupStaleConnections();
@@ -1306,6 +1374,7 @@ private:
     }
 
     void EvictOldestConnection() {
+        if (m_connections.empty()) return;
         auto oldest = m_connections.begin();
         for (auto it = m_connections.begin(); it != m_connections.end(); ++it) {
             if (it->second.lastActivity < oldest->second.lastActivity) {
@@ -1313,6 +1382,13 @@ private:
             }
         }
         if (oldest != m_connections.end()) {
+            // Remove the connection's id from any per-swarm tracking set, otherwise
+            // m_swarmConnections retains stale ids forever and inflates the
+            // observed connectedPeers count for that swarm.
+            const uint64_t evictedId = oldest->first;
+            for (auto& [hash, idSet] : m_swarmConnections) {
+                idSet.erase(evictedId);
+            }
             m_connections.erase(oldest);
         }
     }
