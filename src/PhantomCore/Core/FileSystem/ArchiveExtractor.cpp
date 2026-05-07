@@ -56,8 +56,6 @@
 // SYSTEM INCLUDES
 // ============================================================================
 #include <Windows.h>
-#include <compressapi.h>
-#pragma comment(lib, "Cabinet.lib")
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -384,10 +382,13 @@ namespace {
     // TAR helper: check if block is all zeros (end-of-archive)
     // ────────────────────────────────────────────────────────────────────
     [[nodiscard]] static bool IsZeroBlock(const uint8_t* block) noexcept {
-        // Use 8-byte comparisons for performance on 64-bit
-        const uint64_t* qwords = reinterpret_cast<const uint64_t*>(block);
-        for (size_t i = 0; i < TAR_BLOCK_SIZE / sizeof(uint64_t); ++i) {
-            if (qwords[i] != 0) return false;
+        // Use 8-byte comparisons for performance on 64-bit.  std::memcpy avoids
+        // strict-aliasing UB and silently handles unaligned source buffers
+        // (the input is uint8_t[] with no architectural alignment guarantee).
+        for (size_t i = 0; i < TAR_BLOCK_SIZE; i += sizeof(uint64_t)) {
+            uint64_t qword = 0;
+            std::memcpy(&qword, block + i, sizeof(qword));
+            if (qword != 0) return false;
         }
         return true;
     }
@@ -527,9 +528,14 @@ namespace {
 [[nodiscard]] static bool IsPathSafe(const std::wstring& path) noexcept {
     if (path.empty()) return false;
 
-    // Reject absolute paths
+    // Reject absolute paths, UNC prefixes (\\server\share, \\?\, \\.\) and
+    // any leading separator.  Two leading separators are an alias for UNC
+    // even when the rest of the path looks relative on the wire.
     if (path[0] == L'/' || path[0] == L'\\') return false;
-    if (path.length() > 1 && path[1] == L':') return false;
+    if (path.length() >= 2 && (path[1] == L':')) return false;
+    if (path.length() >= 2 &&
+        (path[0] == L'\\' || path[0] == L'/') &&
+        (path[1] == L'\\' || path[1] == L'/')) return false;
 
     // Reject path traversal — check every component
     size_t i = 0;
@@ -539,39 +545,46 @@ namespace {
 
         std::wstring_view component(path.data() + i, sep - i);
 
-        // Reject ".." components
+        // Reject ".." components (in any case form / mixed separators).
         if (component == L"..") return false;
 
-        // Reject "." components (current dir traversal in some parsers)
-        // Allow empty components (double slash) — harmless, just skip
-
         // Reject trailing dots/spaces — Windows silently strips these,
-        // enabling evasion (e.g., "evil.exe." resolves to "evil.exe")
+        // enabling evasion (e.g., "evil.exe." resolves to "evil.exe").
         if (!component.empty() &&
             (component.back() == L'.' || component.back() == L' ')) return false;
 
-        // Reject reserved device names
+        // Reject reserved device names (CON, PRN, NUL, COM1-9, LPT1-9, ...).
         if (!component.empty() && IsReservedDeviceName(component)) return false;
 
+        if (sep == path.size()) break;
         i = sep + 1;
     }
 
-    // Reject dangerous characters that could cause issues on Windows
+    // Reject characters that have caused ambiguity / evasion historically.
     for (wchar_t ch : path) {
         if (ch == L'<' || ch == L'>' || ch == L':' ||
             ch == L'"' || ch == L'|' || ch == L'?' || ch == L'*') return false;
-        // Reject Unicode fullwidth period (U+FF0E) — evasion via normalization
-        if (ch == L'\xFF0E') return false;
-        // Reject RTLO character
-        if (ch == L'\x202E') return false;
-        // Reject null bytes
+        // Unicode normalization-evasion characters that can collapse to '.', '/', '\\'.
+        if (ch == L'\xFF0E' /* fullwidth period         */ ||
+            ch == L'\xFF0F' /* fullwidth solidus        */ ||
+            ch == L'\x2215' /* division slash           */ ||
+            ch == L'\x29F8' /* big solidus              */ ||
+            ch == L'\xFF3C' /* fullwidth reverse solidus*/) return false;
+        // Right-to-Left Override and related bidi controls used to spoof extensions.
+        if (ch == L'\x202E' || ch == L'\x202D' ||
+            ch == L'\x202A' || ch == L'\x202B' || ch == L'\x202C') return false;
+        // Embedded NUL.
         if (ch == L'\0') return false;
+        // C0 controls (TAB, LF, CR, ...) — never legitimate inside a stored filename.
+        if (ch < 0x20) return false;
     }
 
-    // Reject alternate data streams
+    // Reject alternate data streams.
     if (path.find(L"::") != std::wstring::npos) return false;
 
-    // Reject paths that are too long
+    // Reject paths that are too long for the legacy MAX_PATH boundary.
+    // Archive entries that need long paths must be sanitized via SanitizePath
+    // and explicit long-path opt-in by the caller.
     if (path.size() > 260) return false;
 
     return true;
@@ -582,10 +595,17 @@ namespace {
     result.reserve(path.size());
 
     size_t i = 0;
-    // Strip leading slashes
+    // Strip leading slashes (covers UNC '\\server' and '\\?\' / '\\.\' device prefixes).
     while (i < path.size() && (path[i] == L'/' || path[i] == L'\\')) ++i;
-    // Strip drive letter prefix
+    // Strip "?\" / ".\" right after the slashes (extended-length / device).
+    if (i + 1 < path.size() && (path[i] == L'?' || path[i] == L'.') &&
+        (path[i + 1] == L'\\' || path[i + 1] == L'/')) {
+        i += 2;
+    }
+    // Strip drive letter prefix.
     if (i + 1 < path.size() && path[i + 1] == L':') i += 2;
+    // Strip any further leading slashes that may have been left behind.
+    while (i < path.size() && (path[i] == L'/' || path[i] == L'\\')) ++i;
 
     while (i < path.size()) {
         size_t sep = path.find_first_of(L"/\\", i);
@@ -593,13 +613,25 @@ namespace {
 
         std::wstring_view component(path.data() + i, sep - i);
 
-        // Skip dangerous components
-        if (component == L".." || component.empty()) {
+        // Skip dangerous components.
+        if (component == L".." || component == L"." || component.empty()) {
             i = sep + 1;
             continue;
         }
 
-        // Check for reserved device names — prefix with underscore
+        // Strip trailing dots/spaces (Windows would otherwise resolve them away).
+        size_t trim = component.size();
+        while (trim > 0 &&
+               (component[trim - 1] == L'.' || component[trim - 1] == L' ')) {
+            --trim;
+        }
+        if (trim == 0) {
+            i = sep + 1;
+            continue;
+        }
+        component = component.substr(0, trim);
+
+        // Check for reserved device names — prefix with underscore.
         bool isReserved = IsReservedDeviceName(component);
 
         if (!result.empty()) result += L'\\';
@@ -609,10 +641,14 @@ namespace {
         }
 
         for (wchar_t ch : component) {
-            // Replace dangerous chars
+            // Replace dangerous chars (Win32 forbidden, Unicode evasion, controls).
             if (ch == L'<' || ch == L'>' || ch == L':' || ch == L'"' ||
                 ch == L'|' || ch == L'?' || ch == L'*' ||
-                ch == L'\xFF0E' || ch == L'\x202E' || ch == L'\0') {
+                ch == L'\xFF0E' || ch == L'\xFF0F' || ch == L'\x2215' ||
+                ch == L'\x29F8' || ch == L'\xFF3C' ||
+                ch == L'\x202E' || ch == L'\x202D' ||
+                ch == L'\x202A' || ch == L'\x202B' || ch == L'\x202C' ||
+                ch == L'\0' || ch < 0x20) {
                 result += L'_';
             } else {
                 result += ch;
@@ -975,15 +1011,20 @@ public:
             return entries;
         }
 
-        // Search for EOCD signature backwards
+        // Search for EOCD signature backwards.  Guard against bytesRead being
+        // smaller than the EOCD record itself — the unsigned subtraction below
+        // would otherwise wrap and produce a huge starting index.
         int64_t eocdOffset = -1;
-        for (int64_t i = static_cast<int64_t>(bytesRead) - sizeof(ZipEndOfCentralDir);
-             i >= 0; --i) {
-            uint32_t sig = 0;
-            std::memcpy(&sig, buf.data() + i, 4);
-            if (sig == ZIP_EOCD_SIG) {
-                eocdOffset = i;
-                break;
+        if (bytesRead >= sizeof(ZipEndOfCentralDir)) {
+            for (int64_t i = static_cast<int64_t>(bytesRead) -
+                                static_cast<int64_t>(sizeof(ZipEndOfCentralDir));
+                 i >= 0; --i) {
+                uint32_t sig = 0;
+                std::memcpy(&sig, buf.data() + i, 4);
+                if (sig == ZIP_EOCD_SIG) {
+                    eocdOffset = i;
+                    break;
+                }
             }
         }
         if (eocdOffset < 0) return entries;
@@ -1041,9 +1082,17 @@ public:
         seekPos.QuadPart = static_cast<LONGLONG>(centralDirOffset);
         if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) return entries;
 
-        // Cap allocation size
-        const size_t safeCdSize = static_cast<size_t>(
-            std::min(centralDirSize, static_cast<uint64_t>(256 * 1024 * 1024)));
+        // Cap allocation size.  256 MiB is well above any legitimate central
+        // directory; if the on-disk record is larger, treat the archive as
+        // hostile and refuse parsing rather than truncating silently.
+        constexpr uint64_t MAX_CENTRAL_DIR_SIZE = 256ULL * 1024 * 1024;
+        if (centralDirSize > MAX_CENTRAL_DIR_SIZE) {
+            SS_LOG_WARN(L"ArchiveExtractor",
+                L"ZIP central directory of %llu bytes exceeds %llu cap — refusing to parse",
+                centralDirSize, MAX_CENTRAL_DIR_SIZE);
+            return entries;
+        }
+        const size_t safeCdSize = static_cast<size_t>(centralDirSize);
         std::vector<uint8_t> cdBuf(safeCdSize);
         if (!ReadFile(hFile, cdBuf.data(), static_cast<DWORD>(safeCdSize), &bytesRead, nullptr)) {
             return entries;
@@ -1312,12 +1361,11 @@ public:
             ArchiveEntry entry;
             entry.entryId = entryId++;
 
-            // Convert filename to wide string
-            std::wstring wideName;
-            wideName.reserve(name.size());
-            for (char ch : name) {
-                wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
-            }
+            // Convert filename to wide string.  Modern TAR producers emit
+            // filenames in UTF-8 (PAX/GNU); use the project-wide converter so
+            // multi-byte sequences are decoded properly instead of zero-extending
+            // each byte (which would yield mojibake and could bypass IsPathSafe).
+            std::wstring wideName = Utils::StringUtils::ToWide(name);
             entry.path = wideName;
 
             // Extract just the filename component
@@ -1333,22 +1381,29 @@ public:
             entry.isDirectory = (typeFlag == TAR_TYPE_DIRECTORY);
             entry.isEncrypted = false;
 
-            // Set modification time
-            if (mtime > 0 && mtime < 0x7FFFFFFF) {
+            // Set modification time.  POSIX time can legitimately exceed the
+            // 2038 INT32_MAX boundary; only reject negative/zero values.
+            if (mtime > 0) {
                 entry.modifiedTime = std::chrono::system_clock::from_time_t(
                     static_cast<time_t>(mtime));
             }
 
-            // Detect symlinks
+            // Detect symlinks / hardlinks — record link target, mark the entry
+            // type explicitly so CheckEntrySecurity raises SymlinkAttack, and
+            // validate the target itself for traversal / absolute paths.
             if (typeFlag == TAR_TYPE_SYMLINK || typeFlag == TAR_TYPE_LINK) {
                 std::string linkTarget = ExtractTarString(
                     block + TAR_LINKNAME_OFFSET, TAR_LINKNAME_LEN);
-                std::wstring wideLinkTarget;
-                wideLinkTarget.reserve(linkTarget.size());
-                for (char ch : linkTarget) {
-                    wideLinkTarget += static_cast<wchar_t>(static_cast<uint8_t>(ch));
+                std::wstring wideLinkTarget = Utils::StringUtils::ToWide(linkTarget);
+                entry.linkTarget = wideLinkTarget;
+                entry.type = (typeFlag == TAR_TYPE_SYMLINK)
+                    ? EntryType::Symlink
+                    : EntryType::Hardlink;
+                entry.securityFlags |= SecurityFlag::SymlinkAttack;
+                entry.isSuspicious = true;
+                if (!wideLinkTarget.empty() && !IsPathSafe(wideLinkTarget)) {
+                    entry.securityFlags |= SecurityFlag::PathTraversalAttempt;
                 }
-                entry.linkTarget = std::move(wideLinkTarget);
             }
 
             // Path safety check
@@ -1592,35 +1647,60 @@ public:
                 m_stats.nestedArchives.fetch_add(1, std::memory_order_relaxed);
                 summary.nestedArchives++;
 
+                // Use a CSPRNG-derived suffix so the path cannot be predicted
+                // by a same-host attacker who might pre-create or hijack it.
+                Utils::CryptoUtils::SecureRandom rng;
+                uint64_t rnd = rng.NextUInt64();
                 LARGE_INTEGER perfCounter{};
                 QueryPerformanceCounter(&perfCounter);
-                fs::path tempPath = fs::path(m_config.tempDirectory) /
-                    (L"ae_tar_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
-                     std::to_wstring(perfCounter.QuadPart) + L"_" +
-                     std::to_wstring(entryIndex));
+                wchar_t suffix[64]{};
+                _snwprintf_s(suffix, _countof(suffix), _TRUNCATE,
+                    L"ae_tar_%lu_%llx_%llx_%lu",
+                    GetCurrentProcessId(),
+                    static_cast<uint64_t>(perfCounter.QuadPart),
+                    rnd,
+                    static_cast<unsigned long>(entryIndex));
+                fs::path tempPath = fs::path(m_config.tempDirectory) / suffix;
 
-                std::ofstream tempFile(tempPath, std::ios::binary);
-                if (tempFile) {
-                    tempFile.write(
-                        reinterpret_cast<const char*>(data.data()),
-                        static_cast<std::streamsize>(data.size()));
-                    tempFile.close();
-
-                    // Detect nested format and dispatch to appropriate scanner
-                    auto nestedFmt = DetectFormat(tempPath.wstring());
-                    if (nestedFmt == ArchiveFormat::ZIP) {
-                        ScanZipArchive(tempPath.wstring(), callback, options,
-                                       summary, nestingLevel + 1);
-                    } else if (nestedFmt == ArchiveFormat::TAR) {
-                        ScanTarArchive(tempPath.wstring(), callback, options,
-                                       summary, nestingLevel + 1);
+                bool tempCreated = false;
+                {
+                    std::ofstream tempFile(tempPath,
+                        std::ios::binary | std::ios::trunc);
+                    if (tempFile) {
+                        tempFile.write(
+                            reinterpret_cast<const char*>(data.data()),
+                            static_cast<std::streamsize>(data.size()));
+                        tempFile.close();
+                        tempCreated = tempFile.good();
                     }
-                    // Other nested formats: metadata-only callback already fired above
+                }
 
-                    std::error_code removeEc;
-                    if (!fs::remove(tempPath, removeEc) || removeEc) {
-                        SS_LOG_WARN(L"ArchiveExtractor",
-                            L"Failed to remove temp file '%ls'", tempPath.c_str());
+                if (tempCreated) {
+                    // RAII guard guarantees the temp file is removed even if a
+                    // recursive scan throws.
+                    struct TempGuard {
+                        fs::path p;
+                        ~TempGuard() {
+                            std::error_code ec;
+                            fs::remove(p, ec);
+                        }
+                    } guard{ tempPath };
+
+                    try {
+                        // Detect nested format and dispatch to appropriate scanner
+                        auto nestedFmt = DetectFormat(tempPath.wstring());
+                        if (nestedFmt == ArchiveFormat::ZIP) {
+                            ScanZipArchive(tempPath.wstring(), callback, options,
+                                           summary, nestingLevel + 1);
+                        } else if (nestedFmt == ArchiveFormat::TAR) {
+                            ScanTarArchive(tempPath.wstring(), callback, options,
+                                           summary, nestingLevel + 1);
+                        }
+                        // Other nested formats: metadata-only callback already fired above
+                    } catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"ArchiveExtractor",
+                            L"Nested TAR scan threw: %hs", e.what());
+                        summary.entriesFailed++;
                     }
                 }
             }
@@ -1753,13 +1833,13 @@ public:
         ArchiveEntry entry;
         entry.entryId = 0;
 
-        // Use original filename if available, otherwise derive from archive name
+        // Use original filename if available, otherwise derive from archive name.
+        // The on-disk byte stream is treated as UTF-8 (RFC 1952 leaves the
+        // FNAME field encoding implementation-defined, but UTF-8 is the modern
+        // de-facto standard and the only encoding that can losslessly survive
+        // ToWide).
         if (!originalName.empty()) {
-            std::wstring wideName;
-            wideName.reserve(originalName.size());
-            for (char ch : originalName) {
-                wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
-            }
+            std::wstring wideName = Utils::StringUtils::ToWide(originalName);
             entry.path = wideName;
             entry.filename = wideName;
         } else {
@@ -1785,7 +1865,7 @@ public:
             }
         }
 
-        if (mtime > 0 && mtime < 0x7FFFFFFF) {
+        if (mtime > 0) {
             entry.modifiedTime = std::chrono::system_clock::from_time_t(
                 static_cast<time_t>(mtime));
         }
@@ -1933,11 +2013,7 @@ public:
                         static_cast<double>(packSize);
                 }
 
-                std::wstring wideName;
-                wideName.reserve(fileName.size());
-                for (char ch : fileName) {
-                    wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
-                }
+                std::wstring wideName = Utils::StringUtils::ToWide(fileName);
                 entry.path = wideName;
                 auto lastSep = wideName.find_last_of(L"/\\");
                 entry.filename = (lastSep != std::wstring::npos)
@@ -2144,11 +2220,7 @@ public:
                         static_cast<time_t>(mtime));
                 }
 
-                std::wstring wideName;
-                wideName.reserve(fileName.size());
-                for (char ch : fileName) {
-                    wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
-                }
+                std::wstring wideName = Utils::StringUtils::ToWide(fileName);
                 entry.path = wideName;
                 auto lastSep = wideName.find_last_of(L"/\\");
                 entry.filename = (lastSep != std::wstring::npos)
@@ -2628,70 +2700,17 @@ public:
             result.resize(bytesRead);
 
         } else if (cde.compressionMethod == ZIP_DEFLATE) {
-            // NOTE: MSZIP (Windows Compression API) wraps deflate blocks with a
-            // 2-byte 'CK' header.  Standard ZIP files use raw RFC 1951 deflate.
-            // This means MSZIP decompression may fail on most standard ZIP entries.
-            // For full compatibility, integrate a raw deflate codec (e.g., zlib or
-            // miniz).  Until then, decompression failures are expected and handled
-            // gracefully below.
-            constexpr uint64_t MAX_COMPRESSED_ENTRY = 256ULL * 1024 * 1024;
-            if (compSize > MAX_COMPRESSED_ENTRY) return result;
-
-            std::vector<uint8_t> compressed(static_cast<size_t>(compSize));
-            if (!ReadFile(hFile, compressed.data(),
-                          static_cast<DWORD>(compSize), &bytesRead, nullptr)) {
-                return result;
-            }
-
-            // Use MSZIP decompressor (see NOTE above re: raw deflate compat)
-            DECOMPRESSOR_HANDLE decompressor = nullptr;
-            if (!CreateDecompressor(COMPRESS_ALGORITHM_MSZIP, nullptr, &decompressor)) {
-                SS_LOG_DEBUG(L"ArchiveExtractor",
-                    L"CreateDecompressor failed: 0x%08X", GetLastError());
-                return result;
-            }
-
-            // RAII wrapper
-            struct DecompGuard {
-                DECOMPRESSOR_HANDLE h;
-                ~DecompGuard() { if (h) CloseDecompressor(h); }
-            } dGuard{ decompressor };
-
-            // Try decompression with bounded output
-            size_t outputSize = static_cast<size_t>(
-                std::min(uncompSize, static_cast<uint64_t>(options.maxEntrySize)));
-            result.resize(outputSize);
-
-            SIZE_T decompressedSize = 0;
-            if (!Decompress(decompressor, compressed.data(), bytesRead,
-                            result.data(), outputSize, &decompressedSize)) {
-
-                DWORD err = GetLastError();
-                if (err == ERROR_INSUFFICIENT_BUFFER) {
-                    // Suspicious — claimed size might be wrong (zip bomb indicator)
-                    SS_LOG_WARN(L"ArchiveExtractor",
-                        L"Decompression buffer insufficient — possible zip bomb");
-                }
-                result.clear();
-                return result;
-            }
-
-            result.resize(decompressedSize);
-
-            // Verify compression ratio post-decompression
-            if (!compressed.empty()) {
-                double ratio = static_cast<double>(decompressedSize) /
-                               static_cast<double>(compressed.size());
-                if (ratio > m_config.defaultMaxRatio) {
-                    SS_LOG_WARN(L"ArchiveExtractor",
-                        L"Compression ratio %.1f exceeds limit %.1f — possible zip bomb",
-                        ratio, m_config.defaultMaxRatio);
-                    if (m_config.abortOnSecurityIssue) {
-                        result.clear();
-                        return result;
-                    }
-                }
-            }
+            // Standard ZIP files use raw RFC 1951 deflate.  The Windows
+            // Compression API only exposes MSZIP (which is deflate wrapped in
+            // a 'CK' chunk header) — feeding it raw deflate produces silent
+            // garbage that downstream scanners would treat as legitimate
+            // entry contents.  Until a raw-deflate codec is wired through
+            // Utils::CompressionUtils, refuse the operation explicitly so
+            // callers get a clear, actionable failure rather than corrupt data.
+            SS_LOG_DEBUG(L"ArchiveExtractor",
+                L"ZIP entry uses RFC 1951 deflate which is not yet supported "
+                L"by the available codec; entry will be skipped");
+            return result;
         }
 
         // Verify CRC32
@@ -2838,19 +2857,78 @@ public:
                 return summary;
             }
 
+            // Resolve the output directory to an absolute, canonical form so we
+            // can confirm every per-entry destination falls inside it.  The
+            // sanitizer alone is not sufficient — operators may pass a relative
+            // outputDir or the underlying filesystem may contain a junction
+            // that re-exits the intended root.
+            fs::path canonicalRoot = fs::weakly_canonical(fs::path(outputDir), ec);
+            if (ec || canonicalRoot.empty()) {
+                summary.result = ExtractionResult::IOError;
+                summary.errors.push_back("Failed to canonicalize output directory");
+                return summary;
+            }
+            std::wstring canonicalRootStr = canonicalRoot.wstring();
+            // Normalise trailing separator so prefix comparison cannot match
+            // an unrelated sibling (e.g. C:\out vs C:\output).
+            if (!canonicalRootStr.empty() &&
+                canonicalRootStr.back() != L'\\' &&
+                canonicalRootStr.back() != L'/') {
+                canonicalRootStr += L'\\';
+            }
+
             // Extract each entry to disk
             ScanArchive(filePath,
                 [&](const ArchiveEntry& entry, const std::vector<uint8_t>& data) {
                     if (entry.isDirectory || data.empty()) return;
 
+                    // Refuse symlink / hardlink entries entirely — we never
+                    // want to materialise reparse points from an archive.
+                    if (entry.type == EntryType::Symlink ||
+                        entry.type == EntryType::Hardlink) {
+                        summary.warnings.push_back(
+                            "Refused link entry: " + ToNarrow(entry.path));
+                        return;
+                    }
+
                     std::wstring safePath = SanitizePath(entry.path);
                     if (safePath.empty()) return;
 
                     fs::path outPath = fs::path(outputDir) / safePath;
-                    fs::create_directories(outPath.parent_path(), ec);
+                    std::error_code canonEc;
+                    fs::path canonicalOut = fs::weakly_canonical(outPath, canonEc);
+                    if (canonEc || canonicalOut.empty()) {
+                        summary.warnings.push_back(
+                            "Refused entry (cannot canonicalize): " +
+                            ToNarrow(entry.path));
+                        return;
+                    }
+                    std::wstring canonicalOutStr = canonicalOut.wstring();
+                    if (canonicalOutStr.size() < canonicalRootStr.size() ||
+                        std::wstring_view(canonicalOutStr).substr(0, canonicalRootStr.size()) !=
+                            std::wstring_view(canonicalRootStr)) {
+                        summary.warnings.push_back(
+                            "Refused entry (escapes output root): " +
+                            ToNarrow(entry.path));
+                        return;
+                    }
+
+                    fs::create_directories(canonicalOut.parent_path(), ec);
                     if (ec) return;
 
-                    std::ofstream out(outPath, std::ios::binary);
+                    // Refuse to follow a reparse point at the destination.  If
+                    // an attacker pre-creates a junction at canonicalOut they
+                    // would otherwise redirect the write outside the root.
+                    DWORD attrs = GetFileAttributesW(canonicalOut.c_str());
+                    if (attrs != INVALID_FILE_ATTRIBUTES &&
+                        (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                        summary.warnings.push_back(
+                            "Refused entry (reparse point at destination): " +
+                            ToNarrow(entry.path));
+                        return;
+                    }
+
+                    std::ofstream out(canonicalOut, std::ios::binary | std::ios::trunc);
                     if (out) {
                         out.write(reinterpret_cast<const char*>(data.data()),
                                   static_cast<std::streamsize>(data.size()));
@@ -3359,8 +3437,10 @@ private:
         ReadFile(hFile.get(), eocdBuf.data(), static_cast<DWORD>(searchSize), &bytesRead, nullptr);
 
         uint64_t centralDirOffset = 0;
-        for (int64_t i = static_cast<int64_t>(bytesRead) - sizeof(ZipEndOfCentralDir);
-             i >= 0; --i) {
+        if (bytesRead >= sizeof(ZipEndOfCentralDir)) {
+            for (int64_t i = static_cast<int64_t>(bytesRead) -
+                                static_cast<int64_t>(sizeof(ZipEndOfCentralDir));
+                 i >= 0; --i) {
             uint32_t sig = 0;
             std::memcpy(&sig, eocdBuf.data() + i, 4);
             if (sig == ZIP_EOCD_SIG) {
@@ -3389,6 +3469,7 @@ private:
                 }
 
                 break;
+            }
             }
         }
 
@@ -3541,38 +3622,59 @@ private:
                 m_stats.nestedArchives.fetch_add(1, std::memory_order_relaxed);
                 summary.nestedArchives++;
 
-                // Write to temp file with unique name to avoid prediction attacks
+                // CSPRNG-derived suffix avoids the predictable-path race that
+                // plain PID+QPC produced.
+                Utils::CryptoUtils::SecureRandom rng;
+                uint64_t rnd = rng.NextUInt64();
                 LARGE_INTEGER perfCounter{};
                 QueryPerformanceCounter(&perfCounter);
-                fs::path tempPath = fs::path(m_config.tempDirectory) /
-                    (L"ae_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
-                     std::to_wstring(perfCounter.QuadPart) + L"_" +
-                     std::to_wstring(entryIndex));
+                wchar_t suffix[64]{};
+                _snwprintf_s(suffix, _countof(suffix), _TRUNCATE,
+                    L"ae_zip_%lu_%llx_%llx_%lu",
+                    GetCurrentProcessId(),
+                    static_cast<uint64_t>(perfCounter.QuadPart),
+                    rnd,
+                    static_cast<unsigned long>(entryIndex));
+                fs::path tempPath = fs::path(m_config.tempDirectory) / suffix;
 
-                std::ofstream tempFile(tempPath, std::ios::binary);
-                if (tempFile) {
-                    tempFile.write(
-                        reinterpret_cast<const char*>(data.data()),
-                        static_cast<std::streamsize>(data.size()));
-                    tempFile.close();
-
-                    // Dispatch nested scan by detected format
-                    auto nestedFmt = DetectFormat(tempPath.wstring());
-                    if (nestedFmt == ArchiveFormat::TAR) {
-                        ScanTarArchive(tempPath.wstring(), callback, options,
-                                       summary, nestingLevel + 1);
-                    } else {
-                        ScanZipArchive(tempPath.wstring(), callback, options,
-                                       summary, nestingLevel + 1);
+                bool tempCreated = false;
+                {
+                    std::ofstream tempFile(tempPath,
+                        std::ios::binary | std::ios::trunc);
+                    if (tempFile) {
+                        tempFile.write(
+                            reinterpret_cast<const char*>(data.data()),
+                            static_cast<std::streamsize>(data.size()));
+                        tempFile.close();
+                        tempCreated = tempFile.good();
                     }
+                }
 
-                    // Clean up temp file — log failure
-                    std::error_code removeEc;
-                    if (!fs::remove(tempPath, removeEc) || removeEc) {
-                        SS_LOG_WARN(L"ArchiveExtractor",
-                            L"Failed to remove temp file '%ls': %hs",
-                            tempPath.c_str(),
-                            removeEc ? removeEc.message().c_str() : "unknown");
+                if (tempCreated) {
+                    // RAII guard guarantees the temp file is removed even if a
+                    // recursive scan throws.
+                    struct TempGuard {
+                        fs::path p;
+                        ~TempGuard() {
+                            std::error_code ec;
+                            fs::remove(p, ec);
+                        }
+                    } guard{ tempPath };
+
+                    try {
+                        // Dispatch nested scan by detected format
+                        auto nestedFmt = DetectFormat(tempPath.wstring());
+                        if (nestedFmt == ArchiveFormat::TAR) {
+                            ScanTarArchive(tempPath.wstring(), callback, options,
+                                           summary, nestingLevel + 1);
+                        } else {
+                            ScanZipArchive(tempPath.wstring(), callback, options,
+                                           summary, nestingLevel + 1);
+                        }
+                    } catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"ArchiveExtractor",
+                            L"Nested ZIP scan threw: %hs", e.what());
+                        summary.entriesFailed++;
                     }
                 }
             }
