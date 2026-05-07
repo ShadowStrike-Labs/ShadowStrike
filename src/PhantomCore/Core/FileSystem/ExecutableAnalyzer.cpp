@@ -136,6 +136,48 @@ std::optional<uint32_t> RVAToFileOffset(uint32_t rva, std::span<const PESection>
 }
 
 /**
+ * @brief Strips C0/C1/DEL control characters from a caller-controlled
+ *        string before it is passed into the wide-format logger.
+ *
+ * The analyzer logs paths, DLL names and exported function names that
+ * originate from the file under analysis. A crafted PE could embed CR/LF
+ * or terminal escape sequences in those strings to forge log lines or
+ * corrupt downstream log shippers. This helper strips all C0/C1 and DEL
+ * controls and caps the output at 512 bytes (with an explicit truncation
+ * marker) so log records remain bounded and machine-parseable.
+ */
+[[nodiscard]] std::string SanitizeNarrowForLog(std::string_view in) {
+    constexpr size_t kCap = 512;
+    std::string out;
+    out.reserve(std::min(in.size(), kCap));
+    for (unsigned char uc : in) {
+        if (out.size() >= kCap) { out.append("...[truncated]"); break; }
+        if (uc < 0x20u || uc == 0x7Fu || (uc >= 0x80u && uc < 0xA0u)) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(uc));
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::wstring SanitizeWideForLog(std::wstring_view in) {
+    constexpr size_t kCap = 512;
+    std::wstring out;
+    out.reserve(std::min(in.size(), kCap));
+    for (wchar_t c : in) {
+        if (out.size() >= kCap) { out.append(L"...[truncated]"); break; }
+        const auto u = static_cast<uint32_t>(c);
+        if (u < 0x20u || u == 0x7Fu || (u >= 0x80u && u < 0xA0u)) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+/**
  * @brief Sanitizes section name (may contain nulls).
  */
 std::string SanitizeSectionName(const char* name, size_t maxLen = 8) {
@@ -492,7 +534,7 @@ public:
         try {
             SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initializing...");
 
-            m_initialized = true;
+            m_initialized.store(true, std::memory_order_release);
             SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initialized successfully");
             return true;
 
@@ -504,7 +546,7 @@ public:
 
     void Shutdown() noexcept {
         std::unique_lock lock(m_mutex);
-        m_initialized = false;
+        m_initialized.store(false, std::memory_order_release);
         SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Shutdown complete");
     }
 
@@ -519,7 +561,7 @@ public:
         info.analysisTime = std::chrono::system_clock::now();
 
         try {
-            if (!m_initialized) {
+            if (!m_initialized.load(std::memory_order_acquire)) {
                 SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Not initialized");
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
@@ -541,7 +583,7 @@ public:
             // Check file exists using real FileUtils API
             if (!Utils::FileUtils::Exists(filePath)) {
                 SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File not found: %hs",
-                    Utils::StringUtils::ToNarrow(filePath).c_str());
+                    SanitizeNarrowForLog(Utils::StringUtils::ToNarrow(filePath)).c_str());
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
@@ -622,8 +664,8 @@ public:
             m_stats.averageAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
 
             SS_LOG_INFO(L"ExecutableAnalyzer",
-                L"ExecutableAnalyzer: Analyzed %hs in %llu μs (type: %u, risk: %u)",
-                Utils::StringUtils::ToNarrow(filePath).c_str(),
+                L"ExecutableAnalyzer: Analyzed %hs in %llu us (type: %u, risk: %u)",
+                SanitizeNarrowForLog(Utils::StringUtils::ToNarrow(filePath)).c_str(),
                 static_cast<uint64_t>(duration.count()),
                 static_cast<unsigned>(info.type),
                 static_cast<unsigned>(info.riskScore));
@@ -641,6 +683,26 @@ public:
         const auto startTime = std::chrono::high_resolution_clock::now();
 
         try {
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::AnalyzeBuffer: Not initialized");
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return ExecutableInfo{};
+            }
+
+            if (buffer.empty()) {
+                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer::AnalyzeBuffer: Empty buffer");
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return ExecutableInfo{};
+            }
+
+            if (buffer.size() > ExecutableAnalyzerConstants::MAX_FILE_SIZE) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer",
+                    L"ExecutableAnalyzer::AnalyzeBuffer: Buffer too large: %zu bytes",
+                    buffer.size());
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return ExecutableInfo{};
+            }
+
             auto info = AnalyzeBufferImpl(buffer, options);
 
             m_stats.buffersAnalyzed.fetch_add(1, std::memory_order_relaxed);
@@ -698,20 +760,37 @@ public:
             return false;
         }
 
-        // e_lfanew must be >= DOS header size, within 4MB (hostile PEs set huge values),
-        // 4-byte aligned, and leave room for NT headers within the buffer.
+        // Minimum bytes needed beyond e_lfanew to validate the NT signature
+        // and the FileHeader. Using sizeof(IMAGE_NT_HEADERS) here would
+        // demand the 64-bit optional header size on x64 builds and falsely
+        // reject legitimate PE32 binaries with smaller optional headers.
+        constexpr size_t kMinNtHeaderBytes = sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
+
         if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
             dosHeader->e_lfanew > 0x400000 ||
             (dosHeader->e_lfanew & 0x3) != 0 ||
-            static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS) > buffer.size()) {
+            static_cast<size_t>(dosHeader->e_lfanew) + kMinNtHeaderBytes > buffer.size()) {
             return false;
         }
 
-        const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-            buffer.data() + dosHeader->e_lfanew
-        );
+        const uint32_t* signature = reinterpret_cast<const uint32_t*>(
+            buffer.data() + dosHeader->e_lfanew);
+        if (*signature != ExecutableAnalyzerConstants::NT_SIGNATURE) {
+            return false;
+        }
 
-        return ntHeaders->Signature == ExecutableAnalyzerConstants::NT_SIGNATURE;
+        const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(
+            buffer.data() + dosHeader->e_lfanew + sizeof(uint32_t));
+
+        // Optional header must fit inside the buffer.
+        const uint64_t optHeaderEnd =
+            static_cast<uint64_t>(dosHeader->e_lfanew) + kMinNtHeaderBytes +
+            fileHeader->SizeOfOptionalHeader;
+        if (optHeaderEnd > buffer.size()) {
+            return false;
+        }
+
+        return true;
     }
 
     ExecutableType GetExecutableType(std::span<const uint8_t> buffer) const {
@@ -995,10 +1074,16 @@ public:
 
         // Allow e_lfanew up to 4MB — packers/protectors often relocate PE headers.
         // Restricting to 4096 would miss packed malware we need to detect.
+        // The minimum required to read FileHeader is signature(4) + IMAGE_FILE_HEADER(20).
+        // The optional header size is checked precisely below using
+        // FileHeader.SizeOfOptionalHeader, which avoids falsely rejecting PE32
+        // images on x64 builds (where sizeof(IMAGE_NT_HEADERS) == 264 vs the
+        // 248 bytes a fully-populated PE32 NT header actually occupies).
+        constexpr size_t kMinNtHeaderBytes = sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
         if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
             dosHeader->e_lfanew > 0x400000 ||
             (dosHeader->e_lfanew & 0x3) != 0 ||
-            static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > buffer.size()) {
+            static_cast<size_t>(dosHeader->e_lfanew) + kMinNtHeaderBytes > buffer.size()) {
             return;
         }
 
@@ -1008,6 +1093,14 @@ public:
         );
 
         if (ntHeaders32->Signature != ExecutableAnalyzerConstants::NT_SIGNATURE) {
+            return;
+        }
+
+        // Validate optional header bytes are present using precise size.
+        const uint16_t sizeOfOptHeader = ntHeaders32->FileHeader.SizeOfOptionalHeader;
+        if (sizeOfOptHeader < sizeof(IMAGE_OPTIONAL_HEADER32) ||
+            static_cast<uint64_t>(dosHeader->e_lfanew) + kMinNtHeaderBytes +
+                static_cast<uint64_t>(sizeOfOptHeader) > buffer.size()) {
             return;
         }
 
@@ -1024,14 +1117,20 @@ public:
         info.isDLL = (characteristics & IMAGE_FILE_DLL) != 0;
         info.isDriver = (characteristics & IMAGE_FILE_SYSTEM) != 0;
 
-        // Timestamp
+        // Timestamp. Skip 0 (unset) and 0xFFFFFFFF (deterministic / reproducible
+        // build sentinel) — feeding either to from_time_t produces misleading
+        // 1970 / 2106 timestamps.
         info.timestamp = ntHeaders32->FileHeader.TimeDateStamp;
-        if (info.timestamp > 0) {
+        if (info.timestamp > 0 && info.timestamp != 0xFFFFFFFFu) {
             info.compilationTime = std::chrono::system_clock::from_time_t(info.timestamp);
         }
 
-        // Parse optional header (architecture-specific)
+        // Parse optional header (architecture-specific). For 64-bit, additionally
+        // ensure the full 64-bit optional header fits.
         if (info.is64Bit) {
+            if (sizeOfOptHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+                return;
+            }
             const auto* ntHeaders64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
                 buffer.data() + dosHeader->e_lfanew
             );
@@ -1087,27 +1186,44 @@ public:
         const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data());
         const size_t ntHeadersOffset = dosHeader->e_lfanew;
 
-        if (ntHeadersOffset + sizeof(IMAGE_NT_HEADERS) > buffer.size()) {
+        // Minimum required: NT signature + FileHeader. Optional header size is
+        // variable (PE32 vs PE32+), so we deliberately do NOT require
+        // sizeof(IMAGE_NT_HEADERS) (which equals the 64-bit form on x64) and
+        // instead validate the optional header size below using
+        // FileHeader.SizeOfOptionalHeader.
+        constexpr size_t kMinNtHeaderBytes = sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
+        if (ntHeadersOffset > buffer.size() ||
+            ntHeadersOffset + kMinNtHeaderBytes > buffer.size()) {
             return;
         }
 
-        const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-            buffer.data() + ntHeadersOffset
-        );
+        const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(
+            buffer.data() + ntHeadersOffset + sizeof(uint32_t));
 
-        const uint16_t numSections = ntHeaders->FileHeader.NumberOfSections;
-        if (numSections > ExecutableAnalyzerConstants::MAX_SECTIONS) {
-            SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Too many sections: %u", numSections);
+        const uint16_t numSections = fileHeader->NumberOfSections;
+        if (numSections == 0 || numSections > ExecutableAnalyzerConstants::MAX_SECTIONS) {
+            if (numSections > ExecutableAnalyzerConstants::MAX_SECTIONS) {
+                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Too many sections: %u", numSections);
+            }
             return;
         }
 
-        const size_t sectionHeadersOffset = ntHeadersOffset +
-            sizeof(IMAGE_NT_HEADERS) - sizeof(IMAGE_OPTIONAL_HEADER) +
-            ntHeaders->FileHeader.SizeOfOptionalHeader;
-
-        if (sectionHeadersOffset + (numSections * sizeof(IMAGE_SECTION_HEADER)) > buffer.size()) {
+        // Validate optional header fits in buffer using precise size from FileHeader.
+        const uint64_t optHeaderEnd =
+            static_cast<uint64_t>(ntHeadersOffset) + kMinNtHeaderBytes +
+            fileHeader->SizeOfOptionalHeader;
+        if (optHeaderEnd > buffer.size()) {
             return;
         }
+
+        const uint64_t sectionHeadersOffset64 = optHeaderEnd;
+        const uint64_t sectionsEnd =
+            sectionHeadersOffset64 +
+            static_cast<uint64_t>(numSections) * sizeof(IMAGE_SECTION_HEADER);
+        if (sectionsEnd > buffer.size()) {
+            return;
+        }
+        const size_t sectionHeadersOffset = static_cast<size_t>(sectionHeadersOffset64);
 
         const auto* sectionHeaders = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
             buffer.data() + sectionHeadersOffset
@@ -1554,6 +1670,24 @@ public:
             const size_t rsrcBase = rsrcOffset.value();
             if (rsrcBase + sizeof(IMAGE_RESOURCE_DIRECTORY) > buffer.size()) return resources;
 
+            // Compute an upper bound for the resource region so that crafted
+            // OffsetToDirectory / OffsetToData values cannot redirect parsing
+            // outside the resource directory and thus outside any well-formed
+            // PE structure. We clamp against both buffer.size() AND the
+            // declared resource directory size.
+            const size_t rsrcLimit = std::min(buffer.size(),
+                rsrcBase + static_cast<size_t>(rsrcDirSize));
+            if (rsrcLimit < rsrcBase + sizeof(IMAGE_RESOURCE_DIRECTORY)) return resources;
+
+            // Helper: validate that an OffsetToDirectory points inside the
+            // resource region (after stripping the high bit which marks
+            // "directory" entries) and leaves room for a directory header.
+            auto inRsrc = [&](size_t absOffset, size_t needed) {
+                return absOffset >= rsrcBase &&
+                    absOffset + needed >= absOffset &&    // overflow guard
+                    absOffset + needed <= rsrcLimit;
+            };
+
             // Parse top-level resource directory (Type level)
             const auto* rootDir = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(buffer.data() + rsrcBase);
             const uint16_t numEntries = rootDir->NumberOfNamedEntries + rootDir->NumberOfIdEntries;
@@ -1567,14 +1701,17 @@ public:
             for (uint16_t i = 0; i < numEntries; ++i) {
                 const size_t entryOffset = rsrcBase + sizeof(IMAGE_RESOURCE_DIRECTORY) +
                     i * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
-                if (entryOffset + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > buffer.size()) break;
+                if (!inRsrc(entryOffset, sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY))) break;
 
                 const auto& entry = entries[i];
                 if (!entry.DataIsDirectory) continue;
 
+                // OffsetToDirectory is the low 31 bits when DataIsDirectory is set.
+                const uint32_t entryDirOff = entry.OffsetToDirectory & 0x7FFFFFFFu;
+
                 // Descend to Name/ID level
-                const size_t nameDir = rsrcBase + entry.OffsetToDirectory;
-                if (nameDir + sizeof(IMAGE_RESOURCE_DIRECTORY) > buffer.size()) continue;
+                const size_t nameDir = rsrcBase + entryDirOff;
+                if (!inRsrc(nameDir, sizeof(IMAGE_RESOURCE_DIRECTORY))) continue;
 
                 const auto* nameDirPtr = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(
                     buffer.data() + nameDir
@@ -1587,14 +1724,16 @@ public:
                 for (uint16_t j = 0; j < nameEntries && resources.size() < ExecutableAnalyzerConstants::MAX_RESOURCES; ++j) {
                     const size_t nameEntryOff = nameDir + sizeof(IMAGE_RESOURCE_DIRECTORY) +
                         j * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
-                    if (nameEntryOff + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > buffer.size()) break;
+                    if (!inRsrc(nameEntryOff, sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY))) break;
 
                     const auto& nameEntry = nameEntriesPtr[j];
                     if (!nameEntry.DataIsDirectory) continue;
 
+                    const uint32_t nameDirOff = nameEntry.OffsetToDirectory & 0x7FFFFFFFu;
+
                     // Descend to Language level
-                    const size_t langDir = rsrcBase + nameEntry.OffsetToDirectory;
-                    if (langDir + sizeof(IMAGE_RESOURCE_DIRECTORY) > buffer.size()) continue;
+                    const size_t langDir = rsrcBase + nameDirOff;
+                    if (!inRsrc(langDir, sizeof(IMAGE_RESOURCE_DIRECTORY))) continue;
 
                     const auto* langDirPtr = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(
                         buffer.data() + langDir
@@ -1607,14 +1746,16 @@ public:
                     for (uint16_t k = 0; k < langEntries && resources.size() < ExecutableAnalyzerConstants::MAX_RESOURCES; ++k) {
                         const size_t langEntryOff = langDir + sizeof(IMAGE_RESOURCE_DIRECTORY) +
                             k * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
-                        if (langEntryOff + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > buffer.size()) break;
+                        if (!inRsrc(langEntryOff, sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY))) break;
 
                         const auto& langEntry = langEntriesPtr[k];
                         if (langEntry.DataIsDirectory) continue;
 
-                        // Get data entry
-                        const size_t dataEntryOff = rsrcBase + langEntry.OffsetToData;
-                        if (dataEntryOff + sizeof(IMAGE_RESOURCE_DATA_ENTRY) > buffer.size()) continue;
+                        // Get data entry. OffsetToData here is a leaf offset
+                        // (high bit clear by definition), but mask defensively
+                        // in case of corrupt input.
+                        const size_t dataEntryOff = rsrcBase + (langEntry.OffsetToData & 0x7FFFFFFFu);
+                        if (!inRsrc(dataEntryOff, sizeof(IMAGE_RESOURCE_DATA_ENTRY))) continue;
 
                         const auto* dataEntry = reinterpret_cast<const IMAGE_RESOURCE_DATA_ENTRY*>(
                             buffer.data() + dataEntryOff
@@ -1718,7 +1859,8 @@ public:
 
             for (size_t i = peOffset - 8; i >= sizeof(IMAGE_DOS_HEADER); i -= 4) {
                 if (i + 4 > buffer.size()) break;
-                const uint32_t dword = *reinterpret_cast<const uint32_t*>(buffer.data() + i);
+                uint32_t dword = 0;
+                std::memcpy(&dword, buffer.data() + i, sizeof(dword));
                 if (dword == RICH_SIGNATURE) {
                     richOffset = i;
                     break;
@@ -1730,7 +1872,8 @@ public:
 
             // Checksum is the DWORD immediately after "Rich"
             if (richOffset + 8 > buffer.size()) return richHeader;
-            const uint32_t xorKey = *reinterpret_cast<const uint32_t*>(buffer.data() + richOffset + 4);
+            uint32_t xorKey = 0;
+            std::memcpy(&xorKey, buffer.data() + richOffset + 4, sizeof(xorKey));
 
             richHeader.present = true;
             richHeader.checksum = xorKey;
@@ -1739,7 +1882,8 @@ public:
             size_t dansOffset = 0;
             for (size_t i = sizeof(IMAGE_DOS_HEADER); i < richOffset; i += 4) {
                 if (i + 4 > buffer.size()) break;
-                const uint32_t dword = *reinterpret_cast<const uint32_t*>(buffer.data() + i);
+                uint32_t dword = 0;
+                std::memcpy(&dword, buffer.data() + i, sizeof(dword));
                 if ((dword ^ xorKey) == DANS_SIGNATURE) {
                     dansOffset = i;
                     break;
@@ -1772,8 +1916,12 @@ public:
                 const size_t off = entriesStart + i * 8;
                 if (off + 8 > buffer.size()) break;
 
-                const uint32_t compId = *reinterpret_cast<const uint32_t*>(buffer.data() + off) ^ xorKey;
-                const uint32_t count = *reinterpret_cast<const uint32_t*>(buffer.data() + off + 4) ^ xorKey;
+                uint32_t compIdRaw = 0;
+                uint32_t countRaw = 0;
+                std::memcpy(&compIdRaw, buffer.data() + off, sizeof(compIdRaw));
+                std::memcpy(&countRaw, buffer.data() + off + 4, sizeof(countRaw));
+                const uint32_t compId = compIdRaw ^ xorKey;
+                const uint32_t count = countRaw ^ xorKey;
 
                 RichHeaderEntry entry;
                 entry.productId = static_cast<uint16_t>(compId >> 16);
@@ -1901,10 +2049,12 @@ public:
 
                     // Metadata root starts with signature 0x424A5342 ("BSJB")
                     if (metaEnd - metaBase >= 16) {
-                        const uint32_t metaSig = *reinterpret_cast<const uint32_t*>(buffer.data() + metaBase);
+                        uint32_t metaSig = 0;
+                        std::memcpy(&metaSig, buffer.data() + metaBase, sizeof(metaSig));
                         if (metaSig == 0x424A5342) {
                             // Read version string at offset 12
-                            const uint32_t versionLen = *reinterpret_cast<const uint32_t*>(buffer.data() + metaBase + 12);
+                            uint32_t versionLen = 0;
+                            std::memcpy(&versionLen, buffer.data() + metaBase + 12, sizeof(versionLen));
                             if (versionLen > 0 && versionLen <= 256 && metaBase + 16 + versionLen <= metaEnd) {
                                 dotNet.targetFramework = std::string(
                                     reinterpret_cast<const char*>(buffer.data() + metaBase + 16),
@@ -2130,7 +2280,7 @@ public:
             // Check security features
             if (!info.hasDEP && !info.isDLL) {
                 anomalies.push_back({
-                    AnomalyType::SuspiciousChecksum,
+                    AnomalyType::MitigationDisabled,
                     "DEP (Data Execution Prevention) not enabled",
                     "",
                     0,
@@ -2141,7 +2291,7 @@ public:
 
             if (!info.hasASLR && !info.isDLL) {
                 anomalies.push_back({
-                    AnomalyType::SuspiciousChecksum,
+                    AnomalyType::MitigationDisabled,
                     "ASLR (Address Space Layout Randomization) not enabled",
                     "",
                     0,
@@ -2183,19 +2333,20 @@ public:
                 });
             }
 
-            // Check overlay
-            if (info.fileSize > info.imageSize) {
-                const uint32_t overlaySize = static_cast<uint32_t>(info.fileSize - info.imageSize);
-                if (overlaySize > 1024 * 1024) {  // > 1MB
-                    anomalies.push_back({
-                        AnomalyType::LargeOverlay,
-                        "Large overlay detected: " + std::to_string(overlaySize) + " bytes",
-                        "",
-                        0,
-                        40,
-                        "T1027"
-                    });
-                }
+            // Check overlay. info.imageSize is the in-memory SizeOfImage and is
+            // unrelated to on-disk size; comparing fileSize against it falsely
+            // flags any image with a non-zero virtual padding. Use the
+            // pre-computed overlaySize, which is derived from the last section's
+            // raw end offset by AnalyzeOverlayImpl().
+            if (info.overlaySize > 1024 * 1024) {  // > 1MB
+                anomalies.push_back({
+                    AnomalyType::LargeOverlay,
+                    "Large overlay detected: " + std::to_string(info.overlaySize) + " bytes",
+                    "",
+                    0,
+                    40,
+                    "T1027"
+                });
             }
 
             // Check TLS callbacks (anti-debug / anti-analysis evasion)
@@ -2228,7 +2379,7 @@ public:
             // Check for missing CFG (Control Flow Guard)
             if (!info.hasCFG && !info.isDLL && !info.dotNet.isDotNet) {
                 anomalies.push_back({
-                    AnomalyType::SuspiciousChecksum,
+                    AnomalyType::MitigationDisabled,
                     "Control Flow Guard (CFG) not enabled",
                     "",
                     0,
@@ -2720,11 +2871,14 @@ public:
             // --- Anomaly features ---
             features.push_back(static_cast<float>(info.anomalies.size()));
 
-            // Count anomalies by severity
+            // Count anomalies by severity. Anomaly severities are emitted in the
+            // 0..100 range (see DetectedAnomaly::severity / per-anomaly emit
+            // sites). Use thresholds aligned with that range so the ML feature
+            // vector actually distinguishes critical from medium severities.
             size_t criticalAnomalies = 0, highAnomalies = 0, mediumAnomalies = 0;
             for (const auto& a : info.anomalies) {
-                if (a.severity >= 8) ++criticalAnomalies;
-                else if (a.severity >= 5) ++highAnomalies;
+                if (a.severity >= 75) ++criticalAnomalies;
+                else if (a.severity >= 50) ++highAnomalies;
                 else ++mediumAnomalies;
             }
             features.push_back(static_cast<float>(criticalAnomalies));
@@ -3334,7 +3488,11 @@ public:
 
                         FileTimeToLocalFileTime(&pCertCtx->pCertInfo->NotBefore, &localFt);
                         FileTimeToSystemTime(&localFt, &st);
-                        // Convert SYSTEMTIME to time_point
+                        // Convert SYSTEMTIME to time_point. mktime() returns
+                        // (time_t)-1 for unrepresentable inputs (e.g. dates
+                        // outside the local time range); preserve epoch instead
+                        // of feeding -1 into from_time_t which would yield
+                        // 1969-12-31T23:59:59.
                         std::tm tmFrom{};
                         tmFrom.tm_year = st.wYear - 1900;
                         tmFrom.tm_mon = st.wMonth - 1;
@@ -3342,7 +3500,11 @@ public:
                         tmFrom.tm_hour = st.wHour;
                         tmFrom.tm_min = st.wMinute;
                         tmFrom.tm_sec = st.wSecond;
-                        sigInfo.certValidFrom = std::chrono::system_clock::from_time_t(std::mktime(&tmFrom));
+                        tmFrom.tm_isdst = -1;
+                        const std::time_t tFrom = std::mktime(&tmFrom);
+                        if (tFrom != static_cast<std::time_t>(-1)) {
+                            sigInfo.certValidFrom = std::chrono::system_clock::from_time_t(tFrom);
+                        }
 
                         FileTimeToLocalFileTime(&pCertCtx->pCertInfo->NotAfter, &localFt);
                         FileTimeToSystemTime(&localFt, &st);
@@ -3353,7 +3515,11 @@ public:
                         tmTo.tm_hour = st.wHour;
                         tmTo.tm_min = st.wMinute;
                         tmTo.tm_sec = st.wSecond;
-                        sigInfo.certValidTo = std::chrono::system_clock::from_time_t(std::mktime(&tmTo));
+                        tmTo.tm_isdst = -1;
+                        const std::time_t tTo = std::mktime(&tmTo);
+                        if (tTo != static_cast<std::time_t>(-1)) {
+                            sigInfo.certValidTo = std::chrono::system_clock::from_time_t(tTo);
+                        }
 
                         // Build certificate chain
                         CERT_CHAIN_PARA chainPara{};
@@ -3465,7 +3631,7 @@ public:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
     ExecutableAnalyzerStatistics m_stats;
     ExecutableAnalyzer::KernelScanCallback m_kernelCallback;
 };

@@ -331,6 +331,7 @@ enum class AnomalyType : uint16_t {
     SuspiciousChecksum = 4,
     InvalidTimestamp = 5,
     FutureTimestamp = 6,
+    MitigationDisabled = 7,    // DEP / ASLR / CFG / shadow stack disabled
 
     // Section anomalies
     ExecutableData = 10,
