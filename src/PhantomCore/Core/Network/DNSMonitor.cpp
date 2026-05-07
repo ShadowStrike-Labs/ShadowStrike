@@ -85,6 +85,106 @@ namespace Core {
 namespace Network {
 
 // ============================================================================
+// File-local hardening helpers
+// ----------------------------------------------------------------------------
+// These helpers exist to prevent log injection and ensure that the tracking
+// caches cannot be poisoned by malformed or attacker-shaped domain input.
+// All caller-supplied domains pass through these gates before being stored,
+// matched, or rendered into a log message.
+// ============================================================================
+namespace {
+
+constexpr size_t   kMaxLogDomainLen        = 253;
+constexpr size_t   kMaxLogNarrowLen        = 512;
+constexpr uint32_t kMinCacheTtlSec         = 1;        // RFC 1035 lower bound
+constexpr uint32_t kMaxCacheTtlSec         = 7 * 24 * 60 * 60;  // 7 days
+constexpr size_t   kMaxTrackedBaseDomains  = 50000;    // Anti-DoS cap
+constexpr size_t   kMaxFilterRules         = 100000;
+
+[[nodiscard]] constexpr bool IsLogSafeChar(unsigned char c) noexcept {
+    // Reject all C0/C1 control characters, NUL, and DEL. Permit only
+    // printable 7-bit ASCII; non-ASCII bytes (e.g. raw IDN) are scrubbed
+    // to avoid terminal control sequence injection through log sinks.
+    return c >= 0x20 && c < 0x7F;
+}
+
+[[nodiscard]] std::string SanitizeForLog(std::string_view in) {
+    std::string out;
+    const size_t n = std::min(in.size(), kMaxLogNarrowLen);
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        out.push_back(IsLogSafeChar(c) ? static_cast<char>(c) : '?');
+    }
+    if (in.size() > kMaxLogNarrowLen) {
+        out.append("...[truncated]");
+    }
+    return out;
+}
+
+[[nodiscard]] std::wstring SanitizeDomainForLog(std::string_view domain) {
+    return Utils::StringUtils::ToWide(SanitizeForLog(domain));
+}
+
+[[nodiscard]] std::wstring SanitizeNarrowToWideForLog(std::string_view s) {
+    return Utils::StringUtils::ToWide(SanitizeForLog(s));
+}
+
+// Strict domain syntactic validation: total length, label length, label
+// charset, no leading/trailing dot, no empty label. Used as an admission
+// gate before insertion into the cache, tracking maps, or filter rules.
+[[nodiscard]] bool IsSyntacticDomain(std::string_view domain) noexcept {
+    if (domain.empty() || domain.size() > kMaxLogDomainLen) return false;
+    if (domain.front() == '.' || domain.back() == '.') return false;
+
+    size_t labelLen = 0;
+    bool labelStart = true;
+    for (char c : domain) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (c == '.') {
+            if (labelLen == 0) return false;        // empty label
+            labelLen = 0;
+            labelStart = true;
+            continue;
+        }
+        ++labelLen;
+        if (labelLen > 63) return false;            // RFC 1035 label cap
+        // First/last char of a label must be alnum; '-' permitted only inside.
+        const bool alnum = (uc >= '0' && uc <= '9') ||
+                           (uc >= 'A' && uc <= 'Z') ||
+                           (uc >= 'a' && uc <= 'z');
+        const bool inner = alnum || c == '-' || c == '_';
+        if (!inner) return false;
+        if (labelStart && !alnum) return false;
+        labelStart = false;
+    }
+    return labelLen != 0;
+}
+
+// Normalise to ASCII-lowercase, strip a single trailing dot. Stable cache key.
+[[nodiscard]] std::string NormalizeDomain(std::string_view domain) {
+    if (domain.empty()) return {};
+    if (domain.back() == '.') domain.remove_suffix(1);
+    std::string out;
+    out.reserve(domain.size());
+    for (char c : domain) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        out.push_back((uc >= 'A' && uc <= 'Z')
+            ? static_cast<char>(uc + ('a' - 'A'))
+            : static_cast<char>(uc));
+    }
+    return out;
+}
+
+[[nodiscard]] uint32_t ClampTtlSec(uint32_t ttl) noexcept {
+    if (ttl < kMinCacheTtlSec) return kMinCacheTtlSec;
+    if (ttl > kMaxCacheTtlSec) return kMaxCacheTtlSec;
+    return ttl;
+}
+
+}  // anonymous namespace
+
+// ============================================================================
 // DNSResourceRecord Helper Methods
 // ============================================================================
 
@@ -110,10 +210,19 @@ std::vector<std::string> DNSResourceRecord::GetTXTRecords() const {
 // ============================================================================
 
 bool DNSFilterRule::Matches(const std::string& domain) const {
+    if (domain.empty() || domain.size() > 253) return false;
+
     if (isRegex) {
+        // NOTE: callers on the hot path should prefer the cached
+        // compiled-regex variant in DNSMonitorImpl::MatchRuleCached().
+        // This per-call recompile path is retained only as a fallback
+        // for callers outside the impl that still rely on it.
         try {
-            std::regex pattern(domainPattern, std::regex::icase);
+            std::regex pattern(domainPattern,
+                std::regex::icase | std::regex::optimize);
             return std::regex_match(domain, pattern);
+        } catch (const std::regex_error&) {
+            return false;
         } catch (...) {
             return false;
         }
@@ -281,6 +390,42 @@ struct DNSMonitorImpl {
     std::mutex m_rulesMutex;
     std::atomic<uint64_t> m_nextRuleId{1};
 
+    // Compiled-regex cache for filter rules. Avoids recompiling the regex on
+    // every DNS query; ProcessQuery calls MatchRuleCached() in the hot path.
+    // Keyed by ruleId; mutated only under m_rulesMutex (alongside m_filterRules).
+    std::unordered_map<uint64_t, std::shared_ptr<const std::regex>>
+        mutable m_compiledRuleRegex;
+
+    // Hot-path matcher: uses the cached compiled regex when available,
+    // and lazily compiles + caches on first miss. Caller must hold m_rulesMutex.
+    [[nodiscard]] bool MatchRuleCached(const DNSFilterRule& rule,
+                                       const std::string& domain) const {
+        if (rule.isRegex) {
+            std::shared_ptr<const std::regex> compiled;
+            auto it = m_compiledRuleRegex.find(rule.ruleId);
+            if (it != m_compiledRuleRegex.end()) {
+                compiled = it->second;
+            } else {
+                try {
+                    compiled = std::make_shared<const std::regex>(
+                        rule.domainPattern,
+                        std::regex::icase | std::regex::optimize);
+                } catch (const std::regex_error&) {
+                    return false;
+                } catch (...) {
+                    return false;
+                }
+                m_compiledRuleRegex.emplace(rule.ruleId, compiled);
+            }
+            try {
+                return std::regex_match(domain, *compiled);
+            } catch (...) {
+                return false;
+            }
+        }
+        return rule.Matches(domain);
+    }
+
     // Domain tracking for tunneling detection
     struct DomainTrackingInfo {
         std::deque<std::chrono::system_clock::time_point> queryTimes;
@@ -350,9 +495,14 @@ struct DNSMonitorImpl {
         analysis.domain = domain;
 
         try {
+            // Reject malformed input upstream of any size_t arithmetic.
+            if (!IsSyntacticDomain(domain)) {
+                return analysis;
+            }
+
             // Extract just the domain name (remove TLD)
             size_t lastDot = domain.find_last_of('.');
-            if (lastDot == std::string::npos) {
+            if (lastDot == std::string::npos || lastDot == 0) {
                 return analysis;  // Invalid domain
             }
 
@@ -406,11 +556,15 @@ struct DNSMonitorImpl {
             analysis.digitRatio = static_cast<double>(digits) / analysis.totalLength;
             analysis.hyphenRatio = static_cast<double>(hyphens) / analysis.totalLength;
 
-            // N-gram analysis (simplified - bigrams only)
+            // N-gram analysis (simplified - bigrams only).
+            // sld.length() >= DGA_MIN_LENGTH (8) here, but use signed-safe form
+            // defensively to avoid any future underflow if the gate changes.
             std::unordered_map<std::string, int> bigrams;
-            for (size_t i = 0; i < sld.length() - 1; i++) {
-                std::string bigram = sld.substr(i, 2);
-                bigrams[bigram]++;
+            if (sld.length() >= 2) {
+                for (size_t i = 0; i + 1 < sld.length(); ++i) {
+                    std::string bigram = sld.substr(i, 2);
+                    bigrams[bigram]++;
+                }
             }
 
             // Common English bigrams
@@ -461,7 +615,7 @@ struct DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA analysis failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+                               SanitizeNarrowToWideForLog(e.what()));
         }
 
         return analysis;
@@ -563,7 +717,7 @@ struct DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Tunneling analysis failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+                               SanitizeNarrowToWideForLog(e.what()));
         }
 
         return analysis;
@@ -608,13 +762,16 @@ struct DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Response validation failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+                               SanitizeNarrowToWideForLog(e.what()));
             return ValidationResult::ERROR;
         }
     }
 
     // Check filter rules
     [[nodiscard]] std::optional<DNSFilterRule> CheckFilterRules(const std::string& domain) {
+        if (!IsSyntacticDomain(domain)) return std::nullopt;
+        const std::string normalized = NormalizeDomain(domain);
+
         std::lock_guard<std::mutex> lock(m_rulesMutex);
 
         for (const auto& [id, rule] : m_filterRules) {
@@ -627,8 +784,8 @@ struct DNSMonitorImpl {
                 }
             }
 
-            // Check match
-            if (rule.Matches(domain)) {
+            // Check match (uses cached compiled regex for regex rules)
+            if (MatchRuleCached(rule, normalized)) {
                 return rule;
             }
         }
@@ -662,16 +819,25 @@ struct DNSMonitorImpl {
                     break;
             }
 
+            // Reject syntactically malformed domains. Silent drop avoids
+            // poisoning the tracking maps and the query history with
+            // attacker-shaped input (control bytes, oversized labels, etc.).
+            if (!IsSyntacticDomain(query.domain)) {
+                m_statistics.errorCount.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            const std::string normDomain = NormalizeDomain(query.domain);
+
             // Check filter rules
             if (m_config.enableFiltering) {
-                if (auto rule = CheckFilterRules(query.domain)) {
+                if (auto rule = CheckFilterRules(normDomain)) {
                     if (rule->action == DNSFilterAction::BLOCK ||
                         rule->action == DNSFilterAction::SINKHOLE) {
                         m_statistics.domainsBlocked.fetch_add(1, std::memory_order_relaxed);
                         rule->hitCount.fetch_add(1, std::memory_order_relaxed);
 
                         SS_LOG_WARN(L"Network", L"DNSMonitor: Blocked query to {} by rule {}",
-                                          Utils::StringUtils::ToWide(query.domain),
+                                          SanitizeDomainForLog(normDomain),
                                           rule->name);
 
                         // Invoke event callbacks
@@ -679,7 +845,7 @@ struct DNSMonitorImpl {
                         event.eventId = 0;
                         event.timestamp = std::chrono::system_clock::now();
                         event.type = DNSEvent::Type::BLOCKED;
-                        event.domain = query.domain;
+                        event.domain = normDomain;
                         event.pid = query.pid;
                         event.processName = query.processName;
                         event.details = *rule;
@@ -692,23 +858,23 @@ struct DNSMonitorImpl {
 
             // DGA detection
             if (m_config.detectDGA) {
-                auto dgaAnalysis = AnalyzeDGAInternal(query.domain);
+                auto dgaAnalysis = AnalyzeDGAInternal(normDomain);
                 if (dgaAnalysis.isDGA) {
                     m_statistics.dgaDetections.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_WARN(L"Network", L"DNSMonitor: DGA domain detected - {} (confidence: {:.2f})",
-                                      Utils::StringUtils::ToWide(query.domain),
+                                      SanitizeDomainForLog(normDomain),
                                       dgaAnalysis.confidence);
 
                     // Invoke DGA callbacks
-                    InvokeDGACallbacks(query.domain, dgaAnalysis);
+                    InvokeDGACallbacks(normDomain, dgaAnalysis);
 
                     // Invoke event callbacks
                     InvokeEventCallbacks(DNSEvent{
                         .eventId = 0,
                         .timestamp = std::chrono::system_clock::now(),
                         .type = DNSEvent::Type::DGA_DETECTED,
-                        .domain = query.domain,
+                        .domain = normDomain,
                         .pid = query.pid,
                         .processName = query.processName,
                         .details = dgaAnalysis
@@ -722,46 +888,61 @@ struct DNSMonitorImpl {
                 std::string subdomain;
 
                 // Extract base domain and subdomain for correlation
-                size_t lastDot = query.domain.find_last_of('.');
+                size_t lastDot = normDomain.find_last_of('.');
                 if (lastDot != std::string::npos && lastDot > 0) {
-                    size_t secondLastDot = query.domain.find_last_of('.', lastDot - 1);
+                    size_t secondLastDot = normDomain.find_last_of('.', lastDot - 1);
                     if (secondLastDot != std::string::npos) {
-                        baseDomain = query.domain.substr(secondLastDot + 1);
-                        subdomain = query.domain.substr(0, secondLastDot);
+                        baseDomain = normDomain.substr(secondLastDot + 1);
+                        subdomain = normDomain.substr(0, secondLastDot);
                     } else {
-                        baseDomain = query.domain;
+                        baseDomain = normDomain;
                     }
                 } else {
-                    baseDomain = query.domain;
+                    baseDomain = normDomain;
                 }
 
                 std::lock_guard<std::mutex> lock(m_trackingMutex);
-                auto& tracking = m_domainTracking[baseDomain];
-                tracking.queryTimes.push_back(std::chrono::system_clock::now());
-                tracking.queryLengths.push_back(query.domain.length());
 
-                // Track unique subdomains (capped to prevent memory exhaustion)
-                if (!subdomain.empty() &&
-                    tracking.uniqueSubdomains.size() < DomainTrackingInfo::MAX_UNIQUE_SUBDOMAINS) {
-                    tracking.uniqueSubdomains.insert(subdomain);
-                }
+                // DoS guard: bound the number of tracked base domains.
+                // If we are at capacity and the incoming domain is not
+                // already tracked, drop the tracking update rather than
+                // grow unboundedly. The cleanup thread reclaims stale
+                // entries on its 10-minute window.
+                auto trackingIt = m_domainTracking.find(baseDomain);
+                const bool atCap = (m_domainTracking.size() >= kMaxTrackedBaseDomains);
+                if (trackingIt != m_domainTracking.end() || !atCap) {
+                    if (trackingIt == m_domainTracking.end()) {
+                        trackingIt = m_domainTracking.emplace(baseDomain, DomainTrackingInfo{}).first;
+                    }
+                    auto& tracking = trackingIt->second;
+                    tracking.queryTimes.push_back(std::chrono::system_clock::now());
+                    tracking.queryLengths.push_back(normDomain.length());
 
-                if (query.recordType == DNSRecordType::TXT) {
-                    tracking.txtQueries++;
-                }
+                    // Track unique subdomains (capped to prevent memory exhaustion)
+                    if (!subdomain.empty() &&
+                        tracking.uniqueSubdomains.size() < DomainTrackingInfo::MAX_UNIQUE_SUBDOMAINS) {
+                        tracking.uniqueSubdomains.insert(subdomain);
+                    }
 
-                // Keep only last 1000 queries per domain
-                if (tracking.queryTimes.size() > 1000) {
-                    tracking.queryTimes.pop_front();
-                    tracking.queryLengths.pop_front();
+                    if (query.recordType == DNSRecordType::TXT) {
+                        tracking.txtQueries++;
+                    }
+
+                    // Keep only last 1000 queries per domain
+                    while (tracking.queryTimes.size() > 1000) {
+                        tracking.queryTimes.pop_front();
+                        tracking.queryLengths.pop_front();
+                    }
                 }
             }
 
-            // Add to query history
+            // Add to query history (use normalised form to keep the index stable)
             {
+                DNSQuery normalized = query;
+                normalized.domain = normDomain;
                 std::lock_guard<std::mutex> lock(m_historyMutex);
-                m_queryHistory.push_back(query);
-                if (m_queryHistory.size() > DNSConstants::MAX_QUERY_HISTORY) {
+                m_queryHistory.push_back(std::move(normalized));
+                while (m_queryHistory.size() > DNSConstants::MAX_QUERY_HISTORY) {
                     m_queryHistory.pop_front();
                 }
             }
@@ -786,7 +967,7 @@ struct DNSMonitorImpl {
         } catch (const std::exception& e) {
             m_statistics.errorCount.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Query processing failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+                               SanitizeNarrowToWideForLog(e.what()));
         }
     }
 
@@ -798,7 +979,7 @@ struct DNSMonitorImpl {
                 callback(query);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Query callback {} failed - {}",
-                                   id, Utils::StringUtils::ToWide(e.what()));
+                                   id, SanitizeNarrowToWideForLog(e.what()));
             }
         }
     }
@@ -810,7 +991,7 @@ struct DNSMonitorImpl {
                 callback(response);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Response callback {} failed - {}",
-                                   id, Utils::StringUtils::ToWide(e.what()));
+                                   id, SanitizeNarrowToWideForLog(e.what()));
             }
         }
     }
@@ -822,7 +1003,7 @@ struct DNSMonitorImpl {
                 callback(event);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Event callback {} failed - {}",
-                                   id, Utils::StringUtils::ToWide(e.what()));
+                                   id, SanitizeNarrowToWideForLog(e.what()));
             }
         }
     }
@@ -834,7 +1015,7 @@ struct DNSMonitorImpl {
                 callback(domain, analysis);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA callback {} failed - {}",
-                                   id, Utils::StringUtils::ToWide(e.what()));
+                                   id, SanitizeNarrowToWideForLog(e.what()));
             }
         }
     }
@@ -846,7 +1027,7 @@ struct DNSMonitorImpl {
                 callback(domain, analysis);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Tunneling callback {} failed - {}",
-                                   id, Utils::StringUtils::ToWide(e.what()));
+                                   id, SanitizeNarrowToWideForLog(e.what()));
             }
         }
     }
@@ -859,7 +1040,7 @@ struct DNSMonitorImpl {
                 callback(domain, expectedIp, actualIp);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Poisoning callback {} failed - {}",
-                                   id, Utils::StringUtils::ToWide(e.what()));
+                                   id, SanitizeNarrowToWideForLog(e.what()));
             }
         }
     }
@@ -891,7 +1072,7 @@ struct DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Monitor thread failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+                               SanitizeNarrowToWideForLog(e.what()));
             return 1;
         }
     }
@@ -933,7 +1114,7 @@ struct DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Cleanup failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+                               SanitizeNarrowToWideForLog(e.what()));
         }
     }
 
@@ -1015,7 +1196,7 @@ bool DNSMonitor::Initialize(const DNSMonitorConfig& config) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Initialization failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
         return false;
     }
 }
@@ -1065,7 +1246,7 @@ void DNSMonitor::Start() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Start failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
     }
 }
 
@@ -1082,7 +1263,7 @@ void DNSMonitor::Stop() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Stop failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
     }
 }
 
@@ -1141,7 +1322,7 @@ void DNSMonitor::Shutdown() noexcept {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Shutdown error - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
     }
 }
 
@@ -1187,7 +1368,7 @@ bool DNSMonitor::IsPoisoned(const std::string& domain, const std::string& ip) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Poisoning check failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
         return false;
     }
 }
@@ -1224,8 +1405,8 @@ bool DNSMonitor::CrossValidate(const std::string& domain,
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: CrossValidate failed for {} - {}",
-                            Utils::StringUtils::ToWide(domain),
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeDomainForLog(domain),
+                            SanitizeNarrowToWideForLog(e.what()));
         return false;
     }
 }
@@ -1320,8 +1501,8 @@ DomainReputation DNSMonitor::GetReputation(const std::string& domain) const {
         }
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Reputation lookup failed for {} - {}",
-                            Utils::StringUtils::ToWide(domain),
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeDomainForLog(domain),
+                            SanitizeNarrowToWideForLog(e.what()));
     }
 
     return reputation;
@@ -1342,7 +1523,39 @@ DomainCategory DNSMonitor::GetCategory(const std::string& domain) const {
 // ============================================================================
 
 uint64_t DNSMonitor::AddFilterRule(const DNSFilterRule& rule) {
+    // Cap the total number of filter rules to prevent unbounded growth
+    // from misconfiguration or hostile policy pushes.
     std::lock_guard<std::mutex> lock(m_impl->m_rulesMutex);
+
+    if (m_impl->m_filterRules.size() >= kMaxFilterRules) {
+        SS_LOG_WARN(L"Network",
+            L"DNSMonitor: Filter rule cap ({}) reached - rule rejected",
+            static_cast<uint64_t>(kMaxFilterRules));
+        return 0;
+    }
+
+    // Validate the pattern: regex rules must compile; non-regex rules must
+    // contain only safe characters (printable ASCII, no control bytes).
+    if (rule.isRegex) {
+        try {
+            std::regex test(rule.domainPattern,
+                std::regex::icase | std::regex::optimize);
+            (void)test;
+        } catch (const std::regex_error&) {
+            SS_LOG_WARN(L"Network",
+                L"DNSMonitor: Rejected invalid regex filter pattern");
+            return 0;
+        }
+    } else {
+        for (unsigned char c : rule.domainPattern) {
+            if (!IsLogSafeChar(c) && c != '*' && c != '.' && c != '-' &&
+                c != '_' && c != '?') {
+                SS_LOG_WARN(L"Network",
+                    L"DNSMonitor: Rejected non-printable filter pattern");
+                return 0;
+            }
+        }
+    }
 
     uint64_t ruleId = m_impl->m_nextRuleId.fetch_add(1, std::memory_order_relaxed);
     DNSFilterRule newRule = rule;
@@ -1352,7 +1565,7 @@ uint64_t DNSMonitor::AddFilterRule(const DNSFilterRule& rule) {
     m_impl->m_filterRules[newRule.priority * 1000000 + ruleId] = newRule;
 
     SS_LOG_INFO(L"Network", L"DNSMonitor: Filter rule added - ID: {}, Pattern: {}",
-                      ruleId, Utils::StringUtils::ToWide(rule.domainPattern));
+                      ruleId, SanitizeNarrowToWideForLog(rule.domainPattern));
 
     return ruleId;
 }
@@ -1363,6 +1576,9 @@ bool DNSMonitor::RemoveFilterRule(uint64_t ruleId) {
     for (auto it = m_impl->m_filterRules.begin(); it != m_impl->m_filterRules.end(); ++it) {
         if (it->second.ruleId == ruleId) {
             m_impl->m_filterRules.erase(it);
+            // Invalidate cached compiled regex for this rule so a future
+            // re-add with the same id cannot reuse a stale pattern.
+            m_impl->m_compiledRuleRegex.erase(ruleId);
             SS_LOG_INFO(L"Network", L"DNSMonitor: Filter rule removed - ID: {}", ruleId);
             return true;
         }
@@ -1372,44 +1588,57 @@ bool DNSMonitor::RemoveFilterRule(uint64_t ruleId) {
 }
 
 bool DNSMonitor::BlockDomain(const std::string& domain, std::wstring_view reason) {
+    if (!IsSyntacticDomain(domain)) return false;
+
     DNSFilterRule rule;
     rule.name = L"Auto-block";
     rule.description = reason.empty() ? L"Blocked domain" : std::wstring(reason);
-    rule.domainPattern = domain;
+    rule.domainPattern = NormalizeDomain(domain);
     rule.isRegex = false;
     rule.action = DNSFilterAction::BLOCK;
     rule.priority = 1;
 
-    AddFilterRule(rule);
-    return true;
+    return AddFilterRule(rule) != 0;
 }
 
 bool DNSMonitor::UnblockDomain(const std::string& domain) {
+    if (!IsSyntacticDomain(domain)) return false;
+    const std::string norm = NormalizeDomain(domain);
+
     std::lock_guard<std::mutex> lock(m_impl->m_rulesMutex);
 
+    bool any = false;
     for (auto it = m_impl->m_filterRules.begin(); it != m_impl->m_filterRules.end();) {
-        if (it->second.domainPattern == domain &&
+        if (it->second.domainPattern == norm &&
             it->second.action == DNSFilterAction::BLOCK) {
+            m_impl->m_compiledRuleRegex.erase(it->second.ruleId);
             it = m_impl->m_filterRules.erase(it);
+            any = true;
         } else {
             ++it;
         }
     }
 
-    return true;
+    return any;
 }
 
 bool DNSMonitor::SinkholeDomain(const std::string& domain, const std::string& sinkholeTo) {
+    if (!IsSyntacticDomain(domain)) return false;
+    // sinkholeTo is an IP/host; reject control bytes but otherwise pass through
+    for (unsigned char c : sinkholeTo) {
+        if (!IsLogSafeChar(c)) return false;
+    }
+
     DNSFilterRule rule;
     rule.name = L"Sinkhole";
     rule.description = L"Sinkholed domain";
-    rule.domainPattern = domain;
+    rule.domainPattern = NormalizeDomain(domain);
     rule.isRegex = false;
     rule.action = DNSFilterAction::SINKHOLE;
     rule.sinkholeTo = sinkholeTo;
     rule.priority = 1;
 
-    AddFilterRule(rule);
+    if (AddFilterRule(rule) == 0) return false;
     m_impl->m_statistics.domainsSinkholed.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -1428,10 +1657,13 @@ std::vector<DNSFilterRule> DNSMonitor::GetFilterRules() const {
 }
 
 bool DNSMonitor::IsBlocked(const std::string& domain) const {
+    if (!IsSyntacticDomain(domain)) return false;
+    const std::string norm = NormalizeDomain(domain);
+
     std::lock_guard<std::mutex> lock(m_impl->m_rulesMutex);
 
     for (const auto& [key, rule] : m_impl->m_filterRules) {
-        if (rule.isEnabled && rule.Matches(domain)) {
+        if (rule.isEnabled && m_impl->MatchRuleCached(rule, norm)) {
             if (rule.action == DNSFilterAction::BLOCK ||
                 rule.action == DNSFilterAction::SINKHOLE) {
                 return true;
@@ -1448,9 +1680,12 @@ bool DNSMonitor::IsBlocked(const std::string& domain) const {
 
 std::optional<DNSCacheEntry> DNSMonitor::QueryCache(const std::string& domain,
                                                      DNSRecordType recordType) const {
+    if (!IsSyntacticDomain(domain)) return std::nullopt;
+    const std::string norm = NormalizeDomain(domain);
+
     std::shared_lock<std::shared_mutex> lock(m_impl->m_cacheMutex);
 
-    DNSMonitorImpl::CacheKey key{domain, recordType};
+    DNSMonitorImpl::CacheKey key{norm, recordType};
     auto it = m_impl->m_cache.find(key);
 
     if (it != m_impl->m_cache.end()) {
@@ -1468,6 +1703,26 @@ std::optional<DNSCacheEntry> DNSMonitor::QueryCache(const std::string& domain,
 }
 
 void DNSMonitor::AddCacheEntry(const DNSCacheEntry& entry) {
+    if (!IsSyntacticDomain(entry.domain)) {
+        return;
+    }
+
+    // Clamp the TTL derived from cachedAt/expiresAt before persisting,
+    // so a hostile upstream cannot pin a poisoned record indefinitely
+    // or churn the cache with sub-second entries.
+    DNSCacheEntry safe = entry;
+    safe.domain = NormalizeDomain(entry.domain);
+
+    auto rawTtl = std::chrono::duration_cast<std::chrono::seconds>(
+        safe.expiresAt - safe.cachedAt).count();
+    const uint64_t rawTtlU = (rawTtl < 0) ? 0ULL : static_cast<uint64_t>(rawTtl);
+    const uint32_t saturated = (rawTtlU > static_cast<uint64_t>(kMaxCacheTtlSec))
+        ? kMaxCacheTtlSec
+        : static_cast<uint32_t>(rawTtlU);
+    const uint32_t clamped = ClampTtlSec(saturated);
+    safe.ttl = clamped;
+    safe.expiresAt = safe.cachedAt + std::chrono::seconds(clamped);
+
     std::unique_lock<std::shared_mutex> lock(m_impl->m_cacheMutex);
 
     if (m_impl->m_cache.size() >= m_impl->m_config.maxCacheEntries) {
@@ -1481,8 +1736,8 @@ void DNSMonitor::AddCacheEntry(const DNSCacheEntry& entry) {
         m_impl->m_cache.erase(oldest);
     }
 
-    DNSMonitorImpl::CacheKey key{entry.domain, entry.recordType};
-    m_impl->m_cache[key] = entry;
+    DNSMonitorImpl::CacheKey key{safe.domain, safe.recordType};
+    m_impl->m_cache[key] = safe;
 
     m_impl->m_statistics.cacheSize.store(
         static_cast<uint32_t>(m_impl->m_cache.size()),
@@ -1491,10 +1746,13 @@ void DNSMonitor::AddCacheEntry(const DNSCacheEntry& entry) {
 }
 
 void DNSMonitor::InvalidateCache(const std::string& domain) {
+    if (!IsSyntacticDomain(domain)) return;
+    const std::string norm = NormalizeDomain(domain);
+
     std::unique_lock<std::shared_mutex> lock(m_impl->m_cacheMutex);
 
     for (auto it = m_impl->m_cache.begin(); it != m_impl->m_cache.end();) {
-        if (it->first.domain == domain) {
+        if (it->first.domain == norm) {
             it = m_impl->m_cache.erase(it);
         } else {
             ++it;
@@ -1683,7 +1941,7 @@ bool DNSMonitor::PerformDiagnostics() const {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Diagnostics failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
         return false;
     }
 }
@@ -1753,7 +2011,7 @@ bool DNSMonitor::SelfTest() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Self-test failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+                            SanitizeNarrowToWideForLog(e.what()));
         return false;
     }
 }
