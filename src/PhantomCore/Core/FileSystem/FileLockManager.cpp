@@ -89,26 +89,15 @@ namespace {
     constexpr const wchar_t* SHADOWSTRIKE_FILTER_PORT = L"\\ShadowStrikePort";
 
     constexpr std::wstring_view CRITICAL_PROC_NAMES[] = {
-        L"csrss.exe", L"smss.exe", L"wininit.exe", L"services.exe",
-        L"lsass.exe", L"winlogon.exe", L"system", L"dwm.exe"
-    };
-
-    constexpr std::wstring_view SYSTEM_PROC_NAMES[] = {
-        L"svchost.exe", L"explorer.exe", L"conhost.exe",
-        L"runtimebroker.exe", L"taskhostw.exe"
+        L"system", L"csrss.exe", L"smss.exe", L"wininit.exe", L"services.exe",
+        L"lsass.exe", L"svchost.exe", L"winlogon.exe", L"explorer.exe",
+        L"dwm.exe"
     };
 
     [[nodiscard]] bool IsCriticalProcessName(std::wstring_view name) noexcept {
         std::wstring lower(name);
         std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
         for (const auto& c : CRITICAL_PROC_NAMES) { if (lower == c) return true; }
-        return false;
-    }
-
-    [[nodiscard]] bool IsSystemProcessName(std::wstring_view name) noexcept {
-        std::wstring lower(name);
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-        for (const auto& s : SYSTEM_PROC_NAMES) { if (lower == s) return true; }
         return false;
     }
 
@@ -331,9 +320,21 @@ public:
     [[nodiscard]] bool IsFileLocked(const std::wstring& filePath) const {
         if (filePath.empty()) return false;
         try {
-            ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            // Use a low-impact probe: shared read-only open with broad share modes.
+            // If the open succeeds, no exclusive lock is held; close immediately.
+            // Otherwise, only ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+            // indicate a real lock — ERROR_ACCESS_DENIED on read-only system
+            // files must NOT be reported as locked (false positive).
+            ScopedHandle hFile(CreateFileW(
+                filePath.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+                nullptr));
             if (hFile.IsValid()) return false;
-            DWORD err = GetLastError();
+            const DWORD err = GetLastError();
             return (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION);
         } catch (...) { return false; }
     }
@@ -494,7 +495,19 @@ public:
             ScopedHandle hProcess(OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner.pid));
             if (!hProcess) return false;
 
-            // PID recycling guard: verify process creation time hasn't changed
+            // PID-recycling defense in depth: cross-check that the handle we
+            // opened still references a process with the same numeric PID
+            // (kernel may have torn down the EPROCESS between
+            //  enumeration and OpenProcess) and that the process has not
+            // already exited.
+            const DWORD verifiedPid = ::GetProcessId(hProcess.Get());
+            if (verifiedPid == 0 || verifiedPid != owner.pid) {
+                SS_LOG_DEBUG(L"FileLockManager",
+                    L"PID %u recycled (resolved=%u), refusing handle close",
+                    owner.pid, verifiedPid);
+                return false;
+            }
+
             FILETIME createTime{}, exitTime{}, kernelTime{}, userTime{};
             if (GetProcessTimes(hProcess.Get(), &createTime, &exitTime, &kernelTime, &userTime)) {
                 if (exitTime.dwLowDateTime != 0 || exitTime.dwHighDateTime != 0) {
@@ -523,11 +536,28 @@ public:
                 { std::lock_guard lk(m_callbackMutex); cb = m_terminateCallback; }
                 if (cb && !force && !cb(owner)) return false;
             }
-            ScopedHandle hProcess(OpenProcess(PROCESS_TERMINATE, FALSE, owner.pid));
+            ScopedHandle hProcess(OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, owner.pid));
             if (!hProcess) return false;
+
+            // PID-recycling defense: ensure this is still the PID we asked for
+            // before issuing TerminateProcess (avoid killing an unrelated
+            // newly-spawned process in the rare-but-possible recycling race).
+            const DWORD verifiedPid = ::GetProcessId(hProcess.Get());
+            if (verifiedPid == 0 || verifiedPid != owner.pid) {
+                SS_LOG_WARN(L"FileLockManager",
+                    L"PID %u recycled (resolved=%u), refusing TerminateProcess",
+                    owner.pid, verifiedPid);
+                return false;
+            }
+
             if (::TerminateProcess(hProcess.Get(), 1)) {
                 m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
                 SS_LOG_WARN(L"FileLockManager", L"Terminated PID %u (%s)", owner.pid, owner.processName.c_str());
+
+                // TerminateProcess is asynchronous. Wait briefly for actual
+                // teardown so the caller's IsFileLocked re-probe is not racing
+                // with handle cleanup. Bounded wait — never block forever.
+                ::WaitForSingleObject(hProcess.Get(), 1000);
                 return true;
             }
             return false;
@@ -620,12 +650,28 @@ public:
             std::lock_guard kernelLock(m_kernelMutex);
             if (!m_kernelDriverAvailable || !m_kernelPortConnected) { if (!ConnectToKernelDriverInternalLocked()) return false; }
             KernelProtocol::ForceCloseRequest req{};
+
+            // The kernel protocol carries paths in a fixed-size wchar_t buffer
+            // (req.filePath). Silently truncating the path would cause the
+            // driver to act on the wrong file — a critical correctness and
+            // safety bug for force-close. Reject paths that don't fit.
+            const size_t maxChars = _countof(req.filePath) - 1; // reserve NUL
+            if (filePath.length() > maxChars) {
+                SS_LOG_ERROR(L"FileLockManager",
+                    L"Kernel unlock rejected: path length %zu exceeds protocol limit %zu",
+                    filePath.length(), maxChars);
+                return false;
+            }
+
             req.header.command = static_cast<uint32_t>(KernelProtocol::Command::ForceCloseHandle);
             req.header.dataLength = sizeof(req) - sizeof(req.header);
             req.targetPid = 0;    // 0 signals kernel to close all process handles for this file
             req.handleValue = 0;  // 0 signals kernel to close all handles (not a specific one)
-            size_t pl = std::min(filePath.length(), static_cast<size_t>(_countof(req.filePath) - 1));
-            wcsncpy_s(req.filePath, filePath.c_str(), pl);
+            if (wcsncpy_s(req.filePath, _countof(req.filePath),
+                          filePath.c_str(), filePath.length()) != 0) {
+                SS_LOG_ERROR(L"FileLockManager", L"wcsncpy_s failed encoding kernel request");
+                return false;
+            }
             KernelProtocol::ForceCloseResponse resp{}; DWORD bytesRet = 0;
             HRESULT hr = FilterSendMessage(m_kernelPort, &req, sizeof(req), &resp, sizeof(resp), &bytesRet);
             if (SUCCEEDED(hr) && bytesRet >= sizeof(resp) && resp.header.status == 0) {
@@ -715,13 +761,41 @@ public:
     uint8_t ResolveFileObjectTypeIndex() const noexcept {
         try {
             if (!m_ntQuerySystemInfo) return 0;
-            ScopedHandle h(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
-            if (!h) return 0;
+
+            // Probe the ObjectTypeIndex used by FILE_TYPE_DISK objects. The
+            // legacy NUL device is FILE_TYPE_CHAR — its ObjectTypeIndex is the
+            // same "File" type on supported Windows kernels, but to be robust
+            // against future kernel changes (and to be consistent with the
+            // FILE_TYPE_DISK filter applied during enumeration) we probe a
+            // real on-disk file under %TEMP%.
+            wchar_t tempDir[MAX_PATH] = { 0 };
+            DWORD tdLen = ::GetTempPathW(MAX_PATH, tempDir);
+            if (tdLen == 0 || tdLen >= MAX_PATH) return 0;
+
+            wchar_t tempFile[MAX_PATH] = { 0 };
+            if (::GetTempFileNameW(tempDir, L"SSL", 0, tempFile) == 0) return 0;
+
+            ScopedHandle h(CreateFileW(
+                tempFile,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                nullptr));
+            if (!h) {
+                ::DeleteFileW(tempFile);
+                return 0;
+            }
+
             DWORD myPid = GetCurrentProcessId();
-            ULONG bufSize = 1 << 20; auto buf = std::make_unique<uint8_t[]>(bufSize);
+            ULONG bufSize = 1u << 20;
+            auto buf = std::make_unique<uint8_t[]>(bufSize);
             NTSTATUS st = m_ntQuerySystemInfo(SystemExtendedHandleInformationClass, buf.get(), bufSize, nullptr);
             while (st == NT_STATUS_INFO_LEN_MISMATCH && bufSize < MAX_HANDLE_BUFFER_BYTES) {
-                bufSize *= 2; buf = std::make_unique<uint8_t[]>(bufSize);
+                if (bufSize > MAX_HANDLE_BUFFER_BYTES / 2) break; // overflow guard before *2
+                bufSize *= 2;
+                buf = std::make_unique<uint8_t[]>(bufSize);
                 st = m_ntQuerySystemInfo(SystemExtendedHandleInformationClass, buf.get(), bufSize, nullptr);
             }
             if (st < 0) return 0;
@@ -806,7 +880,7 @@ public:
                 const auto& entry = sysInfo->Handles[i];
                 if (m_fileTypeIndex != 0 && entry.ObjectTypeIndex != m_fileTypeIndex) continue;
                 auto handlePid = static_cast<DWORD>(entry.UniqueProcessId);
-                if (handlePid == myPid || handlePid == 0 || handlePid == 4) continue;
+                if (handlePid == myPid || handlePid == IDLE_PID || handlePid == SYSTEM_PID) continue;
                 if (foundPids.count(handlePid) && !(entry.GrantedAccess & (FILE_WRITE_DATA | DELETE))) continue;
 
                 auto cacheIt = processCache.find(entry.UniqueProcessId);
@@ -864,13 +938,10 @@ public:
     }
 
     static bool IsCriticalProcessName(const std::wstring& name) noexcept {
-        static const std::unordered_set<std::wstring> critical = {
-            L"system", L"csrss.exe", L"smss.exe", L"wininit.exe", L"services.exe",
-            L"lsass.exe", L"svchost.exe", L"winlogon.exe", L"explorer.exe"
-        };
-        std::wstring lower; lower.reserve(name.size());
-        for (wchar_t c : name) lower += static_cast<wchar_t>(::towlower(c));
-        return critical.count(lower) > 0;
+        // Delegate to the canonical anon-namespace helper so the critical-process
+        // list exists in exactly one place (CRITICAL_PROC_NAMES). Keeping two
+        // diverging lists has caused inconsistent protection behaviour.
+        return ShadowStrike::Core::FileSystem::IsCriticalProcessName(std::wstring_view{ name });
     }
 
     void AnalyzeProcessTrust(LockOwner& owner) const {
@@ -898,8 +969,17 @@ public:
 
     bool DetectProcessInjection(DWORD pid) const {
         try {
-            ScopedHandle hProc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
-            if (!hProc) return false;
+            // Drop PROCESS_VM_READ — VirtualQueryEx only requires
+            // PROCESS_QUERY_INFORMATION (or PROCESS_QUERY_LIMITED_INFORMATION
+            // on Windows 8.1+). Asking for VM_READ unnecessarily escalates the
+            // required privilege and increases AV/EDR noise.
+            ScopedHandle hProc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+            if (!hProc) {
+                // Fall back to the broader access mask only if the limited
+                // variant is unavailable (e.g., very old Windows builds).
+                hProc.Reset(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+                if (!hProc) return false;
+            }
             MEMORY_BASIC_INFORMATION mbi{}; uint8_t* addr = nullptr;
             uint32_t suspiciousCount = 0;
             constexpr uint32_t SUSPICIOUS_THRESHOLD = 3;
@@ -987,7 +1067,7 @@ public:
         bool any = false;
         for (const auto& o : owners) {
             if (o.isCriticalProcess && m_config.protectCriticalProcesses) continue;
-            if (o.handleValue != 0) { LockOwner copy = o; if (CloseHandleOp(copy)) any = true; }
+            if (o.handleValue != 0 && CloseHandleOp(o)) any = true;
         }
         if (!any) result.errors.push_back("Handle close: no handles closed");
         return any;
@@ -998,7 +1078,7 @@ public:
         for (const auto& o : owners) {
             if (o.isCriticalProcess && m_config.protectCriticalProcesses) continue;
             if (o.isSystemProcess && m_config.protectSystemProcesses) continue;
-            LockOwner copy = o; if (TerminateProcessOp(copy, false)) any = true;
+            if (TerminateProcessOp(o, false)) any = true;
         }
         if (!any) result.errors.push_back("Process termination: none terminated");
         return any;
