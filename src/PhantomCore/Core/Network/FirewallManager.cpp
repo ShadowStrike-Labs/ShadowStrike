@@ -234,6 +234,66 @@ namespace {
     return output;
 }
 
+/**
+ * @brief Strip control characters from operator/admin-supplied strings before
+ *        embedding them in log messages.
+ *
+ * Lockdown reasons, country codes, IP strings, and rule names may originate
+ * from network input or external policy files. Treating them as trusted in
+ * log lines invites CRLF log-injection (CWE-117) and breaks downstream SIEM
+ * parsers. The function is noexcept so it is safe inside catch blocks.
+ */
+[[nodiscard]] std::wstring SanitizeWideForLog(std::wstring_view input,
+                                              size_t maxLen = 256) noexcept {
+    std::wstring out;
+    const size_t n = (input.size() < maxLen) ? input.size() : maxLen;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const wchar_t c = input[i];
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    if (input.size() > maxLen) {
+        out.append(L"...");
+    }
+    return out;
+}
+
+[[nodiscard]] std::string SanitizeNarrowForLog(std::string_view input,
+                                               size_t maxLen = 256) noexcept {
+    std::string out;
+    const size_t n = (input.size() < maxLen) ? input.size() : maxLen;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(input[i]);
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    if (input.size() > maxLen) {
+        out.append("...");
+    }
+    return out;
+}
+
+/**
+ * @brief Build a CIDR netmask in HOST byte order with overflow safety.
+ *
+ * Returns a 32-bit mask covering the high `prefixLength` bits. Handles
+ * prefix=0 (mask=0) and prefix=32 (mask=0xFFFFFFFF) without invoking the
+ * undefined `1u << 32` shift that the previous expression triggered.
+ */
+[[nodiscard]] constexpr uint32_t IPv4PrefixMaskHostOrder(uint8_t prefixLength) noexcept {
+    if (prefixLength == 0)  return 0u;
+    if (prefixLength >= 32) return 0xFFFFFFFFu;
+    return static_cast<uint32_t>(0xFFFFFFFFu << (32u - prefixLength));
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -650,6 +710,13 @@ public:
     // Lockdown rules (separate from stealth)
     std::vector<uint64_t> m_lockdownRuleIds;
 
+    // Auxiliary WFP filter IDs that don't fit FirewallRule::wfpFilterId{,6}.
+    // Required for BOTH-direction rules (which need both ALE_AUTH_CONNECT and
+    // ALE_AUTH_RECV_ACCEPT filters) and for IPv6 BOTH-direction rules.
+    // Without this, the secondary filter is leaked at rule-removal time.
+    // Guarded by m_wfpMutex (same as the rest of the WFP-handle state).
+    std::unordered_map<uint64_t, std::vector<UINT64>> m_extraFilterIds;
+
     // ========================================================================
     // CONSTRUCTOR / DESTRUCTOR
     // ========================================================================
@@ -986,6 +1053,12 @@ public:
             return false;
         }
 
+        // Snapshot the current rule (with its filter IDs) so we can attempt a
+        // best-effort rollback if WFP refuses the new shape. Without this, a
+        // failed AddRuleToWFP leaves the rule with no kernel filter at all
+        // while the in-memory record still claims it is enabled.
+        FirewallRule previousRule = it->second;
+
         // Remove old WFP filter
         if (m_running.load(std::memory_order_acquire)) {
             RemoveRuleFromWFP(it->second);
@@ -996,11 +1069,29 @@ public:
         updatedRule.ruleId = ruleId;
         updatedRule.createdAt = it->second.createdAt;
         updatedRule.modifiedAt = system_clock::now();
+        updatedRule.wfpFilterId = 0;
+        updatedRule.wfpFilterId6 = 0;
 
         // Add new WFP filter
         if (m_running.load(std::memory_order_acquire)) {
             if (!AddRuleToWFP(updatedRule)) {
-                SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to update rule in WFP");
+                SS_LOG_ERROR(L"Network",
+                    L"FirewallManager: Failed to install updated rule {} into WFP; "
+                    L"attempting rollback to previous rule definition", ruleId);
+
+                // Best-effort rollback: previousRule still carries its old
+                // wfpFilterId/wfpFilterId6 fields, but those filters were just
+                // deleted by RemoveRuleFromWFP. Reset them and re-add.
+                previousRule.wfpFilterId = 0;
+                previousRule.wfpFilterId6 = 0;
+                if (!AddRuleToWFP(previousRule)) {
+                    SS_LOG_ERROR(L"Network",
+                        L"FirewallManager: Rollback also failed for rule {}; "
+                        L"rule will remain in-memory but is no longer enforced",
+                        ruleId);
+                } else {
+                    it->second = previousRule;
+                }
                 return false;
             }
         }
@@ -1098,8 +1189,7 @@ public:
                     cond.conditionValue.type = FWP_V4_ADDR_MASK;
                     std::memcpy(&addrMask.addr, rule.remoteAddress.address.data(), 4);
                     addrMask.addr = ntohl(addrMask.addr);
-                    addrMask.mask = rule.remoteAddress.prefixLength >= 32 ? 0xFFFFFFFF :
-                        ~((1u << (32 - rule.remoteAddress.prefixLength)) - 1);
+                    addrMask.mask = IPv4PrefixMaskHostOrder(rule.remoteAddress.prefixLength);
                     cond.conditionValue.v4AddrMask = &addrMask;
                     conditions.push_back(cond);
                 }
@@ -1186,14 +1276,23 @@ public:
                 rule.wfpFilterId = filterId;
                 m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
 
-                // Also add inbound filter if direction is BOTH
+                // Also add inbound filter if direction is BOTH. The second
+                // filter ID does not fit in FirewallRule::wfpFilterId, so we
+                // record it in m_extraFilterIds keyed by ruleId so it can be
+                // deleted in RemoveRuleFromWFP.
                 if (rule.direction == RuleDirection::BOTH) {
                     filter.layerKey = FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4;
                     UINT64 filterId2 = 0;
                     DWORD addResult2 = FwpmFilterAdd0(
                         m_wfpEngineHandle, &filter, nullptr, &filterId2);
                     if (addResult2 == ERROR_SUCCESS) {
+                        m_extraFilterIds[rule.ruleId].push_back(filterId2);
                         m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        SS_LOG_WARN(L"Network",
+                            L"FirewallManager: Inbound BOTH-direction IPv4 filter add failed for rule {}: {}",
+                            rule.ruleId, addResult2);
+                        m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }
@@ -1236,6 +1335,23 @@ public:
                 if (addResult6 == ERROR_SUCCESS) {
                     rule.wfpFilterId6 = filterId6;
                     m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+
+                    // BOTH direction also needs an inbound IPv6 filter.
+                    if (rule.direction == RuleDirection::BOTH) {
+                        filter6.layerKey = FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
+                        UINT64 filterId6Inbound = 0;
+                        DWORD addResult6In = FwpmFilterAdd0(
+                            m_wfpEngineHandle, &filter6, nullptr, &filterId6Inbound);
+                        if (addResult6In == ERROR_SUCCESS) {
+                            m_extraFilterIds[rule.ruleId].push_back(filterId6Inbound);
+                            m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            SS_LOG_WARN(L"Network",
+                                L"FirewallManager: Inbound BOTH-direction IPv6 filter add failed for rule {}: {}",
+                                rule.ruleId, addResult6In);
+                            m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
                 } else {
                     SS_LOG_WARN(L"Network",
                         L"FirewallManager: IPv6 filter add failed for rule {}: {}",
@@ -1281,6 +1397,28 @@ public:
                 if (result6 == ERROR_SUCCESS || result6 == FWP_E_FILTER_NOT_FOUND) {
                     m_stats.wfpFilterCount.fetch_sub(1, std::memory_order_relaxed);
                 }
+            }
+
+            // Remove any auxiliary filter IDs (BOTH-direction inbound, IPv6
+            // inbound, etc.) that don't fit in FirewallRule's two filter-ID
+            // slots. Erase the bookkeeping entry afterwards.
+            auto extraIt = m_extraFilterIds.find(rule.ruleId);
+            if (extraIt != m_extraFilterIds.end()) {
+                for (UINT64 extraId : extraIt->second) {
+                    if (extraId == 0) {
+                        continue;
+                    }
+                    DWORD r = FwpmFilterDeleteById0(m_wfpEngineHandle, extraId);
+                    if (r == ERROR_SUCCESS || r == FWP_E_FILTER_NOT_FOUND) {
+                        m_stats.wfpFilterCount.fetch_sub(1, std::memory_order_relaxed);
+                    } else {
+                        SS_LOG_WARN(L"Network",
+                            L"FirewallManager: FwpmFilterDeleteById0 failed for auxiliary filter of rule {}: {}",
+                            rule.ruleId, r);
+                        m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                m_extraFilterIds.erase(extraIt);
             }
 
         } catch (const std::exception& e) {
@@ -1370,22 +1508,30 @@ public:
     }
 
     bool UnblockIPImpl(const std::wstring& ip) {
+        // Parse the IP once outside the loop — ParseIPAddress is non-trivial
+        // (delegates to inet_pton + canonicalisation) and the input does not
+        // change between iterations.
+        bool isIPv6 = false;
+        auto parsedIP = ParseIPAddress(ip, isIPv6);
+        if (!parsedIP) {
+            SS_LOG_WARN(L"Network",
+                L"FirewallManager: UnblockIP rejected invalid IP '{}'",
+                SanitizeWideForLog(ip));
+            return false;
+        }
+
         std::unique_lock lock(m_rulesMutex);
 
         std::vector<uint64_t> toRemove;
 
         for (const auto& [id, rule] : m_rules) {
             if (rule.type == RuleType::IP &&
-                rule.remoteAddress.type == IPAddressMatch::Type::SINGLE) {
-
-                bool isIPv6 = false;
-                auto parsedIP = ParseIPAddress(ip, isIPv6);
-
-                if (parsedIP && std::equal(rule.remoteAddress.address.begin(),
-                                          rule.remoteAddress.address.end(),
-                                          parsedIP->begin())) {
-                    toRemove.push_back(id);
-                }
+                rule.remoteAddress.type == IPAddressMatch::Type::SINGLE &&
+                rule.remoteAddress.isIPv6 == isIPv6 &&
+                std::equal(rule.remoteAddress.address.begin(),
+                           rule.remoteAddress.address.end(),
+                           parsedIP->begin())) {
+                toRemove.push_back(id);
             }
         }
 
@@ -1435,20 +1581,53 @@ public:
     // ========================================================================
 
     bool BlockCountryImpl(const std::string& countryCode, RuleDirection direction) {
+        // ISO 3166-1 alpha-2: exactly two ASCII letters. Reject anything else
+        // before persisting it — both as a defence against log/SIEM injection
+        // and to keep m_blockedCountries from growing unbounded under hostile
+        // policy input.
+        if (countryCode.size() != 2 ||
+            !std::isalpha(static_cast<unsigned char>(countryCode[0])) ||
+            !std::isalpha(static_cast<unsigned char>(countryCode[1]))) {
+            SS_LOG_WARN(L"Network",
+                L"FirewallManager: BlockCountry rejected invalid code '{}'",
+                Utils::StringUtils::ToWide(SanitizeNarrowForLog(countryCode, 16)));
+            return false;
+        }
+
+        // Normalize to upper-case so lookups are deterministic.
+        std::string normalized;
+        normalized.reserve(2);
+        normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(countryCode[0]))));
+        normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(countryCode[1]))));
+
         std::unique_lock lock(m_geoMutex);
+        m_blockedCountries[normalized] = true;
 
-        m_blockedCountries[countryCode] = true;
-
-        SS_LOG_INFO(L"Network", L"FirewallManager: Country {} blocked", countryCode);
+        SS_LOG_INFO(L"Network", L"FirewallManager: Country {} blocked, direction={}",
+            Utils::StringUtils::ToWide(normalized), static_cast<int>(direction));
         return true;
     }
 
     bool UnblockCountryImpl(const std::string& countryCode) {
-        std::unique_lock lock(m_geoMutex);
+        if (countryCode.size() != 2 ||
+            !std::isalpha(static_cast<unsigned char>(countryCode[0])) ||
+            !std::isalpha(static_cast<unsigned char>(countryCode[1]))) {
+            SS_LOG_WARN(L"Network",
+                L"FirewallManager: UnblockCountry rejected invalid code '{}'",
+                Utils::StringUtils::ToWide(SanitizeNarrowForLog(countryCode, 16)));
+            return false;
+        }
 
-        auto removed = m_blockedCountries.erase(countryCode) > 0;
+        std::string normalized;
+        normalized.reserve(2);
+        normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(countryCode[0]))));
+        normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(countryCode[1]))));
+
+        std::unique_lock lock(m_geoMutex);
+        auto removed = m_blockedCountries.erase(normalized) > 0;
         if (removed) {
-            SS_LOG_INFO(L"Network", L"FirewallManager: Country {} unblocked", countryCode);
+            SS_LOG_INFO(L"Network", L"FirewallManager: Country {} unblocked",
+                Utils::StringUtils::ToWide(normalized));
         }
 
         return removed;
@@ -1571,14 +1750,20 @@ public:
             return true;
         }
 
+        // Operator/automation-supplied reason text may contain control
+        // characters or excessive length. Sanitize for logs and cap before
+        // embedding into rule descriptions to avoid CWE-117 and to keep
+        // FirewallRule::description bounded.
+        const std::wstring sanitizedReason = SanitizeWideForLog(reason, 256);
+
         try {
             SS_LOG_WARN(L"Network", L"FirewallManager: EMERGENCY LOCKDOWN ACTIVATED - Reason: {}",
-                std::wstring(reason));
+                sanitizedReason);
 
             // Create lockdown rule blocking ALL outbound traffic
             FirewallRule lockdownOutbound;
             lockdownOutbound.name = L"EMERGENCY LOCKDOWN - OUTBOUND";
-            lockdownOutbound.description = std::format(L"Emergency lockdown: {}", reason);
+            lockdownOutbound.description = std::format(L"Emergency lockdown: {}", sanitizedReason);
             lockdownOutbound.type = RuleType::COMBINED;
             lockdownOutbound.action = RuleAction::BLOCK;
             lockdownOutbound.direction = RuleDirection::OUTBOUND;
@@ -1596,7 +1781,7 @@ public:
             // Also block ALL inbound traffic
             FirewallRule lockdownInbound;
             lockdownInbound.name = L"EMERGENCY LOCKDOWN - INBOUND";
-            lockdownInbound.description = std::format(L"Emergency lockdown: {}", reason);
+            lockdownInbound.description = std::format(L"Emergency lockdown: {}", sanitizedReason);
             lockdownInbound.type = RuleType::COMBINED;
             lockdownInbound.action = RuleAction::BLOCK;
             lockdownInbound.direction = RuleDirection::INBOUND;
@@ -2264,14 +2449,41 @@ bool FirewallManager::UnblockCountry(const std::string& countryCode) {
 void FirewallManager::SetAllowedCountries(const std::vector<std::string>& countryCodes) {
     if (!m_impl) return;
 
-    std::unique_lock lock(m_impl->m_geoMutex);
+    // Validate and normalize ISO 3166-1 alpha-2 codes. An empty list is
+    // legitimate (it disables the allow-list mode). A list with malformed
+    // entries is rejected entirely so the caller does not silently end up
+    // with a partially-applied policy.
+    std::vector<std::string> normalized;
+    normalized.reserve(countryCodes.size());
+    for (const auto& code : countryCodes) {
+        if (code.size() != 2 ||
+            !std::isalpha(static_cast<unsigned char>(code[0])) ||
+            !std::isalpha(static_cast<unsigned char>(code[1]))) {
+            SS_LOG_ERROR(L"Network",
+                L"FirewallManager: SetAllowedCountries rejected — invalid country code in list");
+            return;
+        }
+        std::string up;
+        up.reserve(2);
+        up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(code[0]))));
+        up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(code[1]))));
+        normalized.push_back(std::move(up));
+    }
 
-    m_impl->m_blockedCountries.clear();
+    {
+        std::unique_lock cfgLock(m_impl->m_configMutex);
+        m_impl->m_config.allowedCountries = normalized;
+    }
+    {
+        // Allow-list mode supersedes the explicit blocked set; clear it so
+        // GetBlockedCountries does not return stale entries.
+        std::unique_lock geoLock(m_impl->m_geoMutex);
+        m_impl->m_blockedCountries.clear();
+    }
 
-    // In allow-list mode, all countries not in the list are blocked
-    // This would need proper implementation with geo-IP database
-
-    SS_LOG_INFO(L"Network", L"FirewallManager: Allowed countries set");
+    SS_LOG_INFO(L"Network",
+        L"FirewallManager: Allowed countries set ({} entries)",
+        normalized.size());
 }
 
 void FirewallManager::ClearGeoRestrictions() {
@@ -2499,11 +2711,17 @@ uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) 
 
     if (!m_impl) return 0;
 
+    // Reject obviously hostile inputs before invoking the JSON loader.
+    if (filePath.empty() || filePath.size() > 32767) {  // Win32 MAX_PATH ext.
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Import rejected — invalid file path length");
+        return 0;
+    }
+
     JSON::Json root;
     JSON::Error parseErr;
     if (!JSON::LoadFromFile(filePath, root, &parseErr)) {
         SS_LOG_ERROR(L"Network", L"FirewallManager: Import JSON parse failed: {}",
-            parseErr.message);
+            Utils::StringUtils::ToWide(SanitizeNarrowForLog(parseErr.message)));
         return 0;
     }
 
@@ -2519,14 +2737,34 @@ uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) 
         return 0;
     }
 
+    // Cap the number of rules accepted from a single import to avoid an
+    // attacker-controlled file driving rule-table growth past m_config.maxRules
+    // (AddRuleImpl will reject anyway, but we want a clear, bounded loop).
+    constexpr size_t kImportRuleHardCap = 65536;
+    if (rulesArray.size() > kImportRuleHardCap) {
+        SS_LOG_ERROR(L"Network",
+            L"FirewallManager: Import rejected — rules array size {} exceeds cap {}",
+            rulesArray.size(), kImportRuleHardCap);
+        return 0;
+    }
+
     uint32_t imported = 0;
+    uint32_t skipped = 0;
     for (const auto& entry : rulesArray) {
         try {
             FirewallRule rule;
             std::string name;
-            if (JSON::Get<std::string>(entry, "name", name)) {
-                rule.name = Utils::StringUtils::ToWide(name);
+            if (!JSON::Get<std::string>(entry, "name", name) || name.empty()) {
+                ++skipped;
+                continue;
             }
+            // Cap rule name length defensively before passing through ToWide
+            // and the rule validator.
+            if (name.size() > FirewallConstants::MAX_RULE_NAME_LENGTH) {
+                name.resize(FirewallConstants::MAX_RULE_NAME_LENGTH);
+            }
+            rule.name = Utils::StringUtils::ToWide(name);
+
             bool enabled = true;
             JSON::Get<bool>(entry, "enabled", enabled);
             rule.isEnabled = enabled;
@@ -2534,15 +2772,20 @@ uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) 
             uint64_t ruleId = m_impl->AddRuleImpl(rule);
             if (ruleId != 0) {
                 ++imported;
+            } else {
+                ++skipped;
             }
         }
         catch (const std::exception& e) {
-            SS_LOG_WARN(L"Network", L"FirewallManager: Skipped malformed rule: {}", e.what());
+            SS_LOG_WARN(L"Network", L"FirewallManager: Skipped malformed rule: {}",
+                Utils::StringUtils::ToWide(SanitizeNarrowForLog(e.what())));
+            ++skipped;
         }
     }
 
-    SS_LOG_INFO(L"Network", L"FirewallManager: Imported {} rules from {}",
-        imported, filePath);
+    SS_LOG_INFO(L"Network",
+        L"FirewallManager: Imported {} rules ({} skipped) from file",
+        imported, skipped);
     return imported;
 }
 
