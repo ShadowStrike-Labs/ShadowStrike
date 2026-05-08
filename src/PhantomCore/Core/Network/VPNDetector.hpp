@@ -969,6 +969,24 @@ public:
     [[nodiscard]] bool PerformDiagnostics() const;
     bool ExportDiagnostics(const std::wstring& outputPath) const;
 
+    // ========================================================================
+    // STORE WIRING (ORCHESTRATOR-INJECTED DEPENDENCIES)
+    // ========================================================================
+
+    /**
+     * @brief Inject the ThreatIntelLookup instance used for VPN/proxy IP
+     *        reputation queries.
+     *
+     * The pointer is stored non-owning; the orchestrator is responsible for
+     * keeping the pointee alive for as long as VPNDetector is running.
+     * Pass nullptr to clear the wiring (e.g. during shutdown).
+     *
+     * Thread-safe; lock-free atomic store.
+     *
+     * @param lookup Pointer to a ThreatIntelLookup instance, or nullptr.
+     */
+    void SetThreatIntelLookup(ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept;
+
 private:
     VPNDetector();
     ~VPNDetector();
