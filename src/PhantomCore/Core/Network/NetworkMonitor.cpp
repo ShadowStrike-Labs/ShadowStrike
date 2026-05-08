@@ -71,10 +71,12 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cwctype>
 #include <map>
 #include <deque>
 #include <fstream>
 #include <numeric>
+#include <limits>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <iphlpapi.h>
@@ -88,6 +90,97 @@ namespace ShadowStrike {
 namespace Core {
 namespace Network {
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Internal helpers (anonymous namespace).
+// SECURITY: These helpers normalize external input before it reaches caches,
+// blocklists, or log records. Every public ingress point routes through them.
+// ---------------------------------------------------------------------------
+
+// Sanitize a wide string for log output: strip CR/LF and other control chars
+// to defeat log-injection (CWE-117), and truncate to a fixed bound to avoid
+// flooding the log channel with attacker-controlled payloads.
+[[nodiscard]] std::wstring SanitizeForLogW(std::wstring_view in) noexcept {
+    std::wstring out;
+    const size_t cap = NetworkMonitorConstants::MAX_LOG_FIELD_LENGTH;
+    out.reserve((in.size() < cap ? in.size() : cap) + 3);
+    size_t copied = 0;
+    for (wchar_t c : in) {
+        if (copied >= cap) {
+            out.append(L"...", 3);
+            break;
+        }
+        // Drop CR/LF and C0/C1 control codes; allow tab as space.
+        if (c == L'\r' || c == L'\n' || c == L'\v' || c == L'\f') {
+            out.push_back(L' ');
+        } else if (c == L'\t') {
+            out.push_back(L' ');
+        } else if (c < 0x20 || c == 0x7F) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+        ++copied;
+    }
+    return out;
+}
+
+[[nodiscard]] std::wstring SanitizeForLogA(std::string_view in) noexcept {
+    return SanitizeForLogW(Utils::StringUtils::ToWide(in));
+}
+
+// Normalize a domain name for storage / equality:
+//   * lowercase ASCII (DNS is case-insensitive per RFC 1035 §2.3.3)
+//   * strip a single trailing '.'
+//   * reject control characters and over-length input
+// Returns empty string if the input is invalid.
+[[nodiscard]] std::wstring NormalizeDomain(std::wstring_view in) noexcept {
+    if (in.empty() || in.size() > NetworkMonitorConstants::MAX_DOMAIN_LENGTH) {
+        return std::wstring{};
+    }
+    std::wstring out;
+    out.reserve(in.size());
+    for (wchar_t c : in) {
+        if (c < 0x20 || c == 0x7F || c == L' ' || c == L'\t') {
+            return std::wstring{};
+        }
+        // ASCII case fold; non-ASCII passed through (IDN already encoded upstream).
+        if (c >= L'A' && c <= L'Z') {
+            c = static_cast<wchar_t>(c - L'A' + L'a');
+        }
+        out.push_back(c);
+    }
+    if (!out.empty() && out.back() == L'.') {
+        out.pop_back();
+    }
+    if (out.empty()) {
+        return std::wstring{};
+    }
+    return out;
+}
+
+// SECURITY: cap callers cannot grow tracker maps unboundedly. Returns true if
+// the map already holds the supplied key OR if a slot is available.  When the
+// cap is reached, the call is silently dropped (and the caller may log).
+template <typename Map, typename Key>
+[[nodiscard]] bool HasCapacityOrContains(const Map& m, const Key& k, size_t cap) noexcept {
+    if (m.size() < cap) {
+        return true;
+    }
+    return m.find(k) != m.end();
+}
+
+// IPv4 prefix → host-order mask, with safe handling for prefix==0 and clamping.
+[[nodiscard]] uint32_t PrefixToMaskV4(uint8_t prefix) noexcept {
+    if (prefix == 0) return 0u;
+    if (prefix >= 32) return 0xFFFFFFFFu;
+    return static_cast<uint32_t>(0xFFFFFFFFu << (32u - prefix));
+}
+
+}  // unnamed namespace
+
+
 // ============================================================================
 // IPAddress Helper Methods
 // ============================================================================
@@ -96,13 +189,19 @@ IPAddress::IPAddress(uint32_t v4) noexcept
     : type(IPAddressType::IPV4)
     , ipv4(v4)
 {
-    // Classify IPv4
-    if (v4 == 0x7F000001) {  // 127.0.0.1
+    // Classify IPv4 (host byte order).
+    if (v4 == 0x7F000001u) {
         classification = IPClassification::LOOPBACK;
-    } else if ((v4 & 0xFF000000) == 0x0A000000 ||      // 10.0.0.0/8
-               (v4 & 0xFFF00000) == 0xAC100000 ||      // 172.16.0.0/12
-               (v4 & 0xFFFF0000) == 0xC0A80000) {      // 192.168.0.0/16
+    } else if ((v4 & 0xFF000000u) == 0x0A000000u ||      // 10.0.0.0/8
+               (v4 & 0xFFF00000u) == 0xAC100000u ||      // 172.16.0.0/12
+               (v4 & 0xFFFF0000u) == 0xC0A80000u) {      // 192.168.0.0/16
         classification = IPClassification::PRIVATE;
+    } else if ((v4 & 0xFFFF0000u) == 0xA9FE0000u) {      // 169.254.0.0/16
+        classification = IPClassification::LINK_LOCAL;
+    } else if ((v4 & 0xF0000000u) == 0xE0000000u) {      // 224.0.0.0/4
+        classification = IPClassification::MULTICAST;
+    } else if (v4 == 0xFFFFFFFFu) {
+        classification = IPClassification::BROADCAST;
     } else {
         classification = IPClassification::PUBLIC;
     }
@@ -126,25 +225,40 @@ IPAddress::IPAddress(const std::array<uint8_t, 16>& v6) noexcept
 
 IPAddress::IPAddress(std::string_view str)
 {
+    type = IPAddressType::UNKNOWN;
     if (str.empty()) {
-        type = IPAddressType::UNKNOWN;
         return;
     }
+    // SECURITY: cap the input length defensively before constructing a heap
+    // string. INET6_ADDRSTRLEN (65) bounds any well-formed textual address.
+    if (str.size() >= INET6_ADDRSTRLEN) {
+        return;
+    }
+
+    // Use a stack buffer to avoid heap allocation on the parse hot path and to
+    // guarantee NUL termination for inet_pton.
+    char buf[INET6_ADDRSTRLEN] = {0};
+    std::memcpy(buf, str.data(), str.size());
+    buf[str.size()] = '\0';
 
     // Try IPv4 first
     {
         struct in_addr v4 {};
-        std::string s(str);
-        if (inet_pton(AF_INET, s.c_str(), &v4) == 1) {
+        if (inet_pton(AF_INET, buf, &v4) == 1) {
             type = IPAddressType::IPV4;
             ipv4 = ntohl(v4.S_un.S_addr);
-            // Classify
-            if (ipv4 == 0x7F000001) {
+            if (ipv4 == 0x7F000001u) {
                 classification = IPClassification::LOOPBACK;
-            } else if ((ipv4 & 0xFF000000) == 0x0A000000 ||
-                       (ipv4 & 0xFFF00000) == 0xAC100000 ||
-                       (ipv4 & 0xFFFF0000) == 0xC0A80000) {
+            } else if ((ipv4 & 0xFF000000u) == 0x0A000000u ||
+                       (ipv4 & 0xFFF00000u) == 0xAC100000u ||
+                       (ipv4 & 0xFFFF0000u) == 0xC0A80000u) {
                 classification = IPClassification::PRIVATE;
+            } else if ((ipv4 & 0xFFFF0000u) == 0xA9FE0000u) {
+                classification = IPClassification::LINK_LOCAL;
+            } else if ((ipv4 & 0xF0000000u) == 0xE0000000u) {
+                classification = IPClassification::MULTICAST;
+            } else if (ipv4 == 0xFFFFFFFFu) {
+                classification = IPClassification::BROADCAST;
             } else {
                 classification = IPClassification::PUBLIC;
             }
@@ -155,15 +269,15 @@ IPAddress::IPAddress(std::string_view str)
     // Try IPv6
     {
         struct in6_addr v6 {};
-        std::string s(str);
-        if (inet_pton(AF_INET6, s.c_str(), &v6) == 1) {
+        if (inet_pton(AF_INET6, buf, &v6) == 1) {
             type = IPAddressType::IPV6;
             std::memcpy(ipv6.data(), &v6, 16);
             if (ipv6[0] == 0xFE && (ipv6[1] & 0xC0) == 0x80) {
                 classification = IPClassification::LINK_LOCAL;
             } else if (ipv6[0] == 0xFF) {
                 classification = IPClassification::MULTICAST;
-            } else if (std::all_of(ipv6.begin(), ipv6.end() - 1, [](uint8_t b) { return b == 0; }) &&
+            } else if (std::all_of(ipv6.begin(), ipv6.end() - 1,
+                                   [](uint8_t b) { return b == 0; }) &&
                        ipv6[15] == 0x01) {
                 classification = IPClassification::LOOPBACK;
             } else {
@@ -172,28 +286,31 @@ IPAddress::IPAddress(std::string_view str)
             return;
         }
     }
-
-    type = IPAddressType::UNKNOWN;
+    // Parse failed — leave type = UNKNOWN.
 }
 
 IPAddress::IPAddress(std::wstring_view wstr)
-    : IPAddress(Utils::StringUtils::ToNarrow(std::wstring(wstr)))
+    : IPAddress(Utils::StringUtils::ToNarrow(wstr))
 {
 }
 
 std::string IPAddress::ToString() const {
     if (type == IPAddressType::IPV4) {
-        char buffer[INET_ADDRSTRLEN];
-        struct in_addr addr;
+        char buffer[INET_ADDRSTRLEN] = {0};
+        struct in_addr addr{};
         addr.S_un.S_addr = htonl(ipv4);
-        inet_ntop(AF_INET, &addr, buffer, INET_ADDRSTRLEN);
-        return buffer;
+        if (inet_ntop(AF_INET, &addr, buffer, INET_ADDRSTRLEN) == nullptr) {
+            return "INVALID";
+        }
+        return std::string(buffer);
     } else if (type == IPAddressType::IPV6) {
-        char buffer[INET6_ADDRSTRLEN];
-        struct in6_addr addr;
+        char buffer[INET6_ADDRSTRLEN] = {0};
+        struct in6_addr addr{};
         std::memcpy(&addr, ipv6.data(), 16);
-        inet_ntop(AF_INET6, &addr, buffer, INET6_ADDRSTRLEN);
-        return buffer;
+        if (inet_ntop(AF_INET6, &addr, buffer, INET6_ADDRSTRLEN) == nullptr) {
+            return "INVALID";
+        }
+        return std::string(buffer);
     }
     return "UNKNOWN";
 }
@@ -235,17 +352,24 @@ bool IPAddress::operator<(const IPAddress& other) const noexcept {
 }
 
 size_t IPAddress::Hash::operator()(const IPAddress& ip) const noexcept {
+    // Boost-style hash combine.
+    auto mix = [](size_t seed, size_t v) noexcept {
+        seed ^= v + 0x9E3779B97F4A7C15ULL + (seed << 6) + (seed >> 2);
+        return seed;
+    };
     if (ip.type == IPAddressType::IPV4) {
-        return std::hash<uint32_t>()(ip.ipv4);
+        return mix(0, std::hash<uint32_t>{}(ip.ipv4));
     } else if (ip.type == IPAddressType::IPV6) {
-        size_t hash = 0;
+        size_t seed = 0;
         for (size_t i = 0; i < 16; i += 4) {
-            hash ^= (static_cast<size_t>(ip.ipv6[i]) << 24) |
-                    (static_cast<size_t>(ip.ipv6[i+1]) << 16) |
-                    (static_cast<size_t>(ip.ipv6[i+2]) << 8) |
-                    static_cast<size_t>(ip.ipv6[i+3]);
+            uint32_t chunk =
+                (static_cast<uint32_t>(ip.ipv6[i + 0]) << 24) |
+                (static_cast<uint32_t>(ip.ipv6[i + 1]) << 16) |
+                (static_cast<uint32_t>(ip.ipv6[i + 2]) << 8)  |
+                 static_cast<uint32_t>(ip.ipv6[i + 3]);
+            seed = mix(seed, std::hash<uint32_t>{}(chunk));
         }
-        return hash;
+        return seed;
     }
     return 0;
 }
@@ -499,20 +623,25 @@ bool IPRange::Contains(const IPAddress& ip) const noexcept {
     if (baseAddress.type != ip.type) return false;
 
     if (ip.type == IPAddressType::IPV4) {
-        uint32_t mask = (prefixLength == 0) ? 0 : (~0U << (32 - prefixLength));
+        const uint8_t pfx = (prefixLength > 32) ? 32 : prefixLength;
+        const uint32_t mask = PrefixToMaskV4(pfx);
         return (baseAddress.ipv4 & mask) == (ip.ipv4 & mask);
     } else if (ip.type == IPAddressType::IPV6) {
-        // IPv6 prefix comparison: byte-wise then partial-byte mask
-        size_t fullBytes = prefixLength / 8;
-        size_t remainingBits = prefixLength % 8;
+        // IPv6 prefix comparison: byte-wise then partial-byte mask. Clamp to
+        // [0,128] to defend against malformed callers and avoid shift UB.
+        const uint8_t pfx = (prefixLength > 128) ? 128 : prefixLength;
+        const size_t fullBytes = static_cast<size_t>(pfx) / 8u;
+        const size_t remainingBits = static_cast<size_t>(pfx) % 8u;
 
         for (size_t i = 0; i < fullBytes; i++) {
             if (baseAddress.ipv6[i] != ip.ipv6[i]) return false;
         }
 
         if (remainingBits > 0 && fullBytes < 16) {
-            uint8_t mask = 0xFF << (8 - remainingBits);
-            if ((baseAddress.ipv6[fullBytes] & mask) != (ip.ipv6[fullBytes] & mask)) {
+            const uint8_t mask = static_cast<uint8_t>(
+                0xFFu << (8u - remainingBits));
+            if ((baseAddress.ipv6[fullBytes] & mask) !=
+                (ip.ipv6[fullBytes] & mask)) {
                 return false;
             }
         }
@@ -530,13 +659,13 @@ std::string IPRange::ToString() const {
 uint64_t IPRange::GetAddressCount() const noexcept {
     if (baseAddress.type == IPAddressType::IPV4) {
         if (prefixLength >= 32) return 1;
-        if (prefixLength == 0) return 0xFFFFFFFFULL + 1;
-        return 1ULL << (32 - prefixLength);
+        if (prefixLength == 0) return 0x100000000ULL;
+        return 1ULL << (32u - prefixLength);
     } else if (baseAddress.type == IPAddressType::IPV6) {
-        // IPv6 address count can be enormous, return max uint64_t
+        // IPv6 address count is enormous; saturate at UINT64_MAX.
         if (prefixLength >= 128) return 1;
-        if (prefixLength <= 64) return UINT64_MAX;
-        return 1ULL << (128 - prefixLength);
+        if (prefixLength <= 64) return std::numeric_limits<uint64_t>::max();
+        return 1ULL << (128u - prefixLength);
     }
     return 0;
 }
@@ -568,7 +697,9 @@ struct NetworkMonitorImpl {
 
     // Blocked entities
     std::unordered_set<IPAddress, IPAddress::Hash> m_blockedIPs;
-    std::unordered_map<uint16_t, ProtocolType> m_blockedPorts;  // Port -> Protocol
+    // SECURITY: ports are protocol-scoped — TCP/80 and UDP/80 are distinct
+    // policies, otherwise sequential calls overwrite one another.
+    std::set<std::pair<uint16_t, ProtocolType>> m_blockedPorts;
     std::unordered_set<std::wstring> m_blockedDomains;
     std::unordered_set<uint32_t> m_blockedProcesses;
     mutable std::shared_mutex m_blocklistMutex;
@@ -615,6 +746,11 @@ struct NetworkMonitorImpl {
     std::vector<std::pair<uint64_t, BandwidthAlertCallback>> m_bandwidthCallbacks;
     std::mutex m_callbacksMutex;
     std::atomic<uint64_t> m_nextCallbackId{1};
+
+    // Legacy single-slot connection callback (the SetConnectionCallback bridge
+    // for older integrations that pre-date the multi-callback Register* API).
+    ConnectionCallback m_legacyCallback;
+    mutable std::shared_mutex m_legacyCallbackMutex;
 
     // Statistics
     NetworkMonitorStatistics m_statistics;
@@ -783,19 +919,27 @@ struct NetworkMonitorImpl {
             analysis.firstSeen = tracker.connectionTimes.front();
             analysis.lastSeen = tracker.connectionTimes.back();
 
-            // Calculate intervals
+            // Calculate intervals (clamp negative deltas — wall-clock can move
+            // backward, e.g. NTP step or DST adjustment, and a negative interval
+            // would corrupt the average and stddev computation below).
             std::vector<std::chrono::milliseconds> intervals;
+            intervals.reserve(tracker.connectionTimes.size());
             for (size_t i = 1; i < tracker.connectionTimes.size(); i++) {
                 auto interval = std::chrono::duration_cast<std::chrono::milliseconds>(
                     tracker.connectionTimes[i] - tracker.connectionTimes[i-1]
                 );
+                if (interval.count() < 0) {
+                    interval = std::chrono::milliseconds(0);
+                }
                 intervals.push_back(interval);
             }
+
+            if (intervals.empty()) return analysis;
 
             // Calculate average interval
             auto totalMs = std::accumulate(intervals.begin(), intervals.end(),
                                           std::chrono::milliseconds(0));
-            analysis.averageInterval = totalMs / intervals.size();
+            analysis.averageInterval = totalMs / static_cast<int64_t>(intervals.size());
 
             // Calculate standard deviation
             double avgMs = static_cast<double>(analysis.averageInterval.count());
@@ -866,6 +1010,9 @@ struct NetworkMonitorImpl {
             auto timeSpan = std::chrono::duration_cast<std::chrono::milliseconds>(
                 tracker.lastActivity - tracker.startTime
             );
+            if (timeSpan.count() < 0) {
+                timeSpan = std::chrono::milliseconds(0);
+            }
             analysis.timeSpan = timeSpan;
 
             if (timeSpan.count() > 0) {
@@ -919,6 +1066,9 @@ struct NetworkMonitorImpl {
             analysis.scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
                 tracker.lastScan - tracker.firstScan
             );
+            if (analysis.scanDuration.count() < 0) {
+                analysis.scanDuration = std::chrono::milliseconds(0);
+            }
 
             // Port scan heuristic:
             // - Many ports (>50)
@@ -947,69 +1097,108 @@ struct NetworkMonitorImpl {
     void UpdateBeaconingTracker(const SocketAddress& remote, uint64_t bytes) {
         std::lock_guard<std::mutex> lock(m_beaconingMutex);
 
+        // SECURITY: cap distinct destinations to prevent state explosion under
+        // hostile traffic that opens connections to many random remotes.
+        if (!HasCapacityOrContains(m_beaconingTrackers, remote,
+                                   NetworkMonitorConstants::MAX_BEACONING_TRACKERS)) {
+            return;
+        }
+
         auto& tracker = m_beaconingTrackers[remote];
         tracker.connectionTimes.push_back(std::chrono::system_clock::now());
         tracker.bytesTransferred.push_back(bytes);
         tracker.connectionCount++;
 
-        // Keep only last 100 connections
-        if (tracker.connectionTimes.size() > 100) {
+        // Keep only the most recent samples per tracker.
+        while (tracker.connectionTimes.size() > NetworkMonitorConstants::MAX_TRACKER_HISTORY) {
             tracker.connectionTimes.pop_front();
+        }
+        while (tracker.bytesTransferred.size() > NetworkMonitorConstants::MAX_TRACKER_HISTORY) {
             tracker.bytesTransferred.pop_front();
         }
     }
 
-    // Update port scan tracker
+    // Update port scan tracker. Snapshot any threat-detection result under the
+    // lock, then release the lock before invoking callbacks/log to avoid the
+    // self-deadlock that the previous AnalyzePortScanningInternal-while-locked
+    // pattern guaranteed (CWE-833).
     void UpdatePortScanTracker(const IPAddress& sourceIp, uint16_t port) {
-        std::lock_guard<std::mutex> lock(m_portScanMutex);
+        bool detected = false;
+        size_t portsObserved = 0;
+        long long durationSec = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_portScanMutex);
 
-        auto& tracker = m_portScanTrackers[sourceIp];
-        auto now = std::chrono::system_clock::now();
+            if (!HasCapacityOrContains(m_portScanTrackers, sourceIp,
+                                       NetworkMonitorConstants::MAX_PORTSCAN_TRACKERS)) {
+                return;
+            }
 
-        if (tracker.scannedPorts.empty()) {
-            tracker.firstScan = now;
+            auto& tracker = m_portScanTrackers[sourceIp];
+            const auto now = std::chrono::system_clock::now();
+
+            if (tracker.scannedPorts.empty()) {
+                tracker.firstScan = now;
+            }
+
+            tracker.scannedPorts.insert(port);
+            tracker.lastScan = now;
+
+            if (tracker.scannedPorts.size() >= NetworkMonitorConstants::PORT_SCAN_THRESHOLD) {
+                const auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                    tracker.lastScan - tracker.firstScan);
+                if (duration.count() >= 0 && duration.count() < 60) {
+                    detected = true;
+                    portsObserved = tracker.scannedPorts.size();
+                    durationSec = static_cast<long long>(duration.count());
+                }
+            }
         }
 
-        tracker.scannedPorts.insert(port);
-        tracker.lastScan = now;
+        if (detected) {
+            // Re-acquire briefly via the analyzer (which takes its own lock).
+            InvokeThreatCallbacks(0, ThreatIndicator::PORT_SCANNING,
+                                  AnalyzePortScanningInternal(sourceIp));
 
-        // Check if port scan detected
-        if (tracker.scannedPorts.size() >= NetworkMonitorConstants::PORT_SCAN_THRESHOLD) {
-            auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-                tracker.lastScan - tracker.firstScan
-            );
+            m_statistics.portScansDetected.fetch_add(1, std::memory_order_relaxed);
+            m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-            if (duration.count() < 60) {  // Within 60 seconds
-                // Port scan detected!
-                InvokeThreatCallbacks(0, ThreatIndicator::PORT_SCANNING,
-                                     AnalyzePortScanningInternal(sourceIp));
-
-                m_statistics.portScansDetected.fetch_add(1, std::memory_order_relaxed);
-                m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
-
-                SS_LOG_WARN(L"Network", L"NetworkMonitor: Port scan detected from %ls - %zu ports in %lld seconds",
-                                  sourceIp.ToWString().c_str(), tracker.scannedPorts.size(), duration.count());
-            }
+            SS_LOG_WARN(L"Network",
+                        L"NetworkMonitor: Port scan detected from %ls - %zu ports in %lld seconds",
+                        sourceIp.ToWString().c_str(), portsObserved, durationSec);
         }
     }
 
-    // Update exfiltration tracker
+    // Update exfiltration tracker — same snapshot-then-release pattern.
     void UpdateExfiltrationTracker(uint32_t pid, uint64_t bytesSent) {
-        std::lock_guard<std::mutex> lock(m_exfiltrationMutex);
+        bool overThreshold = false;
+        uint64_t totalBytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_exfiltrationMutex);
 
-        auto& tracker = m_exfiltrationTrackers[pid];
-        auto now = std::chrono::system_clock::now();
+            if (!HasCapacityOrContains(m_exfiltrationTrackers, pid,
+                                       NetworkMonitorConstants::MAX_EXFIL_TRACKERS)) {
+                return;
+            }
 
-        if (tracker.connectionCount == 0) {
-            tracker.startTime = now;
+            auto& tracker = m_exfiltrationTrackers[pid];
+            const auto now = std::chrono::system_clock::now();
+
+            if (tracker.connectionCount == 0) {
+                tracker.startTime = now;
+            }
+
+            tracker.totalBytesSent += bytesSent;
+            tracker.lastActivity = now;
+            tracker.connectionCount++;
+
+            if (tracker.totalBytesSent > NetworkMonitorConstants::SUSPICIOUS_UPLOAD_BYTES) {
+                overThreshold = true;
+                totalBytes = tracker.totalBytesSent;
+            }
         }
 
-        tracker.totalBytesSent += bytesSent;
-        tracker.lastActivity = now;
-        tracker.connectionCount++;
-
-        // Check for exfiltration
-        if (tracker.totalBytesSent > NetworkMonitorConstants::SUSPICIOUS_UPLOAD_BYTES) {
+        if (overThreshold) {
             auto analysis = AnalyzeExfiltrationInternal(pid);
             if (analysis.isLikelyExfiltration) {
                 InvokeThreatCallbacks(0, ThreatIndicator::DATA_EXFILTRATION, analysis);
@@ -1017,8 +1206,9 @@ struct NetworkMonitorImpl {
                 m_statistics.exfiltrationDetected.fetch_add(1, std::memory_order_relaxed);
                 m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                SS_LOG_WARN(L"Network", L"NetworkMonitor: Data exfiltration detected - PID %u sent %llu bytes",
-                                  pid, tracker.totalBytesSent);
+                SS_LOG_WARN(L"Network",
+                            L"NetworkMonitor: Data exfiltration detected - PID %u sent %llu bytes",
+                            pid, static_cast<unsigned long long>(totalBytes));
             }
         }
     }
@@ -1047,12 +1237,33 @@ struct NetworkMonitorImpl {
                 m_statistics.smbConnections.fetch_add(1, std::memory_order_relaxed);
             }
 
-            // Invoke connection callbacks
+            // Invoke connection callbacks (multi-slot)
             InvokeConnectionCallbacks(conn);
+
+            // Legacy single-slot connection callback (copy-and-release pattern
+            // so a re-entrant SetConnectionCallback does not self-deadlock).
+            ConnectionCallback legacy;
+            {
+                std::shared_lock<std::shared_mutex> rl(m_legacyCallbackMutex);
+                legacy = m_legacyCallback;
+            }
+            if (legacy) {
+                try {
+                    legacy(conn);
+                } catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"Network", L"NetworkMonitor: Legacy callback failed - %ls",
+                                 Utils::StringUtils::ToWide(e.what()).c_str());
+                } catch (...) {
+                    SS_LOG_ERROR(L"Network",
+                                 L"NetworkMonitor: Legacy callback threw non-std exception");
+                }
+            }
 
             // Invoke event callbacks
             NetworkEvent event;
-            event.eventId = m_statistics.eventsProcessed.fetch_add(1, std::memory_order_relaxed);
+            // SECURITY/TELEMETRY: eventId is monotonic from a dedicated counter
+            // so eventsProcessed remains a true count of dispatched events.
+            event.eventId = m_statistics.eventsProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
             event.timestamp = std::chrono::system_clock::now();
             event.type = NetworkEvent::Type::CONNECTION_OPENED;
             event.connectionId = conn.connectionId;
@@ -1063,10 +1274,11 @@ struct NetworkMonitorImpl {
 
             InvokeEventCallbacks(event);
 
+            const std::string appName(GetAppProtocolName(conn.appProtocol));
             SS_LOG_INFO(L"Network", L"NetworkMonitor: Connection opened - %ls [%hs] by %ls (PID %u)",
                               Utils::StringUtils::ToWide(conn.tuple.ToString()).c_str(),
-                              GetAppProtocolName(conn.appProtocol).data(),
-                              conn.processContext.processName.c_str(),
+                              appName.c_str(),
+                              SanitizeForLogW(conn.processContext.processName).c_str(),
                               conn.processContext.pid);
 
         } catch (const std::exception& e) {
@@ -1076,57 +1288,94 @@ struct NetworkMonitorImpl {
         }
     }
 
-    // Callback invocation helpers
+    // Callback invocation helpers.
+    //
+    // SECURITY/CORRECTNESS: each helper snapshots the callback list under the
+    // lock, then releases the lock before invoking. This prevents (a) deadlocks
+    // when a user callback re-enters Register*/Unregister* (which take the same
+    // mutex) and (b) priority inversion where a slow consumer stalls every
+    // producer thread that wants to dispatch.
     void InvokeConnectionCallbacks(const ConnectionInfo& conn) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_connectionCallbacks) {
+        decltype(m_connectionCallbacks) snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_connectionCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
-                callback(conn);
+                if (callback) callback(conn);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"NetworkMonitor: Connection callback %llu failed - %ls",
                                    id, Utils::StringUtils::ToWide(e.what()).c_str());
+            } catch (...) {
+                SS_LOG_ERROR(L"Network",
+                             L"NetworkMonitor: Connection callback %llu threw non-std exception", id);
             }
         }
     }
 
     void InvokeStateChangeCallbacks(uint64_t connId, ConnectionState oldState, ConnectionState newState) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_stateChangeCallbacks) {
+        decltype(m_stateChangeCallbacks) snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_stateChangeCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
-                callback(connId, oldState, newState);
+                if (callback) callback(connId, oldState, newState);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"NetworkMonitor: State change callback %llu failed - %ls",
                                    id, Utils::StringUtils::ToWide(e.what()).c_str());
+            } catch (...) {
+                SS_LOG_ERROR(L"Network",
+                             L"NetworkMonitor: State callback %llu threw non-std exception", id);
             }
         }
     }
 
     void InvokeEventCallbacks(const NetworkEvent& event) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_eventCallbacks) {
+        decltype(m_eventCallbacks) snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_eventCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
-                callback(event);
+                if (callback) callback(event);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"NetworkMonitor: Event callback %llu failed - %ls",
                                    id, Utils::StringUtils::ToWide(e.what()).c_str());
+            } catch (...) {
+                SS_LOG_ERROR(L"Network",
+                             L"NetworkMonitor: Event callback %llu threw non-std exception", id);
             }
         }
     }
 
     void InvokeThreatCallbacks(uint64_t connId, ThreatIndicator indicator,
                               const std::variant<BeaconingAnalysis, DataExfiltrationAnalysis, PortScanAnalysis>& analysis) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_threatCallbacks) {
+        decltype(m_threatCallbacks) snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_threatCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
-                callback(connId, indicator, analysis);
+                if (callback) callback(connId, indicator, analysis);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"NetworkMonitor: Threat callback %llu failed - %ls",
                                    id, Utils::StringUtils::ToWide(e.what()).c_str());
+            } catch (...) {
+                SS_LOG_ERROR(L"Network",
+                             L"NetworkMonitor: Threat callback %llu threw non-std exception", id);
             }
         }
     }
 
-    // Monitor thread procedure
+    // Monitor thread procedure.
+    // SECURITY/RELIABILITY: any escape from the loop (exception or return)
+    // must clear m_running so callers' Stop()/Shutdown() observe the
+    // degraded state and do not hang waiting for an unresponsive worker.
     static DWORD WINAPI MonitorThreadProc(LPVOID lpParameter) {
         NetworkMonitorImpl* pThis = static_cast<NetworkMonitorImpl*>(lpParameter);
         if (!pThis) return 1;
@@ -1136,12 +1385,9 @@ struct NetworkMonitorImpl {
 
             // Main monitoring loop
             while (pThis->m_running.load(std::memory_order_acquire)) {
-                // Check stop event
                 if (WaitForSingleObject(pThis->m_hStopEvent, 1000) == WAIT_OBJECT_0) {
                     break;
                 }
-
-                // Perform periodic cleanup
                 pThis->PerformCleanup();
             }
 
@@ -1149,8 +1395,13 @@ struct NetworkMonitorImpl {
             return 0;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Monitor thread failed - %ls",
-                               Utils::StringUtils::ToWide(e.what()).c_str());
+            pThis->m_running.store(false, std::memory_order_release);
+            SS_LOG_FATAL(L"Network", L"NetworkMonitor: Monitor thread aborted - %ls",
+                                Utils::StringUtils::ToWide(e.what()).c_str());
+            return 1;
+        } catch (...) {
+            pThis->m_running.store(false, std::memory_order_release);
+            SS_LOG_FATAL(L"Network", L"NetworkMonitor: Monitor thread aborted - non-std exception");
             return 1;
         }
     }
@@ -1206,6 +1457,32 @@ struct NetworkMonitorImpl {
                 }
             }
 
+            // Reap stale port-scan trackers (no activity for > 10 minutes).
+            {
+                std::lock_guard<std::mutex> lock(m_portScanMutex);
+                const auto cutoff = std::chrono::system_clock::now() - std::chrono::minutes(10);
+                for (auto it = m_portScanTrackers.begin(); it != m_portScanTrackers.end();) {
+                    if (it->second.lastScan < cutoff) {
+                        it = m_portScanTrackers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
+            // Reap stale exfiltration trackers (no activity for > 10 minutes).
+            {
+                std::lock_guard<std::mutex> lock(m_exfiltrationMutex);
+                const auto cutoff = std::chrono::system_clock::now() - std::chrono::minutes(10);
+                for (auto it = m_exfiltrationTrackers.begin(); it != m_exfiltrationTrackers.end();) {
+                    if (it->second.lastActivity < cutoff) {
+                        it = m_exfiltrationTrackers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"NetworkMonitor: Cleanup failed - %ls",
                                Utils::StringUtils::ToWide(e.what()).c_str());
@@ -1252,6 +1529,7 @@ bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
         return true;
     }
 
+    bool wsaStarted = false;
     try {
         m_impl->m_config = config;
 
@@ -1260,19 +1538,21 @@ bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
         m_impl->m_whitelist = std::make_shared<Whitelist::WhitelistStore>();
 
         // Initialize Winsock
-        WSADATA wsaData;
+        WSADATA wsaData{};
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            SS_LOG_ERROR(L"Network", L"NetworkMonitor: WSAStartup failed");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: WSAStartup failed (code %d)", WSAGetLastError());
+            m_impl->m_threatIntel.reset();
+            m_impl->m_whitelist.reset();
             return false;
         }
+        wsaStarted = true;
 
-        // Initialize WFP engine session for network filtering
+        // Initialize WFP engine session for network filtering (best-effort).
         {
             FWPM_SESSION0 session = {};
             session.flags = FWPM_SESSION_FLAG_DYNAMIC;  // Filters auto-removed on process exit
             session.displayData.name = const_cast<wchar_t*>(L"ShadowStrike NetworkMonitor");
             session.displayData.description = const_cast<wchar_t*>(L"ShadowStrike EDR network filtering session");
-            // 10-second transaction timeout
             session.txnWaitTimeoutInMSec = 10000;
 
             DWORD wfpResult = FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, &session,
@@ -1295,6 +1575,16 @@ bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"NetworkMonitor: Initialization failed - %ls",
                             Utils::StringUtils::ToWide(e.what()).c_str());
+        // Roll back partial init so a re-Initialize attempt finds clean state.
+        if (m_impl->m_hWfpEngine) {
+            FwpmEngineClose0(m_impl->m_hWfpEngine);
+            m_impl->m_hWfpEngine = nullptr;
+        }
+        if (wsaStarted) {
+            WSACleanup();
+        }
+        m_impl->m_threatIntel.reset();
+        m_impl->m_whitelist.reset();
         return false;
     }
 }
@@ -1410,6 +1700,25 @@ void NetworkMonitor::Shutdown() noexcept {
             m_impl->m_filterMatchCallbacks.clear();
             m_impl->m_threatCallbacks.clear();
             m_impl->m_bandwidthCallbacks.clear();
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> legacyLock(m_impl->m_legacyCallbackMutex);
+            m_impl->m_legacyCallback = nullptr;
+        }
+
+        // Trackers — release attacker-influenced state.
+        {
+            std::lock_guard<std::mutex> lk(m_impl->m_beaconingMutex);
+            m_impl->m_beaconingTrackers.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_impl->m_portScanMutex);
+            m_impl->m_portScanTrackers.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_impl->m_exfiltrationMutex);
+            m_impl->m_exfiltrationTrackers.clear();
         }
 
         // Release infrastructure
@@ -1589,13 +1898,26 @@ bool NetworkMonitor::TerminateConnection(uint64_t connectionId) {
 // ============================================================================
 
 bool NetworkMonitor::BlockIP(const IPAddress& ip, BlockReason reason, uint32_t durationMs) {
+    (void)durationMs;
     try {
+        if (ip.type == IPAddressType::UNKNOWN) {
+            SS_LOG_WARN(L"Network", L"NetworkMonitor: BlockIP rejected unknown-type address");
+            return false;
+        }
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
+        if (m_impl->m_blockedIPs.size() >= NetworkMonitorConstants::MAX_BLOCKED_IPS &&
+            m_impl->m_blockedIPs.find(ip) == m_impl->m_blockedIPs.end()) {
+            SS_LOG_WARN(L"Network",
+                        L"NetworkMonitor: IP blocklist at capacity (%zu) — refusing %ls",
+                        m_impl->m_blockedIPs.size(), ip.ToWString().c_str());
+            return false;
+        }
         m_impl->m_blockedIPs.insert(ip);
         m_impl->m_statistics.ipsBlocked.fetch_add(1, std::memory_order_relaxed);
 
+        const std::string reasonName(GetBlockReasonName(reason));
         SS_LOG_INFO(L"Network", L"NetworkMonitor: IP %ls blocked - Reason: %hs",
-                          ip.ToWString().c_str(), GetBlockReasonName(reason).data());
+                          ip.ToWString().c_str(), reasonName.c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1637,13 +1959,17 @@ bool NetworkMonitor::BlockIPRange(const IPRange& range, BlockReason reason) {
                 addrRange.valueLow.type = FWP_UINT32;
                 addrRange.valueHigh.type = FWP_UINT32;
 
-                uint32_t mask = (range.prefixLength == 0) ? 0 :
-                                (~0U << (32 - range.prefixLength));
-                uint32_t networkAddr = range.baseAddress.ipv4 & mask;
-                uint32_t broadcastAddr = networkAddr | ~mask;
+                const uint8_t pfx = (range.prefixLength > 32) ? 32u : range.prefixLength;
+                const uint32_t mask = PrefixToMaskV4(pfx);
+                const uint32_t networkAddr   = range.baseAddress.ipv4 & mask;
+                const uint32_t broadcastAddr = networkAddr | ~mask;
 
-                addrRange.valueLow.uint32 = ntohl(networkAddr);
-                addrRange.valueHigh.uint32 = ntohl(broadcastAddr);
+                // SECURITY/CORRECTNESS: WFP IPv4 conditions take HOST byte order
+                // for FWP_UINT32 (per WFP docs and the FirewallManager precedent
+                // that ntohl()'s a network-order memcpy buffer back to host order).
+                // Our IPAddress::ipv4 is already host order, so we pass it raw.
+                addrRange.valueLow.uint32  = networkAddr;
+                addrRange.valueHigh.uint32 = broadcastAddr;
 
                 FWPM_FILTER_CONDITION0 condition = {};
                 condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
@@ -1712,13 +2038,30 @@ bool NetworkMonitor::BlockIPRange(const IPRange& range, BlockReason reason) {
         // Always store in local tracking regardless of WFP success
         {
             std::lock_guard<std::mutex> lock(m_impl->m_blockedRangesMutex);
+            if (m_impl->m_blockedRanges.size() >= NetworkMonitorConstants::MAX_BLOCKED_RANGES) {
+                SS_LOG_WARN(L"Network",
+                            L"NetworkMonitor: Range blocklist at capacity (%zu) — refusing %ls",
+                            m_impl->m_blockedRanges.size(),
+                            Utils::StringUtils::ToWide(range.ToString()).c_str());
+                // Roll back any WFP filter we just installed.
+                if (m_impl->m_hWfpEngine) {
+                    if (entry.wfpFilterIdV4) {
+                        FwpmFilterDeleteById0(m_impl->m_hWfpEngine, entry.wfpFilterIdV4);
+                    }
+                    if (entry.wfpFilterIdV6) {
+                        FwpmFilterDeleteById0(m_impl->m_hWfpEngine, entry.wfpFilterIdV6);
+                    }
+                }
+                return false;
+            }
             m_impl->m_blockedRanges.push_back(std::move(entry));
         }
 
         m_impl->m_statistics.ipsBlocked.fetch_add(1, std::memory_order_relaxed);
+        const std::string reasonName(GetBlockReasonName(reason));
         SS_LOG_INFO(L"Network", L"NetworkMonitor: IP range %ls blocked - Reason: %hs",
                           Utils::StringUtils::ToWide(range.ToString()).c_str(),
-                          GetBlockReasonName(reason).data());
+                          reasonName.c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1729,13 +2072,21 @@ bool NetworkMonitor::BlockIPRange(const IPRange& range, BlockReason reason) {
 }
 
 bool NetworkMonitor::BlockPort(uint16_t port, ProtocolType protocol, BlockReason reason) {
+    (void)reason;
     try {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
-        m_impl->m_blockedPorts[port] = protocol;
+        if (m_impl->m_blockedPorts.size() >= NetworkMonitorConstants::MAX_BLOCKED_PORTS) {
+            SS_LOG_WARN(L"Network",
+                        L"NetworkMonitor: Port blocklist at capacity (%zu) — refusing port %u",
+                        m_impl->m_blockedPorts.size(), static_cast<unsigned>(port));
+            return false;
+        }
+        m_impl->m_blockedPorts.insert({port, protocol});
         m_impl->m_statistics.portsBlocked.fetch_add(1, std::memory_order_relaxed);
 
+        const std::string protoName(GetProtocolTypeName(protocol));
         SS_LOG_INFO(L"Network", L"NetworkMonitor: Port %u (%hs) blocked",
-                          static_cast<unsigned>(port), GetProtocolTypeName(protocol).data());
+                          static_cast<unsigned>(port), protoName.c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1748,10 +2099,11 @@ bool NetworkMonitor::BlockPort(uint16_t port, ProtocolType protocol, BlockReason
 bool NetworkMonitor::UnblockPort(uint16_t port, ProtocolType protocol) {
     try {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
-        m_impl->m_blockedPorts.erase(port);
+        m_impl->m_blockedPorts.erase({port, protocol});
 
+        const std::string protoName(GetProtocolTypeName(protocol));
         SS_LOG_INFO(L"Network", L"NetworkMonitor: Port %u (%hs) unblocked",
-                          static_cast<unsigned>(port), GetProtocolTypeName(protocol).data());
+                          static_cast<unsigned>(port), protoName.c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1762,12 +2114,27 @@ bool NetworkMonitor::UnblockPort(uint16_t port, ProtocolType protocol) {
 }
 
 bool NetworkMonitor::BlockDomain(const std::wstring& domain, BlockReason reason) {
+    (void)reason;
     try {
+        std::wstring normalized = NormalizeDomain(domain);
+        if (normalized.empty()) {
+            SS_LOG_WARN(L"Network", L"NetworkMonitor: BlockDomain rejected invalid input '%ls'",
+                        SanitizeForLogW(domain).c_str());
+            return false;
+        }
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
-        m_impl->m_blockedDomains.insert(domain);
+        if (m_impl->m_blockedDomains.size() >= NetworkMonitorConstants::MAX_BLOCKED_DOMAINS &&
+            m_impl->m_blockedDomains.find(normalized) == m_impl->m_blockedDomains.end()) {
+            SS_LOG_WARN(L"Network",
+                        L"NetworkMonitor: Domain blocklist at capacity (%zu) — refusing '%ls'",
+                        m_impl->m_blockedDomains.size(), SanitizeForLogW(normalized).c_str());
+            return false;
+        }
+        m_impl->m_blockedDomains.insert(std::move(normalized));
         m_impl->m_statistics.domainsBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_INFO(L"Network", L"NetworkMonitor: Domain %ls blocked", domain.c_str());
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Domain '%ls' blocked",
+                    SanitizeForLogW(domain).c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1779,10 +2146,15 @@ bool NetworkMonitor::BlockDomain(const std::wstring& domain, BlockReason reason)
 
 bool NetworkMonitor::UnblockDomain(const std::wstring& domain) {
     try {
+        std::wstring normalized = NormalizeDomain(domain);
+        if (normalized.empty()) {
+            return false;
+        }
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
-        m_impl->m_blockedDomains.erase(domain);
+        m_impl->m_blockedDomains.erase(normalized);
 
-        SS_LOG_INFO(L"Network", L"NetworkMonitor: Domain %ls unblocked", domain.c_str());
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Domain '%ls' unblocked",
+                    SanitizeForLogW(domain).c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -1793,8 +2165,16 @@ bool NetworkMonitor::UnblockDomain(const std::wstring& domain) {
 }
 
 bool NetworkMonitor::BlockProcess(uint32_t pid, BlockReason reason) {
+    (void)reason;
     try {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
+        if (m_impl->m_blockedProcesses.size() >= NetworkMonitorConstants::MAX_BLOCKED_PROCESSES &&
+            m_impl->m_blockedProcesses.find(pid) == m_impl->m_blockedProcesses.end()) {
+            SS_LOG_WARN(L"Network",
+                        L"NetworkMonitor: Process blocklist at capacity (%zu) — refusing PID %u",
+                        m_impl->m_blockedProcesses.size(), pid);
+            return false;
+        }
         m_impl->m_blockedProcesses.insert(pid);
 
         SS_LOG_INFO(L"Network", L"NetworkMonitor: Process %u blocked", pid);
@@ -1825,17 +2205,29 @@ bool NetworkMonitor::UnblockProcess(uint32_t pid) {
 uint64_t NetworkMonitor::AddFilter(const ConnectionFilter& filter) {
     std::lock_guard<std::mutex> lock(m_impl->m_filtersMutex);
 
+    if (m_impl->m_filters.size() >= NetworkMonitorConstants::MAX_FILTERS) {
+        SS_LOG_WARN(L"Network",
+                    L"NetworkMonitor: Filter table at capacity (%zu) — refusing new filter '%ls'",
+                    m_impl->m_filters.size(), SanitizeForLogW(filter.name).c_str());
+        return 0;
+    }
+
     uint64_t filterId = m_impl->m_nextFilterId.fetch_add(1, std::memory_order_relaxed);
     ConnectionFilter newFilter = filter;
     newFilter.filterId = filterId;
     newFilter.createdAt = std::chrono::system_clock::now();
 
-    // Priority-based key
-    uint64_t key = static_cast<uint64_t>(newFilter.priority) * 1000000 + filterId;
+    // SECURITY: priority key composition uses the high 32 bits for priority and
+    // the low 32 bits for filter ID. The previous "priority * 1e6 + id" scheme
+    // would collide once filterId >= 1e6 (one ID-allocation per outbound flow
+    // exhausts that range in seconds on a busy host). std::map ordering lays
+    // out lower-priority first; the dispatch path iterates as-is.
+    const uint64_t key = (static_cast<uint64_t>(newFilter.priority) << 32) |
+                         (filterId & 0xFFFFFFFFULL);
     m_impl->m_filters[key] = newFilter;
 
-    SS_LOG_INFO(L"Network", L"NetworkMonitor: Filter added - ID: %llu, Name: %ls",
-                      filterId, filter.name.c_str());
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Filter added - ID: %llu, Name: '%ls'",
+                      filterId, SanitizeForLogW(filter.name).c_str());
 
     return filterId;
 }
@@ -1861,6 +2253,7 @@ std::vector<ConnectionFilter> NetworkMonitor::GetFilters() const {
     filters.reserve(m_impl->m_filters.size());
 
     for (const auto& [key, filter] : m_impl->m_filters) {
+        (void)key;
         filters.push_back(filter);
     }
 
@@ -1868,8 +2261,22 @@ std::vector<ConnectionFilter> NetworkMonitor::GetFilters() const {
 }
 
 bool NetworkMonitor::IsIPBlocked(const IPAddress& ip) const {
+    if (ip.type == IPAddressType::UNKNOWN) {
+        return false;
+    }
     std::shared_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
-    return m_impl->m_blockedIPs.find(ip) != m_impl->m_blockedIPs.end();
+    if (m_impl->m_blockedIPs.find(ip) != m_impl->m_blockedIPs.end()) {
+        return true;
+    }
+    // SECURITY: software check must also honor CIDR-range blocks; otherwise
+    // BlockIPRange() is silently ineffective when WFP is unavailable.
+    std::lock_guard<std::mutex> rangeLock(m_impl->m_blockedRangesMutex);
+    for (const auto& br : m_impl->m_blockedRanges) {
+        if (br.range.Contains(ip)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::vector<IPAddress> NetworkMonitor::GetBlockedIPs() const {
@@ -1919,8 +2326,11 @@ std::vector<ThreatIndicator> NetworkMonitor::GetThreatIndicators(uint64_t connec
 // ============================================================================
 
 void NetworkMonitor::SetConnectionCallback(ConnectionCallback callback) {
-    std::lock_guard<std::shared_mutex> lock(m_callbackMutex);
-    m_legacyCallback = std::move(callback);
+    // Bridge into the impl-side single-slot callback so ProcessNewConnection
+    // can fire it. Held under a writer-exclusive lock; readers in the
+    // dispatch path acquire shared briefly to copy it out.
+    std::unique_lock<std::shared_mutex> lock(m_impl->m_legacyCallbackMutex);
+    m_impl->m_legacyCallback = std::move(callback);
 }
 
 uint64_t NetworkMonitor::RegisterConnectionCallback(ConnectionCallback callback) {
@@ -2085,28 +2495,46 @@ bool NetworkMonitor::SelfTest() {
     try {
         SS_LOG_INFO(L"Network", L"NetworkMonitor: Starting self-test");
 
-        // Test IP address operations
-        IPAddress testIp(0x7F000001);  // 127.0.0.1
+        // Test IP address operations (no global state mutated).
+        IPAddress testIp(0x7F000001u);  // 127.0.0.1
         if (!testIp.IsLoopback()) {
             SS_LOG_ERROR(L"Network", L"NetworkMonitor: IP classification test failed");
             return false;
         }
 
-        // Test IP blocking
-        BlockIP(IPAddress(0xC0A80101), BlockReason::MANUAL_BLOCK);  // 192.168.1.1
-        if (!IsIPBlocked(IPAddress(0xC0A80101))) {
-            SS_LOG_ERROR(L"Network", L"NetworkMonitor: IP blocking test failed");
+        // SECURITY: Self-test must not pollute the live blocklist. Use
+        // documentation IPs (TEST-NET-1 / RFC 5737, TEST-NET-2, TEST-NET-3),
+        // ports outside the well-known range, and a sentinel test domain.
+        // Verify each insert/lookup/erase round-trips without leaking state.
+        const IPAddress testV4(0xC0000201u);  // 192.0.2.1 (RFC 5737 TEST-NET-1)
+        if (!BlockIP(testV4, BlockReason::MANUAL_BLOCK, 0) ||
+            !IsIPBlocked(testV4) ||
+            !UnblockIP(testV4) ||
+            IsIPBlocked(testV4)) {
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: IP block round-trip test failed");
             return false;
         }
-        UnblockIP(IPAddress(0xC0A80101));
 
-        // Test port blocking
-        BlockPort(8080, ProtocolType::TCP, BlockReason::POLICY_VIOLATION);
-        UnblockPort(8080, ProtocolType::TCP);
+        constexpr uint16_t kSelfTestPort = 65000;
+        if (!BlockPort(kSelfTestPort, ProtocolType::TCP, BlockReason::POLICY_VIOLATION) ||
+            !UnblockPort(kSelfTestPort, ProtocolType::TCP)) {
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Port block round-trip test failed");
+            return false;
+        }
 
-        // Test domain blocking
-        BlockDomain(L"evil.com", BlockReason::MALICIOUS_DOMAIN);
-        UnblockDomain(L"evil.com");
+        const std::wstring kSelfTestDomain = L"selftest.invalid";  // RFC 6761 reserved TLD
+        if (!BlockDomain(kSelfTestDomain, BlockReason::MALICIOUS_DOMAIN) ||
+            !UnblockDomain(kSelfTestDomain)) {
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Domain block round-trip test failed");
+            return false;
+        }
+
+        // Domain normalization rejects malformed inputs.
+        if (!NormalizeDomain(L"  bad\n.example").empty() ||
+            !NormalizeDomain(L"").empty()) {
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Domain normalization test failed");
+            return false;
+        }
 
         SS_LOG_INFO(L"Network", L"NetworkMonitor: Self-test passed");
         return true;
@@ -2131,23 +2559,39 @@ std::string NetworkMonitor::GetVersionString() noexcept {
 std::vector<IPAddress> NetworkMonitor::ResolveHostname(std::wstring_view hostname) {
     std::vector<IPAddress> addresses;
 
-    try {
-        // Convert to narrow string
-        std::string hostA = Utils::StringUtils::ToNarrow(hostname);
+    // SECURITY: bound hostname length and reject embedded control characters
+    // before pushing it through getaddrinfo. RFC 1035 caps a fully-qualified
+    // domain at 253 octets; anything longer cannot be valid and likely is an
+    // attempt to abuse the resolver / log channel.
+    if (hostname.empty() || hostname.size() > NetworkMonitorConstants::MAX_DOMAIN_LENGTH) {
+        return addresses;
+    }
+    for (wchar_t c : hostname) {
+        if (c < 0x20 || c == 0x7F) return addresses;
+    }
 
-        struct addrinfo hints = {0};
+    try {
+        const std::string hostA = Utils::StringUtils::ToNarrow(hostname);
+        if (hostA.empty() || hostA.size() > NetworkMonitorConstants::MAX_DOMAIN_LENGTH) {
+            return addresses;
+        }
+
+        struct addrinfo hints {};
         hints.ai_family = AF_UNSPEC;  // IPv4 or IPv6
         hints.ai_socktype = SOCK_STREAM;
 
         struct addrinfo* result = nullptr;
-        if (getaddrinfo(hostA.c_str(), nullptr, &hints, &result) == 0) {
-            for (struct addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next) {
-                if (ptr->ai_family == AF_INET) {
-                    struct sockaddr_in* addr = reinterpret_cast<struct sockaddr_in*>(ptr->ai_addr);
+        if (getaddrinfo(hostA.c_str(), nullptr, &hints, &result) == 0 && result) {
+            for (struct addrinfo* ptr = result;
+                 ptr != nullptr &&
+                 addresses.size() < NetworkMonitorConstants::MAX_RESOLVED_ADDRESSES;
+                 ptr = ptr->ai_next) {
+                if (ptr->ai_family == AF_INET && ptr->ai_addrlen >= sizeof(sockaddr_in)) {
+                    auto* addr = reinterpret_cast<struct sockaddr_in*>(ptr->ai_addr);
                     addresses.push_back(IPAddress(ntohl(addr->sin_addr.S_un.S_addr)));
-                } else if (ptr->ai_family == AF_INET6) {
-                    struct sockaddr_in6* addr = reinterpret_cast<struct sockaddr_in6*>(ptr->ai_addr);
-                    std::array<uint8_t, 16> ipv6;
+                } else if (ptr->ai_family == AF_INET6 && ptr->ai_addrlen >= sizeof(sockaddr_in6)) {
+                    auto* addr = reinterpret_cast<struct sockaddr_in6*>(ptr->ai_addr);
+                    std::array<uint8_t, 16> ipv6{};
                     std::memcpy(ipv6.data(), &addr->sin6_addr, 16);
                     addresses.push_back(IPAddress(ipv6));
                 }
@@ -2163,15 +2607,22 @@ std::vector<IPAddress> NetworkMonitor::ResolveHostname(std::wstring_view hostnam
 
 std::wstring NetworkMonitor::ReverseLookup(const IPAddress& ip) {
     try {
+        char hostname[NI_MAXHOST] = {0};
         if (ip.type == IPAddressType::IPV4) {
-            struct sockaddr_in addr = {0};
+            struct sockaddr_in addr {};
             addr.sin_family = AF_INET;
             addr.sin_addr.S_un.S_addr = htonl(ip.ipv4);
-
-            char hostname[NI_MAXHOST];
             if (getnameinfo(reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr),
-                          hostname, NI_MAXHOST, nullptr, 0, 0) == 0) {
-                return Utils::StringUtils::ToWide(hostname);
+                          hostname, NI_MAXHOST, nullptr, 0, NI_NAMEREQD) == 0) {
+                return Utils::StringUtils::ToWide(std::string_view(hostname));
+            }
+        } else if (ip.type == IPAddressType::IPV6) {
+            struct sockaddr_in6 addr {};
+            addr.sin6_family = AF_INET6;
+            std::memcpy(&addr.sin6_addr, ip.ipv6.data(), 16);
+            if (getnameinfo(reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr),
+                          hostname, NI_MAXHOST, nullptr, 0, NI_NAMEREQD) == 0) {
+                return Utils::StringUtils::ToWide(std::string_view(hostname));
             }
         }
     } catch (...) {
