@@ -203,7 +203,7 @@ namespace FirewallConstants {
 
     // WFP provider/sublayer GUIDs (defined in implementation)
     // These are placeholder identifiers
-    constexpr uint32_t PROVIDER_KEY = 0x5348414457;          // "SHADW"
+    constexpr uint32_t PROVIDER_KEY = 0x53484457;            // "SHDW"
     constexpr uint32_t SUBLAYER_KEY = 0x53545249;            // "STRI"
 
     // Limits

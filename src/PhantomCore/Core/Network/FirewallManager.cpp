@@ -2766,7 +2766,9 @@ uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) 
             rule.name = Utils::StringUtils::ToWide(name);
 
             bool enabled = true;
-            JSON::Get<bool>(entry, "enabled", enabled);
+            if (!JSON::Get<bool>(entry, "enabled", enabled)) {
+                enabled = true;
+            }
             rule.isEnabled = enabled;
 
             uint64_t ruleId = m_impl->AddRuleImpl(rule);
