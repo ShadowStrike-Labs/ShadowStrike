@@ -294,22 +294,147 @@ bool ReadProcessMemorySafe(HANDLE hProcess, uintptr_t address,
 
 /**
  * @brief Check for DOS signature (MZ).
+ *
+ * Strict-aliasing safe: uses memcpy for the magic word rather than a
+ * misaligned reinterpret_cast onto a packed PE header.
  */
 bool HasDosSignature(std::span<const uint8_t> data) {
     if (data.size() < sizeof(IMAGE_DOS_HEADER)) return false;
 
-    const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-    return dosHeader->e_magic == ReflectiveConstants::DOS_MAGIC;
+    WORD magic = 0;
+    std::memcpy(&magic, data.data(), sizeof(magic));
+    return magic == ReflectiveConstants::DOS_MAGIC;
 }
 
 /**
  * @brief Check for PE signature.
+ *
+ * Strict-aliasing safe.
  */
 bool HasPeSignature(std::span<const uint8_t> data, uint32_t offset) {
-    if (offset + sizeof(DWORD) > data.size()) return false;
+    if (offset > data.size() ||
+        sizeof(DWORD) > data.size() - offset) {
+        return false;
+    }
 
-    const auto* peSignature = reinterpret_cast<const DWORD*>(data.data() + offset);
-    return *peSignature == ReflectiveConstants::PE_SIGNATURE;
+    DWORD signature = 0;
+    std::memcpy(&signature, data.data() + offset, sizeof(signature));
+    return signature == ReflectiveConstants::PE_SIGNATURE;
+}
+
+// ============================================================================
+// GLOBAL DBGHELP SERIALIZATION
+// ============================================================================
+//
+// The dbghelp APIs (StackWalk64, SymXxx) are *not* thread-safe; Microsoft's
+// documentation requires callers to serialize access. The detector's own
+// monitoring thread, kernel-event dispatch threads, and on-demand scan
+// callers all may invoke StackWalk64 concurrently, so we protect every call
+// with this single process-wide mutex.
+inline std::mutex& DbgHelpMutex() noexcept {
+    static std::mutex m;
+    return m;
+}
+
+// ============================================================================
+// RAII SUSPEND GUARD — guarantees ResumeThread on every exit path
+// ============================================================================
+class ScopedThreadSuspend {
+public:
+    explicit ScopedThreadSuspend(HANDLE hThread) noexcept
+        : m_thread(hThread) {
+        if (m_thread && m_thread != INVALID_HANDLE_VALUE) {
+            m_suspended = (SuspendThread(m_thread) != static_cast<DWORD>(-1));
+        }
+    }
+
+    ~ScopedThreadSuspend() noexcept {
+        if (m_suspended && m_thread && m_thread != INVALID_HANDLE_VALUE) {
+            ResumeThread(m_thread);
+        }
+    }
+
+    ScopedThreadSuspend(const ScopedThreadSuspend&) = delete;
+    ScopedThreadSuspend& operator=(const ScopedThreadSuspend&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept { return m_suspended; }
+
+private:
+    HANDLE m_thread{nullptr};
+    bool   m_suspended{false};
+};
+
+// ============================================================================
+// PER-PID KERNEL-EVENT THROTTLE
+// ============================================================================
+//
+// Kernel notifications (memory alloc / protect change / image load) can fire
+// at extremely high rates against the same PID. We must:
+//   1. Never run a full Scan() inline on the kernel callback thread (DoS,
+//      potential deadlock, callback re-entrancy into our own callbacks).
+//   2. Throttle so a single misbehaving process cannot pin us in scan loops.
+//
+// The throttle records the last dispatched-scan timestamp per PID; new
+// requests inside the cooldown are silently dropped.
+class KernelEventThrottle {
+public:
+    [[nodiscard]] bool ShouldDispatch(uint32_t pid) noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(m_mutex);
+
+        // Periodic GC of stale entries (cap memory growth)
+        if (m_last.size() > kMaxEntries) {
+            for (auto it = m_last.begin(); it != m_last.end();) {
+                if (now - it->second > std::chrono::seconds(60)) {
+                    it = m_last.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        auto it = m_last.find(pid);
+        if (it != m_last.end() && (now - it->second) < kCooldown) {
+            return false;
+        }
+        m_last[pid] = now;
+        return true;
+    }
+
+private:
+    static constexpr auto kCooldown   = std::chrono::milliseconds(1000);
+    static constexpr size_t kMaxEntries = 4096;
+    std::mutex m_mutex;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> m_last;
+};
+
+inline KernelEventThrottle& GetKernelEventThrottle() noexcept {
+    static KernelEventThrottle t;
+    return t;
+}
+
+// ============================================================================
+// LOG SANITIZATION
+// ============================================================================
+//
+// Process names / module paths come from external processes. An attacker
+// controlling a process's image path (rare but possible via boot symlinks
+// or mapped sections) can inject CR/LF/control characters into our logs to
+// forge log lines. Sanitize before passing into format strings.
+[[nodiscard]] inline std::wstring SanitizeForLog(const std::wstring& in) noexcept {
+    std::wstring out;
+    out.reserve(in.size());
+    for (wchar_t c : in) {
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    if (out.size() > 260) {
+        out.resize(260);
+    }
+    return out;
 }
 
 /**
@@ -868,6 +993,12 @@ public:
             return result;
         }
 
+        if (pid <= 4) {
+            // System / Idle — never scannable from user-mode
+            result.scanError = L"PID rejected (system/idle process)";
+            return result;
+        }
+
         // Snapshot config under shared lock to avoid races with UpdateConfig
         ReflectiveConfig config;
         {
@@ -876,11 +1007,23 @@ public:
         }
 
         try {
-            // Get process name
+            // Get process name (sanitized for log output)
             result.processName = GetProcessName(pid);
+            const std::wstring sanitizedName = SanitizeForLog(result.processName);
 
-            SS_LOG_INFO(L"ReflectiveDLL", L"Scanning PID %u (%s) in %d mode",
-                pid, result.processName.c_str(), static_cast<int>(mode));
+            // Honor exclusions on every entry path — Scan() is reachable
+            // from kernel callbacks and HasReflectiveLoading(), not just
+            // ScanAllProcesses().
+            if (IsExcluded(result.processName)) {
+                SS_LOG_DEBUG(L"ReflectiveDLL",
+                    L"Skipping excluded process — PID %u (%ls)",
+                    pid, sanitizedName.c_str());
+                result.scanComplete = true;
+                return result;
+            }
+
+            SS_LOG_INFO(L"ReflectiveDLL", L"Scanning PID %u (%ls) in %d mode",
+                pid, sanitizedName.c_str(), static_cast<int>(mode));
 
             // Update statistics
             m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
@@ -925,15 +1068,19 @@ public:
                 }
             }
 
-            // Summary
+            // Summary: pick the *highest-risk* detection as primary, not the
+            // first one found (memory-region order is not severity order).
             result.hasReflectiveLoading = !result.detections.empty();
             if (result.hasReflectiveLoading) {
-                result.primaryThreatType = result.detections[0].loadType;
-                result.overallConfidence = result.detections[0].confidence;
-                result.highestRiskScore = 0;
+                const auto* primary = &result.detections.front();
                 for (const auto& det : result.detections) {
-                    result.highestRiskScore = std::max(result.highestRiskScore, det.riskScore);
+                    if (det.riskScore > primary->riskScore) {
+                        primary = &det;
+                    }
                 }
+                result.primaryThreatType = primary->loadType;
+                result.overallConfidence = primary->confidence;
+                result.highestRiskScore  = primary->riskScore;
             }
 
             result.scanComplete = true;
@@ -1304,8 +1451,14 @@ public:
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return 0;
 
-        // Suspend thread to capture consistent context
-        if (SuspendThread(hThread.get()) == static_cast<DWORD>(-1)) return 0;
+        // RAII suspend — guarantees ResumeThread on every early-return below,
+        // including cases where StackWalk64 throws or SymXxx fails.
+        ScopedThreadSuspend suspendGuard(hThread.get());
+        if (!suspendGuard.ok()) {
+            // SuspendThread can fail on protected/critical threads; do not
+            // walk the stack with an active thread (would yield bogus frames)
+            return 0;
+        }
 
         uint32_t unbackedCount = 0;
 
@@ -1330,6 +1483,10 @@ public:
             frame.AddrStack.Offset = ctx.Esp;
             frame.AddrStack.Mode   = AddrModeFlat;
 #endif
+            // dbghelp is single-threaded — serialize StackWalk64 across the
+            // whole process. The lock is short-lived (single stack walk).
+            std::lock_guard<std::mutex> dbgLock(DbgHelpMutex());
+
             constexpr size_t kMaxFrames = 64;
             for (size_t i = 0; i < kMaxFrames; ++i) {
                 if (!StackWalk64(machineType, hProcess.get(), hThread.get(),
@@ -1346,7 +1503,7 @@ public:
             }
         }
 
-        ResumeThread(hThread.get());
+        // ResumeThread runs automatically via ScopedThreadSuspend dtor.
         return unbackedCount;
     }
 
@@ -1640,8 +1797,44 @@ public:
         return m_monitoring;
     }
 
+    // ========================================================================
+    // ASYNC SCAN DISPATCH (used from kernel-event handlers)
+    // ========================================================================
+    //
+    // Kernel notifications must never run a heavyweight Scan() inline —
+    // doing so risks:
+    //   * deadlock against the kernel's own callback dispatcher when the
+    //     scan blocks on user-mode I/O,
+    //   * unbounded re-entrancy when Scan -> InvokeDetection -> user callback
+    //     -> back into the detector,
+    //   * callback storms when a single PID generates thousands of events
+    //     per second (each handled by a separate Scan).
+    //
+    // We therefore offload to a detached worker, gated by a per-PID
+    // throttle.
+    void DispatchAsyncScan(uint32_t pid, ReflectiveScanMode mode) noexcept {
+        if (pid <= 4) return;
+        if (!m_monitoring.load(std::memory_order_acquire)) return;
+        if (!GetKernelEventThrottle().ShouldDispatch(pid)) return;
+
+        try {
+            std::thread([this, pid, mode]() noexcept {
+                try {
+                    (void)Scan(pid, mode);
+                } catch (...) {
+                    // Swallow — never propagate from a detached worker.
+                }
+            }).detach();
+        } catch (...) {
+            // std::thread can throw on resource exhaustion; degrade gracefully.
+            SS_LOG_ERROR(L"ReflectiveDLL",
+                L"DispatchAsyncScan: failed to spawn worker for PID %u", pid);
+        }
+    }
+
     void OnMemoryAllocation(uint32_t pid, uintptr_t address, size_t size, uint32_t protection) {
         if (!m_monitoring) return;
+        if (pid <= 4) return; // System / Idle
 
         // Snapshot config flag under shared lock
         bool rtMonitoring;
@@ -1663,9 +1856,7 @@ public:
                         L"PE structure in RWX allocation — PID %u, Address 0x%016llX",
                         pid, static_cast<unsigned long long>(address));
 
-                    // Trigger targeted scan on the region
-                    auto result = Scan(pid, ReflectiveScanMode::Standard);
-                    (void)result; // Detection callbacks fire inside Scan()
+                    DispatchAsyncScan(pid, ReflectiveScanMode::Standard);
                 }
             }
         }
@@ -1689,6 +1880,7 @@ public:
     void OnProtectionChange(uint32_t pid, uintptr_t address,
                            uint32_t oldProtection, uint32_t newProtection) {
         if (!m_monitoring) return;
+        if (pid <= 4) return;
 
         // Detect RW->RX transitions (hallmark of reflective loading / manual mapping)
         if (IsWritable(oldProtection) && !IsExecutable(oldProtection) &&
@@ -1703,9 +1895,7 @@ public:
                     L"PE structure found after RW->RX transition — PID %u, Address 0x%016llX — triggering scan",
                     pid, static_cast<unsigned long long>(address));
 
-                // Create immediate detection event
-                auto result = Scan(pid, ReflectiveScanMode::Standard);
-                (void)result;
+                DispatchAsyncScan(pid, ReflectiveScanMode::Standard);
             }
         }
     }
@@ -2406,9 +2596,10 @@ public:
                 L"Kernel image-load from unbacked memory — PID %u, Base 0x%016llX, Size %zu",
                 pid, static_cast<unsigned long long>(imageBase), imageSize);
 
-            // Trigger targeted scan
-            auto result = Scan(pid, ReflectiveScanMode::Standard);
-            (void)result; // Detection callbacks fire inside Scan()
+            // Defer the heavyweight Scan() to a worker — never run on the
+            // kernel-notification thread. Throttle prevents scan-floods from
+            // a single PID and removes Scan re-entrancy via callbacks.
+            DispatchAsyncScan(pid, ReflectiveScanMode::Standard);
         }
     }
 
