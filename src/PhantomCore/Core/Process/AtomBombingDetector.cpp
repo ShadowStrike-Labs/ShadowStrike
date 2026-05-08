@@ -168,6 +168,34 @@ namespace {
 }
 
 /**
+ * @brief Sanitize a wide string for safe inclusion in log records.
+ *
+ * Defends against log-injection attacks where attacker-controlled input
+ * (image paths, atom names) contains CR/LF/control characters used to
+ * forge log lines. Replaces all C0/C1 control characters and embedded
+ * format specifiers with '?'. Truncates to a hard cap to bound the
+ * size of any single log entry.
+ */
+[[nodiscard]] std::wstring SanitizeForLog(std::wstring_view input) noexcept {
+    constexpr size_t kMaxLen = 260;
+    std::wstring out;
+    out.reserve(std::min<size_t>(input.size(), kMaxLen));
+    for (size_t i = 0; i < input.size() && out.size() < kMaxLen; ++i) {
+        const wchar_t c = input[i];
+        // Strip C0 (<0x20), DEL, C1 (0x80-0x9F), and percent (format-string guard).
+        if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F) || c == L'%') {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    if (input.size() > kMaxLen) {
+        out.append(L"...");
+    }
+    return out;
+}
+
+/**
  * @brief RAII wrapper for Windows HANDLE to prevent handle leaks.
  */
 struct ScopedHandle {
@@ -476,6 +504,13 @@ public:
     }
 
     void Shutdown() noexcept {
+        // CRITICAL: Stop monitoring (which joins worker threads) BEFORE acquiring
+        // m_configMutex. Worker threads call SnapshotConfig() which takes a shared
+        // lock on m_configMutex; if Shutdown holds that mutex while joining, the
+        // join deadlocks. m_monitoring is atomic so this transition is race-free
+        // versus concurrent Start/Stop callers.
+        StopMonitoringImpl();
+
         std::unique_lock lock(m_configMutex);
 
         if (!m_initialized.load(std::memory_order_acquire)) {
@@ -483,9 +518,6 @@ public:
         }
 
         SS_LOG_INFO(L"AtomBombing", L"Impl: Shutting down");
-
-        // Stop monitoring
-        StopMonitoringImpl();
 
         // Clear data structures
         {
@@ -599,6 +631,11 @@ public:
             L"DDEMLAnsiClient", L"DDEMLUnicodeClient",
             L"IME", L"MSCTFIME UI"
         };
+
+        // Acquire exclusive lock — every other reader of m_knownSafeAtoms
+        // takes shared_lock(m_atomMutex); writing without the lock is a
+        // documented data race even if logically only Initialize calls this.
+        std::unique_lock lock(m_atomMutex);
 
         // Resolve actual atom values for known window class names
         for (const auto& name : safeNames) {
@@ -1269,13 +1306,13 @@ public:
                 const auto config = SnapshotConfig();
 
                 // Periodic scanning (ScanAtomTableImpl already calls CorrelateEventsImpl
-                // when correlateAtomAndAPC is enabled, so no separate correlation call needed)
+                // when correlateAtomAndAPC is enabled, so no separate correlation call needed).
+                // Returns are intentionally discarded here — results are surfaced through
+                // statistics counters and registered callbacks invoked from inside these calls.
                 if (config.enableOnDemandScanning) {
-                    ScanAtomTableImpl();
+                    (void)ScanAtomTableImpl();
                 } else if (config.correlateAtomAndAPC) {
-                    // If on-demand scanning is disabled but correlation is enabled,
-                    // run correlation only on existing event data
-                    CorrelateEventsImpl(config);
+                    (void)CorrelateEventsImpl(config);
                 }
 
                 // Use stop_token-aware sleep to enable clean shutdown
@@ -1331,7 +1368,7 @@ public:
             SS_LOG_DEBUG(L"AtomBombing",
                 L"Atom 0x%04X created by PID %u (%ls), Suspicion: %d",
                 static_cast<unsigned>(atomValue), creatorPid,
-                atom.creatorProcessName.c_str(),
+                SanitizeForLog(atom.creatorProcessName).c_str(),
                 static_cast<int>(atom.suspicionLevel));
 
         } catch (const std::exception& e) {
@@ -1415,37 +1452,66 @@ public:
     // ========================================================================
 
     void InvokeAttackCallbacks(const AtomBombingAttack& attack) {
-        std::shared_lock lock(m_callbackMutex);
-
-        for (const auto& [id, callback] : m_attackCallbacks) {
+        // Snapshot the callback set under shared lock, then release the lock
+        // before invoking. This prevents deadlock when a callback re-enters
+        // RegisterAttackCallback / UnregisterCallback (which take a unique
+        // lock on the same shared_mutex; recursive shared->unique acquisition
+        // is undefined behavior on std::shared_mutex).
+        std::vector<AttackDetectedCallback> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_attackCallbacks.size());
+            for (const auto& [id, cb] : m_attackCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 callback(attack);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"AtomBombing", L"Attack callback exception: %S", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"AtomBombing", L"Attack callback non-std exception");
             }
         }
     }
 
     void InvokeAtomCallbacks(const AtomInfo& atom) {
-        std::shared_lock lock(m_callbackMutex);
-
-        for (const auto& [id, callback] : m_atomCallbacks) {
+        std::vector<SuspiciousAtomCallback> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_atomCallbacks.size());
+            for (const auto& [id, cb] : m_atomCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 callback(atom);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"AtomBombing", L"Atom callback exception: %S", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"AtomBombing", L"Atom callback non-std exception");
             }
         }
     }
 
     void InvokeAPCCallbacks(const APCEvent& apc) {
-        std::shared_lock lock(m_callbackMutex);
-
-        for (const auto& [id, callback] : m_apcCallbacks) {
+        std::vector<SuspiciousAPCCallback> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_apcCallbacks.size());
+            for (const auto& [id, cb] : m_apcCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 callback(apc);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"AtomBombing", L"APC callback exception: %S", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"AtomBombing", L"APC callback non-std exception");
             }
         }
     }
@@ -1503,8 +1569,64 @@ void AtomBombingDetector::Shutdown() {
 bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
     if (!m_impl) return false;
 
+    // Validate configuration before applying. Reject obviously-malformed
+    // values rather than letting them silently destabilize hot paths
+    // (e.g. zero correlation window disables correlation entirely;
+    //  unbounded maxAtomsToAnalyze can stall a scan for minutes).
+    AtomBombingConfig sanitized = config;
+
+    constexpr uint32_t kMinCorrelationWindowMs = 100;
+    constexpr uint32_t kMaxCorrelationWindowMs = 600'000;   // 10 minutes
+    if (sanitized.apcCorrelationWindowMs < kMinCorrelationWindowMs) {
+        SS_LOG_WARN(L"AtomBombing",
+            L"UpdateConfig: apcCorrelationWindowMs %u below floor; clamping to %u",
+            sanitized.apcCorrelationWindowMs, kMinCorrelationWindowMs);
+        sanitized.apcCorrelationWindowMs = kMinCorrelationWindowMs;
+    } else if (sanitized.apcCorrelationWindowMs > kMaxCorrelationWindowMs) {
+        SS_LOG_WARN(L"AtomBombing",
+            L"UpdateConfig: apcCorrelationWindowMs %u above ceiling; clamping to %u",
+            sanitized.apcCorrelationWindowMs, kMaxCorrelationWindowMs);
+        sanitized.apcCorrelationWindowMs = kMaxCorrelationWindowMs;
+    }
+
+    constexpr uint32_t kMinScanTimeoutMs = 100;
+    constexpr uint32_t kMaxScanTimeoutMs = 300'000;         // 5 minutes
+    if (sanitized.scanTimeoutMs < kMinScanTimeoutMs) {
+        sanitized.scanTimeoutMs = kMinScanTimeoutMs;
+    } else if (sanitized.scanTimeoutMs > kMaxScanTimeoutMs) {
+        sanitized.scanTimeoutMs = kMaxScanTimeoutMs;
+    }
+
+    constexpr size_t kMaxAtomsCeiling = 0x10000;            // > MAX_GLOBAL_ATOM range
+    if (sanitized.maxAtomsToAnalyze == 0 ||
+        sanitized.maxAtomsToAnalyze > kMaxAtomsCeiling) {
+        sanitized.maxAtomsToAnalyze = AtomBombingConstants::MAX_ATOMS_TO_MONITOR;
+    }
+
+    // Cap exclusion list size to prevent O(N) blowup on hot paths.
+    constexpr size_t kMaxExcludedProcesses = 1024;
+    if (sanitized.excludedProcesses.size() > kMaxExcludedProcesses) {
+        SS_LOG_WARN(L"AtomBombing",
+            L"UpdateConfig: excludedProcesses (%zu) exceeds cap; truncating to %zu",
+            sanitized.excludedProcesses.size(), kMaxExcludedProcesses);
+        sanitized.excludedProcesses.resize(kMaxExcludedProcesses);
+    }
+    constexpr size_t kMaxExcludedAtoms = 4096;
+    if (sanitized.excludedAtoms.size() > kMaxExcludedAtoms) {
+        SS_LOG_WARN(L"AtomBombing",
+            L"UpdateConfig: excludedAtoms (%zu) exceeds cap; truncating to %zu",
+            sanitized.excludedAtoms.size(), kMaxExcludedAtoms);
+        sanitized.excludedAtoms.resize(kMaxExcludedAtoms);
+    }
+
+    // Clamp entropy threshold to a sane Shannon range [0.0, 8.0].
+    if (!(sanitized.entropyThreshold >= 0.0) ||
+        !(sanitized.entropyThreshold <= 8.0)) {
+        sanitized.entropyThreshold = AtomBombingConstants::HIGH_ENTROPY_THRESHOLD;
+    }
+
     std::unique_lock lock(m_impl->m_configMutex);
-    m_impl->m_config = config;
+    m_impl->m_config = std::move(sanitized);
 
     SS_LOG_INFO(L"AtomBombing", L"Configuration updated");
     return true;
@@ -1791,6 +1913,16 @@ bool AtomBombingDetector::RemoveMaliciousAtom(uint16_t atomValue) {
         return false;
     }
 
+    // Reject atoms outside the global atom-table range. Local atoms and
+    // sentinel values (0, 0x0001..0xBFFF) cannot be removed via
+    // GlobalDeleteAtom and would only burn 256 syscall iterations.
+    if (atomValue < AtomBombingConstants::MIN_GLOBAL_ATOM) {
+        SS_LOG_WARN(L"AtomBombing",
+            L"RemoveMaliciousAtom: atom 0x%04X outside global range; refusing",
+            static_cast<unsigned>(atomValue));
+        return false;
+    }
+
     try {
         // GlobalDeleteAtom returns 0 on success, the atom value on failure.
         // Atoms are reference-counted; call repeatedly until fully removed.
@@ -1798,8 +1930,20 @@ bool AtomBombingDetector::RemoveMaliciousAtom(uint16_t atomValue) {
         bool deleted = false;
 
         for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+            SetLastError(ERROR_SUCCESS);
             ATOM remaining = GlobalDeleteAtom(static_cast<ATOM>(atomValue));
             if (remaining == 0) {
+                deleted = true;
+                break;
+            }
+            // If the atom is not registered, GlobalDeleteAtom returns the atom
+            // value and sets ERROR_INVALID_HANDLE — bail immediately rather
+            // than spinning the cap.
+            const DWORD lastErr = GetLastError();
+            if (lastErr == ERROR_INVALID_HANDLE) {
+                SS_LOG_DEBUG(L"AtomBombing",
+                    L"RemoveMaliciousAtom: atom 0x%04X not registered",
+                    static_cast<unsigned>(atomValue));
                 deleted = true;
                 break;
             }
@@ -1847,7 +1991,8 @@ bool AtomBombingDetector::TerminateAttacker(const AtomBombingAttack& attack) {
             if (TerminateProcess(hProcess.get(), 1)) {
                 SS_LOG_WARN(L"AtomBombing",
                     L"Terminated attacker process PID %u (%ls)",
-                    attack.attackerPid, attack.attackerProcessName.c_str());
+                    attack.attackerPid,
+                    SanitizeForLog(attack.attackerProcessName).c_str());
                 return true;
             }
         }
