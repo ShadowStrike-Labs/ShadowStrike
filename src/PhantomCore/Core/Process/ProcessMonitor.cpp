@@ -638,19 +638,17 @@ public:
                 } while (Process32NextW(hSnapshot, &pe32));
             }
 
-            // Batch insert under single lock
+            // Batch insert under single lock. Capture uniqueId before moving
+            // info (moved-from ExtendedProcessInfo has unspecified contents
+            // for non-trivial members) and update the PID→UniqueId index in
+            // lock-step instead of clearing and rebuilding it.
             {
                 std::unique_lock lock(m_cacheMutex);
                 for (auto& info : entries) {
-                    m_processCache[info.uniqueId] = std::move(info);
-                    m_pidToUniqueId[m_processCache[info.uniqueId].uniqueId.pid] =
-                        m_processCache.find(info.uniqueId) != m_processCache.end()
-                            ? info.uniqueId : info.uniqueId;
-                }
-                // Re-build pidToUniqueId cleanly from the cache
-                m_pidToUniqueId.clear();
-                for (const auto& [uid, pinfo] : m_processCache) {
-                    m_pidToUniqueId[uid.pid] = uid;
+                    const ProcessUniqueId uid = info.uniqueId;
+                    const uint32_t pid = uid.pid;
+                    m_processCache[uid] = std::move(info);
+                    m_pidToUniqueId[pid] = uid;
                 }
             }
 
@@ -1003,6 +1001,10 @@ public:
         auto parentInfo = GetProcessInfoImpl(processInfo->parentPid);
         if (!parentInfo) {
             // Parent doesn't exist — possible spoofing or orphan
+            ProcessUniqueId synthParent{};
+            synthParent.pid = processInfo->parentPid;
+            InvokeAncestryCallbacks(processInfo->uniqueId, synthParent,
+                L"Ancestry anomaly: claimed parent does not exist");
             return true;
         }
 
@@ -1013,6 +1015,8 @@ public:
             m_stats.ppidSpoofingDetected.fetch_add(1, std::memory_order_relaxed);
 
             InvokeSuspiciousCallbacks(processInfo->uniqueId,
+                L"PPID spoofing: Parent created after child");
+            InvokeAncestryCallbacks(processInfo->uniqueId, parentInfo->uniqueId,
                 L"PPID spoofing: Parent created after child");
 
             return true;
@@ -1032,6 +1036,8 @@ public:
                     pid, processInfo->processName.c_str(), processInfo->parentPid);
                 m_stats.ppidSpoofingDetected.fetch_add(1, std::memory_order_relaxed);
                 InvokeSuspiciousCallbacks(processInfo->uniqueId,
+                    L"PPID spoofing: User process claims smss.exe as parent");
+                InvokeAncestryCallbacks(processInfo->uniqueId, parentInfo->uniqueId,
                     L"PPID spoofing: User process claims smss.exe as parent");
                 return true;
             }
@@ -1479,28 +1485,53 @@ public:
     // ========================================================================
 
     void InvokeProcessCallbacks(const ExtendedProcessInfo& info, bool created) const {
-        std::shared_lock lock(m_callbackMutex);
+        // Snapshot under shared_lock then dispatch unlocked. Holding
+        // m_callbackMutex across user callbacks deadlocks any callback that
+        // (un)registers another callback (which acquires unique_lock on the
+        // same mutex) and serializes long-running callbacks behind our
+        // hot-path event delivery.
+        std::vector<ProcessCallback> snapshot;
+        try {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_processCallbacks.size());
+            for (const auto& [id, cb] : m_processCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        } catch (...) { return; }
 
-        for (const auto& [id, callback] : m_processCallbacks) {
+        for (const auto& callback : snapshot) {
             try {
                 callback(info, created);
                 m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"ProcessMonitor", L"Process callback exception: %S", e.what());
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                SS_LOG_ERROR(L"ProcessMonitor", L"Process callback unknown exception");
+                m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
 
     void InvokeEventCallbacks(const ProcessEvent& event) const {
-        std::shared_lock lock(m_callbackMutex);
+        std::vector<ProcessEventCallback> snapshot;
+        try {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_eventCallbacks.size());
+            for (const auto& [id, cb] : m_eventCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        } catch (...) { return; }
 
-        for (const auto& [id, callback] : m_eventCallbacks) {
+        for (const auto& callback : snapshot) {
             try {
                 callback(event);
                 m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"ProcessMonitor", L"Event callback exception: %S", e.what());
+                m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                SS_LOG_ERROR(L"ProcessMonitor", L"Event callback unknown exception");
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -1510,14 +1541,52 @@ public:
         const ProcessUniqueId& processId,
         const std::wstring& description
     ) const {
-        std::shared_lock lock(m_callbackMutex);
+        std::vector<SuspiciousActivityCallback> snapshot;
+        try {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_suspiciousCallbacks.size());
+            for (const auto& [id, cb] : m_suspiciousCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        } catch (...) { return; }
 
-        for (const auto& [id, callback] : m_suspiciousCallbacks) {
+        for (const auto& callback : snapshot) {
             try {
                 callback(processId, description);
                 m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"ProcessMonitor", L"Suspicious callback exception: %S", e.what());
+                m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                SS_LOG_ERROR(L"ProcessMonitor", L"Suspicious callback unknown exception");
+                m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void InvokeAncestryCallbacks(
+        const ProcessUniqueId& processId,
+        const ProcessUniqueId& parentId,
+        const std::wstring& anomalyType
+    ) const {
+        std::vector<AncestryAnomalyCallback> snapshot;
+        try {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_ancestryCallbacks.size());
+            for (const auto& [id, cb] : m_ancestryCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        } catch (...) { return; }
+
+        for (const auto& callback : snapshot) {
+            try {
+                callback(processId, parentId, anomalyType);
+                m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"ProcessMonitor", L"Ancestry callback exception: %S", e.what());
+                m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                SS_LOG_ERROR(L"ProcessMonitor", L"Ancestry callback unknown exception");
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
