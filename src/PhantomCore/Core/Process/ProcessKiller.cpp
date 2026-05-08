@@ -264,11 +264,40 @@ extern "C" {
 [[nodiscard]] static bool IsProcessRunning(uint32_t pid) noexcept {
     if (pid == 0) return false;
 
-    ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-    if (!hProcess) return false;
+    // SYNCHRONIZE access right is the documented requirement for WaitForSingleObject.
+    // Fall back to PROCESS_QUERY_LIMITED_INFORMATION if SYNCHRONIZE is unavailable
+    // (extremely rare for processes we have any visibility into).
+    ScopedHandle hProcess(OpenProcess(SYNCHRONIZE, FALSE, pid));
+    if (!hProcess) {
+        hProcess = ScopedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        if (!hProcess) return false;
+    }
 
+    // WaitForSingleObject(0) returns WAIT_TIMEOUT iff the process object is not
+    // signaled, i.e. the process is still running. This is correct in the
+    // pathological case where the process exited with code STILL_ACTIVE (259),
+    // which would otherwise cause GetExitCodeProcess to report a false positive.
+    DWORD wr = ::WaitForSingleObject(hProcess.Get(), 0);
+    if (wr == WAIT_TIMEOUT) return true;
+    if (wr == WAIT_OBJECT_0) return false;
+
+    // SYNCHRONIZE handle was unavailable or wait failed — fall back to exit-code
+    // semantics, accepting the well-known STILL_ACTIVE ambiguity as a last resort.
     DWORD exitCode = 0;
     return GetExitCodeProcess(hProcess.Get(), &exitCode) && (exitCode == STILL_ACTIVE);
+}
+
+// Best-effort check that a binary path resides in a Windows system directory.
+// Used to guard the critical-process name list against malware masquerading as
+// e.g. csrss.exe from a non-system path.
+[[nodiscard]] static bool IsSystemDirectoryPath(std::wstring_view path) noexcept {
+    if (path.empty()) return false;
+    std::wstring lower;
+    lower.reserve(path.size());
+    for (wchar_t c : path) lower.push_back(static_cast<wchar_t>(::towlower(c)));
+    return lower.find(L"\\windows\\system32\\") != std::wstring::npos ||
+           lower.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
+           lower.find(L"\\windows\\winsxs\\")   != std::wstring::npos;
 }
 
 [[nodiscard]] static bool IsCriticalProcessName(std::wstring_view name) noexcept {
@@ -889,6 +918,12 @@ public:
                     m_stats.watchdogsDetected++;
                 }
             }
+
+            // Notify registered watchdog observers (defensive copy avoids
+            // re-entrant deadlock if a callback registers/unregisters).
+            if (!watchdogs.empty()) {
+                InvokeWatchdogCallbacks(watchdogs);
+            }
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ProcessKiller", L"DetectWatchdogs exception: %S", e.what());
         }
@@ -939,20 +974,55 @@ public:
         try {
             SS_LOG_INFO(L"ProcessKiller", L"Defeating watchdog group of %zu processes", group.processIds.size());
 
-            // Phase 1: Freeze all
+            // Phase 1: Capture creation times AND freeze every member of the
+            // group while still under the original PIDs. Capturing creation
+            // time before the suspend window closes is required for the
+            // TOCTOU verification in Phase 2 — without it, a PID-reuse race
+            // between detection and kill could result in killing an innocent
+            // process that inherited the PID.
+            struct GroupMember {
+                uint32_t pid{};
+                FILETIME creationTime{};
+                bool valid{false};
+            };
+            std::vector<GroupMember> members;
+            members.reserve(group.processIds.size());
+
             for (uint32_t pid : group.processIds) {
-                ScopedHandle hProc(OpenProcess(PROCESS_SUSPEND_ACCESS, FALSE, pid));
-                if (hProc) NtSuspendProcess(hProc.Get());
+                GroupMember m{};
+                m.pid = pid;
+                ScopedHandle hProc(OpenProcess(
+                    PROCESS_SUSPEND_ACCESS,
+                    FALSE, pid));
+                if (hProc) {
+                    m.creationTime = GetProcessCreationTime(hProc.Get());
+                    m.valid = (m.creationTime.dwLowDateTime != 0 ||
+                               m.creationTime.dwHighDateTime != 0);
+                    NtSuspendProcess(hProc.Get());
+                }
+                members.push_back(m);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-            // Phase 2: Terminate all in parallel
+            // Phase 2: Terminate all in parallel with creation-time verification.
             std::vector<std::future<bool>> futures;
-            for (uint32_t pid : group.processIds) {
-                futures.push_back(std::async(std::launch::async, [pid]() -> bool {
-                    ScopedHandle hProc(OpenProcess(PROCESS_TERMINATE, FALSE, pid));
+            futures.reserve(members.size());
+            for (const auto& m : members) {
+                futures.push_back(std::async(std::launch::async, [m]() -> bool {
+                    ScopedHandle hProc(OpenProcess(
+                        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                        FALSE, m.pid));
                     if (!hProc) return false;
-                    return ::TerminateProcess(hProc.Get(), KillerConstants::EXIT_CODE_SECURITY) != FALSE;
+                    if (m.valid) {
+                        FILETIME current = GetProcessCreationTime(hProc.Get());
+                        if (!CreationTimesMatch(m.creationTime, current)) {
+                            SS_LOG_WARN(L"ProcessKiller",
+                                L"Watchdog defeat: PID %u reused — refusing to kill", m.pid);
+                            return false;
+                        }
+                    }
+                    return ::TerminateProcess(hProc.Get(),
+                        KillerConstants::EXIT_CODE_SECURITY) != FALSE;
                 }));
             }
 
@@ -1020,13 +1090,31 @@ public:
     [[nodiscard]] ProcessCriticality GetCriticalityInternal(uint32_t pid) {
         try {
             std::wstring name = ProcUtils::GetProcessName(pid).value_or(L"");
-            if (IsCriticalProcessName(name)) return ProcessCriticality::Forbidden;
+            if (IsCriticalProcessName(name)) {
+                // Defense-in-depth: a name match is only authoritative if the
+                // binary is actually located in a Windows system directory.
+                // Otherwise malware named csrss.exe (etc.) from a non-system
+                // path would receive blanket immunity from termination.
+                std::wstring path = ProcUtils::GetProcessPath(pid).value_or(L"");
+                if (path.empty() || IsSystemDirectoryPath(path)) {
+                    return ProcessCriticality::Forbidden;
+                }
+                SS_LOG_WARN(L"ProcessKiller",
+                    L"Process %u uses critical-process name '%ls' but resides at '%ls' "
+                    L"(not a system directory) — masquerade suspected, criticality downgraded",
+                    pid, name.c_str(), path.c_str());
+            }
 
             auto prot = GetProtectionInfoInternal(pid);
             if (prot.isCritical) return ProcessCriticality::Critical;
 
             for (const auto& sysProc : KillerConstants::SYSTEM_PROCESSES) {
-                if (IEquals(name, sysProc)) return ProcessCriticality::SystemService;
+                if (IEquals(name, sysProc)) {
+                    std::wstring path = ProcUtils::GetProcessPath(pid).value_or(L"");
+                    if (path.empty() || IsSystemDirectoryPath(path)) {
+                        return ProcessCriticality::SystemService;
+                    }
+                }
             }
             return ProcessCriticality::Normal;
         } catch (...) {
@@ -1149,7 +1237,11 @@ public:
     [[nodiscard]] KillResult KillPrivileged(uint32_t pid, uint32_t exitCode, FILETIME expected) {
         try {
             (void)EnablePrivilege(SE_DEBUG_PRIVILEGE_NAME);
-            ScopedHandle hProcess(OpenProcess(PROCESS_FULL_ACCESS, FALSE, pid));
+            // Request only the rights we actually need. PROCESS_ALL_ACCESS is
+            // commonly denied for elevated/anti-tampered targets and
+            // unnecessarily fails the privileged path before NtTerminate.
+            ScopedHandle hProcess(OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
             if (!hProcess) { m_stats.accessDeniedErrors++; return KillResult::AccessDenied; }
 
             if ((expected.dwLowDateTime || expected.dwHighDateTime) &&
@@ -1825,31 +1917,91 @@ public:
     // ========================================================================
 
     bool InvokePreKillCallbacks(uint32_t pid, const KillOptions& options) {
-        std::shared_lock lock(m_mutex);
+        // Copy callbacks under shared_lock, invoke without holding the lock.
+        // This avoids re-entrant deadlock if a callback (un)registers another
+        // callback (which acquires unique_lock on the same mutex) and ensures
+        // long-running callbacks do not block concurrent termination requests.
+        std::vector<PreKillCallback> snapshot;
         try {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_preKillCallbacks.size());
             for (const auto& [id, cb] : m_preKillCallbacks) {
-                if (cb) { try { if (!cb(pid, options)) return false; } catch (...) {} }
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (...) {}
+        } catch (...) { return true; }
+
+        for (const auto& cb : snapshot) {
+            try {
+                if (!cb(pid, options)) return false;
+            } catch (const std::exception& e) {
+                SS_LOG_WARN(L"ProcessKiller", L"PreKill callback threw: %S", e.what());
+            } catch (...) {
+                SS_LOG_WARN(L"ProcessKiller", L"PreKill callback threw unknown exception");
+            }
+        }
         return true;
     }
 
     void InvokePostKillCallbacks(const ProcessKillInfo& result) {
-        std::shared_lock lock(m_mutex);
+        std::vector<PostKillCallback> snapshot;
         try {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_postKillCallbacks.size());
             for (const auto& [id, cb] : m_postKillCallbacks) {
-                if (cb) { try { cb(result); } catch (...) {} }
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (...) {}
+        } catch (...) { return; }
+
+        for (const auto& cb : snapshot) {
+            try { cb(result); }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"ProcessKiller", L"PostKill callback threw: %S", e.what());
+            } catch (...) {
+                SS_LOG_WARN(L"ProcessKiller", L"PostKill callback threw unknown exception");
+            }
+        }
     }
 
     void InvokeTreeProgressCallbacks(uint32_t current, uint32_t total, const ProcessKillInfo& result) {
-        std::shared_lock lock(m_mutex);
+        std::vector<TreeProgressCallback> snapshot;
         try {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_treeProgressCallbacks.size());
             for (const auto& [id, cb] : m_treeProgressCallbacks) {
-                if (cb) { try { cb(current, total, result); } catch (...) {} }
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (...) {}
+        } catch (...) { return; }
+
+        for (const auto& cb : snapshot) {
+            try { cb(current, total, result); }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"ProcessKiller", L"TreeProgress callback threw: %S", e.what());
+            } catch (...) {
+                SS_LOG_WARN(L"ProcessKiller", L"TreeProgress callback threw unknown exception");
+            }
+        }
+    }
+
+    void InvokeWatchdogCallbacks(const std::vector<WatchdogInfo>& watchdogs) {
+        std::vector<WatchdogDetectedCallback> snapshot;
+        try {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_watchdogCallbacks.size());
+            for (const auto& [id, cb] : m_watchdogCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        } catch (...) { return; }
+
+        for (const auto& cb : snapshot) {
+            for (const auto& wd : watchdogs) {
+                try { cb(wd); }
+                catch (const std::exception& e) {
+                    SS_LOG_WARN(L"ProcessKiller", L"Watchdog callback threw: %S", e.what());
+                } catch (...) {
+                    SS_LOG_WARN(L"ProcessKiller", L"Watchdog callback threw unknown exception");
+                }
+            }
+        }
     }
 
     uint64_t RegisterPreKillCallback(PreKillCallback cb) {
@@ -2100,17 +2252,64 @@ bool ProcessKiller::DefeatWatchdogGroup(const WatchdogGroup& group) {
 }
 
 TreeKillInfo ProcessKiller::KillWithWatchdogs(uint32_t pid, const KillOptions& options) {
+    TreeKillInfo info;
+    info.rootPid = pid;
+    info.startTime = std::chrono::system_clock::now();
+    info.strategy = TreeKillStrategy::Simultaneous;
+
     auto watchdogs = m_impl->DetectWatchdogs(pid);
     std::unordered_set<uint32_t> allPids;
     allPids.insert(pid);
     for (const auto& wd : watchdogs) { allPids.insert(wd.watcherPid); allPids.insert(wd.watchedPid); }
+
+    // Expand to include the full descendant tree of every watchdog member —
+    // not just the root — so a watchdog process can't outlive the kill by
+    // forking children we never enumerated.
     for (uint32_t p : std::vector<uint32_t>(allPids.begin(), allPids.end())) {
         for (uint32_t c : m_impl->GetProcessTreeInternal(p, KillerConstants::MAX_TREE_DEPTH))
             allPids.insert(c);
     }
+
     KillOptions opts = options;
     opts.treeStrategy = TreeKillStrategy::Simultaneous;
-    return m_impl->TerminateTreeEx(pid, opts);
+
+    auto rootName = ProcUtils::GetProcessName(pid);
+    if (rootName) info.rootName = *rootName;
+    info.totalProcesses = static_cast<uint32_t>(allPids.size());
+
+    // Terminate every PID in the consolidated set. Forcing a non-tree call
+    // per PID (Simultaneous) prevents nested TerminateTree from re-walking
+    // descendants we already enumerated and respects the caller's intent
+    // to bring down the whole watchdog cluster atomically.
+    KillOptions perPid = opts;
+    perPid.killTree = false;
+
+    info.processResults.reserve(allPids.size());
+    for (uint32_t p : allPids) {
+        auto r = m_impl->TerminateEx(p, perPid);
+        switch (r.result) {
+            case KillResult::Success:
+            case KillResult::AlreadyDead:
+                info.killedProcesses++;
+                break;
+            case KillResult::Critical:
+            case KillResult::Blocked:
+                info.skippedProcesses++;
+                if (!r.errorMessage.empty()) info.warnings.push_back(r.errorMessage);
+                break;
+            default:
+                info.failedProcesses++;
+                if (!r.errorMessage.empty()) info.errors.push_back(r.errorMessage);
+                break;
+        }
+        info.processResults.push_back(std::move(r));
+    }
+
+    info.endTime = std::chrono::system_clock::now();
+    if (info.failedProcesses == 0) info.overallResult = KillResult::Success;
+    else if (info.killedProcesses > 0) info.overallResult = KillResult::PartialSuccess;
+    else info.overallResult = KillResult::Failed;
+    return info;
 }
 
 // ============================================================================
