@@ -660,21 +660,30 @@ public:
 
     [[nodiscard]] std::vector<NetworkAdapter> EnumerateAdapters() const {
         std::vector<NetworkAdapter> adapters;
+        m_lastEnumerationOk.store(false, std::memory_order_release);
 
         try {
+            // Bounded retry loop for ERROR_BUFFER_OVERFLOW: at most 4 attempts
+            // with the buffer size suggested by the kernel. Caps total
+            // allocation to MAX_ENUMERATION_BUFFER_BYTES (16 MiB) to bound
+            // memory pressure under a hostile or buggy network stack.
+            constexpr ULONG MAX_ENUMERATION_BUFFER_BYTES = 16 * 1024 * 1024;
+            constexpr int MAX_ENUMERATION_ATTEMPTS = 4;
+
             ULONG bufferSize = 15000;
-            std::vector<uint8_t> buffer(bufferSize);
+            std::vector<uint8_t> buffer;
+            ULONG result = ERROR_BUFFER_OVERFLOW;
 
-            ULONG result = GetAdaptersAddresses(
-                AF_UNSPEC,
-                GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_PREFIX,
-                nullptr,
-                reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()),
-                &bufferSize
-            );
-
-            if (result == ERROR_BUFFER_OVERFLOW) {
-                buffer.resize(bufferSize);
+            for (int attempt = 0;
+                 attempt < MAX_ENUMERATION_ATTEMPTS && result == ERROR_BUFFER_OVERFLOW;
+                 ++attempt) {
+                if (bufferSize > MAX_ENUMERATION_BUFFER_BYTES) {
+                    SS_LOG_ERROR(L"Network",
+                        L"GetAdaptersAddresses requested buffer %lu exceeds cap %lu; aborting",
+                        bufferSize, MAX_ENUMERATION_BUFFER_BYTES);
+                    return adapters;
+                }
+                buffer.assign(bufferSize, 0);
                 result = GetAdaptersAddresses(
                     AF_UNSPEC,
                     GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_PREFIX,
@@ -767,6 +776,8 @@ public:
 
                 pAdapter = pAdapter->Next;
             }
+
+            m_lastEnumerationOk.store(true, std::memory_order_release);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"EnumerateAdapters - Exception: %hs", e.what());
@@ -947,13 +958,15 @@ public:
             const std::string& queryIP = connection.remoteServerIP.empty()
                 ? connection.virtualIP : connection.remoteServerIP;
 
-            // Query ThreatIntelLookup for known VPN provider IP ranges and ASN data
-            ThreatIntel::ThreatIntelLookup threatIntel;
-            if (threatIntel.IsInitialized()) {
-                auto result = threatIntel.LookupIPv4(queryIP);
+            // Query the orchestrator-injected ThreatIntelLookup for known
+            // VPN/proxy/anonymizer IP ranges. The pointer is owned by the
+            // orchestrator; we hold only a non-owning atomic reference.
+            ThreatIntel::ThreatIntelLookup* threatIntel =
+                m_threatIntelLookup.load(std::memory_order_acquire);
+
+            if (threatIntel != nullptr && threatIntel->IsInitialized()) {
+                auto result = threatIntel->LookupIPv4(queryIP);
                 if (result.found) {
-                    // If the IP is known in threat intel as a VPN/proxy/anonymizer,
-                    // boost confidence and log
                     if (result.IsSuspicious() || result.IsMalicious()) {
                         connection.confidence += 0.15;
                         SS_LOG_WARN(L"Network",
@@ -968,9 +981,14 @@ public:
                         queryIP.c_str());
                 }
             } else {
-                SS_LOG_DEBUG(L"Network",
-                    L"ThreatIntelLookup not initialized; skipping IP range check for %hs",
-                    queryIP.c_str());
+                // Log once per orchestrator-wiring state transition rather
+                // than on every scan to avoid log flooding when ThreatIntel
+                // is intentionally not wired (e.g. lightweight deployments).
+                if (!m_threatIntelMissingLogged.exchange(true, std::memory_order_acq_rel)) {
+                    SS_LOG_DEBUG(L"Network",
+                        L"ThreatIntelLookup not wired; skipping IP reputation check for %hs",
+                        queryIP.c_str());
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1191,6 +1209,18 @@ public:
 
             auto adapters = EnumerateAdapters();
 
+            // If enumeration failed (returned empty due to an OS error rather
+            // than a genuine "no adapters" state), skip change detection and
+            // do not poison the cached adapter list. Otherwise a transient
+            // GetAdaptersAddresses failure would make every adapter look
+            // "removed" and then "added" on the next successful scan,
+            // generating spurious change-callback storms.
+            if (!m_lastEnumerationOk.load(std::memory_order_acquire)) {
+                SS_LOG_DEBUG(L"Network",
+                    L"VPN adapter scan skipped: enumeration failed transiently");
+                return;
+            }
+
             // Detect adapter changes before overwriting the cached list
             DetectAdapterChanges(adapters);
 
@@ -1223,7 +1253,6 @@ public:
 
                 // Update atomic statistics (no lock needed)
                 m_stats.vpnConnectionsDetected++;
-                m_stats.activeVPNConnections = 1;
 
                 // Protocol statistics
                 if (connection.protocol == VPNProtocol::OPENVPN_UDP ||
@@ -1247,23 +1276,48 @@ public:
                     m_stats.unknownProviders++;
                 }
 
-                // Store connection under lock; cap the map size to prevent unbounded growth
+                // Store connection under lock; reuse existing entry keyed by
+                // adapter index to prevent connectionId churn (the same
+                // adapter scanned across N intervals must keep the same
+                // connectionId, otherwise external callers cannot correlate
+                // FeedPacket() / AnalyzeTraffic() / IdentifyProvider() calls
+                // and the map grows by one entry per scan until eviction).
                 {
                     std::unique_lock lock(m_mutex);
 
-                    // Evict oldest connections if at capacity
-                    while (m_activeConnections.size() >= MAX_ACTIVE_CONNECTIONS) {
-                        // Find connection with oldest detectedAt
-                        auto oldest = m_activeConnections.begin();
-                        for (auto it = m_activeConnections.begin(); it != m_activeConnections.end(); ++it) {
-                            if (it->second.detectedAt < oldest->second.detectedAt) {
-                                oldest = it;
-                            }
+                    bool reused = false;
+                    for (auto& [existingId, existingConn] : m_activeConnections) {
+                        if (existingConn.adapterIndex == connection.adapterIndex) {
+                            // Preserve the existing connection ID and
+                            // detectedAt timestamp so callers and eviction
+                            // logic see a stable lifetime for this VPN.
+                            connection.connectionId = existingId;
+                            connection.detectedAt = existingConn.detectedAt;
+                            existingConn = connection;
+                            reused = true;
+                            break;
                         }
-                        m_activeConnections.erase(oldest);
                     }
 
-                    m_activeConnections[connection.connectionId] = connection;
+                    if (!reused) {
+                        // Evict oldest connections if at capacity. Hard cap
+                        // bounds memory under abnormal adapter-index churn.
+                        while (m_activeConnections.size() >= MAX_ACTIVE_CONNECTIONS) {
+                            auto oldest = m_activeConnections.begin();
+                            for (auto it = m_activeConnections.begin();
+                                 it != m_activeConnections.end(); ++it) {
+                                if (it->second.detectedAt < oldest->second.detectedAt) {
+                                    oldest = it;
+                                }
+                            }
+                            m_activeConnections.erase(oldest);
+                        }
+
+                        m_activeConnections[connection.connectionId] = connection;
+                    }
+
+                    m_stats.activeVPNConnections =
+                        static_cast<uint32_t>(m_activeConnections.size());
                 }
 
                 // Apply policy and invoke callbacks WITHOUT holding the mutex
@@ -1272,10 +1326,10 @@ public:
 
             } else {
                 // No active VPN found; clear stale connections
-                m_stats.activeVPNConnections = 0;
                 {
                     std::unique_lock lock(m_mutex);
                     m_activeConnections.clear();
+                    m_stats.activeVPNConnections = 0;
                 }
             }
 
@@ -1835,6 +1889,21 @@ public:
     // ID generation
     mutable std::atomic<uint64_t> m_nextConnectionId{ 1 };
     std::atomic<uint64_t> m_nextAlertId{ 1 };
+
+    // Orchestrator-injected dependencies (non-owning).
+    // Atomic for lock-free reads from hot detection paths and to allow the
+    // orchestrator to update wiring without synchronizing with m_mutex.
+    std::atomic<ThreatIntel::ThreatIntelLookup*> m_threatIntelLookup{ nullptr };
+
+    // Tracks whether the most recent EnumerateAdapters() call observed a
+    // successful GetAdaptersAddresses() return; used to suppress spurious
+    // adapter add/remove storms on transient failures. Mutable because
+    // EnumerateAdapters() is logically const.
+    mutable std::atomic<bool> m_lastEnumerationOk{ false };
+
+    // Throttle for "ThreatIntel not wired" debug logging — we log once per
+    // wiring transition rather than once per scan.
+    mutable std::atomic<bool> m_threatIntelMissingLogged{ false };
 };
 
 // ============================================================================
@@ -2026,6 +2095,16 @@ TrafficFingerprint VPNDetector::AnalyzeTraffic(uint64_t connectionId) const {
 
 void VPNDetector::FeedPacket(uint64_t connectionId, std::span<const uint8_t> packet) {
     if (packet.empty() || packet.size() < 4) return;
+
+    // Hard cap on inspected packet size. VPN protocol fingerprinting only
+    // needs the first few dozen bytes (OpenVPN/WireGuard/IKE/SSTP/GRE
+    // headers); refusing oversize input prevents an attacker (or a buggy
+    // caller) from feeding multi-megabyte buffers in tight loops just to
+    // burn CPU in this hot path.
+    constexpr size_t kMaxInspectedPacketBytes = 64 * 1024;
+    if (packet.size() > kMaxInspectedPacketBytes) {
+        packet = packet.first(kMaxInspectedPacketBytes);
+    }
 
     // Detect VPN protocol from packet header signatures
     VPNProtocol detected = VPNProtocol::UNKNOWN;
@@ -2380,6 +2459,23 @@ bool VPNDetector::ExportDiagnostics(const std::wstring& outputPath) const {
         SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: %hs", e.what());
         return false;
     }
+}
+
+// ============================================================================
+// STORE WIRING (ORCHESTRATOR-INJECTED DEPENDENCIES)
+// ============================================================================
+
+void VPNDetector::SetThreatIntelLookup(
+    ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept {
+    if (!m_impl) return;
+
+    m_impl->m_threatIntelLookup.store(lookup, std::memory_order_release);
+    // Reset the throttle so the "not wired" debug message can fire again
+    // if the orchestrator later clears wiring.
+    m_impl->m_threatIntelMissingLogged.store(false, std::memory_order_release);
+
+    SS_LOG_INFO(L"Network", L"VPNDetector: ThreatIntelLookup %ls",
+        lookup ? L"wired" : L"cleared");
 }
 
 }  // namespace Network
