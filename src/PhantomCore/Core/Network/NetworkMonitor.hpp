@@ -185,7 +185,7 @@ namespace Network {
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
-class NetworkMonitorImpl;  // PIMPL implementation
+struct NetworkMonitorImpl;  // PIMPL implementation
 
 // ============================================================================
 // NAMESPACE CONSTANTS
@@ -203,6 +203,20 @@ namespace NetworkMonitorConstants {
     constexpr size_t MAX_BLOCKED_IPS = 100000;               // IP blocklist size
     constexpr size_t MAX_BLOCKED_DOMAINS = 50000;            // Domain blocklist
     constexpr size_t MAX_BLOCKED_PORTS = 1000;               // Port blocklist
+    constexpr size_t MAX_BLOCKED_RANGES = 10000;             // CIDR blocklist
+    constexpr size_t MAX_BLOCKED_PROCESSES = 10000;          // Per-PID blocks
+    constexpr size_t MAX_FILTERS = 50000;                    // Active filter rules
+
+    // Per-tracker caps to prevent state explosion under hostile traffic
+    constexpr size_t MAX_BEACONING_TRACKERS = 100000;        // Distinct destinations
+    constexpr size_t MAX_PORTSCAN_TRACKERS  = 100000;        // Distinct sources
+    constexpr size_t MAX_EXFIL_TRACKERS     = 100000;        // Distinct PIDs
+    constexpr size_t MAX_TRACKER_HISTORY    = 100;           // Samples per tracker
+
+    // Hostname / domain normalization caps
+    constexpr size_t MAX_DOMAIN_LENGTH      = 253;           // RFC 1035
+    constexpr size_t MAX_LOG_FIELD_LENGTH   = 256;           // Truncation cap for logs
+    constexpr size_t MAX_RESOLVED_ADDRESSES = 64;            // ResolveHostname cap
 
     // Timing constants
     constexpr uint32_t CONNECTION_TIMEOUT_MS = 300000;       // 5 minutes idle timeout
@@ -733,7 +747,13 @@ struct alignas(64) EnhancedConnectionInfo {
     [[nodiscard]] bool IsInbound() const noexcept {
         return fullInfo.direction == ConnectionDirection::INBOUND;
     }
-    [[nodiscard]] uint64_t GetTimestamp() const noexcept;
+    [[nodiscard]] uint64_t GetTimestamp() const noexcept {
+        // DESIGN: Expose connection creation time as Unix epoch milliseconds for the legacy
+        // EnhancedConnectionInfo consumers (UI/dashboard) that pre-date the chrono-based fields.
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                fullInfo.createTime.time_since_epoch()).count());
+    }
 };
 
 /**
@@ -1614,15 +1634,6 @@ private:
     // ========================================================================
     std::unique_ptr<NetworkMonitorImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
-
-    // ========================================================================
-    // LEGACY MEMBERS
-    // ========================================================================
-    std::atomic<bool> m_running{ false };
-    ConnectionCallback m_legacyCallback;
-    mutable std::shared_mutex m_callbackMutex;
-    std::vector<IPAddress> m_blockedIps;
-    mutable std::shared_mutex m_filterMutex;
 };
 
 // ============================================================================
