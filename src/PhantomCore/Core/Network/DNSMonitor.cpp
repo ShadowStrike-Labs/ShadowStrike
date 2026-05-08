@@ -349,7 +349,8 @@ void DNSStatistics::Reset() noexcept {
 // PIMPL Implementation
 // ============================================================================
 
-struct DNSMonitorImpl {
+class DNSMonitorImpl {
+public:
     // Thread synchronization
     mutable std::shared_mutex m_mutex;
 
