@@ -273,8 +273,27 @@ double HollowingStatistics::GetDetectionRate() const noexcept {
 void HollowingDetectionResult::CalculateConfidence() noexcept {
     int score = 0;
 
+    // De-duplicate detection methods so that repeated occurrences of the same
+    // signal (e.g. SectionMismatch reported per-section) do not artificially
+    // inflate the confidence score.
+    std::array<bool, 32> seen{};
+    auto markSeen = [&seen](DetectionMethod m) noexcept -> bool {
+        const auto idx = static_cast<size_t>(m);
+        if (idx >= seen.size()) {
+            return true;  // Unknown method — score it once
+        }
+        if (seen[idx]) {
+            return false;
+        }
+        seen[idx] = true;
+        return true;
+    };
+
     // Strong indicators (worth 3 points each)
     for (auto method : detectionMethods) {
+        if (!markSeen(method)) {
+            continue;
+        }
         switch (method) {
             case DetectionMethod::PEHeaderMismatch:      score += 3; break;
             case DetectionMethod::SectionMismatch:        score += 3; break;
@@ -518,6 +537,35 @@ struct ProcessHollowingDetectorImpl {
             uint16_t magic = *reinterpret_cast<const uint16_t*>(buffer.data() + optHeaderOffset);
             info.is64Bit = (magic == 0x20b);  // PE32+
 
+            // Cross-validate Machine field against Optional Magic. A crafted PE may
+            // declare Machine=AMD64 with a PE32 (0x10b) optional header, or vice versa.
+            // Reject obviously inconsistent combinations.
+            {
+                const bool magicIsPE32  = (magic == 0x10b);
+                const bool magicIsPE32p = (magic == 0x20b);
+                const bool magicIsROM   = (magic == 0x107);
+                if (!magicIsPE32 && !magicIsPE32p && !magicIsROM) {
+                    info.validationError = L"Invalid Optional Header Magic";
+                    return info;
+                }
+
+                const uint16_t mach = info.machine;
+                const bool mach64 = (mach == 0x8664 /* AMD64 */ ||
+                                     mach == 0xAA64 /* ARM64 */ ||
+                                     mach == 0x0200 /* IA64 */);
+                const bool mach32 = (mach == 0x014c /* I386 */ ||
+                                     mach == 0x01c0 /* ARM */ ||
+                                     mach == 0x01c4 /* ARMNT */);
+                if (magicIsPE32p && mach32) {
+                    info.validationError = L"PE32+ optional header with 32-bit Machine";
+                    return info;
+                }
+                if (magicIsPE32 && mach64) {
+                    info.validationError = L"PE32 optional header with 64-bit Machine";
+                    return info;
+                }
+            }
+
             // Parse Optional Header
             if (info.is64Bit) {
                 if (optHeaderOffset + sizeof(IMAGE_OPTIONAL_HEADER64_CUSTOM) > buffer.size()) {
@@ -602,8 +650,26 @@ struct ProcessHollowingDetectorImpl {
                 }
             }
 
-            // Parse sections
-            size_t sectionHeaderOffset = optHeaderOffset + fileHeader->SizeOfOptionalHeader;
+            // Parse sections.
+            // SizeOfOptionalHeader is attacker-controlled; validate it against a
+            // sane lower/upper bound before computing the section header offset to
+            // prevent integer overflow and out-of-bounds reads on crafted PEs.
+            const uint16_t sizeOfOptHdr = fileHeader->SizeOfOptionalHeader;
+            const size_t minOptHdr = info.is64Bit
+                ? sizeof(IMAGE_OPTIONAL_HEADER64_CUSTOM)
+                : sizeof(IMAGE_OPTIONAL_HEADER32_CUSTOM);
+            if (sizeOfOptHdr < minOptHdr ||
+                sizeOfOptHdr > HollowingConstants::MAX_PE_HEADER_SIZE) {
+                info.validationError = L"SizeOfOptionalHeader out of sane range";
+                return info;
+            }
+
+            size_t sectionHeaderOffset = optHeaderOffset + sizeOfOptHdr;
+            if (sectionHeaderOffset < optHeaderOffset ||  // overflow guard
+                sectionHeaderOffset > buffer.size()) {
+                info.validationError = L"Section header offset out of bounds";
+                return info;
+            }
             for (uint16_t i = 0; i < info.numberOfSections && i < HollowingConstants::MAX_SECTIONS; ++i) {
                 size_t secOffset = sectionHeaderOffset + (i * sizeof(IMAGE_SECTION_HEADER_CUSTOM));
 
@@ -669,8 +735,15 @@ struct ProcessHollowingDetectorImpl {
     // ========================================================================
 
     void InvokeDetectionCallbacks(const HollowingDetectionResult& result) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_detectionCallbacks) {
+        // Snapshot the callback list under the lock and release it before
+        // invoking, so callbacks that re-enter (e.g. UnregisterCallback) do not
+        // self-deadlock on m_callbacksMutex.
+        std::vector<std::pair<uint64_t, HollowingDetectedCallback>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_detectionCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
                 callback(result);
             } catch (const std::exception& e) {
@@ -680,8 +753,12 @@ struct ProcessHollowingDetectorImpl {
     }
 
     void InvokeCreationCallbacks(uint32_t pid, const CreationPatternAnalysis& pattern) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_creationCallbacks) {
+        std::vector<std::pair<uint64_t, SuspiciousCreationCallback>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_creationCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
                 callback(pid, pattern);
             } catch (const std::exception& e) {
@@ -691,8 +768,12 @@ struct ProcessHollowingDetectorImpl {
     }
 
     void InvokeProgressCallbacks(uint32_t pid, const std::wstring& stage, uint32_t percent) {
-        std::lock_guard<std::mutex> lock(m_callbacksMutex);
-        for (const auto& [id, callback] : m_progressCallbacks) {
+        std::vector<std::pair<uint64_t, HollowingScanProgressCallback>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            snapshot = m_progressCallbacks;
+        }
+        for (const auto& [id, callback] : snapshot) {
             try {
                 callback(pid, stage, percent);
             } catch (const std::exception& e) {
@@ -902,6 +983,68 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Hol
     result.scanMode = mode;
     result.scanTime = std::chrono::system_clock::now();
 
+    // Snapshot caching mode at scan entry. The config can be mutated mid-flight
+    // by UpdateConfig(); without snapshotting, the in-progress marker may be
+    // inserted under one setting and never released, leaving a phantom entry.
+    bool cachingEnabledForThisScan = false;
+
+    // Structured finalizer — runs on every exit path (success, exception, or
+    // timeout), updates statistics and releases the in-progress marker. This
+    // replaces an earlier `goto`-based pattern.
+    bool finalizeRan = false;
+    auto finalize = [&]() noexcept {
+        if (finalizeRan) {
+            return;
+        }
+        finalizeRan = true;
+
+        auto endTime = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+        result.scanDurationMs = static_cast<uint32_t>(duration.count());
+
+        m_impl->m_statistics.totalScanTimeMs.fetch_add(result.scanDurationMs, std::memory_order_relaxed);
+
+        uint64_t minTime = m_impl->m_statistics.minScanTimeMs.load(std::memory_order_relaxed);
+        while (result.scanDurationMs < minTime &&
+               !m_impl->m_statistics.minScanTimeMs.compare_exchange_weak(minTime, result.scanDurationMs)) {
+        }
+
+        uint64_t maxTime = m_impl->m_statistics.maxScanTimeMs.load(std::memory_order_relaxed);
+        while (result.scanDurationMs > maxTime &&
+               !m_impl->m_statistics.maxScanTimeMs.compare_exchange_weak(maxTime, result.scanDurationMs)) {
+        }
+
+        if (cachingEnabledForThisScan) {
+            try {
+                std::lock_guard<std::mutex> cacheLock(m_impl->m_cacheMutex);
+                m_impl->m_scansInProgress.erase(pid);
+
+                if (result.scanComplete) {
+                    constexpr size_t MAX_CACHE_ENTRIES = 2048;
+                    if (m_impl->m_scanCache.size() >= MAX_CACHE_ENTRIES) {
+                        auto now = std::chrono::system_clock::now();
+                        for (auto it = m_impl->m_scanCache.begin(); it != m_impl->m_scanCache.end(); ) {
+                            auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.cachedAt);
+                            if (age.count() > m_impl->m_config.cacheTTLSeconds) {
+                                it = m_impl->m_scanCache.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                    ProcessHollowingDetectorImpl::CacheEntry entry;
+                    entry.result = result;
+                    entry.cachedAt = std::chrono::system_clock::now();
+                    m_impl->m_scanCache[pid] = std::move(entry);
+                }
+
+                m_impl->m_cacheCV.notify_all();
+            } catch (...) {
+                // Finalizer must never throw; swallow lock/allocation failures.
+            }
+        }
+    };
+
     try {
         // Guard: must be initialized
         if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
@@ -928,7 +1071,8 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Hol
         }
 
         // Check scan cache and in-progress tracking
-        if (m_impl->m_config.enableCaching) {
+        cachingEnabledForThisScan = m_impl->m_config.enableCaching;
+        if (cachingEnabledForThisScan) {
             std::unique_lock<std::mutex> cacheLock(m_impl->m_cacheMutex);
 
             // Check if result already cached and fresh
@@ -1021,7 +1165,8 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Hol
             result.scanError = L"Scan timeout after header comparison";
             result.scanComplete = false;
             m_impl->m_statistics.timeoutErrors.fetch_add(1, std::memory_order_relaxed);
-            goto finalize_scan;
+            finalize();
+            return result;
         }
 
         m_impl->InvokeProgressCallbacks(pid, L"Analyzing entry point", 70);
@@ -1039,7 +1184,8 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Hol
             result.scanError = L"Scan timeout after entry point analysis";
             result.scanComplete = false;
             m_impl->m_statistics.timeoutErrors.fetch_add(1, std::memory_order_relaxed);
-            goto finalize_scan;
+            finalize();
+            return result;
         }
 
         m_impl->InvokeProgressCallbacks(pid, L"Checking creation pattern", 80);
@@ -1165,7 +1311,14 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Hol
                         bool isExec = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
                         bool isRWX = (mbi.Protect & PAGE_EXECUTE_READWRITE) != 0;
-                        bool isUnbacked = (mbi.Type == 0 || mbi.Type == MEM_PRIVATE);
+                        // Hollowing payloads commonly live in MEM_PRIVATE pages,
+                        // but they may also reside in non-image MEM_MAPPED views
+                        // (e.g. process doppelganging via section objects). Both
+                        // are non-image-backed and therefore "unbacked" from the
+                        // perspective of legitimate module loading.
+                        bool isUnbacked = (mbi.Type == 0 ||
+                                           mbi.Type == MEM_PRIVATE ||
+                                           mbi.Type == MEM_MAPPED);
 
                         if (mbi.State == MEM_COMMIT && isExec && isUnbacked) {
                             result.hasUnbackedExecutableMemory = true;
@@ -1412,52 +1565,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Hol
         SS_LOG_ERROR(L"Hollowing", L"Scan failed for PID %u - %ls", pid, result.scanError.c_str());
     }
 
-finalize_scan:
-    // Update timing statistics
-    auto endTime = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-    result.scanDurationMs = static_cast<uint32_t>(duration.count());
-
-    m_impl->m_statistics.totalScanTimeMs.fetch_add(result.scanDurationMs, std::memory_order_relaxed);
-
-    uint64_t minTime = m_impl->m_statistics.minScanTimeMs.load(std::memory_order_relaxed);
-    while (result.scanDurationMs < minTime &&
-           !m_impl->m_statistics.minScanTimeMs.compare_exchange_weak(minTime, result.scanDurationMs)) {
-    }
-
-    uint64_t maxTime = m_impl->m_statistics.maxScanTimeMs.load(std::memory_order_relaxed);
-    while (result.scanDurationMs > maxTime &&
-           !m_impl->m_statistics.maxScanTimeMs.compare_exchange_weak(maxTime, result.scanDurationMs)) {
-    }
-
-    // Write result to scan cache and clear in-progress marker
-    if (m_impl->m_config.enableCaching) {
-        std::lock_guard<std::mutex> cacheLock(m_impl->m_cacheMutex);
-        m_impl->m_scansInProgress.erase(pid);
-
-        if (result.scanComplete) {
-            // Evict if over capacity
-            constexpr size_t MAX_CACHE_ENTRIES = 2048;
-            if (m_impl->m_scanCache.size() >= MAX_CACHE_ENTRIES) {
-                auto now = std::chrono::system_clock::now();
-                for (auto it = m_impl->m_scanCache.begin(); it != m_impl->m_scanCache.end(); ) {
-                    auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.cachedAt);
-                    if (age.count() > m_impl->m_config.cacheTTLSeconds) {
-                        it = m_impl->m_scanCache.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-            ProcessHollowingDetectorImpl::CacheEntry entry;
-            entry.result = result;
-            entry.cachedAt = std::chrono::system_clock::now();
-            m_impl->m_scanCache[pid] = std::move(entry);
-        }
-
-        m_impl->m_cacheCV.notify_all();
-    }
-
+    finalize();
     return result;
 }
 
@@ -1715,9 +1823,14 @@ HeaderComparison ProcessHollowingDetector::ComparePEHeaders(
     comparison.entryPointMatches = (disk.entryPoint == memory.entryPoint);
     comparison.sizeOfImageMatches = (disk.sizeOfImage == memory.sizeOfImage);
 
-    // PE loader zeroes the checksum field in memory. Only flag mismatch if
-    // both disk and memory have non-zero checksums that disagree.
-    comparison.checksumMatches = (memory.checksum == 0) ||
+    // The Windows PE loader does NOT zero the CheckSum field in the in-memory
+    // image; it preserves the on-disk value. However, many legitimate PEs ship
+    // with a zero CheckSum (only required for kernel-mode and certain system
+    // binaries). Therefore: treat the comparison as matched when either side
+    // is zero (unverifiable), and only flag as a real mismatch when both
+    // values are non-zero and disagree.
+    comparison.checksumMatches = (disk.checksum == 0) ||
+                                 (memory.checksum == 0) ||
                                  (disk.checksum == memory.checksum);
 
     comparison.timestampMatches = (disk.timeDateStamp == memory.timeDateStamp);
@@ -1884,10 +1997,12 @@ EntryPointAnalysis ProcessHollowingDetector::AnalyzeEntryPoint(uint32_t pid) {
 
         analysis.entryPointVA = moduleBase + analysis.entryPointRVA;
 
-        // Determine which section contains the entry point
+        // Determine which section contains the entry point.
+        // Use 64-bit arithmetic to avoid uint32_t overflow when virtualSize or
+        // sizeOfRawData are crafted to wrap around past 0xFFFFFFFF.
         for (const auto& section : diskHeader.sections) {
-            uint32_t secStart = section.virtualAddress;
-            uint32_t secEnd = secStart + std::max(section.virtualSize, section.sizeOfRawData);
+            uint64_t secStart = section.virtualAddress;
+            uint64_t secEnd = secStart + std::max<uint64_t>(section.virtualSize, section.sizeOfRawData);
             if (analysis.entryPointRVA >= secStart && analysis.entryPointRVA < secEnd) {
                 analysis.containingSection = Utils::StringUtils::ToWide(
                     std::string(section.name.data(), strnlen(section.name.data(), 8)));
@@ -1960,8 +2075,8 @@ EntryPointAnalysis ProcessHollowingDetector::AnalyzeEntryPoint(uint32_t pid) {
 
         // Entry point in a writable section is suspicious
         for (const auto& section : diskHeader.sections) {
-            uint32_t secStart = section.virtualAddress;
-            uint32_t secEnd = secStart + std::max(section.virtualSize, section.sizeOfRawData);
+            uint64_t secStart = section.virtualAddress;
+            uint64_t secEnd = secStart + std::max<uint64_t>(section.virtualSize, section.sizeOfRawData);
             if (analysis.entryPointRVA >= secStart && analysis.entryPointRVA < secEnd) {
                 if (section.isWritable && section.isExecutable) {
                     analysis.isAnomalous = true;
@@ -2115,10 +2230,43 @@ CreationPatternAnalysis ProcessHollowingDetector::AnalyzeCreationPattern(uint32_
 
     analysis.observedApiSequence = event.memoryOperations;
 
-    // Check for hollowing API sequence
-    if (!event.memoryOperations.empty()) {
+    // Hollowing API-sequence detection.
+    // We require co-occurrence of *meaningful* primitives — at minimum a
+    // remote write coupled with either an unmap/map of an image section or a
+    // SetThreadContext — before claiming the API sequence matches a hollowing
+    // pattern. Flagging on any single observed memory operation (the previous
+    // behaviour) produces false positives on benign cross-process tooling
+    // (debuggers, anti-cheat injectors, profilers).
+    bool sawWrite = false;
+    bool sawUnmap = false;
+    bool sawMap = false;
+    bool sawSetCtx = false;
+    for (const auto& op : event.memoryOperations) {
+        if (op.find(L"WriteProcessMemory") != std::wstring::npos ||
+            op.find(L"NtWriteVirtualMemory") != std::wstring::npos) {
+            sawWrite = true;
+        }
+        if (op.find(L"NtUnmapViewOfSection") != std::wstring::npos) {
+            sawUnmap = true;
+        }
+        if (op.find(L"NtMapViewOfSection") != std::wstring::npos) {
+            sawMap = true;
+        }
+        if (op.find(L"SetThreadContext") != std::wstring::npos ||
+            op.find(L"NtSetContextThread") != std::wstring::npos) {
+            sawSetCtx = true;
+        }
+    }
+
+    const bool classicSequence = sawUnmap && sawMap && sawWrite;
+    const bool earlyBirdSequence = sawWrite && sawSetCtx;
+    if (classicSequence || earlyBirdSequence) {
         analysis.isSuspiciousPattern = true;
         analysis.matchesHollowingPattern = true;
+    } else if (!event.memoryOperations.empty() &&
+               (sawUnmap || sawMap || sawWrite || sawSetCtx)) {
+        // Partial signal — suspicious but not a confirmed hollowing sequence.
+        analysis.isSuspiciousPattern = true;
     }
 
     return analysis;
@@ -2135,8 +2283,24 @@ void ProcessHollowingDetector::OnProcessCreated(
     bool createdSuspended,
     const std::wstring& imagePath)
 {
+    // Drop events arriving before Initialize() or after Shutdown(); state
+    // mutated outside the initialized window leaks across detector lifecycles.
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
     if (createdSuspended) {
         m_impl->m_statistics.suspendedCreationsMonitored.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // PIDs are reused by the Windows kernel. A new process arriving with the
+    // same PID as a previously-scanned one would otherwise hit a stale cache
+    // entry and a stale in-progress marker. Invalidate both proactively.
+    {
+        std::lock_guard<std::mutex> cacheLock(m_impl->m_cacheMutex);
+        m_impl->m_scanCache.erase(pid);
+        m_impl->m_scansInProgress.erase(pid);
+        m_impl->m_cacheCV.notify_all();
     }
 
     std::lock_guard<std::mutex> lock(m_impl->m_creationEventsMutex);
@@ -2177,6 +2341,9 @@ void ProcessHollowingDetector::OnProcessCreated(
 }
 
 void ProcessHollowingDetector::OnProcessResumed(uint32_t pid) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(m_impl->m_creationEventsMutex);
 
     auto it = m_impl->m_creationEvents.find(pid);
@@ -2191,6 +2358,9 @@ void ProcessHollowingDetector::OnMemoryOperation(
     uintptr_t address,
     size_t size)
 {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(m_impl->m_creationEventsMutex);
 
     auto it = m_impl->m_creationEvents.find(pid);
@@ -2549,23 +2719,39 @@ void ProcessHollowingDetector::RemoveExclusion(const std::wstring& processName) 
 }
 
 bool ProcessHollowingDetector::IsExcluded(uint32_t pid) const {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_exclusionsMutex);
+    // Snapshot exclusion sets under the lock, then release before performing
+    // Win32 calls to query the process name/path. Holding a shared_lock while
+    // doing IO would force concurrent AddExclusion/RemoveExclusion writers to
+    // wait for slow process-handle work and risks priority inversion.
+    std::unordered_set<uint32_t>     excludedPids;
+    std::unordered_set<std::wstring> excludedNames;
+    std::unordered_set<std::wstring> excludedPaths;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_impl->m_exclusionsMutex);
+        excludedPids   = m_impl->m_excludedPids;
+        excludedNames  = m_impl->m_excludedProcessNames;
+        excludedPaths  = m_impl->m_excludedPaths;
+    }
 
-    if (m_impl->m_excludedPids.find(pid) != m_impl->m_excludedPids.end()) {
+    if (excludedPids.find(pid) != excludedPids.end()) {
         return true;
     }
 
-    auto processName = Utils::ProcessUtils::GetProcessName(pid).value_or(L"");
-    if (!processName.empty() &&
-        m_impl->m_excludedProcessNames.find(processName) != m_impl->m_excludedProcessNames.end()) {
-        return true;
+    if (!excludedNames.empty()) {
+        auto processName = Utils::ProcessUtils::GetProcessName(pid).value_or(L"");
+        if (!processName.empty() &&
+            excludedNames.find(processName) != excludedNames.end()) {
+            return true;
+        }
     }
 
-    // Check path exclusions
-    if (!m_impl->m_excludedPaths.empty()) {
+    if (!excludedPaths.empty()) {
         auto processPath = Utils::ProcessUtils::GetProcessPath(pid).value_or(L"");
         if (!processPath.empty()) {
-            for (const auto& excludedPath : m_impl->m_excludedPaths) {
+            for (const auto& excludedPath : excludedPaths) {
+                if (excludedPath.empty()) {
+                    continue;
+                }
                 if (_wcsnicmp(processPath.c_str(), excludedPath.c_str(), excludedPath.size()) == 0) {
                     return true;
                 }
