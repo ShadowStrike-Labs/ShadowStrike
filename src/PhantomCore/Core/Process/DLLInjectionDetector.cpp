@@ -83,6 +83,31 @@ namespace Process {
 namespace {
 
 /**
+ * @brief Sanitize a wide string for safe inclusion in log records.
+ *
+ * Defends against log-injection where attacker-controlled image paths or
+ * DLL names contain CR/LF/control characters used to forge log lines, or
+ * percent characters used to perturb downstream printf-style consumers.
+ */
+[[nodiscard]] std::wstring SanitizeForLog(std::wstring_view input) noexcept {
+    constexpr size_t kMaxLen = 260;
+    std::wstring out;
+    out.reserve(std::min<size_t>(input.size(), kMaxLen));
+    for (size_t i = 0; i < input.size() && out.size() < kMaxLen; ++i) {
+        const wchar_t c = input[i];
+        if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F) || c == L'%') {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    if (input.size() > kMaxLen) {
+        out.append(L"...");
+    }
+    return out;
+}
+
+/**
  * @brief RAII wrapper for Windows HANDLE (process handles, etc.).
  *
  * Prevents handle leaks on early returns, exceptions, or complex control flow.
@@ -676,39 +701,72 @@ public:
     }
 
     void InvokeInjection(const DLLInjectionEvent& event) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_injectionCallbacks) {
+        // Snapshot under shared lock then dispatch unlocked, so callbacks
+        // are free to call Register*/Unregister (which take unique lock)
+        // without deadlocking on a recursive shared->unique acquisition.
+        std::vector<DLLInjectionDetectedCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_injectionCallbacks.size());
+            for (const auto& [id, cb] : m_injectionCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 callback(event);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"DLLInjection", L"InjectionCallback exception: %S", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"DLLInjection", L"InjectionCallback non-std exception");
             }
         }
     }
 
     void InvokeModule(const LoadedDLLInfo& dllInfo) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_moduleCallbacks) {
+        std::vector<ModuleLoadCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_moduleCallbacks.size());
+            for (const auto& [id, cb] : m_moduleCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 callback(dllInfo);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"DLLInjection", L"ModuleCallback exception: %S", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"DLLInjection", L"ModuleCallback non-std exception");
             }
         }
     }
 
     bool InvokeDecision(const LoadedDLLInfo& dllInfo) {
-        std::shared_lock lock(m_mutex);
-
-        // If any callback returns false, block the load
-        for (const auto& [id, callback] : m_decisionCallbacks) {
+        // Snapshot under shared lock, dispatch unlocked. Decision callbacks
+        // routinely register/unregister sibling callbacks (e.g. one-shot
+        // policy hooks); the previous shared-locked dispatch deadlocked
+        // any such reentry. Failing closed (block) on exceptions preserved.
+        std::vector<LoadDecisionCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_decisionCallbacks.size());
+            for (const auto& [id, cb] : m_decisionCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 if (!callback(dllInfo)) {
                     return false;
                 }
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"DLLInjection", L"DecisionCallback exception: %S", e.what());
-                return false; // Block on exception for safety
+                return false; // Fail closed on exception
+            } catch (...) {
+                SS_LOG_ERROR(L"DLLInjection", L"DecisionCallback non-std exception");
+                return false;
             }
         }
 
@@ -716,12 +774,21 @@ public:
     }
 
     void InvokeHook(const HookInfo& hookInfo) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_hookCallbacks) {
+        std::vector<HookInstalledCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_hookCallbacks.size());
+            for (const auto& [id, cb] : m_hookCallbacks) {
+                if (cb) snapshot.push_back(cb);
+            }
+        }
+        for (const auto& callback : snapshot) {
             try {
                 callback(hookInfo);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"DLLInjection", L"HookCallback exception: %S", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"DLLInjection", L"HookCallback non-std exception");
             }
         }
     }
@@ -1006,8 +1073,43 @@ public:
     }
 
     bool UpdateConfig(const DLLInjectionConfig& config) {
+        // Validate / clamp before applying so a misconfigured config can't
+        // disable safety hot paths or trigger O(N) blowups in the loop
+        // bodies that read it.
+        DLLInjectionConfig sanitized = config;
+
+        constexpr uint32_t kMinAnalysisTimeoutMs = 100;
+        constexpr uint32_t kMaxAnalysisTimeoutMs = 600'000;   // 10 minutes
+        if (sanitized.analysisTimeoutMs < kMinAnalysisTimeoutMs) {
+            sanitized.analysisTimeoutMs = kMinAnalysisTimeoutMs;
+        } else if (sanitized.analysisTimeoutMs > kMaxAnalysisTimeoutMs) {
+            sanitized.analysisTimeoutMs = kMaxAnalysisTimeoutMs;
+        }
+
+        constexpr size_t kMaxModulesCeiling = 1'000'000;
+        if (sanitized.maxModulesToTrack == 0 ||
+            sanitized.maxModulesToTrack > kMaxModulesCeiling) {
+            sanitized.maxModulesToTrack = DLLInjectionConstants::MAX_MODULES_TO_TRACK;
+        }
+
+        // Cap exclusion lists to bound the cost of IsProcessExcluded /
+        // IsDLLExcluded which are on the per-load hot path.
+        constexpr size_t kMaxExclusions = 4096;
+        if (sanitized.excludedProcesses.size() > kMaxExclusions) {
+            SS_LOG_WARN(L"DLLInjection",
+                L"UpdateConfig: excludedProcesses (%zu) exceeds cap; truncating",
+                sanitized.excludedProcesses.size());
+            sanitized.excludedProcesses.resize(kMaxExclusions);
+        }
+        if (sanitized.excludedDlls.size() > kMaxExclusions) {
+            sanitized.excludedDlls.resize(kMaxExclusions);
+        }
+        if (sanitized.excludedPaths.size() > kMaxExclusions) {
+            sanitized.excludedPaths.resize(kMaxExclusions);
+        }
+
         std::unique_lock lock(m_mutex);
-        m_config = config;
+        m_config = std::move(sanitized);
         SS_LOG_INFO(L"DLLInjection", L"Configuration updated");
         return true;
     }
@@ -1127,7 +1229,9 @@ public:
             // Invoke callbacks
             m_callbackManager->InvokeModule(info);
 
-            SS_LOG_INFO(L"DLLInjection", L"Analyzed %S - Trust: %d, Risk: %u", Utils::StringUtils::ToNarrow(info.dllName).c_str(), static_cast<int>(info.trustLevel), info.riskScore);
+            SS_LOG_INFO(L"DLLInjection", L"Analyzed %ls - Trust: %d, Risk: %u",
+                SanitizeForLog(info.dllName).c_str(),
+                static_cast<int>(info.trustLevel), info.riskScore);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DLLInjection", L"AnalyzeLoad: %S", e.what());
@@ -1558,7 +1662,7 @@ public:
         try {
             // Check if AppInit_DLLs loading is enabled
             DWORD loadEnabled = 0;
-            Utils::RegistryUtils::QuickReadDWord(
+            (void)Utils::RegistryUtils::QuickReadDWord(
                 HKEY_LOCAL_MACHINE,
                 DLLInjectionConstants::APPINIT_DLLS_PATH,
                 DLLInjectionConstants::APPINIT_LOAD_VALUE,
@@ -1567,7 +1671,7 @@ public:
 
             // Check AppInit_DLLs registry value
             std::wstring value;
-            Utils::RegistryUtils::QuickReadString(
+            (void)Utils::RegistryUtils::QuickReadString(
                 HKEY_LOCAL_MACHINE,
                 DLLInjectionConstants::APPINIT_DLLS_PATH,
                 DLLInjectionConstants::APPINIT_DLLS_VALUE,
@@ -1603,7 +1707,7 @@ public:
             std::wstring wow64Value;
             Utils::RegistryUtils::OpenOptions wow64Opts;
             wow64Opts.wow64_32 = true;
-            Utils::RegistryUtils::QuickReadString(
+            (void)Utils::RegistryUtils::QuickReadString(
                 HKEY_LOCAL_MACHINE,
                 DLLInjectionConstants::APPINIT_DLLS_PATH,
                 DLLInjectionConstants::APPINIT_DLLS_VALUE,
@@ -1612,7 +1716,7 @@ public:
             );
             if (!wow64Value.empty() && wow64Value != value) {
                 DWORD wow64Enabled = 0;
-                Utils::RegistryUtils::QuickReadDWord(
+                (void)Utils::RegistryUtils::QuickReadDWord(
                     HKEY_LOCAL_MACHINE,
                     DLLInjectionConstants::APPINIT_DLLS_PATH,
                     DLLInjectionConstants::APPINIT_LOAD_VALUE,
@@ -1667,7 +1771,7 @@ public:
 
                 // Check for Debugger value (classic IFEO persistence)
                 std::wstring debugger;
-                Utils::RegistryUtils::QuickReadString(
+                (void)Utils::RegistryUtils::QuickReadString(
                     HKEY_LOCAL_MACHINE,
                     fullPath,
                     L"Debugger",
@@ -1694,7 +1798,7 @@ public:
                 // Check for Application Verifier DLL injection (GlobalFlag + VerifierDlls)
                 // This is a less well-known IFEO abuse vector used by APTs
                 DWORD globalFlag = 0;
-                Utils::RegistryUtils::QuickReadDWord(
+                (void)Utils::RegistryUtils::QuickReadDWord(
                     HKEY_LOCAL_MACHINE,
                     fullPath,
                     L"GlobalFlag",
@@ -1703,7 +1807,7 @@ public:
 
                 if (globalFlag != 0) {
                     std::wstring verifierDlls;
-                    Utils::RegistryUtils::QuickReadString(
+                    (void)Utils::RegistryUtils::QuickReadString(
                         HKEY_LOCAL_MACHINE,
                         fullPath,
                         L"VerifierDlls",
@@ -1959,14 +2063,16 @@ public:
 
                 if (!allow || ShouldBlock(dllInfo)) {
                     m_stats.loadsBlocked.fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_WARN(L"DLLInjection", L"Blocked load of %S in PID %u", Utils::StringUtils::ToNarrow(dllPath).c_str(), pid);
+                    SS_LOG_WARN(L"DLLInjection", L"Blocked load of %ls in PID %u",
+                        SanitizeForLog(dllPath).c_str(), pid);
 
                     // In real implementation, would signal driver to block
                     return;
                 }
             }
 
-            SS_LOG_INFO(L"DLLInjection", L"Module loaded - PID %u: %S", pid, Utils::StringUtils::ToNarrow(dllPath).c_str());
+            SS_LOG_INFO(L"DLLInjection", L"Module loaded - PID %u: %ls",
+                pid, SanitizeForLog(dllPath).c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DLLInjection", L"OnModuleLoad: %S", e.what());
@@ -2081,7 +2187,7 @@ public:
 
     void AddToWhitelist(const std::wstring& dllPath) {
         if (m_whitelistStore) {
-            m_whitelistStore->AddPath(
+            (void)m_whitelistStore->AddPath(
                 NormalizePath(dllPath),
                 Whitelist::PathMatchMode::Exact,
                 Whitelist::WhitelistReason::Custom,
@@ -2093,12 +2199,13 @@ public:
             std::unique_lock lock(m_mutex);
             m_localWhitelist.insert(NormalizePath(dllPath));
         }
-        SS_LOG_INFO(L"DLLInjection", L"Added to whitelist: %S", Utils::StringUtils::ToNarrow(dllPath).c_str());
+        SS_LOG_INFO(L"DLLInjection", L"Added to whitelist: %ls",
+            SanitizeForLog(dllPath).c_str());
     }
 
     void RemoveFromWhitelist(const std::wstring& dllPath) {
         if (m_whitelistStore) {
-            m_whitelistStore->RemovePath(
+            (void)m_whitelistStore->RemovePath(
                 NormalizePath(dllPath),
                 Whitelist::PathMatchMode::Exact
             );
@@ -2163,20 +2270,59 @@ private:
 
     /**
      * @brief Check if a process is in the exclusion list.
-     * Uses cached process name to avoid repeated handle opens.
+     *
+     * Matches both filename-only entries (e.g. "explorer.exe") and full-path
+     * entries (e.g. "C:\Windows\explorer.exe"). Filename-only matching is
+     * trivially defeated by renaming, so any exclusion entry that contains
+     * a path separator is treated as an absolute-path requirement and only
+     * matches the canonical full image path of the target process.
+     *
+     * The configuration access is fully serialized under shared_lock to
+     * avoid a torn read against UpdateConfig.
      */
     bool IsProcessExcluded(uint32_t pid) {
-        if (m_config.excludedProcesses.empty()) return false;
+        // Snapshot exclusions under the lock to avoid racing UpdateConfig().
+        std::vector<std::wstring> exclusions;
+        {
+            std::shared_lock lock(m_mutex);
+            if (m_config.excludedProcesses.empty()) return false;
+            exclusions = m_config.excludedProcesses;
+        }
 
-        std::wstring procName = GetProcessNameCached(pid);
+        const std::wstring procName = GetProcessNameCached(pid);
         std::wstring lowerName = procName;
         std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
 
-        std::shared_lock lock(m_mutex);
-        for (const auto& excluded : m_config.excludedProcesses) {
+        // Resolve full image path lazily — only when the exclusion list
+        // actually contains path-style entries (avoids the cost on the hot
+        // path for the common filename-only case).
+        std::wstring lowerFullPath;
+        bool fullPathResolved = false;
+
+        for (const auto& excluded : exclusions) {
+            if (excluded.empty()) continue;
+
             std::wstring lowerExcluded = excluded;
-            std::transform(lowerExcluded.begin(), lowerExcluded.end(), lowerExcluded.begin(), ::towlower);
-            if (lowerName == lowerExcluded) return true;
+            std::transform(lowerExcluded.begin(), lowerExcluded.end(),
+                           lowerExcluded.begin(), ::towlower);
+
+            const bool isPathStyle =
+                (lowerExcluded.find(L'\\') != std::wstring::npos) ||
+                (lowerExcluded.find(L'/')  != std::wstring::npos) ||
+                (lowerExcluded.size() > 1 && lowerExcluded[1] == L':');
+
+            if (isPathStyle) {
+                if (!fullPathResolved) {
+                    lowerFullPath = NormalizePath(GetProcessPath(pid));
+                    fullPathResolved = true;
+                }
+                if (!lowerFullPath.empty()) {
+                    const std::wstring normalizedExcluded = NormalizePath(excluded);
+                    if (lowerFullPath == normalizedExcluded) return true;
+                }
+            } else {
+                if (lowerName == lowerExcluded) return true;
+            }
         }
         return false;
     }
@@ -2511,8 +2657,8 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
-    bool m_monitoring{ false };
+    std::atomic<bool> m_initialized{ false };
+    std::atomic<bool> m_monitoring{ false };
     DLLInjectionConfig m_config;
 
     // Managers
