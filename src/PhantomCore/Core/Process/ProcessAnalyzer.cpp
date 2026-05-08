@@ -264,6 +264,46 @@ using TimePoint = std::chrono::system_clock::time_point;
 }
 
 /**
+ * @brief Sanitize an externally-sourced wide string for safe inclusion in log
+ *        output. Replaces CR, LF and other C0 control characters with a single
+ *        space (defeats CRLF/log-line injection from attacker-controlled paths
+ *        and module names) and truncates to a fixed cap so that hostile inputs
+ *        cannot blow up the logging pipeline.
+ *
+ * SECURITY: All wide strings that originate from kernel notifications,
+ * untrusted process paths, module names, command lines or other external
+ * sources MUST be passed through this helper before being formatted with
+ * %ls / %s / std::format into a log record.
+ */
+[[nodiscard]] static std::wstring SanitizeForLog(std::wstring_view input) noexcept {
+    constexpr size_t kMaxLogChars = 512;
+    std::wstring out;
+    try {
+        const size_t len = (input.size() > kMaxLogChars) ? kMaxLogChars : input.size();
+        out.reserve(len + 4);
+        for (size_t i = 0; i < len; ++i) {
+            const wchar_t c = input[i];
+            // Strip all C0 control characters (\x00-\x1F) and DEL (\x7F).
+            // This neutralizes CR/LF log injection as well as terminal control
+            // sequences (e.g., \x1B for ANSI escapes).
+            if (c < 0x20 || c == 0x7F) {
+                out.push_back(L' ');
+            } else {
+                out.push_back(c);
+            }
+        }
+        if (input.size() > kMaxLogChars) {
+            out.append(L"...");
+        }
+    } catch (...) {
+        // std::bad_alloc or similar — fall back to a constant marker so
+        // the caller always gets a usable, non-throwing value for logging.
+        return L"<sanitize-failed>";
+    }
+    return out;
+}
+
+/**
  * @brief Convert FILETIME to system_clock::time_point for comparison.
  */
 [[nodiscard]] static std::chrono::system_clock::time_point FileTimeToTimePoint(
@@ -670,7 +710,12 @@ public:
 
 bool ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
     try {
-        if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
+        // Reserve the "initializing" slot atomically so concurrent callers
+        // observe a single initialization. We promote the flag to "fully
+        // initialized" only after every store and detector has been bound;
+        // this prevents racing readers from seeing a half-built analyzer
+        // (e.g. m_hashStore == nullptr while m_initialized == true).
+        if (m_initialized.load(std::memory_order_acquire)) {
             SS_LOG_WARN(L"ProcessAnalyzer", L"Already initialized");
             return true;
         }
@@ -714,12 +759,23 @@ bool ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
         (void)memoryScanner;
 
         SS_LOG_INFO(L"ProcessAnalyzer", L"All detection engines bound successfully");
+
+        // Publish the fully-built state. Release-store pairs with the
+        // acquire-load above and with IsInitialized() so other threads
+        // observe a consistent set of stores once they see this true.
+        m_initialized.store(true, std::memory_order_release);
+
         SS_LOG_INFO(L"ProcessAnalyzer", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"ProcessAnalyzer", L"Initialization failed - %S", e.what());
         m_initialized.store(false, std::memory_order_release);
+        // Drop any partially-constructed stores so a retry starts clean.
+        m_hashStore.reset();
+        m_signatureStore.reset();
+        m_threatIntel.reset();
+        m_whitelist.reset();
         return false;
     }
 }
@@ -1326,10 +1382,26 @@ MemorySummary ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32_t pid) {
             return summary;
         }
 
+        // Wall-clock budget: an attacker-influenced address space (e.g. a
+        // process that maps tens of thousands of tiny private regions) could
+        // otherwise stall the analyzer for seconds. The configured cap acts
+        // as a hard ceiling regardless of region count.
+        const auto scanDeadline = Clock::now() +
+            std::chrono::milliseconds(m_config.memoryScanTimeoutMs);
+        bool timedOut = false;
+
         MEMORY_BASIC_INFORMATION mbi{};
         uintptr_t address = 0;
 
         while (VirtualQueryEx(hProcess.Get(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            // Cheap deadline check: only consult the clock every 64 regions
+            // so tight scans on benign processes don't pay an extra syscall
+            // per region.
+            if ((summary.regionCount & 0x3F) == 0 && Clock::now() >= scanDeadline) {
+                timedOut = true;
+                break;
+            }
+
             if (mbi.State == MEM_COMMIT) {
                 summary.totalCommittedSize += mbi.RegionSize;
                 summary.regionCount++;
@@ -1388,6 +1460,14 @@ MemorySummary ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32_t pid) {
             if (summary.regionCount >= m_config.maxMemoryRegions) {
                 break;
             }
+        }
+
+        if (timedOut) {
+            SS_LOG_WARN(L"ProcessAnalyzer",
+                L"Memory analysis timeout after %u ms for PID %u "
+                L"(scanned %llu regions)",
+                m_config.memoryScanTimeoutMs, pid,
+                static_cast<unsigned long long>(summary.regionCount));
         }
 
         // hProcess automatically closed by RAII destructor
@@ -2025,9 +2105,74 @@ NetworkFootprint ProcessAnalyzerImpl::AnalyzeNetworkFootprintInternal(uint32_t p
                             IN_ADDR localAddr{}, remoteAddr{};
                             localAddr.S_un.S_addr = static_cast<ULONG>(row.dwLocalAddr);
                             remoteAddr.S_un.S_addr = static_cast<ULONG>(row.dwRemoteAddr);
-                            wchar_t localBuf[64]{}, remoteBuf[64]{};
-                            InetNtopW(AF_INET, &localAddr, localBuf, 64);
-                            InetNtopW(AF_INET, &remoteAddr, remoteBuf, 64);
+                            wchar_t localBuf[INET6_ADDRSTRLEN]{};
+                            wchar_t remoteBuf[INET6_ADDRSTRLEN]{};
+                            InetNtopW(AF_INET, &localAddr, localBuf,
+                                static_cast<size_t>(INET6_ADDRSTRLEN));
+                            InetNtopW(AF_INET, &remoteAddr, remoteBuf,
+                                static_cast<size_t>(INET6_ADDRSTRLEN));
+                            ci.localAddress = localBuf;
+                            ci.localPort = ntohs(static_cast<uint16_t>(row.dwLocalPort));
+                            ci.remoteAddress = remoteBuf;
+                            ci.remotePort = ntohs(static_cast<uint16_t>(row.dwRemotePort));
+
+                            switch (row.dwState) {
+                                case MIB_TCP_STATE_LISTEN:
+                                    ci.state = L"LISTENING";
+                                    footprint.listeningPortCount++;
+                                    footprint.listeningPorts.push_back(ci.localPort);
+                                    break;
+                                case MIB_TCP_STATE_ESTAB:
+                                    ci.state = L"ESTABLISHED";
+                                    footprint.hasExternalConnections = true;
+                                    break;
+                                case MIB_TCP_STATE_SYN_SENT:
+                                    ci.state = L"SYN_SENT";
+                                    break;
+                                default:
+                                    ci.state = L"OTHER";
+                                    break;
+                            }
+
+                            footprint.activeConnections.push_back(ci);
+                            footprint.tcpConnectionCount++;
+
+                            if (footprint.activeConnections.size() >=
+                                AnalyzerConstants::MAX_NETWORK_CONNECTIONS) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enumerate IPv6 TCP connections. Modern malware (e.g. Cobalt Strike
+        // beacons over IPv6, link-local C2) routinely uses AF_INET6, so
+        // restricting telemetry to AF_INET would create a blind spot.
+        if (footprint.activeConnections.size() <
+            AnalyzerConstants::MAX_NETWORK_CONNECTIONS) {
+            DWORD tcp6Size = 0;
+            if (GetExtendedTcpTable(nullptr, &tcp6Size, FALSE,
+                    AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER &&
+                tcp6Size > 0 && tcp6Size <= 16 * 1024 * 1024) {
+                auto tcp6Buf = std::make_unique<uint8_t[]>(tcp6Size);
+                if (GetExtendedTcpTable(tcp6Buf.get(), &tcp6Size, FALSE,
+                        AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+                    auto* table6 = reinterpret_cast<MIB_TCP6TABLE_OWNER_PID*>(tcp6Buf.get());
+                    for (DWORD i = 0; i < table6->dwNumEntries; ++i) {
+                        const auto& row = table6->table[i];
+                        if (row.dwOwningPid == pid) {
+                            NetworkFootprint::ConnectionInfo ci;
+                            IN6_ADDR localAddr{}, remoteAddr{};
+                            std::memcpy(&localAddr, row.ucLocalAddr, sizeof(localAddr));
+                            std::memcpy(&remoteAddr, row.ucRemoteAddr, sizeof(remoteAddr));
+                            wchar_t localBuf[INET6_ADDRSTRLEN]{};
+                            wchar_t remoteBuf[INET6_ADDRSTRLEN]{};
+                            InetNtopW(AF_INET6, &localAddr, localBuf,
+                                static_cast<size_t>(INET6_ADDRSTRLEN));
+                            InetNtopW(AF_INET6, &remoteAddr, remoteBuf,
+                                static_cast<size_t>(INET6_ADDRSTRLEN));
                             ci.localAddress = localBuf;
                             ci.localPort = ntohs(static_cast<uint16_t>(row.dwLocalPort));
                             ci.remoteAddress = remoteBuf;
@@ -2076,6 +2221,26 @@ NetworkFootprint ProcessAnalyzerImpl::AnalyzeNetworkFootprintInternal(uint32_t p
                     auto* table = reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(udpBuf.get());
                     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
                         const auto& row = table->table[i];
+                        if (row.dwOwningPid == pid) {
+                            footprint.udpEndpointCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enumerate IPv6 UDP endpoints (matches IPv6 TCP enumeration above).
+        {
+            DWORD udp6Size = 0;
+            if (GetExtendedUdpTable(nullptr, &udp6Size, FALSE,
+                    AF_INET6, UDP_TABLE_OWNER_PID, 0) == ERROR_INSUFFICIENT_BUFFER &&
+                udp6Size > 0 && udp6Size <= 16 * 1024 * 1024) {
+                auto udp6Buf = std::make_unique<uint8_t[]>(udp6Size);
+                if (GetExtendedUdpTable(udp6Buf.get(), &udp6Size, FALSE,
+                        AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+                    auto* table6 = reinterpret_cast<MIB_UDP6TABLE_OWNER_PID*>(udp6Buf.get());
+                    for (DWORD i = 0; i < table6->dwNumEntries; ++i) {
+                        const auto& row = table6->table[i];
                         if (row.dwOwningPid == pid) {
                             footprint.udpEndpointCount++;
                         }
@@ -2446,7 +2611,8 @@ void ProcessAnalyzerImpl::OnKernelProcessCreateInternal(
         SS_LOG_WARN(L"ProcessAnalyzer",
             L"Kernel: PID %u created by PID %u (thread %u) but parent is PID %u - "
             L"potential PPID spoofing: %ls",
-            pid, creatingPid, creatingTid, parentPid, imagePath.c_str());
+            pid, creatingPid, creatingTid, parentPid,
+            SanitizeForLog(imagePath).c_str());
     }
 }
 
@@ -2479,13 +2645,14 @@ void ProcessAnalyzerImpl::OnKernelImageLoadInternal(
         // Flag loads from suspicious paths
         if (nameLower.find(L"\\temp\\") != std::wstring::npos ||
             nameLower.find(L"\\appdata\\local\\temp\\") != std::wstring::npos) {
+            const std::wstring safeName = SanitizeForLog(imageName);
             SS_LOG_WARN(L"ProcessAnalyzer",
                 L"Kernel: Suspicious image load in PID %u from temp path: %ls "
                 L"(base=0x%llX, size=%zu)",
-                pid, imageName.c_str(),
+                pid, safeName.c_str(),
                 static_cast<unsigned long long>(imageBase), imageSize);
             InvokeFindingCallbacks(pid,
-                L"Image loaded from suspicious temp path: " + imageName, 20);
+                L"Image loaded from suspicious temp path: " + safeName, 20);
         }
     }
 }
@@ -2532,8 +2699,20 @@ void ProcessAnalyzerImpl::InvokeProgressCallbacks(
 {
     if (!m_config.enableProgressCallbacks) return;
 
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& [id, callback] : m_progressCallbacks) {
+    // Snapshot under lock, invoke outside. User callbacks may legally
+    // call back into ProcessAnalyzer (e.g. RegisterCallback / Unregister)
+    // — holding m_callbacksMutex while invoking them would deadlock since
+    // it is a non-recursive std::mutex.
+    std::vector<AnalysisProgressCallback> snapshot;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        snapshot.reserve(m_progressCallbacks.size());
+        for (const auto& [id, callback] : m_progressCallbacks) {
+            snapshot.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : snapshot) {
         try {
             callback(pid, stage, percent);
         } catch (...) {
@@ -2547,8 +2726,16 @@ void ProcessAnalyzerImpl::InvokeFindingCallbacks(
     const std::wstring& finding,
     uint32_t riskScore)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& [id, callback] : m_findingCallbacks) {
+    std::vector<SuspiciousFindingCallback> snapshot;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        snapshot.reserve(m_findingCallbacks.size());
+        for (const auto& [id, callback] : m_findingCallbacks) {
+            snapshot.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : snapshot) {
         try {
             callback(pid, finding, riskScore);
         } catch (...) {
@@ -2561,8 +2748,16 @@ void ProcessAnalyzerImpl::InvokeModuleCallbacks(
     uint32_t pid,
     const ModuleInfo& module)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& [id, callback] : m_moduleCallbacks) {
+    std::vector<ModuleAnalyzedCallback> snapshot;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        snapshot.reserve(m_moduleCallbacks.size());
+        for (const auto& [id, callback] : m_moduleCallbacks) {
+            snapshot.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : snapshot) {
         try {
             callback(pid, module);
         } catch (...) {
@@ -2759,7 +2954,8 @@ std::vector<ProcessAnalysisResult> ProcessAnalyzer::AnalyzeByPath(
         }
 
     } catch (...) {
-        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeByPath failed for %ls", processPath.c_str());
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeByPath failed for %ls",
+            SanitizeForLog(processPath).c_str());
     }
 
     return results;
@@ -2782,7 +2978,8 @@ std::vector<ProcessAnalysisResult> ProcessAnalyzer::AnalyzeByName(
         }
 
     } catch (...) {
-        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeByName failed for %ls", processName.c_str());
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeByName failed for %ls",
+            SanitizeForLog(processName).c_str());
     }
 
     return results;
@@ -2797,18 +2994,58 @@ std::vector<ProcessAnalysisResult> ProcessAnalyzer::AnalyzeMultiple(
     results.reserve(pids.size());
 
     if (!m_impl) return results;
+    if (pids.empty()) return results;
 
     try {
-        // Parallel analysis
-        std::mutex resultsMutex;
+        // Bound concurrency. The previous implementation used
+        // std::execution::par which silently ignores `maxConcurrent` and
+        // schedules onto every available core — on a 64-core box that
+        // would open 64 simultaneous PROCESS_VM_READ handles into hostile
+        // processes and saturate Authenticode/SignatureStore I/O. We
+        // honour the contract by running a manual worker pool capped at
+        // `maxConcurrent` (and never exceeding hardware concurrency).
+        const uint32_t hwThreads = std::max<uint32_t>(
+            1u, std::thread::hardware_concurrency());
+        const uint32_t requested = (maxConcurrent == 0) ? 1u : maxConcurrent;
+        const uint32_t workerCount = std::min<uint32_t>(
+            std::min<uint32_t>(requested, hwThreads),
+            static_cast<uint32_t>(pids.size()));
 
-        std::for_each(std::execution::par, pids.begin(), pids.end(),
-            [this, depth, &results, &resultsMutex](uint32_t pid) {
-                auto result = m_impl->AnalyzeProcessInternal(pid, depth);
+        results.resize(pids.size());
+        std::atomic<size_t> nextIndex{0};
 
-                std::lock_guard lock(resultsMutex);
-                results.push_back(result);
-            });
+        auto worker = [this, depth, &pids, &results, &nextIndex]() {
+            while (true) {
+                const size_t i = nextIndex.fetch_add(1, std::memory_order_relaxed);
+                if (i >= pids.size()) {
+                    return;
+                }
+                try {
+                    results[i] = m_impl->AnalyzeProcessInternal(pids[i], depth);
+                } catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"ProcessAnalyzer",
+                        L"AnalyzeMultiple worker failed for PID %u - %S",
+                        pids[i], e.what());
+                } catch (...) {
+                    SS_LOG_ERROR(L"ProcessAnalyzer",
+                        L"AnalyzeMultiple worker failed for PID %u (unknown)",
+                        pids[i]);
+                }
+            }
+        };
+
+        if (workerCount <= 1) {
+            worker();
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(workerCount);
+            for (uint32_t w = 0; w < workerCount; ++w) {
+                workers.emplace_back(worker);
+            }
+            for (auto& t : workers) {
+                if (t.joinable()) t.join();
+            }
+        }
 
     } catch (...) {
         SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeMultiple failed");
