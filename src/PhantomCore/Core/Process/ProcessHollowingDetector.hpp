@@ -140,7 +140,7 @@ namespace Process {
 // FORWARD DECLARATIONS
 // ============================================================================
 
-class ProcessHollowingDetectorImpl;
+struct ProcessHollowingDetectorImpl;
 
 // ============================================================================
 // CONSTANTS
@@ -165,7 +165,10 @@ namespace HollowingConstants {
     constexpr uint32_t MAX_SECTIONS = 96;
 
     // Analysis limits
-    constexpr size_t MAX_PE_HEADER_SIZE = 4096;
+    // Sized to safely hold DOS header + PE signature + file header + 64-bit
+    // optional header + MAX_SECTIONS section headers (96 * 40 = 3840 bytes)
+    // with comfortable margin for non-standard / oversized optional headers.
+    constexpr size_t MAX_PE_HEADER_SIZE = 8192;
     constexpr size_t MAX_SECTION_HEADERS_SIZE = 4096;
     constexpr size_t MAX_COMPARISON_SIZE = 1024 * 1024;       ///< 1MB
     constexpr size_t SAMPLE_SIZE_PER_SECTION = 4096;
@@ -431,6 +434,16 @@ struct EntryPointAnalysis {
 
     // Thread analysis
     bool mainThreadAtEntryPoint = false;
+    /**
+     * @brief Win32 start address of the main thread (NtQueryInformationThread /
+     *        ThreadQuerySetWin32StartAddress).
+     *
+     * @note This is the *initial* start routine for the main thread, NOT the
+     *       current instruction pointer. Reading the live RIP would require
+     *       suspending the thread and calling GetThreadContext / Wow64GetThreadContext,
+     *       which is unsafe to do during routine scans. The field name is preserved
+     *       for ABI compatibility with prior releases.
+     */
     uintptr_t mainThreadRIP = 0;
     bool threadContextModified = false;
 
