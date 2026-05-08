@@ -1289,17 +1289,28 @@ public:
     // =========================================================================
 
     /**
-     * @brief Set pattern index.
+     * @brief Set pattern index used for in-memory pattern/YARA scanning.
+     *
+     * Ownership: the caller retains ownership of @p index. The pointer is
+     * stored atomically and may be replaced concurrently with active scans;
+     * however, @p index MUST remain valid for the entire duration of any
+     * scan operation that could be in flight. Pass nullptr to detach.
      */
     void SetPatternIndex(PatternStore::PatternIndex* index);
 
     /**
      * @brief Set emulation engine.
+     *
+     * Ownership: caller retains ownership; pointer must outlive any scan
+     * that may dereference it. Pass nullptr to detach.
      */
     void SetEmulationEngine(Core::Engine::EmulationEngine* engine);
 
     /**
      * @brief Set threat detector.
+     *
+     * Ownership: caller retains ownership; pointer must outlive any scan
+     * that may dereference it. Pass nullptr to detach.
      */
     void SetThreatDetector(Core::Engine::ThreatDetector* detector);
 
