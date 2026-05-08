@@ -49,6 +49,7 @@
 #include <fstream>
 #include <filesystem>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <deque>
@@ -127,6 +128,12 @@ constexpr uint32_t kSeverityEscalationStep  = 1;       // Min level delta
         if (!hex && c != '.' && c != ':' && c != '/' && c != '%') return false;
     }
     return true;
+}
+
+[[nodiscard]] uint32_t SaturatingUint32FromSize(size_t value) noexcept {
+    return value > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
+        ? std::numeric_limits<uint32_t>::max()
+        : static_cast<uint32_t>(value);
 }
 
 }  // anonymous namespace
@@ -781,7 +788,11 @@ public:
             m_stats.synFloodsDetected.fetch_add(1, std::memory_order_relaxed);
 
             if (m_config.autoMitigate) {
-                ApplyMitigationImpl(MitigationAction::SYN_COOKIES, "");
+                const auto mitigation = ApplyMitigationImpl(MitigationAction::SYN_COOKIES, "");
+                if (!mitigation.success) {
+                    SS_LOG_WARN(L"Network", L"DDosProtection: SYN flood auto-mitigation failed: %hs",
+                        SanitizeNarrowForLog(mitigation.errorMessage).c_str());
+                }
             }
         }
     }
@@ -811,7 +822,11 @@ public:
             m_stats.udpFloodsDetected.fetch_add(1, std::memory_order_relaxed);
 
             if (m_config.autoMitigate) {
-                ApplyMitigationImpl(MitigationAction::RATE_LIMIT, "");
+                const auto mitigation = ApplyMitigationImpl(MitigationAction::RATE_LIMIT, "");
+                if (!mitigation.success) {
+                    SS_LOG_WARN(L"Network", L"DDosProtection: UDP flood auto-mitigation failed: %hs",
+                        SanitizeNarrowForLog(mitigation.errorMessage).c_str());
+                }
             }
         }
     }
@@ -867,7 +882,11 @@ public:
             m_stats.httpFloodsDetected.fetch_add(1, std::memory_order_relaxed);
 
             if (m_config.autoMitigate) {
-                ApplyMitigationImpl(MitigationAction::CHALLENGE, "");
+                const auto mitigation = ApplyMitigationImpl(MitigationAction::CHALLENGE, "");
+                if (!mitigation.success) {
+                    SS_LOG_WARN(L"Network", L"DDosProtection: HTTP flood auto-mitigation failed: %hs",
+                        SanitizeNarrowForLog(mitigation.errorMessage).c_str());
+                }
             }
         }
     }
@@ -1286,7 +1305,7 @@ public:
             info.firstSeen = info.lastSeen;
         }
 
-        m_stats.trackedIPs.store(m_trackedIPs.size(), std::memory_order_relaxed);
+        m_stats.trackedIPs.store(SaturatingUint32FromSize(m_trackedIPs.size()), std::memory_order_relaxed);
     }
 
     // ========================================================================
@@ -1331,14 +1350,14 @@ public:
 
             // In real implementation, would analyze historical data
             // For now, use current metrics as baseline
-            baseline.avgPacketsPerSecond = m_currentMetrics.packetsPerSecond.load(std::memory_order_relaxed);
-            baseline.avgBytesPerSecond = m_currentMetrics.bytesPerSecond.load(std::memory_order_relaxed);
-            baseline.avgConnectionsPerSecond = m_currentMetrics.connectionsPerSecond.load(std::memory_order_relaxed);
-            baseline.avgHalfOpenConnections = m_currentMetrics.halfOpenConnections.load(std::memory_order_relaxed);
-            baseline.avgSynRate = m_currentMetrics.synPacketsPerSecond.load(std::memory_order_relaxed);
-            baseline.avgUdpRate = m_currentMetrics.udpPacketsPerSecond.load(std::memory_order_relaxed);
-            baseline.avgIcmpRate = m_currentMetrics.icmpPacketsPerSecond.load(std::memory_order_relaxed);
-            baseline.avgHttpRate = m_currentMetrics.httpRequestsPerSecond.load(std::memory_order_relaxed);
+            baseline.avgPacketsPerSecond = static_cast<double>(m_currentMetrics.packetsPerSecond.load(std::memory_order_relaxed));
+            baseline.avgBytesPerSecond = static_cast<double>(m_currentMetrics.bytesPerSecond.load(std::memory_order_relaxed));
+            baseline.avgConnectionsPerSecond = static_cast<double>(m_currentMetrics.connectionsPerSecond.load(std::memory_order_relaxed));
+            baseline.avgHalfOpenConnections = static_cast<double>(m_currentMetrics.halfOpenConnections.load(std::memory_order_relaxed));
+            baseline.avgSynRate = static_cast<double>(m_currentMetrics.synPacketsPerSecond.load(std::memory_order_relaxed));
+            baseline.avgUdpRate = static_cast<double>(m_currentMetrics.udpPacketsPerSecond.load(std::memory_order_relaxed));
+            baseline.avgIcmpRate = static_cast<double>(m_currentMetrics.icmpPacketsPerSecond.load(std::memory_order_relaxed));
+            baseline.avgHttpRate = static_cast<double>(m_currentMetrics.httpRequestsPerSecond.load(std::memory_order_relaxed));
 
             // Calculate standard deviations (simplified - would need historical samples)
             baseline.stdDevPacketsPerSecond = baseline.avgPacketsPerSecond * 0.2;
@@ -1404,7 +1423,7 @@ public:
                 }
             }
 
-            m_stats.trackedIPs.store(m_trackedIPs.size(), std::memory_order_relaxed);
+            m_stats.trackedIPs.store(SaturatingUint32FromSize(m_trackedIPs.size()), std::memory_order_relaxed);
         }
     }
 
@@ -1650,7 +1669,11 @@ void DDosProtection::Mitigate() {
         std::shared_lock lock(m_impl->m_attackMutex);
         if (!m_impl->m_currentAttack.has_value()) return;
     }
-    m_impl->ApplyMitigationImpl(m_impl->m_config.defaultAction, "");
+    const auto mitigation = m_impl->ApplyMitigationImpl(m_impl->m_config.defaultAction, "");
+    if (!mitigation.success) {
+        SS_LOG_WARN(L"Network", L"DDosProtection: manual mitigation failed: %hs",
+            SanitizeNarrowForLog(mitigation.errorMessage).c_str());
+    }
 }
 
 [[nodiscard]] MitigationResult DDosProtection::ApplyMitigation(
@@ -1755,8 +1778,7 @@ bool DDosProtection::RateLimitIP(const std::string& ip, uint32_t packetsPerSecon
     rule.exceedAction = MitigationAction::THROTTLE;
     rule.blockDurationSec = 60;
 
-    AddRateLimitRule(rule);
-    return true;
+    return AddRateLimitRule(rule) != 0;
 }
 
 [[nodiscard]] bool DDosProtection::IsRateLimited(const std::string& ip) const {
