@@ -99,7 +99,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <iomanip>
 #include <thread>
@@ -386,30 +388,98 @@ namespace {
     std::string current;
     current.reserve(MAX_STRING_LENGTH);
 
+    auto flushCurrent = [&]() {
+        if (current.length() >= minLength) {
+            strings.push_back(std::move(current));
+            current = std::string();
+        } else {
+            current.clear();
+        }
+        current.reserve(MAX_STRING_LENGTH);
+    };
+
+    // ASCII pass
     for (uint8_t byte : data) {
         if (byte >= 0x20 && byte <= 0x7E) {
-            if (current.size() < MAX_STRING_LENGTH) {
-                current += static_cast<char>(byte);
-            }
-        } else {
-            if (current.length() >= minLength) {
-                strings.push_back(std::move(current));
-                current = std::string();
-                current.reserve(MAX_STRING_LENGTH);
+            if (current.size() >= MAX_STRING_LENGTH) {
+                // Cap reached: flush as-is so we don't silently truncate evidence
+                flushCurrent();
                 if (strings.size() >= MAX_EXTRACTED_STRINGS) break;
-            } else {
-                current.clear();
             }
+            current += static_cast<char>(byte);
+        } else {
+            flushCurrent();
+            if (strings.size() >= MAX_EXTRACTED_STRINGS) break;
         }
     }
-
-    // Add final string
     if (strings.size() < MAX_EXTRACTED_STRINGS &&
         current.length() >= minLength && current.length() <= MAX_STRING_LENGTH) {
         strings.push_back(std::move(current));
     }
+    current.clear();
+    current.reserve(MAX_STRING_LENGTH);
+
+    // UTF-16LE pass: most Windows process-memory C2/RAT artifacts (URLs,
+    // pipe/mutex names, hostnames, registry paths) live as wide strings.
+    // ASCII-only extraction is a known evasion path; emit the low byte of
+    // every printable {char, 0x00} pair. Cheap (single linear scan) and
+    // bounded by MAX_EXTRACTED_STRINGS like the ASCII pass.
+    if (strings.size() < MAX_EXTRACTED_STRINGS && data.size() >= 2) {
+        for (size_t i = 0; i + 1 < data.size(); i += 2) {
+            const uint8_t lo = data[i];
+            const uint8_t hi = data[i + 1];
+            if (hi == 0x00 && lo >= 0x20 && lo <= 0x7E) {
+                if (current.size() >= MAX_STRING_LENGTH) {
+                    flushCurrent();
+                    if (strings.size() >= MAX_EXTRACTED_STRINGS) break;
+                }
+                current += static_cast<char>(lo);
+            } else {
+                flushCurrent();
+                if (strings.size() >= MAX_EXTRACTED_STRINGS) break;
+            }
+        }
+        if (strings.size() < MAX_EXTRACTED_STRINGS &&
+            current.length() >= minLength && current.length() <= MAX_STRING_LENGTH) {
+            strings.push_back(std::move(current));
+        }
+    }
 
     return strings;
+}
+
+// Sanitize a wide string for log emission: replace control characters that
+// could enable CRLF / ANSI-escape log injection (kernel-supplied paths,
+// caller-supplied dump paths) with '?'. Bounded copy; never reads past `n`.
+[[nodiscard]] static std::wstring SanitizeForLog(const wchar_t* src, size_t n) {
+    std::wstring out;
+    if (!src || n == 0) return out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const wchar_t c = src[i];
+        if (c == L'\0') break;
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] static std::wstring SanitizeForLog(std::wstring_view sv) {
+    return SanitizeForLog(sv.data(), sv.size());
+}
+
+// Bounded conversion of a kernel-supplied fixed-size WCHAR buffer to wstring.
+// Kernel structures use WCHAR Path[N]; the kernel may not NUL-terminate on the
+// last possible slot. Constructing wstring directly from the array decays to
+// `const wchar_t*` and would read past the array on a missing terminator.
+template <size_t N>
+[[nodiscard]] static std::wstring WStringFromBoundedBuffer(const wchar_t (&buf)[N]) noexcept {
+    static_assert(N > 0, "Buffer must have non-zero size");
+    const size_t len = ::wcsnlen(buf, N);
+    return std::wstring(buf, len);
 }
 
 // ============================================================================
@@ -428,9 +498,18 @@ struct MemoryScanner::Impl {
     MemoryScannerStats m_stats;
 
     std::shared_ptr<Utils::ThreadPool> m_threadPool;
-    PatternStore::PatternIndex* m_patternIndex{ nullptr };
-    Core::Engine::EmulationEngine* m_emulationEngine{ nullptr };
-    Core::Engine::ThreatDetector* m_threatDetector{ nullptr };
+    // Cross-module pointers may be set/cleared concurrently with active scans
+    // running on the thread pool. Atomic storage prevents data races on the
+    // pointer value itself; lifetime of the pointee is the caller's
+    // contract (documented in MemoryScanner.hpp).
+    std::atomic<PatternStore::PatternIndex*> m_patternIndex{ nullptr };
+    std::atomic<Core::Engine::EmulationEngine*> m_emulationEngine{ nullptr };
+    std::atomic<Core::Engine::ThreatDetector*> m_threatDetector{ nullptr };
+
+    // Cooperative cancellation flag. Set on Shutdown(); scan loops check it
+    // periodically to terminate early so the singleton can drain in-flight
+    // work without hanging on long enumerations.
+    std::atomic<bool> m_shutdownRequested{ false };
 
     // Callbacks
     std::unordered_map<uint64_t, MemoryThreatCallback> m_threatCallbacks;
@@ -459,6 +538,10 @@ struct MemoryScanner::Impl {
             m_threadPool = threadPool;
             m_config = config;
             m_initialized = true;
+            // Allow re-initialisation after a previous Shutdown() — clear
+            // any sticky cancellation flag so new scans don't bail
+            // immediately.
+            m_shutdownRequested.store(false, std::memory_order_release);
 
             SS_LOG_INFO(L"MemoryScanner", L"MemoryScanner initialized (mode=%d, YARA=%d, patterns=%d)",
                 static_cast<int>(config.defaultMode),
@@ -474,6 +557,12 @@ struct MemoryScanner::Impl {
     }
 
     void Shutdown() noexcept {
+        // Signal cancellation to any in-flight scans first (lock-free) so
+        // long enumerations on other threads can break out before we wait
+        // on the unique_lock — this avoids deadlocks with scan threads that
+        // currently hold a shared_lock.
+        m_shutdownRequested.store(true, std::memory_order_release);
+
         std::unique_lock lock(m_mutex);
 
         try {
@@ -482,16 +571,16 @@ struct MemoryScanner::Impl {
             m_completeCallbacks.clear();
             m_yaraRules.clear();
 
-            m_patternIndex = nullptr;
-            m_emulationEngine = nullptr;
-            m_threatDetector = nullptr;
+            m_patternIndex.store(nullptr, std::memory_order_release);
+            m_emulationEngine.store(nullptr, std::memory_order_release);
+            m_threatDetector.store(nullptr, std::memory_order_release);
 
             m_initialized = false;
 
             SS_LOG_INFO(L"MemoryScanner", L"MemoryScanner shutdown complete");
 
         } catch (...) {
-            // Suppress all exceptions
+            // Shutdown is noexcept by contract; never propagate.
         }
     }
 
@@ -748,6 +837,41 @@ struct MemoryScanner::Impl {
             }
             SIZE_T bytesRead = 0;
 
+            // TOCTOU mitigation: re-query the live region state immediately
+            // before the read. Between the original enumeration and now the
+            // target process may have freed/decommitted the region, flipped
+            // it to PAGE_NOACCESS, or set PAGE_GUARD. Reading PAGE_GUARD
+            // pages consumes the guard status (DoS vector against the
+            // target); reading PAGE_NOACCESS or freed pages just fails but
+            // wastes effort and produces noisy errors.
+            {
+                MEMORY_BASIC_INFORMATION live{};
+                if (VirtualQueryEx(hProcess,
+                        reinterpret_cast<LPCVOID>(region.baseAddress),
+                        &live, sizeof(live)) != sizeof(live)) {
+                    result.scanned = false;
+                    result.skipReason = "Live VirtualQueryEx failed (region freed)";
+                    return result;
+                }
+                if (live.State != MEM_COMMIT) {
+                    result.scanned = false;
+                    result.skipReason = "Region no longer committed";
+                    return result;
+                }
+                if ((live.Protect & PAGE_GUARD) ||
+                    (live.Protect & PAGE_NOACCESS)) {
+                    result.scanned = false;
+                    result.skipReason = "Region became guard/noaccess after enumeration";
+                    return result;
+                }
+                // Clamp read size to the live region size — the original
+                // enumeration may have spanned merged sub-regions that have
+                // since split.
+                if (live.RegionSize < buffer.size()) {
+                    buffer.resize(static_cast<size_t>(live.RegionSize));
+                }
+            }
+
             if (!ReadProcessMemory(hProcess,
                                   reinterpret_cast<LPCVOID>(region.baseAddress),
                                   buffer.data(),
@@ -774,7 +898,8 @@ struct MemoryScanner::Impl {
 
             // Unified pattern + YARA scanning (single PatternIndex::Search call
             // to avoid duplicate scanning -- both paths use the same index)
-            if ((cfg.enableYARA || cfg.enablePatternMatching) && m_patternIndex) {
+            if ((cfg.enableYARA || cfg.enablePatternMatching) &&
+                m_patternIndex.load(std::memory_order_acquire) != nullptr) {
                 auto allMatches = ScanWithPatterns(buffer);
                 for (const auto& [matchName, offset] : allMatches) {
                     MemoryThreat threat = CreatePatternThreat(pid, region, matchName, offset);
@@ -935,35 +1060,46 @@ struct MemoryScanner::Impl {
                 }
             }
 
-            // ROP chain detection: look for sequences of short gadgets
-            // ending in RET (0xC3) at aligned intervals — indicates a
-            // stack-pivot / ROP payload on the heap or in private memory.
+            // ROP chain detection: a real ROP payload is a sequence of
+            // 8-byte gadget addresses (on x64) packed into the stack/heap
+            // pivot region; it manifests as RET-terminated micro-sequences
+            // 2–20 bytes apart. Naïve "any RET counts" produces a flood of
+            // false positives on any RET-rich byte blob, so we require:
+            //   1. RETs spaced strictly within [2,20] bytes of each other
+            //      (typical x86/x64 gadget length)
+            //   2. A continuous run of MIN_ROP_CHAIN_LENGTH such inter-RET
+            //      gaps with no large gap breaking the chain
+            //   3. Region must be private and at least 64 bytes
+            // We track the index of the previous RET and only count it as
+            // a chained gadget if the spacing is in range; otherwise we
+            // restart the run.
             bool hasROPChain = false;
             if (data.size() >= 64 && region.type == MemoryType::Private) {
+                constexpr size_t kMinGap = 2;
+                constexpr size_t kMaxGap = 20;
+                size_t prevRet = std::numeric_limits<size_t>::max();
                 size_t consecutiveGadgets = 0;
                 size_t maxGadgetRun = 0;
-                // Walk the data looking for RET opcodes spaced 2-20 bytes
-                // apart — a hallmark of chained gadget addresses that
-                // ultimately land on RET-terminated instruction sequences.
                 for (size_t i = 0; i < data.size(); ++i) {
-                    if (data[i] == RET_OPCODE) {
-                        // Check backward for short instruction sequence (2-20 bytes)
-                        if (consecutiveGadgets > 0 || (i >= 2 && i + 1 < data.size())) {
-                            consecutiveGadgets++;
-                            maxGadgetRun = std::max(maxGadgetRun, consecutiveGadgets);
+                    if (data[i] != RET_OPCODE) continue;
+
+                    if (prevRet == std::numeric_limits<size_t>::max()) {
+                        // First RET; start a candidate run.
+                        consecutiveGadgets = 1;
+                    } else {
+                        const size_t gap = i - prevRet;
+                        if (gap >= kMinGap && gap <= kMaxGap) {
+                            ++consecutiveGadgets;
+                        } else {
+                            // Gap too small (overlapping RETs => 0xC3 0xC3
+                            // padding, not gadgets) or too large (chain
+                            // broken). Restart.
+                            consecutiveGadgets = 1;
                         }
-                    } else if (consecutiveGadgets > 0) {
-                        // Allow short gaps between gadgets (2-20 byte instructions)
-                        bool inGap = false;
-                        for (size_t look = i; look < std::min(i + 20, data.size()); ++look) {
-                            if (data[look] == RET_OPCODE) {
-                                inGap = true;
-                                break;
-                            }
-                        }
-                        if (!inGap) {
-                            consecutiveGadgets = 0;
-                        }
+                    }
+                    prevRet = i;
+                    if (consecutiveGadgets > maxGadgetRun) {
+                        maxGadgetRun = consecutiveGadgets;
                     }
                 }
                 if (maxGadgetRun >= MIN_ROP_CHAIN_LENGTH) {
@@ -1058,6 +1194,12 @@ struct MemoryScanner::Impl {
             }
 
         } catch (const std::exception& e) {
+            // Never silently swallow: shellcode detection should never throw
+            // for non-malicious input, so any exception here indicates a
+            // logic bug or hostile input we want surfaced for triage.
+            SS_LOG_WARN(L"MemoryScanner",
+                L"DetectShellcode threw on pid=%u region=0x%llX: %S",
+                pid, static_cast<unsigned long long>(region.baseAddress), e.what());
         }
 
         return threats;
@@ -1330,15 +1472,17 @@ struct MemoryScanner::Impl {
         // When YARA rules are loaded into the PatternStore via ImportFromYaraFile,
         // they are compiled into the same pattern index used by ScanWithPatterns.
         // This method provides a secondary scan path for dynamically loaded rules.
-        if (!m_patternIndex) {
+        if (auto* idx = m_patternIndex.load(std::memory_order_acquire); !idx) {
             SS_LOG_DEBUG(L"MemoryScanner", L"YARA scan skipped: no PatternIndex configured");
             return matches;
         }
 
         try {
+            auto* idx = m_patternIndex.load(std::memory_order_acquire);
+            if (!idx) return matches;
             // Use PatternIndex::Search which covers both YARA-imported and
             // natively-added patterns in the compiled trie
-            auto detections = m_patternIndex->Search(data);
+            auto detections = idx->Search(data);
 
             for (const auto& det : detections) {
                 // Cap matches per region to prevent unbounded allocation
@@ -1368,9 +1512,10 @@ struct MemoryScanner::Impl {
         std::vector<std::pair<std::string, size_t>> matches;
 
         try {
-            if (!m_patternIndex) return matches;
+            auto* idx = m_patternIndex.load(std::memory_order_acquire);
+            if (!idx) return matches;
 
-            auto detections = m_patternIndex->Search(data);
+            auto detections = idx->Search(data);
 
             for (const auto& det : detections) {
                 if (matches.size() >= MemoryScannerConstants::MAX_YARA_MATCHES_PER_REGION) break;
@@ -1446,6 +1591,18 @@ struct MemoryScanner::Impl {
             size_t scannedCount = 0;
             size_t totalBytesAccum = 0;
             for (const auto& region : regions) {
+                // Cooperative cancellation: bail early if Shutdown() was
+                // called or the scanner was de-initialised after the scan
+                // started. Without this, an in-flight scan over thousands
+                // of regions can block service shutdown indefinitely.
+                if (m_shutdownRequested.load(std::memory_order_acquire)) {
+                    SS_LOG_INFO(L"MemoryScanner",
+                        L"Scan of pid=%u cancelled by shutdown after %zu regions",
+                        pid, scannedCount);
+                    result.errorMessage = L"Scan cancelled (shutdown)";
+                    break;
+                }
+
                 // Enforce scan timeout
                 auto elapsed = std::chrono::steady_clock::now() - startTime;
                 if (elapsed >= scanTimeout) {
@@ -1548,12 +1705,25 @@ struct MemoryScanner::Impl {
         result.totalScanTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             endTime - startTime).count();
 
-        // Update average scan time with exponential moving average to avoid
-        // integer overflow and multi-thread races on the read-modify-write.
+        // Update average scan time with an exponential moving average via
+        // a compare_exchange loop. A naive load/compute/store would race
+        // between concurrent scans on different processes and clobber
+        // updates; the CAS loop ensures every completed scan is folded
+        // into the EMA exactly once.
         // EMA weight: newAvg = (old * 7 + current) / 8
-        uint64_t currentAvg = m_stats.avgScanTimeMs.load(std::memory_order_relaxed);
-        uint64_t ema = (currentAvg * 7 + result.totalScanTimeMs) / 8;
-        m_stats.avgScanTimeMs.store(ema, std::memory_order_relaxed);
+        {
+            uint64_t currentAvg = m_stats.avgScanTimeMs.load(std::memory_order_relaxed);
+            for (;;) {
+                const uint64_t ema = (currentAvg * 7 + result.totalScanTimeMs) / 8;
+                if (m_stats.avgScanTimeMs.compare_exchange_weak(
+                        currentAvg, ema,
+                        std::memory_order_release,
+                        std::memory_order_relaxed)) {
+                    break;
+                }
+                // currentAvg now holds the latest value; retry.
+            }
+        }
 
         // Invoke complete callbacks
         InvokeCompleteCallbacks(result);
@@ -2016,7 +2186,7 @@ std::vector<MemoryThreat> MemoryScanner::ScanBuffer(
         }
 
         // Pattern/YARA matching (uses the same PatternIndex as process scans)
-        if (m_impl->m_patternIndex) {
+        if (m_impl->m_patternIndex.load(std::memory_order_acquire) != nullptr) {
             auto matches = m_impl->ScanWithPatterns(data);
             for (const auto& [matchName, offset] : matches) {
                 threats.push_back(m_impl->CreatePatternThreat(0, fakeRegion, matchName, offset));
@@ -2219,17 +2389,18 @@ bool MemoryScanner::DumpRegion(
 
         std::ofstream outFile(outputPath, std::ios::binary);
         if (!outFile) {
-            SS_LOG_ERROR(L"MemoryScanner", L"Failed to create dump file: %S", Utils::StringUtils::ToNarrow(outputPath).c_str());
+            SS_LOG_ERROR(L"MemoryScanner", L"Failed to create dump file: %s",
+                SanitizeForLog(outputPath).c_str());
             return false;
         }
 
         outFile.write(reinterpret_cast<const char*>(data.data()), data.size());
         outFile.close();
 
-        SS_LOG_INFO(L"MemoryScanner", L"Dumped region 0x%llX (%zu bytes) to %S",
+        SS_LOG_INFO(L"MemoryScanner", L"Dumped region 0x%llX (%zu bytes) to %s",
             static_cast<unsigned long long>(address),
             size,
-            Utils::StringUtils::ToNarrow(outputPath).c_str());
+            SanitizeForLog(outputPath).c_str());
 
         return true;
 
@@ -2260,9 +2431,9 @@ bool MemoryScanner::CreateMemoryDump(uint32_t pid, const std::wstring& outputPat
 
         outFile.close();
 
-        SS_LOG_INFO(L"MemoryScanner", L"Memory dump complete: %zu bytes written to %S",
+        SS_LOG_INFO(L"MemoryScanner", L"Memory dump complete: %zu bytes written to %s",
             totalDumped,
-            Utils::StringUtils::ToNarrow(outputPath).c_str());
+            SanitizeForLog(outputPath).c_str());
 
         return true;
 
@@ -2396,18 +2567,19 @@ bool MemoryScanner::UnregisterCompleteCallback(uint64_t callbackId) {
 // ========================================================================
 
 void MemoryScanner::SetPatternIndex(PatternStore::PatternIndex* index) {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_patternIndex = index;
+    // Atomic store: avoid taking the unique_lock so callers can rotate the
+    // pattern index without serialising against in-flight scans (which only
+    // load the pointer with acquire semantics). Lifetime of `index` is the
+    // caller's responsibility; the pointer must outlive any in-flight scan.
+    m_impl->m_patternIndex.store(index, std::memory_order_release);
 }
 
 void MemoryScanner::SetEmulationEngine(Core::Engine::EmulationEngine* engine) {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_emulationEngine = engine;
+    m_impl->m_emulationEngine.store(engine, std::memory_order_release);
 }
 
 void MemoryScanner::SetThreatDetector(Core::Engine::ThreatDetector* detector) {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_threatDetector = detector;
+    m_impl->m_threatDetector.store(detector, std::memory_order_release);
 }
 
 // ========================================================================
@@ -2516,7 +2688,7 @@ void MemoryScanner::OnKernelMemoryEvent(
                         targetPid, hProcess.Get(), region, cfg);
 
                     for (auto& threat : scanResult.threats) {
-                        threat.processName = evt->ProcessImagePath;
+                        threat.processName = WStringFromBoundedBuffer(evt->ProcessImagePath);
                         if (threat.confidence >= cfg.minReportConfidence) {
                             m_impl->InvokeThreatCallbacks(threat);
                             m_impl->m_stats.threatsFound.fetch_add(
@@ -2570,7 +2742,7 @@ void MemoryScanner::OnKernelMemoryEvent(
                             targetPid, hProcess.Get(), region, cfg);
 
                         for (auto& threat : scanResult.threats) {
-                            threat.processName = evt->ProcessImagePath;
+                            threat.processName = WStringFromBoundedBuffer(evt->ProcessImagePath);
                             if (threat.confidence >= cfg.minReportConfidence) {
                                 m_impl->InvokeThreatCallbacks(threat);
                                 m_impl->m_stats.threatsFound.fetch_add(
@@ -2619,7 +2791,7 @@ void MemoryScanner::OnKernelMemoryEvent(
                             evt->TargetProcessId, hTarget.Get(), region, cfg);
 
                         for (auto& threat : scanResult.threats) {
-                            threat.processName = evt->TargetProcessPath;
+                            threat.processName = WStringFromBoundedBuffer(evt->TargetProcessPath);
                             if (threat.confidence >= cfg.minReportConfidence) {
                                 m_impl->InvokeThreatCallbacks(threat);
                                 m_impl->m_stats.threatsFound.fetch_add(
@@ -2655,7 +2827,7 @@ void MemoryScanner::OnKernelMemoryEvent(
                 threat.protection = WindowsProtectionToEnum(evt->RegionProtection);
                 threat.riskScore = static_cast<double>(evt->ThreatScore) / 10.0;
                 threat.confidence = static_cast<double>(evt->Confidence);
-                threat.processName = evt->ProcessImagePath;
+                threat.processName = WStringFromBoundedBuffer(evt->ProcessImagePath);
                 threat.ruleCategory = "Kernel";
 
                 // Map kernel shellcode type to our threat types
