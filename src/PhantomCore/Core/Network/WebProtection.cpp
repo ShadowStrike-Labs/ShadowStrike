@@ -180,6 +180,108 @@ static const std::array<std::string, 15> EXPLOIT_KIT_SIGNATURES = {{
 // HELPER FUNCTIONS
 // ============================================================================
 
+namespace {
+
+// ----------------------------------------------------------------------------
+// ASCII helpers — deliberately not locale-aware. All inputs at the call sites
+// are URLs, hostnames, MIME types, hex digests, and HTML tag fragments, all of
+// which are defined to be ASCII (or already percent/IDNA-encoded above this
+// layer). Using ::tolower / ::isxdigit on raw `char` values is undefined
+// behavior when char is signed and the byte happens to be > 0x7F, so we cast
+// through unsigned char before every classification call.
+// ----------------------------------------------------------------------------
+
+[[nodiscard]] inline char AsciiToLower(char c) noexcept {
+    return static_cast<char>(
+        std::tolower(static_cast<unsigned char>(c)));
+}
+
+inline void AsciiToLowerInPlace(std::string& s) noexcept {
+    std::transform(s.begin(), s.end(), s.begin(), AsciiToLower);
+}
+
+[[nodiscard]] inline bool AsciiHasPrefixCI(std::string_view s,
+                                           std::string_view prefix) noexcept {
+    if (s.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (AsciiToLower(s[i]) != AsciiToLower(prefix[i])) return false;
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Hostname normalization
+// ----------------------------------------------------------------------------
+// Domains as we receive them at this layer (config, callers) are ASCII or
+// already-Punycoded. We lowercase, strip a trailing dot, and clip a trailing
+// port. Returning the empty string on obviously invalid input is intentional;
+// callers guard against empty hosts.
+[[nodiscard]] inline std::string NormalizeHost(std::string host) noexcept {
+    if (host.empty()) return host;
+
+    AsciiToLowerInPlace(host);
+
+    // Strip a trailing port (last ':' that is not part of an IPv6 literal).
+    if (!host.empty() && host.front() != '[') {
+        const auto colon = host.find_last_of(':');
+        if (colon != std::string::npos) {
+            host.erase(colon);
+        }
+    }
+
+    // Strip a single trailing root-label dot ("example.com." -> "example.com").
+    if (!host.empty() && host.back() == '.') {
+        host.pop_back();
+    }
+
+    return host;
+}
+
+// ----------------------------------------------------------------------------
+// SHA-256 hex digest validation (lowercase, exactly 64 hex chars).
+// Used by AddCertificatePin to reject obviously malformed pins before they
+// reach the hot-path comparison logic.
+// ----------------------------------------------------------------------------
+[[nodiscard]] inline bool IsValidSha256HexDigest(std::string_view digest) noexcept {
+    if (digest.size() != 64) return false;
+    for (char c : digest) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        const bool is_hex_lower =
+            (uc >= '0' && uc <= '9') || (uc >= 'a' && uc <= 'f');
+        if (!is_hex_lower) return false;
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Log sanitization
+// ----------------------------------------------------------------------------
+// Strip ASCII control characters (CR, LF, NUL, etc.) so attacker-controlled
+// content cannot forge log lines or terminal escape sequences when it is
+// reflected through SS_LOG_*. Replacement char '?' keeps message length
+// predictable and avoids resizing the output.
+[[nodiscard]] inline std::string SanitizeForLog(std::string_view in) noexcept {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) {
+            out.push_back('?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    // Hard cap to keep a single rogue input from filling the log buffer.
+    constexpr size_t kMaxLoggedChars = 512;
+    if (out.size() > kMaxLoggedChars) {
+        out.resize(kMaxLoggedChars);
+        out.append("...[truncated]");
+    }
+    return out;
+}
+
+}  // namespace
+
 /**
  * @brief Calculates entropy of data (for obfuscation detection).
  */
@@ -458,9 +560,12 @@ public:
     std::atomic<uint64_t> m_nextCallbackId{1};
 
     /// @brief Infrastructure integrations
-    ThreatIntel::ThreatIntelStore* m_threatIntel{nullptr};
-    PatternStore::PatternStore* m_patternStore{nullptr};
-    SignatureStore::SignatureStore* m_signatureStore{nullptr};
+    /// Atomic for lock-free reads from the analysis hot path; the orchestrator
+    /// may rewire or clear any of these at any time without coordinating with
+    /// m_mutex.
+    std::atomic<ThreatIntel::ThreatIntelStore*> m_threatIntel{nullptr};
+    std::atomic<PatternStore::PatternStore*> m_patternStore{nullptr};
+    std::atomic<SignatureStore::SignatureStore*> m_signatureStore{nullptr};
     std::shared_ptr<Whitelist::WhitelistStore> m_whitelist;
 
     // ========================================================================
@@ -1534,7 +1639,7 @@ FormProtectionResult WebProtectionImpl::AnalyzeFormInternal(
 
         // Extract form action
         result.action = extractAttr(lower, formHtml, "action");
-        result.isSecure = (result.action.find("https://") == 0);
+        result.isSecure = AsciiHasPrefixCI(result.action, "https://");
 
         // Extract form method
         result.method = extractAttr(lower, formHtml, "method");
@@ -1860,7 +1965,7 @@ void WebProtectionImpl::GenerateAlert(
 
         SS_LOG_WARN(L"Network", L"WebProtection: Alert generated - ID: %llu, URL: %ls, Severity: %u",
                           static_cast<unsigned long long>(alert.alertId),
-                          Utils::StringUtils::ToWide(url).c_str(),
+                          Utils::StringUtils::ToWide(SanitizeForLog(url)).c_str(),
                           static_cast<unsigned>(severity));
 
     } catch (const std::exception& e) {
@@ -1877,7 +1982,7 @@ WebContentType WebProtectionImpl::DetermineContentType(const std::string& mimeTy
     if (mimeType.empty()) return WebContentType::UNKNOWN;
 
     std::string lower = mimeType;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    AsciiToLowerInPlace(lower);
 
     if (lower.find("html") != std::string::npos) return WebContentType::HTML;
     if (lower.find("javascript") != std::string::npos) return WebContentType::JAVASCRIPT;
@@ -1897,7 +2002,13 @@ WebContentType WebProtectionImpl::DetermineContentType(const std::string& mimeTy
 
 std::string WebProtectionImpl::ExtractHost(const std::string& url) const {
     try {
-        // Simple host extraction (real implementation would be more robust)
+        // Locate the authority component. Per RFC 3986 the authority begins
+        // after "://" (if a scheme is present) and ends at the first '/',
+        // '?', or '#'. Anything before an embedded '@' inside the authority
+        // is userinfo and MUST be discarded — otherwise an attacker can
+        // bypass host-based blocklists with URLs like
+        // "https://trusted.example.com@evil.com/" which a naive parser would
+        // resolve to evil.com but classify as trusted.example.com.
         size_t hostStart = url.find("://");
         if (hostStart == std::string::npos) {
             hostStart = 0;
@@ -1905,17 +2016,52 @@ std::string WebProtectionImpl::ExtractHost(const std::string& url) const {
             hostStart += 3;
         }
 
-        size_t hostEnd = url.find('/', hostStart);
-        if (hostEnd == std::string::npos) {
-            hostEnd = url.length();
+        size_t hostEnd = url.size();
+        for (size_t i = hostStart; i < url.size(); ++i) {
+            const char c = url[i];
+            if (c == '/' || c == '?' || c == '#') {
+                hostEnd = i;
+                break;
+            }
         }
 
-        size_t portPos = url.find(':', hostStart);
-        if (portPos != std::string::npos && portPos < hostEnd) {
-            hostEnd = portPos;
+        // Strip userinfo: the LAST '@' inside [hostStart, hostEnd) terminates
+        // the userinfo segment. Using rfind handles passwords that themselves
+        // contain '@' (legal when percent-encoded but seen in the wild).
+        const std::string_view authority(url.data() + hostStart,
+                                         hostEnd - hostStart);
+        const size_t at = authority.rfind('@');
+        if (at != std::string_view::npos) {
+            hostStart += at + 1;
         }
 
-        return url.substr(hostStart, hostEnd - hostStart);
+        // Bracketed IPv6 literal: keep brackets intact and clip after ']'.
+        if (hostStart < hostEnd && url[hostStart] == '[') {
+            const size_t bracket = url.find(']', hostStart);
+            if (bracket != std::string::npos && bracket < hostEnd) {
+                hostEnd = bracket + 1;
+            }
+        } else {
+            // Strip the port (first ':' after hostStart, before hostEnd).
+            for (size_t i = hostStart; i < hostEnd; ++i) {
+                if (url[i] == ':') {
+                    hostEnd = i;
+                    break;
+                }
+            }
+        }
+
+        if (hostEnd <= hostStart) return {};
+
+        std::string host = url.substr(hostStart, hostEnd - hostStart);
+        AsciiToLowerInPlace(host);
+
+        // Strip a single trailing root-label dot.
+        if (!host.empty() && host.back() == '.') {
+            host.pop_back();
+        }
+
+        return host;
 
     } catch (...) {
         return "";
@@ -2015,11 +2161,58 @@ bool WebProtection::AddCertificatePin(const CertificatePin& pin) {
     if (!m_impl) return false;
 
     try {
+        // Reject obviously malformed pin sets before they reach the
+        // hot-path comparison logic. We require lowercase hex SHA-256
+        // digests (64 chars). Anything else is almost certainly a wiring
+        // bug — silently accepting it would let a misconfigured policy
+        // pin "nothing" and disable enforcement.
+        if (pin.domain.empty()) {
+            SS_LOG_WARN(L"Network",
+                L"WebProtection: Rejected certificate pin with empty domain");
+            return false;
+        }
+
+        const std::string normalizedDomain = NormalizeHost(pin.domain);
+        if (normalizedDomain.empty()) {
+            SS_LOG_WARN(L"Network",
+                L"WebProtection: Rejected certificate pin with invalid domain");
+            return false;
+        }
+
+        if (pin.sha256Pins.empty()) {
+            SS_LOG_WARN(L"Network",
+                L"WebProtection: Rejected certificate pin for %ls - empty pin set",
+                Utils::StringUtils::ToWide(SanitizeForLog(normalizedDomain)).c_str());
+            return false;
+        }
+
+        for (const auto& d : pin.sha256Pins) {
+            if (!IsValidSha256HexDigest(d)) {
+                SS_LOG_WARN(L"Network",
+                    L"WebProtection: Rejected certificate pin for %ls - "
+                    L"primary digest is not a 64-char lowercase SHA-256 hex string",
+                    Utils::StringUtils::ToWide(SanitizeForLog(normalizedDomain)).c_str());
+                return false;
+            }
+        }
+        for (const auto& d : pin.backupPins) {
+            if (!IsValidSha256HexDigest(d)) {
+                SS_LOG_WARN(L"Network",
+                    L"WebProtection: Rejected certificate pin for %ls - "
+                    L"backup digest is not a 64-char lowercase SHA-256 hex string",
+                    Utils::StringUtils::ToWide(SanitizeForLog(normalizedDomain)).c_str());
+                return false;
+            }
+        }
+
+        CertificatePin normalized = pin;
+        normalized.domain = normalizedDomain;
+
         std::unique_lock lock(m_impl->m_pinsMutex);
-        m_impl->m_pins[pin.domain] = pin;
+        m_impl->m_pins[normalizedDomain] = std::move(normalized);
 
         SS_LOG_INFO(L"Network", L"WebProtection: Added certificate pin for %ls",
-                          Utils::StringUtils::ToWide(pin.domain).c_str());
+                          Utils::StringUtils::ToWide(SanitizeForLog(normalizedDomain)).c_str());
         return true;
 
     } catch (const std::exception& e) {
@@ -2032,15 +2225,21 @@ bool WebProtection::AddCertificatePin(const CertificatePin& pin) {
 bool WebProtection::RemoveCertificatePin(const std::string& domain) {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeHost(domain);
+    if (normalized.empty()) return false;
+
     std::unique_lock lock(m_impl->m_pinsMutex);
-    return m_impl->m_pins.erase(domain) > 0;
+    return m_impl->m_pins.erase(normalized) > 0;
 }
 
 bool WebProtection::IsCertificatePinned(const std::string& domain) const {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeHost(domain);
+    if (normalized.empty()) return false;
+
     std::shared_lock lock(m_impl->m_pinsMutex);
-    return m_impl->m_pins.contains(domain);
+    return m_impl->m_pins.contains(normalized);
 }
 
 // Form protection
@@ -2060,7 +2259,7 @@ bool WebProtection::CheckCredentialTheft(
 
     try {
         // Check if URL is suspicious
-        const std::string host = m_impl->ExtractHost(url);
+        const std::string host = NormalizeHost(m_impl->ExtractHost(url));
 
         {
             std::shared_lock lock(m_impl->m_domainsMutex);
@@ -2071,14 +2270,16 @@ bool WebProtection::CheckCredentialTheft(
 
         // Check for credential field patterns
         std::string nameLower = fieldName;
-        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+        AsciiToLowerInPlace(nameLower);
 
         if (nameLower.find("password") != std::string::npos ||
             nameLower.find("passwd") != std::string::npos ||
             nameLower.find("pwd") != std::string::npos) {
 
-            // Password field detected - check if over HTTPS
-            if (url.find("https://") != 0) {
+            // Password field detected - check if over HTTPS (case-insensitive
+            // because URL schemes are defined to be case-insensitive per
+            // RFC 3986 §3.1).
+            if (!AsciiHasPrefixCI(url, "https://")) {
                 SS_LOG_WARN(L"Network", L"WebProtection: Credential theft risk - password over HTTP");
                 return true;
             }
@@ -2176,37 +2377,49 @@ std::vector<BrowserSession> WebProtection::GetActiveSessions() const {
 bool WebProtection::BlockDomain(const std::string& domain) {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeHost(domain);
+    if (normalized.empty()) return false;
+
     std::unique_lock lock(m_impl->m_domainsMutex);
-    m_impl->m_blockedDomains.insert(domain);
+    m_impl->m_blockedDomains.insert(normalized);
 
     SS_LOG_INFO(L"Network", L"WebProtection: Domain blocked - %ls",
-                      Utils::StringUtils::ToWide(domain).c_str());
+                      Utils::StringUtils::ToWide(SanitizeForLog(normalized)).c_str());
     return true;
 }
 
 bool WebProtection::UnblockDomain(const std::string& domain) {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeHost(domain);
+    if (normalized.empty()) return false;
+
     std::unique_lock lock(m_impl->m_domainsMutex);
-    return m_impl->m_blockedDomains.erase(domain) > 0;
+    return m_impl->m_blockedDomains.erase(normalized) > 0;
 }
 
 bool WebProtection::AllowDomain(const std::string& domain) {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeHost(domain);
+    if (normalized.empty()) return false;
+
     std::unique_lock lock(m_impl->m_domainsMutex);
-    m_impl->m_allowedDomains.insert(domain);
+    m_impl->m_allowedDomains.insert(normalized);
 
     SS_LOG_INFO(L"Network", L"WebProtection: Domain allowed - %ls",
-                      Utils::StringUtils::ToWide(domain).c_str());
+                      Utils::StringUtils::ToWide(SanitizeForLog(normalized)).c_str());
     return true;
 }
 
 bool WebProtection::IsDomainBlocked(const std::string& domain) const {
     if (!m_impl) return false;
 
+    const std::string normalized = NormalizeHost(domain);
+    if (normalized.empty()) return false;
+
     std::shared_lock lock(m_impl->m_domainsMutex);
-    return m_impl->m_blockedDomains.contains(domain);
+    return m_impl->m_blockedDomains.contains(normalized);
 }
 
 // Callbacks
@@ -2390,24 +2603,21 @@ bool WebProtection::ExportDiagnostics(const std::wstring& outputPath) const {
 
 void WebProtection::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
     if (!m_impl) return;
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_threatIntel = store;
+    m_impl->m_threatIntel.store(store, std::memory_order_release);
     SS_LOG_INFO(L"Network", L"WebProtection: ThreatIntelStore %ls",
                 store ? L"wired" : L"cleared");
 }
 
 void WebProtection::SetPatternStore(PatternStore::PatternStore* store) noexcept {
     if (!m_impl) return;
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_patternStore = store;
+    m_impl->m_patternStore.store(store, std::memory_order_release);
     SS_LOG_INFO(L"Network", L"WebProtection: PatternStore %ls",
                 store ? L"wired" : L"cleared");
 }
 
 void WebProtection::SetSignatureStore(SignatureStore::SignatureStore* store) noexcept {
     if (!m_impl) return;
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_signatureStore = store;
+    m_impl->m_signatureStore.store(store, std::memory_order_release);
     SS_LOG_INFO(L"Network", L"WebProtection: SignatureStore %ls",
                 store ? L"wired" : L"cleared");
 }
