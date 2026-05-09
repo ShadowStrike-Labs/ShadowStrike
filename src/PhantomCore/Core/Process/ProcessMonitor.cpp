@@ -1144,7 +1144,9 @@ public:
 
             // PPID spoofing detection
             if (m_config.detectPPIDSpoofing) {
-                DetectPPIDSpoofingImpl(info.uniqueId.pid);
+                // Detection side effects are emitted through suspicious/ancestry callbacks
+                // and counters; no caller decision is needed on the process-create path.
+                (void)DetectPPIDSpoofingImpl(info.uniqueId.pid);
             }
 
         } catch (const std::exception& e) {
