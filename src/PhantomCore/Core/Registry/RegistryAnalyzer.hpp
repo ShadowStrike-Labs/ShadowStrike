@@ -174,6 +174,19 @@ namespace RegistryAnalyzerConstants {
     constexpr uint32_t MAX_SCAN_DEPTH = 50;
     constexpr size_t MIN_BLOB_SIZE_FOR_ANALYSIS = 256;
     constexpr size_t MAX_NTAPI_BUFFER_SIZE = 64 * 1024;  // 64 KB cap for NtEnumerateKey
+    // Defensive cap on caller-supplied registry path length. The documented
+    // Win32 maximum is roughly 32767 wide chars total; we cap an order of
+    // magnitude tighter than that since real-world key paths are far shorter
+    // and any value above this size is almost certainly an attempted attack.
+    constexpr size_t MAX_KEY_PATH_LENGTH = 4096;
+    // Defensive cap on threat indicator file size. Larger files indicate
+    // either misconfiguration or an attempt to exhaust analyzer memory.
+    constexpr size_t MAX_INDICATOR_FILE_SIZE = 64 * 1024 * 1024;  // 64 MB
+    // Maximum bytes of raw value data retained inside an in-memory anomaly
+    // record. Full data is hashed before truncation so SHA-256 / ThreatIntel
+    // correlation remains correct, but the in-memory ring buffer cannot be
+    // weaponized into a multi-gigabyte DoS by feeding many large values.
+    constexpr size_t MAX_ANOMALY_RAW_DATA_BYTES = 4096;
 
     // Entropy thresholds
     constexpr double HIGH_ENTROPY_THRESHOLD = 7.0;
@@ -405,6 +418,8 @@ struct alignas(256) RegistryAnomaly {
 
     // Evidence
     std::vector<uint8_t> rawData;
+    bool rawDataTruncated{ false };  ///< true if rawData was capped at MAX_ANOMALY_RAW_DATA_BYTES
+    size_t originalSize{ 0 };        ///< original (uncapped) data length when rawDataTruncated == true
     std::wstring decodedData;
     std::string hexDump;
 
