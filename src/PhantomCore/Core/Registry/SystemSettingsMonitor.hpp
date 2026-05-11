@@ -560,6 +560,7 @@ struct alignas(256) SecurityAlert {
     bool canRemediate{ false };
     RemediationAction recommendedAction{ RemediationAction::Alert };
     bool wasRemediated{ false };
+    bool acknowledged{ false };  ///< Set by AcknowledgeAlert; alert is retained for forensics
 
     // MITRE mapping
     std::string mitreId;
@@ -637,6 +638,11 @@ struct alignas(64) SystemSettingsMonitorConfig {
 
     // History
     size_t maxHistoryEntries{ SystemSettingsMonitorConstants::MAX_HISTORY };
+
+    // Polling cadence for the background monitor thread. Clamped to
+    // [kMinPollIntervalMs, kMaxPollIntervalMs] at use-site so that pathological
+    // values (0, INT_MAX) cannot starve the system or blind the detector.
+    uint32_t monitorPollIntervalMs{ 1000 };
 
     // Factory methods
     static SystemSettingsMonitorConfig CreateDefault() noexcept;
