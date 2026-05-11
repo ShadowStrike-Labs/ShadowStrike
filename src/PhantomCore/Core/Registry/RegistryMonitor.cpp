@@ -92,6 +92,7 @@
 #include <sstream>
 #include <iomanip>
 #include <fstream>
+#include <cwctype>
 
 #pragma comment(lib, "fltLib.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -214,6 +215,143 @@ namespace {
             if (match) return true;
         }
         return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Log-injection hardening: registry paths, value names and process paths
+    // originate from attacker-controlled processes and may contain CR/LF or
+    // other control characters that could be used to forge log lines or
+    // poison downstream SIEM ingestion. Sanitize every wide field we feed
+    // into Logger format strings. Output is also length-capped to defend
+    // against log-flooding via gigantic keys.
+    // ------------------------------------------------------------------------
+    constexpr size_t kMaxLogFieldChars = 1024;
+
+    [[nodiscard]] std::string SanitizeForLog(std::wstring_view wide) {
+        std::string narrow = StringUtils::ToNarrow(wide);
+        if (narrow.size() > kMaxLogFieldChars) {
+            narrow.resize(kMaxLogFieldChars);
+            narrow.append("...<truncated>");
+        }
+        for (char& c : narrow) {
+            const auto uc = static_cast<unsigned char>(c);
+            if (uc < 0x20 || uc == 0x7F) {
+                c = '?';
+            }
+        }
+        return narrow;
+    }
+
+    [[nodiscard]] std::string SanitizeForLog(std::string_view narrowIn) {
+        std::string narrow(narrowIn);
+        if (narrow.size() > kMaxLogFieldChars) {
+            narrow.resize(kMaxLogFieldChars);
+            narrow.append("...<truncated>");
+        }
+        for (char& c : narrow) {
+            const auto uc = static_cast<unsigned char>(c);
+            if (uc < 0x20 || uc == 0x7F) {
+                c = '?';
+            }
+        }
+        return narrow;
+    }
+
+    // Wide variant of the script-signature heuristic. The original narrow
+    // implementation produced false negatives on REG_SZ / REG_EXPAND_SZ
+    // values stored as UTF-16, because every other byte of the marker
+    // ("p\0o\0w\0e\0...") would not appear in the narrow scan.
+    [[nodiscard]] bool ContainsScriptSignatureWide(std::wstring_view wide) noexcept {
+        if (wide.size() < 5) return false;
+        static constexpr std::wstring_view kMarkers[] = {
+            L"powershell", L"Invoke-", L"IEX",
+            L"@echo", L"cmd.exe",
+            L"WScript", L"CreateObject",
+            L"ActiveXObject",
+        };
+        for (auto m : kMarkers) {
+            if (IContainsRaw(wide, m)) return true;
+        }
+        return false;
+    }
+
+    // Lightweight FNV-1a 64-bit hash used by the alert-dedup ring. Combining
+    // PID, op, key path and value name lets us suppress alert/event-callback
+    // floods that target the same key (typical post-exploitation behaviour
+    // when a script repeatedly writes the same Run value), without affecting
+    // the kernel verdict reply which must still be emitted every time.
+    [[nodiscard]] uint64_t HashEventForDedup(uint32_t pid, uint8_t op,
+                                             std::wstring_view keyPath,
+                                             std::wstring_view valueName) noexcept {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        const auto mix = [&h](uint8_t b) noexcept {
+            h ^= b;
+            h *= 0x100000001b3ULL;
+        };
+        const uint8_t pidBytes[5] = {
+            static_cast<uint8_t>(pid),
+            static_cast<uint8_t>(pid >> 8),
+            static_cast<uint8_t>(pid >> 16),
+            static_cast<uint8_t>(pid >> 24),
+            op,
+        };
+        for (auto b : pidBytes) mix(b);
+        for (wchar_t c : keyPath) {
+            const wchar_t lc = ::towlower(c);
+            mix(static_cast<uint8_t>(lc));
+            mix(static_cast<uint8_t>(static_cast<uint16_t>(lc) >> 8));
+        }
+        mix(0xFF);
+        for (wchar_t c : valueName) {
+            const wchar_t lc = ::towlower(c);
+            mix(static_cast<uint8_t>(lc));
+            mix(static_cast<uint8_t>(static_cast<uint16_t>(lc) >> 8));
+        }
+        return h;
+    }
+
+    // Extract a process basename ("filename.exe") from a full image path.
+    // Previously processName was set to the full wide path converted to
+    // narrow form, which polluted UI displays and broke whitelist lookups
+    // by exact name. Empty input → empty output.
+    [[nodiscard]] std::string ProcessBaseName(std::wstring_view fullPath) {
+        if (fullPath.empty()) return {};
+        size_t pos = fullPath.find_last_of(L"\\/");
+        std::wstring_view tail = (pos == std::wstring_view::npos)
+            ? fullPath
+            : fullPath.substr(pos + 1);
+        return StringUtils::ToNarrow(tail);
+    }
+
+    // Hard caps applied to attacker-influenceable lists. These do not change
+    // the public constants; they merely enforce them in the Add* paths so a
+    // misconfigured policy push (or a hostile IPC client able to call into
+    // these APIs through a higher-level wrapper) cannot exhaust memory.
+    constexpr size_t kMaxHoneypotKeys = 1024;
+
+    // How many distinct events to remember for dedup, and the suppression
+    // window. Both are intentionally conservative — the kernel still gets a
+    // verdict per request; only user-facing alerts/callbacks are deduped.
+    constexpr size_t kDedupRingSize = 256;
+    constexpr std::chrono::milliseconds kDedupWindow{ 2000 };
+
+    // Strip large value blobs from a stored event before keeping it in the
+    // recent-events ring. Without this cap, 1000 × 1 MB events ≈ 1 GB of
+    // resident memory in the user-mode service.
+    constexpr size_t kRecentEventDataPreview = 256;
+
+    void TruncateEventForRetention(RegistryEvent& ev) noexcept {
+        try {
+            if (ev.data.size() > kRecentEventDataPreview) {
+                ev.data.resize(kRecentEventDataPreview);
+            }
+            if (ev.previousData.size() > kRecentEventDataPreview) {
+                ev.previousData.resize(kRecentEventDataPreview);
+            }
+        } catch (...) {
+            ev.data.clear();
+            ev.previousData.clear();
+        }
     }
 
 } // anonymous namespace
@@ -607,20 +745,45 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            m_config = config;
+            // Reject re-initialization while running to avoid leaking worker
+            // threads and producing inconsistent kernel-connection state.
+            // Callers must Stop() before reconfiguring.
+            if (m_running) {
+                SS_LOG_ERROR(L"Registry", L"Initialize rejected: monitor is running");
+                return false;
+            }
+
+            // Validate configuration. workerThreads == 0 would dead-lock the
+            // event pipeline (no consumers), so coerce it to a safe default
+            // and clamp to a hard ceiling to bound thread/handle usage.
+            RegistryMonitorConfig sanitised = config;
+            if (sanitised.workerThreads == 0) {
+                sanitised.workerThreads = 1;
+            } else if (sanitised.workerThreads > 32) {
+                sanitised.workerThreads = 32;
+            }
+            if (sanitised.largeValueThreshold == 0 ||
+                sanitised.largeValueThreshold > RegistryMonitorConstants::MAX_VALUE_DATA_SIZE) {
+                sanitised.largeValueThreshold =
+                    RegistryMonitorConstants::LARGE_VALUE_THRESHOLD;
+            }
+
+            m_config = sanitised;
             m_initialized = true;
 
-            if (config.protectShadowStrikeKeys) {
+            if (sanitised.protectShadowStrikeKeys) {
                 SetupSelfDefenseKeys();
             }
 
             SS_LOG_INFO(L"Registry", L"RegistryMonitor initialized (kernel=%d, selfDefense=%d)",
-                config.useKernelCallback ? 1 : 0, config.selfDefenseEnabled ? 1 : 0);
+                sanitised.useKernelCallback ? 1 : 0,
+                sanitised.selfDefenseEnabled ? 1 : 0);
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"RegistryMonitor initialization failed: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryMonitor initialization failed: %hs",
+                SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -667,25 +830,39 @@ public:
         try {
             if (!m_running) return;
 
+            // Order matters: signal the worker loop to exit BEFORE tearing down
+            // the FilterConnection. Disconnect() unblocks GetMessage but the
+            // worker may then race back into the loop and re-observe the
+            // connection pointer; setting m_stopRequested first ensures the
+            // post-Disconnect iteration is the last one.
             m_stopRequested = true;
 
-            // Disconnect kernel filter port via RAII connection wrapper
+            // Disconnect kernel filter port via RAII connection wrapper. Keep
+            // the pointer alive until the workers join so any final reply on
+            // a delayed verdict path does not chase a dangling handle.
             if (m_kernelConnected && m_connection) {
                 m_connection->Disconnect();
                 m_kernelConnected = false;
             }
 
-            // Must release lock before joining worker threads (they may need it)
+            // Must release lock before joining worker threads — workers
+            // re-acquire it via IsRunning()/IsKernelConnected() observers
+            // and via ProcessEvent's snapshot path.
             lock.unlock();
             StopWorkerThreads();
             lock.lock();
+
+            // Now it is safe to drop the connection object; no worker can
+            // resurface to call into it.
+            m_connection.reset();
 
             m_running = false;
 
             SS_LOG_INFO(L"Registry", L"RegistryMonitor stopped");
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"Stop failed: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"Stop failed: %hs",
+                SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -704,12 +881,18 @@ public:
                 lock.lock();
             }
 
+            m_connection.reset();
+
             m_rules.clear();
             m_protectedKeys.clear();
+            m_protectedKeysLower.clear();
             m_alertCallbacks.clear();
             m_eventCallbacks.clear();
             m_valueCallbacks.clear();
             m_recentEvents.clear();
+            m_dedupRing.clear();
+            m_dedupOrder.clear();
+            m_dedupNextSlot = 0;
 
             m_initialized = false;
             m_running = false;
@@ -744,19 +927,47 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
+            if (m_rules.size() >= RegistryMonitorConstants::MAX_RULES) {
+                SS_LOG_ERROR(L"Registry", L"AddRule rejected: MAX_RULES (%zu) reached",
+                    RegistryMonitorConstants::MAX_RULES);
+                return 0;
+            }
+
+            // Bound attacker-influenceable string fields to avoid log/memory
+            // amplification through pattern-driven matching loops.
             RegistryRule newRule = rule;
+            if (newRule.name.size() > 256) newRule.name.resize(256);
+            if (newRule.description.size() > 1024) newRule.description.resize(1024);
+            if (newRule.keyPathPattern.size() > RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
+                SS_LOG_ERROR(L"Registry", L"AddRule rejected: keyPathPattern too long (%zu)",
+                    newRule.keyPathPattern.size());
+                return 0;
+            }
+            if (newRule.processPathPattern.size() > RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
+                SS_LOG_ERROR(L"Registry", L"AddRule rejected: processPathPattern too long");
+                return 0;
+            }
+            if (newRule.processIds.size() > 4096) {
+                SS_LOG_ERROR(L"Registry", L"AddRule rejected: too many processIds (%zu)",
+                    newRule.processIds.size());
+                return 0;
+            }
+
             newRule.ruleId = ++m_nextRuleId;
             newRule.createdAt = std::chrono::system_clock::now();
 
-            m_rules[newRule.ruleId] = newRule;
+            const uint64_t id = newRule.ruleId;
+            const std::string safeName = SanitizeForLog(newRule.name);
+            m_rules[id] = std::move(newRule);
 
             SS_LOG_INFO(L"Registry", L"Added registry rule: %hs (id=%llu)",
-                newRule.name.c_str(), static_cast<unsigned long long>(newRule.ruleId));
+                safeName.c_str(), static_cast<unsigned long long>(id));
 
-            return newRule.ruleId;
+            return id;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"AddRule failed: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"AddRule failed: %hs",
+                SanitizeForLog(e.what()).c_str());
             return 0;
         }
     }
@@ -818,6 +1029,21 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
+            if (keyPath.empty() ||
+                keyPath.size() > RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
+                SS_LOG_WARN(L"Registry", L"AddProtectedKey rejected: invalid path length %zu",
+                    keyPath.size());
+                return;
+            }
+            if (ContainsNullBytes(keyPath)) {
+                SS_LOG_WARN(L"Registry", L"AddProtectedKey rejected: embedded null byte");
+                return;
+            }
+            if (m_protectedKeys.size() >= RegistryMonitorConstants::MAX_PROTECTED_KEYS) {
+                SS_LOG_ERROR(L"Registry", L"AddProtectedKey rejected: MAX_PROTECTED_KEYS reached");
+                return;
+            }
+
             ProtectedKey pk;
             pk.keyPath = keyPath;
             pk.includeSubkeys = true;
@@ -826,12 +1052,16 @@ public:
             pk.protectRename = true;
             pk.protectSecurity = true;
 
-            m_protectedKeys.push_back(pk);
+            m_protectedKeys.push_back(std::move(pk));
+            m_protectedKeysLower.push_back(StringUtils::ToLowerCopy(
+                m_protectedKeys.back().keyPath));
 
-            SS_LOG_INFO(L"Registry", L"Added protected key: %ls", keyPath.c_str());
+            SS_LOG_INFO(L"Registry", L"Added protected key: %hs",
+                SanitizeForLog(keyPath).c_str());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"AddProtectedKey failed: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"AddProtectedKey failed: %hs",
+                SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -839,12 +1069,26 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            m_protectedKeys.push_back(config);
+            if (config.keyPath.empty() ||
+                config.keyPath.size() > RegistryMonitorConstants::MAX_KEY_PATH_LENGTH ||
+                ContainsNullBytes(config.keyPath)) {
+                SS_LOG_WARN(L"Registry", L"AddProtectedKey(config) rejected: invalid path");
+                return;
+            }
+            if (m_protectedKeys.size() >= RegistryMonitorConstants::MAX_PROTECTED_KEYS) {
+                SS_LOG_ERROR(L"Registry", L"AddProtectedKey rejected: MAX_PROTECTED_KEYS reached");
+                return;
+            }
 
-            SS_LOG_INFO(L"Registry", L"Added protected key: %ls", config.keyPath.c_str());
+            m_protectedKeys.push_back(config);
+            m_protectedKeysLower.push_back(StringUtils::ToLowerCopy(config.keyPath));
+
+            SS_LOG_INFO(L"Registry", L"Added protected key: %hs",
+                SanitizeForLog(config.keyPath).c_str());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"AddProtectedKey failed: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"AddProtectedKey failed: %hs",
+                SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -853,18 +1097,34 @@ public:
 
         try {
             const std::wstring lowerTarget = StringUtils::ToLowerCopy(keyPath);
-            auto it = std::remove_if(m_protectedKeys.begin(), m_protectedKeys.end(),
-                [&lowerTarget](const ProtectedKey& pk) {
-                    return StringUtils::ToLowerCopy(pk.keyPath) == lowerTarget;
-                });
 
-            if (it != m_protectedKeys.end()) {
-                m_protectedKeys.erase(it, m_protectedKeys.end());
-                SS_LOG_INFO(L"Registry", L"Removed protected key: %ls", keyPath.c_str());
+            // Walk both vectors in lock-step so the parallel lowercase cache
+            // remains consistent with m_protectedKeys.
+            size_t i = 0;
+            while (i < m_protectedKeys.size()) {
+                const std::wstring& thisLower =
+                    (i < m_protectedKeysLower.size())
+                        ? m_protectedKeysLower[i]
+                        : (m_protectedKeysLower.emplace_back(
+                              StringUtils::ToLowerCopy(m_protectedKeys[i].keyPath)),
+                           m_protectedKeysLower[i]);
+
+                if (thisLower == lowerTarget) {
+                    m_protectedKeys.erase(m_protectedKeys.begin() + i);
+                    if (i < m_protectedKeysLower.size()) {
+                        m_protectedKeysLower.erase(m_protectedKeysLower.begin() + i);
+                    }
+                    SS_LOG_INFO(L"Registry", L"Removed protected key: %hs",
+                        SanitizeForLog(keyPath).c_str());
+                    // Do not break: remove all duplicates if any.
+                } else {
+                    ++i;
+                }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"RemoveProtectedKey failed: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"RemoveProtectedKey failed: %hs",
+                SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -873,17 +1133,27 @@ public:
 
         const std::wstring lowerPath = StringUtils::ToLowerCopy(keyPath);
 
-        for (const auto& pk : m_protectedKeys) {
-            const std::wstring lowerProtected = StringUtils::ToLowerCopy(pk.keyPath);
+        // m_protectedKeysLower is a parallel cache populated under unique_lock
+        // by the Add/Remove paths. Avoiding per-call ToLowerCopy on the entire
+        // protected-key set is the difference between O(N) and O(N·M) work on
+        // a hot path that fires on every registry operation matched by a
+        // sysadmin-deployed policy.
+        const size_t count = std::min(m_protectedKeys.size(),
+                                      m_protectedKeysLower.size());
+        for (size_t i = 0; i < count; ++i) {
+            const auto& pk = m_protectedKeys[i];
+            const std::wstring& lowerProtected = m_protectedKeysLower[i];
 
             if (lowerPath == lowerProtected) {
                 return true;
             }
 
             if (pk.includeSubkeys &&
+                !lowerProtected.empty() &&
                 lowerPath.size() > lowerProtected.size() &&
                 lowerPath.starts_with(lowerProtected) &&
-                (lowerProtected.back() == L'\\' || lowerPath[lowerProtected.size()] == L'\\')) {
+                (lowerProtected.back() == L'\\' ||
+                 lowerPath[lowerProtected.size()] == L'\\')) {
                 return true;
             }
         }
@@ -938,15 +1208,33 @@ public:
         };
 
         try {
-            // Size check
-            if (data.size() > m_config.largeValueThreshold) {
+            // Hostile-input bound: refuse to analyze more than the documented
+            // wire ceiling. Anything above this would mean the deserialiser
+            // (or a future call site) violated its contract; treat as suspect
+            // but do not pull the whole blob through entropy/path scans.
+            const size_t analysedSize = std::min<size_t>(
+                data.size(), RegistryMonitorConstants::MAX_VALUE_DATA_SIZE);
+            std::span<const uint8_t> view = data.subspan(0, analysedSize);
+
+            // Snapshot the configured threshold under shared lock; the field
+            // can be mutated by Initialize() and racing reads of a non-atomic
+            // size_t are undefined behaviour.
+            size_t largeThreshold = 0;
+            {
+                std::shared_lock lock(m_mutex);
+                largeThreshold = m_config.largeValueThreshold;
+            }
+            if (largeThreshold == 0) {
+                largeThreshold = RegistryMonitorConstants::LARGE_VALUE_THRESHOLD;
+            }
+
+            if (data.size() > largeThreshold) {
                 analysis.isLargeValue = true;
                 analysis.riskFactors.push_back("Large value size");
             }
 
-            // Entropy analysis
-            if (data.size() >= RegistryMonitorConstants::MIN_BLOB_SIZE_FOR_ANALYSIS) {
-                analysis.entropy = CalculateEntropyInternal(data);
+            if (view.size() >= RegistryMonitorConstants::MIN_BLOB_SIZE_FOR_ANALYSIS) {
+                analysis.entropy = CalculateEntropyInternal(view);
                 analysis.isHighEntropy = (analysis.entropy >= RegistryMonitorConstants::ENTROPY_THRESHOLD);
 
                 if (analysis.isHighEntropy) {
@@ -954,72 +1242,122 @@ public:
                 }
             }
 
-            // Binary blob detection
-            if (type == RegistryValueType::BINARY && data.size() > 1024) {
+            if (type == RegistryValueType::BINARY && view.size() > 1024) {
                 analysis.isBinaryBlob = true;
                 analysis.riskFactors.push_back("Large binary blob");
             }
 
-            // Executable signature
-            if (ContainsExecutableSignature(data)) {
+            if (ContainsExecutableSignature(view)) {
                 analysis.containsExecutable = true;
                 analysis.riskFactors.push_back("Contains executable signature");
             }
 
-            // Script signature
-            if (ContainsScriptSignature(data)) {
+            // Narrow scan for ASCII script markers (e.g. legacy REG_BINARY
+            // shellcode dumps, batch fragments stored as raw bytes).
+            if (ContainsScriptSignature(view)) {
                 analysis.containsScript = true;
                 analysis.riskFactors.push_back("Contains script content");
             }
 
-            // String analysis for REG_SZ/REG_EXPAND_SZ
-            if (type == RegistryValueType::SZ || type == RegistryValueType::EXPAND_SZ) {
-                // Safe wchar_t extraction with bounds check
-                const size_t charCount = data.size() / sizeof(wchar_t);
-                if (charCount > 0 && data.size() >= sizeof(wchar_t)) {
-                    std::wstring value(reinterpret_cast<const wchar_t*>(data.data()), charCount);
-                    // Strip trailing null if present
-                    if (!value.empty() && value.back() == L'\0') {
+            // String analysis for REG_SZ / REG_EXPAND_SZ / REG_MULTI_SZ
+            if (type == RegistryValueType::SZ ||
+                type == RegistryValueType::EXPAND_SZ ||
+                type == RegistryValueType::MULTI_SZ) {
+
+                const size_t charCount = view.size() / sizeof(wchar_t);
+                if (charCount > 0) {
+                    const wchar_t* base = reinterpret_cast<const wchar_t*>(view.data());
+
+                    // Defensive copy: callers may hand us non-null-terminated
+                    // data. Building std::wstring from (ptr, count) guarantees
+                    // an internal null terminator without reading past the end.
+                    std::wstring value(base, charCount);
+                    while (!value.empty() && value.back() == L'\0') {
                         value.pop_back();
                     }
 
-                    // Null-byte cloaking detection (embedded nulls before end)
-                    if (charCount > 1 && ContainsNullBytes(std::wstring_view(value.data(), charCount - 1))) {
+                    if (charCount > value.size() + 1) {
+                        // Embedded null bytes BEFORE the trailing null and
+                        // before the end of the declared buffer — classic
+                        // cloaking pattern (path appears short to RegEdit
+                        // but the kernel writes the full hidden string).
                         analysis.riskFactors.push_back("Embedded null bytes (cloaking attempt)");
                     }
 
-                    // REG_EXPAND_SZ: expand environment variables to detect evasion
+                    // Wide-character script signature scan. Catches malware
+                    // that stores its PowerShell payload as a real REG_SZ
+                    // (UTF-16) value, which the narrow scan above misses
+                    // because of the interleaved zero bytes.
+                    if (!analysis.containsScript && ContainsScriptSignatureWide(value)) {
+                        analysis.containsScript = true;
+                        analysis.riskFactors.push_back("Contains script content");
+                    }
+
                     if (type == RegistryValueType::EXPAND_SZ && !value.empty()) {
-                        wchar_t expandedBuf[4096]{};
-                        DWORD expandedLen = ExpandEnvironmentStringsW(value.c_str(), expandedBuf,
-                            static_cast<DWORD>(std::size(expandedBuf)));
-                        if (expandedLen > 0 && expandedLen < std::size(expandedBuf)) {
-                            std::wstring expanded(expandedBuf, expandedLen - 1);
-                            if (expanded != value) {
-                                analysis.riskFactors.push_back("Contains expandable environment variables");
-                            }
-                            // Use expanded value for path detection
-                            if (IsPathLike(expanded)) {
-                                addExtractedPath(expanded);
+                        // Two-step expansion: query required size, then
+                        // expand with an exact-fit buffer. Prevents %ENV%
+                        // cloaking that defeats fixed-buffer truncation.
+                        const DWORD required = ExpandEnvironmentStringsW(
+                            value.c_str(), nullptr, 0);
+                        if (required > 0 &&
+                            required <= RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
+                            std::wstring expanded(required, L'\0');
+                            const DWORD wrote = ExpandEnvironmentStringsW(
+                                value.c_str(), expanded.data(), required);
+                            if (wrote > 0 && wrote <= required) {
+                                expanded.resize(wrote > 0 ? wrote - 1 : 0);
+                                if (expanded != value) {
+                                    analysis.riskFactors.push_back(
+                                        "Contains expandable environment variables");
+                                }
+                                if (IsPathLike(expanded)) {
+                                    addExtractedPath(expanded);
+                                }
                             }
                         }
                     }
 
-                    // Path detection on raw value
-                    if (IsPathLike(value)) {
-                        addExtractedPath(value);
-                    }
-
-                    // URL detection (lightweight, no regex on hot path)
-                    std::string narrowValue = StringUtils::ToNarrow(value);
-                    if (ContainsUrlPrefix(narrowValue)) {
-                        analysis.containsUrl = true;
-                        analysis.extractedUrls.push_back(narrowValue);
+                    if (type == RegistryValueType::MULTI_SZ) {
+                        // Split on embedded nulls. Cap iterations defensively
+                        // to prevent quadratic explosion on a pathologically
+                        // crafted blob full of empty strings.
+                        size_t entries = 0;
+                        size_t i = 0;
+                        while (i < charCount && entries < 1024) {
+                            size_t j = i;
+                            while (j < charCount && base[j] != L'\0') ++j;
+                            if (j > i) {
+                                std::wstring entry(base + i, j - i);
+                                if (IsPathLike(entry)) addExtractedPath(entry);
+                                std::string narrow = StringUtils::ToNarrow(entry);
+                                if (ContainsUrlPrefix(narrow)) {
+                                    analysis.containsUrl = true;
+                                    if (analysis.extractedUrls.size() < 64) {
+                                        analysis.extractedUrls.push_back(std::move(narrow));
+                                    }
+                                }
+                                if (!analysis.containsScript &&
+                                    ContainsScriptSignatureWide(entry)) {
+                                    analysis.containsScript = true;
+                                    analysis.riskFactors.push_back("Contains script content");
+                                }
+                                ++entries;
+                            }
+                            i = j + 1;
+                        }
+                    } else {
+                        if (IsPathLike(value)) {
+                            addExtractedPath(value);
+                        }
+                        std::string narrowValue = StringUtils::ToNarrow(value);
+                        if (ContainsUrlPrefix(narrowValue)) {
+                            analysis.containsUrl = true;
+                            analysis.extractedUrls.push_back(std::move(narrowValue));
+                        }
                     }
                 }
             }
 
-            // Risk assessment
             if (analysis.riskFactors.size() >= 3) {
                 analysis.risk = RiskLevel::High;
             } else if (analysis.riskFactors.size() >= 2) {
@@ -1031,7 +1369,8 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"AnalyzeValue - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"AnalyzeValue - Exception: %hs",
+                SanitizeForLog(e.what()).c_str());
         }
 
         return analysis;
@@ -1045,32 +1384,64 @@ public:
         const auto startTime = std::chrono::steady_clock::now();
         RegistryVerdict resultVerdict = RegistryVerdict::Allow;
 
+        // RAII helper: regardless of which return path we take, the event is
+        // recorded into the bounded recent-events ring (forensics) and the
+        // event callbacks fire. This eliminates the silent-loss bug where
+        // Block/Alert/SilentDrop events vanished from the UI ring.
+        struct FinalizeGuard {
+            RegistryMonitorImpl* self;
+            const RegistryEvent& src;
+            RegistryVerdict& verdict;
+            bool armed{ true };
+            ~FinalizeGuard() {
+                if (!armed || !self) return;
+                try {
+                    RegistryEvent retained = src;
+                    TruncateEventForRetention(retained);
+                    {
+                        std::unique_lock lock(self->m_mutex);
+                        self->m_recentEvents.push_back(std::move(retained));
+                        while (self->m_recentEvents.size() > MAX_RECENT_EVENTS) {
+                            self->m_recentEvents.pop_front();
+                        }
+                    }
+                    self->NotifyEventCallbacks(src, verdict);
+                } catch (...) {
+                    // Forensic recording must never propagate exceptions.
+                }
+            }
+        } finalize{ this, event, resultVerdict };
+
         try {
             m_stats.totalEvents++;
 
-            // Validate input: null-byte cloaking detection
             if (ContainsNullBytes(event.keyPath)) {
                 m_stats.blockedOperations++;
-                SS_LOG_FATAL(L"Registry", L"Null-byte key cloaking detected (PID=%u): %ls",
-                    event.processId, event.keyPath.c_str());
+                SS_LOG_FATAL(L"Registry",
+                    L"Null-byte key cloaking detected (PID=%u): %hs",
+                    event.processId,
+                    SanitizeForLog(event.keyPath).c_str());
                 GenerateAlert(event, RegistryThreatType::SELF_DEFENSE_TAMPER,
                     RiskLevel::Critical, "Null-byte registry key cloaking attack");
-                resultVerdict = RegistryVerdict::Block;
+                // Post-operation notifications cannot be blocked (kernel has
+                // already applied the change); collapse Block to Allow there
+                // but keep the alert + audit trail.
+                resultVerdict = event.isPreOperation ? RegistryVerdict::Block
+                                                     : RegistryVerdict::Allow;
                 UpdatePerformanceStats(startTime);
                 return resultVerdict;
             }
 
-            // Cap key path length to prevent abuse
             if (event.keyPath.size() > RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
                 m_stats.blockedOperations++;
                 SS_LOG_WARN(L"Registry", L"Key path exceeds max length (%zu > %zu)",
                     event.keyPath.size(), RegistryMonitorConstants::MAX_KEY_PATH_LENGTH);
-                resultVerdict = RegistryVerdict::Block;
+                resultVerdict = event.isPreOperation ? RegistryVerdict::Block
+                                                     : RegistryVerdict::Allow;
                 UpdatePerformanceStats(startTime);
                 return resultVerdict;
             }
 
-            // Update operation counters
             switch (event.operation) {
                 case RegistryOp::CreateKey:   m_stats.createKeyEvents++; break;
                 case RegistryOp::SetValue:    m_stats.setValueEvents++; break;
@@ -1080,7 +1451,6 @@ public:
                 default: break;
             }
 
-            // Snapshot config and rules under lock for thread-safe evaluation
             RegistryMonitorConfig configSnap;
             std::vector<std::pair<uint64_t, RegistryRule>> rulesSnap;
             RegistryPolicyCallback policySnap;
@@ -1096,54 +1466,57 @@ public:
                 policySnap = m_policyCallback;
             }
 
-            // Self-defense check (IsProtectedKey acquires its own shared_lock)
             if (configSnap.selfDefenseEnabled && IsProtectedKey(event.keyPath)) {
                 m_stats.selfDefenseBlocks++;
                 m_stats.blockedOperations++;
 
-                SS_LOG_FATAL(L"Registry", L"Blocked access to protected key: %ls (process: %hs, PID: %u)",
-                    event.keyPath.c_str(), event.processName.c_str(), event.processId);
+                SS_LOG_FATAL(L"Registry",
+                    L"Blocked access to protected key: %hs (process: %hs, PID: %u)",
+                    SanitizeForLog(event.keyPath).c_str(),
+                    SanitizeForLog(event.processName).c_str(),
+                    event.processId);
 
                 GenerateAlert(event, RegistryThreatType::SELF_DEFENSE_TAMPER,
                              RiskLevel::Critical, "Attempted to modify protected registry key");
 
-                resultVerdict = RegistryVerdict::Block;
+                resultVerdict = event.isPreOperation ? RegistryVerdict::Block
+                                                     : RegistryVerdict::Allow;
                 UpdatePerformanceStats(startTime);
                 return resultVerdict;
             }
 
-            // Apply rules (on snapshot, no lock held)
             RegistryVerdict verdict = ApplyRulesSnapshot(rulesSnap, event);
             if (verdict != RegistryVerdict::Allow) {
                 m_stats.blockedOperations++;
                 if (verdict == RegistryVerdict::SilentDrop) {
                     m_stats.silentDropped++;
                 }
-                resultVerdict = verdict;
+                // Post-op events cannot retroactively block, but rule hits
+                // still count for stats and are retained in the ring.
+                resultVerdict = event.isPreOperation ? verdict : RegistryVerdict::Allow;
                 UpdatePerformanceStats(startTime);
                 return resultVerdict;
             }
 
-            // User policy callback (on snapshot)
             if (policySnap) {
                 verdict = policySnap(event);
                 if (verdict != RegistryVerdict::Allow) {
                     m_stats.blockedOperations++;
-                    resultVerdict = verdict;
+                    resultVerdict = event.isPreOperation ? verdict : RegistryVerdict::Allow;
                     UpdatePerformanceStats(startTime);
                     return resultVerdict;
                 }
             }
 
-            // Threat detection
-            RegistryThreatType threat = DetectThreat(event);
+            RegistryThreatType threat = DetectThreat(event, configSnap);
             if (threat != RegistryThreatType::NONE) {
                 RiskLevel risk = AssessRisk(threat);
 
                 if (risk >= RiskLevel::High) {
                     m_stats.blockedOperations++;
                     GenerateAlert(event, threat, risk, "Registry threat detected");
-                    resultVerdict = RegistryVerdict::Block;
+                    resultVerdict = event.isPreOperation ? RegistryVerdict::Block
+                                                         : RegistryVerdict::Allow;
                     UpdatePerformanceStats(startTime);
                     return resultVerdict;
                 } else {
@@ -1158,21 +1531,10 @@ public:
             m_stats.allowedOperations++;
             resultVerdict = RegistryVerdict::Allow;
 
-            // Store in recent events (bounded)
-            {
-                std::unique_lock lock(m_mutex);
-                m_recentEvents.push_back(event);
-                while (m_recentEvents.size() > MAX_RECENT_EVENTS) {
-                    m_recentEvents.pop_front();
-                }
-            }
-
-            // Notify event callbacks
-            NotifyEventCallbacks(event, resultVerdict);
-
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"ProcessEvent exception: %hs", e.what());
-            resultVerdict = RegistryVerdict::Allow;  // Fail-open to avoid system hang
+            SS_LOG_ERROR(L"Registry", L"ProcessEvent exception: %hs",
+                SanitizeForLog(e.what()).c_str());
+            resultVerdict = RegistryVerdict::Allow;  // Fail-open: never freeze the kernel
         }
 
         UpdatePerformanceStats(startTime);
@@ -1201,13 +1563,30 @@ public:
     void ConfigureDeception(const DeceptionConfig& config) {
         std::unique_lock lock(m_mutex);
         m_config.deception = config;
+        if (m_config.deception.honeypotKeys.size() > kMaxHoneypotKeys) {
+            m_config.deception.honeypotKeys.resize(kMaxHoneypotKeys);
+            SS_LOG_WARN(L"Registry", L"Honeypot key list truncated to %zu entries",
+                kMaxHoneypotKeys);
+        }
         SS_LOG_INFO(L"Registry", L"Deception mode configured (enabled=%d)", config.enabled ? 1 : 0);
     }
 
     void AddHoneypotKey(const std::wstring& keyPath) {
         std::unique_lock lock(m_mutex);
+        if (keyPath.empty() ||
+            keyPath.size() > RegistryMonitorConstants::MAX_KEY_PATH_LENGTH ||
+            ContainsNullBytes(keyPath)) {
+            SS_LOG_WARN(L"Registry", L"AddHoneypotKey rejected: invalid path");
+            return;
+        }
+        if (m_config.deception.honeypotKeys.size() >= kMaxHoneypotKeys) {
+            SS_LOG_ERROR(L"Registry", L"AddHoneypotKey rejected: limit %zu reached",
+                kMaxHoneypotKeys);
+            return;
+        }
         m_config.deception.honeypotKeys.push_back(keyPath);
-        SS_LOG_INFO(L"Registry", L"Added honeypot key: %ls", keyPath.c_str());
+        SS_LOG_INFO(L"Registry", L"Added honeypot key: %hs",
+            SanitizeForLog(keyPath).c_str());
     }
 
     // ========================================================================
@@ -1348,59 +1727,38 @@ private:
     // ========================================================================
 
     void SetupSelfDefenseKeys() {
-        // Protect ShadowStrike registry keys in BOTH kernel path format and user-mode format
-        // Kernel sends \Registry\Machine\... paths; user-mode code may use HKLM\...
-        const std::wstring shadowStrikePaths[] = {
-            L"\\Registry\\Machine\\SOFTWARE\\ShadowStrike",
-            L"HKLM\\SOFTWARE\\ShadowStrike",
-        };
-        for (const auto& path : shadowStrikePaths) {
+        // Helper: push both the ProtectedKey and its precomputed lowercase
+        // path so the IsProtectedKey hot path stays cache-aligned with no
+        // per-call ToLowerCopy on the protected-key set.
+        const auto addSelfDefenseKey = [this](std::wstring path,
+                                              bool includeSecurity = false) {
             ProtectedKey pk;
             pk.keyPath = path;
             pk.includeSubkeys = true;
             pk.protectValues = true;
             pk.protectDelete = true;
             pk.protectRename = true;
-            pk.protectSecurity = true;
+            pk.protectSecurity = includeSecurity;
             pk.isSelfDefense = true;
-            m_protectedKeys.push_back(pk);
-        }
-
-        // Protect service keys
-        const std::wstring servicePaths[] = {
-            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrike",
-            L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrike",
+            m_protectedKeysLower.push_back(StringUtils::ToLowerCopy(path));
+            m_protectedKeys.push_back(std::move(pk));
         };
-        for (const auto& path : servicePaths) {
-            ProtectedKey pk;
-            pk.keyPath = path;
-            pk.includeSubkeys = true;
-            pk.protectValues = true;
-            pk.protectDelete = true;
-            pk.protectRename = true;
-            pk.isSelfDefense = true;
-            m_protectedKeys.push_back(pk);
-        }
 
-        // Protect driver parameters
-        ProtectedKey driverKey;
-        driverKey.keyPath = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\PhantomSensor";
-        driverKey.includeSubkeys = true;
-        driverKey.protectValues = true;
-        driverKey.protectDelete = true;
-        driverKey.protectRename = true;
-        driverKey.isSelfDefense = true;
-        m_protectedKeys.push_back(driverKey);
+        // Protect ShadowStrike registry keys in BOTH kernel path format and
+        // user-mode format. The kernel sends \Registry\Machine\... paths;
+        // user-mode policy code may use HKLM\... — both must match.
+        addSelfDefenseKey(L"\\Registry\\Machine\\SOFTWARE\\ShadowStrike", true);
+        addSelfDefenseKey(L"HKLM\\SOFTWARE\\ShadowStrike", true);
 
-        // Also protect Wow6432Node variant for 32-bit process bypass prevention
-        ProtectedKey wow64Key;
-        wow64Key.keyPath = L"\\Registry\\Machine\\SOFTWARE\\Wow6432Node\\ShadowStrike";
-        wow64Key.includeSubkeys = true;
-        wow64Key.protectValues = true;
-        wow64Key.protectDelete = true;
-        wow64Key.protectRename = true;
-        wow64Key.isSelfDefense = true;
-        m_protectedKeys.push_back(wow64Key);
+        // Service keys.
+        addSelfDefenseKey(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrike");
+        addSelfDefenseKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrike");
+
+        // Sensor driver parameters.
+        addSelfDefenseKey(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\PhantomSensor");
+
+        // Wow6432Node variant — prevents 32-bit-redirection bypass.
+        addSelfDefenseKey(L"\\Registry\\Machine\\SOFTWARE\\Wow6432Node\\ShadowStrike");
 
         SS_LOG_INFO(L"Registry", L"Self-defense keys configured (%zu entries)",
             m_protectedKeys.size());
@@ -1424,7 +1782,8 @@ private:
             return false;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"ConnectToKernelDriver exception: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"ConnectToKernelDriver exception: %hs",
+                SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -1454,21 +1813,83 @@ private:
 
         std::vector<uint8_t> messageBuffer(Communication::MAX_MESSAGE_SIZE);
 
+        // Reconnect backoff state. We start at 500 ms and cap at 30 s so a
+        // permanent kernel-side fault does not pin a CPU. Only one worker
+        // performs the reconnect attempt at a time, gated by m_mutex.
+        std::chrono::milliseconds reconnectDelay{ 500 };
+        constexpr std::chrono::milliseconds kReconnectMin{ 500 };
+        constexpr std::chrono::milliseconds kReconnectMax{ 30000 };
+
         while (!m_stopRequested) {
-            if (!m_connection || !m_connection->IsConnected()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // Connection liveness gate. If the kernel filter port has dropped
+            // (driver unload, FltSendMessage failure, etc.), attempt to
+            // reconnect under unique_lock so multiple workers do not race on
+            // m_connection. Reads of m_connection are otherwise safe because
+            // the pointer itself is only replaced under unique_lock and the
+            // FilterConnection object is internally thread-safe.
+            bool connected = false;
+            {
+                std::shared_lock lock(m_mutex);
+                connected = (m_connection && m_connection->IsConnected());
+            }
+
+            if (!connected) {
+                if (m_stopRequested) break;
+
+                // Attempt reconnect — bounded, single-flight.
+                bool didReconnect = false;
+                {
+                    std::unique_lock lock(m_mutex);
+                    if (!m_stopRequested && m_connection &&
+                        !m_connection->IsConnected()) {
+                        if (m_connection->Connect()) {
+                            m_kernelConnected = true;
+                            didReconnect = true;
+                        }
+                    } else if (m_connection && m_connection->IsConnected()) {
+                        didReconnect = true;
+                    }
+                }
+
+                if (didReconnect) {
+                    SS_LOG_INFO(L"Registry",
+                        L"Reconnected to kernel registry filter (worker tid=%u)",
+                        ::GetCurrentThreadId());
+                    reconnectDelay = kReconnectMin;
+                    continue;
+                }
+
+                std::this_thread::sleep_for(reconnectDelay);
+                reconnectDelay = std::min(reconnectDelay * 2, kReconnectMax);
                 continue;
             }
+            reconnectDelay = kReconnectMin;
 
             size_t bytesReceived = 0;
             try {
+                std::shared_lock lock(m_mutex);
+                if (!m_connection) {
+                    lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
                 bytesReceived = m_connection->GetMessage(messageBuffer, 1000);
+            } catch (const std::exception& e) {
+                SS_LOG_WARN(L"Registry", L"GetMessage threw: %hs",
+                    SanitizeForLog(e.what()).c_str());
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
             } catch (...) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
 
             if (bytesReceived < sizeof(Communication::MessageHeader)) {
+                continue;
+            }
+            if (bytesReceived > messageBuffer.size()) {
+                // Filter-driver protocol violation; drop and resync.
+                m_stats.droppedEvents++;
                 continue;
             }
 
@@ -1482,73 +1903,127 @@ private:
                 continue;
             }
 
-            // Validate payload bounds
-            if (header->dataSize < sizeof(Communication::RegistryNotificationData) ||
-                bytesReceived < sizeof(Communication::MessageHeader) + sizeof(Communication::RegistryNotificationData)) {
+            // Authoritative payload size comes from the header's declared
+            // dataSize, NOT from bytesReceived. An attacker who somehow
+            // injected trailing bytes (or a buggy driver) must not be able
+            // to feed us data beyond the header's contract. We clamp to the
+            // minimum of received-bytes-minus-header and declared dataSize.
+            if (header->dataSize < sizeof(Communication::RegistryNotificationData)) {
                 m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry", L"Undersized registry notification (%zu bytes)", bytesReceived);
+                SS_LOG_WARN(L"Registry", L"Undersized registry notification (dataSize=%u)",
+                    static_cast<unsigned>(header->dataSize));
+                continue;
+            }
+            const size_t headerSize = sizeof(Communication::MessageHeader);
+            if (bytesReceived < headerSize + sizeof(Communication::RegistryNotificationData)) {
+                m_stats.droppedEvents++;
+                SS_LOG_WARN(L"Registry", L"Truncated registry notification (bytes=%zu)",
+                    bytesReceived);
                 continue;
             }
 
-            const auto* regData = reinterpret_cast<const Communication::RegistryNotificationData*>(
-                messageBuffer.data() + sizeof(Communication::MessageHeader));
+            const size_t declaredPayload = header->dataSize;
+            const size_t receivedPayload = bytesReceived - headerSize;
+            const size_t payloadSize = std::min(declaredPayload, receivedPayload);
 
-            // Marshal wire data into RegistryEvent
+            const auto* regData = reinterpret_cast<const Communication::RegistryNotificationData*>(
+                messageBuffer.data() + headerSize);
+
+            // Strict enum validation: refuse to dispatch unknown operation
+            // codes. RegistryOp values are sparse (gaps between 5-10, 13-20,
+            // etc.). We accept anything in the declared upper bound and let
+            // downstream code use Unknown for unmapped gaps.
+            const uint32_t rawOp = regData->operationType;
+            if (rawOp > static_cast<uint32_t>(RegistryOp::RollbackTransaction)) {
+                m_stats.droppedEvents++;
+                SS_LOG_WARN(L"Registry", L"Rejected unknown operationType=%u msgId=%llu",
+                    rawOp,
+                    static_cast<unsigned long long>(header->messageId));
+                continue;
+            }
+
             RegistryEvent event;
             event.eventId = header->messageId;
             event.timestamp = std::chrono::system_clock::now();
             event.processId = regData->processId;
             event.threadId = regData->threadId;
-            event.operation = static_cast<RegistryOp>(regData->operationType);
+            event.operation = static_cast<RegistryOp>(rawOp);
             event.isPreOperation = (regData->flags & 0x01) != 0;
             event.isTransacted = (regData->flags & 0x02) != 0;
             event.valueType = static_cast<RegistryValueType>(regData->valueType);
 
-            // Extract variable-length key path
             const uint8_t* varData = messageBuffer.data() +
-                sizeof(Communication::MessageHeader) +
-                sizeof(Communication::RegistryNotificationData);
-            const size_t varAvailable = bytesReceived -
-                sizeof(Communication::MessageHeader) -
+                headerSize + sizeof(Communication::RegistryNotificationData);
+            const size_t varAvailable = payloadSize -
                 sizeof(Communication::RegistryNotificationData);
 
             size_t offset = 0;
 
-            // Key path (wchar_t array, length in characters)
-            const size_t keyPathBytes = static_cast<size_t>(regData->keyPathLength) * sizeof(wchar_t);
+            // keyPathLength and valueNameLength are uint16 (chars), so the
+            // multiplication by sizeof(wchar_t)=2 cannot overflow size_t.
+            // We still cap to MAX_KEY_PATH_LENGTH to prevent allocation
+            // amplification from a 65535-char attacker-supplied path.
+            const size_t keyPathBytes =
+                static_cast<size_t>(regData->keyPathLength) * sizeof(wchar_t);
             if (keyPathBytes > 0 && offset + keyPathBytes <= varAvailable &&
-                keyPathBytes <= RegistryMonitorConstants::MAX_KEY_PATH_LENGTH * sizeof(wchar_t)) {
+                regData->keyPathLength <= RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
                 event.keyPath.assign(
                     reinterpret_cast<const wchar_t*>(varData + offset),
                     regData->keyPathLength);
                 offset += keyPathBytes;
+            } else if (keyPathBytes > 0) {
+                m_stats.droppedEvents++;
+                SS_LOG_WARN(L"Registry", L"Rejected oversized keyPath chars=%u msgId=%llu",
+                    static_cast<unsigned>(regData->keyPathLength),
+                    static_cast<unsigned long long>(header->messageId));
+                continue;
             }
 
-            // Value name
-            const size_t valueNameBytes = static_cast<size_t>(regData->valueNameLength) * sizeof(wchar_t);
+            const size_t valueNameBytes =
+                static_cast<size_t>(regData->valueNameLength) * sizeof(wchar_t);
             if (valueNameBytes > 0 && offset + valueNameBytes <= varAvailable &&
-                valueNameBytes <= RegistryMonitorConstants::MAX_VALUE_NAME_LENGTH * sizeof(wchar_t)) {
+                regData->valueNameLength <= RegistryMonitorConstants::MAX_VALUE_NAME_LENGTH) {
                 event.valueName.assign(
                     reinterpret_cast<const wchar_t*>(varData + offset),
                     regData->valueNameLength);
                 offset += valueNameBytes;
+            } else if (valueNameBytes > 0) {
+                m_stats.droppedEvents++;
+                SS_LOG_WARN(L"Registry", L"Rejected oversized valueName chars=%u msgId=%llu",
+                    static_cast<unsigned>(regData->valueNameLength),
+                    static_cast<unsigned long long>(header->messageId));
+                continue;
             }
 
-            // Value data
-            if (regData->valueDataLength > 0 && offset + regData->valueDataLength <= varAvailable &&
+            if (regData->valueDataLength > 0 &&
+                offset + regData->valueDataLength <= varAvailable &&
                 regData->valueDataLength <= RegistryMonitorConstants::MAX_VALUE_DATA_SIZE) {
                 event.data.assign(
                     varData + offset,
                     varData + offset + regData->valueDataLength);
                 offset += regData->valueDataLength;
+            } else if (regData->valueDataLength > 0) {
+                m_stats.droppedEvents++;
+                SS_LOG_WARN(L"Registry",
+                    L"Rejected oversized valueData bytes=%u msgId=%llu",
+                    static_cast<unsigned>(regData->valueDataLength),
+                    static_cast<unsigned long long>(header->messageId));
+                continue;
             }
 
-            // Enrich with process context (best-effort, non-blocking)
+            // Enrich with process context (best-effort, non-blocking).
+            // GetProcessName returns just the basename — what UIs expect —
+            // so we use it instead of narrowing the full process path.
             try {
                 auto procPath = ProcessUtils::GetProcessPath(event.processId);
                 if (procPath.has_value()) {
                     event.processPath = procPath.value();
-                    event.processName = StringUtils::ToNarrow(procPath.value());
+                }
+                auto procName = ProcessUtils::GetProcessName(event.processId);
+                if (procName.has_value()) {
+                    event.processName = StringUtils::ToNarrow(procName.value());
+                } else if (procPath.has_value()) {
+                    event.processName = ProcessBaseName(procPath.value());
                 }
                 ProcessUtils::ProcessBasicInfo basicInfo;
                 if (ProcessUtils::GetProcessBasicInfo(event.processId, basicInfo)) {
@@ -1559,14 +2034,16 @@ private:
                     event.isElevated = secInfo.isElevated;
                 }
             } catch (...) {
-                // Process may have exited; proceed with PID only
+                // Process may have exited; proceed with PID only.
             }
 
-            // Core verdict decision
             RegistryVerdict verdict = ProcessEvent(event);
 
-            // Reply to kernel with verdict (only if kernel expects a reply)
-            if (regData->requiresReply) {
+            // Reply gate: only pre-operations can be blocked. The kernel must
+            // not be told to apply a post-op verdict (the change is already
+            // committed) and must not be left waiting if it did not request
+            // a reply. requiresReply is the authoritative flag.
+            if (regData->requiresReply && event.isPreOperation) {
                 Communication::ScanVerdictReply reply{};
                 reply.messageId = header->messageId;
                 reply.shouldCache = false;
@@ -1596,9 +2073,25 @@ private:
 
                 auto replyBuf = Communication::MessageDispatcher::SerializeVerdictReply(reply);
                 if (!replyBuf.empty()) {
-                    if (!m_connection->ReplyMessage(replyBuf, header->messageId)) {
+                    std::shared_lock lock(m_mutex);
+                    if (m_connection &&
+                        !m_connection->ReplyMessage(replyBuf, header->messageId)) {
                         SS_LOG_WARN(L"Registry", L"Failed to reply verdict for msgId=%llu",
                             static_cast<unsigned long long>(header->messageId));
+                    }
+                }
+            } else if (regData->requiresReply) {
+                // Post-op required a reply: send Clean to release the kernel
+                // without blocking. Verdict was used only for telemetry.
+                Communication::ScanVerdictReply reply{};
+                reply.messageId = header->messageId;
+                reply.verdict = Communication::ScanVerdict::Clean;
+                reply.threatDetected = false;
+                auto replyBuf = Communication::MessageDispatcher::SerializeVerdictReply(reply);
+                if (!replyBuf.empty()) {
+                    std::shared_lock lock(m_mutex);
+                    if (m_connection) {
+                        (void)m_connection->ReplyMessage(replyBuf, header->messageId);
                     }
                 }
             }
@@ -1606,39 +2099,6 @@ private:
 
         SS_LOG_DEBUG(L"Registry", L"Registry worker thread stopped (tid=%u)",
             ::GetCurrentThreadId());
-    }
-
-    [[nodiscard]] RegistryVerdict ApplyRules(const RegistryEvent& event) {
-        std::shared_lock lock(m_mutex);
-
-        // Collect enabled rules sorted by priority
-        std::vector<std::pair<uint64_t, const RegistryRule*>> sortedRules;
-        sortedRules.reserve(m_rules.size());
-        for (const auto& [id, rule] : m_rules) {
-            if (rule.enabled) {
-                sortedRules.emplace_back(id, &rule);
-            }
-        }
-
-        std::sort(sortedRules.begin(), sortedRules.end(),
-            [](const auto& a, const auto& b) {
-                return a.second->priority > b.second->priority;
-            });
-
-        for (auto& [id, rulePtr] : sortedRules) {
-            if (RuleMatches(*rulePtr, event)) {
-                // Update match count (under exclusive lock if needed)
-                auto it = m_rules.find(id);
-                if (it != m_rules.end()) {
-                    // matchCount is now non-atomic; safe under shared_lock for read
-                    // Upgrade to unique_lock for write would be needed, but the
-                    // count is advisory so a racy increment is acceptable here.
-                }
-                return rulePtr->verdict;
-            }
-        }
-
-        return RegistryVerdict::Allow;
     }
 
     // Lock-free variant operating on a pre-snapshotted rule set (used by ProcessEvent)
@@ -1722,9 +2182,11 @@ private:
         return true;
     }
 
-    [[nodiscard]] RegistryThreatType DetectThreat(const RegistryEvent& event) {
+    [[nodiscard]] RegistryThreatType DetectThreat(
+        const RegistryEvent& event,
+        const RegistryMonitorConfig& cfg) {
         // Persistence detection
-        if (m_config.detectPersistence && event.IsPersistenceKey()) {
+        if (cfg.detectPersistence && event.IsPersistenceKey()) {
             m_stats.persistenceAttempts++;
 
             if (event.keyPath.find(L"\\Run") != std::wstring::npos) {
@@ -1747,7 +2209,7 @@ private:
         }
 
         // Security changes
-        if (m_config.detectSecurityChanges && event.IsSecurityKey()) {
+        if (cfg.detectSecurityChanges && event.IsSecurityKey()) {
             m_stats.securityChanges++;
 
             if (event.keyPath.find(L"Windows Defender") != std::wstring::npos) {
@@ -1763,10 +2225,11 @@ private:
         }
 
         // Fileless detection
-        if (m_config.detectFileless && m_config.analyzeValues &&
+        if (cfg.detectFileless && cfg.analyzeValues &&
             event.operation == RegistryOp::SetValue && !event.data.empty()) {
 
             auto analysis = AnalyzeValue(event.data, event.valueType);
+            InvokeValueCallbacks(event, analysis);
 
             if (analysis.isBinaryBlob && analysis.isLargeValue) {
                 m_stats.filelessPayloads++;
@@ -1797,6 +2260,18 @@ private:
         return RegistryThreatType::NONE;
     }
 
+    // Backwards-compatible overload: snapshot the config under shared_lock for
+    // any caller that still passes only the event. New call sites should pass
+    // the snapshotted config explicitly to avoid the extra lock.
+    [[nodiscard]] RegistryThreatType DetectThreat(const RegistryEvent& event) {
+        RegistryMonitorConfig snap;
+        {
+            std::shared_lock lock(m_mutex);
+            snap = m_config;
+        }
+        return DetectThreat(event, snap);
+    }
+
     [[nodiscard]] RiskLevel AssessRisk(RegistryThreatType threat) const {
         switch (threat) {
             case RegistryThreatType::SELF_DEFENSE_TAMPER:
@@ -1824,6 +2299,46 @@ private:
     void GenerateAlert(const RegistryEvent& event, RegistryThreatType threat,
                       RiskLevel risk, const std::string& description) {
 
+        // Dedup gate: collapse identical alert events that fire repeatedly
+        // inside the dedup window (e.g. a tight write loop on a Run key).
+        // Statistics are still incremented per attempt, but we suppress the
+        // callback storm + log spam. Self-defense / critical events bypass
+        // dedup so analysts never miss a single tamper attempt.
+        const uint64_t evtHash = HashEventForDedup(
+            event.processId,
+            static_cast<uint8_t>(event.operation),
+            event.keyPath,
+            event.valueName) ^ static_cast<uint64_t>(threat);
+        bool suppressed = false;
+        if (risk < RiskLevel::Critical) {
+            std::unique_lock lock(m_mutex);
+            const auto now = std::chrono::steady_clock::now();
+            auto it = m_dedupRing.find(evtHash);
+            if (it != m_dedupRing.end()) {
+                if (now - it->second < kDedupWindow) {
+                    suppressed = true;
+                } else {
+                    it->second = now;
+                }
+            } else {
+                if (m_dedupOrder.size() < kDedupRingSize) {
+                    m_dedupOrder.push_back(evtHash);
+                } else {
+                    // FIFO eviction
+                    const uint64_t evicted = m_dedupOrder[m_dedupNextSlot];
+                    m_dedupRing.erase(evicted);
+                    m_dedupOrder[m_dedupNextSlot] = evtHash;
+                    m_dedupNextSlot = (m_dedupNextSlot + 1) % kDedupRingSize;
+                }
+                m_dedupRing.emplace(evtHash, now);
+            }
+        }
+
+        if (suppressed) {
+            m_stats.alertsGenerated++;
+            return;
+        }
+
         RegistryAlert alert;
         alert.alertId = ++m_nextAlertId;
         alert.eventId = event.eventId;
@@ -1841,7 +2356,6 @@ private:
         alert.processPath = event.processPath;
         alert.userName = event.userName;
 
-        // MITRE mapping
         switch (threat) {
             case RegistryThreatType::PERSISTENCE_RUN_KEY:
                 alert.mitreTechnique = "T1547";
@@ -1869,11 +2383,12 @@ private:
             m_stats.criticalAlerts++;
         }
 
-        // Invoke callbacks
         InvokeAlertCallbacks(alert);
 
-        SS_LOG_WARN(L"Registry", L"Registry alert: %hs (PID=%u, key=%ls)",
-            description.c_str(), event.processId, event.keyPath.c_str());
+        SS_LOG_WARN(L"Registry", L"Registry alert: %hs (PID=%u, key=%hs)",
+            SanitizeForLog(description).c_str(),
+            event.processId,
+            SanitizeForLog(event.keyPath).c_str());
     }
 
     void InvokeAlertCallbacks(const RegistryAlert& alert) {
@@ -1891,7 +2406,28 @@ private:
             try {
                 callback(alert);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Registry", L"Alert callback threw: %hs", e.what());
+                SS_LOG_ERROR(L"Registry", L"Alert callback threw: %hs",
+                    SanitizeForLog(e.what()).c_str());
+            }
+        }
+    }
+
+    void InvokeValueCallbacks(const RegistryEvent& event,
+                              const ValueAnalysis& analysis) {
+        std::vector<ValueAnalysisCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_valueCallbacks.size());
+            for (const auto& [id, cb] : m_valueCallbacks) {
+                if (cb) callbacks.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacks) {
+            try {
+                callback(event, analysis);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Registry", L"Value callback threw: %hs",
+                    SanitizeForLog(e.what()).c_str());
             }
         }
     }
@@ -1910,7 +2446,8 @@ private:
             try {
                 callback(event, verdict);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Registry", L"Event callback threw: %hs", e.what());
+                SS_LOG_ERROR(L"Registry", L"Event callback threw: %hs",
+                    SanitizeForLog(e.what()).c_str());
             }
         }
     }
@@ -1974,6 +2511,11 @@ private:
 
     // Protection
     std::vector<ProtectedKey> m_protectedKeys;
+    // Parallel cache of pre-lowercased keyPaths for IsProtectedKey hot path.
+    // Kept strictly in sync with m_protectedKeys (1:1 index correspondence)
+    // under the unique_lock taken in AddProtectedKey / RemoveProtectedKey /
+    // Shutdown. Reading is allowed under shared_lock.
+    std::vector<std::wstring> m_protectedKeysLower;
 
     // Recent events
     std::deque<RegistryEvent> m_recentEvents;
@@ -1987,6 +2529,14 @@ private:
 
     // Alert tracking
     std::atomic<uint64_t> m_nextAlertId{ 1 };
+
+    // Alert dedup ring. Maps event-hash -> last-seen timestamp; a FIFO ring
+    // (m_dedupOrder + m_dedupNextSlot) bounds the total membership to
+    // kDedupRingSize entries, preventing memory growth under flood. Protected
+    // by m_mutex.
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_dedupRing;
+    std::vector<uint64_t> m_dedupOrder;
+    size_t m_dedupNextSlot{ 0 };
 };
 
 // ============================================================================
