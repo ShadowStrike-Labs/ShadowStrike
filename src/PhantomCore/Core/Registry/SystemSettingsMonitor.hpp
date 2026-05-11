@@ -571,7 +571,7 @@ struct alignas(256) SecurityAlert {
  * @struct BaselineSnapshot
  * @brief Snapshot of security settings for comparison.
  */
-struct alignas(64) BaselineSnapshot {
+struct alignas(128) BaselineSnapshot {
     uint64_t snapshotId{ 0 };
     std::chrono::system_clock::time_point created;
     std::string description;
