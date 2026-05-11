@@ -914,6 +914,14 @@ struct ProcessInjectionState {
     
     /// @brief Last activity timestamp
     std::chrono::system_clock::time_point lastActivity{};
+
+    /// @brief Captured process creation timestamp (FILETIME quad-part).
+    /// Used to detect PID reuse: if Windows recycles this PID for a new
+    /// process, the live creation tick will differ from the value
+    /// captured here at first sighting, and the state is retired by the
+    /// cleanup pass.  Zero means "could not capture" (e.g. PPL target);
+    /// the reuse check is skipped in that case.
+    uint64_t creationTick = 0;
 };
 
 /**
