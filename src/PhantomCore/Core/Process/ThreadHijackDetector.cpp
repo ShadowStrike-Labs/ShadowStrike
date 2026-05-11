@@ -105,6 +105,107 @@ using Clock = std::chrono::system_clock;
 using TimePoint = std::chrono::system_clock::time_point;
 
 // ============================================================================
+// LOG SANITIZATION — prevent CRLF / control-character log injection
+// ============================================================================
+//
+// Process names, module names and paths originate from foreign processes.
+// An attacker that controls a process image path (boot-time symlinks,
+// mapped sections, alternate data streams) can inject CR/LF or other
+// terminal control characters into our log lines, forging audit trail
+// entries. Every wide string that crosses a `SS_LOG_*("...%ls...")` boundary
+// MUST flow through this sanitizer.
+[[nodiscard]] static std::wstring SanitizeForLog(std::wstring_view in) noexcept {
+    std::wstring out;
+    out.reserve(in.size());
+    for (wchar_t c : in) {
+        // Strip C0/C1 control characters and DEL — keep printable text only.
+        if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F)) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(c);
+        }
+    }
+    // Cap to a sane upper bound to prevent oversized log lines.
+    if (out.size() > 260) {
+        out.resize(260);
+    }
+    return out;
+}
+
+// ============================================================================
+// DBGHELP SERIALIZATION — dbghelp APIs are NOT thread-safe (MS doc'd)
+// ============================================================================
+//
+// StackWalk64, SymXxx must be serialized across every caller in the process.
+// The detector's monitoring thread, kernel-event dispatch threads, and any
+// on-demand scan thread may invoke these concurrently — without
+// serialization the symbol engine corrupts its internal state and StackWalk64
+// returns bogus or zeroed frames.
+[[nodiscard]] static std::mutex& DbgHelpMutex() noexcept {
+    static std::mutex m;
+    return m;
+}
+
+// ============================================================================
+// RAII SCOPED THREAD SUSPEND — guarantees ResumeThread on every exit path
+// ============================================================================
+class ScopedThreadSuspend {
+public:
+    explicit ScopedThreadSuspend(HANDLE hThread, uint32_t tid) noexcept
+        : m_thread(hThread), m_tid(tid) {
+        // DESIGN: never self-suspend — would deadlock the calling thread on
+        // its own ResumeThread (which we'd never reach).
+        if (m_thread && m_thread != INVALID_HANDLE_VALUE &&
+            m_tid != ::GetCurrentThreadId()) {
+            m_suspended = (SuspendThread(m_thread) != static_cast<DWORD>(-1));
+        }
+    }
+
+    ~ScopedThreadSuspend() noexcept {
+        if (m_suspended && m_thread && m_thread != INVALID_HANDLE_VALUE) {
+            ResumeThread(m_thread);
+        }
+    }
+
+    ScopedThreadSuspend(const ScopedThreadSuspend&) = delete;
+    ScopedThreadSuspend& operator=(const ScopedThreadSuspend&) = delete;
+    ScopedThreadSuspend(ScopedThreadSuspend&&) = delete;
+    ScopedThreadSuspend& operator=(ScopedThreadSuspend&&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept { return m_suspended; }
+
+private:
+    HANDLE   m_thread{nullptr};
+    uint32_t m_tid{0};
+    bool     m_suspended{false};
+};
+
+// ============================================================================
+// MAP CAP HELPERS — prevent attacker-driven unbounded growth (DoS)
+// ============================================================================
+//
+// Kernel/ETW event handlers receive untrusted (TID, PID) tuples. Without a
+// hard cap an attacker who can drive thousands of suspend/resume events with
+// random TIDs would inflate m_threadStates / m_threads / m_hijackEvents
+// without bound, exhausting the service's heap.
+template <typename Map>
+static void EnforceMapCap(Map& m, size_t cap) noexcept {
+    if (m.size() <= cap) return;
+    // Evict the oldest entries (front insertion order is not guaranteed for
+    // unordered_map; we simply prune the first (cap/8) elements which is
+    // amortized constant work).
+    const size_t toEvict = (m.size() - cap) + (cap / 8);
+    auto it = m.begin();
+    for (size_t i = 0; i < toEvict && it != m.end(); ++i) {
+        it = m.erase(it);
+    }
+}
+
+constexpr size_t kMaxThreadStates    = 8192;   ///< suspend/resume tracking cap
+constexpr size_t kMaxBaselineThreads = 16384;  ///< baseline / monitor cap
+constexpr size_t kMaxCallbacks       = 1024;   ///< callback registration cap
+
+// ============================================================================
 // RAII HANDLE GUARD — eliminates all handle leaks
 // ============================================================================
 
@@ -239,6 +340,12 @@ static NtQueryInformationThreadFn GetNtQueryInformationThread() noexcept {
         HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return false;
 
+        // Guard against integer overflow: address + buffer.size() must not
+        // wrap. Refuse to read beyond canonical user-mode address space.
+        constexpr uintptr_t kUserModeMax = static_cast<uintptr_t>(0x00007FFFFFFFFFFFULL);
+        if (address < 0x10000 || address > kUserModeMax) return false;
+        if (address > kUserModeMax - 256) return false;
+
         std::array<uint8_t, 256> buffer{};
         SIZE_T bytesRead = 0;
         if (!ReadProcessMemory(hProcess.get(), reinterpret_cast<LPCVOID>(address),
@@ -310,8 +417,9 @@ static NtQueryInformationThreadFn GetNtQueryInformationThread() noexcept {
             }
         }
 
-        // Fallback: VirtualQueryEx
-        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+        // Fallback: VirtualQueryEx — LIMITED rights are sufficient and
+        // succeed on hardened/PPL processes where INFORMATION would fail.
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         if (!hProcess) return false;
 
         MEMORY_BASIC_INFORMATION mbi{};
@@ -330,7 +438,27 @@ static NtQueryInformationThreadFn GetNtQueryInformationThread() noexcept {
 }
 
 /**
+ * @brief Determine whether a target process runs under WoW64 (32-bit on x64).
+ *
+ * Returns false on failure — callers must treat false conservatively as
+ * "assume native architecture". Never throws.
+ */
+[[nodiscard]] static bool IsTargetWow64(HANDLE hProcess) noexcept {
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return false;
+    BOOL wow = FALSE;
+    if (!IsWow64Process(hProcess, &wow)) return false;
+    return wow != FALSE;
+}
+
+/**
  * @brief Get thread's actual stack bounds via NtQueryInformationThread(ThreadBasicInformation).
+ *
+ * WoW64-aware: for 32-bit threads running on 64-bit Windows, the native TEB
+ * pointer returned by NtQueryInformationThread refers to the 64-bit TEB
+ * which still contains valid StackBase/StackLimit fields for the active
+ * (64-bit syscall stub) stack. The 32-bit TEB lives at a different address
+ * and is consulted only for diagnostics — its stack bounds describe the
+ * 32-bit user stack which is the one we actually want to validate.
  */
 [[nodiscard]] static bool GetThreadStackBounds(
     HANDLE hThread,
@@ -347,31 +475,54 @@ static NtQueryInformationThreadFn GetNtQueryInformationThread() noexcept {
 
     if (status != 0 || !tbi.TebBaseAddress) return false;
 
-    // Read stack bounds from TEB (Thread Environment Block)
-    // TEB.NtTib.StackBase is at offset 0x08 (x64)
-    // TEB.NtTib.StackLimit is at offset 0x10 (x64)
-    HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE,
-        GetProcessIdOfThread(hThread)));
+    HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+                                     FALSE, GetProcessIdOfThread(hThread)));
     if (!hProcess) return false;
 
-    struct {
-        uintptr_t stackBaseVal;
-        uintptr_t stackLimitVal;
-    } stackInfo{};
-
-    SIZE_T bytesRead = 0;
-    // TEB offset 0x08 = StackBase, 0x10 = StackLimit
+    // NT_TIB layout:
+    //   x64: StackBase  @ +0x08, StackLimit  @ +0x10
+    //   x86: StackBase  @ +0x04, StackLimit  @ +0x08
+    const bool wow64 = IsTargetWow64(hProcess.get());
     const auto tebAddr = reinterpret_cast<const uint8_t*>(tbi.TebBaseAddress);
-    if (!ReadProcessMemory(hProcess.get(), tebAddr + 0x08,
-                          &stackInfo, sizeof(stackInfo), &bytesRead)) {
-        return false;
+
+    if (wow64) {
+        // Read 32-bit TEB layout from the 32-bit TEB which sits at
+        // TebBaseAddress + 0x2000 in Windows 10+. As a robust fallback we
+        // also probe the legacy offset returned via ThreadDescriptorTableEntry,
+        // but the +0x2000 path is the documented stable layout.
+        const uint8_t* teb32 = tebAddr + 0x2000;
+        uint32_t base32 = 0;
+        uint32_t limit32 = 0;
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(hProcess.get(), teb32 + 0x04, &base32, sizeof(base32), &bytesRead)
+            || bytesRead != sizeof(base32)) {
+            return false;
+        }
+        if (!ReadProcessMemory(hProcess.get(), teb32 + 0x08, &limit32, sizeof(limit32), &bytesRead)
+            || bytesRead != sizeof(limit32)) {
+            return false;
+        }
+        stackBase  = static_cast<uintptr_t>(base32);
+        stackLimit = static_cast<uintptr_t>(limit32);
+    } else {
+        struct {
+            uintptr_t stackBaseVal;
+            uintptr_t stackLimitVal;
+        } stackInfo{};
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(hProcess.get(), tebAddr + 0x08,
+                              &stackInfo, sizeof(stackInfo), &bytesRead)) {
+            return false;
+        }
+        if (bytesRead < sizeof(stackInfo)) return false;
+        stackBase  = stackInfo.stackBaseVal;
+        stackLimit = stackInfo.stackLimitVal;
     }
 
-    if (bytesRead < sizeof(stackInfo)) return false;
-
-    stackBase = stackInfo.stackBaseVal;
-    stackLimit = stackInfo.stackLimitVal;
-    return (stackBase > stackLimit && stackBase > 0x10000);
+    // Reject obviously-bogus values (kernel pages, zero, inverted) — these
+    // would cause every RSP to be flagged as "in range" or "out of range".
+    return (stackBase > stackLimit && stackBase > 0x10000 &&
+            stackBase < static_cast<uintptr_t>(0x00007FFFFFFFFFFFULL));
 }
 
 /**
@@ -691,7 +842,12 @@ bool ThreadHijackDetectorImpl::StartMonitoring() {
             return true;
         }
 
-        if (!m_config.enableRealTimeMonitoring) {
+        bool realTime;
+        {
+            std::shared_lock cfg(m_mutex);
+            realTime = m_config.enableRealTimeMonitoring;
+        }
+        if (!realTime) {
             SS_LOG_WARN(L"ThreadHijack", L"Real-time monitoring disabled in config");
             m_monitoring.store(false, std::memory_order_release);
             return false;
@@ -738,13 +894,29 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
     try {
         m_statistics.threadValidations.fetch_add(1, std::memory_order_relaxed);
 
+        // Race fix: m_config is mutated by UpdateConfig under m_mutex.
+        // Snapshot the bits we read into locals before doing any work so
+        // we observe a self-consistent configuration even if the admin
+        // pushes a new config mid-validation.
+        bool     cfgValidateRip, cfgValidateRsp, cfgValidateSegs, cfgCheckDr, cfgAnalyzeStack;
+        uint32_t cfgMaxUnbackedFrames;
+        {
+            std::shared_lock cfg(m_mutex);
+            cfgValidateRip       = m_config.validateInstructionPointer;
+            cfgValidateRsp       = m_config.validateStackPointer;
+            cfgValidateSegs      = m_config.validateSegmentRegisters;
+            cfgCheckDr           = m_config.checkDebugRegisters;
+            cfgAnalyzeStack      = m_config.analyzeCallStack;
+            cfgMaxUnbackedFrames = m_config.maxUnbackedFrames;
+        }
+
         // Get thread context
         validation.context64 = GetThreadContextInternal(tid);
         validation.instructionPointer = validation.context64.rip;
         validation.stackPointer = validation.context64.rsp;
 
-        // Get owner process — RAII handle
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        // Reduced rights — we only need queries, not full info.
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (!hThread) {
             // ACCESS_DENIED or thread exited — do NOT assume valid
             const DWORD err = GetLastError();
@@ -765,7 +937,7 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
         }
 
         // Validate RIP
-        if (m_config.validateInstructionPointer) {
+        if (cfgValidateRip) {
             validation.ripInKnownModule = IsAddressInModule(ownerPid, validation.instructionPointer);
             validation.ripModule = GetModuleForAddress(ownerPid, validation.instructionPointer);
             validation.ripIsBacked = validation.ripInKnownModule;
@@ -791,7 +963,7 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
         }
 
         // Validate stack pointer — real TEB-based validation
-        if (m_config.validateStackPointer) {
+        if (cfgValidateRsp) {
             uintptr_t stackBase = 0, stackLimit = 0;
             if (GetThreadStackBounds(hThread.get(), stackBase, stackLimit)) {
                 validation.stackBase = stackBase;
@@ -827,7 +999,7 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
         }
 
         // Validate segments
-        if (m_config.validateSegmentRegisters) {
+        if (cfgValidateSegs) {
             validation.segmentsValid = (
                 validation.context64.segCs == ThreadHijackConstants::USER_CS_64 &&
                 validation.context64.segSs == ThreadHijackConstants::USER_SS_64
@@ -850,7 +1022,7 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
         }
 
         // Check debug registers
-        if (m_config.checkDebugRegisters) {
+        if (cfgCheckDr) {
             validation.hasHardwareBreakpoints = HasActiveDebugRegistersInternal(tid);
             if (validation.hasHardwareBreakpoints) {
                 if (validation.context64.dr7 & 0x1)  validation.activeBreakpointCount++;
@@ -866,7 +1038,7 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
         }
 
         // Analyze call stack
-        if (m_config.analyzeCallStack) {
+        if (cfgAnalyzeStack) {
             validation.callStack = GetCallStackInternal(tid, ThreadHijackConstants::MAX_STACK_FRAMES);
             m_statistics.callStacksAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
@@ -879,11 +1051,11 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
             }
             validation.unbackedFrameCount = unbackedCount;
 
-            if (validation.unbackedFrameCount > m_config.maxUnbackedFrames) {
+            if (validation.unbackedFrameCount > cfgMaxUnbackedFrames) {
                 validation.isCompromised = true;
                 validation.issues.push_back(
                     std::format(L"Unbacked stack frames: {} (max={})",
-                               validation.unbackedFrameCount, m_config.maxUnbackedFrames));
+                               validation.unbackedFrameCount, cfgMaxUnbackedFrames));
                 validation.riskScore += 25;
 
                 m_statistics.unbackedFramesDetected.fetch_add(
@@ -910,11 +1082,14 @@ ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) 
 
 bool ThreadHijackDetectorImpl::ValidateThreadStartInternal(uint32_t tid) {
     try {
-        HandleGuard hThread(OpenThread(
-            THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
+        // ThreadQuerySetWin32StartAddress is a "limited" query — the LIMITED
+        // information access right is sufficient and avoids requesting the
+        // broader THREAD_QUERY_INFORMATION privilege on hardened processes.
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (!hThread) return true;  // Can't validate
 
         DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        if (ownerPid == 0) return true;
 
         // Use NtQueryInformationThread to get actual start address
         auto ntQueryThread = GetNtQueryInformationThread();
@@ -928,8 +1103,13 @@ bool ThreadHijackDetectorImpl::ValidateThreadStartInternal(uint32_t tid) {
             if (status == 0 && startAddress != nullptr) {
                 const auto addr = reinterpret_cast<uintptr_t>(startAddress);
                 if (!IsAddressInModule(ownerPid, addr)) {
+                    // APC injection / Early Bird / thread-start hijack pattern:
+                    // a thread that begins life outside any loaded image is
+                    // highly anomalous. Legitimate worker threads always
+                    // start in a runtime stub (ntdll!RtlUserThreadStart,
+                    // ucrt thread_start, etc.).
                     SS_LOG_WARN(L"ThreadHijack",
-                        L"Thread TID %u has unbacked start address 0x%llX",
+                        L"Thread TID %u has unbacked start address 0x%llX (possible APC/Early-Bird)",
                         tid, static_cast<unsigned long long>(addr));
                     return false;
                 }
@@ -949,10 +1129,11 @@ bool ThreadHijackDetectorImpl::IsRIPValidInternal(uint32_t tid) {
     try {
         auto context = GetThreadContextInternal(tid);
 
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (!hThread) return true;
 
         DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        if (ownerPid == 0) return true;
 
         return IsAddressInModule(ownerPid, context.rip);
 
@@ -972,7 +1153,7 @@ bool ThreadHijackDetectorImpl::IsStackValidInternal(uint32_t tid) {
         if (context.rsp < 0x10000 || context.rsp > 0x7FFFFFFFFFFF) return false;
 
         // Validate against actual stack bounds from TEB
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (hThread) {
             uintptr_t stackBase = 0, stackLimit = 0;
             if (GetThreadStackBounds(hThread.get(), stackBase, stackLimit)) {
@@ -994,42 +1175,92 @@ std::vector<uintptr_t> ThreadHijackDetectorImpl::GetCallStackInternal(
     std::vector<uintptr_t> callStack;
 
     try {
-        HandleGuard hThread(OpenThread(
-            THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME, FALSE, tid));
-        if (!hThread) return callStack;
-
-        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
-        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, ownerPid));
-        if (!hProcess) return callStack;
-
-        // Get thread context for StackWalk64 initialization
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_FULL;
-        if (!::GetThreadContext(hThread.get(), &ctx)) {
-            // Fallback: just return RIP
-            auto context = GetThreadContextInternal(tid);
-            if (context.rip != 0) {
-                callStack.push_back(context.rip);
-            }
+        // Reject self-walk early — SuspendThread(self) deadlocks the caller
+        // on the matching ResumeThread that would never execute. Walking
+        // our own live stack also yields incoherent frames.
+        if (tid == ::GetCurrentThreadId()) {
             return callStack;
         }
 
-        // Initialize STACKFRAME64 for x64
+        HandleGuard hThread(OpenThread(
+            THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME,
+            FALSE, tid));
+        if (!hThread) return callStack;
+
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        if (ownerPid == 0) return callStack;
+
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+                                        FALSE, ownerPid));
+        if (!hProcess) return callStack;
+
+        // Suspend before walking — StackWalk64 against a running thread
+        // produces racy / bogus frames as RSP/RBP advance under us. RAII
+        // guarantees ResumeThread on every exit (including throws).
+        ScopedThreadSuspend suspendGuard(hThread.get(), tid);
+        if (!suspendGuard.ok()) {
+            // Protected / critical / already-terminated thread — refuse to
+            // walk rather than report garbage.
+            return callStack;
+        }
+
+        const bool wow64 = IsTargetWow64(hProcess.get());
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (!::GetThreadContext(hThread.get(), &ctx)) {
+            return callStack;
+        }
+
         STACKFRAME64 frame{};
-        frame.AddrPC.Offset = ctx.Rip;
-        frame.AddrPC.Mode = AddrModeFlat;
-        frame.AddrFrame.Offset = ctx.Rbp;
-        frame.AddrFrame.Mode = AddrModeFlat;
-        frame.AddrStack.Offset = ctx.Rsp;
-        frame.AddrStack.Mode = AddrModeFlat;
+        DWORD machineType;
+#if defined(_M_X64)
+        if (wow64) {
+            WOW64_CONTEXT ctx32{};
+            ctx32.ContextFlags = WOW64_CONTEXT_FULL;
+            if (!Wow64GetThreadContext(hThread.get(), &ctx32)) {
+                return callStack;
+            }
+            machineType = IMAGE_FILE_MACHINE_I386;
+            frame.AddrPC.Offset    = ctx32.Eip;
+            frame.AddrPC.Mode      = AddrModeFlat;
+            frame.AddrFrame.Offset = ctx32.Ebp;
+            frame.AddrFrame.Mode   = AddrModeFlat;
+            frame.AddrStack.Offset = ctx32.Esp;
+            frame.AddrStack.Mode   = AddrModeFlat;
+        } else {
+            machineType = IMAGE_FILE_MACHINE_AMD64;
+            frame.AddrPC.Offset    = ctx.Rip;
+            frame.AddrPC.Mode      = AddrModeFlat;
+            frame.AddrFrame.Offset = ctx.Rbp;
+            frame.AddrFrame.Mode   = AddrModeFlat;
+            frame.AddrStack.Offset = ctx.Rsp;
+            frame.AddrStack.Mode   = AddrModeFlat;
+        }
+#else
+        (void)wow64;
+        machineType = IMAGE_FILE_MACHINE_I386;
+        frame.AddrPC.Offset    = ctx.Eip;
+        frame.AddrPC.Mode      = AddrModeFlat;
+        frame.AddrFrame.Offset = ctx.Ebp;
+        frame.AddrFrame.Mode   = AddrModeFlat;
+        frame.AddrStack.Offset = ctx.Esp;
+        frame.AddrStack.Mode   = AddrModeFlat;
+#endif
 
         const uint32_t frameLimit = std::min(maxFrames, ThreadHijackConstants::MAX_STACK_FRAMES);
 
+        // dbghelp is process-globally single-threaded — serialize across
+        // every caller in the service (monitor thread, kernel-event
+        // dispatcher, scan worker, etc.).
+        std::lock_guard<std::mutex> dbgLock(DbgHelpMutex());
+
+        callStack.reserve(frameLimit);
         for (uint32_t i = 0; i < frameLimit; ++i) {
-            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64,
+            if (!StackWalk64(machineType,
                             hProcess.get(), hThread.get(),
                             &frame, &ctx,
-                            nullptr,       // ReadMemoryRoutine (use default)
+                            nullptr,
                             SymFunctionTableAccess64,
                             SymGetModuleBase64,
                             nullptr)) {
@@ -1041,12 +1272,8 @@ std::vector<uintptr_t> ThreadHijackDetectorImpl::GetCallStackInternal(
             callStack.push_back(static_cast<uintptr_t>(frame.AddrPC.Offset));
         }
 
-        // If StackWalk64 yielded nothing, at least return RIP
-        if (callStack.empty() && ctx.Rip != 0) {
-            callStack.push_back(ctx.Rip);
-        }
-
     } catch (...) {
+        // Drop any partial state — RAII guards release everything.
     }
 
     return callStack;
@@ -1056,10 +1283,11 @@ uint32_t ThreadHijackDetectorImpl::CountUnbackedFramesInternal(uint32_t tid) {
     try {
         auto callStack = GetCallStackInternal(tid, ThreadHijackConstants::MAX_STACK_FRAMES);
 
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (!hThread) return 0;
 
         DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        if (ownerPid == 0) return 0;
 
         uint32_t unbackedCount = 0;
         for (uintptr_t frame : callStack) {
@@ -1085,11 +1313,61 @@ ThreadContext64 ThreadHijackDetectorImpl::GetThreadContextInternal(uint32_t tid)
     try {
         m_statistics.contextReads.fetch_add(1, std::memory_order_relaxed);
 
-        HandleGuard hThread(OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid));
+        HandleGuard hThread(OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (!hThread) {
             m_statistics.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
+
+        // WoW64 awareness: a 32-bit thread on x64 has BOTH a native (syscall
+        // stub) context and a 32-bit guest context. The hijacker's payload
+        // overwrites the 32-bit context — naively calling GetThreadContext()
+        // returns the native stub frame whose RIP/RSP point into ntdll's
+        // wow64 transition and tells us nothing about the attack. Pull the
+        // 32-bit context explicitly and project its registers into our
+        // unified 64-bit struct.
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        bool wow64 = false;
+        if (ownerPid != 0) {
+            HandleGuard hProc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid));
+            if (hProc) wow64 = IsTargetWow64(hProc.get());
+        }
+
+#if defined(_M_X64)
+        if (wow64) {
+            WOW64_CONTEXT ctx32{};
+            ctx32.ContextFlags = WOW64_CONTEXT_FULL | WOW64_CONTEXT_DEBUG_REGISTERS;
+            if (Wow64GetThreadContext(hThread.get(), &ctx32)) {
+                result.rip = static_cast<uint64_t>(ctx32.Eip);
+                result.rsp = static_cast<uint64_t>(ctx32.Esp);
+                result.rbp = static_cast<uint64_t>(ctx32.Ebp);
+                result.rflags = static_cast<uint64_t>(ctx32.EFlags);
+                result.rax = static_cast<uint64_t>(ctx32.Eax);
+                result.rbx = static_cast<uint64_t>(ctx32.Ebx);
+                result.rcx = static_cast<uint64_t>(ctx32.Ecx);
+                result.rdx = static_cast<uint64_t>(ctx32.Edx);
+                result.rsi = static_cast<uint64_t>(ctx32.Esi);
+                result.rdi = static_cast<uint64_t>(ctx32.Edi);
+                result.segCs = static_cast<uint16_t>(ctx32.SegCs);
+                result.segSs = static_cast<uint16_t>(ctx32.SegSs);
+                result.segDs = static_cast<uint16_t>(ctx32.SegDs);
+                result.segEs = static_cast<uint16_t>(ctx32.SegEs);
+                result.segFs = static_cast<uint16_t>(ctx32.SegFs);
+                result.segGs = static_cast<uint16_t>(ctx32.SegGs);
+                result.dr0 = static_cast<uint64_t>(ctx32.Dr0);
+                result.dr1 = static_cast<uint64_t>(ctx32.Dr1);
+                result.dr2 = static_cast<uint64_t>(ctx32.Dr2);
+                result.dr3 = static_cast<uint64_t>(ctx32.Dr3);
+                result.dr6 = static_cast<uint64_t>(ctx32.Dr6);
+                result.dr7 = static_cast<uint64_t>(ctx32.Dr7);
+                result.contextFlags = ctx32.ContextFlags;
+                return result;
+            }
+            // Fall through to native query on Wow64GetThreadContext failure
+        }
+#else
+        (void)wow64;
+#endif
 
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
@@ -1169,7 +1447,11 @@ std::vector<ContextChange> ThreadHijackDetectorImpl::CompareContextsInternal(
 
         // Check RSP change (stack pivot)
         if (before.rsp != after.rsp) {
-            const int64_t delta = std::abs(static_cast<int64_t>(after.rsp - before.rsp));
+            // Use unsigned subtraction to avoid signed-overflow UB and the
+            // std::abs(INT64_MIN) UB trap. RSPs are unsigned addresses.
+            const uint64_t delta = (after.rsp > before.rsp)
+                                       ? (after.rsp - before.rsp)
+                                       : (before.rsp - after.rsp);
 
             ContextChange change;
             change.type = ContextModificationType::StackPointer;
@@ -1265,7 +1547,7 @@ std::optional<HijackEvent> ThreadHijackDetectorImpl::DetectHijackInternal(uint32
         event.timestamp = Clock::now();
         event.victimTid = tid;
         event.victimPid = validation.ownerPid;
-        event.victimProcessName = validation.ownerProcessName;
+        event.victimProcessName = SanitizeForLog(validation.ownerProcessName);
         event.targetAddress = validation.instructionPointer;
         event.targetModule = validation.ripModule;
         event.targetIsUnbacked = !validation.ripIsBacked;
@@ -1306,17 +1588,32 @@ std::optional<HijackEvent> ThreadHijackDetectorImpl::DetectHijackInternal(uint32
         // Check if there's pending cross-process state for this thread
         bool crossProcessDetected = false;
         uint32_t suspendDurationMs = 0;
+        uint32_t attackerPid = 0;
         {
             std::shared_lock lock(m_statesMutex);
             auto stateIt = m_threadStates.find(tid);
             if (stateIt != m_threadStates.end()) {
                 crossProcessDetected = (stateIt->second.suspenderPid != 0 &&
                                        stateIt->second.suspenderPid != validation.ownerPid);
+                if (crossProcessDetected) {
+                    attackerPid = stateIt->second.suspenderPid;
+                }
                 if (stateIt->second.isSuspended) {
                     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                         Clock::now() - stateIt->second.suspendTime).count();
                     suspendDurationMs = static_cast<uint32_t>(std::min<long long>(duration, UINT32_MAX));
                 }
+            }
+        }
+
+        // Populate attacker identity for response actions (TerminateAttacker,
+        // policy decisions). Use sanitized name to prevent log-injection via
+        // attacker-controlled image filenames.
+        if (attackerPid != 0) {
+            event.attackerPid = attackerPid;
+            auto attackerName = Utils::ProcessUtils::GetProcessName(attackerPid);
+            if (attackerName.has_value()) {
+                event.attackerProcessName = SanitizeForLog(*attackerName);
             }
         }
 
@@ -1380,9 +1677,10 @@ ScanResult ThreadHijackDetectorImpl::ScanProcessInternal(uint32_t pid) {
             return result;
         }
 
-        // Enumerate threads in process
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        // Enumerate threads in process — RAII guard guarantees CloseHandle
+        // even if Thread32First/Next or downstream calls throw.
+        HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+        if (!hSnapshot || hSnapshot.get() == INVALID_HANDLE_VALUE) {
             result.scanError = L"Failed to create thread snapshot";
             m_statistics.scanErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
@@ -1391,7 +1689,7 @@ ScanResult ThreadHijackDetectorImpl::ScanProcessInternal(uint32_t pid) {
         THREADENTRY32 te{};
         te.dwSize = sizeof(THREADENTRY32);
 
-        if (Thread32First(hSnapshot, &te)) {
+        if (Thread32First(hSnapshot.get(), &te)) {
             do {
                 if (te.th32OwnerProcessID == pid) {
                     result.threadsScanned++;
@@ -1421,10 +1719,9 @@ ScanResult ThreadHijackDetectorImpl::ScanProcessInternal(uint32_t pid) {
                         }
                     }
                 }
-            } while (Thread32Next(hSnapshot, &te));
+            } while (Thread32Next(hSnapshot.get(), &te));
         }
 
-        CloseHandle(hSnapshot);
         result.scanComplete = true;
 
     } catch (const std::exception& e) {
@@ -1451,7 +1748,10 @@ void ThreadHijackDetectorImpl::OnThreadSuspendInternal(
     uint32_t suspenderPid)
 {
     try {
+        // DoS protection: kernel/ETW path is attacker-influenceable; enforce
+        // a hard cap on tracked suspend events.
         std::unique_lock lock(m_statesMutex);
+        EnforceMapCap(m_threadStates, kMaxThreadStates);
 
         auto& state = m_threadStates[targetTid];
         state.tid = targetTid;
@@ -1470,32 +1770,50 @@ void ThreadHijackDetectorImpl::OnThreadResumeInternal(
     uint32_t resumerPid)
 {
     try {
-        std::unique_lock lock(m_statesMutex);
+        // Snapshot config under m_mutex — m_config is mutated by UpdateConfig
+        // and reading it racily would observe torn fields.
+        uint32_t threshold; bool realTime;
+        {
+            std::shared_lock cfg(m_mutex);
+            threshold = m_config.suspendDurationThresholdMs;
+            realTime  = m_config.enableRealTimeMonitoring;
+        }
 
-        auto it = m_threadStates.find(targetTid);
-        if (it != m_threadStates.end()) {
+        // Snapshot all needed fields under the lock, then release before
+        // dispatching DetectHijackInternal. Holding the lock across that
+        // call would risk deadlock (DetectHijack acquires the same mutex),
+        // and accessing `it->second` *after* the unlock would be a
+        // use-after-free if the cleanup thread erases the entry.
+        bool needDetect = false;
+        long long durationMs = 0;
+        uint32_t  suspenderPid = 0;
+
+        {
+            std::unique_lock lock(m_statesMutex);
+            auto it = m_threadStates.find(targetTid);
+            if (it == m_threadStates.end()) {
+                return;
+            }
             it->second.isSuspended = false;
 
-            // Check suspend duration
             const auto now = Clock::now();
-            const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - it->second.suspendTime
-            ).count();
+            durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second.suspendTime).count();
+            suspenderPid = it->second.suspenderPid;
 
-            if (duration > static_cast<long long>(m_config.suspendDurationThresholdMs)) {
-                SS_LOG_WARN(L"ThreadHijack",
-                    L"Long suspend duration %lldms for TID %u (suspended by PID %u, resumed by PID %u)",
-                    static_cast<long long>(duration), targetTid,
-                    it->second.suspenderPid, resumerPid);
-
-                // Release lock before calling DetectHijackInternal to avoid deadlock
-                lock.unlock();
-
-                // Validate thread after long suspend
-                if (m_config.enableRealTimeMonitoring) {
-                    (void)DetectHijackInternal(targetTid);
-                }
+            if (durationMs > static_cast<long long>(threshold)) {
+                needDetect = realTime;
             }
+        }
+
+        if (durationMs > static_cast<long long>(threshold)) {
+            SS_LOG_WARN(L"ThreadHijack",
+                L"Long suspend duration %lldms for TID %u (suspended by PID %u, resumed by PID %u)",
+                durationMs, targetTid, suspenderPid, resumerPid);
+        }
+
+        if (needDetect) {
+            (void)DetectHijackInternal(targetTid);
         }
 
     } catch (const std::exception& e) {
@@ -1510,11 +1828,12 @@ void ThreadHijackDetectorImpl::OnContextChangeInternal(
     uint32_t contextFlags)
 {
     try {
-        // Get owner PID — RAII
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, targetTid));
+        // Reduced rights: we only need to query the owner PID, not full info.
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, targetTid));
         if (!hThread) return;
 
         DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        if (ownerPid == 0) return;
 
         // Check if cross-process modification
         if (modifierPid != ownerPid) {
@@ -1524,8 +1843,13 @@ void ThreadHijackDetectorImpl::OnContextChangeInternal(
                 L"Cross-process context change - TID %u modified by PID %u (owner PID %u), flags=0x%X",
                 targetTid, modifierPid, ownerPid, contextFlags);
 
-            // Validate thread
-            if (m_config.detectCrossProcessModification) {
+            // Race fix: read config field under lock.
+            bool detectCross;
+            {
+                std::shared_lock cfg(m_mutex);
+                detectCross = m_config.detectCrossProcessModification;
+            }
+            if (detectCross) {
                 (void)DetectHijackInternal(targetTid);
             }
         }
@@ -1545,18 +1869,18 @@ void ThreadHijackDetectorImpl::OnSetContextThreadInternal(
         // Get current context before the set
         auto oldContext = GetThreadContextInternal(targetTid);
 
-        // Get owner PID — RAII
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, targetTid));
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, targetTid));
         if (!hThread) return;
 
         DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        if (ownerPid == 0) return;
 
         // Cross-process SetContextThread is always suspicious
         const bool isCrossProcess = (callerPid != ownerPid);
         if (isCrossProcess) {
             SS_LOG_WARN(L"ThreadHijack",
-                L"NtSetContextThread cross-process: caller PID %u → TID %u (owner PID %u), "
-                L"RIP 0x%llX → 0x%llX",
+                L"NtSetContextThread cross-process: caller PID %u -> TID %u (owner PID %u), "
+                L"RIP 0x%llX -> 0x%llX",
                 callerPid, targetTid, ownerPid,
                 static_cast<unsigned long long>(oldContext.rip),
                 static_cast<unsigned long long>(newContext.rip));
@@ -1565,11 +1889,18 @@ void ThreadHijackDetectorImpl::OnSetContextThreadInternal(
         // Compare contexts
         auto changes = CompareContextsInternal(oldContext, newContext, ownerPid);
 
+        // Race fix: snapshot the config bit we need before iterating.
+        bool blockSuspicious;
+        {
+            std::shared_lock cfg(m_mutex);
+            blockSuspicious = m_config.blockSuspiciousChanges;
+        }
+
         for (const auto& change : changes) {
             if (change.isSuspicious || isCrossProcess) {
                 InvokeContextCallbacks(targetTid, change);
 
-                if (m_config.blockSuspiciousChanges || isCrossProcess) {
+                if (blockSuspicious || isCrossProcess) {
                     (void)DetectHijackInternal(targetTid);
                 }
             }
@@ -1616,6 +1947,12 @@ bool ThreadHijackDetectorImpl::BlockContextChangeInternal(
 
 bool ThreadHijackDetectorImpl::RestoreContextInternal(uint32_t tid) {
     try {
+        // Refuse to restore our own thread — would leave us suspended.
+        if (tid == ::GetCurrentThreadId()) {
+            SS_LOG_ERROR(L"ThreadHijack", L"Refusing to restore self (TID %u)", tid);
+            return false;
+        }
+
         // Get baseline
         auto baseline = GetBaselineInternal(tid);
         if (!baseline.has_value()) {
@@ -1631,16 +1968,19 @@ bool ThreadHijackDetectorImpl::RestoreContextInternal(uint32_t tid) {
             return false;
         }
 
-        // Suspend thread before modifying context
-        DWORD prevSuspendCount = SuspendThread(hThread.get());
-        if (prevSuspendCount == static_cast<DWORD>(-1)) {
+        // RAII suspend — guarantees ResumeThread on every exit path including
+        // exception unwind from SetThreadContext.
+        ScopedThreadSuspend suspendGuard(hThread.get(), tid);
+        if (!suspendGuard.ok()) {
             SS_LOG_ERROR(L"ThreadHijack", L"Cannot suspend thread TID %u for restore", tid);
             return false;
         }
 
-        // Build CONTEXT from baseline
+        // Build CONTEXT from baseline — include DEBUG_REGISTERS so that any
+        // hardware breakpoints the attacker installed are cleared back to the
+        // baseline values (otherwise we'd leave DR0-DR7 attacker-controlled).
         CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
         ctx.Rip = baseline->rip;
         ctx.Rsp = baseline->rsp;
         ctx.Rbp = baseline->rbp;
@@ -1659,11 +1999,14 @@ bool ThreadHijackDetectorImpl::RestoreContextInternal(uint32_t tid) {
         ctx.R13 = baseline->r13;
         ctx.R14 = baseline->r14;
         ctx.R15 = baseline->r15;
+        ctx.Dr0 = baseline->dr0;
+        ctx.Dr1 = baseline->dr1;
+        ctx.Dr2 = baseline->dr2;
+        ctx.Dr3 = baseline->dr3;
+        ctx.Dr6 = baseline->dr6;
+        ctx.Dr7 = baseline->dr7;
 
         BOOL setResult = SetThreadContext(hThread.get(), &ctx);
-
-        // Always resume
-        ResumeThread(hThread.get());
 
         if (setResult) {
             m_statistics.contextsRestored.fetch_add(1, std::memory_order_relaxed);
@@ -1671,7 +2014,8 @@ bool ThreadHijackDetectorImpl::RestoreContextInternal(uint32_t tid) {
                 tid, static_cast<unsigned long long>(baseline->rip));
             return true;
         } else {
-            SS_LOG_ERROR(L"ThreadHijack", L"SetThreadContext failed for TID %u", tid);
+            SS_LOG_ERROR(L"ThreadHijack", L"SetThreadContext failed for TID %u (LastError=%lu)",
+                tid, GetLastError());
             return false;
         }
 
@@ -1699,7 +2043,7 @@ bool ThreadHijackDetectorImpl::TerminateAttackerInternal(const HijackEvent& even
         if (result) {
             m_statistics.attackersTerminated.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_WARN(L"ThreadHijack", L"Terminated attacker PID %u (%ls)",
-                event.attackerPid, event.attackerProcessName.c_str());
+                event.attackerPid, SanitizeForLog(event.attackerProcessName).c_str());
         }
 
         return result != FALSE;
@@ -1715,22 +2059,61 @@ bool ThreadHijackDetectorImpl::TerminateAttackerInternal(const HijackEvent& even
 
 void ThreadHijackDetectorImpl::EstablishBaselineInternal(uint32_t tid) {
     try {
+        // Refuse self — would baseline our own walking thread.
+        if (tid == ::GetCurrentThreadId()) {
+            return;
+        }
+
         // Get current context as baseline
         auto context = GetThreadContextInternal(tid);
 
+        // Record the thread's kernel-reported creation time. This is our
+        // identity anchor: Windows reuses TIDs, so a freshly-created thread
+        // that happens to receive the same TID later must NOT inherit a
+        // baseline captured for the prior thread. RestoreContextInternal
+        // re-checks this stamp before applying a restore.
+        FILETIME ftCreate{}, ftExit{}, ftKernel{}, ftUser{};
+        bool haveTimes = false;
+        {
+            HandleGuard hTimeThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
+            if (hTimeThread &&
+                GetThreadTimes(hTimeThread.get(), &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+                haveTimes = true;
+            }
+        }
+
         std::unique_lock lock(m_threadsMutex);
+
+        // DoS protection: bound the baseline map. An attacker who can drive
+        // ProcessMonitor events could otherwise force unbounded growth.
+        EnforceMapCap(m_threads, kMaxBaselineThreads);
 
         auto& monitored = m_threads[tid];
         monitored.threadId = tid;
-        monitored.createTime = Clock::now();
         monitored.lastChecked = Clock::now();
+        if (haveTimes) {
+            // Map FILETIME → system_clock::time_point for our portable struct
+            ULARGE_INTEGER uli{};
+            uli.LowPart  = ftCreate.dwLowDateTime;
+            uli.HighPart = ftCreate.dwHighDateTime;
+            // FILETIME is in 100-ns ticks since 1601-01-01; system_clock
+            // epoch is 1970-01-01. Difference is 11644473600 seconds.
+            constexpr uint64_t kEpochDiff100ns = 116444736000000000ULL;
+            const uint64_t epoch100ns =
+                (uli.QuadPart > kEpochDiff100ns) ? (uli.QuadPart - kEpochDiff100ns) : 0;
+            monitored.createTime = Clock::time_point(
+                std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<uint64_t, std::ratio<1, 10000000>>(epoch100ns)));
+        } else {
+            monitored.createTime = Clock::now();
+        }
 
         // Store full context baseline
         monitored.baselineContext = context;
         monitored.baselineEstablished = true;
 
         // Get owner process — RAII
-        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        HandleGuard hThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (hThread) {
             DWORD ownerPid = GetProcessIdOfThread(hThread.get());
             monitored.ownerPid = ownerPid;
@@ -1865,13 +2248,30 @@ void ThreadHijackDetectorImpl::CleanupThreadWorker() {
 // ============================================================================
 
 void ThreadHijackDetectorImpl::InvokeHijackCallbacks(const HijackEvent& event) {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& [id, callback] : m_hijackCallbacks) {
+    // SECURITY/DEADLOCK: never hold the callbacks mutex while running
+    // external code. A callback that calls Register/UnregisterCallback would
+    // deadlock; a callback that throws would unwind through the lock holder
+    // and leave the map in an inconsistent state. Snapshot under the lock
+    // then dispatch outside it.
+    std::vector<std::pair<uint64_t, HijackDetectedCallback>> snapshot;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        snapshot.reserve(m_hijackCallbacks.size());
+        for (const auto& [id, cb] : m_hijackCallbacks) {
+            snapshot.emplace_back(id, cb);
+        }
+    }
+    for (const auto& [id, callback] : snapshot) {
         try {
-            callback(event);
+            if (callback) callback(event);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ThreadHijack", L"Hijack callback %llu error - %ls",
-                id, Utils::StringUtils::ToWide(e.what()).c_str());
+                static_cast<unsigned long long>(id),
+                Utils::StringUtils::ToWide(e.what()).c_str());
+        } catch (...) {
+            SS_LOG_ERROR(L"ThreadHijack",
+                L"Hijack callback %llu raised non-std exception",
+                static_cast<unsigned long long>(id));
         }
     }
 }
@@ -1880,40 +2280,72 @@ void ThreadHijackDetectorImpl::InvokeContextCallbacks(
     uint32_t tid,
     const ContextChange& change)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& [id, callback] : m_contextCallbacks) {
+    std::vector<std::pair<uint64_t, ContextChangeCallback>> snapshot;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        snapshot.reserve(m_contextCallbacks.size());
+        for (const auto& [id, cb] : m_contextCallbacks) {
+            snapshot.emplace_back(id, cb);
+        }
+    }
+    for (const auto& [id, callback] : snapshot) {
         try {
-            callback(tid, change);
+            if (callback) callback(tid, change);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ThreadHijack", L"Context callback %llu error - %ls",
-                id, Utils::StringUtils::ToWide(e.what()).c_str());
+                static_cast<unsigned long long>(id),
+                Utils::StringUtils::ToWide(e.what()).c_str());
+        } catch (...) {
+            SS_LOG_ERROR(L"ThreadHijack",
+                L"Context callback %llu raised non-std exception",
+                static_cast<unsigned long long>(id));
         }
     }
 }
 
 void ThreadHijackDetectorImpl::InvokeValidationCallbacks(const ThreadValidation& validation) {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& [id, callback] : m_validationCallbacks) {
+    std::vector<std::pair<uint64_t, ValidationCallback>> snapshot;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        snapshot.reserve(m_validationCallbacks.size());
+        for (const auto& [id, cb] : m_validationCallbacks) {
+            snapshot.emplace_back(id, cb);
+        }
+    }
+    for (const auto& [id, callback] : snapshot) {
         try {
-            callback(validation);
+            if (callback) callback(validation);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ThreadHijack", L"Validation callback %llu error - %ls",
-                id, Utils::StringUtils::ToWide(e.what()).c_str());
+                static_cast<unsigned long long>(id),
+                Utils::StringUtils::ToWide(e.what()).c_str());
+        } catch (...) {
+            SS_LOG_ERROR(L"ThreadHijack",
+                L"Validation callback %llu raised non-std exception",
+                static_cast<unsigned long long>(id));
         }
     }
 }
 
 bool ThreadHijackDetectorImpl::ShouldExclude(uint32_t pid) const {
-    // Check excluded PIDs
-    if (std::find(m_config.excludedPids.begin(), m_config.excludedPids.end(), pid) !=
-        m_config.excludedPids.end()) {
+    // Race fix: m_config is mutated by UpdateConfig under m_mutex. Reading
+    // its vectors without the lock is a data race (UB) and can yield torn
+    // reads / mid-resize iteration crashes. Snapshot under shared lock.
+    std::vector<uint32_t>      excludedPids;
+    std::vector<std::wstring>  excludedProcesses;
+    {
+        std::shared_lock lock(m_mutex);
+        excludedPids      = m_config.excludedPids;
+        excludedProcesses = m_config.excludedProcesses;
+    }
+
+    if (std::find(excludedPids.begin(), excludedPids.end(), pid) != excludedPids.end()) {
         return true;
     }
 
-    // Check excluded process names
     auto procName = Utils::ProcessUtils::GetProcessName(pid);
     if (procName.has_value()) {
-        for (const auto& excluded : m_config.excludedProcesses) {
+        for (const auto& excluded : excludedProcesses) {
             if (*procName == excluded) {
                 return true;
             }
@@ -1966,8 +2398,35 @@ bool ThreadHijackDetector::IsInitialized() const noexcept {
 bool ThreadHijackDetector::UpdateConfig(const ThreadHijackConfig& config) {
     if (!m_impl) return false;
 
+    // Clamp untrusted / out-of-band configuration values. Administrators
+    // (or a misconfigured policy file) could otherwise push pathological
+    // values that disable detection or DoS the scanner:
+    //  - maxUnbackedFrames = UINT32_MAX → all stacks pass
+    //  - maxThreadsToMonitor = UINT32_MAX → unbounded baseline map
+    //  - suspendDurationThresholdMs = 0 → every suspend triggers detection
+    ThreadHijackConfig sanitized = config;
+
+    constexpr uint32_t kAbsMaxUnbacked          = 64;
+    constexpr uint32_t kAbsMaxThreadsToMonitor  = kMaxBaselineThreads;
+    constexpr uint32_t kMinSuspendThresholdMs   = 10;
+    constexpr uint32_t kMaxSuspendThresholdMs   = 3600000; // 1 hour
+
+    if (sanitized.maxUnbackedFrames > kAbsMaxUnbacked) {
+        sanitized.maxUnbackedFrames = kAbsMaxUnbacked;
+    }
+    if (sanitized.maxThreadsToMonitor == 0 ||
+        sanitized.maxThreadsToMonitor > kAbsMaxThreadsToMonitor) {
+        sanitized.maxThreadsToMonitor = kAbsMaxThreadsToMonitor;
+    }
+    if (sanitized.suspendDurationThresholdMs < kMinSuspendThresholdMs) {
+        sanitized.suspendDurationThresholdMs = kMinSuspendThresholdMs;
+    }
+    if (sanitized.suspendDurationThresholdMs > kMaxSuspendThresholdMs) {
+        sanitized.suspendDurationThresholdMs = kMaxSuspendThresholdMs;
+    }
+
     std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_config = config;
+    m_impl->m_config = sanitized;
     return true;
 }
 
@@ -1996,21 +2455,19 @@ std::vector<ThreadValidation> ThreadHijackDetector::ValidateProcessThreads(uint3
     if (!m_impl) return validations;
 
     try {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) return validations;
+        HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+        if (!hSnapshot || hSnapshot.get() == INVALID_HANDLE_VALUE) return validations;
 
         THREADENTRY32 te{};
         te.dwSize = sizeof(THREADENTRY32);
 
-        if (Thread32First(hSnapshot, &te)) {
+        if (Thread32First(hSnapshot.get(), &te)) {
             do {
                 if (te.th32OwnerProcessID == pid) {
                     validations.push_back(m_impl->ValidateThreadInternal(te.th32ThreadID));
                 }
-            } while (Thread32Next(hSnapshot, &te));
+            } while (Thread32Next(hSnapshot.get(), &te));
         }
-
-        CloseHandle(hSnapshot);
 
     } catch (...) {
         // Return partial results
@@ -2082,13 +2539,13 @@ ScanResult ThreadHijackDetector::ScanAllProcesses() {
     const auto startTime = Clock::now();
 
     try {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) return combinedResult;
+        HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot || hSnapshot.get() == INVALID_HANDLE_VALUE) return combinedResult;
 
         PROCESSENTRY32W pe{};
         pe.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (Process32FirstW(hSnapshot, &pe)) {
+        if (Process32FirstW(hSnapshot.get(), &pe)) {
             do {
                 auto result = m_impl->ScanProcessInternal(pe.th32ProcessID);
 
@@ -2104,10 +2561,9 @@ ScanResult ThreadHijackDetector::ScanAllProcesses() {
                     combinedResult.detectedHijacks.push_back(hijack);
                 }
 
-            } while (Process32NextW(hSnapshot, &pe));
+            } while (Process32NextW(hSnapshot.get(), &pe));
         }
 
-        CloseHandle(hSnapshot);
         combinedResult.scanComplete = true;
 
     } catch (const std::exception& e) {
@@ -2249,6 +2705,14 @@ uint64_t ThreadHijackDetector::RegisterCallback(HijackDetectedCallback callback)
     if (!m_impl) return 0;
 
     std::lock_guard lock(m_impl->m_callbacksMutex);
+    // DoS protection: refuse unbounded callback registration. A misbehaving
+    // or malicious caller spamming Register* would otherwise grow the map
+    // without bound. Returning 0 is documented as failure.
+    if (m_impl->m_hijackCallbacks.size() >= kMaxCallbacks) {
+        SS_LOG_WARN(L"ThreadHijack", L"RegisterCallback rejected: cap %zu reached",
+            static_cast<size_t>(kMaxCallbacks));
+        return 0;
+    }
     const uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_hijackCallbacks[id] = std::move(callback);
     return id;
@@ -2258,6 +2722,11 @@ uint64_t ThreadHijackDetector::RegisterContextCallback(ContextChangeCallback cal
     if (!m_impl) return 0;
 
     std::lock_guard lock(m_impl->m_callbacksMutex);
+    if (m_impl->m_contextCallbacks.size() >= kMaxCallbacks) {
+        SS_LOG_WARN(L"ThreadHijack", L"RegisterContextCallback rejected: cap %zu reached",
+            static_cast<size_t>(kMaxCallbacks));
+        return 0;
+    }
     const uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_contextCallbacks[id] = std::move(callback);
     return id;
@@ -2267,6 +2736,11 @@ uint64_t ThreadHijackDetector::RegisterValidationCallback(ValidationCallback cal
     if (!m_impl) return 0;
 
     std::lock_guard lock(m_impl->m_callbacksMutex);
+    if (m_impl->m_validationCallbacks.size() >= kMaxCallbacks) {
+        SS_LOG_WARN(L"ThreadHijack", L"RegisterValidationCallback rejected: cap %zu reached",
+            static_cast<size_t>(kMaxCallbacks));
+        return 0;
+    }
     const uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_validationCallbacks[id] = std::move(callback);
     return id;
