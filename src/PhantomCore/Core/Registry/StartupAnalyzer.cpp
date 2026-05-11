@@ -75,6 +75,127 @@ using Utils::StringUtils::ToLowerCopy;
 using Utils::StringUtils::IEquals;
 
 // ============================================================================
+// FILE-LOCAL HARDENING HELPERS
+// ============================================================================
+namespace {
+
+// Cap registry payloads we will read in full to 64 KiB. Beyond this size
+// the value is rejected to thwart resource-exhaustion / log-bombing attempts.
+constexpr DWORD   kMaxRegPayloadBytes    = 64u * 1024u;
+// Maximum number of characters from a hostile-origin string ever rendered
+// into a log line. Long strings are truncated with an explicit marker so
+// they cannot crowd out structured fields downstream.
+constexpr size_t  kMaxLogFieldChars      = 1024;
+
+/**
+ * @brief Sanitise a wide string for safe inclusion in a log line.
+ *
+ * - Strips ASCII control characters (incl. CR/LF/TAB) which could otherwise
+ *   forge log records, terminal escape sequences, or syslog separators.
+ * - Caps total length to defeat unbounded attacker-controlled strings.
+ *
+ * Returns a narrow UTF-8 string sized for the printf-style `%hs` specifier.
+ */
+[[nodiscard]] inline std::string SanitizeForLog(std::wstring_view wide) {
+    std::string narrow = Utils::StringUtils::ToNarrow(wide);
+    if (narrow.size() > kMaxLogFieldChars) {
+        narrow.resize(kMaxLogFieldChars);
+        narrow.append("...<truncated>");
+    }
+    for (char& c : narrow) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) c = '?';
+    }
+    return narrow;
+}
+
+[[nodiscard]] inline std::string SanitizeForLog(std::string_view in) {
+    std::string narrow(in);
+    if (narrow.size() > kMaxLogFieldChars) {
+        narrow.resize(kMaxLogFieldChars);
+        narrow.append("...<truncated>");
+    }
+    for (char& c : narrow) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) c = '?';
+    }
+    return narrow;
+}
+
+/**
+ * @brief Produce a collision-resistant ".disabled.YYYYMMDDhhmmss" suffix.
+ *
+ * Disable-on-collision paths must not clobber a prior backup; the timestamp
+ * yields uniqueness at second granularity without depending on caller state.
+ */
+[[nodiscard]] inline std::wstring MakeDisabledSuffix() {
+    SYSTEMTIME st{};
+    ::GetSystemTime(&st);
+    wchar_t buf[64];
+    swprintf_s(buf, L".disabled.%04u%02u%02u%02u%02u%02u",
+               st.wYear, st.wMonth, st.wDay,
+               st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+/**
+ * @brief Return the absolute path to %WINDIR%\System32, queried at runtime.
+ *
+ * Avoids hardcoding `C:\Windows\System32` which is wrong on systems where
+ * Windows is installed to a non-default drive or directory, and lets the
+ * loader policy (DLL search order, redirection) follow OS guidance.
+ */
+[[nodiscard]] inline std::wstring SystemDirectoryW() {
+    wchar_t buf[MAX_PATH] = {};
+    const UINT n = ::GetSystemDirectoryW(buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return L"C:\\Windows\\System32";
+    std::wstring out(buf, n);
+    if (!out.empty() && out.back() != L'\\') out.push_back(L'\\');
+    return out;
+}
+
+/**
+ * @brief Apply CSV-injection mitigation to one wide cell.
+ *
+ * - Prefixes a single quote when the cell would otherwise begin with a
+ *   formula leader (`=`, `+`, `-`, `@`) — these would be interpreted by
+ *   spreadsheet software as live formulas.
+ * - Strips CR/LF/TAB so a single record always renders as one CSV row.
+ * - Doubles embedded quotes and wraps in `"..."` when the cell contains
+ *   commas or quotes (RFC 4180).
+ */
+[[nodiscard]] inline std::wstring SanitizeCsvCell(std::wstring_view in) {
+    std::wstring s(in);
+    for (auto& wc : s) {
+        if (wc == L'\r' || wc == L'\n' || wc == L'\t') wc = L' ';
+        else if (wc < 0x20) wc = L'?';
+    }
+    if (!s.empty()) {
+        const wchar_t first = s.front();
+        if (first == L'=' || first == L'+' || first == L'-' || first == L'@') {
+            s.insert(s.begin(), L'\'');
+        }
+    }
+    const bool needsQuote =
+        s.find(L',') != std::wstring::npos ||
+        s.find(L'"') != std::wstring::npos;
+    if (needsQuote) {
+        std::wstring out;
+        out.reserve(s.size() + 2);
+        out.push_back(L'"');
+        for (wchar_t wc : s) {
+            if (wc == L'"') out.push_back(L'"');
+            out.push_back(wc);
+        }
+        out.push_back(L'"');
+        return out;
+    }
+    return s;
+}
+
+}  // anonymous namespace
+
+// ============================================================================
 // STATISTICS METHODS
 // ============================================================================
 
@@ -205,20 +326,42 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
     [[nodiscard]] static std::wstring CanonicalizePath(const std::wstring& rawPath) {
         if (rawPath.empty()) return rawPath;
 
-        // Expand environment variables
-        wchar_t expanded[32768];
-        DWORD expandResult = ExpandEnvironmentStringsW(rawPath.c_str(), expanded, _countof(expanded));
-        std::wstring path = (expandResult > 0 && expandResult < _countof(expanded))
-                          ? std::wstring(expanded) : rawPath;
+        // Hard ceiling: 32 Ki wchar_t == 64 KiB. Larger values are pathological
+        // and would only be produced by attacker-driven %ENV% expansion.
+        constexpr DWORD kCeil = 32u * 1024u;
 
-        // Resolve 8.3 short names → long path (defeats obfuscation)
-        wchar_t longPath[32768];
-        DWORD longResult = GetLongPathNameW(path.c_str(), longPath, _countof(longPath));
-        if (longResult > 0 && longResult < _countof(longPath)) {
-            path = longPath;
+        // Expand %ENV% references using a heap buffer; the prior implementation
+        // placed two 64 KiB buffers on the stack which exceeded /STACK on the
+        // service host and gave attacker-controlled inputs direct stack reach.
+        std::wstring path = rawPath;
+        {
+            const DWORD need = ::ExpandEnvironmentStringsW(rawPath.c_str(), nullptr, 0);
+            if (need > 0 && need <= kCeil) {
+                std::vector<wchar_t> buf(need);
+                const DWORD written =
+                    ::ExpandEnvironmentStringsW(rawPath.c_str(), buf.data(), need);
+                if (written > 0 && written <= need) {
+                    // Strip any trailing NUL the API may have included.
+                    DWORD len = written;
+                    if (len > 0 && buf[len - 1] == L'\0') --len;
+                    path.assign(buf.data(), len);
+                }
+            }
         }
 
-        // Use FileUtils::NormalizePath if available to resolve symlinks/junctions
+        // Resolve 8.3 short names -> long path (defeats path-obfuscation evasion).
+        {
+            const DWORD need = ::GetLongPathNameW(path.c_str(), nullptr, 0);
+            if (need > 0 && need <= kCeil) {
+                std::vector<wchar_t> buf(need);
+                const DWORD written = ::GetLongPathNameW(path.c_str(), buf.data(), need);
+                if (written > 0 && written < need) {
+                    path.assign(buf.data(), written);
+                }
+            }
+        }
+
+        // FileUtils::NormalizePath additionally resolves symlinks / junctions.
         Utils::FileUtils::Error fileErr;
         std::wstring normalized = Utils::FileUtils::NormalizePath(path, true, &fileErr);
         if (!fileErr.hasError() && !normalized.empty()) {
@@ -391,26 +534,42 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
 
     [[nodiscard]] static std::wstring ResolveShortcut(const std::wstring& lnkPath) {
         std::wstring target;
-        IShellLinkW* psl = nullptr;
-        HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_IShellLinkW, reinterpret_cast<void**>(&psl));
-        if (FAILED(hr) || !psl) return target;
 
-        IPersistFile* ppf = nullptr;
-        hr = psl->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&ppf));
-        if (SUCCEEDED(hr) && ppf) {
-            hr = ppf->Load(lnkPath.c_str(), STGM_READ);
-            if (SUCCEEDED(hr)) {
-                wchar_t szPath[MAX_PATH];
-                WIN32_FIND_DATAW wfd;
-                hr = psl->GetPath(szPath, MAX_PATH, &wfd, SLGP_RAWPATH);
-                if (SUCCEEDED(hr) && szPath[0] != L'\0') {
-                    target = szPath;
+        // Initialise COM on this thread with single-threaded apartment semantics
+        // (IShellLinkW is STA). DISABLE_OLE1DDE matches the modern shell guidance
+        // and avoids unnecessary inter-process DDE round-trips. Track the result
+        // so we only Uninitialize when *this* call performed the initialisation.
+        const HRESULT coInit = ::CoInitializeEx(
+            nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        const bool weInitialised = SUCCEEDED(coInit);
+        // RPC_E_CHANGED_MODE means COM is already initialised on this thread
+        // with different apartment semantics; we must NOT call CoUninitialize
+        // in that case or we would unbalance the caller.
+
+        IShellLinkW* psl = nullptr;
+        HRESULT hr = ::CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_IShellLinkW, reinterpret_cast<void**>(&psl));
+        if (SUCCEEDED(hr) && psl) {
+            IPersistFile* ppf = nullptr;
+            hr = psl->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&ppf));
+            if (SUCCEEDED(hr) && ppf) {
+                hr = ppf->Load(lnkPath.c_str(), STGM_READ);
+                if (SUCCEEDED(hr)) {
+                    wchar_t szPath[MAX_PATH] = {};
+                    WIN32_FIND_DATAW wfd{};
+                    hr = psl->GetPath(szPath, MAX_PATH, &wfd, SLGP_RAWPATH);
+                    if (SUCCEEDED(hr) && szPath[0] != L'\0') {
+                        target.assign(szPath);
+                    }
                 }
+                ppf->Release();
             }
-            ppf->Release();
+            psl->Release();
         }
-        psl->Release();
+
+        if (weInitialised) {
+            ::CoUninitialize();
+        }
         return target;
     }
 
@@ -604,8 +763,11 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 item.entryName = L"Driver";
                 item.command = driver;
 
-                // Print monitor DLLs are relative to System32
-                std::wstring fullPath = L"C:\\Windows\\System32\\" + driver;
+                // Print monitor DLLs are loaded relative to the system directory.
+                // Query that path at runtime via GetSystemDirectoryW instead of
+                // hardcoding "C:\\Windows\\System32" (which is wrong on systems
+                // that install Windows to a different drive or directory).
+                const std::wstring fullPath = SystemDirectoryW() + driver;
                 item.targetPath = CanonicalizePath(fullPath);
                 std::error_code ec;
                 item.targetExists = fs::exists(item.targetPath, ec);
@@ -860,10 +1022,14 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
     }
 
     void CalculateRiskScore(StartupItem& item) {
-        item.riskScore = 0;
+        // Accumulate in a 32-bit unsigned so that incremental additions cannot
+        // wrap the destination uint8_t mid-computation. The cumulative ceiling
+        // across every contributor below is well over 255, so writing
+        // `item.riskScore += N` directly (uint8_t) would silently wrap.
+        uint32_t score = 0;
         item.riskFactors.clear();
 
-        // Known malicious — immediate 100
+        // Known malicious — short-circuit to the maximum.
         if (item.reputation.isKnownBad) {
             item.riskScore = 100;
             item.isMalicious = true;
@@ -874,81 +1040,60 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
             return;
         }
 
-        // Unsigned binary
         if (!item.signature.isSigned) {
-            item.riskScore += 20;
+            score += 20;
             item.riskFactors.push_back("Unsigned binary");
         }
-
-        // Signed but invalid signature
         if (item.signature.isSigned && !item.signature.isValid) {
-            item.riskScore += 30;
+            score += 30;
             item.riskFactors.push_back("Invalid digital signature");
         }
-
-        // Signed but untrusted chain
         if (item.signature.isSigned && item.signature.isValid && !item.signature.isTrusted) {
-            item.riskScore += 15;
+            score += 15;
             item.riskFactors.push_back("Untrusted certificate chain");
         }
-
-        // Expired or revoked
         if (item.signature.isExpired) {
-            item.riskScore += 10;
+            score += 10;
             item.riskFactors.push_back("Expired certificate");
         }
         if (item.signature.isRevoked) {
-            item.riskScore += 40;
+            score += 40;
             item.riskFactors.push_back("Revoked certificate");
         }
-
-        // Hidden/unusual location
         if (item.isHidden) {
-            item.riskScore += 15;
+            score += 15;
             item.riskFactors.push_back("Hidden startup item");
         }
-
-        // IFEO persistence is inherently suspicious
         if (item.source == StartupSource::IFEO) {
-            item.riskScore += 25;
+            score += 25;
             item.riskFactors.push_back("IFEO debugger persistence (T1546.012)");
         }
-
-        // AppInit_DLLs persistence
         if (item.source == StartupSource::AppInit_DLLs) {
-            item.riskScore += 20;
+            score += 20;
             item.riskFactors.push_back("AppInit_DLLs injection (T1546.010)");
         }
-
-        // LSA persistence
         if (item.source == StartupSource::LSA_AuthenticationPackages ||
             item.source == StartupSource::LSA_SecurityPackages) {
-            item.riskScore += 25;
+            score += 25;
             item.riskFactors.push_back("LSA persistence (credential access)");
         }
-
-        // Print Monitor persistence
         if (item.source == StartupSource::PrintMonitor) {
-            item.riskScore += 15;
+            score += 15;
             item.riskFactors.push_back("Print Monitor persistence (T1547.010)");
         }
-
-        // Orphaned target
         if (!item.targetExists && !item.targetPath.empty()) {
-            item.riskScore += 10;
+            score += 10;
             item.riskFactors.push_back("Target file not found");
         }
-
-        // Unknown reputation (not known good or bad)
         if (!item.reputation.isKnownGood && !item.reputation.isKnownBad) {
-            item.riskScore += 10;
+            score += 10;
             item.riskFactors.push_back("Unknown reputation");
         }
 
-        // Cap at 100
-        if (item.riskScore > 100) item.riskScore = 100;
+        // Clamp to [0,100] before narrowing to uint8_t.
+        score = (std::min<uint32_t>)(score, 100u);
+        item.riskScore = static_cast<uint8_t>(score);
 
-        // Mark as malicious if high aggregate risk
         if (item.riskScore >= 80) {
             item.isMalicious = true;
         }
@@ -1073,41 +1218,71 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
         try {
             if (item.source == StartupSource::StartupFolder_User ||
                 item.source == StartupSource::StartupFolder_AllUsers) {
-                // For folder-based items, rename file to .disabled
-                std::wstring srcPath = item.location + L"\\" + item.entryName;
+                // For folder-based items, rename the file with a timestamped
+                // ".disabled.<ts>" suffix to avoid clobbering any pre-existing
+                // backup file from an earlier disable attempt.
+                const std::wstring srcPath = item.location + L"\\" + item.entryName;
                 std::wstring dstPath = srcPath + L".disabled";
                 std::error_code ec;
+                if (fs::exists(dstPath, ec)) {
+                    dstPath = srcPath + MakeDisabledSuffix();
+                }
+                ec.clear();
                 fs::rename(srcPath, dstPath, ec);
                 return !ec;
             }
 
-            // Registry-based: move value to disabled subkey
-            HKEY hRoot = GetRootKeyForSource(item.source);
+            // Registry-based: move value to a disabled subkey.
+            const HKEY hRoot = GetRootKeyForSource(item.source);
             if (!hRoot) return false;
 
-            // Read the current value
             Utils::RegistryUtils::RegistryKey srcKey;
             Utils::RegistryUtils::Error regErr;
             if (!srcKey.Open(hRoot, item.location, {.access = KEY_READ | KEY_WRITE}, &regErr))
                 return false;
 
+            // Preserve REG_EXPAND_SZ semantics: a value originally stored as
+            // expandable must be rewritten as expandable, otherwise references
+            // such as %SystemRoot% would no longer be expanded by the loader.
             std::wstring value;
+            bool isExpand = false;
             if (!srcKey.ReadString(item.entryName, value, &regErr)) {
-                if (!srcKey.ReadExpandString(item.entryName, value, &regErr)) return false;
+                Utils::RegistryUtils::Error expandErr;
+                if (srcKey.ReadExpandString(item.entryName, value, &expandErr)) {
+                    isExpand = true;
+                } else {
+                    return false;
+                }
             }
 
-            // Create disabled backup key
-            std::wstring disabledPath = item.location + L"\\AutorunsDisabled";
+            // Create / open the per-key backup container.
+            const std::wstring disabledPath = item.location + L"\\AutorunsDisabled";
             Utils::RegistryUtils::RegistryKey disKey;
             if (!disKey.Create(hRoot, disabledPath, {.access = KEY_WRITE}, nullptr, &regErr))
                 return false;
 
-            // Write to disabled key
-            if (!disKey.WriteString(item.entryName, value, &regErr)) return false;
+            // If a backup with the same entryName already exists, append the
+            // timestamped suffix so we never silently overwrite history.
+            std::wstring backupName = item.entryName;
+            {
+                Utils::RegistryUtils::RegistryKey probe;
+                Utils::RegistryUtils::Error probeErr;
+                if (probe.Open(hRoot, disabledPath, {.access = KEY_READ}, &probeErr)) {
+                    Utils::RegistryUtils::Error existsErr;
+                    std::wstring existing;
+                    if (probe.ReadString(item.entryName, existing, &existsErr) ||
+                        probe.ReadExpandString(item.entryName, existing, &existsErr)) {
+                        backupName += MakeDisabledSuffix();
+                    }
+                }
+            }
 
-            // Delete from original
+            const bool wroteBackup = isExpand
+                ? disKey.WriteExpandString(backupName, value, &regErr)
+                : disKey.WriteString(backupName, value, &regErr);
+            if (!wroteBackup) return false;
+
             if (!srcKey.DeleteValue(item.entryName, &regErr)) return false;
-
             return true;
 
         } catch (const std::exception& e) {
@@ -2625,30 +2800,18 @@ bool StartupAnalyzer::ExportItems(const std::wstring& outputPath) const {
         file << L"Name,Source,Status,Category,Risk Score,Malicious,Target Path\n";
 
         for (const auto& item : items) {
-            // CSV-safe: quote fields that might contain commas or quotes
-            auto csvEscape = [](const std::wstring& s) -> std::wstring {
-                if (s.find(L',') != std::wstring::npos ||
-                    s.find(L'"') != std::wstring::npos) {
-                    std::wstring escaped = s;
-                    std::wstring from = L"\"";
-                    std::wstring to = L"\"\"";
-                    size_t pos = 0;
-                    while ((pos = escaped.find(from, pos)) != std::wstring::npos) {
-                        escaped.replace(pos, from.length(), to);
-                        pos += to.length();
-                    }
-                    return L"\"" + escaped + L"\"";
-                }
-                return s;
-            };
-
-            file << csvEscape(item.name) << L","
+            // Use the file-local SanitizeCsvCell which both (a) protects
+            // downstream spreadsheet software from formula-injection attacks
+            // by prefixing dangerous leading characters (=, +, -, @) with
+            // a single quote, and (b) strips CR/LF so a hostile item name
+            // cannot break out of the row and forge additional records.
+            file << SanitizeCsvCell(item.name) << L","
                  << GetStartupSourceName(item.source).data() << L","
                  << GetStartupStatusName(item.status).data() << L","
                  << GetItemCategoryName(item.category).data() << L","
-                 << item.riskScore << L","
+                 << static_cast<unsigned>(item.riskScore) << L","
                  << (item.isMalicious ? L"Yes" : L"No") << L","
-                 << csvEscape(item.targetPath) << L"\n";
+                 << SanitizeCsvCell(item.targetPath) << L"\n";
         }
 
         file.close();
