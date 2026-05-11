@@ -42,6 +42,7 @@
 #include "../../Utils/RegistryUtils.hpp"
 #include "../../Utils/Base64Utils.hpp"
 #include "../../Utils/CertUtils.hpp"
+#include "../../Utils/PE_sig_verf.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
@@ -167,6 +168,138 @@ const std::vector<PersistenceLocation> PERSISTENCE_LOCATIONS = {
     { PersistenceType::Time_Provider, HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\W32Time\\TimeProviders", L"", false, "T1547.003" },
 };
 
+// ============================================================================
+// HARDENED INPUT BOUNDS (defense against malicious registry values)
+// ============================================================================
+constexpr size_t kMaxRawCommandChars     = 32 * 1024;   // 32K wchar registry value cap
+constexpr size_t kMaxMultiStringEntries  = 1024;        // Cap MULTI_SZ explosion
+constexpr size_t kMaxBase64InputChars    = 1 * 1024 * 1024; // 1MB encoded cap
+constexpr size_t kMaxBase64DecodedBytes  = 2 * 1024 * 1024; // 2MB decoded cap
+constexpr size_t kMaxExpandedPathChars   = 32767;       // Win32 long path ceiling
+constexpr size_t kMaxTaskRecursionDepth  = 16;          // Defensive folder recursion cap
+constexpr size_t kMaxArgumentChars       = 32 * 1024;
+constexpr size_t kMaxLogFieldChars       = 1024;        // Anti-log-injection cap
+
+/**
+ * @brief Strip CR/LF and other control characters that enable log injection.
+ *
+ * Registry values, command lines and BSTRs are attacker-controllable. Any
+ * unsanitised flow into Logger could split log lines, forge timestamps, or
+ * inject crafted lines into downstream log parsers (SIEM/Splunk/Elastic).
+ * Caller is responsible for additional truncation if needed.
+ */
+[[nodiscard]] std::string SanitizeForLog(std::wstring_view wide) {
+    std::string narrow = StringUtils::ToNarrow(wide);
+    if (narrow.size() > kMaxLogFieldChars) {
+        narrow.resize(kMaxLogFieldChars);
+        narrow.append("...<truncated>");
+    }
+    for (char& c : narrow) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) {
+            c = '?';
+        }
+    }
+    return narrow;
+}
+
+[[nodiscard]] std::string SanitizeForLog(std::string_view narrowIn) {
+    std::string narrow(narrowIn);
+    if (narrow.size() > kMaxLogFieldChars) {
+        narrow.resize(kMaxLogFieldChars);
+        narrow.append("...<truncated>");
+    }
+    for (char& c : narrow) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) {
+            c = '?';
+        }
+    }
+    return narrow;
+}
+
+/**
+ * @brief Expand environment variables safely with overflow handling.
+ *
+ * ExpandEnvironmentStringsW returns the required size (including the
+ * terminating null) when the buffer is too small. The previous implementation
+ * silently fell back to the unexpanded string when expansion exceeded
+ * MAX_PATH*2, allowing %ENV% based path-cloaking attacks to bypass downstream
+ * suspicious-path heuristics. This helper retries with an exact-size buffer
+ * and enforces a hard ceiling derived from Win32's long-path maximum.
+ */
+[[nodiscard]] std::wstring ExpandEnvVarsSafe(std::wstring_view input) noexcept {
+    if (input.empty()) {
+        return {};
+    }
+    // Cheap heuristic: if no '%' present, no expansion is needed.
+    if (input.find(L'%') == std::wstring::npos) {
+        return std::wstring(input);
+    }
+    std::wstring src(input);
+    const DWORD required = ExpandEnvironmentStringsW(src.c_str(), nullptr, 0);
+    if (required == 0 || required > kMaxExpandedPathChars) {
+        // Refuse pathological expansion; return original to keep ASCII analysis usable.
+        return src;
+    }
+    std::wstring out;
+    try {
+        out.resize(required);
+    } catch (...) {
+        return src;
+    }
+    const DWORD written = ExpandEnvironmentStringsW(src.c_str(), out.data(), required);
+    if (written == 0 || written > required) {
+        return src;
+    }
+    // ExpandEnvironmentStringsW writes the terminating null inside the buffer.
+    if (written > 0 && out[written - 1] == L'\0') {
+        out.resize(written - 1);
+    } else {
+        out.resize(written);
+    }
+    return out;
+}
+
+/**
+ * @brief Resolve short (8.3) path to long path with proper buffer growth.
+ */
+[[nodiscard]] std::wstring NormalizeLongPath(std::wstring_view input) noexcept {
+    if (input.empty()) return {};
+    std::wstring src(input);
+    const DWORD required = GetLongPathNameW(src.c_str(), nullptr, 0);
+    if (required == 0 || required > kMaxExpandedPathChars) {
+        return src;
+    }
+    std::wstring out;
+    try {
+        out.resize(required);
+    } catch (...) {
+        return src;
+    }
+    const DWORD written = GetLongPathNameW(src.c_str(), out.data(), required);
+    if (written == 0 || written >= required) {
+        return src;
+    }
+    out.resize(written);
+    return out;
+}
+
+/**
+ * @brief Conservative ADS detection that ignores legitimate drive/UNC separators.
+ *
+ * Returns true only if a colon appears strictly inside the file/folder name
+ * portion of the path (i.e., after the last backslash, *and* the path is not
+ * a bare drive root). The legacy check flagged `\\?\C:\file` as ADS because
+ * any colon past position 2 was treated as a stream separator.
+ */
+[[nodiscard]] bool DetectAlternateDataStream(std::wstring_view path) noexcept {
+    if (path.size() < 4) return false;
+    const size_t lastBackslash = path.find_last_of(L"\\/");
+    const size_t scanFrom = (lastBackslash == std::wstring::npos) ? 0 : lastBackslash + 1;
+    return path.find(L':', scanFrom) != std::wstring::npos;
+}
+
 /**
  * @brief Calculate Shannon entropy.
  */
@@ -193,34 +326,64 @@ const std::vector<PersistenceLocation> PERSISTENCE_LOCATIONS = {
 
 /**
  * @brief Extract path from command line.
+ *
+ * Hardening:
+ *   - Treats both space *and* tab as the unquoted-path delimiter.
+ *   - Honours a comma as a terminator when used as the rundll32-style
+ *     "<dll>,<entrypoint>" separator inside an unquoted token, so that
+ *     downstream path-existence checks don't include the entrypoint name.
+ *   - Strips a single trailing colon group that some persistence writers use
+ *     to disable an entry (e.g. `"path.exe":disabled`).
  */
 [[nodiscard]] std::wstring ExtractExecutablePath(const std::wstring& commandLine) {
     if (commandLine.empty()) return L"";
 
     std::wstring trimmed = StringUtils::TrimCopy(commandLine);
+    if (trimmed.empty()) return L"";
 
     // Handle quoted path
-    if (trimmed.starts_with(L'"')) {
-        size_t endQuote = trimmed.find(L'"', 1);
+    if (trimmed.front() == L'"') {
+        const size_t endQuote = trimmed.find(L'"', 1);
         if (endQuote != std::wstring::npos) {
             return trimmed.substr(1, endQuote - 1);
         }
+        // Unterminated quote: treat the remainder as the path body, dropping the leading quote.
+        return trimmed.substr(1);
     }
 
-    // Find first space (simple approach)
-    size_t spacePos = trimmed.find(L' ');
-    if (spacePos != std::wstring::npos) {
-        return trimmed.substr(0, spacePos);
+    // Unquoted: terminate at first whitespace, NUL, or rundll32-style comma.
+    size_t end = trimmed.size();
+    for (size_t i = 0; i < trimmed.size(); ++i) {
+        const wchar_t c = trimmed[i];
+        if (c == L' ' || c == L'\t' || c == L',' || c == L'\0') {
+            end = i;
+            break;
+        }
     }
-
-    return trimmed;
+    return trimmed.substr(0, end);
 }
 
 /**
  * @brief Check if path is suspicious.
+ *
+ * Hardening: canonicalises any `..\` traversal so attackers can't hide a
+ * Temp-folder dropper as `C:\Windows\..\Temp\evil.exe`.
  */
 [[nodiscard]] bool IsSuspiciousPath(const std::wstring& path) noexcept {
-    std::wstring lowerPath = StringUtils::ToLowerCopy(path);
+    if (path.empty()) return false;
+
+    std::wstring canonical = path;
+    try {
+        std::error_code ec;
+        auto weak = fs::weakly_canonical(fs::path(path), ec);
+        if (!ec) {
+            canonical = weak.wstring();
+        }
+    } catch (...) {
+        // Fall back to original path on canonicalisation failure.
+    }
+
+    std::wstring lowerPath = StringUtils::ToLowerCopy(canonical);
 
     // Temp directories
     if (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
@@ -242,6 +405,12 @@ const std::vector<PersistenceLocation> PERSISTENCE_LOCATIONS = {
 
     // Public folders
     if (lowerPath.find(L"\\public\\") != std::wstring::npos) {
+        return true;
+    }
+
+    // ProgramData (used by many living-off-the-land droppers)
+    if (lowerPath.find(L"\\programdata\\") != std::wstring::npos &&
+        lowerPath.find(L"\\programdata\\microsoft\\") == std::wstring::npos) {
         return true;
     }
 
@@ -443,13 +612,17 @@ public:
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_scanning{false};
     std::atomic<bool> m_cancelRequested{false};
-    bool m_comInitialized{false};  // Track whether WE initialized COM
+    std::atomic<bool> m_comInitialized{false};  // Track whether WE initialized COM
 
     // Configuration
     PersistenceDetectorConfig m_config{};
 
     // Statistics
     PersistenceDetectorStatistics m_stats{};
+
+    // Authenticode verifier — reused across target verifications so the
+    // CryptoAPI handles aren't reopened per file.
+    pe_sig_utils::PEFileSignatureVerifier m_sigVerifier{};
 
     // Caches
     std::unordered_map<std::wstring, TargetBinary> m_targetCache;
@@ -458,6 +631,10 @@ public:
 
     // Callbacks
     std::atomic<uint64_t> m_nextCallbackId{1};
+    // Alert IDs MUST live on a separate counter from callback IDs; using the
+    // same counter caused new alerts to alias existing callback handles which
+    // produced bogus Unregister() collisions in long-running scans.
+    std::atomic<uint64_t> m_nextAlertId{1};
     std::unordered_map<uint64_t, ScanProgressCallback> m_progressCallbacks;
     std::unordered_map<uint64_t, EntryFoundCallback> m_entryCallbacks;
     std::unordered_map<uint64_t, PersistenceAlertCallback> m_alertCallbacks;
@@ -493,10 +670,10 @@ public:
             // Initialize COM for Task Scheduler and WMI
             HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             if (SUCCEEDED(hr)) {
-                m_comInitialized = true;
+                m_comInitialized.store(true, std::memory_order_release);
             } else if (hr == RPC_E_CHANGED_MODE) {
                 // COM was already initialized with a different threading model — acceptable
-                m_comInitialized = false;
+                m_comInitialized.store(false, std::memory_order_release);
             } else {
                 Logger::Error("PersistenceDetector: COM initialization failed: {:#x}", static_cast<uint32_t>(hr));
                 return false;
@@ -514,6 +691,19 @@ public:
     }
 
     void Shutdown() noexcept {
+        // Acquire scan ordering first to block new scans and let any in-flight
+        // scan finish using COM resources before we tear them down. Without
+        // this, a concurrent ScanImpl on another thread could touch COM after
+        // CoUninitialize and crash the host process.
+        std::unique_lock<std::mutex> scanDrain;
+        try {
+            scanDrain = std::unique_lock<std::mutex>(m_scanMutex);
+        } catch (...) {
+            // std::mutex lock can theoretically throw; on failure we proceed
+            // best-effort but log so it's traceable.
+            Logger::Error("PersistenceDetector::Impl: Failed to acquire scan mutex during shutdown");
+        }
+
         std::unique_lock lock(m_configMutex);
 
         if (!m_initialized.load(std::memory_order_acquire)) {
@@ -538,9 +728,9 @@ public:
             m_alertCallbacks.clear();
         }
 
-        if (m_comInitialized) {
+        if (m_comInitialized.load(std::memory_order_acquire)) {
             CoUninitialize();
-            m_comInitialized = false;
+            m_comInitialized.store(false, std::memory_order_release);
         }
 
         m_initialized.store(false, std::memory_order_release);
@@ -645,6 +835,17 @@ public:
                 }
             }
 
+            // Scan IFEO/SilentProcessExit subkeys (T1546.012). The legacy
+            // IFEO_Debugger entry in PERSISTENCE_LOCATIONS pointed at the
+            // *parent* key and therefore could never observe the per-image
+            // `Debugger` values; this dedicated walk finally captures them.
+            if (scope >= ScanScope::Standard && !m_cancelRequested.load(std::memory_order_acquire)) {
+                auto ifeoEntries = ScanIFEOSubkeys();
+                for (auto& entry : ifeoEntries) {
+                    result.entries.push_back(std::move(entry));
+                }
+            }
+
             // Scan WMI subscriptions
             if (scope >= ScanScope::Extended && !m_cancelRequested.load(std::memory_order_acquire)) {
                 auto wmi = ScanWMISubscriptionsImpl();
@@ -706,91 +907,258 @@ public:
     [[nodiscard]] std::vector<PersistenceEntry> ScanRegistryLocation(const PersistenceLocation& location) {
         std::vector<PersistenceEntry> entries;
 
-        try {
-            // RAII registry key via RegistryUtils
-            Utils::RegistryUtils::RegistryKey regKey;
-            Utils::RegistryUtils::OpenOptions opts;
-            opts.access = KEY_READ;
-            opts.wow64_64 = true;
-            if (!regKey.Open(location.hive, location.subkey, opts)) {
-                return entries;
-            }
+        // On x64 Windows, malware frequently writes persistence into the 32-bit
+        // hive view (Wow6432Node) where 64-bit-only scanners are blind. We must
+        // enumerate BOTH WOW64 views and dedup by (entryName, location, raw).
+        struct ViewPass { bool wow64_64; bool wow64_32; const wchar_t* tag; };
+        const ViewPass kPasses[] = {
+            { true,  false, L"64" },
+            { false, true,  L"32" },
+        };
 
-            // Enumerate all values using RAII-safe enumeration
-            std::vector<Utils::RegistryUtils::ValueInfo> values;
-            if (!regKey.EnumValues(values)) {
-                return entries;
-            }
+        std::unordered_set<std::wstring> seen;
+        seen.reserve(32);
 
-            for (const auto& valInfo : values) {
-                // Skip if looking for specific value and this isn't it
-                if (!location.valueName.empty() &&
-                    !StringUtils::IEquals(location.valueName, valInfo.name)) {
+        for (const auto& pass : kPasses) {
+            try {
+                Utils::RegistryUtils::RegistryKey regKey;
+                Utils::RegistryUtils::OpenOptions opts;
+                opts.access = KEY_READ;
+                opts.wow64_64 = pass.wow64_64;
+                opts.wow64_32 = pass.wow64_32;
+                if (!regKey.Open(location.hive, location.subkey, opts)) {
                     continue;
                 }
 
-                PersistenceEntry entry{};
-                entry.type = location.type;
-                entry.entryName = valInfo.name;
-                entry.location = std::format(L"{}\\{}",
-                    (location.hive == HKEY_LOCAL_MACHINE) ? L"HKLM" :
-                    (location.hive == HKEY_CURRENT_USER) ? L"HKCU" : L"HKCR",
-                    location.subkey);
-                entry.isUserEntry = (location.hive == HKEY_CURRENT_USER);
-                entry.mitreTechnique = location.mitreTechnique;
+                std::vector<Utils::RegistryUtils::ValueInfo> values;
+                if (!regKey.EnumValues(values)) {
+                    continue;
+                }
 
-                // Extract command based on value type (with bounds safety)
-                if (valInfo.type == Utils::RegistryUtils::ValueType::String) {
-                    std::wstring val;
-                    if (regKey.ReadString(valInfo.name, val)) {
-                        entry.rawCommand = val;
+                for (const auto& valInfo : values) {
+                    if (!location.valueName.empty() &&
+                        !StringUtils::IEquals(location.valueName, valInfo.name)) {
+                        continue;
                     }
-                } else if (valInfo.type == Utils::RegistryUtils::ValueType::ExpandString) {
-                    std::wstring val;
-                    if (regKey.ReadExpandString(valInfo.name, val, true)) {
-                        entry.rawCommand = val;
-                    }
-                } else if (valInfo.type == Utils::RegistryUtils::ValueType::MultiString) {
-                    std::vector<std::wstring> multiVal;
-                    if (regKey.ReadMultiString(valInfo.name, multiVal)) {
-                        for (const auto& s : multiVal) {
-                            if (!entry.rawCommand.empty()) entry.rawCommand += L";";
-                            entry.rawCommand += s;
+
+                    PersistenceEntry entry{};
+                    entry.type = location.type;
+                    entry.entryName = valInfo.name;
+                    entry.location = std::format(L"{}\\{} [view={}]",
+                        (location.hive == HKEY_LOCAL_MACHINE) ? L"HKLM" :
+                        (location.hive == HKEY_CURRENT_USER) ? L"HKCU" : L"HKCR",
+                        location.subkey,
+                        pass.tag);
+                    entry.isUserEntry = (location.hive == HKEY_CURRENT_USER);
+                    entry.mitreTechnique = location.mitreTechnique;
+
+                    // Extract command based on value type with hard upper bound.
+                    if (valInfo.type == Utils::RegistryUtils::ValueType::String) {
+                        std::wstring val;
+                        if (regKey.ReadString(valInfo.name, val)) {
+                            if (val.size() > kMaxRawCommandChars) {
+                                Logger::Warn("PersistenceDetector: REG_SZ value '{}' under '{}' exceeds {} chars; truncating",
+                                    SanitizeForLog(valInfo.name),
+                                    SanitizeForLog(location.subkey),
+                                    kMaxRawCommandChars);
+                                val.resize(kMaxRawCommandChars);
+                            }
+                            entry.rawCommand = std::move(val);
+                        }
+                    } else if (valInfo.type == Utils::RegistryUtils::ValueType::ExpandString) {
+                        std::wstring val;
+                        if (regKey.ReadExpandString(valInfo.name, val, true)) {
+                            if (val.size() > kMaxRawCommandChars) {
+                                Logger::Warn("PersistenceDetector: REG_EXPAND_SZ value '{}' under '{}' exceeds {} chars; truncating",
+                                    SanitizeForLog(valInfo.name),
+                                    SanitizeForLog(location.subkey),
+                                    kMaxRawCommandChars);
+                                val.resize(kMaxRawCommandChars);
+                            }
+                            entry.rawCommand = std::move(val);
+                        }
+                    } else if (valInfo.type == Utils::RegistryUtils::ValueType::MultiString) {
+                        std::vector<std::wstring> multiVal;
+                        if (regKey.ReadMultiString(valInfo.name, multiVal)) {
+                            if (multiVal.size() > kMaxMultiStringEntries) {
+                                multiVal.resize(kMaxMultiStringEntries);
+                            }
+                            for (const auto& s : multiVal) {
+                                if (entry.rawCommand.size() >= kMaxRawCommandChars) break;
+                                if (!entry.rawCommand.empty()) entry.rawCommand += L";";
+                                const size_t remaining = kMaxRawCommandChars - entry.rawCommand.size();
+                                if (s.size() <= remaining) {
+                                    entry.rawCommand += s;
+                                } else {
+                                    entry.rawCommand.append(s, 0, remaining);
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
 
-                entry.lastScanned = system_clock::now();
-
-                // Resolve target and assess risk
-                if (m_config.resolveTargets && !entry.rawCommand.empty()) {
-                    entry.target = ResolveTargetImpl(entry.rawCommand);
-
-                    // Whitelist check before scoring
-                    if (IsWhitelisted(entry)) {
-                        entry.risk = PersistenceRiskLevel::Safe;
-                        entry.riskScore = 0;
-                        entry.isKnownGood = true;
-                    } else {
-                        // Hash and threat intel integration
-                        EnrichWithHashLookup(entry);
-                        EnrichWithThreatIntel(entry);
-
-                        entry.risk = AssessRisk(entry);
-                        entry.riskScore = CalculateRiskScore(entry);
+                    // Dedup across WOW64 views.
+                    std::wstring dedupKey;
+                    dedupKey.reserve(entry.entryName.size() + entry.rawCommand.size() + 2);
+                    dedupKey.append(StringUtils::ToLowerCopy(entry.entryName));
+                    dedupKey.push_back(L'|');
+                    dedupKey.append(StringUtils::ToLowerCopy(entry.rawCommand));
+                    if (!seen.insert(std::move(dedupKey)).second) {
+                        continue;
                     }
+
+                    entry.lastScanned = system_clock::now();
+
+                    if (m_config.resolveTargets && !entry.rawCommand.empty()) {
+                        entry.target = ResolveTargetImpl(entry.rawCommand);
+
+                        if (IsWhitelisted(entry)) {
+                            entry.risk = PersistenceRiskLevel::Safe;
+                            entry.riskScore = 0;
+                            entry.isKnownGood = true;
+                        } else {
+                            EnrichWithHashLookup(entry);
+                            EnrichWithThreatIntel(entry);
+
+                            entry.risk = AssessRisk(entry);
+                            entry.riskScore = CalculateRiskScore(entry);
+                        }
+                    }
+
+                    entries.push_back(entry);
+                    InvokeEntryCallbacks(entry);
                 }
 
-                entries.push_back(entry);
-                InvokeEntryCallbacks(entry);
+            } catch (const std::exception& e) {
+                Logger::Error("PersistenceDetector: Registry scan exception at {} [view={}]: {}",
+                    SanitizeForLog(location.subkey),
+                    StringUtils::ToNarrow(pass.tag),
+                    SanitizeForLog(e.what()));
             }
-
-        } catch (const std::exception& e) {
-            Logger::Error("PersistenceDetector: Registry scan exception at {}: {}",
-                StringUtils::ToNarrow(location.subkey), e.what());
         }
 
         return entries;
+    }
+
+    /**
+     * @brief Enumerate IFEO and SilentProcessExit subkeys, surfacing per-image
+     *        Debugger / MonitorProcess hijacks that the parent-only scan misses.
+     *
+     * Both keys live under HKLM with subkey-per-image-name layout:
+     *   HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\<exe>\Debugger
+     *   HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit\<exe>\MonitorProcess
+     *
+     * Both WOW64 views are walked. Each subkey produces at most one
+     * PersistenceEntry (the highest-signal value present).
+     */
+    [[nodiscard]] std::vector<PersistenceEntry> ScanIFEOSubkeys() {
+        std::vector<PersistenceEntry> results;
+
+        struct SubkeyScope {
+            PersistenceType type;
+            std::wstring root;
+            std::wstring valueName;     // The value inside each subkey to read
+            const wchar_t* friendly;
+            const char* mitre;
+        };
+        const SubkeyScope kScopes[] = {
+            { PersistenceType::IFEO_Debugger,
+              L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
+              L"Debugger", L"IFEO", "T1546.012" },
+            { PersistenceType::SilentProcessExit,
+              L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit",
+              L"MonitorProcess", L"SilentProcessExit", "T1546.012" },
+        };
+        const struct { bool w64; bool w32; const wchar_t* tag; } kViews[] = {
+            { true,  false, L"64" },
+            { false, true,  L"32" },
+        };
+
+        std::unordered_set<std::wstring> seen;
+        seen.reserve(64);
+
+        for (const auto& scope : kScopes) {
+            for (const auto& v : kViews) {
+                try {
+                    Utils::RegistryUtils::RegistryKey parent;
+                    Utils::RegistryUtils::OpenOptions popts;
+                    popts.access = KEY_READ;
+                    popts.wow64_64 = v.w64;
+                    popts.wow64_32 = v.w32;
+                    if (!parent.Open(HKEY_LOCAL_MACHINE, scope.root, popts)) {
+                        continue;
+                    }
+
+                    std::vector<std::wstring> subkeys;
+                    if (!parent.EnumKeys(subkeys) || subkeys.empty()) {
+                        continue;
+                    }
+
+                    for (const auto& imageName : subkeys) {
+                        if (imageName.empty()) continue;
+
+                        const std::wstring fullPath = scope.root + L"\\" + imageName;
+                        Utils::RegistryUtils::RegistryKey child;
+                        if (!child.Open(HKEY_LOCAL_MACHINE, fullPath, popts)) {
+                            continue;
+                        }
+
+                        std::wstring value;
+                        if (!child.ReadString(scope.valueName, value) || value.empty()) {
+                            // Fall back to the EXPAND_SZ form for SilentProcessExit
+                            if (!child.ReadExpandString(scope.valueName, value, true) || value.empty()) {
+                                continue;
+                            }
+                        }
+
+                        if (value.size() > kMaxRawCommandChars) {
+                            value.resize(kMaxRawCommandChars);
+                        }
+
+                        std::wstring dedupKey =
+                            StringUtils::ToLowerCopy(imageName) + L"|" +
+                            StringUtils::ToLowerCopy(value);
+                        if (!seen.insert(std::move(dedupKey)).second) {
+                            continue;
+                        }
+
+                        PersistenceEntry entry{};
+                        entry.type = scope.type;
+                        entry.entryName = imageName;
+                        entry.location = std::format(L"HKLM\\{}\\{} [{}; view={}]",
+                            scope.root, imageName, scope.friendly, v.tag);
+                        entry.isUserEntry = false;
+                        entry.mitreTechnique = scope.mitre;
+                        entry.rawCommand = std::move(value);
+                        entry.lastScanned = system_clock::now();
+
+                        if (m_config.resolveTargets && !entry.rawCommand.empty()) {
+                            entry.target = ResolveTargetImpl(entry.rawCommand);
+                            if (IsWhitelisted(entry)) {
+                                entry.risk = PersistenceRiskLevel::Safe;
+                                entry.riskScore = 0;
+                                entry.isKnownGood = true;
+                            } else {
+                                EnrichWithHashLookup(entry);
+                                EnrichWithThreatIntel(entry);
+                                entry.risk = AssessRisk(entry);
+                                entry.riskScore = CalculateRiskScore(entry);
+                            }
+                        }
+
+                        InvokeEntryCallbacks(entry);
+                        results.push_back(std::move(entry));
+                    }
+                } catch (const std::exception& e) {
+                    Logger::Error("PersistenceDetector: IFEO/SPE scan exception at {} [view={}]: {}",
+                        SanitizeForLog(scope.root),
+                        StringUtils::ToNarrow(v.tag),
+                        SanitizeForLog(e.what()));
+                }
+            }
+        }
+
+        return results;
     }
 
     // ========================================================================
@@ -918,7 +1286,15 @@ public:
         return tasks;
     }
 
-    void EnumerateTaskFolder(ITaskFolder* pFolder, std::vector<ScheduledTaskEntry>& tasks) {
+    void EnumerateTaskFolder(ITaskFolder* pFolder, std::vector<ScheduledTaskEntry>& tasks, size_t depth = 0) {
+        // Bound recursion so a hostile/loopy Task Scheduler hierarchy cannot
+        // exhaust the stack. Real-world task trees are shallow; 16 is generous.
+        if (depth >= kMaxTaskRecursionDepth) {
+            Logger::Warn("PersistenceDetector: Task folder recursion depth cap ({}) reached; pruning",
+                kMaxTaskRecursionDepth);
+            return;
+        }
+
         // Enumerate tasks in this folder
         IRegisteredTaskCollection* pTaskCollection = nullptr;
         HRESULT hr = pFolder->GetTasks(TASK_ENUM_HIDDEN, &pTaskCollection);
@@ -950,7 +1326,7 @@ public:
                 ITaskFolder* pSubFolder = nullptr;
                 hr = pFolderCollection->get_Item(_variant_t(i), &pSubFolder);
                 if (SUCCEEDED(hr)) {
-                    EnumerateTaskFolder(pSubFolder, tasks);
+                    EnumerateTaskFolder(pSubFolder, tasks, depth + 1);
                     pSubFolder->Release();
                 }
             }
@@ -1021,8 +1397,20 @@ public:
 
                                     BSTR args = nullptr;
                                     if (SUCCEEDED(pExecAction->get_Arguments(&args))) {
-                                        action.arguments = args;
+                                        if (args != nullptr) {
+                                            const size_t argLen = ::SysStringLen(args);
+                                            action.arguments.assign(args,
+                                                std::min<size_t>(argLen, kMaxArgumentChars));
+                                        }
                                         SysFreeString(args);
+                                    }
+
+                                    BSTR workDir = nullptr;
+                                    if (SUCCEEDED(pExecAction->get_WorkingDirectory(&workDir))) {
+                                        if (workDir != nullptr) {
+                                            action.workingDirectory = workDir;
+                                        }
+                                        SysFreeString(workDir);
                                     }
 
                                     entry.actions.push_back(action);
@@ -1035,6 +1423,63 @@ public:
                     }
 
                     pActions->Release();
+                }
+
+                // Triggers — required to surface persistence reach (boot vs.
+                // logon vs. event-driven). Lack of trigger telemetry was making
+                // it impossible for downstream policy to differentiate a Logon
+                // task from a one-shot Time trigger.
+                ITriggerCollection* pTriggers = nullptr;
+                if (SUCCEEDED(pDefinition->get_Triggers(&pTriggers))) {
+                    LONG triggerCount = 0;
+                    pTriggers->get_Count(&triggerCount);
+
+                    for (LONG i = 1; i <= triggerCount; ++i) {
+                        ITrigger* pTrigger = nullptr;
+                        if (SUCCEEDED(pTriggers->get_Item(i, &pTrigger)) && pTrigger != nullptr) {
+                            ScheduledTaskEntry::TaskTrigger trig{};
+
+                            TASK_TRIGGER_TYPE2 ttype{};
+                            if (SUCCEEDED(pTrigger->get_Type(&ttype))) {
+                                switch (ttype) {
+                                    case TASK_TRIGGER_EVENT:              trig.type = L"Event"; break;
+                                    case TASK_TRIGGER_TIME:               trig.type = L"Time"; break;
+                                    case TASK_TRIGGER_DAILY:              trig.type = L"Daily"; break;
+                                    case TASK_TRIGGER_WEEKLY:             trig.type = L"Weekly"; break;
+                                    case TASK_TRIGGER_MONTHLY:            trig.type = L"Monthly"; break;
+                                    case TASK_TRIGGER_MONTHLYDOW:         trig.type = L"MonthlyDOW"; break;
+                                    case TASK_TRIGGER_IDLE:               trig.type = L"Idle"; break;
+                                    case TASK_TRIGGER_REGISTRATION:       trig.type = L"Registration"; break;
+                                    case TASK_TRIGGER_BOOT:               trig.type = L"Boot"; break;
+                                    case TASK_TRIGGER_LOGON:              trig.type = L"Logon"; break;
+                                    case TASK_TRIGGER_SESSION_STATE_CHANGE: trig.type = L"SessionStateChange"; break;
+                                    default:                              trig.type = L"Unknown"; break;
+                                }
+                            }
+
+                            VARIANT_BOOL enabled = VARIANT_TRUE;
+                            if (SUCCEEDED(pTrigger->get_Enabled(&enabled))) {
+                                trig.enabled = (enabled != VARIANT_FALSE);
+                            }
+
+                            BSTR id = nullptr;
+                            if (SUCCEEDED(pTrigger->get_Id(&id))) {
+                                if (id != nullptr) trig.details = id;
+                                SysFreeString(id);
+                            }
+                            if (trig.details.empty()) {
+                                BSTR start = nullptr;
+                                if (SUCCEEDED(pTrigger->get_StartBoundary(&start))) {
+                                    if (start != nullptr) trig.details = start;
+                                    SysFreeString(start);
+                                }
+                            }
+
+                            entry.triggers.push_back(std::move(trig));
+                            pTrigger->Release();
+                        }
+                    }
+                    pTriggers->Release();
                 }
 
                 pDefinition->Release();
@@ -1129,7 +1574,6 @@ public:
                                     sub.consumerName = vtCName.bstrVal;
 
                                 // Determine consumer type and extract payload
-                                VARIANT vtPath; VariantInit(&vtPath);
                                 if (SUCCEEDED(pConsumerObj->Get(L"__CLASS", 0, &vtClass, nullptr, nullptr)) && vtClass.vt == VT_BSTR) {
                                     sub.consumerType = vtClass.bstrVal;
 
@@ -1211,24 +1655,13 @@ public:
             std::wstring rawPath = ExtractExecutablePath(command);
             if (rawPath.empty()) return target;
 
-            // Expand environment variables (critical for evasion resistance)
-            wchar_t expandedBuf[MAX_PATH * 2]{};
-            DWORD expandedLen = ExpandEnvironmentStringsW(rawPath.c_str(), expandedBuf,
-                                                          static_cast<DWORD>(std::size(expandedBuf)));
-            std::wstring expandedPath;
-            if (expandedLen > 0 && expandedLen < std::size(expandedBuf)) {
-                expandedPath = expandedBuf;
-            } else {
-                expandedPath = rawPath;
-            }
+            // Expand environment variables (critical for evasion resistance).
+            // Uses dynamic-buffer helper to correctly handle expansions that
+            // would otherwise overflow a fixed MAX_PATH*2 stack buffer.
+            std::wstring expandedPath = ExpandEnvVarsSafe(rawPath);
 
-            // Normalize short (8.3) paths to long form
-            wchar_t longPathBuf[MAX_PATH * 2]{};
-            DWORD longLen = GetLongPathNameW(expandedPath.c_str(), longPathBuf,
-                                              static_cast<DWORD>(std::size(longPathBuf)));
-            if (longLen > 0 && longLen < std::size(longPathBuf)) {
-                expandedPath = longPathBuf;
-            }
+            // Normalize short (8.3) paths to long form with proper buffer growth.
+            expandedPath = NormalizeLongPath(expandedPath);
 
             target.path = expandedPath;
 
@@ -1252,9 +1685,16 @@ public:
             target.exists = fs::exists(filePath, ec);
 
             if (target.exists) {
-                target.fileSize = fs::file_size(filePath, ec);
-                auto lwt = fs::last_write_time(filePath, ec);
-                if (!ec) {
+                std::error_code sizeEc;
+                const auto fsz = fs::file_size(filePath, sizeEc);
+                if (!sizeEc) {
+                    target.fileSize = fsz;
+                } else {
+                    target.fileSize = 0;
+                }
+                std::error_code timeEc;
+                auto lwt = fs::last_write_time(filePath, timeEc);
+                if (!timeEc) {
                     auto sctp = std::chrono::clock_cast<std::chrono::system_clock>(lwt);
                     target.modifiedTime = sctp;
                 }
@@ -1291,11 +1731,10 @@ public:
                     target.isHidden = (attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
                 }
 
-                // Check for Alternate Data Streams (ADS) via ":" in path after drive letter
-                if (target.path.size() > 3) {
-                    auto adsPos = target.path.find(L':', 2);
-                    target.hasADS = (adsPos != std::wstring::npos);
-                }
+                // Conservative ADS detection — flag only when a colon appears in
+                // the filename component itself, never on legitimate drive
+                // letters or `\\?\` prefixes.
+                target.hasADS = DetectAlternateDataStream(target.path);
 
                 // Signature verification (if enabled and file is PE)
                 if (m_config.verifySignatures && (target.isExecutable || target.isDLL)) {
@@ -1317,12 +1756,15 @@ public:
                 // Could be deleted malware or ADS-hidden payload
             }
 
-            // Cache result
+            // Cache result with FIFO eviction so we cannot get stuck holding
+            // stale targets indefinitely while skipping fresh ones.
             if (m_config.useCache) {
                 std::unique_lock cacheLock(m_cacheMutex);
-                if (m_targetCache.size() < PersistenceDetectorConstants::SIGNATURE_CACHE_SIZE) {
-                    m_targetCache[command] = target;
+                if (m_targetCache.size() >= PersistenceDetectorConstants::SIGNATURE_CACHE_SIZE) {
+                    // Drop a single (any) entry: bounded eviction.
+                    m_targetCache.erase(m_targetCache.begin());
                 }
+                m_targetCache[command] = target;
             }
 
         } catch (const std::exception& e) {
@@ -1336,35 +1778,67 @@ public:
     // TARGET ENRICHMENT HELPERS
     // ========================================================================
 
+    /**
+     * @brief Verify embedded Authenticode signature on a PE/script binary.
+     *
+     * Replaces the previous CertUtils::Certificate::LoadFromFile implementation,
+     * which interpreted the target as a raw .crt/.cer X.509 file and therefore
+     * reported every real PE as `NotSigned`. We now use the canonical
+     * PEFileSignatureVerifier (same primitive used by StartupAnalyzer) which
+     * walks WinTrust + the embedded WIN_CERTIFICATE table. "Microsoft-signed"
+     * is only honoured when the chain is trusted AND the signer subject
+     * actually matches a known Microsoft signing entity, blocking spoofing
+     * attacks via cert subjects that merely contain the word "microsoft".
+     */
     void VerifyTargetSignature(TargetBinary& target) {
         try {
-            CertUtils::Certificate cert;
-            CertUtils::Error certErr;
-            if (cert.LoadFromFile(target.path, &certErr)) {
-                CertUtils::CertificateInfo info;
-                if (cert.GetInfo(info, &certErr)) {
-                    target.signerName = info.subject;
-                    target.issuerName = info.issuer;
-                }
+            pe_sig_utils::SignatureInfo peInfo;
+            pe_sig_utils::Error peErr;
 
-                if (cert.IsValid()) {
-                    target.signatureStatus = SignatureStatus::SignedValid;
-                    target.isTrusted = true;
+            const bool fullyTrusted = m_sigVerifier.VerifyPESignature(
+                target.path, peInfo, &peErr);
 
-                    std::wstring lowerSigner = StringUtils::ToLowerCopy(target.signerName);
-                    target.isMicrosoftSigned = (lowerSigner.find(L"microsoft") != std::wstring::npos);
-                } else {
-                    target.signatureStatus = SignatureStatus::SignedInvalid;
-                }
-            } else {
+            target.signerName = peInfo.signerName;
+            target.issuerName = peInfo.issuerName;
+
+            if (!peInfo.isSigned) {
                 target.signatureStatus = SignatureStatus::NotSigned;
+                target.isTrusted = false;
+                target.isMicrosoftSigned = false;
+            } else if (fullyTrusted && peInfo.isVerified && peInfo.isChainTrusted) {
+                target.signatureStatus = SignatureStatus::SignedValid;
+                target.isTrusted = true;
+
+                // Strict Microsoft-signer check: chain must be trusted and the
+                // subject CN must start with a known Microsoft identity prefix.
+                // A loose `signer.find("microsoft") != npos` accepts attacker
+                // certs like "Microsoft Update Inc." issued by anyone, which
+                // is why we instead anchor on the well-known signing CNs.
+                const std::wstring signer = StringUtils::ToLowerCopy(peInfo.signerName);
+                const std::wstring issuer = StringUtils::ToLowerCopy(peInfo.issuerName);
+                const bool signerLooksMS =
+                    signer == L"microsoft corporation" ||
+                    signer == L"microsoft windows" ||
+                    signer == L"microsoft windows publisher" ||
+                    signer.starts_with(L"microsoft corporation ") ||
+                    signer.starts_with(L"microsoft windows ");
+                const bool issuerLooksMS =
+                    issuer.find(L"microsoft") != std::wstring::npos &&
+                    (issuer.find(L"code signing pca") != std::wstring::npos ||
+                     issuer.find(L"production pca") != std::wstring::npos ||
+                     issuer.find(L"root certificate authority") != std::wstring::npos);
+                target.isMicrosoftSigned = signerLooksMS && issuerLooksMS;
+            } else {
+                target.signatureStatus = SignatureStatus::SignedInvalid;
+                target.isTrusted = false;
+                target.isMicrosoftSigned = false;
             }
 
             m_stats.signaturesVerified.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
             Logger::Debug("PersistenceDetector: Signature verification exception for {}: {}",
-                StringUtils::ToNarrow(target.path), e.what());
+                SanitizeForLog(target.path), SanitizeForLog(e.what()));
             target.signatureStatus = SignatureStatus::Unknown;
         }
     }
@@ -1378,7 +1852,7 @@ public:
             m_stats.hashesChecked.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
             Logger::Debug("PersistenceDetector: Hash computation failed for {}: {}",
-                StringUtils::ToNarrow(target.path), e.what());
+                SanitizeForLog(target.path), SanitizeForLog(e.what()));
         }
     }
 
@@ -1403,18 +1877,33 @@ public:
 
     /**
      * @brief Check if a persistence entry is whitelisted via config or WhiteListStore.
+     *
+     * Path whitelisting uses prefix matching on the lower-cased canonical path
+     * (not substring) so an attacker cannot bypass the check by embedding the
+     * whitelisted token inside an arbitrary path (e.g. dropping a binary at
+     * `C:\Users\Public\Program Files\evil.exe` to spoof a Program Files match).
+     * Hash whitelisting normalises case so callers can mix upper/lower hex.
      */
     [[nodiscard]] bool IsWhitelisted(const PersistenceEntry& entry) const noexcept {
         try {
-            // Check config-level path whitelist
-            std::wstring lowerPath = StringUtils::ToLowerCopy(entry.target.path);
-            for (const auto& wp : m_config.whitelistedPaths) {
-                if (StringUtils::IContains(lowerPath, StringUtils::ToLowerCopy(wp))) {
-                    return true;
+            // Path whitelist: prefix match on lowercased path.
+            if (!entry.target.path.empty()) {
+                const std::wstring lowerPath = StringUtils::ToLowerCopy(entry.target.path);
+                for (const auto& wp : m_config.whitelistedPaths) {
+                    if (wp.empty()) continue;
+                    std::wstring lowerWp = StringUtils::ToLowerCopy(wp);
+                    // Normalise trailing slash so "C:\Windows" matches "C:\Windows\".
+                    if (!lowerWp.empty() && lowerWp.back() != L'\\' && lowerWp.back() != L'/') {
+                        lowerWp.push_back(L'\\');
+                    }
+                    if (lowerPath.size() >= lowerWp.size() &&
+                        lowerPath.compare(0, lowerWp.size(), lowerWp) == 0) {
+                        return true;
+                    }
                 }
             }
 
-            // Check config-level signer whitelist
+            // Signer whitelist (already case-insensitive via IEquals).
             if (!entry.target.signerName.empty()) {
                 for (const auto& ws : m_config.whitelistedSigners) {
                     if (StringUtils::IEquals(entry.target.signerName, ws)) {
@@ -1423,10 +1912,21 @@ public:
                 }
             }
 
-            // Check config-level hash whitelist
+            // Hash whitelist — case-insensitive hex comparison (ASCII-only).
             if (!entry.target.sha256Hex.empty()) {
+                const auto iequalsAscii = [](std::string_view a, std::string_view b) noexcept {
+                    if (a.size() != b.size()) return false;
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        const auto ca = static_cast<unsigned char>(a[i]);
+                        const auto cb = static_cast<unsigned char>(b[i]);
+                        const auto la = (ca >= 'A' && ca <= 'Z') ? static_cast<unsigned char>(ca + 32) : ca;
+                        const auto lb = (cb >= 'A' && cb <= 'Z') ? static_cast<unsigned char>(cb + 32) : cb;
+                        if (la != lb) return false;
+                    }
+                    return true;
+                };
                 for (const auto& wh : m_config.whitelistedHashes) {
-                    if (entry.target.sha256Hex == wh) {
+                    if (iequalsAscii(entry.target.sha256Hex, wh)) {
                         return true;
                     }
                 }
@@ -1541,14 +2041,41 @@ public:
                             StringUtils::IEquals(tokens[i], L"-encodedcommand")) {
                             if (i + 1 < tokens.size()) {
                                 std::string encoded = StringUtils::ToNarrow(tokens[i + 1]);
+                                // Bound attacker-controlled input BEFORE decode so we
+                                // don't allocate megabytes for a single registry value.
+                                if (encoded.size() > kMaxBase64InputChars) {
+                                    Logger::Warn("PersistenceDetector: PowerShell -EncodedCommand exceeds {} chars; skipping",
+                                        kMaxBase64InputChars);
+                                    continue;
+                                }
                                 std::vector<uint8_t> decodedBytes;
-                                if (Base64Decode(encoded, decodedBytes)) {
-                                    // PowerShell -EncodedCommand uses UTF-16LE encoding
+                                Base64DecodeError b64Err = Base64DecodeError::None;
+                                Base64DecodeOptions b64Opt{};
+                                b64Opt.ignoreWhitespace = true;
+                                b64Opt.acceptMissingPadding = true;
+                                if (Base64Decode(encoded, decodedBytes, b64Err, b64Opt) &&
+                                    !decodedBytes.empty()) {
+                                    if (decodedBytes.size() > kMaxBase64DecodedBytes) {
+                                        decodedBytes.resize(kMaxBase64DecodedBytes);
+                                    }
+                                    // PowerShell -EncodedCommand uses UTF-16LE.
+                                    // - Reject odd-length payloads (cannot form whole UTF-16 code units).
+                                    // - Strip an optional UTF-16LE BOM (0xFF 0xFE).
+                                    const uint8_t* dataPtr = decodedBytes.data();
+                                    size_t dataLen = decodedBytes.size();
+                                    if (dataLen >= 2 && dataPtr[0] == 0xFF && dataPtr[1] == 0xFE) {
+                                        dataPtr += 2;
+                                        dataLen -= 2;
+                                    }
+                                    if ((dataLen % sizeof(wchar_t)) != 0) {
+                                        dataLen -= (dataLen % sizeof(wchar_t));
+                                    }
+
                                     std::wstring wDecoded;
-                                    if (decodedBytes.size() >= 2) {
+                                    if (dataLen >= sizeof(wchar_t)) {
                                         wDecoded.assign(
-                                            reinterpret_cast<const wchar_t*>(decodedBytes.data()),
-                                            decodedBytes.size() / sizeof(wchar_t));
+                                            reinterpret_cast<const wchar_t*>(dataPtr),
+                                            dataLen / sizeof(wchar_t));
                                     }
 
                                     TargetBinary encTarget;
@@ -1557,7 +2084,10 @@ public:
                                     encTarget.arguments = wDecoded;
                                     encTarget.isScript = true;
                                     encTarget.description = L"De-obfuscated PowerShell command";
-                                    targets.push_back(encTarget);
+                                    targets.push_back(std::move(encTarget));
+                                } else if (b64Err != Base64DecodeError::None) {
+                                    Logger::Debug("PersistenceDetector: Base64 decode failed: {}",
+                                        Base64DecodeErrorToString(b64Err));
                                 }
                             }
                         }
@@ -1802,7 +2332,7 @@ public:
         const RealTimeAnalysis& analysis
     ) {
         PersistenceAlert alert{};
-        alert.alertId = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+        alert.alertId = m_nextAlertId.fetch_add(1, std::memory_order_relaxed);
         alert.timestamp = system_clock::now();
         alert.type = analysis.detectedType;
         alert.risk = analysis.risk;
@@ -1822,9 +2352,9 @@ public:
 
         Logger::Warn("PersistenceDetector: ALERT - {} persistence attempt at {}/{} -> {} (Risk={})",
             alert.mitreTechnique,
-            StringUtils::ToNarrow(keyPath),
-            StringUtils::ToNarrow(valueName),
-            StringUtils::ToNarrow(analysis.resolvedTarget),
+            SanitizeForLog(keyPath),
+            SanitizeForLog(valueName),
+            SanitizeForLog(analysis.resolvedTarget),
             static_cast<int>(analysis.risk));
     }
 
