@@ -282,6 +282,12 @@ typedef struct _DEVICE_TRIM_DESCRIPTOR {
 [[nodiscard]] static std::wstring SafeExtractRegString(const BYTE* buffer, DWORD bufferSize) {
     if (!buffer || bufferSize == 0) return {};
     
+    // Cap registry value size to prevent unbounded allocation if a malformed
+    // value reports a hostile size. SystemInfoConstants::MAX_REG_VALUE_SIZE = 32KB.
+    if (bufferSize > SystemInfoConstants::MAX_REG_VALUE_SIZE) {
+        bufferSize = static_cast<DWORD>(SystemInfoConstants::MAX_REG_VALUE_SIZE);
+    }
+
     // Calculate max characters (bufferSize is in bytes, wchar_t is 2 bytes)
     size_t maxChars = bufferSize / sizeof(wchar_t);
     if (maxChars == 0) return {};
@@ -297,6 +303,83 @@ typedef struct _DEVICE_TRIM_DESCRIPTOR {
     
     return std::wstring(wstr, actualLen);
 }
+
+// ============================================================================
+// HOSTILE-STRING SANITIZATION HELPERS
+// ============================================================================
+//
+// Many string fields stored in SystemInfo public structs come from sources an
+// attacker can influence on a compromised host: registry values they can
+// overwrite, volume labels, network adapter descriptions injected via INF
+// installation, SMBIOS strings on rooted firmware, etc.
+//
+// These helpers normalize and bound those strings before they reach:
+//   - the logger (CWE-117: log injection via CR/LF / U+2028 / U+2029 / ANSI
+//     escapes)
+//   - the JSON / text snapshot exporter (CWE-150 / CWE-93)
+//   - the cryptographic machine-fingerprint hash (canonicalization so that
+//     trivial whitespace / case differences do not change identity)
+//
+// We deliberately do NOT mutate the original raw bytes used for parsing logic;
+// sanitization happens at the boundary where the string is exposed or hashed.
+
+namespace {
+
+/// @brief Maximum length for device / registry strings stored in public structs.
+constexpr size_t kMaxDeviceStringLen = 1024;
+
+/// @brief Maximum length for a single fingerprint input field.
+constexpr size_t kMaxFingerprintFieldLen = 256;
+
+/// @brief Strip control characters, DEL, line/paragraph separators, and cap
+///        length. Used before any string is logged or written to the snapshot
+///        export.
+[[nodiscard]] std::wstring SanitizeDeviceString(std::wstring_view in,
+                                                size_t maxLen = kMaxDeviceStringLen) noexcept {
+    std::wstring out;
+    out.reserve(std::min(in.size(), maxLen));
+    for (wchar_t c : in) {
+        if (out.size() >= maxLen) break;
+        // Strip C0 controls (incl. CR/LF/TAB), DEL, and Unicode line/paragraph
+        // separators that defeat single-line log parsers.
+        if (c < 0x20 || c == 0x7F || c == 0x2028 || c == 0x2029) {
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+/// @brief Trim leading / trailing ASCII whitespace.
+[[nodiscard]] std::wstring TrimWhitespace(std::wstring s) noexcept {
+    auto isWs = [](wchar_t c) {
+        return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+    };
+    size_t start = 0;
+    while (start < s.size() && isWs(s[start])) ++start;
+    size_t end = s.size();
+    while (end > start && isWs(s[end - 1])) --end;
+    return s.substr(start, end - start);
+}
+
+/// @brief Canonicalize a value before it is fed into the machine-fingerprint
+///        hash: strip controls, trim, lowercase, bound length. Without this,
+///        an attacker who can flip case / whitespace on BIOS / serial strings
+///        (e.g. via SMBIOS firmware spoofing or registry overwrites) can
+///        trivially change the resulting hardware fingerprint.
+[[nodiscard]] std::wstring NormalizeFingerprintField(std::wstring_view in) noexcept {
+    std::wstring s = TrimWhitespace(SanitizeDeviceString(in, kMaxFingerprintFieldLen));
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+    return s;
+}
+
+/// @brief Hard upper bound on adapter / processor info buffers returned by
+///        Windows. Defends against driver-side buffer-size lies.
+constexpr ULONG kMaxAdapterBufferBytes = 16u * 1024u * 1024u;   // 16 MiB
+constexpr DWORD kMaxProcInfoBufferBytes = 4u * 1024u * 1024u;    // 4 MiB
+
+}  // namespace
 
 // ============================================================================
 // STATISTICS METHODS
@@ -468,7 +551,9 @@ struct SystemInfo::SystemInfoImpl {
             // Use GetLogicalProcessorInformation for accurate physical core count
             DWORD bufferSize = 0;
             GetLogicalProcessorInformation(nullptr, &bufferSize);
-            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && bufferSize > 0) {
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && bufferSize > 0 &&
+                bufferSize <= kMaxProcInfoBufferBytes &&
+                (bufferSize % sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION)) == 0) {
                 std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> buffer(
                     bufferSize / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
                 
@@ -669,7 +754,10 @@ struct SystemInfo::SystemInfoImpl {
                     if (GetVolumeInformationW(drivePath.c_str(), volumeNameBuffer, MAX_PATH + 1,
                                               &volumeSerialNumber, nullptr, nullptr,
                                               fileSystemName, MAX_PATH + 1)) {
-                        info.model = volumeNameBuffer;
+                        // Volume label is user-controllable - sanitize before
+                        // storing in public struct (CWE-117 / log-injection
+                        // hardening, also defends downstream JSON export).
+                        info.model = SanitizeDeviceString(volumeNameBuffer);
                         wchar_t serialBuf[32];
                         swprintf_s(serialBuf, L"%08X", volumeSerialNumber);
                         info.serialNumber = serialBuf;
@@ -703,7 +791,15 @@ struct SystemInfo::SystemInfoImpl {
                                                 nullptr, pAddresses, &bufferSize);
             
             if (result == ERROR_BUFFER_OVERFLOW) {
-                buffer.resize(bufferSize);
+                // Cap requested buffer size: a hostile or buggy IP-stack
+                // helper could otherwise drive us to an arbitrary allocation.
+                if (bufferSize == 0 || bufferSize > kMaxAdapterBufferBytes) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                               L"GetAdaptersAddresses requested oversized buffer: %lu bytes",
+                               static_cast<unsigned long>(bufferSize));
+                    return network;
+                }
+                buffer.assign(bufferSize, 0);
                 pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
                 result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX,
                                               nullptr, pAddresses, &bufferSize);
@@ -714,9 +810,14 @@ struct SystemInfo::SystemInfoImpl {
                      pCurrAddresses = pCurrAddresses->Next) {
 
                     NetworkInterfaceInfo info;
-                    // AdapterName is PCHAR (narrow string), convert to wide
-                    info.name = Utils::StringUtils::ToWide(pCurrAddresses->AdapterName);
-                    info.description = pCurrAddresses->Description;  // Already wide
+                    // AdapterName is PCHAR (narrow string), convert to wide;
+                    // both AdapterName and Description originate from driver
+                    // INF metadata which can be attacker-controlled on
+                    // compromised hosts - sanitize before publishing.
+                    info.name = SanitizeDeviceString(
+                        Utils::StringUtils::ToWide(pCurrAddresses->AdapterName ? pCurrAddresses->AdapterName : ""));
+                    info.description = SanitizeDeviceString(
+                        pCurrAddresses->Description ? pCurrAddresses->Description : L"");
                     info.isUp = (pCurrAddresses->OperStatus == IfOperStatusUp);
                     info.isLoopback = (pCurrAddresses->IfType == IF_TYPE_SOFTWARE_LOOPBACK);
 
@@ -1168,13 +1269,17 @@ struct SystemInfo::SystemInfoImpl {
                 DWORD bufferSize = sizeof(buffer);
                 if (RegQueryValueExW(hKey.get(), L"SystemSerialNumber", nullptr, nullptr,
                                     buffer, &bufferSize) == ERROR_SUCCESS) {
-                    fingerprint.biosSerial = SafeExtractRegString(buffer, bufferSize);
+                    // BIOS/SMBIOS values can be tampered with on rooted
+                    // firmware - sanitize before storing or hashing.
+                    fingerprint.biosSerial =
+                        SanitizeDeviceString(SafeExtractRegString(buffer, bufferSize));
                 }
 
                 bufferSize = sizeof(buffer);
                 if (RegQueryValueExW(hKey.get(), L"BaseBoardSerialNumber", nullptr, nullptr,
                                     buffer, &bufferSize) == ERROR_SUCCESS) {
-                    fingerprint.motherboardSerial = SafeExtractRegString(buffer, bufferSize);
+                    fingerprint.motherboardSerial =
+                        SanitizeDeviceString(SafeExtractRegString(buffer, bufferSize));
                 }
             }
 
@@ -1203,20 +1308,34 @@ struct SystemInfo::SystemInfoImpl {
                 DWORD bufferSize = sizeof(buffer);
                 if (RegQueryValueExW(hCryptoKey.get(), L"MachineGuid", nullptr, nullptr,
                                     buffer, &bufferSize) == ERROR_SUCCESS) {
-                    fingerprint.installationId = SafeExtractRegString(buffer, bufferSize);
+                    fingerprint.installationId =
+                        SanitizeDeviceString(SafeExtractRegString(buffer, bufferSize));
                     fingerprint.machineId = fingerprint.installationId;
                 }
             }
 
-            // Generate hardware fingerprint hash using SHA-256
-            std::wstring combinedData = fingerprint.biosSerial +
-                                       fingerprint.motherboardSerial +
-                                       fingerprint.installationId;
+            // Build a canonical, normalized representation before hashing so
+            // that an attacker cannot perturb the fingerprint by simply
+            // changing case / whitespace in BIOS strings or driver-reported
+            // serials. Each field is also length-bounded to a stable upper
+            // limit (kMaxFingerprintFieldLen). A unit separator (U+001F) is
+            // used between fields so concatenation is unambiguous.
+            std::wstring combinedData;
+            combinedData.reserve(4096);
+            auto appendField = [&combinedData](std::wstring_view v) {
+                combinedData.append(NormalizeFingerprintField(v));
+                combinedData.push_back(L'\x1F');
+            };
+            appendField(fingerprint.biosSerial);
+            appendField(fingerprint.motherboardSerial);
+            appendField(fingerprint.installationId);
+            combinedData.append(L"|mac|");
             for (const auto& mac : fingerprint.macAddresses) {
-                combinedData += mac;
+                appendField(mac);
             }
+            combinedData.append(L"|disk|");
             for (const auto& serial : fingerprint.diskSerials) {
-                combinedData += serial;
+                appendField(serial);
             }
 
             // Use SHA-256 via Hasher class for cryptographically secure fingerprint
@@ -2131,119 +2250,183 @@ std::vector<std::wstring> SystemInfo::RunDiagnostics() const {
 
 bool SystemInfo::ExportSnapshot(const std::wstring& outputPath) const {
     try {
-        // Validate output path
+        // ---- Path validation (CWE-22 / CWE-73) -----------------------------
         if (outputPath.empty() || outputPath.length() > MAX_PATH) {
             SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: invalid path length");
             return false;
+        }
+        // Reject embedded NULs and control characters (defeats truncation and
+        // terminal-escape injection if the file is later displayed).
+        for (wchar_t c : outputPath) {
+            if (c == L'\0' || c < 0x20 || c == 0x7F) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                            L"ExportSnapshot: path contains control characters");
+                return false;
+            }
         }
         if (outputPath.find(L"..") != std::wstring::npos) {
             SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: path traversal rejected");
             return false;
         }
-        SS_LOG_INFO(LOG_CATEGORY, L"Exporting system snapshot to: %ls", outputPath.c_str());
+        // Canonicalize to defeat 8.3-name aliasing and relative path tricks.
+        wchar_t fullPath[MAX_PATH] = {0};
+        DWORD fullLen = GetFullPathNameW(outputPath.c_str(), MAX_PATH, fullPath, nullptr);
+        if (fullLen == 0 || fullLen >= MAX_PATH) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                        L"ExportSnapshot: GetFullPathNameW failed (err=%lu)",
+                        GetLastError());
+            return false;
+        }
+        std::wstring canonical(fullPath, fullLen);
 
-        std::wofstream file(outputPath);
-        if (!file.is_open()) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: failed to open output file");
+        SS_LOG_INFO(LOG_CATEGORY, L"Exporting system snapshot to: %ls", canonical.c_str());
+
+        // ---- Atomic write: stage to a temp file then MoveFileEx --------------
+        // This prevents readers from observing a partial snapshot if the
+        // process is killed mid-write, and avoids leaving a half-written file
+        // on disk under the requested name.
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER uli;
+        uli.LowPart = ft.dwLowDateTime;
+        uli.HighPart = ft.dwHighDateTime;
+        std::wstring tempPath = canonical + L".ss_tmp." + std::to_wstring(uli.QuadPart);
+        if (tempPath.length() >= MAX_PATH) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: temp path too long");
             return false;
         }
 
-        auto snapshot = GetSnapshot();
+        {
+            std::wofstream file(tempPath);
+            if (!file.is_open()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: failed to open output file");
+                return false;
+            }
 
-        file << L"SystemInfo Snapshot\n";
-        file << L"===================\n\n";
+            auto snapshot = GetSnapshot();
 
-        // OS Information
-        file << L"Operating System:\n";
-        file << L"  Product: " << snapshot.os.productName << L"\n";
-        file << L"  Version: " << snapshot.os.majorVersion << L"."
-             << snapshot.os.minorVersion << L"." << snapshot.os.buildNumber << L"\n";
-        file << L"  Edition: " << snapshot.os.edition << L"\n";
-        file << L"  Display Version: " << snapshot.os.displayVersion << L"\n\n";
+            // All snapshot fields that come from attacker-influenceable sources
+            // (volume labels, adapter descriptions, BIOS strings, computer
+            // name, user name, domain name, etc.) are run through
+            // SanitizeDeviceString before being written. This defeats text /
+            // terminal-escape injection if the snapshot is later cat'd or
+            // ingested by a log pipeline (CWE-117 / CWE-150).
+            auto san = [](std::wstring_view s) {
+                return SanitizeDeviceString(s);
+            };
 
-        // CPU Information
-        file << L"CPU:\n";
-        file << L"  Brand: " << snapshot.cpu.brand << L"\n";
-        file << L"  Vendor: " << snapshot.cpu.vendor << L"\n";
-        file << L"  Cores: " << snapshot.cpu.logicalCores << L" logical, "
-             << snapshot.cpu.physicalCores << L" physical\n";
-        file << L"  Features: ";
-        if (snapshot.cpu.hasAVX) file << L"AVX ";
-        if (snapshot.cpu.hasAVX2) file << L"AVX2 ";
-        if (snapshot.cpu.hasAVX512) file << L"AVX512 ";
-        if (snapshot.cpu.hasAESNI) file << L"AES-NI ";
-        file << L"\n\n";
+            file << L"SystemInfo Snapshot\n";
+            file << L"===================\n\n";
 
-        // Memory
-        file << L"Memory:\n";
-        file << L"  Total: " << (snapshot.memory.totalPhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) << L" GB\n";
-        file << L"  Available: " << (snapshot.memory.availablePhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) << L" GB\n";
-        file << L"  Load: " << snapshot.memory.memoryLoad << L"%\n\n";
+            // OS Information
+            file << L"Operating System:\n";
+            file << L"  Product: " << san(snapshot.os.productName) << L"\n";
+            file << L"  Version: " << snapshot.os.majorVersion << L"."
+                 << snapshot.os.minorVersion << L"." << snapshot.os.buildNumber << L"\n";
+            file << L"  Edition: " << san(snapshot.os.edition) << L"\n";
+            file << L"  Display Version: " << san(snapshot.os.displayVersion) << L"\n\n";
 
-        // Virtualization
-        file << L"Virtualization:\n";
-        file << L"  Status: " << (snapshot.virtualization.isVirtualized ? L"Virtualized" : L"Physical") << L"\n";
-        if (snapshot.virtualization.isVirtualized) {
-            file << L"  Type: " << GetVirtualizationTypeName(snapshot.virtualization.type).data() << L"\n";
-            file << L"  Confidence: " << (snapshot.virtualization.confidence * 100.0) << L"%\n";
+            // CPU Information
+            file << L"CPU:\n";
+            file << L"  Brand: " << san(snapshot.cpu.brand) << L"\n";
+            file << L"  Vendor: " << san(snapshot.cpu.vendor) << L"\n";
+            file << L"  Cores: " << snapshot.cpu.logicalCores << L" logical, "
+                 << snapshot.cpu.physicalCores << L" physical\n";
+            file << L"  Features: ";
+            if (snapshot.cpu.hasAVX) file << L"AVX ";
+            if (snapshot.cpu.hasAVX2) file << L"AVX2 ";
+            if (snapshot.cpu.hasAVX512) file << L"AVX512 ";
+            if (snapshot.cpu.hasAESNI) file << L"AES-NI ";
+            file << L"\n\n";
+
+            // Memory
+            file << L"Memory:\n";
+            file << L"  Total: " << (snapshot.memory.totalPhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) << L" GB\n";
+            file << L"  Available: " << (snapshot.memory.availablePhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) << L" GB\n";
+            file << L"  Load: " << snapshot.memory.memoryLoad << L"%\n\n";
+
+            // Virtualization
+            file << L"Virtualization:\n";
+            file << L"  Status: " << (snapshot.virtualization.isVirtualized ? L"Virtualized" : L"Physical") << L"\n";
+            if (snapshot.virtualization.isVirtualized) {
+                file << L"  Type: " << GetVirtualizationTypeName(snapshot.virtualization.type).data() << L"\n";
+                file << L"  Confidence: " << (snapshot.virtualization.confidence * 100.0) << L"%\n";
+            }
+            file << L"\n";
+
+            // Sandbox
+            file << L"Sandbox:\n";
+            file << L"  Status: " << (snapshot.sandbox.isSandboxed ? L"Sandboxed" : L"Normal") << L"\n";
+            if (snapshot.sandbox.isSandboxed) {
+                file << L"  Type: " << GetSandboxTypeName(snapshot.sandbox.type).data() << L"\n";
+                file << L"  Confidence: " << (snapshot.sandbox.confidence * 100.0) << L"%\n";
+            }
+            file << L"\n";
+
+            // Security
+            file << L"Security Settings:\n";
+            file << L"  Secure Boot: " << (snapshot.security.isSecureBoot ? L"Enabled" : L"Disabled") << L"\n";
+            file << L"  BitLocker: " << (snapshot.security.isBitLockerEnabled ? L"Enabled" : L"Disabled") << L"\n";
+            file << L"  UAC: " << (snapshot.security.isUACEnabled ? L"Enabled" : L"Disabled") << L"\n";
+            file << L"  Windows Defender: " << (snapshot.security.isDefenderEnabled ? L"Enabled" : L"Disabled") << L"\n";
+            file << L"  Firewall: " << (snapshot.security.isFirewallEnabled ? L"Enabled" : L"Disabled") << L"\n";
+            file << L"\n";
+
+            // Machine ID - fingerprint fields are already sanitized at source,
+            // but defensive re-sanitization is cheap.
+            file << L"Machine Identification:\n";
+            file << L"  Machine ID: " << san(snapshot.fingerprint.machineId) << L"\n";
+            file << L"  Hardware Fingerprint: " << san(snapshot.fingerprint.hardwareFingerprint) << L"\n\n";
+
+            // Domain Info
+            file << L"Domain:\n";
+            file << L"  Computer Name: " << san(snapshot.domain.computerName) << L"\n";
+            file << L"  Domain Joined: " << (snapshot.domain.isDomainJoined ? L"Yes" : L"No") << L"\n";
+            if (snapshot.domain.isDomainJoined) {
+                file << L"  Domain: " << san(snapshot.domain.domainName) << L"\n";
+                file << L"  FQDN: " << san(snapshot.domain.fqdn) << L"\n";
+            }
+            file << L"\n";
+
+            // User Context
+            file << L"User Context:\n";
+            file << L"  User: " << san(snapshot.userContext.userName) << L"\n";
+            file << L"  Elevated: " << (snapshot.userContext.isElevated ? L"Yes" : L"No") << L"\n";
+            file << L"  System Account: " << (snapshot.userContext.isSystem ? L"Yes" : L"No") << L"\n";
+            file << L"  Local Admin: " << (snapshot.userContext.isLocalAdmin ? L"Yes" : L"No") << L"\n";
+            file << L"\n";
+
+            // Patch Assessment
+            file << L"Patch Assessment:\n";
+            file << L"  Days Since Last Patch: " << snapshot.patchAssessment.daysSinceLastPatch << L"\n";
+            file << L"  Patch Current: " << (snapshot.patchAssessment.isPatchCurrent ? L"Yes" : L"No") << L"\n";
+            file << L"  High Risk: " << (snapshot.patchAssessment.isHighRisk ? L"Yes" : L"No") << L"\n";
+            file << L"\n";
+
+            // OS Validation
+            if (snapshot.osValidation.isSpoofDetected) {
+                file << L"WARNING: OS version spoofing detected!\n";
+                file << L"  Details: " << san(snapshot.osValidation.details) << L"\n\n";
+            }
+
+            file.flush();
+            file.close();
+            if (file.fail()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: write to temp file failed");
+                DeleteFileW(tempPath.c_str());
+                return false;
+            }
         }
-        file << L"\n";
 
-        // Sandbox
-        file << L"Sandbox:\n";
-        file << L"  Status: " << (snapshot.sandbox.isSandboxed ? L"Sandboxed" : L"Normal") << L"\n";
-        if (snapshot.sandbox.isSandboxed) {
-            file << L"  Type: " << GetSandboxTypeName(snapshot.sandbox.type).data() << L"\n";
-            file << L"  Confidence: " << (snapshot.sandbox.confidence * 100.0) << L"%\n";
+        // Atomic publish.
+        if (!MoveFileExW(tempPath.c_str(), canonical.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DWORD err = GetLastError();
+            SS_LOG_ERROR(LOG_CATEGORY,
+                        L"ExportSnapshot: atomic rename failed (err=%lu)", err);
+            DeleteFileW(tempPath.c_str());
+            return false;
         }
-        file << L"\n";
-
-        // Security
-        file << L"Security Settings:\n";
-        file << L"  Secure Boot: " << (snapshot.security.isSecureBoot ? L"Enabled" : L"Disabled") << L"\n";
-        file << L"  BitLocker: " << (snapshot.security.isBitLockerEnabled ? L"Enabled" : L"Disabled") << L"\n";
-        file << L"  UAC: " << (snapshot.security.isUACEnabled ? L"Enabled" : L"Disabled") << L"\n";
-        file << L"  Windows Defender: " << (snapshot.security.isDefenderEnabled ? L"Enabled" : L"Disabled") << L"\n";
-        file << L"  Firewall: " << (snapshot.security.isFirewallEnabled ? L"Enabled" : L"Disabled") << L"\n";
-        file << L"\n";
-
-        // Machine ID
-        file << L"Machine Identification:\n";
-        file << L"  Machine ID: " << snapshot.fingerprint.machineId << L"\n";
-        file << L"  Hardware Fingerprint: " << snapshot.fingerprint.hardwareFingerprint << L"\n\n";
-
-        // Domain Info
-        file << L"Domain:\n";
-        file << L"  Computer Name: " << snapshot.domain.computerName << L"\n";
-        file << L"  Domain Joined: " << (snapshot.domain.isDomainJoined ? L"Yes" : L"No") << L"\n";
-        if (snapshot.domain.isDomainJoined) {
-            file << L"  Domain: " << snapshot.domain.domainName << L"\n";
-            file << L"  FQDN: " << snapshot.domain.fqdn << L"\n";
-        }
-        file << L"\n";
-
-        // User Context
-        file << L"User Context:\n";
-        file << L"  User: " << snapshot.userContext.userName << L"\n";
-        file << L"  Elevated: " << (snapshot.userContext.isElevated ? L"Yes" : L"No") << L"\n";
-        file << L"  System Account: " << (snapshot.userContext.isSystem ? L"Yes" : L"No") << L"\n";
-        file << L"  Local Admin: " << (snapshot.userContext.isLocalAdmin ? L"Yes" : L"No") << L"\n";
-        file << L"\n";
-
-        // Patch Assessment
-        file << L"Patch Assessment:\n";
-        file << L"  Days Since Last Patch: " << snapshot.patchAssessment.daysSinceLastPatch << L"\n";
-        file << L"  Patch Current: " << (snapshot.patchAssessment.isPatchCurrent ? L"Yes" : L"No") << L"\n";
-        file << L"  High Risk: " << (snapshot.patchAssessment.isHighRisk ? L"Yes" : L"No") << L"\n";
-        file << L"\n";
-
-        // OS Validation
-        if (snapshot.osValidation.isSpoofDetected) {
-            file << L"WARNING: OS version spoofing detected!\n";
-            file << L"  Details: " << snapshot.osValidation.details << L"\n\n";
-        }
-
-        file.close();
         return true;
 
     } catch (const std::exception& e) {
