@@ -179,23 +179,35 @@ private:
     if (serviceName.empty()) {
         return false;
     }
-    
-    // Length check (Windows limit is 256 characters)
-    if (serviceName.length() > 256) {
+
+    // Length check (SCM limit is 256 characters, including null terminator implicitly).
+    // Use 255 to be conservative.
+    if (serviceName.length() > 255) {
         return false;
     }
-    
-    // Check for embedded null characters
-    if (serviceName.find(L'\0') != std::wstring::npos) {
+
+    // Leading/trailing whitespace would silently confuse SCM equality checks.
+    if (serviceName.front() == L' ' || serviceName.front() == L'\t' ||
+        serviceName.back()  == L' ' || serviceName.back()  == L'\t') {
         return false;
     }
-    
-    // Check for invalid characters (backslash, forward slash)
-    if (serviceName.find(L'\\') != std::wstring::npos ||
-        serviceName.find(L'/') != std::wstring::npos) {
-        return false;
+
+    // Reject any control character, DEL, path-separators, SCM-illegal punctuation,
+    // and embedded NUL. Windows SCM names must not contain backslash, forward
+    // slash, or any of the reserved file-system characters; control characters
+    // are also rejected to defeat log/UI injection via attacker-supplied names.
+    for (wchar_t ch : serviceName) {
+        if (ch < 0x20 || ch == 0x7F) return false;
+        switch (ch) {
+            case L'\\': case L'/':  case L'<':  case L'>':
+            case L':':  case L'"':  case L'|':  case L'?':
+            case L'*':  case L'\0':
+                return false;
+            default:
+                break;
+        }
     }
-    
+
     return true;
 }
 
@@ -204,6 +216,55 @@ private:
 // ============================================================================
 
 namespace {
+
+// ============================================================================
+// SANITIZATION HELPERS (defense against log/JSON injection via attacker-controlled
+// service names, display names, binary paths, etc.). CWE-117 / CWE-93.
+// ============================================================================
+
+[[nodiscard]] std::wstring SanitizeForLogW(std::wstring_view in, size_t maxLen = 512) noexcept {
+    std::wstring out;
+    out.reserve((std::min)(in.size(), maxLen));
+    for (wchar_t ch : in) {
+        if (out.size() >= maxLen) {
+            out.append(L"...");
+            break;
+        }
+        // Strip control characters, DEL, and Unicode line/paragraph separators
+        // that would break log/JSON serialization or enable forged log lines.
+        if (ch < 0x20 || ch == 0x7F || ch == 0x2028 || ch == 0x2029) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::string SanitizeForLogA(std::string_view in, size_t maxLen = 1024) noexcept {
+    std::string out;
+    out.reserve((std::min)(in.size(), maxLen));
+    for (unsigned char ch : in) {
+        if (out.size() >= maxLen) {
+            out.append("...");
+            break;
+        }
+        if (ch < 0x20 || ch == 0x7F) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(ch));
+        }
+    }
+    return out;
+}
+
+// ============================================================================
+// ENUMERATION BUFFER CAP — defends against pathological SCM responses and
+// integer-overflow-style allocations driven by attacker-influenced state.
+// 64 MiB is several orders of magnitude above any realistic SCM payload
+// (Windows hosts cap out at a few hundred KiB even with thousands of services).
+// ============================================================================
+constexpr DWORD kMaxEnumBufferBytes = 64u * 1024u * 1024u;
 
 // Known legitimate apps that install services in ProgramData
 // (to reduce false positives)
@@ -406,12 +467,139 @@ private:
 }
 
 /**
- * @brief Check if binary is Microsoft-signed.
+ * @brief Canonicalize a Windows path to its fully-qualified, long-form,
+ *        lowercase representation suitable for prefix comparison against
+ *        the canonical system directories. Returns empty on failure.
+ *
+ * Defense in depth against substring spoofing of "trusted" paths
+ * (e.g., C:\evil\windows\system32\foo.exe). CWE-22 / CWE-426.
+ */
+[[nodiscard]] std::wstring CanonicalizePathLower(const std::wstring& path) noexcept {
+    if (path.empty() || path.size() > 32767) return {};
+
+    try {
+        // First, fully-qualify (resolve relative, ".." segments, etc.).
+        DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (needed == 0 || needed > 32768) return {};
+        std::wstring full(needed, L'\0');
+        DWORD wrote = GetFullPathNameW(path.c_str(), needed, full.data(), nullptr);
+        if (wrote == 0 || wrote >= needed) return {};
+        full.resize(wrote);
+
+        // Then resolve 8.3 short names to long form. This neutralizes
+        // PROGRA~1 style aliasing of trusted directories.
+        needed = GetLongPathNameW(full.c_str(), nullptr, 0);
+        if (needed > 0 && needed <= 32768) {
+            std::wstring longForm(needed, L'\0');
+            DWORD wrote2 = GetLongPathNameW(full.c_str(), longForm.data(), needed);
+            if (wrote2 > 0 && wrote2 < needed) {
+                longForm.resize(wrote2);
+                full = std::move(longForm);
+            }
+        }
+
+        return StringUtils::ToLowerCopy(full);
+    } catch (...) {
+        return {};
+    }
+}
+
+/**
+ * @brief Return a lowercase canonical Microsoft prefix set, computed from the
+ *        live system, lazily and once. Functions returns the cached prefixes
+ *        sorted longest-first to ensure proper prefix matching.
+ */
+[[nodiscard]] const std::vector<std::wstring>& GetMicrosoftCanonicalPrefixes() noexcept {
+    static const std::vector<std::wstring> kPrefixes = []() noexcept -> std::vector<std::wstring> {
+        std::vector<std::wstring> result;
+        result.reserve(8);
+
+        auto addCanonical = [&](const std::wstring& raw) {
+            std::wstring canon = CanonicalizePathLower(raw);
+            if (!canon.empty()) {
+                if (canon.back() != L'\\') canon.push_back(L'\\');
+                result.push_back(std::move(canon));
+            }
+        };
+
+        wchar_t buf[MAX_PATH] = {};
+
+        // %WINDIR% (e.g., C:\Windows)
+        if (UINT n = GetWindowsDirectoryW(buf, MAX_PATH); n > 0 && n < MAX_PATH) {
+            addCanonical(std::wstring(buf, n));
+        }
+        // %SYSTEMROOT%\System32
+        if (UINT n = GetSystemDirectoryW(buf, MAX_PATH); n > 0 && n < MAX_PATH) {
+            addCanonical(std::wstring(buf, n));
+        }
+        // %SYSTEMROOT%\SysWOW64
+        if (UINT n = GetSystemWow64DirectoryW(buf, MAX_PATH); n > 0 && n < MAX_PATH) {
+            addCanonical(std::wstring(buf, n));
+        }
+
+        // %ProgramFiles%, %ProgramFiles(x86)%, %ProgramData% — resolve via env var
+        auto addFromEnv = [&](const wchar_t* name, const wchar_t* subdir) {
+            wchar_t value[MAX_PATH];
+            DWORD len = GetEnvironmentVariableW(name, value, MAX_PATH);
+            if (len > 0 && len < MAX_PATH) {
+                std::wstring full(value, len);
+                if (subdir && *subdir) {
+                    if (full.back() != L'\\') full.push_back(L'\\');
+                    full.append(subdir);
+                }
+                addCanonical(full);
+            }
+        };
+
+        // Lock down trusted subtrees only. We deliberately do NOT trust the
+        // whole of ProgramData — only the Microsoft subtree under it.
+        addFromEnv(L"ProgramFiles",       L"Windows Defender\\");
+        addFromEnv(L"ProgramFiles(x86)",  L"Windows Defender\\");
+        addFromEnv(L"ProgramData",        L"Microsoft\\");
+
+        // Sort longest-prefix-first so the most specific paths are checked first.
+        std::sort(result.begin(), result.end(),
+            [](const std::wstring& a, const std::wstring& b) {
+                return a.size() > b.size();
+            });
+
+        return result;
+    }();
+    return kPrefixes;
+}
+
+/**
+ * @brief Check if binary is Microsoft-signed AND resides under a canonical
+ *        Microsoft-owned directory. This combination defeats:
+ *          - EV-signed third-party binaries dropped into untrusted paths
+ *          - Spoofed substrings like C:\foo\windows\system32\evil.exe
+ *          - 8.3 short-name aliasing (PROGRA~1)
+ *          - Relative path / traversal tricks
  */
 [[nodiscard]] bool IsMicrosoftBinary(const std::wstring& binaryPath) noexcept {
     try {
+        if (binaryPath.empty()) return false;
         if (!FileUtils::Exists(binaryPath)) return false;
 
+        // Canonicalize first; if we cannot, treat as untrusted.
+        const std::wstring canon = CanonicalizePathLower(binaryPath);
+        if (canon.empty()) return false;
+
+        const auto& prefixes = GetMicrosoftCanonicalPrefixes();
+        bool inTrustedPath = false;
+        for (const auto& p : prefixes) {
+            if (canon.size() >= p.size() &&
+                std::equal(p.begin(), p.end(), canon.begin())) {
+                inTrustedPath = true;
+                break;
+            }
+        }
+
+        // Not in a known Microsoft directory — never claim it as Microsoft,
+        // even if Authenticode succeeds (any EV-cert holder can sign).
+        if (!inTrustedPath) return false;
+
+        // Now confirm Authenticode signature.
         WINTRUST_FILE_INFO fileData = {};
         fileData.cbStruct = sizeof(fileData);
         fileData.pcwszFilePath = binaryPath.c_str();
@@ -424,33 +612,15 @@ private:
         trustData.pFile = &fileData;
         trustData.dwStateAction = WTD_STATEACTION_VERIFY;
 
-        // Verify digital signature
         GUID guidAction = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         LONG result = WinVerifyTrust(nullptr, &guidAction, &trustData);
-        bool isTrusted = (result == ERROR_SUCCESS);
+        const bool isTrusted = (result == ERROR_SUCCESS);
 
         // Cleanup
         trustData.dwStateAction = WTD_STATEACTION_CLOSE;
         WinVerifyTrust(nullptr, &guidAction, &trustData);
 
-        if (!isTrusted) return false;
-
-        // Check signer name via certificate chain to confirm Microsoft origin
-        // A valid Authenticode signature alone is insufficient — any EV cert holder passes.
-        // We verify by matching the signing certificate subject against Microsoft subjects.
-        std::wstring lowerPath = StringUtils::ToLowerCopy(binaryPath);
-
-        // Trusted Microsoft paths (signed + known-good path = Microsoft)
-        if (lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos) return true;
-        if (lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) return true;
-        if (lowerPath.find(L"\\windows\\winsxs\\") != std::wstring::npos) return true;
-        if (lowerPath.find(L"\\program files\\windows defender\\") != std::wstring::npos) return true;
-        if (lowerPath.find(L"\\program files (x86)\\windows defender\\") != std::wstring::npos) return true;
-        if (lowerPath.find(L"\\program files\\windows nt\\") != std::wstring::npos) return true;
-        if (lowerPath.find(L"\\programdata\\microsoft\\") != std::wstring::npos) return true;
-
-        // Not in a known Microsoft path — signed but not confirmed Microsoft
-        return false;
+        return isTrusted;
 
     } catch (...) {
         return false;
@@ -713,6 +883,12 @@ public:
             if (bytesNeeded == 0) {
                 return services;
             }
+            if (bytesNeeded > kMaxEnumBufferBytes) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ServiceManager: SCM service buffer too large (%lu bytes) — refusing allocation",
+                    bytesNeeded);
+                return services;
+            }
 
             std::vector<uint8_t> buffer(bytesNeeded);
             auto* pServices = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
@@ -781,6 +957,12 @@ public:
                 nullptr, 0, &bytesNeeded, &servicesReturned, &resumeHandle, nullptr);
 
             if (bytesNeeded == 0) return drivers;
+            if (bytesNeeded > kMaxEnumBufferBytes) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ServiceManager: SCM driver buffer too large (%lu bytes) — refusing allocation",
+                    bytesNeeded);
+                return drivers;
+            }
 
             std::vector<uint8_t> buffer(bytesNeeded);
             auto* pServices = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
@@ -917,10 +1099,41 @@ public:
             SS_LOG_ERROR(LOG_CATEGORY, L"Invalid service name for installation");
             return false;
         }
-        
+
+        // Validate binary path: non-empty, bounded length, no embedded NUL,
+        // no control characters. SCM accepts up to ~MAX_PATH * 2 for binary
+        // paths in modern Windows, but we cap to 4096 wide chars to bound
+        // risk and match common SCM stability behavior.
+        if (config.binaryPath.empty() || config.binaryPath.size() > 4096) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"ServiceManager: Invalid binary path length for service %ls",
+                config.serviceName.c_str());
+            return false;
+        }
+        for (wchar_t ch : config.binaryPath) {
+            if (ch == L'\0' || ch < 0x20) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ServiceManager: Binary path contains control character for service %ls",
+                    config.serviceName.c_str());
+                return false;
+            }
+        }
+
+        // Bounded length sanity for other operator-controlled strings.
+        if (config.displayName.size() > 1024 ||
+            config.description.size() > 8192 ||
+            config.serviceAccount.size() > 256 ||
+            config.loadOrderGroup.size() > 256 ||
+            config.dependencies.size() > 256) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"ServiceManager: ServiceConfig field exceeds permitted bounds for %ls",
+                config.serviceName.c_str());
+            return false;
+        }
+
         try {
             SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Installing service: %ls",
-                config.serviceName.c_str());
+                SanitizeForLogW(config.serviceName).c_str());
 
             SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE));
             if (!scm) {
@@ -931,14 +1144,50 @@ public:
             DWORD serviceType = ServiceTypeToWinType(config.serviceType);
             DWORD startType = StartTypeToWinStartType(config.startType);
 
-            // Format dependencies as double-null-terminated multi-string
+            // Format dependencies as double-null-terminated multi-string.
+            // Validate each dependency name to avoid hostile injection.
             std::wstring depsMultiStr;
             for (const auto& dep : config.dependencies) {
+                if (!ValidateServiceName(dep)) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"ServiceManager: Invalid dependency name in config for %ls",
+                        config.serviceName.c_str());
+                    return false;
+                }
                 depsMultiStr += dep;
                 depsMultiStr += L'\0';
             }
-            // Double-null terminator is added by c_str() when passed as LPCWSTR
+            // Final terminator (CreateServiceW expects double-NUL termination).
+            if (!depsMultiStr.empty()) depsMultiStr += L'\0';
             const wchar_t* depsPtr = config.dependencies.empty() ? nullptr : depsMultiStr.c_str();
+
+            // Defense against CWE-428 (unquoted service path): kernel/file-system
+            // drivers must NOT be quoted (SCM parses them as a raw NT path), but
+            // every user-mode binary path containing whitespace MUST be wrapped in
+            // double quotes. Already-quoted paths are left alone.
+            std::wstring effectiveBinaryPath = config.binaryPath;
+            const bool isDriverType =
+                (config.serviceType == ServiceType::KernelDriver ||
+                 config.serviceType == ServiceType::FileSystemDriver);
+            if (!isDriverType) {
+                const bool alreadyQuoted =
+                    effectiveBinaryPath.size() >= 2 &&
+                    effectiveBinaryPath.front() == L'"' &&
+                    effectiveBinaryPath.back()  == L'"';
+                const bool hasWhitespace =
+                    effectiveBinaryPath.find_first_of(L" \t") != std::wstring::npos;
+                if (!alreadyQuoted && hasWhitespace) {
+                    // Embedded quote inside the path would let an attacker break
+                    // out of the quoted region — reject.
+                    if (effectiveBinaryPath.find(L'"') != std::wstring::npos) {
+                        SS_LOG_ERROR(LOG_CATEGORY,
+                            L"ServiceManager: Binary path contains embedded quote — refusing");
+                        return false;
+                    }
+                    effectiveBinaryPath.insert(effectiveBinaryPath.begin(), L'"');
+                    effectiveBinaryPath.push_back(L'"');
+                }
+            }
 
             SCHandleGuard service(CreateServiceW(
                 scm.get(),
@@ -948,7 +1197,7 @@ public:
                 serviceType,
                 startType,
                 SERVICE_ERROR_NORMAL,
-                config.binaryPath.c_str(),
+                effectiveBinaryPath.c_str(),
                 config.loadOrderGroup.empty() ? nullptr : config.loadOrderGroup.c_str(),
                 nullptr,
                 depsPtr,
@@ -1264,19 +1513,33 @@ public:
         uint32_t resetPeriodSeconds,
         uint32_t restartDelayMs) {
 
+        // Clamp operator-supplied values to defensive bounds.
+        // - reset period: between 1 minute and 30 days.
+        // - restart delay: between 1 s and 1 hour. Zero delay would cause a
+        //   tight restart loop if a service crashes immediately.
+        constexpr uint32_t kMinResetSec   = 60u;
+        constexpr uint32_t kMaxResetSec   = 30u * 24u * 60u * 60u;
+        constexpr uint32_t kMinRestartMs  = 1000u;
+        constexpr uint32_t kMaxRestartMs  = 60u * 60u * 1000u;
+
+        const uint32_t clampedReset =
+            (std::clamp)(resetPeriodSeconds, kMinResetSec, kMaxResetSec);
+        const uint32_t clampedDelay =
+            (std::clamp)(restartDelayMs, kMinRestartMs, kMaxRestartMs);
+
         try {
             SC_ACTION actions[3];
             actions[0].Type = FailureActionToWinAction(firstFailure);
-            actions[0].Delay = restartDelayMs;
+            actions[0].Delay = clampedDelay;
 
             actions[1].Type = FailureActionToWinAction(secondFailure);
-            actions[1].Delay = restartDelayMs;
+            actions[1].Delay = clampedDelay;
 
             actions[2].Type = FailureActionToWinAction(subsequentFailures);
-            actions[2].Delay = restartDelayMs;
+            actions[2].Delay = clampedDelay;
 
             SERVICE_FAILURE_ACTIONSW failureActions{};
-            failureActions.dwResetPeriod = resetPeriodSeconds;
+            failureActions.dwResetPeriod = clampedReset;
             failureActions.lpRebootMsg = nullptr;
             failureActions.lpCommand = nullptr;
             failureActions.cActions = 3;
@@ -1656,11 +1919,13 @@ public:
                 // Invoke tamper callbacks
                 InvokeTamperAlertCallbacks(tamperResult);
 
-                // Raise alert via AlertSystem
+                // Raise alert via AlertSystem (sanitize attacker-controlled strings)
                 RaiseServiceAlert(
                     Communication::AlertSeverity::Critical,
-                    "Service tamper detected: " + StringUtils::ToNarrow(serviceName),
-                    "Tamper details: " + StringUtils::ToNarrow(tamperResult.details));
+                    "Service tamper detected: " +
+                        SanitizeForLogA(StringUtils::ToNarrow(serviceName)),
+                    "Tamper details: " +
+                        SanitizeForLogA(StringUtils::ToNarrow(tamperResult.details)));
 
                 // Restore baseline configuration if possible
                 if (m_config.autoRestartOnFailure) {
@@ -1733,36 +1998,50 @@ public:
             // Disable service
             (void)SetStartTypeImpl(serviceName, StartType::Disabled);
 
-            // Quarantine: deny execution by renaming binary with quarantine extension
+            // Quarantine: deny execution by renaming binary with a unique,
+            // time-stamped extension. Adding the timestamp prevents collision
+            // with prior quarantines (which would otherwise be silently clobbered
+            // by MOVEFILE_REPLACE_EXISTING and destroy forensic evidence).
             if (quarantineBinary && !binaryPath.empty()) {
                 std::wstring resolvedPath = ResolveBinaryPath(binaryPath);
                 if (!resolvedPath.empty() && FileUtils::Exists(resolvedPath)) {
-                    std::wstring quarantinePath = resolvedPath + L".ss_quarantine";
+                    const auto epoch_ms =
+                        duration_cast<milliseconds>(
+                            system_clock::now().time_since_epoch()).count();
+                    std::wstring quarantinePath =
+                        resolvedPath + L".ss_quarantine." +
+                        std::to_wstring(static_cast<long long>(epoch_ms));
+                    // Use MOVEFILE_WRITE_THROUGH (no _REPLACE_EXISTING) so we
+                    // never overwrite an existing forensic artifact.
                     if (MoveFileExW(resolvedPath.c_str(), quarantinePath.c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                            MOVEFILE_WRITE_THROUGH)) {
                         SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Quarantined malicious binary: %ls -> %ls",
-                            resolvedPath.c_str(), quarantinePath.c_str());
+                            SanitizeForLogW(resolvedPath).c_str(),
+                            SanitizeForLogW(quarantinePath).c_str());
                     } else {
                         // Fallback: schedule rename on reboot
                         if (MoveFileExW(resolvedPath.c_str(), quarantinePath.c_str(),
-                                MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)) {
+                                MOVEFILE_DELAY_UNTIL_REBOOT)) {
                             SS_LOG_WARN(LOG_CATEGORY,
-                                L"ServiceManager: Scheduled quarantine on reboot for: %ls", resolvedPath.c_str());
+                                L"ServiceManager: Scheduled quarantine on reboot for: %ls",
+                                SanitizeForLogW(resolvedPath).c_str());
                         } else {
                             SS_LOG_ERROR(LOG_CATEGORY,
                                 L"ServiceManager: Failed to quarantine binary: %ls (error: %lu)",
-                                resolvedPath.c_str(), GetLastError());
+                                SanitizeForLogW(resolvedPath).c_str(), GetLastError());
                         }
                     }
                 }
             }
 
-            // Raise alert
+            // Raise alert (sanitize attacker-controlled strings before serialization
+            // to defeat log/JSON injection via service or binary names).
             RaiseServiceAlert(
                 Communication::AlertSeverity::Critical,
-                "Malicious service disabled: " + StringUtils::ToNarrow(serviceName),
-                "Binary: " + StringUtils::ToNarrow(binaryPath) +
-                " | SHA256: " + binaryHash);
+                "Malicious service disabled: " +
+                    SanitizeForLogA(StringUtils::ToNarrow(serviceName)),
+                "Binary: " + SanitizeForLogA(StringUtils::ToNarrow(binaryPath)) +
+                " | SHA256: " + SanitizeForLogA(binaryHash));
 
             m_stats.remediationActions.fetch_add(1, std::memory_order_relaxed);
 
@@ -1994,6 +2273,12 @@ public:
             // First call to get size
             EnumDependentServicesW(hService, SERVICE_ACTIVE, nullptr, 0, &bytesNeeded, &count);
             if (bytesNeeded == 0) return;
+            if (bytesNeeded > kMaxEnumBufferBytes) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ServiceManager: Dependent-service buffer too large (%lu bytes) for %ls — refusing",
+                    bytesNeeded, serviceName.c_str());
+                return;
+            }
 
             std::vector<uint8_t> buffer(bytesNeeded);
             auto* pDeps = reinterpret_cast<ENUM_SERVICE_STATUSW*>(buffer.data());
@@ -2069,8 +2354,10 @@ public:
 
                         RaiseServiceAlert(
                             Communication::AlertSeverity::High,
-                            "ServiceDll hijacking detected: " + StringUtils::ToNarrow(service.serviceName),
-                            "ServiceDll: " + StringUtils::ToNarrow(serviceDll));
+                            "ServiceDll hijacking detected: " +
+                                SanitizeForLogA(StringUtils::ToNarrow(service.serviceName)),
+                            "ServiceDll: " +
+                                SanitizeForLogA(StringUtils::ToNarrow(serviceDll)));
                     }
 
                     // Check if DLL file exists
