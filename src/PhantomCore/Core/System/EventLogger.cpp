@@ -2035,14 +2035,14 @@ public:
             if (m_config.syslog.useTCP) {
                 // RFC 6587 §3.4.1 octet-counting framing: <length> SP <message>
                 // (RFC 5424 implies octet-counting is the preferred transport).
-                // Plain TCP — TLS for syslog over TCP requires an integrated
-                // Schannel session; we explicitly do NOT pretend HTTP/HTTPS is
-                // syslog (it was emitting Host: headers and a request line that
-                // no syslog receiver would parse).
+                // DESIGN: TLS syslog must fail closed until a real Schannel
+                // RFC 5425 transport exists. Silently downgrading a TLS request
+                // to plaintext would violate operator policy and leak audit data.
                 if (m_config.syslog.useTLS) {
-                    SS_LOG_WARN(LOG_CATEGORY,
-                        L"EventLogger: TCP syslog over TLS requested but not configured; "
-                        L"falling back to plaintext TCP for this transmission");
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"EventLogger: TCP syslog over TLS requested but no TLS transport is configured; "
+                        L"dropping syslog event instead of downgrading to plaintext");
+                    return;
                 }
                 SendTcpSyslogFramed(m_config.syslog.serverAddress,
                                     m_config.syslog.port,
