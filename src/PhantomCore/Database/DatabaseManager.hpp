@@ -658,6 +658,12 @@ namespace ShadowStrike {
              */
             template<typename... Args>
             bool ExecuteWithParams(std::string_view sql, DatabaseError* err, Args&&... args);
+
+            /** @brief Returns ROWID from the most recent successful statement on this thread. */
+            int64_t LastInsertRowId() const noexcept;
+
+            /** @brief Returns change count from the most recent successful statement on this thread. */
+            int GetChangedRowCount() const noexcept;
               
             // === Savepoint Support ===
             
@@ -822,10 +828,10 @@ namespace ShadowStrike {
             
             // === Utility Functions ===
             
-            /** @brief Returns ROWID of last INSERT */
+            /** @brief Returns ROWID captured from this thread's most recent successful statement */
             int64_t LastInsertRowId();
             
-            /** @brief Returns rows affected by last statement */
+            /** @brief Returns rows affected by this thread's most recent successful statement */
             int GetChangedRowCount();
             
             /** @brief Alias for GetChangedRowCount() @deprecated */
@@ -920,6 +926,8 @@ namespace ShadowStrike {
             void bindParameters(SQLite::Statement& stmt, int index) {}
             
         private:
+            friend class Transaction;
+
             // Private constructor for singleton
             DatabaseManager();
             ~DatabaseManager();
@@ -954,6 +962,10 @@ namespace ShadowStrike {
             // === Error Handling ===
             void setError(DatabaseError* err, int code, std::wstring_view msg, std::wstring_view ctx = L"") const;
             void setError(DatabaseError* err, const SQLite::Exception& ex, std::wstring_view ctx = L"") const;
+
+            // === Per-thread Statement Outcome ===
+            void recordStatementOutcome(SQLite::Database& db) noexcept;
+            void clearStatementOutcome() noexcept;
             
             // === Member Variables ===
             
@@ -975,6 +987,9 @@ namespace ShadowStrike {
             // === Statistics Counters ===
             std::atomic<int64_t> m_totalQueries{ 0 };        ///< Total queries executed
             std::atomic<int64_t> m_totalTransactions{ 0 };   ///< Total transactions
+
+            static thread_local int64_t s_lastInsertRowId;
+            static thread_local int s_lastChangedRowCount;
             
             // === Background Backup Thread ===
             std::thread m_backupThread;                       ///< Background backup thread
@@ -1026,9 +1041,15 @@ namespace ShadowStrike {
                 }
 
                 stmt.exec();
+                if (m_manager) {
+                    m_manager->recordStatementOutcome(*m_db);
+                }
                 return true;
             }
             catch (const SQLite::Exception& ex) {
+                if (m_manager) {
+                    m_manager->clearStatementOutcome();
+                }
                 if (err) {
                     err->sqliteCode = ex.getErrorCode();
                     err->extendedCode = ex.getExtendedErrorCode();
@@ -1088,11 +1109,13 @@ namespace ShadowStrike {
                 auto stmt = std::make_unique<SQLite::Statement>(*conn, std::string(sql));
                 this->bindParameters(*stmt, 1, std::forward<Args>(args)...);
                 stmt->exec();
+                this->recordStatementOutcome(*conn);
                 this->m_totalQueries.fetch_add(1, std::memory_order_relaxed);
 
                 return true;
             }
             catch (const SQLite::Exception& ex) {
+                this->clearStatementOutcome();
                 this->setError(err, ex, L"ExecuteWithParams");
                 return false;
             }
@@ -1221,6 +1244,7 @@ namespace ShadowStrike {
                     stmt.clearBindings();
                     bindFunc(stmt, row);
                     stmt.exec();
+                    recordStatementOutcome(*conn);
                 }
 
                 conn->exec("COMMIT");

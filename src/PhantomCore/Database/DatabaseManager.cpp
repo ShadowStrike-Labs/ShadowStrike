@@ -133,6 +133,9 @@
 namespace ShadowStrike {
     namespace Database {
 
+        thread_local int64_t DatabaseManager::s_lastInsertRowId = -1;
+        thread_local int DatabaseManager::s_lastChangedRowCount = 0;
+
         // ============================================================================
         // INTERNAL UTILITIES & CONSTANTS
         // ============================================================================
@@ -1228,9 +1231,15 @@ namespace ShadowStrike {
                 // null-terminated, but SQLite::Database::exec(const char*) reads
                 // until NUL. Copy to a std::string so the buffer is terminated.
                 m_db->exec(std::string(sql));
+                if (m_manager) {
+                    m_manager->recordStatementOutcome(*m_db);
+                }
                 return true;
             }
             catch (const SQLite::Exception& ex) {
+                if (m_manager) {
+                    m_manager->clearStatementOutcome();
+                }
                 if (err) {
                     err->sqliteCode = ex.getErrorCode();
                     err->extendedCode = ex.getExtendedErrorCode();
@@ -1239,6 +1248,14 @@ namespace ShadowStrike {
                 }
                 return false;
             }
+        }
+
+        int64_t Transaction::LastInsertRowId() const noexcept {
+            return (m_active && m_db) ? m_db->getLastInsertRowid() : -1;
+        }
+
+        int Transaction::GetChangedRowCount() const noexcept {
+            return (m_active && m_db) ? sqlite3_changes(m_db->getHandle()) : 0;
         }
 
         /**
@@ -1876,10 +1893,12 @@ namespace ShadowStrike {
                 // FIX (Tier 1 - UB): copy to null-terminated string; std::string_view
                 // is not required to be NUL-terminated.
                 conn->exec(std::string(sql));
+                recordStatementOutcome(*conn);
                 m_totalQueries.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             catch (const SQLite::Exception& ex) {
+                clearStatementOutcome();
                 setError(err, ex, L"Execute");
                 return false;
             }
@@ -1922,9 +1941,11 @@ namespace ShadowStrike {
                 for (const auto& sql : statements) {
                     try {
                         conn->exec(sql);
+                        recordStatementOutcome(*conn);
                         m_totalQueries.fetch_add(1, std::memory_order_relaxed);
                     }
                     catch (const SQLite::Exception& ex) {
+                        clearStatementOutcome();
                         // Rollback on any failure
                         try {
                             conn->exec("ROLLBACK");
@@ -1947,6 +1968,7 @@ namespace ShadowStrike {
                 }
                 catch (...) {}
 
+                clearStatementOutcome();
                 setError(err, ex, L"ExecuteMany");
                 return false;
             }
@@ -2065,9 +2087,9 @@ namespace ShadowStrike {
         /**
          * @brief Returns the ROWID of the last INSERT operation.
          * 
-         * Note: Returns the rowid from any connection in the pool,
-         * which may not be the same connection used for the INSERT.
-         * For reliable results, use within a transaction.
+         * The value is captured from the connection that executed the most recent
+         * successful statement on the calling thread. This preserves pooled
+         * connection correctness for Execute/ExecuteWithParams callers.
          * 
          * @return Last insert rowid, or -1 on error
          */
@@ -2076,16 +2098,7 @@ namespace ShadowStrike {
                 return -1;
             }
 
-            DatabaseError err;
-            auto conn = AcquireConnection(&err);
-            if (!conn) {
-                return -1;
-            }
-
-            int64_t rowid = conn->getLastInsertRowid();
-            ReleaseConnection(conn);
-
-            return rowid;
+            return s_lastInsertRowId;
         }
 
         /**
@@ -2100,8 +2113,9 @@ namespace ShadowStrike {
         /**
          * @brief Returns the number of rows changed by the last statement.
          * 
-         * Note: Like LastInsertRowId(), this may not reflect the correct
-         * connection. Use within a transaction for accuracy.
+         * The value is captured from the connection that executed the most recent
+         * successful statement on the calling thread. This preserves pooled
+         * connection correctness for Execute/ExecuteWithParams callers.
          * 
          * @return Number of rows inserted, updated, or deleted
          */
@@ -2110,16 +2124,7 @@ namespace ShadowStrike {
                 return 0;
             }
 
-            DatabaseError err;
-            auto conn = AcquireConnection(&err);
-            if (!conn) {
-                return 0;
-            }
-
-            int changes = sqlite3_changes(conn->getHandle());
-            ReleaseConnection(conn);
-
-            return changes;
+            return s_lastChangedRowCount;
         }
 
         /**
@@ -3008,6 +3013,17 @@ namespace ShadowStrike {
                     SanitizeForLog(ToWide(ex.what())).c_str());
                 return false;
             }
+        }
+
+        void DatabaseManager::recordStatementOutcome(SQLite::Database& db) noexcept {
+            sqlite3* handle = db.getHandle();
+            s_lastInsertRowId = handle ? sqlite3_last_insert_rowid(handle) : -1;
+            s_lastChangedRowCount = handle ? sqlite3_changes(handle) : 0;
+        }
+
+        void DatabaseManager::clearStatementOutcome() noexcept {
+            s_lastInsertRowId = -1;
+            s_lastChangedRowCount = 0;
         }
 
         /**
