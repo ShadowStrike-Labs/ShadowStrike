@@ -659,6 +659,13 @@ namespace ShadowStrike {
             template<typename... Args>
             bool ExecuteWithParams(std::string_view sql, DatabaseError* err, Args&&... args);
 
+            /**
+             * @brief Prepares a parameterized query on the transaction connection.
+             * @return Prepared statement bound to this transaction, or nullptr on error.
+             */
+            template<typename... Args>
+            std::unique_ptr<SQLite::Statement> QueryWithParams(std::string_view sql, DatabaseError* err, Args&&... args);
+
             /** @brief Returns ROWID from the most recent successful statement on this thread. */
             int64_t LastInsertRowId() const noexcept;
 
@@ -1072,6 +1079,46 @@ namespace ShadowStrike {
                     err->context = L"Transaction::ExecuteWithParams";
                 }
                 return false;
+            }
+        }
+
+        template<typename... Args>
+        std::unique_ptr<SQLite::Statement> Transaction::QueryWithParams(std::string_view sql, DatabaseError* err, Args&&... args) {
+            if (!m_active || !m_db) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Transaction not active";
+                    err->context = L"Transaction::QueryWithParams";
+                }
+                return nullptr;
+            }
+
+            try {
+                auto stmt = std::make_unique<SQLite::Statement>(*m_db, std::string(sql));
+                if (m_manager) {
+                    m_manager->bindParameters(*stmt, 1, std::forward<Args>(args)...);
+                }
+                return stmt;
+            }
+            catch (const SQLite::Exception& ex) {
+                if (err) {
+                    err->sqliteCode = ex.getErrorCode();
+                    err->extendedCode = ex.getExtendedErrorCode();
+                    const std::string msg = ex.what();
+                    std::wstring wmsg;
+                    if (!msg.empty()) {
+                        const int wlen = ::MultiByteToWideChar(CP_UTF8, 0,
+                            msg.data(), static_cast<int>(msg.size()), nullptr, 0);
+                        if (wlen > 0) {
+                            wmsg.resize(static_cast<size_t>(wlen));
+                            ::MultiByteToWideChar(CP_UTF8, 0, msg.data(),
+                                static_cast<int>(msg.size()), wmsg.data(), wlen);
+                        }
+                    }
+                    err->message = std::move(wmsg);
+                    err->context = L"Transaction::QueryWithParams";
+                }
+                return nullptr;
             }
         }
 
