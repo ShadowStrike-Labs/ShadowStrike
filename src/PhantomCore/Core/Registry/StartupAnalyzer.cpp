@@ -61,6 +61,7 @@
 #include <fstream>
 #include <filesystem>
 #include <deque>
+#include <unordered_set>
 
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -193,7 +194,252 @@ constexpr size_t  kMaxLogFieldChars      = 1024;
     return s;
 }
 
+[[nodiscard]] inline bool QueryRegistryValueMetadata(
+    const Utils::RegistryUtils::RegistryKey& key,
+    std::wstring_view valueName,
+    DWORD& type,
+    DWORD& size) noexcept {
+    type = REG_NONE;
+    size = 0;
+    std::wstring name(valueName);
+    const LSTATUS status = ::RegQueryValueExW(
+        key.Handle(), name.c_str(), nullptr, &type, nullptr, &size);
+    return status == ERROR_SUCCESS;
+}
+
+[[nodiscard]] inline bool ReadStringValueCapped(
+    const Utils::RegistryUtils::RegistryKey& key,
+    std::wstring_view valueName,
+    std::wstring& out,
+    DWORD* actualType = nullptr) noexcept {
+    DWORD type = REG_NONE;
+    DWORD size = 0;
+    if (!QueryRegistryValueMetadata(key, valueName, type, size)) {
+        return false;
+    }
+    if (type != REG_SZ && type != REG_EXPAND_SZ) {
+        return false;
+    }
+    if (size > kMaxRegPayloadBytes) {
+        SS_LOG_WARN(L"StartupAnalyzer",
+            L"Rejected oversized registry string value %hs (%lu bytes)",
+            SanitizeForLog(valueName).c_str(), size);
+        return false;
+    }
+
+    Utils::RegistryUtils::Error err;
+    const bool ok = (type == REG_EXPAND_SZ)
+        ? key.ReadExpandString(valueName, out, &err)
+        : key.ReadString(valueName, out, &err);
+    if (ok && actualType != nullptr) {
+        *actualType = type;
+    }
+    return ok;
+}
+
+[[nodiscard]] inline bool ReadMultiStringValueCapped(
+    const Utils::RegistryUtils::RegistryKey& key,
+    std::wstring_view valueName,
+    std::vector<std::wstring>& out) noexcept {
+    DWORD type = REG_NONE;
+    DWORD size = 0;
+    if (!QueryRegistryValueMetadata(key, valueName, type, size) || type != REG_MULTI_SZ) {
+        return false;
+    }
+    if (size > kMaxRegPayloadBytes) {
+        SS_LOG_WARN(L"StartupAnalyzer",
+            L"Rejected oversized registry multi-string value %hs (%lu bytes)",
+            SanitizeForLog(valueName).c_str(), size);
+        return false;
+    }
+    Utils::RegistryUtils::Error err;
+    return key.ReadMultiString(valueName, out, &err);
+}
+
+[[nodiscard]] inline std::wstring TrimWide(std::wstring_view input) {
+    const size_t first = input.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring_view::npos) {
+        return {};
+    }
+    const size_t last = input.find_last_not_of(L" \t\r\n");
+    return std::wstring(input.substr(first, last - first + 1));
+}
+
+[[nodiscard]] inline std::vector<std::wstring> SplitStartupValueList(
+    std::wstring_view value,
+    bool splitOnComma,
+    bool splitOnWhitespace) {
+    std::vector<std::wstring> parts;
+    std::wstring current;
+    bool quoted = false;
+
+    auto flush = [&]() {
+        std::wstring trimmed = TrimWide(current);
+        if (!trimmed.empty()) {
+            parts.push_back(std::move(trimmed));
+        }
+        current.clear();
+    };
+
+    for (wchar_t ch : value) {
+        if (ch == L'"') {
+            quoted = !quoted;
+            current.push_back(ch);
+            continue;
+        }
+        const bool delimiter =
+            !quoted &&
+            ((splitOnComma && ch == L',') ||
+             (splitOnWhitespace && (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n')));
+        if (delimiter) {
+            flush();
+        } else {
+            current.push_back(ch);
+        }
+    }
+    flush();
+
+    if (parts.empty()) {
+        std::wstring trimmed = TrimWide(value);
+        if (!trimmed.empty()) {
+            parts.push_back(std::move(trimmed));
+        }
+    }
+    return parts;
+}
+
+[[nodiscard]] inline std::wstring NormalizeKernelRegistryPath(std::wstring_view path) {
+    constexpr std::wstring_view machinePrefix = L"\\REGISTRY\\MACHINE\\";
+    constexpr std::wstring_view userPrefix = L"\\REGISTRY\\USER\\";
+    if (path.rfind(machinePrefix, 0) == 0) {
+        return L"HKEY_LOCAL_MACHINE\\" + std::wstring(path.substr(machinePrefix.size()));
+    }
+    if (path.rfind(userPrefix, 0) == 0) {
+        return L"HKEY_USERS\\" + std::wstring(path.substr(userPrefix.size()));
+    }
+    return std::wstring(path);
+}
+
+[[nodiscard]] inline bool StartsWithI(std::wstring_view value, std::wstring_view prefix) {
+    return value.size() >= prefix.size() &&
+        _wcsnicmp(value.data(), prefix.data(), prefix.size()) == 0;
+}
+
 }  // anonymous namespace
+
+namespace {
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(const std::wstring& value) {
+    return Utils::StringUtils::ToWide(SanitizeForLog(value));
+}
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(std::wstring_view value) {
+    return Utils::StringUtils::ToWide(SanitizeForLog(value));
+}
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(const wchar_t* value) {
+    return value != nullptr ? ToStartupLogToken(std::wstring_view(value)) : L"<null>";
+}
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(const std::string& value) {
+    return Utils::StringUtils::ToWide(SanitizeForLog(value));
+}
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(std::string_view value) {
+    return Utils::StringUtils::ToWide(SanitizeForLog(value));
+}
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(const char* value) {
+    return value != nullptr ? ToStartupLogToken(std::string_view(value)) : L"<null>";
+}
+
+[[nodiscard]] inline std::wstring ToStartupLogToken(bool value) {
+    return value ? L"true" : L"false";
+}
+
+template <typename T>
+[[nodiscard]] inline std::wstring ToStartupLogToken(T value)
+    requires (std::is_integral_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>)
+{
+    return std::to_wstring(static_cast<unsigned long long>(value));
+}
+
+template <typename T>
+[[nodiscard]] inline std::wstring ToStartupLogToken(T value)
+    requires std::is_floating_point_v<T>
+{
+    return std::to_wstring(value);
+}
+
+[[nodiscard]] inline std::wstring FormatStartupLog(std::wstring_view format) {
+    return std::wstring(format);
+}
+
+template <typename... Args>
+[[nodiscard]] std::wstring FormatStartupLog(std::wstring_view format, Args&&... args) {
+    std::array<std::wstring, sizeof...(Args)> tokens{
+        ToStartupLogToken(std::forward<Args>(args))...
+    };
+
+    std::wstring output;
+    output.reserve(format.size() + tokens.size() * 16);
+    size_t tokenIndex = 0;
+    for (size_t i = 0; i < format.size(); ++i) {
+        if (format[i] == L'{' && i + 1 < format.size()) {
+            const size_t close = format.find(L'}', i + 1);
+            if (close != std::wstring_view::npos) {
+                if (tokenIndex < tokens.size()) {
+                    output.append(tokens[tokenIndex++]);
+                } else {
+                    output.append(format.substr(i, close - i + 1));
+                }
+                i = close;
+                continue;
+            }
+        }
+        output.push_back(format[i]);
+    }
+    return output;
+}
+
+inline void StartupLogMessage(Utils::LogLevel level,
+                              const wchar_t* category,
+                              const wchar_t* file,
+                              int line,
+                              const wchar_t* function,
+                              const std::wstring& message) {
+    auto& logger = Utils::Logger::Instance();
+    if (logger.IsInitialized() && logger.IsEnabled(level)) {
+        logger.LogMessage(level, category, message, file, line, function);
+    }
+}
+
+}  // anonymous namespace
+
+#undef SS_LOG_INFO
+#undef SS_LOG_WARN
+#undef SS_LOG_ERROR
+#define SS_LOG_INFO(category, fmt, ...) \
+    do { \
+        StartupLogMessage(::ShadowStrike::Utils::LogLevel::Info, (category), \
+            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), \
+            FormatStartupLog((fmt), ##__VA_ARGS__)); \
+    } while (0)
+#define SS_LOG_WARN(category, fmt, ...) \
+    do { \
+        StartupLogMessage(::ShadowStrike::Utils::LogLevel::Warn, (category), \
+            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), \
+            FormatStartupLog((fmt), ##__VA_ARGS__)); \
+    } while (0)
+#define SS_LOG_ERROR(category, fmt, ...) \
+    do { \
+        StartupLogMessage(::ShadowStrike::Utils::LogLevel::Error, (category), \
+            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FILE__, 0), __LINE__, \
+            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(__FUNCTION__, 1), \
+            FormatStartupLog((fmt), ##__VA_ARGS__)); \
+    } while (0)
 
 // ============================================================================
 // STATISTICS METHODS
@@ -394,13 +640,14 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
     // ========================================================================
 
     void EnumerateRegistryRun(std::vector<StartupItem>& items, HKEY hRoot,
-                             StartupSource source, const std::wstring& keyPath) {
+                             StartupSource source, const std::wstring& keyPath,
+                             Utils::RegistryUtils::OpenOptions openOptions = {}) {
         try {
             // Use RAII RegistryKey wrapper — no raw handles
             Utils::RegistryUtils::RegistryKey regKey;
             Utils::RegistryUtils::Error regErr;
 
-            if (!regKey.Open(hRoot, keyPath, {}, &regErr)) {
+            if (!regKey.Open(hRoot, keyPath, openOptions, &regErr)) {
                 // Key doesn't exist is expected for some paths
                 return;
             }
@@ -419,12 +666,17 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                     continue;
                 }
 
-                std::wstring rawValue;
-                if (valInfo.type == Utils::RegistryUtils::ValueType::ExpandString) {
-                    if (!regKey.ReadExpandString(valInfo.name, rawValue, &regErr)) continue;
-                } else {
-                    if (!regKey.ReadString(valInfo.name, rawValue, &regErr)) continue;
+                if (valInfo.dataSize > kMaxRegPayloadBytes) {
+                    SS_LOG_WARN(L"StartupAnalyzer",
+                        L"Skipping oversized Run value %hs\\%hs (%lu bytes)",
+                        SanitizeForLog(keyPath).c_str(),
+                        SanitizeForLog(valInfo.name).c_str(),
+                        valInfo.dataSize);
+                    continue;
                 }
+
+                std::wstring rawValue;
+                if (!ReadStringValueCapped(regKey, valInfo.name, rawValue)) continue;
 
                 if (rawValue.empty()) continue;
 
@@ -463,6 +715,35 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 L"Registry enumeration failed for {}: {}",
                 keyPath, Utils::StringUtils::ToWide(e.what()));
         }
+    }
+
+    void AppendStartupValueItem(std::vector<StartupItem>& items,
+                                StartupSource source,
+                                const std::wstring& keyPath,
+                                const std::wstring& valueName,
+                                const std::wstring& command,
+                                size_t ordinal = 0) {
+        if (command.empty() || items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) {
+            return;
+        }
+
+        StartupItem item;
+        item.itemId = m_nextItemId.fetch_add(1, std::memory_order_relaxed);
+        item.name = ordinal == 0 ? valueName : valueName + L"[" + std::to_wstring(ordinal) + L"]";
+        item.displayName = item.name;
+        item.source = source;
+        item.location = keyPath;
+        item.entryName = valueName;
+        item.command = command;
+
+        ParseCommand(item);
+        if (!item.targetPath.empty()) {
+            std::error_code ec;
+            item.targetExists = fs::exists(item.targetPath, ec);
+        }
+        item.status = StartupStatus::Enabled;
+        item.isEnabled = true;
+        items.push_back(std::move(item));
     }
 
     void EnumerateStartupFolders(std::vector<StartupItem>& items) {
@@ -579,14 +860,15 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
 
     void EnumerateExtendedAutostartKeys(std::vector<StartupItem>& items) {
         // WoW64 32-bit Run keys (malware hides in 32-bit view on x64)
+        Utils::RegistryUtils::OpenOptions wow32{ .access = KEY_READ, .wow64_32 = true };
         EnumerateRegistryRun(items, HKEY_LOCAL_MACHINE, StartupSource::RegistryRun_Wow64_HKLM,
-            L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run");
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", wow32);
         EnumerateRegistryRun(items, HKEY_CURRENT_USER, StartupSource::RegistryRun_Wow64_HKCU,
-            L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run");
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", wow32);
         EnumerateRegistryRun(items, HKEY_LOCAL_MACHINE, StartupSource::RegistryRunOnce_Wow64_HKLM,
-            L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", wow32);
         EnumerateRegistryRun(items, HKEY_CURRENT_USER, StartupSource::RegistryRunOnce_Wow64_HKCU,
-            L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", wow32);
 
         // RunServices (legacy but still functional on some systems)
         EnumerateRegistryRun(items, HKEY_LOCAL_MACHINE, StartupSource::RegistryRunServices_HKLM,
@@ -613,7 +895,7 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
         EnumerateSingleValue(items, HKEY_LOCAL_MACHINE, StartupSource::AppInit_DLLs,
             L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows", L"AppInit_DLLs");
         EnumerateSingleValue(items, HKEY_LOCAL_MACHINE, StartupSource::AppInit_DLLs,
-            L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows", L"AppInit_DLLs");
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows", L"AppInit_DLLs", wow32);
 
         // LSA Authentication/Security packages (APT persistence)
         EnumerateSingleValue(items, HKEY_LOCAL_MACHINE, StartupSource::LSA_AuthenticationPackages,
@@ -642,46 +924,66 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
         // Natural Language DLL override
         EnumerateSingleValue(items, HKEY_LOCAL_MACHINE, StartupSource::NaturalLanguage_DLL,
             L"SYSTEM\\CurrentControlSet\\Control\\ContentIndex\\Language\\English_US", L"DLLOverridePath");
+
+        EnumerateAllUserRunKeys(items);
+        EnumerateScheduledTasks(items);
+        EnumerateServices(items);
     }
 
     void EnumerateSingleValue(std::vector<StartupItem>& items, HKEY hRoot,
                               StartupSource source, const std::wstring& keyPath,
-                              const std::wstring& valueName) {
+                              const std::wstring& valueName,
+                              Utils::RegistryUtils::OpenOptions openOptions = {}) {
         try {
             Utils::RegistryUtils::RegistryKey regKey;
             Utils::RegistryUtils::Error regErr;
-            if (!regKey.Open(hRoot, keyPath, {}, &regErr)) return;
+            if (!regKey.Open(hRoot, keyPath, openOptions, &regErr)) return;
+
+            std::vector<std::wstring> multiValues;
+            if ((source == StartupSource::LSA_AuthenticationPackages ||
+                 source == StartupSource::LSA_SecurityPackages ||
+                 source == StartupSource::BootExecute) &&
+                ReadMultiStringValueCapped(regKey, valueName, multiValues)) {
+                size_t ordinal = 0;
+                for (const auto& entry : multiValues) {
+                    AppendStartupValueItem(items, source, keyPath, valueName, entry, ordinal++);
+                }
+                return;
+            }
 
             std::wstring value;
-            if (!regKey.ReadString(valueName, value, &regErr)) {
-                if (!regKey.ReadExpandString(valueName, value, &regErr)) return;
-            }
+            if (!ReadStringValueCapped(regKey, valueName, value)) return;
             if (value.empty()) return;
 
-            if (items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) return;
-
-            StartupItem item;
-            item.itemId = m_nextItemId.fetch_add(1, std::memory_order_relaxed);
-            item.name = valueName;
-            item.displayName = valueName;
-            item.source = source;
-            item.location = keyPath;
-            item.entryName = valueName;
-            item.command = value;
-
-            ParseCommand(item);
-            if (!item.targetPath.empty()) {
-                std::error_code ec;
-                item.targetExists = fs::exists(item.targetPath, ec);
+            bool splitComma = false;
+            bool splitWhitespace = false;
+            switch (source) {
+                case StartupSource::Winlogon_Shell:
+                case StartupSource::Winlogon_Userinit:
+                    splitComma = true;
+                    break;
+                case StartupSource::AppInit_DLLs:
+                    splitComma = true;
+                    splitWhitespace = true;
+                    break;
+                default:
+                    break;
             }
-            item.status = StartupStatus::Enabled;
-            item.isEnabled = true;
-            items.push_back(std::move(item));
+            const auto commands = (splitComma || splitWhitespace)
+                ? SplitStartupValueList(value, splitComma, splitWhitespace)
+                : std::vector<std::wstring>{ value };
+
+            size_t ordinal = 0;
+            for (const auto& command : commands) {
+                AppendStartupValueItem(items, source, keyPath, valueName, command, ordinal++);
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"StartupAnalyzer",
-                L"Single-value enumeration failed for {}\\{}: {}",
-                keyPath, valueName, Utils::StringUtils::ToWide(e.what()));
+                L"Single-value enumeration failed for %hs\\%hs: %hs",
+                SanitizeForLog(keyPath).c_str(),
+                SanitizeForLog(valueName).c_str(),
+                SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -702,7 +1004,7 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 if (!exeKey.Open(HKEY_LOCAL_MACHINE, subPath, {}, &regErr)) continue;
 
                 std::wstring debugger;
-                if (!exeKey.ReadString(L"Debugger", debugger, &regErr)) continue;
+                if (!ReadStringValueCapped(exeKey, L"Debugger", debugger)) continue;
                 if (debugger.empty()) continue;
 
                 if (items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) return;
@@ -749,7 +1051,7 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 if (!monKey.Open(HKEY_LOCAL_MACHINE, subPath, {}, &regErr)) continue;
 
                 std::wstring driver;
-                if (!monKey.ReadString(L"Driver", driver, &regErr)) continue;
+                if (!ReadStringValueCapped(monKey, L"Driver", driver)) continue;
                 if (driver.empty()) continue;
 
                 if (items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) return;
@@ -798,7 +1100,7 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 if (!compKey.Open(HKEY_LOCAL_MACHINE, subPath, {}, &regErr)) continue;
 
                 std::wstring stubPath;
-                if (!compKey.ReadString(L"StubPath", stubPath, &regErr)) continue;
+                if (!ReadStringValueCapped(compKey, L"StubPath", stubPath)) continue;
                 if (stubPath.empty()) continue;
 
                 if (items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) return;
@@ -809,7 +1111,7 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
 
                 // Try to get display name
                 std::wstring displayName;
-                if (compKey.ReadString(L"", displayName, &regErr) && !displayName.empty()) {
+                if (ReadStringValueCapped(compKey, L"", displayName) && !displayName.empty()) {
                     item.displayName = displayName;
                 } else {
                     item.displayName = L"Active Setup: " + clsid;
@@ -833,6 +1135,124 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
             SS_LOG_ERROR(L"StartupAnalyzer",
                 L"Active Setup enumeration failed: {}",
                 Utils::StringUtils::ToWide(e.what()));
+        }
+    }
+
+    void EnumerateAllUserRunKeys(std::vector<StartupItem>& items) {
+        try {
+            Utils::RegistryUtils::RegistryKey usersRoot;
+            Utils::RegistryUtils::Error regErr;
+            if (!usersRoot.Open(HKEY_USERS, L"", {}, &regErr)) return;
+
+            std::vector<std::wstring> sids;
+            if (!usersRoot.EnumKeys(sids, &regErr)) return;
+
+            size_t visited = 0;
+            for (const auto& sid : sids) {
+                if (++visited > 512) {
+                    SS_LOG_WARN(L"StartupAnalyzer", L"HKEY_USERS SID enumeration cap reached");
+                    break;
+                }
+                if (sid.empty() || sid.find(L"_Classes") != std::wstring::npos) continue;
+                const std::wstring runPath = sid + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+                const std::wstring runOncePath = sid + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+                EnumerateRegistryRun(items, HKEY_USERS, StartupSource::RegistryRun_HKCU, runPath);
+                EnumerateRegistryRun(items, HKEY_USERS, StartupSource::RegistryRunOnce_HKCU, runOncePath);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"StartupAnalyzer",
+                L"HKEY_USERS startup enumeration failed: %hs",
+                SanitizeForLog(e.what()).c_str());
+        }
+    }
+
+    void EnumerateScheduledTasks(std::vector<StartupItem>& items) {
+        try {
+            auto tasks = PersistenceDetector::Instance().ScanScheduledTasks();
+            for (const auto& task : tasks) {
+                if (!task.enabled) continue;
+                bool autostartTrigger = false;
+                for (const auto& trigger : task.triggers) {
+                    if (trigger.enabled &&
+                        (IEquals(trigger.type, L"Logon") ||
+                         IEquals(trigger.type, L"Boot") ||
+                         IEquals(trigger.type, L"Registration"))) {
+                        autostartTrigger = true;
+                        break;
+                    }
+                }
+                if (!autostartTrigger) continue;
+
+                size_t actionIndex = 0;
+                for (const auto& action : task.actions) {
+                    if (items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) return;
+                    if (!IEquals(action.type, L"Exec") || action.path.empty()) continue;
+
+                    StartupItem item;
+                    item.itemId = m_nextItemId.fetch_add(1, std::memory_order_relaxed);
+                    item.name = task.taskPath.empty() ? task.taskName : task.taskPath;
+                    if (actionIndex > 0) item.name += L"[" + std::to_wstring(actionIndex) + L"]";
+                    item.displayName = task.taskName.empty() ? item.name : task.taskName;
+                    item.description = task.description;
+                    item.source = StartupSource::ScheduledTask;
+                    item.location = task.taskPath;
+                    item.entryName = task.taskName;
+                    item.command = action.arguments.empty() ? action.path : action.path + L" " + action.arguments;
+                    item.workingDirectory = action.workingDirectory;
+                    item.isEnabled = true;
+                    item.status = StartupStatus::Enabled;
+                    ParseCommand(item);
+                    if (!item.targetPath.empty()) {
+                        std::error_code ec;
+                        item.targetExists = fs::exists(item.targetPath, ec);
+                    }
+                    items.push_back(std::move(item));
+                    ++actionIndex;
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"StartupAnalyzer",
+                L"Scheduled task enumeration failed: %hs",
+                SanitizeForLog(e.what()).c_str());
+        }
+    }
+
+    void EnumerateServices(std::vector<StartupItem>& items) {
+        try {
+            auto services = PersistenceDetector::Instance().ScanServices();
+            for (const auto& service : services) {
+                if (items.size() >= StartupAnalyzerConstants::MAX_STARTUP_ITEMS) return;
+                if (service.startType != SERVICE_AUTO_START &&
+                    service.startType != SERVICE_BOOT_START &&
+                    service.startType != SERVICE_SYSTEM_START) {
+                    continue;
+                }
+                if (service.imagePath.empty()) continue;
+
+                StartupItem item;
+                item.itemId = m_nextItemId.fetch_add(1, std::memory_order_relaxed);
+                item.name = service.serviceName;
+                item.displayName = service.displayName.empty() ? service.serviceName : service.displayName;
+                item.description = service.description;
+                item.source = (service.serviceType & (SERVICE_KERNEL_DRIVER | SERVICE_FILE_SYSTEM_DRIVER))
+                    ? StartupSource::DriverService
+                    : StartupSource::Service;
+                item.location = L"SCM";
+                item.entryName = service.serviceName;
+                item.command = service.imagePath;
+                item.status = StartupStatus::Enabled;
+                item.isEnabled = true;
+                ParseCommand(item);
+                if (!item.targetPath.empty()) {
+                    std::error_code ec;
+                    item.targetExists = fs::exists(item.targetPath, ec);
+                }
+                items.push_back(std::move(item));
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"StartupAnalyzer",
+                L"Service enumeration failed: %hs",
+                SanitizeForLog(e.what()).c_str());
         }
     }
 
@@ -1214,6 +1634,45 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
     // REGISTRY WRITE-BACK (Actual disable/enable)
     // ========================================================================
 
+    [[nodiscard]] static bool ResolveRegistryItemRootAndPath(
+        const StartupItem& item,
+        HKEY& hRoot,
+        std::wstring& keyPath) {
+        hRoot = nullptr;
+        keyPath = item.location;
+        constexpr std::wstring_view hkuPrefix = L"HKEY_USERS\\";
+        constexpr std::wstring_view hklmPrefix = L"HKEY_LOCAL_MACHINE\\";
+        constexpr std::wstring_view hkcuPrefix = L"HKEY_CURRENT_USER\\";
+        if (StartsWithI(item.location, hkuPrefix)) {
+            hRoot = HKEY_USERS;
+            keyPath = item.location.substr(hkuPrefix.size());
+            return !keyPath.empty();
+        }
+        if (StartsWithI(item.location, hklmPrefix)) {
+            hRoot = HKEY_LOCAL_MACHINE;
+            keyPath = item.location.substr(hklmPrefix.size());
+            return !keyPath.empty();
+        }
+        if (StartsWithI(item.location, hkcuPrefix)) {
+            hRoot = HKEY_CURRENT_USER;
+            keyPath = item.location.substr(hkcuPrefix.size());
+            return !keyPath.empty();
+        }
+        hRoot = GetRootKeyForSource(item.source);
+        return hRoot != nullptr && !keyPath.empty();
+    }
+
+    [[nodiscard]] static Utils::RegistryUtils::OpenOptions WriteOptionsForSource(StartupSource source) noexcept {
+        Utils::RegistryUtils::OpenOptions options{ .access = KEY_READ | KEY_WRITE };
+        if (source == StartupSource::RegistryRun_Wow64_HKLM ||
+            source == StartupSource::RegistryRun_Wow64_HKCU ||
+            source == StartupSource::RegistryRunOnce_Wow64_HKLM ||
+            source == StartupSource::RegistryRunOnce_Wow64_HKCU) {
+            options.wow64_32 = true;
+        }
+        return options;
+    }
+
     [[nodiscard]] bool WriteDisableToRegistry(const StartupItem& item) {
         try {
             if (item.source == StartupSource::StartupFolder_User ||
@@ -1233,32 +1692,28 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
             }
 
             // Registry-based: move value to a disabled subkey.
-            const HKEY hRoot = GetRootKeyForSource(item.source);
-            if (!hRoot) return false;
+            HKEY hRoot = nullptr;
+            std::wstring keyPath;
+            if (!ResolveRegistryItemRootAndPath(item, hRoot, keyPath)) return false;
 
             Utils::RegistryUtils::RegistryKey srcKey;
             Utils::RegistryUtils::Error regErr;
-            if (!srcKey.Open(hRoot, item.location, {.access = KEY_READ | KEY_WRITE}, &regErr))
+            const auto writeOptions = WriteOptionsForSource(item.source);
+            if (!srcKey.Open(hRoot, keyPath, writeOptions, &regErr))
                 return false;
 
             // Preserve REG_EXPAND_SZ semantics: a value originally stored as
             // expandable must be rewritten as expandable, otherwise references
             // such as %SystemRoot% would no longer be expanded by the loader.
             std::wstring value;
-            bool isExpand = false;
-            if (!srcKey.ReadString(item.entryName, value, &regErr)) {
-                Utils::RegistryUtils::Error expandErr;
-                if (srcKey.ReadExpandString(item.entryName, value, &expandErr)) {
-                    isExpand = true;
-                } else {
-                    return false;
-                }
-            }
+            DWORD valueType = REG_NONE;
+            if (!ReadStringValueCapped(srcKey, item.entryName, value, &valueType)) return false;
+            const bool isExpand = (valueType == REG_EXPAND_SZ);
 
             // Create / open the per-key backup container.
-            const std::wstring disabledPath = item.location + L"\\AutorunsDisabled";
+            const std::wstring disabledPath = keyPath + L"\\AutorunsDisabled";
             Utils::RegistryUtils::RegistryKey disKey;
-            if (!disKey.Create(hRoot, disabledPath, {.access = KEY_WRITE}, nullptr, &regErr))
+            if (!disKey.Create(hRoot, disabledPath, writeOptions, nullptr, &regErr))
                 return false;
 
             // If a backup with the same entryName already exists, append the
@@ -1267,11 +1722,11 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
             {
                 Utils::RegistryUtils::RegistryKey probe;
                 Utils::RegistryUtils::Error probeErr;
-                if (probe.Open(hRoot, disabledPath, {.access = KEY_READ}, &probeErr)) {
-                    Utils::RegistryUtils::Error existsErr;
+                Utils::RegistryUtils::OpenOptions readOptions = writeOptions;
+                readOptions.access = KEY_READ;
+                if (probe.Open(hRoot, disabledPath, readOptions, &probeErr)) {
                     std::wstring existing;
-                    if (probe.ReadString(item.entryName, existing, &existsErr) ||
-                        probe.ReadExpandString(item.entryName, existing, &existsErr)) {
+                    if (ReadStringValueCapped(probe, item.entryName, existing)) {
                         backupName += MakeDisabledSuffix();
                     }
                 }
@@ -1287,8 +1742,8 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"StartupAnalyzer",
-                L"Registry disable write-back failed for {}: {}",
-                item.name, Utils::StringUtils::ToWide(e.what()));
+                L"Registry disable write-back failed for %hs: %hs",
+                SanitizeForLog(item.name).c_str(), SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -1304,24 +1759,30 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 return !ec;
             }
 
-            HKEY hRoot = GetRootKeyForSource(item.source);
-            if (!hRoot) return false;
+            HKEY hRoot = nullptr;
+            std::wstring keyPath;
+            if (!ResolveRegistryItemRootAndPath(item, hRoot, keyPath)) return false;
 
             // Read from disabled key
-            std::wstring disabledPath = item.location + L"\\AutorunsDisabled";
+            std::wstring disabledPath = keyPath + L"\\AutorunsDisabled";
             Utils::RegistryUtils::RegistryKey disKey;
             Utils::RegistryUtils::Error regErr;
-            if (!disKey.Open(hRoot, disabledPath, {.access = KEY_READ | KEY_WRITE}, &regErr))
+            const auto writeOptions = WriteOptionsForSource(item.source);
+            if (!disKey.Open(hRoot, disabledPath, writeOptions, &regErr))
                 return false;
 
             std::wstring value;
-            if (!disKey.ReadString(item.entryName, value, &regErr)) return false;
+            DWORD valueType = REG_NONE;
+            if (!ReadStringValueCapped(disKey, item.entryName, value, &valueType)) return false;
 
             // Write back to original key
             Utils::RegistryUtils::RegistryKey srcKey;
-            if (!srcKey.Open(hRoot, item.location, {.access = KEY_WRITE}, &regErr)) return false;
+            if (!srcKey.Open(hRoot, keyPath, writeOptions, &regErr)) return false;
 
-            if (!srcKey.WriteString(item.entryName, value, &regErr)) return false;
+            const bool wrote = (valueType == REG_EXPAND_SZ)
+                ? srcKey.WriteExpandString(item.entryName, value, &regErr)
+                : srcKey.WriteString(item.entryName, value, &regErr);
+            if (!wrote) return false;
 
             // Remove from disabled key
             (void)disKey.DeleteValue(item.entryName, &regErr);
@@ -1329,8 +1790,8 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"StartupAnalyzer",
-                L"Registry enable write-back failed for {}: {}",
-                item.name, Utils::StringUtils::ToWide(e.what()));
+                L"Registry enable write-back failed for %hs: %hs",
+                SanitizeForLog(item.name).c_str(), SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -1344,18 +1805,19 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
                 return fs::remove(filePath, ec);
             }
 
-            HKEY hRoot = GetRootKeyForSource(item.source);
-            if (!hRoot) return false;
+            HKEY hRoot = nullptr;
+            std::wstring keyPath;
+            if (!ResolveRegistryItemRootAndPath(item, hRoot, keyPath)) return false;
 
             Utils::RegistryUtils::RegistryKey srcKey;
             Utils::RegistryUtils::Error regErr;
-            if (!srcKey.Open(hRoot, item.location, {.access = KEY_WRITE}, &regErr)) return false;
+            if (!srcKey.Open(hRoot, keyPath, WriteOptionsForSource(item.source), &regErr)) return false;
             return srcKey.DeleteValue(item.entryName, &regErr);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"StartupAnalyzer",
-                L"Registry remove write-back failed for {}: {}",
-                item.name, Utils::StringUtils::ToWide(e.what()));
+                L"Registry remove write-back failed for %hs: %hs",
+                SanitizeForLog(item.name).c_str(), SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
@@ -1790,7 +2252,14 @@ void StartupAnalyzer::OnRegistryChange(const std::wstring& keyPath,
         item.location = keyPath;
         item.entryName = valueName;
 
-        // Extract command from data
+        // Extract command from data, capped so a kernel event cannot force
+        // unbounded allocations or log/callback payload amplification.
+        if (data.size() > kMaxRegPayloadBytes) {
+            SS_LOG_WARN(L"StartupAnalyzer",
+                L"Rejected oversized real-time registry payload for {}\\{} ({} bytes)",
+                keyPath, valueName, data.size());
+            return;
+        }
         if (!data.empty() && data.size() >= sizeof(wchar_t)) {
             item.command = StartupAnalyzerImpl::SafeExtractRegString(data.data(),
                 static_cast<DWORD>(data.size()));
@@ -1876,22 +2345,7 @@ void StartupAnalyzer::OnKernelRegistryNotification(const std::wstring& keyPath,
             L"Kernel registry notification: {}\\{} by PID {}",
             keyPath, valueName, processId);
 
-        // Read the actual value from registry to get full data
-        Utils::RegistryUtils::RegistryKey regKey;
-        Utils::RegistryUtils::Error regErr;
-
-        // Determine root key heuristically
-        HKEY hRoot = HKEY_LOCAL_MACHINE;
-        std::wstring subPath = keyPath;
-        if (keyPath.find(L"\\REGISTRY\\USER\\") != std::wstring::npos ||
-            keyPath.find(L"HKEY_CURRENT_USER") != std::wstring::npos) {
-            hRoot = HKEY_CURRENT_USER;
-        }
-
-        // Normalize NT-style paths to Win32
-        if (subPath.find(L"\\REGISTRY\\MACHINE\\") == 0) {
-            subPath = subPath.substr(18);  // Strip \REGISTRY\MACHINE\ prefix
-        }
+        const std::wstring normalizedKeyPath = NormalizeKernelRegistryPath(keyPath);
 
         std::vector<uint8_t> data;
         std::wstring processPath;
@@ -1907,7 +2361,7 @@ void StartupAnalyzer::OnKernelRegistryNotification(const std::wstring& keyPath,
             CloseHandle(hProc);
         }
 
-        OnRegistryChange(keyPath, valueName, data, processId, processPath);
+        OnRegistryChange(normalizedKeyPath, valueName, data, processId, processPath);
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"StartupAnalyzer",
@@ -2550,6 +3004,7 @@ bool StartupAnalyzer::RollbackChange(uint64_t changeId) {
         // during item operations (prevents deadlock: historyMutex → itemsMutex → historyMutex)
         uint64_t targetItemId = 0;
         StartupStatus previousStatus = StartupStatus::Enabled;
+        std::string changeType;
         bool canRollback = false;
         bool found = false;
 
@@ -2562,6 +3017,7 @@ bool StartupAnalyzer::RollbackChange(uint64_t changeId) {
                 canRollback = it->canRollback;
                 targetItemId = it->itemId;
                 previousStatus = it->previousStatus;
+                changeType = it->changeType;
             }
         }
 
@@ -2576,6 +3032,23 @@ bool StartupAnalyzer::RollbackChange(uint64_t changeId) {
         // Phase 2: Update item under items lock only
         auto item = GetItemById(targetItemId);
         if (!item) return false;
+
+        bool registryUpdated = true;
+        if (previousStatus == StartupStatus::Enabled) {
+            registryUpdated = m_impl->WriteEnableToRegistry(*item);
+        } else if (previousStatus == StartupStatus::Disabled) {
+            registryUpdated = m_impl->WriteDisableToRegistry(*item);
+        } else if (previousStatus == StartupStatus::Removed ||
+                   previousStatus == StartupStatus::Quarantined) {
+            registryUpdated = m_impl->WriteRemoveFromRegistry(*item);
+        }
+
+        if (!registryUpdated) {
+            SS_LOG_WARN(L"StartupAnalyzer",
+                L"Rollback change {} could not restore registry/file state for item {} after {}",
+                changeId, item->name, Utils::StringUtils::ToWide(changeType));
+            return false;
+        }
 
         m_impl->RecordChange(*item, "Rollback", item->status, previousStatus);
 
