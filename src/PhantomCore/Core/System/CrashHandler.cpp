@@ -80,10 +80,12 @@ namespace ShadowStrike::Core::System {
 #include <new.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <bcrypt.h>
 
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 // Standard library
 #include <algorithm>
@@ -665,13 +667,19 @@ bool CalculateFileHashStreaming(const std::wstring& filePath, std::string& outHa
         ~HashGuard() { if (h) BCryptDestroyHash(h); }
     } hashGuard{hHash};
     
-    // Read and hash in chunks
-    std::array<uint8_t, HASH_STREAM_BUFFER_SIZE> buffer;
+    // Read and hash in chunks.
+    // Allocate the 64KB streaming buffer on the heap rather than the stack:
+    // when this routine runs from the crash path, the available stack may be
+    // tight and a 64KB std::array would risk a secondary stack overflow.
+    std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[HASH_STREAM_BUFFER_SIZE]);
+    if (!buffer) {
+        return false;
+    }
     DWORD bytesRead = 0;
-    
-    while (ReadFile(hFile, buffer.data(), static_cast<DWORD>(buffer.size()), 
+
+    while (ReadFile(hFile, buffer.get(), static_cast<DWORD>(HASH_STREAM_BUFFER_SIZE),
                     &bytesRead, nullptr) && bytesRead > 0) {
-        status = BCryptHashData(hHash, buffer.data(), bytesRead, 0);
+        status = BCryptHashData(hHash, buffer.get(), bytesRead, 0);
         if (!BCRYPT_SUCCESS(status)) {
             return false;
         }
@@ -1176,12 +1184,27 @@ public:
     // ========================================================================
 
     DumpFileInfo CreateDump(DumpType type, const std::wstring& reason) {
+        return CreateDumpWithException(type, reason, nullptr);
+    }
+
+    /**
+     * @brief Internal: create a minidump, optionally embedding the live exception
+     * context so that post-mortem analysis can locate the faulting instruction.
+     *
+     * When @p exceptionPointers is non-null, MINIDUMP_EXCEPTION_INFORMATION is
+     * constructed in stack-local memory (no heap allocation in the crash path)
+     * and supplied to MiniDumpWriteDump. ClientPointers=FALSE because the
+     * exception pointers reside in our own address space.
+     */
+    DumpFileInfo CreateDumpWithException(DumpType type,
+                                          const std::wstring& reason,
+                                          EXCEPTION_POINTERS* exceptionPointers) {
         DumpFileInfo info;
 
         try {
             // Sanitize reason parameter to prevent path traversal
             const std::wstring sanitizedReason = SanitizeFilenameComponent(reason);
-            
+
             // Generate filename with sanitized components
             auto crashId = GenerateCrashId();
             fs::path dumpPath = fs::path(m_config.dumpDirectory) /
@@ -1193,7 +1216,7 @@ public:
 
             // Create secure file with restrictive ACL
             SecureFileAttributes secAttrs;
-            
+
             HANDLE hFile = CreateFileW(
                 dumpPath.c_str(),
                 GENERIC_WRITE | GENERIC_READ,  // Need read for hash calculation
@@ -1218,22 +1241,34 @@ public:
             // Set up sanitization callback to filter sensitive memory
             DumpSanitizationContext sanitizationCtx;
             sanitizationCtx.filterSensitiveMemory = (type == DumpType::FilterMemory);
-            
+
             // Sensitive memory exclusion requires runtime integration with security modules
             // (credential stores, key storage, etc.) which register their regions dynamically.
-            
+
             MINIDUMP_CALLBACK_INFORMATION callbackInfo;
             callbackInfo.CallbackRoutine = DumpSanitizationCallback;
             callbackInfo.CallbackParam = &sanitizationCtx;
+
+            // Build MINIDUMP_EXCEPTION_INFORMATION only when we actually have
+            // live exception pointers — passing a stale/zeroed structure would
+            // produce a dump WinDbg cannot analyze correctly.
+            MINIDUMP_EXCEPTION_INFORMATION exceptionInfo{};
+            PMINIDUMP_EXCEPTION_INFORMATION exceptionInfoPtr = nullptr;
+            if (exceptionPointers != nullptr) {
+                exceptionInfo.ThreadId = GetCurrentThreadId();
+                exceptionInfo.ExceptionPointers = exceptionPointers;
+                exceptionInfo.ClientPointers = FALSE;
+                exceptionInfoPtr = &exceptionInfo;
+            }
 
             BOOL success = MiniDumpWriteDump(
                 GetCurrentProcess(),
                 GetCurrentProcessId(),
                 hFile,
                 minidumpType,
-                nullptr,        // Exception info (null for manual dump)
-                nullptr,        // User stream info
-                &callbackInfo   // Sanitization callback
+                exceptionInfoPtr,  // Exception info (non-null only for live crash)
+                nullptr,            // User stream info
+                &callbackInfo       // Sanitization callback
             );
 
             if (success) {
@@ -1243,7 +1278,7 @@ public:
                     info.fileSizeBytes = static_cast<uint64_t>(fileSize.QuadPart);
                 }
             }
-            
+
             // Close file before hash calculation
             CloseHandle(hFile);
 
@@ -1713,14 +1748,34 @@ public:
     }
 
     static void SafeTriggerRecovery() noexcept {
+        // Track recovery outcome across the SEH boundary so we can log it without
+        // mixing C++ unwind objects into the __try frame (MSVC C2712).
+        bool recoveryAttempted = false;
+        bool recoverySucceeded = false;
         __try {
             if (ShadowStrike::Security::SelfDefense::HasInstance()) {
-                ShadowStrike::Security::SelfDefense::Instance().TriggerRecovery(
+                recoveryAttempted = true;
+                // TriggerRecovery is [[nodiscard]] — capture the outcome explicitly
+                // so we never silently discard a self-protection failure indicator.
+                recoverySucceeded = ShadowStrike::Security::SelfDefense::Instance().TriggerRecovery(
                     ShadowStrike::Security::ProtectionComponent::Process);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            // SelfDefense not available
+            // SelfDefense not available or threw — treat as recovery failure
+            recoverySucceeded = false;
+        }
+
+        // Log outside the __try (no SEH/C++ object conflict) and only when not
+        // inside the recursive crash path (logging may allocate).
+        if (recoveryAttempted && g_crashRecursionDepth <= 1) {
+            if (recoverySucceeded) {
+                SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense recovery acknowledged%ls", L"");
+            } else {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"SelfDefense recovery request returned failure - watchdog may not restart%ls",
+                    L"");
+            }
         }
     }
 
@@ -2219,9 +2274,14 @@ private:
         report.avVersion = SHADOWSTRIKE_VERSION;
         report.reportTime = std::chrono::system_clock::now();
 
-        // Create minidump
+        // Create minidump.
+        // CRITICAL: pass the live EXCEPTION_POINTERS when available so the
+        // resulting dump embeds the faulting thread context. Without this,
+        // WinDbg's !analyze -v lands on the crash handler frames instead of
+        // the original fault site, which breaks post-mortem triage.
         if (m_config.createDumpOnCrash) {
-            report.dumpFile = CreateDump(m_config.defaultDumpType, L"Crash");
+            auto* ep = static_cast<EXCEPTION_POINTERS*>(exceptionPointers);
+            report.dumpFile = CreateDumpWithException(m_config.defaultDumpType, L"Crash", ep);
         }
 
         // Add to history
