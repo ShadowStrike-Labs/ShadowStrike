@@ -932,7 +932,13 @@ namespace ShadowStrike {
             bool createDatabaseFile(DatabaseError* err);
             bool configurePragmas(SQLite::Database& db, DatabaseError* err);
             bool enableSecurity(SQLite::Database& db, DatabaseError* err);
-            
+
+            // === Validation Helpers ===
+            // FIX: Centralized validation for filesystem paths supplied via config or
+            // restore/backup APIs. Guards against path traversal and embedded NULs
+            // before any I/O is performed.
+            [[nodiscard]] static bool isSafePath(std::wstring_view path) noexcept;
+
             // === Schema Helpers ===
             bool executeSchemaMigration(SQLite::Database& db, int version, DatabaseError* err);
             
@@ -940,6 +946,10 @@ namespace ShadowStrike {
             void backgroundBackupThread();
             bool performBackup(const std::wstring& backupPath, DatabaseError* err);
             void cleanupOldBackups();
+            // FIX: Verify a backup file before allowing it to replace the live DB.
+            // Opens the file read-only and runs PRAGMA integrity_check to ensure the
+            // candidate is a well-formed SQLite database before any destructive op.
+            [[nodiscard]] bool verifyBackupIntegrity(const std::wstring& backupPath, DatabaseError* err) const;
             
             // === Error Handling ===
             void setError(DatabaseError* err, int code, std::wstring_view msg, std::wstring_view ctx = L"") const;
@@ -954,7 +964,14 @@ namespace ShadowStrike {
             std::unique_ptr<PreparedStatementCache> m_statementCache;  ///< Statement cache
             
             mutable std::shared_mutex m_configMutex;    ///< Config access synchronization
-            
+
+            // FIX: Serializes Initialize(), Shutdown(), and RestoreFromFile() against
+            // each other so concurrent lifecycle calls cannot interleave (which
+            // previously caused use-after-free on the connection pool and dangling
+            // backup threads). Acquired in exclusive mode by lifecycle code; never
+            // held during query execution.
+            std::mutex m_lifecycleMutex;
+
             // === Statistics Counters ===
             std::atomic<int64_t> m_totalQueries{ 0 };        ///< Total queries executed
             std::atomic<int64_t> m_totalTransactions{ 0 };   ///< Total transactions
@@ -964,7 +981,7 @@ namespace ShadowStrike {
             std::atomic<bool> m_shutdownBackupThread{ false };///< Shutdown signal
             std::condition_variable m_backupCv;               ///< Backup wake condition
             std::mutex m_backupMutex;                         ///< Backup synchronization
-            std::chrono::steady_clock::time_point m_lastBackup; ///< Last backup timestamp
+            std::chrono::steady_clock::time_point m_lastBackup; ///< Last backup timestamp (guarded by m_backupMutex)
         };
 
         // ============================================================================
@@ -998,9 +1015,12 @@ namespace ShadowStrike {
             }
 
             try {
-                SQLite::Statement stmt(*m_db, sql.data());
+                // FIX: std::string_view is NOT guaranteed null-terminated. Passing
+                // sql.data() directly to SQLite::Statement (which accepts const char*
+                // or std::string) is undefined behavior when sql is a substring view.
+                // Construct an owning std::string to guarantee null-termination.
+                SQLite::Statement stmt(*m_db, std::string(sql));
 
-                // Use DatabaseManager's binding helpers
                 if (m_manager) {
                     m_manager->bindParameters(stmt, 1, std::forward<Args>(args)...);
                 }
@@ -1012,10 +1032,22 @@ namespace ShadowStrike {
                 if (err) {
                     err->sqliteCode = ex.getErrorCode();
                     err->extendedCode = ex.getExtendedErrorCode();
-
-                    // Convert exception message to wide string
-                    std::string msg = ex.what();
-                    err->message = std::wstring(msg.begin(), msg.end());
+                    // FIX: Previous impl used a naive char->wchar_t copy which mangles
+                    // any byte > 0x7F (mojibake). Route through the MultiByteToWideChar
+                    // conversion exposed by DatabaseManager helpers via a UTF-8 cast.
+                    const std::string msg = ex.what();
+                    std::wstring wmsg;
+                    if (!msg.empty()) {
+                        const int wlen = ::MultiByteToWideChar(CP_UTF8, 0,
+                            msg.data(), static_cast<int>(msg.size()), nullptr, 0);
+                        if (wlen > 0) {
+                            wmsg.resize(static_cast<size_t>(wlen));
+                            ::MultiByteToWideChar(CP_UTF8, 0,
+                                msg.data(), static_cast<int>(msg.size()),
+                                wmsg.data(), wlen);
+                        }
+                    }
+                    err->message = std::move(wmsg);
                     err->context = L"Transaction::ExecuteWithParams";
                 }
                 return false;
@@ -1052,7 +1084,8 @@ namespace ShadowStrike {
             } guard{ this, conn };
 
             try {
-                auto stmt = std::make_unique<SQLite::Statement>(*conn, sql.data());
+                // FIX: std::string_view is not null-terminated; use owning string.
+                auto stmt = std::make_unique<SQLite::Statement>(*conn, std::string(sql));
                 this->bindParameters(*stmt, 1, std::forward<Args>(args)...);
                 stmt->exec();
                 this->m_totalQueries.fetch_add(1, std::memory_order_relaxed);
@@ -1094,11 +1127,11 @@ namespace ShadowStrike {
             } guard{ this, conn };
 
             try {
-                auto stmt = std::make_unique<SQLite::Statement>(*conn, sql.data());
+                // FIX: std::string_view is not null-terminated; use owning string.
+                auto stmt = std::make_unique<SQLite::Statement>(*conn, std::string(sql));
                 this->bindParameters(*stmt, 1, std::forward<Args>(args)...);
                 this->m_totalQueries.fetch_add(1, std::memory_order_relaxed);
 
-                // QueryResult will handle release, so mark as released
                 guard.released = true;
                 return QueryResult{ std::move(stmt), conn, this };
             }
@@ -1121,65 +1154,78 @@ namespace ShadowStrike {
                 setError(err, SQLITE_MISUSE, L"Invalid batch insert parameters");
                 return false;
             }
-            
-            // Security: Validate table name against SQL injection
-            // SQL identifiers cannot be parameterized, so we must validate
+
+            // Security: Validate table name against SQL injection.
+            // SQL identifiers cannot be parameterized via bind(); they must be
+            // strictly whitelisted before being concatenated into the statement.
             if (!IsValidSqlIdentifier(tableName)) {
                 setError(err, SQLITE_MISUSE, L"Invalid table name: must contain only alphanumeric characters and underscores");
                 return false;
             }
-            
-            // Security: Validate all column names against SQL injection
+
+            // Security: Validate all column names against SQL injection.
             for (const auto& column : columns) {
                 if (!IsValidSqlIdentifier(column)) {
                     setError(err, SQLITE_MISUSE, L"Invalid column name: must contain only alphanumeric characters and underscores");
                     return false;
                 }
             }
-            
+
+            auto conn = AcquireConnection(err);
+            if (!conn) return false;
+
+            // FIX (CRITICAL): The previous implementation called BeginTransaction()
+            // which acquired a *separate* pool connection. The inserts therefore ran
+            // OUTSIDE the BEGIN/COMMIT scope, defeating atomicity. We now drive the
+            // transaction explicitly on the same connection used for the statements,
+            // and use a RAII guard that rolls back on any failure.
+            struct ConnGuard {
+                DatabaseManager* mgr;
+                std::shared_ptr<SQLite::Database> conn;
+                bool committed = false;
+                ~ConnGuard() {
+                    if (conn) {
+                        if (!committed) {
+                            try { conn->exec("ROLLBACK"); }
+                            catch (...) { /* best effort - log only */ }
+                        }
+                        if (mgr) mgr->ReleaseConnection(conn);
+                    }
+                }
+            } guard{ this, conn };
+
             try {
-                auto conn = AcquireConnection(err);
-                if (!conn) return false;
-                
-                // Build INSERT statement (identifiers are now validated safe)
-                std::string sql = "INSERT INTO ";
-                sql += tableName;
-                sql += " (";
+                conn->exec("BEGIN IMMEDIATE TRANSACTION");
+
+                // Build INSERT statement (identifiers are now validated safe).
+                std::string sql;
+                sql.reserve(32 + tableName.size() + columns.size() * 16);
+                sql.append("INSERT INTO ");
+                sql.append(tableName);
+                sql.append(" (");
                 for (size_t i = 0; i < columns.size(); ++i) {
-                    if (i > 0) sql += ", ";
-                    sql += columns[i];
+                    if (i > 0) sql.append(", ");
+                    sql.append(columns[i]);
                 }
-                sql += ") VALUES (";
+                sql.append(") VALUES (");
                 for (size_t i = 0; i < columns.size(); ++i) {
-                    if (i > 0) sql += ", ";
-                    sql += "?";
+                    if (i > 0) sql.append(", ");
+                    sql.append("?");
                 }
-                sql += ")";
-                
-                auto trans = BeginTransaction(Transaction::Type::Immediate, err);
-                if (!trans || !trans->IsActive()) {
-                    ReleaseConnection(conn);
-                    return false;
-                }
-                
+                sql.append(")");
+
                 SQLite::Statement stmt(*conn, sql);
-                
+
                 for (size_t row = 0; row < rowCount; ++row) {
                     stmt.reset();
                     stmt.clearBindings();
-                    
-                    // Call user's binding function
                     bindFunc(stmt, row);
-                    
                     stmt.exec();
                 }
-                
-                if (!trans->Commit(err)) {
-                    ReleaseConnection(conn);
-                    return false;
-                }
-                
-                ReleaseConnection(conn);
+
+                conn->exec("COMMIT");
+                guard.committed = true;
+                m_totalTransactions.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             catch (const SQLite::Exception& ex) {
@@ -1191,7 +1237,7 @@ namespace ShadowStrike {
         template<typename T>
         void DatabaseManager::bindParameter(SQLite::Statement& stmt, int index, T&& value) {
             using DecayT = std::decay_t<T>;
-            
+
             if constexpr (std::is_same_v<DecayT, bool>) {
                 stmt.bind(index, static_cast<int>(value));
             }
@@ -1210,10 +1256,44 @@ namespace ShadowStrike {
             else if constexpr (std::is_same_v<DecayT, std::string_view>) {
                 stmt.bind(index, std::string(value));
             }
+            else if constexpr (std::is_same_v<DecayT, std::wstring> ||
+                               std::is_same_v<DecayT, std::wstring_view> ||
+                               std::is_same_v<DecayT, const wchar_t*>) {
+                // FIX: Wide-string support routes through UTF-8 conversion so callers
+                // can bind Windows paths and user-provided strings without losing
+                // non-ASCII characters via a naive char-cast.
+                std::wstring_view wsv;
+                if constexpr (std::is_same_v<DecayT, const wchar_t*>) {
+                    wsv = value ? std::wstring_view(value) : std::wstring_view();
+                } else {
+                    wsv = std::wstring_view(value);
+                }
+                if (wsv.empty()) {
+                    stmt.bind(index, std::string());
+                } else {
+                    if (wsv.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+                        throw std::length_error("DatabaseManager::bindParameter: wide string too large");
+                    }
+                    const int needed = ::WideCharToMultiByte(CP_UTF8, 0,
+                        wsv.data(), static_cast<int>(wsv.size()),
+                        nullptr, 0, nullptr, nullptr);
+                    if (needed <= 0) {
+                        throw std::runtime_error("DatabaseManager::bindParameter: UTF-8 conversion failed");
+                    }
+                    std::string utf8(static_cast<size_t>(needed), '\0');
+                    ::WideCharToMultiByte(CP_UTF8, 0,
+                        wsv.data(), static_cast<int>(wsv.size()),
+                        utf8.data(), needed, nullptr, nullptr);
+                    stmt.bind(index, utf8);
+                }
+            }
             else if constexpr (std::is_same_v<DecayT, std::vector<uint8_t>>) {
-                if (value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                    
-					SS_LOG_ERROR(L"Database", L"Blob size exceeds maximum allowed size for binding");
+                // FIX: Previous implementation logged then silently bound a truncated
+                // size, corrupting the row. Now we hard-fail: an oversize blob is a
+                // programmer error and must not be silently truncated.
+                if (value.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+                    SS_LOG_ERROR(L"Database", L"Blob size %zu exceeds INT_MAX for bind", value.size());
+                    throw std::length_error("DatabaseManager::bindParameter: blob exceeds INT_MAX");
                 }
                 stmt.bind(index, value.data(), static_cast<int>(value.size()));
             }
