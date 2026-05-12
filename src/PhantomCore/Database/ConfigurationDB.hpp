@@ -118,6 +118,10 @@
 #include <unordered_map>
 #include <any>
 #include <variant>
+#include <atomic>
+#include <condition_variable>
+#include <filesystem>
+#include <thread>
 
 namespace ShadowStrike {
     namespace Database {
@@ -736,7 +740,7 @@ namespace ShadowStrike {
             std::vector<uint8_t> valueToBlob(const ConfigValue& value) const;
             ConfigValue blobToValue(const std::vector<uint8_t>& blob, ValueType type) const;
 
-            // Helper for UTF-8 conversion
+            // Helper for UTF-8 conversion (delegates to Utils::StringUtils::ToNarrow)
             std::string wstringToUtf8(std::wstring_view wstr) const;
 
             // Validation helpers
