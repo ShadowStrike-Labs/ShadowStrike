@@ -121,6 +121,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <regex>
 #include <thread>
 
 namespace ShadowStrike {
@@ -286,6 +287,7 @@ namespace ShadowStrike {
                 ValueType expectedType;                         ///< Required value type
                 bool required = false;                          ///< Whether key must exist
                 std::wstring pattern;                           ///< Regex pattern for string validation
+                std::shared_ptr<const std::wregex> compiledPattern; ///< Precompiled bounded regex
                 std::optional<int64_t> minInt;                  ///< Minimum value for integers
                 std::optional<int64_t> maxInt;                  ///< Maximum value for integers
                 std::optional<double> minReal;                  ///< Minimum value for reals
@@ -588,7 +590,7 @@ namespace ShadowStrike {
             // Batch Operations
             // ============================================================================
 
-            // Set multiple values in a transaction
+            // Set multiple values through the same validation, audit and read-only pipeline as Set()
             bool SetBatch(const std::vector<std::pair<std::wstring, ConfigValue>>& entries,
                          ConfigScope scope = ConfigScope::Global,
                          std::wstring_view changedBy = L"System",
@@ -599,7 +601,7 @@ namespace ShadowStrike {
                 const std::vector<std::wstring>& keys,
                 DatabaseError* err = nullptr) const;
 
-            // Remove multiple keys
+            // Remove multiple keys through the same audit and read-only pipeline as Remove()
             bool RemoveBatch(const std::vector<std::wstring>& keys,
                            std::wstring_view changedBy = L"System",
                            DatabaseError* err = nullptr);
@@ -726,7 +728,7 @@ namespace ShadowStrike {
             void cacheInvalidate(std::wstring_view key);
             void cacheInvalidateAll();
             std::optional<ConfigEntry> cacheGet(std::wstring_view key) const;
-            void cachePut(const ConfigEntry& entry);
+            void cachePut(const ConfigEntry& entry) const;
 
             // Encryption helpers (using Windows DPAPI or custom crypto)
             std::vector<uint8_t> encryptData(const std::vector<uint8_t>& plaintext,
@@ -757,7 +759,7 @@ namespace ShadowStrike {
             void hotReloadThread();
 
             // Statistics update
-            void updateStats(bool read, bool cacheHit);
+            void updateStats(bool read, bool cacheHit) const;
 
             // ============================================================================
             // State
@@ -793,7 +795,7 @@ namespace ShadowStrike {
 
             // Statistics
             mutable std::mutex m_statsMutex;
-            Statistics m_stats;
+            mutable Statistics m_stats;
         };
 
         // ============================================================================

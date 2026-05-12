@@ -74,6 +74,55 @@ namespace ShadowStrike {
             
             /** @brief AES block size for alignment calculations */
             constexpr size_t AES_BLOCK_SIZE = 16;
+
+            constexpr size_t MAX_CONFIG_KEY_CHARS = 512;
+            constexpr size_t MAX_AUDIT_FIELD_CHARS = 256;
+            constexpr size_t MAX_CONFIG_BLOB_BYTES = 4u * 1024u * 1024u;
+            constexpr size_t MAX_VALIDATION_PATTERN_CHARS = 512;
+            constexpr size_t MAX_VALIDATION_STRING_CHARS = 4096;
+
+            bool IsValidConfigKey(std::wstring_view key) noexcept {
+                if (key.empty() || key.size() > MAX_CONFIG_KEY_CHARS) {
+                    return false;
+                }
+                for (wchar_t c : key) {
+                    if (c == L'\0' || c == L'\r' || c == L'\n' ||
+                        c < 0x20 || c == 0x7F) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            std::wstring SanitizeAuditField(std::wstring_view field) {
+                std::wstring out;
+                out.reserve(std::min(field.size(), MAX_AUDIT_FIELD_CHARS));
+                for (wchar_t c : field) {
+                    if (out.size() >= MAX_AUDIT_FIELD_CHARS) {
+                        break;
+                    }
+                    if (c == L'\0' || c == L'\r' || c == L'\n' ||
+                        c < 0x20 || c == 0x7F) {
+                        out.push_back(L' ');
+                    } else {
+                        out.push_back(c);
+                    }
+                }
+                return out;
+            }
+
+            bool IsSafeImportExportPath(const std::filesystem::path& path) {
+                const std::wstring native = path.wstring();
+                if (native.empty() || native.size() >= 32767 || native.find(L'\0') != std::wstring::npos) {
+                    return false;
+                }
+                for (const auto& part : path) {
+                    if (part == L"..") {
+                        return false;
+                    }
+                }
+                return !path.is_relative();
+            }
             
             /**
              * @brief Helper function to Base64 encode binary data.
@@ -532,10 +581,10 @@ namespace ShadowStrike {
                 return false;
             }
 
-            if (key.empty()) {
+            if (!IsValidConfigKey(key)) {
                 if (err) {
                     err->sqliteCode = SQLITE_MISUSE;
-                    err->message = L"Configuration key cannot be empty";
+                    err->message = L"Configuration key is empty, too long, or contains control characters";
                 }
                 return false;
             }
@@ -682,7 +731,7 @@ namespace ShadowStrike {
             if (m_config.enableCaching) {
                 auto cached = cacheGet(key);
                 if (cached.has_value()) {
-                    const_cast<ConfigurationDB*>(this)->updateStats(true, true);
+                    updateStats(true, true);
                     return cached->value;
                 }
             }
@@ -690,16 +739,16 @@ namespace ShadowStrike {
             // Read from database
             auto entry = dbRead(key, err);
             if (!entry.has_value()) {
-                const_cast<ConfigurationDB*>(this)->updateStats(true, false);
+                updateStats(true, false);
                 return std::nullopt;
             }
 
             // Update cache
             if (m_config.enableCaching) {
-                const_cast<ConfigurationDB*>(this)->cachePut(*entry);
+                cachePut(*entry);
             }
 
-            const_cast<ConfigurationDB*>(this)->updateStats(true, false);
+            updateStats(true, false);
             return entry->value;
         }
 
@@ -806,7 +855,7 @@ namespace ShadowStrike {
             if (m_config.enableCaching) {
                 auto cached = cacheGet(key);
                 if (cached.has_value()) {
-                    const_cast<ConfigurationDB*>(this)->updateStats(true, true);
+                    updateStats(true, true);
                     return cached;
                 }
             }
@@ -814,10 +863,10 @@ namespace ShadowStrike {
             // Read from DB
             auto entry = dbRead(key, err);
             if (entry.has_value() && m_config.enableCaching) {
-                const_cast<ConfigurationDB*>(this)->cachePut(*entry);
+                cachePut(*entry);
             }
 
-            const_cast<ConfigurationDB*>(this)->updateStats(true, entry.has_value());
+            updateStats(true, entry.has_value());
             return entry;
         }
 
@@ -833,6 +882,14 @@ namespace ShadowStrike {
         ) {
             if (!m_initialized.load(std::memory_order_acquire)) {
                 if (err) err->message = L"ConfigurationDB not initialized";
+                return false;
+            }
+
+            if (!IsValidConfigKey(key)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Configuration key is empty, too long, or contains control characters";
+                }
                 return false;
             }
 
@@ -1144,11 +1201,21 @@ namespace ShadowStrike {
                 enableAuditLog = m_config.enableAuditLog;
             }
 
+            if (!IsValidConfigKey(entry.key)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Configuration key is empty, too long, or contains control characters";
+                }
+                return false;
+            }
+
             auto utf8Key = wstringToUtf8(entry.key);
 
-            // ✅ FIX: READ OLD VERSION **BEFORE** STARTING TRANSACTION!
-            const char* checkSql = "SELECT created_at, version, value, type, scope FROM configurations WHERE key = ?";
-            auto existingResult = dbMgr.QueryWithParams(checkSql, nullptr, utf8Key);
+            auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
+            if (!trans || !trans->IsActive()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to start transaction for key: %ls", entry.key.c_str());
+                return false;
+            }
 
             int64_t finalCreatedMs;
             std::optional<int> oldVersion;
@@ -1157,34 +1224,59 @@ namespace ShadowStrike {
             std::optional<ConfigScope> oldScope;
             bool keyExists = false;
 
-            if (existingResult.Next()) {
-                // Key exists — preserve created_at and save old version for history
-                keyExists = true;
-                finalCreatedMs = existingResult.GetInt64(0);
-                oldVersion = existingResult.GetInt(1);
-                oldValueBlob = existingResult.GetBlob(2);
-                oldType = static_cast<ValueType>(existingResult.GetInt(3));
-                oldScope = static_cast<ConfigScope>(existingResult.GetInt(4));
-            }
-            else {
-                // New key
-                finalCreatedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    entry.createdAt.time_since_epoch()).count();
-            }
-
-            // NOW START TRANSACTION
-            auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
-            if (!trans || !trans->IsActive()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to start transaction for key: %ls", entry.key.c_str());
+            auto existingResult = trans->QueryWithParams(
+                "SELECT created_at, version, value, type, scope, is_readonly FROM configurations WHERE key = ?",
+                err,
+                utf8Key);
+            if (!existingResult) {
+                trans->Rollback(nullptr);
                 return false;
             }
 
+            if (existingResult->executeStep()) {
+                keyExists = true;
+                finalCreatedMs = existingResult->getColumn(0).getInt64();
+                oldVersion = existingResult->getColumn(1).getInt();
+                const auto oldBlob = existingResult->getColumn(2);
+                const void* blobData = oldBlob.getBlob();
+                const int blobBytes = oldBlob.getBytes();
+                if (blobData != nullptr && blobBytes > 0) {
+                    const auto* begin = static_cast<const uint8_t*>(blobData);
+                    oldValueBlob = std::vector<uint8_t>(begin, begin + blobBytes);
+                } else {
+                    oldValueBlob = std::vector<uint8_t>{};
+                }
+                oldType = static_cast<ValueType>(existingResult->getColumn(3).getInt());
+                oldScope = static_cast<ConfigScope>(existingResult->getColumn(4).getInt());
+                if (existingResult->getColumn(5).getInt() != 0) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_CONSTRAINT;
+                        err->message = L"Configuration key is read-only";
+                    }
+                    trans->Rollback(nullptr);
+                    return false;
+                }
+            }
+            else {
+                finalCreatedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    entry.createdAt.time_since_epoch()).count();
+            }
+            existingResult.reset();
+
             // Convert value to BLOB
             auto valueBlob = valueToBlob(entry.value);
+            if (valueBlob.size() > MAX_CONFIG_BLOB_BYTES) {
+                if (err) {
+                    err->sqliteCode = SQLITE_TOOBIG;
+                    err->message = L"Configuration value exceeds maximum allowed size";
+                }
+                trans->Rollback(nullptr);
+                return false;
+            }
             auto modifiedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 entry.modifiedAt.time_since_epoch()).count();
             auto utf8Desc = wstringToUtf8(entry.description);
-            auto utf8ModifiedBy = wstringToUtf8(entry.modifiedBy);
+            auto utf8ModifiedBy = wstringToUtf8(SanitizeAuditField(entry.modifiedBy));
 
             // ✅ CRITICAL FIX: Use UPDATE for existing keys, INSERT for new keys
             // This prevents foreign key constraint violation when inserting history
@@ -1202,7 +1294,7 @@ namespace ShadowStrike {
                 modified_at = ?, 
                 modified_by = ?, 
                 version = ?
-            WHERE key = ?
+            WHERE key = ? AND is_readonly = 0
         )SQL";
 
                 if (!trans->ExecuteWithParams(
@@ -1219,6 +1311,14 @@ namespace ShadowStrike {
                     utf8Key  // WHERE clause
                 )) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Failed to update configuration: %ls", entry.key.c_str());
+                    trans->Rollback(nullptr);
+                    return false;
+                }
+                if (trans->GetChangedRowCount() != 1) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_CONSTRAINT;
+                        err->message = L"Configuration update was blocked by read-only protection";
+                    }
                     trans->Rollback(nullptr);
                     return false;
                 }
@@ -1284,8 +1384,8 @@ namespace ShadowStrike {
                     std::chrono::system_clock::now().time_since_epoch()).count();
 
                 auto newValueBlob = valueToBlob(entry.value);
-                auto utf8ChangedBy = wstringToUtf8(changedBy);
-                auto utf8Reason = wstringToUtf8(reason);
+                auto utf8ChangedBy = wstringToUtf8(SanitizeAuditField(changedBy));
+                auto utf8Reason = wstringToUtf8(SanitizeAuditField(reason));
 
                 const char* changeSql = R"SQL(
             INSERT INTO configuration_changes 
@@ -1366,36 +1466,94 @@ namespace ShadowStrike {
             DatabaseError* err
         ) {
             auto& dbMgr = DatabaseManager::Instance();
+            auto utf8Key = wstringToUtf8(key);
 
-            // Get old value for change record
-            auto oldEntry = dbRead(key, nullptr);
+            bool enableAuditLog = false;
+            {
+                std::shared_lock lock(m_configMutex);
+                enableAuditLog = m_config.enableAuditLog;
+            }
 
-            //check if key exists
-            if (!oldEntry.has_value()) {
+            auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
+            if (!trans || !trans->IsActive()) {
+                return false;
+            }
+
+            auto existing = trans->QueryWithParams(
+                "SELECT value, type, is_readonly FROM configurations WHERE key = ?",
+                err,
+                utf8Key);
+            if (!existing) {
+                trans->Rollback(nullptr);
+                return false;
+            }
+
+            if (!existing->executeStep()) {
                 if (err) {
                     err->sqliteCode = SQLITE_ERROR;
                     err->message = L"Configuration key not found";
                 }
+                trans->Rollback(nullptr);
                 return false;
             }
 
-            const char* sql = "DELETE FROM configurations WHERE key = ?";
-            auto utf8Key = wstringToUtf8(key);
-            bool success = dbMgr.ExecuteWithParams(sql, err, utf8Key);
+            const auto oldBlobColumn = existing->getColumn(0);
+            std::vector<uint8_t> oldBlob;
+            const void* oldBlobData = oldBlobColumn.getBlob();
+            const int oldBlobBytes = oldBlobColumn.getBytes();
+            if (oldBlobData != nullptr && oldBlobBytes > 0) {
+                const auto* begin = static_cast<const uint8_t*>(oldBlobData);
+                oldBlob.assign(begin, begin + oldBlobBytes);
+            }
+            if (existing->getColumn(2).getInt() != 0) {
+                if (err) {
+                    err->sqliteCode = SQLITE_CONSTRAINT;
+                    err->message = L"Configuration key is read-only";
+                }
+                trans->Rollback(nullptr);
+                return false;
+            }
+            existing.reset();
 
-            if (success && m_config.enableAuditLog) {
-                ChangeRecord change;
-                change.key = std::wstring(key);
-                change.action = ChangeAction::Deleted;
-                change.oldValue = oldEntry->value;
-                change.changedBy = changedBy;
-                change.timestamp = std::chrono::system_clock::now();
-                change.reason = reason;
-
-                dbWriteChangeRecord(change, nullptr);
+            const char* sql = "DELETE FROM configurations WHERE key = ? AND is_readonly = 0";
+            if (!trans->ExecuteWithParams(sql, err, utf8Key)) {
+                trans->Rollback(nullptr);
+                return false;
             }
 
-            return success;
+            if (trans->GetChangedRowCount() != 1) {
+                if (err) {
+                    err->sqliteCode = SQLITE_CONSTRAINT;
+                    err->message = L"Configuration delete was blocked by read-only protection";
+                }
+                trans->Rollback(nullptr);
+                return false;
+            }
+
+            if (enableAuditLog) {
+                const auto timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                const char* changeSql = R"SQL(
+                INSERT INTO configuration_changes
+                (key, action, old_value, new_value, changed_by, timestamp, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            )SQL";
+                if (!trans->ExecuteWithParams(
+                    changeSql,
+                    err,
+                    utf8Key,
+                    static_cast<int>(ChangeAction::Deleted),
+                    oldBlob,
+                    std::vector<uint8_t>{},
+                    wstringToUtf8(SanitizeAuditField(changedBy)),
+                    timestampMs,
+                    wstringToUtf8(SanitizeAuditField(reason)))) {
+                    trans->Rollback(nullptr);
+                    return false;
+                }
+            }
+
+            return trans->Commit(err);
         }
 
         bool ConfigurationDB::dbWriteChangeRecord(const ChangeRecord& record, DatabaseError* err) {
@@ -1565,8 +1723,24 @@ namespace ShadowStrike {
         // ============================================================================
 
         bool ConfigurationDB::RegisterValidationRule(const ValidationRule& rule) {
+            if (!IsValidConfigKey(rule.key) || rule.pattern.size() > MAX_VALIDATION_PATTERN_CHARS) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Rejected invalid validation rule for key: %ls", rule.key.c_str());
+                return false;
+            }
+
+            ValidationRule storedRule = rule;
+            if (!storedRule.pattern.empty()) {
+                try {
+                    storedRule.compiledPattern = std::make_shared<const std::wregex>(storedRule.pattern, std::regex::ECMAScript);
+                }
+                catch (const std::regex_error&) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Rejected validation rule with invalid regex for key: %ls", rule.key.c_str());
+                    return false;
+                }
+            }
+
             std::unique_lock lock(m_validationMutex);
-            m_validationRules[rule.key] = rule;
+            m_validationRules[storedRule.key] = std::move(storedRule);
             SS_LOG_DEBUG(LOG_CATEGORY, L"Registered validation rule for key: %ls", rule.key.c_str());
             return true;
         }
@@ -1589,19 +1763,25 @@ namespace ShadowStrike {
             const ConfigValue& value,
             std::wstring& errorMessage
         ) const {
-            std::shared_lock lock(m_validationMutex);
-
-            auto it = m_validationRules.find(std::wstring(key));
-            if (it == m_validationRules.end()) {
-                // No rule registered - allow if allowUnknownKeys is true
-                if (!m_config.allowUnknownKeys) {
-                    errorMessage = L"Unknown configuration key";
-                    return false;
-                }
-                return true;
+            bool allowUnknownKeys = false;
+            {
+                std::shared_lock configLock(m_configMutex);
+                allowUnknownKeys = m_config.allowUnknownKeys;
             }
 
-            const auto& rule = it->second;
+            ValidationRule rule;
+            {
+                std::shared_lock lock(m_validationMutex);
+                auto it = m_validationRules.find(std::wstring(key));
+                if (it == m_validationRules.end()) {
+                    if (!allowUnknownKeys) {
+                        errorMessage = L"Unknown configuration key";
+                        return false;
+                    }
+                    return true;
+                }
+                rule = it->second;
+            }
 
             // Check type
             ValueType actualType = ValueType::String;
@@ -1620,16 +1800,20 @@ namespace ShadowStrike {
 
             // String validation
             if (auto* str = std::get_if<std::wstring>(&value)) {
-                if (!rule.pattern.empty()) {
+                if (str->size() > MAX_VALIDATION_STRING_CHARS) {
+                    errorMessage = L"String value exceeds maximum validation length";
+                    return false;
+                }
+
+                if (rule.compiledPattern) {
                     try {
-                        std::wregex regex(rule.pattern);
-                        if (!std::regex_match(*str, regex)) {
-                            errorMessage = L"Value does not match pattern: " + rule.pattern;
+                        if (!std::regex_match(*str, *rule.compiledPattern)) {
+                            errorMessage = L"Value does not match registered validation pattern";
                             return false;
                         }
                     }
                     catch (const std::regex_error&) {
-                        errorMessage = L"Invalid regex pattern in validation rule";
+                        errorMessage = L"Regex validation failed";
                         return false;
                     }
                 }
@@ -2031,7 +2215,7 @@ namespace ShadowStrike {
             m_stats = Statistics{};
         }
 
-        void ConfigurationDB::updateStats(bool read, bool cacheHit) {
+        void ConfigurationDB::updateStats(bool read, bool cacheHit) const {
             std::lock_guard lock(m_statsMutex);
             if (read) {
                 m_stats.totalReads++;
@@ -2091,61 +2275,30 @@ namespace ShadowStrike {
             std::wstring_view changedBy,
             DatabaseError* err
         ) {
-            auto& dbMgr = DatabaseManager::Instance();
-            auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
-            if (!trans || !trans->IsActive()) {
-                return false;
-            }
-
-            
             for (const auto& [key, value] : entries) {
-               
-
-                // Determine value type
-                ValueType type = ValueType::String;
-                if (std::holds_alternative<std::wstring>(value)) type = ValueType::String;
-                else if (std::holds_alternative<int64_t>(value)) type = ValueType::Integer;
-                else if (std::holds_alternative<double>(value)) type = ValueType::Real;
-                else if (std::holds_alternative<bool>(value)) type = ValueType::Boolean;
-                else if (std::holds_alternative<Utils::JSON::Json>(value)) type = ValueType::Json;
-                else if (std::holds_alternative<std::vector<uint8_t>>(value)) type = ValueType::Binary;
-
-                // Convert value to BLOB
-                auto valueBlob = valueToBlob(value);
-
-                // Get timestamps
-                auto now = std::chrono::system_clock::now();
-                auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()).count();
-
-                // Convert strings to UTF-8
-                auto utf8Key = wstringToUtf8(key);
-                auto utf8ChangedBy = wstringToUtf8(changedBy);
-
-                // USE TRANSACTION'S ExecuteWithParams!
-                const char* sql = R"SQL(
-            INSERT OR REPLACE INTO configurations 
-            (key, value, type, scope, is_encrypted, is_readonly, description, 
-             created_at, modified_at, modified_by, version)
-            VALUES (?, ?, ?, ?, 0, 0, '', ?, ?, ?, 1)
-        )SQL";
-
-                if (!trans->ExecuteWithParams(
-                    sql, err,
-                    utf8Key,
-                    valueBlob,
-                    static_cast<int>(type),
-                    static_cast<int>(scope),
-                    nowMs,  // created_at
-                    nowMs,  // modified_at
-                    utf8ChangedBy
-                )) {
-                    trans->Rollback(nullptr);
+                if (!IsValidConfigKey(key)) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_MISUSE;
+                        err->message = L"Configuration key is empty, too long, or contains control characters";
+                    }
+                    return false;
+                }
+                if (valueToBlob(value).size() > MAX_CONFIG_BLOB_BYTES) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_TOOBIG;
+                        err->message = L"Configuration value exceeds maximum allowed size";
+                    }
                     return false;
                 }
             }
 
-            return trans->Commit(err);
+            for (const auto& [key, value] : entries) {
+                if (!Set(key, value, scope, changedBy, L"Batch update", err)) {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         std::unordered_map<std::wstring, ConfigurationDB::ConfigValue> ConfigurationDB::GetBatch(
@@ -2169,50 +2322,20 @@ namespace ShadowStrike {
             std::wstring_view changedBy,
             DatabaseError* err
         ) {
-            auto& dbMgr = DatabaseManager::Instance();
-            auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
-            if (!trans || !trans->IsActive()) {
-                return false;
-            }
-
             for (const auto& key : keys) {
-                auto utf8Key = wstringToUtf8(key);
-
-                const char* checkSql = "SELECT COUNT(*) FROM configurations WHERE key = ?";
-                auto result = dbMgr.QueryWithParams(checkSql, err, utf8Key);
-
-                if (!result.Next() || result.GetInt(0) == 0) {
-                    trans->Rollback(nullptr);
+                if (!IsValidConfigKey(key)) {
                     if (err) {
-                        err->sqliteCode = SQLITE_ERROR;
-                        err->message = L"Key not found: " + key;
+                        err->sqliteCode = SQLITE_MISUSE;
+                        err->message = L"Configuration key is empty, too long, or contains control characters";
                     }
                     return false;
                 }
+            }
 
-                const char* deleteSql = "DELETE FROM configurations WHERE key = ?";
-                if (!trans->ExecuteWithParams(deleteSql, err, utf8Key)) {
-                    trans->Rollback(nullptr);
+            for (const auto& key : keys) {
+                if (!Remove(key, changedBy, L"Batch delete", err)) {
                     return false;
                 }
-            }
-
-            // COMMIT FIRST!
-            if (!trans->Commit(err)) {
-                return false;
-            }
-
-            // INVALIDATE CACHE AFTER COMMIT!
-            if (m_config.enableCaching) {
-                for (const auto& key : keys) {
-                    cacheInvalidate(key);
-                }
-            }
-
-            // UPDATE STATS AFTER SUCCESSFUL COMMIT!
-            {
-                std::lock_guard<std::mutex> lock(m_statsMutex);
-                m_stats.totalDeletes += keys.size();
             }
 
             return true;
@@ -2231,6 +2354,14 @@ namespace ShadowStrike {
             if (!m_initialized.load(std::memory_order_acquire)) {
                 if (err) err->message = L"ConfigurationDB not initialized";
                 SS_LOG_ERROR(LOG_CATEGORY, L"ExportToJson: DB not initialized");
+                return false;
+            }
+            if (!IsSafeImportExportPath(path)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Unsafe JSON export path";
+                }
+                SS_LOG_ERROR(LOG_CATEGORY, L"ExportToJson: unsafe destination path");
                 return false;
             }
 
@@ -2375,6 +2506,14 @@ namespace ShadowStrike {
             if (!m_initialized.load(std::memory_order_acquire)) {
                 if (err) err->message = L"ConfigurationDB not initialized";
                 SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromJson: DB not initialized");
+                return false;
+            }
+            if (!IsSafeImportExportPath(path)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Unsafe JSON import path";
+                }
+                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromJson: unsafe source path");
                 return false;
             }
 
@@ -2566,6 +2705,14 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(LOG_CATEGORY, L"ExportToXml: DB not initialized");
                 return false;
             }
+            if (!IsSafeImportExportPath(path)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Unsafe XML export path";
+                }
+                SS_LOG_ERROR(LOG_CATEGORY, L"ExportToXml: unsafe destination path");
+                return false;
+            }
 
             SS_LOG_INFO(LOG_CATEGORY, L"Exporting configurations to XML: %ls", path.wstring().c_str());
 
@@ -2742,6 +2889,14 @@ namespace ShadowStrike {
             if (!m_initialized.load(std::memory_order_acquire)) {
                 if (err) err->message = L"ConfigurationDB not initialized";
                 SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: DB not initialized");
+                return false;
+            }
+            if (!IsSafeImportExportPath(path)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Unsafe XML import path";
+                }
+                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: unsafe source path");
                 return false;
             }
 
@@ -3328,7 +3483,7 @@ namespace ShadowStrike {
          *       consider implementing an LRU cache with O(1) eviction using
          *       a hash map + doubly-linked list combination.
          */
-        void ConfigurationDB::cachePut(const ConfigEntry& entry) {
+        void ConfigurationDB::cachePut(const ConfigEntry& entry) const {
             std::unique_lock lock(m_cacheMutex);
 
             // Cache size limit check with FIFO eviction
