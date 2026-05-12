@@ -133,10 +133,22 @@ namespace {
         return out;
     }
 
-    /// @brief Resolves NT-namespace path to Win32 path
+    /// @brief Resolves NT-namespace path to Win32 path.
+    ///
+    /// Handles the four prefix families produced by EnumDeviceDrivers /
+    /// GetDeviceDriverFileNameW and friends:
+    ///   - L"\\SystemRoot\\..."          -> %SystemRoot%\\...
+    ///   - L"\\??\\<dos-path>"           -> <dos-path>
+    ///   - L"\\\\?\\<dos-path>"          -> <dos-path>
+    ///   - L"\\Device\\HarddiskVolumeN\\..." -> "X:\\..." via QueryDosDeviceW
+    ///     reverse-lookup over A-Z so file-system APIs (fs::exists, hashing,
+    ///     signature verification) operate on a stable Win32 path rather than
+    ///     an NT device path. Returns the original string when no mapping is
+    ///     possible — callers must already tolerate missing files.
     [[nodiscard]] std::wstring NtPathToWin32Path(const std::wstring& ntPath) {
         if (ntPath.empty()) return {};
         std::wstring result = ntPath;
+
         const std::wstring sysRootPrefix = L"\\SystemRoot\\";
         if (result.size() > sysRootPrefix.size() &&
             _wcsnicmp(result.c_str(), sysRootPrefix.c_str(), sysRootPrefix.size()) == 0) {
@@ -145,13 +157,79 @@ namespace {
                 result = std::wstring(winDir) + L"\\" + result.substr(sysRootPrefix.size());
             }
         }
+
         const std::wstring dosPrefix = L"\\??\\";
         if (result.size() > dosPrefix.size() &&
             _wcsnicmp(result.c_str(), dosPrefix.c_str(), dosPrefix.size()) == 0) {
             result = result.substr(dosPrefix.size());
         }
+
+        const std::wstring extPrefix = L"\\\\?\\";
+        if (result.size() > extPrefix.size() &&
+            _wcsnicmp(result.c_str(), extPrefix.c_str(), extPrefix.size()) == 0) {
+            result = result.substr(extPrefix.size());
+        }
+
+        const std::wstring devicePrefix = L"\\Device\\";
+        if (result.size() > devicePrefix.size() &&
+            _wcsnicmp(result.c_str(), devicePrefix.c_str(), devicePrefix.size()) == 0) {
+            wchar_t deviceTarget[MAX_PATH] = {};
+            for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
+                const wchar_t drive[3] = { letter, L':', L'\0' };
+                const DWORD len = QueryDosDeviceW(drive, deviceTarget, MAX_PATH);
+                if (len == 0) {
+                    continue;
+                }
+                const size_t targetLen = wcsnlen_s(deviceTarget, MAX_PATH);
+                if (targetLen == 0 || targetLen >= result.size()) {
+                    continue;
+                }
+                if (_wcsnicmp(result.c_str(), deviceTarget, targetLen) == 0 &&
+                    (result[targetLen] == L'\\' || result[targetLen] == L'\0')) {
+                    result = std::wstring(drive) + result.substr(targetLen);
+                    break;
+                }
+            }
+        }
+
         return result;
     }
+
+    /// @brief Upper bound on catalog candidates probed for a single driver.
+    /// Defends against pathological catalog stores causing
+    /// CryptCATAdminEnumCatalogFromHash to spin indefinitely.
+    constexpr uint32_t MAX_CATALOG_ITERATIONS = 64;
+
+    /// @brief RAII guard for Win32 HANDLE values returned by CreateFileW.
+    struct ScopedHandle {
+        HANDLE h{ INVALID_HANDLE_VALUE };
+        ScopedHandle() = default;
+        explicit ScopedHandle(HANDLE handle) noexcept : h(handle) {}
+        ScopedHandle(const ScopedHandle&) = delete;
+        ScopedHandle& operator=(const ScopedHandle&) = delete;
+        ScopedHandle(ScopedHandle&& other) noexcept : h(other.h) {
+            other.h = INVALID_HANDLE_VALUE;
+        }
+        ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+            if (this != &other) {
+                reset();
+                h = other.h;
+                other.h = INVALID_HANDLE_VALUE;
+            }
+            return *this;
+        }
+        ~ScopedHandle() { reset(); }
+        void reset() noexcept {
+            if (h != INVALID_HANDLE_VALUE && h != nullptr) {
+                ::CloseHandle(h);
+                h = INVALID_HANDLE_VALUE;
+            }
+        }
+        [[nodiscard]] bool valid() const noexcept {
+            return h != INVALID_HANDLE_VALUE && h != nullptr;
+        }
+        [[nodiscard]] HANDLE get() const noexcept { return h; }
+    };
 
 
     // ========================================================================
@@ -424,20 +502,44 @@ public:
         std::vector<DriverInfo> drivers;
 
         try {
-            auto driverAddresses = std::make_unique<LPVOID[]>(MAX_DRIVERS);
+            // Initial capacity matches the soft cap; if the kernel reports more
+            // drivers we transparently retry once with a buffer sized to the
+            // hard cap so we never silently truncate the loaded-module list.
+            uint32_t capacity = MAX_DRIVERS;
+            auto driverAddresses = std::make_unique<LPVOID[]>(capacity);
             DWORD cbNeeded = 0;
-            const DWORD bufSize = static_cast<DWORD>(MAX_DRIVERS * sizeof(LPVOID));
+            DWORD bufSize = static_cast<DWORD>(capacity * sizeof(LPVOID));
 
             if (!EnumDeviceDrivers(driverAddresses.get(), bufSize, &cbNeeded)) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"EnumDeviceDrivers failed: error %lu", GetLastError());
                 return drivers;
             }
 
-            // Validate cbNeeded to prevent integer overflow/buffer overflow
             if (cbNeeded > bufSize) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Driver list truncated: %lu bytes needed, %lu available",
-                    cbNeeded, bufSize);
-                cbNeeded = bufSize;
+                // Retry once with a larger buffer, but never beyond the hard
+                // cap — refuses to allocate unbounded memory if the kernel
+                // returns a hostile size.
+                const DWORD retryCapacity = (cbNeeded / sizeof(LPVOID)) + 64;
+                if (retryCapacity <= MAX_EXPECTED_DRIVERS) {
+                    SS_LOG_INFO(LOG_CATEGORY,
+                        L"EnumDeviceDrivers: growing buffer from %u to %lu entries",
+                        capacity, static_cast<unsigned long>(retryCapacity));
+                    capacity = retryCapacity;
+                    driverAddresses = std::make_unique<LPVOID[]>(capacity);
+                    bufSize = static_cast<DWORD>(capacity * sizeof(LPVOID));
+                    cbNeeded = 0;
+                    if (!EnumDeviceDrivers(driverAddresses.get(), bufSize, &cbNeeded)) {
+                        SS_LOG_ERROR(LOG_CATEGORY,
+                            L"EnumDeviceDrivers (retry) failed: error %lu", GetLastError());
+                        return drivers;
+                    }
+                }
+                if (cbNeeded > bufSize) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Driver list truncated: %lu bytes needed, %lu available (cap %u)",
+                        cbNeeded, bufSize, MAX_EXPECTED_DRIVERS);
+                    cbNeeded = bufSize;
+                }
             }
 
             if (cbNeeded % sizeof(LPVOID) != 0) {
@@ -446,13 +548,14 @@ public:
             }
 
             uint32_t driverCount = cbNeeded / sizeof(LPVOID);
-            
+
             // Additional sanity check
             if (driverCount > MAX_EXPECTED_DRIVERS) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Unusually high driver count: %u (expected < %u)",
+                SS_LOG_WARN(LOG_CATEGORY, L"Unusually high driver count: %u (clamped at %u)",
                     driverCount, MAX_EXPECTED_DRIVERS);
+                driverCount = MAX_EXPECTED_DRIVERS;
             }
-            
+
             drivers.reserve(driverCount);
 
             // Heap-allocate path buffer (64KB on stack = overflow risk)
@@ -548,14 +651,33 @@ public:
         try {
             m_stats.signaturesVerified.fetch_add(1, std::memory_order_relaxed);
 
-            if (!fs::exists(driverPath)) {
+            if (driverPath.empty() || !fs::exists(driverPath)) {
+                return DriverSignatureStatus::Unknown;
+            }
+
+            // Single-open TOCTOU mitigation: WinVerifyTrust is asked to use this
+            // exact handle so a swap between path-based existence checks and the
+            // trust evaluation cannot substitute a different file.
+            ScopedHandle file(::CreateFileW(
+                driverPath.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr));
+
+            if (!file.valid()) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"VerifySignature: open failed for %ls (err=%lu)",
+                    driverPath.c_str(), GetLastError());
                 return DriverSignatureStatus::Unknown;
             }
 
             WINTRUST_FILE_INFO fileInfo = {};
             fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
             fileInfo.pcwszFilePath = driverPath.c_str();
-            fileInfo.hFile = nullptr;
+            fileInfo.hFile = file.get();
             fileInfo.pgKnownSubject = nullptr;
 
             GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
@@ -571,7 +693,7 @@ public:
 
             LONG status = WinVerifyTrust(nullptr, &policyGUID, &trustData);
 
-            // Clean up
+            // Clean up trust state regardless of outcome.
             trustData.dwStateAction = WTD_STATEACTION_CLOSE;
             WinVerifyTrust(nullptr, &policyGUID, &trustData);
 
@@ -1286,8 +1408,17 @@ private:
             
             // Look up the hash in system catalogs
             hCatInfo = CryptCATAdminEnumCatalogFromHash(hCatAdmin, hashData, hashSize, 0, nullptr);
-            
+
+            uint32_t catalogIterations = 0;
             while (hCatInfo != nullptr) {
+                if (++catalogIterations > MAX_CATALOG_ITERATIONS) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"IsWHQLCertified: catalog enumeration cap (%u) reached for %ls",
+                        MAX_CATALOG_ITERATIONS, driverPath.c_str());
+                    CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+                    hCatInfo = nullptr;
+                    break;
+                }
                 CATALOG_INFO catalogInfo = {};
                 catalogInfo.cbStruct = sizeof(CATALOG_INFO);
                 
