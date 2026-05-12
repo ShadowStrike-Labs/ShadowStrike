@@ -15,9 +15,6 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#include "pch.h"
-
-
 /**
  * @file LogDB.cpp
  * @brief Enterprise-Grade Centralized Logging Database System Implementation
@@ -185,7 +182,7 @@
  * @see PerformanceLogger for RAII timing helper
  */
 
-#include"pch.h"
+#include "pch.h"
 #include "LogDB.hpp"
 #include "../Utils/FileUtils.hpp"
 
@@ -193,6 +190,8 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <regex>
+#include <cstring>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -592,6 +591,134 @@ namespace ShadowStrike {
                 return std::wstring(field);
             }
 
+            // ========================================================================
+            //                      HARDENING CONSTANTS & HELPERS
+            // ========================================================================
+
+            /**
+             * @brief Per-field maximum length (UTF-16 code units) accepted at insert.
+             *
+             * @details Caps DoS-via-large-string attacks and bounds storage cost.
+             * Fields exceeding the cap are truncated with an ellipsis marker.
+             */
+            constexpr size_t LOGDB_MAX_SOURCE_LEN     = 256;
+            constexpr size_t LOGDB_MAX_MESSAGE_LEN    = 8192;
+            constexpr size_t LOGDB_MAX_DETAILS_LEN    = 16384;
+            constexpr size_t LOGDB_MAX_METADATA_LEN   = 16384;
+            constexpr size_t LOGDB_MAX_CONTEXT_LEN    = 4096;
+            constexpr size_t LOGDB_MAX_PATH_LEN       = 1024;
+            constexpr size_t LOGDB_MAX_FUNCNAME_LEN   = 512;
+            constexpr size_t LOGDB_MAX_FTS_QUERY_LEN  = 1024;
+
+            /// Hard caps for query and async queue sizing.
+            constexpr size_t LOGDB_MAX_QUERY_RESULTS  = 100000;
+            constexpr size_t LOGDB_MAX_PENDING_WRITES = 100000;
+            constexpr size_t LOGDB_MAX_EXPORT_ENTRIES = 1000000;
+
+            /// Archive filename prefix used by performRotation; cleanup is gated to this prefix.
+            constexpr const wchar_t* LOGDB_ARCHIVE_PREFIX = L"logs_archive_";
+
+            /**
+             * @brief Clamps a wide string to a maximum length, appending an ellipsis marker.
+             *
+             * @param s Input string.
+             * @param maxLen Maximum length in wide code units (must be >= 4).
+             * @return Possibly-truncated copy of @p s.
+             *
+             * @security Bounds memory consumption of attacker-controllable log fields.
+             */
+            [[nodiscard]] std::wstring ClampField(std::wstring_view s, size_t maxLen) {
+                if (s.size() <= maxLen) {
+                    return std::wstring(s);
+                }
+                if (maxLen <= 4) {
+                    return std::wstring(s.substr(0, maxLen));
+                }
+                std::wstring out;
+                out.reserve(maxLen);
+                out.assign(s.data(), maxLen - 4);
+                out.append(L"...");
+                return out;
+            }
+
+            /**
+             * @brief Strips control characters (CR/LF/ESC/etc.) from a wide string for
+             *        safe rendering on log-export and text/UI surfaces.
+             *
+             * @details Replaces every code unit in U+0000..U+001F (except TAB) and U+007F
+             * with a single space. The DB still stores the raw text; sanitization happens
+             * only on outbound rendering paths to prevent log-injection (CRLF forgery,
+             * ANSI escape smuggling) of attacker-controllable fields.
+             *
+             * @security Mitigates CWE-117 (Improper Output Neutralization for Logs).
+             */
+            [[nodiscard]] std::wstring SanitizeForRender(std::wstring_view s) {
+                std::wstring out;
+                out.reserve(s.size());
+                for (wchar_t c : s) {
+                    if (c == L'\t') { out.push_back(c); continue; }
+                    if (c < 0x20 || c == 0x7F) {
+                        out.push_back(L' ');
+                    } else {
+                        out.push_back(c);
+                    }
+                }
+                return out;
+            }
+
+            /**
+             * @brief Redacts well-known secret patterns from arbitrary text on export.
+             *
+             * @details Pattern-based, conservative pass that masks the value half of
+             * common credential constructions (password=, api_key=, Bearer <token>,
+             * AWS access keys, JWTs). Forensic evidence remains untouched in the DB;
+             * only export-side artifacts (text/JSON/CSV) are scrubbed.
+             *
+             * @security Mitigates inadvertent secret exfiltration via log exports.
+             */
+            [[nodiscard]] std::wstring RedactSecrets(std::wstring_view input) {
+                // Operate on a mutable copy; std::regex over wide strings is supported.
+                std::wstring text(input);
+                try {
+                    static const std::wregex kvSecret(
+                        LR"((?:password|passwd|pwd|api[_-]?key|secret|token|authorization)\s*[:=]\s*\S+)",
+                        std::regex::icase);
+                    static const std::wregex bearer(LR"(Bearer\s+[A-Za-z0-9._\-]+)",
+                        std::regex::icase);
+                    static const std::wregex awsKey(LR"(AKIA[0-9A-Z]{16})");
+                    static const std::wregex jwt(LR"(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})");
+                    text = std::regex_replace(text, kvSecret, std::wstring(L"[REDACTED]"));
+                    text = std::regex_replace(text, bearer,   std::wstring(L"Bearer [REDACTED]"));
+                    text = std::regex_replace(text, awsKey,   std::wstring(L"[REDACTED_AWS_KEY]"));
+                    text = std::regex_replace(text, jwt,      std::wstring(L"[REDACTED_JWT]"));
+                } catch (...) {
+                    // Regex catastrophic-backtrack guard: on any failure, return clamped raw.
+                    return ClampField(input, LOGDB_MAX_DETAILS_LEN);
+                }
+                return text;
+            }
+
+            /**
+             * @brief Validates an absolute filesystem path for export/archive use.
+             *
+             * @param path Path under inspection (Windows wide).
+             * @return true if @p path is absolute, NUL-free, and free of '..' segments.
+             *
+             * @security Mitigates path traversal (CWE-22) on attacker-influenced paths.
+             */
+            [[nodiscard]] bool IsSafePath(std::wstring_view path) noexcept {
+                if (path.empty() || path.size() > 32767) return false;
+                for (wchar_t c : path) {
+                    if (c == L'\0') return false;
+                }
+                std::filesystem::path p(path);
+                if (!p.is_absolute()) return false;
+                for (const auto& part : p) {
+                    if (part == L"..") return false;
+                }
+                return true;
+            }
+
         } // anonymous namespace
 
         // ============================================================================
@@ -669,32 +796,54 @@ namespace ShadowStrike {
          * @endcode
          */
         bool LogDB::Initialize(const Config& config, DatabaseError* err) {
-            if (m_initialized.load(std::memory_order_acquire)) {
-                SS_LOG_WARN(L"LogDB", L"Already initialized");
+            // Serialize concurrent Initialize() / Shutdown() invocations.
+            std::lock_guard<std::mutex> initLock(m_initMutex);
 
+            if (m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"LogDB", L"Already initialized; applying configuration update");
+
+                bool wantAsync = false;
+                bool wasAsync = false;
                 {
                     std::unique_lock<std::shared_mutex> lock(m_configMutex);
+                    wasAsync = m_config.asyncLogging;
                     m_config = config;
+                    wantAsync = m_config.asyncLogging;
+                }
+
+                // Reconcile batch thread with new config (start or stop as needed).
+                if (wantAsync && !wasAsync) {
+                    m_shutdownBatch.store(false, std::memory_order_release);
+                    if (!m_batchThread.joinable()) {
+                        m_batchThread = std::thread(&LogDB::batchWriteThread, this);
+                    }
+                } else if (!wantAsync && wasAsync) {
+                    m_shutdownBatch.store(true, std::memory_order_release);
+                    m_batchCV.notify_all();
+                    if (m_batchThread.joinable()) {
+                        m_batchThread.join();
+                    }
                 }
                 return true;
             }
 
             SS_LOG_INFO(L"LogDB", L"Initializing LogDB...");
 
-            // Use scope to release lock early
             {
                 std::unique_lock<std::shared_mutex> lock(m_configMutex);
                 m_config = config;
-            }  // Lock released here!
+            }
 
-            // FORCE SHUTDOWN FIRST to ensure clean state!
+            // [ARCH-BLOCKER] DatabaseManager is a process-wide singleton shared
+            // with ConfigurationDB / QuarantineDB. Force-shutdown here mirrors the
+            // sibling DB modules' convention (see QuarantineDB.cpp ~line 786) and
+            // is preserved to keep behavior consistent. Resolving the multi-DB
+            // sharing pattern is a cross-cutting architecture change.
             if (DatabaseManager::Instance().IsInitialized()) {
                 SS_LOG_INFO(L"LogDB", L"Shutting down existing DatabaseManager instance");
                 DatabaseManager::Instance().Shutdown();
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
-            // Initialize DatabaseManager with OUR config
             DatabaseConfig dbConfig;
             {
                 std::shared_lock<std::shared_mutex> lock(m_configMutex);
@@ -705,21 +854,21 @@ namespace ShadowStrike {
             }
             dbConfig.minConnections = 2;
             dbConfig.autoBackup = false;
+            // Security audit logs require durability across crashes.
+            dbConfig.synchronousMode = L"NORMAL";
 
             if (!DatabaseManager::Instance().Initialize(dbConfig, err)) {
                 SS_LOG_ERROR(L"LogDB", L"Failed to initialize DatabaseManager");
                 return false;
             }
 
-            // Create schema
             if (!createSchema(err)) {
                 SS_LOG_ERROR(L"LogDB", L"Failed to create schema");
                 DatabaseManager::Instance().Shutdown();
                 return false;
             }
 
-            // Start batch write thread if async logging is enabled
-            bool asyncEnabled;
+            bool asyncEnabled = false;
             {
                 std::shared_lock<std::shared_mutex> lock(m_configMutex);
                 asyncEnabled = m_config.asyncLogging;
@@ -730,30 +879,27 @@ namespace ShadowStrike {
                 m_batchThread = std::thread(&LogDB::batchWriteThread, this);
             }
 
-            // Initialize statistics
             recalculateStatistics(err);
 
             m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(L"LogDB", L"LogDB initialized successfully");
-
-          
-
             return true;
         }
         
         void LogDB::Shutdown() {
+            std::lock_guard<std::mutex> initLock(m_initMutex);
+
             if (!m_initialized.load(std::memory_order_acquire)) {
                 return;
             }
 
             SS_LOG_INFO(L"LogDB", L"Shutting down LogDB...");
 
-            // Flush pending writes
+            // Drain any queued async writes before tearing down the batch thread.
             DatabaseError err;
             Flush(&err);
 
-            // Stop batch thread
             m_shutdownBatch.store(true, std::memory_order_release);
             m_batchCV.notify_all();
 
@@ -761,21 +907,12 @@ namespace ShadowStrike {
                 m_batchThread.join();
             }
 
-            // Shutdown database manager
+            // [ARCH-BLOCKER] See note in Initialize() about shared DatabaseManager.
             DatabaseManager::Instance().Shutdown();
 
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-            // RESET CONFIG TO DEFAULT STATE - DON'T USE Config{}!
-            {
-                std::unique_lock<std::shared_mutex> lock(m_configMutex);
-                m_config.asyncLogging = false;  // ✅ EXPLICITLY SET TO FALSE!
-                m_config.minLogLevel = LogLevel::Info;
-                m_config.enableFullTextSearch = false;
-                // DON'T reset paths - they will be set by Initialize()
-            }
-
+            // Preserve user-supplied configuration (paths, levels, async flag) so a
+            // subsequent Initialize() without an explicit config will not silently
+            // downgrade settings. Only transient/runtime state is cleared.
             m_initialized.store(false, std::memory_order_release);
 
             SS_LOG_INFO(L"LogDB", L"LogDB shut down");
@@ -1081,14 +1218,12 @@ namespace ShadowStrike {
         bool LogDB::LogBatch(const std::vector<LogEntry>& entries, DatabaseError* err) {
             if (entries.empty()) return true;
 
-            // Read config with shared lock
             LogLevel minLevel;
             {
                 std::shared_lock<std::shared_mutex> lock(m_configMutex);
                 minLevel = m_config.minLogLevel;
             }
 
-            //BEGIN TRANSACTION
             auto trans = DatabaseManager::Instance().BeginTransaction(
                 Transaction::Type::Immediate, err);
 
@@ -1096,52 +1231,68 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // USE TRANSACTION'S OWN CONNECTION!
+            uint64_t inserted = 0;
+            uint64_t filtered = 0;
             for (const auto& entry : entries) {
                 if (entry.level < minLevel) {
+                    ++filtered;
                     continue;
                 }
 
-                // PREPARE DATA
-                std::string timestamp = timePointToString(entry.timestamp);
+                // Bound field lengths defensively at the batch path too.
+                LogEntry clamped = entry;
+                clamped.source       = ClampField(clamped.source,       LOGDB_MAX_SOURCE_LEN);
+                clamped.message      = ClampField(clamped.message,      LOGDB_MAX_MESSAGE_LEN);
+                clamped.details      = ClampField(clamped.details,      LOGDB_MAX_DETAILS_LEN);
+                clamped.metadata     = ClampField(clamped.metadata,     LOGDB_MAX_METADATA_LEN);
+                clamped.errorContext = ClampField(clamped.errorContext, LOGDB_MAX_CONTEXT_LEN);
+                clamped.filePath     = ClampField(clamped.filePath,     LOGDB_MAX_PATH_LEN);
+                clamped.functionName = ClampField(clamped.functionName, LOGDB_MAX_FUNCNAME_LEN);
 
-                // USE TRANSACTION'S ExecuteWithParams() METHOD!
+                const std::string timestamp = timePointToString(clamped.timestamp);
+
                 bool success = trans->ExecuteWithParams(
                     SQL_INSERT_ENTRY,
                     err,
                     timestamp,
-                    static_cast<int>(entry.level),
-                    static_cast<int>(entry.category),
-                    ToUTF8(entry.source),
-                    ToUTF8(entry.message),
-                    ToUTF8(entry.details),
-                    static_cast<int>(entry.processId),
-                    static_cast<int>(entry.threadId),
-                    ToUTF8(entry.userName),
-                    ToUTF8(entry.machineName),
-                    ToUTF8(entry.metadata),
-                    static_cast<int>(entry.errorCode),
-                    ToUTF8(entry.errorContext),
-                    entry.durationMs,
-                    ToUTF8(entry.filePath),
-                    entry.lineNumber,
-                    ToUTF8(entry.functionName)
+                    static_cast<int>(clamped.level),
+                    static_cast<int>(clamped.category),
+                    ToUTF8(clamped.source),
+                    ToUTF8(clamped.message),
+                    ToUTF8(clamped.details),
+                    static_cast<int>(clamped.processId),
+                    static_cast<int>(clamped.threadId),
+                    ToUTF8(clamped.userName),
+                    ToUTF8(clamped.machineName),
+                    ToUTF8(clamped.metadata),
+                    static_cast<int>(clamped.errorCode),
+                    ToUTF8(clamped.errorContext),
+                    clamped.durationMs,
+                    ToUTF8(clamped.filePath),
+                    clamped.lineNumber,
+                    ToUTF8(clamped.functionName)
                 );
 
                 if (!success) {
+                    if (err) {
+                        SS_LOG_ERROR(L"LogDB", L"LogBatch: insert failed after %llu entries: %ls",
+                            static_cast<unsigned long long>(inserted), err->message.c_str());
+                    }
                     trans->Rollback(err);
                     return false;
                 }
+                ++inserted;
             }
 
-            // COMMIT TRANSACTION
             if (!trans->Commit(err)) {
                 return false;
             }
 
-            // Update statistics
+            // BUGFIX: previously incremented totalWrites by entries.size() even
+            // for entries filtered out by minLevel. Count only what was inserted.
             std::lock_guard<std::mutex> lock(m_statsMutex);
-            m_stats.totalWrites += entries.size();
+            m_stats.totalWrites    += inserted;
+            m_stats.filteredWrites += filtered;
 
             return true;
         }
@@ -1336,7 +1487,6 @@ namespace ShadowStrike {
         {
             QueryFilter filter;
 
-            
             bool enableFTS;
             {
                 std::shared_lock<std::shared_mutex> lock(m_configMutex);
@@ -1344,9 +1494,17 @@ namespace ShadowStrike {
             }
 
             if (useFullText && enableFTS) {
-                filter.fullTextSearch = searchText;
+                std::wstring q(searchText);
+                if (q.size() > LOGDB_MAX_FTS_QUERY_LEN) {
+                    q.resize(LOGDB_MAX_FTS_QUERY_LEN);
+                }
+                filter.fullTextSearch = std::move(q);
             }
             else {
+                if (useFullText && !enableFTS) {
+                    SS_LOG_WARN(L"LogDB",
+                        L"SearchText: FTS requested but disabled; falling back to LIKE");
+                }
                 std::wstring pattern = L"%";
                 pattern += searchText;
                 pattern += L"%";
@@ -1372,15 +1530,20 @@ namespace ShadowStrike {
         int64_t LogDB::CountEntries(const QueryFilter* filter, DatabaseError* err) {
             std::vector<std::string> params;
             std::string sql;
-            
+
             if (filter) {
                 sql = buildCountSQL(*filter, params);
             } else {
                 sql = SQL_COUNT_ALL;
             }
 
-            auto result = DatabaseManager::Instance().Query(sql, err);
-            
+            // BUGFIX: previously called Query() which silently dropped bound params,
+            // returning the unfiltered total. Use the parameter-binding overload
+            // whenever the filter contributed placeholders.
+            QueryResult result = params.empty()
+                ? DatabaseManager::Instance().Query(sql, err)
+                : DatabaseManager::Instance().QueryWithParamsVector(sql, params, err);
+
             if (result.Next()) {
                 return result.GetInt64(0);
             }
@@ -1403,28 +1566,48 @@ namespace ShadowStrike {
          * Increments totalDeletes counter on success.
          */
         bool LogDB::DeleteEntry(int64_t id, DatabaseError* err) {
-            bool success = DatabaseManager::Instance().ExecuteWithParams(
-                SQL_DELETE_ENTRY, err, id);
-
-            if (success) {
-                
-                int affectedRows = DatabaseManager::Instance().GetChanges();
-
-                if (affectedRows > 0) {
-                    std::lock_guard<std::mutex> lock(m_statsMutex);
-                    m_stats.totalDeletes++;
-                    return true;
+            if (id <= 0) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"DeleteEntry: invalid id";
                 }
-                else {
-                   
-                    if (err) {
-                        err->sqliteCode = SQLITE_OK;
-                        err->message = L"No entry found with given ID";
-                    }
-                    return false;
-                }
+                return false;
             }
 
+            // Wrap statement + change-count read in a single transaction so the
+            // change counter is read from the same connection that executed the
+            // DELETE. Without this, the pooled connection may differ and the
+            // returned change count is unreliable.
+            auto trans = DatabaseManager::Instance().BeginTransaction(
+                Transaction::Type::Immediate, err);
+            if (!trans || !trans->IsActive()) {
+                return false;
+            }
+
+            if (!trans->ExecuteWithParams(SQL_DELETE_ENTRY, err, id)) {
+                trans->Rollback(err);
+                return false;
+            }
+
+            const int affectedRows = DatabaseManager::Instance().GetChangedRowCount();
+
+            if (!trans->Commit(err)) {
+                return false;
+            }
+
+            if (affectedRows > 0) {
+                std::lock_guard<std::mutex> lock(m_statsMutex);
+                m_stats.totalDeletes++;
+                if (m_stats.totalEntries > 0) {
+                    m_stats.totalEntries--;
+                }
+                return true;
+            }
+
+            if (err) {
+                err->sqliteCode = SQLITE_OK;
+                err->message = L"No entry found with given ID";
+            }
             return false;
         }
 
@@ -1510,9 +1693,22 @@ namespace ShadowStrike {
                                std::chrono::system_clock::time_point beforeTimestamp,
                                DatabaseError* err)
         {
-            SS_LOG_INFO(L"LogDB", L"Archiving logs to: %ls", archivePath.data());
+            if (!IsSafePath(archivePath)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"ArchiveLogs: rejected unsafe archive path";
+                }
+                SS_LOG_ERROR(L"LogDB", L"ArchiveLogs: rejected unsafe archive path");
+                return false;
+            }
+            const std::wstring safePath(archivePath);
+            SS_LOG_INFO(L"LogDB", L"Archiving logs to: %ls", safePath.c_str());
 
-            return createArchive(archivePath, beforeTimestamp, err);
+            // Drain pending async writes so the archive captures all queued entries.
+            DatabaseError flushErr;
+            Flush(&flushErr);
+
+            return createArchive(safePath, beforeTimestamp, err);
         }
 
         /**
@@ -1526,9 +1722,36 @@ namespace ShadowStrike {
          * Existing entries will be lost.
          */
         bool LogDB::RestoreLogs(std::wstring_view archivePath, DatabaseError* err) {
-            SS_LOG_INFO(L"LogDB", L"Restoring logs from: %ls", archivePath.data());
+            if (!IsSafePath(archivePath)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"RestoreLogs: rejected unsafe archive path";
+                }
+                SS_LOG_ERROR(L"LogDB", L"RestoreLogs: rejected unsafe archive path");
+                return false;
+            }
+            std::error_code ec;
+            if (!std::filesystem::exists(std::filesystem::path(archivePath), ec) || ec) {
+                if (err) {
+                    err->sqliteCode = SQLITE_CANTOPEN;
+                    err->message = L"RestoreLogs: archive file does not exist";
+                }
+                return false;
+            }
+            const std::wstring safePath(archivePath);
+            SS_LOG_INFO(L"LogDB", L"Restoring logs from: %ls", safePath.c_str());
 
-            return DatabaseManager::Instance().RestoreFromFile(archivePath, err);
+            if (!DatabaseManager::Instance().RestoreFromFile(safePath, err)) {
+                return false;
+            }
+
+            // Post-restore: verify integrity of the now-replaced database.
+            std::vector<std::wstring> issues;
+            if (!DatabaseManager::Instance().CheckIntegrity(issues, err)) {
+                SS_LOG_ERROR(L"LogDB", L"RestoreLogs: post-restore integrity check failed");
+                return false;
+            }
+            return true;
         }
 
         /**
@@ -1594,17 +1817,9 @@ namespace ShadowStrike {
          * @note Returns immediately if async logging is disabled.
          */
         bool LogDB::Flush(DatabaseError* err) {
-            
-            bool asyncLogging;
-            {
-                std::shared_lock<std::shared_mutex> lock(m_configMutex);
-                asyncLogging = m_config.asyncLogging;
-            }
-
-            if (!asyncLogging) {
-                return true;
-            }
-
+            // Always attempt to drain the pending queue. If a caller toggled
+            // asyncLogging off after entries were already queued, we still need
+            // to flush them — checking the current flag would leak data.
             std::lock_guard<std::mutex> lock(m_batchMutex);
 
             if (m_pendingWrites.empty()) {
@@ -1683,8 +1898,36 @@ namespace ShadowStrike {
          * batch thread - that requires re-initialization.
          */
         void LogDB::SetAsyncLogging(bool enabled) {
-            std::unique_lock<std::shared_mutex> lock(m_configMutex);
-            m_config.asyncLogging = enabled;
+            bool wasEnabled = false;
+            {
+                std::unique_lock<std::shared_mutex> lock(m_configMutex);
+                wasEnabled = m_config.asyncLogging;
+                m_config.asyncLogging = enabled;
+            }
+
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            // BUGFIX: previously a silent runtime toggle that left the batch
+            // thread in a desynchronized state. Now we actually start/stop the
+            // background writer to honor the new mode.
+            if (enabled && !wasEnabled) {
+                m_shutdownBatch.store(false, std::memory_order_release);
+                if (!m_batchThread.joinable()) {
+                    m_batchThread = std::thread(&LogDB::batchWriteThread, this);
+                }
+                SS_LOG_INFO(L"LogDB", L"Async logging enabled; batch thread started");
+            } else if (!enabled && wasEnabled) {
+                DatabaseError err;
+                Flush(&err);
+                m_shutdownBatch.store(true, std::memory_order_release);
+                m_batchCV.notify_all();
+                if (m_batchThread.joinable()) {
+                    m_batchThread.join();
+                }
+                SS_LOG_INFO(L"LogDB", L"Async logging disabled; batch thread stopped");
+            }
         }
 
         // ============================================================================
@@ -1793,24 +2036,30 @@ namespace ShadowStrike {
          */
         std::wstring LogDB::FormatLogEntry(const LogEntry& entry, bool includeMetadata) {
             std::wostringstream oss;
-            
-            // Format: [Timestamp] [Level] [Category] Source: Message
+
+            // SECURITY: strip control characters on render so a hostile message
+            // cannot inject newlines/ANSI/escape sequences into logs/consoles.
+            const std::wstring src     = SanitizeForRender(entry.source);
+            const std::wstring msg     = SanitizeForRender(entry.message);
+            const std::wstring details = SanitizeForRender(entry.details);
+            const std::wstring meta    = SanitizeForRender(entry.metadata);
+
             std::string timestampStr = timePointToString(entry.timestamp);
             oss << L"[" << ToWide(timestampStr) << L"] ";
             oss << L"[" << LogLevelToString(entry.level) << L"] ";
             oss << L"[" << LogCategoryToString(entry.category) << L"] ";
-            oss << entry.source << L": " << entry.message;
+            oss << src << L": " << msg;
 
-            if (!entry.details.empty()) {
-                oss << L" | " << entry.details;
+            if (!details.empty()) {
+                oss << L" | " << details;
             }
 
             if (entry.errorCode != 0) {
                 oss << L" (Error: " << entry.errorCode << L")";
             }
 
-            if (includeMetadata && !entry.metadata.empty()) {
-                oss << L" | Metadata: " << entry.metadata;
+            if (includeMetadata && !meta.empty()) {
+                oss << L" | Metadata: " << meta;
             }
 
             return oss.str();
@@ -1831,20 +2080,45 @@ namespace ShadowStrike {
                                 const QueryFilter* filter,
                                 DatabaseError* err)
         {
-            auto entries = filter ? Query(*filter, err) : Query(QueryFilter{}, err);
-
-            Utils::FileUtils::Error fileErr;
-            std::wostringstream content;
-
-            for (const auto& entry : entries) {
-                content << FormatLogEntry(entry, true) << L"\n";
+            if (!IsSafePath(filePath)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"ExportToFile: rejected unsafe destination path";
+                }
+                return false;
             }
 
-            std::wstring contentStr = content.str();
+            // Drain async queue so the export reflects all entries up to this call.
+            DatabaseError flushErr;
+            Flush(&flushErr);
+
+            // Bound entry count regardless of caller-supplied filter.
+            QueryFilter effective = filter ? *filter : QueryFilter{};
+            if (effective.maxResults == 0 || effective.maxResults > LOGDB_MAX_EXPORT_ENTRIES) {
+                effective.maxResults = LOGDB_MAX_EXPORT_ENTRIES;
+            }
+            auto entries = Query(effective, err);
+
+            std::wostringstream content;
+            for (const auto& entry : entries) {
+                LogEntry sanitized = entry;
+                // SECURITY: strip control characters and redact secrets on the
+                // outbound rendering surface. DB retains raw forensic data.
+                sanitized.source       = SanitizeForRender(sanitized.source);
+                sanitized.message      = RedactSecrets(SanitizeForRender(sanitized.message));
+                sanitized.details      = RedactSecrets(SanitizeForRender(sanitized.details));
+                sanitized.metadata     = RedactSecrets(SanitizeForRender(sanitized.metadata));
+                sanitized.errorContext = RedactSecrets(SanitizeForRender(sanitized.errorContext));
+                content << FormatLogEntry(sanitized, true) << L"\r\n";
+            }
+
+            // Emit UTF-8 for SIEM/tooling compatibility (DB is UTF-8 too).
+            const std::string utf8 = ToUTF8(content.str());
+            Utils::FileUtils::Error fileErr;
             return Utils::FileUtils::WriteAllBytesAtomic(
                 filePath,
-                reinterpret_cast<const std::byte*>(contentStr.data()),
-                contentStr.size() * sizeof(wchar_t),
+                reinterpret_cast<const std::byte*>(utf8.data()),
+                utf8.size(),
                 &fileErr
             );
         }
@@ -1866,26 +2140,61 @@ namespace ShadowStrike {
                                 const QueryFilter* filter,
                                 DatabaseError* err)
         {
-            // JSON export implementation with proper escaping
-            // @security Uses EscapeJsonString to prevent JSON injection
-            
-            auto entries = filter ? Query(*filter, err) : Query(QueryFilter{}, err);
+            if (!IsSafePath(filePath)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"ExportToJSON: rejected unsafe destination path";
+                }
+                return false;
+            }
+
+            DatabaseError flushErr;
+            Flush(&flushErr);
+
+            QueryFilter effective = filter ? *filter : QueryFilter{};
+            if (effective.maxResults == 0 || effective.maxResults > LOGDB_MAX_EXPORT_ENTRIES) {
+                effective.maxResults = LOGDB_MAX_EXPORT_ENTRIES;
+            }
+            auto entries = Query(effective, err);
 
             std::wostringstream json;
             json << L"[\n";
 
             for (size_t i = 0; i < entries.size(); ++i) {
                 const auto& entry = entries[i];
-                
+
+                // SECURITY: sanitize + redact attacker-influenced fields on render.
+                const std::wstring src     = RedactSecrets(SanitizeForRender(entry.source));
+                const std::wstring msg     = RedactSecrets(SanitizeForRender(entry.message));
+                const std::wstring details = RedactSecrets(SanitizeForRender(entry.details));
+                const std::wstring meta    = RedactSecrets(SanitizeForRender(entry.metadata));
+                const std::wstring ectx    = RedactSecrets(SanitizeForRender(entry.errorContext));
+                const std::wstring fpath   = SanitizeForRender(entry.filePath);
+                const std::wstring fname   = SanitizeForRender(entry.functionName);
+                const std::wstring user    = SanitizeForRender(entry.userName);
+                const std::wstring host    = SanitizeForRender(entry.machineName);
+
                 json << L"  {\n";
                 json << L"    \"id\": " << entry.id << L",\n";
                 json << L"    \"timestamp\": \"" << EscapeJsonString(ToWide(timePointToString(entry.timestamp))) << L"\",\n";
-                json << L"    \"level\": \"" << EscapeJsonString(LogLevelToString(entry.level)) << L"\",\n";
+                json << L"    \"level\": \""    << EscapeJsonString(LogLevelToString(entry.level))    << L"\",\n";
                 json << L"    \"category\": \"" << EscapeJsonString(LogCategoryToString(entry.category)) << L"\",\n";
-                json << L"    \"source\": \"" << EscapeJsonString(entry.source) << L"\",\n";
-                json << L"    \"message\": \"" << EscapeJsonString(entry.message) << L"\"\n";
+                json << L"    \"source\": \""   << EscapeJsonString(src)     << L"\",\n";
+                json << L"    \"message\": \""  << EscapeJsonString(msg)     << L"\",\n";
+                json << L"    \"details\": \""  << EscapeJsonString(details) << L"\",\n";
+                json << L"    \"processId\": "  << entry.processId  << L",\n";
+                json << L"    \"threadId\": "   << entry.threadId   << L",\n";
+                json << L"    \"userName\": \"" << EscapeJsonString(user) << L"\",\n";
+                json << L"    \"machineName\": \"" << EscapeJsonString(host) << L"\",\n";
+                json << L"    \"metadata\": \"" << EscapeJsonString(meta) << L"\",\n";
+                json << L"    \"errorCode\": "  << entry.errorCode  << L",\n";
+                json << L"    \"errorContext\": \"" << EscapeJsonString(ectx) << L"\",\n";
+                json << L"    \"durationMs\": " << entry.durationMs << L",\n";
+                json << L"    \"filePath\": \"" << EscapeJsonString(fpath) << L"\",\n";
+                json << L"    \"lineNumber\": " << entry.lineNumber << L",\n";
+                json << L"    \"functionName\": \"" << EscapeJsonString(fname) << L"\"\n";
                 json << L"  }";
-                
+
                 if (i < entries.size() - 1) {
                     json << L",";
                 }
@@ -1894,12 +2203,12 @@ namespace ShadowStrike {
 
             json << L"]\n";
 
-            std::wstring jsonStr = json.str();
+            const std::string utf8 = ToUTF8(json.str());
             Utils::FileUtils::Error fileErr;
             return Utils::FileUtils::WriteAllBytesAtomic(
                 filePath,
-                reinterpret_cast<const std::byte*>(jsonStr.data()),
-                jsonStr.size() * sizeof(wchar_t),
+                reinterpret_cast<const std::byte*>(utf8.data()),
+                utf8.size(),
                 &fileErr
             );
         }
@@ -1922,14 +2231,27 @@ namespace ShadowStrike {
                                const QueryFilter* filter,
                                DatabaseError* err)
         {
-            auto entries = filter ? Query(*filter, err) : Query(QueryFilter{}, err);
+            if (!IsSafePath(filePath)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"ExportToCSV: rejected unsafe destination path";
+                }
+                return false;
+            }
+
+            DatabaseError flushErr;
+            Flush(&flushErr);
+
+            QueryFilter effective = filter ? *filter : QueryFilter{};
+            if (effective.maxResults == 0 || effective.maxResults > LOGDB_MAX_EXPORT_ENTRIES) {
+                effective.maxResults = LOGDB_MAX_EXPORT_ENTRIES;
+            }
+            auto entries = Query(effective, err);
 
             // Helper lambda for CSV escape with formula injection prevention
             auto escapeCsvField = [](std::wstring_view field) -> std::wstring {
-                // First sanitize against formula injection
                 std::wstring sanitized = SanitizeCsvFieldW(field);
-                
-                // Then handle structural CSV escaping
+
                 if (sanitized.find(L',') != std::wstring::npos ||
                     sanitized.find(L'"') != std::wstring::npos ||
                     sanitized.find(L'\n') != std::wstring::npos ||
@@ -1946,29 +2268,36 @@ namespace ShadowStrike {
             };
 
             std::wostringstream csv;
-            
-            // Header
-            csv << L"ID,Timestamp,Level,Category,Source,Message,ProcessID,ThreadID\n";
+            csv << L"ID,Timestamp,Level,Category,Source,Message,ProcessID,ThreadID\r\n";
 
-            // Rows
             for (const auto& entry : entries) {
+                const std::wstring src = RedactSecrets(SanitizeForRender(entry.source));
+                const std::wstring msg = RedactSecrets(SanitizeForRender(entry.message));
                 auto timestampStr = timePointToString(entry.timestamp);
                 csv << entry.id << L",";
                 csv << ToWide(timestampStr) << L",";
                 csv << LogLevelToString(entry.level) << L",";
                 csv << LogCategoryToString(entry.category) << L",";
-                csv << escapeCsvField(entry.source) << L",";
-                csv << escapeCsvField(entry.message) << L",";
+                csv << escapeCsvField(src) << L",";
+                csv << escapeCsvField(msg) << L",";
                 csv << entry.processId << L",";
-                csv << entry.threadId << L"\n";
+                csv << entry.threadId << L"\r\n";
             }
 
-            std::wstring csvStr = csv.str();
+            // UTF-8 with BOM for Excel-friendly CSV consumption.
+            std::string utf8 = ToUTF8(csv.str());
+            std::string out;
+            out.reserve(3 + utf8.size());
+            out.push_back(static_cast<char>(0xEF));
+            out.push_back(static_cast<char>(0xBB));
+            out.push_back(static_cast<char>(0xBF));
+            out.append(utf8);
+
             Utils::FileUtils::Error fileErr;
             return Utils::FileUtils::WriteAllBytesAtomic(
                 filePath,
-                reinterpret_cast<const std::byte*>(csvStr.data()),
-                csvStr.size() * sizeof(wchar_t),
+                reinterpret_cast<const std::byte*>(out.data()),
+                out.size(),
                 &fileErr
             );
         }
@@ -2050,17 +2379,35 @@ namespace ShadowStrike {
          */
         bool LogDB::RebuildIndices(DatabaseError* err) {
             SS_LOG_INFO(L"LogDB", L"Rebuilding indices...");
-            
-            // Drop and recreate indices
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_timestamp", nullptr);
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_level", nullptr);
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_category", nullptr);
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_source", nullptr);
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_process", nullptr);
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_error", nullptr);
-            DatabaseManager::Instance().Execute("DROP INDEX IF EXISTS idx_log_composite", nullptr);
 
-            return DatabaseManager::Instance().Execute(SQL_CREATE_INDICES, err);
+            // Atomically drop + recreate to ensure readers never observe a
+            // missing-index window during reconciliation.
+            auto trans = DatabaseManager::Instance().BeginTransaction(
+                Transaction::Type::Immediate, err);
+            if (!trans || !trans->IsActive()) {
+                return false;
+            }
+
+            const char* dropStmts[] = {
+                "DROP INDEX IF EXISTS idx_log_timestamp",
+                "DROP INDEX IF EXISTS idx_log_level",
+                "DROP INDEX IF EXISTS idx_log_category",
+                "DROP INDEX IF EXISTS idx_log_source",
+                "DROP INDEX IF EXISTS idx_log_process",
+                "DROP INDEX IF EXISTS idx_log_error",
+                "DROP INDEX IF EXISTS idx_log_composite",
+            };
+            for (const char* stmt : dropStmts) {
+                if (!trans->Execute(stmt, err)) {
+                    trans->Rollback(err);
+                    return false;
+                }
+            }
+            if (!trans->Execute(SQL_CREATE_INDICES, err)) {
+                trans->Rollback(err);
+                return false;
+            }
+            return trans->Commit(err);
         }
 
         // ============================================================================
@@ -2197,9 +2544,11 @@ namespace ShadowStrike {
                     }
                 }
                 
-                // Update schema version in database metadata
+                // Persist schema version in the DatabaseManager-owned `_metadata`
+                // table (LogDB does not create its own metadata table; the legacy
+                // `db_metadata` reference would silently fail at runtime).
                 DatabaseManager::Instance().ExecuteWithParams(
-                    "INSERT OR REPLACE INTO db_metadata (key, value) VALUES ('log_schema_version', ?)",
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES ('log_schema_version', ?)",
                     nullptr,
                     std::to_string(targetVersion));
                 
@@ -2229,51 +2578,79 @@ namespace ShadowStrike {
         int64_t LogDB::dbInsertEntry(const LogEntry& entry, DatabaseError* err) {
             auto startTime = std::chrono::steady_clock::now();
 
-            std::string timestamp = timePointToString(entry.timestamp);
+            // Bound attacker-controllable field lengths before serialization.
+            LogEntry clamped = entry;
+            clamped.source        = ClampField(clamped.source,        LOGDB_MAX_SOURCE_LEN);
+            clamped.message       = ClampField(clamped.message,       LOGDB_MAX_MESSAGE_LEN);
+            clamped.details       = ClampField(clamped.details,       LOGDB_MAX_DETAILS_LEN);
+            clamped.metadata      = ClampField(clamped.metadata,      LOGDB_MAX_METADATA_LEN);
+            clamped.errorContext  = ClampField(clamped.errorContext,  LOGDB_MAX_CONTEXT_LEN);
+            clamped.filePath      = ClampField(clamped.filePath,      LOGDB_MAX_PATH_LEN);
+            clamped.functionName  = ClampField(clamped.functionName,  LOGDB_MAX_FUNCNAME_LEN);
 
-            
+            const std::string timestamp = timePointToString(clamped.timestamp);
+
             bool success = DatabaseManager::Instance().ExecuteWithParams(
                 SQL_INSERT_ENTRY,
                 err,
                 timestamp,
-                static_cast<int>(entry.level),
-                static_cast<int>(entry.category),
-                ToUTF8(entry.source),
-                ToUTF8(entry.message),
-                ToUTF8(entry.details),
-                static_cast<int>(entry.processId),
-                static_cast<int>(entry.threadId),
-                ToUTF8(entry.userName),
-                ToUTF8(entry.machineName),
-                ToUTF8(entry.metadata),
-                static_cast<int>(entry.errorCode),
-                ToUTF8(entry.errorContext),
-                entry.durationMs,
-                ToUTF8(entry.filePath),
-                entry.lineNumber,
-                ToUTF8(entry.functionName)
+                static_cast<int>(clamped.level),
+                static_cast<int>(clamped.category),
+                ToUTF8(clamped.source),
+                ToUTF8(clamped.message),
+                ToUTF8(clamped.details),
+                static_cast<int>(clamped.processId),
+                static_cast<int>(clamped.threadId),
+                ToUTF8(clamped.userName),
+                ToUTF8(clamped.machineName),
+                ToUTF8(clamped.metadata),
+                static_cast<int>(clamped.errorCode),
+                ToUTF8(clamped.errorContext),
+                clamped.durationMs,
+                ToUTF8(clamped.filePath),
+                clamped.lineNumber,
+                ToUTF8(clamped.functionName)
             );
 
-            if (success) {
-               
-                int64_t id = DatabaseManager::Instance().LastInsertRowId();
-
-                auto endTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-
-                
-                this->updateStatistics(entry);
-
-                std::lock_guard<std::mutex> lock(m_statsMutex);
-                m_stats.totalWrites++;
-                m_stats.avgWriteTime = std::chrono::milliseconds(
-                    (m_stats.avgWriteTime.count() + duration.count()) / 2
-                );
-
-                return id;
+            if (!success) {
+                return -1;
             }
 
-            return -1;
+            const int64_t id = DatabaseManager::Instance().LastInsertRowId();
+
+            const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime);
+
+            // BUGFIX: previous implementation re-locked m_statsMutex after
+            // updateStatistics() had already acquired it — std::mutex is NOT
+            // recursive, which was a guaranteed deadlock on every sync write.
+            // Merge stats updates under a single lock and compute avgWriteTime
+            // as a proper running mean instead of an exponentially-biased average.
+            {
+                std::lock_guard<std::mutex> lock(m_statsMutex);
+                m_stats.totalEntries++;
+                if (clamped.level >= LogLevel::Trace && clamped.level <= LogLevel::Fatal) {
+                    m_stats.entriesByLevel[static_cast<size_t>(clamped.level)]++;
+                }
+                m_stats.entriesByCategory[static_cast<size_t>(clamped.category)]++;
+                if (m_stats.oldestEntry == std::chrono::system_clock::time_point{} ||
+                    clamped.timestamp < m_stats.oldestEntry) {
+                    m_stats.oldestEntry = clamped.timestamp;
+                }
+                if (clamped.timestamp > m_stats.newestEntry) {
+                    m_stats.newestEntry = clamped.timestamp;
+                }
+
+                const uint64_t prevWrites = m_stats.totalWrites;
+                m_stats.totalWrites = prevWrites + 1;
+                // running mean: avg_n = avg_{n-1} + (sample - avg_{n-1}) / n
+                const int64_t avgPrev = m_stats.avgWriteTime.count();
+                const int64_t sample  = duration.count();
+                const int64_t newAvg  = avgPrev + (sample - avgPrev) / static_cast<int64_t>(prevWrites + 1);
+                m_stats.avgWriteTime = std::chrono::milliseconds(newAvg);
+            }
+
+            return id;
         }
 
         /**
@@ -2426,8 +2803,12 @@ namespace ShadowStrike {
 
             // Full-text search
             if (filter.fullTextSearch && enableFTS) {
+                std::wstring ftsQuery = *filter.fullTextSearch;
+                if (ftsQuery.size() > LOGDB_MAX_FTS_QUERY_LEN) {
+                    ftsQuery.resize(LOGDB_MAX_FTS_QUERY_LEN);
+                }
                 sql << " AND id IN (SELECT rowid FROM log_fts WHERE log_fts MATCH ?)";
-                outParams.push_back(ToUTF8(*filter.fullTextSearch));
+                outParams.push_back(ToUTF8(ftsQuery));
             }
 
             // Order and limit
@@ -2437,7 +2818,11 @@ namespace ShadowStrike {
                 sql << " ORDER BY timestamp ASC";
             }
 
-            sql << " LIMIT " << filter.maxResults;
+            // SECURITY: clamp result count to bound memory/CPU on attacker-influenced filters.
+            const size_t cappedResults = (filter.maxResults == 0 || filter.maxResults > LOGDB_MAX_QUERY_RESULTS)
+                ? LOGDB_MAX_QUERY_RESULTS
+                : filter.maxResults;
+            sql << " LIMIT " << cappedResults;
 
             return sql.str();
         }
@@ -2579,6 +2964,18 @@ namespace ShadowStrike {
          */
         void LogDB::enqueuePendingWrite(const LogEntry& entry) {
             std::lock_guard<std::mutex> lock(m_batchMutex);
+
+            // SECURITY: cap the queue to bound memory under a stalled DB or a
+            // logging storm. Dropping the new entry (rather than evicting older
+            // ones) preserves forensic ordering and is reported via statistics.
+            if (m_pendingWrites.size() >= LOGDB_MAX_PENDING_WRITES) {
+                {
+                    std::lock_guard<std::mutex> statsLock(m_statsMutex);
+                    m_stats.droppedAsyncWrites++;
+                }
+                m_batchCV.notify_one();
+                return;
+            }
 
             PendingLogEntry pending;
             pending.entry = entry;
@@ -2722,11 +3119,23 @@ namespace ShadowStrike {
             archivePath += L".db";
 
             if (!createArchive(archivePath, cutoffTime, err)) {
+                SS_LOG_ERROR(L"LogDB", L"performRotation: archive creation failed at %ls",
+                    archivePath.c_str());
                 return false;
             }
 
-            // Delete old entries
-            if (!DeleteBefore(cutoffTime, err)) {
+            // Delete old entries — surface failure with archive path so operators
+            // can correlate with the archive that was just emitted.
+            DatabaseError delErr;
+            if (!DeleteBefore(cutoffTime, &delErr)) {
+                SS_LOG_ERROR(L"LogDB",
+                    L"performRotation: DeleteBefore failed after archive %ls (sqlite=%d, %ls)",
+                    archivePath.c_str(),
+                    delErr.sqliteCode,
+                    delErr.message.c_str());
+                if (err) {
+                    *err = delErr;
+                }
                 return false;
             }
 
@@ -2793,7 +3202,6 @@ namespace ShadowStrike {
          * @note Uses std::filesystem for directory iteration.
          */
         void LogDB::cleanupOldArchives() {
-            // READ CONFIG WITH LOCK FIRST!
             std::wstring archivePath;
             size_t maxArchivedLogs;
             {
@@ -2802,37 +3210,58 @@ namespace ShadowStrike {
                 maxArchivedLogs = m_config.maxArchivedLogs;
             }
 
-            // Find and delete archives exceeding maxArchivedLogs
-            std::filesystem::path archiveDir(archivePath);  // ✅ Use local var!
-
-            if (!std::filesystem::exists(archiveDir)) {
+            std::error_code ec;
+            std::filesystem::path archiveDir(archivePath);
+            if (!std::filesystem::exists(archiveDir, ec) || ec) {
                 return;
             }
 
-            std::vector<std::filesystem::path> archives;
+            struct ArchiveFile {
+                std::filesystem::path path;
+                std::filesystem::file_time_type mtime;
+            };
+            std::vector<ArchiveFile> archives;
 
-            for (const auto& entry : std::filesystem::directory_iterator(archiveDir)) {
-                if (entry.is_regular_file() && entry.path().extension() == L".db") {
-                    archives.push_back(entry.path());
+            try {
+                for (const auto& entry : std::filesystem::directory_iterator(
+                        archiveDir, std::filesystem::directory_options::skip_permission_denied, ec))
+                {
+                    if (ec) break;
+                    if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
+                    const auto& p = entry.path();
+                    if (p.extension() != L".db") continue;
+                    // SECURITY: gate cleanup strictly to our own archive filename pattern
+                    // so a misconfigured archivePath cannot wipe unrelated .db files.
+                    const std::wstring stem = p.stem().wstring();
+                    if (stem.rfind(LOGDB_ARCHIVE_PREFIX, 0) != 0) continue;
+                    auto mt = std::filesystem::last_write_time(p, ec);
+                    if (ec) { ec.clear(); continue; }
+                    archives.push_back({ p, mt });
                 }
-            }
-
-            if (archives.size() <= maxArchivedLogs) {  // ✅ Use local var!
+            } catch (const std::filesystem::filesystem_error& e) {
+                SS_LOG_WARN(L"LogDB", L"cleanupOldArchives: enumeration failed: %hs", e.what());
                 return;
             }
 
-            // Sort by modification time
-            std::sort(archives.begin(), archives.end(), [](const auto& a, const auto& b) {
-                return std::filesystem::last_write_time(a) < std::filesystem::last_write_time(b);
+            if (archives.size() <= maxArchivedLogs) {
+                return;
+            }
+
+            std::sort(archives.begin(), archives.end(),
+                [](const ArchiveFile& a, const ArchiveFile& b) {
+                    return a.mtime < b.mtime;
                 });
 
-            // Delete oldest
-            size_t toDelete = archives.size() - maxArchivedLogs;  // ✅ Use local var!
+            const size_t toDelete = archives.size() - maxArchivedLogs;
             for (size_t i = 0; i < toDelete; ++i) {
-                std::error_code ec;
-                std::filesystem::remove(archives[i], ec);
-                if (!ec) {
-                    SS_LOG_INFO(L"LogDB", L"Deleted old archive: %ls", archives[i].wstring().c_str());
+                std::error_code rmEc;
+                std::filesystem::remove(archives[i].path, rmEc);
+                if (!rmEc) {
+                    SS_LOG_INFO(L"LogDB", L"Deleted old archive: %ls",
+                        archives[i].path.wstring().c_str());
+                } else {
+                    SS_LOG_WARN(L"LogDB", L"Failed to delete archive: %ls (%hs)",
+                        archives[i].path.wstring().c_str(), rmEc.message().c_str());
                 }
             }
         }
@@ -2858,13 +3287,20 @@ namespace ShadowStrike {
             std::lock_guard<std::mutex> lock(m_statsMutex);
 
             m_stats.totalEntries++;
-            
-            if (entry.level < LogLevel::Trace || entry.level > LogLevel::Fatal) {
-                return;
+
+            // BUGFIX: previous gate `entry.level < LogLevel::Trace` is
+            // tautologically false because LogLevel is uint8_t starting at 0.
+            // Use a proper range check that gates both ends.
+            if (entry.level >= LogLevel::Trace && entry.level <= LogLevel::Fatal) {
+                m_stats.entriesByLevel[static_cast<size_t>(entry.level)]++;
             }
-            
-            m_stats.entriesByLevel[static_cast<size_t>(entry.level)]++;
-            m_stats.entriesByCategory[static_cast<size_t>(entry.category)]++;
+            // LogCategory is uint8_t, so the [256] histogram cannot overflow,
+            // but we still bound defensively in case the underlying type ever
+            // changes width.
+            const size_t catIdx = static_cast<size_t>(entry.category);
+            if (catIdx < (sizeof(m_stats.entriesByCategory) / sizeof(m_stats.entriesByCategory[0]))) {
+                m_stats.entriesByCategory[catIdx]++;
+            }
 
             if (m_stats.oldestEntry == std::chrono::system_clock::time_point{} ||
                 entry.timestamp < m_stats.oldestEntry) {
@@ -3000,37 +3436,59 @@ namespace ShadowStrike {
          */
         std::chrono::system_clock::time_point LogDB::stringToTimePoint(std::string_view str) {
             // Parse ISO 8601 format: YYYY-MM-DD HH:MM:SS.mmm
-            std::tm tm = {};
-            
-            // Manual parsing to avoid stream issues
             if (str.length() < 19) {
                 return std::chrono::system_clock::time_point{};
             }
 
-            int year, month, day, hour, minute, second;
-            if (sscanf_s(str.data(), "%d-%d-%d %d:%d:%d", 
-                        &year, &month, &day, &hour, &minute, &second) != 6) {
+            // sscanf_s expects a null-terminated buffer; std::string_view may
+            // not be terminated, so copy into a bounded local buffer.
+            char buf[64];
+            const size_t copyLen = std::min<size_t>(str.size(), sizeof(buf) - 1);
+            std::memcpy(buf, str.data(), copyLen);
+            buf[copyLen] = '\0';
+
+            int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+            if (sscanf_s(buf, "%d-%d-%d %d:%d:%d",
+                         &year, &month, &day, &hour, &minute, &second) != 6) {
                 return std::chrono::system_clock::time_point{};
             }
 
+            // SECURITY: validate ranges before handing to _mkgmtime to avoid
+            // undefined behavior on out-of-range struct tm fields.
+            if (year < 1970 || year > 9999 ||
+                month < 1 || month > 12 ||
+                day < 1   || day > 31 ||
+                hour < 0  || hour > 23 ||
+                minute < 0 || minute > 59 ||
+                second < 0 || second > 60) {
+                return std::chrono::system_clock::time_point{};
+            }
+
+            std::tm tm = {};
             tm.tm_year = year - 1900;
-            tm.tm_mon = month - 1;
+            tm.tm_mon  = month - 1;
             tm.tm_mday = day;
             tm.tm_hour = hour;
-            tm.tm_min = minute;
-            tm.tm_sec = second;
+            tm.tm_min  = minute;
+            tm.tm_sec  = second;
 
-            auto tp = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+            const time_t t = _mkgmtime(&tm);
+            if (t == static_cast<time_t>(-1)) {
+                return std::chrono::system_clock::time_point{};
+            }
+            auto tp = std::chrono::system_clock::from_time_t(t);
 
-            // Parse milliseconds if present
-            auto dotPos = str.find('.');
-            if (dotPos != std::string_view::npos && dotPos + 1 < str.size()) {
+            const size_t dotPos = std::string_view(buf, copyLen).find('.');
+            if (dotPos != std::string_view::npos && dotPos + 1 < copyLen) {
                 try {
-                    int ms = std::stoi(std::string(str.substr(dotPos + 1, 3)));
-                    tp += std::chrono::milliseconds(ms);
-                }
-                catch (...) {
-                    // Ignore parsing errors for milliseconds
+                    const std::string fragment(buf + dotPos + 1,
+                        std::min<size_t>(3, copyLen - dotPos - 1));
+                    int ms = std::stoi(fragment);
+                    if (ms >= 0 && ms < 1000) {
+                        tp += std::chrono::milliseconds(ms);
+                    }
+                } catch (...) {
+                    // Ignore: sub-second precision is best-effort.
                 }
             }
 

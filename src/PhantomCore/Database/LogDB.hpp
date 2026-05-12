@@ -413,6 +413,9 @@ namespace ShadowStrike {
                 
                 uint64_t rotationCount = 0;                 ///< Number of rotations performed
                 uint64_t archivedLogCount = 0;              ///< Number of archives created
+
+                uint64_t droppedAsyncWrites = 0;            ///< Async entries dropped due to queue overflow
+                uint64_t filteredWrites = 0;                ///< Entries filtered by min-level on insert
             };
 
             // ========================================================================
@@ -833,6 +836,7 @@ namespace ShadowStrike {
             // ========================================================================
 
             std::atomic<bool> m_initialized{ false };   ///< Initialization flag
+            mutable std::mutex m_initMutex;             ///< Serializes Initialize()/Shutdown()
             Config m_config;
             mutable std::shared_mutex m_configMutex;   ///< Config read/write mutex
 
