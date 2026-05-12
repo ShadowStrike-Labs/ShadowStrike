@@ -84,6 +84,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <condition_variable>
+#include <limits>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "powrprof.lib")
@@ -115,8 +116,8 @@ namespace HardwareMonitorConstants {
     constexpr uint8_t SMART_CURRENT_PENDING_SECTORS = 197;
     constexpr uint8_t SMART_WEAR_LEVELING = 177;
 
-    // SMART IOCTL codes (not in standard headers)
-    constexpr DWORD SMART_GET_VERSION_CODE = 0x074080;
+    // SMART IOCTL codes (not in standard headers).
+    // Equivalent to CTL_CODE(IOCTL_DISK_BASE=0x07, 0x0022, METHOD_BUFFERED, FILE_READ_ACCESS).
     constexpr DWORD SMART_RCV_DRIVE_DATA_CODE = 0x07C088;
 
     // Thermal thresholds (Celsius)
@@ -129,7 +130,101 @@ namespace HardwareMonitorConstants {
     constexpr uint32_t DISK_TEMP_WARM = 50;
     constexpr uint32_t DISK_TEMP_HOT = 55;
     constexpr uint32_t DISK_TEMP_CRITICAL = 60;
+
+    // Polling interval clamps (defence-in-depth against malformed/hostile config).
+    // A 0 ms interval would busy-loop the monitoring thread; an unbounded large
+    // value combined with the error-backoff multiplier could overflow uint32_t
+    // and cause an effectively-zero sleep, also a busy-loop.
+    constexpr uint32_t MIN_POLLING_INTERVAL_MS = 250;          // 4 Hz upper polling cap
+    constexpr uint32_t MAX_POLLING_INTERVAL_MS = 3600u * 1000u; // 1 hour
+    constexpr uint8_t  MAX_BATTERY_PERCENT = 100;
+
+    // Defensive cap on hostile/garbled wide strings we surface to logs, the
+    // EventLogger or the dashboard. 256 wchars is well above any realistic
+    // device identifier and prevents memory pressure from rogue descriptors.
+    constexpr size_t MAX_LOG_STRING_LEN = 256;
+
+    // Maximum events returned from GetRecentChanges() in a single call.
+    // Caller-supplied uint32_t is clamped to this to avoid massive vector
+    // reservation from a malicious or buggy IPC caller.
+    constexpr uint32_t MAX_RETURNED_CHANGE_EVENTS = 4096;
 }  // namespace HardwareMonitorConstants
+
+// ----------------------------------------------------------------------------
+// Local sanitization helpers — applied to every wide string sourced from
+// device descriptors, SetupAPI / CM_* enumerators, WMI strings, and any other
+// hardware-controlled surface before it crosses a logging or IPC boundary.
+//
+// This is the first line of defence against:
+//   * CRLF / NUL log-injection (forged log entries)
+//   * Embedded ANSI escape codes (terminal hijack)
+//   * Unbounded strings (memory pressure / UI DoS)
+//   * Format-string smuggling when surfaces forward into printf-family APIs
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief Strip control characters from a wide string and bound its length.
+ * Replaces every code unit < 0x20 (and DEL 0x7F) with '?'. Truncates to
+ * MAX_LOG_STRING_LEN code units with a trailing ellipsis marker.
+ *
+ * The input is taken by value so callers can pass temporaries safely; the
+ * function is noexcept-correct via std::wstring's small string optimisation
+ * and the surrounding monitoring loop's outer try/catch.
+ */
+[[nodiscard]] static std::wstring SanitizeForLog(std::wstring s) {
+    for (auto& c : s) {
+        // Strip ASCII control set (0x00-0x1F) and DEL.
+        // Wide chars >= 0x20 (printable + Unicode) are preserved.
+        if (c != L'\0' && static_cast<unsigned>(c) < 0x20u) {
+            c = L'?';
+        } else if (c == 0x7F) {
+            c = L'?';
+        }
+    }
+    if (s.size() > HardwareMonitorConstants::MAX_LOG_STRING_LEN) {
+        s.resize(HardwareMonitorConstants::MAX_LOG_STRING_LEN);
+        s.append(L"...");
+    }
+    return s;
+}
+
+/**
+ * @brief Apply MIN/MAX polling-interval clamps and battery-threshold sanity
+ * checks to a configuration object. Returns true if the input was already
+ * inside the safe envelope; false if any field was clamped.
+ *
+ * DESIGN: A failed clamp is not an Initialize() error — we accept the call
+ * and silently coerce to a safe value, then log at Warning. This avoids the
+ * service refusing to start due to a single mis-typed registry/policy field.
+ */
+static bool ClampHardwareMonitorConfig(HardwareMonitorConfig& cfg) noexcept {
+    bool inRange = true;
+    if (cfg.pollingIntervalMs < HardwareMonitorConstants::MIN_POLLING_INTERVAL_MS) {
+        cfg.pollingIntervalMs = HardwareMonitorConstants::MIN_POLLING_INTERVAL_MS;
+        inRange = false;
+    } else if (cfg.pollingIntervalMs > HardwareMonitorConstants::MAX_POLLING_INTERVAL_MS) {
+        cfg.pollingIntervalMs = HardwareMonitorConstants::MAX_POLLING_INTERVAL_MS;
+        inRange = false;
+    }
+    if (cfg.batteryLowPercent > HardwareMonitorConstants::MAX_BATTERY_PERCENT) {
+        cfg.batteryLowPercent = HardwareMonitorConstants::MAX_BATTERY_PERCENT;
+        inRange = false;
+    }
+    if (cfg.batteryCriticalPercent > cfg.batteryLowPercent) {
+        cfg.batteryCriticalPercent = cfg.batteryLowPercent;
+        inRange = false;
+    }
+    // Ordering invariant: warning <= critical for both temperature axes.
+    if (cfg.diskTempWarningCelsius > cfg.diskTempCriticalCelsius) {
+        cfg.diskTempCriticalCelsius = cfg.diskTempWarningCelsius;
+        inRange = false;
+    }
+    if (cfg.cpuTempWarningCelsius > cfg.cpuTempCriticalCelsius) {
+        cfg.cpuTempCriticalCelsius = cfg.cpuTempWarningCelsius;
+        inRange = false;
+    }
+    return inRange;
+}
 
 // ============================================================================
 // RAII WRAPPERS & HELPERS
@@ -410,6 +505,7 @@ HardwareMonitorConfig HardwareMonitorConfig::CreateDefault() noexcept {
     config.cpuTempCriticalCelsius = 95;
     config.batteryLowPercent = 20;
     config.batteryCriticalPercent = 10;
+    (void)ClampHardwareMonitorConfig(config);
     return config;
 }
 
@@ -544,9 +640,9 @@ public:
         };
         #pragma pack(pop)
 
-        // Use SENDCMDINPARAMS for legacy SMART query
-        constexpr DWORD SMART_RCV_DRIVE_DATA_CODE = 0x07C088;
-        
+        // Use SENDCMDINPARAMS for legacy SMART query (uses the namespace-scope
+        // SMART_RCV_DRIVE_DATA_CODE constant — no local redeclaration).
+
         struct SENDCMDINPARAMS_EX {
             DWORD cBufferSize;
             IDEREGS irDriveRegs;
@@ -575,11 +671,23 @@ public:
         inParams.irDriveRegs.bCylHighReg = 0xC2;
         inParams.irDriveRegs.bCommandReg = 0xB0;       // SMART command
 
-        if (!DeviceIoControl(hDrive, SMART_RCV_DRIVE_DATA_CODE,
+        if (!DeviceIoControl(hDrive, HardwareMonitorConstants::SMART_RCV_DRIVE_DATA_CODE,
                             &inParams, sizeof(SENDCMDINPARAMS_EX) - 1,
                             &outParams, sizeof(outParams),
                             &bytesReturned, nullptr)) {
             // SMART not supported or failed
+            disk.smartSupported = false;
+            disk.smartEnabled = false;
+            return;
+        }
+
+        // Validate the response actually contains a parseable SMART payload
+        // before reading the attribute table. A short response can leave
+        // outParams.bBuffer partially uninitialised; treating it as SMART_DATA
+        // would read stack memory and surface garbage attributes to the UI.
+        constexpr DWORD kSmartHeaderBytes =
+            sizeof(SENDCMDOUTPARAMS_EX) - 512;  // cBufferSize + DriverStatus
+        if (bytesReturned < kSmartHeaderBytes + sizeof(SMART_DATA)) {
             disk.smartSupported = false;
             disk.smartEnabled = false;
             return;
@@ -782,6 +890,43 @@ public:
             disk.failureReason = L"NVMe: Wear indicator exceeded 100%";
         }
 
+        // Available spare guard — per NVMe spec, if available spare drops below
+        // the threshold the device is at risk of failure even without the
+        // critical-warning bit being set yet.
+        if (disk.availableSpareThreshold != 0 &&
+            disk.availableSpare < disk.availableSpareThreshold) {
+            if (disk.healthStatus < DiskHealthStatus::Warning) {
+                disk.healthStatus = DiskHealthStatus::Warning;
+            }
+            disk.failurePredicted = true;
+            if (disk.failureReason.empty()) {
+                disk.failureReason = L"NVMe: Available spare below threshold";
+            }
+        }
+
+        // Total host writes: NVMe reports data-units-written as a 128-bit
+        // little-endian counter; each unit is 1000 logical blocks of 512 bytes.
+        // We can only represent the low 64 bits in disk.totalHostWrites; if the
+        // high half is non-zero, saturate to UINT64_MAX so dashboards display
+        // "≥ 8 EiB" rather than wrapping silently.
+        uint64_t dataUnitsLow = 0;
+        for (int i = 0; i < 8; ++i) {
+            dataUnitsLow |=
+                static_cast<uint64_t>(healthInfo->dataUnitsWritten[i]) << (i * 8);
+        }
+        uint64_t dataUnitsHigh = 0;
+        for (int i = 0; i < 8; ++i) {
+            dataUnitsHigh |=
+                static_cast<uint64_t>(healthInfo->dataUnitsWritten[8 + i]) << (i * 8);
+        }
+        constexpr uint64_t kNvmeUnitBytes = 1000ULL * 512ULL;  // 512,000 bytes per unit
+        if (dataUnitsHigh != 0 ||
+            dataUnitsLow > (std::numeric_limits<uint64_t>::max)() / kNvmeUnitBytes) {
+            disk.totalHostWrites = (std::numeric_limits<uint64_t>::max)();
+        } else {
+            disk.totalHostWrites = dataUnitsLow * kNvmeUnitBytes;
+        }
+
         disk.smartSupported = true;
         disk.smartEnabled = true;
     }
@@ -839,7 +984,7 @@ public:
                     // Validate minimum response size
                     if (bytesReturned < sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
                         SS_LOG_WARN(L"HardwareMonitor", L"Invalid descriptor size for %ls",
-                                   drivePath.c_str());
+                                   SanitizeForLog(drivePath).c_str());
                         continue;
                     }
 
@@ -922,37 +1067,79 @@ public:
         return disks;
     }
 
-    void AnalyzeDiskHealth(DiskHealthInfo& disk) {
+    void AnalyzeDiskHealth(DiskHealthInfo& disk, const HardwareMonitorConfig& cfg) {
         try {
-            // Check temperature
-            if (disk.temperatureCelsius >= m_config.diskTempCriticalCelsius) {
+            // Capture an initial health-percent ceiling derived from any
+            // already-known wear / NVMe percentage indicators. This guarantees
+            // a Critical disk never reports 100% on the dashboard even if its
+            // temperature happens to be normal — a previous bug where dashboards
+            // showed "100% healthy" for drives flagged as failing.
+            uint8_t initialPercent = disk.healthPercent != 0 ? disk.healthPercent : 100;
+            if (disk.diskType == DiskType::SSD_NVMe && disk.percentageUsed != 0) {
+                // NVMe percentageUsed is the spec's wear indicator: 0 = new, 100 = end of life.
+                uint8_t used = (disk.percentageUsed > 100) ? 100 : disk.percentageUsed;
+                initialPercent = static_cast<uint8_t>(100 - used);
+            } else if (disk.wearLevelPercent != 0) {
+                uint8_t worn = (disk.wearLevelPercent > 100) ? 100 : disk.wearLevelPercent;
+                initialPercent = static_cast<uint8_t>(100 - worn);
+            }
+            disk.healthPercent = initialPercent;
+
+            // Check temperature against the caller-snapshotted config.
+            // Reading m_config directly here would race with UpdateConfig().
+            if (cfg.diskTempCriticalCelsius != 0 &&
+                disk.temperatureCelsius >= cfg.diskTempCriticalCelsius) {
                 disk.healthStatus = DiskHealthStatus::Critical;
-                disk.healthPercent = 50;
-            } else if (disk.temperatureCelsius >= m_config.diskTempWarningCelsius) {
-                disk.healthStatus = DiskHealthStatus::Warning;
-                disk.healthPercent = 75;
+                if (disk.healthPercent > 50) disk.healthPercent = 50;
+            } else if (cfg.diskTempWarningCelsius != 0 &&
+                       disk.temperatureCelsius >= cfg.diskTempWarningCelsius) {
+                if (disk.healthStatus < DiskHealthStatus::Warning) {
+                    disk.healthStatus = DiskHealthStatus::Warning;
+                }
+                if (disk.healthPercent > 75) disk.healthPercent = 75;
             }
 
             // Check S.M.A.R.T. attributes for failure prediction
             for (const auto& attr : disk.smartAttributes) {
-                if (attr.isCritical && attr.currentValue <= attr.threshold) {
+                if (attr.isCritical && attr.threshold != 0 &&
+                    attr.currentValue <= attr.threshold) {
                     disk.failurePredicted = true;
-                    disk.failureReason = L"Critical S.M.A.R.T. attribute below threshold: " + attr.name;
+                    disk.failureReason =
+                        L"Critical S.M.A.R.T. attribute below threshold: " +
+                        SanitizeForLog(attr.name);
                     disk.healthStatus = DiskHealthStatus::Critical;
                     break;
                 }
             }
 
-            // Check reallocated sectors (would be from actual SMART data)
-            // If reallocated sectors > 0, predict failure
+            // Final consistency pass: collapse healthPercent to match status so
+            // any downstream renderer reading either field gets a coherent view.
+            switch (disk.healthStatus) {
+                case DiskHealthStatus::Failed:
+                    disk.healthPercent = 0;
+                    break;
+                case DiskHealthStatus::Critical:
+                    if (disk.healthPercent > 50) disk.healthPercent = 50;
+                    break;
+                case DiskHealthStatus::Warning:
+                    if (disk.healthPercent > 75) disk.healthPercent = 75;
+                    break;
+                case DiskHealthStatus::Healthy:
+                    if (disk.healthPercent < 76) disk.healthPercent = 100;
+                    break;
+                case DiskHealthStatus::Unknown:
+                default:
+                    break;
+            }
+
             if (disk.failurePredicted) {
-                // Estimate failure date (simplified)
                 auto now = std::chrono::system_clock::now();
-                disk.predictedFailureDate = now + std::chrono::hours(24 * 30);  // 30 days
+                disk.predictedFailureDate = now + std::chrono::hours(24 * 30);
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"HardwareMonitor", L"Disk health analysis failed - %ls", Utils::StringUtils::ToWide(e.what()).c_str());
+            SS_LOG_ERROR(L"HardwareMonitor", L"Disk health analysis failed - %ls",
+                        SanitizeForLog(Utils::StringUtils::ToWide(e.what())).c_str());
         }
     }
 
@@ -1094,8 +1281,13 @@ public:
                 PDH_FMT_COUNTERVALUE value;
                 if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, 
                                                 nullptr, &value) == ERROR_SUCCESS) {
-                    // Estimate temperature: base 35°C + up to 45°C based on load
+                    // Estimate temperature: base 35°C + up to 45°C based on load.
+                    // PDH has been observed to return negative / NaN values
+                    // during transient counter rebuilds, which would underflow
+                    // the uint32 cast. Clamp to a sane physical range first.
                     double cpuLoad = value.doubleValue;
+                    if (!(cpuLoad >= 0.0)) cpuLoad = 0.0;   // also rejects NaN
+                    if (cpuLoad > 100.0) cpuLoad = 100.0;
                     uint32_t estimatedTemp = static_cast<uint32_t>(
                         35.0 + (cpuLoad * 0.45)
                     );
@@ -1323,8 +1515,8 @@ public:
                 // Get active power plan
                 GUID* activeGuid = nullptr;
                 if (PowerGetActiveScheme(nullptr, &activeGuid) == ERROR_SUCCESS && activeGuid) {
-                    DWORD bufferSize = 512;
                     wchar_t buffer[512];
+                    DWORD bufferSize = sizeof(buffer);   // bytes, not element count
                     if (PowerReadFriendlyName(nullptr, activeGuid, nullptr, nullptr,
                                              reinterpret_cast<PUCHAR>(buffer),
                                              &bufferSize) == ERROR_SUCCESS) {
@@ -1582,8 +1774,9 @@ public:
 
                         SS_LOG_ERROR(L"HardwareMonitor",
                             L"CRITICAL: Firmware version change detected on %ls - was [%ls] now [%ls]",
-                            disk.devicePath.c_str(), it->second.c_str(),
-                            disk.firmwareVersion.c_str());
+                            SanitizeForLog(disk.devicePath).c_str(),
+                            SanitizeForLog(it->second).c_str(),
+                            SanitizeForLog(disk.firmwareVersion).c_str());
 
                         it->second = disk.firmwareVersion;
                         RecordHardwareChange(event);
@@ -1653,7 +1846,8 @@ public:
                 event.suspicionReason = reason;
                 SS_LOG_WARN(L"HardwareMonitor",
                     L"THREAT: Known attack device detected - %ls (%ls)",
-                    event.deviceId.c_str(), reason.c_str());
+                    SanitizeForLog(event.deviceId).c_str(),
+                    SanitizeForLog(reason).c_str());
                 break;
             }
         }
@@ -1684,7 +1878,8 @@ public:
                 event.suspicionReason = dmaReason;
                 SS_LOG_WARN(L"HardwareMonitor",
                     L"THREAT: DMA-capable device insertion detected - %ls (%ls)",
-                    event.deviceId.c_str(), dmaReason.c_str());
+                    SanitizeForLog(event.deviceId).c_str(),
+                    SanitizeForLog(dmaReason).c_str());
             }
         }
 
@@ -1733,7 +1928,7 @@ public:
                     L"BadUSB signature. VID/PID: " + event.deviceName;
                 SS_LOG_WARN(L"HardwareMonitor",
                     L"THREAT: BadUSB composite device detected (HID+Storage) - %ls",
-                    event.deviceId.c_str());
+                    SanitizeForLog(event.deviceId).c_str());
             }
         }
 
@@ -1763,9 +1958,9 @@ public:
                                 event.driverName;
                             SS_LOG_WARN(L"HardwareMonitor",
                                 L"THREAT: Suspicious driver for new device - driver=%ls threat=%u device=%ls",
-                                event.driverName.c_str(),
+                                SanitizeForLog(event.driverName).c_str(),
                                 static_cast<unsigned>(driverInfo->threatLevel),
-                                event.deviceId.c_str());
+                                SanitizeForLog(event.deviceId).c_str());
                         }
 
                         if (!event.driverSignatureValid) {
@@ -1776,7 +1971,8 @@ public:
                                 event.driverName;
                             SS_LOG_WARN(L"HardwareMonitor",
                                 L"ALERT: Unsigned driver loaded for device - driver=%ls device=%ls",
-                                event.driverName.c_str(), event.deviceId.c_str());
+                                SanitizeForLog(event.driverName).c_str(),
+                                SanitizeForLog(event.deviceId).c_str());
                         }
 
                         if (driverInfo->isKnownVulnerable) {
@@ -1787,14 +1983,15 @@ public:
                                 event.driverName;
                             SS_LOG_ERROR(L"HardwareMonitor",
                                 L"CRITICAL: Known vulnerable driver loaded via device insertion - %ls",
-                                event.driverName.c_str());
+                                SanitizeForLog(event.driverName).c_str());
                         }
                     }
                 }
             } catch (const std::exception& e) {
                 SS_LOG_DEBUG(L"HardwareMonitor",
                     L"DriverAnalyzer check skipped for device %ls - %ls",
-                    event.deviceId.c_str(), Utils::StringUtils::ToWide(e.what()).c_str());
+                    SanitizeForLog(event.deviceId).c_str(),
+                    SanitizeForLog(Utils::StringUtils::ToWide(e.what())).c_str());
             }
         }
     }
@@ -1865,30 +2062,35 @@ public:
             }
 
             std::unordered_map<std::wstring, std::wstring> props;
-            props[L"changeType"] = event.changeType;
-            props[L"deviceClass"] = event.deviceClass;
-            props[L"deviceName"] = event.deviceName;
-            props[L"deviceId"] = event.deviceId;
+            // All wide-string properties originate from device/WMI surfaces and
+            // attacker-controlled USB descriptors. Sanitize before forwarding to
+            // EventLogger so embedded CR/LF/NUL cannot forge log records or
+            // corrupt SIEM line framing downstream.
+            props[L"changeType"] = SanitizeForLog(event.changeType);
+            props[L"deviceClass"] = SanitizeForLog(event.deviceClass);
+            props[L"deviceName"] = SanitizeForLog(event.deviceName);
+            props[L"deviceId"] = SanitizeForLog(event.deviceId);
             props[L"isSuspicious"] = event.isSuspicious ? L"true" : L"false";
             props[L"threatType"] = std::to_wstring(static_cast<uint8_t>(event.threatType));
             if (!event.suspicionReason.empty()) {
-                props[L"suspicionReason"] = event.suspicionReason;
+                props[L"suspicionReason"] = SanitizeForLog(event.suspicionReason);
             }
             if (!event.driverName.empty()) {
-                props[L"driverName"] = event.driverName;
-                props[L"driverPath"] = event.driverPath;
+                props[L"driverName"] = SanitizeForLog(event.driverName);
+                props[L"driverPath"] = SanitizeForLog(event.driverPath);
                 props[L"driverSignatureValid"] = event.driverSignatureValid ? L"true" : L"false";
             }
             if (!event.firmwareVersion.empty()) {
-                props[L"firmwareVersion"] = event.firmwareVersion;
+                props[L"firmwareVersion"] = SanitizeForLog(event.firmwareVersion);
             }
             if (!event.previousFirmwareVersion.empty()) {
-                props[L"previousFirmwareVersion"] = event.previousFirmwareVersion;
+                props[L"previousFirmwareVersion"] = SanitizeForLog(event.previousFirmwareVersion);
             }
 
-            std::wstring message = event.changeType + L": " + event.deviceId;
+            std::wstring message =
+                SanitizeForLog(event.changeType) + L": " + SanitizeForLog(event.deviceId);
             if (event.isSuspicious) {
-                message += L" [SUSPICIOUS: " + event.suspicionReason + L"]";
+                message += L" [SUSPICIOUS: " + SanitizeForLog(event.suspicionReason) + L"]";
             }
 
             eventLogger.Log(severity, EventCategory::DriverControl,
@@ -1916,14 +2118,16 @@ public:
         SS_LOG_INFO(L"HardwareMonitor", L"Monitoring thread started");
 
         while (m_monitoring.load(std::memory_order_acquire)) {
-            try {
-                // Snapshot config under lock to avoid data race with UpdateConfig()
-                HardwareMonitorConfig configSnapshot;
-                {
-                    std::shared_lock<std::shared_mutex> lock(m_mutex);
-                    configSnapshot = m_config;
-                }
+            // Snapshot config *outside* the try block so the catch handler can
+            // still read pollingIntervalMs for the backoff sleep without
+            // touching m_config (which would race with UpdateConfig()).
+            HardwareMonitorConfig configSnapshot;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_mutex);
+                configSnapshot = m_config;
+            }
 
+            try {
                 // Refresh all hardware data
                 RefreshHardwareData(configSnapshot);
 
@@ -1941,12 +2145,23 @@ public:
 
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"HardwareMonitor", L"Monitoring loop error - %ls",
-                            Utils::StringUtils::ToWide(e.what()).c_str());
+                            SanitizeForLog(Utils::StringUtils::ToWide(e.what())).c_str());
 
-                // Exponential backoff on consecutive errors
+                // Exponential backoff on consecutive errors. Use the
+                // already-captured configSnapshot — reading m_config here without
+                // a lock would race with UpdateConfig(). Saturating math also
+                // prevents `pollingIntervalMs * multiplier` from wrapping uint32
+                // and producing an effectively-zero sleep that busy-loops the
+                // monitoring thread on every poll failure.
                 uint32_t errors = m_consecutiveErrors.fetch_add(1, std::memory_order_relaxed) + 1;
-                uint32_t backoffMultiplier = std::min(errors, MAX_BACKOFF_MULTIPLIER);
-                uint32_t sleepMs = m_config.pollingIntervalMs * backoffMultiplier;
+                uint32_t backoffMultiplier = (errors > MAX_BACKOFF_MULTIPLIER)
+                    ? MAX_BACKOFF_MULTIPLIER : errors;
+                uint64_t sleepMs64 =
+                    static_cast<uint64_t>(configSnapshot.pollingIntervalMs) * backoffMultiplier;
+                if (sleepMs64 > HardwareMonitorConstants::MAX_POLLING_INTERVAL_MS) {
+                    sleepMs64 = HardwareMonitorConstants::MAX_POLLING_INTERVAL_MS;
+                }
+                uint32_t sleepMs = static_cast<uint32_t>(sleepMs64);
 
                 SS_LOG_WARN(L"HardwareMonitor",
                     L"Backing off for %ums after %u consecutive errors", sleepMs, errors);
@@ -1980,7 +2195,7 @@ public:
             if (configSnapshot.monitorDisks) {
                 auto disks = EnumerateDisks();
                 for (auto& disk : disks) {
-                    AnalyzeDiskHealth(disk);
+                    AnalyzeDiskHealth(disk, configSnapshot);
 
                     // Check for health issues and invoke callbacks
                     if (disk.healthStatus >= DiskHealthStatus::Warning) {
@@ -2220,6 +2435,10 @@ bool HardwareMonitor::Initialize(const HardwareMonitorConfig& config) {
 
     try {
         m_impl->m_config = config;
+        if (!ClampHardwareMonitorConfig(m_impl->m_config)) {
+            SS_LOG_WARN(L"HardwareMonitor",
+                L"Provided configuration contained out-of-range values and was clamped to safe defaults");
+        }
         m_impl->m_initialized.store(true, std::memory_order_release);
 
         SS_LOG_INFO(L"HardwareMonitor", L"Initialized successfully");
@@ -2277,6 +2496,11 @@ bool HardwareMonitor::IsInitialized() const noexcept {
 bool HardwareMonitor::UpdateConfig(const HardwareMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
+    bool clean = ClampHardwareMonitorConfig(m_impl->m_config);
+    if (!clean) {
+        SS_LOG_WARN(L"HardwareMonitor",
+            L"UpdateConfig: input contained out-of-range values and was clamped to safe defaults");
+    }
     SS_LOG_INFO(L"HardwareMonitor", L"Configuration updated");
     return true;
 }
@@ -2417,8 +2641,17 @@ uint8_t HardwareMonitor::GetBatteryPercent() const {
 std::vector<HardwareChangeEvent> HardwareMonitor::GetRecentChanges(uint32_t maxEvents) const {
     std::lock_guard<std::mutex> lock(m_impl->m_historyMutex);
 
+    // Clamp caller-supplied count before reserving — IPC callers can request
+    // UINT32_MAX events and a naive std::min vs. history size would still allow
+    // an arbitrarily large vector if MAX_HISTORY_SIZE were ever raised. The
+    // explicit ceiling keeps memory bounded regardless of history growth.
+    if (maxEvents > HardwareMonitorConstants::MAX_RETURNED_CHANGE_EVENTS) {
+        maxEvents = HardwareMonitorConstants::MAX_RETURNED_CHANGE_EVENTS;
+    }
+
     std::vector<HardwareChangeEvent> changes;
     size_t count = std::min(static_cast<size_t>(maxEvents), m_impl->m_changeHistory.size());
+    changes.reserve(count);
 
     auto it = m_impl->m_changeHistory.rbegin();
     for (size_t i = 0; i < count && it != m_impl->m_changeHistory.rend(); ++i, ++it) {
