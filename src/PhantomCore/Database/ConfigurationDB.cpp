@@ -15,119 +15,28 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-#include "pch.h"
 
 /**
  * ============================================================================
  * ShadowStrike ConfigurationDatabase - IMPLEMENTATION
  * ============================================================================
- *
- * @file ConfigurationDB.cpp
- * @brief Enterprise-grade SQLite-backed configuration management system.
- * 
- * This module provides a comprehensive configuration storage and management
- * system designed for enterprise antivirus deployments. It serves as the
- * primary interface for persistent configuration data that needs to survive
- * application restarts and be accessible via GUI/management interfaces.
- * 
- * Architecture Overview:
- * ----------------------
- * ConfigurationDB sits above the memory-mapped high-performance stores
- * (SignatureIndex, HashStore, PatternStore) and provides:
- * 
- *   ┌─────────────────────────────────────────────────────────────┐
- *   │                    GUI / Management API                      │
- *   └─────────────────────────────────────────────────────────────┘
- *                                 │
- *                                 ▼
- *   ┌─────────────────────────────────────────────────────────────┐
- *   │              ConfigurationDB (SQLite Layer)                  │
- *   │  - User preferences, policies, audit logs                   │
- *   │  - Versioned configurations with rollback                   │
- *   │  - Change notifications for hot-reload                      │
- *   │  - DPAPI encryption for sensitive values                    │
- *   └─────────────────────────────────────────────────────────────┘
- *                                 │
- *                                 ▼
- *   ┌─────────────────────────────────────────────────────────────┐
- *   │           Memory-Mapped Stores (High-Performance)            │
- *   │  - SignatureIndex, HashStore, PatternStore                  │
- *   │  - Sub-microsecond query latency                            │
- *   │  - Lock-free concurrent access                              │
- *   └─────────────────────────────────────────────────────────────┘
- * 
- * Key Features:
- * -------------
- * 1. HIERARCHICAL CONFIGURATION KEYS
- *    Keys use dot-notation (e.g., "network.proxy.host") enabling
- *    prefix-based queries and logical grouping.
- * 
- * 2. MULTI-TYPE VALUE SUPPORT
- *    - String, Integer, Real, Boolean, JSON, Binary, Encrypted
- *    - Type-safe variant storage with automatic serialization
- * 
- * 3. ENCRYPTION (Windows DPAPI)
- *    - Sensitive values encrypted at rest using Windows Data Protection API
- *    - Machine-local encryption bound to Windows credentials
- *    - Optional entropy via master key for additional security
- * 
- * 4. VERSION CONTROL & AUDIT
- *    - Full version history for each configuration key
- *    - Rollback capability to any previous version
- *    - Comprehensive audit log with change reasons
- * 
- * 5. HOT-RELOAD & CHANGE NOTIFICATIONS
- *    - Background thread monitors for external database changes
- *    - Delta-based reload only fetches modified configurations
- *    - Observer pattern for real-time change notifications
- * 
- * 6. VALIDATION FRAMEWORK
- *    - Regex patterns, min/max bounds, allowed values
- *    - Custom validator callbacks for complex rules
- *    - Schema enforcement before write operations
- * 
- * Thread Safety:
- * --------------
- * - All public methods are thread-safe via shared/exclusive locks
- * - Cache operations use reader-writer lock for concurrent reads
- * - Hot-reload thread safely updates cache without blocking readers
- * - Notifications dispatched outside locks to prevent deadlocks
- * 
- * Performance Considerations:
- * ---------------------------
- * - In-memory cache with configurable TTL reduces database I/O
- * - Prepared statements cached by DatabaseManager
- * - WAL mode enabled for concurrent read/write performance
- * - Indexed columns for efficient prefix and scope queries
- * 
- * Error Handling:
- * ---------------
- * All methods accept optional DatabaseError* for detailed error info.
- * Operations that fail return false/nullopt and log via SS_LOG_*.
- * Transactions are rolled back on partial failures.
- * 
- * @note This module uses Windows DPAPI (CryptProtectData/CryptUnprotectData)
- *       for encryption. These are NOT deprecated CAPI hash functions - DPAPI
- *       is the recommended Windows API for data protection at rest.
- *
- * Copyright (c) 2026 ShadowStrike Security Suite
- * All rights reserved.
- *
- * ============================================================================
+ * (See ConfigurationDB.hpp for full architectural documentation.)
  */
 
-#include"pch.h"
-#include"../Utils/StringUtils.hpp"
+#include "pch.h"
+
 #include "ConfigurationDB.hpp"
-#include"DatabaseManager.hpp"
+#include "DatabaseManager.hpp"
+#include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/XMLUtils.hpp"
-#include"../Utils/SystemUtils.hpp"
-#include"../Utils/Base64Utils.hpp"
+#include "../Utils/SystemUtils.hpp"
+#include "../Utils/Base64Utils.hpp"
 
 #include <regex>
 #include <algorithm>
 #include <sstream>
+#include <cstring>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -367,6 +276,29 @@ namespace ShadowStrike {
             {
                 std::unique_lock lock(m_listenersMutex);
                 m_listeners.clear();
+            }
+
+            // ================================================================
+            // ZERO SENSITIVE MATERIAL
+            // ================================================================
+            // The Config::masterKey is DPAPI entropy and must not be left
+            // sitting in the process heap once the database is no longer in
+            // use. SecureZeroMemory is the documented Windows API that cannot
+            // be optimised away by the compiler.
+            {
+                std::unique_lock cfgLock(m_configMutex);
+                if (!m_config.masterKey.empty()) {
+#ifdef _WIN32
+                    ::SecureZeroMemory(m_config.masterKey.data(),
+                                       m_config.masterKey.size());
+#else
+                    std::fill(m_config.masterKey.begin(),
+                              m_config.masterKey.end(),
+                              static_cast<uint8_t>(0));
+#endif
+                    m_config.masterKey.clear();
+                    m_config.masterKey.shrink_to_fit();
+                }
             }
 
             SS_LOG_INFO(LOG_CATEGORY, L"ConfigurationDB shut down successfully");
@@ -994,39 +926,46 @@ namespace ShadowStrike {
                 return {};
             }
 
+            // SECURITY: cap maxResults to bound memory usage and SQL latency.
+            // A caller supplying SIZE_MAX would otherwise let an attacker exfiltrate
+            // the entire configuration table in a single call. 10,000 keys is well
+            // above any legitimate UI/management need.
+            constexpr size_t kHardLimit = 10000;
+            const int64_t effectiveLimit = static_cast<int64_t>(
+                (maxResults == 0 || maxResults > kHardLimit) ? kHardLimit : maxResults);
+
             auto& dbMgr = DatabaseManager::Instance();
             std::vector<std::wstring> keys;
 
-            // Convert prefix to UTF-8 for SQL LIKE
-            std::string sql = "SELECT key FROM configurations WHERE key LIKE ?";
+            // Build the parameterised SQL.  LIMIT is bound as a parameter (not
+            // string-concatenated) so it cannot be poisoned by integer parsing
+            // quirks.  The LIKE clause uses an explicit ESCAPE character so the
+            // caller's raw prefix cannot inject wildcards.
+            std::string sql = "SELECT key FROM configurations WHERE key LIKE ? ESCAPE '\\'";
             if (scope) {
                 sql += " AND scope = ?";
             }
-            sql += " LIMIT " + std::to_string(maxResults);
+            sql += " LIMIT ?";
 
-            // Convert wstring pattern to UTF-8 string
-            std::wstring wpattern = std::wstring(prefix) + L"%";
+            // Convert prefix via the canonical UTF-16 -> UTF-8 helper (handles
+            // surrogate pairs correctly), then escape LIKE metacharacters
+            // ('%', '_' and '\\') before appending the trailing wildcard.
+            std::string utf8Prefix = Utils::StringUtils::ToNarrow(prefix);
             std::string utf8Pattern;
-            utf8Pattern.reserve(wpattern.size() * 3);  // worst case for UTF-8
-            for (wchar_t wc : wpattern) {
-                if (wc < 0x80) {
-                    utf8Pattern.push_back(static_cast<char>(wc));
+            utf8Pattern.reserve(utf8Prefix.size() + 16);
+            for (char c : utf8Prefix) {
+                if (c == '\\' || c == '%' || c == '_') {
+                    utf8Pattern.push_back('\\');
                 }
-                else if (wc < 0x800) {
-                    utf8Pattern.push_back(static_cast<char>(0xC0 | ((wc >> 6) & 0x1F)));
-                    utf8Pattern.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
-                }
-                else {
-                    utf8Pattern.push_back(static_cast<char>(0xE0 | ((wc >> 12) & 0x0F)));
-                    utf8Pattern.push_back(static_cast<char>(0x80 | ((wc >> 6) & 0x3F)));
-                    utf8Pattern.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
-                }
+                utf8Pattern.push_back(c);
             }
+            utf8Pattern.push_back('%');
 
             auto result = scope
-                ? dbMgr.QueryWithParams(sql, err, utf8Pattern, static_cast<int>(*scope))
-                : dbMgr.QueryWithParams(sql, err, utf8Pattern);
+                ? dbMgr.QueryWithParams(sql, err, utf8Pattern, static_cast<int>(*scope), effectiveLimit)
+                : dbMgr.QueryWithParams(sql, err, utf8Pattern, effectiveLimit);
 
+            keys.reserve(static_cast<size_t>(effectiveLimit) < 256 ? static_cast<size_t>(effectiveLimit) : 256);
             while (result.Next()) {
                 keys.push_back(result.GetWString(0));
             }
@@ -1491,25 +1430,23 @@ namespace ShadowStrike {
             );
         }
 
-        // Helper function for wstring to UTF-8 conversion
+        // UTF-8 conversion helper.
+        //
+        // Implementation notes (security / correctness):
+        //   The previous open-coded encoder considered only the BMP and emitted
+        //   3-byte sequences for any wchar_t >= 0x800, silently mangling any
+        //   supplementary-plane codepoint represented as a UTF-16 surrogate
+        //   pair on Windows. Configuration keys, audit "modifiedBy" fields and
+        //   user-supplied reasons must survive a round-trip through the
+        //   database; corruption here would forge or hide audit records.
+        //
+        //   We now delegate to the central Utils::StringUtils::ToNarrow helper
+        //   which is the canonical UTF-16 -> UTF-8 converter used across
+        //   ShadowStrike. ToNarrow correctly handles surrogate pairs and
+        //   replaces malformed sequences with the Unicode replacement
+        //   character (U+FFFD) rather than producing invalid UTF-8.
         std::string ConfigurationDB::wstringToUtf8(std::wstring_view wstr) const {
-            std::string result;
-            result.reserve(wstr.size() * 3);  // worst case for UTF-8
-            for (wchar_t wc : wstr) {
-                if (wc < 0x80) {
-                    result.push_back(static_cast<char>(wc));
-                }
-                else if (wc < 0x800) {
-                    result.push_back(static_cast<char>(0xC0 | ((wc >> 6) & 0x1F)));
-                    result.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
-                }
-                else {
-                    result.push_back(static_cast<char>(0xE0 | ((wc >> 12) & 0x0F)));
-                    result.push_back(static_cast<char>(0x80 | ((wc >> 6) & 0x3F)));
-                    result.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
-                }
-            }
-            return result;
+            return Utils::StringUtils::ToNarrow(wstr);
         }
 
         // ============================================================================
@@ -1532,7 +1469,7 @@ namespace ShadowStrike {
             else if (auto* j = std::get_if<Utils::JSON::Json>(&value)) {
                 std::string jsonStr;
                 if (Utils::JSON::Stringify(*j, jsonStr)) {
-                    return std::wstring(jsonStr.begin(), jsonStr.end());
+                    return Utils::StringUtils::ToWide(jsonStr);
                 }
                 else {
 					return L"<invalid JSON>";
@@ -1793,28 +1730,56 @@ namespace ShadowStrike {
             const ConfigValue& oldValue,
             const ConfigValue& newValue
         ) {
-            std::lock_guard lock(m_listenersMutex);
+            // SECURITY / DEADLOCK: a change-listener callback may call back into
+            // ConfigurationDB (e.g. RegisterChangeListener, Set, Remove) and
+            // would then deadlock or invalidate the m_listeners iterator if we
+            // held m_listenersMutex while dispatching. We therefore snapshot
+            // the matching (id, callback) pairs under the lock and dispatch
+            // outside.
+            struct PendingCall {
+                int id;
+                ChangeCallback callback;
+            };
+            std::vector<PendingCall> pending;
 
-            for (const auto& [id, listener] : m_listeners) {
-                const auto& pattern = listener.first;
-                
-                // Simple wildcard matching (* at end)
-                bool matches = false;
-                if (pattern.back() == L'*') {
-                    auto prefix = pattern.substr(0, pattern.size() - 1);
-                    matches = key.substr(0, prefix.size()) == prefix;
-                }
-                else {
-                    matches = (key == pattern);
-                }
+            {
+                std::lock_guard lock(m_listenersMutex);
+                pending.reserve(m_listeners.size());
 
-                if (matches) {
-                    try {
-                        listener.second(key, oldValue, newValue);
+                for (const auto& [id, listener] : m_listeners) {
+                    const auto& pattern = listener.first;
+                    if (pattern.empty()) {
+                        continue;
                     }
-                    catch (const std::exception& e) {
-                        SS_LOG_ERROR(LOG_CATEGORY, L"Change listener %d threw exception: %hs", id, e.what());
+
+                    bool matches = false;
+                    if (pattern.back() == L'*') {
+                        auto prefix = std::wstring_view(pattern).substr(0, pattern.size() - 1);
+                        matches = (key.size() >= prefix.size()) &&
+                                  (key.substr(0, prefix.size()) == prefix);
                     }
+                    else {
+                        matches = (key == pattern);
+                    }
+
+                    if (matches) {
+                        pending.push_back({ id, listener.second });
+                    }
+                }
+            }
+
+            // Dispatch outside the lock.
+            for (const auto& call : pending) {
+                try {
+                    call.callback(key, oldValue, newValue);
+                }
+                catch (const std::exception& e) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Change listener %d threw exception: %hs", call.id, e.what());
+                }
+                catch (...) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Change listener %d threw non-std exception", call.id);
                 }
             }
         }
@@ -1827,10 +1792,22 @@ namespace ShadowStrike {
             SS_LOG_INFO(LOG_CATEGORY, L"Hot-reload thread started");
 
             while (!m_shutdownHotReload.load(std::memory_order_acquire)) {
+                // Snapshot the configured interval under a shared lock to avoid
+                // a data race against Shutdown/Initialize racing with the
+                // m_config field.
+                std::chrono::milliseconds interval;
+                {
+                    std::shared_lock cfgLock(m_configMutex);
+                    interval = m_config.hotReloadInterval;
+                }
+                if (interval <= std::chrono::milliseconds::zero()) {
+                    interval = std::chrono::seconds(5);
+                }
+
                 std::unique_lock lock(m_hotReloadMutex);
                 m_hotReloadCV.wait_for(
                     lock,
-                    m_config.hotReloadInterval,
+                    interval,
                     [this]() { return m_shutdownHotReload.load(std::memory_order_acquire); }
                 );
 
@@ -1838,7 +1815,9 @@ namespace ShadowStrike {
                     break;
                 }
 
-                // Check for database changes and reload cache
+                // Check for database changes and reload cache.
+                // Errors are logged inside HotReload(); we deliberately do not
+                // propagate them out of the worker thread.
                 HotReload(nullptr);
             }
 
@@ -1910,8 +1889,14 @@ namespace ShadowStrike {
             
             if (err && !err->message.empty()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"HotReload: Database query failed - %ls", err->message.c_str());
-                // Update timestamp anyway to prevent tight retry loop on persistent DB errors
-                m_lastHotReloadMs.store(nowMs, std::memory_order_release);
+                // SECURITY / OBSERVABILITY: do NOT advance m_lastHotReloadMs on
+                // failure. Previously this branch updated the timestamp to
+                // avoid a "tight retry loop", but that silently swallowed
+                // persistent DB errors and froze the delta window. The
+                // hot-reload thread already paces itself via
+                // m_config.hotReloadInterval, so leaving the timestamp
+                // untouched is safe and lets the next tick re-attempt the
+                // same delta.
                 return false;
             }
             
@@ -1924,7 +1909,11 @@ namespace ShadowStrike {
             // ========================================================================
             
             std::vector<std::tuple<std::wstring, ConfigValue, ConfigValue>> pendingNotifications;
-            const bool cachingEnabled = m_config.enableCaching;
+            bool cachingEnabled;
+            {
+                std::shared_lock cfgLock(m_configMutex);
+                cachingEnabled = m_config.enableCaching;
+            }
             size_t processedCount = 0;
             size_t errorCount = 0;
             
@@ -2329,7 +2318,7 @@ namespace ShadowStrike {
 
                         if (std::holds_alternative<std::wstring>(val)) {
                             auto& wstr = std::get<std::wstring>(val);
-                            entry["value"] = std::string(wstr.begin(), wstr.end());
+                            entry["value"] = Utils::StringUtils::ToNarrow(wstr);
                         }
                         else if (std::holds_alternative<int64_t>(val)) {
                             entry["value"] = std::get<int64_t>(val);
@@ -2367,7 +2356,7 @@ namespace ShadowStrike {
             Utils::JSON::Error jsonErr;
             if (!Utils::JSON::SaveToFile(path, root, &jsonErr, saveOpts)) {
                 if (err) {
-                    err->message = std::wstring(jsonErr.message.begin(), jsonErr.message.end());
+                    err->message = Utils::StringUtils::ToWide(jsonErr.message);
                 }
                 SS_LOG_ERROR(LOG_CATEGORY, L"ExportToJson: Failed to write file: %hs", jsonErr.message.c_str());
                 return false;
@@ -2406,7 +2395,7 @@ namespace ShadowStrike {
             Utils::JSON::Error jsonErr;
             if (!Utils::JSON::LoadFromFile(path, root, &jsonErr, parseOpts)) {
                 if (err) {
-                    err->message = std::wstring(jsonErr.message.begin(), jsonErr.message.end());
+                    err->message = Utils::StringUtils::ToWide(jsonErr.message);
                 }
                 SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromJson: Failed to parse file: %hs", jsonErr.message.c_str());
                 return false;
@@ -2426,11 +2415,21 @@ namespace ShadowStrike {
 
             auto& dbMgr = DatabaseManager::Instance();
 
-            // Begin transaction for atomic import
-            if (!dbMgr.BeginTransaction(ShadowStrike::Database::Transaction::Type::Immediate,err)) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromJson: Failed to begin transaction");
-                return false;
-            }
+            // NOTE on atomicity:
+            //   Each Set() invocation already runs inside its own IMMEDIATE
+            //   transaction (see ConfigurationDB::Set -> dbWrite).  SQLite does
+            //   not support nested transactions, so wrapping this loop in an
+            //   outer transaction would cause every per-row write to fail with
+            //   SQLITE_ERROR ("cannot start a transaction within a
+            //   transaction"). The prior implementation called BeginTransaction
+            //   here and immediately discarded the returned unique_ptr<>, which
+            //   begins-then-rolls-back the transaction in a single statement
+            //   and is functionally a no-op. We therefore document the
+            //   per-row atomicity contract instead of restoring the broken
+            //   wrapper. Callers that need all-or-nothing semantics must use
+            //   the per-row error counts (importedCount / errorCount) to
+            //   decide whether to invoke a subsequent rollback at the
+            //   application layer.
 
             for (const auto& entry : configs) {
                 try {
@@ -2442,7 +2441,7 @@ namespace ShadowStrike {
 
                     // Extract fields
                     std::string keyNarrow = entry["key"].get<std::string>();
-                    std::wstring key(keyNarrow.begin(), keyNarrow.end());
+                    std::wstring key = Utils::StringUtils::ToWide(keyNarrow);
 
                     auto type = static_cast<ValueType>(entry["type"].get<int>());
                     auto scope = entry.contains("scope") ?
@@ -2454,7 +2453,7 @@ namespace ShadowStrike {
                     std::wstring description;
                     if (entry.contains("description")) {
                         std::string descNarrow = entry["description"].get<std::string>();
-                        description = std::wstring(descNarrow.begin(), descNarrow.end());
+                        description = Utils::StringUtils::ToWide(descNarrow);
                     }
 
                     // Check if key exists
@@ -2484,7 +2483,7 @@ namespace ShadowStrike {
                         switch (type) {
                         case ValueType::String: {
                             std::string strNarrow = entry["value"].get<std::string>();
-                            value = std::wstring(strNarrow.begin(), strNarrow.end());
+                            value = Utils::StringUtils::ToWide(strNarrow);
                             break;
                         }
                         case ValueType::Integer:
@@ -2545,18 +2544,10 @@ namespace ShadowStrike {
                 }
             }
 
-            // Commit transaction
-			auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
-            if(!trans || !trans->IsActive()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromJson: Transaction not active during commit");
-                return false;
-			}
-
-            if (!trans->Commit(err)) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromJson: Failed to commit transaction");
-                trans->Rollback(nullptr);
-                return false;
-            }
+            // The previous code opened (and then committed) a fresh
+            // transaction here to "commit the import", which was a no-op
+            // because each per-row Set() had already committed its own work.
+            // We now simply log the final summary.
 
             SS_LOG_INFO(LOG_CATEGORY, L"Import complete: %zu imported, %zu skipped, %zu errors",
                 importedCount, skippedCount, errorCount);
@@ -2732,7 +2723,7 @@ namespace ShadowStrike {
             Utils::XML::Error xmlErr;
             if (!Utils::XML::SaveToFile(path, doc, &xmlErr, saveOpts)) {
                 if (err) {
-                    err->message = std::wstring(xmlErr.message.begin(), xmlErr.message.end());
+                    err->message = Utils::StringUtils::ToWide(xmlErr.message);
                 }
                 SS_LOG_ERROR(LOG_CATEGORY, L"ExportToXml: Failed to write file: %hs", xmlErr.message.c_str());
                 return false;
@@ -2771,7 +2762,7 @@ namespace ShadowStrike {
             Utils::XML::Error xmlErr;
             if (!Utils::XML::LoadFromFile(path, doc, &xmlErr, parseOpts)) {
                 if (err) {
-                    err->message = std::wstring(xmlErr.message.begin(), xmlErr.message.end());
+                    err->message = Utils::StringUtils::ToWide(xmlErr.message);
                 }
                 SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: Failed to parse file: %hs", xmlErr.message.c_str());
                 return false;
@@ -2797,16 +2788,11 @@ namespace ShadowStrike {
 
             auto& dbMgr = DatabaseManager::Instance();
 
-            // Begin transaction
-			auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
-            if (!trans || !trans->IsActive()) {
-                                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: Failed to begin transaction");
-								return false;
-            }
-            if (!trans->Commit(err)) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: Failed to begin transaction");
-                return false;
-            }
+            // See atomicity NOTE in ImportFromJson: per-row Set() is the
+            // atomicity unit; an outer transaction here would force every
+            // inner write to fail because SQLite forbids nested
+            // transactions. The previous "begin then commit" pair here was a
+            // no-op that has been removed.
 
             for (auto entry = configs.child("Configuration"); entry; entry = entry.next_sibling("Configuration")) {
                 try {
@@ -2819,7 +2805,7 @@ namespace ShadowStrike {
                     }
 
                     std::string keyUtf8 = keyAttr.as_string();
-                    std::wstring key(keyUtf8.begin(), keyUtf8.end());
+                    std::wstring key = Utils::StringUtils::ToWide(keyUtf8);
 
                     int typeInt = entry.attribute("type").as_int(-1);
                     if (typeInt < 0) {
@@ -2880,7 +2866,7 @@ namespace ShadowStrike {
                         // Parse based on type
                         switch (type) {
                         case ValueType::String:
-                            value = std::wstring(valueText.begin(), valueText.end());
+                            value = Utils::StringUtils::ToWide(valueText);
                             break;
                         case ValueType::Integer:
                             value = static_cast<int64_t>(std::stoll(valueText));
@@ -2924,18 +2910,9 @@ namespace ShadowStrike {
                 }
             }
 
-            // Commit
-			auto trans_ = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
-            if (!trans_ || !trans_->IsActive()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: Failed to begin transaction");
-				return false;
-            }
-
-            if (!trans_->Commit(err)) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"ImportFromXml: Failed to commit transaction");
-                trans_->Rollback(nullptr);
-                return false;
-            }
+            // Per-row atomicity via Set(); the previous spurious second
+            // BeginTransaction/Commit pair here has been removed (see
+            // ImportFromJson atomicity NOTE).
 
             SS_LOG_INFO(LOG_CATEGORY, L"Import complete: %zu imported, %zu skipped, %zu errors",
                 importedCount, skippedCount, errorCount);
@@ -3068,7 +3045,7 @@ namespace ShadowStrike {
 
             }
             catch (const std::exception& ex) {
-                if (err) err->message = L"Exception during rollback: " + std::wstring(ex.what(), ex.what() + strlen(ex.what()));
+                if (err) err->message = L"Exception during rollback: " + Utils::StringUtils::ToWide(ex.what());
                 SS_LOG_ERROR(LOG_CATEGORY, L"Rollback: Exception: %hs", ex.what());
                 return false;
             }
@@ -3120,17 +3097,17 @@ namespace ShadowStrike {
             QueryResult result;
 
             if (key.has_value() && since.has_value() && maxRecords > 0) {
-                std::string keyUtf8(key->begin(), key->end());
+                std::string keyUtf8 = Utils::StringUtils::ToNarrow(*key);
                 int64_t sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(since->time_since_epoch()).count();
                 result = dbMgr.QueryWithParams(sql, err, keyUtf8, sinceMs, static_cast<int>(maxRecords));
             }
             else if (key.has_value() && since.has_value()) {
-                std::string keyUtf8(key->begin(), key->end());
+                std::string keyUtf8 = Utils::StringUtils::ToNarrow(*key);
                 int64_t sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(since->time_since_epoch()).count();
                 result = dbMgr.QueryWithParams(sql, err, keyUtf8, sinceMs);
             }
             else if (key.has_value() && maxRecords > 0) {
-                std::string keyUtf8(key->begin(), key->end());
+                std::string keyUtf8 = Utils::StringUtils::ToNarrow(*key);
                 result = dbMgr.QueryWithParams(sql, err, keyUtf8, static_cast<int>(maxRecords));
             }
             else if (since.has_value() && maxRecords > 0) {
@@ -3138,7 +3115,7 @@ namespace ShadowStrike {
                 result = dbMgr.QueryWithParams(sql, err, sinceMs, static_cast<int>(maxRecords));
             }
             else if (key.has_value()) {
-                std::string keyUtf8(key->begin(), key->end());
+                std::string keyUtf8 = Utils::StringUtils::ToNarrow(*key);
                 result = dbMgr.QueryWithParams(sql, err, keyUtf8);
             }
             else if (since.has_value()) {
@@ -3435,7 +3412,7 @@ namespace ShadowStrike {
                     err->message = L"CryptProtectData failed";
                     err->sqliteCode = GetLastError();
                 }
-                SS_LOG_LAST_ERROR(L"ConfigurationDB", L"CryptProtectData failed");
+                SS_LOG_LAST_ERROR(LOG_CATEGORY, L"CryptProtectData failed");
                 return {};
             }
 
