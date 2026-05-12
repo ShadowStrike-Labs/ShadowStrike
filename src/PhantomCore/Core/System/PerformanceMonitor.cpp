@@ -264,37 +264,58 @@ ResourcePressure CalculatePressure(double usagePercent) {
 
 /**
  * @brief Get idle time in milliseconds.
- * 
- * Uses GetTickCount64() to avoid wraparound issues after 49.7 days uptime.
- * GetTickCount() is 32-bit and wraps at ~49.7 days, causing incorrect
- * idle time calculations on long-running systems.
+ *
+ * LASTINPUTINFO::dwTime is a 32-bit DWORD tick count produced by the same
+ * source as GetTickCount(); it wraps every ~49.7 days. The supported way
+ * to compute idle is therefore in DWORD width so modular subtraction
+ * handles wrap implicitly. The previous implementation compared a 64-bit
+ * GetTickCount64() against a 32-bit dwTime, which yields enormous idle
+ * values immediately after the first wrap of dwTime (any system uptime
+ * beyond 49.7 days), and treated the unrelated "wrap" branch with a
+ * mathematically wrong formula. This is corrected here.
  */
+/**
+ * @brief Sanitize a wide string for safe inclusion in log records.
+ *
+ * Strips CR/LF and other C0 control characters that an attacker-controlled
+ * process name or path could embed to forge fake log lines (CWE-117).
+ * Replaces such code units with a printable placeholder, bounds total
+ * length to prevent log floods.
+ */
+std::wstring SanitizeForLog(const std::wstring& in) {
+    constexpr size_t kMaxLen = 512;
+    std::wstring out;
+    out.reserve(std::min(in.size(), kMaxLen));
+    for (wchar_t ch : in) {
+        if (out.size() >= kMaxLen) {
+            out.append(L"...");
+            break;
+        }
+        // Strip C0 (0x00-0x1F), DEL (0x7F), and Unicode line/paragraph
+        // separators which terminals/log viewers may treat as new lines.
+        if (ch < 0x20 || ch == 0x7F || ch == 0x2028 || ch == 0x2029) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
 uint64_t GetSystemIdleTime() {
     LASTINPUTINFO lii = {};
     lii.cbSize = sizeof(LASTINPUTINFO);
 
-    if (GetLastInputInfo(&lii)) {
-        // SECURITY FIX: Use GetTickCount64() to prevent 49.7-day wraparound
-        // GetTickCount() returns DWORD (32-bit) which wraps after ~49.7 days
-        // GetTickCount64() returns ULONGLONG (64-bit) - won't wrap for 584M years
-        const uint64_t currentTick = GetTickCount64();
-        
-        // lii.dwTime is still 32-bit, but we handle the comparison correctly
-        // by checking if current is less (would indicate wrap if using 32-bit)
-        const uint64_t lastInputTick = static_cast<uint64_t>(lii.dwTime);
-        
-        // Handle potential wraparound of lii.dwTime (it's still 32-bit)
-        // If lastInputTick appears to be in the future, it wrapped
-        if (currentTick >= lastInputTick) {
-            return currentTick - lastInputTick;
-        } else {
-            // lii.dwTime wrapped - calculate correctly
-            // This handles the edge case where dwTime wrapped but GetTickCount64 didn't
-            return currentTick + (0xFFFFFFFFULL - lastInputTick + 1);
-        }
+    if (!GetLastInputInfo(&lii)) {
+        return 0;
     }
 
-    return 0;
+    // DWORD subtraction wraps modulo 2^32 which is exactly what we need
+    // because both GetTickCount() and dwTime use the same modular tick
+    // count. Cast back to 64-bit unsigned for the public return type.
+    const DWORD currentTick = GetTickCount();
+    const DWORD delta = currentTick - lii.dwTime;
+    return static_cast<uint64_t>(delta);
 }
 
 } // anonymous namespace
@@ -584,8 +605,36 @@ private:
 
 class AnomalyDetector {
 public:
-    AnomalyDetector(const ResourceThresholds& thresholds)
+    /**
+     * @brief Constructs the detector with configurable thresholds and a
+     *        sampling interval used to size the per-process sample window.
+     *
+     * The sample deque must span the longest temporal threshold (memory
+     * leak window, mining sustain window, sustained high-CPU window),
+     * otherwise the relevant heuristics never trigger. The previous fixed
+     * 60-sample cap silently disabled memory-leak detection at the default
+     * 1 s sampling interval (window <= 60 s, threshold = 10 min).
+     */
+    AnomalyDetector(const ResourceThresholds& thresholds,
+                    uint32_t samplingIntervalMs)
         : m_thresholds(thresholds) {
+        const uint32_t intervalSec = std::max<uint32_t>(1U, samplingIntervalMs / 1000U);
+
+        const uint64_t memLeakSec = static_cast<uint64_t>(thresholds.memoryLeakDurationMin) * 60ULL;
+        const uint64_t miningSec  = static_cast<uint64_t>(thresholds.miningPatternDurationSec);
+        const uint64_t cpuSec     = static_cast<uint64_t>(thresholds.highCpuDurationSec);
+
+        const uint64_t longestWindowSec = std::max({memLeakSec, miningSec, cpuSec});
+
+        // Add 10% headroom plus a minimum of 60 samples to keep short-window
+        // heuristics stable when sampling is slow. Cap at 24 h equivalent to
+        // prevent runaway memory growth on misconfiguration.
+        constexpr uint64_t kMinSamples  = 60ULL;
+        constexpr uint64_t kMaxSamples  = 24ULL * 60ULL * 60ULL;  // 1 sample/sec for 24h
+        const uint64_t windowSamples    = (longestWindowSec / intervalSec) + (longestWindowSec / (intervalSec * 10U)) + 1ULL;
+        const uint64_t bounded          = std::clamp<uint64_t>(windowSamples, kMinSamples, kMaxSamples);
+
+        m_maxSamples = static_cast<size_t>(bounded);
     }
 
     void Update(const ProcessResourceUsage& usage) {
@@ -598,8 +647,10 @@ public:
         tracker.lastUpdate = std::chrono::steady_clock::now();
         tracker.samples.push_back(usage);
 
-        // Limit sample history (O(1) with deque)
-        while (tracker.samples.size() > 60) {
+        // Limit sample history to the configured window. Sized in ctor to
+        // span the longest temporal threshold; bounded to keep memory growth
+        // O(per-PID).
+        while (tracker.samples.size() > m_maxSamples) {
             tracker.samples.pop_front();
         }
 
@@ -958,11 +1009,12 @@ private:
         anomalies.push_back(anomaly);
 
         SS_LOG_WARN(LOG_CATEGORY, L"Performance anomaly detected - PID %u: %ls",
-                    pid, description.c_str());
+                    pid, SanitizeForLog(description).c_str());
     }
 
     mutable std::shared_mutex m_mutex;
     ResourceThresholds m_thresholds;
+    size_t m_maxSamples{ 60 };
     std::unordered_map<uint32_t, ProcessTracker> m_processTrackers;
     std::unordered_map<uint32_t, std::vector<PerformanceAnomaly>> m_activeAnomalies;
     
@@ -1413,10 +1465,23 @@ private:
         const uint64_t totalDelta = kernelDelta + userDelta;
 
         if (totalDelta > 0) {
+            // SECURITY FIX: kernelDelta nominally includes idleDelta but a
+            // racing reader between GetSystemTimes() snapshots can rarely
+            // observe kernelDelta < idleDelta. Saturate to zero to prevent
+            // unsigned underflow producing a huge bogus kernel CPU percent.
+            const uint64_t kernelBusyDelta =
+                (kernelDelta >= idleDelta) ? (kernelDelta - idleDelta) : 0;
+
             usage.totalCpuPercent = (static_cast<double>(systemDelta) / static_cast<double>(totalDelta)) * 100.0;
             usage.idleCpuPercent = (static_cast<double>(idleDelta) / static_cast<double>(totalDelta)) * 100.0;
-            usage.kernelCpuPercent = (static_cast<double>(kernelDelta - idleDelta) / static_cast<double>(totalDelta)) * 100.0;
+            usage.kernelCpuPercent = (static_cast<double>(kernelBusyDelta) / static_cast<double>(totalDelta)) * 100.0;
             usage.userCpuPercent = (static_cast<double>(userDelta) / static_cast<double>(totalDelta)) * 100.0;
+
+            // Clamp to [0, 100] in case of sampling skew between successive snapshots.
+            usage.totalCpuPercent = std::clamp(usage.totalCpuPercent, 0.0, 100.0);
+            usage.idleCpuPercent = std::clamp(usage.idleCpuPercent, 0.0, 100.0);
+            usage.kernelCpuPercent = std::clamp(usage.kernelCpuPercent, 0.0, 100.0);
+            usage.userCpuPercent = std::clamp(usage.userCpuPercent, 0.0, 100.0);
         }
 
         // Store for next calculation
@@ -1639,21 +1704,53 @@ public:
     // ========================================================================
 
     bool Initialize(const PerformanceMonitorConfig& config) {
+        // SECURITY FIX: refuse re-initialization while the monitor thread is
+        // running. Otherwise the unique_ptr<*> members are swapped under the
+        // worker's nose, which uses them lock-free and would dereference
+        // freed memory. Caller must Shutdown() first.
+        if (m_monitoring.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Initialize rejected: monitor thread is active; call Shutdown() first");
+            return false;
+        }
+
         std::unique_lock lock(m_mutex);
+
+        // Validate configuration to prevent integer-overflow / zero-sampling
+        // pathologies in downstream rate calculations.
+        PerformanceMonitorConfig safeConfig = config;
+        if (safeConfig.samplingIntervalMs == 0) {
+            SS_LOG_WARN(LOG_CATEGORY, L"samplingIntervalMs == 0; clamping to 100 ms");
+            safeConfig.samplingIntervalMs = 100;
+        }
+        if (safeConfig.samplingIntervalMs > 60u * 60u * 1000u) {
+            SS_LOG_WARN(LOG_CATEGORY, L"samplingIntervalMs > 1h; clamping to 1h");
+            safeConfig.samplingIntervalMs = 60u * 60u * 1000u;
+        }
+        if (safeConfig.historyDepthSeconds == 0) {
+            safeConfig.historyDepthSeconds = 60;
+        }
+        if (safeConfig.thresholds.highCpuThreshold < 0.0)   safeConfig.thresholds.highCpuThreshold = 0.0;
+        if (safeConfig.thresholds.highCpuThreshold > 100.0) safeConfig.thresholds.highCpuThreshold = 100.0;
+        if (safeConfig.thresholds.miningCpuThreshold < 0.0)   safeConfig.thresholds.miningCpuThreshold = 0.0;
+        if (safeConfig.thresholds.miningCpuThreshold > 100.0) safeConfig.thresholds.miningCpuThreshold = 100.0;
+        if (safeConfig.cpuThrottleThreshold < 0.0)    safeConfig.cpuThrottleThreshold = 0.0;
+        if (safeConfig.cpuThrottleThreshold > 100.0)  safeConfig.cpuThrottleThreshold = 100.0;
+        if (safeConfig.memoryThrottleThreshold < 0.0)    safeConfig.memoryThrottleThreshold = 0.0;
+        if (safeConfig.memoryThrottleThreshold > 100.0)  safeConfig.memoryThrottleThreshold = 100.0;
 
         try {
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing...");
 
-            m_config = config;
+            m_config = safeConfig;
 
             // Initialize managers
             m_callbackManager = std::make_unique<CallbackManager>();
             m_historyManager = std::make_unique<HistoryManager>();
-            m_anomalyDetector = std::make_unique<AnomalyDetector>(config.thresholds);
+            m_anomalyDetector = std::make_unique<AnomalyDetector>(safeConfig.thresholds, safeConfig.samplingIntervalMs);
             m_processTracker = std::make_unique<ProcessResourceTracker>();
             m_systemTracker = std::make_unique<SystemResourceTracker>();
 
-            m_historyManager->SetMaxHistorySeconds(config.historyDepthSeconds, config.samplingIntervalMs);
+            m_historyManager->SetMaxHistorySeconds(safeConfig.historyDepthSeconds, safeConfig.samplingIntervalMs);
 
             m_initialized = true;
             SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
