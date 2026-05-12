@@ -220,6 +220,41 @@ namespace ShadowStrike {
             constexpr const char* SQL_SET_SCHEMA_VERSION = 
                 "INSERT OR REPLACE INTO _metadata (key, value) VALUES ('schema_version', ?)";
 
+            // FIX (Tier 4 - Log Injection / CWE-117):
+            // SQLite exception messages may contain attacker-controlled bytes (file
+            // paths, identifiers, parameter values). Embedding raw CR/LF or other
+            // control characters into the log stream allows an attacker to forge log
+            // entries. Strip all C0/C1 control characters before logging.
+            std::wstring SanitizeForLog(std::wstring_view in) {
+                std::wstring out;
+                out.reserve(in.size());
+                for (wchar_t c : in) {
+                    if (c == L'\t') { out.push_back(L' '); }
+                    else if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F)) {
+                        out.push_back(L'?');
+                    } else {
+                        out.push_back(c);
+                    }
+                    if (out.size() >= 4096) break; // bound log entry length
+                }
+                return out;
+            }
+
+            // FIX (Tier 4 - Defense in depth): Whitelist values allowed in PRAGMA
+            // statements that take user/config-provided strings. Although the config
+            // is built in-process, this prevents a misconfigured caller from injecting
+            // arbitrary SQL via journal_mode/synchronous/temp_store.
+            bool IsAllowedJournalMode(std::wstring_view v) noexcept {
+                return v == L"DELETE" || v == L"TRUNCATE" || v == L"PERSIST" ||
+                       v == L"MEMORY" || v == L"WAL" || v == L"OFF";
+            }
+            bool IsAllowedSyncMode(std::wstring_view v) noexcept {
+                return v == L"OFF" || v == L"NORMAL" || v == L"FULL" || v == L"EXTRA";
+            }
+            bool IsAllowedTempStore(std::wstring_view v) noexcept {
+                return v == L"DEFAULT" || v == L"FILE" || v == L"MEMORY";
+            }
+
         } // anonymous namespace
 
         // ============================================================================
@@ -839,12 +874,15 @@ namespace ShadowStrike {
          */
         bool ConnectionPool::createConnection(DatabaseError* err) {
             try {
-                // Build connection flags
-                int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-                if (m_config.enableWAL) {
-                    flags |= SQLITE_OPEN_WAL;
-                }
-                
+                // FIX (Tier 1): SQLITE_OPEN_WAL is NOT a valid sqlite3_open_v2 flag;
+                // WAL is enabled via PRAGMA journal_mode after open. Passing it to
+                // the open call previously masked an unrelated bit and was a no-op
+                // at best, undefined at worst. Use SQLITE_OPEN_FULLMUTEX to ensure
+                // each connection is serialized internally (defense in depth even
+                // though the pool already serializes acquisition).
+                int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                            SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE;
+
                 std::string dbPath = ToNarrow(m_config.databasePath);
                 auto connection = std::make_shared<SQLite::Database>(
                     dbPath,
@@ -898,47 +936,138 @@ namespace ShadowStrike {
          */
         bool ConnectionPool::configureConnection(SQLite::Database& db, DatabaseError* err) {
             try {
+                // FIX (Tier 4 - SQL injection defense-in-depth): Whitelist PRAGMA
+                // values that originate from the configuration object. Although the
+                // configuration is constructed in-process, this guarantees that an
+                // upstream misconfiguration cannot inject arbitrary SQL.
+                if (!IsAllowedJournalMode(m_config.journalMode)) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_MISUSE;
+                        err->message = L"Invalid journal mode in configuration";
+                        err->context = L"configureConnection";
+                    }
+                    SS_LOG_ERROR(L"Database", L"Rejected journal mode: %ls",
+                        SanitizeForLog(m_config.journalMode).c_str());
+                    return false;
+                }
+                if (!IsAllowedSyncMode(m_config.synchronousMode)) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_MISUSE;
+                        err->message = L"Invalid synchronous mode in configuration";
+                        err->context = L"configureConnection";
+                    }
+                    SS_LOG_ERROR(L"Database", L"Rejected synchronous mode: %ls",
+                        SanitizeForLog(m_config.synchronousMode).c_str());
+                    return false;
+                }
+                if (!IsAllowedTempStore(m_config.tempStore)) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_MISUSE;
+                        err->message = L"Invalid temp_store in configuration";
+                        err->context = L"configureConnection";
+                    }
+                    SS_LOG_ERROR(L"Database", L"Rejected temp_store: %ls",
+                        SanitizeForLog(m_config.tempStore).c_str());
+                    return false;
+                }
+
                 // Enable foreign key constraint enforcement
                 if (m_config.enableForeignKeys) {
                     db.exec("PRAGMA foreign_keys = ON");
                 }
-                
-                // Configure journal mode (WAL recommended for concurrency)
-                std::string journalMode = "PRAGMA journal_mode = " + ToNarrow(m_config.journalMode);
-                db.exec(journalMode);
-                
+
+                // FIX (Tier 1 - Durability): Configure journal mode and VERIFY the
+                // returned value. PRAGMA journal_mode returns the resulting mode as
+                // a row; on filesystems that don't support WAL (e.g. some network
+                // shares) SQLite silently falls back to a different mode. Treat a
+                // mismatch as a hard configuration failure so the operator finds out
+                // immediately instead of running with weaker durability guarantees.
+                {
+                    const std::string journalSql = "PRAGMA journal_mode = " + ToNarrow(m_config.journalMode);
+                    SQLite::Statement stmt(db, journalSql);
+                    std::string actual;
+                    if (stmt.executeStep()) {
+                        actual = stmt.getColumn(0).getString();
+                    }
+                    std::string expected = ToNarrow(m_config.journalMode);
+                    // SQLite reports modes in lowercase; normalize both sides.
+                    auto toLower = [](std::string s) {
+                        for (auto& c : s) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+                        return s;
+                    };
+                    if (toLower(actual) != toLower(expected)) {
+                        if (err) {
+                            err->sqliteCode = SQLITE_ERROR;
+                            err->message = L"journal_mode could not be set as requested";
+                            err->context = L"configureConnection";
+                        }
+                        SS_LOG_ERROR(L"Database",
+                            L"journal_mode mismatch: requested=%ls actual=%ls",
+                            SanitizeForLog(m_config.journalMode).c_str(),
+                            SanitizeForLog(ToWide(actual)).c_str());
+                        return false;
+                    }
+                }
+
                 // Configure synchronous mode (NORMAL balances safety/speed)
-                std::string syncMode = "PRAGMA synchronous = " + ToNarrow(m_config.synchronousMode);
-                db.exec(syncMode);
-                
+                {
+                    std::string syncMode = "PRAGMA synchronous = " + ToNarrow(m_config.synchronousMode);
+                    db.exec(syncMode);
+                }
+
                 // Configure cache size
-                std::string cacheSize = "PRAGMA cache_size = -" + std::to_string(m_config.cacheSizeKB);
-                db.exec(cacheSize);
-                
+                {
+                    std::string cacheSize = "PRAGMA cache_size = -" + std::to_string(m_config.cacheSizeKB);
+                    db.exec(cacheSize);
+                }
+
                 // Configure page size (only effective before first write)
-                std::string pageSize = "PRAGMA page_size = " + std::to_string(m_config.pageSizeBytes);
-                db.exec(pageSize);
-                
+                {
+                    std::string pageSize = "PRAGMA page_size = " + std::to_string(m_config.pageSizeBytes);
+                    db.exec(pageSize);
+                }
+
                 // Configure temp store
-                std::string tempStore = "PRAGMA temp_store = " + ToNarrow(m_config.tempStore);
-                db.exec(tempStore);
-                
+                {
+                    std::string tempStore = "PRAGMA temp_store = " + ToNarrow(m_config.tempStore);
+                    db.exec(tempStore);
+                }
+
                 // Enable memory-mapped I/O
                 if (m_config.enableMemoryMappedIO) {
                     std::string mmapSize = "PRAGMA mmap_size = " + std::to_string(m_config.mmapSizeMB * 1024 * 1024);
                     db.exec(mmapSize);
                 }
-                
+
                 // Enable secure delete
                 if (m_config.enableSecureDelete) {
                     db.exec("PRAGMA secure_delete = ON");
                 }
-                
-                // Enable lookaside memory allocator
-                if (m_config.lookaside) {
-                    db.exec("PRAGMA lookaside = 1");
+
+                // FIX (Tier 1 - WAL hygiene): Bound the WAL file growth. Without
+                // this PRAGMA, long-running write workloads can grow the -wal file
+                // unbounded, exhausting disk and stalling checkpoint on shutdown.
+                if (m_config.enableWAL) {
+                    db.exec("PRAGMA wal_autocheckpoint = 1000");
                 }
-                
+
+                // FIX (Tier 1): "PRAGMA lookaside = 1" is not valid SQLite syntax;
+                // the lookaside allocator is configured via sqlite3_db_config(
+                // SQLITE_DBCONFIG_LOOKASIDE, ...). Use the official API on the raw
+                // handle so the setting actually takes effect when requested.
+                if (m_config.lookaside) {
+                    sqlite3* handle = db.getHandle();
+                    if (handle) {
+                        // 128 byte slots, 500 slots = ~64KB per connection.
+                        const int rc = sqlite3_db_config(handle, SQLITE_DBCONFIG_LOOKASIDE,
+                                                         nullptr, 128, 500);
+                        if (rc != SQLITE_OK) {
+                            SS_LOG_WARN(L"Database",
+                                L"sqlite3_db_config(LOOKASIDE) failed: rc=%d", rc);
+                        }
+                    }
+                }
+
                 SS_LOG_DEBUG(L"Database", L"Connection configured successfully");
                 return true;
             }
@@ -949,7 +1078,8 @@ namespace ShadowStrike {
                     err->message = ToWide(ex.what());
                     err->context = L"configureConnection";
                 }
-                SS_LOG_ERROR(L"Database", L"Failed to configure connection: %ls", ToWide(ex.what()).c_str());
+                SS_LOG_ERROR(L"Database", L"Failed to configure connection: %ls",
+                    SanitizeForLog(ToWide(ex.what())).c_str());
                 return false;
             }
         }
@@ -1094,7 +1224,10 @@ namespace ShadowStrike {
             }
 
             try {
-                m_db->exec(sql.data());
+                // FIX (Tier 1 - UB): std::string_view is not guaranteed to be
+                // null-terminated, but SQLite::Database::exec(const char*) reads
+                // until NUL. Copy to a std::string so the buffer is terminated.
+                m_db->exec(std::string(sql));
                 return true;
             }
             catch (const SQLite::Exception& ex) {
@@ -1254,7 +1387,19 @@ namespace ShadowStrike {
          */
         bool Transaction::CreateSavepoint(std::string_view name, DatabaseError* err) {
             if (!m_active) return false;
-            
+
+            // FIX (Tier 4 - SQL injection): Savepoint names are SQL identifiers
+            // that cannot be parameterized. Reject anything that is not a strict
+            // identifier before concatenating into SQL.
+            if (!IsValidSqlIdentifier(name)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Invalid savepoint name";
+                    err->context = L"Transaction::CreateSavepoint";
+                }
+                return false;
+            }
+
             try {
                 std::string sql = "SAVEPOINT " + std::string(name);
                 m_db->exec(sql);
@@ -1282,7 +1427,17 @@ namespace ShadowStrike {
          */
         bool Transaction::RollbackToSavepoint(std::string_view name, DatabaseError* err) {
             if (!m_active) return false;
-            
+
+            // FIX (Tier 4 - SQL injection): validate identifier before concatenation.
+            if (!IsValidSqlIdentifier(name)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Invalid savepoint name";
+                    err->context = L"Transaction::RollbackToSavepoint";
+                }
+                return false;
+            }
+
             try {
                 std::string sql = "ROLLBACK TO SAVEPOINT " + std::string(name);
                 m_db->exec(sql);
@@ -1309,7 +1464,17 @@ namespace ShadowStrike {
          */
         bool Transaction::ReleaseSavepoint(std::string_view name, DatabaseError* err) {
             if (!m_active) return false;
-            
+
+            // FIX (Tier 4 - SQL injection): validate identifier before concatenation.
+            if (!IsValidSqlIdentifier(name)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Invalid savepoint name";
+                    err->context = L"Transaction::ReleaseSavepoint";
+                }
+                return false;
+            }
+
             try {
                 std::string sql = "RELEASE SAVEPOINT " + std::string(name);
                 m_db->exec(sql);
@@ -1384,6 +1549,12 @@ namespace ShadowStrike {
          * @note Thread-safe, can be called multiple times (subsequent calls no-op)
          */
         bool DatabaseManager::Initialize(const DatabaseConfig& config, DatabaseError* err) {
+            // FIX (Tier 1 - lifecycle race): serialize Initialize/Shutdown/Restore
+            // so callers that hammer the singleton from multiple modules (as
+            // ConfigurationDB/LogDB/QuarantineDB do) cannot interleave lifecycle
+            // operations and tear down the pool from under in-flight work.
+            std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+
             // Guard against double initialization
             if (m_initialized.load(std::memory_order_acquire)) {
                 SS_LOG_WARN(L"Database", L"DatabaseManager already initialized");
@@ -1393,6 +1564,27 @@ namespace ShadowStrike {
             SS_LOG_SCOPE(L"Database");
             SS_LOG_INFO(L"Database", L"Initializing DatabaseManager...");
 
+            // FIX (Tier 4 - path traversal): validate database path before touching
+            // the filesystem. Rejects empty paths, embedded NULs, and ".." segments.
+            if (!isSafePath(config.databasePath)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Database path failed safety validation";
+                    err->context = L"Initialize";
+                }
+                SS_LOG_ERROR(L"Database", L"Rejected unsafe database path");
+                return false;
+            }
+            if (config.autoBackup && !isSafePath(config.backupDirectory)) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Backup directory failed safety validation";
+                    err->context = L"Initialize";
+                }
+                SS_LOG_ERROR(L"Database", L"Rejected unsafe backup directory");
+                return false;
+            }
+
             std::unique_lock<std::shared_mutex> lock(m_configMutex);
             m_config = config;
 
@@ -1401,6 +1593,8 @@ namespace ShadowStrike {
                 m_connectionPool->Shutdown();
                 m_connectionPool.reset();
             }
+            // FIX: also drop any stale statement cache before we rebuild.
+            m_statementCache.reset();
 
             if (!createDatabaseFile(err)) {
                 return false;
@@ -1413,10 +1607,28 @@ namespace ShadowStrike {
                 return false;
             }
 
+            // FIX (Tier 1 - security): wire enableSecurity() into the init path so
+            // application_id and integrity-relevant settings are actually applied.
+            // Previously the method existed but was never called.
+            {
+                DatabaseError secErr;
+                auto secConn = m_connectionPool->Acquire(
+                    std::chrono::milliseconds(m_config.busyTimeoutMs), &secErr);
+                if (secConn) {
+                    if (!enableSecurity(*secConn, err)) {
+                        m_connectionPool->Release(secConn);
+                        m_connectionPool->Shutdown();
+                        m_connectionPool.reset();
+                        return false;
+                    }
+                    m_connectionPool->Release(secConn);
+                }
+            }
+
             m_statementCache = std::make_unique<PreparedStatementCache>(100);
 
-            // ✅ CRITICAL: Set initialized flag BEFORE calling Execute()
-            // This allows AcquireConnection() to work during table creation
+            // CRITICAL: Set initialized flag BEFORE calling Execute()
+            // This allows AcquireConnection() to work during table creation.
             m_initialized.store(true, std::memory_order_release);
 
             // Create metadata table
@@ -1439,9 +1651,22 @@ namespace ShadowStrike {
                 return false;
             }
 
+            // FIX (Tier 1 - shutdown re-init bug): m_shutdownBackupThread was
+            // never reset to false on Shutdown, so a subsequent Initialize() would
+            // spawn a backup thread that immediately observed shutdown=true and
+            // exited. ConfigurationDB/LogDB/QuarantineDB cycle init/shutdown, so
+            // this was a real loss of automatic backups in production. Reset here.
+            m_shutdownBackupThread.store(false, std::memory_order_release);
+
             // Start background backup thread if enabled
             if (m_config.autoBackup) {
-                m_lastBackup = std::chrono::steady_clock::now();
+                {
+                    // FIX: m_lastBackup is read/written by the backup thread under
+                    // m_backupMutex. Initial write must use the same lock to avoid
+                    // a data race (TSan-visible).
+                    std::lock_guard<std::mutex> blk(m_backupMutex);
+                    m_lastBackup = std::chrono::steady_clock::now();
+                }
                 m_backupThread = std::thread(&DatabaseManager::backgroundBackupThread, this);
             }
 
@@ -1461,32 +1686,43 @@ namespace ShadowStrike {
          * @note Thread-safe
          */
         void DatabaseManager::Shutdown() {
+            // FIX (Tier 1 - lifecycle race): serialize against Initialize/Restore.
+            std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+
             // Prevent double shutdown via atomic exchange
             bool wasInitialized = m_initialized.exchange(false, std::memory_order_acq_rel);
+            if (!wasInitialized && !m_connectionPool && !m_backupThread.joinable()) {
+                // Nothing to do.
+                return;
+            }
 
             SS_LOG_INFO(L"Database", L"Shutting down DatabaseManager...");
-            
+
             // Signal and join backup thread
             m_shutdownBackupThread.store(true, std::memory_order_release);
             m_backupCv.notify_all();
-            
+
             if (m_backupThread.joinable()) {
                 m_backupThread.join();
             }
-            
-            // Clear statement cache (invalidates prepared statements)
+
+            // Clear statement cache (invalidates prepared statements).
+            // FIX: previously the cache reset was nested inside the
+            // `if (m_connectionPool)` branch, leaking the cache when the pool
+            // was already null. Reset unconditionally here.
             if (m_statementCache) {
                 m_statementCache->Clear();
             }
-            
+            m_statementCache.reset();
+
             // Shutdown connection pool
             if (m_connectionPool) {
                 m_connectionPool->Shutdown();
-				m_statementCache.reset();//clear the unique ptr
+                m_connectionPool.reset();
             }
-            
+
             m_initialized.store(false, std::memory_order_release);
-            
+
             SS_LOG_INFO(L"Database", L"DatabaseManager shut down");
         }
 
@@ -1622,25 +1858,25 @@ namespace ShadowStrike {
          * @note Thread-safe - connection acquisition handles synchronization
          */
         bool DatabaseManager::Execute(std::string_view sql, DatabaseError* err) {
-                  auto conn = AcquireConnection(err);
-                if (!conn) return false;
-                
-                // RAII guard ensures connection is released even on exception
-                struct ConnectionGuard {
-                    DatabaseManager* mgr;
-                    std::shared_ptr<SQLite::Database> conn;
+            auto conn = AcquireConnection(err);
+            if (!conn) return false;
 
-                    ~ConnectionGuard() {
-                        if (conn && mgr) {
-                            mgr->ReleaseConnection(conn);
-                        }
+            // RAII guard ensures connection is released even on exception
+            struct ConnectionGuard {
+                DatabaseManager* mgr;
+                std::shared_ptr<SQLite::Database> conn;
+                ~ConnectionGuard() {
+                    if (conn && mgr) {
+                        mgr->ReleaseConnection(conn);
                     }
-                } guard{ this, conn };
-                try{
-                conn->exec(sql.data());
+                }
+            } guard{ this, conn };
+
+            try {
+                // FIX (Tier 1 - UB): copy to null-terminated string; std::string_view
+                // is not required to be NUL-terminated.
+                conn->exec(std::string(sql));
                 m_totalQueries.fetch_add(1, std::memory_order_relaxed);
-                
-               
                 return true;
             }
             catch (const SQLite::Exception& ex) {
@@ -1740,7 +1976,8 @@ namespace ShadowStrike {
             if (!conn) return QueryResult{};
 
             try {
-                auto stmt = std::make_unique<SQLite::Statement>(*conn, sql.data());
+                // FIX (Tier 1 - UB): use std::string(sql) to guarantee NUL terminator.
+                auto stmt = std::make_unique<SQLite::Statement>(*conn, std::string(sql));
                 m_totalQueries.fetch_add(1, std::memory_order_relaxed);
 
                 // QueryResult takes ownership of connection
@@ -1922,10 +2159,17 @@ namespace ShadowStrike {
          * @return true if column exists in table
          */
         bool DatabaseManager::ColumnExists(std::string_view tableName, std::string_view columnName, DatabaseError* err) {
+            // FIX (Tier 4 - SQL injection): table_info() argument is an identifier
+            // that cannot be parameterized. Reject anything other than a strict
+            // identifier before concatenating into the PRAGMA.
+            if (!IsValidSqlIdentifier(tableName)) {
+                setError(err, SQLITE_MISUSE, L"Invalid table name");
+                return false;
+            }
             try {
-                std::string sql = "PRAGMA table_info(" + std::string(tableName) + ")";
+                std::string sql = "PRAGMA table_info(\"" + std::string(tableName) + "\")";
                 auto result = Query(sql, err);
-                
+
                 while (result.Next()) {
                     if (result.GetString(1) == columnName) {
                         return true;
@@ -1997,11 +2241,17 @@ namespace ShadowStrike {
          */
         std::vector<std::string> DatabaseManager::GetColumnNames(std::string_view tableName, DatabaseError* err) {
             std::vector<std::string> columns;
-            
+
+            // FIX (Tier 4 - SQL injection): validate identifier before concatenation.
+            if (!IsValidSqlIdentifier(tableName)) {
+                setError(err, SQLITE_MISUSE, L"Invalid table name");
+                return columns;
+            }
+
             try {
-                std::string sql = "PRAGMA table_info(" + std::string(tableName) + ")";
+                std::string sql = "PRAGMA table_info(\"" + std::string(tableName) + "\")";
                 auto result = Query(sql, err);
-                
+
                 while (result.Next()) {
                     columns.push_back(result.GetString(1));  // Column name is at index 1
                 }
@@ -2009,7 +2259,7 @@ namespace ShadowStrike {
             catch (const SQLite::Exception& ex) {
                 setError(err, ex, L"GetColumnNames");
             }
-            
+
             return columns;
         }
 
@@ -2127,54 +2377,84 @@ namespace ShadowStrike {
          * @return true if backup created successfully
          */
         bool DatabaseManager::BackupToFile(std::wstring_view backupPath, DatabaseError* err) {
+            // FIX (Tier 4 - path traversal): validate caller-supplied path before I/O.
+            if (!isSafePath(backupPath)) {
+                setError(err, SQLITE_MISUSE, L"Backup path failed safety validation", L"BackupToFile");
+                return false;
+            }
             return performBackup(std::wstring(backupPath), err);
         }
 
         /**
          * @brief Restores the database from a backup file.
-         * 
+         *
          * This operation:
-         * 1. Verifies backup file exists
+         * 1. Verifies backup file exists and passes integrity_check
          * 2. Shuts down current database connections
          * 3. Replaces database file with backup
          * 4. Reinitializes the database
-         * 
+         *
          * @param backupPath Path to the backup file
          * @param err Optional error output
          * @return true if restore succeeded
          * @warning All current connections will be closed!
          */
         bool DatabaseManager::RestoreFromFile(std::wstring_view backupPath, DatabaseError* err) {
-            SS_LOG_INFO(L"Database", L"Restoring database from: %ls", backupPath.data());
-            
+            // FIX (Tier 4 - path traversal): validate caller-supplied path before I/O.
+            if (!isSafePath(backupPath)) {
+                setError(err, SQLITE_MISUSE, L"Backup path failed safety validation", L"RestoreFromFile");
+                return false;
+            }
+
+            const std::wstring backupPathStr(backupPath);
+            SS_LOG_INFO(L"Database", L"Restoring database from: %ls",
+                SanitizeForLog(backupPathStr).c_str());
+
             try {
                 namespace fs = std::filesystem;
-                
+
                 // Verify backup file exists
-                if (!fs::exists(backupPath)) {
+                std::error_code ec;
+                if (!fs::exists(backupPathStr, ec) || ec) {
                     setError(err, SQLITE_CANTOPEN, L"Backup file not found", L"RestoreFromFile");
                     return false;
                 }
-                
+
+                // FIX (Tier 6 - corruption recovery): never overwrite the live DB with
+                // a backup that fails integrity_check. Verify before any destructive op.
+                if (!verifyBackupIntegrity(backupPathStr, err)) {
+                    SS_LOG_ERROR(L"Database", L"Backup integrity verification failed; aborting restore");
+                    return false;
+                }
+
+                // Snapshot config under lock before Shutdown clears state (it does not,
+                // but be defensive against future refactors).
+                DatabaseConfig config;
+                {
+                    std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                    config = m_config;
+                }
+
                 // Close all connections (required for file replacement)
                 Shutdown();
-                
+
                 // Replace current database with backup
-                fs::copy_file(backupPath, m_config.databasePath, fs::copy_options::overwrite_existing);
-                
+                fs::copy_file(backupPathStr, config.databasePath,
+                              fs::copy_options::overwrite_existing);
+
                 // Reinitialize with same configuration
-                DatabaseConfig config = m_config;
                 if (!Initialize(config, err)) {
                     SS_LOG_ERROR(L"Database", L"Failed to reinitialize after restore");
                     return false;
                 }
-                
+
                 SS_LOG_INFO(L"Database", L"Database restored successfully");
                 return true;
             }
             catch (const std::exception& ex) {
                 setError(err, SQLITE_ERROR, ToWide(ex.what()), L"RestoreFromFile");
-                SS_LOG_ERROR(L"Database", L"Restore failed: %ls", ToWide(ex.what()).c_str());
+                SS_LOG_ERROR(L"Database", L"Restore failed: %ls",
+                    SanitizeForLog(ToWide(ex.what())).c_str());
                 return false;
             }
         }
@@ -2292,8 +2572,19 @@ namespace ShadowStrike {
                 setError(err, SQLITE_MISUSE, L"DatabaseManager not initialized");
                 return nullptr;
             }
-            
-            return m_connectionPool->Acquire(m_config.connectionTimeout, err);
+
+            // FIX (Tier 1 - race vs Shutdown): if Shutdown() ran between the
+            // initialized check above and the pool dereference, m_connectionPool
+            // may be null. The lifecycle mutex prevents this from happening
+            // concurrently with full Initialize/Shutdown, but a non-lifecycle
+            // caller cannot hold that mutex - re-validate the pointer.
+            auto* pool = m_connectionPool.get();
+            if (!pool) {
+                setError(err, SQLITE_MISUSE, L"Connection pool unavailable");
+                return nullptr;
+            }
+
+            return pool->Acquire(m_config.connectionTimeout, err);
         }
 
         /**
@@ -2358,38 +2649,70 @@ namespace ShadowStrike {
          */
         bool DatabaseManager::UpgradeSchema(int currentVersion, int targetVersion, DatabaseError* err) {
             SS_LOG_INFO(L"Database", L"Upgrading schema from version %d to %d", currentVersion, targetVersion);
-            
-            // Use exclusive transaction for schema changes
-            auto trans = BeginTransaction(Transaction::Type::Exclusive, err);
-            if (!trans || !trans->IsActive()) {
+
+            if (targetVersion < currentVersion) {
+                setError(err, SQLITE_MISUSE, L"Downgrade not supported", L"UpgradeSchema");
                 return false;
             }
-            
-            // Apply each migration sequentially
-            for (int version = currentVersion + 1; version <= targetVersion; ++version) {
-                auto conn = AcquireConnection(err);
-                if (!conn) return false;
-                
-                if (!executeSchemaMigration(*conn, version, err)) {
-                    trans->Rollback(err);
-                    ReleaseConnection(conn);
-                    return false;
+            if (targetVersion == currentVersion) {
+                return true;
+            }
+
+            // FIX (Tier 1 - atomicity): The previous implementation called
+            // BeginTransaction() (which acquired pool connection A) and then for
+            // each migration called AcquireConnection() (which returned a DIFFERENT
+            // pool connection B). Migrations therefore ran OUTSIDE the exclusive
+            // transaction, completely defeating its purpose. We now drive the
+            // exclusive transaction, all migrations, AND the version stamp on the
+            // SAME connection. A RAII guard ensures rollback on any exception.
+            auto conn = AcquireConnection(err);
+            if (!conn) return false;
+
+            struct ConnGuard {
+                DatabaseManager* mgr;
+                std::shared_ptr<SQLite::Database> conn;
+                bool inTxn = false;
+                bool committed = false;
+                ~ConnGuard() {
+                    if (conn) {
+                        if (inTxn && !committed) {
+                            try { conn->exec("ROLLBACK"); }
+                            catch (...) { /* best effort */ }
+                        }
+                        if (mgr) mgr->ReleaseConnection(conn);
+                    }
                 }
-                
-                ReleaseConnection(conn);
+            } guard{ this, conn };
+
+            try {
+                conn->exec("BEGIN EXCLUSIVE TRANSACTION");
+                guard.inTxn = true;
+
+                for (int version = currentVersion + 1; version <= targetVersion; ++version) {
+                    if (!executeSchemaMigration(*conn, version, err)) {
+                        return false;
+                    }
+                }
+
+                // Stamp version on the SAME connection so the metadata write is part
+                // of the same atomic transaction as the schema changes themselves.
+                {
+                    SQLite::Statement stmt(*conn, SQL_SET_SCHEMA_VERSION);
+                    stmt.bind(1, std::to_string(targetVersion));
+                    stmt.exec();
+                }
+
+                conn->exec("COMMIT");
+                guard.committed = true;
+                m_totalTransactions.fetch_add(1, std::memory_order_relaxed);
             }
-            
-            // Update version marker
-            if (!SetSchemaVersion(targetVersion, err)) {
-                trans->Rollback(err);
+            catch (const SQLite::Exception& ex) {
+                setError(err, ex, L"UpgradeSchema");
+                SS_LOG_ERROR(L"Database", L"Schema upgrade failed: %ls",
+                    SanitizeForLog(ToWide(ex.what())).c_str());
                 return false;
             }
-            
-            // Commit all changes
-            if (!trans->Commit(err)) {
-                return false;
-            }
-            
+
             SS_LOG_INFO(L"Database", L"Schema upgraded successfully to version %d", targetVersion);
             return true;
         }
@@ -2406,9 +2729,17 @@ namespace ShadowStrike {
          */
         bool DatabaseManager::createDatabaseFile(DatabaseError* err) {
             namespace fs = std::filesystem;
-            
+
+            // FIX (Tier 4 - path traversal): isSafePath is also called in Initialize,
+            // but reapply here so this private helper can never be safely bypassed
+            // if it is ever called from a new code path.
+            if (!isSafePath(m_config.databasePath)) {
+                setError(err, SQLITE_MISUSE, L"Database path failed safety validation", L"createDatabaseFile");
+                return false;
+            }
+
             fs::path dbPath(m_config.databasePath);
-            
+
             // Create parent directories if needed
             if (dbPath.has_parent_path()) {
                 Utils::FileUtils::Error fileErr;
@@ -2417,7 +2748,40 @@ namespace ShadowStrike {
                     return false;
                 }
             }
-            
+
+            return true;
+        }
+
+        /**
+         * @brief Validates that a filesystem path is safe to use.
+         *
+         * Rejects:
+         * - Empty paths
+         * - Paths containing NUL characters (length-truncation attacks)
+         * - Paths containing relative '..' segments (traversal)
+         * - Paths with embedded control characters
+         */
+        bool DatabaseManager::isSafePath(std::wstring_view path) noexcept {
+            if (path.empty()) return false;
+            if (path.size() > 32767) return false; // Win32 MAX_PATH_LONG
+            for (wchar_t c : path) {
+                if (c == L'\0') return false;
+                if (c < 0x20 && c != L'\t') return false;
+            }
+            // Reject relative '..' segments. We accept absolute paths or
+            // device-relative paths because the database file lives wherever the
+            // configuration object specifies; the caller is trusted to provide a
+            // valid root. Traversal segments are never legitimate.
+            std::wstring_view sep = L"\\/";
+            size_t pos = 0;
+            while (pos < path.size()) {
+                size_t next = path.find_first_of(sep, pos);
+                std::wstring_view seg = path.substr(
+                    pos, next == std::wstring_view::npos ? std::wstring_view::npos : next - pos);
+                if (seg == L"..") return false;
+                if (next == std::wstring_view::npos) break;
+                pos = next + 1;
+            }
             return true;
         }
 
@@ -2513,37 +2877,48 @@ namespace ShadowStrike {
          */
         void DatabaseManager::backgroundBackupThread() {
             SS_LOG_INFO(L"Database", L"Background backup thread started");
-            
+
             while (!m_shutdownBackupThread.load(std::memory_order_acquire)) {
                 std::unique_lock<std::mutex> lock(m_backupMutex);
-                
+
                 // Wait for backup interval or shutdown signal
                 m_backupCv.wait_for(lock, m_config.backupInterval, [this]() {
                     return m_shutdownBackupThread.load(std::memory_order_acquire);
                 });
-                
+
                 // Check for shutdown
                 if (m_shutdownBackupThread.load(std::memory_order_acquire)) {
                     break;
                 }
-                
-                // Verify enough time has passed since last backup
+
+                // Verify enough time has passed since last backup. m_lastBackup is
+                // already guarded by m_backupMutex which we hold here.
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::hours>(now - m_lastBackup);
-                
+
                 if (elapsed >= m_config.backupInterval) {
+                    // FIX: release the lock for the actual backup, since CreateAutoBackup
+                    // acquires database connections and can take seconds-to-minutes.
+                    // Holding m_backupMutex during the backup would block Initialize()
+                    // from setting up a new m_lastBackup, and starve any future
+                    // notify_all() from Shutdown() until backup completes.
+                    lock.unlock();
+
                     SS_LOG_INFO(L"Database", L"Starting automatic backup...");
-                    
                     DatabaseError err;
-                    if (CreateAutoBackup(&err)) {
-                        m_lastBackup = now;
+                    const bool ok = CreateAutoBackup(&err);
+
+                    lock.lock();
+                    if (ok) {
+                        m_lastBackup = std::chrono::steady_clock::now();
                         SS_LOG_INFO(L"Database", L"Automatic backup completed successfully");
                     } else {
-                        SS_LOG_ERROR(L"Database", L"Automatic backup failed: %ls", err.message.c_str());
+                        SS_LOG_ERROR(L"Database", L"Automatic backup failed: %ls",
+                            SanitizeForLog(err.message).c_str());
                     }
                 }
             }
-            
+
             SS_LOG_INFO(L"Database", L"Background backup thread stopped");
         }
 
@@ -2558,25 +2933,79 @@ namespace ShadowStrike {
          * @return true if backup succeeded
          */
         bool DatabaseManager::performBackup(const std::wstring& backupPath, DatabaseError* err) {
-            SS_LOG_INFO(L"Database", L"Creating backup: %ls", backupPath.c_str());
-            
+            SS_LOG_INFO(L"Database", L"Creating backup: %ls", SanitizeForLog(backupPath).c_str());
+
             try {
                 auto conn = AcquireConnection(err);
                 if (!conn) return false;
-                
+
+                struct ConnGuard {
+                    DatabaseManager* mgr;
+                    std::shared_ptr<SQLite::Database> conn;
+                    ~ConnGuard() { if (conn && mgr) mgr->ReleaseConnection(conn); }
+                } guard{ this, conn };
+
                 std::string backupPathStr = ToNarrow(backupPath);
-                
+
                 // Use SQLiteCpp's backup API for online backup
                 conn->backup(backupPathStr.c_str(), SQLite::Database::BackupType::Save);
-                
-                ReleaseConnection(conn);
-                
-                SS_LOG_INFO(L"Database", L"Backup created successfully: %ls", backupPath.c_str());
+
+                SS_LOG_INFO(L"Database", L"Backup created successfully: %ls",
+                    SanitizeForLog(backupPath).c_str());
                 return true;
             }
             catch (const SQLite::Exception& ex) {
                 setError(err, ex, L"performBackup");
-                SS_LOG_ERROR(L"Database", L"Backup failed: %ls", ToWide(ex.what()).c_str());
+                SS_LOG_ERROR(L"Database", L"Backup failed: %ls",
+                    SanitizeForLog(ToWide(ex.what())).c_str());
+                return false;
+            }
+        }
+
+        /**
+         * @brief Verifies a backup file is a valid SQLite database before use.
+         *
+         * Opens the candidate path read-only and runs PRAGMA integrity_check. A
+         * single "ok" row is required for the backup to be considered safe to
+         * restore. Used by RestoreFromFile() to prevent overwriting the live DB
+         * with a corrupt or attacker-supplied file.
+         */
+        bool DatabaseManager::verifyBackupIntegrity(const std::wstring& backupPath,
+                                                    DatabaseError* err) const {
+            try {
+                SQLite::Database probe(ToNarrow(backupPath), SQLITE_OPEN_READONLY);
+                SQLite::Statement stmt(probe, "PRAGMA integrity_check");
+                if (!stmt.executeStep()) {
+                    if (err) {
+                        err->sqliteCode = SQLITE_CORRUPT;
+                        err->message = L"integrity_check returned no rows";
+                        err->context = L"verifyBackupIntegrity";
+                    }
+                    return false;
+                }
+                const std::string result = stmt.getColumn(0).getString();
+                if (result != "ok") {
+                    if (err) {
+                        err->sqliteCode = SQLITE_CORRUPT;
+                        err->message = L"Backup file failed integrity_check";
+                        err->context = L"verifyBackupIntegrity";
+                    }
+                    SS_LOG_ERROR(L"Database", L"Backup integrity_check returned: %ls",
+                        SanitizeForLog(ToWide(result)).c_str());
+                    return false;
+                }
+                // integrity_check on a healthy DB returns exactly one row.
+                return true;
+            }
+            catch (const SQLite::Exception& ex) {
+                if (err) {
+                    err->sqliteCode = ex.getErrorCode();
+                    err->extendedCode = ex.getExtendedErrorCode();
+                    err->message = ToWide(ex.what());
+                    err->context = L"verifyBackupIntegrity";
+                }
+                SS_LOG_ERROR(L"Database", L"verifyBackupIntegrity failed: %ls",
+                    SanitizeForLog(ToWide(ex.what())).c_str());
                 return false;
             }
         }
