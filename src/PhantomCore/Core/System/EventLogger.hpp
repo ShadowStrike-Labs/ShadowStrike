@@ -366,10 +366,22 @@ struct alignas(64) EventLoggerConfig {
     // Security - Field Limits (prevent memory exhaustion)
     uint32_t maxFieldLengthBytes{ 4096 };       // Max length per string field
     uint32_t maxPropertiesCount{ 100 };         // Max properties per event
+    uint32_t maxRawDataBytes{ 65536 };          // Max event.rawData size
+    uint32_t maxExportEvents{ 100000 };         // Hard cap on export size
+    uint32_t maxQueryResults{ 100000 };         // Hard cap on QueryEvents
+    uint32_t maxTcpSyslogFrameBytes{ 65536 };   // RFC 6587 octet-counting cap
+    uint32_t maxUdpSyslogBytes{ 8192 };         // Practical RFC 5426 cap
     
     // Compliance
     bool enableCrashSafeLogging{ true };        // FlushFileBuffers after critical events
     bool secureDeleteRotatedLogs{ false };      // Overwrite before delete
+    uint32_t secureDeletePasses{ 3 };           // Number of overwrite passes
+    
+    // Privacy / PII redaction (for export/file/SIEM destinations)
+    bool redactPII{ false };                    // Redact user/machine/path before egress
+    
+    // Hash-chain persistence (forensic integrity across restarts)
+    std::wstring hashChainStatePath;            // Empty = no persistence
     
     // Callback safety
     uint32_t callbackTimeoutMs{ 1000 };         // Max time for callback execution

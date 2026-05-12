@@ -293,19 +293,31 @@ namespace {
 /**
  * @brief Sanitize string for CEF format (escape pipe, backslash, equals).
  * @note CEF uses pipe as delimiter, backslash as escape, equals in extensions.
+ *       All ASCII control characters (0x00-0x1F except handled cases) are
+ *       collapsed to space to defeat terminal/SIEM control-sequence injection.
  */
 [[nodiscard]] std::string SanitizeForCEF(std::string_view input) {
     std::string result;
     result.reserve(input.size() + input.size() / 10);
     
     for (char c : input) {
+        const unsigned char uc = static_cast<unsigned char>(c);
         switch (c) {
             case '\\': result += "\\\\"; break;
             case '|':  result += "\\|"; break;
             case '=':  result += "\\="; break;
             case '\n': result += "\\n"; break;
             case '\r': result += "\\r"; break;
-            default:   result += c; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) {
+                    // Drop other control bytes (defense against terminal/SIEM
+                    // escape-sequence injection embedded in attacker-controlled fields).
+                    result += ' ';
+                } else {
+                    result += c;
+                }
+                break;
         }
     }
     return result;
@@ -320,12 +332,20 @@ namespace {
     result.reserve(input.size() + input.size() / 10);
     
     for (char c : input) {
+        const unsigned char uc = static_cast<unsigned char>(c);
         switch (c) {
             case '\\': result += "\\\\"; break;
             case '\t': result += "\\t"; break;
             case '\n': result += "\\n"; break;
             case '\r': result += "\\r"; break;
-            default:   result += c; break;
+            case '=':  result += "\\="; break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) {
+                    result += ' ';
+                } else {
+                    result += c;
+                }
+                break;
         }
     }
     return result;
@@ -334,40 +354,73 @@ namespace {
 /**
  * @brief Sanitize string for Syslog structured data (RFC 5424).
  * @note Must escape backslash, double-quote, and right bracket in SD-PARAM values.
+ *       All other control bytes collapsed to space.
  */
 [[nodiscard]] std::string SanitizeForSyslog(std::string_view input) {
     std::string result;
     result.reserve(input.size() + input.size() / 10);
     
     for (char c : input) {
+        const unsigned char uc = static_cast<unsigned char>(c);
         switch (c) {
             case '\\': result += "\\\\"; break;
             case '"':  result += "\\\""; break;
             case ']':  result += "\\]"; break;
-            case '\n': result += " "; break;  // Replace newlines with space
-            case '\r': break;                  // Remove carriage returns
-            default:   result += c; break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) {
+                    result += ' ';
+                } else {
+                    result += c;
+                }
+                break;
         }
     }
     return result;
 }
 
 /**
- * @brief Sanitize string for file logging (prevent log injection via newlines).
+ * @brief Sanitize string for file logging (prevent log injection via newlines
+ *        AND ANSI/terminal escape sequences).
  */
 [[nodiscard]] std::string SanitizeForFile(std::string_view input) {
     std::string result;
     result.reserve(input.size());
     
     for (char c : input) {
+        const unsigned char uc = static_cast<unsigned char>(c);
         switch (c) {
             case '\n': result += "\\n"; break;
             case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
             case '\0': break;  // Strip null bytes
-            default:   result += c; break;
+            default:
+                if (uc < 0x20 || uc == 0x7F) {
+                    // ESC (0x1B), BEL, control chars — collapse to '?'
+                    // to neutralize terminal escape-sequence injection and
+                    // preserve column alignment.
+                    result += '?';
+                } else {
+                    result += c;
+                }
+                break;
         }
     }
     return result;
+}
+
+/**
+ * @brief Strip CR/LF (and other control bytes) from a wide string used as an
+ *        HTTP header value or URL component. Defends against header injection.
+ */
+[[nodiscard]] std::wstring StripHeaderUnsafe(const std::wstring& input) {
+    std::wstring out;
+    out.reserve(input.size());
+    for (wchar_t wc : input) {
+        if (wc == L'\r' || wc == L'\n' || wc == L'\0') continue;
+        if (wc < 0x20) continue;
+        out.push_back(wc);
+    }
+    return out;
 }
 
 /**
@@ -401,24 +454,35 @@ namespace {
     const std::wstring& allowedRoot
 ) {
     try {
+        if (path.empty() || allowedRoot.empty()) {
+            return false;
+        }
+        // Reject NUL bytes (Win32 path stream truncation evasion)
+        if (path.find(L'\0') != std::wstring::npos) {
+            return false;
+        }
         // Normalize path to resolve .. and .
         fs::path normalizedPath = fs::weakly_canonical(fs::path(path));
         fs::path normalizedRoot = fs::weakly_canonical(fs::path(allowedRoot));
         
-        // Check that the normalized path starts with the allowed root
-        std::wstring pathStr = normalizedPath.wstring();
-        std::wstring rootStr = normalizedRoot.wstring();
-        
-        // Case-insensitive comparison on Windows
-        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
-        std::transform(rootStr.begin(), rootStr.end(), rootStr.begin(), ::towlower);
-        
-        if (pathStr.rfind(rootStr, 0) != 0) {
+        // Walk parent chain — robust against prefix-match traversal where
+        // "C:\Logs" would otherwise match "C:\LogsEvil".
+        bool insideRoot = false;
+        for (fs::path p = normalizedPath; !p.empty(); p = p.parent_path()) {
+            std::error_code ec;
+            if (fs::equivalent(p, normalizedRoot, ec) ||
+                p.wstring() == normalizedRoot.wstring()) {
+                insideRoot = true;
+                break;
+            }
+            if (p == p.parent_path()) break;  // Reached filesystem root
+        }
+        if (!insideRoot) {
             return false;
         }
         
         // Additional checks for suspicious patterns
-        std::wstring lowerPath = path;
+        std::wstring lowerPath = normalizedPath.wstring();
         std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
         
         // Block attempts to write to sensitive locations
@@ -475,35 +539,94 @@ bool SetLogFileACL(const std::wstring& filePath) {
 
 /**
  * @brief Flush file to disk (crash-safe).
+ *
+ * @note std::ofstream does not expose its OS handle, so FlushFileBuffers cannot
+ *       be applied to its buffered data directly. The crash-safe code path in
+ *       WriteToFileImpl writes critical events through m_logFileHandle (using
+ *       FILE_APPEND_DATA WriteFile + FlushFileBuffers), which is the ONLY path
+ *       that gives true disk-flush guarantees. This helper is retained for
+ *       non-critical convenience flushes that do not require durability.
  */
 bool FlushFileToDisk(std::ofstream& file) {
-#ifdef _WIN32
-    // First flush C++ buffer
-    file.flush();
-    
-    // Then flush OS buffer to disk using Windows API
-    // Get the file handle from the stream
-    FILE* cFile = nullptr;
-    
-    // Unfortunately std::ofstream doesn't expose the handle directly
-    // We need to use _fileno on the underlying FILE*
-    // This is a limitation - for truly crash-safe logging, we should use
-    // Windows file handles directly (CreateFile/WriteFile/FlushFileBuffers)
-    
-    // DESIGN NOTE: std::ofstream does not expose the underlying OS file handle.
-    // The crash-safe code path in WriteToFileImpl uses a parallel CreateFile/FlushFileBuffers
-    // handle (m_logFileHandle) for critical events, which provides true disk flush guarantees.
-    // This helper is retained only for non-critical convenience flushes.
-    return file.good();
-#else
     file.flush();
     return file.good();
-#endif
 }
 
 // ============================================================================
 // SIEM FORMAT FUNCTIONS (With Sanitization)
 // ============================================================================
+
+/**
+ * @brief Map ShadowStrike EventSeverity to CEF severity (0-10 scale per CEF spec).
+ *        Audit success/failure get explicit semantics independent of the numeric
+ *        enum ordering (where AuditFailure=6 numerically > Critical=4).
+ */
+[[nodiscard]] int MapSeverityToCEF(EventSeverity severity) noexcept {
+    switch (severity) {
+        case EventSeverity::Debug:        return 0;
+        case EventSeverity::Info:         return 2;
+        case EventSeverity::Warning:      return 5;
+        case EventSeverity::Error:        return 7;
+        case EventSeverity::Critical:     return 10;
+        case EventSeverity::AuditSuccess: return 3;
+        case EventSeverity::AuditFailure: return 8;
+    }
+    return 5;
+}
+
+/**
+ * @brief Map ShadowStrike EventSeverity to RFC 5424 syslog severity (0=Emergency..7=Debug).
+ *        Audit failures are treated as Warning, audit successes as Informational.
+ */
+[[nodiscard]] int MapSeverityToSyslog(EventSeverity severity) noexcept {
+    switch (severity) {
+        case EventSeverity::Critical:     return 2;  // crit
+        case EventSeverity::Error:        return 3;  // err
+        case EventSeverity::AuditFailure: return 4;  // warning
+        case EventSeverity::Warning:      return 4;  // warning
+        case EventSeverity::AuditSuccess: return 6;  // info
+        case EventSeverity::Info:         return 6;  // info
+        case EventSeverity::Debug:        return 7;  // debug
+    }
+    return 6;
+}
+
+/**
+ * @brief Apply optional PII redaction to a copy of a security event prior to
+ *        external egress (file/syslog/SIEM). Username and full file path are
+ *        replaced with stable SHA-256 prefixes; machine name is hashed.
+ *        Hashes preserve correlation across events while removing identifiers.
+ */
+[[nodiscard]] SecurityEvent ApplyPIIRedaction(const SecurityEvent& event) {
+    SecurityEvent redacted = event;
+    auto hashShort = [](const std::wstring& w) -> std::wstring {
+        if (w.empty()) return {};
+        const std::string narrow = StringUtils::ToNarrow(w);
+        std::string hex;
+        if (!HashUtils::ComputeHex(HashUtils::Algorithm::SHA256,
+                                   narrow.data(), narrow.size(), hex)) {
+            return L"[redacted]";
+        }
+        std::wstring hexW = StringUtils::ToWide(hex);
+        return L"[redacted:" + hexW.substr(0, 12) + L"]";
+    };
+    if (!redacted.context.userName.empty()) {
+        redacted.context.userName = hashShort(redacted.context.userName);
+    }
+    if (!redacted.context.machineName.empty()) {
+        redacted.context.machineName = hashShort(redacted.context.machineName);
+    }
+    if (!redacted.filePath.empty()) {
+        // Keep file name visible for triage; redact only the parent path.
+        try {
+            fs::path p(redacted.filePath);
+            redacted.filePath = hashShort(p.parent_path().wstring()) + L"\\" + p.filename().wstring();
+        } catch (...) {
+            redacted.filePath = hashShort(redacted.filePath);
+        }
+    }
+    return redacted;
+}
 
 /**
  * @brief Format event as CEF (Common Event Format) with sanitization.
@@ -515,7 +638,7 @@ bool FlushFileToDisk(std::ofstream& file) {
     oss << "CEF:0|ShadowStrike|NGAV|3.0.0|"
         << event.windowsEventId << "|"
         << SanitizeForCEF(StringUtils::ToNarrow(event.message)) << "|"
-        << static_cast<int>(event.severity) << "|";
+        << MapSeverityToCEF(event.severity) << "|";
 
     // Extensions (all values sanitized)
     oss << "cat=" << SanitizeForCEF(StringUtils::ToNarrow(CategoryToString(event.category))) << " ";
@@ -591,26 +714,35 @@ bool FlushFileToDisk(std::ofstream& file) {
     std::ostringstream oss;
 
     // Priority = Facility * 8 + Severity
-    int facility = 16; // local0
-    int syslogSeverity = std::min(static_cast<int>(event.severity), 7);
-    int priority = facility * 8 + syslogSeverity;
+    constexpr int kFacilityLocal0 = 16;
+    int syslogSeverity = MapSeverityToSyslog(event.severity);
+    int priority = kFacilityLocal0 * 8 + syslogSeverity;
 
     oss << "<" << priority << ">1 ";
 
-    // Timestamp (ISO 8601 with microseconds)
+    // Timestamp (ISO 8601 with microseconds, UTC)
     auto timeT = system_clock::to_time_t(event.timestamp);
     auto micros = duration_cast<microseconds>(event.timestamp.time_since_epoch()) % 1000000;
-    std::tm tm;
-    gmtime_s(&tm, &timeT);
-    char timeBuffer[64];
-    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%dT%H:%M:%S", &tm);
-    oss << timeBuffer << "." << std::setfill('0') << std::setw(6) << micros.count() << "Z ";
+    std::tm tm{};
+    if (gmtime_s(&tm, &timeT) != 0) {
+        // Fallback: emit NILVALUE timestamp per RFC 5424 §6.2.3
+        oss << "- ";
+    } else {
+        char timeBuffer[64]{};
+        if (strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%dT%H:%M:%S", &tm) == 0) {
+            oss << "- ";
+        } else {
+            oss << timeBuffer << "." << std::setfill('0') << std::setw(6) << micros.count() << "Z ";
+        }
+    }
 
     // Hostname (sanitized)
-    oss << SanitizeForSyslog(StringUtils::ToNarrow(event.context.machineName)) << " ";
+    const std::string host = SanitizeForSyslog(StringUtils::ToNarrow(event.context.machineName));
+    oss << (host.empty() ? "-" : host) << " ";
 
     // App-Name (sanitized)
-    oss << SanitizeForSyslog(StringUtils::ToNarrow(config.appName)) << " ";
+    const std::string app = SanitizeForSyslog(StringUtils::ToNarrow(config.appName));
+    oss << (app.empty() ? "-" : app) << " ";
 
     // ProcID
     oss << event.context.processId << " ";
@@ -629,7 +761,7 @@ bool FlushFileToDisk(std::ofstream& file) {
     }
     oss << "] ";
 
-    // Message (sanitized - newlines replaced with spaces)
+    // Message (sanitized - newlines/controls replaced)
     oss << SanitizeForSyslog(StringUtils::ToNarrow(event.message));
 
     return oss.str();
@@ -838,8 +970,9 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            SS_LOG_WARN(LOG_CATEGORY, L"EventLogger::Impl already initialized");
-            return true;
+            // Reject — configuration is immutable after first successful init.
+            SS_LOG_WARN(LOG_CATEGORY, L"EventLogger::Impl: Initialize called while already initialized — new configuration rejected (call Shutdown first to reconfigure)");
+            return false;
         }
 
         try {
@@ -856,6 +989,12 @@ public:
 
             // Reset statistics
             m_stats.Reset();
+
+            // Restore persisted hash-chain head (if configured) so forensic
+            // continuity survives process restarts.
+            if (m_config.enableHashChain) {
+                LoadHashChainHead();
+            }
 
             // Initialize Windows Event Log source
             if (config.destinations & static_cast<uint8_t>(LogDestination::WindowsEventLog)) {
@@ -902,8 +1041,16 @@ public:
         // Signal shutdown
         m_shutdown.store(true, std::memory_order_release);
 
-        // Flush pending events
-        FlushImpl();
+        // Flush pending events — FlushImpl performs allocations that may throw;
+        // a thrown exception would propagate out of a noexcept function and
+        // terminate the process. Contain it.
+        try {
+            FlushImpl();
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger::Shutdown: FlushImpl exception suppressed: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger::Shutdown: FlushImpl unknown exception suppressed");
+        }
 
         // Stop worker threads
         m_workerCV.notify_all();
@@ -929,9 +1076,12 @@ public:
             }
         }
 
-        // Clear callbacks
+        // Clear callbacks — acquire BOTH mutexes in a stable order
+        // (m_callbackMutex before m_callbackFailureMutex everywhere) so that
+        // callers that need both cannot deadlock against this path.
         {
             std::unique_lock cbLock(m_callbackMutex);
+            std::lock_guard failLock(m_callbackFailureMutex);
             m_eventCallbacks.clear();
             m_auditCallbacks.clear();
             m_callbackFailureCounts.clear();
@@ -991,7 +1141,9 @@ public:
                     return false;
                 }
                 
-                // Also open with Windows API for FlushFileBuffers
+                // Also open with Windows API for FlushFileBuffers.
+                // FILE_APPEND_DATA semantics ensure writes are atomic at OS level
+                // and append to current EOF regardless of ofstream cursor.
                 m_logFileHandle = CreateFileW(
                     m_config.logFilePath.c_str(),
                     FILE_APPEND_DATA,
@@ -1001,6 +1153,11 @@ public:
                     FILE_ATTRIBUTE_NORMAL,
                     nullptr
                 );
+                if (m_logFileHandle == INVALID_HANDLE_VALUE) {
+                    const DWORD err = GetLastError();
+                    SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Crash-safe handle open failed (GLE=%lu) — FlushFileBuffers unavailable", err);
+                    // Not fatal: ofstream still works for non-critical events.
+                }
             }
 
             // Set restrictive ACL if configured
@@ -1090,35 +1247,103 @@ public:
     }
 
     /**
-     * @brief Get and update hash chain link.
+     * @brief Update the running hash chain head based on this event's HMAC.
+     *        Optionally persists the new head to disk so the chain survives
+     *        process restarts (forensic continuity).
+     *
+     * @note Must be called AFTER ComputeEventHmac() so the chain link incorporates
+     *       the just-computed signature.
      */
-    [[nodiscard]] std::string GetAndUpdateHashChain(const SecurityEvent& event) {
-        if (!m_config.enableHashChain) {
-            return "";
-        }
-
-        std::unique_lock lock(m_hashChainMutex);
-        
-        std::string previousHash = m_previousEventHash;
-        
-        // Compute hash of this event for the chain
+    void UpdateHashChainHead(const SecurityEvent& event) {
         std::ostringstream oss;
         oss << event.eventId << "|" << event.sequenceNumber << "|" << event.hmacSignature;
-        std::string eventData = oss.str();
-        
+        const std::string eventData = oss.str();
+
         std::string newHash;
         HashUtils::Error err;
-        if (HashUtils::ComputeHex(
+        if (!HashUtils::ComputeHex(
                 HashUtils::Algorithm::SHA256,
                 eventData.data(),
                 eventData.size(),
                 newHash,
                 false,
                 &err)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Hash-chain update failed (event %llu)",
+                static_cast<unsigned long long>(event.eventId));
+            return;
+        }
+
+        {
+            std::lock_guard lock(m_hashChainMutex);
             m_previousEventHash = newHash;
         }
-        
-        return previousHash;
+
+        PersistHashChainHead(newHash);
+    }
+
+    /**
+     * @brief Atomically persist the chain head to disk (best-effort).
+     *        Writes "<hex>\n" to a temp file then ReplaceFile/MoveFileEx to the
+     *        configured path. Failures are logged but never propagate; missing
+     *        persistence simply re-bootstraps the chain on next start.
+     */
+    void PersistHashChainHead(const std::string& hexHash) noexcept {
+        if (m_config.hashChainStatePath.empty()) {
+            return;
+        }
+        try {
+            const std::wstring& target = m_config.hashChainStatePath;
+            const std::wstring tmp = target + L".tmp";
+
+            HANDLE h = CreateFileW(
+                tmp.c_str(),
+                GENERIC_WRITE,
+                0,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                return;
+            }
+            const std::string payload = hexHash + "\n";
+            DWORD written = 0;
+            (void)WriteFile(h, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr);
+            FlushFileBuffers(h);
+            CloseHandle(h);
+
+            // Atomic replace (best effort)
+            if (!MoveFileExW(tmp.c_str(), target.c_str(),
+                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                DeleteFileW(tmp.c_str());
+            }
+        } catch (...) {
+            // Persistence is best-effort; never let it kill the logger.
+        }
+    }
+
+    /**
+     * @brief Load the persisted hash chain head (if any) into m_previousEventHash.
+     */
+    void LoadHashChainHead() noexcept {
+        if (m_config.hashChainStatePath.empty()) {
+            return;
+        }
+        try {
+            std::ifstream in(m_config.hashChainStatePath, std::ios::binary);
+            if (!in) return;
+            std::string line;
+            std::getline(in, line);
+            // Validate: must be 64 lowercase-hex characters (SHA-256)
+            if (line.size() != 64) return;
+            for (char c : line) {
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return;
+            }
+            std::lock_guard lock(m_hashChainMutex);
+            m_previousEventHash = std::move(line);
+        } catch (...) {
+            // Ignore — chain will be re-seeded.
+        }
     }
 
     // ========================================================================
@@ -1141,8 +1366,14 @@ public:
                 }
             }
 
-            // Check severity filter
-            if (event.severity < m_config.minimumSeverity) {
+            // Severity filter. The numeric enum ordering places Audit* (5,6) AFTER
+            // Critical (4), which would unintentionally hide audit records when
+            // minimumSeverity=Critical. Audit events are policy-driven and must
+            // bypass severity-based suppression — they are filtered only when the
+            // category itself is disabled (handled upstream).
+            const bool isAudit = event.severity == EventSeverity::AuditSuccess ||
+                                 event.severity == EventSeverity::AuditFailure;
+            if (!isAudit && event.severity < m_config.minimumSeverity) {
                 return;
             }
 
@@ -1190,11 +1421,21 @@ public:
                 event.context.userName = GetCurrentUserNameSafe();
             }
 
-            // Compute integrity signature
-            // Order: 1) HMAC first (covers event content), 2) then chain (includes HMAC)
+            // Compute integrity signature.
+            // Order: 1) HMAC first (covers event content + previous-event hash from chain),
+            //        2) then chain head updated using the new HMAC.
+            // Note: event.previousEventHash is populated BEFORE HMAC so the chain link
+            // is part of the canonical string. The chain head is then updated based on
+            // this event's resulting HMAC, providing a forward-only Merkle-style link.
             if (m_config.enableTamperProtection) {
+                {
+                    std::lock_guard chainLock(m_hashChainMutex);
+                    event.previousEventHash = m_previousEventHash;
+                }
                 event.hmacSignature = ComputeEventHmac(event);
-                event.previousEventHash = GetAndUpdateHashChain(event);
+                if (m_config.enableHashChain) {
+                    UpdateHashChainHead(event);
+                }
             }
 
             // Invoke callbacks (with timeout protection)
@@ -1228,8 +1469,18 @@ public:
             m_stats.queueHighWaterMark.store(currentSize, std::memory_order_relaxed);
         }
         
-        // Check if queue is full (leaving room for critical events)
-        size_t effectiveMaxSize = m_config.asyncQueueSize - m_config.criticalQueueReserve;
+        // Check if queue is full (leaving room for critical events).
+        // Use saturated subtraction: if criticalQueueReserve >= asyncQueueSize the
+        // operator- on unsigned types would wrap to ~0 and disable backpressure.
+        size_t effectiveMaxSize;
+        if (m_config.criticalQueueReserve >= m_config.asyncQueueSize) {
+            effectiveMaxSize = m_config.asyncQueueSize / 2;
+        } else {
+            effectiveMaxSize = m_config.asyncQueueSize - m_config.criticalQueueReserve;
+        }
+        if (effectiveMaxSize == 0) {
+            effectiveMaxSize = 1;
+        }
         
         if (m_eventQueue.size() >= effectiveMaxSize) {
             // Drop lowest priority events first
@@ -1459,24 +1710,33 @@ public:
             WriteToWindowsEventLogImpl(event);
         }
 
-        // Internal DB
+        // Internal DB always receives the unredacted event (local forensics).
         if (m_config.destinations & static_cast<uint8_t>(LogDestination::InternalDB)) {
             WriteToDBImpl(event);
         }
 
-        // File (thread-safe with dedicated mutex)
+        // Build redacted view ONCE for any external/egress destination. Local
+        // DB retains the full event (forensic value); file / syslog / SIEM see
+        // the redacted form when policy demands. Local file is treated as
+        // potentially attacker-readable in compromised-endpoint scenarios.
+        const bool redact = m_config.redactPII;
+        const SecurityEvent* externalView = redact ? nullptr : &event;
+        std::optional<SecurityEvent> redactedStorage;
+        if (redact) {
+            redactedStorage.emplace(ApplyPIIRedaction(event));
+            externalView = &(*redactedStorage);
+        }
+
         if (m_config.destinations & static_cast<uint8_t>(LogDestination::File)) {
-            WriteToFileImpl(event);
+            WriteToFileImpl(*externalView);
         }
 
-        // Syslog
         if (m_config.destinations & static_cast<uint8_t>(LogDestination::Syslog)) {
-            ForwardToSyslogImpl(event);
+            ForwardToSyslogImpl(*externalView);
         }
 
-        // SIEM
         if (m_config.destinations & static_cast<uint8_t>(LogDestination::SIEM)) {
-            ForwardToSIEMImpl(event);
+            ForwardToSIEMImpl(*externalView);
         }
     }
 
@@ -1504,10 +1764,19 @@ public:
         secEvent.timestamp = event.timestamp;
         secEvent.windowsEventId = EventIds::POLICY_CHANGED;
         
-        // Compute integrity for audit event
+        // Compute integrity for audit event using the SAME ordering as LogImpl:
+        // 1) capture current chain head into previousEventHash,
+        // 2) compute HMAC over canonical (which includes the chain link),
+        // 3) update chain head based on the resulting HMAC.
         if (m_config.enableTamperProtection) {
-            secEvent.previousEventHash = GetAndUpdateHashChain(secEvent);
+            {
+                std::lock_guard chainLock(m_hashChainMutex);
+                secEvent.previousEventHash = m_previousEventHash;
+            }
             secEvent.hmacSignature = ComputeEventHmac(secEvent);
+            if (m_config.enableHashChain) {
+                UpdateHashChainHead(secEvent);
+            }
         }
 
         ProcessEvent(secEvent);
@@ -1528,10 +1797,33 @@ public:
             WORD eventType = SeverityToEventType(event.severity);
             DWORD eventId = event.windowsEventId != 0 ? event.windowsEventId : EventIds::SYSTEM_STARTUP;
 
+            // ReportEventW limits: max 256 inserts AND total combined size of all
+            // strings must fit in a 32KB message. Apply per-string cap (e.g. 8000
+            // wide chars ≈ 16KB) so a hostile / pathological event cannot exceed
+            // the limit and cause the API to fail silently.
+            constexpr size_t kMaxEventLogStrings = 8;          // We currently emit at most 2
+            constexpr size_t kMaxEventLogStringLen = 8000;     // Per-string wide-char cap
+
+            std::vector<std::wstring> ownedStrings;
+            ownedStrings.reserve(2);
+            auto pushCapped = [&](const std::wstring& src) {
+                if (src.empty()) return;
+                if (src.size() > kMaxEventLogStringLen) {
+                    ownedStrings.emplace_back(src.substr(0, kMaxEventLogStringLen - 3) + L"...");
+                } else {
+                    ownedStrings.emplace_back(src);
+                }
+            };
+            pushCapped(event.message);
+            pushCapped(event.details);
+            if (ownedStrings.size() > kMaxEventLogStrings) {
+                ownedStrings.resize(kMaxEventLogStrings);
+            }
+
             std::vector<LPCWSTR> strings;
-            strings.push_back(event.message.c_str());
-            if (!event.details.empty()) {
-                strings.push_back(event.details.c_str());
+            strings.reserve(ownedStrings.size());
+            for (const auto& s : ownedStrings) {
+                strings.push_back(s.c_str());
             }
 
             BOOL success = ReportEventW(
@@ -1542,7 +1834,7 @@ public:
                 nullptr,
                 static_cast<WORD>(strings.size()),
                 0,
-                strings.data(),
+                strings.empty() ? nullptr : strings.data(),
                 nullptr
             );
 
@@ -1670,10 +1962,36 @@ public:
             oss << "\n";
 
             std::string logLine = oss.str();
-            m_logFile << logLine;
+
+            // Crash-safe writers consider critical/threat-detection events.
+            const bool crashSafe = m_config.enableCrashSafeLogging &&
+                                   (event.priority == EventPriority::Critical ||
+                                    event.severity == EventSeverity::Critical ||
+                                    event.category == EventCategory::ThreatDetection);
+
+            // Prefer the Win32 handle (FILE_APPEND_DATA — atomic at OS level and
+            // bypasses C++ stream buffering). The parallel ofstream cannot be
+            // flushed to disk via FlushFileBuffers because std::ofstream owns its
+            // own CRT buffer that the Win32 API has no visibility into. Using the
+            // handle directly guarantees that what we just wrote is what gets
+            // committed by the subsequent FlushFileBuffers().
+            bool wroteViaHandle = false;
+            if (m_logFileHandle != INVALID_HANDLE_VALUE) {
+                DWORD bytesWritten = 0;
+                if (WriteFile(m_logFileHandle,
+                              logLine.data(),
+                              static_cast<DWORD>(logLine.size()),
+                              &bytesWritten,
+                              nullptr) &&
+                    bytesWritten == logLine.size()) {
+                    wroteViaHandle = true;
+                }
+            }
+            if (!wroteViaHandle) {
+                m_logFile << logLine;
+            }
             
             // Track sanitization
-            std::string unsanitized = StringUtils::ToNarrow(event.message);
             if (logLine.find("\\n") != std::string::npos || logLine.find("\\r") != std::string::npos) {
                 m_stats.sanitizationApplied.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1682,12 +2000,12 @@ public:
             size_t bytesWritten = logLine.size();
             m_currentLogFileSize.fetch_add(bytesWritten, std::memory_order_relaxed);
 
-            // Crash-safe flush for critical events
-            if (m_config.enableCrashSafeLogging && 
-                (event.priority == EventPriority::Critical || 
-                 event.severity == EventSeverity::Critical ||
-                 event.category == EventCategory::ThreatDetection)) {
-                m_logFile.flush();
+            // Crash-safe flush for critical events. Now meaningful because the
+            // write itself went through m_logFileHandle.
+            if (crashSafe) {
+                if (!wroteViaHandle) {
+                    m_logFile.flush();
+                }
                 if (m_logFileHandle != INVALID_HANDLE_VALUE) {
                     FlushFileBuffers(m_logFileHandle);
                 }
@@ -1712,36 +2030,124 @@ public:
             }
 
             std::string syslogMessage = FormatAsSyslog(event, m_config.syslog);
-            std::vector<uint8_t> postData(syslogMessage.begin(), syslogMessage.end());
+            std::vector<uint8_t> payload(syslogMessage.begin(), syslogMessage.end());
 
-            NetworkUtils::Error netErr;
-            
             if (m_config.syslog.useTCP) {
-                // Build URL: scheme://host:port
-                std::wstring scheme = m_config.syslog.useTLS ? L"https" : L"http";
-                std::wstring url = std::format(L"{}://{}:{}/",
-                    scheme, m_config.syslog.serverAddress, m_config.syslog.port);
-                
-                NetworkUtils::HttpRequestOptions opts;
-                opts.method = NetworkUtils::HttpMethod::POST;
-                opts.contentType = L"text/plain";
-                opts.timeoutMs = 5000;
-                opts.verifySSL = m_config.syslog.useTLS;
-                
-                std::vector<uint8_t> response;
-                if (NetworkUtils::HttpPost(url, postData, response, opts, &netErr)) {
-                    m_stats.syslogEventsForwarded.fetch_add(1, std::memory_order_relaxed);
+                // RFC 6587 §3.4.1 octet-counting framing: <length> SP <message>
+                // (RFC 5424 implies octet-counting is the preferred transport).
+                // Plain TCP — TLS for syslog over TCP requires an integrated
+                // Schannel session; we explicitly do NOT pretend HTTP/HTTPS is
+                // syslog (it was emitting Host: headers and a request line that
+                // no syslog receiver would parse).
+                if (m_config.syslog.useTLS) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"EventLogger: TCP syslog over TLS requested but not configured; "
+                        L"falling back to plaintext TCP for this transmission");
                 }
+                SendTcpSyslogFramed(m_config.syslog.serverAddress,
+                                    m_config.syslog.port,
+                                    payload);
             } else {
-                // UDP syslog (RFC 5426) - direct socket send
                 SendUdpDatagram(
                     m_config.syslog.serverAddress,
                     m_config.syslog.port,
-                    postData);
+                    payload);
             }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Syslog forward exception: %hs", e.what());
+        }
+    }
+
+    /**
+     * @brief Send an RFC 6587 octet-counted syslog frame over plaintext TCP.
+     *        Best-effort, bounded (configured cap), short connect/send timeouts.
+     */
+    void SendTcpSyslogFramed(
+        const std::wstring& host,
+        uint16_t port,
+        const std::vector<uint8_t>& data
+    ) noexcept {
+        try {
+            const size_t cap = m_config.maxTcpSyslogFrameBytes ? m_config.maxTcpSyslogFrameBytes : 65536;
+            const size_t bodyLen = std::min(data.size(), cap);
+
+            // Build "<len> <body>" frame (RFC 6587 §3.4.1)
+            std::string lenPrefix = std::to_string(bodyLen) + " ";
+            std::vector<char> frame;
+            frame.reserve(lenPrefix.size() + bodyLen);
+            frame.insert(frame.end(), lenPrefix.begin(), lenPrefix.end());
+            frame.insert(frame.end(),
+                         reinterpret_cast<const char*>(data.data()),
+                         reinterpret_cast<const char*>(data.data()) + bodyLen);
+
+            const std::string hostNarrow = StringUtils::ToNarrow(host);
+            const std::string portStr = std::to_string(port);
+
+            WSADATA wsaData{};
+            if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+                return;
+            }
+
+            struct addrinfo hints{}, *result = nullptr;
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+
+            if (getaddrinfo(hostNarrow.c_str(), portStr.c_str(), &hints, &result) != 0 || !result) {
+                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: TCP syslog DNS resolution failed for %ls", host.c_str());
+                WSACleanup();
+                return;
+            }
+
+            SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+            if (sock == INVALID_SOCKET) {
+                freeaddrinfo(result);
+                WSACleanup();
+                return;
+            }
+
+            const DWORD timeoutMs = 3000;
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                       reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+
+            if (connect(sock, result->ai_addr, static_cast<int>(result->ai_addrlen)) == SOCKET_ERROR) {
+                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: TCP syslog connect failed (WSA=%d) to %ls:%u",
+                            WSAGetLastError(), host.c_str(), static_cast<unsigned>(port));
+                closesocket(sock);
+                freeaddrinfo(result);
+                WSACleanup();
+                return;
+            }
+
+            // Send all bytes — handle partial sends.
+            size_t totalSent = 0;
+            while (totalSent < frame.size()) {
+                int n = send(sock,
+                             frame.data() + totalSent,
+                             static_cast<int>(frame.size() - totalSent),
+                             0);
+                if (n == SOCKET_ERROR || n == 0) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: TCP syslog send failed (WSA=%d)",
+                                WSAGetLastError());
+                    break;
+                }
+                totalSent += static_cast<size_t>(n);
+            }
+
+            if (totalSent == frame.size()) {
+                m_stats.syslogEventsForwarded.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            shutdown(sock, SD_SEND);
+            closesocket(sock);
+            freeaddrinfo(result);
+            WSACleanup();
+
+        } catch (...) {
+            // Never let transport errors propagate.
         }
     }
 
@@ -1752,9 +2158,12 @@ public:
         const std::vector<uint8_t>& data
     ) noexcept {
         try {
-            // Cap UDP datagram to RFC 5426 max (65535 - headers, practical max ~8192)
-            constexpr size_t MAX_UDP_SYSLOG = 8192;
-            size_t sendSize = std::min(data.size(), MAX_UDP_SYSLOG);
+            // Cap UDP datagram to RFC 5426 practical max. Configurable but never
+            // exceeds 65507 (max UDP payload). 8192 is the historical default.
+            constexpr size_t HARD_MAX_UDP_SYSLOG = 65507;
+            size_t configured = m_config.maxUdpSyslogBytes ? m_config.maxUdpSyslogBytes : 8192;
+            if (configured > HARD_MAX_UDP_SYSLOG) configured = HARD_MAX_UDP_SYSLOG;
+            size_t sendSize = std::min(data.size(), configured);
 
             std::string hostNarrow = StringUtils::ToNarrow(host);
             std::string portStr = std::to_string(port);
@@ -1829,28 +2238,20 @@ public:
                     return;
             }
 
-            // Prepare payload
-            std::vector<uint8_t> postData;
-            
-            if (m_config.siem.compressPayload) {
-                // Compress then send
-                std::vector<uint8_t> uncompressed(formattedEvent.begin(), formattedEvent.end());
-                if (!CompressionUtils::CompressBuffer(
-                        CompressionUtils::Algorithm::XpressHuff,
-                        uncompressed.data(),
-                        uncompressed.size(),
-                        postData)) {
-                    // Fall back to uncompressed
-                    postData = std::move(uncompressed);
-                }
-            } else {
-                postData.assign(formattedEvent.begin(), formattedEvent.end());
-            }
+            // Prepare payload.
+            // NOTE: We intentionally do NOT advertise Content-Encoding: deflate.
+            // The legacy code compressed with XpressHuff and labeled the payload
+            // "deflate" — that is a protocol lie that no standard SIEM ingester
+            // can transparently decompress. Compression for HTTPS to a SIEM is
+            // typically not worth the misframing risk, so we now always send
+            // the uncompressed payload over TLS and ignore the compressPayload
+            // flag at this transport. (Storage-tier compression remains.)
+            std::vector<uint8_t> postData(formattedEvent.begin(), formattedEvent.end());
 
             // Build SIEM URL
             std::wstring url = m_config.siem.endpoint;
             if (url.find(L"/api/") == std::wstring::npos) {
-                if (url.back() != L'/') url += L'/';
+                if (!url.empty() && url.back() != L'/') url += L'/';
                 url += L"api/v1/events";
             }
 
@@ -1862,19 +2263,18 @@ public:
             opts.timeoutMs = 10000;
             opts.verifySSL = true;
             
-            // Auth header
+            // Auth header — strip any CR/LF/control bytes from the API key to
+            // defeat HTTP header injection through configuration tampering.
             if (!m_config.siem.apiKey.empty()) {
-                NetworkUtils::HttpHeader authHeader;
-                authHeader.name = L"Authorization";
-                authHeader.value = L"Bearer " + m_config.siem.apiKey;
-                opts.headers.push_back(std::move(authHeader));
-            }
-            
-            if (m_config.siem.compressPayload) {
-                NetworkUtils::HttpHeader encodingHeader;
-                encodingHeader.name = L"Content-Encoding";
-                encodingHeader.value = L"deflate";
-                opts.headers.push_back(std::move(encodingHeader));
+                const std::wstring safeKey = StripHeaderUnsafe(m_config.siem.apiKey);
+                if (safeKey.empty()) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: SIEM apiKey contained only invalid header characters — skipping Authorization");
+                } else {
+                    NetworkUtils::HttpHeader authHeader;
+                    authHeader.name = L"Authorization";
+                    authHeader.value = L"Bearer " + safeKey;
+                    opts.headers.push_back(std::move(authHeader));
+                }
             }
 
             // Send
@@ -2015,76 +2415,157 @@ public:
 
     void CompressRotatedLog(const fs::path& logPath) {
         try {
-            // Read the log file
+            std::error_code ec;
+            const uintmax_t srcSize = fs::file_size(logPath, ec);
+            if (ec) return;
+
+            // Hard cap: refuse to in-memory compress files > 512 MiB. For
+            // larger files the safer behavior is to leave the log uncompressed
+            // (still readable, still rotated). This avoids OOM on endpoints
+            // that have accumulated huge logs in low-RAM scenarios.
+            constexpr uintmax_t kMaxCompressBytes = 512ULL * 1024 * 1024;
+            if (srcSize > kMaxCompressBytes) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"EventLogger: Rotated log %llu bytes exceeds in-memory compression cap; "
+                    L"leaving uncompressed", static_cast<unsigned long long>(srcSize));
+                return;
+            }
+
+            // Stream the file in (single read, bounded by cap).
             std::ifstream inFile(logPath, std::ios::binary);
             if (!inFile) return;
-            
-            std::vector<uint8_t> content(
-                (std::istreambuf_iterator<char>(inFile)),
-                std::istreambuf_iterator<char>()
-            );
+
+            std::vector<uint8_t> content;
+            content.reserve(static_cast<size_t>(srcSize));
+            constexpr size_t kChunk = 64 * 1024;
+            std::array<char, kChunk> buf{};
+            while (inFile) {
+                inFile.read(buf.data(), buf.size());
+                const std::streamsize got = inFile.gcount();
+                if (got > 0) {
+                    content.insert(content.end(),
+                                   reinterpret_cast<const uint8_t*>(buf.data()),
+                                   reinterpret_cast<const uint8_t*>(buf.data() + got));
+                }
+            }
             inFile.close();
-            
-            // Compress using infrastructure
+
             std::vector<uint8_t> compressed;
             if (CompressionUtils::CompressBuffer(
                     CompressionUtils::Algorithm::XpressHuff,
                     content.data(),
                     content.size(),
                     compressed)) {
-                
-                // Write compressed file
+
                 fs::path compressedPath = logPath;
                 compressedPath.replace_extension(L".log.xz");
-                
-                std::ofstream outFile(compressedPath, std::ios::binary);
-                outFile.write(reinterpret_cast<const char*>(compressed.data()), compressed.size());
-                outFile.close();
-                
-                // Secure delete original if configured
+
+                {
+                    std::ofstream outFile(compressedPath, std::ios::binary | std::ios::trunc);
+                    if (!outFile) {
+                        SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to open compressed output for rotated log");
+                        return;
+                    }
+                    outFile.write(reinterpret_cast<const char*>(compressed.data()),
+                                  static_cast<std::streamsize>(compressed.size()));
+                    outFile.flush();
+                }
+
                 if (m_config.secureDeleteRotatedLogs) {
                     SecureDeleteFile(logPath);
                 } else {
-                    fs::remove(logPath);
+                    fs::remove(logPath, ec);
                 }
-                
-                SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Compressed rotated log: %llu -> %llu bytes", 
-                    static_cast<unsigned long long>(content.size()), static_cast<unsigned long long>(compressed.size()));
+
+                SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Compressed rotated log: %llu -> %llu bytes",
+                    static_cast<unsigned long long>(content.size()),
+                    static_cast<unsigned long long>(compressed.size()));
             }
-            
+
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Log compression exception: %hs", e.what());
         }
     }
 
+    /**
+     * @brief Securely overwrite a file's contents (multi-pass) before unlinking.
+     *
+     * The previous implementation opened the stream with std::ios::trunc, which
+     * IMMEDIATELY truncates the file to zero bytes — the OS is then free to
+     * recycle the original allocation units before any overwrite is written.
+     * The fix is to open the underlying HANDLE without truncation, write zeros
+     * then random bytes over the EXACT byte range that the file currently
+     * occupies, FlushFileBuffers between passes, then delete. This guarantees
+     * the original sectors are physically overwritten on rotational media and
+     * forces a TRIM on SSDs as part of the subsequent delete.
+     *
+     * @note On SSDs with wear-leveling no purely-software approach can
+     *       guarantee the prior cell contents are unrecoverable. We document
+     *       this and rely on full-disk encryption / TRIM for that guarantee.
+     */
     void SecureDeleteFile(const fs::path& filePath) {
         try {
-            // Overwrite file content before deleting
-            auto fileSize = fs::file_size(filePath);
-            std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
-            
-            // Overwrite with zeros
-            std::vector<char> zeros(std::min(fileSize, static_cast<uintmax_t>(4096)), 0);
-            for (uintmax_t written = 0; written < fileSize; written += zeros.size()) {
-                file.write(zeros.data(), std::min(zeros.size(), static_cast<size_t>(fileSize - written)));
+            std::error_code ec;
+            const uintmax_t fileSize = fs::file_size(filePath, ec);
+            if (ec) {
+                return;
             }
-            
-            // Overwrite with random data
+            const std::wstring pathW = filePath.wstring();
+
+            HANDLE h = CreateFileW(
+                pathW.c_str(),
+                GENERIC_WRITE,
+                0,                         // no sharing during overwrite
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                fs::remove(filePath, ec);  // best-effort fallback
+                return;
+            }
+
+            constexpr size_t kBlock = 64 * 1024;
+            std::vector<uint8_t> blockBuf(kBlock, 0);
+            const uint32_t passes = (m_config.secureDeletePasses == 0)
+                                        ? 3u
+                                        : m_config.secureDeletePasses;
             std::random_device rd;
             std::mt19937 gen(rd());
-            std::uniform_int_distribution<> dis(0, 255);
-            for (auto& byte : zeros) {
-                byte = static_cast<char>(dis(gen));
+            std::uniform_int_distribution<int> dis(0, 255);
+
+            for (uint32_t pass = 0; pass < passes; ++pass) {
+                // Pattern selection: pass 0 = 0x00, last pass = random,
+                // intermediate passes = 0xFF (DOD 5220.22-M-inspired).
+                if (pass == passes - 1) {
+                    for (auto& b : blockBuf) b = static_cast<uint8_t>(dis(gen));
+                } else if (pass == 0) {
+                    std::fill(blockBuf.begin(), blockBuf.end(), uint8_t{0x00});
+                } else {
+                    std::fill(blockBuf.begin(), blockBuf.end(), uint8_t{0xFF});
+                }
+
+                // Rewind to start of file.
+                LARGE_INTEGER zero{};
+                if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) {
+                    break;
+                }
+
+                uintmax_t remaining = fileSize;
+                while (remaining > 0) {
+                    const DWORD chunk = static_cast<DWORD>(std::min<uintmax_t>(remaining, kBlock));
+                    DWORD written = 0;
+                    if (!WriteFile(h, blockBuf.data(), chunk, &written, nullptr) ||
+                        written != chunk) {
+                        break;
+                    }
+                    remaining -= written;
+                }
+                FlushFileBuffers(h);
             }
-            
-            file.seekp(0);
-            for (uintmax_t written = 0; written < fileSize; written += zeros.size()) {
-                file.write(zeros.data(), std::min(zeros.size(), static_cast<size_t>(fileSize - written)));
-            }
-            
-            file.close();
-            fs::remove(filePath);
-            
+
+            CloseHandle(h);
+            fs::remove(filePath, ec);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Secure delete exception: %hs", e.what());
             // Fall back to regular delete
@@ -2160,6 +2641,12 @@ public:
         std::vector<SecurityEvent> results;
 
         try {
+            // Enforce hard cap to prevent OOM on caller-supplied maxResults.
+            const uint32_t hardCap = m_config.maxQueryResults ? m_config.maxQueryResults : 100000;
+            if (maxResults == 0 || maxResults > hardCap) {
+                maxResults = hardCap;
+            }
+
             // Query from DB with proper LogDB QueryFilter
             auto& logDB = Database::LogDB::Instance();
             
@@ -2267,6 +2754,27 @@ public:
                     }
                 }
                 
+                // Category filter: LogDB collapses our EventCategory enum into a
+                // single LogCategory::Security row, but the original category
+                // string is preserved in the JSON metadata. When the caller
+                // requested a category, drop entries whose metadata-recorded
+                // category string disagrees. Events without a recoverable
+                // category string are conservatively kept (caller will see them
+                // with event.category = System(0)).
+                if (category.has_value() && !entry.metadata.empty()) {
+                    try {
+                        auto md = nlohmann::json::parse(StringUtils::ToNarrow(entry.metadata));
+                        if (md.contains("category")) {
+                            const std::string wanted = StringUtils::ToNarrow(CategoryToString(*category));
+                            if (md["category"].get<std::string>() != wanted) {
+                                continue;
+                            }
+                        }
+                    } catch (...) {
+                        // Best-effort: keep the event on parse failure.
+                    }
+                }
+
                 results.push_back(std::move(event));
             }
 
