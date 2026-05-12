@@ -295,7 +295,7 @@ struct alignas(64) ForensicEvent {
 struct alignas(32) SyslogConfig {
     std::wstring serverAddress;
     uint16_t port{ 514 };
-    bool useTLS{ false };
+    bool useTLS{ false };              // TCP TLS is fail-closed until RFC 5425 transport is implemented
     bool useTCP{ true };              // TCP vs UDP
     std::wstring facility;
     std::wstring appName{ L"ShadowStrike" };
