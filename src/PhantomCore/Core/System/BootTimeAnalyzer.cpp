@@ -151,6 +151,157 @@ namespace BootTimeAnalyzerConstants {
 static constexpr wchar_t LOG_CATEGORY[] = L"BootTimeAnalyzer";
 
 // ============================================================================
+// INTERNAL HELPERS (file-local linkage)
+// ============================================================================
+namespace {
+
+// Hard caps that bound attacker-influenced data (registry/WMI/COM strings).
+constexpr size_t  kMaxLogStringChars         = 512;     // wchar elements
+constexpr size_t  kMaxRegStringChars         = 4096;
+constexpr size_t  kMaxBcdIndicatorValueChars = 260;
+constexpr size_t  kMaxTaskFolderRecursion    = 32;
+constexpr size_t  kMaxWmiConsumersPerClass   = 256;
+constexpr ULONG   kWmiNextTimeoutMs          = 1000;
+constexpr ULONGLONG kMaxReasonableBootMs     = 10ULL * 60ULL * 1000ULL; // 10 minutes
+constexpr DWORD   kMaxDriverEnumGrowSlots    = 8192;
+constexpr uint64_t kMaxHashFileBytes         = 128ULL * 1024ULL * 1024ULL; // 128 MiB
+
+// Strip CR/LF/control chars and clamp length. Use on any attacker-controlled
+// wstring before passing to logger or persisting in audit fields.
+[[nodiscard]] inline std::wstring SanitizeForLog(std::wstring_view in,
+                                                 size_t maxChars = kMaxLogStringChars) noexcept {
+    std::wstring out;
+    try {
+        const size_t limit = std::min(in.size(), maxChars);
+        out.reserve(limit);
+        for (size_t i = 0; i < limit; ++i) {
+            wchar_t c = in[i];
+            if (c == L'\r' || c == L'\n' || c == L'\t') {
+                out.push_back(L' ');
+            } else if (c < 0x20 || c == 0x7F) {
+                out.push_back(L'?');
+            } else {
+                out.push_back(c);
+            }
+        }
+        if (in.size() > maxChars) {
+            out.append(L"...[truncated]");
+        }
+    } catch (...) {
+        out.clear();
+    }
+    return out;
+}
+
+// Reject names that would let an attacker escape a registry sub-key by way of
+// backslash/dot/colon/wildcard. Used before concatenating into registry paths.
+[[nodiscard]] inline bool IsSafeRegistryNameComponent(std::wstring_view name) noexcept {
+    if (name.empty() || name.size() > 255) return false;
+    for (wchar_t c : name) {
+        if (c < 0x20 || c == 0x7F) return false;
+        if (c == L'\\' || c == L'/' || c == L':' || c == L'*' ||
+            c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') {
+            return false;
+        }
+    }
+    // Refuse plain "." or ".." traversal tokens.
+    if (name == L"." || name == L"..") return false;
+    return true;
+}
+
+// Saturating add to avoid overflow when summing attacker-influenced 100ns ticks.
+[[nodiscard]] inline ULONGLONG SaturatingAddU64(ULONGLONG a, ULONGLONG b) noexcept {
+    return (b > (UINT64_MAX - a)) ? UINT64_MAX : (a + b);
+}
+
+// Saturating multiply for delay/duration heuristics.
+[[nodiscard]] inline uint32_t SaturatingMulU32(uint32_t a, uint32_t b, uint32_t cap) noexcept {
+    uint64_t r = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+    if (r > cap) r = cap;
+    return static_cast<uint32_t>(r);
+}
+
+// Validate caller-provided export paths. Refuses NUL embeds, abnormally long
+// paths, and obvious directory traversal.
+[[nodiscard]] inline bool IsSafeExportPath(const std::wstring& p) noexcept {
+    if (p.empty() || p.size() > 32767) return false; // MAX path limit per Win32 \\?\ prefix
+    for (wchar_t c : p) {
+        if (c == L'\0') return false;
+        if (c < 0x20) return false;
+    }
+    // Block .. as a path component for safety against unintended writes.
+    if (p.find(L"..\\") != std::wstring::npos ||
+        p.find(L"../") != std::wstring::npos) {
+        return false;
+    }
+    return true;
+}
+
+// Safely null-terminate a wide buffer that was written by RegQueryValueExW.
+// `byteSize` is the OUT size in bytes (as returned by RegQueryValueExW).
+// `cap` bounds the resulting string length. Returns a sanitized std::wstring.
+[[nodiscard]] inline std::wstring SafeWStringFromRegBytes(const BYTE* bytes,
+                                                          DWORD byteSize,
+                                                          size_t cap) noexcept {
+    if (!bytes || byteSize == 0) return L"";
+    DWORD chars = byteSize / static_cast<DWORD>(sizeof(wchar_t));
+    if (chars == 0) return L"";
+    if (chars > cap) chars = static_cast<DWORD>(cap);
+    std::wstring out;
+    try {
+        out.reserve(chars);
+        // Reinterpret the byte buffer one wchar at a time using memcpy to
+        // avoid strict-aliasing UB.
+        for (DWORD i = 0; i < chars; ++i) {
+            wchar_t wc = 0;
+            std::memcpy(&wc, bytes + i * sizeof(wchar_t), sizeof(wchar_t));
+            if (wc == L'\0') break;
+            // Strip CR/LF/control characters defensively.
+            if (wc == L'\r' || wc == L'\n' || wc == L'\t') {
+                out.push_back(L' ');
+            } else if (wc < 0x20 || wc == 0x7F) {
+                out.push_back(L'?');
+            } else {
+                out.push_back(wc);
+            }
+        }
+    } catch (...) {
+        return L"";
+    }
+    return out;
+}
+
+// RAII helper for BSTR.
+struct ScopedBstr {
+    BSTR b{ nullptr };
+    ScopedBstr() = default;
+    ~ScopedBstr() { if (b) ::SysFreeString(b); }
+    ScopedBstr(const ScopedBstr&) = delete;
+    ScopedBstr& operator=(const ScopedBstr&) = delete;
+    BSTR* operator&() noexcept { return &b; }
+    operator BSTR() const noexcept { return b; }
+    [[nodiscard]] std::wstring ToWString() const {
+        return b ? std::wstring(b, ::SysStringLen(b)) : std::wstring();
+    }
+};
+
+// RAII helper for VARIANT.
+struct ScopedVariant {
+    VARIANT v{};
+    ScopedVariant() noexcept { ::VariantInit(&v); }
+    ~ScopedVariant() { ::VariantClear(&v); }
+    ScopedVariant(const ScopedVariant&) = delete;
+    ScopedVariant& operator=(const ScopedVariant&) = delete;
+    VARIANT* operator&() noexcept { return &v; }
+    [[nodiscard]] bool IsBstr() const noexcept { return v.vt == VT_BSTR && v.bstrVal != nullptr; }
+    [[nodiscard]] std::wstring ToWString() const {
+        return IsBstr() ? std::wstring(v.bstrVal, ::SysStringLen(v.bstrVal)) : std::wstring();
+    }
+};
+
+} // anonymous namespace
+
+// ============================================================================
 // STATISTICS METHODS
 // ============================================================================
 
@@ -216,6 +367,10 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
     KernelBootData m_kernelBootData;
     mutable std::shared_mutex m_kernelDataMutex;
 
+    // RegistryMonitor event-callback ID for BCD change observation.
+    // Stored so Shutdown can deregister and avoid clobbering global policy.
+    uint64_t m_bcdCallbackId{ 0 };
+
     BootTimeAnalyzerImpl() = default;
     
     // ========================================================================
@@ -252,15 +407,54 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
 
     std::chrono::system_clock::time_point GetLastBootTime() const {
         try {
-            // Method 1: Use GetTickCount64 to calculate boot time from current time
+            // Correlate monotonic uptime with the wall clock. GetTickCount64()
+            // is unbiased by NTP changes after boot. We treat the returned
+            // tickCount as ms-since-boot and back-calculate the wall-time
+            // boot instant. Cap at a sane upper bound to defeat absurd
+            // tampered counters (kept here as a safety net against drivers
+            // that hook QueryPerformanceCounter / GetTickCount64).
             ULONGLONG tickCount = GetTickCount64();
-            auto bootTime = std::chrono::system_clock::now() -
-                           std::chrono::milliseconds(tickCount);
-            return bootTime;
+            // Clamp tickCount to a century in milliseconds; nothing larger
+            // is a real Windows uptime.
+            constexpr ULONGLONG kCenturyMs = 100ULL * 365ULL * 24ULL * 3600ULL * 1000ULL;
+            if (tickCount > kCenturyMs) {
+                tickCount = kCenturyMs;
+            }
+            auto now = std::chrono::system_clock::now();
+            return now - std::chrono::milliseconds(static_cast<int64_t>(tickCount));
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"BootTimeAnalyzer: Failed to get boot time - %hs", e.what());
             return std::chrono::system_clock::now();
         }
+    }
+
+    // Returns true iff the registry value is REG_QWORD/REG_DWORD and the
+    // 100-nanosecond timestamp could be read.
+    [[nodiscard]] static bool ReadRegHundredNsCounter(HKEY hKey,
+                                                      LPCWSTR name,
+                                                      ULONGLONG& outValue) noexcept {
+        outValue = 0;
+        DWORD type = 0;
+        // Try QWORD first (Windows usually stores these as 64-bit).
+        ULONGLONG q = 0;
+        DWORD size = sizeof(q);
+        LONG lr = RegQueryValueExW(hKey, name, nullptr, &type,
+                                   reinterpret_cast<LPBYTE>(&q), &size);
+        if (lr == ERROR_SUCCESS && size == sizeof(q) && type == REG_QWORD) {
+            outValue = q;
+            return true;
+        }
+        // Fall back to DWORD.
+        DWORD d = 0;
+        size = sizeof(d);
+        type = 0;
+        lr = RegQueryValueExW(hKey, name, nullptr, &type,
+                              reinterpret_cast<LPBYTE>(&d), &size);
+        if (lr == ERROR_SUCCESS && size == sizeof(d) && type == REG_DWORD) {
+            outValue = static_cast<ULONGLONG>(d);
+            return true;
+        }
+        return false;
     }
 
     /// @brief Get actual boot duration from Windows performance data
@@ -269,63 +463,50 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
         try {
             // Method 1: Query boot performance data from registry
             // Windows stores boot timing in: HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power
-            HKEY hKey;
+            HKEY hKey = nullptr;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                              L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
                              0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                
-                // Try to read FwPOSTTime (firmware/UEFI time in 100ns units)
-                ULONGLONG fwPostTime = 0;
-                DWORD size = sizeof(fwPostTime);
-                DWORD type = 0;
-                
-                if (RegQueryValueExW(hKey, L"FwPOSTTime", nullptr, &type,
-                                    reinterpret_cast<LPBYTE>(&fwPostTime), &size) == ERROR_SUCCESS) {
-                    // FwPOSTTime is in 100-nanosecond intervals
-                    // Convert to milliseconds
-                    ULONGLONG fwPostMs = fwPostTime / 10000;
-                    
-                    // Also try to get BootPOSTTime for additional accuracy
-                    ULONGLONG bootPostTime = 0;
-                    size = sizeof(bootPostTime);
-                    if (RegQueryValueExW(hKey, L"BootPostTime", nullptr, &type,
-                                        reinterpret_cast<LPBYTE>(&bootPostTime), &size) == ERROR_SUCCESS) {
-                        // Combine firmware and OS boot times
-                        RegCloseKey(hKey);
-                        return std::chrono::milliseconds(fwPostMs + (bootPostTime / 10000));
-                    }
-                    
-                    RegCloseKey(hKey);
-                    return std::chrono::milliseconds(fwPostMs);
-                }
-                
+
+                ULONGLONG fwPostTime = 0;       // 100ns
+                ULONGLONG bootPostTime = 0;     // 100ns
+                bool haveFw   = ReadRegHundredNsCounter(hKey, L"FwPOSTTime",   fwPostTime);
+                bool haveBoot = ReadRegHundredNsCounter(hKey, L"BootPOSTTime", bootPostTime);
                 RegCloseKey(hKey);
+
+                if (haveFw || haveBoot) {
+                    // Cap each component at 30 minutes (100ns ticks).
+                    constexpr ULONGLONG kHundredNsPer30Min = 30ULL * 60ULL * 10000000ULL;
+                    if (fwPostTime   > kHundredNsPer30Min) fwPostTime   = kHundredNsPer30Min;
+                    if (bootPostTime > kHundredNsPer30Min) bootPostTime = kHundredNsPer30Min;
+                    ULONGLONG totalMs = SaturatingAddU64(fwPostTime / 10000ULL,
+                                                        bootPostTime / 10000ULL);
+                    if (totalMs > kMaxReasonableBootMs) {
+                        totalMs = kMaxReasonableBootMs;
+                    }
+                    if (totalMs > 0) {
+                        return std::chrono::milliseconds(static_cast<int64_t>(totalMs));
+                    }
+                }
             }
-            
-            // Method 2: Fallback - Query from WMI Win32_PerfFormattedData_PerfOS_System
-            // SystemUpTime counter gives uptime, but we need boot duration
-            // For now, estimate from typical boot phases if performance data unavailable
-            
-            // Method 3: Use Event Log to find boot complete event
-            // Event ID 12 (System) = Kernel boot start
-            // Event ID 6005 (EventLog) = Event log service started
-            
-            // Fallback: Return a reasonable estimate based on system analysis
-            // This is NOT the same as uptime - we estimate actual boot duration
+
+            // Method 2/3: Fallback estimate from phase analysis
             auto phases = AnalyzeBootPhases();
-            std::chrono::milliseconds totalDuration{0};
+            ULONGLONG totalMs = 0;
             for (const auto& phase : phases) {
-                totalDuration += phase.duration;
+                int64_t d = phase.duration.count();
+                if (d > 0) {
+                    totalMs = SaturatingAddU64(totalMs, static_cast<ULONGLONG>(d));
+                }
             }
-            
-            // If we got real data from phases, return it
-            if (totalDuration.count() > 0) {
-                return totalDuration;
+            if (totalMs > kMaxReasonableBootMs) totalMs = kMaxReasonableBootMs;
+            if (totalMs > 0) {
+                return std::chrono::milliseconds(static_cast<int64_t>(totalMs));
             }
-            
-            // Ultimate fallback: estimate 30 seconds typical boot
+
+            // Ultimate fallback: 30s typical boot
             return std::chrono::milliseconds(30000);
-            
+
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"BootTimeAnalyzer: Failed to get total boot time - %hs", e.what());
             return std::chrono::milliseconds(0);
@@ -353,31 +534,25 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                              L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
                              0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                
-                DWORD size = sizeof(fwPostTime);
-                DWORD type = 0;
-                
-                // Firmware/UEFI time
-                RegQueryValueExW(hKey, L"FwPOSTTime", nullptr, &type,
-                                reinterpret_cast<LPBYTE>(&fwPostTime), &size);
-                
-                // Boot driver initialization time
-                size = sizeof(bootDriverTime);
-                RegQueryValueExW(hKey, L"BootDriverInitTime", nullptr, &type,
-                                reinterpret_cast<LPBYTE>(&bootDriverTime), &size);
-                
-                // System driver initialization time
-                size = sizeof(systemDriverTime);
-                RegQueryValueExW(hKey, L"SystemDriverInitTime", nullptr, &type,
-                                reinterpret_cast<LPBYTE>(&systemDriverTime), &size);
-                
+
+                (void)ReadRegHundredNsCounter(hKey, L"FwPOSTTime",          fwPostTime);
+                (void)ReadRegHundredNsCounter(hKey, L"BootDriverInitTime", bootDriverTime);
+                (void)ReadRegHundredNsCounter(hKey, L"SystemDriverInitTime", systemDriverTime);
+
                 RegCloseKey(hKey);
             }
-            
-            // Convert from 100ns to milliseconds, with fallback defaults
-            auto uefiMs = fwPostTime > 0 ? static_cast<int64_t>(fwPostTime / 10000) : 2000LL;
-            auto bootDriverMs = bootDriverTime > 0 ? static_cast<int64_t>(bootDriverTime / 10000) : 500LL;
-            auto systemDriverMs = systemDriverTime > 0 ? static_cast<int64_t>(systemDriverTime / 10000) : 3000LL;
+
+            // Convert from 100ns ticks to ms, clamping each value to defeat
+            // malicious or corrupt registry data.
+            auto clampMs = [](ULONGLONG ticks100ns, int64_t fallback) -> int64_t {
+                if (ticks100ns == 0) return fallback;
+                ULONGLONG ms = ticks100ns / 10000ULL;
+                if (ms > kMaxReasonableBootMs) ms = kMaxReasonableBootMs;
+                return static_cast<int64_t>(ms);
+            };
+            auto uefiMs         = clampMs(fwPostTime,        2000LL);
+            auto bootDriverMs   = clampMs(bootDriverTime,     500LL);
+            auto systemDriverMs = clampMs(systemDriverTime,  3000LL);
 
             // Phase 1: UEFI/BIOS
             BootPhaseMetric uefiPhase;
@@ -494,18 +669,34 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             std::unordered_map<std::wstring, ELAMDriverStatus> elamClassifications;
             LoadELAMClassifications(elamClassifications);
             
-            // Heap-allocate driver buffer to avoid large stack allocation
-            constexpr DWORD maxDriverSlots = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_DRIVERS_ENUMERATED);
-            auto driversBuffer = std::make_unique<LPVOID[]>(maxDriverSlots);
+            // Heap-allocate driver buffer, growing once if the system has more
+            // drivers than our initial cap.
+            DWORD slots = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_DRIVERS_ENUMERATED);
+            auto driversBuffer = std::make_unique<LPVOID[]>(slots);
             DWORD cbNeeded = 0;
 
-            if (EnumDeviceDrivers(driversBuffer.get(),
-                                  maxDriverSlots * sizeof(LPVOID), &cbNeeded)) {
+            BOOL enumOk = EnumDeviceDrivers(driversBuffer.get(),
+                                            slots * sizeof(LPVOID), &cbNeeded);
+            if (enumOk && cbNeeded == slots * sizeof(LPVOID)) {
+                // Possibly truncated. Try once with a larger buffer.
+                DWORD grow = std::min<DWORD>(kMaxDriverEnumGrowSlots, slots * 4);
+                auto bigger = std::make_unique<LPVOID[]>(grow);
+                DWORD cbNeeded2 = 0;
+                if (EnumDeviceDrivers(bigger.get(), grow * sizeof(LPVOID), &cbNeeded2)) {
+                    if (cbNeeded2 > cbNeeded) {
+                        driversBuffer = std::move(bigger);
+                        slots = grow;
+                        cbNeeded = cbNeeded2;
+                    }
+                }
+            }
+
+            if (enumOk) {
                 DWORD numDrivers = cbNeeded / sizeof(LPVOID);
-                if (numDrivers > maxDriverSlots) {
-                    numDrivers = maxDriverSlots;
-                    SS_LOG_WARN(LOG_CATEGORY, L"Driver enumeration capped at %u (system has more)",
-                               maxDriverSlots);
+                if (numDrivers > slots) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Driver enumeration capped at %lu (system has %lu)",
+                               slots, numDrivers);
+                    numDrivers = slots;
                 }
 
                 for (DWORD i = 0; i < numDrivers; i++) {
@@ -520,50 +711,66 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                     wchar_t driverPath[MAX_PATH]{};
                     if (GetDeviceDriverFileNameW(driversBuffer[i], driverPath, MAX_PATH)) {
                         std::wstring fullPath = driverPath;
-                        // Convert \SystemRoot\ to actual path
-                        if (fullPath.find(L"\\SystemRoot\\") == 0) {
+                        // Convert "\SystemRoot\" prefix to actual Windows directory.
+                        constexpr std::wstring_view kSysRoot = L"\\SystemRoot\\";
+                        if (fullPath.compare(0, kSysRoot.size(), kSysRoot.data(),
+                                             kSysRoot.size()) == 0) {
                             wchar_t windowsDir[MAX_PATH]{};
-                            if (GetWindowsDirectoryW(windowsDir, MAX_PATH)) {
-                                fullPath = std::wstring(windowsDir) + fullPath.substr(11);
+                            UINT n = GetWindowsDirectoryW(windowsDir, MAX_PATH);
+                            if (n > 0 && n < MAX_PATH) {
+                                std::wstring win = windowsDir;
+                                if (!win.empty() && win.back() != L'\\') win.push_back(L'\\');
+                                fullPath = win + fullPath.substr(kSysRoot.size());
                             }
                         }
                         driver.driverPath = std::move(fullPath);
                     }
 
-                    // Query actual driver load timing from registry
-                    HKEY hKey;
-                    std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" + 
-                                           std::wstring(driverName);
-                    
+                    // Default values
                     driver.initDuration = std::chrono::microseconds(50000);  // 50ms default
                     driver.loadOrder = i;
                     driver.isCritical = false;
                     driver.delayedBoot = false;
-                    
-                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                        DWORD startType = 0;
-                        DWORD size = sizeof(startType);
-                        
-                        if (RegQueryValueExW(hKey, L"Start", nullptr, nullptr,
-                                           reinterpret_cast<LPBYTE>(&startType), &size) == ERROR_SUCCESS) {
-                            // SERVICE_BOOT_START = 0, SERVICE_SYSTEM_START = 1
-                            driver.isCritical = (startType == 0 || startType == 1);
-                            driver.delayedBoot = (startType > 2);
+
+                    // Only consult the per-driver registry key when the driver
+                    // name is a safe single component (no traversal).
+                    if (IsSafeRegistryNameComponent(driver.driverName)) {
+                        HKEY hKey = nullptr;
+                        std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" +
+                                               driver.driverName;
+
+                        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0,
+                                          KEY_READ, &hKey) == ERROR_SUCCESS) {
+                            DWORD startType = 0;
+                            DWORD size = sizeof(startType);
+                            DWORD type = 0;
+                            if (RegQueryValueExW(hKey, L"Start", nullptr, &type,
+                                                reinterpret_cast<LPBYTE>(&startType), &size) == ERROR_SUCCESS &&
+                                type == REG_DWORD && size == sizeof(startType)) {
+                                driver.isCritical = (startType == 0 || startType == 1);
+                                driver.delayedBoot = (startType > 2);
+                            }
+
+                            DWORD loadTime = 0;
+                            size = sizeof(loadTime);
+                            type = 0;
+                            if (RegQueryValueExW(hKey, L"LoadTime", nullptr, &type,
+                                                reinterpret_cast<LPBYTE>(&loadTime), &size) == ERROR_SUCCESS &&
+                                type == REG_DWORD && size == sizeof(loadTime)) {
+                                // Cap at 60s of microseconds to defeat tampered values.
+                                if (loadTime > 60ULL * 1000ULL * 1000ULL) {
+                                    loadTime = 60U * 1000U * 1000U;
+                                }
+                                driver.initDuration = std::chrono::microseconds(loadTime);
+                            }
+
+                            RegCloseKey(hKey);
                         }
-                        
-                        DWORD loadTime = 0;
-                        size = sizeof(loadTime);
-                        if (RegQueryValueExW(hKey, L"LoadTime", nullptr, nullptr,
-                                           reinterpret_cast<LPBYTE>(&loadTime), &size) == ERROR_SUCCESS) {
-                            driver.initDuration = std::chrono::microseconds(loadTime);
-                        }
-                        
-                        RegCloseKey(hKey);
                     }
-                    
+
                     // Check ELAM classification using infrastructure
                     std::wstring lowerName = Utils::StringUtils::ToLowerCopy(driver.driverName);
-                        
+
                     auto elamIt = elamClassifications.find(lowerName);
                     if (elamIt != elamClassifications.end()) {
                         driver.elamStatus = elamIt->second;
@@ -602,27 +809,34 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                 DWORD index = 0;
                 wchar_t driverName[256];
                 DWORD driverNameSize;
-                
+
                 while (true) {
                     driverNameSize = _countof(driverName);
-                    LONG result = RegEnumKeyExW(hKey, index++, driverName, &driverNameSize,
+                    LONG result = RegEnumKeyExW(hKey, index, driverName, &driverNameSize,
                                                nullptr, nullptr, nullptr, nullptr);
-                    
+
                     if (result == ERROR_NO_MORE_ITEMS) break;
-                    if (result != ERROR_SUCCESS) continue;
-                    
+                    if (result != ERROR_SUCCESS) {
+                        // Stop on hard errors instead of silently skipping into an
+                        // infinite loop or producing wrong indices.
+                        break;
+                    }
+                    ++index;
+
                     // Open driver subkey to get classification
                     HKEY hDriverKey;
                     if (RegOpenKeyExW(hKey, driverName, 0, KEY_READ, &hDriverKey) == ERROR_SUCCESS) {
                         DWORD classification = 0;
                         DWORD size = sizeof(classification);
-                        
-                        if (RegQueryValueExW(hDriverKey, L"Classification", nullptr, nullptr,
-                                            reinterpret_cast<LPBYTE>(&classification), &size) == ERROR_SUCCESS) {
-                            
+                        DWORD vtype = 0;
+
+                        if (RegQueryValueExW(hDriverKey, L"Classification", nullptr, &vtype,
+                                            reinterpret_cast<LPBYTE>(&classification), &size) == ERROR_SUCCESS &&
+                            vtype == REG_DWORD && size == sizeof(classification)) {
+
                             std::wstring lowerName = Utils::StringUtils::ToLowerCopy(
                                 std::wstring_view(driverName, driverNameSize));
-                            
+
                             // ELAM classifications: 0=Unknown, 1=Good, 2=Bad, 3=BadButRequired
                             switch (classification) {
                                 case 1: classifications[lowerName] = ELAMDriverStatus::Good; break;
@@ -631,7 +845,7 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                                 default: classifications[lowerName] = ELAMDriverStatus::Unknown_; break;
                             }
                         }
-                        
+
                         RegCloseKey(hDriverKey);
                     }
                 }
@@ -694,27 +908,38 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                                         config->dwStartType == SERVICE_SYSTEM_START) {
 
                                         ServiceBootMetric svc;
-                                        svc.serviceName = serviceStatus[i].lpServiceName;
-                                        svc.displayName = serviceStatus[i].lpDisplayName;
-                                        
-                                        // Query actual service timing from registry performance data
-                                        // Services store timing in their registry key
-                                        HKEY hKey;
-                                        std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" + 
-                                                               svc.serviceName;
-                                        
-                                        svc.startDuration = std::chrono::milliseconds(200);  // Default estimate
-                                        svc.delayFromBoot = std::chrono::milliseconds(5000 + (autoStartIndex * 100));
-                                        
-                                        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                                            // Try to read performance timing
-                                            DWORD startTicks = 0;
-                                            DWORD size = sizeof(startTicks);
-                                            if (RegQueryValueExW(hKey, L"StartTime", nullptr, nullptr,
-                                                               reinterpret_cast<LPBYTE>(&startTicks), &size) == ERROR_SUCCESS) {
-                                                svc.startDuration = std::chrono::milliseconds(startTicks);
+                                        svc.serviceName = serviceStatus[i].lpServiceName ?
+                                                          serviceStatus[i].lpServiceName : L"";
+                                        svc.displayName = serviceStatus[i].lpDisplayName ?
+                                                          serviceStatus[i].lpDisplayName : L"";
+
+                                        // Defaults; delay saturates so a very long auto-start
+                                        // list cannot overflow our 32-bit ms estimate.
+                                        svc.startDuration = std::chrono::milliseconds(200);
+                                        svc.delayFromBoot = std::chrono::milliseconds(
+                                            5000U + SaturatingMulU32(autoStartIndex, 100U, 5U * 60U * 1000U));
+
+                                        // Only read the per-service registry key if the
+                                        // service name is a safe single component.
+                                        if (IsSafeRegistryNameComponent(svc.serviceName)) {
+                                            HKEY hKey = nullptr;
+                                            std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" +
+                                                                   svc.serviceName;
+
+                                            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0,
+                                                              KEY_READ, &hKey) == ERROR_SUCCESS) {
+                                                DWORD startTicks = 0;
+                                                DWORD size = sizeof(startTicks);
+                                                DWORD vtype = 0;
+                                                if (RegQueryValueExW(hKey, L"StartTime", nullptr, &vtype,
+                                                                    reinterpret_cast<LPBYTE>(&startTicks), &size) == ERROR_SUCCESS &&
+                                                    vtype == REG_DWORD && size == sizeof(startTicks)) {
+                                                    // Clamp to one minute to defeat tampered values.
+                                                    if (startTicks > 60U * 1000U) startTicks = 60U * 1000U;
+                                                    svc.startDuration = std::chrono::milliseconds(startTicks);
+                                                }
+                                                RegCloseKey(hKey);
                                             }
-                                            RegCloseKey(hKey);
                                         }
                                         
                                         // Check for delayed auto-start
@@ -854,8 +1079,13 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                         if (app.appPath.empty()) continue;  // Skip invalid entries
                         
                         app.launchType = type;
-                        app.delayFromLogon = std::chrono::milliseconds(1000 + (index * 500));
-                        app.loadDuration = std::chrono::milliseconds(500 + (index * 200));
+                        // Saturating heuristics keep delay estimates within
+                        // 10 minutes regardless of how many entries are present.
+                        const uint32_t idxU32 = static_cast<uint32_t>(index);
+                        app.delayFromLogon = std::chrono::milliseconds(
+                            1000U + SaturatingMulU32(idxU32, 500U, 10U * 60U * 1000U));
+                        app.loadDuration = std::chrono::milliseconds(
+                            500U + SaturatingMulU32(idxU32, 200U, 10U * 60U * 1000U));
                         app.isEssential = false;
                         
                         // Calculate impact score based on actual characteristics
@@ -1076,170 +1306,170 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             hr = pService->GetFolder(_bstr_t(L"\\"), &pRootFolder);
             if (SUCCEEDED(hr) && pRootFolder) {
                 // Enumerate all tasks in root folder
-                EnumerateTaskFolder(pRootFolder, items);
+                EnumerateTaskFolder(pRootFolder, items, 0);
                 pRootFolder->Release();
             }
-            
+
             pService->Release();
-            
+
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"BootTimeAnalyzer: Scheduled task enumeration failed - %hs", e.what());
         }
     }
-    
-    void EnumerateTaskFolder(ITaskFolder* pFolder, std::vector<StartupItem>& items) const {
+
+    void EnumerateTaskFolder(ITaskFolder* pFolder, std::vector<StartupItem>& items,
+                             size_t depth) const {
         if (!pFolder) return;
-        
+        if (depth > kMaxTaskFolderRecursion) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Task folder recursion depth exceeded — stopping");
+            return;
+        }
+
         try {
             // Get tasks in this folder
             IRegisteredTaskCollection* pTasks = nullptr;
             HRESULT hr = pFolder->GetTasks(TASK_ENUM_HIDDEN, &pTasks);
-            
+
             if (SUCCEEDED(hr) && pTasks) {
                 LONG taskCount = 0;
-                pTasks->get_Count(&taskCount);
-                
-                for (LONG i = 1; i <= taskCount; ++i) {
-                    IRegisteredTask* pTask = nullptr;
-                    hr = pTasks->get_Item(_variant_t(i), &pTask);
-                    
-                    if (SUCCEEDED(hr) && pTask) {
-                        ProcessScheduledTask(pTask, items);
-                        pTask->Release();
+                if (SUCCEEDED(pTasks->get_Count(&taskCount)) && taskCount > 0) {
+                    for (LONG i = 1; i <= taskCount; ++i) {
+                        IRegisteredTask* pTask = nullptr;
+                        hr = pTasks->get_Item(_variant_t(i), &pTask);
+
+                        if (SUCCEEDED(hr) && pTask) {
+                            ProcessScheduledTask(pTask, items);
+                            pTask->Release();
+                        }
                     }
                 }
-                
                 pTasks->Release();
             }
-            
+
             // Recursively enumerate subfolders
             ITaskFolderCollection* pSubFolders = nullptr;
             hr = pFolder->GetFolders(0, &pSubFolders);
-            
+
             if (SUCCEEDED(hr) && pSubFolders) {
                 LONG folderCount = 0;
-                pSubFolders->get_Count(&folderCount);
-                
-                for (LONG i = 1; i <= folderCount; ++i) {
-                    ITaskFolder* pSubFolder = nullptr;
-                    hr = pSubFolders->get_Item(_variant_t(i), &pSubFolder);
-                    
-                    if (SUCCEEDED(hr) && pSubFolder) {
-                        EnumerateTaskFolder(pSubFolder, items);
-                        pSubFolder->Release();
+                if (SUCCEEDED(pSubFolders->get_Count(&folderCount)) && folderCount > 0) {
+                    for (LONG i = 1; i <= folderCount; ++i) {
+                        ITaskFolder* pSubFolder = nullptr;
+                        hr = pSubFolders->get_Item(_variant_t(i), &pSubFolder);
+
+                        if (SUCCEEDED(hr) && pSubFolder) {
+                            EnumerateTaskFolder(pSubFolder, items, depth + 1);
+                            pSubFolder->Release();
+                        }
                     }
                 }
-                
                 pSubFolders->Release();
             }
-            
+
         } catch (...) {
             // Ignore errors in task enumeration
         }
     }
-    
+
     void ProcessScheduledTask(IRegisteredTask* pTask, std::vector<StartupItem>& items) const {
         if (!pTask) return;
-        
+
         try {
             // Get task definition
             ITaskDefinition* pDef = nullptr;
             HRESULT hr = pTask->get_Definition(&pDef);
             if (FAILED(hr) || !pDef) return;
-            
+
             // Check if task has boot/logon triggers
             ITriggerCollection* pTriggers = nullptr;
             hr = pDef->get_Triggers(&pTriggers);
-            
+
             bool isBootOrLogonTask = false;
-            
+
             if (SUCCEEDED(hr) && pTriggers) {
                 LONG triggerCount = 0;
-                pTriggers->get_Count(&triggerCount);
-                
-                for (LONG i = 1; i <= triggerCount; ++i) {
-                    ITrigger* pTrigger = nullptr;
-                    hr = pTriggers->get_Item(i, &pTrigger);
-                    
-                    if (SUCCEEDED(hr) && pTrigger) {
-                        TASK_TRIGGER_TYPE2 triggerType;
-                        pTrigger->get_Type(&triggerType);
-                        
-                        if (triggerType == TASK_TRIGGER_BOOT || 
-                            triggerType == TASK_TRIGGER_LOGON) {
-                            isBootOrLogonTask = true;
+                if (SUCCEEDED(pTriggers->get_Count(&triggerCount)) && triggerCount > 0) {
+                    for (LONG i = 1; i <= triggerCount; ++i) {
+                        ITrigger* pTrigger = nullptr;
+                        hr = pTriggers->get_Item(i, &pTrigger);
+
+                        if (SUCCEEDED(hr) && pTrigger) {
+                            TASK_TRIGGER_TYPE2 triggerType = TASK_TRIGGER_EVENT;
+                            if (SUCCEEDED(pTrigger->get_Type(&triggerType))) {
+                                if (triggerType == TASK_TRIGGER_BOOT ||
+                                    triggerType == TASK_TRIGGER_LOGON) {
+                                    isBootOrLogonTask = true;
+                                }
+                            }
+                            pTrigger->Release();
                         }
-                        
-                        pTrigger->Release();
+
+                        if (isBootOrLogonTask) break;
                     }
-                    
-                    if (isBootOrLogonTask) break;
                 }
-                
                 pTriggers->Release();
             }
-            
+
             // Only include boot/logon tasks
             if (isBootOrLogonTask) {
-                BSTR bstrName = nullptr;
+                ScopedBstr bstrName;
                 pTask->get_Name(&bstrName);
-                
-                BSTR bstrPath = nullptr;
+
+                ScopedBstr bstrPath;
                 pTask->get_Path(&bstrPath);
-                
+
                 // Get actions (executable path)
                 IActionCollection* pActions = nullptr;
                 hr = pDef->get_Actions(&pActions);
-                
+
                 std::wstring execPath;
                 if (SUCCEEDED(hr) && pActions) {
                     IAction* pAction = nullptr;
                     hr = pActions->get_Item(1, &pAction);
-                    
+
                     if (SUCCEEDED(hr) && pAction) {
-                        TASK_ACTION_TYPE actionType;
-                        pAction->get_Type(&actionType);
-                        
-                        if (actionType == TASK_ACTION_EXEC) {
+                        TASK_ACTION_TYPE actionType = TASK_ACTION_EXEC;
+                        if (SUCCEEDED(pAction->get_Type(&actionType)) &&
+                            actionType == TASK_ACTION_EXEC) {
                             IExecAction* pExecAction = nullptr;
-                            hr = pAction->QueryInterface(IID_IExecAction, 
+                            hr = pAction->QueryInterface(IID_IExecAction,
                                                         reinterpret_cast<void**>(&pExecAction));
                             if (SUCCEEDED(hr) && pExecAction) {
-                                BSTR bstrExecPath = nullptr;
-                                pExecAction->get_Path(&bstrExecPath);
-                                if (bstrExecPath) {
-                                    execPath = bstrExecPath;
-                                    SysFreeString(bstrExecPath);
+                                ScopedBstr bstrExecPath;
+                                if (SUCCEEDED(pExecAction->get_Path(&bstrExecPath)) &&
+                                    bstrExecPath) {
+                                    execPath = SanitizeForLog(bstrExecPath.ToWString(),
+                                                              kMaxRegStringChars);
                                 }
                                 pExecAction->Release();
                             }
                         }
-                        
+
                         pAction->Release();
                     }
-                    
+
                     pActions->Release();
                 }
-                
+
                 // Create startup item
                 StartupItem item;
-                item.name = bstrName ? bstrName : L"Unknown Task";
+                item.name = bstrName.b ? SanitizeForLog(bstrName.ToWString())
+                                       : std::wstring(L"Unknown Task");
                 item.path = execPath;
                 item.commandLine = execPath;
-                item.registryLocation = bstrPath ? bstrPath : L"Task Scheduler";
+                item.registryLocation = bstrPath.b ? SanitizeForLog(bstrPath.ToWString(),
+                                                                    kMaxRegStringChars)
+                                                  : std::wstring(L"Task Scheduler");
                 item.type = StartupItemType::ScheduledTask;
                 item.isEnabled = true;
                 item.isRunning = false;
                 item.riskLevel = StartupItemRisk::Low;
-                
-                items.push_back(item);
-                
-                if (bstrName) SysFreeString(bstrName);
-                if (bstrPath) SysFreeString(bstrPath);
+
+                items.push_back(std::move(item));
             }
-            
+
             pDef->Release();
-            
+
         } catch (...) {
             // Ignore errors processing individual tasks
         }
@@ -1297,10 +1527,21 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                                         nullptr, &pEnumerator);
             
             if (SUCCEEDED(hr) && pEnumerator) {
-                IWbemClassObject* pObj = nullptr;
-                ULONG returned = 0;
-                
-                while (pEnumerator->Next(WBEM_INFINITE, 1, &pObj, &returned) == S_OK) {
+                size_t consumed = 0;
+                while (consumed < kMaxWmiConsumersPerClass) {
+                    IWbemClassObject* pObj = nullptr;
+                    ULONG returned = 0;
+                    HRESULT nhr = pEnumerator->Next(kWmiNextTimeoutMs, 1, &pObj, &returned);
+                    if (nhr == WBEM_S_FALSE) break;
+                    if (nhr == WBEM_S_TIMEDOUT) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                                   L"WMI Next() timed out enumerating %ls — aborting class",
+                                   SanitizeForLog(consumerClass).c_str());
+                        break;
+                    }
+                    if (FAILED(nhr) || returned == 0 || pObj == nullptr) break;
+                    ++consumed;
+
                     StartupItem item;
                     item.type = StartupItemType::WMISubscription;
                     item.registryLocation = L"WMI\\" + consumerClass;
@@ -1308,39 +1549,42 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                     item.riskLevel = StartupItemRisk::High;  // WMI subscriptions are suspicious
                     item.isSuspicious = true;
                     item.suspicionReason = L"WMI Event Subscription (common persistence mechanism)";
-                    
-                    // Get Name property
-                    VARIANT vtName;
-                    VariantInit(&vtName);
-                    hr = pObj->Get(L"Name", 0, &vtName, nullptr, nullptr);
-                    if (SUCCEEDED(hr) && vtName.vt == VT_BSTR) {
-                        item.name = vtName.bstrVal;
+
+                    // Get Name property (RAII-managed VARIANT).
+                    {
+                        ScopedVariant vtName;
+                        if (SUCCEEDED(pObj->Get(L"Name", 0, &vtName.v, nullptr, nullptr)) &&
+                            vtName.v.vt == VT_BSTR && vtName.v.bstrVal) {
+                            item.name = SanitizeForLog(std::wstring(vtName.v.bstrVal,
+                                                                    ::SysStringLen(vtName.v.bstrVal)));
+                        }
                     }
-                    VariantClear(&vtName);
-                    
-                    // Get CommandLineTemplate or ScriptFileName based on consumer type
-                    VARIANT vtCmd;
-                    VariantInit(&vtCmd);
-                    if (consumerClass == L"CommandLineEventConsumer") {
-                        hr = pObj->Get(L"CommandLineTemplate", 0, &vtCmd, nullptr, nullptr);
-                    } else {
-                        hr = pObj->Get(L"ScriptFileName", 0, &vtCmd, nullptr, nullptr);
+
+                    // Get CommandLineTemplate or ScriptFileName based on consumer type.
+                    {
+                        ScopedVariant vtCmd;
+                        const wchar_t* prop = (consumerClass == L"CommandLineEventConsumer")
+                                              ? L"CommandLineTemplate"
+                                              : L"ScriptFileName";
+                        if (SUCCEEDED(pObj->Get(prop, 0, &vtCmd.v, nullptr, nullptr)) &&
+                            vtCmd.v.vt == VT_BSTR && vtCmd.v.bstrVal) {
+                            std::wstring s = SanitizeForLog(
+                                std::wstring(vtCmd.v.bstrVal,
+                                             ::SysStringLen(vtCmd.v.bstrVal)),
+                                kMaxRegStringChars);
+                            item.commandLine = s;
+                            item.path = std::move(s);
+                        }
                     }
-                    
-                    if (SUCCEEDED(hr) && vtCmd.vt == VT_BSTR) {
-                        item.commandLine = vtCmd.bstrVal;
-                        item.path = vtCmd.bstrVal;
-                    }
-                    VariantClear(&vtCmd);
-                    
+
                     if (!item.name.empty()) {
-                        items.push_back(item);
+                        items.push_back(std::move(item));
                         m_statistics.suspiciousItemsFound.fetch_add(1, std::memory_order_relaxed);
                     }
-                    
+
                     pObj->Release();
                 }
-                
+
                 pEnumerator->Release();
             }
             
@@ -1542,21 +1786,47 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                 return;
             }
 
-            // Calculate hash using HashUtils::Hasher
+            // Calculate hash using HashUtils::Hasher. The read buffer lives on
+            // the heap to keep stack usage bounded under recursive enumeration,
+            // and we cap the total bytes hashed to defeat hostile multi-GB files.
             try {
                 Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
                 if (hasher.Init()) {
-                    // Read file in chunks
-                    std::ifstream file(item.path, std::ios::binary);
-                    if (file.is_open()) {
-                        char buffer[65536];
-                        while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
-                            (void)hasher.Update(buffer, static_cast<size_t>(file.gcount()));
+                    std::error_code fec;
+                    uintmax_t fileSize = fs::file_size(item.path, fec);
+                    if (fec) {
+                        fileSize = 0;
+                    }
+                    if (fileSize <= kMaxHashFileBytes) {
+                        std::ifstream file(item.path, std::ios::binary);
+                        if (file.is_open()) {
+                            constexpr size_t kChunk = 64 * 1024;
+                            auto buffer = std::make_unique<char[]>(kChunk);
+                            uint64_t totalRead = 0;
+                            while (file.read(buffer.get(), kChunk) || file.gcount() > 0) {
+                                std::streamsize got = file.gcount();
+                                if (got <= 0) break;
+                                if (totalRead + static_cast<uint64_t>(got) > kMaxHashFileBytes) {
+                                    // Hard cap reached — abandon hash to avoid
+                                    // unbounded work on attacker-controlled input.
+                                    item.sha256Hash.clear();
+                                    break;
+                                }
+                                totalRead += static_cast<uint64_t>(got);
+                                (void)hasher.Update(buffer.get(), static_cast<size_t>(got));
+                            }
+                            if (totalRead > 0 && item.sha256Hash.empty()) {
+                                std::string hexHash;
+                                if (hasher.FinalHex(hexHash, false)) {
+                                    item.sha256Hash = std::move(hexHash);
+                                }
+                            }
                         }
-                        std::string hexHash;
-                        if (hasher.FinalHex(hexHash, false)) {
-                            item.sha256Hash = hexHash;
-                        }
+                    } else {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                                   L"BootTimeAnalyzer: Skipping hash of oversize file (%llu bytes): %ls",
+                                   static_cast<unsigned long long>(fileSize),
+                                   SanitizeForLog(item.path).c_str());
                     }
                 }
 
@@ -1740,12 +2010,15 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
 
                 // SpecVersion is a REG_SZ string like "2.0" or "1.2", NOT a DWORD
                 wchar_t specVersionStr[64]{};
-                DWORD size = sizeof(specVersionStr);
+                DWORD size = sizeof(specVersionStr) - sizeof(wchar_t);  // reserve space for terminator
                 DWORD type = 0;
                 if (RegQueryValueExW(hKey, L"SpecVersion", nullptr, &type,
                                     reinterpret_cast<LPBYTE>(specVersionStr),
                                     &size) == ERROR_SUCCESS) {
                     if (type == REG_SZ || type == REG_EXPAND_SZ) {
+                        // Force null-termination defensively.
+                        size_t maxIdx = (sizeof(specVersionStr) / sizeof(wchar_t)) - 1;
+                        specVersionStr[maxIdx] = L'\0';
                         std::wstring ver(specVersionStr);
                         if (ver.find(L"2.") == 0) {
                             status.tpmVersion = 20;  // TPM 2.0
@@ -1753,8 +2026,10 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                             status.tpmVersion = 12;  // TPM 1.2
                         }
                     } else if (type == REG_DWORD && size == sizeof(DWORD)) {
-                        // Fallback: some systems store it as DWORD
-                        DWORD specVersion = *reinterpret_cast<const DWORD*>(specVersionStr);
+                        // Fallback: some systems store it as DWORD. Use memcpy to
+                        // avoid strict-aliasing UB on the wchar_t buffer.
+                        DWORD specVersion = 0;
+                        std::memcpy(&specVersion, specVersionStr, sizeof(DWORD));
                         status.tpmVersion = (specVersion >= 0x200) ? 20 : 12;
                     }
                 }
@@ -1997,13 +2272,15 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                 if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                                 L"SYSTEM\\CurrentControlSet\\Control",
                                 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                    wchar_t debugMode[64]{};
-                    DWORD size = sizeof(debugMode);
+                    BYTE debugBuf[64 * sizeof(wchar_t)]{};
+                    DWORD size = sizeof(debugBuf);
                     DWORD type = 0;
                     if (RegQueryValueExW(hKey, L"SystemStartOptions", nullptr, &type,
-                                        reinterpret_cast<LPBYTE>(debugMode),
-                                        &size) == ERROR_SUCCESS) {
-                        std::wstring opts = Utils::StringUtils::ToLowerCopy(debugMode);
+                                        debugBuf, &size) == ERROR_SUCCESS &&
+                        (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                        std::wstring raw = SafeWStringFromRegBytes(debugBuf, size,
+                                                                   kMaxRegStringChars);
+                        std::wstring opts = Utils::StringUtils::ToLowerCopy(raw);
                         if (opts.find(L"debug") != std::wstring::npos) {
                             BCDTamperIndicator ind;
                             ind.type = BCDTamperType::KernelDebuggingEnabled;
@@ -2052,12 +2329,14 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                                 L"SYSTEM\\CurrentControlSet\\Control\\SafeBoot",
                                 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                     // Presence of key is normal; check for suspiciously altered AlternateShell
-                    wchar_t altShell[MAX_PATH]{};
-                    DWORD size = sizeof(altShell);
+                    BYTE altBuf[MAX_PATH * sizeof(wchar_t)]{};
+                    DWORD size = sizeof(altBuf);
                     DWORD type = 0;
                     if (RegQueryValueExW(hKey, L"AlternateShell", nullptr, &type,
-                                        reinterpret_cast<LPBYTE>(altShell),
-                                        &size) == ERROR_SUCCESS) {
+                                        altBuf, &size) == ERROR_SUCCESS &&
+                        (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                        std::wstring altShell = SafeWStringFromRegBytes(altBuf, size,
+                                                                         kMaxRegStringChars);
                         std::wstring shell = Utils::StringUtils::ToLowerCopy(altShell);
                         if (shell.find(L"cmd.exe") == std::wstring::npos &&
                             !shell.empty()) {
@@ -2066,7 +2345,8 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                             ind.description = L"SafeBoot AlternateShell is set to a non-standard "
                                              L"executable — possible persistence or tamper.";
                             ind.bcdElement = L"AlternateShell";
-                            ind.currentValue = altShell;
+                            ind.currentValue = SanitizeForLog(altShell,
+                                                              kMaxBcdIndicatorValueChars);
                             ind.expectedValue = L"cmd.exe";
                             ind.detectedAt = now;
                             indicators.push_back(std::move(ind));
@@ -2195,7 +2475,8 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                     ++unsignedBootDrivers;
                     SS_LOG_WARN(LOG_CATEGORY,
                                L"BOOT DRIVER SECURITY: Unsigned/test-signed boot driver '%ls' [%ls]",
-                               drv.driverName.c_str(), drv.driverPath.c_str());
+                               SanitizeForLog(drv.driverName).c_str(),
+                               SanitizeForLog(drv.driverPath, kMaxRegStringChars).c_str());
                 }
 
                 // Check known-vulnerable drivers (BYOVD attack surface)
@@ -2203,7 +2484,7 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                     ++vulnerableBootDrivers;
                     SS_LOG_ERROR(LOG_CATEGORY,
                                 L"BOOT DRIVER VULNERABILITY: Known-vulnerable boot driver '%ls' loaded at boot",
-                                drv.driverName.c_str());
+                                SanitizeForLog(drv.driverName).c_str());
                 }
             }
 
@@ -2232,8 +2513,10 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                 DWORD val = 0;
                 DWORD size = sizeof(val);
-                if (RegQueryValueExW(hKey, L"TestSigning", nullptr, nullptr,
-                                    reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS) {
+                DWORD type = 0;
+                if (RegQueryValueExW(hKey, L"TestSigning", nullptr, &type,
+                                    reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS &&
+                    type == REG_DWORD && size == sizeof(val)) {
                     status.testSigningEnabled = (val != 0);
                 }
                 RegCloseKey(hKey);
@@ -2243,14 +2526,19 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
 
     void CheckCodeIntegrity(BootSecurityStatus& status) const {
         try {
-            HKEY hKey;
+            // RequirePlatformSecurityFeatures is REG_MULTI_SZ — the wrong type to
+            // read as DWORD. Use CODE_INTEGRITY_PATH\Enabled (DWORD) instead, which
+            // is the authoritative HVCI enforcement bit.
+            HKEY hKey = nullptr;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                            L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+                            BootTimeAnalyzerConstants::CODE_INTEGRITY_PATH,
                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                 DWORD ciEnabled = 0;
                 DWORD size = sizeof(ciEnabled);
-                if (RegQueryValueExW(hKey, L"RequirePlatformSecurityFeatures", nullptr, nullptr,
-                                    reinterpret_cast<LPBYTE>(&ciEnabled), &size) == ERROR_SUCCESS) {
+                DWORD type = 0;
+                if (RegQueryValueExW(hKey, L"Enabled", nullptr, &type,
+                                    reinterpret_cast<LPBYTE>(&ciEnabled), &size) == ERROR_SUCCESS &&
+                    type == REG_DWORD && size == sizeof(ciEnabled)) {
                     status.codeIntegrityEnabled = (ciEnabled != 0);
                 }
                 RegCloseKey(hKey);
@@ -2291,12 +2579,14 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                             L"SYSTEM\\CurrentControlSet\\Control",
                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                wchar_t opts[256]{};
-                DWORD size = sizeof(opts);
+                BYTE buf[256 * sizeof(wchar_t)]{};
+                DWORD size = sizeof(buf);
                 DWORD type = 0;
                 if (RegQueryValueExW(hKey, L"SystemStartOptions", nullptr, &type,
-                                    reinterpret_cast<LPBYTE>(opts), &size) == ERROR_SUCCESS) {
-                    std::wstring optStr = Utils::StringUtils::ToLowerCopy(opts);
+                                    buf, &size) == ERROR_SUCCESS &&
+                    (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                    std::wstring raw = SafeWStringFromRegBytes(buf, size, kMaxRegStringChars);
+                    std::wstring optStr = Utils::StringUtils::ToLowerCopy(raw);
                     status.kernelDebuggingEnabled = (optStr.find(L"debug") != std::wstring::npos);
                 }
                 RegCloseKey(hKey);
@@ -2376,6 +2666,17 @@ void BootTimeAnalyzer::Shutdown() noexcept {
         {
             std::unique_lock<std::shared_mutex> analysisLock(m_impl->m_analysisMutex);
             m_impl->m_lastAnalysis.reset();
+        }
+
+        // Deregister BCD change callback from RegistryMonitor (if any).
+        // Done before taking the main mutex to avoid lock-order inversion with
+        // RegistryMonitor's own internal locks.
+        if (m_impl->m_bcdCallbackId != 0) {
+            try {
+                auto& regMon = Registry::RegistryMonitor::Instance();
+                (void)regMon.UnregisterCallback(m_impl->m_bcdCallbackId);
+            } catch (...) { /* deregistration is best-effort */ }
+            m_impl->m_bcdCallbackId = 0;
         }
 
         // Now take the main mutex for infrastructure teardown
@@ -2566,8 +2867,23 @@ std::chrono::milliseconds BootTimeAnalyzer::GetTotalBootTime() const {
 }
 
 std::chrono::milliseconds BootTimeAnalyzer::GetShadowStrikeBootImpact() const {
-    // Would measure actual impact in production
-    return std::chrono::milliseconds(150);
+    // Pull authoritative value from the kernel telemetry channel.  If kernel
+    // telemetry has not been observed yet, fall back to the value reported in
+    // the most recent full analysis under the same lock.
+    if (m_impl) {
+        std::shared_lock<std::shared_mutex> klock(m_impl->m_kernelDataMutex);
+        if (m_impl->m_kernelBootData.hasData &&
+            m_impl->m_kernelBootData.kernelReportedBootTime.count() > 0) {
+            return m_impl->m_kernelBootData.kernelReportedBootTime;
+        }
+    }
+    if (m_impl) {
+        std::shared_lock<std::shared_mutex> alock(m_impl->m_analysisMutex);
+        if (m_impl->m_lastAnalysis.has_value()) {
+            return m_impl->m_lastAnalysis->shadowStrikeImpact;
+        }
+    }
+    return std::chrono::milliseconds(0);
 }
 
 // ============================================================================
@@ -2665,40 +2981,54 @@ bool BootTimeAnalyzer::DisableStartupItem(const StartupItem& item) {
         switch (item.type) {
             case StartupItemType::RunKey:
             case StartupItemType::RunOnceKey: {
-                // Disable by renaming the registry value (prepend with "!")
-                // This is how Windows handles disabled startup items
-                HKEY hRoot = HKEY_LOCAL_MACHINE;
-                
-                // Determine if it's HKLM or HKCU based on registry location
+                // Disable by renaming the registry value (prepend with "!").
+                // The hive cannot be inferred from the relative subkey path alone
+                // (both HKCU and HKLM expose ...\CurrentVersion\Run), so try
+                // HKCU first when hinted and fall back to HKLM.
+                HKEY candidates[2] = { HKEY_LOCAL_MACHINE, HKEY_LOCAL_MACHINE };
+                int candidateCount = 1;
                 if (item.registryLocation.find(L"HKEY_CURRENT_USER") != std::wstring::npos ||
                     item.registryLocation.find(L"\\CurrentVersion\\Run") != std::wstring::npos) {
-                    // Try HKCU first for user Run keys
-                    hRoot = HKEY_CURRENT_USER;
+                    candidates[0] = HKEY_CURRENT_USER;
+                    candidates[1] = HKEY_LOCAL_MACHINE;
+                    candidateCount = 2;
                 }
-                
-                HKEY hKey;
-                if (RegOpenKeyExW(hRoot, item.registryLocation.c_str(), 0, 
-                                 KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
-                    
-                    // Read current value
-                    BYTE data[BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE];
-                    DWORD dataSize = sizeof(data);
+
+                for (int c = 0; c < candidateCount && !success; ++c) {
+                    HKEY hKey = nullptr;
+                    if (RegOpenKeyExW(candidates[c], item.registryLocation.c_str(), 0,
+                                     KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) {
+                        continue;
+                    }
+
+                    auto data = std::make_unique<BYTE[]>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
+                    DWORD dataSize = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
                     DWORD type = 0;
-                    
-                    if (RegQueryValueExW(hKey, item.name.c_str(), nullptr, &type, 
-                                        data, &dataSize) == ERROR_SUCCESS) {
-                        
-                        // Delete the original value
+
+                    LONG qr = RegQueryValueExW(hKey, item.name.c_str(), nullptr, &type,
+                                              data.get(), &dataSize);
+                    if (qr != ERROR_SUCCESS) {
+                        RegCloseKey(hKey);
+                        continue;
+                    }
+
+                    // Atomically swap: write the disabled "!"-prefixed value first,
+                    // then delete the original.  This avoids losing the value if
+                    // the second step fails (which previously happened).
+                    std::wstring disabledName = L"!" + item.name;
+                    if (RegSetValueExW(hKey, disabledName.c_str(), 0, type,
+                                      data.get(), dataSize) == ERROR_SUCCESS) {
                         if (RegDeleteValueW(hKey, item.name.c_str()) == ERROR_SUCCESS) {
-                            // Create disabled value with "!" prefix
-                            std::wstring disabledName = L"!" + item.name;
-                            if (RegSetValueExW(hKey, disabledName.c_str(), 0, type, 
-                                              data, dataSize) == ERROR_SUCCESS) {
-                                success = true;
-                            }
+                            success = true;
+                        } else {
+                            // Roll back the disabled value to avoid duplication.
+                            (void)RegDeleteValueW(hKey, disabledName.c_str());
+                            SS_LOG_WARN(LOG_CATEGORY,
+                                       L"BootTimeAnalyzer: Disable rollback (delete failed) for %ls",
+                                       SanitizeForLog(item.name).c_str());
                         }
                     }
-                    
+
                     RegCloseKey(hKey);
                 }
                 break;
@@ -2803,38 +3133,50 @@ bool BootTimeAnalyzer::EnableStartupItem(const StartupItem& item) {
         switch (item.type) {
             case StartupItemType::RunKey:
             case StartupItemType::RunOnceKey: {
-                // Re-enable by removing "!" prefix from registry value name
-                HKEY hRoot = HKEY_LOCAL_MACHINE;
-                
+                // Re-enable by removing "!" prefix from registry value name.
+                HKEY candidates[2] = { HKEY_LOCAL_MACHINE, HKEY_LOCAL_MACHINE };
+                int candidateCount = 1;
                 if (item.registryLocation.find(L"HKEY_CURRENT_USER") != std::wstring::npos ||
                     item.registryLocation.find(L"\\CurrentVersion\\Run") != std::wstring::npos) {
-                    hRoot = HKEY_CURRENT_USER;
+                    candidates[0] = HKEY_CURRENT_USER;
+                    candidates[1] = HKEY_LOCAL_MACHINE;
+                    candidateCount = 2;
                 }
-                
-                HKEY hKey;
-                if (RegOpenKeyExW(hRoot, item.registryLocation.c_str(), 0, 
-                                 KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
-                    
-                    // Look for disabled version (with "!" prefix)
+
+                for (int c = 0; c < candidateCount && !success; ++c) {
+                    HKEY hKey = nullptr;
+                    if (RegOpenKeyExW(candidates[c], item.registryLocation.c_str(), 0,
+                                     KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) {
+                        continue;
+                    }
+
                     std::wstring disabledName = L"!" + item.name;
-                    
-                    BYTE data[BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE];
-                    DWORD dataSize = sizeof(data);
+                    auto data = std::make_unique<BYTE[]>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
+                    DWORD dataSize = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
                     DWORD type = 0;
-                    
-                    if (RegQueryValueExW(hKey, disabledName.c_str(), nullptr, &type, 
-                                        data, &dataSize) == ERROR_SUCCESS) {
-                        
-                        // Delete the disabled value
+
+                    LONG qr = RegQueryValueExW(hKey, disabledName.c_str(), nullptr, &type,
+                                              data.get(), &dataSize);
+                    if (qr != ERROR_SUCCESS) {
+                        RegCloseKey(hKey);
+                        continue;
+                    }
+
+                    // Write the restored value first, then delete the disabled
+                    // variant.  Roll back on failure to keep the registry in a
+                    // consistent state.
+                    if (RegSetValueExW(hKey, item.name.c_str(), 0, type,
+                                      data.get(), dataSize) == ERROR_SUCCESS) {
                         if (RegDeleteValueW(hKey, disabledName.c_str()) == ERROR_SUCCESS) {
-                            // Restore original value name
-                            if (RegSetValueExW(hKey, item.name.c_str(), 0, type, 
-                                              data, dataSize) == ERROR_SUCCESS) {
-                                success = true;
-                            }
+                            success = true;
+                        } else {
+                            (void)RegDeleteValueW(hKey, item.name.c_str());
+                            SS_LOG_WARN(LOG_CATEGORY,
+                                       L"BootTimeAnalyzer: Enable rollback (delete failed) for %ls",
+                                       SanitizeForLog(item.name).c_str());
                         }
                     }
-                    
+
                     RegCloseKey(hKey);
                 }
                 break;
@@ -3042,36 +3384,43 @@ void BootTimeAnalyzer::RegisterBCDChangeCallback() {
             return;
         }
 
-        // Register a policy callback that intercepts BCD-related registry writes.
-        // The RegistryMonitor kernel callback (CmRegisterCallback) will fire for any
-        // write to HKLM\BCD00000000 or HKLM\SYSTEM\...\Control\CI\Config.
-        regMon.SetPolicyCallback([](const Registry::RegistryEvent& event) -> Registry::RegistryVerdict {
-            // Only intercept SetValue operations on BCD-critical paths
-            if (event.operation != Registry::RegistryOp::SetValue &&
-                event.operation != Registry::RegistryOp::DeleteValue) {
-                return Registry::RegistryVerdict::Allow;
-            }
+        // Register an observation-only event callback.  The RegistryMonitor
+        // policy-callback slot is global and single-instance; using it here
+        // would clobber the engine-wide policy decision.  RegisterEventCallback
+        // returns a handle we can use to deregister at shutdown.
+        Registry::RegistryEventCallback cb =
+            [](const Registry::RegistryEvent& event, Registry::RegistryVerdict /*verdict*/) {
+                if (event.operation != Registry::RegistryOp::SetValue &&
+                    event.operation != Registry::RegistryOp::DeleteValue) {
+                    return;
+                }
 
-            auto lowerPath = Utils::StringUtils::ToLowerCopy(event.keyPath);
+                auto lowerPath = Utils::StringUtils::ToLowerCopy(event.keyPath);
 
-            // Detect BCD store writes
-            if (lowerPath.find(L"bcd00000000") != std::wstring::npos ||
-                lowerPath.find(L"control\\ci") != std::wstring::npos ||
-                lowerPath.find(L"control\\deviceguard") != std::wstring::npos ||
-                lowerPath.find(L"control\\earlylunch") != std::wstring::npos) {
+                // Detect writes to BCD-critical / boot-policy areas, including
+                // the ELAM driver registration root ("earlylaunch").
+                if (lowerPath.find(L"bcd00000000")           != std::wstring::npos ||
+                    lowerPath.find(L"control\\ci")           != std::wstring::npos ||
+                    lowerPath.find(L"control\\deviceguard")  != std::wstring::npos ||
+                    lowerPath.find(L"control\\earlylaunch")  != std::wstring::npos) {
 
-                SS_LOG_WARN(LOG_CATEGORY,
-                           L"BCD CHANGE ALERT: PID=%u writing to '%ls' value='%ls'",
-                           event.processId, event.keyPath.c_str(), event.valueName.c_str());
+                    SS_LOG_WARN(LOG_CATEGORY,
+                               L"BCD CHANGE ALERT: PID=%u writing to '%ls' value='%ls'",
+                               event.processId,
+                               SanitizeForLog(event.keyPath).c_str(),
+                               SanitizeForLog(event.valueName).c_str());
+                }
+            };
 
-                // Alert but don't block — let the existing policy engine decide
-                return Registry::RegistryVerdict::Alert;
-            }
+        uint64_t id = regMon.RegisterEventCallback(std::move(cb));
+        if (id == 0) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to register BCD event callback (id=0)");
+            return;
+        }
+        m_impl->m_bcdCallbackId = id;
 
-            return Registry::RegistryVerdict::Allow;
-        });
-
-        SS_LOG_INFO(LOG_CATEGORY, L"BCD change monitoring callback registered with RegistryMonitor");
+        SS_LOG_INFO(LOG_CATEGORY, L"BCD change monitoring callback registered (id=%llu)",
+                   static_cast<unsigned long long>(id));
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(LOG_CATEGORY, L"Failed to register BCD change callback - %hs", e.what());
@@ -3200,6 +3549,13 @@ std::vector<std::wstring> BootTimeAnalyzer::RunDiagnostics() const {
 
 bool BootTimeAnalyzer::ExportReport(const std::wstring& outputPath) const {
     try {
+        if (!IsSafeExportPath(outputPath)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                       L"BootTimeAnalyzer: ExportReport rejected unsafe path '%ls'",
+                       SanitizeForLog(outputPath).c_str());
+            return false;
+        }
+
         std::wofstream file(outputPath);
         if (!file.is_open()) {
             return false;
@@ -3240,6 +3596,13 @@ bool BootTimeAnalyzer::ExportReport(const std::wstring& outputPath) const {
 
 bool BootTimeAnalyzer::ExportOptimizations(const std::wstring& outputPath) const {
     try {
+        if (!IsSafeExportPath(outputPath)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                       L"BootTimeAnalyzer: ExportOptimizations rejected unsafe path '%ls'",
+                       SanitizeForLog(outputPath).c_str());
+            return false;
+        }
+
         std::wofstream file(outputPath);
         if (!file.is_open()) {
             return false;
