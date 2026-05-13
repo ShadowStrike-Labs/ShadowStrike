@@ -2957,8 +2957,17 @@ namespace ShadowStrike {
 
             auto entries = Query(filter, err);
             
+            size_t failures = 0;
             for (const auto& entry : entries) {
-                DeleteQuarantinedFile(entry.id, L"System", L"Automatic cleanup - retention expired", nullptr);
+                if (!DeleteQuarantinedFile(entry.id, L"System",
+                        L"Automatic cleanup - retention expired", nullptr)) {
+                    ++failures;
+                }
+            }
+            if (failures != 0) {
+                SS_LOG_WARN(L"QuarantineDB",
+                    L"Cleanup: %zu of %zu expired entries failed to delete",
+                    failures, entries.size());
             }
 
             std::lock_guard<std::mutex> lock(m_statsMutex);

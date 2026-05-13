@@ -2745,7 +2745,11 @@ std::string QuarantineManager::SubmitSample(uint64_t entryId) {
 
         entry.sampleSubmitted = true;
         entry.submissionId = submissionId;
-        m_impl->m_database->UpdateEntry(ToDBEntry(entry));
+        if (!m_impl->m_database->UpdateEntry(ToDBEntry(entry))) {
+            SS_LOG_WARN(L"QuarantineManager",
+                L"QuarantineManager: SubmitSample: failed to persist updated entry %llu",
+                static_cast<unsigned long long>(entryId));
+        }
         m_impl->UpdateCache(entry);
 
         m_impl->m_stats.samplesSubmitted.fetch_add(1, std::memory_order_relaxed);
@@ -2817,7 +2821,11 @@ std::wstring QuarantineManager::PreserveEvidence(uint64_t entryId) {
         // Update entry
         entry.evidencePreserved = true;
         entry.forensicsPath = archivePath.wstring();
-        m_impl->m_database->UpdateEntry(ToDBEntry(entry));
+        if (!m_impl->m_database->UpdateEntry(ToDBEntry(entry))) {
+            SS_LOG_WARN(L"QuarantineManager",
+                L"QuarantineManager: PreserveEvidence: failed to persist updated entry %llu",
+                static_cast<unsigned long long>(entryId));
+        }
         m_impl->UpdateCache(entry);
 
         SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Evidence preserved at: %ls", archivePath.wstring().c_str());
