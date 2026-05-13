@@ -819,6 +819,16 @@ namespace ShadowStrike {
             {
                 std::lock_guard<std::mutex> keyLock(m_keyMutex);
                 m_masterKey = deriveEncryptionKey();
+                if (m_masterKey.empty() && m_config.enableEncryption) {
+                    SS_LOG_ERROR(L"QuarantineDB",
+                        L"Master key derivation failed; refusing to initialize with encryption enabled");
+                    if (err) {
+                        err->sqliteCode = SQLITE_ERROR;
+                        err->message = L"Failed to derive quarantine master encryption key";
+                    }
+                    DatabaseManager::Instance().Shutdown();
+                    return false;
+                }
             }
 
             // Start background cleanup thread if enabled
@@ -872,11 +882,16 @@ namespace ShadowStrike {
                 m_cleanupThread.join();
             }
 
-            // Clear encryption key from memory
+            // Clear encryption key from memory (use SecureZeroMemory so the
+            // compiler cannot elide the zeroing; std::fill is a documented hazard
+            // here because the buffer is about to be freed by clear()).
             {
                 std::lock_guard<std::mutex> lock(m_keyMutex);
-                std::fill(m_masterKey.begin(), m_masterKey.end(), 0);
+                if (!m_masterKey.empty()) {
+                    ::SecureZeroMemory(m_masterKey.data(), m_masterKey.size());
+                }
                 m_masterKey.clear();
+                m_masterKey.shrink_to_fit();
             }
 
             // Shutdown database manager
@@ -931,7 +946,7 @@ namespace ShadowStrike {
                 std::wstring_view detectionReason,
                 DatabaseError* err)
         {
-            SS_LOG_INFO(L"QuarantineDB", L"Quarantining file: %ls", originalPath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Quarantining file: %ls", std::wstring(originalPath).c_str());
 
             // Read original file
             Utils::FileUtils::Error fileErr;
@@ -942,7 +957,7 @@ namespace ShadowStrike {
                     err->sqliteCode = SQLITE_ERROR;
                     err->message = L"Failed to read original file";
                 }
-                SS_LOG_ERROR(L"QuarantineDB", L"Failed to read file: %ls", originalPath.data());
+                SS_LOG_ERROR(L"QuarantineDB", L"Failed to read file: %ls", std::wstring(originalPath).c_str());
                 return -1;
             }
 
@@ -2925,7 +2940,15 @@ namespace ShadowStrike {
          * Updates cleanup timestamp and counter in statistics.
          */
         bool QuarantineDB::cleanupOldEntries(DatabaseError* err) {
-            auto cutoffTime = std::chrono::system_clock::now() - m_config.maxRetentionDays;
+            // Snapshot configuration under shared lock; the background thread
+            // races with Set* configuration mutators otherwise.
+            std::chrono::hours retentionDays{};
+            {
+                std::shared_lock<std::shared_mutex> cfgLock(m_configMutex);
+                retentionDays = m_config.maxRetentionDays;
+            }
+
+            auto cutoffTime = std::chrono::system_clock::now() - retentionDays;
             
             QueryFilter filter;
             filter.endTime = cutoffTime;
@@ -3031,6 +3054,11 @@ namespace ShadowStrike {
             
             // Generate or retrieve persistent salt
             std::vector<uint8_t> salt = generateSalt();
+            if (salt.empty()) {
+                SS_LOG_ERROR(L"QuarantineDB",
+                    L"Cannot derive encryption key: persistent salt is unavailable");
+                return std::vector<uint8_t>{};
+            }
             
             BCRYPT_ALG_HANDLE hAlgorithm = nullptr;
             NTSTATUS status;
@@ -3040,11 +3068,7 @@ namespace ShadowStrike {
                 nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
             if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"QuarantineDB", L"Failed to open SHA256 for PBKDF2: 0x%08X", status);
-                // Fallback to secure random key
-                std::vector<uint8_t> key(CryptoConstants::AES_KEY_SIZE);
-                BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()),
-                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-                return key;
+                return std::vector<uint8_t>{};
             }
             
             // Derive key using PBKDF2
@@ -3062,20 +3086,22 @@ namespace ShadowStrike {
             
             BCryptCloseAlgorithmProvider(hAlgorithm, 0);
             
+            // Securely clear entropy regardless of outcome.
+            if (!entropyUtf8.empty()) {
+                ::SecureZeroMemory(const_cast<char*>(entropyUtf8.data()), entropyUtf8.size());
+            }
+
             if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"QuarantineDB", L"PBKDF2 key derivation failed: 0x%08X", status);
-                // Fallback to secure random key
-                std::vector<uint8_t> key(CryptoConstants::AES_KEY_SIZE);
-                BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()),
-                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-                return key;
+                // Zero any partial derived key to avoid leaking weak material.
+                if (!derivedKey.empty()) {
+                    ::SecureZeroMemory(derivedKey.data(), derivedKey.size());
+                }
+                return std::vector<uint8_t>{};
             }
             
             SS_LOG_DEBUG(L"QuarantineDB", L"Encryption key derived using PBKDF2-SHA256 (%zu iterations)",
                 CryptoConstants::PBKDF2_ITERATIONS);
-            
-            // Securely clear entropy
-            SecureZeroMemory(const_cast<char*>(entropyUtf8.data()), entropyUtf8.size());
             
             return derivedKey;
 #else
@@ -3103,35 +3129,87 @@ namespace ShadowStrike {
          * - Adding entropy to encryption operations
          */
         std::vector<uint8_t> QuarantineDB::generateSalt() {
+            // Salt MUST be persistent across process lifetimes; otherwise PBKDF2
+            // derives a different master key on every restart and every encrypted
+            // vault file becomes permanently undecryptable. The salt is stored
+            // inside the quarantine base directory whose ACL already restricts
+            // access. It is NOT a secret on its own, but losing it implies total
+            // data loss for the quarantine vault.
+            std::wstring saltPath = m_config.quarantineBasePath;
+            if (!saltPath.empty() && saltPath.back() != L'\\' && saltPath.back() != L'/') {
+                saltPath.push_back(L'\\');
+            }
+            saltPath.append(L".qsalt.bin");
+
+            // Attempt to load existing salt first.
+            {
+                std::vector<std::byte> existing;
+                Utils::FileUtils::Error rerr;
+                if (Utils::FileUtils::ReadAllBytes(saltPath, existing, &rerr) &&
+                    existing.size() == CryptoConstants::SALT_SIZE) {
+                    std::vector<uint8_t> salt(CryptoConstants::SALT_SIZE);
+                    std::memcpy(salt.data(), existing.data(), CryptoConstants::SALT_SIZE);
+                    SS_LOG_DEBUG(L"QuarantineDB", L"Loaded persistent PBKDF2 salt (%zu bytes)",
+                        salt.size());
+                    return salt;
+                }
+                if (!existing.empty()) {
+                    SS_LOG_WARN(L"QuarantineDB",
+                        L"Existing salt file has unexpected size (%zu); regenerating",
+                        existing.size());
+                }
+            }
+
+            // Generate fresh salt and persist atomically.
             std::vector<uint8_t> salt(CryptoConstants::SALT_SIZE);
-            
+
 #ifdef _WIN32
             NTSTATUS status = BCryptGenRandom(
                 nullptr,
                 salt.data(),
                 static_cast<ULONG>(salt.size()),
                 BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            
+
             if (!BCRYPT_SUCCESS(status)) {
-                SS_LOG_WARN(L"QuarantineDB", L"BCryptGenRandom failed: 0x%08X, using fallback", status);
-                // Fallback using high-resolution timer and other entropy sources
-                auto now = std::chrono::high_resolution_clock::now();
-                auto seed = now.time_since_epoch().count();
-                std::mt19937_64 rng(seed);
-                std::uniform_int_distribution<int> dist(0, 255);
-                for (auto& byte : salt) {
-                    byte = static_cast<uint8_t>(dist(rng));
-                }
+                SS_LOG_ERROR(L"QuarantineDB",
+                    L"BCryptGenRandom failed for salt: 0x%08X. Quarantine vault cannot be initialized.",
+                    status);
+                // Return empty salt to signal failure to caller.
+                salt.clear();
+                return salt;
             }
 #else
-            // Non-Windows: use random_device
             std::random_device rd;
             std::uniform_int_distribution<int> dist(0, 255);
             for (auto& byte : salt) {
                 byte = static_cast<uint8_t>(dist(rd));
             }
 #endif
-            
+
+            Utils::FileUtils::Error werr;
+            if (!Utils::FileUtils::WriteAllBytesAtomic(
+                    saltPath,
+                    reinterpret_cast<const std::byte*>(salt.data()),
+                    salt.size(),
+                    &werr)) {
+                SS_LOG_ERROR(L"QuarantineDB",
+                    L"Failed to persist quarantine salt to %ls (win32=%u). "
+                    L"Re-initialization will lose access to existing vault entries.",
+                    saltPath.c_str(),
+                    static_cast<unsigned>(werr.win32));
+                // Continue: encryption still works for this process, but vault
+                // entries written now will be unrecoverable after restart. The
+                // caller is loudly notified.
+            } else {
+#ifdef _WIN32
+                // Best-effort: mark salt file hidden + system to discourage casual edits.
+                ::SetFileAttributesW(saltPath.c_str(),
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+#endif
+                SS_LOG_INFO(L"QuarantineDB", L"Persisted new PBKDF2 salt (%zu bytes)",
+                    salt.size());
+            }
+
             return salt;
         }
 
@@ -3235,19 +3313,51 @@ namespace ShadowStrike {
                 return;
             }
 
+            // Sanitize user-supplied details: strip ASCII control characters
+            // (including CR/LF) to prevent audit-log injection where an attacker-
+            // controlled filename or note could forge new log lines.
+            std::wstring sanitized;
+            sanitized.reserve(details.size());
+            for (wchar_t ch : details) {
+                if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+                    sanitized.push_back(L' ');
+                } else if (ch < 0x20 || ch == 0x7F) {
+                    sanitized.push_back(L'?');
+                } else {
+                    sanitized.push_back(ch);
+                }
+            }
+            // Cap audit detail length to prevent unbounded growth on hostile input.
+            constexpr size_t kMaxAuditDetailChars = 4096;
+            if (sanitized.size() > kMaxAuditDetailChars) {
+                sanitized.resize(kMaxAuditDetailChars);
+                sanitized.append(L"...[truncated]");
+            }
+
             std::string timestamp = timePointToString(std::chrono::system_clock::now());
 
-            DatabaseManager::Instance().ExecuteWithParams(
+            DatabaseError auditErr;
+            const bool ok = DatabaseManager::Instance().ExecuteWithParams(
                 SQL_INSERT_AUDIT,
-                nullptr,
+                &auditErr,
                 timestamp,
                 entryId,
                 static_cast<int>(action),
                 ToUTF8(m_userName),
                 ToUTF8(m_machineName),
-                ToUTF8(details),
+                ToUTF8(sanitized),
                 1  // success
             );
+            if (!ok) {
+                // Audit failures must never be silent: emit a structured warning
+                // so monitoring can surface dropped audit records.
+                SS_LOG_WARN(L"QuarantineDB",
+                    L"Audit event dropped (action=%d, entry=%lld, sqlite=%d): %ls",
+                    static_cast<int>(action),
+                    entryId,
+                    auditErr.sqliteCode,
+                    auditErr.message.c_str());
+            }
         }
 
         // ============================================================================
@@ -3618,7 +3728,7 @@ namespace ShadowStrike {
         bool QuarantineDB::ExportEntry(int64_t entryId, std::wstring_view exportPath,
             bool includeMetadata, DatabaseError* err)
         {
-            SS_LOG_INFO(L"QuarantineDB", L"Exporting quarantine entry %lld to: %ls", entryId, exportPath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Exporting quarantine entry %lld to: %ls", entryId, std::wstring(exportPath).c_str());
 
             // Get entry
             auto entryOpt = GetEntry(entryId, err);
@@ -3741,7 +3851,7 @@ namespace ShadowStrike {
          * hash integrity, and creates new quarantine entry with imported data.
          */
         int64_t QuarantineDB::ImportEntry(std::wstring_view importPath, DatabaseError* err) {
-            SS_LOG_INFO(L"QuarantineDB", L"Importing quarantine entry from: %ls", importPath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Importing quarantine entry from: %ls", std::wstring(importPath).c_str());
 
             // Load JSON file
             using namespace ShadowStrike::Utils::JSON;
@@ -3888,7 +3998,7 @@ namespace ShadowStrike {
             DatabaseError* err)
         {
             SS_LOG_INFO(L"QuarantineDB", L"Preparing entry %lld for analysis submission to: %ls", 
-                       entryId, submissionEndpoint.data());
+                       entryId, std::wstring(submissionEndpoint).c_str());
 
             // Validate entry exists
             auto entryOpt = GetEntry(entryId, err);
@@ -4074,7 +4184,7 @@ namespace ShadowStrike {
         bool QuarantineDB::ExportToJSON(std::wstring_view filePath, const QueryFilter* filter,
             DatabaseError* err)
         {
-            SS_LOG_INFO(L"QuarantineDB", L"Exporting to JSON: %ls", filePath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Exporting to JSON: %ls", std::wstring(filePath).c_str());
 
             // Get entries
             auto entries = filter ? Query(*filter, err) : GetActiveEntries(10000, err);
@@ -4150,7 +4260,7 @@ namespace ShadowStrike {
         bool QuarantineDB::ExportToCSV(std::wstring_view filePath, const QueryFilter* filter,
             DatabaseError* err)
         {
-            SS_LOG_INFO(L"QuarantineDB", L"Exporting to CSV: %ls", filePath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Exporting to CSV: %ls", std::wstring(filePath).c_str());
 
             // Get entries
             auto entries = filter ? Query(*filter, err) : GetActiveEntries(10000, err);
@@ -4265,7 +4375,7 @@ namespace ShadowStrike {
          * @note Logs audit event for compliance tracking.
          */
         bool QuarantineDB::BackupQuarantine(std::wstring_view backupPath, DatabaseError* err) {
-            SS_LOG_INFO(L"QuarantineDB", L"Creating quarantine backup: %ls", backupPath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Creating quarantine backup: %ls", std::wstring(backupPath).c_str());
 
             std::filesystem::path backupFilePath(backupPath);
 
@@ -4412,7 +4522,7 @@ namespace ShadowStrike {
          * @warning Duplicate detection not performed - may create duplicates.
          */
         bool QuarantineDB::RestoreQuarantine(std::wstring_view backupPath, DatabaseError* err) {
-            SS_LOG_INFO(L"QuarantineDB", L"Restoring quarantine from backup: %ls", backupPath.data());
+            SS_LOG_INFO(L"QuarantineDB", L"Restoring quarantine from backup: %ls", std::wstring(backupPath).c_str());
 
             using namespace ShadowStrike::Utils::JSON;
             Json backup;
