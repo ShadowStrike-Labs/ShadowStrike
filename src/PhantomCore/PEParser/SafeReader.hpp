@@ -169,10 +169,16 @@ public:
     /**
      * @brief Construct from span.
      * @param data Span of bytes.
+     *
+     * If the span's data pointer is null but its size is non-zero (a malformed
+     * span), the size is clamped to 0 to preserve the class invariant that a
+     * non-zero m_size always implies a non-null m_data.  This matches the
+     * raw-pointer constructor's behaviour and prevents null-dereference under
+     * subsequent reads even if a caller passes an invalid span.
      */
     explicit SafeReader(std::span<const uint8_t> data) noexcept
         : m_data(data.data())
-        , m_size(data.size())
+        , m_size(data.data() ? data.size() : 0)
     {}
 
     /**
@@ -419,6 +425,11 @@ public:
      * @param length Exact length to read.
      * @param out Output string (trimmed at first null if present).
      * @return true if read succeeded.
+     *
+     * @note This function is noexcept; if the std::string assignment
+     *       fails to allocate (std::bad_alloc) the failure is swallowed
+     *       and false is returned with out left empty, so callers in
+     *       noexcept parser frames never trigger std::terminate.
      */
     [[nodiscard]] bool ReadFixedString(size_t offset, size_t length,
                                         std::string& out) const noexcept {
@@ -433,8 +444,15 @@ public:
             std::memchr(start, '\0', length)
         );
 
-        size_t strLen = nullPos ? (nullPos - start) : length;
-        out.assign(start, strLen);
+        size_t strLen = nullPos ? static_cast<size_t>(nullPos - start) : length;
+        try {
+            out.assign(start, strLen);
+        } catch (...) {
+            // Allocation failure: leave caller-supplied string empty and
+            // report failure rather than terminate the calling noexcept frame.
+            try { out.clear(); } catch (...) {}
+            return false;
+        }
         return true;
     }
 
