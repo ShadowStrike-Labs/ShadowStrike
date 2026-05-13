@@ -66,41 +66,65 @@ namespace ShadowStrike::FuzzyHasher {
 
         /**
          * @brief Parse a digest string "blocksize:hash1:hash2" into components.
+         *
+         * Defense-in-depth: operates on a bounded std::string_view rather than
+         * a raw C string, so no unbounded scan is possible even if a future
+         * caller forgets the external strnlen guard applied by CompareDigests.
+         * All boundary searches use string_view::find which is bound by size().
+         *
+         * @param digest Bounded view over the digest text (already length-capped)
+         * @param out    Parsed components on success
          * @return true on success, false on malformed input
          */
-        [[nodiscard]] bool ParseDigest(const char* digest, ParsedDigest& out) noexcept {
-            if (!digest || digest[0] == '\0') {
+        [[nodiscard]] bool ParseDigest(std::string_view digest, ParsedDigest& out) noexcept {
+            if (digest.empty()) {
                 return false;
             }
 
-            // Find first colon — separates blocksize from hash1
-            const char* colon1 = std::strchr(digest, ':');
-            if (!colon1 || colon1 == digest) {
+            // Find first colon — separates blocksize from hash1.
+            // string_view::find is bounded by size() — cannot run past the end.
+            const size_t colon1 = digest.find(':');
+            if (colon1 == std::string_view::npos || colon1 == 0) {
                 return false;
             }
 
-            // BUG-2 FIX: use strtoull (64-bit) instead of strtoul (32-bit on Windows).
-            // On Windows, unsigned long is 32 bits. strtoul overflow returns ULONG_MAX
-            // (0xFFFFFFFF), making the check bs > 0xFFFFFFFFul always false — a crafted
-            // blocksize of 4294967295 would bypass the guard and cascade into BUG-1.
+            // BUG-2 FIX: parse blocksize with explicit bounds.
+            // Construct a null-terminated stack buffer of the blocksize substring
+            // (bounded to 10 chars for uint32_t max + 1 NUL), then strtoull on it.
+            // This avoids strtoull scanning past the colon and removes any reliance
+            // on the underlying buffer's null-termination.
+            constexpr size_t kMaxBlockSizeChars = 10; // uint32_t max = 10 digits
+            if (colon1 > kMaxBlockSizeChars) {
+                return false; // blocksize substring too long to be a valid uint32_t
+            }
+            char bsBuf[kMaxBlockSizeChars + 1] = { 0 };
+            for (size_t i = 0; i < colon1; ++i) {
+                const char c = digest[i];
+                if (c < '0' || c > '9') {
+                    return false; // strict-decimal: no signs, no whitespace, no hex
+                }
+                bsBuf[i] = c;
+            }
+            // bsBuf is now a NUL-terminated decimal string of length colon1.
+
             char* endPtr = nullptr;
-            const unsigned long long bsLong = std::strtoull(digest, &endPtr, 10);
-            if (endPtr != colon1 || bsLong == 0 || bsLong > 0xFFFFFFFFULL) {
+            const unsigned long long bsLong = std::strtoull(bsBuf, &endPtr, 10);
+            if (endPtr == nullptr || *endPtr != '\0' ||
+                bsLong == 0 || bsLong > 0xFFFFFFFFULL) {
                 return false;
             }
             out.blockSize = static_cast<uint32_t>(bsLong);
 
-            // Find second colon — separates hash1 from hash2
-            const char* hash1Start = colon1 + 1;
-            const char* colon2 = std::strchr(hash1Start, ':');
-            if (!colon2) {
+            // Find second colon — separates hash1 from hash2.
+            const size_t colon2 = digest.find(':', colon1 + 1);
+            if (colon2 == std::string_view::npos) {
                 return false;
             }
 
-            out.sig1 = std::string_view(hash1Start, static_cast<size_t>(colon2 - hash1Start));
-            out.sig2 = std::string_view(colon2 + 1);
+            out.sig1 = digest.substr(colon1 + 1, colon2 - colon1 - 1);
+            out.sig2 = digest.substr(colon2 + 1);
 
-            // Validate component lengths
+            // Validate component lengths.
             if (out.sig1.empty() || out.sig2.empty() ||
                 out.sig1.size() > kMaxSignatureComponentLength ||
                 out.sig2.size() > kMaxSignatureComponentLength) {
@@ -294,23 +318,29 @@ namespace ShadowStrike::FuzzyHasher {
                 return -1;
             }
 
-            // BUG-3 FIX: bound the strchr scan in ParseDigest by verifying that
-            // both strings are within a safe maximum length before touching them.
-            // A null-terminator-less string passed by a hostile caller would
-            // cause strchr to scan arbitrarily far into memory.
+            // BUG-3 FIX: bound the parse scan by verifying that both strings are
+            // within a safe maximum length BEFORE any pointer arithmetic.  A
+            // null-terminator-less string passed by a hostile caller would
+            // otherwise cause strchr/find to scan arbitrarily far into memory.
             //
             // Maximum valid digest length:
-            //   blocksize (10 chars for uint32_t max) + ':' + sig1 (64) + ':' + sig2 (32) = 109
-            // We allow 200 chars to be generous but still bound the scan.
+            //   blocksize (10 chars for uint32_t max) + ':' + sig1 (64) + ':' + sig2 (64)
+            //   = 141.  We allow 200 chars to remain generous while still bounding.
+            //
+            // Defense-in-depth: ParseDigest now consumes a bounded std::string_view
+            // so it cannot scan past the asserted length even if this check were
+            // ever weakened upstream.
             constexpr size_t kMaxDigestLen = 200;
-            if (strnlen(digest1, kMaxDigestLen + 1) > kMaxDigestLen ||
-                strnlen(digest2, kMaxDigestLen + 1) > kMaxDigestLen) {
+            const size_t len1 = strnlen(digest1, kMaxDigestLen + 1);
+            const size_t len2 = strnlen(digest2, kMaxDigestLen + 1);
+            if (len1 > kMaxDigestLen || len2 > kMaxDigestLen) {
                 return -1;
             }
 
             ParsedDigest d1, d2;
 
-            if (!ParseDigest(digest1, d1) || !ParseDigest(digest2, d2)) {
+            if (!ParseDigest(std::string_view(digest1, len1), d1) ||
+                !ParseDigest(std::string_view(digest2, len2), d2)) {
                 return -1;
             }
 
