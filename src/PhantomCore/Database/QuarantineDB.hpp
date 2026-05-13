@@ -254,7 +254,8 @@ namespace ShadowStrike {
                 Deleted = 2,        ///< File was permanently deleted
                 Submitted = 3,      ///< File was submitted for cloud analysis
                 Whitelisted = 4,    ///< File was marked as safe (false positive)
-                Failed = 5          ///< Operation failed
+                Failed = 5,         ///< Operation failed
+                System = 6          ///< Quarantine subsystem lifecycle or maintenance event
             };
 
             /**
