@@ -244,12 +244,18 @@ namespace ShadowStrike {
 
         uint64_t BloomFilter::Hash(uint64_t value, size_t seed) const noexcept {
             // Enhanced double hashing (Kirsch & Mitzenmacher, 2006):
-            // h_i(x) = h1(x) + i * h2(x) + i^2
+            //   h_i(x) = h1(x) + i * h2(x) + i^2
             // Proven equivalent to k fully-independent hash functions for
             // Bloom filters. Two base hashes give optimal bit distribution
             // regardless of k, outperforming naive FNV-1a with seed mixing.
+            //
+            // SECURITY: All arithmetic is performed in uint64_t (modular,
+            // well-defined wraparound). 'seed' is promoted explicitly to
+            // avoid any narrow-integer surprises on platforms where size_t
+            // is 32-bit; on x64 this is a no-op.
 
-            // h1: FNV-1a over value bytes
+            // h1: FNV-1a over value bytes (byte-wise reinterpret is well-defined
+            // for unsigned char access into any object representation).
             uint64_t h1 = 14695981039346656037ULL;
             const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
             for (size_t i = 0; i < sizeof(uint64_t); ++i) {
@@ -265,10 +271,15 @@ namespace ShadowStrike {
             h2 *= 0xc4ceb9fe1a85ec53ULL;
             h2 ^= h2 >> 33;
 
-            // Force h2 odd for better modular distribution across the bit array
+            // Force h2 odd for better modular distribution across the bit array.
+            // (Note: distinct bloom filter hash positions only need decorrelation,
+            //  not cryptographic strength — adversarial-input concerns are
+            //  addressed by the authoritative B+Tree check that follows any
+            //  positive bloom hit.)
             h2 |= 1ULL;
 
-            return h1 + seed * h2 + seed * seed;
+            const uint64_t s = static_cast<uint64_t>(seed);
+            return h1 + s * h2 + s * s;
         }
 
 
