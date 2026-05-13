@@ -283,17 +283,22 @@ namespace ShadowStrike {
         }
 
         StoreError HashBucket::Remove(const HashValue& hash) noexcept {
-            // Validate state
+            // Acquire exclusive lock FIRST, then validate state under the lock.
+            // Checking m_index outside the lock would create a TOCTOU window
+            // against any future code path that resets the unique_ptr while
+            // peer threads hold a HashBucket reference. The acquisition cost
+            // is negligible relative to the B+Tree mutation itself.
+            std::unique_lock<std::shared_mutex> lock(m_rwLock);
+
             if (!m_index) {
                 SS_LOG_ERROR(L"HashBucket", L"Remove: Index not initialized");
                 return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
             }
 
-            std::unique_lock<std::shared_mutex> lock(m_rwLock);
-
-            // Note: Cannot remove from Bloom filter (it's append-only by design)
-            // This may cause false positives, but bloom filter is just an optimization
-            // The B+Tree is the authoritative source
+            // NOTE: Bloom filter is append-only by design — Remove does not
+            // clear bits. This produces benign false positives until the next
+            // Rebuild()/Compact() refreshes the bloom from current B+Tree
+            // contents. The B+Tree is always authoritative.
             return m_index->Remove(hash);
         }
 
@@ -304,15 +309,18 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::Success };
             }
 
-            // Validate state
+            // Acquire exclusive lock FIRST so the m_index validation and the
+            // batch mutation observe a consistent snapshot of bucket state.
+            std::unique_lock<std::shared_mutex> lock(m_rwLock);
+
             if (!m_index) {
                 SS_LOG_ERROR(L"HashBucket", L"BatchInsert: Index not initialized");
                 return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
             }
 
-            std::unique_lock<std::shared_mutex> lock(m_rwLock);
-
-            // Add all to Bloom filter first
+            // Add all to Bloom filter first (mirrors single-Insert ordering).
+            // Failure of the B+Tree batch below leaves these as benign false
+            // positives — acceptable and documented design.
             if (m_bloomFilter) {
                 for (const auto& [hash, _] : entries) {
                     m_bloomFilter->Add(hash.FastHash());
