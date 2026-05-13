@@ -17,6 +17,7 @@
  */
 #include "pch.h"
 #include "HashStore.hpp"
+#include "HashStore_Record.hpp"
 #include <sstream>
 #include <fstream>
 #include <string>
@@ -511,14 +512,28 @@ namespace HashStore {
                                 return true; // Skip corrupt entry
                             }
 
+                            // Pull authoritative metadata from the on-disk record
+                            // allocated alongside the HashValue. ReadName returns
+                            // an empty string for malformed records — fall back to
+                            // a deterministic synthetic identifier so the export
+                            // round-trip never emits an empty NAME field.
+                            std::string storedName =
+                                Record::ReadName(m_mappedView, signatureOffset);
+                            if (storedName.empty()) {
+                                storedName = "Hash_" + std::to_string(fastHash);
+                            }
+
+                            const ThreatLevel storedLevel =
+                                Record::ReadThreatLevel(m_mappedView, signatureOffset);
+
                             // Write TYPE:HASH:NAME:LEVEL with named threat level for round-trip
                             const char* hashTypeStr = Format::HashTypeToString(hashPtr->type);
                             std::string hashHex = Format::FormatHashString(*hashPtr);
 
                             file << hashTypeStr << ":"
                                  << hashHex << ":"
-                                 << "Hash_" << fastHash << ":"
-                                 << ThreatLevelToString(ThreatLevel::Medium) << "\n";
+                                 << storedName << ":"
+                                 << ThreatLevelToString(storedLevel) << "\n";
 
                             if (file.fail()) {
                                 writeError = true;
@@ -958,16 +973,32 @@ namespace HashStore {
                                     return true;
                                 }
 
+                                // Authoritative name / threat level / description
+                                // pulled from the on-disk record. Empty fields fall
+                                // back to safe synthetic values so JSON consumers
+                                // never see missing keys.
+                                std::string storedName =
+                                    Record::ReadName(m_mappedView, signatureOffset);
+                                if (storedName.empty()) {
+                                    storedName = "Hash_" + std::to_string(fastHash);
+                                }
+                                const ThreatLevel storedLevel =
+                                    Record::ReadThreatLevel(m_mappedView, signatureOffset);
+                                const std::string storedDesc =
+                                    Record::ReadDescription(m_mappedView, signatureOffset);
+
                                 Json entry;
                                 entry["type"] =
                                     Format::HashTypeToString(hashPtr->type);
                                 entry["hash"] =
                                     Format::FormatHashString(*hashPtr);
-                                entry["name"] =
-                                    "Hash_" + std::to_string(fastHash);
+                                entry["name"] = std::move(storedName);
                                 entry["threat_level"] =
-                                    static_cast<int>(ThreatLevel::Medium);
+                                    static_cast<int>(storedLevel);
                                 entry["length_bytes"] = hashPtr->length;
+                                if (!storedDesc.empty()) {
+                                    entry["description"] = storedDesc;
+                                }
 
                                 hashesArray.push_back(std::move(entry));
                                 exportCount++;
