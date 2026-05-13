@@ -31,6 +31,7 @@
  */
 #include"pch.h"
 #include "HashStore.hpp"
+#include "HashStore_Record.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/JSONUtils.hpp"
@@ -1461,22 +1462,61 @@ DetectionResult HashStore::BuildDetectionResult(
 ) const noexcept {
     DetectionResult result{};
     result.signatureId = signatureOffset;
-    result.threatLevel = ThreatLevel::Medium;
     result.fileOffset = 0;
     result.matchTimestamp = static_cast<uint64_t>(
         std::chrono::system_clock::now().time_since_epoch().count());
     result.matchTimeNanoseconds = 0;
-    
-    // Safely build signature name
-    try {
-        result.signatureName = "Hash_" + Format::FormatHashString(hash);
+
+    // Pull authoritative metadata (name, description, threat level) from the
+    // on-disk record allocated by AddHash / AddHashBatch. The record layout
+    // is defined in HashStore_Record.hpp and validated via record magic and
+    // bounded length fields — readers below cannot dereference out of range
+    // even on a corrupted database.
+    const Record::Header* rec = nullptr;
+    if (m_mappedView.IsValid()) {
+        rec = Record::GetHeader(m_mappedView, signatureOffset);
     }
-    catch (const std::exception&) {
-        result.signatureName = "Hash_Unknown";
+
+    if (rec) {
+        result.threatLevel = Record::ClampThreatLevel(rec->threatLevel);
+
+        std::string storedName = Record::ReadName(m_mappedView, signatureOffset);
+        if (!storedName.empty()) {
+            try {
+                result.signatureName = std::move(storedName);
+            } catch (const std::exception&) {
+                result.signatureName.clear();
+            }
+        }
+
+        try {
+            std::string storedDesc =
+                Record::ReadDescription(m_mappedView, signatureOffset);
+            if (!storedDesc.empty()) {
+                result.description = std::move(storedDesc);
+            }
+        } catch (const std::exception&) {
+            // Best-effort: leave description blank on failure.
+        }
+    } else {
+        // Record missing or corrupted — fall back to a deterministic
+        // synthetic name so callers always receive a usable identifier
+        // (telemetry / alert pipelines must never receive an empty name).
+        result.threatLevel = ThreatLevel::Medium;
     }
-    
-    result.description = "Known malicious hash";
-    
+
+    if (result.signatureName.empty()) {
+        try {
+            result.signatureName = "Hash_" + Format::FormatHashString(hash);
+        } catch (const std::exception&) {
+            result.signatureName = "Hash_Unknown";
+        }
+    }
+
+    if (result.description.empty()) {
+        result.description = "Known malicious hash";
+    }
+
     return result;
 }
 
