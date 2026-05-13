@@ -122,9 +122,44 @@ namespace ShadowStrike::FuzzyHasher {
             return kSalt;
         }
 
-        // =====================================================================
-        // PE section extraction helpers for HashBufferNormalized
-        // =====================================================================
+        /**
+         * @brief Sanitize an attacker-influenced narrow string for safe logging.
+         *
+         * PE section names (and other externally-sourced byte strings) are 8
+         * raw bytes that can contain any value including CR/LF and other
+         * control characters.  Logging them verbatim into a structured or
+         * flat-file log enables CWE-117 (Log Injection / Log Forging) — an
+         * adversary crafting a malicious PE can splice fake log records and
+         * obscure forensic evidence.
+         *
+         * Replace any byte outside printable ASCII (0x20..0x7E) with '.' so
+         * the logged form is bounded, safe to render in any log viewer, and
+         * cannot break the log record format.  Length is capped to 64 chars
+         * so that an oversized name (PE specifies max 8, but a hostile parser
+         * variant might emit longer) cannot inflate log size.
+         */
+        [[nodiscard]] std::string SanitizeForLog(const std::string& in) noexcept {
+            constexpr size_t kMaxLogLen = 64;
+            std::string out;
+            try {
+                out.reserve(std::min(in.size(), kMaxLogLen));
+                const size_t n = std::min(in.size(), kMaxLogLen);
+                for (size_t i = 0; i < n; ++i) {
+                    const unsigned char c = static_cast<unsigned char>(in[i]);
+                    out.push_back((c >= 0x20 && c <= 0x7E) ? static_cast<char>(c) : '.');
+                }
+                if (in.size() > kMaxLogLen) {
+                    out += "...";
+                }
+            } catch (...) {
+                // SanitizeForLog must never throw — its only consumer is the
+                // logger itself.  On allocation failure return a fixed marker.
+                return std::string("<sanitize-failed>");
+            }
+            return out;
+        }
+
+
 
         /**
          * @brief Extract and concatenate the raw bytes of all executable/code
@@ -160,10 +195,16 @@ namespace ShadowStrike::FuzzyHasher {
                     const uint64_t secEnd =
                         static_cast<uint64_t>(sec.rawAddress) + sec.rawSize;
                     if (secEnd > data.size()) {
+                        // CWE-117 fix: sec.name is 8 raw bytes from the PE file
+                        // and can contain CR/LF/control characters chosen by an
+                        // adversary.  SanitizeForLog replaces any non-printable
+                        // byte with '.' before formatting, so a hostile name
+                        // cannot inject fake log records.
+                        const std::string safeName = SanitizeForLog(sec.name);
                         SS_LOG_WARN(L"FuzzyHasher",
                             L"HashBufferNormalized: section '%S' extends beyond "
                             L"buffer (rawAddr=%u, rawSize=%u, bufSize=%zu) — skipped",
-                            sec.name.c_str(), sec.rawAddress, sec.rawSize, data.size());
+                            safeName.c_str(), sec.rawAddress, sec.rawSize, data.size());
                         continue;
                     }
 
@@ -566,12 +607,23 @@ namespace ShadowStrike::FuzzyHasher {
                 if (bs == 0 || (bs & (bs - 1)) != 0) return true;
             }
 
-            // CHECK 2: signature component lengths must be >= kRollingWindowSize (7).
-            // Signatures shorter than the rolling window can never satisfy
-            // HasCommonSubstring and will always score 0, yet a crafted digest
-            // with length just at this boundary might trigger edge-case behaviour.
+            // CHECK 2: signature component lengths must be >= kRollingWindowSize (7)
+            // AND within their respective generator-side maxima.  Signatures shorter
+            // than the rolling window can never satisfy HasCommonSubstring and will
+            // always score 0; signatures longer than the generator could ever emit
+            // are necessarily crafted.
+            //
+            //   sig1 max = kDigestComponentLength (64)
+            //   sig2 max = kHalfDigestLength      (32)
+            //
+            // Tighter than the previous "<= kMaxSignatureComponentLength" cap, which
+            // accepted sig2 up to 64 chars — a value the generator never produces.
+            // A crafted sig2 longer than 32 chars is, by construction, hostile.
             constexpr size_t kMinSigLen = 7; // kRollingWindowSize from RollingHash.hpp
-            if (sig1.size() < kMinSigLen || sig2.size() < kMinSigLen) {
+            if (sig1.size() < kMinSigLen || sig1.size() > kDigestComponentLength) {
+                return true;
+            }
+            if (sig2.size() < kMinSigLen || sig2.size() > kHalfDigestLength) {
                 return true;
             }
 
