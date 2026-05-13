@@ -523,7 +523,7 @@ namespace ShadowStrike {
              * @post m_initialized is true on success
              * @warning Must be called before any quarantine operations
              */
-            bool Initialize(const Config& config, DatabaseError* err = nullptr);
+            [[nodiscard]] bool Initialize(const Config& config, DatabaseError* err = nullptr);
 
             /**
              * @brief Shuts down the quarantine system gracefully.
@@ -546,7 +546,7 @@ namespace ShadowStrike {
              * @return true if Initialize() succeeded and Shutdown() not called.
              * @note Thread-safe via atomic flag.
              */
-            bool IsInitialized() const noexcept { return m_initialized.load(); }
+            [[nodiscard]] bool IsInitialized() const noexcept { return m_initialized.load(std::memory_order_acquire); }
 
             /** @} */ // end of Lifecycle Methods
 
@@ -582,7 +582,7 @@ namespace ShadowStrike {
              * 
              * @warning Original file is deleted on successful quarantine
              */
-            int64_t QuarantineFile(std::wstring_view originalPath,
+            [[nodiscard]] int64_t QuarantineFile(std::wstring_view originalPath,
                                   ThreatType threatType,
                                   ThreatSeverity severity,
                                   std::wstring_view threatName,
@@ -600,7 +600,7 @@ namespace ShadowStrike {
              * @details Use this when file content is already in memory
              * (e.g., from a previous scan operation). Skips file I/O.
              */
-            int64_t QuarantineFileDetailed(const QuarantineEntry& entry,
+            [[nodiscard]] int64_t QuarantineFileDetailed(const QuarantineEntry& entry,
                                           const std::vector<uint8_t>& fileData,
                                           DatabaseError* err = nullptr);
 
@@ -627,7 +627,7 @@ namespace ShadowStrike {
              * @note Does NOT delete the quarantine copy
              * @warning Restored file may still be malicious - use with caution
              */
-            bool RestoreFile(int64_t entryId,
+            [[nodiscard]] bool RestoreFile(int64_t entryId,
                            std::wstring_view restorePath = L"",
                            std::wstring_view restoredBy = L"",
                            std::wstring_view reason = L"",
@@ -650,7 +650,7 @@ namespace ShadowStrike {
              * 
              * @warning This operation is irreversible
              */
-            bool DeleteQuarantinedFile(int64_t entryId,
+            [[nodiscard]] bool DeleteQuarantinedFile(int64_t entryId,
                                       std::wstring_view deletedBy = L"",
                                       std::wstring_view reason = L"",
                                       DatabaseError* err = nullptr);
@@ -665,7 +665,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if all files quarantined successfully.
              */
-            bool QuarantineBatch(const std::vector<std::wstring>& filePaths,
+            [[nodiscard]] bool QuarantineBatch(const std::vector<std::wstring>& filePaths,
                                ThreatType threatType,
                                ThreatSeverity severity,
                                std::wstring_view threatName,
@@ -678,7 +678,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if all restorations succeeded.
              */
-            bool RestoreBatch(const std::vector<int64_t>& entryIds,
+            [[nodiscard]] bool RestoreBatch(const std::vector<int64_t>& entryIds,
                             std::wstring_view restoredBy = L"",
                             DatabaseError* err = nullptr);
 
@@ -689,7 +689,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if all deletions succeeded.
              */
-            bool DeleteBatch(const std::vector<int64_t>& entryIds,
+            [[nodiscard]] bool DeleteBatch(const std::vector<int64_t>& entryIds,
                            std::wstring_view deletedBy = L"",
                            DatabaseError* err = nullptr);
 
@@ -710,7 +710,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return QuarantineEntry if found, std::nullopt otherwise.
              */
-            std::optional<QuarantineEntry> GetEntry(int64_t id, DatabaseError* err = nullptr);
+            [[nodiscard]] std::optional<QuarantineEntry> GetEntry(int64_t id, DatabaseError* err = nullptr);
 
             /**
              * @brief Queries quarantine entries with complex filtering.
@@ -806,7 +806,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return Number of matching entries, -1 on error.
              */
-            int64_t CountEntries(const QueryFilter* filter = nullptr,
+            [[nodiscard]] int64_t CountEntries(const QueryFilter* filter = nullptr,
                                DatabaseError* err = nullptr);
 
             /** @} */ // end of Query Operations
@@ -831,7 +831,7 @@ namespace ShadowStrike {
              * @details Reads encrypted file, decrypts, decompresses, and
              * returns original file content. Does NOT restore the file.
              */
-            bool ExtractFileData(int64_t entryId,
+            [[nodiscard]] bool ExtractFileData(int64_t entryId,
                                std::vector<uint8_t>& outData,
                                DatabaseError* err = nullptr);
 
@@ -845,7 +845,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if hashes retrieved successfully.
              */
-            bool GetFileHash(int64_t entryId,
+            [[nodiscard]] bool GetFileHash(int64_t entryId,
                            std::wstring& md5,
                            std::wstring& sha1,
                            std::wstring& sha256,
@@ -861,7 +861,7 @@ namespace ShadowStrike {
              * @details Extracts file, recalculates SHA256, and compares
              * against stored hash. Updates statistics accordingly.
              */
-            bool VerifyIntegrity(int64_t entryId, DatabaseError* err = nullptr);
+            [[nodiscard]] bool VerifyIntegrity(int64_t entryId, DatabaseError* err = nullptr);
 
             /**
              * @brief Updates metadata for an existing quarantine entry.
@@ -869,7 +869,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if update succeeded.
              */
-            bool UpdateEntry(const QuarantineEntry& entry, DatabaseError* err = nullptr);
+            [[nodiscard]] bool UpdateEntry(const QuarantineEntry& entry, DatabaseError* err = nullptr);
 
             /**
              * @brief Appends notes to an existing quarantine entry.
@@ -878,7 +878,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if notes added successfully.
              */
-            bool AddNotes(int64_t entryId,
+            [[nodiscard]] bool AddNotes(int64_t entryId,
                         std::wstring_view notes,
                         DatabaseError* err = nullptr);
 
@@ -898,7 +898,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if cleanup completed (even if no entries removed).
              */
-            bool CleanupExpired(DatabaseError* err = nullptr);
+            [[nodiscard]] bool CleanupExpired(DatabaseError* err = nullptr);
 
             /**
              * @brief Removes oldest entries until vault is under target size.
@@ -906,7 +906,7 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if cleanup completed successfully.
              */
-            bool CleanupBySize(size_t targetSize, DatabaseError* err = nullptr);
+            [[nodiscard]] bool CleanupBySize(size_t targetSize, DatabaseError* err = nullptr);
 
             /**
              * @brief Permanently deletes all quarantine entries.
@@ -917,7 +917,7 @@ namespace ShadowStrike {
              * 
              * @warning Irreversible operation - requires confirmation flag
              */
-            bool DeleteAll(bool confirmed, DatabaseError* err = nullptr);
+            [[nodiscard]] bool DeleteAll(bool confirmed, DatabaseError* err = nullptr);
 
             /**
              * @brief Exports a single quarantine entry to a JSON file.
@@ -930,7 +930,7 @@ namespace ShadowStrike {
              * 
              * @details Exports include Base64-encoded file content for portability.
              */
-            bool ExportEntry(int64_t entryId,
+            [[nodiscard]] bool ExportEntry(int64_t entryId,
                            std::wstring_view exportPath,
                            bool includeMetadata = true,
                            DatabaseError* err = nullptr);
@@ -944,7 +944,7 @@ namespace ShadowStrike {
              * 
              * @details Validates hash integrity during import.
              */
-            int64_t ImportEntry(std::wstring_view importPath,
+            [[nodiscard]] int64_t ImportEntry(std::wstring_view importPath,
                               DatabaseError* err = nullptr);
 
             /**
@@ -962,7 +962,7 @@ namespace ShadowStrike {
              * @pre Entry must be in Active or Pending status
              * @post Entry status changed to Pending with submission notes
              */
-            bool SubmitForAnalysis(int64_t entryId,
+            [[nodiscard]] bool SubmitForAnalysis(int64_t entryId,
                                  std::wstring_view submissionEndpoint,
                                  DatabaseError* err = nullptr);
 
@@ -1028,7 +1028,7 @@ namespace ShadowStrike {
              * 
              * @note Exports metadata only, not file content
              */
-            bool ExportToJSON(std::wstring_view filePath,
+            [[nodiscard]] bool ExportToJSON(std::wstring_view filePath,
                             const QueryFilter* filter = nullptr,
                             DatabaseError* err = nullptr);
 
@@ -1042,7 +1042,7 @@ namespace ShadowStrike {
              * 
              * @details UTF-8 encoded with BOM, proper field escaping.
              */
-            bool ExportToCSV(std::wstring_view filePath,
+            [[nodiscard]] bool ExportToCSV(std::wstring_view filePath,
                            const QueryFilter* filter = nullptr,
                            DatabaseError* err = nullptr);
 
@@ -1091,28 +1091,28 @@ namespace ShadowStrike {
              * @param err Optional error output parameter.
              * @return true if vacuum succeeded.
              */
-            bool Vacuum(DatabaseError* err = nullptr);
+            [[nodiscard]] bool Vacuum(DatabaseError* err = nullptr);
 
             /**
              * @brief Verifies database integrity.
              * @param err Optional error output parameter.
              * @return true if database is intact.
              */
-            bool CheckIntegrity(DatabaseError* err = nullptr);
+            [[nodiscard]] bool CheckIntegrity(DatabaseError* err = nullptr);
 
             /**
              * @brief Optimizes database for performance.
              * @param err Optional error output parameter.
              * @return true if optimization succeeded.
              */
-            bool Optimize(DatabaseError* err = nullptr);
+            [[nodiscard]] bool Optimize(DatabaseError* err = nullptr);
 
             /**
              * @brief Rebuilds all database indices.
              * @param err Optional error output parameter.
              * @return true if rebuild succeeded.
              */
-            bool RebuildIndices(DatabaseError* err = nullptr);
+            [[nodiscard]] bool RebuildIndices(DatabaseError* err = nullptr);
 
             /**
              * @brief Creates a full backup of the quarantine vault.
@@ -1124,7 +1124,7 @@ namespace ShadowStrike {
              * @details Includes all entries with encrypted file content.
              * @warning Backup files can be very large.
              */
-            bool BackupQuarantine(std::wstring_view backupPath, DatabaseError* err = nullptr);
+            [[nodiscard]] bool BackupQuarantine(std::wstring_view backupPath, DatabaseError* err = nullptr);
 
             /**
              * @brief Restores quarantine from a backup file.
@@ -1136,7 +1136,7 @@ namespace ShadowStrike {
              * @details Validates hash integrity during restore.
              * @note Creates new entry IDs, does not preserve originals.
              */
-            bool RestoreQuarantine(std::wstring_view backupPath, DatabaseError* err = nullptr);
+            [[nodiscard]] bool RestoreQuarantine(std::wstring_view backupPath, DatabaseError* err = nullptr);
 
             /**
              * @brief Logs an audit event for compliance tracking.
