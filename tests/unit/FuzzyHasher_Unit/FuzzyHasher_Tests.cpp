@@ -262,6 +262,35 @@ TEST(FuzzyHasherTest, SuspiciousDigestScreenRejectsCraftedInputsAndAllowsLegitim
     EXPECT_TRUE(FH::IsSuspiciousDigest("3:AAAAAAA:HIJKLMN"));
     EXPECT_FALSE(FH::IsSuspiciousDigest("3:ABCDEFG:HIJKLMN"));
 
+    // Regression: sig2 longer than kHalfDigestLength (32) must be rejected.
+    // The generator can never emit sig2 > 32 chars; a longer sig2 is, by
+    // construction, a hostile / crafted digest and must be flagged.
+    {
+        const std::string sig2Oversize(33, 'B'); // 33 > kHalfDigestLength
+        const std::string crafted = std::string("3:ABCDEFGH:") + sig2Oversize;
+        EXPECT_TRUE(FH::IsSuspiciousDigest(crafted));
+    }
+    // sig2 at exactly kHalfDigestLength (32) is still legitimate.
+    {
+        const std::string sig2Max(32, 'A');
+        // All-same-character would trigger CHECK 3, so vary the content:
+        std::string sig2Varied(32, 'A');
+        for (size_t i = 0; i < sig2Varied.size(); ++i) {
+            sig2Varied[i] = static_cast<char>('A' + (i % 16));
+        }
+        const std::string okMax = std::string("3:ABCDEFGH:") + sig2Varied;
+        EXPECT_FALSE(FH::IsSuspiciousDigest(okMax));
+    }
+    // Regression: sig1 longer than kDigestComponentLength (64) must be rejected.
+    {
+        std::string sig1Oversize(65, 'A');
+        for (size_t i = 0; i < sig1Oversize.size(); ++i) {
+            sig1Oversize[i] = static_cast<char>('A' + (i % 16));
+        }
+        const std::string crafted = std::string("3:") + sig1Oversize + ":HIJKLMN";
+        EXPECT_TRUE(FH::IsSuspiciousDigest(crafted));
+    }
+
     const auto digest = FH::HashBuffer(MakePatternData(4096));
     ASSERT_TRUE(digest.has_value());
     EXPECT_FALSE(FH::IsSuspiciousDigest(*digest));
