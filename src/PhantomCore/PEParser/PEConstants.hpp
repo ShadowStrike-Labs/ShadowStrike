@@ -139,6 +139,9 @@ namespace SectionCharacteristics {
     inline constexpr uint32_t LNK_REMOVE             = 0x00000800;
     inline constexpr uint32_t LNK_COMDAT             = 0x00001000;
     inline constexpr uint32_t GPREL                  = 0x00008000;
+    // MEM_PURGEABLE and MEM_16BIT intentionally share bit 0x00020000.
+    // Per the Microsoft PE/COFF specification this single bit is reused with
+    // different semantics depending on machine type; do NOT "deduplicate" it.
     inline constexpr uint32_t MEM_PURGEABLE          = 0x00020000;
     inline constexpr uint32_t MEM_16BIT              = 0x00020000;
     inline constexpr uint32_t MEM_LOCKED             = 0x00040000;
