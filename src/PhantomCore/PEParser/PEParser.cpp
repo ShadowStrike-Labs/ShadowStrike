@@ -43,6 +43,42 @@
 namespace ShadowStrike {
 namespace PEParser {
 
+namespace {
+
+// ----------------------------------------------------------------------------
+// Exception-safe vector growth helpers.
+//
+// Many internal parser methods are declared noexcept and must remain so to
+// honor the public PEParser API contract. However, std::vector::push_back
+// and std::vector::emplace_back can throw std::bad_alloc on memory pressure;
+// inside a noexcept frame that immediately calls std::terminate(), crashing
+// the process. These helpers swallow allocation failures: the offending
+// anomaly/import/section entry is silently dropped and the parser continues.
+// Reliability under memory pressure is prioritized over completeness of
+// optional telemetry — every dropped entry is recoverable from a re-parse,
+// whereas a terminated agent process is not.
+// ----------------------------------------------------------------------------
+
+template<typename Vec, typename... Args>
+inline void SafeEmplace(Vec& v, Args&&... args) noexcept {
+    try {
+        v.emplace_back(std::forward<Args>(args)...);
+    } catch (...) {
+        // Allocation failure — record nothing; parser remains usable.
+    }
+}
+
+template<typename Vec, typename T>
+inline void SafePush(Vec& v, T&& value) noexcept {
+    try {
+        v.push_back(std::forward<T>(value));
+    } catch (...) {
+        // Allocation failure — record nothing; parser remains usable.
+    }
+}
+
+} // namespace
+
 // ============================================================================
 // Implementation Class (PIMPL)
 // ============================================================================
@@ -357,7 +393,7 @@ public:
                 return false;
             }
 
-            m_rawSections.push_back(header);
+            SafePush(m_rawSections, header);
 
             SectionInfo info;
 
@@ -392,18 +428,18 @@ public:
 
             // Check for W+X
             if (info.isExecutable && info.isWritable) {
-                info.anomalies.emplace_back(AnomalyType::SectionWritableExecutable,
+                SafeEmplace(info.anomalies, AnomalyType::SectionWritableExecutable,
                                             L"Section is both writable and executable");
             }
 
-            m_info.sections.push_back(std::move(info));
+            SafePush(m_info.sections, std::move(info));
         }
 
         // Check for overlapping sections
         std::vector<std::pair<size_t, size_t>> overlaps;
         if (CheckSectionOverlaps(m_rawSections, overlaps)) {
             for (const auto& [i, j] : overlaps) {
-                m_info.anomalies.emplace_back(AnomalyType::UnusualSectionOrder,
+                SafeEmplace(m_info.anomalies, AnomalyType::UnusualSectionOrder,
                                               L"Sections overlap in file");
             }
         }
@@ -417,7 +453,7 @@ public:
                 sec.isPackedHeuristic = (sec.entropy > 7.0 &&
                     (sec.isExecutable || sec.hasCode));
                 if (sec.entropy > 7.2) {
-                    m_info.anomalies.emplace_back(AnomalyType::SectionHighEntropy,
+                    SafeEmplace(m_info.anomalies, AnomalyType::SectionHighEntropy,
                         L"Section has very high entropy (>7.2) — likely packed or encrypted");
                 }
             }
@@ -434,7 +470,7 @@ public:
         if (m_info.entryPointRva == 0) {
             // Zero entry point can be valid for DLLs
             if (!m_info.isDLL) {
-                m_info.anomalies.emplace_back(AnomalyType::EntryPointZero,
+                SafeEmplace(m_info.anomalies, AnomalyType::EntryPointZero,
                                               L"Entry point is zero");
             }
             return;
@@ -457,17 +493,17 @@ public:
 
                 // Check for suspicious entry point location
                 if (i == m_info.sections.size() - 1) {
-                    m_info.anomalies.emplace_back(AnomalyType::EntryPointInLastSection,
+                    SafeEmplace(m_info.anomalies, AnomalyType::EntryPointInLastSection,
                                                   L"Entry point in last section (packer indicator)");
                 }
 
                 if (sec.isWritable) {
-                    m_info.anomalies.emplace_back(AnomalyType::EntryPointInWritableSection,
+                    SafeEmplace(m_info.anomalies, AnomalyType::EntryPointInWritableSection,
                                                   L"Entry point in writable section");
                 }
 
                 if (!sec.isExecutable) {
-                    m_info.anomalies.emplace_back(AnomalyType::CodeOutsideCodeSection,
+                    SafeEmplace(m_info.anomalies, AnomalyType::CodeOutsideCodeSection,
                                                   L"Entry point in non-executable section");
                 }
 
@@ -477,10 +513,10 @@ public:
 
         // Entry point not in any section
         if (m_info.entryPointRva < m_info.sizeOfHeaders) {
-            m_info.anomalies.emplace_back(AnomalyType::EntryPointInHeader,
+            SafeEmplace(m_info.anomalies, AnomalyType::EntryPointInHeader,
                                           L"Entry point in PE header");
         } else {
-            m_info.anomalies.emplace_back(AnomalyType::EntryPointOutsideFile,
+            SafeEmplace(m_info.anomalies, AnomalyType::EntryPointOutsideFile,
                                           L"Entry point outside all sections");
         }
     }
@@ -527,7 +563,7 @@ public:
             m_info.overlaySize = m_info.fileSize - overlayStart;
 
             if (m_info.overlaySize > 0) {
-                m_info.anomalies.emplace_back(AnomalyType::OverlayPresent,
+                SafeEmplace(m_info.anomalies, AnomalyType::OverlayPresent,
                                               L"File has overlay data");
 
                 // Calculate overlay entropy — high entropy indicates embedded
@@ -550,7 +586,7 @@ public:
                             }
                         }
                         if (entropy > 7.0) {
-                            m_info.anomalies.emplace_back(AnomalyType::OverlayHighEntropy,
+                            SafeEmplace(m_info.anomalies, AnomalyType::OverlayHighEntropy,
                                 L"Overlay data has high entropy (>7.0) — encrypted/compressed payload");
                         }
                     }
@@ -566,7 +602,7 @@ public:
     void DetectAnomalies() noexcept {
         // Timestamp anomalies
         if (m_info.timeDateStamp == 0) {
-            m_info.anomalies.emplace_back(AnomalyType::TimestampZero,
+            SafeEmplace(m_info.anomalies, AnomalyType::TimestampZero,
                                           L"Timestamp is zero");
         } else {
             // Check for future timestamp (more than 1 day in future)
@@ -574,24 +610,24 @@ public:
             auto nowEpoch = std::chrono::duration_cast<std::chrono::seconds>(
                 now.time_since_epoch()).count();
             if (m_info.timeDateStamp > nowEpoch + 86400) {
-                m_info.anomalies.emplace_back(AnomalyType::TimestampInFuture,
+                SafeEmplace(m_info.anomalies, AnomalyType::TimestampInFuture,
                                               L"Timestamp is in the future");
             }
             // Check for very old timestamp (before 1995)
             if (m_info.timeDateStamp < 788918400) {  // 1995-01-01
-                m_info.anomalies.emplace_back(AnomalyType::TimestampVeryOld,
+                SafeEmplace(m_info.anomalies, AnomalyType::TimestampVeryOld,
                                               L"Timestamp is suspiciously old");
             }
         }
 
         // Security feature checks
         if ((m_info.dllCharacteristics & DllCharacteristics::DYNAMIC_BASE) == 0) {
-            m_info.anomalies.emplace_back(AnomalyType::NoASLR,
+            SafeEmplace(m_info.anomalies, AnomalyType::NoASLR,
                                           L"ASLR not enabled");
         }
 
         if ((m_info.dllCharacteristics & DllCharacteristics::NX_COMPAT) == 0) {
-            m_info.anomalies.emplace_back(AnomalyType::NoDEP,
+            SafeEmplace(m_info.anomalies, AnomalyType::NoDEP,
                                           L"DEP/NX not enabled");
         }
 
@@ -607,7 +643,7 @@ public:
         if (!m_info.isDotNet &&
             m_info.timeDateStamp > kCFGEpoch &&
             (m_info.dllCharacteristics & DllCharacteristics::GUARD_CF) == 0) {
-            m_info.anomalies.emplace_back(
+            SafeEmplace(m_info.anomalies, 
                 AnomalyType::NoCFG,
                 L"Control Flow Guard (GUARD_CF) not enabled on modern binary (post-2014)");
         }
@@ -617,21 +653,21 @@ public:
         // traditional SEH-overwrite techniques if CFG/SEHOP is also absent.
         if (!m_info.isDLL && !m_info.isDriver && !m_info.isDotNet &&
             (m_info.dllCharacteristics & DllCharacteristics::NO_SEH) == 0) {
-            m_info.anomalies.emplace_back(
+            SafeEmplace(m_info.anomalies, 
                 AnomalyType::NoSEH,
                 L"NO_SEH flag not set; executable may contain exploitable SEH handlers");
         }
 
         // Checksum check
         if (m_info.checksum == 0 && m_info.isDriver) {
-            m_info.anomalies.emplace_back(AnomalyType::WeakChecksum,
+            SafeEmplace(m_info.anomalies, AnomalyType::WeakChecksum,
                                           L"Driver has no checksum");
         }
 
         // Section name checks
         for (const auto& sec : m_info.sections) {
             if (sec.name.empty()) {
-                m_info.anomalies.emplace_back(AnomalyType::SectionNameEmpty,
+                SafeEmplace(m_info.anomalies, AnomalyType::SectionNameEmpty,
                                               L"Section has empty name");
             } else {
                 // Check for non-printable characters
@@ -643,7 +679,7 @@ public:
                     }
                 }
                 if (hasNonPrintable) {
-                    m_info.anomalies.emplace_back(AnomalyType::SectionNameNonPrintable,
+                    SafeEmplace(m_info.anomalies, AnomalyType::SectionNameNonPrintable,
                                                   L"Section has non-printable characters in name");
                 }
 
@@ -668,7 +704,7 @@ public:
                 };
                 for (const auto& suspicious : kSuspiciousNames) {
                     if (sec.name == suspicious) {
-                        m_info.anomalies.emplace_back(AnomalyType::SectionNameSuspicious,
+                        SafeEmplace(m_info.anomalies, AnomalyType::SectionNameSuspicious,
                             L"Section name matches known packer/protector signature");
                         break;
                     }
@@ -678,7 +714,7 @@ public:
 
         // Check for no imports (suspicious for most executables)
         if (!m_info.dataDirectories[DataDirectory::IMPORT].present && !m_info.isDLL) {
-            m_info.anomalies.emplace_back(AnomalyType::NoImports,
+            SafeEmplace(m_info.anomalies, AnomalyType::NoImports,
                                           L"No import table");
         }
 
@@ -695,7 +731,7 @@ public:
             // If majority of executable sections show packing indicators
             if (execSections > 0 && packedSections > 0 &&
                 packedSections >= (execSections + 1) / 2) {
-                m_info.anomalies.emplace_back(AnomalyType::PackerSignatureDetected,
+                SafeEmplace(m_info.anomalies, AnomalyType::PackerSignatureDetected,
                     L"Majority of executable sections show high entropy — likely packed");
             }
         }
@@ -776,7 +812,7 @@ public:
         while (descriptorCount < Limits::MAX_IMPORT_DESCRIPTORS) {
             // Loop detection
             if (visitedDescriptors.count(offset)) {
-                m_info.anomalies.emplace_back(AnomalyType::DelayLoadSuspicious,
+                SafeEmplace(m_info.anomalies, AnomalyType::DelayLoadSuspicious,
                                               L"Circular import descriptor chain");
                 break;
             }
@@ -818,7 +854,7 @@ public:
                 ParseImportThunks(thunkRva, desc.FirstThunk, import.functions);
             }
 
-            out.push_back(std::move(import));
+            SafePush(out, std::move(import));
 
             offset += sizeof(ImportDescriptor);
             ++descriptorCount;
@@ -892,7 +928,7 @@ public:
                 iatOffset += sizeof(uint32_t);
             }
 
-            out.push_back(std::move(func));
+            SafePush(out, std::move(func));
             ++funcCount;
         }
     }
@@ -1016,7 +1052,7 @@ public:
         out.exports.reserve(dir.NumberOfFunctions);
         for (auto& exp : eat) {
             if (exp.rva != 0) {
-                out.exports.push_back(std::move(exp));
+                SafePush(out.exports, std::move(exp));
             }
         }
 
@@ -1071,7 +1107,7 @@ public:
                     if (callbacksRva > static_cast<uint64_t>(UINT32_MAX)) {
                         SS_LOG_WARN(L"PEParser",
                             L"TLS callback VA exceeds 32-bit RVA range; skipping callbacks");
-                        m_info.anomalies.emplace_back(AnomalyType::TLSCallbackPresent,
+                        SafeEmplace(m_info.anomalies, AnomalyType::TLSCallbackPresent,
                             L"TLS callback address produces RVA > UINT32_MAX — possible crafted PE");
                     } else {
                         auto cbOffset = RvaToOffsetInternal(static_cast<uint32_t>(callbacksRva));
@@ -1080,7 +1116,7 @@ public:
                             for (size_t i = 0; i < Limits::MAX_TLS_CALLBACKS; ++i) {
                                 uint64_t callback;
                                 if (!m_reader.Read(offset, callback) || callback == 0) break;
-                                out.callbacks.push_back(callback);
+                                SafePush(out.callbacks, callback);
                                 offset += sizeof(uint64_t);
                             }
                         }
@@ -1114,7 +1150,7 @@ public:
                         for (size_t i = 0; i < Limits::MAX_TLS_CALLBACKS; ++i) {
                             uint32_t callback;
                             if (!m_reader.Read(offset, callback) || callback == 0) break;
-                            out.callbacks.push_back(callback);
+                            SafePush(out.callbacks, callback);
                             offset += sizeof(uint32_t);
                         }
                     }
@@ -1124,7 +1160,7 @@ public:
 
         // Flag TLS callbacks as anomaly
         if (!out.callbacks.empty()) {
-            m_info.anomalies.emplace_back(AnomalyType::TLSCallbackPresent,
+            SafeEmplace(m_info.anomalies, AnomalyType::TLSCallbackPresent,
                                           L"TLS callbacks present");
         }
 
@@ -1192,14 +1228,21 @@ public:
 
                 if (type != RelocationType::RELOC_ABSOLUTE) {  // Skip padding
                     RelocationEntry reloc;
-                    reloc.rva = block.VirtualAddress + off;
+                    // SafeAdd: attacker-controlled VirtualAddress + 12-bit off
+                    // must not wrap.  On overflow, skip the entry (record only
+                    // well-defined RVAs).
+                    if (!SafeMath::SafeAdd(block.VirtualAddress,
+                                           static_cast<uint32_t>(off),
+                                           reloc.rva)) {
+                        continue;
+                    }
                     reloc.type = type;
-                    relocBlock.entries.push_back(reloc);
+                    SafePush(relocBlock.entries, reloc);
                     ++totalEntries;
                 }
             }
 
-            out.push_back(std::move(relocBlock));
+            SafePush(out, std::move(relocBlock));
             offset += block.SizeOfBlock;
             ++blockCount;
         }
@@ -1252,7 +1295,7 @@ public:
                 ParseCodeViewInfo(entry.PointerToRawData, entry.SizeOfData, info);
             }
 
-            out.push_back(std::move(info));
+            SafePush(out, std::move(info));
         }
 
         return true;
@@ -1278,22 +1321,38 @@ public:
                 // trigger outbound SMB auth, excessively long, or embed control chars.
                 std::string_view path;
                 if (m_reader.ReadString(offset + 24, size - 24, path)) {
-                    // 1. Reject UNC paths entirely to prevent outbound SMB auth
-                    if (path.size() >= 2 && path[0] == '\\' && path[1] == '\\') {
+                    // 1. Reject any path that begins with a backslash run.
+                    //    This covers UNC (\\server\share), device (\\?\, \\.\)
+                    //    and Win32 file-namespace prefixes (\??\) — all of which
+                    //    can trigger network or driver auth side-effects.
+                    const bool rejectPath =
+                        (path.size() >= 1 && path[0] == '\\') ||
+                        (path.size() >= 1 && path[0] == '/');
+                    if (rejectPath) {
                         info.pdbPath.clear();
                     } else {
-                        // 2. Limit to MAX_PATH characters
-                        const size_t maxLen = std::min(path.size(), static_cast<size_t>(MAX_PATH));
-                        std::string sanitized;
-                        sanitized.reserve(maxLen);
-                        for (size_t k = 0; k < maxLen; ++k) {
-                            const unsigned char c = static_cast<unsigned char>(path[k]);
-                            // 3. Strip null bytes and control characters (0x00-0x1F, DEL 0x7F)
-                            if (c >= 0x20u && c != 0x7Fu) {
-                                sanitized += static_cast<char>(c);
+                        // 2. Cap at the PE-specific PDB-path limit (1024 chars).
+                        const size_t maxLen = std::min(
+                            path.size(),
+                            static_cast<size_t>(Limits::MAX_PDB_PATH_LENGTH));
+                        try {
+                            std::string sanitized;
+                            sanitized.reserve(maxLen);
+                            for (size_t k = 0; k < maxLen; ++k) {
+                                const unsigned char c =
+                                    static_cast<unsigned char>(path[k]);
+                                // 3. Strip null bytes and control characters
+                                //    (0x00-0x1F, DEL 0x7F).
+                                if (c >= 0x20u && c != 0x7Fu) {
+                                    sanitized += static_cast<char>(c);
+                                }
                             }
+                            info.pdbPath = std::move(sanitized);
+                        } catch (...) {
+                            // Allocation failure: leave pdbPath empty rather
+                            // than terminate the noexcept parser frame.
+                            info.pdbPath.clear();
                         }
-                        info.pdbPath = std::move(sanitized);
                     }
                 }
             }
@@ -1381,7 +1440,7 @@ public:
             entry.productId = static_cast<uint16_t>(id & 0xFFFF);
             entry.useCount = count;
 
-            out.entries.push_back(entry);
+            SafePush(out.entries, entry);
             entryOffset += 8;
         }
 
@@ -1465,7 +1524,7 @@ public:
             std::unordered_set<uint32_t>& visited) noexcept {
 
         if (depth >= maxDepth) {
-            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+            SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                 L"Resource tree depth limit exceeded");
             return;
         }
@@ -1474,7 +1533,7 @@ public:
 
         // Loop detection: offsets are relative to section base (uint32_t).
         if (!visited.insert(dirOffsetFromBase).second) {
-            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+            SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                 L"Circular reference detected in resource directory");
             return;
         }
@@ -1487,7 +1546,7 @@ public:
             return;
 
         if (dirFileOffset + sizeof(ResourceDirectory) > rsrcEnd) {
-            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+            SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                 L"Resource directory offset is outside the resource section");
             return;
         }
@@ -1498,13 +1557,13 @@ public:
         uint32_t numEntries;
         if (!SafeMath::SafeAdd(static_cast<uint32_t>(dir.NumberOfNamedEntries),
                                static_cast<uint32_t>(dir.NumberOfIdEntries), numEntries)) {
-            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+            SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                 L"Resource directory entry count overflow");
             return;
         }
 
         if (numEntries > static_cast<uint32_t>(Limits::MAX_RESOURCE_ENTRIES)) {
-            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+            SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                 L"Resource directory entry count exceeds limit; truncating");
             numEntries = static_cast<uint32_t>(Limits::MAX_RESOURCE_ENTRIES);
         }
@@ -1570,7 +1629,7 @@ public:
                                        dataEntryFileOffset)) continue;
 
                 if (dataEntryFileOffset + sizeof(ResourceDataEntry) > rsrcEnd) {
-                    m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                    SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                         L"Resource data entry is outside the resource section bounds");
                     continue;
                 }
@@ -1579,7 +1638,7 @@ public:
                 if (!m_reader.Read(dataEntryFileOffset, dataEntry)) continue;
 
                 if (dataEntry.Size > 0x1000000u) {  // > 16 MB
-                    m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                    SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                         L"Resource data entry has suspiciously large size (>16 MB)");
                 }
 
@@ -1597,11 +1656,11 @@ public:
                     if (dataFileOpt) {
                         resEntry.offset = static_cast<uint32_t>(*dataFileOpt & 0xFFFFFFFFu);
                         if (!m_reader.ValidateRange(*dataFileOpt, dataEntry.Size)) {
-                            m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                            SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                                 L"Resource data extends beyond file boundary");
                         }
                     } else {
-                        m_info.anomalies.emplace_back(AnomalyType::ResourceSizeAnomaly,
+                        SafeEmplace(m_info.anomalies, AnomalyType::ResourceSizeAnomaly,
                             L"Resource data RVA cannot be resolved to a file offset");
                     }
                 }
@@ -1638,7 +1697,7 @@ public:
                     }
                 }
 
-                out.push_back(std::move(resEntry));
+                SafePush(out, std::move(resEntry));
             }
         }
     }
@@ -1734,7 +1793,7 @@ public:
 
         const uint32_t computed = acc & 0xFFFFu;
         if (computed != m_info.checksum) {
-            m_info.anomalies.emplace_back(AnomalyType::ChecksumMismatch,
+            SafeEmplace(m_info.anomalies, AnomalyType::ChecksumMismatch,
                 L"PE checksum does not match computed value — possible tampering");
         }
     }
@@ -1848,13 +1907,13 @@ public:
                             thunkOff += sizeof(uint32_t);
                         }
 
-                        import.functions.push_back(std::move(func));
+                        SafePush(import.functions, std::move(func));
                         ++funcCount;
                     }
                 }
             }
 
-            out.push_back(std::move(import));
+            SafePush(out, std::move(import));
             offset += sizeof(DelayImportDescriptor);
             ++descriptorCount;
         }
@@ -1996,7 +2055,7 @@ public:
             entry.beginAddress = beginAddr;
             entry.endAddress = endAddr;
             entry.unwindInfoAddress = unwindInfo;
-            out.push_back(entry);
+            SafePush(out, entry);
         }
 
         return true;
@@ -2083,11 +2142,24 @@ bool PEParser::ParseFile(const std::wstring& path, PEInfo& out, PEError* err) no
     );
 
     if (!m_impl->ParseInternal(err)) {
-        out = PEInfo();
+        try { out = PEInfo(); } catch (...) {}
         return false;
     }
 
-    out = m_impl->m_info;
+    // PEInfo contains many heap-backed fields (vectors of section/import/etc.
+    // metadata and wide-string members); the assignment can throw bad_alloc
+    // under memory pressure.  Inside a noexcept boundary that becomes
+    // std::terminate(), so explicitly catch and surface the failure cleanly.
+    try {
+        out = m_impl->m_info;
+    } catch (...) {
+        if (err) {
+            err->Set(ValidationResult::UnknownError,
+                     L"Out-of-memory while copying PEInfo result", 0);
+        }
+        try { out = PEInfo(); } catch (...) {}
+        return false;
+    }
     return true;
 }
 
@@ -2106,11 +2178,20 @@ bool PEParser::ParseBuffer(const uint8_t* data, size_t size, PEInfo& out, PEErro
     m_impl->m_reader = SafeReader(data, size);
 
     if (!m_impl->ParseInternal(err)) {
-        out = PEInfo();
+        try { out = PEInfo(); } catch (...) {}
         return false;
     }
 
-    out = m_impl->m_info;
+    try {
+        out = m_impl->m_info;
+    } catch (...) {
+        if (err) {
+            err->Set(ValidationResult::UnknownError,
+                     L"Out-of-memory while copying PEInfo result", 0);
+        }
+        try { out = PEInfo(); } catch (...) {}
+        return false;
+    }
     return true;
 }
 
@@ -2311,7 +2392,7 @@ bool PEParser::ValidatePE(std::vector<ValidationResult>& issues) const noexcept 
     issues.clear();
 
     if (!m_impl->m_parsed) {
-        issues.push_back(ValidationResult::UnknownError);
+        SafePush(issues, ValidationResult::UnknownError);
         return false;
     }
 
@@ -2326,14 +2407,14 @@ bool PEParser::ValidatePE(std::vector<ValidationResult>& issues) const noexcept 
             nullptr
         );
         if (result != ValidationResult::Valid) {
-            issues.push_back(result);
+            SafePush(issues, result);
         }
     }
 
     // Check section overlaps
     std::vector<std::pair<size_t, size_t>> overlaps;
     if (CheckSectionOverlaps(m_impl->m_rawSections, overlaps)) {
-        issues.push_back(ValidationResult::SectionOverlap);
+        SafePush(issues, ValidationResult::SectionOverlap);
     }
 
     return issues.empty();
