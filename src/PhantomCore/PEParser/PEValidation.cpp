@@ -627,6 +627,7 @@ namespace PEParser {
         case 13:  // IMAGE_SUBSYSTEM_EFI_ROM
         case 14:  // IMAGE_SUBSYSTEM_XBOX
         case 16:  // IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION
+        case 17:  // IMAGE_SUBSYSTEM_XBOX_CODE_CATALOG
             break;
         default:
             if (err) {
@@ -818,6 +819,7 @@ namespace PEParser {
         case 13:  // IMAGE_SUBSYSTEM_EFI_ROM
         case 14:  // IMAGE_SUBSYSTEM_XBOX
         case 16:  // IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION
+        case 17:  // IMAGE_SUBSYSTEM_XBOX_CODE_CATALOG
             break;
         default:
             if (err) {
