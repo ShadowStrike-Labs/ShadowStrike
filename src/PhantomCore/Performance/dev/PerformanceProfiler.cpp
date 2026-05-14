@@ -399,8 +399,8 @@ namespace Performance {
                     std::lock_guard lock(m_activeProfilesMutex);
                     m_activeProfiles.clear();
                 }
-            } catch (...) {
-                // Lock failure — do not propagate from noexcept
+            } catch (const std::exception& ex) {
+                Logger::Warn("ClearHistory failed to acquire profiler locks: {}", ex.what());
             }
         }
 
@@ -408,7 +408,8 @@ namespace Performance {
             try {
                 std::lock_guard lock(m_activeProfilesMutex);
                 return m_activeProfiles.size();
-            } catch (...) {
+            } catch (const std::exception& ex) {
+                Logger::Warn("GetActiveProfileCount failed to acquire profiler lock: {}", ex.what());
                 return 0;
             }
         }
@@ -700,8 +701,8 @@ namespace Performance {
         try {
             PerformanceProfiler::Instance().StartProfile(m_name);
             m_active = true;
-        } catch (...) {
-            // Never throw from RAII constructor used in profiling context
+        } catch (const std::exception& ex) {
+            Logger::Warn("ScopedProfile start failed for '{}': {}", m_name, ex.what());
         }
     }
 
@@ -709,8 +710,8 @@ namespace Performance {
         if (m_active) {
             try {
                 PerformanceProfiler::Instance().StopProfile(m_name);
-            } catch (...) {
-                // Never throw from destructor
+            } catch (const std::exception& ex) {
+                Logger::Warn("ScopedProfile stop failed for '{}': {}", m_name, ex.what());
             }
         }
     }
