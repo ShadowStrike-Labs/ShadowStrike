@@ -437,19 +437,27 @@ namespace {
     }
 
     /**
-     * @brief Case-insensitive substring search using Windows CharLowerBuff.
+     * @brief Case-insensitive substring search.
+     *
+     * Uses `std::towlower` for per-character lower-casing. The previous
+     * implementation relied on the documented but fragile Windows trick
+     * of passing a single character zero-extended into LPWSTR to
+     * `::CharLowerW`, which provokes /W4 /WX reinterpret-cast scrutiny
+     * and is not portable across MUI / locale changes. `towlower` from
+     * `<cwctype>` is locale-aware via the C global locale (which the
+     * ShadowStrike service explicitly leaves at "C" for deterministic
+     * detection) and avoids the cast entirely.
      */
     [[nodiscard]] bool WideIContains(std::wstring_view haystack, std::wstring_view needle) noexcept {
         if (needle.empty()) return true;
         if (haystack.size() < needle.size()) return false;
 
-        // Use the codebase utility if available; fallback to manual search
         auto it = std::search(
             haystack.begin(), haystack.end(),
             needle.begin(), needle.end(),
             [](wchar_t a, wchar_t b) noexcept {
-                return ::CharLowerW(reinterpret_cast<LPWSTR>(static_cast<ULONG_PTR>(a))) ==
-                       ::CharLowerW(reinterpret_cast<LPWSTR>(static_cast<ULONG_PTR>(b)));
+                return std::towlower(static_cast<wint_t>(a)) ==
+                       std::towlower(static_cast<wint_t>(b));
             }
         );
         return it != haystack.end();
@@ -820,7 +828,16 @@ public:
 
             wchar_t processName[MAX_PATH] = {};
             DWORD nameSize = MAX_PATH;
-            ::QueryFullProcessImageNameW(hProcess, 0, processName, &nameSize);
+            if (!::QueryFullProcessImageNameW(hProcess, 0, processName, &nameSize)) {
+                // Non-fatal: we can still terminate without knowing the
+                // image name; log the failure for forensics and continue
+                // with an explicit "unknown" marker so log lines remain
+                // unambiguous (zero-initialised buffer would print empty).
+                Utils::Logger::Warn(
+                    "ShadowCopyProtector: QueryFullProcessImageNameW failed for PID={}, error={}",
+                    pid, ::GetLastError());
+                wcscpy_s(processName, _countof(processName), L"<unknown>");
+            }
 
             BOOL terminated = ::TerminateProcess(hProcess, 1);
             DWORD err = ::GetLastError();
