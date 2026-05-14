@@ -667,6 +667,13 @@ struct FileIntegrityMonitor::Impl {
         if (verifyThread.joinable())     verifyThread.join();
         if (changeQueueThread.joinable()) changeQueueThread.join();
 
+        // [FIM-A-005] Drain any pending changes so a subsequent StartMonitoring
+        // doesn't inherit stale events from the previous session.
+        {
+            std::lock_guard lkQ(changeQueueMutex);
+            pendingChanges.clear();
+        }
+
         SS_LOG_INFO(L"FIM", L"Monitoring stopped");
     }
 
@@ -1166,8 +1173,8 @@ struct FileIntegrityMonitor::Impl {
         SS_LOG_DEBUG(L"FIM", L"Directory monitor thread started");
 
         while (!stopFlag.load(std::memory_order_acquire)) {
-            std::vector<HANDLE> handles;
-            std::vector<size_t> indices;
+            std::vector<HANDLE>       handles;
+            std::vector<std::wstring> handleDirs; // [FIM-A-001] lookup key
 
             {
                 std::shared_lock lk(dirWatchMutex);
@@ -1175,7 +1182,7 @@ struct FileIntegrityMonitor::Impl {
                     if (dirWatches[i] && dirWatches[i]->active &&
                         dirWatches[i]->overlapped.hEvent) {
                         handles.push_back(dirWatches[i]->overlapped.hEvent);
-                        indices.push_back(i);
+                        handleDirs.push_back(dirWatches[i]->directory);
                     }
                 }
             }
@@ -1193,11 +1200,24 @@ struct FileIntegrityMonitor::Impl {
             if (waitResult >= WAIT_OBJECT_0 &&
                 waitResult < WAIT_OBJECT_0 + handles.size()) {
 
-                size_t idx = indices[waitResult - WAIT_OBJECT_0];
-                std::shared_lock lk(dirWatchMutex);
-                if (idx >= dirWatches.size()) continue;
+                // [FIM-A-001] Re-find the watch by directory name. Index-based
+                // lookup is unsafe: RemoveMonitoredDirectory may have erased
+                // and shifted entries while we were waiting. Looking up by the
+                // captured directory name guarantees we either operate on the
+                // intended watch or skip safely.
+                const std::wstring& targetDir = handleDirs[waitResult - WAIT_OBJECT_0];
 
-                auto& dw = dirWatches[idx];
+                std::shared_lock lk(dirWatchMutex);
+                DirWatch* dw = nullptr;
+                for (auto& candidate : dirWatches) {
+                    if (candidate && candidate->active &&
+                        candidate->directory == targetDir) {
+                        dw = candidate.get();
+                        break;
+                    }
+                }
+                if (!dw) continue;
+
                 DWORD bytesReturned = 0;
                 if (!::GetOverlappedResult(dw->hDir, &dw->overlapped,
                                             &bytesReturned, FALSE))
@@ -1213,10 +1233,15 @@ struct FileIntegrityMonitor::Impl {
                     FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SECURITY   |
                     FILE_NOTIFY_CHANGE_CREATION;
 
-                ::ReadDirectoryChangesW(
-                    dw->hDir, dw->buffer.get(), DIR_NOTIFY_BUFFER_SZ,
-                    dw->recursive ? TRUE : FALSE, NOTIFY_FILTER,
-                    nullptr, &dw->overlapped, nullptr);
+                if (!::ReadDirectoryChangesW(
+                        dw->hDir, dw->buffer.get(), DIR_NOTIFY_BUFFER_SZ,
+                        dw->recursive ? TRUE : FALSE, NOTIFY_FILTER,
+                        nullptr, &dw->overlapped, nullptr)) {
+                    SS_LOG_WARN(L"FIM",
+                        L"ReadDirectoryChangesW re-arm failed for %s (err=%u); deactivating watch",
+                        dw->directory.c_str(), ::GetLastError());
+                    dw->active = false;
+                }
             }
         }
         SS_LOG_DEBUG(L"FIM", L"Directory monitor thread exiting");
@@ -1224,10 +1249,25 @@ struct FileIntegrityMonitor::Impl {
 
     void ProcessDirectoryNotifications(const uint8_t* buf, DWORD size,
                                         const std::wstring& baseDir) {
-        const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buf);
+        // [FIM-A-002] Strict bounds validation against hostile/malformed
+        // FILE_NOTIFY_INFORMATION chains. We must never read past buf+size.
+        if (!buf || size < sizeof(FILE_NOTIFY_INFORMATION)) return;
+
+        const uint8_t* const end    = buf + size;
+        const uint8_t*       cursor = buf;
 
         while (true) {
-            DWORD nameLen = info->FileNameLength / sizeof(wchar_t);
+            // Ensure we can read the fixed header
+            if (cursor + sizeof(FILE_NOTIFY_INFORMATION) > end) break;
+
+            const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(cursor);
+
+            // Ensure the FileName payload is fully within [buf, end)
+            const size_t headerSize = offsetof(FILE_NOTIFY_INFORMATION, FileName);
+            if (info->FileNameLength % sizeof(wchar_t) != 0) break;
+            if (info->FileNameLength > static_cast<DWORD>(end - cursor) - headerSize) break;
+
+            const DWORD nameLen = info->FileNameLength / sizeof(wchar_t);
             if (nameLen > 0 && nameLen < MAX_PATH_LEN) {
                 std::wstring fileName(info->FileName, nameLen);
                 std::wstring fullPath = baseDir + L"\\" + fileName;
@@ -1245,9 +1285,11 @@ struct FileIntegrityMonitor::Impl {
             }
 
             if (info->NextEntryOffset == 0) break;
-            info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-                reinterpret_cast<const uint8_t*>(info) + info->NextEntryOffset);
-            if (reinterpret_cast<const uint8_t*>(info) >= buf + size) break;
+
+            // NextEntryOffset must move forward and stay within the buffer.
+            if (info->NextEntryOffset < headerSize + info->FileNameLength) break;
+            if (info->NextEntryOffset > static_cast<DWORD>(end - cursor)) break;
+            cursor += info->NextEntryOffset;
         }
     }
 
@@ -1377,12 +1419,29 @@ struct FileIntegrityMonitor::Impl {
         std::wstring sys32  = Utils::SystemUtils::GetSystemDirectoryPath();
         std::wstring winDir = Utils::SystemUtils::GetWindowsDirectoryPath();
 
-        if (cfg.monitorDrivers && !sys32.empty())
-            DoAddMonitoredDirectory(sys32 + L"\\drivers", true);
-        if (cfg.monitorSystemFiles && !sys32.empty())
-            DoAddMonitoredDirectory(sys32, false);
-        if (cfg.monitorBootFiles && !winDir.empty())
-            DoAddMonitoredDirectory(winDir + L"\\boot", true);
+        // [FIM-A-004] Deduplicate against existing watches. Without this,
+        // every Start/Stop cycle re-adds the same system directories and
+        // eventually saturates MAX_DIR_WATCHES, blocking user-added watches.
+        auto alreadyWatching = [this](const std::wstring& target) -> bool {
+            std::wstring norm = NormalizeFilePath(target);
+            std::shared_lock lk(dirWatchMutex);
+            for (const auto& dw : dirWatches) {
+                if (dw && dw->directory == norm) return true;
+            }
+            return false;
+        };
+
+        if (cfg.monitorDrivers && !sys32.empty()) {
+            std::wstring p = sys32 + L"\\drivers";
+            if (!alreadyWatching(p)) DoAddMonitoredDirectory(p, true);
+        }
+        if (cfg.monitorSystemFiles && !sys32.empty()) {
+            if (!alreadyWatching(sys32)) DoAddMonitoredDirectory(sys32, false);
+        }
+        if (cfg.monitorBootFiles && !winDir.empty()) {
+            std::wstring p = winDir + L"\\boot";
+            if (!alreadyWatching(p)) DoAddMonitoredDirectory(p, true);
+        }
     }
 
     // ================================================================
@@ -1414,6 +1473,14 @@ struct FileIntegrityMonitor::Impl {
         if (!Utils::FileUtils::ReadAllTextUtf8(filePath, content, &err))
             return false;
 
+        // [FIM-A-003] Snapshot config under configMutex once, instead of
+        // touching config.maxMonitoredFiles unsynchronized from the hot loop.
+        size_t maxFiles;
+        {
+            std::shared_lock lkCfg(configMutex);
+            maxFiles = config.maxMonitoredFiles;
+        }
+
         std::istringstream iss(content);
         std::string line;
         size_t imported = 0;
@@ -1441,7 +1508,7 @@ struct FileIntegrityMonitor::Impl {
 
             {
                 std::unique_lock lk2(baselineMutex);
-                if (baselines.size() >= config.maxMonitoredFiles) break;
+                if (baselines.size() >= maxFiles) break;
                 baselines[normPath] = std::move(bl);
             }
             ++imported;
