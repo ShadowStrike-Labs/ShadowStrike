@@ -47,6 +47,8 @@
 // ============================================================================
 #include <thread>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -308,6 +310,15 @@ public:
             m_running.store(false, std::memory_order_release);
         }
 
+        // Wake the monitor thread immediately if it is parked in the
+        // interval wait; otherwise Shutdown() blocks for up to
+        // pollingIntervalMs (60s worst case) which is unacceptable for
+        // service shutdown and ETW-orchestrated reconfiguration.
+        {
+            std::lock_guard cvLock(m_shutdownMutex);
+        }
+        m_shutdownCv.notify_all();
+
         if (m_thread.joinable()) {
             m_thread.join();
         }
@@ -402,8 +413,12 @@ public:
             const auto cycleEnd = Clock::now();
             const auto elapsed  = std::chrono::duration_cast<std::chrono::milliseconds>(cycleEnd - cycleStart);
             if (elapsed.count() < static_cast<long long>(cfg.pollingIntervalMs)) {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(cfg.pollingIntervalMs - static_cast<uint32_t>(elapsed.count())));
+                const auto waitMs = std::chrono::milliseconds(
+                    cfg.pollingIntervalMs - static_cast<uint32_t>(elapsed.count()));
+                std::unique_lock cvLock(m_shutdownMutex);
+                m_shutdownCv.wait_for(cvLock, waitMs, [this]() {
+                    return !m_running.load(std::memory_order_acquire);
+                });
             }
         }
 
@@ -461,8 +476,16 @@ public:
         for (const DWORD pid : pidBuf) {
             if (pid == 0) continue; // Idle process
 
+            // PROCESS_QUERY_LIMITED_INFORMATION is sufficient for
+            // GetProcessIoCounters and QueryFullProcessImageNameW and works
+            // against protected and elevated processes that reject the
+            // legacy PROCESS_QUERY_INFORMATION | PROCESS_VM_READ pair.
+            // Refusing those processes would create an evasion window:
+            // ransomware running as SYSTEM or under a PPL parent would not
+            // be sampled at all and would never reach the sustained-write
+            // detector. See MSDN: "Process Security and Access Rights".
             auto hProc = WrapHandle(
-                ::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+                ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
             if (!hProc) continue;
 
             IO_COUNTERS ioCtrs{};
@@ -473,11 +496,20 @@ public:
             usage.processId = pid;
 
             WCHAR nameBuf[MAX_PATH] = L"<unknown>";
-            HMODULE hMod = nullptr;
-            DWORD cbNeeded = 0;
-            if (::EnumProcessModules(hProc.get(), &hMod, sizeof(hMod), &cbNeeded)) {
-                ::GetModuleBaseNameW(hProc.get(), hMod, nameBuf,
-                                     static_cast<DWORD>(std::size(nameBuf)));
+            DWORD nameLen = static_cast<DWORD>(std::size(nameBuf));
+            if (::QueryFullProcessImageNameW(hProc.get(), 0, nameBuf, &nameLen)
+                && nameLen > 0) {
+                std::wstring_view full(nameBuf, nameLen);
+                const auto slash = full.find_last_of(L"\\/");
+                if (slash != std::wstring_view::npos) {
+                    const auto base = full.substr(slash + 1);
+                    // base is a view into nameBuf; copy before overwriting.
+                    std::wstring copy(base);
+                    std::fill(std::begin(nameBuf), std::end(nameBuf), L'\0');
+                    const size_t n =
+                        std::min(copy.size(), std::size(nameBuf) - 1);
+                    std::copy_n(copy.begin(), n, std::begin(nameBuf));
+                }
             }
             usage.processName    = nameBuf;
             usage.totalReadBytes  = ioCtrs.ReadTransferCount;
@@ -497,17 +529,29 @@ public:
             trk.processName = usage.processName;
 
             // --- Delta computation ---
+            // On the very first observation of a PID we have no prior
+            // counters, so subtracting from zero produces a value equal to
+            // the process's lifetime I/O. With deltaTime fenced to a
+            // minimum of 1.0s, that fabricated rate would seed the
+            // sustained-write sliding window and could trigger a
+            // ransomware alert on a long-lived legitimate process the
+            // first time DiskMonitor sees it after start-up or after a
+            // configuration reload. Suppress rate computation for this
+            // cycle, snapshot the counters, and wait for the next pass.
             const auto& prev = trk.prevCounters;
-            const uint64_t dRead  = (ioCtrs.ReadTransferCount  >= prev.readBytes)
-                                  ? (ioCtrs.ReadTransferCount  - prev.readBytes)  : 0;
-            const uint64_t dWrite = (ioCtrs.WriteTransferCount >= prev.writeBytes)
-                                  ? (ioCtrs.WriteTransferCount - prev.writeBytes) : 0;
-            const uint64_t dRdOps = (ioCtrs.ReadOperationCount  >= prev.readOps)
-                                  ? (ioCtrs.ReadOperationCount  - prev.readOps)   : 0;
-            const uint64_t dWrOps = (ioCtrs.WriteOperationCount >= prev.writeOps)
-                                  ? (ioCtrs.WriteOperationCount - prev.writeOps)  : 0;
-            const uint64_t dOther = (ioCtrs.OtherOperationCount >= prev.otherOps)
-                                  ? (ioCtrs.OtherOperationCount - prev.otherOps)  : 0;
+            uint64_t dRead = 0, dWrite = 0, dRdOps = 0, dWrOps = 0, dOther = 0;
+            if (!trk.firstSample) {
+                dRead  = (ioCtrs.ReadTransferCount  >= prev.readBytes)
+                       ? (ioCtrs.ReadTransferCount  - prev.readBytes)  : 0;
+                dWrite = (ioCtrs.WriteTransferCount >= prev.writeBytes)
+                       ? (ioCtrs.WriteTransferCount - prev.writeBytes) : 0;
+                dRdOps = (ioCtrs.ReadOperationCount  >= prev.readOps)
+                       ? (ioCtrs.ReadOperationCount  - prev.readOps)   : 0;
+                dWrOps = (ioCtrs.WriteOperationCount >= prev.writeOps)
+                       ? (ioCtrs.WriteOperationCount - prev.writeOps)  : 0;
+                dOther = (ioCtrs.OtherOperationCount >= prev.otherOps)
+                       ? (ioCtrs.OtherOperationCount - prev.otherOps)  : 0;
+            }
 
             usage.readBytesPerSec  = static_cast<double>(dRead)  / deltaTime;
             usage.writeBytesPerSec = static_cast<double>(dWrite) / deltaTime;
@@ -521,6 +565,14 @@ public:
             trk.prevCounters.readOps    = ioCtrs.ReadOperationCount;
             trk.prevCounters.writeOps   = ioCtrs.WriteOperationCount;
             trk.prevCounters.otherOps   = ioCtrs.OtherOperationCount;
+
+            if (trk.firstSample) {
+                trk.firstSample = false;
+                // No rates available this cycle — skip detector feeds and
+                // global accumulation so a freshly observed PID cannot
+                // perturb statistics with a fabricated lifetime spike.
+                continue;
+            }
 
             // --- Sustained write (ransomware) detection ---
             trk.writeRateSamples.push_back(usage.writeBytesPerSec);
@@ -859,6 +911,7 @@ private:
         std::deque<double> otherOpsSamples;
         bool               ransomwareAlerted = false;
         bool               fileEnumAlerted   = false;
+        bool               firstSample       = true;   // suppress lifetime-counter spike on first observation
         TimePoint          lastSeen;
         std::wstring       processName;
     };
@@ -995,6 +1048,8 @@ private:
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_running{false};
     std::thread       m_thread;
+    std::mutex                m_shutdownMutex;
+    std::condition_variable   m_shutdownCv;
     DiskMonitorConfig m_config;               // protected by m_configMutex
     InternalStats     m_stats;
     uint32_t          m_selfPid = 0;
