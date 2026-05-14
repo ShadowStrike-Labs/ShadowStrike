@@ -625,15 +625,10 @@ namespace ShadowStrike {
                             return true; // Continue enumeration
                         }
 
-                        const uint8_t* dataBase =
-                            static_cast<const uint8_t*>(m_mappedView.baseAddress);
-                        const HashValue* hashPtr =
-                            reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
-
-                        // Validate bounds
-                        if (signatureOffset + sizeof(HashValue) > m_mappedView.fileSize) {
+                        const HashValue* hashPtr = Record::GetHash(m_mappedView, signatureOffset);
+                        if (!hashPtr) {
                             SS_LOG_WARN(L"HashStore",
-                                L"Rebuild: Hash at 0x%llX exceeds file bounds",
+                                L"Rebuild: hash record at 0x%llX is malformed or out of bounds",
                                 signatureOffset);
                             return true;
                         }

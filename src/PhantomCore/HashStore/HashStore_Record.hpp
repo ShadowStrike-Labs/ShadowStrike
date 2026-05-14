@@ -67,6 +67,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <string>
 
 namespace ShadowStrike {
@@ -203,7 +204,7 @@ static_assert(HEADER_OFFSET % alignof(HashValue) == 0,
         return std::string(
             reinterpret_cast<const char*>(base + nameStart),
             rec->nameLength);
-    } catch (...) {
+    } catch (const std::exception&) {
         return {};
     }
 }
@@ -227,7 +228,7 @@ static_assert(HEADER_OFFSET % alignof(HashValue) == 0,
         return std::string(
             reinterpret_cast<const char*>(base + descStart),
             rec->descLength);
-    } catch (...) {
+    } catch (const std::exception&) {
         return {};
     }
 }
@@ -252,7 +253,7 @@ static_assert(HEADER_OFFSET % alignof(HashValue) == 0,
         return std::string(
             reinterpret_cast<const char*>(base + tagsStart),
             rec->tagsJsonLength);
-    } catch (...) {
+    } catch (const std::exception&) {
         return {};
     }
 }

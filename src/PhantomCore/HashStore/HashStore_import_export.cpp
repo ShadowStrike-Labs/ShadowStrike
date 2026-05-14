@@ -93,7 +93,7 @@ namespace HashStore {
             if (val >= 10)  return ThreatLevel::Low;
             return ThreatLevel::Info;
         }
-        catch (...) {
+        catch (const std::exception&) {
             return ThreatLevel::Medium;
         }
     }
@@ -152,7 +152,7 @@ namespace HashStore {
 
             return result.empty() ? std::string("Unknown") : result;
         }
-        catch (...) {
+        catch (const std::exception&) {
             return "Unknown";
         }
     }
@@ -355,10 +355,10 @@ namespace HashStore {
                     try {
                         progressCallback(lineNum, estimatedTotalLines);
                     }
-                    catch (...) {
+                    catch (const std::exception& ex) {
                         SS_LOG_WARN(L"HashStore",
-                            L"ImportFromFile: progress callback threw at line %zu, ignoring",
-                            lineNum);
+                            L"ImportFromFile: progress callback threw at line %zu: %S",
+                            lineNum, ex.what());
                     }
                 }
             }
@@ -397,11 +397,6 @@ namespace HashStore {
             SS_LOG_ERROR(L"HashStore", L"ImportFromFile: exception: %S", ex.what());
             return StoreError{ SignatureStoreError::Unknown, 0,
                 "Unexpected exception during import" };
-        }
-        catch (...) {
-            SS_LOG_ERROR(L"HashStore", L"ImportFromFile: unknown exception");
-            return StoreError{ SignatureStoreError::Unknown, 0,
-                "Unknown exception during import" };
         }
     }
 
@@ -491,24 +486,8 @@ namespace HashStore {
                     [&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
                         // ForEach is noexcept; lambda must not allow exceptions to propagate.
                         try {
-                            const uint8_t* dataBase =
-                                static_cast<const uint8_t*>(m_mappedView.baseAddress);
-
-                            if (dataBase == nullptr) {
-                                writeError = true;
-                                return false;
-                            }
-
-                            // Bounds checks before dereferencing
-                            if (signatureOffset >= m_mappedView.fileSize ||
-                                signatureOffset > m_mappedView.fileSize - sizeof(HashValue)) {
-                                return true; // Skip corrupt offset, continue
-                            }
-
-                            const HashValue* hashPtr =
-                                reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
-
-                            if (hashPtr->length == 0 || hashPtr->length > 64) {
+                            const HashValue* hashPtr = Record::GetHash(m_mappedView, signatureOffset);
+                            if (!hashPtr || hashPtr->length == 0 || hashPtr->length > 64) {
                                 return true; // Skip corrupt entry
                             }
 
@@ -543,7 +522,10 @@ namespace HashStore {
                             exportedCount++;
                             return true;
                         }
-                        catch (...) {
+                        catch (const std::exception& ex) {
+                            SS_LOG_ERROR(L"HashStore",
+                                L"ExportToFile: exception while exporting offset 0x%llX: %S",
+                                signatureOffset, ex.what());
                             writeError = true;
                             return false;
                         }
@@ -597,10 +579,6 @@ namespace HashStore {
         }
         catch (const std::exception& ex) {
             SS_LOG_ERROR(L"HashStore", L"ExportToFile: exception: %S", ex.what());
-            return StoreError{ SignatureStoreError::Unknown, 0, "Export operation failed" };
-        }
-        catch (...) {
-            SS_LOG_ERROR(L"HashStore", L"ExportToFile: unknown exception");
             return StoreError{ SignatureStoreError::Unknown, 0, "Export operation failed" };
         }
     }
@@ -865,11 +843,6 @@ namespace HashStore {
             return StoreError{ SignatureStoreError::Unknown, 0,
                 "Unexpected exception during JSON import" };
         }
-        catch (...) {
-            SS_LOG_ERROR(L"HashStore", L"ImportFromJson: unknown exception");
-            return StoreError{ SignatureStoreError::Unknown, 0,
-                "Unknown exception during JSON import" };
-        }
     }
 
     // ============================================================================
@@ -885,10 +858,10 @@ namespace HashStore {
          * JSON HASH EXPORT
          * ========================================================================
          *
-         * HEADER PATCH NEEDED:
-         *   - Same MD5-as-sentinel type filter issue as ExportToFile.
-         *   - ForEach only provides fastHash/signatureOffset. Actual name and
-         *     threat level are not accessible; placeholders are used.
+         * The v2 on-disk record stores HashValue plus authoritative metadata at
+         * each signature offset, allowing JSON exports to preserve name,
+         * description, and threat level without placeholder synthesis except for
+         * corrupt legacy entries.
          *
          * Security:
          *   - Internal offsets (signatureOffset, fastHash) are NOT exported.
@@ -959,17 +932,8 @@ namespace HashStore {
                                     return false;
                                 }
 
-                                if (signatureOffset >= m_mappedView.fileSize ||
-                                    signatureOffset >
-                                        m_mappedView.fileSize - sizeof(HashValue)) {
-                                    return true;
-                                }
-
-                                const HashValue* hashPtr =
-                                    reinterpret_cast<const HashValue*>(
-                                        dataBase + signatureOffset);
-
-                                if (hashPtr->length == 0 || hashPtr->length > 64) {
+                                const HashValue* hashPtr = Record::GetHash(m_mappedView, signatureOffset);
+                                if (!hashPtr || hashPtr->length == 0 || hashPtr->length > 64) {
                                     return true;
                                 }
 
@@ -1004,7 +968,10 @@ namespace HashStore {
                                 exportCount++;
                                 return true;
                             }
-                            catch (...) {
+                            catch (const std::exception& ex) {
+                                SS_LOG_ERROR(L"HashStore",
+                                    L"ExportToJson: exception while exporting offset 0x%llX: %S",
+                                    signatureOffset, ex.what());
                                 return false;
                             }
                         });
@@ -1068,10 +1035,6 @@ namespace HashStore {
         }
         catch (const std::exception& ex) {
             SS_LOG_ERROR(L"HashStore", L"ExportToJson: exception: %S", ex.what());
-            return "{}";
-        }
-        catch (...) {
-            SS_LOG_ERROR(L"HashStore", L"ExportToJson: unknown exception");
             return "{}";
         }
     }

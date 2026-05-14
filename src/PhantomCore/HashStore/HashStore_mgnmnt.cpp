@@ -33,58 +33,30 @@
 //   Rebuild() after bulk removals to recreate the bloom filter from
 //   current B+Tree contents and purge stale false positives.
 //
-// HEADER PATCH NEEDED:
-//   BuildDetectionResult() in HashStore.cpp currently returns hardcoded
-//   metadata. It should be updated to read HashSignatureRecord from the
-//   allocated signatureOffset to return the actual name, description,
-//   tags, and threat level stored by AddHash()/UpdateHashMetadata().
+// RECORD CONTRACT:
+//   AddHash(), AddHashBatch(), and UpdateHashMetadata() write the shared v2
+//   HashStore_Record.hpp layout. All read paths consume the same helper to
+//   prevent reader/writer skew during metadata round trips.
 //
 // ============================================================================
 
 #include "pch.h"
 #include "HashStore.hpp"
+#include "HashStore_Record.hpp"
 #include <map>
 #include <unordered_set>
-#include <ctime>
-#include <cstring>
 #include "../Utils/JSONUtils.hpp"
 
 namespace ShadowStrike {
 namespace HashStore {
 
-// ============================================================================
-// LOCAL: On-disk record format for hash signature entries
-// ============================================================================
-
 namespace {
 
-constexpr uint32_t HASH_RECORD_MAGIC   = 0x52535348;  // 'HSSR'
-constexpr uint32_t HASH_RECORD_VERSION = 1;
-constexpr size_t   MAX_NAME_LEN        = 256;
-constexpr size_t   MAX_DESC_LEN        = 4096;
+constexpr size_t   MAX_NAME_LEN        = Record::MAX_NAME_LEN;
+constexpr size_t   MAX_DESC_LEN        = Record::MAX_DESC_LEN;
 constexpr size_t   MAX_TAGS            = 32;
 constexpr size_t   MAX_TAG_LEN         = 64;
 constexpr size_t   MAX_BATCH_SIZE      = 100000;
-
-#pragma pack(push, 1)
-struct HashSignatureRecord {
-    uint32_t magic;
-    uint32_t version;
-    uint8_t  hashType;
-    uint8_t  threatLevel;
-    uint16_t nameLength;
-    uint32_t descLength;
-    uint32_t tagsJsonLength;
-    uint64_t creationTime;
-    // Variable-length payload follows:
-    //   char name[nameLength]
-    //   char description[descLength]
-    //   char tagsJson[tagsJsonLength]
-};
-#pragma pack(pop)
-
-static_assert(sizeof(HashSignatureRecord) == 28,
-    "HashSignatureRecord must be exactly 28 bytes");
 
 // Validates a ThreatLevel against the declared enum values
 [[nodiscard]] bool IsValidThreatLevel(ThreatLevel level) noexcept {
@@ -137,55 +109,27 @@ static_assert(sizeof(HashSignatureRecord) == 28,
         Utils::JSON::Json arr = tags;
         return Utils::JSON::Stringify(arr, output);
     }
-    catch (...) {
+    catch (const std::exception& ex) {
+        SS_LOG_WARN(L"HashStore", L"SerializeTagsJson failed: %S", ex.what());
         return false;
     }
 }
 
-// Write a HashSignatureRecord + payload to the memory-mapped file
+// Write a shared HashStore v2 record to the memory-mapped file.
 [[nodiscard]] bool WriteSignatureRecord(
     MemoryMappedView& view,
     uint64_t offset,
+    const HashValue& hash,
     HashType hashType,
     ThreatLevel threatLevel,
     const std::string& name,
     const std::string& description,
     const std::string& tagsJson) noexcept
 {
-    constexpr size_t kHeader = sizeof(HashSignatureRecord);
-    const size_t payloadSize = name.size() + description.size() + tagsJson.size();
-
-    if (offset > view.fileSize || kHeader + payloadSize > view.fileSize - offset) {
+    if (hash.type != hashType) {
         return false;
     }
-
-    auto* rec = view.GetAtMutable<HashSignatureRecord>(offset);
-    if (!rec) {
-        return false;
-    }
-
-    rec->magic          = HASH_RECORD_MAGIC;
-    rec->version        = HASH_RECORD_VERSION;
-    rec->hashType       = static_cast<uint8_t>(hashType);
-    rec->threatLevel    = static_cast<uint8_t>(threatLevel);
-    rec->nameLength     = static_cast<uint16_t>(name.size());
-    rec->descLength     = static_cast<uint32_t>(description.size());
-    rec->tagsJsonLength = static_cast<uint32_t>(tagsJson.size());
-    rec->creationTime   = static_cast<uint64_t>(std::time(nullptr));
-
-    uint8_t* dst = reinterpret_cast<uint8_t*>(rec) + kHeader;
-    if (!name.empty()) {
-        std::memcpy(dst, name.data(), name.size());
-        dst += name.size();
-    }
-    if (!description.empty()) {
-        std::memcpy(dst, description.data(), description.size());
-        dst += description.size();
-    }
-    if (!tagsJson.empty()) {
-        std::memcpy(dst, tagsJson.data(), tagsJson.size());
-    }
-    return true;
+    return Record::Write(view, offset, hash, threatLevel, name, description, tagsJson);
 }
 
 // Read the signature name from an existing record (best-effort)
@@ -193,30 +137,7 @@ static_assert(sizeof(HashSignatureRecord) == 28,
     const MemoryMappedView& view,
     uint64_t offset) noexcept
 {
-    constexpr size_t kHeader = sizeof(HashSignatureRecord);
-    if (!view.IsValid() || offset + kHeader > view.fileSize) {
-        return {};
-    }
-
-    const auto* rec = view.GetAt<HashSignatureRecord>(offset);
-    if (!rec || rec->magic != HASH_RECORD_MAGIC) {
-        return {};
-    }
-
-    const uint64_t nameEnd = offset + kHeader + rec->nameLength;
-    if (rec->nameLength == 0 || rec->nameLength > MAX_NAME_LEN || nameEnd > view.fileSize) {
-        return {};
-    }
-
-    const auto* namePtr = reinterpret_cast<const char*>(
-        static_cast<const uint8_t*>(view.baseAddress) + offset + kHeader);
-
-    try {
-        return std::string(namePtr, rec->nameLength);
-    }
-    catch (...) {
-        return {};
-    }
+    return Record::ReadName(view, offset);
 }
 
 // Read the ThreatLevel from an existing record (best-effort fallback)
@@ -224,18 +145,7 @@ static_assert(sizeof(HashSignatureRecord) == 28,
     const MemoryMappedView& view,
     uint64_t offset) noexcept
 {
-    constexpr size_t kHeader = sizeof(HashSignatureRecord);
-    if (!view.IsValid() || offset + kHeader > view.fileSize) {
-        return ThreatLevel::Medium;
-    }
-
-    const auto* rec = view.GetAt<HashSignatureRecord>(offset);
-    if (!rec || rec->magic != HASH_RECORD_MAGIC) {
-        return ThreatLevel::Medium;
-    }
-
-    const ThreatLevel stored = static_cast<ThreatLevel>(rec->threatLevel);
-    return IsValidThreatLevel(stored) ? stored : ThreatLevel::Medium;
+    return Record::ReadThreatLevel(view, offset);
 }
 
 // Elapsed-time helper (microseconds) with overflow protection
@@ -370,8 +280,8 @@ StoreError HashStore::AddHash(
         }
     }
 
-    const size_t recordSize = sizeof(HashSignatureRecord) +
-        signatureName.size() + description.size() + tagsJson.size();
+    const size_t recordSize = Record::TotalRecordSize(
+        signatureName.size(), description.size(), tagsJson.size());
 
     // ====================================================================
     // 4. ACQUIRE GLOBAL WRITE LOCK
@@ -422,7 +332,7 @@ StoreError HashStore::AddHash(
             "Failed to allocate space for signature entry" };
     }
 
-    if (!WriteSignatureRecord(m_mappedView, signatureOffset,
+    if (!WriteSignatureRecord(m_mappedView, signatureOffset, hash,
             hash.type, threatLevel, signatureName, description, tagsJson)) {
         SS_LOG_ERROR(L"HashStore",
             L"AddHash: Failed to write record at offset 0x%llX", signatureOffset);
@@ -641,8 +551,7 @@ StoreError HashStore::AddHashBatch(
             }
 
             // Allocate storage for this entry
-            const size_t entrySize = sizeof(HashSignatureRecord) +
-                signatureNames[idx].size();
+            const size_t entrySize = Record::TotalRecordSize(signatureNames[idx].size(), 0, 0);
             const uint64_t offset = AllocateSignatureEntry(entrySize);
             if (offset == UINT64_MAX) {
                 SS_LOG_ERROR(L"HashStore",
@@ -652,7 +561,7 @@ StoreError HashStore::AddHashBatch(
                 continue;
             }
 
-            if (!WriteSignatureRecord(m_mappedView, offset,
+            if (!WriteSignatureRecord(m_mappedView, offset, hashes[idx],
                     hashes[idx].type, threatLevels[idx],
                     signatureNames[idx], {}, {})) {
                 SS_LOG_ERROR(L"HashStore",
@@ -982,8 +891,8 @@ StoreError HashStore::UpdateHashMetadata(
     // 7. ALLOCATE NEW STORAGE & WRITE UPDATED RECORD
     // ====================================================================
 
-    const size_t newRecordSize = sizeof(HashSignatureRecord) +
-        existingName.size() + newDescription.size() + tagsJson.size();
+    const size_t newRecordSize = Record::TotalRecordSize(
+        existingName.size(), newDescription.size(), tagsJson.size());
 
     const uint64_t newOffset = AllocateSignatureEntry(newRecordSize);
     if (newOffset == UINT64_MAX) {
@@ -994,7 +903,7 @@ StoreError HashStore::UpdateHashMetadata(
             "Failed to allocate space for updated metadata" };
     }
 
-    if (!WriteSignatureRecord(m_mappedView, newOffset,
+    if (!WriteSignatureRecord(m_mappedView, newOffset, hash,
             hash.type, existingThreat, existingName,
             newDescription, tagsJson)) {
         SS_LOG_ERROR(L"HashStore",

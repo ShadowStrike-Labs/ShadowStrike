@@ -65,6 +65,8 @@
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include "pch.h"
+
 #include <windows.h>
 
 #include <array>
@@ -665,9 +667,8 @@ TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_DetectsCorrectly) {
         << "hashMatches should be non-empty when hash lookup triggers.";
 }
 
-/// Hash detections currently project through HashStore::BuildDetectionResult(),
-/// which emits a deterministic Medium severity regardless of the seeded
-/// signature metadata.
+/// Hash detections must preserve the authoritative threat level stored with the
+/// seeded HashStore record.
 TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_ThreatLevelPreserved) {
     SKIP_IF_NOT_READY();
     using namespace IntegrationTestData;
@@ -681,12 +682,11 @@ TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_ThreatLevelPreserve
         std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
 
     ASSERT_FALSE(result.hashMatches.empty());
-    EXPECT_EQ(result.hashMatches.front().threatLevel, SS::ThreatLevel::Medium)
-        << "Hash detections must follow the current HashStore threat projection contract.";
+    EXPECT_EQ(result.hashMatches.front().threatLevel, SS::ThreatLevel::Critical)
+        << "Hash detections must preserve the seeded HashStore threat level.";
 }
 
-/// Hash detections currently synthesize a Hash_<sha256> signature name instead
-/// of round-tripping the author-time metadata.
+/// Hash detections must preserve the signature name stored in HashStore.
 TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_SignatureNamePopulated) {
     SKIP_IF_NOT_READY();
     using namespace IntegrationTestData;
@@ -699,12 +699,9 @@ TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_SignatureNamePopula
     const SS::ScanResult result = s_sigStore->ScanBuffer(
         std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
 
-    const std::string expectedName = "Hash_" + HashHelpers::ComputeSHA256Hex(
-        std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
-    ASSERT_FALSE(expectedName.empty());
     ASSERT_FALSE(result.hashMatches.empty());
-    EXPECT_EQ(result.hashMatches.front().signatureName, expectedName)
-        << "Hash detections must expose the current synthesized signature-name contract.";
+    EXPECT_EQ(result.hashMatches.front().signatureName, "Test.Malware.HashPayload.SHA256")
+        << "Hash detections must expose the seeded signature name.";
 }
 
 /// A benign all-zeros buffer must produce no hash detections.
@@ -1380,14 +1377,11 @@ TEST_F(ScanPipelineFixture, DetectionCallback_Callback_HashMatch_InvokedWithCorr
     EXPECT_GT(callCount.load(), 0)
         << "Detection callback must be invoked at least once for a hash match.";
     {
-        const std::string expectedName = "Hash_" + HashHelpers::ComputeSHA256Hex(
-            std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
-        ASSERT_FALSE(expectedName.empty());
         std::lock_guard<std::mutex> lk(captureMtx);
-        EXPECT_EQ(capturedLevel, SS::ThreatLevel::Medium)
-            << "Callback must receive the current hash-detection ThreatLevel projection.";
-        EXPECT_EQ(capturedName, expectedName)
-            << "Callback must receive the current synthesized hash signature name.";
+        EXPECT_EQ(capturedLevel, SS::ThreatLevel::Critical)
+            << "Callback must receive the seeded hash-detection ThreatLevel.";
+        EXPECT_EQ(capturedName, "Test.Malware.HashPayload.SHA256")
+            << "Callback must receive the seeded hash signature name.";
     }
 }
 
@@ -1478,8 +1472,7 @@ TEST_F(ScanPipelineFixture, ConcurrencySafety_EightThreads_SimultaneousScan_NoCr
             opts.enablePatternScan = false;
             opts.enableYaraScan    = false;
 
-            const std::string expectedName = "Hash_" + HashHelpers::ComputeSHA256Hex(
-                std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
+            const std::string expectedName = "Test.Malware.HashPayload.SHA256";
 
             for (int i = 0; i < kIterations; ++i) {
                 const SS::ScanResult result = s_sigStore->ScanBuffer(
@@ -1487,7 +1480,7 @@ TEST_F(ScanPipelineFixture, ConcurrencySafety_EightThreads_SimultaneousScan_NoCr
 
                 if (result.HasDetections() &&
                     !result.hashMatches.empty() &&
-                    result.hashMatches.front().threatLevel == SS::ThreatLevel::Medium &&
+                    result.hashMatches.front().threatLevel == SS::ThreatLevel::Critical &&
                     result.hashMatches.front().signatureName == expectedName) {
                     successCount.fetch_add(1, std::memory_order_relaxed);
                 } else {
@@ -1568,7 +1561,7 @@ TEST_F(ScanPipelineFixture, ContractHardening_HashOnlyScan_CountAndMaxThreatAreC
 
     ASSERT_TRUE(result.HasDetections());
     EXPECT_EQ(result.GetDetectionCount(), 1u);
-    EXPECT_EQ(result.GetMaxThreatLevel(), SS::ThreatLevel::Medium);
+    EXPECT_EQ(result.GetMaxThreatLevel(), SS::ThreatLevel::Critical);
     EXPECT_TRUE(result.IsSuccessful());
 }
 
