@@ -39,6 +39,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 
 namespace ShadowStrike {
 namespace PEParser {
@@ -52,19 +53,27 @@ namespace {
 // honor the public PEParser API contract. However, std::vector::push_back
 // and std::vector::emplace_back can throw std::bad_alloc on memory pressure;
 // inside a noexcept frame that immediately calls std::terminate(), crashing
-// the process. These helpers swallow allocation failures: the offending
-// anomaly/import/section entry is silently dropped and the parser continues.
-// Reliability under memory pressure is prioritized over completeness of
-// optional telemetry — every dropped entry is recoverable from a re-parse,
-// whereas a terminated agent process is not.
+// the process. These helpers drop only the offending optional telemetry entry
+// and emit a rate-limited warning, preserving parser availability without
+// hiding memory-pressure degradation.
 // ----------------------------------------------------------------------------
+
+inline void LogGrowthFailureOnce(const char* operation) noexcept {
+    static std::atomic_bool logged{ false };
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        SS_LOG_WARN(L"PEParser",
+            L"Optional PE telemetry dropped during %S because vector growth failed",
+            operation);
+    }
+}
 
 template<typename Vec, typename... Args>
 inline void SafeEmplace(Vec& v, Args&&... args) noexcept {
     try {
         v.emplace_back(std::forward<Args>(args)...);
-    } catch (...) {
-        // Allocation failure — record nothing; parser remains usable.
+    } catch (const std::exception&) {
+        LogGrowthFailureOnce("emplace_back");
     }
 }
 
@@ -72,8 +81,16 @@ template<typename Vec, typename T>
 inline void SafePush(Vec& v, T&& value) noexcept {
     try {
         v.push_back(std::forward<T>(value));
-    } catch (...) {
-        // Allocation failure — record nothing; parser remains usable.
+    } catch (const std::exception&) {
+        LogGrowthFailureOnce("push_back");
+    }
+}
+
+inline void ResetOutputInfo(PEInfo& out) noexcept {
+    try {
+        out = PEInfo();
+    } catch (const std::exception&) {
+        SS_LOG_WARN(L"PEParser", L"Failed to reset PEInfo output after parse failure");
     }
 }
 
@@ -1348,9 +1365,9 @@ public:
                                 }
                             }
                             info.pdbPath = std::move(sanitized);
-                        } catch (...) {
-                            // Allocation failure: leave pdbPath empty rather
-                            // than terminate the noexcept parser frame.
+                        } catch (const std::exception&) {
+                            SS_LOG_WARN(L"PEParser",
+                                L"CodeView PDB path sanitizer dropped path due to allocation failure");
                             info.pdbPath.clear();
                         }
                     }
@@ -2142,7 +2159,7 @@ bool PEParser::ParseFile(const std::wstring& path, PEInfo& out, PEError* err) no
     );
 
     if (!m_impl->ParseInternal(err)) {
-        try { out = PEInfo(); } catch (...) {}
+        ResetOutputInfo(out);
         return false;
     }
 
@@ -2152,12 +2169,12 @@ bool PEParser::ParseFile(const std::wstring& path, PEInfo& out, PEError* err) no
     // std::terminate(), so explicitly catch and surface the failure cleanly.
     try {
         out = m_impl->m_info;
-    } catch (...) {
+    } catch (const std::exception&) {
         if (err) {
             err->Set(ValidationResult::UnknownError,
                      L"Out-of-memory while copying PEInfo result", 0);
         }
-        try { out = PEInfo(); } catch (...) {}
+        ResetOutputInfo(out);
         return false;
     }
     return true;
@@ -2178,18 +2195,18 @@ bool PEParser::ParseBuffer(const uint8_t* data, size_t size, PEInfo& out, PEErro
     m_impl->m_reader = SafeReader(data, size);
 
     if (!m_impl->ParseInternal(err)) {
-        try { out = PEInfo(); } catch (...) {}
+        ResetOutputInfo(out);
         return false;
     }
 
     try {
         out = m_impl->m_info;
-    } catch (...) {
+    } catch (const std::exception&) {
         if (err) {
             err->Set(ValidationResult::UnknownError,
                      L"Out-of-memory while copying PEInfo result", 0);
         }
-        try { out = PEInfo(); } catch (...) {}
+        ResetOutputInfo(out);
         return false;
     }
     return true;

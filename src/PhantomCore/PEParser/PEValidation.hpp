@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <exception>
 
 #include "PEConstants.hpp"
 #include "PETypes.hpp"
@@ -232,8 +233,13 @@ struct PEError {
      */
     void Set(ValidationResult c, const wchar_t* msg, uint64_t off = 0) noexcept {
         code = c;
-        // std::wstring assignment can throw std::bad_alloc; swallow under memory pressure.
-        try { if (msg) message = msg; } catch (...) {}
+        try {
+            if (msg) {
+                message = msg;
+            }
+        } catch (const std::exception&) {
+            message.clear();
+        }
         offset = off;
     }
 
@@ -243,8 +249,20 @@ struct PEError {
     void SetWithContext(ValidationResult c, const wchar_t* msg,
                         const wchar_t* ctx, uint64_t off = 0) noexcept {
         code = c;
-        try { if (msg) message = msg; } catch (...) {}
-        try { if (ctx) context = ctx; } catch (...) {}
+        try {
+            if (msg) {
+                message = msg;
+            }
+        } catch (const std::exception&) {
+            message.clear();
+        }
+        try {
+            if (ctx) {
+                context = ctx;
+            }
+        } catch (const std::exception&) {
+            context.clear();
+        }
         offset = off;
     }
 };
