@@ -1450,7 +1450,7 @@ RecoveryResult RansomwareDecryptor::RecoverFromVSS(std::wstring_view filePath,
             if (snapshots.empty()) {
                 result.status = DecryptionStatus::Failed;
                 result.errorMessage = "No VSS snapshots available for volume " +
-                    std::string(volume.begin(), volume.end());
+                    Utils::StringUtils::ToNarrow(volume);
                 return result;
             }
 
@@ -1857,7 +1857,7 @@ EncryptedFileInfo RansomwareDecryptor::AnalyzeFile(std::wstring_view filePath) {
                 closeBracket != std::wstring::npos && closeBracket > openBracket + 1) {
                 std::wstring wid = filename.substr(openBracket + 1,
                                                    closeBracket - openBracket - 1);
-                info.victimId.assign(wid.begin(), wid.end());
+                info.victimId = Utils::StringUtils::ToNarrow(wid);
             }
         }
 
@@ -2718,8 +2718,8 @@ void DecryptorStatistics::Reset() noexcept {
 
 std::string DecryptionResult::ToJson() const {
     nlohmann::json j;
-    j["originalPath"] = std::string(originalPath.begin(), originalPath.end());
-    j["decryptedPath"] = std::string(decryptedPath.begin(), decryptedPath.end());
+    j["originalPath"] = Utils::StringUtils::ToNarrow(originalPath);
+    j["decryptedPath"] = Utils::StringUtils::ToNarrow(decryptedPath);
     j["status"] = static_cast<int>(status);
     j["family"] = static_cast<int>(family);
     j["keyId"] = keyId;
@@ -2750,16 +2750,15 @@ std::string BatchDecryptionResult::ToJson() const {
 
 std::string RecoveryResult::ToJson() const {
     nlohmann::json j;
-    j["encryptedPath"] = std::string(encryptedPath.begin(), encryptedPath.end());
-    j["recoveredPath"] = std::string(recoveredPath.begin(), recoveredPath.end());
+    j["encryptedPath"] = Utils::StringUtils::ToNarrow(encryptedPath);
+    j["recoveredPath"] = Utils::StringUtils::ToNarrow(recoveredPath);
     j["methodUsed"] = static_cast<int>(methodUsed);
     j["status"] = static_cast<int>(status);
     j["durationMs"] = durationMs;
     j["recoveredSize"] = recoveredSize;
     j["integrityVerified"] = integrityVerified;
     if (!forensicCopyPath.empty())
-        j["forensicCopyPath"] = std::string(
-            forensicCopyPath.begin(), forensicCopyPath.end());
+        j["forensicCopyPath"] = Utils::StringUtils::ToNarrow(forensicCopyPath);
     if (!errorMessage.empty()) j["error"] = errorMessage;
     return j.dump();
 }
@@ -2792,7 +2791,7 @@ std::string DecryptionKey::ToJson() const {
 
 std::string EncryptedFileInfo::ToJson() const {
     nlohmann::json j;
-    j["filePath"] = std::string(filePath.begin(), filePath.end());
+    j["filePath"] = Utils::StringUtils::ToNarrow(filePath);
     j["fileSize"] = fileSize;
     j["family"] = static_cast<int>(family);
     j["algorithm"] = static_cast<int>(algorithm);
@@ -2803,7 +2802,7 @@ std::string EncryptedFileInfo::ToJson() const {
 
 std::string RansomNoteInfo::ToJson() const {
     nlohmann::json j;
-    j["filePath"] = std::string(filePath.begin(), filePath.end());
+    j["filePath"] = Utils::StringUtils::ToNarrow(filePath);
     j["family"] = static_cast<int>(family);
     j["familyName"] = std::string(RansomwareDecryptor::GetFamilyName(family));
     if (!bitcoinAddress.empty()) j["bitcoinAddress"] = bitcoinAddress;
