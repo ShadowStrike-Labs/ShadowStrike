@@ -41,6 +41,7 @@
 #include <span>
 #include <limits>
 #include <type_traits>
+#include <exception>
 
 namespace ShadowStrike {
 namespace PEParser {
@@ -447,10 +448,10 @@ public:
         size_t strLen = nullPos ? static_cast<size_t>(nullPos - start) : length;
         try {
             out.assign(start, strLen);
-        } catch (...) {
+        } catch (const std::exception&) {
             // Allocation failure: leave caller-supplied string empty and
             // report failure rather than terminate the calling noexcept frame.
-            try { out.clear(); } catch (...) {}
+            out.clear();
             return false;
         }
         return true;

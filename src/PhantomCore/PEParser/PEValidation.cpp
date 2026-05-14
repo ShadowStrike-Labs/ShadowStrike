@@ -27,9 +27,49 @@
 #include "../Utils/Logger.hpp"
 
 #include <limits>
+#include <atomic>
 
 namespace ShadowStrike {
 namespace PEParser {
+
+namespace {
+
+void LogValidationGrowthFailureOnce(const char* container) noexcept {
+    static std::atomic_bool logged{ false };
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        Utils::Logger::Warn("PEValidation: optional {} telemetry dropped because vector growth failed",
+            container);
+    }
+}
+
+bool TryAddAnomaly(std::vector<Anomaly>& anomalies,
+                   AnomalyType type,
+                   const wchar_t* description) noexcept
+{
+    try {
+        anomalies.emplace_back(type, description);
+        return true;
+    } catch (const std::exception&) {
+        LogValidationGrowthFailureOnce("anomaly");
+        return false;
+    }
+}
+
+bool TryAddOverlap(std::vector<std::pair<size_t, size_t>>& overlaps,
+                   size_t left,
+                   size_t right) noexcept
+{
+    try {
+        overlaps.emplace_back(left, right);
+        return true;
+    } catch (const std::exception&) {
+        LogValidationGrowthFailureOnce("section-overlap");
+        return false;
+    }
+}
+
+} // namespace
 
 // ============================================================================
 // Validation Result String Conversion
@@ -861,11 +901,9 @@ namespace PEParser {
     // the PE headers in memory — this is a known evasion technique.
     if (header.VirtualAddress == 0 && header.VirtualSize > 0) {
         if (outAnomalies) {
-            try {
-                outAnomalies->emplace_back(
-                    AnomalyType::UnusualSectionOrder,
-                    L"Section has VirtualAddress == 0 with non-zero VirtualSize (header overlay technique)");
-            } catch (...) {}
+            (void)TryAddAnomaly(*outAnomalies,
+                AnomalyType::UnusualSectionOrder,
+                L"Section has VirtualAddress == 0 with non-zero VirtualSize (header overlay technique)");
         }
     }
 
@@ -873,11 +911,9 @@ namespace PEParser {
     // Empty sections waste space and are sometimes used as markers by packers
     if (header.VirtualSize == 0 && header.SizeOfRawData == 0) {
         if (outAnomalies) {
-            try {
-                outAnomalies->emplace_back(
-                    AnomalyType::SectionZeroRawSize,
-                    L"Section has zero virtual and raw size");
-            } catch (...) {}
+            (void)TryAddAnomaly(*outAnomalies,
+                AnomalyType::SectionZeroRawSize,
+                L"Section has zero virtual and raw size");
         }
     }
 
@@ -887,11 +923,9 @@ namespace PEParser {
     constexpr uint32_t kRWXMask = 0xE0000000u;  // MEM_EXECUTE | MEM_READ | MEM_WRITE
     if ((header.Characteristics & kRWXMask) == 0 && header.SizeOfRawData > 0) {
         if (outAnomalies) {
-            try {
-                outAnomalies->emplace_back(
-                    AnomalyType::SectionSizeMismatch,
-                    L"Section has no memory access flags (not readable, writable, or executable)");
-            } catch (...) {}
+            (void)TryAddAnomaly(*outAnomalies,
+                AnomalyType::SectionSizeMismatch,
+                L"Section has no memory access flags (not readable, writable, or executable)");
         }
     }
 
@@ -954,13 +988,9 @@ namespace PEParser {
     if (header.PointerToRawData != 0 && fileAlignment > 0) {
         if ((header.PointerToRawData % fileAlignment) != 0) {
             if (outAnomalies) {
-                try {
-                    outAnomalies->emplace_back(
-                        AnomalyType::SectionAlignmentViolation,
-                        L"Section PointerToRawData is not aligned to FileAlignment");
-                } catch (...) {
-                    // Anomaly recording is informational; allocation failure is non-fatal.
-                }
+                (void)TryAddAnomaly(*outAnomalies,
+                    AnomalyType::SectionAlignmentViolation,
+                    L"Section PointerToRawData is not aligned to FileAlignment");
             }
         }
     }
@@ -1003,7 +1033,7 @@ namespace PEParser {
 
             // Check for overlap
             if (s1Start < s2End && s2Start < s1End) {
-                try { outOverlaps.emplace_back(i, j); } catch (...) {}
+                (void)TryAddOverlap(outOverlaps, i, j);
             }
         }
     }
@@ -1043,7 +1073,7 @@ namespace PEParser {
                     }
                 }
                 if (!alreadyRecorded) {
-                    try { outOverlaps.emplace_back(i, j); } catch (...) {}
+                    (void)TryAddOverlap(outOverlaps, i, j);
                 }
             }
         }
