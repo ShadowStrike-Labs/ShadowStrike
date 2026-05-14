@@ -100,6 +100,11 @@ void BackupProtector_OnProcessNotify(std::uint32_t pid,
                                      const std::wstring& commandLine,
                                      bool isCreation) noexcept;
 
+void FileBackupManager_OnProcessNotify(std::uint32_t pid,
+                                       std::uint32_t parentPid,
+                                       const std::wstring& imagePath,
+                                       bool isCreation) noexcept;
+
 }  // namespace ShadowStrike::Ransomware::Wiring::Internal
 
 namespace ShadowStrike::Ransomware::Wiring {
@@ -223,6 +228,12 @@ void DispatchProcessNotify(std::uint32_t pid,
     // BackupProtector intercepts destructive backup-removal commands
     // (vssadmin delete shadows, wbadmin delete, etc.) at process creation.
     BackupProtector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
+
+    // FileBackupManager commits any pending JIT backups when the source
+    // process exits — must run on both creation and termination events so
+    // dead-PID entries are not left behind to leak memory and starve the
+    // eviction logic of room for still-running processes.
+    FileBackupManager_OnProcessNotify(pid, parentPid, imagePath, isCreation);
 
     // WannaCry only cares about process creation events (service/mutex
     // indicators are checked in the creation hot path).
