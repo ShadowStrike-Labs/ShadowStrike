@@ -172,11 +172,16 @@ void DispatchFileWrite(std::uint32_t pid,
     if (filePath.empty()) return;
 
     // Honeypot first — a decoy touch is an immediate high-confidence signal.
+    // OnHoneypotTouched runs the full response pipeline (terminate, backup,
+    // snapshot, lockdown), so we short-circuit the regular AnalyzeWrite
+    // path to avoid double-triggering on the same kernel event. The Locky
+    // sub-detector is also skipped because the process is being torn down.
     if (RansomwareDetector_IsHoneypotPath(filePath)) {
         RansomwareDetector_OnHoneypotTouched(pid, filePath);
         (void)HoneypotManager_OnKernelNotification(
             filePath, pid, /*threadId*/ 0,
             /*accessTypeRaw = Write*/ 2);
+        return;
     }
 
     // Behavioral write analysis + Locky-family scoring.
