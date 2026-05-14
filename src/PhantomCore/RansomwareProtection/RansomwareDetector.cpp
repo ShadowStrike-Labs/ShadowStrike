@@ -233,14 +233,50 @@ public:
         return ref;
     }
 
+    // Caller MUST hold `m_statsMutex` in unique mode. Drops time-expired
+    // entries, then — if still above the hard cap — evicts the
+    // least-recently-active entries (LRU by `lastActivity`) until at or
+    // below the cap. This guarantees bounded memory under sustained
+    // process-creation pressure (DoS resistance).
     void CleanupOldStats() {
-        auto expiry = Clock::now() - std::chrono::seconds(RansomwareConstants::STATS_RETENTION_SECS);
+        const auto expiry = Clock::now()
+            - std::chrono::seconds(RansomwareConstants::STATS_RETENTION_SECS);
         for (auto it = m_processStats.begin(); it != m_processStats.end(); ) {
             // Lock each IOStats to safely read lastActivity (non-atomic)
             bool expired;
             { std::lock_guard lk(it->second->mutex); expired = it->second->lastActivity < expiry; }
             expired ? it = m_processStats.erase(it) : ++it;
         }
+
+        if (m_processStats.size() <= RansomwareConstants::MAX_TRACKED_PROCESSES) {
+            return;
+        }
+
+        // LRU eviction by lastActivity. Snapshot (pid, lastActivity) under
+        // each IOStats lock, partial_sort by oldest, then erase the oldest
+        // entries until at-cap. Worst case O(N log K) for K victims.
+        struct Entry { uint32_t pid; TimePoint lastActivity; };
+        std::vector<Entry> entries;
+        entries.reserve(m_processStats.size());
+        for (const auto& [pid, statsPtr] : m_processStats) {
+            TimePoint la;
+            { std::lock_guard lk(statsPtr->mutex); la = statsPtr->lastActivity; }
+            entries.push_back({pid, la});
+        }
+
+        const size_t excess = m_processStats.size() - RansomwareConstants::MAX_TRACKED_PROCESSES;
+        std::partial_sort(entries.begin(), entries.begin() + static_cast<std::ptrdiff_t>(excess),
+                          entries.end(),
+                          [](const Entry& a, const Entry& b) noexcept {
+                              return a.lastActivity < b.lastActivity;
+                          });
+        for (size_t i = 0; i < excess; ++i) {
+            m_processStats.erase(entries[i].pid);
+        }
+
+        SS_LOG_WARN(L"RansomwareDetector",
+            L"IOStats LRU evicted %zu oldest entries (cap=%zu)",
+            excess, static_cast<size_t>(RansomwareConstants::MAX_TRACKED_PROCESSES));
     }
 
     void UpdateWriteStats(IOStats& s, size_t bytes, bool isHighEntropy) {
@@ -656,6 +692,42 @@ DetectionEvent RansomwareDetector::AnalyzeWriteEx(uint32_t pid,
             }
         }
 
+        // 2a. Pre-write callback veto. Callback may inspect entropy/path/data
+        // and override the verdict (e.g. AppGuard policy, sandbox lockdown).
+        // Callback is invoked with NO locks held to prevent deadlock.
+        {
+            PreWriteCallback cb;
+            { std::lock_guard lk(m_impl->m_callbackMutex); cb = m_impl->m_preWriteCallback; }
+            if (cb) {
+                DetectionAction override = DetectionAction::Allow;
+                try {
+                    override = cb(pid, std::wstring(filePath), buffer);
+                } catch (const std::exception& ex) {
+                    SS_LOG_ERROR(L"RansomwareDetector",
+                        L"PreWriteCallback threw: %hs", ex.what());
+                } catch (...) {
+                    SS_LOG_ERROR(L"RansomwareDetector",
+                        L"PreWriteCallback threw unknown exception");
+                }
+                if (override == DetectionAction::Block ||
+                    override == DetectionAction::BlockAndKill) {
+                    event.action = override;
+                    event.verdict = DetectionVerdict::PossibleRansom;
+                    { std::lock_guard lkS(stats.mutex); stats.isBlocked = true; }
+                    m_impl->m_stats.operationsBlocked.fetch_add(1, std::memory_order_relaxed);
+                    if (override == DetectionAction::BlockAndKill &&
+                        m_impl->m_config.enableAutoBlock) {
+                        m_impl->ExecuteResponsePipeline(pid, event);
+                    } else {
+                        m_impl->FireDetectionCallback(event);
+                        m_impl->FireBlockCallback(pid, L"Pre-write callback veto");
+                        m_impl->RecordDetection(event);
+                    }
+                    return event;
+                }
+            }
+        }
+
         // 3. Update stats
         m_impl->UpdateWriteStats(stats, buffer.size(), isHighEntropy);
 
@@ -689,7 +761,7 @@ DetectionEvent RansomwareDetector::AnalyzeWriteEx(uint32_t pid,
             event.verdict = DetectionVerdict::PossibleRansom;
             if (m_impl->m_config.enableAutoBlock) {
                 event.action = DetectionAction::Block;
-                stats.isBlocked = true;
+                { std::lock_guard lk(stats.mutex); stats.isBlocked = true; }
                 m_impl->m_stats.operationsBlocked.fetch_add(1, std::memory_order_relaxed);
                 m_impl->FireDetectionCallback(event);
                 m_impl->FireBlockCallback(pid, L"High-confidence ransomware indicators");
@@ -773,6 +845,7 @@ DetectionEvent RansomwareDetector::AnalyzeRenameEx(uint32_t pid,
             }
         } else if (event.confidence >= RansomwareConstants::MIN_ALERT_CONFIDENCE) {
             event.verdict = DetectionVerdict::Suspicious;
+            event.action = DetectionAction::AllowWithBackup;
             m_impl->FireDetectionCallback(event);
             m_impl->RecordDetection(event);
         }
@@ -830,6 +903,7 @@ DetectionEvent RansomwareDetector::AnalyzeDeleteEx(uint32_t pid, std::wstring_vi
             }
         } else if (event.confidence >= RansomwareConstants::MIN_ALERT_CONFIDENCE) {
             event.verdict = DetectionVerdict::Suspicious;
+            event.action = DetectionAction::AllowWithBackup;
             m_impl->FireDetectionCallback(event);
             m_impl->RecordDetection(event);
         }
@@ -849,20 +923,6 @@ void RansomwareDetector::OnHoneypotTouched(uint32_t pid, const std::wstring& fil
             L"HONEYPOT TOUCHED by PID %u - File: %ls", pid, filePath.c_str());
         m_impl->m_stats.honeypotTriggers.fetch_add(1, std::memory_order_relaxed);
 
-        // Immediate process tree kill via ProcessKiller (RAII, no raw HANDLEs)
-        if (m_impl->m_config.enableProcessKill) {
-            auto result = Core::Process::ProcessKiller::TerminateTree(pid);
-            if (result == Core::Process::KillResult::Success ||
-                result == Core::Process::KillResult::AlreadyDead) {
-                m_impl->m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
-                SS_LOG_INFO(L"RansomwareDetector", L"Process tree %u terminated (honeypot)", pid);
-            } else {
-                SS_LOG_ERROR(L"RansomwareDetector",
-                    L"Failed to terminate PID %u after honeypot touch (result=%u)",
-                    pid, static_cast<unsigned>(result));
-            }
-        }
-
         DetectionEvent event;
         event.eventId = m_impl->m_nextEventId.fetch_add(1, std::memory_order_relaxed);
         event.timestamp = std::chrono::system_clock::now();
@@ -873,7 +933,11 @@ void RansomwareDetector::OnHoneypotTouched(uint32_t pid, const std::wstring& fil
         event.detectionFlags = static_cast<uint16_t>(DetectionTechnique::HoneypotAccess);
         event.confidence = 1.0;
 
-        // Trigger full response pipeline (backup, snapshot, lockdown)
+        // Single-source response: ExecuteResponsePipeline is responsible for
+        // ProcessKiller::TerminateTree, emergency backup, snapshot, lockdown,
+        // recovery, and callback fan-out. Calling TerminateTree here would
+        // double-attempt the kill and confuse stats; the pipeline's
+        // MarkRespondedOnce gate ensures idempotency per PID.
         m_impl->ExecuteResponsePipeline(pid, event);
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(L"RansomwareDetector", L"OnHoneypotTouched failed: %hs", ex.what());
@@ -912,7 +976,7 @@ void RansomwareDetector::OnProcessCreated(uint32_t pid,
     // process events directly from the kernel. Here we track the process and
     // fire the detection callback so external listeners can correlate.
     auto& stats = m_impl->GetOrCreateStats(pid);
-    try { stats.processName = std::wstring(imagePath); } catch (...) {}
+    { std::lock_guard lk(stats.mutex); stats.processName = std::wstring(imagePath); }
 
     SS_LOG_DEBUG(L"RansomwareDetector",
         L"Process created: PID=%u path=%ls", pid,
@@ -961,31 +1025,43 @@ void RansomwareDetector::OnSubDetectorIndicator(uint32_t pid, double score,
     if (m_impl->IsRecoveryPid(pid)) return;
 
     IOStats& stats = m_impl->GetOrCreateStats(pid);
-    stats.confidenceScore += score;
+
+    // Sample/mutate the non-atomic confidenceScore and processName under
+    // the per-stats mutex; the orchestrator's response pipeline is then
+    // invoked WITHOUT holding the lock to prevent contention/deadlock.
+    double accumulated = 0.0;
+    std::wstring snapshotProcessName;
+    {
+        std::lock_guard lkS(stats.mutex);
+        stats.confidenceScore += score;
+        accumulated = stats.confidenceScore;
+        snapshotProcessName = stats.processName;
+    }
 
     SS_LOG_INFO(L"RansomwareDetector",
         L"Sub-detector indicator: PID=%u score=+%.1f total=%.1f detail=%ls",
-        pid, score, stats.confidenceScore, std::wstring(detail).c_str());
+        pid, score, accumulated, std::wstring(detail).c_str());
 
     // Check accumulated score against thresholds
-    if (stats.confidenceScore >= RansomwareConstants::BLOCK_SCORE_THRESHOLD) {
+    if (accumulated >= RansomwareConstants::BLOCK_SCORE_THRESHOLD) {
         DetectionEvent event;
         event.eventId = m_impl->m_nextEventId.fetch_add(1, std::memory_order_relaxed);
         event.timestamp = std::chrono::system_clock::now();
         event.pid = pid;
-        event.processName = stats.processName;
+        event.processName = snapshotProcessName;
         event.family = family;
-        event.confidence = std::clamp(stats.confidenceScore / 100.0, 0.0, 1.0);
+        event.confidence = std::clamp(accumulated / 100.0, 0.0, 1.0);
         event.verdict = DetectionVerdict::ConfirmedRansom;
         event.details = detail;
         m_impl->ExecuteResponsePipeline(pid, event);
-    } else if (stats.confidenceScore >= RansomwareConstants::ALERT_SCORE_THRESHOLD) {
+    } else if (accumulated >= RansomwareConstants::ALERT_SCORE_THRESHOLD) {
         DetectionEvent event;
         event.eventId = m_impl->m_nextEventId.fetch_add(1, std::memory_order_relaxed);
         event.timestamp = std::chrono::system_clock::now();
         event.pid = pid;
+        event.processName = snapshotProcessName;
         event.family = family;
-        event.confidence = std::clamp(stats.confidenceScore / 100.0, 0.0, 1.0);
+        event.confidence = std::clamp(accumulated / 100.0, 0.0, 1.0);
         event.verdict = DetectionVerdict::Suspicious;
         event.action = DetectionAction::AllowWithBackup;
         event.details = detail;
@@ -1018,9 +1094,20 @@ std::vector<uint32_t> RansomwareDetector::GetHighRiskProcesses() const {
     std::vector<uint32_t> result;
     std::shared_lock lk(m_impl->m_statsMutex);
     for (const auto& [p, s] : m_impl->m_processStats) {
-        if (s->highEntropyWrites.load(std::memory_order_relaxed) >= 3 ||
-            s->isBlocked || s->confidenceScore >= RansomwareConstants::ALERT_SCORE_THRESHOLD)
+        // highEntropyWrites is atomic — can be read without per-stats lock.
+        if (s->highEntropyWrites.load(std::memory_order_relaxed) >= 3) {
             result.push_back(p);
+            continue;
+        }
+        // isBlocked (bool) and confidenceScore (double) are non-atomic;
+        // sample under the per-stats mutex to avoid a data race with
+        // AnalyzeWriteEx / OnSubDetectorIndicator.
+        bool blocked;
+        double score;
+        { std::lock_guard lkS(s->mutex); blocked = s->isBlocked; score = s->confidenceScore; }
+        if (blocked || score >= RansomwareConstants::ALERT_SCORE_THRESHOLD) {
+            result.push_back(p);
+        }
     }
     return result;
 }
