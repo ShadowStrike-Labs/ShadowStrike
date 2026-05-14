@@ -168,10 +168,19 @@ namespace {
         L"Restore-My-Files.txt"
     };
 
-    /// @brief Convert extension to lowercase for comparison
+    /// @brief Convert extension to lowercase for comparison.
+    ///
+    /// Extensions are pure ASCII by convention. Using a locale-sensitive
+    /// helper such as ``::towlower`` would, under e.g. Turkish locale,
+    /// fold 'I' to a non-ASCII code point and break the EXTENSION_MAP
+    /// lookup. We therefore implement a strict ASCII fold here.
     [[nodiscard]] std::wstring NormalizeExtension(const std::wstring& ext) {
         std::wstring result = ext;
-        std::transform(result.begin(), result.end(), result.begin(), ::towlower);
+        for (auto& wc : result) {
+            if (wc >= L'A' && wc <= L'Z') {
+                wc = static_cast<wchar_t>(wc + (L'a' - L'A'));
+            }
+        }
         return result;
     }
 
@@ -188,15 +197,39 @@ namespace {
         }
     }
 
-    /// @brief Generate a recovery/batch ID using Windows GUID
+    /// @brief Generate a recovery/batch ID using Windows GUID.
+    ///
+    /// The GUID returned by ``StringFromGUID2`` is pure ASCII (digits,
+    /// hex letters, dashes, braces), so the narrow conversion below is
+    /// safe by construction. We use ``WideCharToMultiByte`` rather than
+    /// a naive ``std::string(ws.begin(), ws.end())`` because the latter
+    /// performs an implicit ``wchar_t``-to-``char`` narrowing that
+    /// triggers C4244 under ``/W4`` and silently truncates non-ASCII
+    /// input - a defensive choice in case the format ever changes.
     [[nodiscard]] std::string GenerateRecoveryId() {
         ::GUID guid{};
         if (SUCCEEDED(::CoCreateGuid(&guid))) {
             wchar_t buf[40]{};
             if (::StringFromGUID2(guid, buf, 40) > 0) {
-                std::wstring ws(buf);
+                const std::wstring_view ws(buf);
                 if (ws.size() > 2) {
-                    return std::string(ws.begin() + 1, ws.end() - 1);
+                    // Strip the surrounding braces produced by StringFromGUID2
+                    const std::wstring_view inner = ws.substr(1, ws.size() - 2);
+
+                    const int needed = ::WideCharToMultiByte(
+                        CP_UTF8, 0,
+                        inner.data(), static_cast<int>(inner.size()),
+                        nullptr, 0, nullptr, nullptr);
+                    if (needed > 0) {
+                        std::string out(static_cast<size_t>(needed), '\0');
+                        const int written = ::WideCharToMultiByte(
+                            CP_UTF8, 0,
+                            inner.data(), static_cast<int>(inner.size()),
+                            out.data(), needed, nullptr, nullptr);
+                        if (written == needed) {
+                            return out;
+                        }
+                    }
                 }
             }
         }
@@ -598,12 +631,47 @@ public:
 
                 std::vector<uint8_t> ciphertext(ciphertextLen);
                 std::vector<uint8_t> tag(TAG_SIZE);
-                DWORD bytesRead = 0;
 
-                ::ReadFile(hInput, ciphertext.data(),
-                           static_cast<DWORD>(ciphertextLen), &bytesRead, nullptr);
-                ::ReadFile(hInput, tag.data(),
-                           static_cast<DWORD>(TAG_SIZE), &bytesRead, nullptr);
+                // Both ReadFile calls were previously unchecked and reused the
+                // same ``bytesRead`` variable, so a short read on the first
+                // call would be silently overwritten by the second, leading
+                // to a misleading "authentication error" on what is really
+                // an I/O failure. We now verify each read independently.
+                DWORD ctRead = 0;
+                if (!::ReadFile(hInput, ciphertext.data(),
+                                static_cast<DWORD>(ciphertextLen),
+                                &ctRead, nullptr) ||
+                    ctRead != static_cast<DWORD>(ciphertextLen))
+                {
+                    SS_LOG_LAST_ERROR(LOG_CAT,
+                        L"AEAD ciphertext read failed: expected %zu, got %lu",
+                        ciphertextLen, static_cast<unsigned long>(ctRead));
+                    ::SecureZeroMemory(ciphertext.data(), ciphertext.size());
+                    outputGuard.h = INVALID_HANDLE_VALUE;
+                    ::CloseHandle(hOutput);
+                    fs::remove(tempPath, ec);
+                    result.status = DecryptionStatus::IOError;
+                    result.errorMessage = "AEAD ciphertext read short or failed";
+                    return result;
+                }
+
+                DWORD tagRead = 0;
+                if (!::ReadFile(hInput, tag.data(),
+                                static_cast<DWORD>(TAG_SIZE),
+                                &tagRead, nullptr) ||
+                    tagRead != static_cast<DWORD>(TAG_SIZE))
+                {
+                    SS_LOG_LAST_ERROR(LOG_CAT,
+                        L"AEAD tag read failed: expected %zu, got %lu",
+                        TAG_SIZE, static_cast<unsigned long>(tagRead));
+                    ::SecureZeroMemory(ciphertext.data(), ciphertext.size());
+                    outputGuard.h = INVALID_HANDLE_VALUE;
+                    ::CloseHandle(hOutput);
+                    fs::remove(tempPath, ec);
+                    result.status = DecryptionStatus::IOError;
+                    result.errorMessage = "AEAD tag read short or failed";
+                    return result;
+                }
 
                 std::vector<uint8_t> plaintext;
                 if (!cipher.DecryptAEAD(ciphertext.data(), ciphertextLen,

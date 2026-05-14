@@ -458,9 +458,73 @@ struct DecryptionKey {
 
     DecryptionKey() = default;
     DecryptionKey(const DecryptionKey& other) = default;
-    DecryptionKey& operator=(const DecryptionKey& other) = default;
     DecryptionKey(DecryptionKey&& other) noexcept = default;
-    DecryptionKey& operator=(DecryptionKey&& other) noexcept = default;
+
+    /// @brief Copy-assignment that securely wipes prior key material
+    /// before replacement.
+    ///
+    /// The defaulted operator would let the destination's existing
+    /// keyData / iv / rsaPrivateKey buffers be freed via the standard
+    /// allocator WITHOUT being zeroed first (CWE-244 - Improper Clearing
+    /// of Heap Memory Before Release), because the secure destructor only
+    /// runs at object destruction, not on reassignment. We therefore
+    /// explicitly zero the existing buffers before adopting the new
+    /// contents.
+    DecryptionKey& operator=(const DecryptionKey& other) {
+        if (this == &other) return *this;
+        if (!keyData.empty()) {
+            ::SecureZeroMemory(keyData.data(), keyData.size());
+        }
+        if (!iv.empty()) {
+            ::SecureZeroMemory(iv.data(), iv.size());
+        }
+        if (!rsaPrivateKey.empty()) {
+            ::SecureZeroMemory(rsaPrivateKey.data(), rsaPrivateKey.size());
+        }
+        keyId         = other.keyId;
+        keyType       = other.keyType;
+        source        = other.source;
+        family        = other.family;
+        algorithm     = other.algorithm;
+        keyData       = other.keyData;
+        iv            = other.iv;
+        rsaPrivateKey = other.rsaPrivateKey;
+        validFrom     = other.validFrom;
+        validUntil    = other.validUntil;
+        victimIds     = other.victimIds;
+        isMasterKey   = other.isMasterKey;
+        notes         = other.notes;
+        return *this;
+    }
+
+    /// @brief Move-assignment that securely wipes prior key material
+    /// before adopting the source's buffers.
+    DecryptionKey& operator=(DecryptionKey&& other) noexcept {
+        if (this == &other) return *this;
+        if (!keyData.empty()) {
+            ::SecureZeroMemory(keyData.data(), keyData.size());
+        }
+        if (!iv.empty()) {
+            ::SecureZeroMemory(iv.data(), iv.size());
+        }
+        if (!rsaPrivateKey.empty()) {
+            ::SecureZeroMemory(rsaPrivateKey.data(), rsaPrivateKey.size());
+        }
+        keyId         = std::move(other.keyId);
+        keyType       = other.keyType;
+        source        = other.source;
+        family        = other.family;
+        algorithm     = other.algorithm;
+        keyData       = std::move(other.keyData);
+        iv            = std::move(other.iv);
+        rsaPrivateKey = std::move(other.rsaPrivateKey);
+        validFrom     = other.validFrom;
+        validUntil    = other.validUntil;
+        victimIds     = std::move(other.victimIds);
+        isMasterKey   = other.isMasterKey;
+        notes         = std::move(other.notes);
+        return *this;
+    }
 
     /**
      * @brief Check if key is valid for file
