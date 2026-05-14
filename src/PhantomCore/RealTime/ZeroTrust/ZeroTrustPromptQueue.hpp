@@ -98,9 +98,9 @@ public:
      * Eviction semantics: when the queue already holds @ref kMaxPending
      * entries (regardless of their answer state), the OLDEST entry is
      * unconditionally evicted (FIFO) before the new entry is inserted. A
-     * caller currently blocked in WaitFor() for the evicted id will receive
-     * PromptAnswer::Timeout when its own caller-supplied timeout elapses
-     * (the id ceases to be visible to WaitFor's scan after eviction).
+     * caller currently blocked in WaitFor() for the evicted id is awakened by
+     * the next queue notification and receives PromptAnswer::Timeout as soon
+     * as the id ceases to be visible to WaitFor's scan.
      *
      * The caller-provided @c entry.id and @c entry.answer fields are ignored
      * and overwritten by the queue (see PromptEntry documentation).
@@ -113,8 +113,10 @@ public:
     /**
      * @brief Block until the prompt is answered or the timeout elapses.
      *
-     * On timeout the entry is marked Timeout internally and Timeout is
-     * returned. The caller must not assume the ID remains valid after Timeout.
+     * On deadline expiry the entry is marked Timeout internally and Timeout is
+     * returned. If the entry was evicted or purged before the deadline, Timeout
+     * is returned immediately. The caller must not assume the ID remains valid
+     * after Timeout.
      */
     [[nodiscard]] PromptAnswer WaitFor(std::uint64_t id,
                                        std::chrono::milliseconds timeout);

@@ -140,13 +140,19 @@ PromptAnswer ZeroTrustPromptQueue::WaitFor(std::uint64_t id,
 
     std::unique_lock lock(m_impl->m_mutex);
     while (true) {
+        bool found = false;
         for (auto& e : m_impl->m_queue) {
             if (e.id == id) {
+                found = true;
                 if (e.answer != PromptAnswer::Pending) {
                     return e.answer;
                 }
                 break;
             }
+        }
+
+        if (!found) {
+            return PromptAnswer::Timeout;
         }
 
         const auto now = std::chrono::steady_clock::now();
