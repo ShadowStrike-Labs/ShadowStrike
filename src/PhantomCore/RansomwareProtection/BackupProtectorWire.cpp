@@ -38,4 +38,38 @@ void BackupProtector_Shutdown() noexcept {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel event dispatch for BackupProtector.
+//
+// BackupProtector exists to intercept destructive backup-removal commands
+// (vssadmin delete shadows, wbadmin delete, wmic shadowcopy delete, bcdedit
+// recoveryenabled no, etc.) at process-creation time. Without this hook the
+// module's pattern store, whitelist, and AnalyzeProcess pipeline would never
+// run and the protection would be a no-op.
+//
+// We only invoke the handler on creation events; process-exit notifications
+// are uninteresting to BackupProtector. We swallow exceptions so a single
+// misbehaving call cannot take the IPC dispatcher down.
+// ---------------------------------------------------------------------------
+void BackupProtector_OnProcessNotify(std::uint32_t pid,
+                                     const std::wstring& imagePath,
+                                     const std::wstring& commandLine,
+                                     bool isCreation) noexcept {
+    if (!isCreation) return;
+    if (imagePath.empty() || commandLine.empty()) return;
+
+    try {
+        BackupProtector::Instance().OnKernelProcessNotify(
+            pid,
+            std::wstring_view{imagePath},
+            std::wstring_view{commandLine},
+            /*isCreate=*/true);
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("RansomwareWiring: BackupProtector OnKernelProcessNotify exception: {}",
+                            e.what());
+    } catch (...) {
+        Utils::Logger::Warn("RansomwareWiring: BackupProtector OnKernelProcessNotify unknown exception");
+    }
+}
+
 }  // namespace ShadowStrike::Ransomware::Wiring::Internal
