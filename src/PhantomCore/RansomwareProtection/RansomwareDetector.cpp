@@ -1517,7 +1517,7 @@ std::string IOStats::ToJson() const {
     std::lock_guard lk(mutex);
     nlohmann::json j;
     j["pid"] = pid;
-    j["processName"] = std::string(processName.begin(), processName.end());
+    j["processName"] = Utils::StringUtils::ToNarrow(processName);
     j["writeCount"] = writeCount.load(std::memory_order_relaxed);
     j["renameCount"] = renameCount.load(std::memory_order_relaxed);
     j["deleteCount"] = deleteCount.load(std::memory_order_relaxed);
@@ -1537,14 +1537,14 @@ std::string DetectionEvent::ToJson() const {
     nlohmann::json j;
     j["eventId"] = eventId;
     j["pid"] = pid;
-    j["filePath"] = std::string(filePath.begin(), filePath.end());
+    j["filePath"] = Utils::StringUtils::ToNarrow(filePath);
     j["verdict"] = static_cast<int>(verdict);
     j["action"] = static_cast<int>(action);
     j["detectionFlags"] = detectionFlags;
     j["family"] = static_cast<int>(family);
     j["confidence"] = confidence;
     if (entropyResult) j["entropy"] = nlohmann::json::parse(entropyResult->ToJson());
-    if (!details.empty()) j["details"] = std::string(details.begin(), details.end());
+    if (!details.empty()) j["details"] = Utils::StringUtils::ToNarrow(details);
     return j.dump();
 }
 
