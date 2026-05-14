@@ -95,6 +95,11 @@ void HoneypotManager_OnImageLoad(std::uint32_t pid,
                                  const std::wstring& imagePath,
                                  std::uintptr_t imageBase) noexcept;
 
+void BackupProtector_OnProcessNotify(std::uint32_t pid,
+                                     const std::wstring& imagePath,
+                                     const std::wstring& commandLine,
+                                     bool isCreation) noexcept;
+
 }  // namespace ShadowStrike::Ransomware::Wiring::Internal
 
 namespace ShadowStrike::Ransomware::Wiring {
@@ -214,6 +219,10 @@ void DispatchProcessNotify(std::uint32_t pid,
     RansomwareDetector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
     LockyDetector_OnProcessNotify(pid, parentPid, imagePath, isCreation);
     HoneypotManager_OnProcessNotify(pid, parentPid, imagePath, isCreation);
+
+    // BackupProtector intercepts destructive backup-removal commands
+    // (vssadmin delete shadows, wbadmin delete, etc.) at process creation.
+    BackupProtector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
 
     // WannaCry only cares about process creation events (service/mutex
     // indicators are checked in the creation hot path).
