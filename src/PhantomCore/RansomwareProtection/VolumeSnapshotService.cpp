@@ -259,6 +259,37 @@ struct VssComponentsGuard {
     return false;
 }
 
+// Reject snapshot-relative paths that could escape the snapshot device root via
+// traversal segments, drive letters, or UNC/device prefixes. The caller will
+// concatenate the result onto the snapshot device path; an unchecked '..\..'
+// would expose live-volume contents during a restore operation, defeating the
+// point-in-time recovery guarantee.
+[[nodiscard]] bool IsSafeSnapshotRelativePath(const std::wstring& rel) noexcept {
+    if (rel.empty() || rel.size() > VSSConstants::MAX_VOLUME_PATH_LEN * 4) {
+        return false;
+    }
+    // Reject absolute / device / UNC prefixes.
+    if (rel.size() >= 2 && rel[1] == L':')          return false;   // drive letter
+    if (rel.starts_with(L"\\\\"))                    return false;   // UNC / device
+    if (rel.starts_with(L"\\?\\") || rel.starts_with(L"\\??\\")) return false;
+    if (rel.front() == L'/' || rel.front() == L'\\') return false;   // leading separator
+
+    // Reject any path segment equal to ".."; iterate manually to remain
+    // independent of fs::path normalization quirks.
+    std::wstring_view sv{rel};
+    size_t i = 0;
+    while (i < sv.size()) {
+        size_t j = i;
+        while (j < sv.size() && sv[j] != L'\\' && sv[j] != L'/') ++j;
+        const std::wstring_view seg = sv.substr(i, j - i);
+        if (seg == L".." ) return false;
+        // NUL byte inside the path is a smuggling attempt.
+        if (seg.find(L'\0') != std::wstring_view::npos) return false;
+        i = (j < sv.size()) ? j + 1 : j;
+    }
+    return true;
+}
+
 // Convert FILETIME-epoch 100ns ticks (VSS_TIMESTAMP = LONGLONG) to system_clock::time_point
 [[nodiscard]] SystemTimePoint FileTimeToSystemTime(const VSS_TIMESTAMP& ts) {
     // VSS_TIMESTAMP is a LONGLONG representing 100ns intervals since 1601-01-01
@@ -383,6 +414,31 @@ std::string VolumeSnapshotStatistics::ToJson() const {
     j["totalRestorationTimeMs"] = totalRestorationTimeMs.load();
     j["currentOperations"]      = currentOperations.load();
     j["emergencySnapshotsCreated"] = emergencySnapshotsCreated.load();
+
+    json byTypeArr = json::array();
+    for (size_t i = 0; i < byType.size(); ++i) {
+        const uint64_t v = byType[i].load();
+        if (v > 0) {
+            byTypeArr.push_back({
+                {"type",  std::string(GetSnapshotTypeName(static_cast<SnapshotType>(i)))},
+                {"count", v}
+            });
+        }
+    }
+    j["byType"] = std::move(byTypeArr);
+
+    json byResultArr = json::array();
+    for (size_t i = 0; i < byResult.size(); ++i) {
+        const uint64_t v = byResult[i].load();
+        if (v > 0) {
+            byResultArr.push_back({
+                {"result", std::string(GetVSSResultName(static_cast<VSSResult>(i)))},
+                {"count",  v}
+            });
+        }
+    }
+    j["byResult"] = std::move(byResultArr);
+
     return j.dump();
 }
 
@@ -612,25 +668,40 @@ void VolumeSnapshotServiceImpl::Shutdown() {
     // Stop monitoring first (outside the main lock to avoid deadlock with thread join)
     StopMonitoring();
 
-    std::unique_lock lock(m_mutex);
-    if (!m_isActive.load(std::memory_order_relaxed)) return;
+    // Snapshot mount state under the lock and clear it so that UnexposeSnapshot
+    // (which re-enters m_mutex via shared_lock) is invoked without holding any
+    // lock. std::shared_mutex does NOT permit a thread holding unique to take
+    // shared on the same mutex — doing so is undefined behaviour and was a
+    // guaranteed deadlock at shutdown (also reachable from the dtor).
+    std::vector<std::wstring> mountedToUnexpose;
+    {
+        std::unique_lock lock(m_mutex);
+        if (!m_isActive.load(std::memory_order_relaxed)) {
+            return;
+        }
+        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
-    m_status.store(ModuleStatus::Stopping, std::memory_order_release);
-
-    // Unmount all mounted snapshots
-    for (const auto& [sid, mp] : m_mountedSnapshots) {
-        UnexposeSnapshot(sid);
+        mountedToUnexpose.reserve(m_mountedSnapshots.size());
+        for (const auto& [sid, mp] : m_mountedSnapshots) {
+            mountedToUnexpose.push_back(sid);
+        }
+        m_mountedSnapshots.clear();
     }
-    m_mountedSnapshots.clear();
 
-    // Uninitialize COM
-    if (m_comInitialized) {
-        CoUninitialize();
-        m_comInitialized = false;
+    // Best-effort unexpose; errors are logged but never block shutdown.
+    for (const auto& sid : mountedToUnexpose) {
+        (void)UnexposeSnapshot(sid);
     }
 
-    m_isActive.store(false, std::memory_order_release);
-    m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+    {
+        std::unique_lock lock(m_mutex);
+        if (m_comInitialized) {
+            CoUninitialize();
+            m_comInitialized = false;
+        }
+        m_isActive.store(false, std::memory_order_release);
+        m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+    }
     SS_LOG_INFO(kLogCategory, L"VolumeSnapshotService shutdown complete");
 }
 
@@ -669,6 +740,13 @@ VSSResult VolumeSnapshotServiceImpl::CreateSnapshotInternal(
     if (!m_isActive.load(std::memory_order_relaxed)) {
         return VSSResult::NotInitialized;
     }
+
+    // NOTE: This unique_lock is intentionally held across the VSS COM
+    // operations below. VSS itself serializes snapshot creation per backup
+    // session (StartSnapshotSet returns VSS_E_SNAPSHOT_SET_IN_PROGRESS if
+    // overlapping), and the writer/freeze sequence is sensitive to overlapping
+    // callers, so user-space serialization keeps behaviour deterministic.
+    // Query/enumeration paths use shared_lock and remain unblocked.
 
     // Enforce per-volume snapshot cap
     {
@@ -821,8 +899,14 @@ VSSResult VolumeSnapshotServiceImpl::CreateSnapshot(
     SnapshotType type)
 {
     SnapshotOptions opts;
-    opts.type        = type;
-    opts.autoCleanup = m_config.autoCleanupSnapshots;
+    opts.type = type;
+    {
+        // Snapshot the cleanup flag under the lock — UpdateConfiguration
+        // writes m_config under unique_lock, so an unprotected read here is
+        // a data race per [intro.races].
+        std::shared_lock lock(m_mutex);
+        opts.autoCleanup = m_config.autoCleanupSnapshots;
+    }
     return CreateSnapshotEx(volumeName, outSnapshotId, opts);
 }
 
@@ -920,7 +1004,7 @@ VSSResult VolumeSnapshotServiceImpl::CreateSnapshotSet(
         IVssAsync* pAsync = nullptr;
         hr = comps.ptr->GatherWriterMetadata(&pAsync);
         if (SUCCEEDED(hr) && pAsync) {
-            WaitForVssAsync(pAsync);
+            (void)WaitForVssAsync(pAsync);
             pAsync->Release();
         }
     }
@@ -1040,7 +1124,17 @@ std::vector<SnapshotInfo> VolumeSnapshotServiceImpl::QuerySnapshots() {
 
             snapshots.push_back(std::move(info));
             VssFreeSnapshotProperties(&snap);
+        } else {
+            // Defensive: VSS may surface other object types here even though
+            // we queried for VSS_OBJECT_SNAPSHOT. Free any embedded BSTR/UNICODE
+            // strings to avoid leaking provider allocations on enumeration.
+            SS_LOG_DEBUG(kLogCategory,
+                L"QuerySnapshots: unexpected object type %d in enumeration",
+                static_cast<int>(prop.Type));
         }
+        // Re-zero so the next iteration starts from a clean slate even if we
+        // returned early via continue in future refactors.
+        prop = VSS_OBJECT_PROP{};
     }
     pEnum->Release();
 
@@ -1339,6 +1433,12 @@ VSSResult VolumeSnapshotServiceImpl::RestoreFile(
     if (snapshotId.empty() || sourceFile.empty() || destFile.empty()) {
         return VSSResult::InvalidParameter;
     }
+    if (!IsSafeSnapshotRelativePath(sourceFile)) {
+        SS_LOG_ERROR(kLogCategory,
+            L"RestoreFile: rejected unsafe source path: %ls",
+            sourceFile.c_str());
+        return VSSResult::InvalidParameter;
+    }
 
     auto startTime = Clock::now();
 
@@ -1388,6 +1488,12 @@ VSSResult VolumeSnapshotServiceImpl::RestoreDirectory(
     bool recursive)
 {
     if (snapshotId.empty() || sourceDir.empty() || destDir.empty()) {
+        return VSSResult::InvalidParameter;
+    }
+    if (!IsSafeSnapshotRelativePath(sourceDir)) {
+        SS_LOG_ERROR(kLogCategory,
+            L"RestoreDirectory: rejected unsafe source path: %ls",
+            sourceDir.c_str());
         return VSSResult::InvalidParameter;
     }
 
@@ -1440,7 +1546,46 @@ VSSResult VolumeSnapshotServiceImpl::RestoreToOriginalLocation(
     const std::wstring& snapshotId,
     const std::wstring& filePath)
 {
-    return RestoreFile(snapshotId, filePath, filePath);
+    if (snapshotId.empty() || filePath.empty()) {
+        return VSSResult::InvalidParameter;
+    }
+
+    // Derive a volume-relative source path from an absolute path. Snapshot
+    // device objects expose the contents of the volume rooted at the device
+    // (e.g. "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN\"), so the source
+    // path must NOT include the drive letter or volume GUID — only the path
+    // relative to the volume root. Concatenating an absolute path would
+    // produce a malformed Win32 path and the restore would fail.
+    std::wstring relative;
+    if (filePath.size() >= 3 &&
+        std::iswalpha(filePath[0]) && filePath[1] == L':' &&
+        (filePath[2] == L'\\' || filePath[2] == L'/'))
+    {
+        // "C:\Users\foo\bar.txt" -> "Users\foo\bar.txt"
+        relative = filePath.substr(3);
+    } else if (filePath.starts_with(L"\\\\?\\")) {
+        // "\\?\Volume{GUID}\Users\foo\bar.txt" — find first separator after the
+        // volume prefix and take everything after it.
+        const size_t pos = filePath.find(L'\\', 4);
+        if (pos == std::wstring::npos || pos + 1 >= filePath.size()) {
+            SS_LOG_ERROR(kLogCategory,
+                L"RestoreToOriginalLocation: cannot strip volume from %ls",
+                filePath.c_str());
+            return VSSResult::InvalidParameter;
+        }
+        relative = filePath.substr(pos + 1);
+    } else {
+        SS_LOG_ERROR(kLogCategory,
+            L"RestoreToOriginalLocation: filePath must be absolute (got %ls)",
+            filePath.c_str());
+        return VSSResult::InvalidParameter;
+    }
+
+    if (relative.empty()) {
+        return VSSResult::InvalidParameter;
+    }
+
+    return RestoreFile(snapshotId, relative, filePath);
 }
 
 // ============================================================================
@@ -1772,7 +1917,7 @@ std::vector<WriterInfo> VolumeSnapshotServiceImpl::GetWriters() {
     IVssAsync* pGather = nullptr;
     hr = comps.ptr->GatherWriterMetadata(&pGather);
     if (SUCCEEDED(hr) && pGather) {
-        WaitForVssAsync(pGather);
+        (void)WaitForVssAsync(pGather);
         pGather->Release();
     }
 
@@ -1780,7 +1925,7 @@ std::vector<WriterInfo> VolumeSnapshotServiceImpl::GetWriters() {
     IVssAsync* pStatus = nullptr;
     hr = comps.ptr->GatherWriterStatus(&pStatus);
     if (SUCCEEDED(hr) && pStatus) {
-        WaitForVssAsync(pStatus);
+        (void)WaitForVssAsync(pStatus);
         pStatus->Release();
     }
 
@@ -2306,6 +2451,17 @@ std::string VolumeSnapshotStatisticsSnapshot::ToJson() const {
         }
     }
     j["byType"] = std::move(types);
+
+    nlohmann::json results = nlohmann::json::array();
+    for (size_t i = 0; i < byResult.size(); ++i) {
+        if (byResult[i] > 0) {
+            results.push_back({
+                {"result", std::string(GetVSSResultName(static_cast<VSSResult>(i)))},
+                {"count",  byResult[i]}
+            });
+        }
+    }
+    j["byResult"] = std::move(results);
     return j.dump();
 }
 
