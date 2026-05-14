@@ -25,9 +25,7 @@
 
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,6 +46,18 @@ enum class PromptAnswer : std::uint8_t {
 // PROMPT ENTRY
 // ============================================================================
 
+/**
+ * @brief Single uncertain-verdict prompt awaiting user adjudication.
+ *
+ * The @c id and @c answer fields are owned by the queue:
+ *   - Enqueue() overwrites @c id with a fresh monotonically-increasing value
+ *     and forces @c answer to PromptAnswer::Pending regardless of caller input.
+ *   - If @c createdAt is left default-constructed, Enqueue() fills it with the
+ *     current wall-clock time.
+ * Callers therefore should NOT rely on the @c id of the object they passed in;
+ * the queue-assigned id is returned by Enqueue() and must be used for WaitFor()
+ * and Answer().
+ */
 struct PromptEntry {
     std::uint64_t id                              = 0;
     std::chrono::system_clock::time_point createdAt;
@@ -63,6 +73,18 @@ struct PromptEntry {
 // ZERO TRUST PROMPT QUEUE — MEYERS' SINGLETON
 // ============================================================================
 
+/**
+ * @brief Bounded FIFO queue of pending zero-trust user prompts.
+ *
+ * Thread-safety: every public method is safe to call concurrently from any
+ * number of producer threads (typically a process-execution hook) and consumer
+ * threads (typically the UI / IPC dispatcher). Internally synchronised by a
+ * std::mutex paired with a condition_variable so WaitFor() blocks efficiently.
+ *
+ * Lifetime: instantiated lazily on first Instance() call and destroyed at
+ * normal process teardown. No explicit Shutdown() is exposed — there is no
+ * background thread to join and the bounded queue is bounded RAM.
+ */
 class [[nodiscard]] ZeroTrustPromptQueue final {
 public:
     [[nodiscard]] static ZeroTrustPromptQueue& Instance();
@@ -73,11 +95,18 @@ public:
     /**
      * @brief Enqueue a new prompt.
      *
-     * If the queue already holds kMaxPending entries whose answer is Pending,
-     * the oldest such entry is auto-answered Timeout and evicted before
-     * inserting the new one.
+     * Eviction semantics: when the queue already holds @ref kMaxPending
+     * entries (regardless of their answer state), the OLDEST entry is
+     * unconditionally evicted (FIFO) before the new entry is inserted. A
+     * caller currently blocked in WaitFor() for the evicted id will receive
+     * PromptAnswer::Timeout when its own caller-supplied timeout elapses
+     * (the id ceases to be visible to WaitFor's scan after eviction).
      *
-     * @return Opaque monotonically-increasing ID for the new entry.
+     * The caller-provided @c entry.id and @c entry.answer fields are ignored
+     * and overwritten by the queue (see PromptEntry documentation).
+     *
+     * @return Opaque monotonically-increasing ID for the new entry. Use this
+     *         id with WaitFor() / Answer().
      */
     [[nodiscard]] std::uint64_t Enqueue(PromptEntry entry);
 
