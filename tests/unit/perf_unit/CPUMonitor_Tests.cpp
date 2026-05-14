@@ -15,7 +15,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "../../../src/PhantomCore/Performance/CPUMonitor.hpp"
 
@@ -224,6 +227,69 @@ TEST_F(CPUMonitorTest, CallbackRegistrationUsesStableNonZeroIdsAndRejectsNullHan
 
 TEST_F(CPUMonitorTest, SelfTestPassesOnSupportedWindowsHost) {
     EXPECT_TRUE(monitor.SelfTest());
+}
+
+TEST_F(CPUMonitorTest, UpdateConfigurationPurgesProcessCacheWhenTrackingDisabled) {
+    SSP::CPUMonitorConfig config;
+    config.samplingIntervalMs = 250;
+    config.trackPerProcess = true;
+    ASSERT_TRUE(monitor.Initialize(config));
+    ASSERT_TRUE(monitor.StartMonitoring());
+
+    // Give the worker a brief window to populate per-process history.
+    std::this_thread::sleep_for(std::chrono::milliseconds(750));
+    monitor.StopMonitoring();
+
+    SSP::CPUMonitorConfig disabled = config;
+    disabled.trackPerProcess = false;
+    ASSERT_TRUE(monitor.UpdateConfiguration(disabled));
+
+    // After the toggle, GetTopConsumers must not surface any stale entry —
+    // they would only persist if the purge in UpdateConfiguration regressed.
+    EXPECT_TRUE(monitor.GetTopConsumers(16).empty());
+    EXPECT_FALSE(monitor.GetProcessInfo(::GetCurrentProcessId()).has_value());
+}
+
+TEST_F(CPUMonitorTest, UnregisterCallbackFromCallbackContextDoesNotDeadlock) {
+    SSP::CPUMonitorConfig config;
+    config.samplingIntervalMs = 100;
+    // Lowest valid threshold so the offender list is reliably non-empty on
+    // any modestly active host (the test process itself easily exceeds 1%).
+    config.highUsageThreshold = 1.0;
+    ASSERT_TRUE(monitor.Initialize(config));
+
+    std::atomic<bool> entered{false};
+    std::atomic<uint32_t> capturedId{0};
+    std::atomic<uint32_t> unregisterCalls{0};
+
+    const uint32_t id = monitor.RegisterHighCpuCallback(
+        [&](uint32_t, const std::wstring&, double) {
+            entered.store(true, std::memory_order_relaxed);
+            // Self-unregister from inside the callback. Without the
+            // snapshot-then-dispatch fix this would deadlock on the
+            // callback shared_mutex (shared->exclusive on same thread).
+            monitor.UnregisterHighCpuCallback(capturedId.load(
+                std::memory_order_relaxed));
+            unregisterCalls.fetch_add(1, std::memory_order_relaxed);
+        });
+    ASSERT_NE(id, 0u);
+    capturedId.store(id, std::memory_order_relaxed);
+
+    ASSERT_TRUE(monitor.StartMonitoring());
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(8);
+    while (!entered.load(std::memory_order_relaxed) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    monitor.StopMonitoring();
+
+    // The primary safety property is that we reach here at all (no deadlock).
+    // The offender list is host-dependent, so we tolerate a quiet machine.
+    EXPECT_LE(unregisterCalls.load(std::memory_order_relaxed), 64u);
+    if (entered.load(std::memory_order_relaxed)) {
+        EXPECT_GE(unregisterCalls.load(std::memory_order_relaxed), 1u);
+    }
 }
 
 }  // namespace
