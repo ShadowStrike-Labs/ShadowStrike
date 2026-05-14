@@ -811,7 +811,11 @@ namespace ShadowStrike {
                         searchAborted = true;
                         return;
                     }
-                    catch (...) { /* continue */ }
+                    catch (const std::exception& ex) {
+                        SS_LOG_DEBUG(L"PatternIndex",
+                            L"Search: skipped match result allocation for pattern %llu: %S",
+                            patternId, ex.what());
+                    }
                 }
             };
 
@@ -1041,8 +1045,11 @@ namespace ShadowStrike {
             // Store back-pointer to parent PatternIndex for searches
             ctx.m_patternIndex = this;
 
-            // Initialize trie traversal to root node
-            ctx.m_currentNodeOffset = m_rootOffset.load(std::memory_order_acquire);
+            // Initialize trie traversal to root node, preserving the 32-bit on-disk offset contract.
+            const uint64_t rootOffset64 = m_rootOffset.load(std::memory_order_acquire);
+            ctx.m_currentNodeOffset = (rootOffset64 <= UINT32_MAX)
+                ? static_cast<uint32_t>(rootOffset64)
+                : 0u;
 
             SS_LOG_TRACE(L"PatternIndex", L"CreateSearchContext: New context created with root offset 0x%X",
                 ctx.m_currentNodeOffset);
@@ -1137,7 +1144,13 @@ namespace ShadowStrike {
             }
 
             // Get root node offset
-            const uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+            const uint64_t rootOffset64 = m_rootOffset.load(std::memory_order_acquire);
+            if (rootOffset64 > UINT32_MAX) {
+                SS_LOG_ERROR(L"PatternIndex", L"AddPattern: Root offset exceeds 32-bit trie offset range");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                  "Root offset exceeds trie offset range" };
+            }
+            const uint32_t rootOffset = static_cast<uint32_t>(rootOffset64);
             if (rootOffset == 0 || rootOffset >= m_indexSize) {
                 SS_LOG_ERROR(L"PatternIndex", L"AddPattern: Invalid root offset");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0,
@@ -1415,7 +1428,13 @@ namespace ShadowStrike {
             }
 
             // Get root node offset
-            const uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+            const uint64_t rootOffset64 = m_rootOffset.load(std::memory_order_acquire);
+            if (rootOffset64 > UINT32_MAX) {
+                SS_LOG_ERROR(L"PatternIndex", L"RemovePattern: Root offset exceeds 32-bit trie offset range");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                  "Root offset exceeds trie offset range" };
+            }
+            const uint32_t rootOffset = static_cast<uint32_t>(rootOffset64);
             if (rootOffset == 0 || rootOffset >= m_indexSize) {
                 SS_LOG_ERROR(L"PatternIndex", L"RemovePattern: Invalid root offset");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0,
@@ -1690,7 +1709,11 @@ namespace ShadowStrike {
 
             // Reset trie traversal to root node if we have a valid parent
             if (m_patternIndex) {
-                m_currentNodeOffset = m_patternIndex->m_rootOffset.load(std::memory_order_acquire);
+                const uint64_t rootOffset64 =
+                    m_patternIndex->m_rootOffset.load(std::memory_order_acquire);
+                m_currentNodeOffset = (rootOffset64 <= UINT32_MAX)
+                    ? static_cast<uint32_t>(rootOffset64)
+                    : 0u;
             }
             else {
                 m_currentNodeOffset = 0;
@@ -1770,9 +1793,9 @@ namespace ShadowStrike {
                     L"Feed: Failed to allocate memory for chunk (%zu bytes)", chunk.size());
                 return results;
             }
-            catch (...) {
+            catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"PatternIndex::SearchContext",
-                    L"Feed: Unknown error appending chunk to buffer");
+                    L"Feed: failed to append chunk to buffer: %S", ex.what());
                 return results;
             }
 
@@ -1806,7 +1829,14 @@ namespace ShadowStrike {
             }
 
             // Get root node for reset operations
-            const uint32_t rootOffset = m_patternIndex->m_rootOffset.load(std::memory_order_acquire);
+            const uint64_t rootOffset64 =
+                m_patternIndex->m_rootOffset.load(std::memory_order_acquire);
+            if (rootOffset64 > UINT32_MAX) {
+                SS_LOG_ERROR(L"PatternIndex::SearchContext",
+                    L"Feed: Root offset exceeds 32-bit trie offset range");
+                return results;
+            }
+            const uint32_t rootOffset = static_cast<uint32_t>(rootOffset64);
             if (rootOffset == 0 || rootOffset >= indexSize) {
                 SS_LOG_ERROR(L"PatternIndex::SearchContext",
                     L"Feed: Invalid root offset in parent PatternIndex");
@@ -1889,7 +1919,11 @@ namespace ShadowStrike {
                         det.matchTimestamp = GetCurrentTimeNs();
                         results.push_back(std::move(det));
                     }
-                    catch (...) { /* continue */ }
+                    catch (const std::exception& ex) {
+                        SS_LOG_DEBUG(L"PatternIndex::SearchContext",
+                            L"Feed: skipped match result allocation for pattern %llu: %S",
+                            patternId, ex.what());
+                    }
                 }
             };
 

@@ -176,8 +176,8 @@ bool AhoCorasickAutomaton::AddPattern(
         } catch (const std::bad_alloc&) {
             SS_LOG_ERROR(L"AhoCorasick", L"Failed to allocate root node - out of memory");
             return false;
-        } catch (...) {
-            SS_LOG_ERROR(L"AhoCorasick", L"Unexpected exception allocating root node");
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"AhoCorasick", L"Exception allocating root node: %S", ex.what());
             return false;
         }
     }
@@ -244,8 +244,8 @@ bool AhoCorasickAutomaton::AddPattern(
             } catch (const std::bad_alloc&) {
                 SS_LOG_ERROR(L"AhoCorasick", L"Memory allocation failed at byte %zu", i);
                 return false;
-            } catch (...) {
-                SS_LOG_ERROR(L"AhoCorasick", L"Unexpected exception during node allocation");
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"AhoCorasick", L"Exception during node allocation: %S", ex.what());
                 return false;
             }
         }
@@ -285,8 +285,8 @@ bool AhoCorasickAutomaton::AddPattern(
     } catch (const std::bad_alloc&) {
         SS_LOG_ERROR(L"AhoCorasick", L"Failed to add pattern output - out of memory");
         return false;
-    } catch (...) {
-        SS_LOG_ERROR(L"AhoCorasick", L"Unexpected exception adding pattern output");
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"AhoCorasick", L"Exception adding pattern output: %S", ex.what());
         return false;
     }
 
@@ -362,10 +362,6 @@ bool AhoCorasickAutomaton::Compile() noexcept {
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(L"AhoCorasick", 
             L"Exception during failure link construction: %S", ex.what());
-        return false;
-    } catch (...) {
-        SS_LOG_ERROR(L"AhoCorasick", 
-            L"Unknown exception during failure link construction");
         return false;
     }
     
@@ -546,10 +542,6 @@ void AhoCorasickAutomaton::Search(
                         SS_LOG_ERROR(L"AhoCorasick", 
                             L"Callback threw exception at offset %zu: %S", offset, ex.what());
                         // Continue processing - don't let callback failure abort search
-                    } catch (...) {
-                        SS_LOG_ERROR(L"AhoCorasick", 
-                            L"Callback threw unknown exception at offset %zu", offset);
-                        // Continue processing
                     }
                 }
             }

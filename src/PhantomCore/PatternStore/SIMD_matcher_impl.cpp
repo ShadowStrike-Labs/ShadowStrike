@@ -257,7 +257,9 @@ std::vector<size_t> SIMDMatcher::SearchAVX2(
     try {
         matches.reserve(std::min(searchLen / 64, size_t(10000)));
     }
-    catch (...) {}
+    catch (const std::bad_alloc& ex) {
+        SS_LOG_WARN(L"SIMDMatcher", L"AVX2 scalar fallback reserve failed: %S", ex.what());
+    }
     
     for (size_t i = 0; i < searchLen; ++i) {
         if (i + pattern.size() > buffer.size()) break;
@@ -268,7 +270,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX2(
         if (match) {
             if (matches.size() >= SIMD_MAX_MATCHES) return matches;
             try { matches.push_back(i); }
-            catch (...) { return matches; }
+            catch (const std::bad_alloc&) { return matches; }
         }
     }
     return matches;
@@ -456,7 +458,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
                             try {
                                 matches.push_back(matchPos);
                             }
-                            catch (...) {
+                            catch (const std::bad_alloc&) {
                                 return matches;
                             }
                         }
@@ -479,7 +481,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
             if (match) {
                 if (matches.size() >= SIMD_MAX_MATCHES) return matches;
                 try { matches.push_back(i); }
-                catch (...) { return matches; }
+                catch (const std::bad_alloc&) { return matches; }
             }
         }
     }
