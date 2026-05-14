@@ -293,5 +293,40 @@ TEST_F(NetworkPerformanceMonitorTest, SelfTestPassesAfterInitialization) {
     EXPECT_TRUE(monitor.SelfTest());
 }
 
+TEST_F(NetworkPerformanceMonitorTest, ConfigValidationRejectsOutOfRangeDetectorThresholds) {
+    SSP::NetworkMonitorConfig config;
+    EXPECT_TRUE(config.IsValid());
+
+    // Beaconing jitter is a dimensionless coefficient of variation;
+    // values outside [0,1] and any non-finite value must be rejected.
+    config.beaconingJitterThreshold = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(config.IsValid());
+    config.beaconingJitterThreshold = std::numeric_limits<double>::infinity();
+    EXPECT_FALSE(config.IsValid());
+    config.beaconingJitterThreshold = -0.01;
+    EXPECT_FALSE(config.IsValid());
+    config.beaconingJitterThreshold = 1.5;
+    EXPECT_FALSE(config.IsValid());
+    config.beaconingJitterThreshold = 0.0;
+    EXPECT_TRUE(config.IsValid());
+    config.beaconingJitterThreshold = 1.0;
+    EXPECT_TRUE(config.IsValid());
+    config.beaconingJitterThreshold = SSP::NetworkConstants::BEACONING_JITTER_THRESHOLD;
+
+    // Interface error rate is an errors/sec scalar; must be finite and > 0.
+    config.interfaceErrorRateThreshold = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(config.IsValid());
+    config.interfaceErrorRateThreshold = 0.0;
+    EXPECT_FALSE(config.IsValid());
+    config.interfaceErrorRateThreshold = -1.0;
+    EXPECT_FALSE(config.IsValid());
+    config.interfaceErrorRateThreshold = 100.0;
+    EXPECT_TRUE(config.IsValid());
+
+    // Bandwidth threshold must also reject Inf.
+    config.highBandwidthThresholdMbps = std::numeric_limits<double>::infinity();
+    EXPECT_FALSE(config.IsValid());
+}
+
 }  // namespace
 }  // namespace ShadowStrike::Performance::Test

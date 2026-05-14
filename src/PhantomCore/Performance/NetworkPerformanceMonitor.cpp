@@ -59,6 +59,8 @@
 #include <sstream>
 #include <iomanip>
 #include <condition_variable>
+#include <mutex>
+#include <shared_mutex>
 #include <cstring>
 
 namespace ShadowStrike {
@@ -252,11 +254,21 @@ std::string NetworkGlobalStats::ToJson() const {
 }
 
 bool NetworkMonitorConfig::IsValid() const noexcept {
+    // Reject NaN/Inf in all double fields by requiring finite-and-in-range.
+    auto finiteInRange = [](double v, double lo, double hi) {
+        return std::isfinite(v) && v >= lo && v <= hi;
+    };
     return pollingIntervalMs >= NetworkConstants::MIN_POLLING_INTERVAL_MS &&
            pollingIntervalMs <= NetworkConstants::MAX_POLLING_INTERVAL_MS &&
+           std::isfinite(highBandwidthThresholdMbps) &&
            highBandwidthThresholdMbps > 0.0 &&
            connectionFloodThreshold > 0 &&
-           exfiltrationThresholdBytes > 0;
+           exfiltrationThresholdBytes > 0 &&
+           // Coefficient of variation is dimensionless; 0 disables the
+           // detector and >1 is unphysical for a positive distribution.
+           finiteInRange(beaconingJitterThreshold, 0.0, 1.0) &&
+           std::isfinite(interfaceErrorRateThreshold) &&
+           interfaceErrorRateThreshold > 0.0;
 }
 
 std::string NetworkMonitorModuleStats::ToJson() const {
@@ -336,8 +348,17 @@ public:
             std::unique_lock lock(m_lifecycleMutex);
             if (!m_initialized.load(std::memory_order_acquire)) return;
             m_stopRequested.store(true, std::memory_order_release);
-            m_shutdownCv.notify_all();
         }
+        // Acquire the CV mutex briefly so any waiter that has just
+        // observed m_stopRequested==false re-checks the predicate after
+        // we have flipped it. Notifying without this brief hand-off
+        // would still be correct for the predicate overload of wait_for
+        // (it re-checks under the lock), but taking the mutex makes the
+        // happens-before edge explicit.
+        {
+            std::lock_guard cvLock(m_shutdownMutex);
+        }
+        m_shutdownCv.notify_all();
 
         if (m_thread.joinable()) {
             m_thread.join();
@@ -441,8 +462,15 @@ public:
     [[nodiscard]] std::vector<NetworkAlert> GetRecentAlerts(size_t maxCount) const {
         std::shared_lock lock(m_alertMutex);
         const size_t n = std::min(maxCount, m_recentAlerts.size());
-        return {m_recentAlerts.end() - static_cast<ptrdiff_t>(n),
-                m_recentAlerts.end()};
+        // Public contract (NetworkPerformanceMonitor.hpp): most-recent
+        // first. The underlying deque is push_back-ordered (oldest at
+        // front), so walk back-to-front while filling the result.
+        std::vector<NetworkAlert> out;
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            out.push_back(m_recentAlerts[m_recentAlerts.size() - 1 - i]);
+        }
+        return out;
     }
 
     // ========================================================================
@@ -553,7 +581,14 @@ private:
     }
 
     void WaitForInterval(std::chrono::milliseconds duration) {
-        std::shared_lock lock(m_dataMutex);
+        // Use a dedicated mutex for the interval wait. The previous
+        // implementation acquired a shared_lock on m_dataMutex, which
+        // forced any concurrent UpdateConfig (which needs an exclusive
+        // lock on the same mutex) to stall for the entire polling
+        // interval — up to 5 seconds at the configuration ceiling.
+        // m_stopRequested is atomic, so the predicate is safe to check
+        // without holding the data mutex.
+        std::unique_lock lock(m_shutdownMutex);
         m_shutdownCv.wait_for(lock, duration, [this] {
             return m_stopRequested.load(std::memory_order_acquire);
         });
@@ -1220,7 +1255,28 @@ private:
 
             // Record cooldown
             const uint64_t cooldownKey = MakeCooldownKey(alert.type, alert.processId);
-            m_alertCooldowns[cooldownKey] = Clock::now();
+            const auto now = Clock::now();
+            m_alertCooldowns[cooldownKey] = now;
+
+            // Bound the cooldown map: under sustained alerts against many
+            // distinct (type, pid) pairs the map would grow without limit
+            // because entries are only refreshed on re-emission. Prune
+            // anything past the cooldown window when the map crosses a
+            // soft cap derived from MAX_TRACKED_PROCESSES.
+            constexpr size_t kCooldownSoftCap =
+                NetworkConstants::MAX_TRACKED_PROCESSES * 4;
+            if (m_alertCooldowns.size() > kCooldownSoftCap) {
+                const auto cutoff = now -
+                    std::chrono::seconds(NetworkConstants::ALERT_COOLDOWN_SEC);
+                for (auto it = m_alertCooldowns.begin();
+                     it != m_alertCooldowns.end(); ) {
+                    if (it->second < cutoff) {
+                        it = m_alertCooldowns.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
         }
 
         for (const auto& cb : cbs) {
@@ -1334,7 +1390,8 @@ private:
     mutable std::shared_mutex m_dataMutex;
     mutable std::shared_mutex m_alertMutex;
 
-    std::condition_variable_any m_shutdownCv;
+    std::condition_variable m_shutdownCv;
+    std::mutex              m_shutdownMutex;
 
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_stopRequested{false};
