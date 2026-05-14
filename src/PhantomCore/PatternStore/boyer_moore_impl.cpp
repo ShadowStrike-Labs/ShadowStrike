@@ -765,9 +765,6 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(L"BoyerMoore", L"BuildGoodSuffixTable: Exception: %S", ex.what());
                 m_goodSuffixTable.assign(m, 1);  // Safe fallback
             }
-            catch (...) {
-                m_goodSuffixTable.assign(m, 1);
-            }
         }
         
 

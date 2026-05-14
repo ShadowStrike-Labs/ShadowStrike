@@ -321,8 +321,9 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
                 SS_LOG_ERROR(L"PatternCompiler", L"Invalid gap format: %S", token.c_str());
                 return std::nullopt;
             }
-            catch (...) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse gap: %S", token.c_str());
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse gap '%S': %S",
+                    token.c_str(), ex.what());
                 return std::nullopt;
             }
 
@@ -380,8 +381,9 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
                 SS_LOG_ERROR(L"PatternCompiler", L"Invalid byte range format: %S", token.c_str());
                 return std::nullopt;
             }
-            catch (...) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse byte range: %S", token.c_str());
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse byte range '%S': %S",
+                    token.c_str(), ex.what());
                 return std::nullopt;
             }
 
@@ -422,8 +424,9 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
 
                 SS_LOG_DEBUG(L"PatternCompiler", L"Hex byte: 0x%02X", val);
             }
-            catch (...) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Invalid hex byte: %S", token.c_str());
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Invalid hex byte '%S': %S",
+                    token.c_str(), ex.what());
                 return std::nullopt;
             }
 
@@ -456,8 +459,10 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
                         continue;
                     }
                 }
-                catch (...) {
-                    // Fall through to unknown token handling
+                catch (const std::exception& ex) {
+                    SS_LOG_DEBUG(L"PatternCompiler",
+                        L"Failed to parse compact hex token '%S': %S",
+                        token.c_str(), ex.what());
                 }
             }
         }
@@ -629,8 +634,8 @@ bool PatternCompiler::ValidatePattern(
                     return false;
                 }
             }
-            catch (...) {
-                errorMessage = "Failed to parse gap values";
+            catch (const std::exception& ex) {
+                errorMessage = std::string("Failed to parse gap values: ") + ex.what();
                 return false;
             }
 
@@ -672,8 +677,8 @@ bool PatternCompiler::ValidatePattern(
                     return false;
                 }
             }
-            catch (...) {
-                errorMessage = "Failed to parse byte range";
+            catch (const std::exception& ex) {
+                errorMessage = std::string("Failed to parse byte range: ") + ex.what();
                 return false;
             }
 
@@ -1044,8 +1049,9 @@ std::vector<DetectionResult> PatternStore::Scan(
             results.insert(results.end(), 
                 std::make_move_iterator(simdResults.begin()),
                 std::make_move_iterator(simdResults.end()));
-        } catch (...) {
-            SS_LOG_WARN(L"PatternStore", L"Scan: SIMD scan failed, falling back to automaton");
+        } catch (const std::exception& ex) {
+            SS_LOG_WARN(L"PatternStore", L"Scan: SIMD scan failed (%S), falling back to automaton",
+                ex.what());
             results.clear();
         }
     }
@@ -1057,8 +1063,8 @@ std::vector<DetectionResult> PatternStore::Scan(
             results.insert(results.end(),
                 std::make_move_iterator(acResults.begin()),
                 std::make_move_iterator(acResults.end()));
-        } catch (...) {
-            SS_LOG_ERROR(L"PatternStore", L"Scan: Automaton scan failed");
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"PatternStore", L"Scan: Automaton scan failed: %S", ex.what());
         }
     }
 
@@ -1101,8 +1107,10 @@ std::vector<DetectionResult> PatternStore::Scan(
                         const_cast<std::vector<uint64_t>&>(m_hitCounters)[result.signatureId]
                     );
                     counter.fetch_add(1, std::memory_order_relaxed);
-                } catch (...) {
-                    // Ignore hit counter update failures
+                } catch (const std::exception& ex) {
+                    SS_LOG_DEBUG(L"PatternStore",
+                        L"Scan: hit-counter update failed for signature %llu: %S",
+                        result.signatureId, ex.what());
                 }
             }
         }
@@ -1474,8 +1482,9 @@ StoreError PatternStore::AddPatternBatch(
             SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Memory allocation failed at index %zu", i);
             failCount++;
             // Don't break - try to continue with remaining patterns
-        } catch (...) {
-            SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Exception at index %zu", i);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Exception at index %zu: %S",
+                i, ex.what());
             failCount++;
         }
     }
@@ -2946,7 +2955,7 @@ std::optional<std::vector<uint8_t>> HexStringToBytes(
             return std::nullopt;
         } catch (const std::invalid_argument&) {
             return std::nullopt;
-        } catch (...) {
+        } catch (const std::exception&) {
             return std::nullopt;
         }
     }
