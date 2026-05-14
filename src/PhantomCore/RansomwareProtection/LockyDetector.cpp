@@ -459,23 +459,24 @@ public:
     void UpdateDGADomainsLocked() {
         static constexpr uint32_t seeds[] = {1, 3, 5, 7, 12, 17};
 
-        const auto now = std::chrono::system_clock::now();
-        const std::time_t t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm{};
-#ifdef _WIN32
-        localtime_s(&tm, &t);
-#else
-        localtime_r(&t, &tm);
-#endif
-        const int year  = tm.tm_year + 1900;
-        const int month = tm.tm_mon + 1;
-        const int day   = tm.tm_mday;
+        // Compute today as a sys_days so that arithmetic correctly rolls over
+        // month and year boundaries. The previous implementation passed
+        // day+offset directly (e.g. day=32 on Dec 31), producing an invalid
+        // calendar date that Locky's real DGA never generates — opening a
+        // detection gap at every month boundary.
+        const auto today = std::chrono::floor<std::chrono::days>(
+            std::chrono::system_clock::now());
 
         m_generatedDGADomains.clear();
 
         // Generate for today and tomorrow (+1 day rollover coverage)
         for (int dayOffset = 0; dayOffset <= 1; ++dayOffset) {
-            const int d = day + dayOffset;
+            const std::chrono::year_month_day ymd{
+                today + std::chrono::days{dayOffset}};
+            const int year  = static_cast<int>(ymd.year());
+            const int month = static_cast<int>(static_cast<unsigned>(ymd.month()));
+            const int d     = static_cast<int>(static_cast<unsigned>(ymd.day()));
+
             for (const uint32_t seed : seeds) {
                 auto domains = GenerateLockyDomains(year, month, d, seed);
                 for (auto& domain : domains) {
@@ -551,32 +552,41 @@ public:
         std::unique_lock lock(m_behaviorMutex);
 
         // Double-check after acquiring exclusive lock
-        auto& entry = m_processBehaviors[pid];
-        if (entry) return entry;
+        if (auto it = m_processBehaviors.find(pid); it != m_processBehaviors.end()) {
+            return it->second;
+        }
 
-        // Enforce cap to prevent unbounded memory growth
-        if (m_processBehaviors.size() > LockyConstants::MAX_TRACKED_PROCESSES) {
+        // Enforce cap BEFORE insertion so the purge below can never erase the
+        // entry we are about to construct (which previously caused a UAF where
+        // a reference to a default-inserted node was invalidated when purge
+        // removed it because its zero-initialized lastActivity timestamp
+        // already qualified as "stale").
+        if (m_processBehaviors.size() >= LockyConstants::MAX_TRACKED_PROCESSES) {
             PurgeStaleProcessesLocked();
         }
 
-        entry = std::make_shared<ProcessBehavior>();
+        auto behavior = std::make_shared<ProcessBehavior>();
 
-        // Hold per-entry lock during initialization to prevent
-        // TOCTOU race where another thread reads partially written fields
-        std::lock_guard pbLock(entry->mtx);
-        entry->pid = pid;
-        entry->firstSeen = Clock::now();
-        entry->lastActivity = entry->firstSeen;
+        // Initialize under the per-entry mutex before the entry becomes visible
+        // to other threads via the map. This prevents readers from observing a
+        // partially-constructed ProcessBehavior.
+        {
+            std::lock_guard pbLock(behavior->mtx);
+            behavior->pid = pid;
+            behavior->firstSeen = Clock::now();
+            behavior->lastActivity = behavior->firstSeen;
 
-        // Resolve process name (best-effort)
-        auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
-        if (pathOpt) {
-            entry->processPath = *pathOpt;
-            entry->processName = std::wstring(
-                ExtractFilename(*pathOpt));
+            // Resolve process name (best-effort)
+            auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
+            if (pathOpt) {
+                behavior->processPath = *pathOpt;
+                behavior->processName = std::wstring(
+                    ExtractFilename(*pathOpt));
+            }
         }
 
-        return entry;
+        auto [it, inserted] = m_processBehaviors.emplace(pid, std::move(behavior));
+        return it->second;
     }
 
     [[nodiscard]] std::shared_ptr<ProcessBehavior> FindBehavior(uint32_t pid) const {
@@ -594,7 +604,11 @@ public:
     }
 
     void PurgeProcessState(uint32_t pid) {
-        std::unique_lock lock(m_mutex);
+        // Must use m_behaviorMutex (guards m_processBehaviors), NOT m_mutex
+        // which guards configuration. Previously this used the wrong mutex,
+        // creating a data race with GetOrCreateBehavior / FindBehavior /
+        // PurgeStaleProcessesLocked.
+        std::unique_lock lock(m_behaviorMutex);
         m_processBehaviors.erase(pid);
     }
 
