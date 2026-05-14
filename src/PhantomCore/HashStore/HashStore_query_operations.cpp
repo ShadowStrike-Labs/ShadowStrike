@@ -18,6 +18,7 @@
 #include"pch.h"
 #include "../Utils/StringUtils.hpp"
 #include"HashStore.hpp"
+#include "HashStore_Record.hpp"
 #include <algorithm>
 #include<tlsh/tlsh.h>
 #include "../FuzzyHasher/FuzzyHasher.hpp"
@@ -87,8 +88,8 @@ namespace ShadowStrike {
                 // GetFromCache() returns std::optional<DetectionResult> which cannot
                 // distinguish "cache miss" from "cached negative" — both are std::nullopt.
                 // Storing negatives would only waste cache slots without ever serving hits.
-                // HEADER PATCH NEEDED: Change GetFromCache return type to
-                // std::optional<std::optional<DetectionResult>> to enable negative caching.
+                // Negative caching requires a tri-state cache contract; keeping misses
+                // uncached avoids corrupting positive lookup semantics.
                 return std::nullopt;
             }
 
@@ -476,12 +477,6 @@ namespace ShadowStrike {
                     // We need to dereference the offset to get the full HashValue
                     // which contains type, length, and actual hash bytes
 
-                    // Calculate address: base + offset
-                    const uint8_t* dataBase = static_cast<const uint8_t*>(m_mappedView.baseAddress);
-                    if (dataBase == nullptr) {
-                        return true; // Continue with next - invalid state
-                    }
-
                     // Bounds check: offset must be within file
                     if (signatureOffset >= m_mappedView.fileSize) {
                         SS_LOG_WARN(L"HashStore",
@@ -490,15 +485,10 @@ namespace ShadowStrike {
                         return true; // Continue to next
                     }
 
-                    // Get HashValue from memory-mapped region
-                    const HashValue* storedHashPtr = reinterpret_cast<const HashValue*>(
-                        dataBase + signatureOffset
-                        );
-
-                    // Validate pointer bounds (entire HashValue must fit)
-                    if (signatureOffset + sizeof(HashValue) > m_mappedView.fileSize) {
+                    const HashValue* storedHashPtr = Record::GetHash(m_mappedView, signatureOffset);
+                    if (!storedHashPtr) {
                         SS_LOG_WARN(L"HashStore",
-                            L"FuzzyMatch: HashValue at offset 0x%llX exceeds file bounds",
+                            L"FuzzyMatch: hash record at offset 0x%llX is malformed or out of bounds",
                             signatureOffset);
                         return true; // Continue
                     }
@@ -618,8 +608,10 @@ namespace ShadowStrike {
                                                         }
                                                     }
                                                 }
-                                                catch (...) {
-                                                    // Skip invalid candidate, continue with others
+                                                catch (const std::exception& ex) {
+                                                    SS_LOG_DEBUG(L"HashStore",
+                                                        L"FuzzyMatch: skipped candidate fuzzy blocksize parse failure: %S",
+                                                        ex.what());
                                                 }
                                             }
                                         }
