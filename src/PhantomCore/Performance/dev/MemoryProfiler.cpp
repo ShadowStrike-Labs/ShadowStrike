@@ -113,6 +113,10 @@ struct TimestampedSample {
 
 struct ProcessMemoryHistory {
     std::deque<TimestampedSample> samples;
+    // Captured process image name from the most recent sample. Used to detect
+    // PID reuse (kernel recycles PIDs aggressively) and discard stale samples
+    // that would otherwise contaminate the leak-detection regression.
+    std::wstring lastName;
     bool active{false};
 };
 
@@ -231,17 +235,34 @@ public:
     std::condition_variable m_sleepCv;
     std::atomic<bool> m_isMonitoring{false};
     std::atomic<bool> m_stopRequested{false};
-    std::atomic<bool> m_initialized{false};
     std::thread m_monitorThread;
+
+    // Serializes Start/StopMonitoring to prevent two concurrent callers from
+    // racing on the std::thread object (joining a thread from two threads is
+    // undefined behavior, and a Start/Stop interleave could leak the worker
+    // and terminate() from std::thread's destructor).
+    std::mutex m_lifecycleMutex;
 
     // ========================================================================
     // LIFECYCLE
     // ========================================================================
 
     bool Initialize(const MemoryProfilerConfig& config) {
+        // A live monitoring thread reads m_config concurrently; tear it down
+        // first so the new configuration is applied atomically and no sample
+        // is taken with a half-updated configuration.
+        const bool wasMonitoring = m_isMonitoring.load(std::memory_order_acquire);
+        if (wasMonitoring) {
+            StopMonitoring();
+        }
+
         {
             std::unique_lock lock(m_dataMutex);
             m_config = config;
+            // Drop history accumulated under previous configuration so that
+            // history-size and leak-detection thresholds apply consistently.
+            m_processHistory.clear();
+            m_processCache.clear();
         }
 
         if (!RefreshSystemStats()) {
@@ -249,11 +270,19 @@ public:
                         L"Initial system stats refresh failed during initialization");
         }
 
-        m_initialized.store(true, std::memory_order_release);
         SS_LOG_INFO(L"MemoryProfiler",
                     L"Initialized. Interval=%ums History=%u MaxProcs=%u MinSamplesLeak=%u",
                     config.samplingIntervalMs, config.historySize,
                     config.maxTrackedProcesses, config.minSamplesForLeakDetection);
+
+        if (wasMonitoring) {
+            // Best-effort: restore prior monitoring state. Failure to recreate
+            // the worker is reported but does not invalidate the new config.
+            if (!StartMonitoring()) {
+                SS_LOG_WARN(L"MemoryProfiler",
+                            L"Initialize: monitoring was active but could not be resumed");
+            }
+        }
         return true;
     }
 
@@ -262,25 +291,40 @@ public:
         std::unique_lock lock(m_dataMutex);
         m_processHistory.clear();
         m_processCache.clear();
-        m_initialized.store(false, std::memory_order_release);
     }
 
     bool StartMonitoring() {
+        // Serialize against concurrent Start/StopMonitoring callers; without
+        // this guard, two threads can both observe m_isMonitoring == false
+        // and try to construct m_monitorThread, or a Stop call may race with
+        // an in-progress Start and leak the worker thread.
+        std::lock_guard lifecycle(m_lifecycleMutex);
+
         if (m_isMonitoring.load(std::memory_order_acquire)) {
             return true;
         }
 
+        // If a previous monitor thread terminated abnormally, std::thread
+        // remains joinable but cannot be reassigned without joining first.
+        if (m_monitorThread.joinable()) {
+            m_monitorThread.join();
+        }
+
         m_stopRequested.store(false, std::memory_order_release);
+
+        // Publish the monitoring flag BEFORE constructing the worker so any
+        // concurrent IsMonitoring/StopMonitoring observer sees a consistent
+        // state. Roll back on construction failure.
+        m_isMonitoring.store(true, std::memory_order_release);
 
         try {
             m_monitorThread = std::thread(&MemoryProfilerImpl::MonitoringLoop, this);
         } catch (const std::system_error& e) {
+            m_isMonitoring.store(false, std::memory_order_release);
             SS_LOG_ERROR(L"MemoryProfiler",
                          L"Failed to create monitoring thread: error_code=%d", e.code().value());
             return false;
         }
-
-        m_isMonitoring.store(true, std::memory_order_release);
 
         uint32_t interval;
         {
@@ -292,7 +336,15 @@ public:
     }
 
     void StopMonitoring() {
+        std::lock_guard lifecycle(m_lifecycleMutex);
+
         if (!m_isMonitoring.load(std::memory_order_acquire)) {
+            // If a prior StartMonitoring failed mid-flight, the thread object
+            // may still be joinable; reap it to keep the std::thread destructor
+            // contract intact.
+            if (m_monitorThread.joinable()) {
+                m_monitorThread.join();
+            }
             return;
         }
 
@@ -300,7 +352,7 @@ public:
         {
             std::lock_guard lock(m_sleepMutex);
         }
-        m_sleepCv.notify_one();
+        m_sleepCv.notify_all();
 
         if (m_monitorThread.joinable()) {
             m_monitorThread.join();
@@ -382,7 +434,12 @@ public:
             return false;
         }
 
-        // Query kernel pool statistics via GetPerformanceInfo
+        // Query kernel pool statistics via GetPerformanceInfo. On failure we
+        // intentionally preserve the previous pool readings rather than
+        // overwriting the cached values with zeros — a transient GetPerformanceInfo
+        // failure (e.g., during high system load) must not surface as a sudden
+        // "pool collapsed to 0" telemetry point.
+        bool perfOk = false;
         uint64_t pagedPool = 0;
         uint64_t nonPagedPool = 0;
         PERFORMANCE_INFORMATION perfInfo{};
@@ -391,10 +448,13 @@ public:
             const uint64_t pageSize = static_cast<uint64_t>(perfInfo.PageSize);
             pagedPool    = static_cast<uint64_t>(perfInfo.KernelPaged) * pageSize;
             nonPagedPool = static_cast<uint64_t>(perfInfo.KernelNonpaged) * pageSize;
+            perfOk = true;
         } else {
             SS_LOG_LAST_ERROR(L"MemoryProfiler", L"GetPerformanceInfo failed (non-critical)");
         }
 
+        uint32_t highLoad   = 0;
+        uint32_t threshold  = 0;
         {
             std::unique_lock lock(m_dataMutex);
             m_currentSystemStats.totalPhysical    = memInfo.ullTotalPhys;
@@ -402,14 +462,20 @@ public:
             m_currentSystemStats.totalCommit       = memInfo.ullTotalPageFile;
             m_currentSystemStats.availableCommit   = memInfo.ullAvailPageFile;
             m_currentSystemStats.memoryLoad        = memInfo.dwMemoryLoad;
-            m_currentSystemStats.pagedPool         = pagedPool;
-            m_currentSystemStats.nonPagedPool      = nonPagedPool;
-
-            if (memInfo.dwMemoryLoad >= m_config.highLoadThreshold) {
-                SS_LOG_WARN(L"MemoryProfiler",
-                            L"High system memory load: %u%% (threshold: %u%%)",
-                            memInfo.dwMemoryLoad, m_config.highLoadThreshold);
+            if (perfOk) {
+                m_currentSystemStats.pagedPool    = pagedPool;
+                m_currentSystemStats.nonPagedPool = nonPagedPool;
             }
+            highLoad  = memInfo.dwMemoryLoad;
+            threshold = m_config.highLoadThreshold;
+        }
+
+        // Log outside the writer lock to keep the critical section short and
+        // to avoid stalling readers if the logger backend blocks on I/O.
+        if (highLoad >= threshold) {
+            SS_LOG_WARN(L"MemoryProfiler",
+                        L"High system memory load: %u%% (threshold: %u%%)",
+                        highLoad, threshold);
         }
 
         return true;
@@ -512,9 +578,21 @@ public:
                 history.active = false;
             }
 
-            // Update histories with new samples
+            // Update histories with new samples.
+            //
+            // PID-reuse defence: Windows recycles process IDs aggressively
+            // (especially on long-running endpoints). If a PID we previously
+            // tracked has been assigned to a freshly spawned process, the
+            // image name will differ. In that case we must discard the prior
+            // sample series — otherwise the linear regression will fit a
+            // synthetic upward slope spanning two unrelated processes and
+            // emit a false-positive memory-leak alert.
             for (const auto& cp : collected) {
                 auto& history = m_processHistory[cp.info.pid];
+                if (!history.lastName.empty() && history.lastName != cp.info.name) {
+                    history.samples.clear();
+                }
+                history.lastName = cp.info.name;
                 history.active = true;
                 history.samples.push_back({cp.info.privateUsage, cp.sampleTime});
 
