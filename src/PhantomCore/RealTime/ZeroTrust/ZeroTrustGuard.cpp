@@ -35,10 +35,9 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
-#include <format>
+#include <cstdio>
 #include <mutex>
 #include <shared_mutex>
-#include <sstream>
 
 namespace ShadowStrike::PhantomCore::RealTime::ZeroTrust {
 
@@ -69,9 +68,40 @@ constexpr double kThresholdAggressive = 0.95;
 // INTERNAL HELPERS
 // ============================================================================
 
-/// @brief Clamp a double to [0.0, 1.0].
+/// @brief Clamp a double to [0.0, 1.0]; treats NaN as 0.0 (most-restrictive).
 [[nodiscard]] inline double Clamp01(double v) noexcept {
+    if (std::isnan(v)) return 0.0;
     return (v < 0.0) ? 0.0 : (v > 1.0) ? 1.0 : v;
+}
+
+/// @brief Format a double in [0,1] to a fixed 3-decimal narrow string,
+///        locale-independently. NaN/Inf collapse to "nan"/"inf" markers so
+///        reason strings remain deterministic and safe to log.
+[[nodiscard]] inline std::string FormatTrust(double v) {
+    if (std::isnan(v)) return "nan";
+    if (!std::isfinite(v)) return v < 0.0 ? "-inf" : "inf";
+    char buf[16]{};
+    const int n = std::snprintf(buf, sizeof(buf), "%.3f", v);
+    if (n <= 0) return "0.000";
+    return std::string(buf, static_cast<std::size_t>(
+        (static_cast<std::size_t>(n) < sizeof(buf)) ? n : sizeof(buf) - 1));
+}
+
+/// @brief Strict lowercase-hex sanitiser for safe logging of caller-supplied
+///        sha256 strings. Replaces any non-hex byte with '?' and truncates to
+///        at most @p maxChars characters to prevent log injection / overflow.
+[[nodiscard]] inline std::string SanitizeShaForLog(const std::string& sha,
+                                                   std::size_t maxChars = 16) {
+    std::string out;
+    out.reserve(std::min(sha.size(), maxChars));
+    for (std::size_t i = 0; i < sha.size() && i < maxChars; ++i) {
+        const unsigned char c = static_cast<unsigned char>(sha[i]);
+        const bool isHex = (c >= '0' && c <= '9')
+                        || (c >= 'a' && c <= 'f')
+                        || (c >= 'A' && c <= 'F');
+        out.push_back(isHex ? static_cast<char>(c) : '?');
+    }
+    return out;
 }
 
 /**
@@ -223,7 +253,6 @@ struct ZeroTrustGuard::Impl {
     std::atomic<bool>            m_enabled{false};
     std::atomic<bool>            m_initialized{false};
     std::atomic<bool>            m_running{false};
-    std::atomic<std::uint64_t>   m_promptCounter{0};
 
     Impl()  = default;
     ~Impl() = default;
@@ -255,7 +284,14 @@ ZeroTrustGuard::~ZeroTrustGuard() {
 // ============================================================================
 
 bool ZeroTrustGuard::Initialize() {
-    if (m_impl->m_initialized.load(std::memory_order_acquire)) {
+    // Single-shot initialisation: only the thread that flips m_initialized
+    // from false → true performs the load. Concurrent callers safely no-op
+    // after the winning thread completes.
+    bool expected = false;
+    if (!m_impl->m_initialized.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
         return true;
     }
 
@@ -282,7 +318,6 @@ bool ZeroTrustGuard::Initialize() {
     }
 
     m_impl->m_enabled.store(moduleEnabled, std::memory_order_release);
-    m_impl->m_initialized.store(true, std::memory_order_release);
 
     // Note on subsystem singletons:
     //  - AccessControlManager::Instance() (ShadowStrike::RealTime) — available;
@@ -337,7 +372,7 @@ bool ZeroTrustGuard::ApplyMode(std::uint8_t modeOrdinal) {
     const auto mode = static_cast<ProtectionMode>(modeOrdinal);
 
     SS_LOG_INFO(kLogCategory,
-        L"ZeroTrustGuard: ApplyMode(%hhu)", modeOrdinal);
+        L"ZeroTrustGuard: ApplyMode(%u)", static_cast<unsigned>(modeOrdinal));
 
     if (mode == ProtectionMode::Off) {
         m_impl->m_enabled.store(false, std::memory_order_release);
@@ -345,11 +380,22 @@ bool ZeroTrustGuard::ApplyMode(std::uint8_t modeOrdinal) {
         return true;
     }
 
+    // Reject unknown / out-of-range mode ordinals before they silently fall
+    // through the switch and leave the module in a stale-config state.
+    if (mode != ProtectionMode::Passive
+        && mode != ProtectionMode::Balanced
+        && mode != ProtectionMode::Aggressive) {
+        SS_LOG_WARN(kLogCategory,
+            L"ZeroTrustGuard: ApplyMode rejected unknown ordinal %u",
+            static_cast<unsigned>(modeOrdinal));
+        return false;
+    }
+
     // Write the canonical ModeThresholds keys so other subscribers see them.
     if (!ApplyModeThresholds("ZeroTrust", mode)) {
         SS_LOG_WARN(kLogCategory,
-            L"ZeroTrustGuard: ApplyModeThresholds() failed for mode %hhu",
-            modeOrdinal);
+            L"ZeroTrustGuard: ApplyModeThresholds() failed for mode %u",
+            static_cast<unsigned>(modeOrdinal));
         // Non-fatal: we still apply the in-memory snapshot.
     }
 
@@ -369,6 +415,7 @@ bool ZeroTrustGuard::ApplyMode(std::uint8_t modeOrdinal) {
             m_impl->m_config.uncertainBehavior = UncertainBehavior::Prompt;
             break;
         default:
+            // Already filtered above; defensive no-op.
             break;
     }
 
@@ -421,12 +468,13 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
     // 3. Fast-path BLOCK: known malware hash.
     // ------------------------------------------------------------------
     if (inputs.hashInMalwareStore) {
-        const std::wstring safePath = TruncateW(inputs.imagePath, 128);
+        const std::wstring  safePath = TruncateW(inputs.imagePath, 128);
+        const std::string   safeSha  = SanitizeShaForLog(inputs.sha256);
         SS_LOG_WARN(kLogCategory,
             L"ZeroTrustGuard: BLOCK image='%.128ls' sha=%.16hs "
             L"trust=0.000 threshold=%.3f reason=malware store",
             safePath.c_str(),
-            inputs.sha256.c_str(),
+            safeSha.c_str(),
             cfg.threshold);
         return DecisionResult{
             .verdict       = Verdict::Block,
@@ -459,11 +507,12 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
     // ------------------------------------------------------------------
     auto makeBlockResult = [&](const char* reasonStr) -> DecisionResult {
         const std::wstring safePath = TruncateW(inputs.imagePath, 128);
+        const std::string  safeSha  = SanitizeShaForLog(inputs.sha256);
         SS_LOG_WARN(kLogCategory,
             L"ZeroTrustGuard: BLOCK image='%.128ls' sha=%.16hs "
             L"trust=%.3f threshold=%.3f reason=%hs",
             safePath.c_str(),
-            inputs.sha256.c_str(),
+            safeSha.c_str(),
             trust, effectiveThreshold, reasonStr);
         return DecisionResult{
             .verdict       = Verdict::Block,
@@ -504,26 +553,30 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
     const double upperEdge = effectiveThreshold + kBand;
     const double lowerEdge = effectiveThreshold - kBand;
 
-    // Build a human-readable signal summary for the reason string.
+    // Build a human-readable signal summary for the reason string. Use
+    // locale-independent snprintf formatting; std::to_string for floating
+    // point honours the global CRT locale, which can flip the decimal mark
+    // to ',' on non-"C" systems and corrupt downstream telemetry parsers.
     std::string signals;
     signals.reserve(128);
     {
         if (inputs.publisherSigned && inputs.publisherTrusted) signals += "trusted-publisher ";
         else if (inputs.publisherSigned) signals += "signed ";
         if (inputs.reputationScore.has_value())
-            signals += "rep=" + std::to_string(inputs.reputationScore.value()).substr(0, 4) + " ";
+            signals += "rep=" + FormatTrust(inputs.reputationScore.value()) + " ";
         if (inputs.staticBenignConfidence.has_value())
-            signals += "static=" + std::to_string(inputs.staticBenignConfidence.value()).substr(0, 4) + " ";
-        if (inputs.riskSignalsFromACM)
-            signals += "acm-risk=0x" + [&]{
-                char buf[12]{}; snprintf(buf, sizeof(buf), "%08X", inputs.riskSignalsFromACM);
-                return std::string(buf);
-            }();
+            signals += "static=" + FormatTrust(inputs.staticBenignConfidence.value()) + " ";
+        if (inputs.riskSignalsFromACM) {
+            char buf[20]{};
+            std::snprintf(buf, sizeof(buf), "acm-risk=0x%08X",
+                          inputs.riskSignalsFromACM);
+            signals += buf;
+        }
         if (signals.empty()) signals = "no signals";
     }
 
     if (trust >= upperEdge) {
-        const std::string reason = "allow: trust=" + std::to_string(trust).substr(0, 5)
+        const std::string reason = "allow: trust=" + FormatTrust(trust)
                                    + " >= threshold+band (" + signals + ")";
         return DecisionResult{
             .verdict       = Verdict::Allow,
@@ -534,14 +587,15 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
     }
 
     if (trust < lowerEdge) {
-        const std::string reason = "block: trust=" + std::to_string(trust).substr(0, 5)
+        const std::string reason = "block: trust=" + FormatTrust(trust)
                                    + " < threshold-band (" + signals + ")";
         const std::wstring safePath = TruncateW(inputs.imagePath, 128);
+        const std::string  safeSha  = SanitizeShaForLog(inputs.sha256);
         SS_LOG_WARN(kLogCategory,
             L"ZeroTrustGuard: BLOCK image='%.128ls' sha=%.16hs "
             L"trust=%.3f threshold=%.3f reason=%hs",
             safePath.c_str(),
-            inputs.sha256.c_str(),
+            safeSha.c_str(),
             trust, effectiveThreshold, reason.c_str());
         return DecisionResult{
             .verdict       = Verdict::Block,
@@ -554,9 +608,9 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
     // ------------------------------------------------------------------
     // 7. Uncertain: apply UncertainBehavior policy.
     // ------------------------------------------------------------------
-    const std::string uncertainReason = "uncertain: trust=" + std::to_string(trust).substr(0, 5)
-                                        + " in band [" + std::to_string(lowerEdge).substr(0, 5)
-                                        + "," + std::to_string(upperEdge).substr(0, 5)
+    const std::string uncertainReason = "uncertain: trust=" + FormatTrust(trust)
+                                        + " in band [" + FormatTrust(lowerEdge)
+                                        + "," + FormatTrust(upperEdge)
                                         + "] (" + signals + ")";
 
     switch (cfg.uncertainBehavior) {
@@ -570,11 +624,12 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
 
         case UncertainBehavior::SilentBlock: {
             const std::wstring safePath = TruncateW(inputs.imagePath, 128);
+            const std::string  safeSha  = SanitizeShaForLog(inputs.sha256);
             SS_LOG_WARN(kLogCategory,
                 L"ZeroTrustGuard: BLOCK (silent) image='%.128ls' sha=%.16hs "
                 L"trust=%.3f threshold=%.3f reason=uncertain",
                 safePath.c_str(),
-                inputs.sha256.c_str(),
+                safeSha.c_str(),
                 trust, effectiveThreshold);
             return DecisionResult{
                 .verdict       = Verdict::Block,
@@ -611,15 +666,20 @@ DecisionResult ZeroTrustGuard::Decide(const DecisionInputs& inputs) {
                 .promptId       = promptId,
             };
         }
-    }
 
-    // Unreachable — all enum values handled.
-    return DecisionResult{
-        .verdict       = Verdict::Uncertain,
-        .computedTrust = trust,
-        .threshold     = effectiveThreshold,
-        .reason        = uncertainReason,
-    };
+        default:
+            // Defensive fail-safe: an out-of-range UncertainBehavior must
+            // never produce a permissive verdict on a zero-trust path.
+            SS_LOG_WARN(kLogCategory,
+                L"ZeroTrustGuard: invalid UncertainBehavior=%u — failing safe (Block)",
+                static_cast<unsigned>(cfg.uncertainBehavior));
+            return DecisionResult{
+                .verdict       = Verdict::Block,
+                .computedTrust = trust,
+                .threshold     = effectiveThreshold,
+                .reason        = "uncertain, invalid policy → fail-safe block",
+            };
+    }
 }
 
 // ============================================================================
@@ -632,11 +692,36 @@ ZeroTrustConfigSnapshot ZeroTrustGuard::GetConfig() const {
 }
 
 bool ZeroTrustGuard::SetConfig(const ZeroTrustConfigSnapshot& next) {
-    // Validate before locking.
-    if (next.threshold < 0.0 || next.threshold > 1.0) {
+    // Validate every bounded field before locking. ZeroTrustGuard is a hard
+    // security boundary — silently clamping invalid policy in-place would
+    // mask configuration bugs and weaken the audit trail.
+    auto inUnit = [](double v) noexcept {
+        return std::isfinite(v) && v >= 0.0 && v <= 1.0;
+    };
+
+    if (!inUnit(next.threshold)) {
         SS_LOG_WARN(kLogCategory,
             L"ZeroTrustGuard: SetConfig() rejected — threshold %.3f out of [0,1]",
             next.threshold);
+        return false;
+    }
+    if (!inUnit(next.minReputation)) {
+        SS_LOG_WARN(kLogCategory,
+            L"ZeroTrustGuard: SetConfig() rejected — minReputation %.3f out of [0,1]",
+            next.minReputation);
+        return false;
+    }
+    if (!inUnit(next.minStaticBenign)) {
+        SS_LOG_WARN(kLogCategory,
+            L"ZeroTrustGuard: SetConfig() rejected — minStaticBenign %.3f out of [0,1]",
+            next.minStaticBenign);
+        return false;
+    }
+    const auto behaviorInt = static_cast<std::uint8_t>(next.uncertainBehavior);
+    if (behaviorInt > static_cast<std::uint8_t>(UncertainBehavior::Prompt)) {
+        SS_LOG_WARN(kLogCategory,
+            L"ZeroTrustGuard: SetConfig() rejected — UncertainBehavior=%u invalid",
+            static_cast<unsigned>(behaviorInt));
         return false;
     }
 
@@ -645,10 +730,10 @@ bool ZeroTrustGuard::SetConfig(const ZeroTrustConfigSnapshot& next) {
     lock.unlock();
 
     SS_LOG_INFO(kLogCategory,
-        L"ZeroTrustGuard: Config updated threshold=%.3f ztMode=%hs behavior=%hhu",
+        L"ZeroTrustGuard: Config updated threshold=%.3f ztMode=%hs behavior=%u",
         next.threshold,
         next.zeroTrustMode ? "true" : "false",
-        static_cast<std::uint8_t>(next.uncertainBehavior));
+        static_cast<unsigned>(behaviorInt));
 
     if (::ShadowStrike::Config::ConfigManager::HasInstance()) {
         if (!PersistConfigToManager(next)) {
