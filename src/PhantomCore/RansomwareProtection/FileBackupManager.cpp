@@ -1552,21 +1552,25 @@ void FileBackupManager::ReportRollbackToAlertSystem(
         ? Communication::AlertSeverity::Critical
         : Communication::AlertSeverity::High;
 
-    std::string title = "Ransomware rollback for PID " + std::to_string(pid);
-    std::string detail = "Restored " + std::to_string(result.filesRestored) + "/" +
+    std::string subject = "Ransomware rollback for PID " + std::to_string(pid);
+    std::string details = "Restored " + std::to_string(result.filesRestored) + "/" +
                          std::to_string(result.filesAttempted) + " files (" +
                          std::to_string(result.bytesRestored) + " bytes) in " +
                          std::to_string(result.durationMs) + "ms";
     if (result.filesFailed > 0) {
-        detail += " — " + std::to_string(result.filesFailed) + " FAILED";
+        details += " — " + std::to_string(result.filesFailed) + " FAILED";
     }
 
+    // RaiseAlert(severity, type, subject, details, source).  Previously
+    // the literal "FileBackupManager" was being passed as the alert
+    // subject and the actual subject as details, which corrupted the
+    // SIEM payload for every rollback alert.
     (void)AlertSystem::Instance().RaiseAlert(
         severity,
         Communication::AlertType::ThreatDetection,
-        "FileBackupManager",
-        title,
-        detail);
+        subject,
+        details,
+        "FileBackupManager");
 }
 
 void FileBackupManager::ReportBackupTelemetry(
