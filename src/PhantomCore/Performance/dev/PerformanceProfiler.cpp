@@ -126,6 +126,13 @@ namespace Performance {
                 EndSessionLocked();
             }
 
+            // Cap the session name to bound memory and log inputs that exceed
+            // the cap so the caller can see why their string was truncated.
+            if (name.size() > kMaxProfileNameLength) {
+                Logger::Warn("PerformanceProfiler::StartSession name length {} exceeds limit {} — truncating",
+                    name.size(), kMaxProfileNameLength);
+            }
+
             m_sessionName = name.substr(0, kMaxProfileNameLength);
             m_snapshots.clear();
             m_stats.clear();
@@ -221,6 +228,22 @@ namespace Performance {
             const uint64_t timestamp = static_cast<uint64_t>(
                 std::chrono::system_clock::now().time_since_epoch().count());
 
+            // Best-effort snapshot of the process working-set at sample time so
+            // MetricSnapshot::memoryUsageBytes (a public field of the dev API)
+            // is populated rather than always zero. The query is only issued
+            // when a session is active so the non-recording fast path keeps its
+            // current overhead profile.
+            uint64_t memoryAtStop = 0;
+            const bool sessionActive = m_sessionActive.load(std::memory_order_relaxed);
+            if (sessionActive) {
+                PROCESS_MEMORY_COUNTERS_EX pmcSnap{};
+                pmcSnap.cb = sizeof(pmcSnap);
+                if (GetProcessMemoryInfo(GetCurrentProcess(),
+                        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmcSnap), sizeof(pmcSnap))) {
+                    memoryAtStop = pmcSnap.WorkingSetSize;
+                }
+            }
+
             std::unique_lock lock(m_mutex);
 
             // Record snapshot only during an active session
@@ -229,7 +252,7 @@ namespace Performance {
                     m_snapshots.pop_front();
                 }
                 m_snapshots.push_back(MetricSnapshot{
-                    name, durationNs, cpuCycles, 0, hashedThreadId, timestamp
+                    name, durationNs, cpuCycles, memoryAtStop, hashedThreadId, timestamp
                 });
             }
 
@@ -483,16 +506,21 @@ namespace Performance {
 
             double percent = 0.0;
 
-            if (m_lastCpuTime.QuadPart != 0) {
-                const ULONGLONG timeDiff   = now.QuadPart - m_lastCpuTime.QuadPart;
-                if (timeDiff > 0) {
-                    const ULONGLONG kernelDiff = kernel.QuadPart - m_lastSysCpuTime.QuadPart;
-                    const ULONGLONG userDiff   = user.QuadPart - m_lastUserCpuTime.QuadPart;
-                    percent = static_cast<double>(kernelDiff + userDiff)
-                        / static_cast<double>(timeDiff)
-                        / m_numProcessors * 100.0;
-                    percent = std::clamp(percent, 0.0, 100.0);
-                }
+            // Wall-clock FILETIME is normally monotonic but may step backward
+            // after SetSystemTime / NTP correction. Guard the subtraction so
+            // we never feed a wrapped ULONGLONG into the CPU-usage ratio.
+            if (m_lastCpuTime.QuadPart != 0 && now.QuadPart > m_lastCpuTime.QuadPart) {
+                const ULONGLONG timeDiff = now.QuadPart - m_lastCpuTime.QuadPart;
+                // Process kernel/user times are accumulated and should be
+                // monotonic, but guard against pathological ordering anyway.
+                const ULONGLONG kernelDiff = (kernel.QuadPart >= m_lastSysCpuTime.QuadPart)
+                    ? (kernel.QuadPart - m_lastSysCpuTime.QuadPart) : 0;
+                const ULONGLONG userDiff   = (user.QuadPart   >= m_lastUserCpuTime.QuadPart)
+                    ? (user.QuadPart   - m_lastUserCpuTime.QuadPart)   : 0;
+                percent = static_cast<double>(kernelDiff + userDiff)
+                    / static_cast<double>(timeDiff)
+                    / m_numProcessors * 100.0;
+                percent = std::clamp(percent, 0.0, 100.0);
             }
 
             m_lastCpuTime     = now;
@@ -542,6 +570,7 @@ namespace Performance {
                         {"name",   s.name},
                         {"dur_ns", s.durationNs},
                         {"cpu",    s.cpuCycles},
+                        {"mem",    s.memoryUsageBytes},
                         {"tid",    s.threadId},
                         {"ts",     s.timestamp}
                     });
