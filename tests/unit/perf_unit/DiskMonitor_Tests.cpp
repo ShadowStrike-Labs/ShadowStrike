@@ -15,7 +15,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "../../../src/PhantomCore/Performance/DiskMonitor.hpp"
 
@@ -266,6 +268,32 @@ TEST_F(DiskMonitorTest, CallbackRegistrationAndResetAreSafeForNullAndLiveHandler
 
 TEST_F(DiskMonitorTest, SelfTestPassesOnSupportedWindowsHost) {
     EXPECT_TRUE(monitor.SelfTest());
+}
+
+TEST_F(DiskMonitorTest, ShutdownPromptlyInterruptsLongPollingInterval) {
+    SSP::DiskMonitorConfig config;
+    config.enabled = true;
+    // Largest valid interval — any non-interruptible sleep here would
+    // pin Shutdown() to multiple seconds and regress service shutdown.
+    config.pollingIntervalMs = 5000;
+    config.enableProcessMonitoring = false;
+    config.enableDriveSpaceMonitoring = false;
+    ASSERT_TRUE(monitor.Initialize(config));
+    EXPECT_TRUE(monitor.IsInitialized());
+
+    // Let the worker enter its interval wait.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    const auto start = std::chrono::steady_clock::now();
+    monitor.Shutdown();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    EXPECT_FALSE(monitor.IsInitialized());
+    // The condition_variable wake must drop the join well below the
+    // polling interval. A 2s ceiling tolerates slow CI hosts while still
+    // catching any regression to std::this_thread::sleep_for.
+    EXPECT_LT(elapsed.count(), 2000);
 }
 
 }  // namespace
