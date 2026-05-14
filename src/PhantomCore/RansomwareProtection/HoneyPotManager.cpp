@@ -178,7 +178,10 @@ namespace {
     [[nodiscard]] size_t SecureRandomIndex(size_t upperBound) {
         if (upperBound <= 1) return 0;
         uint64_t raw = 0;
-        CryptoRandomBytes(reinterpret_cast<uint8_t*>(&raw), sizeof(raw));
+        if (!CryptoRandomBytes(reinterpret_cast<uint8_t*>(&raw), sizeof(raw))) {
+            SS_LOG_WARN(kLogCategory, L"CSPRNG failed while selecting honeypot template index");
+            return 0;
+        }
         return static_cast<size_t>(raw % upperBound);
     }
 
@@ -447,7 +450,10 @@ std::optional<std::string> HoneypotManagerImpl::DeployHoneypot(
         // Collision avoidance with CSPRNG suffix
         if (fs::exists(fullPath)) {
             uint32_t suffix = 0;
-            CryptoRandomBytes(reinterpret_cast<uint8_t*>(&suffix), sizeof(suffix));
+            if (!CryptoRandomBytes(reinterpret_cast<uint8_t*>(&suffix), sizeof(suffix))) {
+                suffix = static_cast<uint32_t>(GetTickCount64() & 0xFFFFFFFFu);
+                SS_LOG_WARN(kLogCategory, L"CSPRNG failed while generating honeypot collision suffix");
+            }
             suffix %= 10000u;
             std::wstring stem = fullPath.stem().wstring();
             std::wstring ext  = fullPath.extension().wstring();
@@ -536,7 +542,10 @@ void HoneypotManagerImpl::RandomizeTimestamps(const std::wstring& path) const {
 
     // Offset creation time 30-180 days into the past
     uint32_t daysBack = 0;
-    CryptoRandomBytes(reinterpret_cast<uint8_t*>(&daysBack), sizeof(daysBack));
+    if (!CryptoRandomBytes(reinterpret_cast<uint8_t*>(&daysBack), sizeof(daysBack))) {
+        daysBack = 30;
+        SS_LOG_WARN(kLogCategory, L"CSPRNG failed while randomizing honeypot creation timestamp");
+    }
     daysBack = 30 + (daysBack % 151);
 
     FILETIME ft{};
@@ -555,7 +564,10 @@ void HoneypotManagerImpl::RandomizeTimestamps(const std::wstring& path) const {
     uliW.LowPart  = ftWrite.dwLowDateTime;
     uliW.HighPart = ftWrite.dwHighDateTime;
     uint32_t hoursBack = 0;
-    CryptoRandomBytes(reinterpret_cast<uint8_t*>(&hoursBack), sizeof(hoursBack));
+    if (!CryptoRandomBytes(reinterpret_cast<uint8_t*>(&hoursBack), sizeof(hoursBack))) {
+        hoursBack = 2;
+        SS_LOG_WARN(kLogCategory, L"CSPRNG failed while randomizing honeypot write timestamp");
+    }
     hoursBack = 2 + (hoursBack % 720);
     uliW.QuadPart -= static_cast<uint64_t>(hoursBack) * 36000000000ULL;
     ftWrite.dwLowDateTime  = uliW.LowPart;
@@ -717,7 +729,11 @@ void HoneypotManagerImpl::RegenerateTrap(const std::wstring& filePath) {
                 it->second.status = HoneypotStatus::Active;
                 it->second.lastVerified = Clock::now();
                 FileUtils::Error err;
-                FileUtils::ComputeFileSHA256(it->second.path, it->second.contentHash, &err);
+                if (!FileUtils::ComputeFileSHA256(it->second.path, it->second.contentHash, &err)) {
+                    SS_LOG_WARN(kLogCategory,
+                        L"Failed to refresh regenerated honeypot hash for %ls: %S",
+                        it->second.path.c_str(), err.message.c_str());
+                }
             }
         }
 
@@ -1131,7 +1147,10 @@ void HoneypotManagerImpl::CreateHoneypotFile(
     size_t targetSize = tmpl.minSize;
     if (tmpl.maxSize > tmpl.minSize) {
         uint32_t r = 0;
-        CryptoRandomBytes(reinterpret_cast<uint8_t*>(&r), sizeof(r));
+        if (!CryptoRandomBytes(reinterpret_cast<uint8_t*>(&r), sizeof(r))) {
+            r = 0;
+            SS_LOG_WARN(kLogCategory, L"CSPRNG failed while selecting honeypot content size");
+        }
         targetSize = tmpl.minSize + (r % (tmpl.maxSize - tmpl.minSize + 1));
     }
     targetSize = std::clamp(targetSize,
