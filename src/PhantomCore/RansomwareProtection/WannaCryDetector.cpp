@@ -153,6 +153,36 @@ const std::vector<std::pair<std::string, std::vector<uint8_t>>> MEMORY_SCAN_PATT
 
 constexpr size_t MAX_SMB_PACKET_SIZE = 65535;
 
+// Defence-in-depth caps for public IOC ingestion APIs. The detector is part of a
+// long-lived endpoint agent; ThreatIntel feeds, management plane pushes, or a
+// compromised caller could otherwise grow these sets without bound, exhausting
+// process memory. The caps are deliberately generous (well above realistic
+// real-world IOC volumes for this family) so that legitimate threat-intel
+// enrichment is never throttled.
+constexpr size_t MAX_KILLSWITCH_DOMAINS = 4096;
+constexpr size_t MAX_KNOWN_HASHES       = 65536;
+constexpr size_t MAX_DOMAIN_LENGTH      = 253;   // RFC 1035
+
+// Re-validate that a tracked PID still refers to the same process image we
+// originally detected. WannaCry's auto-terminate path runs asynchronously
+// relative to process exit, so without this check a recycled PID could cause
+// us to kill an innocent victim. processName may be empty for code paths that
+// detected purely from a kernel-side event - in that case the caller has no
+// trustworthy baseline to validate against and we conservatively allow the
+// kill (the same behaviour the previous code had).
+[[nodiscard]] bool IsPidStillThisProcess(uint32_t pid,
+                                          const std::wstring& processName) noexcept {
+    try {
+        if (processName.empty()) return true;  // no baseline - cannot validate, allow
+        auto currentPath = Utils::ProcessUtils::GetProcessPath(pid);
+        if (!currentPath.has_value()) return false;
+        return Utils::StringUtils::IEquals(
+            fs::path(*currentPath).filename().wstring(), processName);
+    } catch (...) {
+        return false;  // fail-closed on validation errors
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -409,7 +439,14 @@ public:
             Hash256 fileHash{};
             Utils::FileUtils::Error fileErr;
             if (!Utils::FileUtils::ComputeFileSHA256(*processPath, fileHash, &fileErr)) {
-                if (m_config.verboseLogging)
+                // Snapshot verboseLogging under the shared lock - reading m_config
+                // without synchronisation races with UpdateConfiguration / Initialize.
+                bool verbose = false;
+                {
+                    std::shared_lock cfgLock(m_mutex);
+                    verbose = m_config.verboseLogging;
+                }
+                if (verbose)
                     Utils::Logger::Debug("WannaCryDetector: Could not hash PID {} image: {}",
                                          pid, fileErr.message);
                 return false;
@@ -483,6 +520,15 @@ public:
 
     [[nodiscard]] DetectionConfidence CalculateConfidence(const WannaCryDetectionResult& result) const noexcept {
         try {
+            // Snapshot the SMB threshold once under the config mutex. Reading
+            // m_config from this hot path concurrently with UpdateConfiguration
+            // would be a data race on a non-atomic uint16_t.
+            uint16_t smbThreshold = WannaCryConstants::SMB_SCAN_THRESHOLD;
+            try {
+                std::shared_lock cfgLock(m_mutex);
+                smbThreshold = m_config.smbScanThreshold;
+            } catch (...) { /* fall through with default */ }
+
             uint32_t score = 0;
             // High-weight indicators
             if (result.mutexDetected) score += 40;
@@ -494,7 +540,7 @@ public:
             score += static_cast<uint32_t>((std::min)(result.artifactsFound.size(), size_t(5))) * 8;
             if (result.hostsScanned > 0) score += 15;
             if (result.filesEncrypted > 0) score += 15;
-            if (result.smbConnectionCount >= m_config.smbScanThreshold) score += 20;
+            if (result.smbConnectionCount >= smbThreshold) score += 20;
             // Low-weight
             score += static_cast<uint32_t>((std::min)(result.indicators.size(), size_t(10))) * 3;
 
@@ -596,11 +642,17 @@ bool WannaCryDetector::Initialize(const WannaCryDetectorConfiguration& config) {
         return true;
     } catch (const std::exception& ex) {
         Utils::Logger::Error("WannaCryDetector: Init failed: {}", ex.what());
-        m_impl->m_status = ModuleStatus::Error;
+        try {
+            std::unique_lock errLock(m_impl->m_mutex);
+            m_impl->m_status = ModuleStatus::Error;
+        } catch (...) {}
         return false;
     } catch (...) {
         Utils::Logger::Fatal("WannaCryDetector: Init failed (unknown exception)");
-        m_impl->m_status = ModuleStatus::Error;
+        try {
+            std::unique_lock errLock(m_impl->m_mutex);
+            m_impl->m_status = ModuleStatus::Error;
+        } catch (...) {}
         return false;
     }
 }
@@ -740,8 +792,21 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
             // Cache result
             {
                 std::unique_lock cl(m_impl->m_cacheMutex);
-                if (m_impl->m_detectionCache.size() >= WannaCryConstants::MAX_CACHED_DETECTIONS)
+                if (m_impl->m_detectionCache.size() >= WannaCryConstants::MAX_CACHED_DETECTIONS) {
                     m_impl->PurgeStaleCacheEntries();
+                    // If purge didn't reclaim space (no stale entries), evict the
+                    // oldest entry to enforce the hard cap. Without this, a burst
+                    // of fresh detections within TTL would grow the map unbounded.
+                    if (m_impl->m_detectionCache.size() >= WannaCryConstants::MAX_CACHED_DETECTIONS) {
+                        auto oldest = m_impl->m_detectionCache.begin();
+                        for (auto it = m_impl->m_detectionCache.begin();
+                             it != m_impl->m_detectionCache.end(); ++it) {
+                            if (it->second.cachedAt < oldest->second.cachedAt) oldest = it;
+                        }
+                        if (oldest != m_impl->m_detectionCache.end())
+                            m_impl->m_detectionCache.erase(oldest);
+                    }
+                }
                 m_impl->m_detectionCache[pid] = {result, Clock::now()};
             }
 
@@ -762,13 +827,7 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
                 result.confidence >= DetectionConfidence::High &&
                 hasPidSpecificEvidence) {
                 // Re-validate PID still points to same process (mitigate PID reuse TOCTOU)
-                auto currentPath = Utils::ProcessUtils::GetProcessPath(pid);
-                bool pidStillValid = currentPath.has_value() &&
-                    (result.processName.empty() ||
-                     Utils::StringUtils::IEquals(
-                         fs::path(*currentPath).filename().wstring(), result.processName));
-
-                if (pidStillValid) {
+                if (IsPidStillThisProcess(pid, result.processName)) {
                     (void)RequestKernelProcessBlock(pid, L"WannaCry detection: " +
                         Utils::StringUtils::ToWide(GetWannaCryVariantName(result.variant)));
 
@@ -781,10 +840,10 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
                     }
                 } else {
                     SS_LOG_WARN(L"WannaCryDetector",
-                        L"PID %u image changed or exited before termination — skipping kill (PID reuse safety)",
+                        L"PID %u image changed or exited before termination - skipping kill (PID reuse safety)",
                         pid);
                 }
-            } else if (config.autoTerminate &&
+            }else if (config.autoTerminate &&
                        result.confidence >= DetectionConfidence::High &&
                        !hasPidSpecificEvidence) {
                 SS_LOG_WARN(L"WannaCryDetector",
@@ -980,12 +1039,26 @@ void WannaCryDetector::OnNetworkConnection(const SMBConnectionEvent& event) {
             ReportThreatToBehaviorAnalyzer(result);
 
             if (config.autoTerminate && result.confidence >= DetectionConfidence::High) {
-                (void)RequestKernelProcessBlock(event.pid, L"WannaCry SMB propagation detected");
-                Utils::ProcessUtils::Error termErr;
-                if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
-                    ++m_impl->m_stats.processesTerminated;
-                else
-                    SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate propagating PID %u", event.pid);
+                // PID-reuse safety: capture the current process name now so that
+                // if the PID has already been recycled we kill nothing.
+                auto preKillPath = Utils::ProcessUtils::GetProcessPath(event.pid);
+                if (!preKillPath.has_value()) {
+                    SS_LOG_WARN(L"WannaCryDetector",
+                        L"SMB-propagation PID %u no longer exists - skipping kill", event.pid);
+                } else {
+                    result.processName = fs::path(*preKillPath).filename().wstring();
+                    (void)RequestKernelProcessBlock(event.pid, L"WannaCry SMB propagation detected");
+                    if (!IsPidStillThisProcess(event.pid, result.processName)) {
+                        SS_LOG_WARN(L"WannaCryDetector",
+                            L"PID %u image changed before terminate - PID-reuse guard tripped", event.pid);
+                    } else {
+                        Utils::ProcessUtils::Error termErr;
+                        if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
+                            ++m_impl->m_stats.processesTerminated;
+                        else
+                            SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate propagating PID %u", event.pid);
+                    }
+                }
             }
         }
     } catch (const std::exception& ex) {
@@ -1024,12 +1097,26 @@ void WannaCryDetector::OnDnsQuery(const DnsQueryEvent& event) {
         ReportThreatToBehaviorAnalyzer(result);
 
         if (config.autoTerminate && result.confidence >= DetectionConfidence::High) {
-            (void)RequestKernelProcessBlock(event.pid, L"WannaCry kill-switch DNS query");
-            Utils::ProcessUtils::Error termErr;
-            if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
-                ++m_impl->m_stats.processesTerminated;
-            else
-                SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate kill-switch PID %u", event.pid);
+            // PID-reuse safety: capture identity before any blocking call,
+            // re-validate immediately before terminate.
+            auto preKillPath = Utils::ProcessUtils::GetProcessPath(event.pid);
+            if (!preKillPath.has_value()) {
+                SS_LOG_WARN(L"WannaCryDetector",
+                    L"Kill-switch PID %u no longer exists - skipping kill", event.pid);
+            } else {
+                result.processName = fs::path(*preKillPath).filename().wstring();
+                (void)RequestKernelProcessBlock(event.pid, L"WannaCry kill-switch DNS query");
+                if (!IsPidStillThisProcess(event.pid, result.processName)) {
+                    SS_LOG_WARN(L"WannaCryDetector",
+                        L"PID %u image changed before terminate - PID-reuse guard tripped", event.pid);
+                } else {
+                    Utils::ProcessUtils::Error termErr;
+                    if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
+                        ++m_impl->m_stats.processesTerminated;
+                    else
+                        SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate kill-switch PID %u", event.pid);
+                }
+            }
         }
     } catch (const std::exception& ex) {
         Utils::Logger::Error("WannaCryDetector: OnDnsQuery error: {}", ex.what());
@@ -1067,12 +1154,24 @@ void WannaCryDetector::OnServiceCreated(const ServiceEvent& event) {
 
         // Immediate termination - service creation is high-confidence
         if (config.autoTerminate) {
-            (void)RequestKernelProcessBlock(event.pid, L"WannaCry service creation detected");
-            Utils::ProcessUtils::Error termErr;
-            if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
-                ++m_impl->m_stats.processesTerminated;
-            else
-                SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate service-creating PID %u", event.pid);
+            auto preKillPath = Utils::ProcessUtils::GetProcessPath(event.pid);
+            if (!preKillPath.has_value()) {
+                SS_LOG_WARN(L"WannaCryDetector",
+                    L"Service-creator PID %u no longer exists - skipping kill", event.pid);
+            } else {
+                result.processName = fs::path(*preKillPath).filename().wstring();
+                (void)RequestKernelProcessBlock(event.pid, L"WannaCry service creation detected");
+                if (!IsPidStillThisProcess(event.pid, result.processName)) {
+                    SS_LOG_WARN(L"WannaCryDetector",
+                        L"PID %u image changed before terminate - PID-reuse guard tripped", event.pid);
+                } else {
+                    Utils::ProcessUtils::Error termErr;
+                    if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
+                        ++m_impl->m_stats.processesTerminated;
+                    else
+                        SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate service-creating PID %u", event.pid);
+                }
+            }
         }
     } catch (const std::exception& ex) {
         Utils::Logger::Error("WannaCryDetector: OnServiceCreated error: {}", ex.what());
@@ -1232,8 +1331,18 @@ std::string WannaCryDetector::GetSMBVersionInfo() const {
 
 void WannaCryDetector::AddKillSwitchDomain(std::string_view domain) {
     try {
-        if (domain.empty()) return;
+        if (domain.empty() || domain.size() > MAX_DOMAIN_LENGTH) {
+            SS_LOG_WARN(L"WannaCryDetector",
+                L"AddKillSwitchDomain rejected: invalid length (%zu)", domain.size());
+            return;
+        }
         std::unique_lock lock(m_impl->m_killSwitchMutex);
+        if (m_impl->m_killSwitchDomains.size() >= MAX_KILLSWITCH_DOMAINS) {
+            SS_LOG_WARN(L"WannaCryDetector",
+                L"AddKillSwitchDomain rejected: cap %zu reached",
+                MAX_KILLSWITCH_DOMAINS);
+            return;
+        }
         m_impl->m_killSwitchDomains.insert(std::string(domain));
         SS_LOG_INFO(L"WannaCryDetector", L"Added kill-switch domain: %hs", std::string(domain).c_str());
     } catch (const std::exception& ex) {
@@ -1243,7 +1352,6 @@ void WannaCryDetector::AddKillSwitchDomain(std::string_view domain) {
 
 void WannaCryDetector::AddKnownHash(const Hash256& hash) {
     try {
-        std::unique_lock lock(m_impl->m_hashMutex);
         std::string hashStr;
         hashStr.reserve(64);
         for (uint8_t byte : hash) {
@@ -1251,7 +1359,13 @@ void WannaCryDetector::AddKnownHash(const Hash256& hash) {
             hashStr.push_back(hex[(byte >> 4) & 0x0F]);
             hashStr.push_back(hex[byte & 0x0F]);
         }
-        m_impl->m_knownHashes.insert(hashStr);
+        std::unique_lock lock(m_impl->m_hashMutex);
+        if (m_impl->m_knownHashes.size() >= MAX_KNOWN_HASHES) {
+            SS_LOG_WARN(L"WannaCryDetector",
+                L"AddKnownHash rejected: cap %zu reached", MAX_KNOWN_HASHES);
+            return;
+        }
+        m_impl->m_knownHashes.insert(std::move(hashStr));
     } catch (const std::exception& ex) {
         Utils::Logger::Error("WannaCryDetector: AddKnownHash failed: {}", ex.what());
     }
@@ -1269,22 +1383,35 @@ void WannaCryDetector::UpdatePatternsFromThreatIntel() {
         try {
             auto& ti = ThreatIntel::ThreatIntelManager::Instance();
             if (ti.IsInitialized()) {
-                // Validate known hashes against ThreatIntel for enrichment
-                size_t enriched = 0;
+                // CRITICAL: copy the IOC sets out FIRST and release the locks
+                // before performing any ThreatIntel lookups. ti.LookupHash /
+                // LookupDomain may perform network I/O, hit other singletons,
+                // or acquire mutexes themselves - holding our IOC mutex across
+                // those calls is both a lock-order hazard and a multi-second
+                // stall for every concurrent reader of the same set.
+                std::vector<std::string> hashesCopy;
+                std::vector<std::string> domainsCopy;
                 {
                     std::shared_lock hl(m_impl->m_hashMutex);
-                    for (const auto& hash : m_impl->m_knownHashes) {
-                        auto lookup = ti.LookupHash("sha256", hash);
-                        if (lookup.IsMalicious()) ++enriched;
-                    }
+                    hashesCopy.reserve(m_impl->m_knownHashes.size());
+                    hashesCopy.assign(m_impl->m_knownHashes.begin(),
+                                      m_impl->m_knownHashes.end());
                 }
-                // Validate kill-switch domains
                 {
                     std::shared_lock kl(m_impl->m_killSwitchMutex);
-                    for (const auto& domain : m_impl->m_killSwitchDomains) {
-                        auto lookup = ti.LookupDomain(domain);
-                        if (lookup.found) ++enriched;
-                    }
+                    domainsCopy.reserve(m_impl->m_killSwitchDomains.size());
+                    domainsCopy.assign(m_impl->m_killSwitchDomains.begin(),
+                                       m_impl->m_killSwitchDomains.end());
+                }
+
+                size_t enriched = 0;
+                for (const auto& hash : hashesCopy) {
+                    auto lookup = ti.LookupHash("sha256", hash);
+                    if (lookup.IsMalicious()) ++enriched;
+                }
+                for (const auto& domain : domainsCopy) {
+                    auto lookup = ti.LookupDomain(domain);
+                    if (lookup.found) ++enriched;
                 }
                 SS_LOG_INFO(L"WannaCryDetector", L"ThreatIntel enrichment: %zu IOCs validated", enriched);
             }
@@ -1435,11 +1562,36 @@ bool WannaCryDetector::SelfTest() {
             }
         }
 
-        // Test 4: Hash checking
+        // Test 4: Hash checking. The test injects a synthetic hash, then
+        // removes it so the runtime IOC set is not permanently polluted.
+        // A residual all-zero entry would otherwise be a permanent
+        // false-positive trigger should any caller ever compare against
+        // an uninitialised Hash256.
         {
             Hash256 testHash{};
-            AddKnownHash(testHash);
-            if (!CheckKnownHash(testHash)) {
+            // Use a deterministic non-zero pattern to make accidental
+            // collisions with real samples astronomically unlikely.
+            for (size_t i = 0; i < testHash.size(); ++i)
+                testHash[i] = static_cast<uint8_t>(0xA5u ^ static_cast<uint8_t>(i));
+            std::string hashStr;
+            hashStr.reserve(64);
+            for (uint8_t byte : testHash) {
+                const char hex[] = "0123456789abcdef";
+                hashStr.push_back(hex[(byte >> 4) & 0x0F]);
+                hashStr.push_back(hex[byte & 0x0F]);
+            }
+
+            bool inserted = false;
+            {
+                std::unique_lock lock(m_impl->m_hashMutex);
+                inserted = m_impl->m_knownHashes.insert(hashStr).second;
+            }
+            bool ok = CheckKnownHash(testHash);
+            if (inserted) {
+                std::unique_lock lock(m_impl->m_hashMutex);
+                m_impl->m_knownHashes.erase(hashStr);
+            }
+            if (!ok) {
                 Utils::Logger::Error("WannaCryDetector: Self-test FAIL: hash check");
                 return false;
             }
