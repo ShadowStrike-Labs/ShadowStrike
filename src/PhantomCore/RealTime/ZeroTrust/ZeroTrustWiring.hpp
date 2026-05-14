@@ -29,6 +29,14 @@ namespace ShadowStrike::PhantomCore::RealTime::ZeroTrust {
 /**
  * @brief Build the ModuleDescriptor that wires ZeroTrustGuard into the
  *        HomeProductOrchestrator lifecycle.
+ *
+ * Returns a freshly-constructed descriptor by value; the caller normally
+ * passes it directly to HomeProductOrchestrator::RegisterModule(). May throw
+ * std::bad_alloc on string-allocation failure (the returned ModuleDescriptor
+ * embeds owned std::string fields); no other exceptions are propagated.
+ *
+ * Thread-safety: pure factory — safe to call from any thread; produces no
+ * shared state of its own.
  */
 [[nodiscard]] ShadowStrike::Products::Home::ModuleDescriptor
 CreateZeroTrustModuleDescriptor();
