@@ -935,13 +935,19 @@ void HoneypotManagerImpl::HandleDetectedAccess(
             auto severity = shouldKill
                 ? AlertSeverity::Critical
                 : AlertSeverity::High;
-            std::string title = "Honeypot access by PID " + std::to_string(pid);
-            std::string detail = "Trap: " + StringUtils::ToNarrow(event.honeypotPath) +
+            std::string subject = "Honeypot access by PID " + std::to_string(pid);
+            std::string details = "Trap: " + StringUtils::ToNarrow(event.honeypotPath) +
                 " | Process: " + StringUtils::ToNarrow(event.processName) +
                 " | Action: " + event.actionTaken;
+            // RaiseAlert(severity, type, subject, details, source).  The
+            // previous call was shifted by one — the literal
+            // "HoneypotManager" was being recorded as the alert subject,
+            // the real subject as details, and the real details as the
+            // source field — corrupting every honeypot alert sent to
+            // SIEM.
             (void)AlertSystem::Instance().RaiseAlert(
                 severity, AlertType::ThreatDetection,
-                "HoneypotManager", title, detail);
+                subject, details, "HoneypotManager");
         }
         if (TelemetryCollector::HasInstance()) {
             TelemetryCollector::Instance().RecordCustom("honeypot_access", {
@@ -1690,6 +1696,7 @@ void HoneypotManager::OnKernelProcessNotify(
     uint32_t pid, uint32_t parentPid,
     std::wstring_view imagePath, bool isCreate)
 {
+    (void)pid;
     (void)parentPid;
     (void)imagePath;
     if (!IsInitialized()) return;
@@ -1757,17 +1764,18 @@ void HoneypotManager::ReportAccessToAlertSystem(
         ? Communication::AlertSeverity::Critical
         : Communication::AlertSeverity::High;
 
-    std::string title = "Honeypot access by PID " + std::to_string(pid);
-    std::string detail = "Trap: " + Utils::StringUtils::ToNarrow(event.honeypotPath) +
+    std::string subject = "Honeypot access by PID " + std::to_string(pid);
+    std::string details = "Trap: " + Utils::StringUtils::ToNarrow(event.honeypotPath) +
         " | Process: " + Utils::StringUtils::ToNarrow(event.processName) +
         " | Action: " + event.actionTaken;
 
+    // RaiseAlert(severity, type, subject, details, source).
     (void)AlertSystem::Instance().RaiseAlert(
         severity,
         Communication::AlertType::ThreatDetection,
-        "HoneypotManager",
-        title,
-        detail);
+        subject,
+        details,
+        "HoneypotManager");
 }
 
 void HoneypotManager::ReportHoneypotTelemetry(
