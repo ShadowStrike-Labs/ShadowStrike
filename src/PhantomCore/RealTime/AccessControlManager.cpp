@@ -208,7 +208,7 @@ namespace {
 
     // Get persistence path
     std::wstring GetPersistencePath() {
-        wchar_t* programData = nullptr;
+        // FIX: ACM-N7 — removed unused wchar_t* programData local
         std::wstring result;
         DWORD size = ::GetEnvironmentVariableW(L"ProgramData", nullptr, 0);
         if (size > 0) {
@@ -243,6 +243,19 @@ namespace {
         }
         ::CloseServiceHandle(hSCM);
         return running;
+    }
+
+    // FIX: ACM-N8 — zero out sensitive string buffers before release. The header
+    // explicitly requires SecureZeroMemory before deallocation of session tokens
+    // and MFA secret codes; without this, a process-memory snapshot (e.g. via
+    // MiniDumpWriteDump in another protected process) can recover bearer tokens
+    // long after a session has been revoked. SecureZeroMemory is guaranteed by
+    // the SDK not to be elided by the optimizer.
+    void SecureWipe(std::wstring& s) noexcept {
+        if (!s.empty()) {
+            ::SecureZeroMemory(s.data(), s.size() * sizeof(wchar_t));
+        }
+        s.clear();
     }
 
 } // anonymous namespace
@@ -344,6 +357,10 @@ public:
         // Clear sessions
         {
             std::unique_lock sessLock(m_sessionMutex);
+            // FIX: ACM-N8 — wipe bearer tokens before clearing on shutdown.
+            for (auto& [id, sess] : m_sessions) {
+                SecureWipe(sess.sessionToken);
+            }
             m_sessions.clear();
             m_tokenToSessionId.clear();
         }
@@ -351,6 +368,11 @@ public:
         // Clear MFA challenges
         {
             std::unique_lock mfaLock(m_mfaMutex);
+            // FIX: ACM-N8 — wipe MFA secret codes and challenge IDs before clearing.
+            for (auto& [id, ch] : m_activeChallenges) {
+                SecureWipe(ch.secretCode);
+                SecureWipe(ch.challengeId);
+            }
             m_activeChallenges.clear();
         }
 
@@ -928,7 +950,17 @@ public:
 
         SessionState oldState = it->second.state;
         it->second.state = SessionState::REVOKED;
-        m_tokenToSessionId.erase(it->second.sessionToken);
+
+        // FIX: ACM-N8 — wipe the token both in the lookup map key copy and the
+        // session record before clearing/erasing. We remove from the lookup map
+        // by token value, then secure-wipe the in-session copy.
+        auto tokenIt = m_tokenToSessionId.find(it->second.sessionToken);
+        if (tokenIt != m_tokenToSessionId.end()) {
+            // The map key is const; we cannot wipe it in-place. Erase by iterator
+            // and rely on the immediately following SecureWipe of the canonical copy.
+            m_tokenToSessionId.erase(tokenIt);
+        }
+        SecureWipe(it->second.sessionToken);
 
         IncrementStat(&AccessControlStatistics::sessionsRevoked);
         if (oldState == SessionState::ACTIVE || oldState == SessionState::ELEVATED) {
@@ -955,6 +987,8 @@ public:
                 SessionState old = sess.state;
                 sess.state = SessionState::REVOKED;
                 m_tokenToSessionId.erase(sess.sessionToken);
+                // FIX: ACM-N8 — secure-wipe the bearer token on bulk revoke.
+                SecureWipe(sess.sessionToken);
                 revoked.push_back({id, old});
                 ++count;
             }
@@ -1018,8 +1052,15 @@ public:
             std::chrono::milliseconds(m_config.mfaChallengeTimeoutMs);
         challenge.failedAttempts = 0;
 
-        m_activeChallenges[sessionId] = std::move(challenge);
-        std::wstring challengeId = m_activeChallenges[sessionId].challengeId;
+        // FIX: ACM-N1 — capture challengeId AND expiry under mfaLock BEFORE releasing it.
+        // The prior code re-read m_activeChallenges[sessionId].expiry after unlocking the
+        // mfaMutex, creating a TOCTOU race: another thread could have erased or replaced
+        // the entry (e.g. a concurrent VerifyMFAResponse on expiry, or a parallel
+        // InitiateMFAChallenge), causing either a stale read or a default-constructed
+        // time_point being returned to the caller.
+        auto& stored = m_activeChallenges[sessionId] = std::move(challenge);
+        std::wstring challengeId = stored.challengeId;
+        auto challengeExpiry = stored.expiry;
         IncrementStat(&AccessControlStatistics::mfaChallenges);
 
         // Release mfaMutex BEFORE acquiring sessionMutex (lock ordering: session → mfa)
@@ -1036,7 +1077,7 @@ public:
 
         result.success = true;
         result.challengeId = std::move(challengeId);
-        result.challengeExpiry = m_activeChallenges[sessionId].expiry;
+        result.challengeExpiry = challengeExpiry;
         result.methodUsed = (method == MFAMethod::NONE) ? MFAMethod::TOTP : method;
 
         SS_LOG_INFO(L"ACM", L"MFA challenge initiated for session %llu", sessionId);
@@ -1805,6 +1846,34 @@ uint32_t AccessControlManager::CreateRole(
         return 0;
     }
 
+    // FIX: ACM-N2 — enforce that the creator cannot mint a role granting permissions
+    // beyond their own effective set. Without this, any holder of ADMIN_ROLE_CREATE
+    // could escalate by defining a role with arbitrary grants (e.g. SYSTEM_KERNEL_ACCESS)
+    // and then assigning it (or persuading another admin to assign it). We compute the
+    // creator's effective permissions under the already-held roleMutex.
+    std::bitset<MAX_PERMISSIONS> creatorGrants;
+    std::bitset<MAX_PERMISSIONS> creatorDenies;
+    {
+        auto creatorRoles = m_impl->GetUserRolesInternal_Locked(createdBy);
+        for (uint32_t rid : creatorRoles) {
+            auto rit = m_impl->m_roles.find(rid);
+            if (rit == m_impl->m_roles.end() || !rit->second.isEnabled) continue;
+            creatorGrants |= rit->second.grantedPermissions;
+            creatorDenies |= rit->second.deniedPermissions;
+        }
+    }
+    const std::bitset<MAX_PERMISSIONS> creatorEffective = creatorGrants & ~creatorDenies;
+    if (!ValidateRolePermissions(definition, creatorEffective)) {
+        SS_LOG_WARN(L"ACM",
+            L"CreateRole denied: SID %ls attempted to grant permissions exceeding own effective set",
+            createdBy.stringSid.c_str());
+        roleLock.unlock();
+        m_impl->LogAuditEvent(createdBy, Permission::ADMIN_ROLE_CREATE,
+            AccessDecision::DENY,
+            L"Privilege escalation attempt via CreateRole");
+        return 0;
+    }
+
     // Find next available custom role ID
     uint32_t newId = 0;
     for (uint32_t id = static_cast<uint32_t>(RoleType::CUSTOM_START);
@@ -2000,7 +2069,121 @@ bool AccessControlManager::RequiresMFA(
 // ============================================================================
 
 bool AccessControlManager::IsAdmin(const SecurityIdentifier& userSid) const {
-    return IsAdminSidString(userSid.stringSid);
+    // FIX: ACM-N3 — IsAdminSidString only checks whether the SID *is* the well-known
+    // BUILTIN\Administrators group SID (S-1-5-32-544); it does not check whether the
+    // user is a *member* of that group. That mis-semantics caused callers (gating
+    // sensitive operations) to treat ordinary admin users as non-admins and vice versa.
+    //
+    // Correct behaviour:
+    //   1. If the SID matches the well-known Administrators group SID itself → true.
+    //   2. If the SID belongs to the current process token's user → use CheckTokenMembership
+    //      (the canonical Windows API for "am I an admin") against an impersonation
+    //      duplicate of the token.
+    //   3. Otherwise → resolve the account name and consult NetUserGetLocalGroups
+    //      including indirect (group-of-group) memberships.
+    //
+    // On failure to determine membership we return false (deny-by-default) and log
+    // explicitly so the caller's decision is auditable.
+
+    if (userSid.stringSid.empty()) return false;
+
+    // Case 1: SID *is* BUILTIN\Administrators.
+    if (IsAdminSidString(userSid.stringSid)) return true;
+
+    PSID pUserSid = nullptr;
+    if (!::ConvertStringSidToSidW(userSid.stringSid.c_str(), &pUserSid)) {
+        SS_LOG_WARN(L"ACM", L"IsAdmin: invalid SID '%ls'", userSid.stringSid.c_str());
+        return false;
+    }
+    UniqueLocal<void> userSidGuard(pUserSid);
+
+    // Build the well-known BUILTIN\Administrators SID once for comparison.
+    BYTE adminSidBuf[SECURITY_MAX_SID_SIZE]{};
+    DWORD adminSidSize = sizeof(adminSidBuf);
+    if (!::CreateWellKnownSid(WinBuiltinAdministratorsSid,
+                              nullptr, adminSidBuf, &adminSidSize)) {
+        SS_LOG_ERROR(L"ACM", L"IsAdmin: CreateWellKnownSid failed: 0x%08X",
+                     ::GetLastError());
+        return false;
+    }
+
+    // Determine the current process user SID.
+    HANDLE hProcTokenRaw = nullptr;
+    if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE,
+                           &hProcTokenRaw)) {
+        auto hProcToken = WrapHandle(hProcTokenRaw);
+
+        DWORD needed = 0;
+        ::GetTokenInformation(hProcToken.get(), TokenUser, nullptr, 0, &needed);
+        if (needed > 0) {
+            std::vector<BYTE> userBuf(needed);
+            if (::GetTokenInformation(hProcToken.get(), TokenUser,
+                                       userBuf.data(), needed, &needed)) {
+                auto* tu = reinterpret_cast<TOKEN_USER*>(userBuf.data());
+                if (tu->User.Sid && ::EqualSid(tu->User.Sid, pUserSid)) {
+                    // Case 2: this is the current process user — use the canonical API.
+                    HANDLE hImpRaw = nullptr;
+                    if (::DuplicateToken(hProcToken.get(),
+                                          SecurityImpersonation, &hImpRaw)) {
+                        auto hImp = WrapHandle(hImpRaw);
+                        BOOL isMember = FALSE;
+                        if (::CheckTokenMembership(hImp.get(),
+                                                    adminSidBuf, &isMember)) {
+                            return isMember != FALSE;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Case 3: foreign SID — resolve to account name and walk local-group memberships
+    // (LG_INCLUDE_INDIRECT covers nested group-of-group inclusion). This handles both
+    // local accounts and domain users authenticated against the local machine.
+    wchar_t name[256]{};
+    wchar_t domain[256]{};
+    DWORD nameLen = 256, domLen = 256;
+    SID_NAME_USE use{};
+    if (!::LookupAccountSidW(nullptr, pUserSid, name, &nameLen,
+                              domain, &domLen, &use)) {
+        SS_LOG_WARN(L"ACM",
+            L"IsAdmin: cannot resolve SID '%ls' (LookupAccountSidW failed: 0x%08X)",
+            userSid.stringSid.c_str(), ::GetLastError());
+        return false;
+    }
+
+    std::wstring fullName;
+    if (domLen > 0 && domain[0] != L'\0') {
+        fullName = std::wstring(domain) + L"\\" + std::wstring(name);
+    } else {
+        fullName = std::wstring(name);
+    }
+
+    LPLOCALGROUP_USERS_INFO_0 groups = nullptr;
+    DWORD entriesRead = 0, totalEntries = 0;
+    NET_API_STATUS netStatus = ::NetUserGetLocalGroups(
+        nullptr, fullName.c_str(), 0, LG_INCLUDE_INDIRECT,
+        reinterpret_cast<LPBYTE*>(&groups), MAX_PREFERRED_LENGTH,
+        &entriesRead, &totalEntries);
+
+    if (netStatus != NERR_Success || groups == nullptr) {
+        SS_LOG_INFO(L"ACM",
+            L"IsAdmin: NetUserGetLocalGroups failed for '%ls' (status=%lu); denying",
+            fullName.c_str(), static_cast<unsigned long>(netStatus));
+        if (groups) ::NetApiBufferFree(groups);
+        return false;
+    }
+
+    bool isAdmin = false;
+    for (DWORD i = 0; i < entriesRead; ++i) {
+        const wchar_t* groupName = groups[i].lgrui0_name;
+        if (groupName && ::_wcsicmp(groupName, L"Administrators") == 0) {
+            isAdmin = true;
+            break;
+        }
+    }
+    ::NetApiBufferFree(groups);
+    return isAdmin;
 }
 
 std::optional<UserPrincipal> AccessControlManager::ResolveUser(
@@ -2402,21 +2585,91 @@ ProcessProtectionLevel AccessControlManager::GetProcessProtectionLevel(
 uint32_t AccessControlManager::ProtectShadowStrikeProcesses(
     ProcessProtectionLevel level)
 {
+    // FIX: ACM-N4 — the prior implementation substring-matched the executable name
+    // (`ShadowStrike` / `Phantom`) inside PROCESSENTRY32W::szExeFile. An attacker can
+    // trivially copy malware to `ShadowStrike-evil.exe` (or rename via the standard
+    // copy-and-launch primitive) and inherit our process-protection DACL hardening.
+    // We now require that the candidate process's *full image path* live underneath
+    // our trusted install directory (the parent of the current module). The current
+    // process is always protected as before.
     uint32_t count = 0;
     HANDLE hSnap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
     auto snapGuard = WrapHandle(hSnap);
 
+    // Derive the canonical trusted install directory from our own module path.
+    std::wstring installDir;
+    {
+        wchar_t modulePath[MAX_PATH + 1]{};
+        DWORD len = ::GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) {
+            SS_LOG_ERROR(L"ACM",
+                L"ProtectShadowStrikeProcesses: GetModuleFileNameW failed (0x%08X) — refusing to enumerate without trust anchor",
+                ::GetLastError());
+            return 0;
+        }
+        try {
+            fs::path mp(modulePath);
+            installDir = fs::weakly_canonical(mp.parent_path()).wstring();
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"ACM",
+                L"ProtectShadowStrikeProcesses: install dir canonicalization failed: %hs",
+                ex.what());
+            return 0;
+        }
+    }
+    if (installDir.empty()) return 0;
+
+    // Append a trailing separator so a sibling directory cannot prefix-match
+    // (e.g. install dir "C:\Program Files\ShadowStrike" must not authorize
+    // "C:\Program Files\ShadowStrike-evil\foo.exe").
+    if (installDir.back() != L'\\' && installDir.back() != L'/') {
+        installDir.push_back(L'\\');
+    }
+    std::wstring installDirLower = installDir;
+    std::transform(installDirLower.begin(), installDirLower.end(),
+                   installDirLower.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    DWORD myPid = ::GetCurrentProcessId();
+    const DWORD myPid = ::GetCurrentProcessId();
 
     if (::Process32FirstW(hSnap, &pe)) {
         do {
-            std::wstring_view name(pe.szExeFile);
-            bool isSS = (name.find(L"ShadowStrike") != std::wstring_view::npos ||
-                          name.find(L"Phantom") != std::wstring_view::npos);
-            if (isSS || pe.th32ProcessID == myPid) {
+            bool trusted = (pe.th32ProcessID == myPid);
+
+            if (!trusted && pe.th32ProcessID > 4) {
+                HANDLE hRaw = ::OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                if (hRaw) {
+                    auto hProc = WrapHandle(hRaw);
+                    wchar_t imagePath[MAX_PATH + 1]{};
+                    DWORD ipLen = MAX_PATH;
+                    if (::QueryFullProcessImageNameW(hProc.get(), 0,
+                                                      imagePath, &ipLen) && ipLen > 0) {
+                        try {
+                            fs::path ip(imagePath);
+                            std::wstring canon =
+                                fs::weakly_canonical(ip).wstring();
+                            std::transform(canon.begin(), canon.end(),
+                                           canon.begin(),
+                                           [](wchar_t c) {
+                                               return static_cast<wchar_t>(::towlower(c));
+                                           });
+                            if (canon.size() > installDirLower.size() &&
+                                canon.compare(0, installDirLower.size(),
+                                              installDirLower) == 0) {
+                                trusted = true;
+                            }
+                        } catch (...) {
+                            // Canonicalization failed → not trusted.
+                        }
+                    }
+                }
+            }
+
+            if (trusted) {
                 ProcessProtectionConfig cfg;
                 cfg.targetPid = pe.th32ProcessID;
                 cfg.level = level;
