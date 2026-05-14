@@ -565,10 +565,13 @@ public:
             const uint32_t pid = pe.th32ProcessID;
             if (pid == 0) continue; // System Idle Process
 
-            if (newCache.size() >= cfg.maxTrackedProcesses) break;
-
-            CalculateProcessUsage(pid, pe.szExeFile, nowMs,
-                                  oldHistory, newCache, newHistory);
+            // Cap per-process tracking only; continue tallying totals so the
+            // system snapshot reflects the real process/thread count rather
+            // than truncating at the tracked-process cap.
+            if (newCache.size() < cfg.maxTrackedProcesses) {
+                CalculateProcessUsage(pid, pe.szExeFile, nowMs,
+                                      oldHistory, newCache, newHistory);
+            }
 
         } while (::Process32NextW(snapshot.Get(), &pe));
 
@@ -741,10 +744,16 @@ public:
             }
         }
 
-        // Dispatch to registered callbacks WITHOUT holding m_dataMutex
-        // (prevents deadlock if a callback queries CPUMonitor)
-        std::shared_lock cbLock(m_callbackMutex);
-        for (const auto& entry : m_callbacks) {
+        // Snapshot callbacks under shared lock, then dispatch WITHOUT holding
+        // any lock. Holding m_callbackMutex during dispatch would deadlock if
+        // a handler called UnregisterHighCpuCallback (which acquires unique
+        // ownership of the same shared_mutex on the dispatching thread).
+        std::vector<CallbackEntry> dispatchList;
+        {
+            std::shared_lock cbLock(m_callbackMutex);
+            dispatchList = m_callbacks;
+        }
+        for (const auto& entry : dispatchList) {
             for (const auto& p : offenders) {
                 try {
                     entry.callback(p.pid, p.name, p.cpuUsagePercent);
@@ -952,6 +961,13 @@ bool CPUMonitor::UpdateConfiguration(const CPUMonitorConfig& config) {
         return false;
     }
     std::unique_lock lock(m_impl->m_dataMutex);
+    // If per-process tracking was just disabled, purge cached history so the
+    // memory footprint matches the active configuration and GetTopConsumers()
+    // does not surface stale samples from a previous policy window.
+    if (m_impl->m_config.trackPerProcess && !config.trackPerProcess) {
+        m_impl->m_processHistory.clear();
+        m_impl->m_processCache.clear();
+    }
     m_impl->m_config = config;
     SS_LOG_INFO(L"CPUMonitor",
         L"Configuration updated. interval=%ums highThresh=%.1f%%",
