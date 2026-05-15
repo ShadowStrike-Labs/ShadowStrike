@@ -62,6 +62,7 @@
 #include <algorithm>
 #include <queue>
 #include <filesystem>
+#include <cwctype>
 
 namespace ShadowStrike {
 namespace Security {
@@ -2135,9 +2136,11 @@ public:
             if (!isTestSigned) {
                 std::string lowerCN;
                 lowerCN.reserve(signer.signerName.size());
-                for (char c : signer.signerName) {
-                    lowerCN += static_cast<char>(
-                        std::tolower(static_cast<unsigned char>(c)));
+                for (wchar_t c : signer.signerName) {
+                    const wchar_t lowered = static_cast<wchar_t>(std::towlower(c));
+                    if (lowered >= L'\0' && lowered <= L'\x7F') {
+                        lowerCN.push_back(static_cast<char>(lowered));
+                    }
                 }
                 static constexpr std::array testPatterns = {
                     "test sign", "testsign", "test cert", "testcert",
@@ -2667,7 +2670,9 @@ TrustedPublisherGuard::TrustedPublisherGuard(
 
 TrustedPublisherGuard::~TrustedPublisherGuard() {
     if (m_added) {
-        DigitalSignatureValidator::Instance().RemoveTrustedPublisher(m_thumbprint);
+        if (!DigitalSignatureValidator::Instance().RemoveTrustedPublisher(m_thumbprint)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"TrustedPublisherGuard cleanup could not remove trusted publisher");
+        }
     }
 }
 

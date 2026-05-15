@@ -3475,7 +3475,9 @@ std::string CryptoManagerImpl::RotateKey(const std::string& oldKeyId) {
         NotifyKeyRotation(oldKeyId, *oldMeta, *newMeta);
     }
 
-    DeleteKey(oldKeyId);
+    if (!DeleteKey(oldKeyId)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"RotateKey: failed to delete retired key metadata for id: %hs", oldKeyId.c_str());
+    }
 
     return newKeyId;
 }
@@ -4773,11 +4775,15 @@ bool CryptoManagerImpl::SelfTest() {
             auto retrieved = RetrieveKey(keyId);
             if (!retrieved || *retrieved != key) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Key retrieval");
-                DeleteKey(keyId);
+                if (!DeleteKey(keyId)) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Self-test cleanup failed for key id: %hs", keyId.c_str());
+                }
                 return false;
             }
 
-            DeleteKey(keyId);
+            if (!DeleteKey(keyId)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Self-test cleanup failed for key id: %hs", keyId.c_str());
+            }
         }
 
         SS_LOG_INFO(LOG_CATEGORY, L"CryptoManager self-test passed");
@@ -5322,3 +5328,4 @@ std::string_view GetKeyStorageName(KeyStorage storage) noexcept {
 
 }  // namespace Security
 }  // namespace ShadowStrike
+
