@@ -356,6 +356,51 @@ static bool SehScanBreakpoints(const BYTE* pStart, size_t size, size_t& outBreak
     }
 }
 
+/**
+ * @brief SEH-guarded read of a ULONG at an arbitrary address.
+ * @return true on success; false if the read faulted.
+ */
+static bool SehReadUlong(const void* address, ULONG& out) noexcept {
+    __try {
+        out = *static_cast<const volatile ULONG*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+/**
+ * @brief SEH-guarded read of a pointer-sized value at an arbitrary address.
+ * @return true on success; false if the read faulted.
+ */
+static bool SehReadPointer(const void* address, void*& out) noexcept {
+    __try {
+        out = *const_cast<void**>(static_cast<void* const*>(address));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+/**
+ * @brief SEH-guarded copy of up to `size` bytes (size capped by caller).
+ * @return number of bytes copied; 0 if the read faulted before any byte.
+ */
+static size_t SehReadBytes(const BYTE* src, BYTE* dst, size_t size) noexcept {
+    size_t copied = 0;
+    __try {
+        for (size_t i = 0; i < size; ++i) {
+            dst[i] = src[i];
+            ++copied;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return copied;
+}
+
 #endif // _WIN32
 
 // ============================================================================
@@ -1197,34 +1242,36 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_NtGlobalFlag() {
     result.timestamp = startTime;
 
 #ifdef _WIN32
-    try {
-        PPEB pPeb = GetPEB();
-        if (pPeb) {
-            // NtGlobalFlag is at offset 0x68 (x86) or 0xBC (x64) in PEB
+    PPEB pPeb = GetPEB();
+    if (pPeb) {
+        // NtGlobalFlag is at offset 0x68 (x86) or 0xBC (x64) in PEB.
+        // PEB layout is documented but not guaranteed stable; raw access
+        // is SEH-guarded because access violations are NOT C++ exceptions
+        // under MSVC default /EHsc and would otherwise terminate the process.
 #ifdef _WIN64
-            ULONG ntGlobalFlag = *reinterpret_cast<PULONG>(
-                reinterpret_cast<PBYTE>(pPeb) + 0xBC);
+        constexpr size_t kNtGlobalFlagOffset = 0xBC;
 #else
-            ULONG ntGlobalFlag = *reinterpret_cast<PULONG>(
-                reinterpret_cast<PBYTE>(pPeb) + 0x68);
+        constexpr size_t kNtGlobalFlagOffset = 0x68;
 #endif
+        ULONG ntGlobalFlag = 0;
+        const void* addr = reinterpret_cast<const BYTE*>(pPeb) + kNtGlobalFlagOffset;
+        if (!SehReadUlong(addr, ntGlobalFlag)) {
+            result.errorCode = 2;
+            result.message = "NtGlobalFlag read faulted (PEB layout unavailable)";
+            SS_LOG_WARN(L"AntiDebug", L"NtGlobalFlag read faulted at 0x%IX",
+                        reinterpret_cast<uintptr_t>(addr));
+        } else if (ntGlobalFlag & NT_GLOBAL_FLAG_DEBUGGED) {
+            result.detected = true;
+            result.confidence = DetectionConfidence::High;
+            result.score = AntiDebugConstants::WEIGHT_PEB_DETECTION;
+            result.debuggerType = DebuggerType::UserMode;
+            result.message = "NtGlobalFlag indicates debugger presence";
+            result.details["ntglobalflag"] = std::to_string(ntGlobalFlag);
 
-            if (ntGlobalFlag & NT_GLOBAL_FLAG_DEBUGGED) {
-                result.detected = true;
-                result.confidence = DetectionConfidence::High;
-                result.score = AntiDebugConstants::WEIGHT_PEB_DETECTION;
-                result.debuggerType = DebuggerType::UserMode;
-                result.message = "NtGlobalFlag indicates debugger presence";
-                result.details["ntglobalflag"] = std::to_string(ntGlobalFlag);
-
-                SS_LOG_WARN(L"AntiDebug", L"NtGlobalFlag debug flags detected: 0x%lX", ntGlobalFlag);
-            } else {
-                result.message = "NtGlobalFlag is clean";
-            }
+            SS_LOG_WARN(L"AntiDebug", L"NtGlobalFlag debug flags detected: 0x%lX", ntGlobalFlag);
+        } else {
+            result.message = "NtGlobalFlag is clean";
         }
-    } catch (const std::exception& e) {
-        result.errorCode = 1;
-        result.message = std::string("NtGlobalFlag check failed: ") + e.what();
     }
 #else
     result.message = "NtGlobalFlag check not supported on this platform";
@@ -1241,35 +1288,37 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_HeapFlags() {
     result.timestamp = startTime;
 
 #ifdef _WIN32
-    try {
-        PPEB pPeb = GetPEB();
-        if (pPeb) {
-            // PEB::ProcessHeap is not declared in winternl.h (opaque struct).
-            // Access via documented offset: 0x30 on x64, 0x18 on x86.
+    PPEB pPeb = GetPEB();
+    if (pPeb) {
+        // PEB::ProcessHeap is not declared in winternl.h (opaque struct).
+        // Access via documented offset: 0x30 on x64, 0x18 on x86.
+        // All raw reads are SEH-guarded — PEB layout is not part of the
+        // stable Win32 ABI and access violations are not catchable as
+        // C++ exceptions under /EHsc.
 #ifdef _WIN64
-            constexpr size_t kProcessHeapOffset = 0x30;
+        constexpr size_t kProcessHeapOffset = 0x30;
+        constexpr size_t kHeapFlagsOffset   = 0x70;
+        constexpr size_t kHeapForceOffset   = 0x74;
 #else
-            constexpr size_t kProcessHeapOffset = 0x18;
+        constexpr size_t kProcessHeapOffset = 0x18;
+        constexpr size_t kHeapFlagsOffset   = 0x40;
+        constexpr size_t kHeapForceOffset   = 0x44;
 #endif
-            PVOID processHeap = *reinterpret_cast<PVOID*>(
-                reinterpret_cast<PBYTE>(pPeb) + kProcessHeapOffset);
-
-            if (processHeap) {
-                // Heap flags are at different offsets depending on architecture
-                // ForceFlags at offset 0x44 (x86) or 0x74 (x64)
-                // Flags at offset 0x40 (x86) or 0x70 (x64)
-#ifdef _WIN64
-                ULONG heapFlags = *reinterpret_cast<PULONG>(
-                    reinterpret_cast<PBYTE>(processHeap) + 0x70);
-                ULONG forceFlags = *reinterpret_cast<PULONG>(
-                    reinterpret_cast<PBYTE>(processHeap) + 0x74);
-#else
-                ULONG heapFlags = *reinterpret_cast<PULONG>(
-                    reinterpret_cast<PBYTE>(processHeap) + 0x40);
-                ULONG forceFlags = *reinterpret_cast<PULONG>(
-                    reinterpret_cast<PBYTE>(processHeap) + 0x44);
-#endif
-
+        void* processHeap = nullptr;
+        const void* heapPtrAddr = reinterpret_cast<const BYTE*>(pPeb) + kProcessHeapOffset;
+        if (!SehReadPointer(heapPtrAddr, processHeap)) {
+            result.errorCode = 2;
+            result.message = "ProcessHeap pointer read faulted";
+        } else if (processHeap) {
+            ULONG heapFlags = 0;
+            ULONG forceFlags = 0;
+            const void* flagsAddr = reinterpret_cast<const BYTE*>(processHeap) + kHeapFlagsOffset;
+            const void* forceAddr = reinterpret_cast<const BYTE*>(processHeap) + kHeapForceOffset;
+            if (!SehReadUlong(flagsAddr, heapFlags) || !SehReadUlong(forceAddr, forceFlags)) {
+                result.errorCode = 3;
+                result.message = "Heap flag read faulted";
+                SS_LOG_WARN(L"AntiDebug", L"Heap flag read faulted");
+            } else {
                 // Normal heap has Flags = 2 and ForceFlags = 0
                 // Debugged heap has additional flags set
                 constexpr ULONG kHeapGrowableFlag = 0x00000002;
@@ -1290,9 +1339,6 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_HeapFlags() {
                 }
             }
         }
-    } catch (const std::exception& e) {
-        result.errorCode = 1;
-        result.message = std::string("Heap flags check failed: ") + e.what();
     }
 #else
     result.message = "Heap flags check not supported on this platform";
@@ -2420,15 +2466,14 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_SoftwareBreakpoints() {
                     size = AntiDebugConstants::MAX_CODE_SECTION_SIZE;
                 }
 
-                // Scan for 0xCC pattern (INT 3)
+                // SEH-guarded scan — a partially mapped section tail or a
+                // section header pointing past mapped memory must not crash
+                // the process. The parametric overload uses the same helper.
                 size_t breakpointCount = 0;
-                for (SIZE_T j = 0; j < size; ++j) {
-                    if (pStart[j] == 0xCC) {
-                        breakpointCount++;
-                        if (breakpointCount >= AntiDebugConstants::MAX_BREAKPOINTS_THRESHOLD) {
-                            break;
-                        }
-                    }
+                if (!SehScanBreakpoints(pStart, size, breakpointCount)) {
+                    SS_LOG_WARN(L"AntiDebug", L"Code section scan faulted (section=%.8hs)",
+                                reinterpret_cast<const char*>(pSection->Name));
+                    continue;
                 }
 
                 if (breakpointCount >= AntiDebugConstants::MAX_BREAKPOINTS_THRESHOLD) {
@@ -2589,19 +2634,55 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
     PIMAGE_IMPORT_DESCRIPTOR pImportDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
         reinterpret_cast<PBYTE>(hModule) + importRva);
 
+    // Query our own module size so we can bound the import-descriptor and
+    // thunk walks. A torn-down or malformed import directory must not cause
+    // us to walk past the module image and into unrelated memory.
+    MODULEINFO selfInfo = {};
+    if (!::GetModuleInformation(::GetCurrentProcess(), hModule, &selfInfo, sizeof(selfInfo))) {
+        result.errorCode = 5;
+        result.message = "GetModuleInformation failed for host module";
+        result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
+        return result;
+    }
+    const uintptr_t imgStart = reinterpret_cast<uintptr_t>(hModule);
+    const uintptr_t imgEnd   = imgStart + selfInfo.SizeOfImage;
+
+    auto withinImage = [imgStart, imgEnd](const void* p, size_t span) noexcept {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+        return a >= imgStart && (a + span) <= imgEnd && (a + span) > a;
+    };
+
+    // Hard caps as a belt-and-braces guard against malformed tables that
+    // somehow pass the in-range checks.
+    constexpr size_t kMaxImportDescriptors = 4096;
+    constexpr size_t kMaxThunksPerModule   = 16384;
+
     size_t hookCount = 0;
     std::vector<HookInfo> foundHooks;
 
-    while (pImportDesc->Name != 0) {
+    size_t descCount = 0;
+    while (withinImage(pImportDesc, sizeof(IMAGE_IMPORT_DESCRIPTOR)) &&
+           pImportDesc->Name != 0 && descCount++ < kMaxImportDescriptors) {
+        if (pImportDesc->Name >= selfInfo.SizeOfImage) {
+            break;
+        }
         LPCSTR dllName = reinterpret_cast<LPCSTR>(
             reinterpret_cast<PBYTE>(hModule) + pImportDesc->Name);
+
+        if (pImportDesc->FirstThunk == 0 ||
+            pImportDesc->FirstThunk >= selfInfo.SizeOfImage) {
+            ++pImportDesc;
+            continue;
+        }
 
         PIMAGE_THUNK_DATA pThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
             reinterpret_cast<PBYTE>(hModule) + pImportDesc->FirstThunk);
 
         HMODULE hDll = ::GetModuleHandleA(dllName);
         if (hDll) {
-            while (pThunk->u1.Function != 0) {
+            size_t thunkCount = 0;
+            while (withinImage(pThunk, sizeof(IMAGE_THUNK_DATA)) &&
+                   pThunk->u1.Function != 0 && thunkCount++ < kMaxThunksPerModule) {
                 FARPROC pFunc = reinterpret_cast<FARPROC>(pThunk->u1.Function);
 
                 MODULEINFO modInfo = {};
@@ -2691,17 +2772,26 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_InlineHooks() {
             if (pFunc) {
                 PBYTE pBytes = reinterpret_cast<PBYTE>(pFunc);
 
+                // SEH-guarded read of the first 16 bytes — exported function
+                // pages may unmap their tail or be hot-patched into guard
+                // regions; a direct dereference would crash the host process.
+                BYTE prefix[16] = {};
+                const size_t copied = SehReadBytes(pBytes, prefix, sizeof(prefix));
+                if (copied < 2) {
+                    continue;
+                }
+
                 bool isHooked = false;
 
-                if (pBytes[0] == 0xE9) {
+                if (prefix[0] == 0xE9) {
                     isHooked = true;
-                } else if (pBytes[0] == 0xFF && pBytes[1] == 0x25) {
+                } else if (prefix[0] == 0xFF && prefix[1] == 0x25) {
                     isHooked = true;
-                } else if (pBytes[0] == 0x68) {
+                } else if (prefix[0] == 0x68) {
                     isHooked = true;
                 }
 #ifdef _WIN64
-                else if (pBytes[0] == 0x48 && pBytes[1] == 0xB8) {
+                else if (copied >= 2 && prefix[0] == 0x48 && prefix[1] == 0xB8) {
                     isHooked = true;
                 }
 #endif
@@ -2715,7 +2805,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_InlineHooks() {
                     hookInfo.moduleName = NarrowToWide(dllName);
                     hookInfo.functionName = funcName;
                     hookInfo.isSuspicious = true;
-                    hookInfo.currentBytes.assign(pBytes, pBytes + 16);
+                    hookInfo.currentBytes.assign(prefix, prefix + copied);
 
                     foundHooks.push_back(std::move(hookInfo));
 
