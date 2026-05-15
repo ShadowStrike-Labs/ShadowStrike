@@ -862,12 +862,29 @@ public:
                 return std::nullopt;
             }
 
+            // FileHash is fixed at 32 bytes. Reject algorithms that produce
+            // larger digests outright rather than silently failing inside
+            // CryptGetHashParam with ERROR_MORE_DATA.
+            size_t expectedDigestSize = 0;
+            switch (algorithm) {
+                case SignatureHashAlgorithm::SHA1:   expectedDigestSize = 20; break;
+                case SignatureHashAlgorithm::SHA256: expectedDigestSize = 32; break;
+                case SignatureHashAlgorithm::SHA384:
+                case SignatureHashAlgorithm::SHA512:
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"CalculateAuthenticodeHash: digest size of selected algorithm exceeds FileHash capacity (%zu bytes); refusing",
+                        sizeof(FileHash));
+                    CloseHandle(hFile);
+                    return std::nullopt;
+                default:
+                    expectedDigestSize = 32;
+                    break;
+            }
+
             ALG_ID algId = CALG_SHA_256;
             switch (algorithm) {
                 case SignatureHashAlgorithm::SHA1:   algId = CALG_SHA1; break;
                 case SignatureHashAlgorithm::SHA256: algId = CALG_SHA_256; break;
-                case SignatureHashAlgorithm::SHA384: algId = CALG_SHA_384; break;
-                case SignatureHashAlgorithm::SHA512: algId = CALG_SHA_512; break;
                 default: algId = CALG_SHA_256; break;
             }
 
@@ -885,12 +902,25 @@ public:
                 return std::nullopt;
             }
 
-            // Stream in HASH_CHUNK_SIZE chunks to avoid OOM on large files
+            // Stream in HASH_CHUNK_SIZE chunks to avoid OOM on large files.
+            // Distinguish a real ReadFile() failure from end-of-file so we
+            // never finalize a digest over a partial read.
             uint8_t chunk[HASH_CHUNK_SIZE];
-            DWORD bytesRead = 0;
             bool hashOk = true;
 
-            while (ReadFile(hFile, chunk, HASH_CHUNK_SIZE, &bytesRead, nullptr) && bytesRead > 0) {
+            for (;;) {
+                DWORD bytesRead = 0;
+                if (!ReadFile(hFile, chunk, HASH_CHUNK_SIZE, &bytesRead, nullptr)) {
+                    const DWORD err = GetLastError();
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"CalculateAuthenticodeHash: ReadFile failed for '%ls' (GLE=%lu)",
+                        pathStr.c_str(), err);
+                    hashOk = false;
+                    break;
+                }
+                if (bytesRead == 0) {
+                    break;  // EOF
+                }
                 if (!CryptHashData(hHash, chunk, bytesRead, 0)) {
                     hashOk = false;
                     break;
@@ -905,8 +935,17 @@ public:
                 return std::nullopt;
             }
 
-            DWORD hashLen = sizeof(hash);
+            DWORD hashLen = static_cast<DWORD>(sizeof(hash));
             if (!CryptGetHashParam(hHash, HP_HASHVAL, hash.data(), &hashLen, 0)) {
+                CryptDestroyHash(hHash);
+                CryptReleaseContext(hProv, 0);
+                return std::nullopt;
+            }
+
+            if (hashLen != static_cast<DWORD>(expectedDigestSize)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"CalculateAuthenticodeHash: digest length mismatch (got %lu, expected %zu)",
+                    hashLen, expectedDigestSize);
                 CryptDestroyHash(hHash);
                 CryptReleaseContext(hProv, 0);
                 return std::nullopt;
@@ -927,6 +966,21 @@ public:
         std::span<const uint8_t> expectedHash,
         SignatureHashAlgorithm algorithm
     ) noexcept {
+        // Require the caller to supply exactly the digest size for the
+        // requested algorithm. Accepting any prefix would let an attacker
+        // forge a match using only a few leading bytes of the real digest.
+        size_t expectedDigestSize = 0;
+        switch (algorithm) {
+            case SignatureHashAlgorithm::SHA1:   expectedDigestSize = 20; break;
+            case SignatureHashAlgorithm::SHA256: expectedDigestSize = 32; break;
+            case SignatureHashAlgorithm::SHA384: expectedDigestSize = 48; break;
+            case SignatureHashAlgorithm::SHA512: expectedDigestSize = 64; break;
+            default: return false;
+        }
+        if (expectedHash.size() != expectedDigestSize) {
+            return false;
+        }
+
         auto calculatedHash = CalculateAuthenticodeHash(filePath, algorithm);
         if (!calculatedHash.has_value()) {
             return false;
@@ -936,8 +990,12 @@ public:
             return false;
         }
 
-        return std::equal(expectedHash.begin(), expectedHash.end(),
-                          calculatedHash->begin());
+        // Constant-time comparison over exactly expectedDigestSize bytes.
+        volatile uint8_t diff = 0;
+        for (size_t i = 0; i < expectedDigestSize; ++i) {
+            diff |= static_cast<uint8_t>(expectedHash[i] ^ (*calculatedHash)[i]);
+        }
+        return diff == 0;
     }
 
     // ========================================================================
