@@ -150,6 +150,7 @@ struct NetworkTrafficFilter::Impl {
     // -------------------------------------------------------------------------
     // Synchronization
     // -------------------------------------------------------------------------
+    mutable std::shared_mutex m_configMutex;
     mutable std::shared_mutex m_ruleMutex;
     mutable std::shared_mutex m_connectionMutex;
     mutable std::shared_mutex m_blocklistMutex;
@@ -157,6 +158,14 @@ struct NetworkTrafficFilter::Impl {
     mutable std::shared_mutex m_historyMutex;
     mutable std::shared_mutex m_dnsMutex;
     mutable std::shared_mutex m_eventMutex;
+
+    // Snapshot the configuration under a brief shared lock.  All hot-path
+    // readers MUST use this helper rather than touching m_config directly so
+    // that concurrent UpdateConfig() callers can never observe a torn struct.
+    [[nodiscard]] NetworkFilterConfig SnapshotConfig() const {
+        std::shared_lock lock(m_configMutex);
+        return m_config;
+    }
 
     // -------------------------------------------------------------------------
     // Data Stores
@@ -206,6 +215,8 @@ struct NetworkTrafficFilter::Impl {
     // -------------------------------------------------------------------------
     ShadowStrike::ThreatIntel::ThreatIntelIndex* m_threatIntel{ nullptr };
     ShadowStrike::PatternStore::PatternIndex*    m_patternIndex{ nullptr };
+    ShadowStrike::Core::Engine::BehaviorAnalyzer* m_behaviorAnalyzer{ nullptr };
+    ShadowStrike::Core::Engine::ThreatDetector*   m_threatDetector{ nullptr };
 
     // -------------------------------------------------------------------------
     // Callbacks
@@ -309,6 +320,7 @@ struct NetworkTrafficFilter::Impl {
             }
 
             // Layout: [FILTER_MESSAGE_HEADER (OS)][SHADOWSTRIKE_MESSAGE_HEADER][payload]
+            const auto* osHeader = reinterpret_cast<const FILTER_MESSAGE_HEADER*>(buffer.data());
             const auto* ssHeader = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(
                 buffer.data() + sizeof(FILTER_MESSAGE_HEADER));
 
@@ -324,7 +336,10 @@ struct NetworkTrafficFilter::Impl {
             switch (static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(ssHeader->MessageType)) {
                 case FilterMessageType_NetworkAlert: {
                     const auto* evt = static_cast<const NETWORK_CONNECTION_EVENT*>(payload);
-                    ProcessNetworkConnectionEvent(*evt, ssHeader->MessageId);
+                    // Use the OS-assigned MessageId for the reply correlation; the
+                    // ShadowStrike-protocol MessageId is for internal correlation
+                    // only and would not match what FltSendMessage queued.
+                    ProcessNetworkConnectionEvent(*evt, osHeader->MessageId);
                     break;
                 }
                 default:
@@ -335,7 +350,7 @@ struct NetworkTrafficFilter::Impl {
         Utils::Logger::Info("NetworkTrafficFilter: WFP listener thread exiting.");
     }
 
-    void ProcessNetworkConnectionEvent(const NETWORK_CONNECTION_EVENT& evt, uint64_t messageId) {
+    void ProcessNetworkConnectionEvent(const NETWORK_CONNECTION_EVENT& evt, uint64_t osMessageId) {
         NetworkConnection conn;
         conn.connectionId  = GenerateConnectionId();
         conn.processId     = evt.Header.ProcessId;
@@ -351,27 +366,59 @@ struct NetworkTrafficFilter::Impl {
             conn.tuple.local.address.ipv4    = evt.LocalAddress.Address.V4.Address;
             conn.tuple.remote.address.version = IPVersion::IPv4;
             conn.tuple.remote.address.ipv4    = evt.RemoteAddress.Address.V4.Address;
-        } else {
+        } else if (evt.LocalAddress.Address.Family == AF_INET6) {
             conn.tuple.local.address.version = IPVersion::IPv6;
             std::memcpy(conn.tuple.local.address.ipv6.data(),
                         evt.LocalAddress.Address.V6.Bytes, 16);
             conn.tuple.remote.address.version = IPVersion::IPv6;
             std::memcpy(conn.tuple.remote.address.ipv6.data(),
                         evt.RemoteAddress.Address.V6.Bytes, 16);
+        } else {
+            // Unknown/zero family from a malformed kernel event: reject so we
+            // don't propagate uninitialised address bytes through the pipeline.
+            Utils::Logger::Warn("NetworkTrafficFilter: Rejecting kernel event with unknown address family {}.",
+                static_cast<unsigned>(evt.LocalAddress.Address.Family));
+            // Still send a deny reply so the kernel does not stall waiting on us.
+            struct {
+                FILTER_REPLY_HEADER  ReplyHeader;
+                uint32_t             Verdict;
+            } badReply{};
+            badReply.ReplyHeader.MessageId = osMessageId;
+            badReply.ReplyHeader.Status    = S_OK;
+            badReply.Verdict               = 1u; // block on parse failure
+            (void)FilterReplyMessage(m_hPort, &badReply.ReplyHeader, sizeof(badReply));
+            return;
         }
         conn.tuple.local.port  = ntohs(evt.LocalAddress.Port);
         conn.tuple.remote.port = ntohs(evt.RemoteAddress.Port);
         conn.creationTime      = Now();
         conn.lastActivity      = Now();
 
-        if (evt.RemoteHostname[0] != L'\0') {
-            conn.domainName = Utils::StringUtils::ToNarrow(evt.RemoteHostname);
+        // Kernel-supplied wide buffers are fixed-size and MAY be unterminated
+        // when an attacker controls the source path or hostname.  Bound every
+        // read with wcsnlen against the declared array capacity to prevent
+        // out-of-bounds reads when constructing std::wstring/std::string.
+        {
+            constexpr size_t kHostnameMax =
+                sizeof(evt.RemoteHostname) / sizeof(evt.RemoteHostname[0]);
+            const size_t hostLen = wcsnlen(evt.RemoteHostname, kHostnameMax);
+            if (hostLen > 0) {
+                std::wstring hostW(evt.RemoteHostname, hostLen);
+                conn.domainName = Utils::StringUtils::ToNarrow(hostW);
+            }
         }
-        if (evt.ProcessImagePath[0] != L'\0') {
-            conn.processName = evt.ProcessImagePath;
-        } else if (auto name = Utils::ProcessUtils::GetProcessName(evt.Header.ProcessId)) {
-            conn.processName = *name;
+        {
+            constexpr size_t kPathMax =
+                sizeof(evt.ProcessImagePath) / sizeof(evt.ProcessImagePath[0]);
+            const size_t pathLen = wcsnlen(evt.ProcessImagePath, kPathMax);
+            if (pathLen > 0) {
+                conn.processName.assign(evt.ProcessImagePath, pathLen);
+            } else if (auto name = Utils::ProcessUtils::GetProcessName(evt.Header.ProcessId)) {
+                conn.processName = *name;
+            }
         }
+
+        m_statTotalConnections.fetch_add(1, std::memory_order_relaxed);
 
         // Evaluate and respond
         // First check blocklists (bypassed in original path — CRITICAL)
@@ -395,15 +442,26 @@ struct NetworkTrafficFilter::Impl {
             action = EvaluateRules(conn);
         }
 
-        // Send verdict back
+        if (action == FilterAction::Block) {
+            m_statConnectionsBlocked.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            m_statConnectionsAllowed.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Send verdict back using the OS-assigned MessageId so the filter
+        // manager can correlate the reply with the original message.
         struct {
             FILTER_REPLY_HEADER  ReplyHeader;
             uint32_t             Verdict;
         } reply{};
-        reply.ReplyHeader.MessageId  = messageId;
+        reply.ReplyHeader.MessageId  = osMessageId;
         reply.ReplyHeader.Status     = S_OK;
         reply.Verdict                = (action == FilterAction::Block) ? 1u : 0u;
-        FilterReplyMessage(m_hPort, &reply.ReplyHeader, sizeof(reply));
+        const HRESULT hr = FilterReplyMessage(m_hPort, &reply.ReplyHeader, sizeof(reply));
+        if (FAILED(hr)) {
+            Utils::Logger::Warn("NetworkTrafficFilter: FilterReplyMessage failed: 0x{:08X} (msgId={})",
+                static_cast<uint32_t>(hr), osMessageId);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -412,9 +470,10 @@ struct NetworkTrafficFilter::Impl {
 
     FilterAction EvaluateRules(const NetworkConnection& conn) {
         m_statRulesEvaluated++;
+        const NetworkFilterConfig cfg = SnapshotConfig();
         std::shared_lock lock(m_ruleMutex);
 
-        FilterAction result       = m_config.defaultAction;
+        FilterAction result       = cfg.defaultAction;
         uint32_t     highestPrio  = 0;
         bool         matched      = false;
 
@@ -507,7 +566,8 @@ struct NetworkTrafficFilter::Impl {
         analysis.processId = pid;
         analysis.remote    = remote;
 
-        if (!m_config.detectC2) return analysis;
+        const NetworkFilterConfig cfg = SnapshotConfig();
+        if (!cfg.detectC2) return analysis;
 
         std::lock_guard lock(m_beaconMutex);
         auto key     = std::make_pair(pid, remote.ToString());
@@ -562,7 +622,7 @@ struct NetworkTrafficFilter::Impl {
         analysis.avgInterval = mean / 1000.0;
         analysis.jitter      = cv;
 
-        if (cv < m_config.beaconVarianceThreshold) {
+        if (cv < cfg.beaconVarianceThreshold) {
             analysis.isBeacon  = true;
             analysis.confidence = std::clamp((1.0 - cv) * 100.0, 0.0, 100.0);
             m_statC2Detected.fetch_add(1, std::memory_order_relaxed);
@@ -577,7 +637,7 @@ struct NetworkTrafficFilter::Impl {
 
     void CleanupStaleConnections() {
         const auto now     = Now();
-        const auto timeout = m_config.connectionTimeout;
+        const auto timeout = SnapshotConfig().connectionTimeout;
 
         std::unique_lock lock(m_connectionMutex);
         for (auto it = m_connections.begin(); it != m_connections.end(); ) {
@@ -657,7 +717,10 @@ bool NetworkTrafficFilter::Initialize(std::shared_ptr<Utils::ThreadPool> threadP
     if (m_impl->m_initialized.exchange(true)) return true;
 
     m_impl->m_threadPool = threadPool;
-    m_impl->m_config     = config;
+    {
+        std::unique_lock lock(m_impl->m_configMutex);
+        m_impl->m_config = config;
+    }
 
     Utils::Logger::Info("NetworkTrafficFilter: Initializing...");
 
@@ -717,18 +780,15 @@ bool NetworkTrafficFilter::IsRunning() const noexcept {
 }
 
 void NetworkTrafficFilter::UpdateConfig(const NetworkFilterConfig& config) {
-    // config is a value type – no mutex needed for the swap itself, but
-    // we serialise against readers of m_config by using a brief exclusive lock
-    // on an existing mutex.  We re-use m_ruleMutex as the config guard.
     {
-        std::unique_lock lock(m_impl->m_ruleMutex);
+        std::unique_lock lock(m_impl->m_configMutex);
         m_impl->m_config = config;
     }
     Utils::Logger::Info("NetworkTrafficFilter: Configuration updated.");
 }
 
 NetworkFilterConfig NetworkTrafficFilter::GetConfig() const {
-    std::shared_lock lock(m_impl->m_ruleMutex);
+    std::shared_lock lock(m_impl->m_configMutex);
     return m_impl->m_config;
 }
 
@@ -741,19 +801,21 @@ FilterAction NetworkTrafficFilter::OnConnectionAttempt(const NetworkConnection& 
         return FilterAction::Allow;
     }
 
+    const NetworkFilterConfig cfg = m_impl->SnapshotConfig();
+
     m_impl->m_statTotalConnections.fetch_add(1, std::memory_order_relaxed);
 
-    // --- Connection limit enforcement ---
-    {
-        std::shared_lock lock(m_impl->m_connectionMutex);
-        if (m_impl->m_connections.size() >= m_impl->m_config.maxConnections) {
-            Utils::Logger::Warn("NetworkTrafficFilter: Max tracked connections ({}) reached; dropping oldest.",
-                m_impl->m_config.maxConnections);
-            // We drop from the map under exclusive lock below – take it now
-            lock.unlock();
-            std::unique_lock wLock(m_impl->m_connectionMutex);
-            if (!m_impl->m_connections.empty())
+    // --- Connection limit enforcement (single exclusive lock; no TOCTOU) ---
+    if (cfg.maxConnections > 0) {
+        std::unique_lock lock(m_impl->m_connectionMutex);
+        if (m_impl->m_connections.size() >= cfg.maxConnections) {
+            Utils::Logger::Warn("NetworkTrafficFilter: Max tracked connections ({}) reached; dropping one entry.",
+                cfg.maxConnections);
+            if (!m_impl->m_connections.empty()) {
                 m_impl->m_connections.erase(m_impl->m_connections.begin());
+                if (m_impl->m_statActiveConnections.load(std::memory_order_relaxed) > 0)
+                    m_impl->m_statActiveConnections.fetch_sub(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -870,6 +932,8 @@ void NetworkTrafficFilter::OnConnectionClosed(uint64_t connectionId) {
 }
 
 void NetworkTrafficFilter::OnDataTransfer(uint64_t connectionId, bool outbound, size_t dataSize, std::span<const uint8_t> data) {
+    const NetworkFilterConfig cfg = m_impl->SnapshotConfig();
+
     // Exclusive lock: we modify connection fields (bytesSent/Received, lastActivity, appProtocol, isTLS)
     std::unique_lock lock(m_impl->m_connectionMutex);
     auto it = m_impl->m_connections.find(connectionId);
@@ -885,7 +949,7 @@ void NetworkTrafficFilter::OnDataTransfer(uint64_t connectionId, bool outbound, 
     it->second.lastActivity = Now();
 
     // Deep Packet Inspection
-    if (m_impl->m_config.deepInspection && data.size() >= 4) {
+    if (cfg.deepInspection && data.size() >= 4) {
         if ((data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' ') ||
             (data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T') ||
             (data[0] == 'H' && data[1] == 'E' && data[2] == 'A' && data[3] == 'D') ||
@@ -907,13 +971,13 @@ void NetworkTrafficFilter::OnDataTransfer(uint64_t connectionId, bool outbound, 
     lock.unlock();
 
     // Exfiltration check (outside connection lock)
-    if (outbound && m_impl->m_config.detectExfiltration &&
-        dataSize > m_impl->m_config.largeTransferThreshold) {
+    if (outbound && cfg.detectExfiltration &&
+        dataSize > cfg.largeTransferThreshold) {
         CheckExfiltration(pid);
     }
 
     // C2 beacon analysis (outside connection lock)
-    if (outbound && m_impl->m_config.detectC2) {
+    if (outbound && cfg.detectC2) {
         auto analysis = m_impl->AnalyzeBeacon(pid, remote);
         if (analysis.isBeacon) {
             std::vector<C2DetectionCallback> callbacks;
@@ -1289,22 +1353,25 @@ bool NetworkTrafficFilter::SaveRulesToFile(const std::wstring& filePath) const {
 FilterAction NetworkTrafficFilter::OnDNSQuery(const DNSQueryEvent& query) {
     m_impl->m_statDnsQueries.fetch_add(1, std::memory_order_relaxed);
 
+    const NetworkFilterConfig cfg = m_impl->SnapshotConfig();
+
     // Detect DGA
     bool blocked = false;
     FilterAction action = FilterAction::Allow;
 
-    if (m_impl->m_config.detectDGA && IsDGADomain(query.domain)) {
+    const bool isDga = (cfg.detectDGA && IsDGADomain(query.domain));
+    if (isDga) {
         m_impl->m_statDgaDetected.fetch_add(1, std::memory_order_relaxed);
-        action = m_impl->m_config.maliciousDomainAction;
+        action = cfg.maliciousDomainAction;
         if (action == FilterAction::Block)
             m_impl->m_statDnsBlocked.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Domain blocklist check
     if (action != FilterAction::Block) {
-        std::shared_lock lock(m_impl->m_blocklistMutex);
         std::string lower = query.domain;
         for (auto& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        std::shared_lock lock(m_impl->m_blocklistMutex);
         if (m_impl->m_blockedDomains.count(lower)) {
             action = FilterAction::Block;
             m_impl->m_statDnsBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -1333,7 +1400,7 @@ FilterAction NetworkTrafficFilter::OnDNSQuery(const DNSQueryEvent& query) {
     // Store in DNS history
     DNSQueryEvent stored = query;
     stored.blocked = blocked;
-    stored.isDGA   = (m_impl->m_config.detectDGA && IsDGADomain(query.domain));
+    stored.isDGA   = isDga;
     {
         std::unique_lock lock(m_impl->m_dnsMutex);
         if (m_impl->m_recentDNS.size() >= NetworkFilterConstants::MAX_CONNECTION_HISTORY)
@@ -1370,6 +1437,7 @@ BeaconAnalysis NetworkTrafficFilter::AnalyzeBeaconPattern(uint32_t pid, const Ne
 
 bool NetworkTrafficFilter::IsDGADomain(const std::string& domain) const {
     if (domain.empty()) return false;
+    const NetworkFilterConfig cfg = m_impl->SnapshotConfig();
     // Extract the registrable part (everything before the last two labels)
     std::string host = domain;
     // Strip trailing dot
@@ -1380,7 +1448,7 @@ bool NetworkTrafficFilter::IsDGADomain(const std::string& domain) const {
     if (label.size() < 6) return false; // too short to be DGA
 
     const double entropy = CalculateDomainEntropy(label);
-    if (entropy < m_impl->m_config.dgaEntropyThreshold) return false;
+    if (entropy < cfg.dgaEntropyThreshold) return false;
 
     // Consonant ratio heuristic: DGA domains tend to have high consonant density
     static constexpr std::string_view kVowels = "aeiouAEIOU";
@@ -1396,7 +1464,7 @@ bool NetworkTrafficFilter::IsDGADomain(const std::string& domain) const {
     const double consonantRatio = static_cast<double>(consonants) / static_cast<double>(alphaCount);
 
     // High entropy AND high consonant ratio = likely DGA
-    return (entropy >= m_impl->m_config.dgaEntropyThreshold && consonantRatio > 0.70);
+    return (entropy >= cfg.dgaEntropyThreshold && consonantRatio > 0.70);
 }
 
 double NetworkTrafficFilter::CalculateDomainEntropy(const std::string& domain) const {
@@ -1404,6 +1472,7 @@ double NetworkTrafficFilter::CalculateDomainEntropy(const std::string& domain) c
 }
 
 bool NetworkTrafficFilter::CheckExfiltration(uint32_t pid) {
+    const NetworkFilterConfig cfg = m_impl->SnapshotConfig();
     // Compute total outbound bytes for this PID across all connections
     uint64_t totalOut = 0;
     {
@@ -1413,7 +1482,7 @@ bool NetworkTrafficFilter::CheckExfiltration(uint32_t pid) {
         }
     }
 
-    if (totalOut < m_impl->m_config.largeTransferThreshold) return false;
+    if (totalOut < cfg.largeTransferThreshold) return false;
 
     m_impl->m_statExfiltrationDetected.fetch_add(1, std::memory_order_relaxed);
     Utils::Logger::Warn("NetworkTrafficFilter: Potential exfiltration by PID {} ({} bytes out).", pid, totalOut);
@@ -1427,7 +1496,7 @@ bool NetworkTrafficFilter::CheckExfiltration(uint32_t pid) {
             callbacks.push_back(cb);
     }
 
-    bool block = (m_impl->m_config.exfiltrationAction == FilterAction::Block);
+    bool block = (cfg.exfiltrationAction == FilterAction::Block);
     for (const auto& cb : callbacks) {
         try {
             NetworkEndpoint dummy{};
@@ -1637,6 +1706,14 @@ void NetworkTrafficFilter::SetThreatIntelIndex(ShadowStrike::ThreatIntel::Threat
 
 void NetworkTrafficFilter::SetPatternIndex(ShadowStrike::PatternStore::PatternIndex* index) {
     m_impl->m_patternIndex = index;
+}
+
+void NetworkTrafficFilter::SetBehaviorAnalyzer(ShadowStrike::Core::Engine::BehaviorAnalyzer* analyzer) {
+    m_impl->m_behaviorAnalyzer = analyzer;
+}
+
+void NetworkTrafficFilter::SetThreatDetector(ShadowStrike::Core::Engine::ThreatDetector* detector) {
+    m_impl->m_threatDetector = detector;
 }
 
 // ============================================================================
