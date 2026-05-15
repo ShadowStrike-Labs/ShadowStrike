@@ -237,6 +237,31 @@ namespace RealTime {
             return entropy;
         }
 
+        // Aligned-safe little-endian load helpers. Avoid reinterpret_cast on
+        // possibly-misaligned bytes (UB under strict-aliasing / UBSan and slow
+        // on some platforms even though x64 tolerates unaligned access).
+        [[nodiscard]] inline uint32_t LoadLE32(const uint8_t* p) noexcept {
+            uint32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            return v;
+        }
+        [[nodiscard]] inline uint64_t LoadLE64(const uint8_t* p) noexcept {
+            uint64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            return v;
+        }
+
+        [[nodiscard]] inline float ClampUnit(float v) noexcept {
+            if (v < 0.0f) return 0.0f;
+            if (v > 1.0f) return 1.0f;
+            return v;
+        }
+        [[nodiscard]] inline double ClampEntropy(double v) noexcept {
+            if (v < 0.0) return 0.0;
+            if (v > 8.0) return 8.0;
+            return v;
+        }
+
         bool MemContains(const uint8_t* hay, size_t hLen, const uint8_t* needle, size_t nLen) {
             if (nLen > hLen || nLen == 0) return false;
             for (size_t i = 0; i <= hLen - nLen; ++i) {
@@ -554,12 +579,15 @@ namespace RealTime {
     }
 
     bool MemoryProtection::MemoryProtectionImpl::DetectReflectiveDLL(const uint8_t* data, size_t size) {
-        if (size < 0x100) return false;
+        if (!data || size < 0x100) return false;
         if (data[0] != 'M' || data[1] != 'Z') return false;
-        if (size < 0x40) return false;
-        uint32_t peOff = *reinterpret_cast<const uint32_t*>(data + 0x3C);
-        if (peOff >= size - 4 || peOff > 0x1000) return false;
-        uint32_t peSig = *reinterpret_cast<const uint32_t*>(data + peOff);
+        if (size < 0x40 + sizeof(uint32_t)) return false;
+        const uint32_t peOff = LoadLE32(data + 0x3C);
+        // peOff must leave room for a 4-byte signature AND be within a sane
+        // PE-header window (<= 0x1000).  Use subtraction-safe comparison.
+        if (peOff > 0x1000) return false;
+        if (peOff > size || sizeof(uint32_t) > size - peOff) return false;
+        const uint32_t peSig = LoadLE32(data + peOff);
         return peSig == PE_SIG_VAL;
     }
     // =========================================================================
@@ -673,10 +701,11 @@ namespace RealTime {
                 continue;
             }
 
-            if (hdr.size() >= 0x40) {
-                uint32_t peOff = *reinterpret_cast<const uint32_t*>(hdr.data() + 0x3C);
-                if (peOff < hdr.size() - 4 && peOff <= 0x400) {
-                    uint32_t peSig = *reinterpret_cast<const uint32_t*>(hdr.data() + peOff);
+            if (hdr.size() >= 0x40 + sizeof(uint32_t)) {
+                const uint32_t peOff = LoadLE32(hdr.data() + 0x3C);
+                if (peOff <= 0x400 && peOff <= hdr.size() &&
+                    sizeof(uint32_t) <= hdr.size() - peOff) {
+                    const uint32_t peSig = LoadLE32(hdr.data() + peOff);
                     if (peSig != PE_SIG_VAL) {
                         MemoryViolation v;
                         v.type = MemoryViolationType::Module_Stomping;
@@ -759,7 +788,7 @@ namespace RealTime {
             if (!ReadSafe(pid, stackStart, stackData, STACK_SCAN)) continue;
             uint32_t suspRet = 0, totalRet = 0;
             for (size_t off = 0; off + sizeof(uint64_t) <= stackData.size(); off += sizeof(uint64_t)) {
-                uint64_t potRet = *reinterpret_cast<const uint64_t*>(stackData.data() + off);
+                const uint64_t potRet = LoadLE64(stackData.data() + off);
                 if (potRet == 0) continue;
                 if (potRet < 0x10000 || potRet > 0x7FFFFFFFFFFF) continue;
                 ++totalRet;
@@ -916,8 +945,8 @@ namespace RealTime {
         v.type = MemoryViolationType::Kernel_Shellcode;
         v.address = e->DetectionAddress; v.size = static_cast<size_t>(e->RegionSize);
         v.targetPid = e->ProcessId; v.threadId = e->ThreadId; v.fromKernel = true;
-        v.entropy = static_cast<double>(e->Entropy) / 1000.0;
-        v.confidence = static_cast<float>(e->Confidence) / 100.0f;
+        v.entropy = ClampEntropy(static_cast<double>(e->Entropy) / 1000.0);
+        v.confidence = ClampUnit(static_cast<float>(e->Confidence) / 100.0f);
         v.detectedAt = std::chrono::system_clock::now();
         std::string det = "Kernel shellcode: ";
         if (e->HasAPIHashing) det += "[API-Hash] ";
@@ -928,7 +957,10 @@ namespace RealTime {
         if (e->HasStackPivot) det += "[StackPivot] ";
         det += "Score=" + std::to_string(e->ThreatScore);
         v.details = std::move(det);
-        v.dump.assign(e->ContentSample, e->ContentSample + std::min(sizeof(e->ContentSample), MAX_DUMP_SIZE));
+        {
+            const size_t dl = std::min<size_t>(sizeof(e->ContentSample), MAX_DUMP_SIZE);
+            v.dump.assign(e->ContentSample, e->ContentSample + dl);
+        }
         if (e->PrimaryType == Shellcode_Syscall) v.type = MemoryViolationType::Syscall_Stub;
         else if (e->PrimaryType == Shellcode_APIHash) v.type = MemoryViolationType::API_Hash_Resolution;
         else if (e->PrimaryType == Shellcode_ROP || e->PrimaryType == Shellcode_JOP) v.type = MemoryViolationType::ROP_Gadget;
@@ -944,8 +976,8 @@ namespace RealTime {
         v.address = e->InjectedAddress; v.size = static_cast<size_t>(e->InjectedSize);
         v.sourcePid = e->SourceProcessId; v.targetPid = e->TargetProcessId;
         v.threadId = e->SourceThreadId; v.fromKernel = true;
-        v.entropy = static_cast<double>(e->Entropy) / 1000.0;
-        v.confidence = static_cast<float>(e->Confidence) / 100.0f;
+        v.entropy = ClampEntropy(static_cast<double>(e->Entropy) / 1000.0);
+        v.confidence = ClampUnit(static_cast<float>(e->Confidence) / 100.0f);
         v.detectedAt = std::chrono::system_clock::now();
         switch (e->InjectionType) {
         case Injection_ReflectiveDLL:       v.type = MemoryViolationType::Reflective_DLL; break;
@@ -976,7 +1008,7 @@ namespace RealTime {
         v.address = e->ActualImageBase; v.size = static_cast<size_t>(e->ActualImageSize);
         v.targetPid = e->HollowedProcessId; v.sourcePid = e->ParentProcessId;
         v.threadId = e->HollowedThreadId; v.fromKernel = true;
-        v.confidence = static_cast<float>(e->Confidence) / 100.0f;
+        v.confidence = ClampUnit(static_cast<float>(e->Confidence) / 100.0f);
         v.detectedAt = std::chrono::system_clock::now();
         if (e->Flags & HOLLOWING_FLAG_DOPPELGANGING) v.type = MemoryViolationType::Process_Doppelganging;
         else if (e->Flags & HOLLOWING_FLAG_CONFIRMED) v.type = MemoryViolationType::Process_Hollowing;
@@ -1028,7 +1060,7 @@ namespace RealTime {
         v.address = e->TargetAddress; v.size = static_cast<size_t>(e->Size_);
         v.sourcePid = e->SourceProcessId; v.targetPid = e->TargetProcessId;
         v.threadId = e->SourceThreadId; v.fromKernel = true;
-        v.entropy = static_cast<double>(e->ContentEntropy) / 1000.0;
+        v.entropy = ClampEntropy(static_cast<double>(e->ContentEntropy) / 1000.0);
         v.detectedAt = std::chrono::system_clock::now();
         if (e->DetectionFlags & MEMACCESS_FLAG_LSASS_TARGET) v.confidence = 0.93f;
         else if (e->DetectionFlags & MEMACCESS_FLAG_AV_TARGET) v.confidence = 0.95f;
@@ -1106,7 +1138,13 @@ namespace RealTime {
             default: break;
             }
             std::string subj = std::string("Memory Threat: ") + ViolationTypeToStr(v.type) + " PID " + std::to_string(pid);
-            as.RaiseAlert(sev, Communication::AlertType::ThreatDetection, subj, v.ToJson(), "MemoryProtection");
+            const std::string alertId =
+                as.RaiseAlert(sev, Communication::AlertType::ThreatDetection, subj, v.ToJson(), "MemoryProtection");
+            if (alertId.empty()) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"AlertSystem returned empty alert id for PID=%u type=%hs (alert may have been suppressed or rate-limited)",
+                    pid, ViolationTypeToStr(v.type));
+            }
             m_stats.alertsRaised++;
         } catch (const std::exception& ex) {
             SS_LOG_WARN(LOG_CATEGORY, L"AlertSystem report failed: %hs", ex.what());
@@ -1200,7 +1238,14 @@ namespace RealTime {
         result.pid = pid;
         result.compromised = false;
 
-        auto regions = CollectRegions(pid, m_config.maxRegionsPerScan);
+        // Hold a shared lock for the duration of the scan so that concurrent
+        // Configure() calls cannot mutate m_config while detection helpers
+        // read alertThreshold / blockThreshold / highEntropyThreshold.  Multiple
+        // scans may proceed in parallel under shared ownership.
+        std::shared_lock<std::shared_mutex> cfgLk(m_dataMutex);
+
+        const uint32_t maxRegions = m_config.maxRegionsPerScan;
+        auto regions = CollectRegions(pid, maxRegions);
         for (const auto& mbi : regions)
             result.pagesScanned += (mbi.RegionSize / 4096);
 
@@ -1241,6 +1286,10 @@ namespace RealTime {
         ProcessUtils::ProcessId pid, uint64_t addr, size_t size, MemoryScanResult& result) {
         auto startTime = std::chrono::high_resolution_clock::now();
         result.pid = pid;
+
+        // Hold shared lock so detection helpers see a stable m_config.
+        std::shared_lock<std::shared_mutex> cfgLk(m_dataMutex);
+
         std::vector<uint8_t> buf;
         if (!ReadSafe(pid, addr, buf, std::min(size, SHELLCODE_SCAN_WINDOW))) return;
         double ent = CalcEntropy(buf.data(), buf.size());
@@ -1248,7 +1297,10 @@ namespace RealTime {
 
         auto mkV = [&](MemoryViolationType t, float c, const char* det) {
             MemoryViolation v;
-            v.type = t; v.address = addr; v.size = size; v.confidence = c;
+            // Report the actual inspected window size, not the caller-requested
+            // size — otherwise a 1MB request that only scanned the first 4KB
+            // produces a misleading violation footprint.
+            v.type = t; v.address = addr; v.size = ds; v.confidence = c;
             v.entropy = ent; v.targetPid = pid; v.details = det;
             v.detectedAt = std::chrono::system_clock::now();
             CapDump(v, d, ds);
@@ -1262,6 +1314,12 @@ namespace RealTime {
 
         result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now() - startTime);
+
+        // Reflect targeted scans in the global statistics so dashboards see them.
+        m_stats.scansPerformed++;
+        result.pagesScanned = (ds + 4095) / 4096;
+        m_stats.pagesScanned += result.pagesScanned;
+        m_stats.totalScanTimeUs += result.scanDuration.count();
     }
 
     // =========================================================================
@@ -1315,7 +1373,15 @@ namespace RealTime {
             try {
                 ProcessCreationMonitor::Instance().UnregisterTerminateCallback(m_pcmTerminateCbId);
                 m_pcmTerminateCbId = 0;
-            } catch (...) {}
+            } catch (const std::exception& ex) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ProcessCreationMonitor::UnregisterTerminateCallback(id=%llu) threw: %hs",
+                    m_pcmTerminateCbId, ex.what());
+            } catch (...) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ProcessCreationMonitor::UnregisterTerminateCallback(id=%llu) threw (unknown)",
+                    m_pcmTerminateCbId);
+            }
         }
         SS_LOG_INFO(LOG_CATEGORY, L"MemoryProtection engine stopped");
     }
@@ -1401,6 +1467,17 @@ namespace RealTime {
     }
 
     bool MemoryProtection::MonitorProcess(Utils::ProcessUtils::ProcessId pid) {
+        // System/idle PIDs and obviously invalid PIDs must never enter the
+        // monitoring set: the periodic scanner would either no-op or fail
+        // noisily on every iteration.
+        if (pid == 0 || pid == 4) {
+            SS_LOG_WARN(LOG_CATEGORY, L"MonitorProcess rejected: invalid/system PID=%u", pid);
+            return false;
+        }
+        if (!ProcessUtils::IsProcessRunning(pid)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"MonitorProcess rejected: PID=%u not running", pid);
+            return false;
+        }
         std::unique_lock lk(m_impl->m_dataMutex);
         if (m_impl->m_monitoredProcesses.contains(pid)) return true;
         m_impl->m_monitoredProcesses.insert(pid);
@@ -1479,6 +1556,13 @@ namespace RealTime {
 
         // Dispatch by declared structure size.
         // With #pragma pack(push,1) all structures have distinct sizes.
+        //
+        // The kernel handlers reach ProcessViolation() which reads
+        // m_config.alertThreshold / blockThreshold.  Hold a shared lock for
+        // the duration of the dispatch so a concurrent Configure() cannot
+        // mutate these fields underneath us.
+        std::shared_lock<std::shared_mutex> cfgLk(m_impl->m_dataMutex);
+
         if (declaredSize == sizeof(SHELLCODE_DETECTION_EVENT)) {
             m_impl->HandleKernelShellcode(static_cast<const SHELLCODE_DETECTION_EVENT*>(payload));
         } else if (declaredSize == sizeof(INJECTION_DETECTION_EVENT)) {
@@ -1573,13 +1657,10 @@ namespace RealTime {
                 }
             }
             if (flags & EXPLOIT_PROTECT_HEAP_TERMINATE) {
-                PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY hchk{};
-                hchk.RaiseExceptionOnInvalidHandleReference = 1;
-                hchk.HandleExceptionsPermanentlyEnabled     = 1;
-                (void)SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &hchk, sizeof(hchk));
-
                 // PROCESS_MITIGATION_HEAP_POLICY requires recent Windows SDK
-                // Use runtime check via GetProcAddress to remain compatible
+                // (ProcessHeapPolicy enumerator value = 16).  Strict handle
+                // check is intentionally handled below under STRICT_HANDLES so
+                // each flag has a single, well-defined responsibility.
                 struct HeapPolicy_ { DWORD Flags; };
                 HeapPolicy_ hp{};
                 hp.Flags = 0x1;  // TerminateOnHeapErrors
@@ -1590,6 +1671,17 @@ namespace RealTime {
                         GetLastError());
                     allOk = false;
                 }
+            }
+            if (flags & EXPLOIT_PROTECT_SEHOP) {
+                // SEHOP is a system-wide / per-image setting controlled via the
+                // IMAGE_LOAD_CONFIG_DIRECTORY (SEHandlerTable) and registry
+                // policies — it is NOT a runtime SetProcessMitigationPolicy
+                // policy on Windows.  Document that explicitly so callers do
+                // not assume silent success.
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"EnableExploitProtection: SEHOP cannot be applied at runtime per-process; "
+                    L"ensure binary is built with /SAFESEH and SEHOP is enabled system-wide (PID=%u)",
+                    pid);
             }
             if (flags & EXPLOIT_PROTECT_NO_DYNAMIC_CODE) {
                 PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dcp{};
@@ -1617,8 +1709,14 @@ namespace RealTime {
         }
 
         // Always: register the process for continuous monitoring regardless of
-        // whether hardware mitigations could be applied.
-        MonitorProcess(pid);
+        // whether hardware mitigations could be applied.  Use the return value
+        // so that failures (invalid/dead PID, system PIDs) are reflected back.
+        const bool monitorOk = MonitorProcess(pid);
+        if (!monitorOk) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"EnableExploitProtection: monitor registration failed for PID=%u", pid);
+            allOk = false;
+        }
         return allOk;
     }
 
@@ -1662,8 +1760,10 @@ namespace RealTime {
         {
             uint8_t peHdr[0x100] = {};
             peHdr[0] = 'M'; peHdr[1] = 'Z';
-            *reinterpret_cast<uint32_t*>(peHdr + 0x3C) = 0x80u;
-            *reinterpret_cast<uint32_t*>(peHdr + 0x80) = 0x00004550u; // "PE\0\0"
+            const uint32_t peOff = 0x80u;
+            const uint32_t peSig = 0x00004550u; // "PE\0\0"
+            std::memcpy(peHdr + 0x3C, &peOff, sizeof(peOff));
+            std::memcpy(peHdr + 0x80, &peSig, sizeof(peSig));
             if (!m_impl->DetectReflectiveDLL(peHdr, sizeof(peHdr))) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: reflective DLL header not detected");
                 passed = false;
