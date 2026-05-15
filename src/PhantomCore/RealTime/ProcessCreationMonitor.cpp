@@ -281,17 +281,36 @@ namespace {
         return std::to_string(pid) + "_" + std::to_string(ms);
     }
 
-    /// @brief Check if string contains another string (case insensitive)
+    /// @brief ASCII-only case fold. Locale-independent — non-ASCII wchar_t values
+    ///        pass through unchanged. Safe for path / command-line / hash-string
+    ///        matching where the only case-bearing characters are ASCII.
+    constexpr wchar_t AsciiToLower(wchar_t c) noexcept {
+        return (c >= L'A' && c <= L'Z')
+            ? static_cast<wchar_t>(c + (L'a' - L'A'))
+            : c;
+    }
+
+    /// @brief Check if string contains another string (case insensitive, ASCII fold).
+    /// @note Defers to Utils::StringUtils::IContains, which uses Windows
+    ///       CompareStringOrdinal under the hood for fully locale-independent
+    ///       behaviour (avoids the Turkish-locale dotted/dotless I trap that
+    ///       a raw ::towlower would introduce).
     bool ContainsCaseInsensitive(std::wstring_view str, std::wstring_view sub) {
-        auto it = std::search(
-            str.begin(), str.end(),
-            sub.begin(), sub.end(),
-            [](wchar_t ch1, wchar_t ch2) {
-                return ::towlower(static_cast<wint_t>(ch1)) ==
-                       ::towlower(static_cast<wint_t>(ch2));
-            }
-        );
-        return it != str.end();
+        return Utils::StringUtils::IContains(str, sub);
+    }
+
+    /// @brief Case-insensitive ASCII hash compare. Hashes are hex-encoded ASCII
+    ///        so a simple A-Z↔a-z fold is sufficient and locale-independent.
+    [[nodiscard]] bool EqualsHashIgnoreCase(const std::string& a, const std::string& b) noexcept {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const unsigned char ca = static_cast<unsigned char>(a[i]);
+            const unsigned char cb = static_cast<unsigned char>(b[i]);
+            const unsigned char la = (ca >= 'A' && ca <= 'Z') ? static_cast<unsigned char>(ca + ('a' - 'A')) : ca;
+            const unsigned char lb = (cb >= 'A' && cb <= 'Z') ? static_cast<unsigned char>(cb + ('a' - 'A')) : cb;
+            if (la != lb) return false;
+        }
+        return true;
     }
 
     /// @brief Convert suspicious pattern to string
@@ -346,17 +365,21 @@ namespace {
         return false;
     }
 
-    /// @brief Case-insensitive wildcard path match (supports * glob token)
+    /// @brief Case-insensitive wildcard path match (supports * glob token).
+    /// @note Uses an ASCII case fold (AsciiToLower) rather than ::towlower —
+    ///       under non-default locales (e.g. Turkish), ::towlower(L'I') yields
+    ///       L'ı' which would silently break path-pattern matching against
+    ///       rules authored in en-US (a privilege-escalation hazard for any
+    ///       Allow rule that depends on case-insensitive matching).
     bool PathMatchesPattern(const std::wstring& path, const std::wstring& pattern) noexcept {
         if (pattern.empty() || pattern == L"*") return true;
 
-        // Build lower-case copies via ::towlower to avoid string allocation in hot path
+        // Build lower-case copies via AsciiToLower — locale-independent, no allocation
+        // beyond the two result strings.
         std::wstring lPath(path.size(), L'\0');
         std::wstring lPat(pattern.size(), L'\0');
-        std::transform(path.begin(),    path.end(),    lPath.begin(),
-                       [](wchar_t c){ return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c))); });
-        std::transform(pattern.begin(), pattern.end(), lPat.begin(),
-                       [](wchar_t c){ return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c))); });
+        std::transform(path.begin(),    path.end(),    lPath.begin(), AsciiToLower);
+        std::transform(pattern.begin(), pattern.end(), lPat.begin(),  AsciiToLower);
 
         if (lPat.find(L'*') == std::wstring::npos)
             return lPath == lPat;
@@ -764,6 +787,7 @@ struct ProcessCreationMonitor::Impl {
                     event.processId, event.imagePath.c_str(),
                     detection->signatureName.c_str(),
                     static_cast<uint32_t>(detection->threatLevel));
+                NotifyCreate(event, ProcessVerdict::Block);
                 return ProcessVerdict::Block;
             }
         }
@@ -780,12 +804,14 @@ struct ProcessCreationMonitor::Impl {
         if (ruleVerdict.has_value()) {
             if (*ruleVerdict == ProcessVerdict::Block) {
                 stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
+                NotifyCreate(event, ProcessVerdict::Block);
                 return ProcessVerdict::Block;
             }
             if (*ruleVerdict == ProcessVerdict::Allow) {
                 // Explicit Allow rule — trusted process, skip further expensive checks
                 UpdateProcessState(event, ProcessVerdict::Allow, cfg);
                 stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
+                NotifyCreate(event, ProcessVerdict::Allow);
                 return ProcessVerdict::Allow;
             }
         }
@@ -805,6 +831,7 @@ struct ProcessCreationMonitor::Impl {
                 scanVerdict = PerformScan(event, localScanEngine);
                 if (scanVerdict == ProcessVerdict::Block) {
                     stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
+                    NotifyCreate(event, ProcessVerdict::Block);
                     return ProcessVerdict::Block;
                 }
             }
@@ -1236,7 +1263,7 @@ struct ProcessCreationMonitor::Impl {
             bool match = true;
 
             if (rule.imagePathPattern && !PathMatchesPattern(event.imagePath, *rule.imagePathPattern)) match = false;
-            if (match && rule.imageHash && event.imageHash != *rule.imageHash) match = false;
+            if (match && rule.imageHash && !EqualsHashIgnoreCase(event.imageHash, *rule.imageHash)) match = false;
             if (match && rule.imageNamePattern && !PathMatchesPattern(event.imageFileName, *rule.imageNamePattern)) match = false;
 
             if (match && rule.commandLinePattern) {
@@ -1593,9 +1620,16 @@ ProcessVerdict ProcessCreationMonitor::OnProcessCreate(uint32_t pid, const std::
     event.parentProcessId = parentPid;
     event.timestamp = std::chrono::system_clock::now();
 
-    // Extract filename
-    std::filesystem::path p(imagePath);
-    event.imageFileName = p.filename().wstring();
+    // Extract filename — std::filesystem::path can throw on malformed input
+    // (extremely long paths, embedded NULs from a hostile kernel feed, etc).
+    // Falling back to imagePath itself keeps the lightweight kernel-callback
+    // path exception-safe without dropping the event.
+    try {
+        std::filesystem::path p(imagePath);
+        event.imageFileName = p.filename().wstring();
+    } catch (...) {
+        event.imageFileName.clear();
+    }
 
     return m_impl->HandleProcessCreate(event);
 }
@@ -1716,6 +1750,14 @@ bool ProcessCreationMonitor::IsCommandLineSuspicious(const std::wstring& command
 }
 
 std::wstring ProcessCreationMonitor::DecodeEncodedContent(const std::wstring& content) const {
+    // Defensive input cap. The Windows command-line limit is ~32 KiB; PowerShell
+    // -EncodedCommand payloads in the wild are well below this. Refuse anything
+    // larger to bound the allocations that follow (decoded ≈ 0.75 × narrow).
+    constexpr size_t kMaxEncodedInputChars = 64 * 1024;
+    if (content.empty() || content.size() > kMaxEncodedInputChars) {
+        return {};
+    }
+
     // Base64 decode: input is a wide string of Base64-ASCII chars
     static constexpr std::string_view kB64Chars =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1817,6 +1859,26 @@ std::vector<ProcessPolicyRule> ProcessCreationMonitor::GetRules() const {
 
 bool ProcessCreationMonitor::LoadRulesFromFile(const std::wstring& filePath) {
     try {
+        // Defensive cap on rules file size. Rules are authored by administrators;
+        // anything larger than 8 MiB indicates corruption or hostile substitution
+        // and would let nlohmann::json balloon memory before validation.
+        constexpr uintmax_t kMaxRulesFileBytes = 8ull * 1024ull * 1024ull;
+        std::error_code sizeEc;
+        const uintmax_t fileSize = std::filesystem::file_size(filePath, sizeEc);
+        if (sizeEc) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"Failed to stat rules file %ls: %hs", filePath.c_str(), sizeEc.message().c_str());
+            return false;
+        }
+        if (fileSize > kMaxRulesFileBytes) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"Rules file too large: %ls (%llu bytes, cap=%llu)",
+                filePath.c_str(),
+                static_cast<unsigned long long>(fileSize),
+                static_cast<unsigned long long>(kMaxRulesFileBytes));
+            return false;
+        }
+
         std::ifstream file(filePath);
         if (!file.is_open()) {
             SS_LOG_ERROR(L"ProcessCreationMonitor",
