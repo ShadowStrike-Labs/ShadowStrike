@@ -336,6 +336,50 @@ namespace {
         }
     };
 
+    /// Maximum bytes of an attacker-controlled wide string we are willing to
+    /// pull through ToNarrow / format into a log line. Anything beyond this
+    /// is presumed hostile and capped.
+    constexpr size_t MAX_KERNEL_PATH_CHARS    = 32768;   // 32 KiB wchar — enough for \\?\ paths
+    constexpr size_t MAX_KERNEL_CMDLINE_CHARS = 32768;   // 32 KiB wchar — NT command-line cap
+    constexpr size_t MAX_KERNEL_REASON_CHARS  = 1024;    // block-reason cap
+    constexpr uint64_t MAX_KERNEL_IMAGE_SIZE  = 256ull * 1024ull * 1024ull; // 256 MiB
+
+    /// Sanitize an attacker-controlled wide string for inclusion in a log line.
+    ///
+    /// Threat model: file paths, command lines, image paths and block reasons
+    /// flow from the kernel and the file system and are therefore attacker-
+    /// controlled. Without sanitization, a malicious payload can embed CR/LF
+    /// or ANSI escape sequences to forge log lines (log-injection / "smudging")
+    /// or break downstream log ingestion pipelines. We strip every control
+    /// character (< 0x20 and DEL) and cap to a fixed length so a hostile
+    /// actor cannot blow the formatter's buffer either.
+    [[nodiscard]] std::wstring SanitizeForLog(std::wstring_view in,
+                                              size_t maxChars = 256) {
+        std::wstring out;
+        const size_t cap = (in.size() < maxChars) ? in.size() : maxChars;
+        out.reserve(cap);
+        for (size_t i = 0; i < cap; ++i) {
+            const wchar_t ch = in[i];
+            if (ch < 0x20 || ch == 0x7F) {
+                out.push_back(L'?');
+            } else {
+                out.push_back(ch);
+            }
+        }
+        if (in.size() > maxChars) {
+            out.append(L"...");
+        }
+        return out;
+    }
+
+    /// Validate that a kernel-sourced process id is plausible for user-mode
+    /// JS-scanner work. Rejects:
+    ///   - PID 0 (System Idle Process — never runs scripts)
+    ///   - PID 4 (System / kernel)
+    [[nodiscard]] inline bool IsAcceptableUserModePid(uint32_t pid) noexcept {
+        return pid != 0 && pid != 4;
+    }
+
     /// JSON-escape a string for safe embedding in JSON values.
     [[nodiscard]] std::string JsonEscape(std::string_view str) {
         std::string out;
@@ -841,7 +885,20 @@ JSScanResult JavaScriptScannerImpl::ScanFile(
         if (!std::filesystem::exists(path, ec)) {
             result.status = JSScanStatus::ErrorFileAccess;
             result.description = "File not found";
-            SS_LOG_WARN(LOG_CATEGORY, L"File not found: %ls", path.wstring().c_str());
+            SS_LOG_WARN(LOG_CATEGORY, L"File not found: %ls",
+                        SanitizeForLog(path.wstring()).c_str());
+            return result;
+        }
+
+        // Reject non-regular files (devices, reparse points / junctions, sockets,
+        // FIFOs). Symlinks to regular files are fine but we reject reparse points
+        // explicitly to defang TOCTOU games and $Recycle.Bin/device path tricks.
+        const auto fileStatus = std::filesystem::symlink_status(path, ec);
+        if (ec || !std::filesystem::is_regular_file(fileStatus)) {
+            result.status = JSScanStatus::ErrorFileAccess;
+            result.description = "Not a regular file";
+            SS_LOG_WARN(LOG_CATEGORY, L"Refusing to scan non-regular file: %ls",
+                        SanitizeForLog(path.wstring()).c_str());
             return result;
         }
 
@@ -873,7 +930,7 @@ JSScanResult JavaScriptScannerImpl::ScanFile(
             result.status = JSScanStatus::ErrorFileAccess;
             result.description = "Cannot read file: " + fileError.message;
             SS_LOG_ERROR(LOG_CATEGORY, L"Cannot read file: %ls (error %u)",
-                         path.wstring().c_str(), fileError.win32);
+                         SanitizeForLog(path.wstring()).c_str(), fileError.win32);
             return result;
         }
 
@@ -1571,23 +1628,40 @@ void JavaScriptScannerImpl::UnregisterCallbacks() {
 }
 
 void JavaScriptScannerImpl::NotifyCallbacks(const JSScanResult& result) {
-    std::shared_lock lock(m_callbackMutex);
-    for (const auto& callback : m_callbacks) {
+    // Copy the callback list under the lock and invoke OUTSIDE the lock.
+    // Invoking attacker-influenced callbacks while holding m_callbackMutex
+    // would allow a slow / blocking / re-entrant callback to wedge every
+    // subsequent registration and notification — and could deadlock if a
+    // callback re-entered the scanner (which is a public, supported API).
+    std::vector<JSScanResultCallback> snapshot;
+    {
+        std::shared_lock lock(m_callbackMutex);
+        snapshot = m_callbacks;
+    }
+    for (const auto& callback : snapshot) {
         try {
             callback(result);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Callback exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Callback raised unknown exception");
         }
     }
 }
 
 void JavaScriptScannerImpl::NotifyError(const std::string& message, int code) {
-    std::shared_lock lock(m_callbackMutex);
-    for (const auto& callback : m_errorCallbacks) {
+    // Same lock-then-copy-then-invoke discipline as NotifyCallbacks.
+    std::vector<JSErrorCallback> snapshot;
+    {
+        std::shared_lock lock(m_callbackMutex);
+        snapshot = m_errorCallbacks;
+    }
+    for (const auto& callback : snapshot) {
         try {
             callback(message, code);
         } catch (...) {
-            // Ignore callback exceptions
+            // Error-callback exceptions are intentionally swallowed to
+            // avoid recursive error-handling loops.
         }
     }
 }
@@ -2485,6 +2559,16 @@ void JavaScriptScannerImpl::OnKernelProcessNotify(
     if (!m_initialized.load(std::memory_order_acquire)) return;
     if (!isCreate) return;  // Only interested in process creation
 
+    // Kernel input validation — reject pseudo-PIDs and implausibly large
+    // attacker-controlled strings before any allocation.
+    if (!IsAcceptableUserModePid(processId)) return;
+    if (imagePath.empty() || imagePath.size() > MAX_KERNEL_PATH_CHARS) return;
+    if (commandLine.size() > MAX_KERNEL_CMDLINE_CHARS) {
+        // Truncate rather than reject — we still want to inspect the head
+        // of a hostile, gigabyte-long command line.
+        commandLine = commandLine.substr(0, MAX_KERNEL_CMDLINE_CHARS);
+    }
+
     // Detect JS engine processes
     const auto lastSep = imagePath.find_last_of(L"\\/");
     const auto fileName = (lastSep != std::wstring_view::npos)
@@ -2501,10 +2585,9 @@ void JavaScriptScannerImpl::OnKernelProcessNotify(
     if (!isJSEngine) return;
 
     SS_LOG_INFO(LOG_CATEGORY,
-        L"Kernel: JS engine process created PID=%u image=%.*ls",
+        L"Kernel: JS engine process created PID=%u image=%ls",
         processId,
-        static_cast<int>(std::min(imagePath.size(), size_t(260))),
-        imagePath.data());
+        SanitizeForLog(imagePath, 260).c_str());
 
     // Check command line for inline script or encoded content
     if (!commandLine.empty()) {
@@ -2532,6 +2615,14 @@ void JavaScriptScannerImpl::OnKernelImageLoad(
 
     if (!m_initialized.load(std::memory_order_acquire)) return;
 
+    // Kernel input validation: reject pseudo-PIDs, empty/oversized paths,
+    // and implausible image geometry. Note: imageBase==0 is impossible for
+    // a real loaded image; we tolerate it (some kernel paths may not fill
+    // it) but reject implausibly large sizes.
+    if (!IsAcceptableUserModePid(processId)) return;
+    if (imagePath.empty() || imagePath.size() > MAX_KERNEL_PATH_CHARS) return;
+    if (static_cast<uint64_t>(imageSize) > MAX_KERNEL_IMAGE_SIZE) return;
+
     const auto lastSep = imagePath.find_last_of(L"\\/");
     const auto fileName = (lastSep != std::wstring_view::npos)
         ? imagePath.substr(lastSep + 1) : imagePath;
@@ -2548,16 +2639,21 @@ void JavaScriptScannerImpl::OnKernelImageLoad(
     if (!isJSRuntime) return;
 
     SS_LOG_INFO(LOG_CATEGORY,
-        L"Kernel: JS runtime loaded PID=%u image=%.*ls base=0x%llX size=%zu",
+        L"Kernel: JS runtime loaded PID=%u image=%ls base=0x%llX size=%zu",
         processId,
-        static_cast<int>(std::min(imagePath.size(), size_t(260))),
-        imagePath.data(),
+        SanitizeForLog(imagePath, 260).c_str(),
         imageBase, imageSize);
 }
 
 bool JavaScriptScannerImpl::RequestKernelProcessBlock(
     uint32_t processId,
     const std::wstring& reason) {
+
+    if (!IsAcceptableUserModePid(processId)) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Refusing kernel process block for pseudo-PID %u", processId);
+        return false;
+    }
 
     try {
         auto& ipc = Communication::IPCManager::Instance();
@@ -2570,13 +2666,19 @@ bool JavaScriptScannerImpl::RequestKernelProcessBlock(
 
         blockRequest.messageType = 0x30;  // FilterMessageType_RegisterProtectedProcess
         blockRequest.processId = processId;
-        wcsncpy_s(blockRequest.reason, reason.c_str(),
-                   std::min(reason.size(), size_t(255)));
+        // Bound the caller-supplied reason to the fixed wchar_t array, leaving
+        // room for the NUL terminator. wcsncpy_s with array-deduced destination
+        // size guarantees the destination is NUL-terminated.
+        const size_t reasonCopyChars =
+            std::min<size_t>(reason.size(),
+                             (sizeof(blockRequest.reason) / sizeof(wchar_t)) - 1);
+        wcsncpy_s(blockRequest.reason, reason.c_str(), reasonCopyChars);
 
         if (ipc.SendToKernel(&blockRequest, sizeof(blockRequest))) {
             SS_LOG_INFO(LOG_CATEGORY,
                 L"Kernel process block requested PID=%u reason=%ls",
-                processId, reason.c_str());
+                processId,
+                SanitizeForLog(reason, MAX_KERNEL_REASON_CHARS).c_str());
             return true;
         }
 
@@ -2588,6 +2690,10 @@ bool JavaScriptScannerImpl::RequestKernelProcessBlock(
         SS_LOG_ERROR(LOG_CATEGORY,
             L"Kernel process block exception PID=%u: %hs",
             processId, e.what());
+        return false;
+    } catch (...) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Kernel process block unknown exception PID=%u", processId);
         return false;
     }
 }
