@@ -165,6 +165,31 @@ namespace {
     }
 
     /**
+     * @brief RAII zeroizer for retrieved private-key material.
+     *        Guarantees private-key bytes returned from RetrieveKey() are
+     *        wiped from the heap on every return path regardless of outcome.
+     */
+    class ScopedKeyZeroizer {
+    public:
+        explicit ScopedKeyZeroizer(std::optional<std::vector<uint8_t>>& key) noexcept
+            : m_key(&key) {}
+
+        ScopedKeyZeroizer(const ScopedKeyZeroizer&) = delete;
+        ScopedKeyZeroizer& operator=(const ScopedKeyZeroizer&) = delete;
+        ScopedKeyZeroizer(ScopedKeyZeroizer&&) = delete;
+        ScopedKeyZeroizer& operator=(ScopedKeyZeroizer&&) = delete;
+
+        ~ScopedKeyZeroizer() {
+            if (m_key && m_key->has_value() && !(*m_key)->empty()) {
+                SecureZeroMemory((*m_key)->data(), (*m_key)->size());
+            }
+        }
+
+    private:
+        std::optional<std::vector<uint8_t>>* m_key;
+    };
+
+    /**
      * @brief RAII wrapper for BCrypt algorithm handles
      */
     class BCryptAlgorithmHandle {
@@ -2078,11 +2103,24 @@ CryptoResult CryptoManagerImpl::EncryptFile(
     const auto readSize = static_cast<size_t>(fileSize.QuadPart);
     std::vector<uint8_t> fileContent(readSize);
     DWORD bytesRead = 0;
-    if (readSize > 0 && !ReadFile(hInput.Get(), fileContent.data(),
-                                   static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
-        return CryptoResult::InvalidData;
+    if (readSize > 0) {
+        if (!ReadFile(hInput.Get(), fileContent.data(),
+                      static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
+            const DWORD err = GetLastError();
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"EncryptFile: ReadFile failed for '%ls' (GLE=%lu)",
+                inputPathStr.c_str(), err);
+            SecureZeroMemory(fileContent.data(), fileContent.capacity());
+            return CryptoResult::InvalidData;
+        }
+        if (bytesRead != static_cast<DWORD>(readSize)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"EncryptFile: short read for '%ls' (expected %zu, got %lu)",
+                inputPathStr.c_str(), readSize, bytesRead);
+            SecureZeroMemory(fileContent.data(), fileContent.capacity());
+            return CryptoResult::InvalidData;
+        }
     }
-    fileContent.resize(bytesRead);
 
     auto result = Encrypt(fileContent, key, algorithm, {}, {});
     SecureZeroMemory(fileContent.data(), fileContent.capacity());
@@ -2153,11 +2191,22 @@ CryptoResult CryptoManagerImpl::DecryptFile(
     const auto readSize = static_cast<size_t>(fileSize.QuadPart);
     std::vector<uint8_t> ciphertext(readSize);
     DWORD bytesRead = 0;
-    if (readSize > 0 && !ReadFile(hInput.Get(), ciphertext.data(),
-                                   static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
-        return CryptoResult::InvalidData;
+    if (readSize > 0) {
+        if (!ReadFile(hInput.Get(), ciphertext.data(),
+                      static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
+            const DWORD err = GetLastError();
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DecryptFile: ReadFile failed for '%ls' (GLE=%lu)",
+                inputPathStr.c_str(), err);
+            return CryptoResult::InvalidData;
+        }
+        if (bytesRead != static_cast<DWORD>(readSize)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DecryptFile: short read for '%ls' (expected %zu, got %lu)",
+                inputPathStr.c_str(), readSize, bytesRead);
+            return CryptoResult::InvalidData;
+        }
     }
-    ciphertext.resize(bytesRead);
 
     const size_t ivSize = GetIVSize(algorithm);
     const size_t tagSize = GetTagSize(algorithm);
@@ -2525,8 +2574,26 @@ bool CryptoManagerImpl::VerifyHMAC(
     std::span<const uint8_t> expectedMAC,
     std::span<const uint8_t> key,
     HashAlgorithm algorithm) {
+    if (expectedMAC.empty() || key.empty()) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"VerifyHMAC: rejected empty %ls",
+            expectedMAC.empty() ? L"expectedMAC" : L"key");
+        m_stats.authenticationFailures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     auto computed = ComputeHMAC(data, key, algorithm);
-    return ConstantTimeCompare(computed, expectedMAC);
+    if (computed.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"VerifyHMAC: HMAC computation failed (algorithm=%d)",
+            static_cast<int>(algorithm));
+        m_stats.authenticationFailures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const bool valid = ConstantTimeCompare(computed, expectedMAC);
+    if (!valid) {
+        m_stats.authenticationFailures.fetch_add(1, std::memory_order_relaxed);
+    }
+    return valid;
 }
 
 std::optional<std::vector<uint8_t>> CryptoManagerImpl::HashFile(
@@ -2586,10 +2653,23 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::HashFile(
     std::vector<uint8_t> buffer(FILE_CHUNK_SIZE);
     DWORD bytesRead = 0;
 
-    while (ReadFile(hFile.Get(), buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)
-           && bytesRead > 0) {
+    for (;;) {
+        if (!ReadFile(hFile.Get(), buffer.data(),
+                      static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
+            const DWORD err = GetLastError();
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"HashFile: ReadFile failed for '%ls' (GLE=%lu) — refusing to finalize partial hash",
+                filePathStr.c_str(), err);
+            return std::nullopt;
+        }
+        if (bytesRead == 0) {
+            break;  // EOF
+        }
         status = BCryptHashData(hashHandle.Get(), buffer.data(), bytesRead, 0);
         if (!NT_SUCCESS(status)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"HashFile: BCryptHashData failed for '%ls' (NTSTATUS=0x%08X)",
+                filePathStr.c_str(), status);
             return std::nullopt;
         }
     }
@@ -3129,18 +3209,65 @@ bool CryptoManagerImpl::VerifyPassword(
             return false;
         }
         KDFAlgorithm algorithm = static_cast<KDFAlgorithm>(rawAlgorithm);
-        uint32_t iterations = static_cast<uint32_t>(std::stoul(parts[1]));
+
+        // Reject empty/odd salt or hash fields. Empty hash would cause
+        // outputLength=0 and ConstantTimeCompare(empty,empty) → true (auth bypass).
+        if (parts[2].empty() || parts[3].empty() ||
+            (parts[2].length() % 2) != 0 || (parts[3].length() % 2) != 0) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"VerifyPassword: malformed hash record (salt=%zu, hash=%zu)",
+                parts[2].length(), parts[3].length());
+            return false;
+        }
+
+        // Reject implausible iteration counts.
+        uint32_t iterations = 0;
+        try {
+            unsigned long parsed = std::stoul(parts[1]);
+            if (parsed == 0 || parsed > 100000000UL) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"VerifyPassword: iteration count out of range: %lu", parsed);
+                return false;
+            }
+            iterations = static_cast<uint32_t>(parsed);
+        } catch (...) {
+            SS_LOG_WARN(LOG_CATEGORY, L"VerifyPassword: unparseable iteration count");
+            return false;
+        }
+
+        auto hexNibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            return -1;
+        };
 
         std::vector<uint8_t> salt;
+        salt.reserve(parts[2].length() / 2);
         for (size_t i = 0; i < parts[2].length(); i += 2) {
-            salt.push_back(static_cast<uint8_t>(
-                std::stoi(parts[2].substr(i, 2), nullptr, 16)));
+            int hi = hexNibble(parts[2][i]);
+            int lo = hexNibble(parts[2][i + 1]);
+            if (hi < 0 || lo < 0) {
+                SS_LOG_WARN(LOG_CATEGORY, L"VerifyPassword: non-hex character in salt");
+                return false;
+            }
+            salt.push_back(static_cast<uint8_t>((hi << 4) | lo));
         }
 
         std::vector<uint8_t> expectedHash;
+        expectedHash.reserve(parts[3].length() / 2);
         for (size_t i = 0; i < parts[3].length(); i += 2) {
-            expectedHash.push_back(static_cast<uint8_t>(
-                std::stoi(parts[3].substr(i, 2), nullptr, 16)));
+            int hi = hexNibble(parts[3][i]);
+            int lo = hexNibble(parts[3][i + 1]);
+            if (hi < 0 || lo < 0) {
+                SS_LOG_WARN(LOG_CATEGORY, L"VerifyPassword: non-hex character in stored hash");
+                return false;
+            }
+            expectedHash.push_back(static_cast<uint8_t>((hi << 4) | lo));
+        }
+
+        if (expectedHash.empty()) {
+            return false;
         }
 
         KDFParameters params;
@@ -3149,6 +3276,9 @@ bool CryptoManagerImpl::VerifyPassword(
         params.outputLength = expectedHash.size();
 
         auto derived = DeriveKey(password, salt, params);
+        if (derived.empty() || derived.size() != expectedHash.size()) {
+            return false;
+        }
         return ConstantTimeCompare(derived, expectedHash);
 
     } catch (...) {
@@ -3358,6 +3488,7 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::ExportKey(
     if (!keyData) {
         return std::nullopt;
     }
+    ScopedKeyZeroizer keyDataGuard(keyData);
 
     auto meta = GetKeyMetadata(keyId);
     if (!meta || !meta->isExportable) {
@@ -3803,6 +3934,7 @@ SignatureResult CryptoManagerImpl::Sign(
         result.result = CryptoResult::KeyNotFound;
         return result;
     }
+    ScopedKeyZeroizer keyDataGuard(keyData);
 
     auto keyMeta = GetKeyMetadata(privateKeyId);
     if (!keyMeta) {
@@ -4111,6 +4243,7 @@ DecryptionResult CryptoManagerImpl::RSADecrypt(
         result.result = CryptoResult::KeyNotFound;
         return result;
     }
+    ScopedKeyZeroizer keyDataGuard(keyData);
 
     std::shared_lock algLock(m_algMutex);
     if (!m_rsaAlg.IsValid()) {
@@ -4206,6 +4339,7 @@ std::optional<std::vector<uint8_t>> CryptoManagerImpl::ECDHKeyAgreement(
     if (!keyData) {
         return std::nullopt;
     }
+    ScopedKeyZeroizer keyDataGuard(keyData);
 
     std::shared_lock algLock(m_algMutex);
     if (!m_ecdhP256Alg.IsValid()) {
@@ -4302,9 +4436,18 @@ bool CryptoManagerImpl::InitializeAlgorithms() {
         return false;
     }
 
-    m_rsaAlg.Open(BCRYPT_RSA_ALGORITHM);
-    m_ecdsaP256Alg.Open(BCRYPT_ECDSA_P256_ALGORITHM);
-    m_ecdhP256Alg.Open(BCRYPT_ECDH_P256_ALGORITHM);
+    if (!m_rsaAlg.Open(BCRYPT_RSA_ALGORITHM)) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"InitializeAlgorithms: BCryptOpenAlgorithmProvider(RSA) failed; RSA operations will be unavailable");
+    }
+    if (!m_ecdsaP256Alg.Open(BCRYPT_ECDSA_P256_ALGORITHM)) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"InitializeAlgorithms: BCryptOpenAlgorithmProvider(ECDSA P-256) failed; ECDSA operations will be unavailable");
+    }
+    if (!m_ecdhP256Alg.Open(BCRYPT_ECDH_P256_ALGORITHM)) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"InitializeAlgorithms: BCryptOpenAlgorithmProvider(ECDH P-256) failed; ECDH key agreement will be unavailable");
+    }
 
     return true;
 }
@@ -4328,11 +4471,12 @@ bool CryptoManagerImpl::InitializeTPM() {
                                           NCRYPT_RSA_ALGORITHM,
                                           L"SS_TPM_SEAL_KEY", 0, 0);
         if (status != ERROR_SUCCESS) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Failed to create TPM seal key: 0x%08lX", status);
-            m_tpmAvailable.store(true, std::memory_order_release);
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"InitializeTPM: NCryptCreatePersistedKey failed: 0x%08lX; marking TPM unavailable",
+                status);
             m_tpmSealKey = 0;
-            SS_LOG_INFO(LOG_CATEGORY, L"TPM initialized (seal key unavailable)");
-            return true;
+            m_tpmAvailable.store(false, std::memory_order_release);
+            return false;
         }
 
         DWORD keyLen = CryptoConstants::RSA_2048_KEY_BITS;
