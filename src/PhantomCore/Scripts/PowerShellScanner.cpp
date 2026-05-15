@@ -545,6 +545,14 @@ public:
                 return finalize(result, startTime);
             }
 
+            if (commandLine.size() > PSConstants::MAX_CMDLINE_LENGTH) {
+                SS_LOG_WARN(LOG_CAT, L"Command line too long: %zu bytes (max: %zu)",
+                    commandLine.size(), PSConstants::MAX_CMDLINE_LENGTH);
+                result.status      = ScanStatus::SKIPPED_SIZE_LIMIT;
+                result.description = "Command line exceeds length limit";
+                return finalize(result, startTime);
+            }
+
             std::string cmdLower = toLower(std::string(commandLine));
 
             // Only scan PowerShell processes
@@ -1024,7 +1032,9 @@ private:
 
     [[nodiscard]] std::string decodeBase64(std::string_view encoded) const noexcept {
         try {
-            if (encoded.empty() || encoded.size() > 10 * 1024 * 1024) return {};
+            const uint32_t maxSize = getConfigValue<uint32_t>(
+                [](const PowerShellScanConfig& c){ return c.maxScriptSize; });
+            if (encoded.empty() || encoded.size() > maxSize) return {};
 
             // Clean whitespace
             std::string clean;
@@ -1323,6 +1333,7 @@ private:
         const std::string& cmdLine,
         std::string& payload
     ) const noexcept {
+        if (cmdLine.size() > PSConstants::MAX_CMDLINE_LENGTH) return false;
         std::string lower = toLower(cmdLine);
         static constexpr const char* FLAGS[] = {
             "-encodedcommand ", "-enc ", "-e ", "-ec ",
@@ -1519,18 +1530,22 @@ private:
 
     void insertCache(const std::string& hash, const ScanResult& result) noexcept {
         if (hash.empty()) return;
-        std::unique_lock lk(m_cacheMtx);
-        auto it = m_cache.find(hash);
-        if (it != m_cache.end()) {
-            m_cacheLru.erase(it->second.lruIt);
-            m_cache.erase(it);
-        }
-        while (m_cache.size() >= PSConstants::SCAN_CACHE_CAPACITY && !m_cacheLru.empty()) {
-            m_cache.erase(m_cacheLru.back());
-            m_cacheLru.pop_back();
-        }
-        m_cacheLru.push_front(hash);
-        m_cache.emplace(hash, CacheEntry{result, Clock::now(), m_cacheLru.begin()});
+        try {
+            std::unique_lock lk(m_cacheMtx);
+            auto it = m_cache.find(hash);
+            if (it != m_cache.end()) {
+                m_cacheLru.erase(it->second.lruIt);
+                m_cache.erase(it);
+            }
+            while (m_cache.size() >= PSConstants::SCAN_CACHE_CAPACITY && !m_cacheLru.empty()) {
+                m_cache.erase(m_cacheLru.back());
+                m_cacheLru.pop_back();
+            }
+            m_cacheLru.push_front(hash);
+            m_cache.emplace(hash, CacheEntry{result, Clock::now(), m_cacheLru.begin()});
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(LOG_CAT, L"Cache insert failed: %hs", ex.what());
+        } catch (...) {}
     }
 
     [[nodiscard]] std::string computeContentHash(const char* data, size_t size) const noexcept {
@@ -1651,6 +1666,12 @@ public:
         if (!m_initialized.load(std::memory_order_acquire)) return;
         if (!isCreate) return;
 
+        if (imagePath.size() > PSConstants::MAX_WSTRING_TRANSFORM_LEN ||
+            commandLine.size() > PSConstants::MAX_WSTRING_TRANSFORM_LEN) {
+            SS_LOG_WARN(LOG_CAT, L"Kernel notify: path/cmdline too long PID=%u", processId);
+            return;
+        }
+
         // Extract filename from full path
         const auto lastSep = imagePath.find_last_of(L"\\/");
         const auto fileName = (lastSep != std::wstring_view::npos)
@@ -1694,6 +1715,10 @@ public:
         size_t imageSize
     ) noexcept {
         if (!m_initialized.load(std::memory_order_acquire)) return;
+
+        if (imagePath.size() > PSConstants::MAX_WSTRING_TRANSFORM_LEN) {
+            return;
+        }
 
         // Extract filename
         const auto lastSep = imagePath.find_last_of(L"\\/");
