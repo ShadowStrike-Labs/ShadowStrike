@@ -124,10 +124,14 @@ bool DispatchFileScan(std::uint32_t /*pid*/,
     }
 
     // Microsoft Office macros (legacy + OpenXML + macro-enabled variants).
+    // Also includes OpenDocument (.odt/.ods), Publisher (.pub), Visio (.vsd),
+    // and XLL add-ins (.xll) which MacroDetector now handles.
     if (ext == L".doc" || ext == L".docm" || ext == L".docx" ||
         ext == L".xls" || ext == L".xlsm" || ext == L".xlsx" || ext == L".xlsb" ||
         ext == L".ppt" || ext == L".pptm" || ext == L".pptx" ||
-        ext == L".rtf" || ext == L".dotm" || ext == L".xltm") {
+        ext == L".rtf" || ext == L".dotm" || ext == L".xltm" ||
+        ext == L".odt" || ext == L".ods" || ext == L".xll" ||
+        ext == L".pub" || ext == L".vsd") {
         return MacroDetector_ScanDocument(filePath);
     }
 
