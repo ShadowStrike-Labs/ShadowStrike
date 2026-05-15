@@ -117,10 +117,12 @@ namespace Constants {
 }
 
 namespace PSConstants {
-    inline constexpr size_t SCAN_CACHE_CAPACITY       = 4096;
+    inline constexpr size_t SCAN_CACHE_CAPACITY        = 4096;
     inline constexpr std::chrono::seconds SCAN_CACHE_TTL{300};
-    inline constexpr size_t MAX_CALLBACKS              = 16;
-    inline constexpr uint32_t KERNEL_MSG_BLOCK_PROCESS = 0x30;
+    inline constexpr size_t MAX_CALLBACKS               = 16;
+    inline constexpr uint32_t KERNEL_MSG_BLOCK_PROCESS  = 0x30;
+    inline constexpr size_t MAX_CMDLINE_LENGTH          = 32767;
+    inline constexpr size_t MAX_WSTRING_TRANSFORM_LEN   = 65536;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
