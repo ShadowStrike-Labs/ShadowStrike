@@ -360,6 +360,59 @@ private:
     HANDLE m_handle = INVALID_HANDLE_VALUE;
 };
 
+// Normalize a hostname for pinning/lookup: strip ASCII whitespace, lowercase,
+// trim trailing dots. Bypass-resistant: case-mixed and trailing-dot variants
+// must resolve to the same key as their canonical form.
+[[nodiscard]] std::string NormalizeHostname(std::string_view host) {
+    std::string out;
+    out.reserve(host.size());
+    for (char c : host) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        out.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    while (!out.empty() && out.back() == '.') out.pop_back();
+    return out;
+}
+
+// Cryptographically verify that `subject` was signed by `issuer` using
+// CryptVerifyCertificateSignatureEx. Returns true on a valid signature.
+// Returns false if either side lacks raw DER bytes, contexts cannot be
+// constructed, or the signature does not verify. Treat unknown rawData as
+// SignatureInvalid at the caller, never as "trusted".
+[[nodiscard]] bool VerifyCertSignedByIssuer(
+    const std::vector<uint8_t>& subjectDer,
+    const std::vector<uint8_t>& issuerDer) noexcept {
+
+    if (subjectDer.empty() || issuerDer.empty()) {
+        return false;
+    }
+
+    CertContextPtr subjCtx(CertCreateCertificateContext(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        subjectDer.data(),
+        static_cast<DWORD>(subjectDer.size())));
+    if (!subjCtx) return false;
+
+    CertContextPtr issuerCtx(CertCreateCertificateContext(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        issuerDer.data(),
+        static_cast<DWORD>(issuerDer.size())));
+    if (!issuerCtx) return false;
+
+    BOOL ok = CryptVerifyCertificateSignatureEx(
+        0,
+        X509_ASN_ENCODING,
+        CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT,
+        const_cast<void*>(static_cast<const void*>(subjCtx.Get())),
+        CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT,
+        const_cast<void*>(static_cast<const void*>(issuerCtx.Get())),
+        0,
+        nullptr);
+
+    return ok != FALSE;
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -1311,6 +1364,43 @@ public:
             }
         }
 
+        // Cryptographically verify each chain link: chain[i] must be signed
+        // by chain[i+1]. Without this, an attacker can prepend forged
+        // intermediates to a trusted root and pass all other checks.
+        // The terminal root is verified self-signed only if it claims to be.
+        for (size_t i = 0; i + 1 < chain.size(); ++i) {
+            const auto& subj = chain[i];
+            const auto& iss  = chain[i + 1];
+            if (subj.rawData.empty() || iss.rawData.empty()) {
+                details.result = ValidationResult::SignatureInvalid;
+                details.errorMessage =
+                    "Certificate at index " + std::to_string(i) +
+                    " missing raw DER for signature verification";
+                return details;
+            }
+            if (!VerifyCertSignedByIssuer(subj.rawData, iss.rawData)) {
+                details.result = ValidationResult::SignatureInvalid;
+                details.errorMessage =
+                    "Certificate at index " + std::to_string(i) +
+                    " not signed by certificate at index " +
+                    std::to_string(i + 1);
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Chain signature verification failed at index %zu", i);
+                return details;
+            }
+        }
+
+        // If the terminal certificate is presented as self-signed (root),
+        // require the self-signature to verify cryptographically.
+        if (chain.back().isSelfSigned && !chain.back().rawData.empty()) {
+            if (!VerifyCertSignedByIssuer(chain.back().rawData,
+                                          chain.back().rawData)) {
+                details.result = ValidationResult::SignatureInvalid;
+                details.errorMessage = "Root certificate self-signature invalid";
+                return details;
+            }
+        }
+
         // Check root trust
         const auto& root = chain.back();
         details.trustLevel = GetTrustLevelInternal(root);
@@ -1890,16 +1980,22 @@ public:
         std::string_view hostname,
         const CertificateFingerprint& fingerprint) {
 
+        auto host = NormalizeHostname(hostname);
+        if (host.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"PinCertificate: empty hostname");
+            return false;
+        }
+
         std::unique_lock lock(m_mutex);
 
-        if (m_pinnedCerts.size() >= CertificateConstants::MAX_PINNED_CERTIFICATES) {
+        if (m_pinnedCerts.size() >= CertificateConstants::MAX_PINNED_CERTIFICATES &&
+            m_pinnedCerts.find(host) == m_pinnedCerts.end()) {
             SS_LOG_WARN(LOG_CATEGORY, L"Maximum pinned certificates reached");
             return false;
         }
 
-        m_pinnedCerts[std::string(hostname)] = fingerprint;
-        SS_LOG_INFO(LOG_CATEGORY, L"Pinned certificate for %hs",
-                    std::string(hostname).c_str());
+        m_pinnedCerts[host] = fingerprint;
+        SS_LOG_INFO(LOG_CATEGORY, L"Pinned certificate for %hs", host.c_str());
         return true;
     }
 
@@ -1912,22 +2008,25 @@ public:
     }
 
     [[nodiscard]] bool UnpinCertificate(std::string_view hostname) {
+        auto host = NormalizeHostname(hostname);
         std::unique_lock lock(m_mutex);
-        return m_pinnedCerts.erase(std::string(hostname)) > 0;
+        return m_pinnedCerts.erase(host) > 0;
     }
 
     [[nodiscard]] bool IsPinned(std::string_view hostname) const {
+        auto host = NormalizeHostname(hostname);
         std::shared_lock lock(m_mutex);
-        return m_pinnedCerts.find(std::string(hostname)) != m_pinnedCerts.end();
+        return m_pinnedCerts.find(host) != m_pinnedCerts.end();
     }
 
     [[nodiscard]] bool VerifyPinnedCertificate(
         std::string_view hostname,
         const CertificateInfo& cert) const {
 
+        auto host = NormalizeHostname(hostname);
         std::shared_lock lock(m_mutex);
 
-        auto it = m_pinnedCerts.find(std::string(hostname));
+        auto it = m_pinnedCerts.find(host);
         if (it == m_pinnedCerts.end()) {
             return true;  // Not pinned, allow
         }
@@ -1950,7 +2049,20 @@ public:
         const CertificateFingerprint& fingerprint,
         std::string_view reason) {
 
+        // Cap the blocklist to prevent unbounded memory growth from
+        // attacker-influenced inputs. Allow re-blocking existing entries
+        // (reason update) even when at cap.
+        constexpr size_t kMaxBlockedCerts =
+            CertificateConstants::MAX_CACHED_CERTIFICATES;
+
         std::unique_lock lock(m_mutex);
+        if (m_blockedCerts.size() >= kMaxBlockedCerts &&
+            m_blockedCerts.find(fingerprint) == m_blockedCerts.end()) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"BlockCertificate: blocklist cap reached (%zu)",
+                kMaxBlockedCerts);
+            return false;
+        }
         m_blockedCerts[fingerprint] = std::string(reason);
         SS_LOG_INFO(LOG_CATEGORY, L"Blocked certificate");
         return true;
@@ -3303,6 +3415,17 @@ void CertificateValidator::OnKernelImageLoad(
                 std::string(GetValidationResultName(details.result)));
         }
 
+        // Suppress alert/telemetry flood for inputs that VerifyFile could not
+        // parse as a raw certificate (e.g., signed PE binaries — Authenticode
+        // verification is handled by a different pipeline). Treat
+        // ValidationResult::Error here as "inapplicable", not "malicious".
+        if (details.result == ValidationResult::Error) {
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"OnKernelImageLoad: VerifyFile returned Error (non-cert input), "
+                L"suppressing alert path for PID %u", processId);
+            return;
+        }
+
         // Pre-compute data needed by async helpers (no `this` capture — safe from UAF)
         auto detailsCopy = std::make_shared<ValidationDetails>(std::move(details));
         auto pid = processId;
@@ -3350,6 +3473,15 @@ void CertificateValidator::OnKernelProcessCreate(
             std::string narrowPath = Utils::StringUtils::ToNarrow(imagePath);
             (void)RequestKernelProcessBlock(processId,
                 "Process certificate revoked: " + narrowPath);
+        }
+
+        // Same suppression as OnKernelImageLoad: skip alert/telemetry when
+        // VerifyFile returned Error (file is not a parseable raw certificate).
+        if (details.result == ValidationResult::Error) {
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"OnKernelProcessCreate: VerifyFile returned Error (non-cert input), "
+                L"suppressing alert path for PID %u", processId);
+            return;
         }
 
         // Pre-compute data for async helpers (no `this` capture — safe from UAF)
