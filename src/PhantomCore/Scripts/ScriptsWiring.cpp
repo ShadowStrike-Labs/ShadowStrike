@@ -117,9 +117,11 @@ bool DispatchFileScan(std::uint32_t /*pid*/,
         return VBScriptScanner_ScanFile(filePath, ext);
     }
 
-    // Python scripts / bytecode.
+    // Python scripts / bytecode / wheels / eggs.
+    // T3: Add .whl/.egg/.pyd routing as scanner handles them
     if (ext == L".py" || ext == L".pyw" ||
-        ext == L".pyc" || ext == L".pyo" || ext == L".pyz") {
+        ext == L".pyc" || ext == L".pyo" || ext == L".pyz" ||
+        ext == L".whl" || ext == L".egg" || ext == L".pyd") {
         return PythonScriptScanner_ScanFile(filePath, ext);
     }
 
