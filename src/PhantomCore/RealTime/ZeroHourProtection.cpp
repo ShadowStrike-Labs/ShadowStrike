@@ -236,6 +236,7 @@ public:
         {
             std::unique_lock lock(m_integrationMutex);
             m_threatIntelLookup = nullptr;
+            m_threatIntelStore  = nullptr;
             m_whitelistStore    = nullptr;
         }
     }
@@ -308,40 +309,63 @@ public:
         }
     }
 
-    // Fire Callbacks
-    void FireFileHoldCallback(const HeldFile& file) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, cb] : m_holdCallbacks) {
-            try { cb(file); } catch (...) {}
+    // Fire Callbacks — copy callback list under lock, invoke without lock.
+    // Holding m_callbackMutex while invoking user code deadlocks if the
+    // callback registers/unregisters (writer-starvation under shared_lock).
+    template <typename CbMap, typename Invoker>
+    void InvokeCallbacksDetached(const CbMap& map, Invoker&& invoke,
+                                 const char* siteName) {
+        std::vector<typename CbMap::mapped_type> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(map.size());
+            for (const auto& [id, cb] : map) {
+                if (cb) snapshot.push_back(cb);
+            }
         }
+        for (auto& cb : snapshot) {
+            try {
+                invoke(cb);
+            } catch (const std::exception& ex) {
+                Utils::Logger::Warn(
+                    "ZeroHourProtection: {} callback threw std::exception: {}",
+                    siteName, ex.what());
+            } catch (...) {
+                Utils::Logger::Warn(
+                    "ZeroHourProtection: {} callback threw unknown exception",
+                    siteName);
+            }
+        }
+    }
+
+    void FireFileHoldCallback(const HeldFile& file) {
+        InvokeCallbacksDetached(m_holdCallbacks,
+            [&](const FileHoldCallback& cb) { cb(file); },
+            "FileHold");
     }
 
     void FireVerdictCallback(const std::wstring& path, const FileAnalysisResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, cb] : m_verdictCallbacks) {
-            try { cb(path, result); } catch (...) {}
-        }
+        InvokeCallbacksDetached(m_verdictCallbacks,
+            [&](const VerdictCallback& cb) { cb(path, result); },
+            "Verdict");
     }
 
     void FireThreatLevelCallback(ThreatLevel oldLevel, ThreatLevel newLevel, std::wstring_view reason) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, cb] : m_threatLevelCallbacks) {
-            try { cb(oldLevel, newLevel, reason); } catch (...) {}
-        }
+        InvokeCallbacksDetached(m_threatLevelCallbacks,
+            [&](const ThreatLevelCallback& cb) { cb(oldLevel, newLevel, reason); },
+            "ThreatLevel");
     }
 
     void FireSignatureUpdateCallback(const MicroSigUpdatePackage& package, bool success) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, cb] : m_sigUpdateCallbacks) {
-            try { cb(package, success); } catch (...) {}
-        }
+        InvokeCallbacksDetached(m_sigUpdateCallbacks,
+            [&](const SignatureUpdateCallback& cb) { cb(package, success); },
+            "SignatureUpdate");
     }
 
     void FireCloudStatusCallback(CloudServiceStatus oldStatus, CloudServiceStatus newStatus) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& [id, cb] : m_cloudStatusCallbacks) {
-            try { cb(oldStatus, newStatus); } catch (...) {}
-        }
+        InvokeCallbacksDetached(m_cloudStatusCallbacks,
+            [&](const CloudStatusCallback& cb) { cb(oldStatus, newStatus); },
+            "CloudStatus");
     }
 
     void UpdateCloudStatus(CloudServiceStatus newStatus) {
@@ -432,6 +456,21 @@ bool ZeroHourProtection::Initialize(const ZeroHourProtectionConfig& config) {
         return true;
     }
 
+    // Validate critical fields — refuse to come up with a config that would
+    // disable protection through obviously bogus values (Tier 4).
+    if (config.holdTimeoutMs == 0 ||
+        config.maxVerdictCacheSize == 0 ||
+        config.cleanVerdictTTLMs == 0 ||
+        config.maliciousVerdictTTLMs == 0 ||
+        config.unknownVerdictTTLMs == 0 ||
+        config.microSigIntervalMs == 0 ||
+        config.outbreakCheckIntervalMs == 0) {
+        Utils::Logger::Error(
+            "ZeroHourProtection: Initialize rejected — invalid config "
+            "(zero timeout / cache size)");
+        return false;
+    }
+
     {
         std::unique_lock lock(m_impl->m_configMutex);
         m_impl->m_config = config;
@@ -439,8 +478,11 @@ bool ZeroHourProtection::Initialize(const ZeroHourProtectionConfig& config) {
 
     m_impl->m_stats.Reset();
 
-    // Start hold monitor thread BEFORE marking initialized (no config lock held)
+    // Reset shutdown flag so a previous Shutdown() doesn't poison this run.
+    m_impl->m_isShutdown.store(false, std::memory_order_release);
     m_impl->m_stopMonitor = false;
+
+    // Start hold monitor thread BEFORE marking initialized (no config lock held)
     m_impl->m_holdMonitorThread = std::make_unique<std::thread>(
         &ZeroHourProtectionImpl::MonitorHeldFiles, m_impl.get());
 
@@ -482,6 +524,19 @@ ZeroHourProtectionConfig ZeroHourProtection::GetConfig() const {
 }
 
 bool ZeroHourProtection::UpdateConfig(const ZeroHourProtectionConfig& config) {
+    // Refuse configs that would silently disable protection.
+    if (config.holdTimeoutMs == 0 ||
+        config.maxVerdictCacheSize == 0 ||
+        config.cleanVerdictTTLMs == 0 ||
+        config.maliciousVerdictTTLMs == 0 ||
+        config.unknownVerdictTTLMs == 0 ||
+        config.microSigIntervalMs == 0 ||
+        config.outbreakCheckIntervalMs == 0) {
+        Utils::Logger::Error(
+            "ZeroHourProtection: UpdateConfig rejected — invalid config "
+            "(zero timeout / cache size)");
+        return false;
+    }
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
     return true;
@@ -517,6 +572,8 @@ void ZeroHourProtection::SetOutbreakMode(bool active, std::wstring_view reason) 
     }
 
     m_impl->FireThreatLevelCallback(expected, desired, reason);
+    m_impl->m_stats.currentThreatLevel.store(
+        static_cast<uint8_t>(desired), std::memory_order_relaxed);
 }
 
 bool ZeroHourProtection::IsOutbreakModeActive() const noexcept {
@@ -543,6 +600,8 @@ void ZeroHourProtection::SetThreatLevel(ThreatLevel level, std::wstring_view rea
         std::wstring(reason).c_str());
 
     m_impl->FireThreatLevelCallback(expected, level, reason);
+    m_impl->m_stats.currentThreatLevel.store(
+        static_cast<uint8_t>(level), std::memory_order_relaxed);
 }
 
 std::vector<OutbreakInfo> ZeroHourProtection::GetActiveOutbreaks() const {
@@ -608,24 +667,50 @@ FileAnalysisResult ZeroHourProtection::AnalyzeFile(const FileAnalysisRequest& re
     // 3. Check Verdict Cache
     if (auto cached = QueryCache(request.hash)) {
         result.cloudResult = *cached;
-        result.verdict = cached->verdict;
-
-        if (cached->verdict == CloudVerdict::MALICIOUS) {
-            result.shouldAllow = false;
-            result.threatName = cached->threatName;
-            m_impl->m_stats.verdictsMalicious++;
-        } else if (cached->verdict == CloudVerdict::SUSPICIOUS &&
-                   GetThreatLevel() >= ThreatLevel::HIGH) {
-            result.shouldAllow = false; // Block suspicious in high-threat posture
-            m_impl->m_stats.verdictsSuspicious++;
-        } else if (cached->verdict == CloudVerdict::CLEAN ||
-                   cached->verdict == CloudVerdict::WHITELISTED) {
-            result.shouldAllow = true;
-            m_impl->m_stats.verdictsClean++;
-        }
-
+        result.verdict     = cached->verdict;
+        result.threatName  = cached->threatName;
+        result.source      = FileAnalysisResult::Source::LOCAL_CACHE;
         m_impl->m_stats.cloudCacheHits++;
-        result.source = FileAnalysisResult::Source::LOCAL_CACHE;
+
+        // Every cached verdict must produce an explicit shouldAllow decision.
+        // Falling through with the default `shouldAllow=true` would silently
+        // fail-open on cached SUSPICIOUS/PUA/RISKWARE/PENDING entries.
+        const ThreatLevel level = GetThreatLevel();
+        switch (cached->verdict) {
+            case CloudVerdict::WHITELISTED:
+            case CloudVerdict::CLEAN:
+                result.shouldAllow = true;
+                m_impl->m_stats.verdictsClean++;
+                break;
+            case CloudVerdict::MALICIOUS:
+            case CloudVerdict::BLACKLISTED:
+                result.shouldAllow = false;
+                m_impl->m_stats.verdictsMalicious++;
+                break;
+            case CloudVerdict::SUSPICIOUS:
+                // Block in elevated/high/critical postures; allow at NORMAL.
+                result.shouldAllow = (level < ThreatLevel::ELEVATED);
+                m_impl->m_stats.verdictsSuspicious++;
+                break;
+            case CloudVerdict::PUA:
+            case CloudVerdict::RISKWARE:
+                // PUA/Riskware: allow under normal posture, block when elevated.
+                result.shouldAllow = (level < ThreatLevel::HIGH);
+                m_impl->m_stats.verdictsPUA++;
+                break;
+            case CloudVerdict::PENDING:
+            case CloudVerdict::LOOKUP_FAILED:
+            case CloudVerdict::UNKNOWN:
+            default: {
+                // Stale/incomplete cache entry — defer to fallback policy.
+                std::shared_lock configLock(m_impl->m_configMutex);
+                result.shouldAllow =
+                    (m_impl->m_config.cloudConfig.fallbackPolicy ==
+                     FallbackPolicy::ALLOW_UNKNOWN);
+                m_impl->m_stats.verdictsUnknown++;
+                break;
+            }
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         result.totalTime = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -976,11 +1061,19 @@ uint64_t ZeroHourProtection::SubmitForDetonation(
 
     if (filePath.empty()) return 0;
 
-    // Enforce file-size cap to prevent abusive detonation submissions
+    // Cap the pending detonation queue. Without this, a hostile actor could
+    // submit unbounded files and exhaust memory before any cloud round-trip
+    // completes. We share MAX_PENDING_FILES with the hold queue since both
+    // are short-lived per-file slots awaiting a cloud verdict.
     {
-        std::shared_lock configLock(m_impl->m_configMutex);
-        // No size check here since we don't re-stat in this call; caller
-        // is expected to have validated via FileAnalysisRequest.fileSize.
+        std::shared_lock lock(m_impl->m_detonationMutex);
+        if (m_impl->m_pendingDetonations.size() >=
+            ZeroHourConstants::MAX_PENDING_FILES) {
+            SS_LOG_WARN(L"ZeroHourProtection",
+                L"SubmitForDetonation rejected — pending queue at capacity (%zu)",
+                m_impl->m_pendingDetonations.size());
+            return 0;
+        }
     }
 
     const uint64_t detonationId =
@@ -988,6 +1081,11 @@ uint64_t ZeroHourProtection::SubmitForDetonation(
 
     {
         std::unique_lock lock(m_impl->m_detonationMutex);
+        // Re-check under exclusive lock to close the TOCTOU window.
+        if (m_impl->m_pendingDetonations.size() >=
+            ZeroHourConstants::MAX_PENDING_FILES) {
+            return 0;
+        }
         m_impl->m_pendingDetonations[detonationId] = filePath;
     }
 
@@ -1436,6 +1534,7 @@ size_t ZeroHourProtection::GetCacheSize() const noexcept {
 // ============================================================================
 
 uint64_t ZeroHourProtection::RegisterVerdictCallback(VerdictCallback callback) {
+    if (!callback) return 0;
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = m_impl->m_callbackIdCounter++;
     m_impl->m_verdictCallbacks[id] = std::move(callback);
@@ -1443,6 +1542,7 @@ uint64_t ZeroHourProtection::RegisterVerdictCallback(VerdictCallback callback) {
 }
 
 uint64_t ZeroHourProtection::RegisterFileHoldCallback(FileHoldCallback callback) {
+    if (!callback) return 0;
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = m_impl->m_callbackIdCounter++;
     m_impl->m_holdCallbacks[id] = std::move(callback);
@@ -1450,6 +1550,7 @@ uint64_t ZeroHourProtection::RegisterFileHoldCallback(FileHoldCallback callback)
 }
 
 uint64_t ZeroHourProtection::RegisterOutbreakCallback(OutbreakCallback callback) {
+    if (!callback) return 0;
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = m_impl->m_callbackIdCounter++;
     m_impl->m_outbreakCallbacks[id] = std::move(callback);
@@ -1457,6 +1558,7 @@ uint64_t ZeroHourProtection::RegisterOutbreakCallback(OutbreakCallback callback)
 }
 
 uint64_t ZeroHourProtection::RegisterThreatLevelCallback(ThreatLevelCallback callback) {
+    if (!callback) return 0;
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = m_impl->m_callbackIdCounter++;
     m_impl->m_threatLevelCallbacks[id] = std::move(callback);
