@@ -371,16 +371,36 @@ typedef struct _NETWORK_DNS_EVENT {
 } NETWORK_DNS_EVENT, *PNETWORK_DNS_EVENT;
 
 // DNS query types
+#ifndef DNS_TYPE_A
 #define DNS_TYPE_A                        1
+#endif
+#ifndef DNS_TYPE_NS
 #define DNS_TYPE_NS                       2
+#endif
+#ifndef DNS_TYPE_CNAME
 #define DNS_TYPE_CNAME                    5
+#endif
+#ifndef DNS_TYPE_SOA
 #define DNS_TYPE_SOA                      6
+#endif
+#ifndef DNS_TYPE_PTR
 #define DNS_TYPE_PTR                      12
+#endif
+#ifndef DNS_TYPE_MX
 #define DNS_TYPE_MX                       15
+#endif
+#ifndef DNS_TYPE_TXT
 #define DNS_TYPE_TXT                      16
+#endif
+#ifndef DNS_TYPE_AAAA
 #define DNS_TYPE_AAAA                     28
+#endif
+#ifndef DNS_TYPE_SRV
 #define DNS_TYPE_SRV                      33
+#endif
+#ifndef DNS_TYPE_ANY
 #define DNS_TYPE_ANY                      255
+#endif
 
 // DNS flags
 #define DNS_FLAG_RECURSIVE                0x00000001
