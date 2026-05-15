@@ -53,6 +53,13 @@ bool InitializeScriptsSubsystem() noexcept {
     const bool py  = PythonScriptScanner_Init();
     const bool mac = MacroDetector_Init();
 
+    // Surface which scanners failed so operators can act on a partial bring-up
+    // instead of seeing only an "N/4 ready" count.
+    if (!js)  Utils::Logger::Warn ("ScriptsWiring: JavaScriptScanner_Init failed");
+    if (!vbs) Utils::Logger::Warn ("ScriptsWiring: VBScriptScanner_Init failed");
+    if (!py)  Utils::Logger::Warn ("ScriptsWiring: PythonScriptScanner_Init failed");
+    if (!mac) Utils::Logger::Warn ("ScriptsWiring: MacroDetector_Init failed");
+
     const int ok = (js ? 1 : 0) + (vbs ? 1 : 0) + (py ? 1 : 0) + (mac ? 1 : 0);
     Utils::Logger::Info("ScriptsWiring: subsystem online ({}/4 scanners ready)",
                         ok);
@@ -79,8 +86,16 @@ void ShutdownScriptsSubsystem() noexcept {
 namespace {
 
 std::wstring ExtractLowerExtension(const std::wstring& path) noexcept {
+    // Restrict the search to the final path component so that a directory
+    // containing a dot (e.g. "C:\program files.evil\foo") cannot fool the
+    // dispatcher into routing on an apparent extension that is really part
+    // of a parent directory name.
+    const auto sep = path.find_last_of(L"\\/");
+    const std::size_t fileStart = (sep == std::wstring::npos) ? 0 : sep + 1;
+    if (fileStart >= path.size()) return {};
+
     const auto dot = path.find_last_of(L'.');
-    if (dot == std::wstring::npos || dot + 1 >= path.size()) {
+    if (dot == std::wstring::npos || dot < fileStart || dot + 1 >= path.size()) {
         return {};
     }
     std::wstring ext = path.substr(dot);
