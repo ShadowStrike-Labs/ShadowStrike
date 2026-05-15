@@ -189,6 +189,45 @@ constexpr std::array<uint8_t, 5> BYPASS_PATTERN_MOV_EAX = { 0xB8, 0x57, 0x00, 0x
     return oss.str();
 }
 
+// Sanitize a wide string for inclusion in a log line.
+//
+// Threat model: contentName, processName, processPath and applicationName
+// flow from the host script engine / kernel and are therefore attacker-
+// controlled.  Without sanitization, a malicious payload can embed CR/LF
+// and ANSI escape sequences and forge log lines (log-injection /
+// "smudging") or break downstream log ingestion pipelines.  We strip all
+// control characters (< 0x20 and DEL) and cap to a fixed length so a
+// hostile actor cannot blow the formatter's buffer either.
+[[nodiscard]] std::wstring SanitizeForLog(std::wstring_view in,
+                                          size_t maxChars = 256) {
+    std::wstring out;
+    const size_t cap = (in.size() < maxChars) ? in.size() : maxChars;
+    out.reserve(cap);
+    for (size_t i = 0; i < cap; ++i) {
+        wchar_t ch = in[i];
+        // Replace control / non-printable characters with '?'.  We keep
+        // SPACE (0x20) and printable ASCII / Unicode unchanged.
+        if (ch < 0x20 || ch == 0x7F) {
+            out.push_back(L'?');
+        } else {
+            out.push_back(ch);
+        }
+    }
+    if (in.size() > maxChars) {
+        out.append(L"...");
+    }
+    return out;
+}
+
+// Validate that a kernel-sourced process id is plausible for AMSI work.
+// Rejects:
+//   - PID 0 (System Idle Process — never has amsi.dll, indicates spoofing)
+//   - PID 4 (System / kernel)
+// Returns true if the pid is acceptable for user-mode AMSI inspection.
+[[nodiscard]] inline bool IsAcceptableUserModePid(uint32_t pid) noexcept {
+    return pid != 0 && pid != 4;
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -447,20 +486,47 @@ public:
             return false;
         }
 
+        // From this point on, m_amsiContext owns a real AMSI ref-count.
+        // Any subsequent failure path MUST call AmsiUninitialize to balance
+        // it — otherwise we leak the system AMSI provider chain and Windows
+        // will accumulate phantom providers across re-init cycles.
+        struct AmsiInitGuard {
+            HAMSICONTEXT* ctx;
+            bool committed = false;
+            ~AmsiInitGuard() {
+                if (!committed && ctx && *ctx != nullptr) {
+                    AmsiUninitialize(*ctx);
+                    *ctx = nullptr;
+                }
+            }
+        } amsiGuard{ &m_amsiContext };
+
         // Store expected function prologues for integrity checking
         if (!CaptureExpectedPrologues()) {
             SS_LOG_WARN(LOG_CATEGORY, L"Failed to capture expected prologues");
             // Non-fatal - continue initialization
         }
 
-        // Start integrity monitoring thread if enabled
+        // Start integrity monitoring thread if enabled.  std::thread
+        // construction can throw on resource exhaustion; the RAII guard
+        // above ensures AmsiUninitialize runs on that path.
         if (m_config.enableIntegrityMonitoring) {
             m_integrityMonitorRunning = true;
-            m_integrityMonitorThread = std::thread(&AMSIIntegrationImpl::IntegrityMonitorLoop, this);
+            try {
+                m_integrityMonitorThread = std::thread(
+                    &AMSIIntegrationImpl::IntegrityMonitorLoop, this);
+            } catch (const std::system_error& e) {
+                m_integrityMonitorRunning = false;
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to start integrity monitor thread: %hs", e.what());
+                m_status = ModuleStatus::Error;
+                return false;
+            }
         }
 
         m_stats.Reset();
         m_status = ModuleStatus::Running;
+        amsiGuard.committed = true;
 
         SS_LOG_INFO(LOG_CATEGORY, L"AMSI Integration initialized successfully");
         return true;
@@ -509,6 +575,9 @@ public:
         // Close captured sessions and uninitialize (no lock needed, we own the handles)
         if (capturedContext != nullptr) {
             for (auto& [id, hSession] : capturedSessions) {
+                // AmsiCloseSession returns void per AMSI SDK, but we use
+                // structured logging to keep an audit trail of session
+                // teardown.  No HRESULT to inspect.
                 AmsiCloseSession(capturedContext, hSession);
             }
             AmsiUninitialize(capturedContext);
@@ -687,11 +756,28 @@ public:
                 .fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Compute content hash for caching/logging
-        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
-        if (hasher.Init()) {
-            hasher.Update(request.content.data(), request.content.size());
-            hasher.FinalHex(response.contentHash, false);
+        // Compute content hash for caching/logging.  Each step of the
+        // HashUtils::Hasher API is [[nodiscard]] and must be checked: a
+        // failed hash means we MUST NOT touch the cache / whitelist /
+        // threat-intel paths below (they key on the hash and any reuse of
+        // a stale string from a previous scan would cross-contaminate the
+        // verdict for an attacker-supplied buffer).
+        {
+            Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+            bool hashOk = hasher.Init();
+            if (hashOk) {
+                hashOk = hasher.Update(request.content.data(),
+                                       request.content.size());
+            }
+            if (hashOk) {
+                hashOk = hasher.FinalHex(response.contentHash, false);
+            }
+            if (!hashOk) {
+                response.contentHash.clear();
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"SHA-256 hashing failed; cache/whitelist/ThreatIntel "
+                    L"fast-paths disabled for this scan");
+            }
         }
 
         // FIX 6: Whitelist fast-path — skip scanning entirely for known-good hashes
@@ -708,7 +794,8 @@ public:
                         endTime - startTime);
 
                     SS_LOG_DEBUG(LOG_CATEGORY,
-                        L"Content whitelisted, skipping scan: %ls", request.contentName.c_str());
+                        L"Content whitelisted, skipping scan: %ls",
+                        SanitizeForLog(request.contentName).c_str());
                     InvokeScanCallback(response);
                     return response;
                 }
@@ -737,7 +824,8 @@ public:
                         endTime - startTime);
 
                     SS_LOG_WARN(LOG_CATEGORY,
-                        L"ThreatIntel pre-scan: malicious hash for %ls", request.contentName.c_str());
+                        L"ThreatIntel pre-scan: malicious hash for %ls",
+                        SanitizeForLog(request.contentName).c_str());
                     InvokeScanCallback(response);
                     return response;
                 }
@@ -822,7 +910,7 @@ public:
             response.riskScore = 100.0;
 
             SS_LOG_WARN(LOG_CATEGORY, L"Malicious content detected: %ls",
-                        request.contentName.c_str());
+                        SanitizeForLog(request.contentName).c_str());
         } else {
             m_stats.cleanResults.fetch_add(1, std::memory_order_relaxed);
         }
@@ -992,7 +1080,8 @@ public:
         m_stats.sessionsCreated.fetch_add(1, std::memory_order_relaxed);
 
         SS_LOG_DEBUG(LOG_CATEGORY, L"Opened AMSI session %llu for %ls",
-                     session.sessionId, session.applicationName.c_str());
+                     session.sessionId,
+                     SanitizeForLog(session.applicationName).c_str());
 
         return session.sessionId;
     }
@@ -1120,8 +1209,16 @@ public:
 
             SS_LOG_ERROR(LOG_CATEGORY, L"AMSI tampering detected in process %u", processId);
 
+            // Snapshot config flag under shared lock — m_config is mutated
+            // by UpdateConfiguration and we must not read it racily.
+            bool autoRepair = false;
+            {
+                std::shared_lock cfgLock(m_mutex);
+                autoRepair = m_config.enableAutoRepair;
+            }
+
             // Auto-repair if enabled
-            if (m_config.enableAutoRepair) {
+            if (autoRepair) {
                 if (RepairIntegrity(processId)) {
                     report.status = AmsiIntegrityStatus::Repaired;
                 }
@@ -1711,18 +1808,33 @@ private:
         SS_LOG_INFO(LOG_CATEGORY, L"Integrity monitor thread started");
 
         while (m_integrityMonitorRunning) {
+            // Snapshot interval under shared lock — m_config may be updated
+            // concurrently by UpdateConfiguration.  Reading without the
+            // lock would be a data race on a non-atomic field and could
+            // produce a torn value (yielding wait_for(0ms) busy-spin or
+            // garbage huge waits on 32-bit reads of 64-bit fields).
+            uint32_t intervalMs = AMSIConstants::INTEGRITY_CHECK_INTERVAL_MS;
+            {
+                std::shared_lock cfgLock(m_mutex);
+                intervalMs = m_config.integrityCheckIntervalMs;
+            }
+
             // Wait for interval or stop signal
             {
                 std::unique_lock lock(m_integrityMonitorMutex);
                 m_integrityMonitorCV.wait_for(lock,
-                    std::chrono::milliseconds(m_config.integrityCheckIntervalMs),
+                    std::chrono::milliseconds(intervalMs),
                     [this] { return !m_integrityMonitorRunning; });
             }
 
             if (!m_integrityMonitorRunning) break;
 
-            // Check current process
-            CheckIntegrity(GetCurrentProcessId());
+            // Check current process.  The returned AmsiIntegrityReport is
+            // intentionally discarded here: all actionable side effects
+            // (callbacks, alerting, telemetry, statistics) happen inside
+            // CheckIntegrity itself.  We cast to void to make the
+            // discard explicit and silence C4834.
+            (void)CheckIntegrity(GetCurrentProcessId());
 
             // Check monitored processes
             std::unordered_set<uint32_t> processesToCheck;
@@ -1864,6 +1976,17 @@ private:
     // ========================================================================
 
     void CheckCrossProcessIntegrity(uint32_t pid) {
+        // Reject kernel / idle pseudo-PIDs.  amsi.dll never lives in those
+        // contexts and OpenProcess on PID 4 with PROCESS_VM_READ will
+        // either silently succeed and produce garbage or fail with
+        // ACCESS_DENIED depending on token; either way it MUST NOT lead
+        // to an "AMSI tampering" alert against the kernel.
+        if (!IsAcceptableUserModePid(pid)) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"Cross-process integrity: skipping reserved PID %u", pid);
+            return;
+        }
+
         // Open the target process with memory-read privileges
         HANDLE hProcess = OpenProcess(
             PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
@@ -1897,8 +2020,22 @@ private:
             return;
         }
 
+        // If the target has more modules than our static buffer holds we
+        // only see the first N.  Log so an operator can spot the case
+        // where amsi.dll might fall off the enumerated slice — better
+        // than silently mis-reporting "not loaded".
+        if (cbNeeded > sizeof(hMods)) {
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Cross-process integrity: PID %u has %lu modules, "
+                L"enumeration truncated to %zu entries",
+                pid, static_cast<unsigned long>(cbNeeded / sizeof(HMODULE)),
+                sizeof(hMods) / sizeof(HMODULE));
+        }
+
         HMODULE hAmsiRemote = nullptr;
-        DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+        DWORD moduleCount = (std::min<DWORD>)(cbNeeded,
+                                              static_cast<DWORD>(sizeof(hMods)))
+                            / sizeof(HMODULE);
         for (DWORD i = 0; i < moduleCount; ++i) {
             WCHAR moduleName[MAX_PATH]{};
             if (GetModuleBaseNameW(hProcess, hMods[i], moduleName, MAX_PATH) > 0) {
@@ -1997,8 +2134,16 @@ private:
             cfgLock.unlock();
 
             if (shouldTerminate) {
-                RequestKernelProcessBlockImpl(pid,
+                // Block-request to kernel is best-effort: capture and
+                // surface the result rather than silently swallowing
+                // [[nodiscard]] from a security-critical primitive.
+                const bool blocked = RequestKernelProcessBlockImpl(pid,
                     L"Repeated AMSI bypass detected in script host");
+                if (!blocked) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Kernel block request FAILED for PID %u; "
+                        L"manual remediation may be required", pid);
+                }
             }
         }
     }
@@ -2022,13 +2167,20 @@ public:
                 + " | Repaired: " + (event.wasRepaired ? "yes" : "no")
                 + " | " + event.details;
 
-            alertSystem.RaiseAlert(
+            const std::string alertId = alertSystem.RaiseAlert(
                 Communication::AlertSeverity::Critical,
                 Communication::AlertType::Security,
                 subject, details, "AMSIIntegration");
 
-            SS_LOG_DEBUG(LOG_CATEGORY,
-                L"Bypass alert dispatched to AlertSystem for PID %u", event.processId);
+            if (alertId.empty()) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"AlertSystem accepted bypass event but returned no alert "
+                    L"id for PID %u", event.processId);
+            } else {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"Bypass alert dispatched to AlertSystem for PID %u (id=%hs)",
+                    event.processId, alertId.c_str());
+            }
         } catch (const std::exception& e) {
             SS_LOG_WARN(LOG_CATEGORY,
                 L"AlertSystem dispatch failed: %hs", e.what());
@@ -2158,7 +2310,7 @@ public:
             if (sent) {
                 SS_LOG_INFO(LOG_CATEGORY,
                     L"Kernel process block requested for PID %u: %ls",
-                    processId, reason.c_str());
+                    processId, SanitizeForLog(truncatedReason).c_str());
             } else {
                 SS_LOG_ERROR(LOG_CATEGORY,
                     L"Failed to send kernel process block for PID %u", processId);
@@ -2198,13 +2350,41 @@ public:
                                     std::wstring_view imagePath,
                                     std::wstring_view commandLine,
                                     bool isCreate) {
+        // commandLine is currently surfaced only for future scoring use;
+        // sink it explicitly to make the intent clear and to keep the
+        // signature stable for callers.
+        (void)commandLine;
+
+        // Reject kernel/idle pseudo-PIDs.  An attacker who can forge IPC
+        // notifications must not be able to start AMSI monitoring against
+        // PID 0/4 and trigger a misleading "tampering in System" alert.
+        if (!IsAcceptableUserModePid(processId)) {
+            return;
+        }
+
+        // Defence-in-depth: an empty path is meaningless for filename
+        // matching and an unbounded path would be either truncated by
+        // std::filesystem or trigger an allocation; cap defensively.
+        constexpr size_t kMaxImagePathChars = 32768;
+        if (imagePath.empty() || imagePath.size() > kMaxImagePathChars) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"OnKernelProcessNotify: rejecting invalid imagePath "
+                L"(len=%zu) for PID %u", imagePath.size(), processId);
+            return;
+        }
+
         if (isCreate) {
             if (IsScriptHostProcess(imagePath)) {
+                const std::wstring fileName =
+                    std::filesystem::path(imagePath).filename().wstring();
                 SS_LOG_INFO(LOG_CATEGORY,
                     L"Script host detected: PID %u (%ls)", processId,
-                    std::filesystem::path(imagePath).filename().c_str());
+                    SanitizeForLog(fileName, 128).c_str());
 
-                StartIntegrityMonitoring(processId);
+                if (!StartIntegrityMonitoring(processId)) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Failed to start integrity monitoring for PID %u", processId);
+                }
             }
         } else {
             // Process destruction - clean up monitoring state
@@ -2227,6 +2407,31 @@ public:
                                 std::wstring_view imagePath,
                                 uint64_t imageBase,
                                 size_t imageSize) {
+        // Validate kernel-sourced inputs.  imagePath/imageBase/imageSize
+        // arrive across an IPC boundary from the minifilter and may be
+        // forged by anyone able to inject into that channel.  Reject
+        // pseudo-PIDs, empty/oversized paths, and obviously bogus image
+        // metrics (zero base or 4 GiB+ size — amsi.dll is < 100 KB).
+        if (!IsAcceptableUserModePid(processId)) {
+            return;
+        }
+        constexpr size_t kMaxImagePathChars = 32768;
+        if (imagePath.empty() || imagePath.size() > kMaxImagePathChars) {
+            return;
+        }
+        if (imageBase == 0) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"OnKernelImageLoad: rejecting zero imageBase for PID %u", processId);
+            return;
+        }
+        constexpr size_t kMaxPlausibleAmsiDllBytes = 16 * 1024 * 1024;
+        if (imageSize == 0 || imageSize > kMaxPlausibleAmsiDllBytes) {
+            SS_LOG_TRACE(LOG_CATEGORY,
+                L"OnKernelImageLoad: rejecting implausible imageSize %zu for PID %u",
+                imageSize, processId);
+            return;
+        }
+
         auto filename = std::filesystem::path(imagePath).filename().wstring();
         for (auto& ch : filename) {
             ch = static_cast<wchar_t>(std::towlower(ch));
@@ -2247,8 +2452,9 @@ public:
 
         if (isMonitored) {
             if (processId == GetCurrentProcessId()) {
-                // In-process: direct check
-                CheckIntegrity(processId);
+                // In-process: direct check.  Return value is consumed via
+                // CheckIntegrity's side effects (callbacks/telemetry).
+                (void)CheckIntegrity(processId);
             } else {
                 // Cross-process: use ReadProcessMemory path
                 CheckCrossProcessIntegrity(processId);
