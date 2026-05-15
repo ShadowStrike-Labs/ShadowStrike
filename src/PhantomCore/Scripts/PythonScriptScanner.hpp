@@ -190,6 +190,12 @@ namespace PythonConstants {
 
     /// @brief Minimum printable string length for bytecode extraction
     inline constexpr size_t MIN_EXTRACTED_STRING_LENGTH = 6;
+
+    /// @brief Maximum callback registrations (prevent unbounded callback vector)
+    inline constexpr size_t MAX_CALLBACKS = 16;
+
+    /// @brief Maximum path length for validation (Windows limit)
+    inline constexpr size_t MAX_PATH_LENGTH = 32767;
     
     /// @brief Suspicious imports
     inline constexpr const char* SUSPICIOUS_IMPORTS[] = {
