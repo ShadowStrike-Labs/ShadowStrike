@@ -570,20 +570,37 @@ public:
     // =========================================================================
 
     bool Initialize(const VBSScannerConfiguration& config) {
-        if (m_initialized.exchange(true)) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Already initialized");
-            return true;
+        // Validate before flipping any state to avoid leaving the module in
+        // a partially-initialized state visible to concurrent callers.
+        if (!config.IsValid()) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration");
+            return false;
+        }
+
+        // Use status as the lifecycle gate: only the first caller that
+        // transitions Uninitialized/Stopped -> Initializing wins.  This closes
+        // the race in which a second thread observed m_initialized==true while
+        // the first thread later failed validation and reset it to false.
+        for (;;) {
+            ModuleStatus expected = m_status.load(std::memory_order_acquire);
+            if (expected == ModuleStatus::Running || expected == ModuleStatus::Paused) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Already initialized (status=%d)",
+                    static_cast<int>(expected));
+                return true;
+            }
+            if (expected == ModuleStatus::Initializing || expected == ModuleStatus::Stopping) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Cannot initialize while status=%d",
+                    static_cast<int>(expected));
+                return false;
+            }
+            // Allow transition from Uninitialized, Stopped, or Error.
+            if (m_status.compare_exchange_weak(expected, ModuleStatus::Initializing,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
         }
 
         SS_LOG_INFO(LOG_CATEGORY, L"Initializing...");
-        m_status = ModuleStatus::Initializing;
-
-        if (!config.IsValid()) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration");
-            m_initialized = false;
-            m_status = ModuleStatus::Error;
-            return false;
-        }
 
         {
             std::unique_lock lock(m_configMutex);
@@ -610,17 +627,18 @@ public:
         }
 
         m_stats.Reset();
-        m_status = ModuleStatus::Running;
+        m_initialized.store(true, std::memory_order_release);
+        m_status.store(ModuleStatus::Running, std::memory_order_release);
 
         SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
         return true;
     }
 
     void Shutdown() {
-        if (!m_initialized.exchange(false)) return;
+        if (!m_initialized.exchange(false, std::memory_order_acq_rel)) return;
 
         SS_LOG_INFO(LOG_CATEGORY, L"Shutting down...");
-        m_status = ModuleStatus::Stopping;
+        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
         // Clear cache
         {
@@ -635,7 +653,7 @@ public:
             m_errorCallbacks.clear();
         }
 
-        m_status = ModuleStatus::Stopped;
+        m_status.store(ModuleStatus::Stopped, std::memory_order_release);
         SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
     }
 
@@ -997,25 +1015,40 @@ public:
     }
 
     std::string ResolveStrReverse(std::string_view source) {
-        // Resolve StrReverse("literal") -> reversed string
+        // Resolve StrReverse("literal") -> reversed string.
+        // Single-pass append rewrite — O(N) on input length.  The previous
+        // implementation re-built prefix+replacement+suffix per match,
+        // degrading to O(N^2) on adversarial inputs.
         static const std::regex reversePattern(
             R"re(strreverse\s*\(\s*"([^"]*)"\s*\))re",
             std::regex::icase | std::regex::optimize);
 
-        std::string result(source);
-        std::smatch match;
+        const std::string src(source);
+        std::string out;
+        out.reserve(src.size());
+
+        std::sregex_iterator it(src.begin(), src.end(), reversePattern);
+        const std::sregex_iterator end;
+
+        std::string::const_iterator cursor = src.cbegin();
         size_t iters = 0;
 
-        while (std::regex_search(result, match, reversePattern) && iters < MAX_REGEX_ITERATIONS) {
-            std::string literal = match[1].str();
-            std::string reversed(literal.rbegin(), literal.rend());
-            std::string replacement = "\"" + reversed + "\"";
-
-            result = match.prefix().str() + replacement + match.suffix().str();
+        while (it != end && iters < MAX_REGEX_ITERATIONS) {
+            const auto& m = *it;
+            // Append the slice between the previous match end and this match.
+            out.append(cursor, m[0].first);
+            const std::string literal = m[1].str();
+            out.push_back('"');
+            out.append(literal.rbegin(), literal.rend());
+            out.push_back('"');
+            cursor = m[0].second;
+            ++it;
             ++iters;
         }
 
-        return result;
+        // Append the unmatched tail.
+        out.append(cursor, src.cend());
+        return out;
     }
 
     void ExtractStringsFromScript(std::string_view source, std::vector<std::string>& strings) {
@@ -1549,13 +1582,23 @@ public:
                 }
             }
 
-            // Check cache
-            {
+            // Check cache (only if we have a usable key)
+            if (!result.sha256.empty()) {
                 std::shared_lock lock(m_cacheMutex);
                 auto cacheIt = m_scanCache.find(result.sha256);
                 if (cacheIt != m_scanCache.end() &&
                     cacheIt->second.expiry > std::chrono::system_clock::now()) {
-                    return cacheIt->second.result;
+                    VBSScanResult cached = cacheIt->second.result;
+                    // The cached result was populated from a prior scan that
+                    // may have stamped a different path/scan time.  Restore
+                    // the caller-supplied context so we do not leak prior
+                    // filePath/scanTime values across requests with the same
+                    // content hash.
+                    cached.filePath.clear();
+                    cached.scanTime = result.scanTime;
+                    cached.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - startTime);
+                    return cached;
                 }
             }
 
@@ -1778,16 +1821,17 @@ public:
                 }
             }
 
-            // Populate cache
-            {
+            // Populate cache (only when we have a meaningful key; an empty
+            // SHA-256 would collide every empty-hash scan onto a single entry).
+            if (!result.sha256.empty()) {
                 std::unique_lock lock(m_cacheMutex);
                 if (m_scanCache.size() >= MAX_CACHE_SIZE) {
-                    // Evict oldest entries
+                    // Evict expired entries first.
                     auto now = std::chrono::system_clock::now();
                     std::erase_if(m_scanCache, [&now](const auto& pair) {
                         return pair.second.expiry <= now;
                     });
-                    // If still full, clear half
+                    // If still full, evict half via iterator walk.
                     if (m_scanCache.size() >= MAX_CACHE_SIZE) {
                         auto it = m_scanCache.begin();
                         size_t toRemove = m_scanCache.size() / 2;
@@ -1877,6 +1921,19 @@ public:
 
             content.resize(fileSize);
             file.read(content.data(), static_cast<std::streamsize>(fileSize));
+            // gcount() reflects what we actually got; truncating tail prevents
+            // a short read from leaving uninitialized-looking trailing bytes
+            // (zero-initialized by string ctor here, but a future allocator
+            // change must not silently feed phantom NUL bytes to the parser).
+            const auto got = file.gcount();
+            content.resize(static_cast<size_t>(std::max<std::streamsize>(0, got)));
+            if (static_cast<std::streamsize>(fileSize) != got) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Short read for %ls: expected %llu, got %lld",
+                    path.wstring().c_str(),
+                    static_cast<unsigned long long>(fileSize),
+                    static_cast<long long>(got));
+            }
 
         } catch (const std::exception& e) {
             result.status = VBSScanStatus::ErrorFileAccess;
@@ -1933,7 +1990,14 @@ public:
         size_t iters = 0;
 
         while (it != end && iters < MAX_REGEX_ITERATIONS) {
-            extracted += (*it)[1].str();
+            const std::string block = (*it)[1].str();
+            if (extracted.size() + block.size() + 1 > VBSConstants::MAX_SCRIPT_SIZE) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"HTA VBScript extraction capped at %zu bytes",
+                    VBSConstants::MAX_SCRIPT_SIZE);
+                break;
+            }
+            extracted += block;
             extracted += "\n";
             ++it;
             ++iters;
@@ -1947,7 +2011,14 @@ public:
             std::sregex_iterator sit(content.begin(), content.end(), anyScriptPattern);
             iters = 0;
             while (sit != end && iters < MAX_REGEX_ITERATIONS) {
-                extracted += (*sit)[1].str();
+                const std::string block = (*sit)[1].str();
+                if (extracted.size() + block.size() + 1 > VBSConstants::MAX_SCRIPT_SIZE) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"HTA generic-script extraction capped at %zu bytes",
+                        VBSConstants::MAX_SCRIPT_SIZE);
+                    break;
+                }
+                extracted += block;
                 extracted += "\n";
                 ++sit;
                 ++iters;
@@ -1970,7 +2041,14 @@ public:
         size_t iters = 0;
 
         while (it != end && iters < MAX_REGEX_ITERATIONS) {
-            extracted += (*it)[1].str();
+            const std::string block = (*it)[1].str();
+            if (extracted.size() + block.size() + 1 > VBSConstants::MAX_SCRIPT_SIZE) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"WSF VBScript extraction capped at %zu bytes",
+                    VBSConstants::MAX_SCRIPT_SIZE);
+                break;
+            }
+            extracted += block;
             extracted += "\n";
             ++it;
             ++iters;
@@ -2179,23 +2257,45 @@ public:
     // =========================================================================
 
     void InvokeScanCallbacks(const VBSScanResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& callback : m_scanCallbacks) {
+        // Copy the callback list under the lock so we can invoke without
+        // holding it.  This prevents a callback that calls back into
+        // UnregisterCallbacks (which takes the unique_lock) from
+        // deadlocking against this shared_lock holder.
+        std::vector<VBSScanResultCallback> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot = m_scanCallbacks;
+        }
+        for (const auto& callback : snapshot) {
+            if (!callback) continue;
             try {
                 callback(result);
+            } catch (const std::exception& e) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Scan callback threw: %hs", e.what());
             } catch (...) {
-                // Don't let callback exceptions propagate
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Scan callback threw unknown exception");
             }
         }
     }
 
     void InvokeErrorCallbacks(const std::string& message, int code) {
-        std::shared_lock lock(m_callbackMutex);
-        for (const auto& callback : m_errorCallbacks) {
+        std::vector<ErrorCallback> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot = m_errorCallbacks;
+        }
+        for (const auto& callback : snapshot) {
+            if (!callback) continue;
             try {
                 callback(message, code);
+            } catch (const std::exception& e) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Error callback threw: %hs", e.what());
             } catch (...) {
-                // Don't let callback exceptions propagate
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Error callback threw unknown exception");
             }
         }
     }
