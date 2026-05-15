@@ -114,6 +114,23 @@ namespace {
         L".ps1", L".vbs", L".js", L".bat", L".cmd", L".wsf", L".hta", L".py"
     };
 
+    [[nodiscard]] bool FitsWidePayload(size_t bodySize,
+                                       size_t fixedSize,
+                                       uint16_t firstLength,
+                                       uint16_t secondLength,
+                                       uint16_t thirdLength = 0) noexcept {
+        if (bodySize < fixedSize) {
+            return false;
+        }
+
+        const size_t availableChars = (bodySize - fixedSize) / sizeof(wchar_t);
+        const size_t requiredChars =
+            static_cast<size_t>(firstLength) +
+            static_cast<size_t>(secondLength) +
+            static_cast<size_t>(thirdLength);
+        return requiredChars <= availableChars;
+    }
+
 } // namespace
 
 // ============================================================================
@@ -466,9 +483,22 @@ struct FileSystemFilter::Impl {
     void MessageLoop() {
         Utils::Logger::Info("FileSystemFilter: Message thread started");
 
+        // Snapshot the buffer size once; ignore later UpdateConfig() changes -
+        // resizing under FilterGetMessage is unsafe.
+        const size_t bufferSize = m_config.messageBufferSize;
+        if (bufferSize < sizeof(FILTER_MESSAGE_HEADER) + sizeof(FilterMessageHeader)) {
+            Utils::Logger::Error(
+                "FileSystemFilter: Message buffer too small ({} bytes) - aborting message thread",
+                bufferSize);
+            return;
+        }
+
         // Allocate message buffer
-        std::vector<uint8_t> buffer(m_config.messageBufferSize);
+        std::vector<uint8_t> buffer(bufferSize);
         PFILTER_MESSAGE_HEADER pMessage = reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer.data());
+
+        // Maximum bytes the kernel could have written after the FILTER_MESSAGE_HEADER.
+        const size_t maxPayloadBytes = bufferSize - sizeof(FILTER_MESSAGE_HEADER);
 
         while (!m_stopMessageLoop) {
             if (m_hPort == INVALID_HANDLE_VALUE) {
@@ -476,11 +506,16 @@ struct FileSystemFilter::Impl {
                 continue;
             }
 
+            // [FSF-A-001] Reset the application-level header before each call so
+            // a short kernel write cannot leave stale magic/size from a prior
+            // iteration to be re-interpreted as a valid frame.
+            std::memset(buffer.data(), 0, sizeof(FILTER_MESSAGE_HEADER) + sizeof(FilterMessageHeader));
+
             // Get message from driver
             HRESULT hr = FilterGetMessage(
                 m_hPort,
                 pMessage,
-                static_cast<DWORD>(m_config.messageBufferSize),
+                static_cast<DWORD>(bufferSize),
                 nullptr  // Overlapped (NULL = synchronous)
             );
 
@@ -494,28 +529,69 @@ struct FileSystemFilter::Impl {
                 continue;
             }
 
-            // Process the message
-            const void* data = reinterpret_cast<const uint8_t*>(pMessage) + sizeof(FILTER_MESSAGE_HEADER);
-            const FilterMessageHeader* header = static_cast<const FilterMessageHeader*>(data);
+            // [FSF-A-001] Validate the application-level header lies inside the
+            // buffer before reading any of its fields.
+            const uint8_t* payload = buffer.data() + sizeof(FILTER_MESSAGE_HEADER);
+            const FilterMessageHeader* header =
+                reinterpret_cast<const FilterMessageHeader*>(payload);
 
             if (header->magic != FilterConstants::MESSAGE_MAGIC) {
-                Utils::Logger::Warn("FileSystemFilter: Invalid message magic");
+                Utils::Logger::Warn("FileSystemFilter: Invalid message magic 0x{:08X}",
+                    header->magic);
                 continue;
             }
 
-            ProcessMessage(header, reinterpret_cast<const uint8_t*>(header) + sizeof(FilterMessageHeader));
+            // [FSF-A-002] Refuse unknown protocol versions - never parse layouts we
+            // do not control.
+            if (header->version != FilterConstants::PROTOCOL_VERSION) {
+                Utils::Logger::Warn(
+                    "FileSystemFilter: Unsupported protocol version {} (expected {})",
+                    header->version, FilterConstants::PROTOCOL_VERSION);
+                continue;
+            }
+
+            // [FSF-A-001] header->dataSize is the length of the payload that
+            // follows the FilterMessageHeader. Validate it fits inside the buffer
+            // we actually allocated.
+            const uint32_t dataSize = header->dataSize;
+            if (dataSize > maxPayloadBytes - sizeof(FilterMessageHeader)) {
+                Utils::Logger::Warn(
+                    "FileSystemFilter: Declared dataSize {} exceeds buffer ({} bytes available) - dropping",
+                    dataSize, maxPayloadBytes - sizeof(FilterMessageHeader));
+                continue;
+            }
+
+            const void* bodyPtr = payload + sizeof(FilterMessageHeader);
+            ProcessMessage(header, bodyPtr, dataSize);
         }
 
         Utils::Logger::Info("FileSystemFilter: Message thread exiting");
     }
 
-    void ProcessMessage(const FilterMessageHeader* header, const void* data) {
+    void ProcessMessage(const FilterMessageHeader* header,
+                        const void* data, size_t dataSize) {
         switch (header->messageType) {
             case FilterMessageType::FileScanOnOpen:
             case FilterMessageType::FileScanOnExecute:
             case FilterMessageType::FileScanOnWrite:
             case FilterMessageType::FileScanNetwork:
-                HandleScanRequest(reinterpret_cast<const FileScanRequest*>(data), data);
+                if (dataSize < sizeof(FileScanRequest)) {
+                    Utils::Logger::Warn(
+                        "FileSystemFilter: Scan request body too small ({} < {}) - dropping",
+                        dataSize, sizeof(FileScanRequest));
+                    return;
+                }
+                {
+                    const auto* request = reinterpret_cast<const FileScanRequest*>(data);
+                    if (!FitsWidePayload(dataSize, sizeof(FileScanRequest),
+                                         request->pathLength,
+                                         request->processNameLength)) {
+                        Utils::Logger::Warn(
+                            "FileSystemFilter: Scan request string lengths exceed body size - dropping");
+                        return;
+                    }
+                    HandleScanRequest(request, data);
+                }
                 break;
 
             case FilterMessageType::NotifyFileCreate:
@@ -523,7 +599,24 @@ struct FileSystemFilter::Impl {
             case FilterMessageType::NotifyFileRename:
             case FilterMessageType::NotifyFileDelete:
             case FilterMessageType::NotifyFileMap:
-                HandleNotification(reinterpret_cast<const FileNotification*>(data), data);
+                if (dataSize < sizeof(FileNotification)) {
+                    Utils::Logger::Warn(
+                        "FileSystemFilter: Notification body too small ({} < {}) - dropping",
+                        dataSize, sizeof(FileNotification));
+                    return;
+                }
+                {
+                    const auto* notification = reinterpret_cast<const FileNotification*>(data);
+                    if (!FitsWidePayload(dataSize, sizeof(FileNotification),
+                                         notification->pathLength,
+                                         notification->newPathLength,
+                                         notification->processNameLength)) {
+                        Utils::Logger::Warn(
+                            "FileSystemFilter: Notification string lengths exceed body size - dropping");
+                        return;
+                    }
+                    HandleNotification(notification, data);
+                }
                 break;
 
             default:
