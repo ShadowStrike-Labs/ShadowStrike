@@ -780,7 +780,11 @@ const std::vector<std::string> MacroDetectorImpl::s_persistenceIndicators = {
 
 [[nodiscard]] size_t MacroDetectorImpl::BinaryFind(
     std::span<const uint8_t> data, std::string_view needle, size_t startPos) noexcept {
-    if (needle.empty() || data.size() < needle.size() || startPos > data.size() - needle.size()) {
+    if (needle.empty() || data.size() < needle.size()) {
+        return std::string::npos;
+    }
+    // Guard against overflow: check startPos + needle.size() <= data.size()
+    if (startPos > data.size() || needle.size() > data.size() - startPos) {
         return std::string::npos;
     }
     auto needleBytes = reinterpret_cast<const uint8_t*>(needle.data());
@@ -947,6 +951,24 @@ void MacroDetectorImpl::Shutdown() {
     }
 
     std::wstring widePath = path.wstring();
+    
+    // Validate path length and reject paths with embedded NUL or control characters
+    if (widePath.size() > 32767) {
+        SS_LOG_ERROR(L"MacroDetector", L"Path too long (%zu chars)", widePath.size());
+        result.status = MacroScanStatus::ErrorFileAccess;
+        NotifyError("Path exceeds maximum length", -1);
+        return result;
+    }
+    
+    // Check for embedded NUL or control characters in path (path traversal/injection defense)
+    for (wchar_t c : widePath) {
+        if (c == L'\0' || (c < 32 && c != L'\t')) {
+            SS_LOG_ERROR(L"MacroDetector", L"Path contains invalid character");
+            result.status = MacroScanStatus::ErrorFileAccess;
+            NotifyError("Path contains invalid character", -1);
+            return result;
+        }
+    }
 
     // Check file exists
     Utils::FileUtils::Error fileErr;
@@ -1417,6 +1439,13 @@ void MacroDetectorImpl::Shutdown() {
     if (ec || fileSize < 4) {
         return DocumentFormat::Unknown;
     }
+    
+    // Reject files exceeding max document size to prevent allocation attacks
+    if (fileSize > m_config.maxDocumentSize) {
+        SS_LOG_WARN(L"MacroDetector", L"DetectFormat: file exceeds max size (%llu bytes)", 
+                    static_cast<unsigned long long>(fileSize));
+        return DocumentFormat::Unknown;
+    }
 
     std::array<uint8_t, 16> header{};
     size_t bytesToRead = std::min(static_cast<size_t>(fileSize), header.size());
@@ -1645,6 +1674,25 @@ void MacroDetectorImpl::Shutdown() {
     deobfuscated += result.substr(lastPos);
     result = deobfuscated;
 
+    // Concatenation simplification (basic) - apply only if still under size limit
+    if (result.size() <= MacroConstants::MAX_REGEX_INPUT_SIZE) {
+        std::regex concatPattern(R"re("([^"]*)" \& "([^"]*)")re");
+        searchStart = result.cbegin();
+        deobfuscated.clear();
+        lastPos = 0;
+
+        while (std::regex_search(searchStart, result.cend(), match, concatPattern)) {
+            size_t matchPos = match.position() + (searchStart - result.cbegin());
+            deobfuscated += result.substr(lastPos, matchPos - lastPos);
+            deobfuscated += "\"" + match[1].str() + match[2].str() + "\"";
+
+            lastPos = matchPos + match.length();
+            searchStart = match.suffix().first;
+        }
+        deobfuscated += result.substr(lastPos);
+        result = deobfuscated;
+    }
+
     // If the output changed, recurse to handle nested obfuscation layers
     if (result != safeInput) {
         return Deobfuscate(result, depth + 1);
@@ -1674,6 +1722,21 @@ void MacroDetectorImpl::Shutdown() {
         std::string url = urlIt->str();
         if (std::find(iocs.begin(), iocs.end(), url) == iocs.end()) {
             iocs.push_back(std::move(url));
+        }
+    }
+    
+    // Extract domains (e.g., evil.com without protocol)
+    std::regex domainPattern(R"(\b([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b)");
+    std::sregex_iterator domainIt(safeCode.begin(), safeCode.end(), domainPattern);
+    
+    for (; domainIt != endSentinel && iocs.size() < 100; ++domainIt) {
+        std::string domain = domainIt->str();
+        // Filter out common legitimate domains to reduce noise
+        if (domain.find("microsoft.com") == std::string::npos &&
+            domain.find("windows.com") == std::string::npos &&
+            domain.find("office.com") == std::string::npos &&
+            std::find(iocs.begin(), iocs.end(), domain) == iocs.end()) {
+            iocs.push_back(std::move(domain));
         }
     }
 
@@ -1874,13 +1937,26 @@ void MacroDetectorImpl::ResetStatistics() {
         outProject.isProtected = true;
         outProject.protectionType = "Password Protected";
     }
+    
+    // VBA Stomping detection: check for P-code only (source code removed but P-code remains)
+    // This is a common evasion where VBA source is removed but compiled P-code executes.
+    // Indicators: presence of _VBA_PROJECT or PerformanceCache but missing Attribute VB_Name
+    if (BinaryContains(content, "_VBA_PROJECT") || BinaryContains(content, "PerformanceCache")) {
+        bool hasSourceCode = BinaryContains(content, "Attribute VB_Name") ||
+                             BinaryContains(content, "Sub ") ||
+                             BinaryContains(content, "Function ");
+        if (!hasSourceCode) {
+            outProject.hasPCodeOnly = true;
+            SS_LOG_WARN(L"MacroDetector", L"VBA stomping detected: P-code only, no source");
+        }
+    }
 
     outProject.moduleCount = outProject.modules.size();
     for (const auto& mod : outProject.modules) {
         outProject.totalSourceSize += mod.sourceSize;
     }
 
-    return !outProject.modules.empty();
+    return !outProject.modules.empty() || outProject.hasPCodeOnly;
 }
 
 [[nodiscard]] bool MacroDetectorImpl::ParseOpenXMLDocument(
@@ -1929,8 +2005,18 @@ void MacroDetectorImpl::ResetStatistics() {
     }
 
     if (pos != std::string::npos) {
-        // Extract a bounded chunk of VBA code from the binary
-        size_t maxExtract = std::min(size_t(10000), content.size() - pos);
+        // Cap extraction to MAX_VBA_PROJECT_SIZE (50 MB) to prevent unbounded allocations
+        size_t remainingBytes = content.size() - pos;
+        size_t maxExtract = std::min({
+            remainingBytes,
+            size_t(10000),
+            MacroConstants::MAX_VBA_PROJECT_SIZE
+        });
+        
+        if (maxExtract == 0) {
+            return false;
+        }
+        
         outVBA.assign(reinterpret_cast<const char*>(content.data() + pos), maxExtract);
 
         // Clean up non-printable characters
@@ -1967,7 +2053,12 @@ void MacroDetectorImpl::ResetStatistics() {
     xlm.sheetName = "Macro1";
 
     // Extract text-like content for regex matching, capped for ReDoS safety
+    // Check content.size() first to avoid allocating MAX_REGEX_INPUT_SIZE when content is smaller
     size_t safeLen = std::min(content.size(), MacroConstants::MAX_REGEX_INPUT_SIZE);
+    if (safeLen == 0) {
+        return false;
+    }
+    
     std::string safeStr;
     safeStr.reserve(safeLen);
     for (size_t i = 0; i < safeLen; ++i) {
@@ -2401,27 +2492,32 @@ void MacroDetectorImpl::ResetStatistics() {
                 // Extract URL (up to next quote, angle bracket, or whitespace)
                 size_t urlStart = httpPos;
                 size_t urlEnd = urlStart;
-                while (urlEnd < window.size()) {
+                constexpr size_t MAX_URL_LENGTH = 2048;
+                while (urlEnd < window.size() && (urlEnd - urlStart) < MAX_URL_LENGTH) {
                     char c = static_cast<char>(window[urlEnd]);
                     if (c == '"' || c == '\'' || c == '>' || c == '<' ||
-                        c == ' ' || c == '\n' || c == '\r') {
+                        c == ' ' || c == '\n' || c == '\r' || c == '\0') {
                         break;
                     }
                     ++urlEnd;
                 }
-                if (urlEnd > urlStart &&
+                // Validate extracted URL length before assignment
+                size_t urlLen = urlEnd - urlStart;
+                if (urlLen > 0 && urlLen <= MAX_URL_LENGTH &&
                     outInjections.size() < MacroConstants::MAX_TEMPLATE_INJECTIONS) {
                     TemplateInjectionInfo info;
                     info.templateUrl.assign(
                         reinterpret_cast<const char*>(window.data() + urlStart),
-                        urlEnd - urlStart);
+                        urlLen);
                     info.xmlElement = marker;
                     info.relationshipType = marker;
                     outInjections.push_back(std::move(info));
 
                     SS_LOG_WARN(L"MacroDetector",
-                                L"Template injection detected: %hs -> %hs",
-                                marker, outInjections.back().templateUrl.c_str());
+                                L"Template injection detected: %hs -> %.*hs",
+                                marker, 
+                                static_cast<int>(std::min(urlLen, size_t(256))),
+                                outInjections.back().templateUrl.c_str());
                 }
             }
 
@@ -2505,10 +2601,21 @@ void MacroDetectorImpl::ResetStatistics() {
 [[nodiscard]] MacroScanResult MacroDetectorImpl::ScanVBAContent(std::string_view vbaContent) {
     // Scan raw VBA content submitted by AMSI provider or other callers.
     // No document container to parse — analyze the VBA code directly.
+    // Cap input size to prevent resource exhaustion.
     if (vbaContent.empty()) {
         MacroScanResult result;
         result.status = MacroScanStatus::Clean;
         result.scanTime = std::chrono::system_clock::now();
+        return result;
+    }
+    
+    // Enforce MAX_VBA_PROJECT_SIZE limit on raw VBA input
+    if (vbaContent.size() > MacroConstants::MAX_VBA_PROJECT_SIZE) {
+        MacroScanResult result;
+        result.status = MacroScanStatus::SkippedSizeLimit;
+        result.scanTime = std::chrono::system_clock::now();
+        SS_LOG_WARN(L"MacroDetector", L"ScanVBAContent: input exceeds MAX_VBA_PROJECT_SIZE (%zu bytes)",
+                    vbaContent.size());
         return result;
     }
 
@@ -2551,6 +2658,12 @@ void MacroDetectorImpl::OnKernelProcessNotify(
 
     if (!m_initialized.load(std::memory_order_acquire)) return;
     if (!isCreate) return;
+
+    // Validate input lengths to prevent processing malicious oversized strings
+    if (imagePath.size() > 32767 || commandLine.size() > 32767) {
+        SS_LOG_WARN(L"MacroDetector", L"Kernel: Oversized path/cmdline rejected PID=%u", processId);
+        return;
+    }
 
     // Extract filename from path
     const auto lastSep = imagePath.find_last_of(L"\\/");
@@ -2608,6 +2721,11 @@ void MacroDetectorImpl::OnKernelImageLoad(
 
     if (!m_initialized.load(std::memory_order_acquire)) return;
 
+    // Validate input length
+    if (imagePath.size() > 32767) {
+        return;
+    }
+
     const auto lastSep = imagePath.find_last_of(L"\\/");
     const auto fileName = (lastSep != std::wstring_view::npos)
         ? imagePath.substr(lastSep + 1) : imagePath;
@@ -2654,8 +2772,9 @@ void MacroDetectorImpl::OnKernelImageLoad(
 
         blockRequest.messageType = MacroConstants::KERNEL_MSG_BLOCK_PROCESS;
         blockRequest.processId = processId;
-        wcsncpy_s(blockRequest.reason, reason.c_str(),
-                   std::min(reason.size(), size_t(255)));
+        // _countof includes the NUL terminator, so we use _countof - 1 for safe copy
+        wcsncpy_s(blockRequest.reason, _countof(blockRequest.reason),
+                  reason.c_str(), _TRUNCATE);
 
         if (ipc.SendToKernel(&blockRequest, sizeof(blockRequest))) {
             SS_LOG_INFO(L"MacroDetector",
