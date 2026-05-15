@@ -216,6 +216,15 @@ struct ProcessKeyHash {
     }
 };
 
+// FIX: BB-N4 - blocked-process entry keyed by ProcessKey to defend against PID
+// reuse within the TTL window. Recording both creation time and block timestamp
+// lets us reject false-positives where the OS recycled a recently-terminated PID
+// onto an unrelated process before the 10-minute TTL elapsed.
+struct BlockedEntry {
+    uint64_t creationTime{0};
+    int64_t  blockedAtMs{0};
+};
+
 struct CompiledRule {
     BehaviorRule rule;
     std::unique_ptr<std::regex> targetRegex;
@@ -616,14 +625,41 @@ public:
         }
 
         // Step 3: Fast path -- already blocked PID (with TTL to prevent PID reuse false positives)
+        // FIX: BB-N4 - additionally verify the process creation time matches the blocked
+        // entry's recorded creationTime; if the PID was reused within the TTL window the
+        // creation times will differ and we fall through to normal evaluation.
         // No heap allocations before this check per performance contract
         {
             std::shared_lock blockedLock(m_blockedMutex);
             auto it = m_blockedPids.find(behavior.processId);
             if (it != m_blockedPids.end() &&
-                (NowEpochMs() - it->second) <= kBlockedPidTtlMs) {
-                RecordAnalysisTime(startTime);
-                return BlockAction::TerminateProcess;
+                (NowEpochMs() - it->second.blockedAtMs) <= kBlockedPidTtlMs) {
+                // Promote shared lock release before potential cache hit to avoid
+                // holding the blockedMutex while querying the ProcessUtils API.
+                BlockedEntry entry = it->second;
+                blockedLock.unlock();
+
+                ProcessKey live = GetProcessKey(behavior.processId);
+                // Only short-circuit if creationTime is known and matches.
+                // If we cannot resolve a creation time (entry.creationTime == 0 or
+                // live.creationTime == 0) we fall back to the legacy PID-only check
+                // because a stale block is preferable to under-blocking a confirmed
+                // malicious PID within the TTL.
+                if (entry.creationTime == 0 ||
+                    live.creationTime == 0 ||
+                    entry.creationTime == live.creationTime) {
+                    RecordAnalysisTime(startTime);
+                    return BlockAction::TerminateProcess;
+                }
+                // PID was reused - purge the stale entry and proceed with eval.
+                {
+                    std::unique_lock writeLock(m_blockedMutex);
+                    auto stale = m_blockedPids.find(behavior.processId);
+                    if (stale != m_blockedPids.end() &&
+                        stale->second.creationTime == entry.creationTime) {
+                        m_blockedPids.erase(stale);
+                    }
+                }
             }
         }
 
@@ -787,8 +823,10 @@ public:
 
         SS_LOG_INFO(kLogCategory, L"Manual block for PID %u: %hs", pid, reason.c_str());
         {
+            // FIX: BB-N4 - record creation time alongside block timestamp.
+            ProcessKey key = GetProcessKey(pid);
             std::unique_lock blockedLock(m_blockedMutex);
-            m_blockedPids[pid] = NowEpochMs();
+            m_blockedPids[pid] = BlockedEntry{ key.creationTime, NowEpochMs() };
         }
 
         BlockEvent evt{};
@@ -830,7 +868,7 @@ public:
         std::shared_lock blockedLock(m_blockedMutex);
         auto it = m_blockedPids.find(pid);
         return it != m_blockedPids.end() &&
-               (NowEpochMs() - it->second) <= kBlockedPidTtlMs;
+               (NowEpochMs() - it->second.blockedAtMs) <= kBlockedPidTtlMs;
     }
 
     // ========================================================================
@@ -974,6 +1012,24 @@ public:
     bool AddExclusion(const BehaviorExclusion& exclusion) {
         if (exclusion.exclusionId.empty()) {
             SS_LOG_WARN(kLogCategory, L"AddExclusion: empty exclusionId");
+            return false;
+        }
+        // FIX: BB-N5 - reject "match-everything" exclusions where every pattern
+        // field is empty AND no specific behavior types are listed. IsExcluded's
+        // "all-fields match" semantics treat empty patterns as wildcards, so an
+        // exclusion with no constraints whatsoever would whitelist *every*
+        // behavior from *every* process - a catastrophic bypass primitive if
+        // such an entry were ever produced (config corruption, parser bug,
+        // attacker-controlled exclusion file). At least one constraint must
+        // be present.
+        if (exclusion.processPathPattern.empty() &&
+            exclusion.commandLinePattern.empty() &&
+            exclusion.targetPattern.empty() &&
+            !exclusion.behaviorType.has_value()) {
+            SS_LOG_ERROR(kLogCategory,
+                L"AddExclusion: refusing wildcard exclusion '%hs' "
+                L"(all pattern fields are empty and no behaviorType filter set)",
+                exclusion.exclusionId.c_str());
             return false;
         }
         std::unique_lock exclLock(m_exclusionMutex);
@@ -1270,7 +1326,6 @@ private:
     bool HandleBlockAction(const ProcessBehavior& behavior, BlockAction action,
                            const std::string& ruleId, const std::string& details,
                            const std::string& mitreId) {
-        m_stats.threatsBlocked.fetch_add(1, std::memory_order_relaxed);
         bool success = true;
         switch (action) {
             case BlockAction::TerminateProcess:
@@ -1300,13 +1355,27 @@ private:
                 SS_LOG_WARN(kLogCategory, L"BLOCKED op from PID %u rule=%hs MITRE=%hs",
                     behavior.processId, ruleId.c_str(), mitreId.c_str());
                 break;
+            // FIX: BB-N3 - Quarantine and network-isolation enforcement is not yet
+            // wired to QuarantineManager / NetworkIsolator backends. Until those
+            // managers are integrated, reporting these actions as successful would
+            // produce misleading SOC telemetry ("threat blocked") while the
+            // offending process continues to execute. Emit an explicit unenforced
+            // warning, mark the action as unsuccessful, and do not count it
+            // against `threatsBlocked`. The detection event itself is still
+            // recorded by the caller (RecordBlockEvent + InvokeCallbacks).
             case BlockAction::QuarantineFile:
-                SS_LOG_WARN(kLogCategory, L"QUARANTINE for PID %u rule=%hs MITRE=%hs",
+                SS_LOG_WARN(kLogCategory,
+                    L"QUARANTINE requested but NOT ENFORCED (QuarantineManager not wired) "
+                    L"PID=%u rule=%hs MITRE=%hs",
                     behavior.processId, ruleId.c_str(), mitreId.c_str());
+                success = false;
                 break;
             case BlockAction::IsolateNetwork:
-                SS_LOG_WARN(kLogCategory, L"NETWORK ISOLATE for PID %u rule=%hs MITRE=%hs",
+                SS_LOG_WARN(kLogCategory,
+                    L"NETWORK ISOLATE requested but NOT ENFORCED (NetworkIsolator not wired) "
+                    L"PID=%u rule=%hs MITRE=%hs",
                     behavior.processId, ruleId.c_str(), mitreId.c_str());
+                success = false;
                 break;
             case BlockAction::AlertOnly:
                 SS_LOG_WARN(kLogCategory, L"ALERT: PID %u rule=%hs MITRE=%hs (%hs)",
@@ -1317,7 +1386,17 @@ private:
                     behavior.processId, ruleId.c_str(), mitreId.c_str());
                 break;
             default:
+                success = false;
                 break;
+        }
+        // FIX: BB-N3 - only count toward threatsBlocked when an enforcement
+        // action actually succeeded (or when the action class is informational
+        // by design, i.e. AlertOnly / LogOnly / BlockOperation). This avoids
+        // inflating telemetry with failed terminations and unenforced stubs.
+        if (success &&
+            action != BlockAction::AlertOnly &&
+            action != BlockAction::LogOnly) {
+            m_stats.threatsBlocked.fetch_add(1, std::memory_order_relaxed);
         }
         return success;
     }
@@ -1332,17 +1411,33 @@ private:
             return false;
         }
         try {
-            if (Utils::ProcessUtils::TerminateProcess(pid)) {
+            // FIX: BB-N1 - Resolve the ProcessKey BEFORE termination so we can
+            // record the original creation time and defend against PID reuse
+            // attacks. Once the process exits, the creation time becomes
+            // unrecoverable.
+            ProcessKey key = GetProcessKey(pid);
+
+            // FIX: BB-N2 - Terminate the entire process tree, not just the
+            // root. This matches the header contract and is essential for
+            // ransomware/lateral-movement scenarios where the offending PID
+            // has already spawned encryption workers or persistence helpers
+            // that would otherwise be orphaned and continue executing.
+            Utils::ProcessUtils::Error termErr{};
+            if (Utils::ProcessUtils::TerminateProcessTree(pid, 0, &termErr)) {
                 m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
-                SS_LOG_INFO(kLogCategory, L"Terminated PID %u", pid);
+                SS_LOG_INFO(kLogCategory, L"Terminated process tree rooted at PID %u", pid);
                 {
                     std::unique_lock blockedLock(m_blockedMutex);
-                    m_blockedPids[pid] = NowEpochMs();
+                    m_blockedPids[pid] = BlockedEntry{ key.creationTime, NowEpochMs() };
                 }
                 m_processKeyCache.Invalidate(pid);
                 return true;
             }
-            SS_LOG_ERROR(kLogCategory, L"Failed to terminate PID %u", pid);
+            SS_LOG_ERROR(kLogCategory,
+                L"Failed to terminate process tree for PID %u: code=%u msg=%hs",
+                pid,
+                static_cast<unsigned>(termErr.win32),
+                Utils::StringUtils::ToNarrow(termErr.message).c_str());
             return false;
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(kLogCategory, L"Exception terminating PID %u: %hs", pid, ex.what());
@@ -1609,7 +1704,8 @@ private:
     std::unordered_map<uint32_t, ProcessBehaviorChain> m_behaviorChains;
 
     mutable std::shared_mutex       m_blockedMutex;
-    std::unordered_map<uint32_t, int64_t> m_blockedPids; // PID → block timestamp (epoch ms)
+    // FIX: BB-N4 - see BlockedEntry. PID -> {creationTime, blockedAtMs}.
+    std::unordered_map<uint32_t, BlockedEntry> m_blockedPids;
 
     mutable std::shared_mutex       m_historyMutex;
     std::deque<BlockEvent>          m_history;
