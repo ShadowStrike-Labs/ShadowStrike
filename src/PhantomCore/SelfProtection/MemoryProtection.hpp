@@ -1384,6 +1384,7 @@ public:
 
 private:
     friend class ::ShadowStrike::Service::AntivirusServiceImpl;
+    friend class ProtectedRegionGuard;
 
     // ========================================================================
     // PRIVATE CONSTRUCTOR

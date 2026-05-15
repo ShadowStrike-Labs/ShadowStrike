@@ -78,9 +78,6 @@ namespace Security {
 
 namespace {
     constexpr const wchar_t* LOG_CATEGORY = L"MemoryProtection";
-
-    // Authorization token for internal operations
-    constexpr std::string_view INTERNAL_AUTH_TOKEN = "SS_INTERNAL_MEMORY_PROTECTION_AUTH";
 }
 
 // ============================================================================
@@ -495,10 +492,18 @@ public:
 
         // Generate random encryption key for this session
         generateSessionKey();
+
+        // Generate a per-instance authorization token via the OS CSPRNG.
+        // The previous design used a hard-coded constexpr token string which
+        // is trivially extractable from the binary and turned every
+        // auth-gated entry point (Shutdown, UnprotectRegion, DisableAntiDump,
+        // RestorePEHeaders, ClearEventHistory, ResetStatistics,
+        // UpdateRegionBaseline) into an unauthenticated backdoor.
+        generateInternalAuthToken();
     }
 
     ~MemoryProtectionImpl() noexcept {
-        Shutdown(INTERNAL_AUTH_TOKEN);
+        shutdownUnchecked();
     }
 
     // ========================================================================
@@ -579,7 +584,12 @@ public:
             SS_LOG_WARN(LOG_CATEGORY, L"Invalid authorization token for shutdown");
             return;
         }
+        shutdownUnchecked();
+    }
 
+    /// Internal shutdown path used by the destructor (which cannot present a
+    /// caller-supplied token) and by Shutdown() after the auth check passes.
+    void shutdownUnchecked() noexcept {
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
@@ -589,8 +599,14 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Shutting down MemoryProtection");
         m_status = ModuleStatus::Stopping;
 
-        // Stop integrity monitoring
-        stopIntegrityMonitoring();
+        // Stop integrity monitoring outside the mutex to avoid join-on-self
+        // when the monitoring thread is blocked trying to acquire m_mutex.
+        m_integrityMonitorRunning = false;
+        lock.unlock();
+        if (m_integrityMonitorThread.joinable()) {
+            m_integrityMonitorThread.join();
+        }
+        lock.lock();
 
         // Free all secure allocations
         freeAllSecureAllocations();
@@ -840,8 +856,16 @@ public:
         // Free the memory
         VirtualFree(basePtr, 0, MEM_RELEASE);
 
-        // Update statistics
-        m_stats.totalSecureBytes -= alloc.size;
+        // Update statistics — guard against underflow if ResetStatistics
+        // happens to fire between AllocateSecure and FreeSecure for this ptr.
+        uint64_t prev = m_stats.totalSecureBytes.load(std::memory_order_relaxed);
+        while (true) {
+            uint64_t next = (prev >= alloc.size) ? (prev - alloc.size) : 0ULL;
+            if (m_stats.totalSecureBytes.compare_exchange_weak(prev, next,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
 
         // Remove from tracking
         m_secureAllocations.erase(it);
@@ -1354,12 +1378,20 @@ public:
     }
 
     [[nodiscard]] bool ObfuscatePEHeaders() noexcept {
+        std::unique_lock lock(m_mutex);
+        return obfuscatePEHeadersInternal();
+    }
+
+    /// Internal variant that assumes m_mutex is already held by the caller.
+    /// Required because Initialize() and EnableAntiDump() acquire the
+    /// unique_lock and then chain into enableAntiDumpInternal() which previously
+    /// called the public ObfuscatePEHeaders — re-acquiring a non-recursive
+    /// shared_mutex on the same thread, producing a hard deadlock.
+    [[nodiscard]] bool obfuscatePEHeadersInternal() noexcept {
         HMODULE hModule = GetModuleHandle(nullptr);
         if (!hModule) {
             return false;
         }
-
-        std::unique_lock lock(m_mutex);
 
         auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
         if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
@@ -1768,12 +1800,20 @@ public:
 
         while (address < maxAddress) {
             auto regionInfo = QueryMemoryRegion(address);
+            uintptr_t nextAddress;
             if (regionInfo.has_value()) {
                 result.push_back(regionInfo.value());
-                address = regionInfo->baseAddress + regionInfo->regionSize;
+                nextAddress = regionInfo->baseAddress + regionInfo->regionSize;
             } else {
-                address += MemoryProtectionConstants::PAGE_SIZE;
+                nextAddress = address + MemoryProtectionConstants::PAGE_SIZE;
             }
+            // Guarantee forward progress — a malformed region descriptor that
+            // reports a zero size or an earlier base address must not pin the
+            // enumerator in an infinite loop.
+            if (nextAddress <= address) {
+                nextAddress = address + MemoryProtectionConstants::PAGE_SIZE;
+            }
+            address = nextAddress;
         }
 
         return result;
@@ -1968,7 +2008,7 @@ public:
                         passed = false;
                     }
 
-                    UnprotectRegion("selftest_region", INTERNAL_AUTH_TOKEN);
+                    UnprotectRegion("selftest_region", m_internalAuthToken);
                 }
 
                 VirtualFree(testRegion, 0, MEM_RELEASE);
@@ -2043,6 +2083,15 @@ public:
         return result == 0;
     }
 
+    /// Returns the per-instance authorization token. Trusted internal callers
+    /// (declared as friends of MemoryProtection) use this to drive auth-gated
+    /// entry points such as UnprotectRegion from RAII guards and from the
+    /// integrity self-test.
+    [[nodiscard]] std::string GetInternalAuthToken() const {
+        std::shared_lock lock(m_mutex);
+        return m_internalAuthToken;
+    }
+
 private:
     // ========================================================================
     // INTERNAL METHODS
@@ -2114,8 +2163,9 @@ private:
             return true;
         }
 
-        // Obfuscate PE headers
-        if (ObfuscatePEHeaders()) {
+        // Use the internal (lock-held) variant — callers of this routine
+        // already hold m_mutex exclusively.
+        if (obfuscatePEHeadersInternal()) {
             m_antiDumpEnabled = true;
             SS_LOG_INFO(LOG_CATEGORY, L"Anti-dump protection enabled");
             return true;
@@ -2160,8 +2210,13 @@ private:
                 VirtualUnlock(ptr, alloc.size);
             }
 
-            void* basePtr = m_allocationBaseMap[ptr];
-            VirtualFree(basePtr, 0, MEM_RELEASE);
+            // Use find() rather than operator[] to avoid silently inserting
+            // a nullptr entry for any tracking-state mismatch and then
+            // calling VirtualFree(nullptr).
+            auto baseIt = m_allocationBaseMap.find(ptr);
+            if (baseIt != m_allocationBaseMap.end() && baseIt->second != nullptr) {
+                VirtualFree(baseIt->second, 0, MEM_RELEASE);
+            }
         }
 
         m_secureAllocations.clear();
@@ -2313,11 +2368,55 @@ private:
     }
 
     [[nodiscard]] bool verifyAuthToken(std::string_view token) const noexcept {
-        // Constant-time comparison to prevent timing side-channels
-        if (token.size() != INTERNAL_AUTH_TOKEN.size()) {
+        // Snapshot the per-instance token under the shared lock so that a
+        // concurrent regeneration cannot tear the buffer mid-compare.
+        std::string secret;
+        {
+            std::shared_lock lock(m_mutex);
+            secret = m_internalAuthToken;
+        }
+
+        if (token.empty() || secret.empty() || token.size() != secret.size()) {
+            // Still perform a fixed-cost comparison to avoid leaking length.
+            volatile uint8_t sink = 0;
+            for (size_t i = 0; i < secret.size(); ++i) {
+                sink |= static_cast<uint8_t>(secret[i]);
+            }
+            (void)sink;
             return false;
         }
-        return ConstantTimeCompare(token.data(), INTERNAL_AUTH_TOKEN.data(), token.size());
+        return ConstantTimeCompare(token.data(), secret.data(), token.size());
+    }
+
+    void generateInternalAuthToken() noexcept {
+        // 32 random bytes hex-encoded -> 64-char token.
+        std::array<uint8_t, 32> raw{};
+        NTSTATUS status = BCryptGenRandom(
+            nullptr,
+            raw.data(),
+            static_cast<ULONG>(raw.size()),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(status)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"BCryptGenRandom failed for internal auth token: 0x%08lx", status);
+            // Leave the token empty so verifyAuthToken rejects every call —
+            // strictly preferable to a predictable fallback. Operators see the
+            // error log and re-create the singleton in a safer environment.
+            m_internalAuthToken.clear();
+            return;
+        }
+
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::string out;
+        out.resize(raw.size() * 2);
+        for (size_t i = 0; i < raw.size(); ++i) {
+            out[2 * i + 0] = kHex[(raw[i] >> 4) & 0x0F];
+            out[2 * i + 1] = kHex[raw[i] & 0x0F];
+        }
+        m_internalAuthToken = std::move(out);
+
+        // Best-effort scrub of the intermediate buffer.
+        RtlSecureZeroMemory(raw.data(), raw.size());
     }
 
     void fireEvent(const ProtectionEvent& event) noexcept {
@@ -2395,6 +2494,12 @@ private:
     // Session encryption key
     std::array<uint8_t, MemoryProtectionConstants::ENCRYPTION_KEY_SIZE> m_sessionKey{};
 
+    // Per-instance authorization token generated via BCryptGenRandom at
+    // construction; never derived from a constexpr literal or other
+    // deterministic source. Mutable because verifyAuthToken (const) snapshots
+    // it under a shared_lock on the same mutex used for state writes.
+    std::string m_internalAuthToken;
+
     // Event tracking
     std::atomic<uint64_t> m_nextEventId;
     std::vector<ProtectionEvent> m_eventHistory;
@@ -2444,7 +2549,7 @@ void MemoryProtection::Shutdown(std::string_view authorizationToken) {
 }
 
 std::string MemoryProtection::GetInternalAuthToken() const {
-    return std::string(INTERNAL_AUTH_TOKEN);
+    return m_impl->GetInternalAuthToken();
 }
 
 bool MemoryProtection::IsInitialized() const noexcept {
@@ -2795,11 +2900,17 @@ ProtectedRegionGuard::ProtectedRegionGuard(std::string_view id, uintptr_t addres
     : m_id(id)
 {
     m_protected = MemoryProtection::Instance().ProtectRegion(id, address, size);
+    if (m_protected) {
+        // Capture the per-instance authorization token now so that the
+        // destructor can present it to the auth-gated UnprotectRegion path
+        // without relying on any hard-coded literal.
+        m_authToken = MemoryProtection::Instance().GetInternalAuthToken();
+    }
 }
 
 ProtectedRegionGuard::~ProtectedRegionGuard() {
     if (m_protected) {
-        MemoryProtection::Instance().UnprotectRegion(m_id, INTERNAL_AUTH_TOKEN);
+        MemoryProtection::Instance().UnprotectRegion(m_id, m_authToken);
     }
 }
 
