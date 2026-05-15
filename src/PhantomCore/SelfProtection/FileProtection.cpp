@@ -887,7 +887,9 @@ void FileProtectionImpl::SetProtectionMode(FileProtectionMode mode) {
 }
 
 void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
-    ProtectDirectory(path, ProtectionType::Full, true);
+    if (!ProtectDirectory(path, ProtectionType::Full, true)) {
+        SS_LOG_WARN(L"FileProtection", L"ProtectDirectory default request failed: %ls", path.c_str());
+    }
 }
 
 [[nodiscard]] bool FileProtectionImpl::ProtectDirectory(std::wstring_view path,
@@ -1149,8 +1151,8 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     lock.unlock();
 
     // Create backup if enabled (I/O — do outside lock)
-    if (m_config.enableAutoBackup) {
-        CreateBackup(normalizedPath);
+    if (m_config.enableAutoBackup && !CreateBackup(normalizedPath)) {
+        SS_LOG_WARN(L"FileProtection", L"Automatic backup failed for protected file: %ls", normalizedPath.c_str());
     }
 
     SS_LOG_INFO(L"FileProtection", L"Protected file: %ls (type: %hs)",
@@ -2592,7 +2594,8 @@ void FileProtectionImpl::IntegrityMonitorThread() {
 
         // VerifyAllIntegrity -> VerifyFileIntegrity already records events
         // and calls NotifyIntegrityViolation, so no extra notification needed.
-        VerifyAllIntegrity();
+        const auto integrityResults = VerifyAllIntegrity();
+        SS_LOG_DEBUG(L"FileProtection", L"Integrity monitor checked %zu protected files", integrityResults.size());
     }
 
     SS_LOG_INFO(L"FileProtection", L"Integrity monitor thread stopped");
@@ -3280,7 +3283,9 @@ FileProtectionGuard::FileProtectionGuard(std::wstring_view path, ProtectionType 
 
 FileProtectionGuard::~FileProtectionGuard() {
     if (m_protected) {
-        FileProtection::Instance().UnprotectFile(m_path, m_authToken);
+        if (!FileProtection::Instance().UnprotectFile(m_path, m_authToken)) {
+            SS_LOG_WARN(L"FileProtection", L"FileProtectionGuard cleanup failed for: %ls", m_path.c_str());
+        }
     }
 }
 

@@ -534,16 +534,22 @@ public:
             m_config = config;
 
             // Apply process hardening based on configuration
-            if (config.enableDEP) {
-                enableDEPInternal();
+            if (config.enableDEP && !enableDEPInternal()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to enable DEP during initialization");
+                m_status = ModuleStatus::Error;
+                return false;
             }
 
-            if (config.enableASLR) {
-                enableASLRInternal();
+            if (config.enableASLR && !enableASLRInternal()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to verify ASLR during initialization");
+                m_status = ModuleStatus::Error;
+                return false;
             }
 
-            if (config.enableCFG) {
-                enableCFGInternal();
+            if (config.enableCFG && !enableCFGInternal()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to verify CFG during initialization");
+                m_status = ModuleStatus::Error;
+                return false;
             }
 
             // Initialize secure heap if enabled
@@ -554,7 +560,11 @@ public:
             // Enable anti-dump if configured
             if (config.enableAntiDump) {
                 SS_LOG_INFO(LOG_CATEGORY, L"Enabling anti-dump protection...");
-                enableAntiDumpInternal();
+                if (!enableAntiDumpInternal()) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to enable anti-dump protection during initialization");
+                    m_status = ModuleStatus::Error;
+                    return false;
+                }
                 SS_LOG_INFO(LOG_CATEGORY, L"Anti-dump protection enabled");
             }
 
@@ -661,7 +671,9 @@ public:
 
     void SetProtectionLevel(MemoryProtectionLevel level) noexcept {
         auto config = MemoryProtectionConfiguration::FromLevel(level);
-        SetConfiguration(config);
+        if (!SetConfiguration(config)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"SetProtectionLevel rejected generated configuration");
+        }
     }
 
     [[nodiscard]] MemoryProtectionLevel GetProtectionLevel() const noexcept {
@@ -676,9 +688,15 @@ public:
     void ApplyProcessHardening() noexcept {
         SS_LOG_INFO(LOG_CATEGORY, L"Applying process hardening");
 
-        EnableASLR();
-        EnableDEP();
-        EnableCFG();
+        if (!EnableASLR()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ApplyProcessHardening could not verify ASLR");
+        }
+        if (!EnableDEP()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ApplyProcessHardening could not enable DEP");
+        }
+        if (!EnableCFG()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ApplyProcessHardening could not verify CFG");
+        }
 
         // Set process mitigation policies
         applyMitigationPolicies();
@@ -1308,7 +1326,8 @@ public:
     }
 
     void ForceIntegrityCheck() noexcept {
-        VerifyAllIntegrity();
+        const auto results = VerifyAllIntegrity();
+        SS_LOG_INFO(LOG_CATEGORY, L"Forced memory integrity check completed for %zu regions", results.size());
     }
 
     [[nodiscard]] bool UpdateRegionBaseline(std::string_view id,
@@ -2008,7 +2027,10 @@ public:
                         passed = false;
                     }
 
-                    UnprotectRegion("selftest_region", m_internalAuthToken);
+                    if (!UnprotectRegion("selftest_region", m_internalAuthToken)) {
+                        SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: cleanup failed for protected test region");
+                        passed = false;
+                    }
                 }
 
                 VirtualFree(testRegion, 0, MEM_RELEASE);
@@ -2256,7 +2278,9 @@ private:
 
                 // Also validate heap
                 if (m_config.enableHeapProtection) {
-                    ValidateHeapIntegrity();
+                    if (!ValidateHeapIntegrity()) {
+                        SS_LOG_WARN(LOG_CATEGORY, L"Heap integrity validation failed during monitoring pass");
+                    }
                 }
             }
 
@@ -2303,7 +2327,8 @@ private:
         for (size_t i = 0; i < size; i++) {
             crc32 ^= data[i];
             for (int j = 0; j < 8; j++) {
-                crc32 = (crc32 >> 1) ^ (0xEDB88320 & (-(crc32 & 1)));
+                const uint32_t mask = static_cast<uint32_t>(0u - (crc32 & 1u));
+                crc32 = (crc32 >> 1) ^ (0xEDB88320u & mask);
             }
         }
         crc32 ^= 0xFFFFFFFF;
@@ -2910,7 +2935,9 @@ ProtectedRegionGuard::ProtectedRegionGuard(std::string_view id, uintptr_t addres
 
 ProtectedRegionGuard::~ProtectedRegionGuard() {
     if (m_protected) {
-        MemoryProtection::Instance().UnprotectRegion(m_id, m_authToken);
+        if (!MemoryProtection::Instance().UnprotectRegion(m_id, m_authToken)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ProtectedRegionGuard cleanup failed for region: %hs", m_id.c_str());
+        }
     }
 }
 
