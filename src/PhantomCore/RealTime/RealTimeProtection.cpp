@@ -590,7 +590,9 @@ public:
                 Utils::Logger::Info("RealTimeProtection: CacheManager initialized");
             }
             catch (const std::exception& ex) {
-                Utils::Logger::Warn("RealTimeProtection: CacheManager init failed, continuing without cache");
+                Utils::Logger::Warn(
+                    "RealTimeProtection: CacheManager init failed ({}), continuing without verdict cache",
+                    ex.what());
             }
 
             // 2. Initialize Scan Engine
@@ -633,12 +635,12 @@ public:
 
                 if (Security::TamperProtection::Instance().Initialize(tamperConfig)) {
                     // Protect our own installation files and critical registry keys
-                    Security::TamperProtection::Instance().ProtectSelf();
-                    Security::TamperProtection::Instance().ProtectInstallation();
-                    Security::TamperProtection::Instance().ProtectServiceRegistry();
+                    (void)Security::TamperProtection::Instance().ProtectSelf();
+                    (void)Security::TamperProtection::Instance().ProtectInstallation();
+                    (void)Security::TamperProtection::Instance().ProtectServiceRegistry();
 
                     // Run initial APT tamper sweep — detect hooks/injection from before we started
-                    Security::TamperProtection::Instance().RunAPTTamperSweep();
+                    (void)Security::TamperProtection::Instance().RunAPTTamperSweep();
 
                     SS_LOG_INFO(L"RealTimeProtection",
                         L"TamperProtection initialized in Enforce mode with auto-repair + APT sweep");
@@ -648,7 +650,7 @@ public:
                 }
             } catch (const std::exception& ex) {
                 SS_LOG_WARN(L"RealTimeProtection",
-                    L"TamperProtection init exception: %hs", ex.what());
+                    L"TamperProtection init exception: %hs -- self-protection disabled", ex.what());
             }
 
             // 5. Start Protection Components
@@ -668,7 +670,10 @@ public:
 
             // 9. Initialize PhantomCortex AI/ML engine
             try {
-                ShadowStrike::AI::CortexConfigManager::Instance().LoadFromRegistry();
+                // Best-effort load; on failure the manager falls back to defaults
+                // (which we further normalize below). Status is consumed via
+                // GetConfig() rather than the boolean return.
+                (void)ShadowStrike::AI::CortexConfigManager::Instance().LoadFromRegistry();
                 ShadowStrike::AI::CortexConfig cortexConfig =
                     ShadowStrike::AI::CortexConfigManager::Instance().GetConfig();
 
@@ -698,7 +703,7 @@ public:
                 cpuCfg.highUsageThreshold = 90.0;
                 cpuCfg.selfUsageAlertThreshold = 10.0;
                 if (Performance::CPUMonitor::Instance().Initialize(cpuCfg)) {
-                    Performance::CPUMonitor::Instance().StartMonitoring();
+                    (void)Performance::CPUMonitor::Instance().StartMonitoring();
                     SS_LOG_INFO(L"RealTimeProtection", L"CPUMonitor initialized and monitoring");
                 } else {
                     SS_LOG_WARN(L"RealTimeProtection", L"CPUMonitor initialization failed");
@@ -911,10 +916,10 @@ public:
 
         // Set up auto-resume if duration specified
         if (durationMs > 0) {
-            m_threadPool->Submit([this, durationMs](const Utils::TaskContext&) {
+            (void)m_threadPool->Submit([this, durationMs](const Utils::TaskContext&) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(durationMs));
                 if (m_state == ProtectionState::PAUSED) {
-                    Resume();
+                    (void)Resume();
                 }
             });
         }
@@ -1212,8 +1217,10 @@ public:
             if (sandbox.Initialize(m_threadPool)) {
                 m_sandboxDetectorInitialized = true;
 
-                // Wire detection callback for SOC/SIEM telemetry
-                sandbox.RegisterCallback(
+                // Wire detection callback for SOC/SIEM telemetry.
+                // The detector singleton owns the callback for process lifetime;
+                // it is released by Shutdown() in ShutdownAntiEvasionDetectors().
+                (void)sandbox.RegisterCallback(
                     [](const ShadowStrike::AntiEvasion::SandboxEvasionResult& result) {
                         if (result.isSandboxLikely) {
                             Utils::Logger::Warn(
@@ -1259,8 +1266,9 @@ public:
             if (timeBased.Initialize(m_threadPool)) {
                 m_timeBasedDetectorInitialized = true;
 
-                // Wire detection callback for SOC/SIEM telemetry
-                timeBased.RegisterCallback(
+                // Wire detection callback for SOC/SIEM telemetry.
+                // Detector singleton owns the callback for process lifetime.
+                (void)timeBased.RegisterCallback(
                     [](const ShadowStrike::AntiEvasion::TimingEvasionResult& result) {
                         if (result.isEvasive) {
                             Utils::Logger::Warn(
@@ -1328,15 +1336,22 @@ public:
         try {
             auto& fsf = FileSystemFilter::Instance();
             if (fsf.Initialize(m_threadPool)) {
-                fsf.Start();
-                SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ProtectionComponentState::RUNNING);
+                if (!fsf.Start()) {
+                    Utils::Logger::Error(
+                        "RealTimeProtection: FileSystemFilter::Start failed - "
+                        "component running in ERROR state, remaining components will still be started");
+                    SetComponentState(ComponentType::FILE_SYSTEM_FILTER,
+                                      ProtectionComponentState::ERROR);
+                } else {
+                    SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ProtectionComponentState::RUNNING);
 
-                // Wire up scan engine
-                fsf.SetScanEngine(&Core::Engine::ScanEngine::Instance());
+                    // Wire up scan engine
+                    fsf.SetScanEngine(&Core::Engine::ScanEngine::Instance());
 
-                // Wire up hash store for known-malware lookups
-                if (m_sharedHashStore) {
-                    fsf.SetHashStore(m_sharedHashStore.get());
+                    // Wire up hash store for known-malware lookups
+                    if (m_sharedHashStore) {
+                        fsf.SetHashStore(m_sharedHashStore.get());
+                    }
                 }
             }
         } catch (...) {
@@ -1410,12 +1425,26 @@ public:
                     Utils::Logger::Error("RealTimeProtection: BehaviorBlocker::Initialize failed");
                     SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::ERROR);
                 } else {
-                    bb.LoadDefaultRules();
-                    bb.Start();
-                    bb.PushRulesToKernel();
-                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::RUNNING);
-                    Utils::Logger::Info("RealTimeProtection: BehaviorBlocker initialized with {} default rules",
-                        bb.GetStatistics().activeRuleCount);
+                    const bool rulesLoaded = bb.LoadDefaultRules();
+                    if (!rulesLoaded) {
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: BehaviorBlocker::LoadDefaultRules returned "
+                            "false - starting with empty rule set");
+                    }
+                    if (!bb.Start()) {
+                        Utils::Logger::Error(
+                            "RealTimeProtection: BehaviorBlocker::Start failed (rulesLoaded={})",
+                            rulesLoaded);
+                        SetComponentState(ComponentType::BEHAVIOR_BLOCKER,
+                                          ProtectionComponentState::ERROR);
+                    } else {
+                        // PushRulesToKernel is best-effort: user-mode behavior
+                        // blocking remains operational even if the kernel sync fails.
+                        (void)bb.PushRulesToKernel();
+                        SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::RUNNING);
+                        Utils::Logger::Info("RealTimeProtection: BehaviorBlocker initialized with {} default rules",
+                            bb.GetStatistics().activeRuleCount);
+                    }
                 }
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: BehaviorBlocker startup exception: {}",
@@ -1623,7 +1652,9 @@ public:
             try {
                 auto& ntf = NetworkTrafficFilter::Instance();
                 if (ntf.IsRunning()) {
-                    ntf.RegisterEventCallback(
+                    // Best-effort event bridge: registration ID is owned by the
+                    // filter for process lifetime (released on filter shutdown).
+                    (void)ntf.RegisterEventCallback(
                         [](const NetworkEvent& event) {
                             try {
                                 auto& analyzer = Core::Network::TrafficAnalyzer::Instance();
@@ -1655,7 +1686,7 @@ public:
                     SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::ERROR);
                 } else {
                     if (ep.Start()) {
-                        ep.PushMitigationsToKernel();
+                        (void)ep.PushMitigationsToKernel();
                         SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::RUNNING);
                         Utils::Logger::Info("RealTimeProtection: ExploitPrevention initialized and running");
                     } else {
@@ -1681,8 +1712,8 @@ public:
                     Utils::Logger::Error("RealTimeProtection: FileIntegrityMonitor::Initialize failed");
                     SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::ERROR);
                 } else {
-                    fim.StartMonitoring();
-                    fim.CreateSystemBaselines();
+                    (void)fim.StartMonitoring();
+                    (void)fim.CreateSystemBaselines();
                     SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::RUNNING);
                     auto fimStats = fim.GetStats();
                     Utils::Logger::Info("RealTimeProtection: FIM initialized - {} files monitored, {} dirs",
@@ -1700,8 +1731,14 @@ public:
         // AccessControlManager
         try {
             auto& acm = AccessControlManager::Instance();
-            acm.Initialize(AccessControlManagerConfig::CreateEnterprise());
-            SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::RUNNING);
+            if (!acm.Initialize(AccessControlManagerConfig::CreateEnterprise())) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: AccessControlManager::Initialize failed - "
+                    "ACM running in ERROR state");
+                SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::ERROR);
+            } else {
+                SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::RUNNING);
+            }
         } catch (...) {
             SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::ERROR);
         }
@@ -1793,7 +1830,7 @@ public:
                     SetComponentState(ComponentType::ZERO_HOUR, ProtectionComponentState::ERROR);
                 } else {
                     // Register verdict callback for SOC/SIEM integration
-                    zhp.RegisterVerdictCallback(
+                    (void)zhp.RegisterVerdictCallback(
                         [](const std::wstring& filePath, const FileAnalysisResult& result) {
                             if (result.verdict != CloudVerdict::CLEAN) {
                                 Utils::Logger::Warn(
@@ -1804,7 +1841,7 @@ public:
                             }
                         });
                     // Register outbreak callback for rapid response
-                    zhp.RegisterOutbreakCallback(
+                    (void)zhp.RegisterOutbreakCallback(
                         [](const OutbreakInfo& outbreak, bool isNew) {
                             Utils::Logger::Error(
                                 "RealTimeProtection: [ZHP] OUTBREAK {}: {} "
@@ -1816,7 +1853,7 @@ public:
                                 outbreak.localVictimCount);
                         });
                     // Register signature update callback
-                    zhp.RegisterSignatureUpdateCallback(
+                    (void)zhp.RegisterSignatureUpdateCallback(
                         [](const MicroSigUpdatePackage& package, bool success) {
                             Utils::Logger::Info(
                                 "RealTimeProtection: [ZHP] Signature update {}: "
@@ -2318,18 +2355,25 @@ public:
         // 5. Map Result
         ScanResult scanResult = MapEngineResult(engineResult, filePath);
 
-        // 6. Invoke file scan callbacks
+        // 6. Invoke file scan callbacks (snapshot callbacks first to avoid holding lock during dispatch)
+        std::vector<RTPFileScanCallback> callbackSnapshot;
         {
             std::shared_lock lock(m_callbackMutex);
-            RTPFileScanRequest rtpReq;
-            rtpReq.filePath = filePath;
-            rtpReq.pid = req.ProcessId;
-
+            callbackSnapshot.reserve(m_fileScanCallbacks.size());
             for (const auto& [id, callback] : m_fileScanCallbacks) {
-                try {
-                    callback(rtpReq, scanResult);
-                } catch (...) {}
+                callbackSnapshot.push_back(callback);
             }
+        }
+
+        // Dispatch outside the lock
+        RTPFileScanRequest rtpReq;
+        rtpReq.filePath = filePath;
+        rtpReq.pid = req.ProcessId;
+
+        for (const auto& callback : callbackSnapshot) {
+            try {
+                (void)callback(rtpReq, scanResult);
+            } catch (...) {}
         }
 
         // 7. Update Cache
@@ -2342,12 +2386,19 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
         m_performanceMetrics.totalScans++;
-        uint64_t currentAvg = m_performanceMetrics.avgScanTimeUs.load();
-        uint64_t newAvg = (currentAvg * 9 + duration.count()) / 10;
-        m_performanceMetrics.avgScanTimeUs.store(newAvg);
+        
+        // Validate duration is non-negative before converting to unsigned
+        if (duration.count() >= 0) {
+            uint64_t durationUs = static_cast<uint64_t>(duration.count());
+            uint64_t currentAvg = m_performanceMetrics.avgScanTimeUs.load();
+            uint64_t newAvg = (currentAvg * 9 + durationUs) / 10;
+            m_performanceMetrics.avgScanTimeUs.store(newAvg);
 
-        if (duration.count() > m_performanceMetrics.maxScanTimeUs.load()) {
-            m_performanceMetrics.maxScanTimeUs.store(duration.count());
+            if (durationUs > m_performanceMetrics.maxScanTimeUs.load()) {
+                m_performanceMetrics.maxScanTimeUs.store(durationUs);
+            }
+        } else {
+            Utils::Logger::Warn("RealTimeProtection: Negative scan duration detected (clock anomaly): {}", duration.count());
         }
 
         // 9. Handle Threat
@@ -2577,10 +2628,14 @@ public:
                                 Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)));
                         }
 
+                        const size_t techniqueCount = vmResult.GetTechniqueCount();
+                        if (techniqueCount > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                            Utils::Logger::Warn("RealTimeProtection: VM evasion technique count overflow: {}", techniqueCount);
+                        }
                         EmitEvasionTelemetry(req.processId, imagePath,
                             std::format(L"VM Evasion [score={:.1f}]", vmResult.evasionScore),
                             "VMEvasionDetector", static_cast<float>(vmResult.evasionScore),
-                            vmResult.GetTechniqueCount(), true);
+                            static_cast<uint32_t>(std::min(techniqueCount, static_cast<size_t>(std::numeric_limits<uint32_t>::max()))), true);
                     }
                 }
             }
@@ -2801,27 +2856,35 @@ public:
             try {
                 auto& mp = MemoryProtection::Instance();
                 if (mp.IsRunning()) {
-                    mp.MonitorProcess(req.processId);
+                    // Best-effort: failures are logged inside MemoryProtection.
+                    (void)mp.MonitorProcess(req.processId);
                 }
             } catch (...) {}
         }
 
-        // Invoke process creation callbacks
+        // Invoke process creation callbacks (snapshot callbacks first to avoid holding lock during dispatch)
         bool shouldBlock = false;
+        std::vector<RTPProcessCreateCallback> callbackSnapshot;
         {
             std::shared_lock lock(m_callbackMutex);
-            RTPProcessNotifyRequest rtpReq;
-            rtpReq.pid = req.processId;
-            rtpReq.parentPid = req.parentProcessId;
-            rtpReq.imagePath = imagePath;
-            rtpReq.commandLine = commandLine;
-            rtpReq.isCreation = req.isCreation;
-
+            callbackSnapshot.reserve(m_processCreateCallbacks.size());
             for (const auto& [id, callback] : m_processCreateCallbacks) {
-                try {
-                    callback(rtpReq, shouldBlock);
-                } catch (...) {}
+                callbackSnapshot.push_back(callback);
             }
+        }
+
+        // Dispatch outside the lock
+        RTPProcessNotifyRequest rtpReq;
+        rtpReq.pid = req.processId;
+        rtpReq.parentPid = req.parentProcessId;
+        rtpReq.imagePath = imagePath;
+        rtpReq.commandLine = commandLine;
+        rtpReq.isCreation = req.isCreation;
+
+        for (const auto& callback : callbackSnapshot) {
+            try {
+                callback(rtpReq, shouldBlock);
+            } catch (...) {}
         }
 
         if (shouldBlock) {
@@ -3469,7 +3532,7 @@ public:
 
                         // Feed to URLAnalyzer for domain reputation check
                         auto& ua = Core::Network::URLAnalyzer::Instance();
-                        ua.AnalyzeDomain(domainNarrow);
+                        (void)ua.AnalyzeDomain(domainNarrow);
 
                         // Feed to DNSMonitor for DGA analysis
                         auto& dm = Core::Network::DNSMonitor::Instance();
@@ -3500,7 +3563,7 @@ public:
                         // Feed SNI to URLAnalyzer for domain reputation
                         if (!sni.empty()) {
                             auto& ua = Core::Network::URLAnalyzer::Instance();
-                            ua.AnalyzeDomain(sni);
+                            (void)ua.AnalyzeDomain(sni);
                         }
 
                         // Feed to TrafficAnalyzer for JA3 correlation
@@ -3510,7 +3573,7 @@ public:
                                 reinterpret_cast<const uint8_t*>(tlsEvent->JA3Fingerprint),
                                 strnlen(tlsEvent->JA3Fingerprint, MAX_JA3_FINGERPRINT_LENGTH));
                             if (!ja3Span.empty()) {
-                                ta.AnalyzePacket(ja3Span, std::chrono::system_clock::now());
+                                (void)ta.AnalyzePacket(ja3Span, std::chrono::system_clock::now());
                             }
                         }
 
@@ -3669,7 +3732,7 @@ public:
                         tp.ForceIntegrityCheck();
 
                         // Run APT sweep — kernel tamper alerts often indicate advanced attacks
-                        tp.RunAPTTamperSweep();
+                        (void)tp.RunAPTTamperSweep();
 
                         // Log event for correlation
                         SS_LOG_WARN(L"RealTimeProtection",
@@ -3937,14 +4000,21 @@ public:
             }
         }
 
-        // Invoke threat detection callbacks
+        // Invoke threat detection callbacks (snapshot callbacks first to avoid holding lock during dispatch)
+        std::vector<ThreatDetectionCallback> callbackSnapshot;
         {
             std::shared_lock lock(m_callbackMutex);
+            callbackSnapshot.reserve(m_threatDetectionCallbacks.size());
             for (const auto& [id, callback] : m_threatDetectionCallbacks) {
-                try {
-                    callback(event);
-                } catch (...) {}
+                callbackSnapshot.push_back(callback);
             }
+        }
+
+        // Dispatch outside the lock
+        for (const auto& callback : callbackSnapshot) {
+            try {
+                callback(event);
+            } catch (...) {}
         }
 
         // User notification
@@ -4275,9 +4345,18 @@ public:
         if (oldState != newState) {
             m_protectionStatus.state = newState;
 
-            // Invoke state change callbacks
-            std::shared_lock lock(m_callbackMutex);
-            for (const auto& [id, callback] : m_stateChangeCallbacks) {
+            // Invoke state change callbacks (snapshot callbacks first to avoid holding lock during dispatch)
+            std::vector<StateChangeCallback> callbackSnapshot;
+            {
+                std::shared_lock lock(m_callbackMutex);
+                callbackSnapshot.reserve(m_stateChangeCallbacks.size());
+                for (const auto& [id, callback] : m_stateChangeCallbacks) {
+                    callbackSnapshot.push_back(callback);
+                }
+            }
+
+            // Dispatch outside the lock
+            for (const auto& callback : callbackSnapshot) {
                 try {
                     callback(oldState, newState, L"");
                 } catch (...) {}
@@ -4298,9 +4377,18 @@ public:
         m_componentStatus[idx].lastStateChange = Now();
 
         if (oldState != state) {
-            // Invoke component status callbacks
-            std::shared_lock lock(m_callbackMutex);
-            for (const auto& [id, callback] : m_componentStatusCallbacks) {
+            // Invoke component status callbacks (snapshot callbacks first to avoid holding lock during dispatch)
+            std::vector<ComponentStatusCallback> callbackSnapshot;
+            {
+                std::shared_lock lock(m_callbackMutex);
+                callbackSnapshot.reserve(m_componentStatusCallbacks.size());
+                for (const auto& [id, callback] : m_componentStatusCallbacks) {
+                    callbackSnapshot.push_back(callback);
+                }
+            }
+
+            // Dispatch outside the lock
+            for (const auto& callback : callbackSnapshot) {
                 try {
                     callback(component, oldState, state);
                 } catch (...) {}
@@ -4317,7 +4405,9 @@ public:
         sr.isThreat = (er.verdict == Core::Engine::ScanVerdict::Infected ||
                        er.verdict == Core::Engine::ScanVerdict::Suspicious);
         sr.threatName = Utils::StringUtils::ToWide(er.threatName);
-        sr.confidence = er.confidence;
+        // Clamp confidence float [0.0-1.0] to uint8 [0-100]
+        sr.confidence = static_cast<uint8_t>(std::clamp(er.confidence * 100.0f, 0.0f, 100.0f));
+        // Clamp severity to uint8 range (er.severity is ThreatLevel enum)
         sr.severity = static_cast<uint8_t>(er.severity);
 
         switch (er.verdict) {
@@ -4807,6 +4897,10 @@ size_t RealTimeProtection::GetCacheSize() const noexcept {
 // ============================================================================
 
 uint64_t RealTimeProtection::RegisterFileScanCallback(RTPFileScanCallback callback) {
+    if (!callback) {
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty file scan callback");
+        return 0;
+    }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_fileScanCallbacks[id] = std::move(callback);
@@ -4814,6 +4908,10 @@ uint64_t RealTimeProtection::RegisterFileScanCallback(RTPFileScanCallback callba
 }
 
 uint64_t RealTimeProtection::RegisterProcessCreateCallback(RTPProcessCreateCallback callback) {
+    if (!callback) {
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty process create callback");
+        return 0;
+    }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_processCreateCallbacks[id] = std::move(callback);
@@ -4821,6 +4919,10 @@ uint64_t RealTimeProtection::RegisterProcessCreateCallback(RTPProcessCreateCallb
 }
 
 uint64_t RealTimeProtection::RegisterThreatDetectionCallback(ThreatDetectionCallback callback) {
+    if (!callback) {
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty threat detection callback");
+        return 0;
+    }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_threatDetectionCallbacks[id] = std::move(callback);
@@ -4828,6 +4930,10 @@ uint64_t RealTimeProtection::RegisterThreatDetectionCallback(ThreatDetectionCall
 }
 
 uint64_t RealTimeProtection::RegisterStateChangeCallback(StateChangeCallback callback) {
+    if (!callback) {
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty state change callback");
+        return 0;
+    }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_stateChangeCallbacks[id] = std::move(callback);
@@ -4835,6 +4941,10 @@ uint64_t RealTimeProtection::RegisterStateChangeCallback(StateChangeCallback cal
 }
 
 uint64_t RealTimeProtection::RegisterComponentStatusCallback(ComponentStatusCallback callback) {
+    if (!callback) {
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty component status callback");
+        return 0;
+    }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_componentStatusCallbacks[id] = std::move(callback);
@@ -4842,6 +4952,10 @@ uint64_t RealTimeProtection::RegisterComponentStatusCallback(ComponentStatusCall
 }
 
 uint64_t RealTimeProtection::RegisterNotificationCallback(UserNotificationCallback callback) {
+    if (!callback) {
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty notification callback");
+        return 0;
+    }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_notificationCallbacks[id] = std::move(callback);
