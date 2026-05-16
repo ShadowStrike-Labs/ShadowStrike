@@ -84,14 +84,6 @@ namespace ShadowStrike {
             // Performance tracking (relaxed ordering for statistics)
             m_totalLookups.fetch_add(1, std::memory_order_relaxed);
 
-            LARGE_INTEGER startTime{};
-            const bool hasTimer = (m_perfFrequency.QuadPart > 0);
-            if (hasTimer) {
-                if (!QueryPerformanceCounter(&startTime)) {
-                    startTime.QuadPart = 0;  // Graceful fallback
-                }
-            }
-
             // Lock-free read (shared lock allows concurrent readers)
             std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
@@ -100,19 +92,7 @@ namespace ShadowStrike {
                 return std::nullopt;
             }
 
-            auto result = LookupByFastHashInternal(fastHash);
-
-            // Performance tracking (only if we have valid timer and found result)
-            if (hasTimer && result.has_value() && startTime.QuadPart > 0) {
-                LARGE_INTEGER endTime{};
-                if (QueryPerformanceCounter(&endTime)) {
-                    // Could track average lookup time here for performance monitoring
-                    // uint64_t elapsedNs = ((endTime.QuadPart - startTime.QuadPart) * 1000000000ULL) 
-                    //                      / m_perfFrequency.QuadPart;
-                }
-            }
-
-            return result;
+            return LookupByFastHashInternal(fastHash);
         }
 
         std::vector<uint64_t> SignatureIndex::RangeQuery(
@@ -171,9 +151,12 @@ namespace ShadowStrike {
             // 4. Early exit when all keys > maxFastHash
             // ========================================================================
 
-            uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+            // SECURITY (v1.1): m_rootOffset is uint64_t to support >4GB indices.
+            // Using uint32_t here truncates and corrupts lookups in large databases.
+            const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
             if (rootOffset >= m_indexSize) {
-                SS_LOG_WARN(L"SignatureIndex", L"RangeQuery: Invalid root offset");
+                SS_LOG_WARN(L"SignatureIndex", L"RangeQuery: Invalid root offset 0x%llX (indexSize=%llu)",
+                    rootOffset, m_indexSize);
                 return results;
             }
 
@@ -188,7 +171,8 @@ namespace ShadowStrike {
             size_t iterations = 0;
 
             // Track visited nodes to detect cycles
-            std::unordered_set<uint32_t> visitedNodes;
+            // SECURITY (v1.1): Node offsets are 64-bit to support >4GB indices.
+            std::unordered_set<uint64_t> visitedNodes;
             visitedNodes.reserve(1024);
 
             // Use stack-based traversal for in-order tree walk
@@ -254,33 +238,33 @@ namespace ShadowStrike {
                     // children that don't contain keys in our range
 
                     if (frame.childIndex <= node->keyCount) {
-                        uint32_t childOffset = node->children[frame.childIndex];
-                        
-                        // Determine if we should visit this child based on range
-                        bool shouldVisit = true;
-                        
-                        if (frame.childIndex < node->keyCount) {
-                            // This child contains keys < node->keys[childIndex]
-                            // Skip if all keys in this subtree are < minFastHash
-                            // (We can only skip if the separator key is < min)
-                            if (frame.childIndex > 0 && node->keys[frame.childIndex - 1] < minFastHash) {
-                                // All keys in previous subtrees are definitely < min
-                                // But this subtree may still have keys >= min
-                            }
-                        }
-                        
-                        // Check if we're past the range entirely
+                        // SECURITY (v1.1): children[] is uint64_t; truncating to uint32_t
+                        // corrupts offsets in databases > 4GB.
+                        const uint64_t childOffset = node->children[frame.childIndex];
+
+                        // Range pruning: stop descending once the separator key to our
+                        // left exceeds maxFastHash. Internal-node keys[i-1] is the upper
+                        // bound on the subtree rooted at children[i-1]; if it is already
+                        // past max, every subsequent child slot is also past max.
                         if (frame.childIndex > 0 && node->keys[frame.childIndex - 1] > maxFastHash) {
-                            // All remaining children have keys > maxFastHash
                             rangeExhausted = true;
                             stack.pop_back();
                             continue;
                         }
 
+                        // Range pruning: if the separator key to our right is below
+                        // minFastHash, the current child slot (whose subtree ends at that
+                        // separator) cannot contain any in-range keys. Skip to the next.
+                        if (frame.childIndex < node->keyCount &&
+                            node->keys[frame.childIndex] < minFastHash) {
+                            frame.childIndex++;
+                            continue;
+                        }
+
                         frame.childIndex++;
 
-                        if (shouldVisit && childOffset != 0 && childOffset < m_indexSize) {
-                            // SECURITY: Cycle detection
+                        if (childOffset != 0 && childOffset < m_indexSize) {
+                            // SECURITY: Cycle detection (64-bit offsets)
                             if (visitedNodes.count(childOffset) == 0) {
                                 visitedNodes.insert(childOffset);
                                 const BPlusTreeNode* childNode = GetNode(childOffset);
@@ -290,7 +274,7 @@ namespace ShadowStrike {
                             }
                             else {
                                 SS_LOG_ERROR(L"SignatureIndex",
-                                    L"RangeQuery: Cycle detected at offset 0x%X", childOffset);
+                                    L"RangeQuery: Cycle detected at offset 0x%llX", childOffset);
                             }
                         }
                     }
