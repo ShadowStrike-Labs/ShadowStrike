@@ -4525,52 +4525,226 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
         
         std::vector<IOCEntry> batch;
         batch.reserve(batchSize);
-        
+
         IOCEntry entry;
         ImportProgress progress{};
         progress.totalEntries = reader.GetEstimatedTotal().value_or(0);
-        
+
         // Maximum entries to prevent DoS (configurable via options if needed)
         constexpr size_t MAX_TOTAL_ENTRIES = 100'000'000;  // 100 million
-        
+
         // Progress callback invocation counter (for periodic updates)
         size_t progressCallbackCounter = 0;
         constexpr size_t PROGRESS_CALLBACK_INTERVAL = 10;  // Invoke callback every N entries (low for responsive cancellation)
-        
+
+        // SECURITY: Snapshot original entry count so we can roll the database
+        // back to a known-good state if a fatal error occurs mid-import. Without
+        // this, a partial failure would leave the on-disk header pointing past
+        // garbage entries and corrupt subsequent lookups across the index.
+        const size_t snapshotCount = database.GetEntryCount();
+        bool fatalDbError = false;
+
+        // String-pool-backed IOC types cannot be persisted by this importer
+        // because the working DBStringPoolAdapter buffer above is in-process
+        // only and the underlying memory-mapped database currently exposes
+        // no append-string API. Writing such an entry would persist a
+        // stringRef whose offset points outside the mapped region, corrupting
+        // every future read. We refuse to persist them rather than silently
+        // poison the database. ARCH-BLOCKER: extend ThreatIntelDatabase with
+        // a mmap-backed string pool, then route DBStringPoolAdapter through it.
+        auto requiresStringPool = [](IOCType t) noexcept {
+            switch (t) {
+                case IOCType::Domain:
+                case IOCType::URL:
+                case IOCType::Email:
+                case IOCType::JA3:
+                case IOCType::JA3S:
+                case IOCType::RegistryKey:
+                case IOCType::ProcessName:
+                case IOCType::MutexName:
+                case IOCType::NamedPipe:
+                case IOCType::CertFingerprint:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+
+        // Atomic batch writer: applies a vector of normalized entries to the
+        // database, honouring conflict resolution policy, and reverts to the
+        // pre-batch entry count on allocation failure to keep the file header
+        // consistent with the indexed entries actually written.
+        auto writeBatchToDatabase = [&](std::vector<IOCEntry>& currentBatch) -> bool {
+            if (currentBatch.empty()) {
+                return true;
+            }
+            const size_t batchSnapshot = database.GetEntryCount();
+            for (IOCEntry& src : currentBatch) {
+                // Refuse entries whose stringRef offsets reference the
+                // in-process pool. See ARCH-BLOCKER comment above.
+                if (requiresStringPool(src.type)) {
+                    ++result.totalSkipped;
+                    continue;
+                }
+
+                const std::string indexKey = ThreatIntelDatabase::FormatIOCValueForIndex(src);
+                if (indexKey.empty()) {
+                    ++result.totalSkipped;
+                    continue;
+                }
+
+                const size_t existingIdx = database.FindEntry(indexKey, src.type);
+                if (existingIdx != SIZE_MAX) {
+                    IOCEntry* dst = database.GetMutableEntry(existingIdx);
+                    if (dst == nullptr) {
+                        ++result.totalSkipped;
+                        continue;
+                    }
+                    switch (options.conflictResolution) {
+                        case ConflictResolution::SkipDuplicates:
+                            ++result.totalSkipped;
+                            break;
+                        case ConflictResolution::OverwriteExisting:
+                            *dst = src;
+                            ++result.totalUpdated;
+                            break;
+                        case ConflictResolution::KeepHigherConfidence:
+                            if (static_cast<uint8_t>(src.confidence) > static_cast<uint8_t>(dst->confidence)) {
+                                *dst = src;
+                                ++result.totalUpdated;
+                            } else {
+                                ++result.totalSkipped;
+                            }
+                            break;
+                        case ConflictResolution::KeepHigherReputation:
+                            if (static_cast<uint8_t>(src.reputation) > static_cast<uint8_t>(dst->reputation)) {
+                                *dst = src;
+                                ++result.totalUpdated;
+                            } else {
+                                ++result.totalSkipped;
+                            }
+                            break;
+                        case ConflictResolution::KeepMostRecent:
+                            if (src.lastSeen > dst->lastSeen) {
+                                *dst = src;
+                                ++result.totalUpdated;
+                            } else {
+                                ++result.totalSkipped;
+                            }
+                            break;
+                        case ConflictResolution::KeepOldest:
+                            ++result.totalSkipped;
+                            break;
+                        case ConflictResolution::UpdateExisting:
+                        case ConflictResolution::MergeAll:
+                            if (static_cast<uint8_t>(src.reputation) > static_cast<uint8_t>(dst->reputation)) {
+                                dst->reputation = src.reputation;
+                            }
+                            if (static_cast<uint8_t>(src.confidence) > static_cast<uint8_t>(dst->confidence)) {
+                                dst->confidence = src.confidence;
+                            }
+                            if (src.lastSeen > dst->lastSeen) {
+                                dst->lastSeen = src.lastSeen;
+                            }
+                            if (dst->firstSeen == 0 ||
+                                (src.firstSeen != 0 && src.firstSeen < dst->firstSeen)) {
+                                dst->firstSeen = src.firstSeen;
+                            }
+                            dst->flags = static_cast<IOCFlags>(
+                                static_cast<uint32_t>(dst->flags) |
+                                static_cast<uint32_t>(src.flags));
+                            ++result.totalMerged;
+                            break;
+                        case ConflictResolution::Custom: {
+                            if (m_conflictCallback) {
+                                IOCEntry resolved = m_conflictCallback(*dst, src);
+                                *dst = resolved;
+                                ++result.totalUpdated;
+                            } else {
+                                ++result.totalSkipped;
+                            }
+                            break;
+                        }
+                        default:
+                            ++result.totalSkipped;
+                            break;
+                    }
+                    continue;
+                }
+
+                // No collision: allocate and persist.
+                const size_t newIdx = database.AllocateEntry();
+                if (newIdx == SIZE_MAX) {
+                    // Allocation failed -> roll the database back to the
+                    // count we started this batch with so the header never
+                    // references uninitialised slots.
+                    (void)database.SetEntryCount(batchSnapshot);
+                    return false;
+                }
+                IOCEntry* dst = database.GetMutableEntry(newIdx);
+                if (dst == nullptr) {
+                    (void)database.SetEntryCount(batchSnapshot);
+                    return false;
+                }
+                *dst = src;
+                database.AddToIndex(newIdx, indexKey, src.type);
+
+                // Track stats by type/source for the import report.
+                ++result.totalImported;
+                ++result.countByType[src.type];
+                ++result.countBySource[src.source];
+            }
+            return true;
+        };
+
         while (reader.ReadNextEntry(entry, &stringPool)) {
             // Check cancellation
             if (m_cancellationRequested.load(std::memory_order_acquire)) {
                 result.wasCancelled = true;
                 break;
             }
-            
+
             result.totalParsed++;
             progressCallbackCounter++;
-            
+
             // Safety limit check
             if (result.totalParsed > MAX_TOTAL_ENTRIES) {
                 result.errorMessage = "Maximum entry count exceeded";
                 break;
             }
-            
+
             if (ValidateEntry(entry, options)) {
                 NormalizeEntry(entry, options, &stringPool);
-                batch.push_back(entry);
-                
-                if (batch.size() >= batchSize) {
-                    // Insert batch
-                    // database.AddIOCs(batch);
-                    result.totalImported += batch.size();
-                    batch.clear();
+
+                // Run optional caller validation hook; allow it to drop entry.
+                if (m_validationCallback && !m_validationCallback(entry)) {
+                    result.totalValidationFailures++;
+                } else if (options.dryRun) {
+                    // Dry-run: count as imported but do not touch the DB.
+                    ++result.totalImported;
+                    ++result.countByType[entry.type];
+                    ++result.countBySource[entry.source];
+                } else {
+                    batch.push_back(entry);
+
+                    if (batch.size() >= batchSize) {
+                        if (!writeBatchToDatabase(batch)) {
+                            result.errorMessage = "Database allocation failed during batch insert";
+                            fatalDbError = true;
+                            batch.clear();
+                            break;
+                        }
+                        batch.clear();
+                    }
                 }
             } else {
                 result.totalValidationFailures++;
             }
-            
+
             // Periodic progress callback (every N entries or when batch fills)
             if (progressCallback && progressCallbackCounter >= PROGRESS_CALLBACK_INTERVAL) {
                 progressCallbackCounter = 0;
-                UpdateProgress(progress, result.totalParsed, progress.totalEntries, 
+                UpdateProgress(progress, result.totalParsed, progress.totalEntries,
                                reader.GetBytesRead(), 0, startTime);
                 if (!progressCallback(progress)) {
                     m_cancellationRequested.store(true, std::memory_order_release);
@@ -4579,10 +4753,23 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
                 }
             }
         }
-        
+
+        // Flush any pending entries before reporting completion. Cancellation
+        // and fatal DB errors are honoured: cancellation discards the in-flight
+        // batch, fatal errors trigger a full rollback below.
+        if (!fatalDbError && !result.wasCancelled && !batch.empty() &&
+            !options.dryRun) {
+            if (!writeBatchToDatabase(batch)) {
+                result.errorMessage = "Database allocation failed during final batch insert";
+                fatalDbError = true;
+            }
+        }
+        batch.clear();
+
         // Final progress callback at end of import
-        if (progressCallback && !result.wasCancelled && !m_cancellationRequested.load(std::memory_order_acquire)) {
-            UpdateProgress(progress, result.totalParsed, progress.totalEntries, 
+        if (progressCallback && !result.wasCancelled && !fatalDbError &&
+            !m_cancellationRequested.load(std::memory_order_acquire)) {
+            UpdateProgress(progress, result.totalParsed, progress.totalEntries,
                            reader.GetBytesRead(), 0, startTime);
             progress.percentComplete = 100.0;
             if (!progressCallback(progress)) {
@@ -4590,25 +4777,63 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
                 result.wasCancelled = true;
             }
         }
-        
-        // Insert remaining entries
-        if (!batch.empty() && !result.wasCancelled) {
-            // database.AddIOCs(batch);
-            result.totalImported += batch.size();
+
+        // On a fatal database failure, perform a global rollback to the count
+        // we observed before any batch was applied. This protects readers that
+        // rely on the deduplication hash index being consistent with the
+        // visible entry array. Note: per-batch rollback already runs inside
+        // writeBatchToDatabase; this is the outer safety net for partial
+        // batches that did succeed before a later batch failed.
+        if (fatalDbError && !options.dryRun) {
+            (void)database.SetEntryCount(snapshotCount);
+            // Conservative: invalidate counters we already incremented for the
+            // partially-applied work, because the rollback above made those
+            // writes invisible to the database.
+            result.totalImported = 0;
+            result.totalUpdated = 0;
+            result.totalMerged = 0;
+            result.countByType.clear();
+            result.countBySource.clear();
         }
-        
-        result.success = !result.wasCancelled && result.errorMessage.empty();
+
+        // Persist authoritative header metadata when we actually changed the
+        // database. UpdateTimestamp + UpdateHeaderChecksum keep the on-disk
+        // header consistent so future readers don't reject the file as
+        // tampered.
+        if (!options.dryRun && !fatalDbError &&
+            (result.totalImported + result.totalUpdated + result.totalMerged) > 0) {
+            database.UpdateTimestamp();
+            (void)database.UpdateHeaderChecksum();
+            if (options.rebuildIndex) {
+                (void)database.Flush();
+            }
+        }
+
+        result.wasDryRun = options.dryRun;
+        result.success = !result.wasCancelled && !fatalDbError && result.errorMessage.empty();
         result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - startTime).count();
-        
+        if (result.durationMs > 0) {
+            result.entriesPerSecond = static_cast<double>(result.totalImported + result.totalUpdated) *
+                                      1000.0 / static_cast<double>(result.durationMs);
+        }
+        result.bytesRead = reader.GetBytesRead();
+        result.detectedFormat = options.format;
+
+        // Roll cumulative statistics into the importer instance counters.
+        m_totalEntriesImported.fetch_add(result.totalImported, std::memory_order_relaxed);
+        m_totalBytesRead.fetch_add(result.bytesRead, std::memory_order_relaxed);
+        m_totalParseErrors.fetch_add(result.totalParseErrors, std::memory_order_relaxed);
+        m_totalImportCount.fetch_add(1, std::memory_order_relaxed);
+
         return result;
-    } catch (const std::bad_alloc& e) {
+    } catch (const std::bad_alloc&) {
         result.success = false;
         result.errorMessage = "Memory allocation failed during import";
         return result;
-    } catch (const std::exception& e) {
+    } catch (const std::exception& ex) {
         result.success = false;
-        result.errorMessage = std::string("Import error: ") + e.what();
+        result.errorMessage = std::string("Import error: ") + ex.what();
         return result;
     }
 }
@@ -5304,6 +5529,143 @@ IOCType ThreatIntelImporter::DetectIOCType(std::string_view value) {
     }
     
     return crc ^ 0xFFFFFFFF;
+}
+
+// ============================================================================
+// ImportOptions Factory Builders
+// ============================================================================
+
+ImportOptions ImportOptions::FastBulkImport() {
+    ImportOptions o;
+    o.validationLevel = ValidationLevel::Basic;
+    o.normalization = NormalizationFlags::TrimWhitespace | NormalizationFlags::LowercaseAll;
+    o.conflictResolution = ConflictResolution::SkipDuplicates;
+    o.batchSize = 50000;
+    o.bufferSize = 4ULL * 1024 * 1024;
+    o.continueOnError = true;
+    o.maxParseErrors = 10000;
+    o.logParseErrors = false;
+    o.updateCache = false;
+    o.rebuildIndex = false;
+    o.parallelParsing = true;
+    return o;
+}
+
+ImportOptions ImportOptions::ValidatedImport() {
+    ImportOptions o;
+    o.validationLevel = ValidationLevel::Strict;
+    o.normalization = NormalizationFlags::Standard | NormalizationFlags::ValidateHashLength;
+    o.conflictResolution = ConflictResolution::UpdateExisting;
+    o.batchSize = 1000;
+    o.bufferSize = 1ULL * 1024 * 1024;
+    o.continueOnError = false;
+    o.maxParseErrors = 100;
+    o.logParseErrors = true;
+    o.updateCache = true;
+    o.rebuildIndex = true;
+    o.parallelParsing = false;
+    return o;
+}
+
+ImportOptions ImportOptions::FeedUpdate(uint32_t feedId, ThreatIntelSource source) {
+    ImportOptions o = ValidatedImport();
+    o.feedId = feedId;
+    o.defaultSource = source;
+    o.conflictResolution = ConflictResolution::KeepMostRecent;
+    o.normalization = NormalizationFlags::Standard;
+    return o;
+}
+
+ImportOptions ImportOptions::IPListImport() {
+    ImportOptions o = FastBulkImport();
+    o.format = ImportFormat::PlainText;
+    o.allowedIOCTypes = { IOCType::IPv4, IOCType::IPv6 };
+    o.csvConfig.autoDetectIOCType = true;
+    return o;
+}
+
+ImportOptions ImportOptions::HashListImport() {
+    ImportOptions o = FastBulkImport();
+    o.format = ImportFormat::PlainText;
+    o.allowedIOCTypes = { IOCType::FileHash };
+    o.normalization = NormalizationFlags::TrimWhitespace |
+                      NormalizationFlags::LowercaseAll |
+                      NormalizationFlags::NormalizeHashes |
+                      NormalizationFlags::ValidateHashLength;
+    return o;
+}
+
+// ============================================================================
+// Callback wiring + cancellation + statistics
+// ============================================================================
+
+void ThreatIntelImporter::SetValidationCallback(ImportValidationCallback callback) {
+    m_validationCallback = std::move(callback);
+}
+
+void ThreatIntelImporter::SetConflictCallback(ImportConflictCallback callback) {
+    m_conflictCallback = std::move(callback);
+}
+
+void ThreatIntelImporter::SetErrorCallback(ImportErrorCallback callback) {
+    m_errorCallback = std::move(callback);
+}
+
+void ThreatIntelImporter::RequestCancel() noexcept {
+    m_cancellationRequested.store(true, std::memory_order_release);
+}
+
+bool ThreatIntelImporter::IsCancellationRequested() const noexcept {
+    return m_cancellationRequested.load(std::memory_order_acquire);
+}
+
+void ThreatIntelImporter::ResetCancellation() noexcept {
+    m_cancellationRequested.store(false, std::memory_order_release);
+}
+
+uint64_t ThreatIntelImporter::GetTotalEntriesImported() const noexcept {
+    return m_totalEntriesImported.load(std::memory_order_acquire);
+}
+
+uint64_t ThreatIntelImporter::GetTotalBytesRead() const noexcept {
+    return m_totalBytesRead.load(std::memory_order_acquire);
+}
+
+uint32_t ThreatIntelImporter::GetTotalImportCount() const noexcept {
+    return m_totalImportCount.load(std::memory_order_acquire);
+}
+
+uint64_t ThreatIntelImporter::GetTotalParseErrors() const noexcept {
+    return m_totalParseErrors.load(std::memory_order_acquire);
+}
+
+// ============================================================================
+// Compression detection
+// ============================================================================
+
+ImportCompression ThreatIntelImporter::DetectCompression(std::span<const uint8_t> data) {
+    if (data.size() < 4) {
+        return ImportCompression::None;
+    }
+    const uint8_t b0 = data[0];
+    const uint8_t b1 = data[1];
+    const uint8_t b2 = data[2];
+    const uint8_t b3 = data[3];
+    if (b0 == 0x1F && b1 == 0x8B) return ImportCompression::GZIP;
+    if (b0 == 0x50 && b1 == 0x4B &&
+        ((b2 == 0x03 && b3 == 0x04) ||
+         (b2 == 0x05 && b3 == 0x06) ||
+         (b2 == 0x07 && b3 == 0x08))) {
+        return ImportCompression::ZIP;
+    }
+    if (b0 == 0x28 && b1 == 0xB5 && b2 == 0x2F && b3 == 0xFD) return ImportCompression::ZSTD;
+    if (b0 == 0x04 && b1 == 0x22 && b2 == 0x4D && b3 == 0x18) return ImportCompression::LZ4;
+    if (b0 == 0x42 && b1 == 0x5A && b2 == 0x68) return ImportCompression::BZIP2;
+    if (data.size() >= 6 && b0 == 0xFD && b1 == 0x37 && b2 == 0x7A && b3 == 0x58 &&
+        data[4] == 0x5A && data[5] == 0x00) {
+        return ImportCompression::XZ;
+    }
+    return ImportCompression::None;
 }
 
 } // namespace ThreatIntel
