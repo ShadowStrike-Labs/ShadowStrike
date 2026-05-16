@@ -356,13 +356,24 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         return false;
     }
     
-    // Verify integrity if requested
-    if (config.verifyOnOpen && !config.readOnly) {
-        // TITANIUM: Use internal verify that doesn't acquire mutex
-        if (!VerifyIntegrityInternal()) {
-            Close();
-            return false;
-        }
+    // TITANIUM: Always validate integrity on open regardless of readOnly.
+    // A hostile attacker who can drop a file at the database path must not be
+    // able to coerce a read-only consumer into honouring forged header fields.
+    // OpenExisting performs a baseline magic+bounds check; this is the
+    // authoritative checksum/version/entry-count cross-check.
+    const bool needVerify = fileExists && config.verifyOnOpen;
+    if (needVerify && !VerifyIntegrityInternal()) {
+        // TITANIUM: Release the lock before calling Close() to avoid
+        // self-deadlock on m_mutex; Close() acquires a unique_lock.
+        m_region.Close();
+        m_header = nullptr;
+        m_entries = nullptr;
+        m_hashIndex.clear();
+        m_hashIndex.shrink_to_fit();
+        m_hashIndexBuilt = false;
+        m_isOpen.store(false, std::memory_order_release);
+        m_stats.isOpen = false;
+        return false;
     }
     
     // Update statistics
@@ -1213,7 +1224,14 @@ bool ThreatIntelDatabase::VerifyIntegrityInternal() const noexcept {
         return false;
     }
     
-    // Verify version compatibility - use versionMajor from header
+    // TITANIUM: Strict version compatibility (matches ThreatIntelFormat conventions).
+    // The on-disk layout of IOCEntry/Header is tied to the major version; loading
+    // a file with a different major risks misinterpreting every field.
+    if (m_header->versionMajor != THREATINTEL_DB_VERSION_MAJOR) {
+        return false;
+    }
+    
+    // TITANIUM: Verify version compatibility
     if (m_header->versionMajor > THREATINTEL_DB_VERSION_MAJOR) {
         return false;
     }
@@ -1491,6 +1509,20 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
             return false;
         }
         
+        // TITANIUM: Reject files that exceed configured / hard limits so a
+        // truncated or oversized blob cannot drive subsequent size_t arithmetic
+        // into surprising states. Also catches negative LONGLONG sign bit.
+        if (fileSize.QuadPart < 0 ||
+            static_cast<uint64_t>(fileSize.QuadPart) > DATABASE_MAX_SIZE) {
+            CloseHandle(fileHandle);
+            return false;
+        }
+        if (config.maxSize > 0 &&
+            static_cast<uint64_t>(fileSize.QuadPart) > config.maxSize) {
+            CloseHandle(fileHandle);
+            return false;
+        }
+        
         // Create file mapping
         DWORD protect = config.readOnly ? PAGE_READONLY : PAGE_READWRITE;
         
@@ -1542,6 +1574,45 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
             return false;
         }
         
+        // TITANIUM: Strict version check at open time. A mismatched major
+        // version means the on-disk layout differs from what this build
+        // expects; continuing would reinterpret arbitrary bytes as IOCEntry.
+        if (m_header->versionMajor != THREATINTEL_DB_VERSION_MAJOR) {
+            m_region.Close();
+            m_header = nullptr;
+            return false;
+        }
+        
+        // TITANIUM: Validate entryDataOffset before deriving m_entries.
+        // A hostile or corrupted header could set entryDataOffset >= file size,
+        // producing an out-of-bounds pointer the rest of the code dereferences.
+        const size_t regionSize = m_region.Size();
+        const uint64_t entryDataOffset = m_header->entryDataOffset;
+        if (entryDataOffset < sizeof(ThreatIntelDatabaseHeader) ||
+            entryDataOffset >= regionSize) {
+            m_region.Close();
+            m_header = nullptr;
+            return false;
+        }
+        
+        // TITANIUM: Cross-check declared active-entry count against the actual
+        // mapped region. Prevents callers iterating past the mapping.
+        const size_t dataSpace = regionSize - static_cast<size_t>(entryDataOffset);
+        const size_t maxPossibleEntries = dataSpace / sizeof(IOCEntry);
+        if (m_header->totalActiveEntries > maxPossibleEntries) {
+            m_region.Close();
+            m_header = nullptr;
+            return false;
+        }
+        
+        // TITANIUM: Validate header CRC unconditionally for existing files.
+        // Read-only consumers must not honour a forged header.
+        if (!VerifyHeaderChecksumInternal()) {
+            m_region.Close();
+            m_header = nullptr;
+            return false;
+        }
+        
         // Set entries pointer using entryDataOffset
         m_entries = reinterpret_cast<IOCEntry*>(
             static_cast<uint8_t*>(baseAddress) + m_header->entryDataOffset
@@ -1574,7 +1645,12 @@ void ThreatIntelDatabase::InitializeHeader(size_t fileSize) noexcept {
     
     // Set entry data offset (page-aligned after header)
     m_header->entryDataOffset = AlignToPage(sizeof(ThreatIntelDatabaseHeader));
-    m_header->entryDataSize = fileSize - m_header->entryDataOffset;
+    // TITANIUM: Guard against pathological fileSize < entryDataOffset which
+    // would underflow the size_t subtraction below. CreateDatabase already
+    // forces fileSize >= DATABASE_MIN_SIZE, but defend in depth.
+    m_header->entryDataSize = (fileSize > m_header->entryDataOffset)
+        ? (fileSize - m_header->entryDataOffset)
+        : 0;
     
     // Set timestamps
     uint64_t now = static_cast<uint64_t>(
