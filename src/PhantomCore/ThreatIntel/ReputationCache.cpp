@@ -352,7 +352,11 @@ uint32_t CacheShard::AllocateEntry() noexcept {
     }
     
     if (m_freeHead == UINT32_MAX) {
-        EvictLRU();
+        // EvictLRU is [[nodiscard]] — track the victim and account for it.
+        const uint32_t victim = EvictLRU();
+        if (victim != UINT32_MAX) {
+            m_evictionCount.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     if (m_freeHead == UINT32_MAX || m_freeHead >= m_capacity) {
@@ -801,40 +805,29 @@ CacheStatistics ReputationCache::GetStatistics() const noexcept {
         }
         
         // TITANIUM: Use saturating addition to prevent overflow
-        const size_t hits = shard->GetHitCount();
-        const size_t misses = shard->GetMissCount();
-        const size_t capacity = shard->GetCapacity();
-        const size_t entries = shard->GetEntryCount();
-        
-        // Prevent overflow by checking before adding
-        if (stats.cacheHits <= SIZE_MAX - hits) {
-            stats.cacheHits += hits;
-        } else {
-            stats.cacheHits = SIZE_MAX;
-        }
-        
-        if (stats.cacheMisses <= SIZE_MAX - misses) {
-            stats.cacheMisses += misses;
-        } else {
-            stats.cacheMisses = SIZE_MAX;
-        }
-        
-        // TITANIUM: Safe eviction calculation (capacity - entries)
-        if (capacity >= entries) {
-            const size_t evictable = capacity - entries;
-            if (stats.evictions <= SIZE_MAX - evictable) {
-                stats.evictions += evictable;
+        const uint64_t hits = shard->GetHitCount();
+        const uint64_t misses = shard->GetMissCount();
+        const uint64_t evictions = shard->GetEvictionCount();
+        const uint64_t inserts = shard->GetInsertCount();
+
+        auto satAdd = [](uint64_t& acc, uint64_t add) noexcept {
+            if (acc <= std::numeric_limits<uint64_t>::max() - add) {
+                acc += add;
             } else {
-                stats.evictions = SIZE_MAX;
+                acc = std::numeric_limits<uint64_t>::max();
             }
-        }
+        };
+        satAdd(stats.cacheHits, hits);
+        satAdd(stats.cacheMisses, misses);
+        satAdd(stats.evictions, evictions);
+        satAdd(stats.insertions, inserts);
     }
 
     // TITANIUM: Safe calculation of totalLookups
-    if (stats.cacheHits <= SIZE_MAX - stats.cacheMisses) {
+    if (stats.cacheHits <= std::numeric_limits<uint64_t>::max() - stats.cacheMisses) {
         stats.totalLookups = stats.cacheHits + stats.cacheMisses;
     } else {
-        stats.totalLookups = SIZE_MAX;
+        stats.totalLookups = std::numeric_limits<uint64_t>::max();
     }
     
     stats.bloomRejects = m_bloomRejects.load(std::memory_order_relaxed);

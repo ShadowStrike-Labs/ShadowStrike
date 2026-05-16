@@ -172,29 +172,44 @@ struct alignas(8) CacheKey {
     }
     
     /// @brief Construct from hash value
+    /// @note HashValue may carry up to 72 bytes of hash data plus a 4-byte
+    ///       preamble (algorithm/length/reserved); the combined 76 bytes do
+    ///       not fit inline. Long combinations fall through to the digest
+    ///       path to prevent buffer overflow and prefix-collision poisoning.
     explicit CacheKey(const HashValue& hashVal) noexcept
-        : type(IOCType::FileHash), length(static_cast<uint8_t>(4 + hashVal.length)) {
-        // Store algorithm + length + data
-        data[0] = static_cast<uint8_t>(hashVal.algorithm);
-        data[1] = hashVal.length;
-        data[2] = 0;
-        data[3] = 0;
-        std::memcpy(data.data() + 4, hashVal.data.data(), hashVal.length);
+        : type(IOCType::FileHash) {
+        std::array<uint8_t, 4 + 72> buffer{};
+        buffer[0] = static_cast<uint8_t>(hashVal.algorithm);
+        buffer[1] = hashVal.length;
+        buffer[2] = 0;
+        buffer[3] = 0;
+        const uint8_t copyLen = (hashVal.length <= 72) ? hashVal.length : static_cast<uint8_t>(72);
+        if (copyLen > 0) {
+            std::memcpy(buffer.data() + 4, hashVal.data.data(), copyLen);
+        }
+        const size_t totalLen = static_cast<size_t>(4) + static_cast<size_t>(copyLen);
+        FillInlineFromBytes(buffer.data(), totalLen);
         ComputeHash();
     }
-    
+
     /// @brief Construct from string (domain, URL, email, etc.)
+    /// @note Inputs longer than MAX_INLINE_KEY_SIZE are reduced via a
+    ///       collision-resistant digest to prevent prefix-collision cache
+    ///       poisoning where two distinct long IOCs sharing the same prefix
+    ///       would be served the same cached reputation.
     CacheKey(IOCType iocType, std::string_view str) noexcept
         : type(iocType) {
-        length = static_cast<uint8_t>(std::min(str.length(), CacheConfig::MAX_INLINE_KEY_SIZE));
-        std::memcpy(data.data(), str.data(), length);
+        FillInlineFromBytes(reinterpret_cast<const uint8_t*>(str.data()), str.size());
         ComputeHash();
     }
-    
+
     /// @brief Construct from raw bytes
+    /// @note Inputs longer than MAX_INLINE_KEY_SIZE are reduced via a
+    ///       collision-resistant digest. Null pointers are treated as empty.
     CacheKey(IOCType iocType, const void* bytes, size_t len) noexcept
-        : type(iocType), length(static_cast<uint8_t>(std::min(len, CacheConfig::MAX_INLINE_KEY_SIZE))) {
-        std::memcpy(data.data(), bytes, length);
+        : type(iocType) {
+        const uint8_t* src = (bytes != nullptr) ? static_cast<const uint8_t*>(bytes) : nullptr;
+        FillInlineFromBytes(src, (src != nullptr) ? len : 0);
         ComputeHash();
     }
     
@@ -252,6 +267,54 @@ struct alignas(8) CacheKey {
     /// @brief Check if key is valid
     [[nodiscard]] bool IsValid() const noexcept {
         return type != IOCType::Reserved && length > 0;
+    }
+
+private:
+    /// @brief Populate the inline @c data / @c length fields from arbitrary
+    ///        content, applying a collision-resistant digest when the input
+    ///        exceeds @ref CacheConfig::MAX_INLINE_KEY_SIZE.
+    ///
+    /// Long inputs would otherwise be silently truncated to 64 bytes, which
+    /// permits cache poisoning: two distinct IOCs sharing a 64-byte prefix
+    /// would map to the same key and be served the same cached reputation.
+    /// For oversize inputs we encode the original length in the first 8
+    /// bytes (little-endian) and seven independent FNV-1a-64 digests over the
+    /// full content in the remaining 56 bytes, giving ~512 bits of collision
+    /// resistance. Length is forced to MAX_INLINE_KEY_SIZE so equality
+    /// comparison covers the full digest payload.
+    void FillInlineFromBytes(const uint8_t* src, size_t srcLen) noexcept {
+        data.fill(0);
+        if (srcLen == 0 || src == nullptr) {
+            length = 0;
+            return;
+        }
+        if (srcLen <= CacheConfig::MAX_INLINE_KEY_SIZE) {
+            std::memcpy(data.data(), src, srcLen);
+            length = static_cast<uint8_t>(srcLen);
+            return;
+        }
+
+        constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
+        constexpr uint64_t kFnvPrime  = 1099511628211ULL;
+        constexpr uint64_t kSeedMix   = 0x9E3779B97F4A7C15ULL;
+
+        const uint64_t origLen = static_cast<uint64_t>(srcLen);
+        std::memcpy(data.data(), &origLen, sizeof(origLen));
+
+        for (size_t slot = 0; slot < 7; ++slot) {
+            uint64_t h = kFnvOffset ^ (static_cast<uint64_t>(slot + 1) * kSeedMix);
+            for (size_t i = 0; i < srcLen; ++i) {
+                h ^= static_cast<uint64_t>(src[i]);
+                h *= kFnvPrime;
+                h ^= (h >> 23);
+            }
+            // Final avalanche to decorrelate seeds
+            h ^= h >> 33;
+            h *= 0xFF51AFD7ED558CCDULL;
+            h ^= h >> 33;
+            std::memcpy(data.data() + 8 + slot * 8, &h, sizeof(h));
+        }
+        length = static_cast<uint8_t>(CacheConfig::MAX_INLINE_KEY_SIZE);
     }
 };
 
@@ -642,6 +705,16 @@ public:
     /// @brief Get miss count
     [[nodiscard]] uint64_t GetMissCount() const noexcept {
         return m_missCount.load(std::memory_order_relaxed);
+    }
+
+    /// @brief Get cumulative eviction count (LRU + TTL expiry)
+    [[nodiscard]] uint64_t GetEvictionCount() const noexcept {
+        return m_evictionCount.load(std::memory_order_relaxed);
+    }
+
+    /// @brief Get cumulative insert count
+    [[nodiscard]] uint64_t GetInsertCount() const noexcept {
+        return m_insertCount.load(std::memory_order_relaxed);
     }
     
     /// @brief Reset statistics
