@@ -853,9 +853,13 @@ std::optional<HashValue> ParseHashString(
     
     // For fuzzy and TLSH, the string IS the hash (not hex encoded)
     if (algo == HashAlgorithm::FUZZY || algo == HashAlgorithm::TLSH) {
-        // Validate length fits in hash data array
-        constexpr size_t MAX_FUZZY_HASH_LEN = 72;
-        if (hashStr.length() > MAX_FUZZY_HASH_LEN || 
+        // Constrain by the algorithm-specific maximum (FUZZY: 72, TLSH:
+        // 70). The previous code shared a single 72-byte cap regardless of
+        // algorithm, which let a 71/72-character TLSH input through even
+        // though TLSH is a fixed 70-char canonical form. Empty strings are
+        // also rejected here (length == 0 is meaningless for these algos).
+        if (hashStr.empty() ||
+            hashStr.length() > expectedLength ||
             hashStr.length() > sizeof(HashValue::data)) {
             return std::nullopt;
         }
@@ -2181,9 +2185,6 @@ bool SafeParseIPv6(std::string_view str, uint16_t segments[8]) noexcept {
     size_t afterCount = 0;
     
     if (!afterDC.empty()) {
-        // Check for IPv4-mapped address at end
-        bool hasIPv4 = (afterDC.find('.') != std::string_view::npos);
-        
         size_t pos = 0;
         while (pos < afterDC.size() && afterCount < 8) {
             size_t colonPos = afterDC.find(':', pos);
@@ -2195,6 +2196,14 @@ bool SafeParseIPv6(std::string_view str, uint16_t segments[8]) noexcept {
             
             // Check if this is IPv4 part
             if (part.find('.') != std::string_view::npos) {
+                // RFC 4291 §2.2: an embedded IPv4 dotted-quad MUST be the
+                // final element. Reject "::1:1.2.3.4:5" and similar inputs
+                // where data follows the IPv4 segment - the previous code
+                // parsed the IPv4 and unconditionally broke, silently
+                // truncating the rest of the address.
+                if (colonPos != afterDC.size()) {
+                    return false;
+                }
                 // Parse IPv4 into last 2 segments
                 uint8_t ipv4[4];
                 if (!SafeParseIPv4(part, ipv4)) {
