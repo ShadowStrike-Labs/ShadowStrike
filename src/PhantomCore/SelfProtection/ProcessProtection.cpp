@@ -62,10 +62,10 @@
 // ============================================================================
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <sstream>
 #include <iomanip>
-#include <random>
 #include <deque>
 
 // ============================================================================
@@ -73,7 +73,9 @@
 // ============================================================================
 
 #ifdef _WIN32
+#include <bcrypt.h>
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 // NTDLL function typedefs
 typedef NTSTATUS(NTAPI* NtQueryInformationProcess_t)(
@@ -143,16 +145,64 @@ namespace {
 }
 
 /**
- * @brief Generate authorization token for internal use
+ * @brief Generate authorization token for internal use.
+ *
+ * SECURITY: Uses the OS CSPRNG (BCryptGenRandom with the system-preferred
+ * RNG) to produce 32 cryptographically strong bytes, hex-encoded to a
+ * 64-character token. On CSPRNG failure the token is returned empty so
+ * that every VerifyAuthToken call rejects — refusing to operate is
+ * strictly safer than falling back to a predictable PRNG (e.g. mt19937),
+ * which would expose every privileged entry point to forgery.
  */
 [[nodiscard]] std::string GenerateInternalAuthToken() {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint64_t> dist;
+#ifdef _WIN32
+    std::array<uint8_t, 32> raw{};
+    NTSTATUS status = ::BCryptGenRandom(
+        nullptr,
+        raw.data(),
+        static_cast<ULONG>(raw.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-    std::ostringstream oss;
-    oss << "SS_INTERNAL_" << std::hex << dist(gen) << dist(gen);
-    return oss.str();
+    if (!BCRYPT_SUCCESS(status)) {
+        // Fallback to legacy CryptGenRandom (PROV_RSA_AES) — still a real
+        // CSPRNG, just an older surface. Only if BOTH fail do we refuse.
+        HCRYPTPROV hProv = 0;
+        if (::CryptAcquireContextW(&hProv, nullptr, nullptr,
+                                   PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+            BOOL ok = ::CryptGenRandom(hProv,
+                                       static_cast<DWORD>(raw.size()),
+                                       raw.data());
+            ::CryptReleaseContext(hProv, 0);
+            if (!ok) {
+                Utils::Logger::Error(
+                    "[ProcessProtection] CryptGenRandom failed after BCryptGenRandom failure (0x{:08X}); "
+                    "internal auth token will be empty and all privileged calls will be rejected",
+                    static_cast<unsigned>(status));
+                ::RtlSecureZeroMemory(raw.data(), raw.size());
+                return std::string{};
+            }
+        } else {
+            Utils::Logger::Error(
+                "[ProcessProtection] BCryptGenRandom failed (0x{:08X}) and CryptAcquireContext "
+                "fallback unavailable; internal auth token will be empty and all privileged calls will be rejected",
+                static_cast<unsigned>(status));
+            ::RtlSecureZeroMemory(raw.data(), raw.size());
+            return std::string{};
+        }
+    }
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(raw.size() * 2, '\0');
+    for (size_t i = 0; i < raw.size(); ++i) {
+        out[2 * i + 0] = kHex[(raw[i] >> 4) & 0x0F];
+        out[2 * i + 1] = kHex[raw[i] & 0x0F];
+    }
+    ::RtlSecureZeroMemory(raw.data(), raw.size());
+    return out;
+#else
+    // Non-Windows builds: refuse rather than use a weak PRNG.
+    return std::string{};
+#endif
 }
 
 /**
@@ -739,6 +789,24 @@ bool ProcessProtectionImpl::Initialize(const ProcessProtectionConfiguration& con
     }
 
     lock.lock();
+
+    // DESIGN: Re-check status after re-acquiring the lock. Between the
+    // unlock above and this point a concurrent Shutdown() (called with a
+    // valid auth token) could have flipped the state machine. Without
+    // this check we would unconditionally clobber Status back to Running
+    // and assert m_initialized=true, corrupting the lifecycle and leaving
+    // a monitoring thread we never started referencing freed state.
+    if (m_status.load(std::memory_order_acquire) != ModuleStatus::Initializing) {
+        Utils::Logger::Warn(
+            "[ProcessProtection] Initialization aborted - state changed during setup; "
+            "rolling back partial protection state");
+        // CloseProtectedHandles() requires the exclusive lock we currently hold.
+        CloseProtectedHandles();
+        m_whitelistedCallers.clear();
+        // Leave status as set by the racing caller (Stopping/Stopped).
+        return false;
+    }
+
     m_initialized.store(true, std::memory_order_release);
     SetStatus(ModuleStatus::Running);
 
@@ -1105,6 +1173,13 @@ bool ProcessProtectionImpl::SetCriticalProcess(uint32_t processId, bool critical
         return false;
     }
 
+    // Only works on current process; reject early before touching token
+    // privileges so we don't temporarily elevate for a no-op.
+    if (processId != GetCurrentProcessIdSafe()) {
+        Utils::Logger::Warn("[ProcessProtection] Can only set critical flag on current process");
+        return false;
+    }
+
     // Need SE_DEBUG_PRIVILEGE
     HANDLE hToken = nullptr;
     if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
@@ -1120,14 +1195,18 @@ bool ProcessProtectionImpl::SetCriticalProcess(uint32_t processId, bool critical
         return false;
     }
 
-    ::AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    ::CloseHandle(hToken);
-
-    // Only works on current process
-    if (processId != GetCurrentProcessIdSafe()) {
-        Utils::Logger::Warn("[ProcessProtection] Can only set critical flag on current process");
-        return false;
-    }
+    // SECURITY: Snapshot prior privilege state so we can restore exactly
+    // what was there. AdjustTokenPrivileges with PreviousState writes the
+    // pre-call attributes for each LUID we touched; we replay it to drop
+    // SeDebugPrivilege back to its original disabled state on exit and
+    // avoid leaking the elevated privilege to subsequent code paths.
+    TOKEN_PRIVILEGES previousState = {};
+    DWORD previousReturnLength = 0;
+    const BOOL adjustOk = ::AdjustTokenPrivileges(
+        hToken, FALSE, &tp, sizeof(tp),
+        &previousState, &previousReturnLength);
+    const DWORD adjustErr = ::GetLastError();
+    const bool privilegeWasEnabled = adjustOk && (adjustErr != ERROR_NOT_ALL_ASSIGNED);
 
     BOOLEAN wasCritical = FALSE;
     NTSTATUS status = m_pRtlSetProcessIsCritical(
@@ -1135,6 +1214,19 @@ bool ProcessProtectionImpl::SetCriticalProcess(uint32_t processId, bool critical
         &wasCritical,
         FALSE
     );
+
+    // Always restore the prior privilege state, regardless of NTSTATUS.
+    if (privilegeWasEnabled && previousReturnLength >= sizeof(TOKEN_PRIVILEGES)) {
+        ::AdjustTokenPrivileges(hToken, FALSE, &previousState, sizeof(previousState),
+                                nullptr, nullptr);
+    } else if (privilegeWasEnabled) {
+        // No previous state captured (size 0) — explicitly disable.
+        TOKEN_PRIVILEGES disableTp = tp;
+        disableTp.Privileges[0].Attributes = 0;
+        ::AdjustTokenPrivileges(hToken, FALSE, &disableTp, sizeof(disableTp),
+                                nullptr, nullptr);
+    }
+    ::CloseHandle(hToken);
 
     if (NT_SUCCESS(status)) {
         std::unique_lock lock(m_mutex);
@@ -1971,37 +2063,47 @@ bool ProcessProtectionImpl::SelfTest() {
 }
 
 bool ProcessProtectionImpl::VerifyProcessIntegrity(uint32_t processId) {
-    // NOTE: This method must NOT acquire m_mutex since it may be called
-    // from MonitoringThreadFunc which already holds a lock on m_mutex.
-    // Callers must ensure proper synchronization.
+    // DESIGN: Hold the shared_lock for the entire span that the cached
+    // process handle is dereferenced. Releasing the lock before calling
+    // GetExitCodeProcess() would race with UnprotectProcess(), which takes
+    // a unique_lock, calls CloseHandle, and erases the entry — leaving us
+    // calling GetExitCodeProcess on a stale/closed handle (and potentially
+    // a handle the OS has since recycled to an unrelated kernel object).
+    // GetExitCodeProcess is a fast, non-blocking query; holding the
+    // shared_lock across it is acceptable.
 
-    // Verify process is still running
 #ifdef _WIN32
-    HANDLE hProcess = nullptr;
+    bool needFallbackOpen = false;
     {
         std::shared_lock lock(m_mutex);
         auto it = m_protectedProcesses.find(processId);
         if (it == m_protectedProcesses.end()) {
             return false;
         }
-        hProcess = it->second.processHandle;
+        HANDLE hProcess = it->second.processHandle;
+        if (hProcess) {
+            DWORD exitCode = 0;
+            if (::GetExitCodeProcess(hProcess, &exitCode)) {
+                if (exitCode != STILL_ACTIVE) {
+                    Utils::Logger::Warn(
+                        "[ProcessProtection] Process {} has terminated (exit code: {})",
+                        processId, exitCode);
+                    return false;
+                }
+            }
+        } else {
+            needFallbackOpen = true;
+        }
     }
 
-    if (hProcess) {
-        DWORD exitCode = 0;
-        if (::GetExitCodeProcess(hProcess, &exitCode)) {
-            if (exitCode != STILL_ACTIVE) {
-                Utils::Logger::Warn("[ProcessProtection] Process {} has terminated (exit code: {})",
-                                   processId, exitCode);
-                return false;
-            }
-        }
-    } else {
-        // No handle stored - check by trying to open the process
+    if (needFallbackOpen) {
+        // No cached handle — open transiently. This path holds no lock
+        // because the handle is local to this call.
         HANDLE hCheck = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
         if (!hCheck) {
-            Utils::Logger::Warn("[ProcessProtection] Process {} no longer accessible (error: 0x{:08X})",
-                               processId, ::GetLastError());
+            Utils::Logger::Warn(
+                "[ProcessProtection] Process {} no longer accessible (error: 0x{:08X})",
+                processId, ::GetLastError());
             return false;
         }
         DWORD exitCode = 0;
@@ -2384,10 +2486,15 @@ bool ProcessProtectionImpl::IsShadowStrikeComponent(uint32_t processId) const {
 }
 
 bool ProcessProtectionImpl::VerifyAuthToken(std::string_view token) const {
-    if (token.empty()) {
-        return false;
-    }
-    return ConstantTimeCompare(token, m_internalAuthToken);
+    // SECURITY: ConstantTimeCompare folds the length difference into the
+    // result, so we deliberately do NOT short-circuit on empty input —
+    // doing so would leak length information via timing. We additionally
+    // reject when the stored secret is itself empty (which happens only
+    // if the CSPRNG failed at construction); that check depends solely on
+    // a per-instance invariant and cannot be used as an oracle against
+    // attacker-controlled input.
+    const bool match = ConstantTimeCompare(token, m_internalAuthToken);
+    return match && !m_internalAuthToken.empty();
 }
 
 void ProcessProtectionImpl::CloseProtectedHandles() {
