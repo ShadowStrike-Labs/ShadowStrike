@@ -607,7 +607,7 @@ namespace ShadowStrike {
             // ========================================================================
 
             struct NodeInfo {
-                uint32_t offset;
+                uint64_t offset;            // v1.1: 64-bit to match BPlusTreeNode layout
                 const BPlusTreeNode* node;
                 double fillRate;
                 uint32_t depth;
@@ -620,9 +620,9 @@ namespace ShadowStrike {
             size_t nodeCount = 0;
             size_t sparseCount = 0;
 
-            // Recursive tree traversal
-            std::function<void(uint32_t, uint32_t)> traverse =
-                [&](uint32_t nodeOffset, uint32_t depth) {
+            // Recursive tree traversal (offsets are 64-bit since v1.1)
+            std::function<void(uint64_t, uint32_t)> traverse =
+                [&](uint64_t nodeOffset, uint32_t depth) {
                 if (nodeCount > 100000) {
                     SS_LOG_WARN(L"SignatureIndex",
                         L"Compact: Node count limit exceeded (>100K)");
@@ -632,7 +632,15 @@ namespace ShadowStrike {
                 const BPlusTreeNode* node = GetNode(nodeOffset);
                 if (!node) {
                     SS_LOG_WARN(L"SignatureIndex",
-                        L"Compact: Cannot load node at offset 0x%X", nodeOffset);
+                        L"Compact: Cannot load node at offset 0x%llX", nodeOffset);
+                    return;
+                }
+
+                // SECURITY: Validate keyCount before deriving fill rate
+                if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
+                    SS_LOG_ERROR(L"SignatureIndex",
+                        L"Compact: Invalid keyCount %u at offset 0x%llX, skipping subtree",
+                        node->keyCount, nodeOffset);
                     return;
                 }
 
@@ -654,21 +662,22 @@ namespace ShadowStrike {
                 if (isSparse) sparseCount++;
 
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"Compact: Analyzed node at offset 0x%X "
+                    L"Compact: Analyzed node at offset 0x%llX "
                     L"(depth=%u, keys=%u, fill=%.1f%%, sparse=%u)",
                     nodeOffset, depth, node->keyCount, fillRate * 100.0, isSparse ? 1 : 0);
 
                 // Recursively traverse children (internal nodes only)
                 if (!node->isLeaf) {
                     for (uint32_t i = 0; i <= node->keyCount; ++i) {
-                        if (node->children[i] != 0) {
-                            traverse(node->children[i], depth + 1);
+                        const uint64_t childOff = node->children[i];
+                        if (childOff != 0 && childOff < m_indexSize) {
+                            traverse(childOff, depth + 1);
                         }
                     }
                 }
                 };
 
-            uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+            const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
             traverse(rootOffset, 0);
 
             SS_LOG_INFO(L"SignatureIndex",
@@ -676,18 +685,42 @@ namespace ShadowStrike {
                 nodeCount, sparseCount);
 
             // ========================================================================
-            // STEP 6: MERGE SPARSE NODES (Via COW Transaction)
+            // STEP 6: REPORT MERGE OPPORTUNITIES (analysis only)
             // ========================================================================
+            //
+            // ENTERPRISE NOTE:
+            //   The previous implementation called CloneNode() on sparse parents and
+            //   children, mutated the clones with merged key/child arrays, and then
+            //   dropped them on the floor with a comment "In real implementation: add
+            //   to COW pool for atomic commit". The cloned, modified nodes were never
+            //   linked into the tree, so the on-disk B+Tree was unchanged while the
+            //   caller-visible log still claimed "%zu nodes merged". That is silent
+            //   data lying — unacceptable in an NGAV engine.
+            //
+            //   In addition, STEP 7 unconditionally rewrote m_rootOffset via a 32-bit
+            //   truncation of a uint64_t child slot (children[] is uint64_t since v1.1)
+            //   without verifying that the new offset pointed at a valid, mapped node
+            //   reachable through the regular file-offset path. On databases that hit
+            //   the 4 GB boundary or that had children populated from the COW heap-
+            //   address path, this corrupted the root pointer permanently.
+            //
+            //   Until a real transactional COW commit pipeline exists, Compact() must
+            //   limit itself to read-only analysis. We still walk the tree, identify
+            //   merge candidates, and surface the result so operators / the rebuild
+            //   path can act on it — but we do not mutate any persistent state.
+            //
+            // ========================================================================
+
+            size_t mergeCandidatePairs = 0;
+            size_t projectedNodesMergeable = 0;
 
             if (sparseCount > 0) {
                 SS_LOG_DEBUG(L"SignatureIndex",
-                    L"Compact: Starting merge of %zu sparse nodes", sparseCount);
+                    L"Compact: Analyzing %zu sparse nodes for merge opportunities",
+                    sparseCount);
 
-                size_t nodesMerged = 0;
-                size_t nodesRemoved = 0;
-
-                // Group sparse nodes by parent for potential merging
-                std::map<uint32_t, std::vector<size_t>> sparseByParent;
+                // Group sparse nodes by parent (parentOffset is 64-bit since v1.1)
+                std::map<uint64_t, std::vector<size_t>> sparseByParent;
 
                 for (size_t i = 0; i < allNodes.size(); ++i) {
                     if (allNodes[i].isSparse) {
@@ -699,182 +732,50 @@ namespace ShadowStrike {
                     L"Compact: Grouped sparse nodes into %zu parent groups",
                     sparseByParent.size());
 
-                // ====================================================================
-                // ATTEMPT MERGE: For each parent with multiple sparse children
-                // ====================================================================
-
                 for (const auto& [parentOffset, childIndices] : sparseByParent) {
                     if (childIndices.size() < 2) {
                         continue; // Need at least 2 siblings to merge
                     }
 
-                    SS_LOG_DEBUG(L"SignatureIndex",
-                        L"Compact: Parent 0x%X has %zu sparse children - attempting merge",
-                        parentOffset, childIndices.size());
-
-                    // Check if all siblings can fit into one node
-                    uint32_t totalKeys = 0;
+                    uint64_t totalKeys = 0;
                     for (size_t childIdx : childIndices) {
                         totalKeys += allNodes[childIdx].node->keyCount;
                     }
 
-                    // Account for separator keys from parent
-                    uint32_t separatorKeys = static_cast<uint32_t>(childIndices.size()) - 1;
-                    uint32_t totalKeysWithSeparators = totalKeys + separatorKeys;
+                    const uint64_t separatorKeys =
+                        static_cast<uint64_t>(childIndices.size()) - 1;
+                    const uint64_t totalKeysWithSeparators = totalKeys + separatorKeys;
 
                     if (totalKeysWithSeparators <= BPlusTreeNode::MAX_KEYS) {
-                        // ============================================================
-                        // MERGE IS POSSIBLE
-                        // ============================================================
+                        mergeCandidatePairs++;
+                        projectedNodesMergeable += (childIndices.size() - 1);
 
                         SS_LOG_TRACE(L"SignatureIndex",
-                            L"Compact: Merging %zu nodes (%u keys) into one node",
-                            childIndices.size(), totalKeysWithSeparators);
-
-                        // Clone parent and first child
-                        const BPlusTreeNode* parentNode = GetNode(parentOffset);
-                        if (!parentNode) {
-                            SS_LOG_WARN(L"SignatureIndex",
-                                L"Compact: Cannot load parent node at 0x%X", parentOffset);
-                            continue;
-                        }
-
-                        BPlusTreeNode* clonedParent = CloneNode(parentNode);
-                        BPlusTreeNode* mergedChild = CloneNode(allNodes[childIndices[0]].node);
-
-                        if (!clonedParent || !mergedChild) {
-                            SS_LOG_ERROR(L"SignatureIndex",
-                                L"Compact: Failed to clone nodes for merge");
-                            continue;
-                        }
-
-                        // Merge all siblings into first child
-                        uint32_t insertPos = mergedChild->keyCount;
-
-                        for (size_t i = 1; i < childIndices.size(); ++i) {
-                            const BPlusTreeNode* sibling = allNodes[childIndices[i]].node;
-
-                            // Defense-in-depth: abort merge if insertPos would exceed array
-                            if (insertPos >= BPlusTreeNode::MAX_KEYS) {
-                                SS_LOG_WARN(L"SignatureIndex",
-                                    L"Compact: insertPos %u reached MAX_KEYS during merge, aborting",
-                                    insertPos);
-                                break;
-                            }
-
-                            // Add separator key from parent
-                            uint32_t childPos = 0;
-                            for (uint32_t j = 0; j < clonedParent->keyCount; ++j) {
-                                if (clonedParent->children[j + 1] ==
-                                    allNodes[childIndices[i]].offset) {
-                                    mergedChild->keys[insertPos] = clonedParent->keys[j];
-                                    insertPos++;
-                                    break;
-                                }
-                            }
-
-                            // Merge sibling's keys and children
-                            for (uint32_t j = 0; j < sibling->keyCount; ++j) {
-                                if (insertPos >= BPlusTreeNode::MAX_KEYS) break;
-                                mergedChild->keys[insertPos] = sibling->keys[j];
-                                if (!mergedChild->isLeaf) {
-                                    mergedChild->children[insertPos] = sibling->children[j];
-                                }
-                                insertPos++;
-                            }
-
-                            // Last child of sibling
-                            if (!mergedChild->isLeaf) {
-                                mergedChild->children[insertPos] = sibling->children[sibling->keyCount];
-                            }
-
-                            nodesRemoved++;
-                        }
-
-                        mergedChild->keyCount = insertPos;
-
-                        SS_LOG_TRACE(L"SignatureIndex",
-                            L"Compact: Merged node now has %u keys", mergedChild->keyCount);
-
-                        // Remove merged children from parent
-                        uint32_t removeCount = static_cast<uint32_t>(childIndices.size()) - 1;
-                        for (uint32_t i = 0; i < removeCount; ++i) {
-                            // FIX: Check keyCount > 0 to prevent underflow
-                            if (clonedParent->keyCount == 0) {
-                                SS_LOG_WARN(L"SignatureIndex",
-                                    L"Compact: Parent keyCount is 0, cannot remove more entries");
-                                break;
-                            }
-
-                            // Remove entry from parent
-                            uint32_t removePos = 0;
-                            bool foundPos = false;
-                            for (uint32_t j = 0; j < clonedParent->keyCount; ++j) {
-                                // SECURITY: Bounds check on children access
-                                if (j + 1 <= clonedParent->keyCount &&
-                                    clonedParent->children[j + 1] == allNodes[childIndices[i + 1]].offset) {
-                                    removePos = j;
-                                    foundPos = true;
-                                    break;
-                                }
-                            }
-
-                            if (!foundPos) {
-                                SS_LOG_WARN(L"SignatureIndex",
-                                    L"Compact: Could not find child position to remove");
-                                continue;
-                            }
-
-                            // Shift entries (bounds-safe)
-                            // FIX: Check keyCount > 1 to prevent underflow in loop condition
-                            if (clonedParent->keyCount > 1) {
-                                for (uint32_t j = removePos; j < clonedParent->keyCount - 1; ++j) {
-                                    // SECURITY: Additional bounds check
-                                    if (j + 1 >= BPlusTreeNode::MAX_KEYS || j + 2 > BPlusTreeNode::MAX_KEYS) break;
-                                    clonedParent->keys[j] = clonedParent->keys[j + 1];
-                                    clonedParent->children[j + 1] = clonedParent->children[j + 2];
-                                }
-                            }
-                            clonedParent->keyCount--;
-                        }
-
-                        nodesMerged += removeCount;
-
-                        // Update COW pool
-                        // (In real implementation: add to COW pool for atomic commit)
+                            L"Compact: Parent 0x%llX has %zu siblings mergeable into one "
+                            L"(%llu keys, separators included)",
+                            parentOffset, childIndices.size(), totalKeysWithSeparators);
                     }
                     else {
                         SS_LOG_TRACE(L"SignatureIndex",
-                            L"Compact: Cannot merge %zu nodes "
-                            L"(total keys %u > max %zu)",
-                            childIndices.size(), totalKeysWithSeparators,
-                            BPlusTreeNode::MAX_KEYS);
+                            L"Compact: Parent 0x%llX has %zu sparse children but combined "
+                            L"key count %llu exceeds MAX_KEYS %zu - not mergeable",
+                            parentOffset, childIndices.size(),
+                            totalKeysWithSeparators, BPlusTreeNode::MAX_KEYS);
                     }
                 }
 
                 SS_LOG_INFO(L"SignatureIndex",
-                    L"Compact: Merge complete - %zu nodes merged, %zu nodes removed",
-                    nodesMerged, nodesRemoved);
+                    L"Compact: Analysis complete - %zu parent groups with mergeable "
+                    L"siblings, ~%zu nodes could be reclaimed by Rebuild()",
+                    mergeCandidatePairs, projectedNodesMergeable);
             }
 
-            // ========================================================================
-            // STEP 7: REDUCE TREE HEIGHT IF POSSIBLE
-            // ========================================================================
-
-            const BPlusTreeNode* root = GetNode(m_rootOffset.load(std::memory_order_acquire));
-            if (root && !root->isLeaf && root->keyCount == 0 && root->children[0] != 0) {
-                // Root has single child - can descend
-                uint32_t newRootOffset = root->children[0];
-                m_rootOffset.store(newRootOffset, std::memory_order_release);
-
-                uint32_t newHeight = m_treeHeight.load(std::memory_order_acquire);
-                if (newHeight > 1) {
-                    newHeight--;
-                    m_treeHeight.store(newHeight, std::memory_order_release);
-                    SS_LOG_INFO(L"SignatureIndex",
-                        L"Compact: Tree height reduced to %u", newHeight);
-                }
-            }
+            // STEP 7 (tree-height reduction) intentionally removed: see note above.
+            // The prior implementation mutated m_rootOffset based on a 32-bit
+            // truncation of a 64-bit children[] slot, which can corrupt the root
+            // pointer on >4 GB databases or when children point into the COW heap.
+            // Tree-height reduction belongs in Rebuild(), which constructs a fresh
+            // on-disk image transactionally.
 
             // ========================================================================
             // STEP 8: CLEAR NODE CACHE
