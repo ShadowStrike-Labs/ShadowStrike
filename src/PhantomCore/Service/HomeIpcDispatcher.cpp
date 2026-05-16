@@ -73,6 +73,7 @@
 // Standard library
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <map>
 #include <mutex>
@@ -223,6 +224,23 @@ template<typename T>
     return out;
 }
 
+/// Convert a UTF-8 std::string to std::wstring. A naive char-by-char copy
+/// truncates UTF-8 multi-byte sequences and silently corrupts non-ASCII file
+/// paths supplied by the UI; the engine then either fails to find files or,
+/// worse, scans an unintended target. MultiByteToWideChar with CP_UTF8 is the
+/// only correct conversion.
+[[nodiscard]] std::wstring NarrowToWide(std::string_view s) {
+    if (s.empty()) return {};
+    const int need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (need <= 0) return {};
+    std::wstring out(static_cast<std::size_t>(need), L'\0');
+    const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        s.data(), static_cast<int>(s.size()), out.data(), need);
+    if (written <= 0) return {};
+    return out;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -231,56 +249,93 @@ template<typename T>
 
 struct HomeIpcDispatcher::Impl {
     // ---- Pause state --------------------------------------------------------
+    //
+    // The original implementation spawned a detached std::thread that held a
+    // bare `this` pointer and dereferenced Impl members (pauseEndTime, the
+    // mutex, the atomic flag) *after* signalling the resume side-effects.
+    // On service shutdown the detached thread continued to touch Impl members
+    // after this object was destroyed — undefined behaviour even though the
+    // singleton lives for the process lifetime, because std::terminate races
+    // and pending DllMain teardown can disturb member storage.
+    //
+    // A std::jthread joined by Impl's destructor eliminates the dangling-this
+    // window; a stop_token gates the resume side-effects so a shutdown does
+    // not flip protection state on its way out.
     mutable std::mutex                                      pauseMutex;
-    std::optional<std::chrono::steady_clock::time_point>   pauseEndTime;
-    std::thread                                             pauseTimerThread;
+    std::condition_variable                                 pauseCv;
+    std::optional<std::chrono::steady_clock::time_point>    pauseEndTime;
     std::atomic<bool>                                       pauseTimerActive{false};
+    std::jthread                                            pauseTimerThread;
+
+    ~Impl() {
+        // Request stop then notify so the timer wakes and observes the token
+        // before std::jthread's own destructor joins. Without the notify, the
+        // wait_until predicate is never re-evaluated and the join blocks
+        // indefinitely.
+        if (pauseTimerThread.joinable()) {
+            pauseTimerThread.request_stop();
+        }
+        pauseCv.notify_all();
+    }
 
     void ScheduleResume(std::chrono::seconds delay) {
         {
             std::lock_guard<std::mutex> lk(pauseMutex);
             pauseEndTime = std::chrono::steady_clock::now() + delay;
         }
+        pauseCv.notify_all();
 
         if (pauseTimerActive.exchange(true)) {
-            // Timer already running — updating pauseEndTime above is enough:
-            // the existing thread will fire at the new deadline.
+            // An active timer thread is already waiting; it observes the new
+            // deadline via the predicate when the CV wakes it up above.
             return;
         }
 
-        if (pauseTimerThread.joinable()) pauseTimerThread.detach();
-        pauseTimerThread = std::thread([this]() {
-            for (;;) {
-                std::optional<std::chrono::steady_clock::time_point> target;
-                {
-                    std::lock_guard<std::mutex> lk(pauseMutex);
-                    target = pauseEndTime;
-                }
-                if (!target) break;
-                std::this_thread::sleep_until(*target);
+        if (pauseTimerThread.joinable()) {
+            // Previous timer thread has finished (pauseTimerActive was false).
+            // Drain it cleanly before re-arming.
+            pauseTimerThread.request_stop();
+            pauseTimerThread.join();
+        }
 
-                // Re-read to check whether the deadline was moved forward.
-                const auto now = std::chrono::steady_clock::now();
-                {
-                    std::lock_guard<std::mutex> lk(pauseMutex);
-                    if (pauseEndTime && now < *pauseEndTime) {
-                        // Caller rescheduled; loop back and wait again.
-                        continue;
+        pauseTimerThread = std::jthread([this](std::stop_token stoken) {
+            // Always release the active flag, regardless of how we exit.
+            struct ActiveGuard {
+                std::atomic<bool>& flag;
+                ~ActiveGuard() { flag.store(false, std::memory_order_release); }
+            } guard{pauseTimerActive};
+
+            bool ranToCompletion = false;
+            {
+                std::unique_lock<std::mutex> lk(pauseMutex);
+                while (!stoken.stop_requested() && pauseEndTime.has_value()) {
+                    const auto target = *pauseEndTime;
+                    pauseCv.wait_until(lk, target, [&] {
+                        return stoken.stop_requested()
+                            || !pauseEndTime.has_value()
+                            || *pauseEndTime != target;
+                    });
+                    if (stoken.stop_requested()) return;
+                    if (!pauseEndTime.has_value()) return;
+                    if (std::chrono::steady_clock::now() >= *pauseEndTime) {
+                        pauseEndTime.reset();
+                        ranToCompletion = true;
+                        break;
                     }
-                    pauseEndTime.reset();
+                    // Deadline was moved; loop and wait on the new target.
                 }
-                break;
             }
+
+            if (!ranToCompletion || stoken.stop_requested()) return;
 
             HomeProductOrchestrator::Instance().ResumeAllModules();
 
             const auto ev = Events::BuildProtectionStateChanged(
                 "active", "auto-resume after timed pause");
-            if (!ev.empty())
+            if (!ev.empty()) {
                 ServiceCommunicator::Instance().BroadcastEvent(
                     CommandType::ProtectionStateChanged, ev);
-
-            pauseTimerActive.store(false, std::memory_order_release);
+            }
         });
     }
 
@@ -327,8 +382,28 @@ struct HomeIpcDispatcher::Impl {
     }
 
     // ---- Config key allow-list ----------------------------------------------
+    //
+    // ConfigManager::SetValue accepts arbitrary string keys. Even with the
+    // "Home/" prefix gate, untrusted callers could submit pathological keys
+    // (excessive length, embedded control bytes, traversal sequences) that
+    // bloat the config store or surface oddly in audit trails. Bound the
+    // suffix length and reject control characters and ".." segments.
     [[nodiscard]] static bool IsAllowedConfigKey(std::string_view key) noexcept {
-        return key.size() > 5 && key.substr(0, 5) == "Home/";
+        static constexpr std::size_t kMaxConfigKeyLen = 256u;
+        if (key.size() <= 5u || key.size() > kMaxConfigKeyLen) return false;
+        if (key.substr(0, 5) != "Home/") return false;
+
+        for (std::size_t i = 5; i < key.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(key[i]);
+            if (c < 0x20 || c == 0x7F) return false;     // control bytes
+            if (c == '\\' || c == '\"') return false;     // never legitimate
+        }
+        // Reject any ".." segment to block path-traversal-shaped keys.
+        if (key.find("..") != std::string_view::npos) return false;
+        // Reject consecutive or trailing separators.
+        if (key.find("//") != std::string_view::npos) return false;
+        if (key.back() == '/') return false;
+        return true;
     }
 };
 
@@ -344,15 +419,7 @@ HomeIpcDispatcher& HomeIpcDispatcher::Instance() {
 HomeIpcDispatcher::HomeIpcDispatcher()
     : m_impl(std::make_unique<Impl>()) {}
 
-HomeIpcDispatcher::~HomeIpcDispatcher() {
-    m_impl->pauseTimerActive.store(false, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(m_impl->pauseMutex);
-        m_impl->pauseEndTime.reset();
-    }
-    if (m_impl->pauseTimerThread.joinable())
-        m_impl->pauseTimerThread.detach();
-}
+HomeIpcDispatcher::~HomeIpcDispatcher() = default;
 
 // ============================================================================
 // Install
@@ -821,6 +888,13 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         rec->scanId = impl->NewScanId();
         const std::string scanId = rec->scanId;
 
+        // Register the record in the activeScans map *before* spawning the
+        // async task or the watcher thread. The progress callback and the
+        // watcher both look the record up by id via FindScan; if AddScan
+        // raced after std::async, an early progress event or a fast-completing
+        // scan could observe an empty map and silently drop completion.
+        impl->AddScan(rec);
+
         ScanProgressCallback progressCb =
             [impl, scanId, &svc](const ScanProgress& p) mutable {
                 auto r = impl->FindScan(scanId);
@@ -849,10 +923,20 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             std::vector<std::wstring> paths;
             if (j.contains("paths") && j["paths"].is_array()) {
                 for (const auto& p : j["paths"]) {
-                    if (p.is_string()) {
-                        const auto s = p.get<std::string>();
-                        paths.push_back(std::wstring(s.begin(), s.end()));
+                    if (!p.is_string()) continue;
+                    const auto s = p.get<std::string>();
+                    auto wide = NarrowToWide(s);
+                    if (wide.empty()) {
+                        // Reject the whole request rather than silently
+                        // scanning a partial path set on UTF-8 conversion
+                        // failure — that would surprise the user and could be
+                        // exploited to redirect scope.
+                        svc.SendResponseEnvelope(clientId, CommandType::StartScan, requestId,
+                            MakeErrorResponse("invalid_value",
+                                "paths must contain valid UTF-8 strings").dump());
+                        return;
                     }
+                    paths.push_back(std::move(wide));
                 }
             }
             if (paths.empty()) {
@@ -884,8 +968,6 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             }
             r->percent.store(100.0f, std::memory_order_relaxed);
         }).detach();
-
-        impl->AddScan(std::move(rec));
 
         nlohmann::json resp{{"ok", true}, {"scanId", scanId}};
         svc.SendResponseEnvelope(clientId, CommandType::StartScan, requestId, resp.dump());
