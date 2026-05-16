@@ -31,6 +31,7 @@
  */
 
 #include "ServiceController.hpp"
+#include "AntivirusService.hpp"
 #include "../Utils/Logger.hpp"
 //#include "../../Utils/JsonUtils.hpp" // Assumed infrastructure
 #include <shared_mutex>
@@ -38,9 +39,6 @@
 #include <chrono>
 #include <map>
 #include <sstream>
-
-// Macros for Service definition
-#define SERVICE_NAME L"ShadowStrikeService"
 
 namespace ShadowStrike::Service {
 
@@ -77,20 +75,22 @@ namespace ShadowStrike::Service {
 
         void RegisterHandler(LPVOID context) {
             m_serviceStatusHandle = RegisterServiceCtrlHandlerExW(
-                SERVICE_NAME,
+                ServiceConstants::SERVICE_NAME,
                 ServiceController::ServiceCtrlHandler,
                 context
             );
 
             if (!m_serviceStatusHandle) {
-                // Log critical error, but we can't do much if logging fails
-                // In a real scenario, write to Event Log
+                // Surface to the platform log so SCM-side registration failures
+                // are diagnosable post-mortem; this is the only path that ever
+                // runs before any user-mode dispatcher is up.
+                SS_LOG_ERROR(L"ServiceController",
+                    L"RegisterServiceCtrlHandlerExW failed (err=%lu)",
+                    GetLastError());
             }
         }
 
         void ReportStatus(DWORD currentState, DWORD win32ExitCode = NO_ERROR, DWORD waitHint = 0) {
-            static DWORD checkPoint = 1;
-
             std::unique_lock lock(m_statusMutex);
 
             m_serviceStatus.dwCurrentState = currentState;
@@ -98,9 +98,15 @@ namespace ShadowStrike::Service {
             m_serviceStatus.dwWaitHint = waitHint;
 
             if (currentState == SERVICE_START_PENDING || currentState == SERVICE_STOP_PENDING) {
-                m_serviceStatus.dwCheckPoint = checkPoint++;
+                // Checkpoint must monotonically increase between SCM updates.
+                // Previously was a function-local `static DWORD` — race-free
+                // only because the mutex above serialised it, but storing it
+                // as instance state makes intent explicit and avoids surprise
+                // sharing across hypothetical re-instantiation in tests.
+                m_serviceStatus.dwCheckPoint = ++m_checkPoint;
             } else {
                 m_serviceStatus.dwCheckPoint = 0;
+                m_checkPoint = 0;
             }
 
             if (currentState == SERVICE_RUNNING) {
@@ -149,7 +155,14 @@ namespace ShadowStrike::Service {
                 InitializeComponents();
                 initOk = true;
             }
+            catch (const std::exception& ex) {
+                Utils::Logger::Error(
+                    "[ServiceController] InitializeComponents threw: {}", ex.what());
+                initOk = false;
+            }
             catch (...) {
+                Utils::Logger::Error(
+                    "[ServiceController] InitializeComponents threw non-std exception");
                 initOk = false;
             }
 
@@ -183,43 +196,60 @@ namespace ShadowStrike::Service {
         }
 
         DWORD HandleControl(DWORD control, DWORD eventType, LPVOID eventData) {
-            switch (control) {
-                case SERVICE_CONTROL_STOP:
-                    Stop();
-                    return NO_ERROR;
+            // The SCM invokes this on a control thread; any uncaught exception
+            // here would propagate into Windows-internal code and crash the
+            // process, taking down the protection service. Catch and convert.
+            try {
+                switch (control) {
+                    case SERVICE_CONTROL_STOP:
+                    case SERVICE_CONTROL_SHUTDOWN:
+                        Stop();
+                        return NO_ERROR;
 
-                case SERVICE_CONTROL_SHUTDOWN:
-                    Stop();
-                    return NO_ERROR;
+                    case SERVICE_CONTROL_INTERROGATE:
+                        ReportStatus(m_serviceStatus.dwCurrentState,
+                                     m_serviceStatus.dwWin32ExitCode,
+                                     m_serviceStatus.dwWaitHint);
+                        return NO_ERROR;
 
-                case SERVICE_CONTROL_INTERROGATE:
-                    return NO_ERROR;
+                    case SERVICE_CONTROL_POWEREVENT:
+                        (void)eventType;
+                        (void)eventData;
+                        return NO_ERROR;
 
-                case SERVICE_CONTROL_POWEREVENT:
-                    if (eventType == PBT_APMPOWERSTATUSCHANGE) {
-                        // Handle power change
-                    }
-                    return NO_ERROR;
+                    case SERVICE_CONTROL_SESSIONCHANGE:
+                        (void)eventType;
+                        (void)eventData;
+                        return NO_ERROR;
 
-                case SERVICE_CONTROL_SESSIONCHANGE:
-                     // Handle session change (user login/logout)
-                    return NO_ERROR;
-
-                default:
-                    return ERROR_CALL_NOT_IMPLEMENTED;
+                    default:
+                        return ERROR_CALL_NOT_IMPLEMENTED;
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error(
+                    "[ServiceController] HandleControl({}) threw: {}",
+                    static_cast<unsigned>(control), ex.what());
+                return ERROR_GEN_FAILURE;
+            } catch (...) {
+                Utils::Logger::Error(
+                    "[ServiceController] HandleControl({}) threw non-std exception",
+                    static_cast<unsigned>(control));
+                return ERROR_GEN_FAILURE;
             }
         }
 
         std::string GetStatusJson() const {
-            std::shared_lock lock(m_statsMutex);
-            // Construct JSON manually to avoid dependency issues in this snippet
+            // m_startTime is only written under m_startTimeMutex during
+            // InitializeComponents; serialise reads against that to avoid a
+            // benign-but-real torn read on 32-bit platforms / future MSVC
+            // configurations.
+            std::shared_lock statsLock(m_statsMutex);
             std::stringstream ss;
             ss << "{";
             ss << "\"service\": \"ShadowStrike\",";
-            ss << "\"status\": \"" << (m_running ? "running" : "stopped") << "\",";
+            ss << "\"status\": \"" << (m_running.load(std::memory_order_acquire) ? "running" : "stopped") << "\",";
             ss << "\"uptime_seconds\": " << GetUptime() << ",";
             ss << "\"components\": {";
-            // Iterate components
             ss << "}";
             ss << "}";
             return ss.str();
@@ -275,6 +305,7 @@ namespace ShadowStrike::Service {
         SERVICE_STATUS_HANDLE m_serviceStatusHandle;
         SERVICE_STATUS m_serviceStatus;
         std::mutex m_statusMutex;
+        DWORD m_checkPoint{0};
 
         // State
         std::atomic<bool> m_running{false};
@@ -321,8 +352,10 @@ namespace ShadowStrike::Service {
     }
 
     DWORD WINAPI ServiceController::ServiceCtrlHandler(DWORD control, DWORD eventType, LPVOID eventData, LPVOID context) {
+        // SCM may invoke the handler before our singleton is fully constructed
+        // (extremely unlikely in practice but defensible). Validate context.
         auto* service = static_cast<ServiceController*>(context);
-        if (!service) return ERROR_INVALID_PARAMETER;
+        if (!service || !service->m_impl) return ERROR_INVALID_PARAMETER;
 
         return service->m_impl->HandleControl(control, eventType, eventData);
     }
