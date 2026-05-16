@@ -221,6 +221,16 @@ private:
     bool CreatePipeSecurityDescriptor();
     void CleanupDisconnectedClients();
 
+    // Performs a bounded-time overlapped WriteFile on an overlapped-mode
+    // pipe handle. Returns true on full write within @timeoutMs; on timeout
+    // the IO is cancelled with CancelIoEx so the handle remains usable for
+    // teardown. @bytesWritten reflects what the kernel reports completed.
+    [[nodiscard]] bool TimedWrite(HANDLE pipe,
+                                  const void* data,
+                                  DWORD size,
+                                  DWORD timeoutMs,
+                                  DWORD& bytesWritten) noexcept;
+
     // Member variables
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_initialized{false};
@@ -233,6 +243,12 @@ private:
     std::thread m_listenThread;
     std::unique_ptr<Utils::ThreadPool> m_clientThreadPool;
     mutable std::shared_mutex m_mutex; // Protects handlers and clients map
+
+    // Manual-reset stop event signaled by Stop(). Used by ListenLoop's
+    // overlapped ConnectNamedPipe wait so shutdown does not depend on a
+    // dummy client-side connect (which can race or be denied by the
+    // pipe ACL during driver-resume scenarios).
+    ScopedHandle m_stopEvent;
 
     // Handlers
     std::map<CommandType, CommandHandler> m_handlers;
@@ -301,11 +317,19 @@ ServiceCommunicatorImpl::~ServiceCommunicatorImpl() {
 
 bool ServiceCommunicatorImpl::CreatePipeSecurityDescriptor() {
     // Strict SDDL:
-    // D: (DACL)
-    // (A;;GA;;;SY) - Allow Generic All (Full Control) to SYSTEM
-    // (A;;GA;;;BA) - Allow Generic All (Full Control) to Built-in Administrators
-    // Deny everyone else implicitly
-    const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
+    //   O:SY                       - Owner = SYSTEM (prevents owner-rights bypass)
+    //   G:SY                       - Primary group = SYSTEM
+    //   D:P                        - Protected DACL (no inheritance from parent)
+    //     (A;;GA;;;SY)             - SYSTEM: Generic All
+    //     (A;;GA;;;BA)             - Built-in Administrators: Generic All
+    //   S:(ML;;NWNRNX;;;HI)        - Mandatory label: deny write/read/execute up
+    //                                from below HIGH integrity (blocks Medium IL
+    //                                processes spawned by a compromised admin
+    //                                shell that hasn't elevated).
+    // Deny everyone else implicitly. The mandatory label adds defense-in-depth
+    // against a Medium-IL attacker that already holds a token in the BA group.
+    const wchar_t* sddl =
+        L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NWNRNX;;;HI)";
 
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl,
@@ -329,6 +353,14 @@ bool ServiceCommunicatorImpl::Initialize() {
     if (!CreatePipeSecurityDescriptor()) {
         return false;
     }
+
+    // Create the manual-reset stop event used to break the accept loop.
+    HANDLE hStop = CreateEventW(nullptr, /*manualReset=*/TRUE, /*initial=*/FALSE, nullptr);
+    if (hStop == nullptr) {
+        SS_LOG_ERROR(L"IPC", L"CreateEvent (stop) failed. Error: %lu", GetLastError());
+        return false;
+    }
+    m_stopEvent = ScopedHandle(hStop);
 
     // Register default handlers
     RegisterHandler(CommandType::Heartbeat, [](CommandType, const std::vector<uint8_t>&, std::vector<uint8_t>&) {
@@ -365,21 +397,26 @@ void ServiceCommunicatorImpl::Stop() {
 
     m_running = false;
 
-    // Connect a dummy client to unblock ConnectNamedPipe if it's stuck waiting
-    HANDLE hPipe = CreateFileW(
-        CommunicationConstants::PIPE_NAME,
-        GENERIC_READ | GENERIC_WRITE,
-        0, nullptr, OPEN_EXISTING, 0, nullptr
-    );
-    if (hPipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(hPipe);
+    // Signal the stop event first so an in-flight ConnectNamedPipe wait
+    // returns immediately via WaitForMultipleObjects without needing a
+    // privileged dummy connect (the pipe ACL would otherwise reject any
+    // non-SYSTEM/non-Admin process trying to "kick" the accept loop).
+    if (m_stopEvent.IsValid()) {
+        SetEvent(m_stopEvent);
     }
 
     if (m_listenThread.joinable()) {
         m_listenThread.join();
     }
 
-    // Close all client connections
+    // Tear down the thread pool BEFORE closing client pipes so that any
+    // in-flight HandleClient task observes m_running == false and exits
+    // its read loop cleanly, releasing its ClientContext-owned handle.
+    if (m_clientThreadPool) {
+        m_clientThreadPool->Shutdown(/*waitForCompletion=*/true);
+    }
+
+    // Close all client connections (duplicated handles in m_activeClients).
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
         m_activeClients.clear(); // ScopedHandle destructors will close handles
@@ -393,6 +430,11 @@ bool ServiceCommunicatorImpl::IsRunning() const noexcept {
 }
 
 void ServiceCommunicatorImpl::ListenLoop() {
+    // Counter used to assign per-connection client IDs. Atomic because Stop()
+    // tears the loop down asynchronously and future maintenance may legitimately
+    // spawn auxiliary accept threads; cheap to make it correct now.
+    static std::atomic<uint64_t> s_idCounter{0};
+
     while (m_running) {
         CleanupDisconnectedClients();
 
@@ -400,7 +442,11 @@ void ServiceCommunicatorImpl::ListenLoop() {
         {
             std::lock_guard<std::mutex> lock(m_clientsMutex);
             if (m_activeClients.size() >= CommunicationConstants::MAX_CONCURRENT_CLIENTS) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                // Backoff briefly; honor stop event so shutdown isn't delayed.
+                if (m_stopEvent.IsValid() &&
+                    WaitForSingleObject(m_stopEvent, 100) == WAIT_OBJECT_0) {
+                    break;
+                }
                 continue;
             }
         }
@@ -418,71 +464,206 @@ void ServiceCommunicatorImpl::ListenLoop() {
 
         if (hPipe == INVALID_HANDLE_VALUE) {
             SS_LOG_ERROR(L"IPC", L"CreateNamedPipe failed. Error: %lu", GetLastError());
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            if (m_stopEvent.IsValid() &&
+                WaitForSingleObject(m_stopEvent, 1000) == WAIT_OBJECT_0) {
+                break;
+            }
             continue;
         }
 
+        // RAII for the accept-side pipe handle until ownership transfers.
+        ScopedHandle pipeGuard(hPipe);
+
         m_stats.connectionAttempts++;
 
-        // Wait for client connection
-        // Note: In a fully optimized IOCP model, we'd use ConnectEx or bind the handle to IOCP immediately.
-        // For simplicity and clarity in this enterprise implementation, we'll use blocking ConnectNamedPipe
-        // in this thread, but handle the connected client in a detached thread/task.
-        // Since we have a dummy client connect in Stop(), this won't block indefinitely on shutdown.
+        // Overlapped accept: ConnectNamedPipe on a FILE_FLAG_OVERLAPPED handle
+        // MUST be issued with a non-null OVERLAPPED structure; passing nullptr
+        // (the previous behaviour) is documented as invalid and on some Windows
+        // builds leaves the pipe in an unrecoverable state.
+        HANDLE hConnectEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (hConnectEvent == nullptr) {
+            SS_LOG_ERROR(L"IPC", L"CreateEvent (connect) failed. Error: %lu",
+                         GetLastError());
+            continue; // pipeGuard closes hPipe
+        }
+        ScopedHandle eventGuard(hConnectEvent);
 
-        // We actually need Overlapped ConnectNamedPipe to be interruptible properly or use a loop.
-        // Using synchronous connect here for simplicity as Accept loop is common for named pipes.
-        BOOL connected = ConnectNamedPipe(hPipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        OVERLAPPED ov = {};
+        ov.hEvent = hConnectEvent;
 
-        if (connected) {
-            SS_LOG_INFO(L"IPC", L"Client connected.");
+        BOOL connected = FALSE;
+        if (ConnectNamedPipe(hPipe, &ov)) {
+            // Some Windows builds return TRUE for an immediate connect; treat
+            // as already-connected.
+            connected = TRUE;
+        } else {
+            const DWORD err = GetLastError();
+            if (err == ERROR_PIPE_CONNECTED) {
+                connected = TRUE;
+                SetEvent(hConnectEvent);
+            } else if (err == ERROR_IO_PENDING) {
+                HANDLE waitHandles[2] = { hConnectEvent, m_stopEvent };
+                const DWORD waitResult = WaitForMultipleObjects(
+                    2, waitHandles, FALSE, INFINITE);
+                if (waitResult == WAIT_OBJECT_0) {
+                    DWORD transferred = 0;
+                    if (GetOverlappedResult(hPipe, &ov, &transferred, FALSE)) {
+                        connected = TRUE;
+                    } else {
+                        SS_LOG_WARN(L"IPC", L"ConnectNamedPipe GOR failed. Error: %lu",
+                                    GetLastError());
+                    }
+                } else {
+                    // Stop requested: cancel pending IO and drop the pipe.
+                    CancelIoEx(hPipe, &ov);
+                    DWORD transferred = 0;
+                    (void)GetOverlappedResult(hPipe, &ov, &transferred, TRUE);
+                    break; // outer while; pipeGuard / eventGuard run
+                }
+            } else {
+                SS_LOG_WARN(L"IPC", L"ConnectNamedPipe failed. Error: %lu", err);
+            }
+        }
 
-            auto clientCtx = std::make_shared<ClientContext>();
-            clientCtx->pipeHandle = hPipe; // Transfer ownership
-            clientCtx->server = this;
-            static uint64_t idCounter = 0;
-            clientCtx->clientId = ++idCounter;
+        if (!connected) {
+            // Recycle the pipe handle on failure (RAII closes it).
+            continue;
+        }
 
-            // Add to active clients list for broadcasting
-            {
-                std::lock_guard<std::mutex> lock(m_clientsMutex);
+        SS_LOG_INFO(L"IPC", L"Client connected.");
+
+        auto clientCtx = std::make_shared<ClientContext>();
+        clientCtx->pipeHandle = ScopedHandle(pipeGuard.handle); // Transfer ownership
+        pipeGuard.handle = INVALID_HANDLE_VALUE;                 // disarm guard
+        clientCtx->server = this;
+        clientCtx->clientId =
+            s_idCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        // Add to active clients list for broadcasting
+        bool added = false;
+        {
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+
+            // Duplicate the pipe handle for the broadcast/response side.
+            // We MUST verify the duplicate succeeded — the previous code stored
+            // an uninitialised handle on failure, which the broadcast path
+            // would then use as a target for WriteFile.
+            HANDLE hDup = nullptr;
+            if (!DuplicateHandle(GetCurrentProcess(),
+                                 clientCtx->pipeHandle.handle,
+                                 GetCurrentProcess(),
+                                 &hDup,
+                                 0,
+                                 FALSE,
+                                 DUPLICATE_SAME_ACCESS)) {
+                SS_LOG_ERROR(L"IPC",
+                    L"DuplicateHandle failed for client %llu (err=%lu); refusing.",
+                    clientCtx->clientId, GetLastError());
+            } else {
                 auto activeClient = std::make_shared<ActiveClient>();
-                // Duplicate handle for the active clients list (broadcast needs its own handle)
-                // while the ThreadPool task owns the original via ClientContext
-                HANDLE hDup;
-                DuplicateHandle(GetCurrentProcess(), hPipe, GetCurrentProcess(), &hDup, 0, FALSE, DUPLICATE_SAME_ACCESS);
-                activeClient->pipe = hDup;
-                activeClient->id = clientCtx->clientId;
+                activeClient->pipe = ScopedHandle(hDup);
+                activeClient->id   = clientCtx->clientId;
 
-                // Record the Windows session ID of the connecting client for use by
-                // the AuthHandshake v2 handler (IpcAuthToken::Verify requires sessionId).
+                // Record the Windows session ID of the connecting client for
+                // use by the AuthHandshake v2 handler (IpcAuthToken::Verify
+                // requires sessionId).
                 ULONG sessionId = 0;
-                if (!GetNamedPipeClientSessionId(hPipe, &sessionId)) {
-                    SS_LOG_WARN(L"IPC", L"GetNamedPipeClientSessionId failed for client %llu (err=%lu); sessionId=0 assumed",
+                if (!GetNamedPipeClientSessionId(clientCtx->pipeHandle.handle,
+                                                 &sessionId)) {
+                    SS_LOG_WARN(L"IPC",
+                        L"GetNamedPipeClientSessionId failed for client %llu (err=%lu); sessionId=0 assumed",
                         clientCtx->clientId, GetLastError());
                 }
                 activeClient->sessionId = static_cast<std::uint32_t>(sessionId);
 
-                m_activeClients.push_back(activeClient);
+                m_activeClients.push_back(std::move(activeClient));
+                added = true;
             }
-            m_stats.activeConnections++;
+        }
 
-            // Submit client handling to bounded thread pool
-            if (m_clientThreadPool) {
-                auto future = m_clientThreadPool->Submit(
-                    [this, clientCtx](const Utils::TaskContext&) {
-                        HandleClient(clientCtx);
-                    });
-                (void)future;  // Fire-and-forget: client lifetime managed by HandleClient
-            } else {
-                SS_LOG_ERROR(L"IPC", L"ThreadPool unavailable, rejecting client %llu",
-                             clientCtx->clientId);
-                CloseHandle(hPipe);
-            }
+        if (!added) {
+            // Couldn't duplicate handle: drop the client (clientCtx destruct
+            // closes the original pipe handle).
+            continue;
+        }
+
+        m_stats.activeConnections++;
+
+        // Submit client handling to bounded thread pool
+        if (m_clientThreadPool) {
+            auto future = m_clientThreadPool->Submit(
+                [this, clientCtx](const Utils::TaskContext&) {
+                    HandleClient(clientCtx);
+                });
+            (void)future;  // Fire-and-forget: client lifetime managed by HandleClient
         } else {
-            CloseHandle(hPipe);
+            SS_LOG_ERROR(L"IPC", L"ThreadPool unavailable, rejecting client %llu",
+                         clientCtx->clientId);
+            // Rollback the active-client entry we just registered.
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            m_activeClients.erase(
+                std::remove_if(m_activeClients.begin(), m_activeClients.end(),
+                    [id = clientCtx->clientId](const auto& c) { return c->id == id; }),
+                m_activeClients.end());
+            m_stats.activeConnections--;
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Bounded-time overlapped WriteFile helper.
+//
+// Required because the listen/accept pipes are created with
+// FILE_FLAG_OVERLAPPED; passing a NULL lpOverlapped to WriteFile on such a
+// handle is documented as undefined behaviour and can corrupt data or hang.
+// Centralising the implementation also lets every broadcast path enforce a
+// timeout so a single slow/stalled UI client cannot wedge the entire service.
+// ----------------------------------------------------------------------------
+bool ServiceCommunicatorImpl::TimedWrite(HANDLE pipe,
+                                         const void* data,
+                                         DWORD size,
+                                         DWORD timeoutMs,
+                                         DWORD& bytesWritten) noexcept
+{
+    bytesWritten = 0;
+    if (pipe == nullptr || pipe == INVALID_HANDLE_VALUE ||
+        data == nullptr || size == 0) {
+        return false;
+    }
+
+    HANDLE hEvent = CreateEventW(nullptr, /*manualReset=*/TRUE,
+                                 /*initial=*/FALSE, nullptr);
+    if (hEvent == nullptr) {
+        return false;
+    }
+    ScopedHandle evGuard(hEvent);
+
+    OVERLAPPED ov = {};
+    ov.hEvent = hEvent;
+
+    if (WriteFile(pipe, data, size, &bytesWritten, &ov)) {
+        return bytesWritten == size;
+    }
+
+    const DWORD err = GetLastError();
+    if (err != ERROR_IO_PENDING) {
+        return false;
+    }
+
+    const DWORD wait = WaitForSingleObject(hEvent, timeoutMs);
+    if (wait != WAIT_OBJECT_0) {
+        // Timed out or wait failure — cancel and drain to release the buffer.
+        CancelIoEx(pipe, &ov);
+        DWORD drained = 0;
+        (void)GetOverlappedResult(pipe, &ov, &drained, TRUE);
+        bytesWritten = drained;
+        return false;
+    }
+
+    if (!GetOverlappedResult(pipe, &ov, &bytesWritten, FALSE)) {
+        return false;
+    }
+    return bytesWritten == size;
 }
 
 void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client) {
@@ -540,9 +721,16 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                 //   bytes [20-23]= Envelope::payloadSize (uint32, real JSON length)
                 // We need at least 24 bytes before committing to the v2 path.
                 if (accumulator.size() >= 24u) {
-                    const uint16_t v2ver  = *reinterpret_cast<const uint16_t*>(accumulator.data() + 4);
-                    const uint16_t v2res  = *reinterpret_cast<const uint16_t*>(accumulator.data() + 6);
-                    const uint32_t v2type = *reinterpret_cast<const uint32_t*>(accumulator.data() + 8);
+                    // Use memcpy into typed locals to avoid strict-aliasing and
+                    // alignment UB on the raw byte stream. The accumulator's
+                    // backing storage is not guaranteed to be 4/8-byte aligned
+                    // after the std::vector::erase calls below.
+                    uint16_t v2ver  = 0;
+                    uint16_t v2res  = 0;
+                    uint32_t v2type = 0;
+                    std::memcpy(&v2ver,  accumulator.data() + 4, sizeof(v2ver));
+                    std::memcpy(&v2res,  accumulator.data() + 6, sizeof(v2res));
+                    std::memcpy(&v2type, accumulator.data() + 8, sizeof(v2type));
 
                     constexpr uint32_t kV2CommandMin = 100u;
                     constexpr uint32_t kV2CommandMax = 400u;
@@ -550,8 +738,10 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                     if (v2ver == 1u && v2res == 0u &&
                         v2type >= kV2CommandMin && v2type <= kV2CommandMax)
                     {
-                        const uint32_t realPayloadSize = *reinterpret_cast<const uint32_t*>(
-                            accumulator.data() + 20);
+                        uint32_t realPayloadSize = 0;
+                        std::memcpy(&realPayloadSize,
+                                    accumulator.data() + 20,
+                                    sizeof(realPayloadSize));
 
                         if (realPayloadSize > CommunicationConstants::MAX_MESSAGE_SIZE) {
                             SS_LOG_WARN(L"IPC", L"V2 payload too large (%u) from client %llu. Dropping.",
@@ -565,8 +755,10 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                             break; // Wait for more data
                         }
 
-                        const uint64_t requestId = *reinterpret_cast<const uint64_t*>(
-                            accumulator.data() + 12);
+                        uint64_t requestId = 0;
+                        std::memcpy(&requestId,
+                                    accumulator.data() + 12,
+                                    sizeof(requestId));
                         const CommandType v2cmd  = static_cast<CommandType>(v2type);
 
                         const std::string_view jsonView(
@@ -596,8 +788,12 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                     // Fall through to v1 path.
                 }
 
-                // ── V1 path (existing code) ───────────────────────────────────────────────
-                WireHeader* header = reinterpret_cast<WireHeader*>(accumulator.data());
+                // ── V1 path ───────────────────────────────────────────────────────────────
+                // Copy the header into a properly aligned local to avoid UB on
+                // unaligned reads from the byte-stream accumulator.
+                WireHeader v1Header{};
+                std::memcpy(&v1Header, accumulator.data(), sizeof(WireHeader));
+                const WireHeader* const header = &v1Header;
 
                 if (header->payloadSize > CommunicationConstants::MAX_MESSAGE_SIZE) {
                     SS_LOG_WARN(L"IPC", L"Message too large (%u). Dropping client.", header->payloadSize);
@@ -667,9 +863,19 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                         }
 
                         DWORD bytesWritten = 0;
-                        WriteFile(client->pipeHandle, respBuffer.data(), static_cast<DWORD>(respBuffer.size()), &bytesWritten, nullptr);
-                        m_stats.bytesSent += bytesWritten;
-                        m_stats.messagesSent++;
+                        if (TimedWrite(client->pipeHandle,
+                                       respBuffer.data(),
+                                       static_cast<DWORD>(respBuffer.size()),
+                                       CommunicationConstants::WRITE_TIMEOUT_MS,
+                                       bytesWritten)) {
+                            m_stats.bytesSent += bytesWritten;
+                            m_stats.messagesSent++;
+                        } else {
+                            SS_LOG_WARN(L"IPC",
+                                L"v1 response write failed/timeout for client %llu (err=%lu)",
+                                client->clientId, GetLastError());
+                            goto disconnect;
+                        }
                     }
 
                     // Remove processed message from accumulator
@@ -801,8 +1007,10 @@ void ServiceCommunicatorImpl::SendResponseEnvelopeToClient(
     }
 
     DWORD written = 0;
-    if (!WriteFile(target->pipe, buf.data(), static_cast<DWORD>(buf.size()), &written, nullptr)) {
-        SS_LOG_WARN(L"IPC", L"SendResponseEnvelope: WriteFile failed (err=%lu) for client %llu",
+    if (!TimedWrite(target->pipe, buf.data(),
+                    static_cast<DWORD>(buf.size()),
+                    CommunicationConstants::WRITE_TIMEOUT_MS, written)) {
+        SS_LOG_WARN(L"IPC", L"SendResponseEnvelope: write failed/timeout (err=%lu) for client %llu",
             GetLastError(), clientId);
     } else {
         m_stats.bytesSent  += written;
@@ -837,30 +1045,48 @@ void ServiceCommunicatorImpl::ProcessV2Message(
 }
 
 size_t ServiceCommunicatorImpl::Broadcast(CommandType type, const std::vector<uint8_t>& payload) {
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
-    size_t count = 0;
+    // Snapshot targets under the mutex, then run blocking writes lock-free so a
+    // single slow client cannot stall accept/disconnect on the global lock.
+    struct WriteTarget {
+        std::shared_ptr<ActiveClient> client; // keep handle alive
+        HANDLE                        pipe;
+    };
+    std::vector<WriteTarget> targets;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        targets.reserve(m_activeClients.size());
+        for (auto& c : m_activeClients) {
+            targets.push_back({ c, static_cast<HANDLE>(c->pipe) });
+        }
+    }
 
     WireHeader header;
     header.magic = CommunicationConstants::PROTOCOL_MAGIC;
     header.command = static_cast<uint32_t>(type);
     header.payloadSize = static_cast<uint32_t>(payload.size());
-    header.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    header.timestamp = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
 
     std::vector<uint8_t> packet;
     packet.resize(sizeof(WireHeader) + payload.size());
-    memcpy(packet.data(), &header, sizeof(WireHeader));
+    std::memcpy(packet.data(), &header, sizeof(WireHeader));
     if (!payload.empty()) {
-        memcpy(packet.data() + sizeof(WireHeader), payload.data(), payload.size());
+        std::memcpy(packet.data() + sizeof(WireHeader), payload.data(), payload.size());
     }
 
-    for (auto& client : m_activeClients) {
+    size_t count = 0;
+    for (auto& tgt : targets) {
         DWORD written = 0;
-        // Blocking write per client — acceptable for named pipe broadcast
-        // (kernel-mode filtering ensures only trusted SYSTEM/Admin clients connect)
-        if (WriteFile(client->pipe, packet.data(), static_cast<DWORD>(packet.size()), &written, nullptr)) {
-            count++;
+        if (TimedWrite(tgt.pipe, packet.data(),
+                       static_cast<DWORD>(packet.size()),
+                       CommunicationConstants::WRITE_TIMEOUT_MS, written)) {
+            ++count;
             m_stats.messagesSent++;
             m_stats.bytesSent += written;
+        } else {
+            SS_LOG_WARN(L"IPC",
+                L"Broadcast write failed/timeout for client %llu (err=%lu)",
+                tgt.client->id, GetLastError());
         }
     }
     return count;
@@ -913,16 +1139,15 @@ size_t ServiceCommunicatorImpl::BroadcastEvent(CommandType                      
     size_t count = 0;
     for (auto& tgt : targets) {
         DWORD written = 0;
-        if (WriteFile(tgt.pipe,
-                      serializedEnvelope.data(),
-                      static_cast<DWORD>(serializedEnvelope.size()),
-                      &written, nullptr)) {
+        if (TimedWrite(tgt.pipe, serializedEnvelope.data(),
+                       static_cast<DWORD>(serializedEnvelope.size()),
+                       CommunicationConstants::WRITE_TIMEOUT_MS, written)) {
             ++count;
             m_stats.messagesSent++;
             m_stats.bytesSent += written;
         } else {
             SS_LOG_WARN(L"IPC",
-                L"BroadcastEvent WriteFile failed for client %llu: %lu",
+                L"BroadcastEvent write failed/timeout for client %llu: %lu",
                 tgt.client->id, GetLastError());
         }
     }
