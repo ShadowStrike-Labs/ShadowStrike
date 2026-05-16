@@ -1008,7 +1008,15 @@ StoreError BatchSignatureBuilder::BuildParallel() noexcept {
     // Mutex only for error collection (cold path)
     std::mutex errorMutex;
     std::vector<BatchError> collectedErrors;
-    collectedErrors.reserve(std::min(size_t(1000), totalFiles / 10 + 1));
+    // Reserve is allowed to fail under extreme memory pressure. Catching
+    // std::bad_alloc here keeps BuildParallel noexcept-clean - the vector
+    // can still grow on demand, just without the up-front capacity hint.
+    try {
+        collectedErrors.reserve(std::min(size_t(1000), totalFiles / 10 + 1));
+    } catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"BatchSignatureBuilder",
+            L"BuildParallel: Error-buffer reserve failed; continuing without pre-allocation");
+    }
 
     // ========================================================================
     // STEP 5: BUILDER MUTEX (SignatureBuilder is NOT thread-safe)
