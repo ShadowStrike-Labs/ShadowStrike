@@ -1969,10 +1969,17 @@ namespace SignatureStore {
                     continue;
                 }
 
-                // Exception-safe push
+                // Exception-safe push: insert fingerprint FIRST, then vector entry.
+                // On vector push_back failure, roll back the fingerprint so the
+                // fingerprint set never references a non-existent pending entry.
                 try {
-                    m_pendingPatterns.push_back(inputs[i]);
-                    m_patternFingerprints.insert(inputs[i].patternString);
+                    auto fingerprintIt = m_patternFingerprints.insert(inputs[i].patternString).first;
+                    try {
+                        m_pendingPatterns.push_back(inputs[i]);
+                    } catch (...) {
+                        m_patternFingerprints.erase(fingerprintIt);
+                        throw;
+                    }
                     addedCount++;
                 } catch (const std::bad_alloc&) {
                     SS_LOG_ERROR(L"SignatureBuilder",
@@ -2313,10 +2320,17 @@ namespace SignatureStore {
                     continue;
                 }
 
-                // Exception-safe push
+                // Exception-safe push: insert fingerprint FIRST, then vector entry.
+                // On vector push_back failure, roll back the rule-name entry so the
+                // name set never references a non-existent pending rule.
                 try {
-                    m_pendingYaraRules.push_back(inputs[i]);
-                    m_yaraRuleNames.insert(fullName);
+                    auto nameIt = m_yaraRuleNames.insert(fullName).first;
+                    try {
+                        m_pendingYaraRules.push_back(inputs[i]);
+                    } catch (...) {
+                        m_yaraRuleNames.erase(nameIt);
+                        throw;
+                    }
                     addedCount++;
                 } catch (const std::bad_alloc&) {
                     SS_LOG_ERROR(L"SignatureBuilder",
