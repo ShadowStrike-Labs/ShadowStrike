@@ -314,17 +314,38 @@ public:
         m_stats.Reset();
         m_stats.startTime = Clock::now();
 
+        // DESIGN: Keep m_status at Initializing across the kernel-bridge
+        // setup. Releasing the lock with status already Running would let a
+        // concurrent authorized Shutdown() race in (its own
+        // UnregisterKernelHandler() could complete before our
+        // RegisterKernelHandler() returns, leaking a kernel registration
+        // against torn state). Holding the lock across kernel I/O isn't
+        // viable — the filter port can block — so we release the lock,
+        // perform kernel I/O, re-acquire, and only then transition to
+        // Running after confirming no racing Shutdown occurred.
+        lock.unlock();
+
+        const bool kernelSync = SyncProtectedKeysToKernel();
+        RegisterKernelHandler();
+
+        lock.lock();
+
+        if (m_status.load() != ModuleStatus::Initializing) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Initialization aborted - state changed to %d during kernel bridge setup; "
+                L"unregistering kernel handler",
+                static_cast<int>(m_status.load()));
+            lock.unlock();
+            UnregisterKernelHandler();
+            return false;
+        }
+
         m_status = ModuleStatus::Running;
-        SS_LOG_INFO(LOG_CATEGORY, L"Registry protection initialized successfully");
+        SS_LOG_INFO(LOG_CATEGORY, L"Registry protection initialized successfully (kernel sync %s)",
+            kernelSync ? L"ok" : L"unavailable");
         SS_LOG_INFO(LOG_CATEGORY, L"Protected keys: %llu, Mode: %hs",
             m_stats.totalProtectedKeys.load(std::memory_order_relaxed),
             std::string(GetProtectionModeName(m_mode)).c_str());
-
-        // Kernel bridge: sync protected keys and register event handler
-        // Release lock first — kernel I/O may block on filter port
-        lock.unlock();
-        SyncProtectedKeysToKernel();
-        RegisterKernelHandler();
 
         return true;
     }
@@ -1915,19 +1936,14 @@ private:
     }
 
     [[nodiscard]] bool VerifyAuthToken(std::string_view token) const {
-        if (token.empty() || m_sessionSecret.empty()) {
-            return false;
-        }
-        if (!token.starts_with(AUTH_TOKEN_PREFIX)) {
-            return false;
-        }
-
-        // Compute expected token using HMAC-SHA256(sessionSecret, purpose)
+        // SECURITY: Avoid short-circuiting on empty/prefix mismatch. We must
+        // perform the same HMAC computation and constant-time compare in all
+        // cases so an attacker cannot use timing to learn anything about
+        // the expected token's length, prefix, or whether the session secret
+        // has been initialized. The fixed-cost paths still reject invalid
+        // input — they just refuse to leak side-channel information about
+        // why.
         const std::string expected = ComputeAuthToken();
-        if (expected.empty()) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to compute expected auth token for verification");
-            return false;
-        }
 
         // Constant-time comparison: XOR-fold both lengths into the accumulator
         // to avoid early-exit length oracle that leaks expected token length.
@@ -1940,7 +1956,13 @@ private:
                 ? static_cast<uint8_t>(expected[i]) : 0;
             accumulator |= (a ^ b);
         }
-        return accumulator == 0;
+        const bool match = (accumulator == 0);
+
+        // Reject on per-instance invariants that cannot serve as input oracles:
+        // an empty session secret (CSPRNG failure or post-shutdown wipe) makes
+        // every comparison invalid, and an unexpectedly empty expected token
+        // means HMAC computation failed.
+        return match && !m_sessionSecret.empty() && !expected.empty();
     }
 
     [[nodiscard]] std::string ComputeAuthToken() const {
