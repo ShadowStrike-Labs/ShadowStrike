@@ -362,11 +362,13 @@ SignatureBuilder::SignatureBuilder(SignatureBuilder&& other) noexcept
     , m_outputBase(other.m_outputBase)
     , m_outputSize(other.m_outputSize)
     , m_currentOffset(other.m_currentOffset)
+    , m_sectionOffsets(other.m_sectionOffsets)
     , m_buildInProgress(other.m_buildInProgress.load(std::memory_order_relaxed))
     , m_currentStage(std::move(other.m_currentStage))
     , m_customDeduplication(std::move(other.m_customDeduplication))
     , m_customOptimization(std::move(other.m_customOptimization))
     , m_incrementalMode(other.m_incrementalMode)
+    , m_compiledPatternCache(std::move(other.m_compiledPatternCache))
     , m_perfFrequency(other.m_perfFrequency)
     , m_buildStartTime(other.m_buildStartTime)
 {
@@ -376,6 +378,7 @@ SignatureBuilder::SignatureBuilder(SignatureBuilder&& other) noexcept
     other.m_outputBase = nullptr;
     other.m_outputSize = 0;
     other.m_currentOffset = 0;
+    other.m_sectionOffsets = {};
 }
 
 SignatureBuilder& SignatureBuilder::operator=(SignatureBuilder&& other) noexcept {
@@ -405,11 +408,13 @@ SignatureBuilder& SignatureBuilder::operator=(SignatureBuilder&& other) noexcept
         m_outputBase = other.m_outputBase;
         m_outputSize = other.m_outputSize;
         m_currentOffset = other.m_currentOffset;
+        m_sectionOffsets = other.m_sectionOffsets;
         m_buildInProgress.store(other.m_buildInProgress.load(std::memory_order_relaxed));
         m_currentStage = std::move(other.m_currentStage);
         m_customDeduplication = std::move(other.m_customDeduplication);
         m_customOptimization = std::move(other.m_customOptimization);
         m_incrementalMode = other.m_incrementalMode;
+        m_compiledPatternCache = std::move(other.m_compiledPatternCache);
         m_perfFrequency = other.m_perfFrequency;
         m_buildStartTime = other.m_buildStartTime;
 
@@ -419,6 +424,7 @@ SignatureBuilder& SignatureBuilder::operator=(SignatureBuilder&& other) noexcept
         other.m_outputBase = nullptr;
         other.m_outputSize = 0;
         other.m_currentOffset = 0;
+        other.m_sectionOffsets = {};
     }
     return *this;
 }
@@ -809,6 +815,15 @@ StoreError SignatureBuilder::Build() noexcept {
         return StoreError{SignatureStoreError::Unknown, 0, "Build already in progress"};
     }
 
+    // CRITICAL RAII guard: ensures m_buildInProgress is reset on ANY exit path (success, error, exception)
+    struct BuildInProgressGuard {
+        std::atomic<bool>& flag;
+        explicit BuildInProgressGuard(std::atomic<bool>& f) noexcept : flag(f) {}
+        ~BuildInProgressGuard() noexcept { flag.store(false, std::memory_order_release); }
+        BuildInProgressGuard(const BuildInProgressGuard&) = delete;
+        BuildInProgressGuard& operator=(const BuildInProgressGuard&) = delete;
+    } buildGuard(m_buildInProgress);
+
     QueryPerformanceCounter(&m_buildStartTime);
 
     // Stage 1: Validate
@@ -816,7 +831,6 @@ StoreError SignatureBuilder::Build() noexcept {
     StoreError err = ValidateInputs();
     if (!err.IsSuccess()) {
         CleanupOutputHandles();
-        m_buildInProgress.store(false);
         return err;
     }
 
@@ -825,7 +839,6 @@ StoreError SignatureBuilder::Build() noexcept {
     err = Deduplicate();
     if (!err.IsSuccess()) {
         CleanupOutputHandles();
-        m_buildInProgress.store(false);
         return err;
     }
 
@@ -834,7 +847,6 @@ StoreError SignatureBuilder::Build() noexcept {
     err = Optimize();
     if (!err.IsSuccess()) {
         CleanupOutputHandles();
-        m_buildInProgress.store(false);
         return err;
     }
 
@@ -843,7 +855,6 @@ StoreError SignatureBuilder::Build() noexcept {
     err = BuildIndices();
     if (!err.IsSuccess()) {
         CleanupOutputHandles();
-        m_buildInProgress.store(false);
         return err;
     }
 
@@ -852,7 +863,6 @@ StoreError SignatureBuilder::Build() noexcept {
     err = Serialize();
     if (!err.IsSuccess()) {
         CleanupOutputHandles();
-        m_buildInProgress.store(false);
         return err;
     }
 
@@ -872,8 +882,6 @@ StoreError SignatureBuilder::Build() noexcept {
     } else {
         m_statistics.totalBuildTimeMilliseconds = 0;
     }
-
-    m_buildInProgress.store(false);
 
     SS_LOG_INFO(L"SignatureBuilder", L"Build complete in %llu ms", 
         m_statistics.totalBuildTimeMilliseconds);
@@ -1122,7 +1130,8 @@ StoreError SignatureBuilder::DeduplicateHashes() noexcept {
     if (m_pendingHashes.empty()) return StoreError{ SignatureStoreError::Success };
 
     try {
-        
+        // HARDENED: std::execution::par_unseq can throw std::bad_alloc or other exceptions
+        // Wrap in try-catch since this is a noexcept function
         std::sort(std::execution::par_unseq, m_pendingHashes.begin(), m_pendingHashes.end(),
             [](const HashSignatureInput& a, const HashSignatureInput& b) {
                 if (a.hash.type != b.hash.type) {
@@ -1146,9 +1155,17 @@ StoreError SignatureBuilder::DeduplicateHashes() noexcept {
 
         m_pendingHashes.erase(last, m_pendingHashes.end());
     }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Hash deduplication failed (out of memory): %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("Hash deduplication OOM: ") + e.what() };
+    }
     catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureBuilder", L"Hash deduplication failed: %S", e.what());
         return StoreError{ SignatureStoreError::Unknown, 0, std::string("Hash deduplication error: ") + e.what() };
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Hash deduplication failed with unknown exception");
+        return StoreError{ SignatureStoreError::Unknown, 0, "Hash deduplication unknown error" };
     }
 
     return StoreError{ SignatureStoreError::Success };
@@ -1158,6 +1175,7 @@ StoreError SignatureBuilder::DeduplicatePatterns() noexcept {
     if (m_pendingPatterns.empty()) return StoreError{ SignatureStoreError::Success };
 
     try {
+        // HARDENED: std::execution::par_unseq can throw - wrap in comprehensive exception handling
         std::sort(std::execution::par_unseq, m_pendingPatterns.begin(), m_pendingPatterns.end(),
             [](const auto& a, const auto& b) {
                 return a.patternString < b.patternString;
@@ -1170,9 +1188,17 @@ StoreError SignatureBuilder::DeduplicatePatterns() noexcept {
 
         m_pendingPatterns.erase(last, m_pendingPatterns.end());
     }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Pattern deduplication failed (out of memory): %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("Pattern deduplication OOM: ") + e.what() };
+    }
     catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureBuilder", L"Pattern deduplication failed: %S", e.what());
         return StoreError{ SignatureStoreError::Unknown, 0, std::string("Pattern deduplication error: ") + e.what() };
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Pattern deduplication failed with unknown exception");
+        return StoreError{ SignatureStoreError::Unknown, 0, "Pattern deduplication unknown error" };
     }
 
     return StoreError{ SignatureStoreError::Success };
@@ -1196,9 +1222,17 @@ StoreError SignatureBuilder::DeduplicateYaraRules() noexcept {
 
         m_pendingYaraRules.erase(last, m_pendingYaraRules.end());
     }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"YARA deduplication failed (out of memory): %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("YARA deduplication OOM: ") + e.what() };
+    }
     catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureBuilder", L"YARA deduplication failed: %S", e.what());
         return StoreError{ SignatureStoreError::Unknown, 0, std::string("YARA deduplication error: ") + e.what() };
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"YARA deduplication failed with unknown exception");
+        return StoreError{ SignatureStoreError::Unknown, 0, "YARA deduplication unknown error" };
     }
 
     return StoreError{ SignatureStoreError::Success };
@@ -1791,6 +1825,9 @@ void SignatureBuilder::Reset() noexcept {
     m_patternFingerprints.clear();
     m_yaraRuleNames.clear();
 
+    m_compiledPatternCache.clear();
+    m_sectionOffsets = {};
+
     m_statistics = BuildStatistics{};
     m_currentStage.clear();
 }
@@ -2226,8 +2263,8 @@ StoreError SignatureBuilder::ValidateOutput(
                 return false;
             }
 
-            // Section must be within file bounds
-            if (offset >= fileSize.QuadPart) {
+            // Section must be within file bounds (signed/unsigned safe compare)
+            if (offset >= static_cast<uint64_t>(fileSize.QuadPart)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ValidateOutput: Section '%s' offset (0x%llX) beyond file size (0x%llX)",
                     sectionName.c_str(), offset, static_cast<uint64_t>(fileSize.QuadPart));
@@ -2715,14 +2752,15 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
         metrics.averageHashLookupNanoseconds = validCount > 0 ? hashLookupTimes[0] : 0;
     } else {
         // Remove min/max outliers
-        validCount -= 2;
+        const size_t outlierCount = 2;
+        validCount = (validCount > outlierCount) ? (validCount - outlierCount) : 0;
 
         uint64_t sumHashLookup = 0;
         for (size_t i = 1; i < hashLookupTimes.size() - 1; ++i) {
             sumHashLookup += hashLookupTimes[i];
         }
 
-        metrics.averageHashLookupNanoseconds = validCount > 0 ? (sumHashLookup / validCount) : 0;
+        metrics.averageHashLookupNanoseconds = (validCount > 0) ? (sumHashLookup / validCount) : 0;
 
         SS_LOG_INFO(L"SignatureBuilder",
             L"BenchmarkDatabase:   Hash Lookup Results:");
@@ -2817,12 +2855,15 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
             L"BenchmarkDatabase: Not enough pattern scan samples for accurate statistics");
         metrics.averagePatternScanMicroseconds = patternScanTimes.empty() ? 0 : patternScanTimes[0];
     } else {
+        const size_t outlierCount = 2;
+        const size_t validCount = (patternScanTimes.size() > outlierCount) ? (patternScanTimes.size() - outlierCount) : 0;
+
         uint64_t sumPatternScan = 0;
         for (size_t i = 1; i < patternScanTimes.size() - 1; ++i) {
             sumPatternScan += patternScanTimes[i];
         }
 
-        metrics.averagePatternScanMicroseconds = sumPatternScan / (patternScanTimes.size() - 2);
+        metrics.averagePatternScanMicroseconds = (validCount > 0) ? (sumPatternScan / validCount) : 0;
 
         SS_LOG_INFO(L"SignatureBuilder",
             L"BenchmarkDatabase:   Pattern Scan Results (10MB buffer):");
