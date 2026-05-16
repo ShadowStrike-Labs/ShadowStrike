@@ -65,7 +65,19 @@ namespace ShadowStrike {
                 return ScanResult{};
             }
 
-            // VALIDATION 5: Options sanity check
+            // VALIDATION 5: Options sanity check. We reject syntactically invalid
+            // options (e.g. timeout above MAX_TIMEOUT_MS, maxResults above
+            // ABSOLUTE_MAX_RESULTS) — a caller passing nonsense should not be able
+            // to coerce the scanner into uncapped behaviour. GetValidated* helpers
+            // still cap the working values downstream.
+            if (!options.Validate()) {
+                SS_LOG_WARN(L"SignatureStore", L"ScanBuffer: Options failed Validate(); rejecting");
+                ScanResult invalid{};
+                invalid.errorCount = 1;
+                invalid.lastError = "Invalid scan options";
+                return invalid;
+            }
+
             if (options.timeoutMilliseconds == 0) {
                 SS_LOG_DEBUG(L"SignatureStore", L"ScanBuffer: Zero timeout specified, using default 10s");
             }
@@ -149,6 +161,19 @@ namespace ShadowStrike {
             // ========================================================================
             // TITANIUM VALIDATION LAYER - FILE SCANNING
             // ========================================================================
+
+            // VALIDATION 0: Refuse early when the store is not initialized. Without
+            // this, we would proceed to mmap a (possibly very large) file only to
+            // discover in ScanBuffer that nothing can be scanned. The mmap itself
+            // is observable side-effect (file lock, page cache) that we want to
+            // avoid for a closed/uninitialized store.
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_DEBUG(L"SignatureStore", L"ScanFile: Store not initialized");
+                ScanResult result{};
+                result.errorCount = 1;
+                result.lastError = "Store not initialized";
+                return result;
+            }
 
             // VALIDATION 1: Empty path check
             if (filePath.empty()) {
@@ -654,13 +679,84 @@ namespace ShadowStrike {
                 return ScanResult{};
             }
 
-            // TITANIUM: Always track bytes processed, even if store is unavailable
-            // This allows streaming progress tracking independent of scan capability
+            // TITANIUM: bound m_bytesProcessed against overflow.
+            const size_t chunkSize = chunk.size();
+            if (m_bytesProcessed > SIZE_MAX - chunkSize) {
+                SS_LOG_ERROR(L"SignatureStore",
+                    L"StreamScanner::FeedChunk: byte counter overflow, refusing chunk");
+                ScanResult result{};
+                result.errorCount = 1;
+                result.lastError = "Stream length overflow";
+                return result;
+            }
+
+            // Hard DoS cap on the accumulator. Without this, a caller that feeds
+            // small chunks while the store is closed could grow m_buffer
+            // unboundedly. Anything beyond the cap is rejected (the bytes are not
+            // counted as processed) and the caller is told to slow down.
+            constexpr size_t MAX_STREAM_ACCUMULATOR = 100ULL * 1024 * 1024; // 100 MB
+
+            // ----------------------------------------------------------------
+            // LARGE-CHUNK BYPASS (>= DIRECT_SCAN_LIMIT).
+            //
+            // When the store is initialized we drain the existing accumulator
+            // first (so data fed via previous small chunks is not silently lost)
+            // and then scan the large chunk in-place without copying. When the
+            // store is NOT initialized we cannot scan, so we either buffer the
+            // chunk (subject to MAX_STREAM_ACCUMULATOR) and let Finalize() scan
+            // it, or reject it.
+            // ----------------------------------------------------------------
+            constexpr size_t DIRECT_SCAN_LIMIT = 50ULL * 1024 * 1024;
+            if (chunkSize > DIRECT_SCAN_LIMIT) {
+                if (m_store && m_store->IsInitialized()) {
+                    SS_LOG_DEBUG(L"SignatureStore",
+                        L"StreamScanner: Direct scan for large chunk (%zu bytes)", chunkSize);
+
+                    ScanResult prior{};
+                    if (!m_buffer.empty()) {
+                        prior = m_store->ScanBuffer(m_buffer, m_options);
+                    }
+                    m_buffer.clear();
+
+                    ScanResult direct = m_store->ScanBuffer(chunk, m_options);
+                    m_bytesProcessed += chunkSize;
+
+                    if (!prior.detections.empty()) {
+                        try {
+                            direct.detections.insert(direct.detections.end(),
+                                prior.detections.begin(), prior.detections.end());
+                        }
+                        catch (const std::bad_alloc&) {
+                            SS_LOG_WARN(L"SignatureStore",
+                                L"StreamScanner: failed to merge prior detections (OOM)");
+                        }
+                        direct.errorCount += prior.errorCount;
+                        if (direct.lastError.empty()) {
+                            direct.lastError = prior.lastError;
+                        }
+                    }
+                    return direct;
+                }
+                // Fall through to the buffered path so the chunk is preserved
+                // (subject to the accumulator cap) for a later Finalize().
+            }
+
+            // ----------------------------------------------------------------
+            // BUFFERED ACCUMULATION PATH
+            // ----------------------------------------------------------------
+            if (m_buffer.size() > MAX_STREAM_ACCUMULATOR - chunkSize) {
+                SS_LOG_WARN(L"SignatureStore",
+                    L"StreamScanner::FeedChunk: accumulator at cap (%zu), rejecting %zu bytes",
+                    m_buffer.size(), chunkSize);
+                ScanResult result{};
+                result.errorCount = 1;
+                result.lastError = "Stream accumulator cap exceeded";
+                return result;
+            }
+
             try {
                 m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-                if (m_bytesProcessed <= SIZE_MAX - chunk.size()) {
-                    m_bytesProcessed += chunk.size();
-                }
+                m_bytesProcessed += chunkSize;
             }
             catch (const std::bad_alloc&) {
                 SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Buffer allocation failed");
@@ -670,38 +766,19 @@ namespace ShadowStrike {
                 return result;
             }
 
-            // VALIDATION 2: Check store availability for actual scanning
+            // Store not available - data buffered, will be scanned in Finalize().
             if (!m_store || !m_store->IsInitialized()) {
-                // Store not available - data is buffered but can't be scanned yet
-                // This is not an error - bytes are tracked and will be scanned in Finalize()
                 return ScanResult{};
             }
 
-            // 1. LARGE CHUNK BYPASS (50MB+)
-            // Scan very large chunks directly without buffering.
-            // Eliminates memory allocation and memcpy overhead.
-            constexpr size_t DIRECT_SCAN_LIMIT = 50 * 1024 * 1024;
-            if (chunk.size() > DIRECT_SCAN_LIMIT) {
-                SS_LOG_DEBUG(L"SignatureStore", L"StreamScanner: Direct scan for large chunk (%zu bytes)", chunk.size());
-                // Note: For direct scan, we already added to buffer above - clear it and scan directly
-                m_buffer.clear();
-                m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-                auto result = m_store->ScanBuffer(m_buffer, m_options);
-                m_buffer.clear();
-                return result;
-            }
-
-            // 2. BUFFER MANAGEMENT & THRESHOLD SCAN (10MB)
-            // If the buffer exceeds 10MB, scan and clear it
-            constexpr size_t SCAN_THRESHOLD = 10 * 1024 * 1024;
-
+            // BUFFER MANAGEMENT & THRESHOLD SCAN (10MB)
+            constexpr size_t SCAN_THRESHOLD = 10ULL * 1024 * 1024;
             if (m_buffer.size() >= SCAN_THRESHOLD) {
                 auto result = m_store->ScanBuffer(m_buffer, m_options);
                 m_buffer.clear();
                 return result;
             }
 
-            // 3. Buffer accumulated but below threshold - no scan needed yet
             return ScanResult{};
         }
 
