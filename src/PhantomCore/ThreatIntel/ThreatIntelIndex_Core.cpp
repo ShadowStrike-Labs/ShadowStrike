@@ -101,83 +101,137 @@ StoreError ThreatIntelIndex::Initialize(
         );
     }
 
-    // Store view and header
-    m_impl->view = &view;
-    m_impl->header = header;
-    m_impl->buildOptions = options;
+    // Each std::make_unique below may throw std::bad_alloc. Initialize() is
+    // declared noexcept, so an escaping exception would call std::terminate
+    // and crash the host process. Catch every failure path, roll the impl
+    // state back to the empty post-construction shape, and return a
+    // diagnostic error so callers can react.
+    try {
+        // Store view and header
+        m_impl->view = &view;
+        m_impl->header = header;
+        m_impl->buildOptions = options;
 
-    // Initialize index structures
-    if (options.buildIPv4) {
-        m_impl->ipv4Index = std::make_unique<IPv4RadixTree>();
-    }
-
-    if (options.buildIPv6) {
-        m_impl->ipv6Index = std::make_unique<IPv6PatriciaTrie>();
-    }
-
-    if (options.buildDomain) {
-        m_impl->domainIndex = std::make_unique<DomainSuffixTrie>();
-    }
-
-    if (options.buildURL) {
-        m_impl->urlIndex = std::make_unique<URLPatternMatcher>();
-    }
-
-    if (options.buildEmail) {
-        m_impl->emailIndex = std::make_unique<EmailHashTable>();
-    }
-
-    if (options.buildGeneric) {
-        m_impl->genericIndex = std::make_unique<GenericBPlusTree>();
-    }
-
-    if (options.buildHash) {
-        // Initialize hash indexes for each algorithm
-        for (size_t i = 0; i < m_impl->hashIndexes.size(); ++i) {
-            m_impl->hashIndexes[i] = std::make_unique<HashBPlusTree>(
-                static_cast<HashAlgorithm>(i)
-            );
-        }
-    }
-
-    // Initialize bloom filters if enabled
-    if (options.buildBloomFilters) {
-        size_t bloomSize = CalculateBloomFilterSizeDefault(header->totalActiveEntries);
-
+        // Initialize index structures
         if (options.buildIPv4) {
-            m_impl->bloomFilters[IOCType::IPv4] =
-                std::make_unique<IndexBloomFilter>(bloomSize);
+            m_impl->ipv4Index = std::make_unique<IPv4RadixTree>();
         }
 
         if (options.buildIPv6) {
-            m_impl->bloomFilters[IOCType::IPv6] =
-                std::make_unique<IndexBloomFilter>(bloomSize);
+            m_impl->ipv6Index = std::make_unique<IPv6PatriciaTrie>();
         }
 
         if (options.buildDomain) {
-            m_impl->bloomFilters[IOCType::Domain] =
-                std::make_unique<IndexBloomFilter>(bloomSize);
+            m_impl->domainIndex = std::make_unique<DomainSuffixTrie>();
         }
 
         if (options.buildURL) {
-            m_impl->bloomFilters[IOCType::URL] =
-                std::make_unique<IndexBloomFilter>(bloomSize);
-        }
-
-        if (options.buildHash) {
-            m_impl->bloomFilters[IOCType::FileHash] =
-                std::make_unique<IndexBloomFilter>(bloomSize);
+            m_impl->urlIndex = std::make_unique<URLPatternMatcher>();
         }
 
         if (options.buildEmail) {
-            m_impl->bloomFilters[IOCType::Email] =
-                std::make_unique<IndexBloomFilter>(bloomSize);
+            m_impl->emailIndex = std::make_unique<EmailHashTable>();
         }
+
+        if (options.buildGeneric) {
+            m_impl->genericIndex = std::make_unique<GenericBPlusTree>();
+        }
+
+        if (options.buildHash) {
+            // Initialize hash indexes for each algorithm
+            for (size_t i = 0; i < m_impl->hashIndexes.size(); ++i) {
+                m_impl->hashIndexes[i] = std::make_unique<HashBPlusTree>(
+                    static_cast<HashAlgorithm>(i)
+                );
+            }
+        }
+
+        // Initialize bloom filters if enabled
+        if (options.buildBloomFilters) {
+            // Clamp the expected-element count so a freshly created or empty
+            // database (totalActiveEntries == 0) still produces a usable
+            // bloom filter. A zero-bit filter would cause downstream
+            // divide-by-zero and false-rejects on every lookup.
+            constexpr uint64_t kMinExpectedElements = 1024;
+            const uint64_t expected = header->totalActiveEntries == 0
+                ? kMinExpectedElements
+                : header->totalActiveEntries;
+            size_t bloomSize = CalculateBloomFilterSizeDefault(static_cast<size_t>(expected));
+            if (bloomSize == 0) {
+                bloomSize = static_cast<size_t>(kMinExpectedElements);
+            }
+
+            if (options.buildIPv4) {
+                m_impl->bloomFilters[IOCType::IPv4] =
+                    std::make_unique<IndexBloomFilter>(bloomSize);
+            }
+
+            if (options.buildIPv6) {
+                m_impl->bloomFilters[IOCType::IPv6] =
+                    std::make_unique<IndexBloomFilter>(bloomSize);
+            }
+
+            if (options.buildDomain) {
+                m_impl->bloomFilters[IOCType::Domain] =
+                    std::make_unique<IndexBloomFilter>(bloomSize);
+            }
+
+            if (options.buildURL) {
+                m_impl->bloomFilters[IOCType::URL] =
+                    std::make_unique<IndexBloomFilter>(bloomSize);
+            }
+
+            if (options.buildHash) {
+                m_impl->bloomFilters[IOCType::FileHash] =
+                    std::make_unique<IndexBloomFilter>(bloomSize);
+            }
+
+            if (options.buildEmail) {
+                m_impl->bloomFilters[IOCType::Email] =
+                    std::make_unique<IndexBloomFilter>(bloomSize);
+            }
+        }
+
+        m_initialized.store(true, std::memory_order_release);
+
+        return StoreError::Success();
+    } catch (const std::bad_alloc&) {
+        // Roll back every structure that may have been partially constructed
+        // so a subsequent Initialize() call starts from a clean slate.
+        m_impl->ipv4Index.reset();
+        m_impl->ipv6Index.reset();
+        m_impl->domainIndex.reset();
+        m_impl->urlIndex.reset();
+        m_impl->emailIndex.reset();
+        m_impl->genericIndex.reset();
+        for (auto& hashIndex : m_impl->hashIndexes) {
+            hashIndex.reset();
+        }
+        m_impl->bloomFilters.clear();
+        m_impl->view = nullptr;
+        m_impl->header = nullptr;
+        return StoreError::WithMessage(
+            ThreatIntelError::OutOfMemory,
+            "Allocation failure constructing index sub-structures"
+        );
+    } catch (...) {
+        m_impl->ipv4Index.reset();
+        m_impl->ipv6Index.reset();
+        m_impl->domainIndex.reset();
+        m_impl->urlIndex.reset();
+        m_impl->emailIndex.reset();
+        m_impl->genericIndex.reset();
+        for (auto& hashIndex : m_impl->hashIndexes) {
+            hashIndex.reset();
+        }
+        m_impl->bloomFilters.clear();
+        m_impl->view = nullptr;
+        m_impl->header = nullptr;
+        return StoreError::WithMessage(
+            ThreatIntelError::Unknown,
+            "Unknown exception during index initialization"
+        );
     }
-
-    m_initialized.store(true, std::memory_order_release);
-
-    return StoreError::Success();
 }
 
 bool ThreatIntelIndex::IsInitialized() const noexcept {
