@@ -116,6 +116,12 @@ static constexpr std::size_t    kMaxResponseBytes = 512u * 1024u;  // 512 KiB
 static constexpr std::uint32_t  kMaxJsonDepth  = 8u;
 static constexpr std::uint32_t  kMaxJsonNodes  = 4096u;
 
+void LogBroadcastResult(const wchar_t* context, std::size_t delivered) noexcept {
+    if (delivered == 0u) {
+        SS_LOG_DEBUG(kLogCat, L"%ls broadcast had no authenticated subscribers", context ? context : L"event");
+    }
+}
+
 // ============================================================================
 // JSON helpers (service-side, independent of Messages.hpp)
 // ============================================================================
@@ -333,8 +339,9 @@ struct HomeIpcDispatcher::Impl {
             const auto ev = Events::BuildProtectionStateChanged(
                 "active", "auto-resume after timed pause");
             if (!ev.empty()) {
-                ServiceCommunicator::Instance().BroadcastEvent(
+                const auto delivered = ServiceCommunicator::Instance().BroadcastEvent(
                     CommandType::ProtectionStateChanged, ev);
+                LogBroadcastResult(L"auto-resume protection-state", delivered);
             }
         });
     }
@@ -608,7 +615,11 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 return;
             }
             SS_LOG_INFO(kLogCat, L"UpdateConfig globalMode clientId=%llu", clientId);
-            ConfigManager::Instance().SetValue("Home/GlobalMode", *mode);
+            if (!ConfigManager::Instance().SetValue("Home/GlobalMode", *mode)) {
+                svc.SendResponseEnvelope(clientId, CommandType::UpdateConfig, requestId,
+                    MakeErrorResponse("config_write_failed", "globalMode could not be persisted").dump());
+                return;
+            }
             svc.SendResponseEnvelope(clientId, CommandType::UpdateConfig, requestId,
                 MakeOk().dump());
             return;
@@ -635,16 +646,23 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             return;
         }
         const auto& valNode = j["value"];
+        bool persisted = false;
         if (valNode.is_string()) {
-            ConfigManager::Instance().SetValue(*key, valNode.get<std::string>());
+            persisted = ConfigManager::Instance().SetValue(*key, valNode.get<std::string>());
         } else if (valNode.is_number_integer()) {
-            ConfigManager::Instance().SetValue(*key, valNode.get<int32_t>());
+            persisted = ConfigManager::Instance().SetValue(*key, valNode.get<int32_t>());
         } else if (valNode.is_boolean()) {
-            ConfigManager::Instance().SetValue(*key, valNode.get<bool>());
+            persisted = ConfigManager::Instance().SetValue(*key, valNode.get<bool>());
         } else {
             svc.SendResponseEnvelope(clientId, CommandType::UpdateConfig, requestId,
                 MakeErrorResponse("unsupported_type",
                     "value must be string, integer, or boolean").dump());
+            return;
+        }
+
+        if (!persisted) {
+            svc.SendResponseEnvelope(clientId, CommandType::UpdateConfig, requestId,
+                MakeErrorResponse("config_write_failed", "configuration value could not be persisted").dump());
             return;
         }
 
@@ -838,8 +856,10 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         impl->ScheduleResume(std::chrono::seconds(static_cast<int64_t>(minutes) * 60));
 
         const auto ev = Events::BuildProtectionStateChanged("paused", "user-requested pause");
-        if (!ev.empty())
-            svc.BroadcastEvent(CommandType::ProtectionStateChanged, ev);
+        if (!ev.empty()) {
+            const auto delivered = svc.BroadcastEvent(CommandType::ProtectionStateChanged, ev);
+            LogBroadcastResult(L"pause protection-state", delivered);
+        }
 
         nlohmann::json resp{{"ok", true}, {"pausedRemainingSec", minutes * 60}};
         svc.SendResponseEnvelope(clientId, CommandType::PauseProtection, requestId, resp.dump());
@@ -862,8 +882,10 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         }
 
         const auto ev = Events::BuildProtectionStateChanged("active", "user-requested resume");
-        if (!ev.empty())
-            svc.BroadcastEvent(CommandType::ProtectionStateChanged, ev);
+        if (!ev.empty()) {
+            const auto delivered = svc.BroadcastEvent(CommandType::ProtectionStateChanged, ev);
+            LogBroadcastResult(L"resume protection-state", delivered);
+        }
 
         svc.SendResponseEnvelope(clientId, CommandType::ResumeProtection, requestId,
             MakeOk().dump());
@@ -910,8 +932,10 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                     static_cast<int>(p.percentComplete),
                     p.filesScanned,
                     0);
-                if (!ev.empty())
-                    svc.BroadcastEvent(CommandType::ScanProgressEvent, ev);
+                if (!ev.empty()) {
+                    const auto delivered = svc.BroadcastEvent(CommandType::ScanProgressEvent, ev);
+                    LogBroadcastResult(L"scan progress", delivered);
+                }
             };
 
         if (scope == "full") {

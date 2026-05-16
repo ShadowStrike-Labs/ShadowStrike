@@ -1520,8 +1520,10 @@ private:
 /**
  * @brief Protect current installation
  */
+#ifndef SS_PROTECT_INSTALLATION
 #define SS_PROTECT_INSTALLATION() \
     ::ShadowStrike::Security::TamperProtection::Instance().ProtectInstallation()
+#endif
 
 /**
  * @brief Force integrity check

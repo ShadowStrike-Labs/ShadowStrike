@@ -277,7 +277,10 @@ public:
                 return false;
             }
             SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection initialized — calling ProtectSelf");
-            Security::TamperProtection::Instance().ProtectSelf();
+            if (!Security::TamperProtection::Instance().ProtectSelf()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"TamperProtection ProtectSelf failed");
+                return false;
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection ProtectSelf completed");
 
             // Process Protection (must be initialized before RealTimeProtection
@@ -491,7 +494,9 @@ public:
         }
 
         // Start Communication subsystems
-        Communication::ServiceCommunication::Instance().Start(true);
+        if (!Communication::ServiceCommunication::Instance().Start(true)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunication failed to start; service telemetry channel degraded");
+        }
 
         // Initialize and start the v2 IPC pipe server, then wire all PhantomHome
         // UI command handlers before any client can connect and send a verb.
@@ -514,7 +519,9 @@ public:
         }
 
         // Register AMSI provider
-        Scripts::AMSIIntegration::Instance().RegisterProvider();
+        if (!Scripts::AMSIIntegration::Instance().RegisterProvider()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"AMSI provider registration failed; script scanning remains available through direct scanners");
+        }
 
         // Start health monitoring (all modules now initialized, heartbeat loop can begin)
         if (!ServiceMonitor::Instance().StartMonitoring()) {
@@ -578,7 +585,9 @@ public:
             Update::UpdateManager::Instance().Shutdown();
         }
 
-        Scripts::AMSIIntegration::Instance().UnregisterProvider();
+        if (!Scripts::AMSIIntegration::Instance().UnregisterProvider()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"AMSI provider unregistration reported failure during shutdown");
+        }
         Scripts::AMSIIntegration::Instance().Shutdown();
 
         RealTime::RealTimeProtection::Instance().Stop();
