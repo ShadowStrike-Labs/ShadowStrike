@@ -290,6 +290,11 @@ namespace SignatureStore {
                 return result;
             }
 
+            // Clear compiled pattern cache to release memory (cache served its purpose:
+            // SerializePatterns, SerializeAhoCorasickToDisk, and BuildOutputPool)
+            m_compiledPatternCache.clear();
+            m_compiledPatternCache.shrink_to_fit();
+
             // Back-fill header section offsets and sizes now that all sections are written.
             // The header was written with hashIndexOffset set in SerializeHeader; the
             // remaining fields are populated here with the actual offsets tracked during
@@ -323,13 +328,31 @@ namespace SignatureStore {
             // Commit the guard before manual cleanup
             guard.Commit();
             
-            // Clean up with proper ordering
-            UnmapViewOfFile(m_outputBase);
+            // Clean up with proper ordering and error logging
+            if (!UnmapViewOfFile(m_outputBase)) {
+                const DWORD err = GetLastError();
+                SS_LOG_WARN(L"SignatureBuilder",
+                    L"Serialize: UnmapViewOfFile failed (error: %lu)", err);
+            }
             m_outputBase = nullptr;
-            CloseHandle(m_outputMapping);
-            m_outputMapping = INVALID_HANDLE_VALUE;
-            CloseHandle(m_outputFile);
-            m_outputFile = INVALID_HANDLE_VALUE;
+            
+            if (m_outputMapping && m_outputMapping != INVALID_HANDLE_VALUE) {
+                if (!CloseHandle(m_outputMapping)) {
+                    const DWORD err = GetLastError();
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"Serialize: CloseHandle(mapping) failed (error: %lu)", err);
+                }
+                m_outputMapping = INVALID_HANDLE_VALUE;
+            }
+            
+            if (m_outputFile && m_outputFile != INVALID_HANDLE_VALUE) {
+                if (!CloseHandle(m_outputFile)) {
+                    const DWORD err = GetLastError();
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"Serialize: CloseHandle(file) failed (error: %lu)", err);
+                }
+                m_outputFile = INVALID_HANDLE_VALUE;
+            }
 
             LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
@@ -587,23 +610,16 @@ namespace SignatureStore {
             // STEP 2: PRE-COMPILE ALL PATTERNS (SINGLE PASS - MAJOR OPTIMIZATION)
             // ========================================================================
             // FIX: Previously patterns were compiled 3 times (automaton, entropy, serialize)
-            // Now we compile once and cache the results for O(n) instead of O(3n)
+            // Now we compile once and cache the results in m_compiledPatternCache for 
+            // reuse by SerializeAhoCorasickToDisk and BuildOutputPool.
 
-            struct CompiledPatternCache {
-                std::vector<uint8_t> bytes;
-                std::vector<uint8_t> mask;
-                PatternMode mode;
-                float entropy;
-                bool valid;
-            };
-
-            std::vector<CompiledPatternCache> compiledCache;
-            compiledCache.reserve(m_pendingPatterns.size());
+            m_compiledPatternCache.clear();
+            m_compiledPatternCache.reserve(m_pendingPatterns.size());
 
             for (size_t patternIdx = 0; patternIdx < m_pendingPatterns.size(); ++patternIdx) {
                 const auto& pattern = m_pendingPatterns[patternIdx];
 
-                CompiledPatternCache cache{};
+                CompiledPatternCacheEntry cache{};
                 cache.valid = false;
 
                 auto compiledPattern = PatternStore::PatternCompiler::CompilePattern(
@@ -621,19 +637,19 @@ namespace SignatureStore {
                     m_statistics.invalidSignaturesSkipped++;
                 }
                 
-                compiledCache.push_back(std::move(cache));
+                m_compiledPatternCache.push_back(std::move(cache));
             }
             
             SS_LOG_DEBUG(L"SignatureBuilder", 
-                L"SerializePatterns: Pre-compiled %zu patterns", compiledCache.size());
+                L"SerializePatterns: Pre-compiled %zu patterns (cached)", m_compiledPatternCache.size());
 
             // ========================================================================
             // STEP 3: BUILD AHO-CORASICK AUTOMATON USING CACHED COMPILED PATTERNS
             // ========================================================================
             PatternStore::AhoCorasickAutomaton automaton;
 
-            for (size_t patternIdx = 0; patternIdx < compiledCache.size(); ++patternIdx) {
-                const auto& cache = compiledCache[patternIdx];
+            for (size_t patternIdx = 0; patternIdx < m_compiledPatternCache.size(); ++patternIdx) {
+                const auto& cache = m_compiledPatternCache[patternIdx];
                 if (!cache.valid) continue;
 
                 if (!automaton.AddPattern(cache.bytes, static_cast<uint64_t>(patternIdx))) {
@@ -660,8 +676,8 @@ namespace SignatureStore {
             std::vector<std::pair<size_t, float>> patternsByEntropy;
             patternsByEntropy.reserve(m_pendingPatterns.size());
 
-            for (size_t patternIdx = 0; patternIdx < compiledCache.size(); ++patternIdx) {
-                const auto& cache = compiledCache[patternIdx];
+            for (size_t patternIdx = 0; patternIdx < m_compiledPatternCache.size(); ++patternIdx) {
+                const auto& cache = m_compiledPatternCache[patternIdx];
                 if (cache.valid) {
                     patternsByEntropy.emplace_back(patternIdx, cache.entropy);
                 }
@@ -685,7 +701,7 @@ namespace SignatureStore {
 
             for (const auto& [origIdx, entropy] : patternsByEntropy) {
                 const auto& pattern = m_pendingPatterns[origIdx];
-                const auto& cache = compiledCache[origIdx];
+                const auto& cache = m_compiledPatternCache[origIdx];
                 
                 // Skip invalid patterns (already filtered but double-check)
                 if (!cache.valid) continue;
@@ -854,8 +870,8 @@ namespace SignatureStore {
             // Use cached compiled pattern sizes instead of re-compiling
             for (const auto& [origIdx, entropy] : patternsByEntropy) {
                 // Bounds check before accessing cache
-                if (origIdx < compiledCache.size()) {
-                    const auto& cache = compiledCache[origIdx];
+                if (origIdx < m_compiledPatternCache.size()) {
+                    const auto& cache = m_compiledPatternCache[origIdx];
                     if (cache.valid && !cache.bytes.empty()) {
                         entropySum += entropy;
                         uint32_t patternSize = static_cast<uint32_t>(cache.bytes.size());
@@ -971,26 +987,29 @@ namespace SignatureStore {
 
             // Build trie by inserting each pattern
             for (size_t patternIdx = 0; patternIdx < m_pendingPatterns.size(); ++patternIdx) {
-                const auto& pattern = m_pendingPatterns[patternIdx];
-
-                // Compile pattern to binary
-                PatternMode mode;
-                std::vector<uint8_t> mask;
-
-                auto compiledPattern = PatternStore::PatternCompiler::CompilePattern(
-                    pattern.patternString, mode, mask
-                );
-
-                if (!compiledPattern.has_value()) {
+                // FIX: Use cached compiled patterns from SerializePatterns instead of
+                // recompiling (which was the 2nd compilation and a major perf bottleneck)
+                if (patternIdx >= m_compiledPatternCache.size()) {
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"SerializeAhoCorasickToDisk: Pattern %zu not in cache, skipping",
+                        patternIdx);
                     continue;
                 }
 
-                // Insert pattern into trie
+                const auto& cache = m_compiledPatternCache[patternIdx];
+                if (!cache.valid || cache.bytes.empty()) {
+                    SS_LOG_DEBUG(L"SignatureBuilder",
+                        L"SerializeAhoCorasickToDisk: Pattern %zu invalid/empty in cache, skipping",
+                        patternIdx);
+                    continue;
+                }
+
+                // Insert pattern into trie using cached compilation
                 uint64_t currentNodeId = 0; // Start at root
                 uint32_t depth = 0;
 
-                for (size_t byteIdx = 0; byteIdx < compiledPattern->size(); ++byteIdx) {
-                    uint8_t byte = (*compiledPattern)[byteIdx];
+                for (size_t byteIdx = 0; byteIdx < cache.bytes.size(); ++byteIdx) {
+                    uint8_t byte = cache.bytes[byteIdx];
 
                     auto& currentNode = trieNodes[currentNodeId];
 
@@ -1410,27 +1429,30 @@ namespace SignatureStore {
             size_t totalOutputs = 0;
 
             for (size_t patternIdx = 0; patternIdx < m_pendingPatterns.size(); ++patternIdx) {
-                const auto& pattern = m_pendingPatterns[patternIdx];
-
-                // Compile pattern to get binary form
-                PatternMode mode;
-                std::vector<uint8_t> mask;
-
-                auto compiledPattern = PatternStore::PatternCompiler::CompilePattern(
-                    pattern.patternString, mode, mask
-                );
-
-                if (!compiledPattern.has_value()) {
+                // FIX: Use cached compiled patterns from SerializePatterns instead of
+                // recompiling (which was the 3rd compilation and a major perf bottleneck)
+                if (patternIdx >= m_compiledPatternCache.size()) {
                     SS_LOG_WARN(L"SignatureBuilder",
-                        L"BuildOutputPool: Failed to compile pattern for output pool: %S",
-                        pattern.name.c_str());
+                        L"BuildOutputPool: Pattern %zu not in cache, skipping", patternIdx);
+                    continue;
+                }
+
+                const auto& cache = m_compiledPatternCache[patternIdx];
+                if (!cache.valid || cache.bytes.empty()) {
+                    SS_LOG_DEBUG(L"SignatureBuilder",
+                        L"BuildOutputPool: Pattern %zu invalid/empty in cache, skipping",
+                        patternIdx);
                     continue;
                 }
 
                 // For Aho-Corasick, each pattern creates output at its terminal node
                 // and potentially at ancestor nodes (suffix matches)
                 OutputListEntry entry;
-                entry.trieNodeOffset = 0; // Will be updated when we process trie
+                entry.trieNodeOffset = 0; // FIXME: This field is never used; the runtime
+                                          // trie-walker relies on the output pool offsets
+                                          // being embedded in the terminal nodes during
+                                          // serialization. If the reader expects non-zero
+                                          // trieNodeOffset, this is a silent data-loss bug.
                 entry.patternIds.push_back(static_cast<uint64_t>(patternIdx));
 
                 outputLists.push_back(std::move(entry));
@@ -1478,7 +1500,10 @@ namespace SignatureStore {
                 }
                 currentPoolOffset += entry.patternIds.size() * sizeof(uint64_t);
 
-                // Record offset for later reference
+                // Record offset for later reference.
+                // INVARIANT: entry.patternIds[0] == patternIdx (unique per pattern),
+                // so this map assignment never overwrites. If patterns could share
+                // IDs, this would be a collision bug.
                 if (!entry.patternIds.empty()) {
                     outputListOffsets[entry.patternIds[0]] = currentPoolOffset - requiredSpace;
                 }
@@ -1535,9 +1560,16 @@ namespace SignatureStore {
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Pool offset: 0x%llX - 0x%llX",
                 poolOffset, currentPoolOffset);
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Pool utilization: %.2f%%",
-                (100.0 * actualPoolSize) / estimatedPoolSize);
+            
+            // HARDENED: Division-by-zero protection for pool utilization percentage
+            if (estimatedPoolSize > 0) {
+                SS_LOG_INFO(L"SignatureBuilder",
+                    L"  Pool utilization: %.2f%%",
+                    (100.0 * actualPoolSize) / estimatedPoolSize);
+            } else {
+                SS_LOG_INFO(L"SignatureBuilder",
+                    L"  Pool utilization: N/A (no patterns)");
+            }
 
             // ========================================================================
             // STEP 10: FINAL VALIDATION
@@ -1637,6 +1669,9 @@ namespace SignatureStore {
             // ========================================================================
             uint64_t currentOffset = m_currentOffset;
             uint64_t yaraOffset = Format::AlignToPage(currentOffset);
+
+            // CRITICAL: Record section start for header back-fill
+            m_sectionOffsets.yaraStart = yaraOffset;
 
             if (yaraOffset + yaraDataSize > m_outputSize) {
                 SS_LOG_ERROR(L"SignatureBuilder",
@@ -1800,6 +1835,9 @@ namespace SignatureStore {
             // ========================================================================
             uint64_t currentOffset = m_currentOffset;
             uint64_t metadataOffset = Format::AlignToPage(currentOffset);
+
+            // CRITICAL: Record section start for header back-fill
+            m_sectionOffsets.metadataStart = metadataOffset;
 
             if (metadataOffset + jsonContent.size() > m_outputSize) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"SerializeMetadata: Insufficient space");
