@@ -153,8 +153,19 @@ namespace ShadowStrike {
 
                 for (const char c : str) {
                     const unsigned char uc = static_cast<unsigned char>(c);
-                    // RFC 3986 unreserved characters
-                    if (std::isalnum(uc) || uc == '-' || uc == '_' || uc == '.' || uc == '~') {
+                    // RFC 3986 unreserved characters. Use an explicit ASCII
+                    // range check rather than std::isalnum, which is
+                    // locale-dependent: under some MBCS-aware locales bytes
+                    // >= 0x80 are reported as alphanumeric and would be
+                    // emitted raw, producing URLs that are at best invalid
+                    // and at worst usable to smuggle non-ASCII payloads past
+                    // server-side validators.
+                    const bool isUnreserved =
+                        (uc >= '0' && uc <= '9') ||
+                        (uc >= 'a' && uc <= 'z') ||
+                        (uc >= 'A' && uc <= 'Z') ||
+                        uc == '-' || uc == '_' || uc == '.' || uc == '~';
+                    if (isUnreserved) {
                         oss << c;
                     }
                     else {
@@ -328,39 +339,16 @@ namespace ShadowStrike {
              * @return true if valid IPv4 address
              */
             [[nodiscard]] inline bool IsValidIPv4(std::string_view str) {
-                if (str.empty() || str.size() > 15) {  // Max: "255.255.255.255"
-                    return false;
-                }
-
-                int segments = 0;
-                int value = 0;
-                int digitCount = 0;
-
-                for (char c : str) {
-                    if (c == '.') {
-                        if (digitCount == 0 || value > 255) {
-                            return false;
-                        }
-                        segments++;
-                        if (segments > 3) {
-                            return false;  // Too many segments
-                        }
-                        value = 0;
-                        digitCount = 0;
-                    }
-                    else if (c >= '0' && c <= '9') {
-                        value = value * 10 + (c - '0');
-                        digitCount++;
-                        if (digitCount > 3 || value > 255) {
-                            return false;
-                        }
-                    }
-                    else {
-                        return false;  // Invalid character
-                    }
-                }
-
-                return segments == 3 && digitCount > 0 && value <= 255;
+                // Delegate to the canonical parser so callers (CSV/STIX,
+                // SSRF filter, IOC type detection) share a single accept
+                // grammar. The previous hand-rolled validator accepted
+                // segments with leading zeros (e.g. "010.010.010.010"),
+                // which inet_pton et al interpret as octal - a source of
+                // SSRF bypasses against allow/deny lists keyed on the
+                // decimal form. SafeParseIPv4 rejects leading zeros and
+                // out-of-range octets.
+                uint8_t octets[4]{};
+                return ShadowStrike::ThreatIntel::Format::SafeParseIPv4(str, octets);
             }
 
             /**
@@ -373,50 +361,14 @@ namespace ShadowStrike {
              * @return true if valid IPv6 address
              */
             [[nodiscard]] inline bool IsValidIPv6(std::string_view str) {
-                if (str.empty() || str.size() > 45) {  // Max IPv6 length with embedded IPv4
-                    return false;
-                }
-
-                int colonCount = 0;
-                bool hasDoubleColon = false;
-                int groupLen = 0;
-
-                for (size_t i = 0; i < str.size(); ++i) {
-                    const char c = str[i];
-                    if (c == ':') {
-                        if (groupLen > 4) {
-                            return false;  // Group too long
-                        }
-                        colonCount++;
-                        groupLen = 0;
-                        if (i + 1 < str.size() && str[i + 1] == ':') {
-                            if (hasDoubleColon) {
-                                return false;  // Only one :: allowed
-                            }
-                            hasDoubleColon = true;
-                        }
-                    }
-                    else if ((c >= '0' && c <= '9') ||
-                        (c >= 'a' && c <= 'f') ||
-                        (c >= 'A' && c <= 'F')) {
-                        groupLen++;
-                        if (groupLen > 4) {
-                            return false;  // Hex group too long
-                        }
-                    }
-                    else {
-                        return false;  // Invalid character
-                    }
-                }
-
-                // Final group check
-                if (groupLen > 4) {
-                    return false;
-                }
-
-                // Must have at least 2 colons (3 groups minimum in compressed form)
-                // Maximum 7 colons (8 groups)
-                return colonCount >= 2 && colonCount <= 7;
+                // Delegate to the canonical parser. The previous validator
+                // only counted colons and group-hex-digit lengths, accepting
+                // malformed inputs such as "1:2:3" (3 groups, no '::') or
+                // refusing valid embedded-IPv4 forms like "::ffff:192.0.2.1".
+                // SafeParseIPv6 implements RFC 4291 group accounting and
+                // embedded-IPv4 dotted-quad handling.
+                uint16_t segments[8]{};
+                return ShadowStrike::ThreatIntel::Format::SafeParseIPv6(str, segments);
             }
 
             /**
