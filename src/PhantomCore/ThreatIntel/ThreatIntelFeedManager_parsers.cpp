@@ -568,7 +568,9 @@ namespace ShadowStrike {
                     else break;
 
                     hash.length = static_cast<uint8_t>(hashLen);
-                    ShadowStrike::ThreatIntel_Util::ParseHexString(value, hash.data.data(), hashLen);
+                    if (!ShadowStrike::ThreatIntel_Util::ParseHexString(value, hash.data.data(), hashLen)) {
+                        return false;
+                    }
                     entry.value.hash = hash;
                     break;
                 }

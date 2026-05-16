@@ -3088,8 +3088,11 @@ bool ExtendDatabase(
         DWORD win32Error = GetLastError();
         error = StoreError::FromWin32(ThreatIntelError::FileWriteError, win32Error);
         error.context = "SetFilePointerEx failed";
-        // Try to recover by remapping original size
-        RemapView(view, error);
+        // Try to recover by remapping original size while preserving the root failure.
+        StoreError remapError;
+        if (!RemapView(view, remapError)) {
+            error.context += "; remap recovery failed: " + remapError.context;
+        }
         return false;
     }
     
@@ -3103,8 +3106,11 @@ bool ExtendDatabase(
         }
         error.context = "SetEndOfFile failed";
         
-        // Try to recover by remapping original size
-        RemapView(view, error);
+        // Try to recover by remapping original size while preserving the root failure.
+        StoreError remapError;
+        if (!RemapView(view, remapError)) {
+            error.context += "; remap recovery failed: " + remapError.context;
+        }
         return false;
     }
     

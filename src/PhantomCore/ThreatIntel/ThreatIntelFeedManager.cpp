@@ -36,8 +36,12 @@
 #include "../Utils/Base64Utils.hpp"
 #include "../Utils/Logger.hpp"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 #include <WinINet.h>
 #include <bcrypt.h>
