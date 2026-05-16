@@ -483,7 +483,8 @@ namespace ShadowStrike {
             parent = FindCOWNodeByAddr(parentAddr);
             if (parent != nullptr) {
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"InsertIntoParent: Found parent in COW pool (truncAddr=0x%X)", parentAddr);
+                    L"InsertIntoParent: Found parent in COW pool (addr=0x%llX)",
+                    static_cast<unsigned long long>(parentAddr));
             }
             else {
                 // Parent is a file offset - check if already cloned
@@ -491,20 +492,23 @@ namespace ShadowStrike {
                 if (fileIt != m_fileOffsetToCOWNode.end()) {
                     parent = fileIt->second;
                     SS_LOG_TRACE(L"SignatureIndex",
-                        L"InsertIntoParent: Found existing parent clone (fileOffset=0x%X)", parentAddr);
+                        L"InsertIntoParent: Found existing parent clone (fileOffset=0x%llX)",
+                        static_cast<unsigned long long>(parentAddr));
                 }
                 else {
                     // Clone parent from file
                     if (parentAddr >= m_indexSize) {
                         SS_LOG_ERROR(L"SignatureIndex",
-                            L"InsertIntoParent: Parent offset 0x%X out of bounds", parentAddr);
+                            L"InsertIntoParent: Parent offset 0x%llX out of bounds",
+                            static_cast<unsigned long long>(parentAddr));
                         return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Parent offset out of bounds" };
                     }
 
                     const BPlusTreeNode* fileParent = GetNode(parentAddr);
                     if (!fileParent) {
                         SS_LOG_ERROR(L"SignatureIndex",
-                            L"InsertIntoParent: Failed to get parent node at offset 0x%X", parentAddr);
+                            L"InsertIntoParent: Failed to get parent node at offset 0x%llX",
+                            static_cast<unsigned long long>(parentAddr));
                         return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Parent node not found" };
                     }
 
@@ -519,7 +523,8 @@ namespace ShadowStrike {
                     m_fileOffsetToCOWNode[parentAddr] = parent;
                     
                     SS_LOG_TRACE(L"SignatureIndex",
-                        L"InsertIntoParent: Cloned parent from file offset 0x%X", parentAddr);
+                        L"InsertIntoParent: Cloned parent from file offset 0x%llX",
+                        static_cast<unsigned long long>(parentAddr));
                 }
             }
 
@@ -866,10 +871,11 @@ namespace ShadowStrike {
                                   "Index not initialized" };
             }
 
-            uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+            const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
             if (rootOffset >= m_indexSize) {
                 SS_LOG_ERROR(L"SignatureIndex",
-                    L"Remove: Invalid root offset 0x%X", rootOffset);
+                    L"Remove: Invalid root offset 0x%llX",
+                    static_cast<unsigned long long>(rootOffset));
                 return StoreError{ SignatureStoreError::IndexCorrupted, 0,
                                   "Invalid root offset" };
             }
