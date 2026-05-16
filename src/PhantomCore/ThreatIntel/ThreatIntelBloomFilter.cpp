@@ -42,7 +42,7 @@ namespace ShadowStrike {
             expectedElements = std::min(expectedElements, kMaxExpectedElements);
 
             // TITANIUM: Apply bounds to false positive rate
-            if (falsePositiveRate <= 0.0 || falsePositiveRate >= 1.0) {
+            if (!(falsePositiveRate > 0.0) || !(falsePositiveRate < 1.0)) {
                 falsePositiveRate = 0.01;
             }
             falsePositiveRate = std::clamp(falsePositiveRate, kMinFalsePositiveRate, kMaxFalsePositiveRate);
@@ -67,10 +67,20 @@ namespace ShadowStrike {
                 m_dataSize = wordCount;
             }
             catch (const std::bad_alloc&) {
-                // TITANIUM: Graceful degradation - use minimum size on allocation failure
-                m_bitCount = 64;
-                m_data = std::make_unique<std::atomic<uint64_t>[]>(1);
-                m_dataSize = 1;
+                // TITANIUM: Graceful degradation - retry with minimum size on allocation failure.
+                // If even the minimum allocation fails, leave the filter in a permissive
+                // disabled state (m_data == nullptr) so MightContain fails open rather than
+                // throwing or producing false negatives that would bypass the cache.
+                try {
+                    m_data = std::make_unique<std::atomic<uint64_t>[]>(1);
+                    m_bitCount = 64;
+                    m_dataSize = 1;
+                }
+                catch (const std::bad_alloc&) {
+                    m_data.reset();
+                    m_bitCount = 0;
+                    m_dataSize = 0;
+                }
             }
 
             // Initialize all bits to zero
@@ -106,6 +116,7 @@ namespace ShadowStrike {
 
         bool BloomFilter::MightContain(const CacheKey& key) const noexcept {
             if (!key.IsValid()) {
+                // An invalid key cannot be present; matches Add() which rejects it.
                 return false;
             }
 
@@ -114,9 +125,15 @@ namespace ShadowStrike {
 
         bool BloomFilter::MightContain(
             const std::array<uint64_t, CacheConfig::BLOOM_HASH_FUNCTIONS>& hashes) const noexcept {
-            // TITANIUM: Early exit if bloom filter is not properly initialized
+            // FAIL-OPEN: when the filter is not properly initialized (e.g. allocation
+            // failure left m_data == nullptr) we must return true so callers fall
+            // through to the authoritative cache/store lookup. Returning false here
+            // would silently turn the bloom filter into a blanket negative-cache,
+            // bypassing every reputation query and producing false negatives on
+            // genuine malicious IOCs - the worst possible failure mode for an NGAV
+            // cache.
             if (m_bitCount == 0 || !m_data || m_dataSize == 0) {
-                return false;
+                return true;
             }
 
             for (const uint64_t hash : hashes) {
@@ -161,7 +178,11 @@ namespace ShadowStrike {
             const double k = static_cast<double>(CacheConfig::BLOOM_HASH_FUNCTIONS);
             const double exponent = -k * static_cast<double>(n) / static_cast<double>(m_bitCount);
             const double base = 1.0 - std::exp(exponent);
-            return std::pow(base, k);
+            // Clamp before pow() to defend against NaN/negative drift from
+            // floating-point rounding on extremely lightly-loaded filters.
+            const double clampedBase = std::clamp(base, 0.0, 1.0);
+            const double rate = std::pow(clampedBase, k);
+            return std::clamp(rate, 0.0, 1.0);
         }
 
         void BloomFilter::SetBit(size_t index) noexcept {
