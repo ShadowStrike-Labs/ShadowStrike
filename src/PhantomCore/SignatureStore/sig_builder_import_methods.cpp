@@ -999,7 +999,10 @@ namespace {
             // ========================================================================
             // STEP 2: OPEN FILE STREAM
             // ========================================================================
-            std::ifstream file(filePath);
+            // SECURITY: open the validated canonical path, not the caller-supplied
+            // raw path. Using the raw path here would bypass the path-traversal /
+            // canonicalization checks above (CWE-22 TOCTOU).
+            std::ifstream file(canonicalPath);
             if (!file.is_open()) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromFile: Cannot open file stream");
                 return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file stream" };
@@ -1239,6 +1242,19 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path too long" };
             }
 
+            // Path traversal protection (CWE-22): canonicalize before any
+            // file-system access so we never operate on the caller-supplied
+            // raw path (which may contain '..' segments, symlinks, or UNC
+            // tricks). All subsequent file I/O uses canonicalPath.
+            std::wstring canonicalPath;
+            std::string pathError;
+            if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, pathError)) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ImportYaraRulesFromFile: Path validation failed: %S", pathError.c_str());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Path validation failed: " + pathError };
+            }
+
             // Validate namespace
             if (namespace_.empty() || namespace_.length() > MAX_NAMESPACE_LENGTH) {
                 SS_LOG_ERROR(L"SignatureBuilder",
@@ -1259,16 +1275,16 @@ namespace {
             // ========================================================================
             // STEP 2: FILE VALIDATION
             // ========================================================================
-            DWORD attribs = GetFileAttributesW(filePath.c_str());
+            DWORD attribs = GetFileAttributesW(canonicalPath.c_str());
             if (attribs == INVALID_FILE_ATTRIBUTES || (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ImportYaraRulesFromFile: File not found or is directory: %s",
-                    filePath.c_str());
+                    canonicalPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "File not found" };
             }
 
             // Check file size using RAII guard (YARA files shouldn't be huge)
-            FileHandleGuard hFileGuard(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            FileHandleGuard hFileGuard(CreateFileW(canonicalPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
 
             if (!hFileGuard.isValid()) {
@@ -1298,7 +1314,7 @@ namespace {
             // ========================================================================
             // STEP 3: READ FILE CONTENT
             // ========================================================================
-            std::ifstream file(filePath, std::ios::binary);
+            std::ifstream file(canonicalPath, std::ios::binary);
             if (!file.is_open()) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportYaraRulesFromFile: Cannot open file stream");
                 return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file stream" };
@@ -1421,7 +1437,7 @@ namespace {
             input.namespace_ = namespace_;
             
             try {
-                input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+                input.source = ShadowStrike::Utils::StringUtils::ToNarrow(canonicalPath);
             } catch (...) {
                 input.source = "yara_file_import";
             }
@@ -1470,6 +1486,18 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Path too long" };
             }
 
+            // Path traversal protection (CWE-22): canonicalize the directory
+            // path before enumeration so we never recurse from a non-canonical
+            // root.
+            std::wstring canonicalDirPath;
+            std::string pathError;
+            if (!Format::ValidateAndCanonicalizePath(directoryPath, canonicalDirPath, pathError)) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ImportYaraRulesFromDirectory: Path validation failed: %S", pathError.c_str());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Path validation failed: " + pathError };
+            }
+
             // Validate namespace
             if (namespace_.empty() || namespace_.length() > MAX_NAMESPACE_LENGTH) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportYaraRulesFromDirectory: Invalid namespace");
@@ -1488,11 +1516,11 @@ namespace {
             // ========================================================================
             // STEP 2: DIRECTORY EXISTENCE CHECK
             // ========================================================================
-            DWORD attribs = GetFileAttributesW(directoryPath.c_str());
+            DWORD attribs = GetFileAttributesW(canonicalDirPath.c_str());
             if (attribs == INVALID_FILE_ATTRIBUTES || !(attribs & FILE_ATTRIBUTE_DIRECTORY)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ImportYaraRulesFromDirectory: Directory not found or not a directory: %s",
-                    directoryPath.c_str());
+                    canonicalDirPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "Directory not found" };
             }
 
@@ -1502,7 +1530,7 @@ namespace {
             std::vector<std::wstring> yaraFiles;
             
             try {
-                yaraFiles = YaraUtils::FindYaraFiles(directoryPath, true);
+                yaraFiles = YaraUtils::FindYaraFiles(canonicalDirPath, true);
             } catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ImportYaraRulesFromDirectory: Exception finding YARA files: %S", ex.what());
@@ -1512,7 +1540,7 @@ namespace {
             if (yaraFiles.empty()) {
                 SS_LOG_WARN(L"SignatureBuilder",
                     L"ImportYaraRulesFromDirectory: No YARA files found in %s",
-                    directoryPath.c_str());
+                    canonicalDirPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, 0, "No YARA files found" };
             }
 
@@ -2343,6 +2371,13 @@ namespace {
                     LARGE_INTEGER currentTime;
                     QueryPerformanceCounter(&currentTime);
 
+                    // Division-by-zero protection for performance counter
+                    if (m_perfFrequency.QuadPart <= 0) {
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"ImportFromDatabase: Invalid performance frequency, skipping pattern timeout check");
+                        continue;
+                    }
+
                     uint64_t elapsedMs = ((currentTime.QuadPart - importStartTime.QuadPart) * 1000ULL) /
                         m_perfFrequency.QuadPart;
 
@@ -2393,7 +2428,16 @@ namespace {
                     return StoreError{ SignatureStoreError::InvalidFormat, 0, "Cannot read YARA section" };
                 }
 
-                std::vector<uint8_t> yaraBuffer(yaraDataPtr, yaraDataPtr + sourceHeader->yaraRulesSize);
+                std::vector<uint8_t> yaraBuffer;
+                try {
+                    yaraBuffer.assign(yaraDataPtr, yaraDataPtr + sourceHeader->yaraRulesSize);
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"ImportFromDatabase: Memory allocation failed for YARA buffer (%llu bytes)",
+                        static_cast<uint64_t>(sourceHeader->yaraRulesSize));
+                    return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                                      "Memory allocation failed for YARA rules buffer" };
+                }
 
                 std::wstring tempPath;
                 {
@@ -2436,9 +2480,16 @@ namespace {
                         0,
                         nullptr,
                         CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                        FILE_ATTRIBUTE_TEMPORARY,
                         nullptr
                     );
+
+                    // NOTE: We intentionally do NOT pass FILE_FLAG_DELETE_ON_CLOSE
+                    // here. Combined with exclusive share mode (0), the flag would
+                    // unlink the file the instant we close the handle below, before
+                    // yr_rules_load() reopens it by path - yielding ERROR_FILE_NOT_FOUND
+                    // on the load. TempFileGuard handles deletion deterministically
+                    // when this function returns.
 
                     if (hFile == INVALID_HANDLE_VALUE) {
                         SS_LOG_ERROR(L"SignatureBuilder",
@@ -2499,14 +2550,12 @@ namespace {
                     std::string ruleNamespace = rule->ns ? rule->ns->name : "imported";
                     std::string fullName = ruleNamespace + "::" + ruleName;
 
-                    if (m_yaraRuleNames.find(fullName) != m_yaraRuleNames.end()) {
-                        if (m_config.enableDeduplication) {
-                            SS_LOG_DEBUG(L"SignatureBuilder",
-                                L"ImportFromDatabase: Skipped duplicate YARA rule: %S", fullName.c_str());
-                            yaraDuplicates++;
-                            continue;
-                        }
-                    }
+                    // Duplicate detection is handled atomically inside AddYaraRule
+                    // (under m_stateMutex), which returns SignatureStoreError::DuplicateEntry
+                    // for existing rules. We previously inspected m_yaraRuleNames here
+                    // without acquiring the lock, which is a data race against any
+                    // concurrent writer. The post-call branch below already counts
+                    // duplicates correctly.
 
                     std::string ruleSource;
                     try {
