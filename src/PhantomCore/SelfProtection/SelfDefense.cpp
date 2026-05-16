@@ -331,6 +331,7 @@ public:
     // Lifecycle
     bool Initialize(const SelfDefenseConfiguration& config);
     void Shutdown(std::string_view authorizationToken);
+    void ShutdownInternal();  ///< Bypasses auth-token check; only callable from destructor path.
     bool IsInitialized() const noexcept { return m_initialized.load(std::memory_order_acquire); }
     ModuleStatus GetStatus() const noexcept { return m_status.load(std::memory_order_acquire); }
     bool Pause(std::string_view authorizationToken, uint32_t durationMs);
@@ -478,12 +479,16 @@ private:
 
     std::thread m_watchdogThread;
     std::atomic<bool> m_watchdogRunning{false};
-    std::condition_variable_any m_watchdogCv;
+    mutable std::mutex m_watchdogMutex;          ///< Dedicated mutex for watchdog CV; never overlaps m_mutex.
+    std::condition_variable m_watchdogCv;
     std::unordered_map<std::string, HeartbeatRecord> m_heartbeatRecords;
 
     std::atomic<bool> m_serviceProtected{false};
     std::atomic<bool> m_driverProtected{false};
     std::atomic<bool> m_kernelHandlerRegistered{false};
+    std::atomic<bool> m_initializing{false};      ///< Guards reentrant Initialize() during in-progress init.
+    std::atomic<bool> m_shutdownInProgress{false};///< True only during Shutdown teardown window.
+    std::atomic<int64_t> m_pauseDeadlineNs{0};    ///< Steady-clock ns timestamp at which an auto-resume becomes due (0 = no deadline).
 
     InternalStats m_stats;
 
@@ -642,7 +647,7 @@ void SelfDefense::OnKernelSelfProtectEvent(const void* data, uint32_t size) { m_
 
 SelfDefenseImpl::~SelfDefenseImpl() {
     if (m_initialized.load(std::memory_order_acquire)) {
-        Shutdown("");
+        ShutdownInternal();
     }
 }
 
@@ -797,6 +802,22 @@ void SelfDefenseImpl::UpdateComponentStatus(ProtectionComponent comp, bool activ
 // ============================================================================
 
 bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
+    // Guard against reentrant or concurrent Initialize(). The body releases m_mutex
+    // partway through (line below) to invoke ProtectProcess()/ProtectInstallationDirectory()
+    // which themselves acquire m_mutex. A second Initialize() arriving during that window
+    // would otherwise observe m_initialized == false and re-enter, overwriting m_config
+    // and regenerating m_authSecret (invalidating all outstanding authorization tokens).
+    bool expected = false;
+    if (!m_initializing.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"Initialize rejected: another Initialize is already in progress");
+        return false;
+    }
+    struct InitGuard {
+        std::atomic<bool>& flag;
+        ~InitGuard() { flag.store(false, std::memory_order_release); }
+    } initGuard{m_initializing};
+
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
@@ -918,9 +939,31 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
 // ============================================================================
 
 void SelfDefenseImpl::Shutdown(std::string_view authorizationToken) {
+    // Public entry point requires a valid HMAC authorization token. Only the
+    // private ShutdownInternal() path (invoked from the destructor) bypasses
+    // authorization; that path is unreachable from outside this translation unit.
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!VerifyAuthorizationToken(authorizationToken)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"Shutdown rejected: invalid or missing authorization token");
+        return;
+    }
+    ShutdownInternal();
+}
+
+void SelfDefenseImpl::ShutdownInternal() {
     if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+
+    // Mark teardown so that VerifyAuthorizationToken() can permit the empty-token
+    // path that protected-resource cleanup callers below rely on.
+    m_shutdownInProgress.store(true, std::memory_order_release);
+    struct ShutdownGuard {
+        std::atomic<bool>& flag;
+        ~ShutdownGuard() { flag.store(false, std::memory_order_release); }
+    } shutdownGuard{m_shutdownInProgress};
 
     m_status.store(ModuleStatus::Stopping, std::memory_order_release);
     SS_LOG_INFO(LOG_CATEGORY, L"Shutting down self-defense engine");
@@ -930,6 +973,9 @@ void SelfDefenseImpl::Shutdown(std::string_view authorizationToken) {
 
     // Stop watchdog thread
     if (m_watchdogRunning.exchange(false, std::memory_order_acq_rel)) {
+        {
+            std::lock_guard<std::mutex> wlock(m_watchdogMutex);
+        }
         m_watchdogCv.notify_all();
         if (m_watchdogThread.joinable()) {
             m_watchdogThread.join();
@@ -976,24 +1022,52 @@ void SelfDefenseImpl::Shutdown(std::string_view authorizationToken) {
 
     m_serviceProtected.store(false, std::memory_order_release);
     m_driverProtected.store(false, std::memory_order_release);
+    m_pauseDeadlineNs.store(0, std::memory_order_release);
     m_status.store(ModuleStatus::Stopped, std::memory_order_release);
     SS_LOG_INFO(LOG_CATEGORY, L"Self-defense shutdown complete");
 }
 
-bool SelfDefenseImpl::Pause(std::string_view authorizationToken, uint32_t /*durationMs*/) {
+bool SelfDefenseImpl::Pause(std::string_view authorizationToken, uint32_t durationMs) {
     if (!m_initialized.load(std::memory_order_acquire)) return false;
     if (!VerifyAuthorizationToken(authorizationToken)) {
         SS_LOG_WARN(LOG_CATEGORY, L"Pause rejected: invalid authorization token");
         return false;
     }
+
+    // Bound the pause window. Zero means "until Resume()". A non-zero duration
+    // is enforced by the watchdog, which auto-resumes once the deadline passes.
+    // Cap at one hour to prevent a malicious or buggy caller from holding the
+    // engine paused forever via an oversized value.
+    constexpr uint32_t kMaxPauseMs = 60u * 60u * 1000u;
+    if (durationMs > kMaxPauseMs) durationMs = kMaxPauseMs;
+
+    if (durationMs > 0) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(durationMs);
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()).count();
+        m_pauseDeadlineNs.store(static_cast<int64_t>(ns), std::memory_order_release);
+    } else {
+        m_pauseDeadlineNs.store(0, std::memory_order_release);
+    }
+
     m_status.store(ModuleStatus::Paused, std::memory_order_release);
-    SS_LOG_WARN(LOG_CATEGORY, L"Self-defense PAUSED by authorized request");
+    {
+        std::lock_guard<std::mutex> wlock(m_watchdogMutex);
+    }
+    m_watchdogCv.notify_all();
+    SS_LOG_WARN(LOG_CATEGORY, L"Self-defense PAUSED by authorized request (durationMs=%u)", durationMs);
     return true;
 }
 
 void SelfDefenseImpl::Resume() {
     if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) {
+        m_pauseDeadlineNs.store(0, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> wlock(m_watchdogMutex);
+        }
+        m_watchdogCv.notify_all();
         SS_LOG_INFO(LOG_CATEGORY, L"Self-defense resumed");
     }
 }
@@ -2162,7 +2236,45 @@ bool SelfDefenseImpl::ProtectServiceRegistryKeys() {
 
 bool SelfDefenseImpl::ProtectMemoryRegion(uintptr_t address, size_t size) {
     if (address == 0 || size == 0) return false;
-    auto hash = ComputeSHA256(reinterpret_cast<const void*>(address), size);
+    // Cap caller-supplied size to keep the SHA-256 compute bounded; an attacker
+    // could otherwise drive multi-GB hashing on a hot path.
+    constexpr size_t kMaxRegionBytes = 512ull * 1024ull * 1024ull; // 512 MiB
+    if (size > kMaxRegionBytes) {
+        SS_LOG_WARN(LOG_CATEGORY, L"ProtectMemoryRegion rejected: size %zu exceeds cap", size);
+        return false;
+    }
+
+    // Validate the entire requested range is committed and readable BEFORE
+    // dereferencing it for hashing. Without this the caller can pass an
+    // uncommitted or reserved-only span and trigger an access violation
+    // inside our own process — a trivial DoS against self-defense.
+    {
+        uintptr_t cursor = address;
+        const uintptr_t end = address + size;
+        if (end < address) return false; // pointer wrap
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"ProtectMemoryRegion: VirtualQuery failed at 0x%llX",
+                            static_cast<unsigned long long>(cursor));
+                return false;
+            }
+            if (mbi.State != MEM_COMMIT) return false;
+            constexpr DWORD kReadable =
+                PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if ((mbi.Protect & kReadable) == 0) return false;
+            if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+            const uintptr_t regionEnd =
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (regionEnd <= cursor) return false;
+            cursor = regionEnd;
+        }
+    }
+
+    std::vector<uint8_t> hash = ComputeSHA256(reinterpret_cast<const void*>(address), size);
+    if (hash.empty()) return false;
+
     std::unique_lock lock(m_mutex);
     if (m_protectedMemoryRegions.size() >= SelfDefenseConstants::MAX_PROTECTED_MEMORY_REGIONS) return false;
     m_protectedMemoryRegions.push_back({address, size, std::move(hash)});
@@ -2179,36 +2291,70 @@ bool SelfDefenseImpl::UnprotectMemoryRegion(uintptr_t address, std::string_view 
     return true;
 }
 
+namespace {
+// SEH-isolated PE header parse. Must have NO C++ objects with non-trivial
+// destructors in the enclosing function (MSVC C2712 forbids __try in a
+// function that requires object unwinding). Returns true if a code section
+// was found and the (base,size) pair is safe to hash.
+[[nodiscard]] bool ParseCodeSectionSafe(HMODULE hModule,
+                                        uintptr_t& baseOut,
+                                        size_t& sizeOut) noexcept {
+    baseOut = 0;
+    sizeOut = 0;
+    if (!hModule) return false;
+    __try {
+        const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hModule);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+        const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            reinterpret_cast<const uint8_t*>(hModule) + dosHeader->e_lfanew);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
+
+        const auto* section = IMAGE_FIRST_SECTION(ntHeaders);
+        for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; ++i, ++section) {
+            if ((section->Characteristics & IMAGE_SCN_CNT_CODE) != 0) {
+                const size_t sz = section->Misc.VirtualSize;
+                if (sz == 0 || sz >= 512u * 1024u * 1024u) continue;
+                baseOut = reinterpret_cast<uintptr_t>(hModule) + section->VirtualAddress;
+                sizeOut = sz;
+                return true;
+            }
+        }
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+} // namespace
+
 bool SelfDefenseImpl::ProtectCodeSection() {
     HMODULE hModule = ::GetModuleHandleW(nullptr);
     if (!hModule) return false;
 
-    auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hModule);
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
-
-    auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const uint8_t*>(hModule) + dosHeader->e_lfanew);
-    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
-
-    const auto* section = IMAGE_FIRST_SECTION(ntHeaders);
-    for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; ++i, ++section) {
-        if (section->Characteristics & IMAGE_SCN_CNT_CODE) {
-            uintptr_t base = reinterpret_cast<uintptr_t>(hModule) + section->VirtualAddress;
-            size_t sz = section->Misc.VirtualSize;
-            if (sz > 0 && sz < 512 * 1024 * 1024) {
-                auto hash = ComputeSHA256(reinterpret_cast<const void*>(base), sz);
-                std::unique_lock lock(m_mutex);
-                m_codeSectionBase = base;
-                m_codeSectionSize = sz;
-                m_codeSectionHash = std::move(hash);
-                SS_LOG_INFO(LOG_CATEGORY, L"Code section protected: base=0x%llX size=%zu",
-                            static_cast<unsigned long long>(base), sz);
-                UpdateComponentStatus(ProtectionComponent::Memory, true, ComponentHealth::Healthy);
-                return true;
-            }
-        }
+    // PE headers live inside our own image and should always be readable, but
+    // memory corruption / DLL hollowing scenarios can leave them unmapped or
+    // protected. Defer header parsing into a SEH-isolated helper so a hostile
+    // or corrupted image cannot crash the watchdog (which drives this from
+    // ProtectionComponent recovery and the periodic integrity sweep).
+    uintptr_t base = 0;
+    size_t sz = 0;
+    if (!ParseCodeSectionSafe(hModule, base, sz)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"ProtectCodeSection: no usable code section");
+        return false;
     }
-    return false;
+
+    std::vector<uint8_t> hash = ComputeSHA256(reinterpret_cast<const void*>(base), sz);
+    if (hash.empty()) return false;
+
+    std::unique_lock lock(m_mutex);
+    m_codeSectionBase = base;
+    m_codeSectionSize = sz;
+    m_codeSectionHash = std::move(hash);
+    SS_LOG_INFO(LOG_CATEGORY, L"Code section protected: base=0x%llX size=%zu",
+                static_cast<unsigned long long>(base), sz);
+    UpdateComponentStatus(ProtectionComponent::Memory, true, ComponentHealth::Healthy);
+    return true;
 }
 
 bool SelfDefenseImpl::VerifyMemoryIntegrity() {
@@ -2257,6 +2403,9 @@ void SelfDefenseImpl::StopWatchdog(std::string_view authorizationToken) {
         return;
     }
     if (m_watchdogRunning.exchange(false, std::memory_order_acq_rel)) {
+        {
+            std::lock_guard<std::mutex> wlock(m_watchdogMutex);
+        }
         m_watchdogCv.notify_all();
         if (m_watchdogThread.joinable()) m_watchdogThread.join();
         UpdateComponentStatus(ProtectionComponent::Watchdog, false, ComponentHealth::Unknown);
@@ -2353,12 +2502,39 @@ std::vector<ComponentStatus> SelfDefenseImpl::GetAllComponentStatuses() const {
 void SelfDefenseImpl::WatchdogThreadFunc() {
     SS_LOG_INFO(LOG_CATEGORY, L"Watchdog thread started");
     while (m_watchdogRunning.load(std::memory_order_acquire)) {
+        // Sleep on a dedicated mutex/CV so the watchdog never holds m_mutex
+        // during its idle interval. Holding m_mutex (even in shared mode)
+        // across wait_for serialized every writer in the engine — including
+        // ProtectProcess / UnprotectProcess / Shutdown — for up to
+        // watchdogIntervalMs at a time.
+        const auto intervalMs = m_config.watchdogIntervalMs;
         {
-            std::shared_lock lock(m_mutex);
-            m_watchdogCv.wait_for(lock, Milliseconds(m_config.watchdogIntervalMs),
+            std::unique_lock<std::mutex> wlock(m_watchdogMutex);
+            m_watchdogCv.wait_for(wlock, Milliseconds(intervalMs),
                 [this] { return !m_watchdogRunning.load(std::memory_order_relaxed); });
         }
         if (!m_watchdogRunning.load(std::memory_order_acquire)) break;
+
+        // Auto-resume if a bounded pause window has elapsed.
+        if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) {
+            const auto deadlineNs = m_pauseDeadlineNs.load(std::memory_order_acquire);
+            if (deadlineNs != 0) {
+                const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (nowNs >= deadlineNs) {
+                    m_pauseDeadlineNs.store(0, std::memory_order_release);
+                    auto expectedPaused = ModuleStatus::Paused;
+                    if (m_status.compare_exchange_strong(expectedPaused, ModuleStatus::Running,
+                                                          std::memory_order_acq_rel)) {
+                        SS_LOG_WARN(LOG_CATEGORY, L"Self-defense auto-resumed after pause deadline elapsed");
+                    }
+                }
+            }
+            // While paused, skip the active checks below.
+            if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) {
+                continue;
+            }
+        }
 
         // Check heartbeat freshness
         auto now = Clock::now();
@@ -2623,9 +2799,20 @@ std::string SelfDefenseImpl::GenerateAuthorizationToken(std::string_view purpose
 }
 
 bool SelfDefenseImpl::VerifyAuthorizationToken(std::string_view token) const {
-    if (token.empty() || m_authSecret.empty()) {
-        // During shutdown (empty secret) or destructor, allow empty token
-        return m_authSecret.empty();
+    // The empty-token success path is reserved exclusively for the destructor
+    // teardown sequence (ShutdownInternal -> m_shutdownInProgress=true).
+    // Outside of that window, an empty token MUST fail even when m_authSecret
+    // is empty (e.g., between Shutdown and a subsequent Initialize). This
+    // prevents a hostile caller from issuing privileged operations such as
+    // UnprotectProcess / ClearThreatHistory / ResetStatistics simply by
+    // passing an empty token before re-initialization.
+    if (token.empty()) {
+        return m_shutdownInProgress.load(std::memory_order_acquire);
+    }
+    if (m_authSecret.empty()) {
+        // No active secret. Only the teardown path may accept this; we've
+        // already short-circuited empty tokens above, so reject the rest.
+        return false;
     }
 
     // Parse v2 token as hex(hmac):expiryTs:hex(purpose).
@@ -2782,7 +2969,23 @@ void SelfDefenseImpl::RegisterKernelHandler() {
 }
 
 void SelfDefenseImpl::UnregisterKernelHandler() {
-    m_kernelHandlerRegistered.store(false, std::memory_order_release);
+    // Flip the local flag so any in-flight callback that has already entered
+    // the registered lambda short-circuits before touching `this`.
+    if (!m_kernelHandlerRegistered.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    // IPCManager::RegisterGenericHandler stores a single callable. Clearing it
+    // is the only way to drop our `this`-capturing lambda and prevent IPCManager
+    // from dispatching into a destroyed SelfDefenseImpl after Shutdown. This
+    // mirrors the pattern used by FileProtection on its own teardown.
+    if (Communication::IPCManager::HasInstance()) {
+        try {
+            Communication::IPCManager::Instance().RegisterGenericHandler(nullptr);
+        } catch (...) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Exception while clearing IPC kernel handler during shutdown");
+        }
+    }
+    SS_LOG_INFO(LOG_CATEGORY, L"Kernel SelfProtectAlert handler unregistered");
 }
 
 void SelfDefenseImpl::SyncProtectedProcessesToKernel() {
@@ -2877,7 +3080,28 @@ void SelfDefenseImpl::OnKernelSelfProtectEventInternal(const void* data, uint32_
     }
 
     ThreatEvent evt;
-    evt.type = ThreatType::ProcessTermination;
+    // Derive the canonical threat classification from the access mask, matching
+    // the same priority order used by FilterAccessRequest(): code-injection
+    // signals (CREATE_THREAD) outrank memory-modification signals (VM_WRITE /
+    // VM_OPERATION) which outrank termination, with suspend/resume as the
+    // residual class. Misclassifying a CreateRemoteThread injection as a
+    // process-termination event would route it to the wrong response policy
+    // and skew per-threat statistics.
+    if ((accessMask & PROCESS_CREATE_THREAD) != 0) {
+        evt.type = ThreatType::CodeInjection;
+        // CodeInjection is tracked via RecordThreatEvent->IncrementThreatTypeStat.
+    } else if ((accessMask & (PROCESS_VM_WRITE | PROCESS_VM_OPERATION)) != 0) {
+        evt.type = ThreatType::MemoryModification;
+        m_stats.memoryModificationBlocked.fetch_add(1, std::memory_order_relaxed);
+    } else if ((accessMask & PROCESS_TERMINATE) != 0) {
+        evt.type = ThreatType::ProcessTermination;
+        m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
+    } else if ((accessMask & PROCESS_SUSPEND_RESUME) != 0) {
+        evt.type = ThreatType::ProcessSuspension;
+    } else {
+        evt.type = ThreatType::ProcessTermination;
+        m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
+    }
     evt.attackerProcessId = attackerPid;
     evt.attackerProcessName = GetProcessName(attackerPid);
     evt.attackerProcessPath = GetProcessImagePath(attackerPid);
@@ -2890,8 +3114,6 @@ void SelfDefenseImpl::OnKernelSelfProtectEventInternal(const void* data, uint32_
     if (!description.empty()) {
         evt.details["kernel_description"] = Utils::StringUtils::ToNarrow(description);
     }
-
-    m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
 
     SS_LOG_WARN(LOG_CATEGORY, L"KERNEL: PID %u attempted 0x%08X on protected PID %u — BLOCKED",
                attackerPid, accessMask, targetPid);
