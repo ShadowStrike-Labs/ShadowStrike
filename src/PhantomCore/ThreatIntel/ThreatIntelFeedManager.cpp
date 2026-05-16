@@ -316,9 +316,15 @@ bool AuthCredentials::NeedsTokenRefresh() const noexcept {
     if (accessToken.empty()) return true;
     if (tokenExpiry == 0) return false;
     
-    // Refresh 5 minutes before expiry
-    uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
-    return now >= (tokenExpiry - 300);
+    // Refresh 5 minutes before expiry. Guard against underflow when tokenExpiry
+    // is less than the refresh window (misconfigured/test value): in that case
+    // the token must be refreshed immediately.
+    constexpr uint64_t kRefreshWindowSeconds = 300;
+    if (tokenExpiry <= kRefreshWindowSeconds) {
+        return true;
+    }
+    const uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
+    return now >= (tokenExpiry - kRefreshWindowSeconds);
 }
 
 void AuthCredentials::Clear() noexcept {
@@ -1261,53 +1267,6 @@ ThreatIntelFeedManager::~ThreatIntelFeedManager() {
     }
 }
 
-ThreatIntelFeedManager::ThreatIntelFeedManager(ThreatIntelFeedManager&& other) noexcept 
-    : m_config{}
-    , m_running{false}
-    , m_shutdown{false}
-    , m_initialized{false}
-{
-    // Lock the other object and transfer state
-    std::unique_lock<std::shared_mutex> feedsLock(other.m_feedsMutex);
-    std::lock_guard<std::mutex> parsersLock(other.m_parsersMutex);
-    
-    m_config = std::move(other.m_config);
-    m_feeds = std::move(other.m_feeds);
-    m_parsers = std::move(other.m_parsers);
-    m_running.store(other.m_running.load(std::memory_order_acquire), std::memory_order_release);
-    m_initialized.store(other.m_initialized.load(std::memory_order_acquire), std::memory_order_release);
-    
-    // Reset other's state
-    other.m_running.store(false, std::memory_order_release);
-    other.m_initialized.store(false, std::memory_order_release);
-}
-
-ThreatIntelFeedManager& ThreatIntelFeedManager::operator=(ThreatIntelFeedManager&& other) noexcept {
-    if (this != &other) {
-        // First shutdown this instance
-        Shutdown();
-        
-        // Lock both objects (consistent ordering to prevent deadlock)
-        std::unique_lock<std::shared_mutex> thisLock(m_feedsMutex, std::defer_lock);
-        std::unique_lock<std::shared_mutex> otherLock(other.m_feedsMutex, std::defer_lock);
-        std::lock(thisLock, otherLock);
-        
-        std::lock_guard<std::mutex> thisParsersLock(m_parsersMutex);
-        std::lock_guard<std::mutex> otherParsersLock(other.m_parsersMutex);
-        
-        m_config = std::move(other.m_config);
-        m_feeds = std::move(other.m_feeds);
-        m_parsers = std::move(other.m_parsers);
-        m_running.store(other.m_running.load(std::memory_order_acquire), std::memory_order_release);
-        m_initialized.store(other.m_initialized.load(std::memory_order_acquire), std::memory_order_release);
-        
-        // Reset other's state
-        other.m_running.store(false, std::memory_order_release);
-        other.m_initialized.store(false, std::memory_order_release);
-    }
-    return *this;
-}
-
 // ============================================================================
 // INITIALIZATION & LIFECYCLE
 // ============================================================================
@@ -1343,35 +1302,57 @@ bool ThreatIntelFeedManager::Initialize(const Config& config) {
             
             const std::filesystem::path dataPath(m_config.dataDirectory);
             
-            // First check: Reject paths with obvious traversal patterns
-            const std::string pathStr = dataPath.string();
-            if (pathStr.find("..") != std::string::npos) {
-                SS_LOG_ERROR(L"ThreatIntelFeedManager", 
-                    L"Security: Path contains traversal sequence: %S", pathStr.c_str());
-                m_initialized.store(false, std::memory_order_release);
-                return false;
+            // First check: Reject paths with traversal sequence components.
+            // Walk each component so legitimate names containing ".." substrings
+            // (e.g., "my..app") are not rejected, while genuine "../" traversal
+            // is caught regardless of position.
+            for (const auto& comp : dataPath) {
+                if (comp.string() == "..") {
+                    SS_LOG_ERROR(L"ThreatIntelFeedManager",
+                        L"Security: Path contains traversal component: %S",
+                        dataPath.string().c_str());
+                    m_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
             }
             
-            // Check for Windows device names
-            static const std::array<std::string_view, 12> reservedNames = {
+            // Check for Windows reserved device names in EVERY path component
+            // (not just the leaf). E.g., "C:\\data\\CON\\feeds" must be rejected
+            // even though the filename is "feeds".
+            static constexpr std::array<std::string_view, 22> reservedNames = {
                 "CON", "PRN", "AUX", "NUL",
-                "COM1", "COM2", "COM3", "COM4",
-                "LPT1", "LPT2", "LPT3", "LPT4"
+                "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
             };
             
-            std::string filename = dataPath.filename().string();
-            // Convert to uppercase for comparison
-            std::transform(filename.begin(), filename.end(), filename.begin(), ::toupper);
-            // Remove extension
-            auto dotPos = filename.find('.');
-            if (dotPos != std::string::npos) {
-                filename = filename.substr(0, dotPos);
-            }
+            auto isReservedComponent = [](std::string stem) -> bool {
+                // Use only the portion before the first '.' for comparison.
+                const auto dotPos = stem.find('.');
+                if (dotPos != std::string::npos) {
+                    stem.resize(dotPos);
+                }
+                std::transform(stem.begin(), stem.end(), stem.begin(),
+                    [](unsigned char c) { return static_cast<char>(::toupper(c)); });
+                for (const auto& reserved : reservedNames) {
+                    if (stem == reserved) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             
-            for (const auto& reserved : reservedNames) {
-                if (filename == reserved) {
-                    SS_LOG_ERROR(L"ThreatIntelFeedManager", 
-                        L"Security: Path contains reserved device name");
+            for (const auto& comp : dataPath) {
+                const std::string compStr = comp.string();
+                if (compStr.empty() || compStr == "/" || compStr == "\\") {
+                    continue;
+                }
+                // Skip Windows drive root (e.g., "C:")
+                if (compStr.size() == 2 && compStr[1] == ':') {
+                    continue;
+                }
+                if (isReservedComponent(compStr)) {
+                    SS_LOG_ERROR(L"ThreatIntelFeedManager",
+                        L"Security: Path contains reserved device name component");
                     m_initialized.store(false, std::memory_order_release);
                     return false;
                 }
@@ -1380,24 +1361,45 @@ bool ThreatIntelFeedManager::Initialize(const Config& config) {
             // Create directories
             std::filesystem::create_directories(dataPath);
             
-            // Second check: Get canonical path and verify it resolves properly
+            // Second check: Resolve canonical path. canonical() removes any
+            // remaining ".." or symlink indirection; weakly_canonical handles
+            // paths that may not fully exist yet. If neither succeeds we treat
+            // the path as untrusted and refuse to use it.
             std::error_code ec;
-            const auto canonicalPath = std::filesystem::canonical(dataPath, ec);
+            auto canonicalPath = std::filesystem::canonical(dataPath, ec);
             if (ec) {
-                SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                ec.clear();
+                canonicalPath = std::filesystem::weakly_canonical(dataPath, ec);
+            }
+            if (ec) {
+                SS_LOG_ERROR(L"ThreatIntelFeedManager",
                     L"Security: Failed to canonicalize path: %S", ec.message().c_str());
                 m_initialized.store(false, std::memory_order_release);
                 return false;
             }
             
-            // Third check: Verify canonical path doesn't escape expected location
-            // The canonical path should not contain ".." after resolution
-            const std::string canonicalStr = canonicalPath.string();
-            if (canonicalStr.find("..") != std::string::npos) {
-                SS_LOG_ERROR(L"ThreatIntelFeedManager", 
-                    L"Security: Canonical path still contains traversal");
-                m_initialized.store(false, std::memory_order_release);
-                return false;
+            // Re-verify components after canonicalization (symlinks may have
+            // resolved into a reserved name or traversal sequence).
+            for (const auto& comp : canonicalPath) {
+                const std::string compStr = comp.string();
+                if (compStr == "..") {
+                    SS_LOG_ERROR(L"ThreatIntelFeedManager",
+                        L"Security: Canonical path contains traversal");
+                    m_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+                if (compStr.empty() || compStr == "/" || compStr == "\\") {
+                    continue;
+                }
+                if (compStr.size() == 2 && compStr[1] == ':') {
+                    continue;
+                }
+                if (isReservedComponent(compStr)) {
+                    SS_LOG_ERROR(L"ThreatIntelFeedManager",
+                        L"Security: Canonical path contains reserved device name");
+                    m_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
             }
             
             // Verify we can write to the directory
@@ -1750,7 +1752,7 @@ bool ThreatIntelFeedManager::AddFeed(const ThreatFeedConfig& config) {
     }
     
     try {
-        auto context = std::make_unique<FeedContext>();
+        auto context = std::make_shared<FeedContext>();
         context->config = config;
         context->rateLimit = std::make_unique<RateLimitConfig>(config.rateLimit);
         context->stats.status.store(FeedSyncStatus::Idle, std::memory_order_release);
@@ -1985,33 +1987,30 @@ bool ThreatIntelFeedManager::EnableFeed(const std::string& feedId) {
         return false;
     }
     
-    std::unique_lock<std::shared_mutex> lock(m_feedsMutex);
-    
-    auto it = m_feeds.find(feedId);
-    if (it == m_feeds.end() || !it->second || it->second->config.enabled) {
-        return false;
+    // Capture a shared_ptr to the context while holding the unique_lock so it
+    // remains valid after we release the map lock to emit events / schedule.
+    std::shared_ptr<FeedContext> ctx;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_feedsMutex);
+        auto it = m_feeds.find(feedId);
+        if (it == m_feeds.end() || !it->second || it->second->config.enabled) {
+            return false;
+        }
+        
+        it->second->config.enabled = true;
+        it->second->stats.status.store(FeedSyncStatus::Idle, std::memory_order_release);
+        it->second->cancelRequested.store(false, std::memory_order_release);
+        m_stats.enabledFeeds.fetch_add(1, std::memory_order_relaxed);
+        
+        ctx = it->second;  // shared_ptr copy keeps context alive
     }
     
-    it->second->config.enabled = true;
-    it->second->stats.status.store(FeedSyncStatus::Idle, std::memory_order_release);
-    it->second->cancelRequested.store(false, std::memory_order_release);
-    m_stats.enabledFeeds.fetch_add(1, std::memory_order_relaxed);
+    EmitEvent(FeedEventType::FeedEnabled, feedId);
     
-    const bool isRunning = m_running.load(std::memory_order_acquire);
-    FeedContext* contextPtr = it->second.get();
-    const std::string feedIdCopy = feedId;
-    
-    // Emit event without holding lock
-    lock.unlock();
-    EmitEvent(FeedEventType::FeedEnabled, feedIdCopy);
-    
-    if (isRunning && contextPtr) {
-        std::shared_lock<std::shared_mutex> readLock(m_feedsMutex);
-        // Re-validate context is still valid after releasing lock
-        auto itCheck = m_feeds.find(feedIdCopy);
-        if (itCheck != m_feeds.end() && itCheck->second.get() == contextPtr) {
-            ScheduleNextSync(*contextPtr);
-        }
+    if (m_running.load(std::memory_order_acquire) && ctx) {
+        // Safe: shared_ptr ownership guarantees the context is alive even if
+        // RemoveFeed has erased the map entry concurrently.
+        ScheduleNextSync(*ctx);
     }
     
     return true;
@@ -2075,7 +2074,12 @@ SyncResult ThreatIntelFeedManager::SyncFeed(
         return result;
     }
     
-    FeedContext* context = nullptr;
+    // Capture a shared_ptr to the context while holding the shared_lock so the
+    // FeedContext remains alive across the entire ExecuteSync call (which
+    // performs network I/O and may run for seconds-to-minutes), even if a
+    // concurrent RemoveFeed erases the map entry. Capturing a raw pointer here
+    // would produce a use-after-free.
+    std::shared_ptr<FeedContext> ctx;
     {
         std::shared_lock<std::shared_mutex> lock(m_feedsMutex);
         auto it = m_feeds.find(feedId);
@@ -2085,10 +2089,10 @@ SyncResult ThreatIntelFeedManager::SyncFeed(
             result.errorMessage = "Feed not found";
             return result;
         }
-        context = it->second.get();
+        ctx = it->second;
     }
     
-    return ExecuteSync(*context, SyncTrigger::Manual, std::move(progressCallback));
+    return ExecuteSync(*ctx, SyncTrigger::Manual, std::move(progressCallback));
 }
 
 std::future<SyncResult> ThreatIntelFeedManager::SyncFeedAsync(
@@ -2424,18 +2428,21 @@ void ThreatIntelFeedManager::SetAuthRefreshCallback(AuthRefreshCallback callback
 
 void ThreatIntelFeedManager::SetTargetDatabase(std::shared_ptr<ThreatIntelDatabase> database) {
     if (database) {
+        std::unique_lock<std::shared_mutex> lk(m_depsMutex);
         m_database = std::move(database);
     }
 }
 
 void ThreatIntelFeedManager::SetTargetStore(std::shared_ptr<ThreatIntelStore> store) {
     if (store) {
+        std::unique_lock<std::shared_mutex> lk(m_depsMutex);
         m_store = std::move(store);
     }
 }
 
 void ThreatIntelFeedManager::SetHttpClient(std::shared_ptr<IHttpClient> client) {
     if (client) {
+        std::unique_lock<std::shared_mutex> lk(m_depsMutex);
         m_httpClient = std::move(client);
     }
 }
@@ -2852,12 +2859,17 @@ void ThreatIntelFeedManager::WorkerThread() {
             m_taskQueue.pop();
         }
         
-        // Acquire sync slot using condition variable (safer than semaphore)
+        // Acquire sync slot using condition variable (safer than semaphore).
+        // Honor the operator-configured ceiling (m_config.maxConcurrentSyncs)
+        // rather than the hardcoded compile-time constant; MAX_CONCURRENT_SYNCS
+        // is retained as an absolute upper bound enforced by Config::Validate.
         {
             std::unique_lock<std::mutex> syncLock(m_syncLimiterMutex);
-            const bool acquired = m_syncLimiterCv.wait_for(syncLock, std::chrono::seconds(30), [this]() {
+            const uint32_t limit = std::max<uint32_t>(1u,
+                std::min<uint32_t>(m_config.maxConcurrentSyncs, MAX_CONCURRENT_SYNCS_CEILING));
+            const bool acquired = m_syncLimiterCv.wait_for(syncLock, std::chrono::seconds(30), [this, limit]() {
                 return m_shutdown.load(std::memory_order_acquire) ||
-                       m_activeSyncCount.load(std::memory_order_acquire) < MAX_CONCURRENT_SYNCS;
+                       m_activeSyncCount.load(std::memory_order_acquire) < limit;
             });
             
             if (m_shutdown.load(std::memory_order_acquire)) break;
@@ -2868,18 +2880,21 @@ void ThreatIntelFeedManager::WorkerThread() {
         
         // Execute sync with exception safety
         try {
-            FeedContext* context = nullptr;
+            // Capture a shared_ptr while holding the lock. RemoveFeed may erase
+            // the map entry while we run ExecuteSync; the shared_ptr keeps the
+            // FeedContext alive for the duration of this iteration.
+            std::shared_ptr<FeedContext> ctx;
             {
                 std::shared_lock<std::shared_mutex> lock(m_feedsMutex);
                 auto it = m_feeds.find(task.feedId);
                 if (it != m_feeds.end() && it->second) {
-                    context = it->second.get();
+                    ctx = it->second;
                 }
             }
             
-            if (context && context->config.enabled && 
-                !context->cancelRequested.load(std::memory_order_acquire)) {
-                SyncResult result = ExecuteSync(*context, task.trigger, task.progressCallback);
+            if (ctx && ctx->config.enabled && 
+                !ctx->cancelRequested.load(std::memory_order_acquire)) {
+                SyncResult result = ExecuteSync(*ctx, task.trigger, task.progressCallback);
                 
                 if (task.completionCallback) {
                     try {
@@ -3277,7 +3292,7 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
         response.error = "Invalid URL scheme (only https supported for threat intelligence feeds)";
         return response;
     }
-    if (isHttp && !isHttps) {
+    if (!isHttps) {
         // Plain HTTP feeds are a MITM vector — attacker can inject false IOCs
         EmitEvent(FeedEventType::HealthWarning, context.config.feedId,
                  "SECURITY: Feed URL uses plain HTTP - rejecting to prevent IOC injection attacks");
@@ -3287,27 +3302,54 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
     
     // SSRF protection: reject URLs targeting internal/private networks
     {
-        // Extract hostname from URL (after "http://" or "https://")
+        // Extract authority component from URL (between "://" and the next "/?#").
         const size_t schemeEnd = url.find("://");
         if (schemeEnd == std::string::npos) {
             response.error = "Malformed URL: missing scheme separator";
             return response;
         }
-        const size_t hostStart = schemeEnd + 3;
-        const size_t hostEnd = url.find_first_of(":/?#", hostStart);
-        const std::string host = url.substr(hostStart, 
-            (hostEnd != std::string::npos) ? (hostEnd - hostStart) : std::string::npos);
+        const size_t authorityStart = schemeEnd + 3;
+        const size_t authorityEnd = url.find_first_of("/?#", authorityStart);
+        const std::string authority = url.substr(authorityStart,
+            (authorityEnd != std::string::npos) ? (authorityEnd - authorityStart) : std::string::npos);
         
-        // Block localhost variants
+        // Reject embedded userinfo ("user:pass@host"). The host-extraction
+        // routine below would otherwise read "user" or "user:pass" as the host,
+        // bypassing private-IP prefix checks and letting WinINet/Wininet
+        // resolve and connect to a different target. Credentials in URLs are
+        // also a bad practice for threat feeds — auth belongs in Authorization
+        // headers via AuthCredentials.
+        if (authority.find('@') != std::string::npos) {
+            response.error = "SSRF blocked: URL embeds userinfo (user:pass@host) - "
+                             "use AuthCredentials for authentication";
+            return response;
+        }
+        
+        // Strip optional port to get the host component.
+        std::string host;
+        if (!authority.empty() && authority.front() == '[') {
+            // Bracketed IPv6 host: "[...]" optionally followed by ":port".
+            const size_t rb = authority.find(']');
+            if (rb == std::string::npos) {
+                response.error = "Malformed URL: unterminated IPv6 host";
+                return response;
+            }
+            host = authority.substr(0, rb + 1);  // keep brackets for comparison
+        } else {
+            const size_t colon = authority.find(':');
+            host = (colon == std::string::npos) ? authority : authority.substr(0, colon);
+        }
+        
+        // Block localhost variants (IPv4 and IPv6)
         if (host == "localhost" || host.starts_with("127.") || host == "::1" ||
-            host == "0.0.0.0" || host == "[::1]") {
+            host == "0.0.0.0" || host == "[::1]" || host == "[0:0:0:0:0:0:0:1]") {
             response.error = "SSRF blocked: localhost targets are not permitted";
             return response;
         }
         
-        // Block private/reserved IPv4 ranges via simple prefix check
-        // Full resolution-based check is not feasible without DNS, but prefix filtering
-        // catches direct IP usage (the primary SSRF vector)
+        // Block private/reserved IPv4 ranges via simple prefix check.
+        // Full resolution-based check is not feasible without DNS, but prefix
+        // filtering catches direct IP usage (the primary SSRF vector).
         static constexpr std::string_view kBlockedPrefixes[] = {
             "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
             "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
@@ -3317,6 +3359,31 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
         for (const auto& prefix : kBlockedPrefixes) {
             if (host.starts_with(prefix)) {
                 response.error = "SSRF blocked: private/reserved IP range not permitted";
+                return response;
+            }
+        }
+        
+        // Block bracketed IPv6 private/reserved ranges (link-local fe80::/10,
+        // unique local fc00::/7, IPv4-mapped ::ffff:0:0/96 used to wrap
+        // private IPv4 like ::ffff:127.0.0.1).
+        if (!host.empty() && host.front() == '[' && host.size() >= 3) {
+            // host == "[xxxx...]"
+            std::string inner = host.substr(1, host.size() - 2);
+            std::string innerLower;
+            innerLower.reserve(inner.size());
+            for (char c : inner) {
+                innerLower.push_back(static_cast<char>(
+                    (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c));
+            }
+            const bool isLinkLocal =
+                innerLower.starts_with("fe8") || innerLower.starts_with("fe9") ||
+                innerLower.starts_with("fea") || innerLower.starts_with("feb");
+            const bool isUniqueLocal =
+                innerLower.starts_with("fc") || innerLower.starts_with("fd");
+            const bool isIPv4Mapped =
+                innerLower.starts_with("::ffff:") || innerLower.starts_with("::");
+            if (isLinkLocal || isUniqueLocal || isIPv4Mapped) {
+                response.error = "SSRF blocked: private/reserved IPv6 range not permitted";
                 return response;
             }
         }
@@ -3337,7 +3404,16 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
      * 
      * Enterprise-grade design: Dependency injection for testability
      */
-    if (m_httpClient) {
+    // Snapshot the configurable HTTP client under m_depsMutex. Reading the
+    // shared_ptr concurrently with Set*() without synchronization is a data
+    // race on the raw pointer slot (control-block refcount is atomic, the
+    // pointer is not).
+    std::shared_ptr<IHttpClient> httpClient;
+    {
+        std::shared_lock<std::shared_mutex> lk(m_depsMutex);
+        httpClient = m_httpClient;
+    }
+    if (httpClient) {
         try {
             // Build HTTP request with authentication
             HttpRequest request{};  // Aggregate initialization
@@ -3372,7 +3448,7 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
             }
             
             // Execute request using custom client
-            response = m_httpClient->Execute(request);
+            response = httpClient->Execute(request);
             
             return response;
             
@@ -3895,9 +3971,16 @@ bool ThreatIntelFeedManager::StoreIOCs(
     constexpr size_t CANCELLATION_CHECK_INTERVAL = 1000;
     constexpr size_t PROGRESS_UPDATE_INTERVAL = 5000;
     
-    // Get store reference - prefer ThreatIntelStore if available (has caching)
-    auto store = m_store;  // Thread-safe shared_ptr copy
-    auto database = m_database;  // Thread-safe shared_ptr copy
+    // Get store reference - prefer ThreatIntelStore if available (has caching).
+    // Snapshot under m_depsMutex so concurrent Set*() calls cannot race with
+    // these copies (the shared_ptr pointer slot is not atomic on its own).
+    std::shared_ptr<ThreatIntelStore> store;
+    std::shared_ptr<ThreatIntelDatabase> database;
+    {
+        std::shared_lock<std::shared_mutex> lk(m_depsMutex);
+        store = m_store;
+        database = m_database;
+    }
     
     // Cancellation flag from progress callback
     bool cancelRequested = false;
@@ -4812,7 +4895,11 @@ bool ThreatIntelFeedManager::RefreshOAuth2Token(FeedContext& context) {
     }
     
     // Fallback: Check if we have an HTTP client that can handle the POST
-    auto httpClient = m_httpClient;  // Thread-safe copy
+    std::shared_ptr<IHttpClient> httpClient;
+    {
+        std::shared_lock<std::shared_mutex> lk(m_depsMutex);
+        httpClient = m_httpClient;
+    }
     if (httpClient) {
         HttpRequest request;
         request.url = auth.tokenUrl;
@@ -4921,7 +5008,33 @@ void ThreatIntelFeedManager::EmitEvent(FeedEventType type, const std::string& fe
     
     if (callback) {
         try {
-            FeedEvent event = FeedEvent::Create(type, feedId, message);
+            // Sanitize feed-controlled strings to prevent log/event injection:
+            // strip CR/LF, control characters, and DEL, and cap length. Callers
+            // (parsers, HTTP responses, etc.) may pass server-controlled bytes.
+            auto sanitize = [](const std::string& in) -> std::string {
+                constexpr size_t kMaxLen = 1024;
+                std::string out;
+                out.reserve(std::min(in.size(), kMaxLen));
+                size_t budget = kMaxLen;
+                for (char c : in) {
+                    if (budget == 0) break;
+                    const unsigned char uc = static_cast<unsigned char>(c);
+                    if (uc < 0x20 || uc == 0x7F) {
+                        // Replace control characters with a single space to
+                        // preserve token boundaries without enabling injection.
+                        out.push_back(' ');
+                    } else {
+                        out.push_back(c);
+                    }
+                    --budget;
+                }
+                if (in.size() > kMaxLen) {
+                    out.append("...[truncated]");
+                }
+                return out;
+            };
+            
+            FeedEvent event = FeedEvent::Create(type, sanitize(feedId), sanitize(message));
             callback(event);
         } catch (const std::exception&) {
             // Swallow callback exceptions to prevent caller disruption

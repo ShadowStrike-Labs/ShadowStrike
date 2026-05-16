@@ -693,14 +693,15 @@ struct FeedStats {
             currentRetryAttempt.store(other.currentRetryAttempt.load(std::memory_order_relaxed), std::memory_order_relaxed);
             nextScheduledSync.store(other.nextScheduledSync.load(std::memory_order_relaxed), std::memory_order_relaxed);
             syncProgress.store(other.syncProgress.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            // Deadlock-free paired lock acquisition: scoped_lock uses std::lock
+            // internally to avoid AB/BA lock-order inversion when two threads
+            // perform `a = b` and `b = a` concurrently.
             {
-                std::lock_guard<std::mutex> lock1(other.errorMutex);
-                std::lock_guard<std::mutex> lock2(errorMutex);
+                std::scoped_lock lk(other.errorMutex, errorMutex);
                 lastErrorMessage = other.lastErrorMessage;
             }
             {
-                std::lock_guard<std::mutex> lock1(other.phaseMutex);
-                std::lock_guard<std::mutex> lock2(phaseMutex);
+                std::scoped_lock lk(other.phaseMutex, phaseMutex);
                 currentPhase = other.currentPhase;
             }
         }
@@ -708,12 +709,14 @@ struct FeedStats {
     }
     
     // Move constructor
-    FeedStats(FeedStats&& other) noexcept
+    // Not noexcept: we must hold `other`'s mutexes while moving its string
+    // members, because GetFeedStats()/callers may race with SetLastError().
+    // Moving a std::string read by another thread is UB without a lock.
+    FeedStats(FeedStats&& other)
         : status(other.status.load(std::memory_order_relaxed))
         , lastSuccessfulSync(other.lastSuccessfulSync.load(std::memory_order_relaxed))
         , lastSyncAttempt(other.lastSyncAttempt.load(std::memory_order_relaxed))
         , lastErrorTime(other.lastErrorTime.load(std::memory_order_relaxed))
-        , lastErrorMessage(std::move(other.lastErrorMessage))
         , totalSuccessfulSyncs(other.totalSuccessfulSyncs.load(std::memory_order_relaxed))
         , totalFailedSyncs(other.totalFailedSyncs.load(std::memory_order_relaxed))
         , totalIOCsFetched(other.totalIOCsFetched.load(std::memory_order_relaxed))
@@ -726,17 +729,25 @@ struct FeedStats {
         , consecutiveErrors(other.consecutiveErrors.load(std::memory_order_relaxed))
         , currentRetryAttempt(other.currentRetryAttempt.load(std::memory_order_relaxed))
         , nextScheduledSync(other.nextScheduledSync.load(std::memory_order_relaxed))
-        , syncProgress(other.syncProgress.load(std::memory_order_relaxed))
-        , currentPhase(std::move(other.currentPhase)) {}
+        , syncProgress(other.syncProgress.load(std::memory_order_relaxed)) {
+        {
+            std::lock_guard<std::mutex> lk(other.errorMutex);
+            lastErrorMessage = std::move(other.lastErrorMessage);
+        }
+        {
+            std::lock_guard<std::mutex> lk(other.phaseMutex);
+            currentPhase = std::move(other.currentPhase);
+        }
+    }
     
     // Move assignment
-    FeedStats& operator=(FeedStats&& other) noexcept {
+    // Not noexcept: see move constructor rationale.
+    FeedStats& operator=(FeedStats&& other) {
         if (this != &other) {
             status.store(other.status.load(std::memory_order_relaxed), std::memory_order_relaxed);
             lastSuccessfulSync.store(other.lastSuccessfulSync.load(std::memory_order_relaxed), std::memory_order_relaxed);
             lastSyncAttempt.store(other.lastSyncAttempt.load(std::memory_order_relaxed), std::memory_order_relaxed);
             lastErrorTime.store(other.lastErrorTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            lastErrorMessage = std::move(other.lastErrorMessage);
             totalSuccessfulSyncs.store(other.totalSuccessfulSyncs.load(std::memory_order_relaxed), std::memory_order_relaxed);
             totalFailedSyncs.store(other.totalFailedSyncs.load(std::memory_order_relaxed), std::memory_order_relaxed);
             totalIOCsFetched.store(other.totalIOCsFetched.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -750,7 +761,14 @@ struct FeedStats {
             currentRetryAttempt.store(other.currentRetryAttempt.load(std::memory_order_relaxed), std::memory_order_relaxed);
             nextScheduledSync.store(other.nextScheduledSync.load(std::memory_order_relaxed), std::memory_order_relaxed);
             syncProgress.store(other.syncProgress.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            currentPhase = std::move(other.currentPhase);
+            {
+                std::scoped_lock lk(other.errorMutex, errorMutex);
+                lastErrorMessage = std::move(other.lastErrorMessage);
+            }
+            {
+                std::scoped_lock lk(other.phaseMutex, phaseMutex);
+                currentPhase = std::move(other.currentPhase);
+            }
         }
         return *this;
     }
@@ -1324,8 +1342,14 @@ public:
     // Non-copyable, movable
     ThreatIntelFeedManager(const ThreatIntelFeedManager&) = delete;
     ThreatIntelFeedManager& operator=(const ThreatIntelFeedManager&) = delete;
-    ThreatIntelFeedManager(ThreatIntelFeedManager&&) noexcept;
-    ThreatIntelFeedManager& operator=(ThreatIntelFeedManager&&) noexcept;
+    // Move operations deleted: the previous implementation transferred only a
+    // subset of members (m_feeds, m_parsers, atomics) and left worker/scheduler/
+    // health threads, queues, callbacks, and dependency shared_ptrs unmoved,
+    // resulting in a corrupted target instance whenever `other` was running.
+    // The manager owns long-lived threads bound to `this` and is fundamentally
+    // not move-safe; callers should hold it by pointer/reference.
+    ThreatIntelFeedManager(ThreatIntelFeedManager&&) = delete;
+    ThreatIntelFeedManager& operator=(ThreatIntelFeedManager&&) = delete;
     
     // ========================================================================
     // INITIALIZATION & LIFECYCLE
@@ -1716,8 +1740,12 @@ private:
     /// @brief Configuration
     Config m_config;
     
-    /// @brief Feed contexts (feedId -> context)
-    std::unordered_map<std::string, std::unique_ptr<FeedContext>> m_feeds;
+    /// @brief Feed contexts (feedId -> context).
+    /// Held by shared_ptr so that long-running operations (SyncFeed,
+    /// EnableFeed re-schedule, WorkerThread::ExecuteSync) can copy the
+    /// pointer under shared_lock and keep the FeedContext alive even if
+    /// RemoveFeed erases the map entry concurrently.
+    std::unordered_map<std::string, std::shared_ptr<FeedContext>> m_feeds;
     mutable std::shared_mutex m_feedsMutex;
     
     /// @brief Sync task queue
@@ -1746,13 +1774,19 @@ private:
     /// @brief Manager statistics
     FeedManagerStats m_stats;
     
-    /// @brief Target database
+    /// @brief Guards reads/writes of m_database, m_store, m_httpClient.
+    /// Non-atomic assignment to a std::shared_ptr from one thread while
+    /// another thread copies it is a data race on the pointer slot (the
+    /// control-block refcount is atomic, but the raw pointer member is not).
+    mutable std::shared_mutex m_depsMutex;
+    
+    /// @brief Target database (read/write under m_depsMutex)
     std::shared_ptr<ThreatIntelDatabase> m_database;
     
-    /// @brief Target store
+    /// @brief Target store (read/write under m_depsMutex)
     std::shared_ptr<ThreatIntelStore> m_store;
     
-    /// @brief HTTP client
+    /// @brief HTTP client (read/write under m_depsMutex)
     std::shared_ptr<IHttpClient> m_httpClient;
     
     /// @brief Parsers by protocol
@@ -1774,8 +1808,9 @@ private:
     /// @brief Active sync count
     std::atomic<uint32_t> m_activeSyncCount{0};
     
-    /// @brief Maximum concurrent syncs
-    static constexpr uint32_t MAX_CONCURRENT_SYNCS = 4;
+    /// @brief Absolute ceiling on concurrent syncs (Config::maxConcurrentSyncs
+    /// is further clamped to this value). 32 mirrors Config::Validate.
+    static constexpr uint32_t MAX_CONCURRENT_SYNCS_CEILING = 32;
     
     /// @brief Sync concurrency limiter mutex
     std::mutex m_syncLimiterMutex;
