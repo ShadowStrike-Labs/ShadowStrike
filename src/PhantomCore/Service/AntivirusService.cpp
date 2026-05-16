@@ -73,6 +73,7 @@
 #include "ProductExtensions.hpp"
 #include "HomeIpcDispatcher.hpp"
 #include "ServiceCommunicator.hpp"
+#include "IpcAuthToken.hpp"
 
 // ============================================================================
 // WINDOWS SDK
@@ -94,6 +95,56 @@ namespace Service {
 // LOGGING CATEGORY
 // ============================================================================
 static constexpr const wchar_t* LOG_CATEGORY = L"Service";
+
+// ============================================================================
+// IPC AUTH TOKEN PROVISIONING HELPERS
+// ============================================================================
+//
+// IpcAuthToken::Verify() consults an in-memory per-session token cache that is
+// only populated by EnsureForSession(). Without an explicit provisioning step
+// the cache is permanently cold and every UI AuthHandshake fails — every v2
+// command handler in HomeIpcDispatcher is unreachable. EnsureForSession is
+// therefore invoked at two well-defined service-lifecycle moments:
+//
+//   1. After IPC subsystems are running (Impl::Start), for the currently
+//      active console session.
+//   2. On WTS_SESSION_LOGON / WTS_CONSOLE_CONNECT session-change events, so a
+//      user logging in after service start receives a fresh token file.
+//
+// Provisioning failure is logged but never fatal: the service must continue
+// to provide kernel/realtime protection even when no interactive desktop is
+// available (Server Core, sessions where the user has no profile, etc.).
+namespace {
+
+void ProvisionIpcAuthToken(std::uint32_t sessionId, const wchar_t* reason) noexcept {
+    // Session 0 is the non-interactive services session and has no profile
+    // directory; WTSQueryUserToken would fail anyway.
+    if (sessionId == 0u || sessionId == 0xFFFFFFFFu) {
+        return;
+    }
+    try {
+        const std::string token = IpcAuthToken::EnsureForSession(sessionId);
+        if (token.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"IPC auth token provisioning failed for session %u (%ls)",
+                sessionId, reason ? reason : L"");
+        } else {
+            SS_LOG_INFO(LOG_CATEGORY,
+                L"IPC auth token provisioned for session %u (%ls)",
+                sessionId, reason ? reason : L"");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"IPC auth token provisioning threw for session %u: %hs",
+            sessionId, e.what());
+    } catch (...) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"IPC auth token provisioning threw unknown exception for session %u",
+            sessionId);
+    }
+}
+
+} // anonymous namespace
 
 // ============================================================================
 // STATIC INITIALIZATION
@@ -452,6 +503,13 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — HomeIpcDispatcher not installed");
             } else {
                 HomeIpcDispatcher::Instance().Install(ipcSvc);
+
+                // Provision per-session IPC auth token for the active console
+                // session so the first interactive UI launch can authenticate
+                // without waiting for a session-change event.
+                const DWORD activeConsole = ::WTSGetActiveConsoleSessionId();
+                ProvisionIpcAuthToken(static_cast<std::uint32_t>(activeConsole),
+                                      L"service-start");
             }
         }
 
@@ -1014,6 +1072,22 @@ void AntivirusService::OnSessionChange(DWORD eventType, WTSSESSION_NOTIFICATION*
 
     const DWORD sessionId = notification->dwSessionId;
     SS_LOG_INFO(LOG_CATEGORY, L"Session change event: type=%u sessionId=%u", eventType, sessionId);
+
+    // Provision (or refresh) the per-session IPC auth token whenever a user
+    // becomes interactively present. Logoff/lock events deliberately leave the
+    // cache entry intact: a subsequent logon for the same sessionId rotates it
+    // via EnsureForSession's first-writer-wins generator.
+    switch (eventType) {
+        case WTS_SESSION_LOGON:
+        case WTS_CONSOLE_CONNECT:
+        case WTS_REMOTE_CONNECT:
+        case WTS_SESSION_UNLOCK:
+            ProvisionIpcAuthToken(static_cast<std::uint32_t>(sessionId),
+                                  L"session-change");
+            break;
+        default:
+            break;
+    }
 
     // Broadcast session event to connected GUI/tray clients via ServiceCommunication
     if (Communication::ServiceCommunication::HasInstance() &&
