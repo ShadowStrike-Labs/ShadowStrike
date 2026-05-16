@@ -28,6 +28,49 @@
 namespace ShadowStrike {
 	namespace ThreatIntel {
 
+        namespace {
+
+        // Maximum nesting depth accepted by JSON / STIX / TAXII parsers.
+        // nlohmann::json::parse is recursive descent; an attacker-supplied
+        // payload of "[[[[[[..." can otherwise blow the worker thread's
+        // default 1 MB stack (~256 KiB of nesting is sufficient).
+        constexpr int kMaxJsonParseDepth = 100;
+
+        // Parser callback that enforces kMaxJsonParseDepth. Throws on excess
+        // depth so the surrounding try/catch reports a clean error and the
+        // partially-built tree is discarded.
+        inline bool DepthLimitedAccept(int depth,
+                                       nlohmann::json::parse_event_t /*event*/,
+                                       nlohmann::json& /*parsed*/) {
+            if (depth > kMaxJsonParseDepth) {
+                throw std::runtime_error("JSON nesting depth exceeds limit");
+            }
+            return true;
+        }
+
+        // Sanitises feed-controlled bytes that flow into m_lastError / logs.
+        // Replaces control characters (including CR/LF) with spaces and caps
+        // length, blocking log-line forgery from attacker-controlled payloads.
+        inline std::string SanitiseDiagnostic(std::string_view in) {
+            constexpr size_t kMaxLen = 512;
+            std::string out;
+            out.reserve(std::min<size_t>(in.size(), kMaxLen));
+            for (size_t i = 0; i < in.size() && i < kMaxLen; ++i) {
+                const unsigned char uc = static_cast<unsigned char>(in[i]);
+                if (uc < 0x20 || uc == 0x7F) {
+                    out.push_back(' ');
+                } else {
+                    out.push_back(static_cast<char>(uc));
+                }
+            }
+            if (in.size() > kMaxLen) {
+                out.append("...[truncated]");
+            }
+            return out;
+        }
+
+        }  // namespace
+
         // ============================================================================
         // JSON FEED PARSER IMPLEMENTATION
         // ============================================================================
@@ -53,9 +96,10 @@ namespace ShadowStrike {
             }
 
             try {
-                // Parse JSON with size validation
+                // Parse JSON with size validation and bounded recursion depth
                 std::string_view jsonView(reinterpret_cast<const char*>(data.data()), data.size());
-                nlohmann::json root = nlohmann::json::parse(jsonView);
+                nlohmann::json root = nlohmann::json::parse(
+                    jsonView.begin(), jsonView.end(), DepthLimitedAccept);
 
                 // Navigate to IOC array using path
                 nlohmann::json* iocArray = &root;
@@ -202,7 +246,7 @@ namespace ShadowStrike {
 
             }
             catch (const nlohmann::json::exception& e) {
-                m_lastError = "JSON parse error: " + std::string(e.what());
+                m_lastError = "JSON parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
             catch (const std::bad_alloc&) {
@@ -210,7 +254,7 @@ namespace ShadowStrike {
                 return false;
             }
             catch (const std::exception& e) {
-                m_lastError = "Parse error: " + std::string(e.what());
+                m_lastError = "Parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
         }
@@ -239,7 +283,8 @@ namespace ShadowStrike {
 
             try {
                 std::string_view jsonView(reinterpret_cast<const char*>(data.data()), data.size());
-                nlohmann::json root = nlohmann::json::parse(jsonView);
+                nlohmann::json root = nlohmann::json::parse(
+                    jsonView.begin(), jsonView.end(), DepthLimitedAccept);
 
                 nlohmann::json* iocArray = &root;
 
@@ -342,7 +387,7 @@ namespace ShadowStrike {
 
             }
             catch (const nlohmann::json::exception& e) {
-                m_lastError = "JSON parse error: " + std::string(e.what());
+                m_lastError = "JSON parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
             catch (const std::bad_alloc&) {
@@ -350,7 +395,7 @@ namespace ShadowStrike {
                 return false;
             }
             catch (const std::exception& e) {
-                m_lastError = "Streaming parse error: " + std::string(e.what());
+                m_lastError = "Streaming parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
         }
@@ -596,7 +641,7 @@ namespace ShadowStrike {
 
             }
             catch (const std::exception& e) {
-                m_lastError = "Entry parse error: " + std::string(e.what());
+                m_lastError = "Entry parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
         }
@@ -714,18 +759,44 @@ namespace ShadowStrike {
             }
 
             try {
-                std::string content(reinterpret_cast<const char*>(data.data()), data.size());
-                std::istringstream stream(content);
-                std::string line;
+                // Read directly from the byte span: building a separate
+                // std::string copy was costing 100 MB extra on the hot path
+                // (data is already owned by the caller for the lifetime of
+                // this call).
+                const char* const base = reinterpret_cast<const char*>(data.data());
+                size_t pos = 0;
+                size_t end = data.size();
+
+                // Strip UTF-8 BOM (EF BB BF) at the start of the stream.
+                if (end >= 3 &&
+                    static_cast<uint8_t>(base[0]) == 0xEF &&
+                    static_cast<uint8_t>(base[1]) == 0xBB &&
+                    static_cast<uint8_t>(base[2]) == 0xBF) {
+                    pos = 3;
+                }
 
                 bool firstLine = true;
                 size_t lineNum = 0;
 
-                // Pre-allocate with estimate
-                const size_t estimatedLines = std::count(content.begin(), content.end(), '\n');
-                outEntries.reserve(std::min(estimatedLines, size_t{ 100000 }));
+                // Reserve a conservative bucket; the previous std::count
+                // scan over a 100 MB buffer was itself a multi-hundred-MB/s
+                // hit. Reserving an exact line count is not worth a pre-pass.
+                outEntries.reserve(std::min<size_t>(MAX_LINE_COUNT, 16384));
 
-                while (std::getline(stream, line)) {
+                while (pos < end) {
+                    // Locate next newline.
+                    size_t lineEnd = pos;
+                    while (lineEnd < end && base[lineEnd] != '\n') ++lineEnd;
+
+                    size_t rawLen = lineEnd - pos;
+                    // Strip a trailing '\r' from CRLF files written on Windows.
+                    if (rawLen > 0 && base[pos + rawLen - 1] == '\r') {
+                        --rawLen;
+                    }
+
+                    std::string_view line(base + pos, rawLen);
+                    pos = (lineEnd < end) ? lineEnd + 1 : end;
+
                     lineNum++;
 
                     // Line count limit
@@ -866,7 +937,7 @@ namespace ShadowStrike {
                 return false;
             }
             catch (const std::exception& e) {
-                m_lastError = "CSV parse error: " + std::string(e.what());
+                m_lastError = "CSV parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
         }
@@ -1032,7 +1103,8 @@ namespace ShadowStrike {
             try {
                 // Safe string construction with size validation
                 std::string jsonStr(reinterpret_cast<const char*>(data.data()), data.size());
-                nlohmann::json root = nlohmann::json::parse(jsonStr);
+                nlohmann::json root = nlohmann::json::parse(
+                    jsonStr.begin(), jsonStr.end(), DepthLimitedAccept);
 
                 // STIX bundle structure validation
                 if (!root.is_object()) {
@@ -1134,7 +1206,7 @@ namespace ShadowStrike {
 
             }
             catch (const nlohmann::json::exception& e) {
-                m_lastError = "STIX JSON parse error: " + std::string(e.what());
+                m_lastError = "STIX JSON parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
             catch (const std::bad_alloc&) {
@@ -1142,7 +1214,7 @@ namespace ShadowStrike {
                 return false;
             }
             catch (const std::exception& e) {
-                m_lastError = "STIX parse error: " + std::string(e.what());
+                m_lastError = "STIX parse error: " + SanitiseDiagnostic(e.what());
                 return false;
             }
         }
@@ -1303,10 +1375,29 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // Find value in quotes - use proper quote matching
+            // Find the *first* opening single quote and its matching closing
+            // single quote, honouring backslash escapes. The previous
+            // implementation used find('\'') paired with rfind('\''), which
+            // collapsed compound patterns such as
+            //   [file:hashes.MD5 = 'aaa' AND ipv4-addr:value = 'bbb']
+            // into a single value that ran from the first quote to the last,
+            // silently mangling the IOC and dropping the second indicator.
             const size_t valueStart = rest.find('\'');
-            const size_t valueEnd = rest.rfind('\'');
-            if (valueStart == std::string::npos || valueEnd == std::string::npos || valueEnd <= valueStart) {
+            if (valueStart == std::string::npos) {
+                return false;
+            }
+            size_t valueEnd = std::string::npos;
+            for (size_t i = valueStart + 1; i < rest.size(); ++i) {
+                if (rest[i] == '\\' && i + 1 < rest.size()) {
+                    ++i;  // skip escaped character
+                    continue;
+                }
+                if (rest[i] == '\'') {
+                    valueEnd = i;
+                    break;
+                }
+            }
+            if (valueEnd == std::string::npos) {
                 return false;
             }
 
