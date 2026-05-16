@@ -943,9 +943,21 @@ public:
     
     /**
      * @brief Shutdown tamper protection
-     * @param authorizationToken Security token (empty triggers INTERNAL_SHUTDOWN for RAII dtor)
+     * @param authorizationToken Security token; must match the value returned
+     *        by GetInternalAuthToken() for trusted in-process callers, or a
+     *        valid SelfDefense-issued token when SelfDefense integration is
+     *        enabled. Destructor-driven teardown uses a private code path and
+     *        does not require a token.
      */
     void Shutdown(std::string_view authorizationToken = {});
+
+    /**
+     * @brief Returns the per-instance internal authorization token used by
+     *        trusted in-process callers (e.g. AntivirusService teardown) to
+     *        invoke auth-gated entry points such as Shutdown / Pause without
+     *        embedding a sentinel string in the binary.
+     */
+    [[nodiscard]] std::string GetInternalAuthToken() const;
     
     /**
      * @brief Check if initialized

@@ -438,6 +438,22 @@ TamperProtectionConfiguration TamperProtectionConfiguration::FromMode(TamperProt
     return "Multiple";
 }
 
+// Constant-time string comparison. XOR-folds the length difference into the
+// result so a mismatch in length does NOT short-circuit (prevents length
+// oracle). Mirrors ProcessProtection.cpp's helper — kept local to TU to avoid
+// cross-module header dependencies.
+[[nodiscard]] bool ConstantTimeCompare(std::string_view a, std::string_view b) noexcept {
+    const size_t lenA = a.size();
+    const size_t lenB = b.size();
+    const size_t minLen = (lenA < lenB) ? lenA : lenB;
+
+    volatile uint8_t result = static_cast<uint8_t>(lenA ^ lenB);
+    for (size_t i = 0; i < minLen; ++i) {
+        result |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
+    }
+    return result == 0;
+}
+
 [[nodiscard]] std::string_view GetSubsystemName(TamperSubsystem subsystem) noexcept {
     switch (subsystem) {
         case TamperSubsystem::FileProtection:      return "FileProtection";
@@ -460,7 +476,7 @@ TamperProtectionConfiguration TamperProtectionConfiguration::FromMode(TamperProt
 class TamperProtectionImpl final {
 public:
     TamperProtectionImpl() = default;
-    ~TamperProtectionImpl() { Shutdown("INTERNAL_SHUTDOWN"); }
+    ~TamperProtectionImpl() { ShutdownInternal(); }
 
     // Non-copyable, non-movable
     TamperProtectionImpl(const TamperProtectionImpl&) = delete;
@@ -473,6 +489,23 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool Initialize(const TamperProtectionConfiguration& config) {
+        // Reject re-entry from a second thread while a previous Initialize is
+        // still in flight. Initialize's body briefly drops m_mutex inside some
+        // subsystem inits; without this CAS guard a racing caller could
+        // observe m_status != Running and re-execute the whole sequence,
+        // regenerating m_internalAuthToken and invalidating every outstanding
+        // token mid-flight.
+        bool expected = false;
+        if (!m_initializing.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Initialize rejected: another Initialize is in progress");
+            return false;
+        }
+        struct InitGuard {
+            std::atomic<bool>& flag;
+            ~InitGuard() { flag.store(false, std::memory_order_release); }
+        } initGuard{m_initializing};
+
         std::unique_lock lock(m_mutex);
 
         if (m_status != ModuleStatus::Uninitialized &&
@@ -501,7 +534,9 @@ public:
             m_subsystemStatuses[static_cast<TamperSubsystem>(i)] = status;
         }
 
-        // Start monitoring thread if enabled
+        // Start monitoring thread if enabled. The monitor uses its own
+        // dedicated mutex/CV (m_monitorMutex / m_monitorCV) so it never
+        // contends with engine readers/writers on m_mutex during wait_for.
         if (m_config.enablePeriodicChecks) {
             m_monitorRunning = true;
             m_monitorThread = std::thread(&TamperProtectionImpl::MonitorLoop, this);
@@ -527,6 +562,21 @@ public:
     }
 
     void Shutdown(std::string_view authToken) {
+        // Public entry point: REQUIRES a valid authorization token. The
+        // previous implementation accepted the literal "INTERNAL_SHUTDOWN"
+        // string as an auth bypass — any in-process module (e.g. a malicious
+        // plugin DLL) knowing that hardcoded string could tear down the
+        // tamper-protection engine. Destructor-driven teardown now uses the
+        // private ShutdownInternal() entry point which is not reachable from
+        // outside this translation unit.
+        if (!VerifyAuthToken(authToken)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Shutdown attempt with invalid token");
+            return;
+        }
+        ShutdownInternal();
+    }
+
+    void ShutdownInternal() {
         std::unique_lock lock(m_mutex);
 
         if (m_status == ModuleStatus::Uninitialized ||
@@ -534,17 +584,16 @@ public:
             return;
         }
 
-        // Verify authorization (skip for internal shutdown)
-        if (authToken != "INTERNAL_SHUTDOWN" && !VerifyAuthToken(authToken)) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Shutdown attempt with invalid token");
-            return;
-        }
-
         m_status = ModuleStatus::Stopping;
 
-        // Stop monitor thread
-        m_monitorRunning = false;
-        m_monitorCV.notify_all();
+        // Signal the monitor thread to wake on its dedicated CV. Wake under
+        // the monitor mutex so notify is correctly synchronised with the
+        // monitor's wait_for predicate check.
+        m_monitorRunning.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> mlock(m_monitorMutex);
+            m_monitorCV.notify_all();
+        }
 
         lock.unlock();
 
@@ -572,6 +621,11 @@ public:
 
         m_status = ModuleStatus::Stopped;
         SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection shutdown complete");
+    }
+
+    [[nodiscard]] std::string GetInternalAuthToken() const {
+        std::shared_lock lock(m_mutex);
+        return m_internalAuthToken;
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
@@ -2271,11 +2325,26 @@ private:
             return false;
         }
 
-        if (token == m_internalAuthToken) {
+        // Snapshot the internal token under the shared lock, then compare in
+        // constant time outside the lock. Direct std::string equality leaks
+        // the length of the matching prefix via early-exit timing.
+        std::string snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot = m_internalAuthToken;
+        }
+        if (!snapshot.empty() && ConstantTimeCompare(token, snapshot)) {
             return true;
         }
 
-        if (m_config.enableSelfDefenseIntegration &&
+        // SelfDefense delegation is a separate authority — its own
+        // VerifyAuthorizationToken is responsible for its own timing safety.
+        bool selfDefenseEnabled = false;
+        {
+            std::shared_lock lock(m_mutex);
+            selfDefenseEnabled = m_config.enableSelfDefenseIntegration;
+        }
+        if (selfDefenseEnabled &&
             SelfDefense::HasInstance() &&
             SelfDefense::Instance().IsInitialized()) {
             return SelfDefense::Instance().VerifyAuthorizationToken(token);
@@ -2694,25 +2763,47 @@ private:
         SS_LOG_INFO(LOG_CATEGORY, L"Monitor loop started");
 
         while (m_monitorRunning.load(std::memory_order_acquire)) {
-            std::unique_lock lock(m_mutex);
-            m_monitorCV.wait_for(lock, Milliseconds(m_config.checkIntervalMs),
-                [this] { return !m_monitorRunning.load(std::memory_order_acquire); });
+            // Wait on a DEDICATED mutex/CV — never on m_mutex. The previous
+            // implementation held a unique_lock on m_mutex (EXCLUSIVE!) for
+            // the full checkIntervalMs (default several seconds, up to
+            // MAX_CHECK_INTERVAL_MS), serializing every reader and writer in
+            // the engine — ProtectFile, ProtectRegistryKey, GetStatistics,
+            // configuration mutations — behind the monitor sleep.
+            uint32_t intervalMs = 0;
+            {
+                std::shared_lock cfgLock(m_mutex);
+                intervalMs = m_config.checkIntervalMs;
+            }
+            {
+                std::unique_lock<std::mutex> wait(m_monitorMutex);
+                m_monitorCV.wait_for(wait, Milliseconds(intervalMs), [this] {
+                    return !m_monitorRunning.load(std::memory_order_acquire);
+                });
+            }
 
             if (!m_monitorRunning.load(std::memory_order_acquire)) break;
 
-            // Check if paused
+            // Honor pause window. Auto-clear when the deadline has elapsed.
             if (m_paused.load(std::memory_order_acquire)) {
-                if (Clock::now() > m_pauseEndTime) {
+                TimePoint deadline;
+                {
+                    std::shared_lock dLock(m_mutex);
+                    deadline = m_pauseEndTime;
+                }
+                if (Clock::now() > deadline) {
                     m_paused.store(false, std::memory_order_release);
                 } else {
                     continue;
                 }
             }
 
-            lock.unlock();
-
             // Perform periodic integrity checks
-            if (m_config.enablePeriodicChecks) {
+            bool periodic = false;
+            {
+                std::shared_lock cfgLock(m_mutex);
+                periodic = m_config.enablePeriodicChecks;
+            }
+            if (periodic) {
                 VerifyAllIntegrity();
             }
         }
@@ -2804,10 +2895,15 @@ private:
     std::vector<SubsystemStatusCallback> m_statusCallbacks;
     TamperResponseHandler m_responseHandler;
 
-    // Monitor thread
+    // Monitor thread — runs on its OWN mutex/CV, never on m_mutex, so a
+    // pending periodic sweep never blocks engine readers/writers.
     std::atomic<bool> m_monitorRunning{false};
     std::thread m_monitorThread;
-    std::condition_variable_any m_monitorCV;
+    mutable std::mutex m_monitorMutex;
+    std::condition_variable m_monitorCV;
+
+    // Re-entrancy guard for Initialize — see Initialize() comment.
+    std::atomic<bool> m_initializing{false};
 
     // Internal statistics — atomic for thread safety, snapshot via GetStatistics()
     struct InternalStats {
@@ -2842,9 +2938,11 @@ TamperProtection::TamperProtection()
 }
 
 TamperProtection::~TamperProtection() {
-    if (m_impl) {
-        m_impl->Shutdown("INTERNAL_SHUTDOWN");
-    }
+    // Reset PIMPL — the impl destructor calls ShutdownInternal() which bypasses
+    // auth. Previously we passed the literal sentinel "INTERNAL_SHUTDOWN"; that
+    // sentinel has been removed because any in-process module could pass it
+    // and tear the engine down without credentials.
+    m_impl.reset();
     s_instanceCreated.store(false, std::memory_order_release);
 }
 
@@ -2893,6 +2991,10 @@ TamperProtection::~TamperProtection() {
 
 void TamperProtection::Shutdown(std::string_view authToken) {
     m_impl->Shutdown(authToken);
+}
+
+std::string TamperProtection::GetInternalAuthToken() const {
+    return m_impl->GetInternalAuthToken();
 }
 
 [[nodiscard]] bool TamperProtection::IsInitialized() const noexcept {

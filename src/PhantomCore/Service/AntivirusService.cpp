@@ -635,7 +635,15 @@ public:
                 Security::ProcessProtection::Instance().GetInternalAuthToken());
         }
 
-        Security::TamperProtection::Instance().Shutdown("INTERNAL_SHUTDOWN");
+        // TamperProtection shutdown — authenticate via the runtime-issued
+        // internal token, matching the pattern used by ProcessProtection /
+        // MemoryProtection above. The previous "INTERNAL_SHUTDOWN" sentinel
+        // string was an auth bypass usable by any in-process module.
+        if (Security::TamperProtection::HasInstance() &&
+            Security::TamperProtection::Instance().IsInitialized()) {
+            Security::TamperProtection::Instance().Shutdown(
+                Security::TamperProtection::Instance().GetInternalAuthToken());
+        }
 
         // MemoryProtection shutdown (after TamperProtection so integrity
         // monitors are no longer checking our protected regions)
