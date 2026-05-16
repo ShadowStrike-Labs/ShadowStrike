@@ -42,6 +42,7 @@
 
 // STL
 #include <array>
+#include <atomic>
 #include <functional>
 #include <shared_mutex>
 #include <unordered_map>
@@ -231,8 +232,10 @@ private:
 /// Security implementation notes:
 ///   - `volatile unsigned char acc` forces the compiler to materialise every
 ///     store to `acc`; it cannot collapse or hoist the XOR loop.
-///   - `_ReadWriteBarrier()` is an MSVC full compiler fence that prevents the
-///     read of `acc` from being scheduled before the loop completes.
+///   - `std::atomic_signal_fence(std::memory_order_seq_cst)` is a portable
+///     C++20 compiler-only fence that prevents the read of `acc` from being
+///     scheduled before the loop completes. (It replaces the legacy
+///     MSVC-specific `_ReadWriteBarrier()` intrinsic, which is deprecated.)
 ///   - Together these provide defence-in-depth against compiler timing
 ///     side-channels under /O2.  Hardware-level constant-time guarantees
 ///     are architecture-dependent; x64 conditional moves ensure no branch.
@@ -249,7 +252,7 @@ private:
     }
 
     // Compiler memory fence: prevents reordering the `acc` read before the loop.
-    _ReadWriteBarrier();
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 
     return acc == 0;
 }
@@ -493,6 +496,17 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
     return TokenCache::Instance().GetOrGenerate(sessionId, [sessionId]() -> std::string
     {
         std::array<std::uint8_t, kNonceBytes> nonce{};
+
+        // Unconditional RAII scrub: every exit path from this block — success,
+        // logged failure, or unwinding exception — zeroes the raw nonce
+        // bytes. The previous implementation scrubbed only on the Base64
+        // failure path and on success, leaving the secret in stack memory if
+        // the function returned for any other reason.
+        struct NonceScrub {
+            std::array<std::uint8_t, kNonceBytes>& n;
+            ~NonceScrub() { ::RtlSecureZeroMemory(n.data(), n.size()); }
+        } scrubNonce{nonce};
+
         if (!GenerateNonce(nonce)) {
             SS_LOG_ERROR(kLogCat,
                 L"EnsureForSession: nonce generation failed for session %u", sessionId);
@@ -503,10 +517,8 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
         if (!ShadowStrike::Utils::Base64Encode(nonce.data(), nonce.size(), tokenB64)) {
             SS_LOG_ERROR(kLogCat,
                 L"EnsureForSession: Base64Encode failed for session %u", sessionId);
-            RtlSecureZeroMemory(nonce.data(), nonce.size());
             return {};
         }
-        RtlSecureZeroMemory(nonce.data(), nonce.size());
 
         HANDLE rawUserToken = nullptr;
         if (!::WTSQueryUserToken(sessionId, &rawUserToken)) {
