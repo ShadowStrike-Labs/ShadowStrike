@@ -974,6 +974,16 @@ StoreError YaraRuleStore::Initialize(
         return err;
     }
 
+    // TITANIUM: take the global lock exclusively so concurrent Initialize/Close
+    // cannot race on m_mappedView, m_rules and m_ruleMetadata. Re-check
+    // m_initialized after acquiring the lock to be idempotent under contention.
+    std::unique_lock<std::shared_mutex> initLock(m_globalLock);
+
+    if (m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"Initialize: Already initialized (race)");
+        return StoreError{SignatureStoreError::Success};
+    }
+
     m_databasePath = databasePath;
     m_readOnly.store(readOnly, std::memory_order_release);
 
@@ -1362,7 +1372,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanBuffer(
     // TITANIUM VALIDATION LAYER - BUFFER SCANNING
     // ========================================================================
     
-    // VALIDATION 1: Initialization state
+    // VALIDATION 1: Initialization state (fast unlocked path)
     if (!m_initialized.load(std::memory_order_acquire)) {
         SS_LOG_WARN(L"YaraRuleStore", L"ScanBuffer: Store not initialized");
         return {};
@@ -1386,14 +1396,44 @@ std::vector<YaraMatch> YaraRuleStore::ScanBuffer(
             buffer.size(), YaraTitaniumLimits::MAX_SCAN_BUFFER_SIZE);
         return {};
     }
-    
-    // VALIDATION 5: Rules loaded check
-    if (!m_rules) {
-        SS_LOG_WARN(L"YaraRuleStore", L"ScanBuffer: No compiled rules loaded");
-        return {};
+
+    // TITANIUM CRITICAL: acquire the global shared lock for the entire scan.
+    // Close() holds the same lock exclusively while destroying m_rules and
+    // clearing m_ruleMetadata; without this guard a concurrent Close() can
+    // free YR_RULES while yr_rules_scan_mem is still dereferencing it
+    // (use-after-free) or clear m_ruleMetadata while the callback iterates it.
+    // The shared_lock is recursive-safe across distinct threads but MUST NOT be
+    // held by callers of ScanBuffer (verified for ScanFile, ScanContext).
+    std::vector<YaraMatch> results;
+    {
+        std::shared_lock<std::shared_mutex> scanLock(m_globalLock);
+
+        // Re-check initialization under the lock — Close() may have run between
+        // the unlocked fast-path check and lock acquisition.
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_DEBUG(L"YaraRuleStore", L"ScanBuffer: Store closed during entry");
+            return {};
+        }
+
+        // VALIDATION 5: Rules loaded check (now race-free under the lock)
+        if (!m_rules) {
+            SS_LOG_WARN(L"YaraRuleStore", L"ScanBuffer: No compiled rules loaded");
+            return {};
+        }
+
+        results = PerformScan(buffer.data(), buffer.size(), options);
     }
 
-    return PerformScan(buffer.data(), buffer.size(), options);
+    // Lock released. Apply deferred best-effort hit-count updates now that we
+    // can safely take m_globalLock exclusively from UpdateRuleHitCount.
+    for (const auto& match : results) {
+        if (!match.ruleName.empty()) {
+            const std::string ns = match.namespace_.empty() ? "default" : match.namespace_;
+            const_cast<YaraRuleStore*>(this)->UpdateRuleHitCount(ns + "::" + match.ruleName);
+        }
+    }
+
+    return results;
 }
 
 std::vector<YaraMatch> YaraRuleStore::ScanFile(
@@ -1546,13 +1586,24 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
         // Allow but warn - may fail due to permissions
     }
 
-    // VALIDATION 4: Initialization state
+    // VALIDATION 4: Initialization state (fast unlocked path)
     if (!m_initialized.load(std::memory_order_acquire)) {
         SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: Store not initialized");
         return matches;
     }
 
-    // VALIDATION 5: Rules loaded check
+    // TITANIUM CRITICAL: hold the global shared lock for the entire scan to
+    // prevent Close() from destroying m_rules / clearing m_ruleMetadata while
+    // yr_rules_scan_proc and its callback are still using them.
+    std::shared_lock<std::shared_mutex> scanLock(m_globalLock);
+
+    // Re-check initialization under the lock.
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_DEBUG(L"YaraRuleStore", L"ScanProcess: Store closed during entry");
+        return matches;
+    }
+
+    // VALIDATION 5: Rules loaded check (race-free under the lock)
     if (!m_rules) {
         SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: No compiled rules loaded");
         return matches;
@@ -1712,8 +1763,8 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
 
             ctx->matches->push_back(std::move(match));
 
-            // Update best-effort hit statistics (const_cast safe: UpdateRuleHitCount uses try_to_lock)
-            const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(fullName);
+            // TITANIUM: hit-count updates are deferred (see PerformScan
+            // comment); recursive acquisition of m_globalLock is unsupported.
         }
 
         return CALLBACK_CONTINUE;
@@ -1768,6 +1819,18 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
         matches.clear();
     }
 
+    // Release the global shared lock before applying deferred best-effort
+    // hit-count updates (UpdateRuleHitCount takes m_globalLock exclusively;
+    // recursive acquisition on the same thread is unsupported).
+    scanLock.unlock();
+
+    for (const auto& match : matches) {
+        if (!match.ruleName.empty()) {
+            const std::string ns = match.namespace_.empty() ? "default" : match.namespace_;
+            const_cast<YaraRuleStore*>(this)->UpdateRuleHitCount(ns + "::" + match.ruleName);
+        }
+    }
+
     return matches;
 }
 
@@ -1815,16 +1878,30 @@ std::vector<YaraMatch> YaraRuleStore::ScanContext::FeedChunk(
         return {};
     }
     
-    // VALIDATION 4: Buffer overflow protection
+    // VALIDATION 4: Buffer overflow protection.
+    // Compute the cap-check without unsigned wraparound: m_buffer.size() and
+    // chunk.size() can each approach SIZE_MAX in theory; do the comparison in
+    // the form `chunk.size() > MAX - m_buffer.size()` to avoid overflow.
     constexpr size_t MAX_CONTEXT_BUFFER = 100 * 1024 * 1024; // 100MB max
-    if (m_buffer.size() + chunk.size() > MAX_CONTEXT_BUFFER) {
-        SS_LOG_ERROR(L"YaraRuleStore", 
-            L"ScanContext::FeedChunk: Buffer would exceed limit (%zu + %zu > %zu)",
-            m_buffer.size(), chunk.size(), MAX_CONTEXT_BUFFER);
-        // Force scan current buffer and clear
-        auto results = m_store->ScanBuffer(m_buffer, m_options);
+
+    // If the chunk alone exceeds the cap, reject it outright — there is no
+    // safe way to accumulate it.
+    if (chunk.size() > MAX_CONTEXT_BUFFER) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"ScanContext::FeedChunk: Chunk exceeds cap (%zu > %zu)",
+            chunk.size(), MAX_CONTEXT_BUFFER);
+        return {};
+    }
+
+    std::vector<YaraMatch> drainResults;
+    if (chunk.size() > MAX_CONTEXT_BUFFER - m_buffer.size()) {
+        SS_LOG_DEBUG(L"YaraRuleStore",
+            L"ScanContext::FeedChunk: Accumulator full, draining %zu bytes before accumulating",
+            m_buffer.size());
+        if (!m_buffer.empty()) {
+            drainResults = m_store->ScanBuffer(m_buffer, m_options);
+        }
         m_buffer.clear();
-        return results;
     }
     
     // Add chunk to buffer
@@ -1834,7 +1911,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanContext::FeedChunk(
     } catch (const std::bad_alloc&) {
         SS_LOG_ERROR(L"YaraRuleStore", L"ScanContext::FeedChunk: Memory allocation failed");
         m_buffer.clear();
-        return {};
+        return drainResults;
     }
 
     // Scan when buffer reaches threshold (10MB)
@@ -1842,10 +1919,20 @@ std::vector<YaraMatch> YaraRuleStore::ScanContext::FeedChunk(
     if (m_buffer.size() >= SCAN_THRESHOLD) {
         auto results = m_store->ScanBuffer(m_buffer, m_options);
         m_buffer.clear();
+        if (!drainResults.empty()) {
+            try {
+                results.insert(results.end(),
+                    std::make_move_iterator(drainResults.begin()),
+                    std::make_move_iterator(drainResults.end()));
+            } catch (const std::bad_alloc&) {
+                SS_LOG_WARN(L"YaraRuleStore",
+                    L"ScanContext::FeedChunk: failed to merge drain results (OOM)");
+            }
+        }
         return results;
     }
 
-    return {};
+    return drainResults;
 }
 
 std::vector<YaraMatch> YaraRuleStore::ScanContext::Finalize() noexcept {
@@ -2083,8 +2170,11 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
             ctx->matches->push_back(std::move(match));
             ctx->totalMatchesAdded++;
 
-            // Update best-effort hit statistics (const_cast safe: uses try_to_lock, non-critical)
-            const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(fullName);
+            // TITANIUM: hit-count updates are deferred to after PerformScan
+            // releases m_scanMutex AND the caller releases the shared_lock on
+            // m_globalLock. UpdateRuleHitCount needs to acquire the global
+            // lock exclusively; recursive acquisition (shared then exclusive)
+            // on the same thread is unsupported by std::shared_mutex.
 
             return CALLBACK_CONTINUE;
         };
