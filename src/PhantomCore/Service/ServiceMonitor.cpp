@@ -73,17 +73,24 @@ namespace ShadowStrike {
             std::atomic<bool> m_stopRequested{false};
             mutable std::shared_mutex m_statsMutex;
 
+            // Interruptible sleep: lets Stop() wake the monitor thread
+            // immediately instead of waiting up to one poll quantum.
+            std::mutex m_sleepMutex;
+            std::condition_variable m_sleepCv;
+
             // Configuration
             std::atomic<uint64_t> m_maxMemoryBytes{1024 * 1024 * 512}; // 512 MB default
             std::atomic<double> m_maxCpuPercent{25.0};                 // 25% default
-            std::chrono::milliseconds m_heartbeatTimeout{30000};       // 30 seconds default
+            // Heartbeat timeout in milliseconds (atomic for lock-free reads
+            // from the monitor thread while a config thread updates it).
+            std::atomic<int64_t> m_heartbeatTimeoutMs{30000};
 
-            // State
+            // State (guarded by m_statsMutex unless noted)
             std::chrono::steady_clock::time_point m_lastHeartbeat;
             std::chrono::steady_clock::time_point m_startTime;
             ServiceHealthStats m_currentStats;
 
-            // CPU Calculation helpers
+            // CPU Calculation helpers (touched only by the monitor thread)
             ULARGE_INTEGER m_lastCpuSysTime{};
             ULARGE_INTEGER m_lastCpuUserTime{};
             ULARGE_INTEGER m_lastSysCpuTime{};
@@ -134,7 +141,10 @@ namespace ShadowStrike {
             }
 
             m_stopRequested = false;
-            m_lastHeartbeat = std::chrono::steady_clock::now();
+            {
+                std::unique_lock lock(m_statsMutex);
+                m_lastHeartbeat = std::chrono::steady_clock::now();
+            }
 
             try {
                 m_monitorThread = std::thread(&ServiceMonitorImpl::MonitorLoop, this);
@@ -153,8 +163,20 @@ namespace ShadowStrike {
             }
 
             m_stopRequested = true;
+            // Wake the monitor thread out of its interruptible sleep so the
+            // shutdown path doesn't have to wait for a full poll quantum.
+            {
+                std::lock_guard sleepLock(m_sleepMutex);
+            }
+            m_sleepCv.notify_all();
+
             if (m_monitorThread.joinable()) {
-                m_monitorThread.join();
+                try {
+                    m_monitorThread.join();
+                } catch (const std::system_error& e) {
+                    SS_LOG_ERROR(kServiceMonitorLogCategory,
+                        L"Monitor thread join failed: %hs", e.what());
+                }
             }
             SS_LOG_INFO(kServiceMonitorLogCategory, L"Monitoring thread stopped");
         }
@@ -190,7 +212,7 @@ namespace ShadowStrike {
                     {"limits", {
                         {"maxMemoryBytes", m_maxMemoryBytes.load()},
                         {"maxCpuPercent", m_maxCpuPercent.load()},
-                        {"heartbeatTimeoutMs", m_heartbeatTimeout.count()}
+                        {"heartbeatTimeoutMs", m_heartbeatTimeoutMs.load(std::memory_order_acquire)}
                     }}
                 };
 
@@ -213,24 +235,45 @@ namespace ShadowStrike {
         }
 
         void ServiceMonitor::ServiceMonitorImpl::SetHeartbeatTimeout(std::chrono::milliseconds timeout) {
-            m_heartbeatTimeout = timeout;
+            if (timeout <= std::chrono::milliseconds::zero()) {
+                SS_LOG_WARN(kServiceMonitorLogCategory,
+                    L"Refusing non-positive heartbeat timeout (%lld ms); keeping previous value.",
+                    static_cast<long long>(timeout.count()));
+                return;
+            }
+            m_heartbeatTimeoutMs.store(timeout.count(), std::memory_order_release);
         }
 
         void ServiceMonitor::ServiceMonitorImpl::MonitorLoop() {
-            while (!m_stopRequested) {
-                CollectMetrics();
+            using namespace std::chrono_literals;
+            // Bounded polling interval — the inner sleep is interruptible via
+            // m_sleepCv, so Stop() returns promptly even under a long sleep.
+            constexpr auto kPollInterval = 1000ms;
 
-                // Sleep for 1 second
-                for (int i = 0; i < 10; ++i) {
-                    if (m_stopRequested) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            while (!m_stopRequested.load(std::memory_order_acquire)) {
+                try {
+                    CollectMetrics();
+                } catch (const std::exception& e) {
+                    // Swallow but log — a transient OS API failure must NOT
+                    // tear down the monitor thread silently. Health visibility
+                    // is the whole point of this subsystem.
+                    SS_LOG_ERROR(kServiceMonitorLogCategory,
+                        L"CollectMetrics threw: %hs", e.what());
+                } catch (...) {
+                    SS_LOG_ERROR(kServiceMonitorLogCategory,
+                        L"CollectMetrics threw an unknown exception");
                 }
+
+                std::unique_lock sleepLock(m_sleepMutex);
+                m_sleepCv.wait_for(sleepLock, kPollInterval, [this] {
+                    return m_stopRequested.load(std::memory_order_acquire);
+                });
             }
         }
 
         double ServiceMonitor::ServiceMonitorImpl::CalculateCpuUsage() {
-            FILETIME ftime, fsys, fuser;
-            ULARGE_INTEGER now, sys, user;
+            FILETIME ftime;
+            ULARGE_INTEGER now;
             double percent = 0.0;
 
             GetSystemTimeAsFileTime(&ftime);
@@ -240,31 +283,38 @@ namespace ShadowStrike {
             FILETIME ftCreation, ftExit, ftKernel, ftUser;
 
             if (GetProcessTimes(hProcess, &ftCreation, &ftExit, &ftKernel, &ftUser)) {
-                ULARGE_INTEGER uKernel, uUser;
+                ULARGE_INTEGER uKernel{}, uUser{};
                 uKernel.LowPart = ftKernel.dwLowDateTime;
                 uKernel.HighPart = ftKernel.dwHighDateTime;
                 uUser.LowPart = ftUser.dwLowDateTime;
                 uUser.HighPart = ftUser.dwHighDateTime;
 
                 if (!m_firstCpuSample) {
-                    ULONGLONG sysDiff = now.QuadPart - m_lastSysCpuTime.QuadPart;
-                    ULONGLONG userDiff = (uKernel.QuadPart - m_lastCpuSysTime.QuadPart) + (uUser.QuadPart - m_lastCpuUserTime.QuadPart);
+                    // Wall-clock delta (100-ns ticks).
+                    const ULONGLONG sysDiff =
+                        (now.QuadPart >= m_lastSysCpuTime.QuadPart)
+                            ? (now.QuadPart - m_lastSysCpuTime.QuadPart) : 0ULL;
+
+                    // Process CPU time delta (kernel + user, 100-ns ticks).
+                    const ULONGLONG kernelDelta =
+                        (uKernel.QuadPart >= m_lastCpuSysTime.QuadPart)
+                            ? (uKernel.QuadPart - m_lastCpuSysTime.QuadPart) : 0ULL;
+                    const ULONGLONG userDelta =
+                        (uUser.QuadPart >= m_lastCpuUserTime.QuadPart)
+                            ? (uUser.QuadPart - m_lastCpuUserTime.QuadPart) : 0ULL;
+                    const ULONGLONG processDelta = kernelDelta + userDelta;
 
                     if (sysDiff > 0) {
-                        // Needs to be divided by number of processors usually, but for process specific usage:
-                        // Total system time difference vs process time difference
-                        // CPU percent: (process time delta) / (wall clock delta × num processors)
-                        // This normalizes per-process usage against total available CPU capacity
-
-                        // Let's use a simpler approach relative to wall clock
-                        // Percent = (Process Time Delta) / (Wall Clock Delta * NumProcessors)
-
                         SYSTEM_INFO sysInfo;
                         GetSystemInfo(&sysInfo);
-
-                        if (sysDiff > 0) {
-                             percent = (double)(userDiff * 100.0) / (double)(sysDiff * sysInfo.dwNumberOfProcessors);
-                        }
+                        const DWORD numProc = sysInfo.dwNumberOfProcessors
+                                                  ? sysInfo.dwNumberOfProcessors : 1u;
+                        // (process time delta) / (wall-clock delta * numProc) * 100
+                        percent = static_cast<double>(processDelta) * 100.0
+                                / (static_cast<double>(sysDiff)
+                                   * static_cast<double>(numProc));
+                        if (percent < 0.0)   percent = 0.0;
+                        if (percent > 100.0) percent = 100.0;
                     }
                 }
 
@@ -281,8 +331,10 @@ namespace ShadowStrike {
             ServiceHealthStats newStats;
 
             // 1. Memory and Handles
-            PROCESS_MEMORY_COUNTERS_EX pmc;
-            if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                     sizeof(pmc))) {
                 newStats.memoryUsageBytes = pmc.PrivateUsage;
             }
 
@@ -294,26 +346,45 @@ namespace ShadowStrike {
             // 2. CPU
             newStats.cpuUsagePercent = CalculateCpuUsage();
 
-            // 3. Uptime
-            auto now = std::chrono::steady_clock::now();
-            newStats.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(now - m_startTime).count();
-
-            // 4. Thread count via ToolHelp32 snapshot
+            // 3. Uptime — read m_startTime under the stats lock (it is set in
+            // the constructor and never reassigned, but read here for parity
+            // with the protected access discipline).
+            const auto now = std::chrono::steady_clock::now();
+            std::chrono::steady_clock::time_point startTimeSnapshot;
+            std::chrono::steady_clock::time_point heartbeatSnapshot;
             {
-                DWORD pid = GetCurrentProcessId();
-                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-                if (hSnap != INVALID_HANDLE_VALUE) {
+                std::shared_lock lock(m_statsMutex);
+                startTimeSnapshot = m_startTime;
+                heartbeatSnapshot = m_lastHeartbeat;
+            }
+            newStats.uptimeSeconds =
+                std::chrono::duration_cast<std::chrono::seconds>(now - startTimeSnapshot).count();
+
+            // 4. Thread count via ToolHelp32 snapshot — wrap the snapshot
+            // handle in a RAII guard so an exception while iterating cannot
+            // leak the kernel handle.
+            {
+                const DWORD pid = GetCurrentProcessId();
+                HANDLE rawSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (rawSnap != INVALID_HANDLE_VALUE) {
+                    struct SnapDeleter {
+                        void operator()(HANDLE h) const noexcept {
+                            if (h && h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+                        }
+                    };
+                    std::unique_ptr<void, SnapDeleter> hSnap(rawSnap);
+
                     uint64_t count = 0;
-                    THREADENTRY32 te = {};
+                    THREADENTRY32 te{};
                     te.dwSize = sizeof(THREADENTRY32);
-                    if (Thread32First(hSnap, &te)) {
+                    if (Thread32First(hSnap.get(), &te)) {
                         do {
                             if (te.th32OwnerProcessID == pid) {
                                 ++count;
                             }
-                        } while (Thread32Next(hSnap, &te));
+                            te.dwSize = sizeof(THREADENTRY32);
+                        } while (Thread32Next(hSnap.get(), &te));
                     }
-                    CloseHandle(hSnap);
                     newStats.threadCount = count;
                 }
             }
@@ -324,7 +395,8 @@ namespace ShadowStrike {
             status << "OK";
 
             // Check Limits
-            if (newStats.memoryUsageBytes > m_maxMemoryBytes) {
+            const uint64_t memLimit = m_maxMemoryBytes.load(std::memory_order_acquire);
+            if (memLimit != 0 && newStats.memoryUsageBytes > memLimit) {
                 healthy = false;
                 status.str("");
                 status << "High Memory Usage: " << (newStats.memoryUsageBytes / 1024 / 1024) << "MB";
@@ -332,15 +404,19 @@ namespace ShadowStrike {
                     static_cast<unsigned long long>(newStats.memoryUsageBytes));
             }
 
-            if (newStats.cpuUsagePercent > m_maxCpuPercent.load()) {
+            const double cpuLimit = m_maxCpuPercent.load(std::memory_order_acquire);
+            if (newStats.cpuUsagePercent > cpuLimit) {
                 // CPU spikes are normal during scans; only flag sustained overuse
                 SS_LOG_WARN(kServiceMonitorLogCategory, L"CPU usage %.1f%% exceeds threshold %.1f%%",
-                    newStats.cpuUsagePercent, m_maxCpuPercent.load());
+                    newStats.cpuUsagePercent, cpuLimit);
             }
 
             // Check Hang (Heartbeat)
-            auto timeSinceLastHeartbeat = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastHeartbeat);
-            if (timeSinceLastHeartbeat > m_heartbeatTimeout) {
+            const auto timeSinceLastHeartbeat =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - heartbeatSnapshot);
+            const std::chrono::milliseconds heartbeatTimeout{
+                m_heartbeatTimeoutMs.load(std::memory_order_acquire)};
+            if (timeSinceLastHeartbeat > heartbeatTimeout) {
                 healthy = false;
                 status.str("");
                 status << "Service Hung (No Heartbeat for " << timeSinceLastHeartbeat.count() << "ms)";
