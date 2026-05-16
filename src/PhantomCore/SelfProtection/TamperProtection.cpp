@@ -1039,13 +1039,16 @@ public:
 
         for (const auto& file : criticalFiles) {
             auto fullPath = installDir / file;
-            if (std::filesystem::exists(fullPath)) {
-                ProtectFile(fullPath.wstring(), true);
+            if (std::filesystem::exists(fullPath) &&
+                !ProtectFile(fullPath.wstring(), true)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to protect critical installation file: %ls", fullPath.c_str());
             }
         }
 
         // Protect the entire installation directory (non-critical)
-        ProtectDirectory(installDir.wstring(), true);
+        if (!ProtectDirectory(installDir.wstring(), true)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to protect installation directory: %ls", installDir.c_str());
+        }
 
         return true;
     }
@@ -1087,7 +1090,9 @@ public:
         baseline.status = IntegrityStatus::Valid;
 
         // Compute registry key hash
-        ComputeRegistryHashInternal(path, baseline.contentHash);
+        if (!ComputeRegistryHashInternal(path, baseline.contentHash)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to compute registry baseline hash: %ls", path.c_str());
+        }
 
         {
             std::unique_lock lock(m_mutex);
@@ -1140,7 +1145,11 @@ public:
         result.expectedHash = it->second.contentHash;
 
         Hash256 currentHash{};
-        ComputeRegistryHashInternal(path, currentHash);
+        if (!ComputeRegistryHashInternal(path, currentHash)) {
+            result.status = IntegrityStatus::Unknown;
+            result.errorMessage = "Failed to compute registry hash";
+            return result;
+        }
         result.computedHash = currentHash;
         result.hashMatch = (result.expectedHash == result.computedHash);
 
@@ -1177,7 +1186,9 @@ public:
         };
 
         for (const auto& key : serviceKeys) {
-            ProtectRegistryKey(key, true);
+            if (!ProtectRegistryKey(key, true)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to protect service registry key: %ls", key);
+            }
         }
 
         SS_LOG_INFO(LOG_CATEGORY, L"Protected service registry keys");
@@ -1217,7 +1228,9 @@ public:
         baseline.status = IntegrityStatus::Valid;
 
         // Compute process memory hash
-        ComputeProcessHashInternal(processId, baseline.contentHash);
+        if (!ComputeProcessHashInternal(processId, baseline.contentHash)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to compute process baseline hash for PID %u", processId);
+        }
 
         {
             std::unique_lock lock(m_mutex);
@@ -1245,7 +1258,11 @@ public:
         result.expectedHash = it->second.contentHash;
 
         Hash256 currentHash{};
-        ComputeProcessHashInternal(processId, currentHash);
+        if (!ComputeProcessHashInternal(processId, currentHash)) {
+            result.status = IntegrityStatus::Unknown;
+            result.errorMessage = "Failed to compute process hash";
+            return result;
+        }
         result.computedHash = currentHash;
         result.hashMatch = (result.expectedHash == result.computedHash);
 
@@ -1468,7 +1485,9 @@ public:
     [[nodiscard]] Hash256 ComputeFileHash(std::wstring_view filePath, VerificationMethod method) {
         Hash256 hash{};
         std::wstring path(filePath);
-        ComputeFileHashInternal(path, method, hash);
+        if (!ComputeFileHashInternal(path, method, hash)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to compute file hash: %ls", path.c_str());
+        }
         return hash;
     }
 
@@ -1561,7 +1580,8 @@ public:
 
     void ForceIntegrityCheck() {
         SS_LOG_INFO(LOG_CATEGORY, L"Forced integrity check initiated");
-        VerifyAllIntegrity();
+        const auto results = VerifyAllIntegrity();
+        SS_LOG_INFO(LOG_CATEGORY, L"Forced integrity check completed for %zu resources", results.size());
     }
 
     // ========================================================================
@@ -2804,7 +2824,8 @@ private:
                 periodic = m_config.enablePeriodicChecks;
             }
             if (periodic) {
-                VerifyAllIntegrity();
+                const auto results = VerifyAllIntegrity();
+                SS_LOG_DEBUG(LOG_CATEGORY, L"Periodic integrity check completed for %zu resources", results.size());
             }
         }
 
@@ -3346,10 +3367,14 @@ ResourceProtectionGuard::~ResourceProtectionGuard() {
     if (m_protected) {
         switch (m_type) {
             case ProtectedResourceType::File:
-                TamperProtection::Instance().UnprotectFile(m_resourcePath, m_authToken);
+                if (!TamperProtection::Instance().UnprotectFile(m_resourcePath, m_authToken)) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"ResourceProtectionGuard failed to unprotect file: %ls", m_resourcePath.c_str());
+                }
                 break;
             case ProtectedResourceType::RegistryKey:
-                TamperProtection::Instance().UnprotectRegistryKey(m_resourcePath, m_authToken);
+                if (!TamperProtection::Instance().UnprotectRegistryKey(m_resourcePath, m_authToken)) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"ResourceProtectionGuard failed to unprotect registry key: %ls", m_resourcePath.c_str());
+                }
                 break;
             default:
                 break;
