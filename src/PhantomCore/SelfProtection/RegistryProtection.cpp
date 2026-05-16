@@ -289,8 +289,9 @@ public:
         // Add default protected keys
         for (const auto& defaultKey : RegistryProtectionConstants::DEFAULT_PROTECTED_KEYS) {
             const std::wstring keyPath(defaultKey);
-            if (!IsKeyProtectedInternal(keyPath)) {
-                AddProtectedKeyInternal(keyPath, KeyProtectionType::Full, true);
+            if (!IsKeyProtectedInternal(keyPath) &&
+                !AddProtectedKeyInternal(keyPath, KeyProtectionType::Full, true)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to add default protected key: %ls", keyPath.c_str());
             }
         }
 
@@ -463,7 +464,9 @@ public:
 
     void ProtectKey(const std::wstring& keyPath) {
         std::unique_lock lock(m_mutex);
-        AddProtectedKeyInternal(keyPath, KeyProtectionType::Full, true);
+        if (!AddProtectedKeyInternal(keyPath, KeyProtectionType::Full, true)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ProtectKey default request failed: %ls", keyPath.c_str());
+        }
     }
 
     [[nodiscard]] bool ProtectKey(std::wstring_view keyPath, KeyProtectionType type,
@@ -1068,7 +1071,9 @@ public:
         }
 
         // Create snapshot before updating baseline
-        CreateSnapshotInternal(normalized);
+        if (!CreateSnapshotInternal(normalized)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Baseline update could not create snapshot: %ls", normalized.c_str());
+        }
 
         it->second.integrity = RegistryIntegrityStatus::Valid;
         it->second.lastVerified = Clock::now();
@@ -1719,8 +1724,8 @@ private:
             includeSubkeys ? L"yes" : L"no");
 
         // Create initial snapshot if enabled
-        if (m_config.enableSnapshots) {
-            CreateSnapshotInternal(normalized);
+        if (m_config.enableSnapshots && !CreateSnapshotInternal(normalized)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Initial snapshot creation failed for key: %ls", normalized.c_str());
         }
 
         return true;
@@ -2130,10 +2135,13 @@ private:
                     + " Key=" + keyNarrow
                     + " Reason=" + event.description;
 
-                alertSys.RaiseAlert(
+                const std::string alertId = alertSys.RaiseAlert(
                     Communication::AlertSeverity::High,
                     Communication::AlertType::Security,
                     subject, details, "RegistryProtection");
+                if (alertId.empty()) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"AlertSystem rejected registry block event alert");
+                }
             }
         } catch (const std::exception& e) {
             SS_LOG_DEBUG(LOG_CATEGORY, L"AlertSystem dispatch failed: %hs", e.what());
@@ -2185,13 +2193,16 @@ private:
                 const std::string keyNarrow = WideToNarrow(key.keyPath);
                 const std::string statusName(GetIntegrityStatusName(key.integrity));
 
-                alertSys.RaiseAlert(
+                const std::string alertId = alertSys.RaiseAlert(
                     Communication::AlertSeverity::Critical,
                     Communication::AlertType::Security,
                     "Registry integrity violation: " + keyNarrow,
                     "Key=" + keyNarrow + " Status=" + statusName
                         + " Type=" + std::string(GetProtectionTypeName(key.type)),
                     "RegistryProtection");
+                if (alertId.empty()) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"AlertSystem rejected registry integrity violation alert");
+                }
             }
         } catch (const std::exception& e) {
             SS_LOG_DEBUG(LOG_CATEGORY, L"AlertSystem integrity dispatch failed: %hs", e.what());
@@ -2403,7 +2414,7 @@ public:
                 const std::string opName(GetRegistryOperationName(event.operation));
                 const std::string keyNarrow = WideToNarrow(event.keyPath);
 
-                alertSys.RaiseAlert(
+                const std::string alertId = alertSys.RaiseAlert(
                     Communication::AlertSeverity::Critical,
                     Communication::AlertType::Security,
                     "Kernel blocked registry tampering: " + opName + " on " + keyNarrow,
@@ -2411,6 +2422,9 @@ public:
                         + " Key=" + keyNarrow
                         + " Source=KernelCallback",
                     "RegistryProtection");
+                if (alertId.empty()) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"AlertSystem rejected kernel registry block alert");
+                }
             }
         } catch (const std::exception& e) {
             SS_LOG_DEBUG(LOG_CATEGORY, L"AlertSystem kernel event dispatch failed: %hs", e.what());
@@ -3087,8 +3101,11 @@ RegistryProtectionGuard::RegistryProtectionGuard(std::wstring_view keyPath, KeyP
 
 RegistryProtectionGuard::~RegistryProtectionGuard() {
     if (m_protected) {
-        RegistryProtection::Instance().UnprotectKey(m_keyPath, m_authToken);
-        SS_LOG_DEBUG(LOG_CATEGORY, L"Guard: Key unprotected: %ls", m_keyPath.c_str());
+        if (RegistryProtection::Instance().UnprotectKey(m_keyPath, m_authToken)) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"Guard: Key unprotected: %ls", m_keyPath.c_str());
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY, L"Guard: Failed to unprotect key: %ls", m_keyPath.c_str());
+        }
     }
     // Scrub auth token from memory to prevent credential harvesting
     if (!m_authToken.empty()) {
