@@ -455,14 +455,19 @@ void SignatureStore::Close() noexcept {
     // Mark uninitialized BEFORE releasing lock to prevent new operations from starting
     m_initialized.store(false, std::memory_order_release);
 
-    // Clear caches (need to release global lock first, then acquire cache lock)
+    // Clear ONLY the SignatureStore-level query cache here. The component
+    // sub-stores have just been Close()'d above (still under the exclusive
+    // lock) and their caches were released as part of their own Close().
+    // Calling m_hashStore->ClearCache() etc. on a Close()'d sub-store invokes
+    // implementation-defined behaviour in the sub-stores; previously this
+    // happened unconditionally via ClearAllCaches() and was a TOCTOU hazard.
     lock.unlock();
-    
+
     try {
-        ClearAllCaches();
+        ClearQueryCache();
     }
     catch (...) {
-        SS_LOG_ERROR(L"SignatureStore", L"Close: ClearAllCaches exception");
+        SS_LOG_ERROR(L"SignatureStore", L"Close: ClearQueryCache exception");
     }
 
     SS_LOG_INFO(L"SignatureStore", L"Closed successfully");
@@ -1744,31 +1749,35 @@ StoreError SignatureStore::MergeDatabases(
         // ====================================================================
         // MERGE PATTERN STORES
         // ====================================================================
+        //
+        // ENTERPRISE NOTE: PatternStore exposes ExportToJson() but has no
+        // ImportFromJson() / AddPatternBatch-from-source API, and the source
+        // PatternStore does not expose a public pattern-enumeration iterator.
+        // There is therefore NO supported way to transfer compiled patterns
+        // from a source PatternStore into a freshly-created output store via
+        // the existing public API.
+        //
+        // The previous implementation called sourcePatternStores[i]->ExportToJson()
+        // ONLY to compute its byte size, then incremented totalPatternsMerged
+        // from sourceStats.totalPatterns and logged "Total patterns processed".
+        // The output store was never populated. Callers received Success with
+        // misleading "merged" counts while the output database was empty —
+        // silent data loss in a security product.
+        //
+        // Until PatternStore gains an import path, surface this as a non-fatal
+        // partial failure rather than fabricating success metrics.
+        // ====================================================================
+        bool patternMergeUnsupported = false;
         if (!sourcePatternStores.empty()) {
-            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu pattern stores",
+            SS_LOG_WARN(L"SignatureStore",
+                L"MergeDatabases: %zu pattern store(s) supplied but PatternStore exposes no "
+                L"ImportFromJson/source-enumeration API; pattern merge is NOT supported and "
+                L"the output pattern store will contain only its freshly-created (empty) state",
                 sourcePatternStores.size());
+            patternMergeUnsupported = true;
 
-            uint64_t totalPatternsMerged = 0;
-            for (size_t i = 0; i < sourcePatternStores.size(); ++i) {
-                try {
-                    auto sourceStats = sourcePatternStores[i]->GetStatistics();
-                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu]: %llu patterns",
-                        i, sourceStats.totalPatterns);
-
-                    std::string patternsJson = sourcePatternStores[i]->ExportToJson();
-                    if (!patternsJson.empty()) {
-                        totalPatternsMerged += sourceStats.totalPatterns;
-                    }
-
-                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu] processed", i);
-                }
-                catch (const std::exception& e) {
-                    SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Pattern store [%zu] exception: %S", i, e.what());
-                }
-            }
-
-            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total patterns processed: %llu", totalPatternsMerged);
-
+            // Still rebuild+flush the empty output so the file on disk is
+            // consistent with a brand-new PatternStore image.
             StoreError rebuildErr = outputPatternStore.Rebuild();
             if (!rebuildErr.IsSuccess()) {
                 SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store rebuild failed: %S",
@@ -1785,25 +1794,24 @@ StoreError SignatureStore::MergeDatabases(
         // ====================================================================
         // MERGE YARA STORES
         // ====================================================================
+        //
+        // ENTERPRISE NOTE: same problem as PatternStore. YaraRuleStore has
+        // AddRulesFromSource(source_text) and AddRulesFromFile(path) but no
+        // public way to extract original rule source from an existing store.
+        // ExportToJson() returns metadata only. We therefore cannot reconstruct
+        // the source text needed for AddRulesFromSource on the output store.
+        //
+        // Previous code added sourceStats.totalRules into totalRulesMerged
+        // without doing any merge at all. Same lie as the pattern branch.
+        // ====================================================================
+        bool yaraMergeUnsupported = false;
         if (!sourceYaraStores.empty()) {
-            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu YARA stores",
+            SS_LOG_WARN(L"SignatureStore",
+                L"MergeDatabases: %zu YARA store(s) supplied but YaraRuleStore exposes no "
+                L"public rule-source enumeration API; YARA merge is NOT supported and the "
+                L"output YARA store will contain only its freshly-created (empty) state",
                 sourceYaraStores.size());
-
-            uint64_t totalRulesMerged = 0;
-            for (size_t i = 0; i < sourceYaraStores.size(); ++i) {
-                try {
-                    auto sourceStats = sourceYaraStores[i]->GetStatistics();
-                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: YARA store [%zu]: %llu rules",
-                        i, sourceStats.totalRules);
-
-                    totalRulesMerged += sourceStats.totalRules;
-                }
-                catch (const std::exception& e) {
-                    SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: YARA store [%zu] exception: %S", i, e.what());
-                }
-            }
-
-            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total YARA rules processed: %llu", totalRulesMerged);
+            yaraMergeUnsupported = true;
 
             StoreError rebuildErr = outputYaraStore.Recompile();
             if (!rebuildErr.IsSuccess()) {
@@ -1815,6 +1823,18 @@ StoreError SignatureStore::MergeDatabases(
             if (!flushErr.IsSuccess()) {
                 SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: YARA store flush failed");
             }
+        }
+
+        if (patternMergeUnsupported || yaraMergeUnsupported) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"MergeDatabases: Completed with partial coverage (pattern=%S yara=%S unsupported)",
+                patternMergeUnsupported ? "1" : "0",
+                yaraMergeUnsupported ? "1" : "0");
+            return StoreError{
+                SignatureStoreError::InvalidFormat,
+                0,
+                "MergeDatabases: hash store merged; pattern/yara merge unsupported by current API"
+            };
         }
 
         SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merge completed successfully");
@@ -2020,9 +2040,24 @@ ScanResult SignatureStore::ExecuteParallelScan(
     // ========================================================================
     // MERGE HASH MATCHES INTO FINAL RESULTS
     // ========================================================================
-    result.detections.insert(result.detections.end(), 
-                            result.hashMatches.begin(), 
-                            result.hashMatches.end());
+    // Respect options.maxResults across the entire merged detections vector.
+    // The per-future loop above only capped pattern+YARA detections relative
+    // to themselves; appending hashMatches here unconditionally could push
+    // result.detections past the caller-requested maxResults bound.
+    if (!result.hashMatches.empty()) {
+        const size_t roomForHash = (options.maxResults > result.detections.size())
+            ? (options.maxResults - result.detections.size())
+            : 0;
+        const size_t hashToAdd = std::min(result.hashMatches.size(), roomForHash);
+        if (hashToAdd < result.hashMatches.size()) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"ExecuteParallelScan: hashMatches truncated from %zu to %zu to honour maxResults=%zu",
+                result.hashMatches.size(), hashToAdd, options.maxResults);
+        }
+        result.detections.insert(result.detections.end(),
+                                 result.hashMatches.begin(),
+                                 result.hashMatches.begin() + hashToAdd);
+    }
 
     return result;
 }
