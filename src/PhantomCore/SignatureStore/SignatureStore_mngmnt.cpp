@@ -22,6 +22,77 @@
 namespace ShadowStrike {
 	namespace SignatureStore {
 
+        namespace {
+            // ============================================================================
+            // MANAGEMENT INPUT LIMITS
+            // ============================================================================
+            // Centralized so cross-cutting bounds stay consistent. All limits are
+            // intentionally conservative; signature management is an administrative
+            // operation, never a hot path.
+            constexpr size_t MNG_MAX_NAME_LENGTH      = 1024;
+            constexpr size_t MNG_MAX_DESC_LENGTH      = 4096;
+            constexpr size_t MNG_MAX_TAGS             = 100;
+            constexpr size_t MNG_MAX_TAG_LENGTH       = 256;
+            constexpr size_t MNG_MAX_NAMESPACE_LENGTH = 256;
+            constexpr size_t MNG_MAX_RULE_NAME_LENGTH = 256;
+            constexpr size_t MNG_MAX_PATTERN_LENGTH   = 64ull * 1024;            // 64KB
+            constexpr size_t MNG_MAX_RULE_LENGTH      = 10ull * 1024 * 1024;     // 10MB
+            constexpr size_t MNG_MAX_PATH_LENGTH      = 32767;                   // \\?\ ext path
+            constexpr uint32_t MNG_MIN_HASH_LEN       = 1;
+            constexpr uint32_t MNG_MAX_HASH_LEN       = 64;
+
+            [[nodiscard]] inline bool ContainsNullByte(const std::string& s) noexcept {
+                return s.find('\0') != std::string::npos;
+            }
+            [[nodiscard]] inline bool ContainsNullByte(const std::wstring& s) noexcept {
+                return s.find(L'\0') != std::wstring::npos;
+            }
+
+            // Validate every tag (count + per-tag length + null-byte injection).
+            // Returns Success on accept, populated StoreError on reject.
+            [[nodiscard]] StoreError ValidateTags(const std::vector<std::string>& tags) noexcept {
+                if (tags.size() > MNG_MAX_TAGS) {
+                    return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                        "Too many tags" };
+                }
+                for (const auto& tag : tags) {
+                    if (tag.length() > MNG_MAX_TAG_LENGTH) {
+                        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                            "Tag too long" };
+                    }
+                    if (ContainsNullByte(tag)) {
+                        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                            "Tag contains null byte" };
+                    }
+                }
+                return StoreError{ SignatureStoreError::Success };
+            }
+
+            // Validate an input path used by Import/Export. Performs empty, length,
+            // and null-byte injection checks; canonicalization is delegated to the
+            // underlying component (each subsystem owns its own I/O semantics).
+            [[nodiscard]] StoreError ValidateIoPath(const std::wstring& path,
+                const wchar_t* opName) noexcept {
+                if (path.empty()) {
+                    SS_LOG_ERROR(L"SignatureStore", L"%s: Empty path", opName);
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty path" };
+                }
+                if (path.length() > MNG_MAX_PATH_LENGTH) {
+                    SS_LOG_ERROR(L"SignatureStore", L"%s: Path too long (%zu)",
+                        opName, path.length());
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                        "Path exceeds maximum length" };
+                }
+                if (ContainsNullByte(path)) {
+                    SS_LOG_ERROR(L"SignatureStore", L"%s: Path contains null character",
+                        opName);
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                        "Path contains null character" };
+                }
+                return StoreError{ SignatureStoreError::Success };
+            }
+        } // namespace
+
         // ============================================================================
         // SIGNATURE MANAGEMENT (Write Operations)
         // ============================================================================
@@ -44,52 +115,82 @@ namespace ShadowStrike {
             }
 
             // Acquire shared lock to prevent Close()/Shutdown() from destroying
-            // component pointers between our null check and usage (TOCTOU fix)
+            // component pointers between our null check and usage (TOCTOU fix).
+            // Close() takes the same mutex exclusively; we either run fully before
+            // it or fully after it, never overlapping.
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            // VALIDATION 2: Component availability (under lock)
+            // VALIDATION 2: Initialization state under lock (defense-in-depth).
+            // Close() does NOT reset component unique_ptrs to null — it only calls
+            // their Close() and clears m_initialized. We must therefore reject
+            // post-Close operations explicitly, otherwise we would dispatch into a
+            // closed sub-store.
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"AddHash: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Store not initialized" };
+            }
+
+            // VALIDATION 3: Component availability (under lock)
             if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddHash: HashStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
             }
 
-            // VALIDATION 3: Hash validation
-            if (hash.length == 0 || hash.length > 64) {
+            // VALIDATION 4: Hash validation
+            if (hash.length < MNG_MIN_HASH_LEN || hash.length > MNG_MAX_HASH_LEN) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddHash: Invalid hash length (%u)", hash.length);
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Invalid hash length" };
             }
 
-            // Validate hash type using length check (invalid types return 0)
-            if (GetHashLengthForType(hash.type) == 0) {
+            // Validate hash type using length check (invalid types return 0) and
+            // cross-check that the declared length matches the canonical length
+            // expected for the type — prevents persisting truncated/oversized hashes.
+            const uint32_t expectedHashLen = GetHashLengthForType(hash.type);
+            if (expectedHashLen == 0) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddHash: Invalid hash type");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Invalid hash type" };
             }
+            if (hash.length != expectedHashLen) {
+                SS_LOG_ERROR(L"SignatureStore",
+                    L"AddHash: Hash length (%u) does not match type-expected length (%u)",
+                    hash.length, expectedHashLen);
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Hash length mismatch for declared type" };
+            }
 
-            // VALIDATION 4: Name validation
+            // VALIDATION 5: Name validation (length + null-byte injection)
             if (name.empty()) {
                 SS_LOG_WARN(L"SignatureStore", L"AddHash: Empty signature name");
                 // Allow but log warning
             }
-
-            // VALIDATION 5: Name length limit
-            constexpr size_t MAX_NAME_LENGTH = 1024;
-            if (name.length() > MAX_NAME_LENGTH) {
+            if (name.length() > MNG_MAX_NAME_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddHash: Name too long (%zu chars)", name.length());
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Name too long" };
             }
-
-            // VALIDATION 6: Description length limit
-            constexpr size_t MAX_DESC_LENGTH = 4096;
-            if (description.length() > MAX_DESC_LENGTH) {
-                SS_LOG_WARN(L"SignatureStore", L"AddHash: Description too long, truncating");
-                // Will be truncated by underlying store
+            if (ContainsNullByte(name)) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddHash: Name contains null byte");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0, "Name contains null byte" };
             }
 
-            // VALIDATION 7: Tags count limit
-            constexpr size_t MAX_TAGS = 100;
-            if (tags.size() > MAX_TAGS) {
-                SS_LOG_WARN(L"SignatureStore", L"AddHash: Too many tags (%zu), only first %zu will be used",
-                    tags.size(), MAX_TAGS);
+            // VALIDATION 6: Description length + null-byte
+            if (description.length() > MNG_MAX_DESC_LENGTH) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddHash: Description too long (%zu)",
+                    description.length());
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Description too long" };
+            }
+            if (ContainsNullByte(description)) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddHash: Description contains null byte");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Description contains null byte" };
+            }
+
+            // VALIDATION 7: Tag fanout & content validation
+            if (auto err = ValidateTags(tags); !err.IsSuccess()) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddHash: Tag validation failed: %S",
+                    err.message.c_str());
+                return err;
             }
 
             try {
@@ -125,30 +226,62 @@ namespace ShadowStrike {
             // Acquire shared lock (TOCTOU fix: prevents Close() from destroying m_patternStore)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            // VALIDATION 2: Component availability (under lock)
+            // VALIDATION 2: Initialization state (defense-in-depth)
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"AddPattern: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Store not initialized" };
+            }
+
+            // VALIDATION 3: Component availability (under lock)
             if (!m_patternStoreEnabled.load(std::memory_order_acquire) || !m_patternStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddPattern: PatternStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
             }
 
-            // VALIDATION 3: Pattern string validation
+            // VALIDATION 4: Pattern string validation
             if (patternString.empty()) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Empty pattern string");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Pattern string cannot be empty" };
             }
 
-            // VALIDATION 4: Pattern length limit
-            constexpr size_t MAX_PATTERN_LENGTH = 65536;  // 64KB max pattern
-            if (patternString.length() > MAX_PATTERN_LENGTH) {
+            // VALIDATION 5: Pattern length limit
+            if (patternString.length() > MNG_MAX_PATTERN_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Pattern too long (%zu bytes)", patternString.length());
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Pattern too long" };
             }
+            // NOTE: We deliberately do NOT reject null bytes in patternString. Hex
+            // and binary YARA-style patterns legitimately contain 0x00 bytes; the
+            // pattern compiler is responsible for syntactic validation.
 
-            // VALIDATION 5: Name validation
-            constexpr size_t MAX_NAME_LENGTH = 1024;
-            if (name.length() > MAX_NAME_LENGTH) {
+            // VALIDATION 6: Name validation
+            if (name.length() > MNG_MAX_NAME_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Name too long");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Name too long" };
+            }
+            if (ContainsNullByte(name)) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Name contains null byte");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Name contains null byte" };
+            }
+
+            // VALIDATION 7: Description length + null-byte
+            if (description.length() > MNG_MAX_DESC_LENGTH) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Description too long");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Description too long" };
+            }
+            if (ContainsNullByte(description)) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Description contains null byte");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Description contains null byte" };
+            }
+
+            // VALIDATION 8: Tag fanout & content validation
+            if (auto err = ValidateTags(tags); !err.IsSuccess()) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Tag validation failed: %S",
+                    err.message.c_str());
+                return err;
             }
 
             try {
@@ -181,30 +314,45 @@ namespace ShadowStrike {
             // Acquire shared lock (TOCTOU fix: prevents Close() from destroying m_yaraStore)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            // VALIDATION 2: Component availability (under lock)
+            // VALIDATION 2: Initialization state (defense-in-depth)
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"AddYaraRule: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Store not initialized" };
+            }
+
+            // VALIDATION 3: Component availability (under lock)
             if (!m_yaraStoreEnabled.load(std::memory_order_acquire) || !m_yaraStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: YaraStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
             }
 
-            // VALIDATION 3: Rule source validation
+            // VALIDATION 4: Rule source validation
             if (ruleSource.empty()) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Empty rule source");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Rule source cannot be empty" };
             }
 
-            // VALIDATION 4: Rule source length limit
-            constexpr size_t MAX_RULE_LENGTH = 10 * 1024 * 1024;  // 10MB max rule
-            if (ruleSource.length() > MAX_RULE_LENGTH) {
+            // VALIDATION 5: Rule source length limit (DoS protection — YARA parser
+            // has exponential edge cases on adversarial input)
+            if (ruleSource.length() > MNG_MAX_RULE_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Rule source too long (%zu bytes)", ruleSource.length());
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Rule source too long" };
             }
+            // NOTE: We do NOT reject NUL bytes in ruleSource: YARA condition
+            // strings can legitimately contain "\x00" sequences in hex contexts.
+            // The YARA compiler enforces its own grammar.
 
-            // VALIDATION 5: Namespace validation
-            constexpr size_t MAX_NAMESPACE_LENGTH = 256;
-            if (namespace_.length() > MAX_NAMESPACE_LENGTH) {
+            // VALIDATION 6: Namespace validation (length + null-byte injection —
+            // namespaces are used as identifiers downstream)
+            if (namespace_.length() > MNG_MAX_NAMESPACE_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Namespace too long");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Namespace too long" };
+            }
+            if (ContainsNullByte(namespace_)) {
+                SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Namespace contains null byte");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Namespace contains null byte" };
             }
 
             try {
@@ -234,22 +382,37 @@ namespace ShadowStrike {
             // Acquire shared lock (TOCTOU fix)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            // VALIDATION 2: Component availability (under lock)
+            // VALIDATION 2: Initialization state
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"RemoveHash: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Store not initialized" };
+            }
+
+            // VALIDATION 3: Component availability (under lock)
             if (!m_hashStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: HashStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
             }
 
-            // VALIDATION 3: Hash validation
-            if (hash.length == 0 || hash.length > 64) {
+            // VALIDATION 4: Hash validation
+            if (hash.length < MNG_MIN_HASH_LEN || hash.length > MNG_MAX_HASH_LEN) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: Invalid hash length (%u)", hash.length);
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Invalid hash length" };
             }
 
-            // Validate hash type using length check (invalid types return 0)
-            if (GetHashLengthForType(hash.type) == 0) {
+            // Validate hash type and cross-check declared length against canonical
+            const uint32_t expectedHashLen = GetHashLengthForType(hash.type);
+            if (expectedHashLen == 0) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: Invalid hash type");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Invalid hash type" };
+            }
+            if (hash.length != expectedHashLen) {
+                SS_LOG_ERROR(L"SignatureStore",
+                    L"RemoveHash: Hash length (%u) does not match type-expected length (%u)",
+                    hash.length, expectedHashLen);
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Hash length mismatch for declared type" };
             }
 
             try {
@@ -279,13 +442,20 @@ namespace ShadowStrike {
             // Acquire shared lock (TOCTOU fix)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            // VALIDATION 2: Component availability (under lock)
+            // VALIDATION 2: Initialization state
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"RemovePattern: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Store not initialized" };
+            }
+
+            // VALIDATION 3: Component availability (under lock)
             if (!m_patternStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemovePattern: PatternStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
             }
 
-            // VALIDATION 3: Signature ID validation
+            // VALIDATION 4: Signature ID note
             // NOTE: Pattern ID 0 is valid in PatternStore (first pattern can have ID 0)
             // Only log warning for debugging, allow the operation
             if (signatureId == 0) {
@@ -319,23 +489,34 @@ namespace ShadowStrike {
             // Acquire shared lock (TOCTOU fix)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            // VALIDATION 2: Component availability (under lock)
+            // VALIDATION 2: Initialization state
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"RemoveYaraRule: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Store not initialized" };
+            }
+
+            // VALIDATION 3: Component availability (under lock)
             if (!m_yaraStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: YaraStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
             }
 
-            // VALIDATION 3: Rule name validation
+            // VALIDATION 4: Rule name validation
             if (ruleName.empty()) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: Empty rule name");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Rule name cannot be empty" };
             }
 
-            // VALIDATION 4: Rule name length limit
-            constexpr size_t MAX_RULE_NAME_LENGTH = 256;
-            if (ruleName.length() > MAX_RULE_NAME_LENGTH) {
+            // VALIDATION 5: Rule name length + null-byte
+            if (ruleName.length() > MNG_MAX_RULE_NAME_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: Rule name too long");
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Rule name too long" };
+            }
+            if (ContainsNullByte(ruleName)) {
+                SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: Rule name contains null byte");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Rule name contains null byte" };
             }
 
             try {
@@ -361,26 +542,31 @@ namespace ShadowStrike {
         ) noexcept {
             SS_LOG_INFO(L"SignatureStore", L"ImportHashes: %s", filePath.c_str());
 
-            // TITANIUM: Path validation
-            if (filePath.empty()) {
-                SS_LOG_ERROR(L"SignatureStore", L"ImportHashes: Empty file path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty file path" };
+            // Read-only check (Import mutates the store)
+            if (m_readOnly.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ImportHashes: Store is read-only");
+                return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
 
-            // Check for path traversal attacks (null bytes, etc.)
-            if (filePath.find(L'\0') != std::wstring::npos) {
-                SS_LOG_ERROR(L"SignatureStore", L"ImportHashes: Invalid path (contains null)");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
+            // Path validation (empty, length cap, null-byte injection)
+            if (auto err = ValidateIoPath(filePath, L"ImportHashes"); !err.IsSuccess()) {
+                return err;
             }
 
             // Acquire shared lock (TOCTOU fix: prevents Close() from destroying m_hashStore)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ImportHashes: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Store not initialized" };
+            }
+
             if (!m_hashStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
             }
 
-            // TITANIUM: Exception-safe import with callback protection
+            // Exception-safe import; the user-supplied progress callback is forwarded
+            // unchanged (the underlying HashStore wraps callback invocations).
             try {
                 return m_hashStore->ImportFromFile(filePath, progressCallback);
             }
@@ -397,19 +583,22 @@ namespace ShadowStrike {
         StoreError SignatureStore::ImportPatterns(const std::wstring& filePath) noexcept {
             SS_LOG_INFO(L"SignatureStore", L"ImportPatterns: %s", filePath.c_str());
 
-            // TITANIUM: Path validation
-            if (filePath.empty()) {
-                SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns: Empty file path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty file path" };
+            if (m_readOnly.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ImportPatterns: Store is read-only");
+                return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
 
-            if (filePath.find(L'\0') != std::wstring::npos) {
-                SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns: Invalid path (contains null)");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
+            if (auto err = ValidateIoPath(filePath, L"ImportPatterns"); !err.IsSuccess()) {
+                return err;
             }
 
             // Acquire shared lock (TOCTOU fix)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ImportPatterns: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Store not initialized" };
+            }
 
             if (!m_patternStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
@@ -434,25 +623,32 @@ namespace ShadowStrike {
         ) noexcept {
             SS_LOG_INFO(L"SignatureStore", L"ImportYaraRules: %s", filePath.c_str());
 
-            // TITANIUM: Path and namespace validation
-            if (filePath.empty()) {
-                SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Empty file path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty file path" };
+            if (m_readOnly.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ImportYaraRules: Store is read-only");
+                return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
 
-            if (filePath.find(L'\0') != std::wstring::npos) {
-                SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Invalid path (contains null)");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
+            if (auto err = ValidateIoPath(filePath, L"ImportYaraRules"); !err.IsSuccess()) {
+                return err;
             }
 
-            // Namespace can be empty but should not contain null bytes
-            if (namespace_.find('\0') != std::string::npos) {
+            // Namespace can be empty but must not contain null bytes or be oversize
+            if (namespace_.length() > MNG_MAX_NAMESPACE_LENGTH) {
+                SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Namespace too long");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Namespace too long" };
+            }
+            if (ContainsNullByte(namespace_)) {
                 SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Invalid namespace");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid namespace" };
             }
 
             // Acquire shared lock (TOCTOU fix)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ImportYaraRules: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Store not initialized" };
+            }
 
             if (!m_yaraStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
@@ -477,19 +673,25 @@ namespace ShadowStrike {
         ) const noexcept {
             SS_LOG_INFO(L"SignatureStore", L"ExportHashes: %s", outputPath.c_str());
 
-            // TITANIUM: Output path validation
-            if (outputPath.empty()) {
-                SS_LOG_ERROR(L"SignatureStore", L"ExportHashes: Empty output path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty output path" };
+            if (auto err = ValidateIoPath(outputPath, L"ExportHashes"); !err.IsSuccess()) {
+                return err;
             }
 
-            if (outputPath.find(L'\0') != std::wstring::npos) {
-                SS_LOG_ERROR(L"SignatureStore", L"ExportHashes: Invalid path (contains null)");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
+            // Reject invalid hash type filters explicitly; underlying store would
+            // otherwise return an empty file silently.
+            if (GetHashLengthForType(typeFilter) == 0) {
+                SS_LOG_ERROR(L"SignatureStore", L"ExportHashes: Invalid hash type filter");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                    "Invalid hash type filter" };
             }
 
             // Acquire shared lock (TOCTOU fix: prevents Close() during export)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ExportHashes: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Store not initialized" };
+            }
 
             if (!m_hashStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
@@ -511,19 +713,17 @@ namespace ShadowStrike {
         StoreError SignatureStore::ExportPatterns(const std::wstring& outputPath) const noexcept {
             SS_LOG_INFO(L"SignatureStore", L"ExportPatterns: %s", outputPath.c_str());
 
-            // TITANIUM: Output path validation
-            if (outputPath.empty()) {
-                SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Empty output path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty output path" };
-            }
-
-            if (outputPath.find(L'\0') != std::wstring::npos) {
-                SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Invalid path (contains null)");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
+            if (auto err = ValidateIoPath(outputPath, L"ExportPatterns"); !err.IsSuccess()) {
+                return err;
             }
 
             // Acquire shared lock (TOCTOU fix: prevents Close() during export)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ExportPatterns: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Store not initialized" };
+            }
 
             if (!m_patternStoreEnabled.load(std::memory_order_acquire) || !m_patternStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"PatternStore not available");
@@ -531,14 +731,15 @@ namespace ShadowStrike {
             }
 
             try {
-                // Get JSON from pattern store
+                // Serialize patterns to JSON and write atomically. The atomic writer
+                // routes through Utils::FileUtils which performs temp-file + rename,
+                // protecting against partial writes on power loss / abort.
                 std::string jsonContent = m_patternStore->ExportToJson();
                 if (jsonContent.empty()) {
                     SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Failed to export JSON");
                     return StoreError{ SignatureStoreError::Unknown, 0, "JSON export failed" };
                 }
 
-                // Write JSON to file atomically
                 ShadowStrike::Utils::FileUtils::Error fileErr{};
                 if (!ShadowStrike::Utils::FileUtils::WriteAllTextUtf8Atomic(outputPath, jsonContent, &fileErr)) {
                     SS_LOG_ERROR(L"SignatureStore",
@@ -567,19 +768,17 @@ namespace ShadowStrike {
         StoreError SignatureStore::ExportYaraRules(const std::wstring& outputPath) const noexcept {
             SS_LOG_INFO(L"SignatureStore", L"ExportYaraRules: %s", outputPath.c_str());
 
-            // TITANIUM: Output path validation
-            if (outputPath.empty()) {
-                SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules: Empty output path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty output path" };
-            }
-
-            if (outputPath.find(L'\0') != std::wstring::npos) {
-                SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules: Invalid path (contains null)");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
+            if (auto err = ValidateIoPath(outputPath, L"ExportYaraRules"); !err.IsSuccess()) {
+                return err;
             }
 
             // Acquire shared lock (TOCTOU fix: prevents Close() during export)
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                SS_LOG_WARN(L"SignatureStore", L"ExportYaraRules: Store not initialized");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Store not initialized" };
+            }
 
             if (!m_yaraStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
