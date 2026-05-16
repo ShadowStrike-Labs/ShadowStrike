@@ -76,7 +76,8 @@ namespace ShadowStrike {
 
                     SS_LOG_WARN(L"SignatureIndex",
                         L"InvalidateCacheEntry: Cleared out-of-bounds cached pointer "
-                        L"at index %zu (offset=0x%X)", cacheIndex, nodeOffset);
+                        L"at index %zu (offset=0x%llX)", cacheIndex,
+                        static_cast<unsigned long long>(nodeOffset));
                     return;
                 }
 
@@ -90,7 +91,8 @@ namespace ShadowStrike {
 
                     SS_LOG_TRACE(L"SignatureIndex",
                         L"InvalidateCacheEntry: Invalidated cache entry at index %zu "
-                        L"(offset=0x%X)", cacheIndex, nodeOffset);
+                        L"(offset=0x%llX)", cacheIndex,
+                        static_cast<unsigned long long>(nodeOffset));
                     return;
                 }
             }
@@ -98,8 +100,9 @@ namespace ShadowStrike {
             // Entry not found at expected slot (may have been evicted or overwritten
             // by a different offset that hashes to the same slot)
             SS_LOG_TRACE(L"SignatureIndex",
-                L"InvalidateCacheEntry: Cache entry for offset 0x%X not found "
-                L"at slot %zu (may have been evicted)", nodeOffset, cacheIndex);
+                L"InvalidateCacheEntry: Cache entry for offset 0x%llX not found "
+                L"at slot %zu (may have been evicted)",
+                static_cast<unsigned long long>(nodeOffset), cacheIndex);
         }
 
         void SignatureIndex::ClearCache() noexcept {
