@@ -50,11 +50,33 @@ namespace Service {
 // ============================================================================
 
 bool ServiceInstaller::Install() {
-    // Get current module path
-    wchar_t modulePath[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) {
-        SS_LOG_ERROR(L"Installer", L"Failed to get module file name. Error: %lu", GetLastError());
-        return false;
+    // Resolve the current module path with a dynamically grown buffer so that
+    // installations from a long path (Windows allows up to ~32767 wchar with
+    // \\?\ prefix) succeed instead of silently truncating. Truncation was a
+    // real-world exploit primitive against unquoted/short binary paths.
+    std::vector<wchar_t> modulePath(MAX_PATH);
+    for (;;) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD written = GetModuleFileNameW(
+            nullptr, modulePath.data(),
+            static_cast<DWORD>(modulePath.size()));
+        if (written == 0) {
+            SS_LOG_ERROR(L"Installer",
+                L"GetModuleFileName failed (err=%lu)", GetLastError());
+            return false;
+        }
+        if (written < modulePath.size() &&
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            modulePath.resize(written);
+            modulePath.push_back(L'\0');
+            break;
+        }
+        if (modulePath.size() >= 32768u) {
+            SS_LOG_ERROR(L"Installer",
+                L"Module path exceeds 32K wchars; refusing to install.");
+            return false;
+        }
+        modulePath.resize(modulePath.size() * 2u);
     }
 
     // Default configuration
@@ -62,7 +84,10 @@ bool ServiceInstaller::Install() {
     config.name = ServiceConstants::SERVICE_NAME;
     config.displayName = ServiceConstants::DISPLAY_NAME;
     config.description = ServiceConstants::DESCRIPTION;
-    config.binaryPath = std::wstring(L"\"") + modulePath + L"\"";
+    // Quoted binary path: blocks the classic unquoted-service-path elevation
+    // vector where a directory like 'C:\Program Files\Foo' is interpreted as
+    // 'C:\Program.exe' with 'Files\Foo' as the first argument.
+    config.binaryPath = std::wstring(L"\"") + modulePath.data() + L"\"";
     config.startType = SERVICE_AUTO_START;
     config.delayedStart = true;
     config.enableRecovery = true;
@@ -116,7 +141,10 @@ bool ServiceInstaller::Install(const ServiceConfig& config) {
         if (err == ERROR_SERVICE_EXISTS) {
             SS_LOG_INFO(L"Installer", L"Service already exists, attempting in-place configuration update");
 
-            // Open existing service for reconfiguration
+            // Open existing service for reconfiguration. Request SERVICE_CHANGE_CONFIG
+            // so we can reapply description/delayed-start/recovery too — the previous
+            // code only refreshed the binary path and description, leaving a stale
+            // recovery policy if the installer was rerun with new parameters.
             SC_HANDLE hExisting = OpenServiceW(hSCManager, config.name.c_str(),
                                                SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG);
             if (!hExisting) {
@@ -141,9 +169,25 @@ bool ServiceInstaller::Install(const ServiceConfig& config) {
                 return false;
             }
 
-            // Update description on existing service
+            // Reapply description, delayed-start and recovery so the policy is
+            // not silently stuck at whatever a previous installer build set.
             if (!config.description.empty()) {
-                ConfigureDescription(hExisting, config.description);
+                if (!ConfigureDescription(hExisting, config.description)) {
+                    SS_LOG_WARN(L"Installer",
+                        L"In-place description update failed (err=%lu)", GetLastError());
+                }
+            }
+            if (config.startType == SERVICE_AUTO_START) {
+                if (!ConfigureDelayedAutoStart(hExisting, config.delayedStart)) {
+                    SS_LOG_WARN(L"Installer",
+                        L"In-place delayed auto-start update failed (err=%lu)", GetLastError());
+                }
+            }
+            if (config.enableRecovery) {
+                if (!ConfigureRecovery(hExisting, config)) {
+                    SS_LOG_WARN(L"Installer",
+                        L"In-place recovery configuration update failed (err=%lu)", GetLastError());
+                }
             }
 
             SS_LOG_INFO(L"Installer", L"Existing service configuration updated successfully");
@@ -226,16 +270,43 @@ bool ServiceInstaller::Uninstall() {
 
     std::shared_ptr<void> serviceGuard(hService, [](void* h) { CloseServiceHandle((SC_HANDLE)h); });
 
-    // Stop service if running
-    SERVICE_STATUS_PROCESS ssp;
-    DWORD bytesNeeded;
-    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
+    // Stop service if running. Poll until SERVICE_STOPPED with a bounded
+    // timeout instead of relying on a fixed Sleep(1000) — large protection
+    // products can need several seconds to flush state.
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD bytesNeeded = 0;
+    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
+                             reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytesNeeded)) {
         if (ssp.dwCurrentState != SERVICE_STOPPED) {
             SS_LOG_INFO(L"Installer", L"Stopping service before deletion...");
-            SERVICE_STATUS status;
-            ControlService(hService, SERVICE_CONTROL_STOP, &status);
-            // Give it some time to stop
-            Sleep(1000);
+            SERVICE_STATUS status{};
+            if (!ControlService(hService, SERVICE_CONTROL_STOP, &status)) {
+                const DWORD ctlErr = GetLastError();
+                if (ctlErr != ERROR_SERVICE_NOT_ACTIVE &&
+                    ctlErr != ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+                    SS_LOG_WARN(L"Installer",
+                        L"ControlService(STOP) returned %lu; continuing.", ctlErr);
+                }
+            }
+
+            constexpr DWORD kMaxWaitMs   = 30000;
+            constexpr DWORD kPollEveryMs = 250;
+            DWORD waited = 0;
+            while (waited < kMaxWaitMs) {
+                Sleep(kPollEveryMs);
+                waited += kPollEveryMs;
+                if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
+                                          reinterpret_cast<LPBYTE>(&ssp),
+                                          sizeof(ssp), &bytesNeeded)) {
+                    break;
+                }
+                if (ssp.dwCurrentState == SERVICE_STOPPED) break;
+            }
+            if (ssp.dwCurrentState != SERVICE_STOPPED) {
+                SS_LOG_WARN(L"Installer",
+                    L"Service did not stop within %lu ms; deletion will be queued.",
+                    static_cast<unsigned long>(kMaxWaitMs));
+            }
         }
     }
 
@@ -372,7 +443,16 @@ bool ServiceInstaller::ConfigureRecovery(SC_HANDLE hService, const ServiceConfig
 
     SERVICE_FAILURE_ACTIONSW sfa;
     ZeroMemory(&sfa, sizeof(sfa));
-    sfa.dwResetPeriod = config.resetPeriodDays * 86400; // Convert days to seconds
+    // Cap reset period to avoid uint32_t overflow when an over-eager config
+    // value (e.g. 'never reset' was historically encoded as a very large
+    // dayCount) silently wraps to a near-zero reset interval, which makes
+    // the failure counter reset every second and effectively disables the
+    // recovery escalation policy.
+    constexpr uint32_t kMaxResetPeriodDays = 365u; // 1 year cap
+    const uint32_t resetDays = (config.resetPeriodDays > kMaxResetPeriodDays)
+                                   ? kMaxResetPeriodDays
+                                   : config.resetPeriodDays;
+    sfa.dwResetPeriod = resetDays * 86400u; // seconds
     sfa.lpRebootMsg = nullptr;
     sfa.lpCommand = nullptr;
     sfa.cActions = static_cast<DWORD>(actions.size());
@@ -387,7 +467,9 @@ bool ServiceInstaller::ConfigureRecovery(SC_HANDLE hService, const ServiceConfig
 }
 
 bool ServiceInstaller::ConfigureDescription(SC_HANDLE hService, const std::wstring& description) {
-    SERVICE_DESCRIPTIONW sd;
+    SERVICE_DESCRIPTIONW sd{};
+    // ChangeServiceConfig2W treats lpDescription as a read-only buffer; the
+    // const_cast is required by the SDK signature, not by mutation.
     sd.lpDescription = const_cast<LPWSTR>(description.c_str());
 
     if (!ChangeServiceConfig2W(hService, SERVICE_CONFIG_DESCRIPTION, &sd)) {
@@ -397,7 +479,7 @@ bool ServiceInstaller::ConfigureDescription(SC_HANDLE hService, const std::wstri
 }
 
 bool ServiceInstaller::ConfigureDelayedAutoStart(SC_HANDLE hService, bool delayed) {
-    SERVICE_DELAYED_AUTO_START_INFO info;
+    SERVICE_DELAYED_AUTO_START_INFO info{};
     info.fDelayedAutostart = delayed ? TRUE : FALSE;
 
     if (!ChangeServiceConfig2W(hService, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &info)) {
