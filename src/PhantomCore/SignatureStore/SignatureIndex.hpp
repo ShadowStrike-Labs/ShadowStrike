@@ -415,17 +415,6 @@ private:
         return nullptr;
     }
 
-    // DEPRECATED: Retained for backward compatibility during transition.
-    // Prefer FindCOWNodeByAddr() which does exact 64-bit lookup.
-    [[nodiscard]] BPlusTreeNode* FindCOWNodeByTruncatedAddr(uint32_t truncatedAddr) const noexcept {
-        for (const auto& [fullAddr, node] : m_ptrAddrToCOWNode) {
-            if (static_cast<uint32_t>(fullAddr) == truncatedAddr) {
-                return node;
-            }
-        }
-        return nullptr;
-    }
-
     // Performance monitoring
     mutable LARGE_INTEGER m_perfFrequency{};
     

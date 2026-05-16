@@ -349,13 +349,14 @@ StoreError SignatureIndex::Verify() const noexcept {
     }
 
     // Verify root node exists and is valid
-    uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
-    
+    const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+
     // SECURITY: Validate root offset is within bounds
     if (rootOffset >= m_indexSize) {
-        SS_LOG_ERROR(L"SignatureIndex", 
-            L"Verify: Root offset 0x%X exceeds index size 0x%llX",
-            rootOffset, m_indexSize);
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"Verify: Root offset 0x%llX exceeds index size 0x%llX",
+            static_cast<unsigned long long>(rootOffset),
+            static_cast<unsigned long long>(m_indexSize));
         return StoreError{SignatureStoreError::IndexCorrupted, 0, "Root offset out of bounds"};
     }
 
@@ -446,15 +447,16 @@ void SignatureIndex::ForEach(
     }
 
     // Find root
-    uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
-    
+    const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+
     // SECURITY: Validate root offset
     if (rootOffset >= m_indexSize) {
-        SS_LOG_ERROR(L"SignatureIndex", 
-            L"ForEach: Invalid root offset 0x%X", rootOffset);
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"ForEach: Invalid root offset 0x%llX",
+            static_cast<unsigned long long>(rootOffset));
         return;
     }
-    
+
     const BPlusTreeNode* root = GetNode(rootOffset);
     if (!root) {
         SS_LOG_DEBUG(L"SignatureIndex", L"ForEach: Empty tree");
@@ -472,11 +474,14 @@ void SignatureIndex::ForEach(
     size_t entriesProcessed = 0;
     size_t leavesProcessed = 0;
     bool stopRequested = false;
-    
-    std::unordered_set<uint32_t> visitedOffsets;
+
+    // SECURITY: offsets are uint64_t (v1.1 format); a 32-bit set would silently
+    // alias two distinct >4GB offsets and either short-circuit cycle detection
+    // or report false positives, corrupting traversal.
+    std::unordered_set<uint64_t> visitedOffsets;
     visitedOffsets.reserve(1024);
     visitedOffsets.insert(rootOffset);
-    
+
     // Use stack-based traversal to avoid recursion depth issues
     struct TraversalFrame {
         const BPlusTreeNode* node;
@@ -533,9 +538,9 @@ void SignatureIndex::ForEach(
         else {
             // Internal node - visit children in order (left to right for sorted traversal)
             if (frame.childIndex <= node->keyCount) {
-                uint32_t childOffset = node->children[frame.childIndex];
+                const uint64_t childOffset = node->children[frame.childIndex];
                 frame.childIndex++; // Move to next child for when we return
-                
+
                 // SECURITY: Validate child offset
                 if (childOffset != 0 && childOffset < m_indexSize) {
                     // SECURITY: Cycle detection
@@ -547,12 +552,14 @@ void SignatureIndex::ForEach(
                         }
                         else {
                             SS_LOG_WARN(L"SignatureIndex",
-                                L"ForEach: Failed to load child at offset 0x%X", childOffset);
+                                L"ForEach: Failed to load child at offset 0x%llX",
+                                static_cast<unsigned long long>(childOffset));
                         }
                     }
                     else {
                         SS_LOG_ERROR(L"SignatureIndex",
-                            L"ForEach: Cycle detected at offset 0x%X", childOffset);
+                            L"ForEach: Cycle detected at offset 0x%llX",
+                            static_cast<unsigned long long>(childOffset));
                     }
                 }
             }
@@ -602,15 +609,16 @@ void SignatureIndex::ForEachInternalNoLock(
     }
 
     // Find root
-    uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
-    
+    const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+
     // SECURITY: Validate root offset
     if (rootOffset >= m_indexSize) {
-        SS_LOG_ERROR(L"SignatureIndex", 
-            L"ForEachInternalNoLock: Invalid root offset 0x%X", rootOffset);
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"ForEachInternalNoLock: Invalid root offset 0x%llX",
+            static_cast<unsigned long long>(rootOffset));
         return;
     }
-    
+
     const BPlusTreeNode* root = GetNode(rootOffset);
     if (!root) {
         SS_LOG_DEBUG(L"SignatureIndex", L"ForEachInternalNoLock: Empty tree");
@@ -629,8 +637,9 @@ void SignatureIndex::ForEachInternalNoLock(
     size_t entriesProcessed = 0;
     size_t leavesProcessed = 0;
     bool stopRequested = false;
-    
-    std::unordered_set<uint32_t> visitedOffsets;
+
+    // SECURITY: must match the v1.1 64-bit offset width (see ForEach() rationale).
+    std::unordered_set<uint64_t> visitedOffsets;
     visitedOffsets.insert(rootOffset);
     
     // Use stack-based traversal to avoid recursion depth issues
@@ -683,9 +692,9 @@ void SignatureIndex::ForEachInternalNoLock(
         else {
             // Internal node - visit children in order (left to right)
             if (frame.childIndex <= node->keyCount) {
-                uint32_t childOffset = node->children[frame.childIndex];
+                const uint64_t childOffset = node->children[frame.childIndex];
                 frame.childIndex++; // Move to next child for when we return
-                
+
                 // Validate child offset
                 if (childOffset != 0 && childOffset < m_indexSize) {
                     // Cycle detection
@@ -877,9 +886,9 @@ void SignatureIndex::DumpTree(std::function<void(const std::string&)> output) co
         
         char buffer[256];
         
-        // Root offset
-        int ret = snprintf(buffer, sizeof(buffer), "Root offset: 0x%X", 
-            m_rootOffset.load(std::memory_order_acquire));
+        // Root offset (uint64_t in v1.1)
+        int ret = snprintf(buffer, sizeof(buffer), "Root offset: 0x%llX",
+            static_cast<unsigned long long>(m_rootOffset.load(std::memory_order_acquire)));
         if (ret > 0 && ret < static_cast<int>(sizeof(buffer))) {
             output(buffer);
         }
@@ -953,7 +962,7 @@ bool SignatureIndex::ValidateInvariantsInternal(std::string& errorMessage) const
         }
 
         // Validate root exists and is within bounds
-        uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+        const uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
         if (rootOffset >= m_indexSize) {
             errorMessage = "Root offset out of bounds";
             return false;
