@@ -615,12 +615,30 @@ DomainSuffixTrie::DomainSuffixTrie()
 
 DomainSuffixTrie::~DomainSuffixTrie() = default;
 
+namespace {
+
+// RFC 1035: a domain name is at most 253 characters in presentation form;
+// individual labels are bounded by 63 octets. Reject anything obviously
+// oversized to keep the trie's depth and per-insert allocations bounded under
+// hostile input (CWE-770).
+constexpr size_t kMaxDomainPresentationLength = 253;
+
+// RFC 5321 caps mailbox length at 256 octets in transit; the published 320
+// figure is a misreading of "64 local + @ + 255 domain". 320 leaves headroom.
+constexpr size_t kMaxEmailLength = 320;
+
+} // anonymous namespace
+
 bool DomainSuffixTrie::Insert(std::string_view domain, const IndexValue& value) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
-    
+
+    if (domain.empty() || domain.size() > kMaxDomainPresentationLength) {
+        return false;
+    }
+
     // Normalize domain
     const std::string normalized = NormalizeDomain(domain);
-    if (normalized.empty()) {
+    if (normalized.empty() || normalized.size() > kMaxDomainPresentationLength) {
         return false;
     }
     
@@ -657,8 +675,11 @@ bool DomainSuffixTrie::Insert(std::string_view domain, const IndexValue& value) 
 bool DomainSuffixTrie::Lookup(std::string_view domain, IndexValue& outValue) const {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     
+    if (domain.empty() || domain.size() > kMaxDomainPresentationLength) {
+        return false;
+    }
     const std::string normalized = NormalizeDomain(domain);
-    if (normalized.empty()) {
+    if (normalized.empty() || normalized.size() > kMaxDomainPresentationLength) {
         return false;
     }
     
@@ -694,8 +715,11 @@ bool DomainSuffixTrie::Contains(std::string_view domain) const {
 bool DomainSuffixTrie::Remove(std::string_view domain) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     
+    if (domain.empty() || domain.size() > kMaxDomainPresentationLength) {
+        return false;
+    }
     const std::string normalized = NormalizeDomain(domain);
-    if (normalized.empty()) {
+    if (normalized.empty() || normalized.size() > kMaxDomainPresentationLength) {
         return false;
     }
     
@@ -784,7 +808,7 @@ EmailHashTable::EmailHashTable(size_t initialCapacity) {
 bool EmailHashTable::Insert(std::string_view email, const IndexValue& value) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     
-    if (email.empty()) {
+    if (email.empty() || email.size() > kMaxEmailLength) {
         return false;
     }
     
@@ -811,7 +835,7 @@ bool EmailHashTable::Insert(std::string_view email, const IndexValue& value) {
 bool EmailHashTable::Lookup(std::string_view email, IndexValue& outValue) const {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     
-    if (email.empty()) {
+    if (email.empty() || email.size() > kMaxEmailLength) {
         return false;
     }
     
@@ -843,7 +867,7 @@ bool EmailHashTable::Contains(std::string_view email) const {
 bool EmailHashTable::Remove(std::string_view email) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     
-    if (email.empty()) {
+    if (email.empty() || email.size() > kMaxEmailLength) {
         return false;
     }
     

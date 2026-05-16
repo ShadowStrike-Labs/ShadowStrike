@@ -260,9 +260,15 @@ namespace ShadowStrike {
             /// @brief Get entry count (alias for GetSize)
             [[nodiscard]] size_t GetEntryCount() const noexcept { return m_entries.size(); }
             
-            /// @brief Estimate memory usage in bytes
+            /// @brief Get memory usage in bytes
             [[nodiscard]] size_t GetMemoryUsage() const noexcept {
-                // Approximate: key strings + values + bucket overhead
+                // Acquire a shared lock so we don't race with Insert/Remove
+                // mutating the bucket array while we walk it. Without this,
+                // `m_entries.bucket_count()` and the range-for loop could
+                // dereference invalidated iterators after a concurrent rehash
+                // — undefined behaviour inside a noexcept function would
+                // terminate the process.
+                std::shared_lock<std::shared_mutex> lock(m_mutex);
                 size_t usage = m_entries.bucket_count() * sizeof(void*);
                 for (const auto& [key, val] : m_entries) {
                     usage += key.capacity() + sizeof(IndexValue) + sizeof(void*);
