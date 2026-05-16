@@ -35,7 +35,9 @@
  * ============================================================================
  */
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 
 #include "YaraRuleStore.hpp"
 
