@@ -30,8 +30,12 @@
 #include "ThreatIntelExporter.hpp"
 #include "ThreatIntelDatabase.hpp"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
