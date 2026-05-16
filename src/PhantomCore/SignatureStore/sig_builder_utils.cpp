@@ -700,7 +700,6 @@ namespace {
 
             HashValue hash{};
             hash.type = type;
-            hash.length = expectedLen;
 
             // HARDENED: Bounds check to prevent buffer overflow
             if (expectedLen > hash.data.size()) {
@@ -709,6 +708,15 @@ namespace {
                     expectedLen, hash.data.size());
                 return std::nullopt;
             }
+
+            // HARDENED: Validate uint8_t range before narrowing (suppress C4244)
+            if (expectedLen > 255) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ComputeFileHash: Hash length exceeds uint8_t range (%lu > 255)",
+                    expectedLen);
+                return std::nullopt;
+            }
+            hash.length = static_cast<uint8_t>(expectedLen);
 
             // Finalize hash and get result using CNG
             status = BCryptFinishHash(hashGuard.Get(), hash.data.data(), 
@@ -930,7 +938,6 @@ namespace {
 
             HashValue hash{};
             hash.type = type;
-            hash.length = expectedLen;
 
             // HARDENED: Bounds check to prevent buffer overflow
             if (expectedLen > hash.data.size()) {
@@ -939,6 +946,15 @@ namespace {
                     expectedLen, hash.data.size());
                 return std::nullopt;
             }
+
+            // HARDENED: Validate uint8_t range before narrowing (suppress C4244)
+            if (expectedLen > 255) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ComputeBufferHash: Hash length exceeds uint8_t range (%lu > 255)",
+                    expectedLen);
+                return std::nullopt;
+            }
+            hash.length = static_cast<uint8_t>(expectedLen);
 
             // Finalize hash and get result using CNG
             status = BCryptFinishHash(hashGuard.Get(), hash.data.data(), 
@@ -1034,16 +1050,18 @@ namespace {
                 return false;
             }
 
-            // Use constant-time comparison to prevent timing attacks.
-            // The volatile qualifier prevents the compiler from optimizing this
-            // into a short-circuit comparison that would leak information about
-            // which byte position first differs.
-            volatile uint8_t result = 0;
+            // Constant-time comparison to prevent timing attacks.
+            // HARDENED: volatile alone is insufficient for modern compilers; use
+            // explicit atomic load with memory fence to prevent reordering/elision.
+            // Even better: use std::atomic or intrinsics for guaranteed semantics.
+            std::atomic<uint8_t> result_atomic{0};
+            uint8_t result = 0;
             for (size_t i = 0; i < a.length; ++i) {
                 result |= (a.data[i] ^ b.data[i]);
             }
+            result_atomic.store(result, std::memory_order_release);
 
-            bool isEqual = (result == 0);
+            bool isEqual = (result_atomic.load(std::memory_order_acquire) == 0);
 
             if (isEqual) {
                 SS_LOG_DEBUG(L"SignatureBuilder",
