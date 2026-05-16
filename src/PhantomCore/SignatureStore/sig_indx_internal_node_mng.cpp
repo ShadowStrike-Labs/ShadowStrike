@@ -28,6 +28,16 @@ namespace ShadowStrike {
 
     namespace SignatureStore {
 
+// ============================================================================
+// COW POOL CONSTANTS
+// ============================================================================
+
+namespace {
+    // Maximum number of COW (Copy-On-Write) nodes in the transaction pool.
+    // This limit prevents unbounded memory growth during large batch inserts.
+    // Shared by AllocateNode and CloneNode.
+    constexpr size_t MAX_COW_NODES = 10000;
+} // anonymous namespace
 
 // ============================================================================
 // INTERNAL NODE MANAGEMENT
@@ -1015,7 +1025,6 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
 
     try {
         // Pre-check COW pool size before allocation to fail fast
-        constexpr size_t MAX_COW_NODES = 10000;
         if (m_cowNodes.size() >= MAX_COW_NODES) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"AllocateNode: COW pool already at maximum size (%zu nodes) - allocation denied",
@@ -1300,7 +1309,6 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
         BPlusTreeNode* ptr = clone.get();
 
         // Pre-check COW pool size before push_back
-        constexpr size_t MAX_COW_NODES = 10000;
         if (m_cowNodes.size() >= MAX_COW_NODES) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"CloneNode: COW pool size limit exceeded (%zu)",
