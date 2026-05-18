@@ -51,7 +51,7 @@ namespace ShadowStrike  {
                 case SymmetricAlgorithm::AES_256_CFB:
                     return BCRYPT_AES_ALGORITHM;
                 case SymmetricAlgorithm::ChaCha20_Poly1305:
-                    return L"ChaCha20-Poly1305";
+                    return BCRYPT_CHACHA20_POLY1305_ALGORITHM;
                 default:
                     return nullptr;
                 }
