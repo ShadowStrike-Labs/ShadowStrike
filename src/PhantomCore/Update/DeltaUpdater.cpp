@@ -21,6 +21,9 @@
 
 #include <unordered_map>
 #include <cstring>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 // ============================================================================
 // ANONYMOUS NAMESPACE – Internal helpers, constants, serialization
@@ -33,6 +36,18 @@ constexpr const wchar_t* kLogCategory = L"DeltaUpdater";
 constexpr uint8_t  kFlagCompressed  = 0x01;
 constexpr size_t   kDiffBlockSize   = 4096;
 constexpr int      kMaxHashProbes   = 16;
+
+// Maximum allowed expansion ratio when decompressing a patch payload.
+// Caps decompression-bomb amplification: a small compressed blob cannot
+// claim a huge uncompressed footprint.
+constexpr uint64_t kMaxDecompressRatio = 64;
+
+// Hard floor on uncompressed bound so even tiny compressed inputs can still
+// expand to a useful working buffer (header overhead etc.).
+constexpr uint64_t kMinDecompressFloor = 64 * 1024;
+
+// Only one wire-format version is currently defined for the SSDP container.
+constexpr uint16_t kSupportedHeaderVersion = 1;
 
 constexpr uint64_t kMaxPatchBytes =
     static_cast<uint64_t>(ShadowStrike::Update::DeltaConstants::MAX_PATCH_SIZE_MB)
@@ -201,14 +216,14 @@ struct NtdllCompress {
                                      std::vector<uint8_t>& out) {
     auto& nt = NtdllCompress::Get();
     if (!nt.Resolve() || inLen == 0) return false;
-    if (expectedLen > kMaxFileBytes) return false;
+    if (expectedLen == 0 || expectedLen > kMaxFileBytes) return false;
 
     const auto fmtEng = static_cast<USHORT>(kXpressHuff | kEngineMaximum);
     ULONG cwsSize = 0, fwsSize = 0;
     if (nt.pGetWsSize(fmtEng, &cwsSize, &fwsSize) < 0) return false;
 
     auto ws = std::make_unique<uint8_t[]>(fwsSize);
-    out.resize(expectedLen);
+    out.assign(expectedLen, 0);
 
     ULONG finalSz = 0;
     NTSTATUS st = nt.pDecompressEx(kXpressHuff,
@@ -216,7 +231,8 @@ struct NtdllCompress {
         const_cast<PUCHAR>(in), static_cast<ULONG>(inLen),
         &finalSz, ws.get());
     if (st < 0) { out.clear(); return false; }
-    out.resize(finalSz);
+    // Strict length check — silent truncation is treated as corruption.
+    if (finalSz != expectedLen) { out.clear(); return false; }
     return true;
 }
 
@@ -236,6 +252,18 @@ struct NtdllCompress {
 
 [[nodiscard]] bool ReadFileBytes(const std::filesystem::path& p,
                                  std::vector<uint8_t>& out) {
+    // Symlink/junction defense: refuse to read through reparse points.
+    // The patcher operates on installed binaries; following an attacker
+    // controlled reparse point would give a read primitive against any
+    // target the service account can reach.
+    FU::Error sErr;
+    FU::FileStat st{};
+    if (!FU::Stat(p.wstring(), st, &sErr) || !st.exists) return false;
+    if (st.isReparsePoint) {
+        SS_LOG_ERROR(kLogCategory,
+            L"Refusing to read reparse point: %s", p.c_str());
+        return false;
+    }
     std::vector<std::byte> raw;
     FU::Error err;
     if (!FU::ReadAllBytes(p.wstring(), raw, &err)) return false;
@@ -290,7 +318,8 @@ namespace Update {
 
 bool PatchHeader::IsValid() const noexcept {
     if (magic != DeltaConstants::PATCH_MAGIC) return false;
-    if (version == 0 || version > 10)         return false;
+    // Only version 1 of the wire format is implemented end-to-end.
+    if (version != 1)                         return false;
     if (static_cast<uint8_t>(algorithm) >
         static_cast<uint8_t>(PatchAlgorithm::Custom)) return false;
     if (sourceSize > kMaxFileBytes)  return false;
@@ -419,23 +448,35 @@ public:
     // ====================================================================
 
     void NotifyProgress(const PatchProgress& p) {
-        std::lock_guard lk(m_callbackMutex);
-        if (m_progressCb) {
-            try { m_progressCb(p); } catch (...) {}
+        PatchProgressCallback cb;
+        {
+            std::lock_guard lk(m_callbackMutex);
+            cb = m_progressCb;
+        }
+        if (cb) {
+            try { cb(p); } catch (...) {}
         }
     }
 
     void NotifyCompletion(const PatchResult& r) {
-        std::lock_guard lk(m_callbackMutex);
-        if (m_completionCb) {
-            try { m_completionCb(r); } catch (...) {}
+        PatchCompletionCallback cb;
+        {
+            std::lock_guard lk(m_callbackMutex);
+            cb = m_completionCb;
+        }
+        if (cb) {
+            try { cb(r); } catch (...) {}
         }
     }
 
     void NotifyError(const std::string& msg, int code) {
-        std::lock_guard lk(m_callbackMutex);
-        if (m_errorCb) {
-            try { m_errorCb(msg, code); } catch (...) {}
+        ErrorCallback cb;
+        {
+            std::lock_guard lk(m_callbackMutex);
+            cb = m_errorCb;
+        }
+        if (cb) {
+            try { cb(msg, code); } catch (...) {}
         }
     }
 
@@ -484,7 +525,6 @@ public:
 
         size_t opPos     = 0;
         size_t outPos    = 0;
-        size_t sourcePos = 0; // tracked for Add operations
 
         while (opPos < ops.size()) {
             if (ops.size() - opPos < 5) {
@@ -499,20 +539,13 @@ public:
 
             switch (opcode) {
             case PatchOperation::Add: {
-                if (length > ops.size() - opPos) return false;
-                if (sourcePos > source.size() ||
-                    length > source.size() - sourcePos) return false;
-                if (outPos > targetSize ||
-                    length > targetSize - outPos) return false;
-
-                for (uint32_t i = 0; i < length; ++i)
-                    output[outPos + i] =
-                        static_cast<uint8_t>(source[sourcePos + i] ^ ops[opPos + i]);
-
-                sourcePos += length;
-                outPos    += length;
-                opPos     += length;
-                break;
+                // The Add opcode is reserved and is never produced by this
+                // implementation's encoder. Refuse to interpret it so a
+                // hostile patch cannot exercise an undertested code path.
+                SS_LOG_ERROR(kLogCategory,
+                    L"Reserved opcode 'Add' encountered at offset %zu",
+                    opPos - 5);
+                return false;
             }
             case PatchOperation::Copy: {
                 if (ops.size() - opPos < 8) return false;
@@ -687,6 +720,21 @@ public:
             return false;
         }
 
+        // Strict wire-format gating: only the documented header version and
+        // the Custom algorithm are implemented end-to-end. Refuse anything
+        // else rather than silently treating it as Custom.
+        if (hdr.version != kSupportedHeaderVersion) {
+            result.errorMessage = "Unsupported patch header version";
+            NotifyError(result.errorMessage, kErrInvalidHeader);
+            return false;
+        }
+        if (hdr.algorithm != PatchAlgorithm::Custom &&
+            hdr.algorithm != PatchAlgorithm::Auto) {
+            result.errorMessage = "Patch algorithm not supported by this build";
+            NotifyError(result.errorMessage, kErrInvalidHeader);
+            return false;
+        }
+
         SetProgress(PatchState::Validating, 5, 0,
                     hdr.targetSize, "Validating patch header");
 
@@ -701,6 +749,12 @@ public:
         if (patchData.size() < payloadOff ||
             hdr.patchSize > patchData.size() - payloadOff) {
             result.errorMessage = "Patch data truncated";
+            NotifyError(result.errorMessage, kErrInvalidHeader);
+            return false;
+        }
+        // Refuse trailing garbage after the declared payload.
+        if (patchData.size() != payloadOff + hdr.patchSize) {
+            result.errorMessage = "Patch container has unexpected trailing bytes";
             NotifyError(result.errorMessage, kErrInvalidHeader);
             return false;
         }
@@ -738,8 +792,19 @@ public:
                 return false;
             }
             uint64_t uncompLen = GetU64(payload);
-            if (uncompLen > kMaxPatchBytes) {
+            if (uncompLen == 0 || uncompLen > kMaxPatchBytes) {
                 result.errorMessage = "Decompressed size exceeds limit";
+                NotifyError(result.errorMessage, kErrPatchTooLarge);
+                return false;
+            }
+            // Reject expansion ratios that look like decompression bombs.
+            // A small compressed blob cannot legitimately claim a huge
+            // uncompressed footprint.
+            const uint64_t compressedLen = static_cast<uint64_t>(payloadLen - 8);
+            uint64_t ratioCap = compressedLen * kMaxDecompressRatio;
+            if (ratioCap < kMinDecompressFloor) ratioCap = kMinDecompressFloor;
+            if (uncompLen > ratioCap) {
+                result.errorMessage = "Patch expansion ratio exceeds policy";
                 NotifyError(result.errorMessage, kErrPatchTooLarge);
                 return false;
             }
@@ -1184,7 +1249,14 @@ PatchResult DeltaUpdater::ApplyPatchFile(const fs::path& sourcePath,
     // Ensure parent directory exists
     if (outputPath.has_parent_path()) {
         FU::Error fErr;
-        FU::CreateDirectories(outputPath.parent_path().wstring(), &fErr);
+        if (!FU::CreateDirectories(outputPath.parent_path().wstring(), &fErr)) {
+            result.success = false;
+            result.errorMessage = "Failed to create output directory";
+            m_impl->NotifyError(result.errorMessage, kErrIO);
+            m_impl->m_stats.patchesFailed++;
+            m_impl->m_status = DeltaUpdaterStatus::Running;
+            return result;
+        }
     }
 
     // Write output
@@ -1236,11 +1308,25 @@ PatchResult DeltaUpdater::ApplyPatchMemory(
         return result;
     }
 
-    // Write result to temp file so caller can retrieve it
+    // Write result to temp file so caller can retrieve it.
+    // Use cryptographically random bytes for the filename to prevent a local
+    // attacker from pre-creating a file (or symlink/junction) at the path
+    // we are about to write.
     wchar_t nameBuf[64]{};
-    auto tick = static_cast<unsigned long long>(
-        Clock::now().time_since_epoch().count());
-    swprintf_s(nameBuf, L"ssdp_%llx.tmp", tick);
+    uint8_t rnd[16]{};
+    NTSTATUS rs = ::BCryptGenRandom(nullptr, rnd, sizeof(rnd),
+                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (rs < 0) {
+        result.errorMessage = "RNG unavailable for temp file";
+        m_impl->NotifyError(result.errorMessage, kErrIO);
+        m_impl->m_status = DeltaUpdaterStatus::Running;
+        return result;
+    }
+    swprintf_s(nameBuf,
+        L"ssdp_%02x%02x%02x%02x%02x%02x%02x%02x"
+        L"%02x%02x%02x%02x%02x%02x%02x%02x.tmp",
+        rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7],
+        rnd[8], rnd[9], rnd[10], rnd[11], rnd[12], rnd[13], rnd[14], rnd[15]);
     fs::path tmpPath = m_impl->m_tempDir / nameBuf;
 
     if (WriteFileBytes(tmpPath, output)) {
@@ -1306,7 +1392,13 @@ bool DeltaUpdater::CreatePatch(const fs::path& oldFile,
     // Ensure parent directory exists
     if (patchFile.has_parent_path()) {
         FU::Error fErr;
-        FU::CreateDirectories(patchFile.parent_path().wstring(), &fErr);
+        if (!FU::CreateDirectories(patchFile.parent_path().wstring(), &fErr)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Failed to create patch parent directory: %s",
+                patchFile.parent_path().c_str());
+            m_impl->m_status = DeltaUpdaterStatus::Running;
+            return false;
+        }
     }
 
     // Write
@@ -1412,6 +1504,11 @@ bool DeltaUpdater::VerifySource(const fs::path& sourcePath,
     if (!FU::Stat(sourcePath.wstring(), st, &fErr) || !st.exists) {
         SS_LOG_ERROR(kLogCategory,
             L"VerifySource: file not found: %s", sourcePath.c_str());
+        return false;
+    }
+    if (st.isReparsePoint) {
+        SS_LOG_ERROR(kLogCategory,
+            L"VerifySource: refusing reparse point: %s", sourcePath.c_str());
         return false;
     }
     if (st.size != header.sourceSize) {
