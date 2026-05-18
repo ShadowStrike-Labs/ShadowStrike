@@ -169,6 +169,44 @@ namespace {
     constexpr char szOID_ECDSA_SHA1[] = "1.2.840.10045.4.1";
 #endif
 
+    /**
+     * @brief Translates a RevocationMode into CertGetCertificateChain flag bits.
+     *
+     * The caller-supplied flags are preserved; this helper returns the additional
+     * bits that the configured policy contributes. Honoring this policy state is
+     * required so that SetRevocationMode() is not silently inert.
+     */
+    [[nodiscard]] inline DWORD revocation_flags_for(RevocationMode mode) noexcept {
+        switch (mode) {
+        case RevocationMode::OnlineOnly:
+            // Strict: revocation must be checked for the entire chain except root.
+            return CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+        case RevocationMode::OfflineAllowed:
+            // Same chain coverage, but accumulate timeouts so a slow/offline
+            // responder does not stall verification; offline-revocation trust
+            // errors are tolerated when interpreting the chain status.
+            return CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+                 | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT;
+        case RevocationMode::Disabled:
+            return 0;
+        }
+        return CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+    }
+
+    /**
+     * @brief Mask of CERT_TRUST_* error bits to ignore for a given mode.
+     *
+     * In OfflineAllowed mode, offline-revocation and unknown-revocation conditions
+     * must not be fatal — they fall back to "best effort" rather than hard fail.
+     */
+    [[nodiscard]] inline DWORD ignorable_trust_errors_for(RevocationMode mode) noexcept {
+        if (mode == RevocationMode::OfflineAllowed) {
+            return CERT_TRUST_IS_OFFLINE_REVOCATION
+                 | CERT_TRUST_REVOCATION_STATUS_UNKNOWN;
+        }
+        return 0;
+    }
+
 } // anonymous namespace
 
 #endif // _WIN32
@@ -1836,6 +1874,24 @@ bool Certificate::VerifyChain(Error* err,
         return false;
     }
 
+    // Enforce signature-algorithm policy before consulting any external trust
+    // database. A weak-signature leaf can never be promoted to trusted, so
+    // reject it up front to provide a clear diagnostic.
+    if (!IsStrongSignatureAlgo(allowSha1Weak_)) {
+        set_err(err,
+            allowSha1Weak_
+                ? L"VerifyChain: signature algorithm rejected (MD2/MD5/unknown)"
+                : L"VerifyChain: signature algorithm rejected (SHA-1 or weaker)",
+            ERROR_INVALID_DATA);
+        return false;
+    }
+
+    // Compose effective chain flags: caller flags OR'd with the bits required
+    // by the configured RevocationMode. This guarantees SetRevocationMode()
+    // actually influences verification.
+    const DWORD effectiveFlags = chainFlags | revocation_flags_for(revocationMode_);
+    const DWORD ignorableErrors = ignorable_trust_errors_for(revocationMode_);
+
     // Initialize chain parameters
     CERT_CHAIN_PARA chainPara{};
     chainPara.cbSize = sizeof(chainPara);
@@ -1860,7 +1916,7 @@ bool Certificate::VerifyChain(Error* err,
         verificationTime,
         hAdditionalStore,
         &chainPara,
-        chainFlags,
+        effectiveFlags,
         nullptr,                // Reserved
         &chainCtx)) {
         set_err(err, L"VerifyChain: CertGetCertificateChain failed", GetLastError());
@@ -1873,28 +1929,32 @@ bool Certificate::VerifyChain(Error* err,
         ~ChainGuard() { if (ctx != nullptr) CertFreeCertificateChain(ctx); }
     } chainGuard{ chainCtx };
 
-    // Verify chain trust status first
-    if (chainCtx->TrustStatus.dwErrorStatus != CERT_TRUST_NO_ERROR) {
+    // Verify chain trust status first (mask out conditions that the configured
+    // RevocationMode explicitly tolerates).
+    const DWORD effectiveTrustStatus =
+        chainCtx->TrustStatus.dwErrorStatus & ~ignorableErrors;
+
+    if (effectiveTrustStatus != CERT_TRUST_NO_ERROR) {
         // Detailed error message based on trust status
-        if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_TIME_VALID) {
+        if (effectiveTrustStatus & CERT_TRUST_IS_NOT_TIME_VALID) {
             set_err(err, L"VerifyChain: certificate expired or not yet valid",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
-        else if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_REVOKED) {
+        else if (effectiveTrustStatus & CERT_TRUST_IS_REVOKED) {
             set_err(err, L"VerifyChain: certificate has been revoked",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
-        else if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_SIGNATURE_VALID) {
+        else if (effectiveTrustStatus & CERT_TRUST_IS_NOT_SIGNATURE_VALID) {
             set_err(err, L"VerifyChain: certificate signature is invalid",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
-        else if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
+        else if (effectiveTrustStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
             set_err(err, L"VerifyChain: untrusted root certificate",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
         else {
             set_err(err, L"VerifyChain: chain trust status error",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
         return false;
     }
@@ -1989,16 +2049,28 @@ bool Certificate::VerifyChainWithStore(HCERTSTORE hRootStore,
         return false;
     }
 
-    // Configure custom chain engine
+    // Enforce signature-algorithm policy on the leaf up front (see VerifyChain).
+    if (!IsStrongSignatureAlgo(allowSha1Weak_)) {
+        set_err(err,
+            allowSha1Weak_
+                ? L"VerifyChainWithStore: signature algorithm rejected (MD2/MD5/unknown)"
+                : L"VerifyChainWithStore: signature algorithm rejected (SHA-1 or weaker)",
+            ERROR_INVALID_DATA);
+        return false;
+    }
+
+    const DWORD effectiveFlags = chainFlags | revocation_flags_for(revocationMode_);
+    const DWORD ignorableErrors = ignorable_trust_errors_for(revocationMode_);
+
+    // Configure custom chain engine.
+    // hExclusiveRoot binds the trusted roots. Intermediates are NOT trust
+    // anchors and must not be placed in hExclusiveTrustedPeople (that field
+    // is for end-entity trusted peers); they are passed below to
+    // CertGetCertificateChain via hAdditionalStore so the chain builder can
+    // discover them as issuer candidates.
     CERT_CHAIN_ENGINE_CONFIG config{};
     config.cbSize = sizeof(config);
     config.hExclusiveRoot = hRootStore;
-
-    // hExclusiveTrustStore is preferred over hExclusiveIntermediate in newer Windows
-    // but we use what's available for compatibility
-    if (hIntermediateStore != nullptr) {
-        config.hExclusiveTrustedPeople = hIntermediateStore;
-    }
 
     // Create custom chain engine
     HCERTCHAINENGINE hEngine = nullptr;
@@ -2034,9 +2106,9 @@ bool Certificate::VerifyChainWithStore(HCERTSTORE hRootStore,
         hEngine,
         m_certContext,
         const_cast<LPFILETIME>(verificationTime),
-        nullptr,                // No additional store (using engine stores)
+        hIntermediateStore,     // Issuer candidates (intermediates), not trust anchors
         &chainPara,
-        chainFlags,
+        effectiveFlags,
         nullptr,                // Reserved
         &chainCtx
     );
@@ -2052,23 +2124,26 @@ bool Certificate::VerifyChainWithStore(HCERTSTORE hRootStore,
         ~ChainGuard() { if (ctx != nullptr) CertFreeCertificateChain(ctx); }
     } chainGuard{ chainCtx };
 
-    // Check trust status
-    if (chainCtx->TrustStatus.dwErrorStatus != CERT_TRUST_NO_ERROR) {
-        if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_TIME_VALID) {
+    // Check trust status (mask conditions tolerated by the configured mode).
+    const DWORD effectiveTrustStatus =
+        chainCtx->TrustStatus.dwErrorStatus & ~ignorableErrors;
+
+    if (effectiveTrustStatus != CERT_TRUST_NO_ERROR) {
+        if (effectiveTrustStatus & CERT_TRUST_IS_NOT_TIME_VALID) {
             set_err(err, L"VerifyChainWithStore: certificate expired or not yet valid",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
-        else if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_REVOKED) {
+        else if (effectiveTrustStatus & CERT_TRUST_IS_REVOKED) {
             set_err(err, L"VerifyChainWithStore: certificate has been revoked",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
-        else if (chainCtx->TrustStatus.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
+        else if (effectiveTrustStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
             set_err(err, L"VerifyChainWithStore: untrusted root certificate",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
         else {
             set_err(err, L"VerifyChainWithStore: chain trust status error",
-                static_cast<DWORD>(chainCtx->TrustStatus.dwErrorStatus));
+                static_cast<DWORD>(effectiveTrustStatus));
         }
         return false;
     }
