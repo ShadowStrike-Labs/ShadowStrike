@@ -128,6 +128,22 @@ namespace ShadowStrike {
 			bool ParseMacAddress(std::wstring_view str, MacAddress& mac, Error* err) noexcept {
 				try {
 					str = Internal::TrimWhitespace(str);
+
+					// Bound input length defensively.  The longest legitimate form is
+					// XX-XX-XX-XX-XX-XX (17 characters); anything beyond a small slack
+					// is either malformed or an attacker hunting for a parser pathology.
+					if (str.size() < 11 || str.size() > 32) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid MAC address length");
+						return false;
+					}
+
+					auto hexValue = [](wchar_t c, int& out) noexcept -> bool {
+						if (c >= L'0' && c <= L'9') { out = c - L'0'; return true; }
+						if (c >= L'a' && c <= L'f') { out = c - L'a' + 10; return true; }
+						if (c >= L'A' && c <= L'F') { out = c - L'A' + 10; return true; }
+						return false;
+					};
+
 					std::array<uint8_t, 6> bytes{};
 					int byteIndex = 0;
 					size_t pos = 0;
@@ -142,8 +158,13 @@ namespace ShadowStrike {
 							return false;
 						}
 
-						std::wstring byteStr(str.substr(pos, 2));
-						bytes[byteIndex++] = static_cast<uint8_t>(std::stoi(byteStr, nullptr, 16));
+						int hi = 0, lo = 0;
+						if (!hexValue(str[pos], hi) || !hexValue(str[pos + 1], lo)) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER,
+								L"MAC address octet contains a non-hex character");
+							return false;
+						}
+						bytes[byteIndex++] = static_cast<uint8_t>((hi << 4) | lo);
 
 						if (sepPos == std::wstring_view::npos) break;
 						pos = sepPos + 1;
@@ -151,6 +172,13 @@ namespace ShadowStrike {
 
 					if (byteIndex != 6) {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"MAC address must have 6 bytes");
+						return false;
+					}
+
+					// Reject trailing content after the sixth octet
+					if (pos + 2 < str.length()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER,
+							L"Unexpected content after MAC address");
 						return false;
 					}
 
@@ -169,6 +197,11 @@ namespace ShadowStrike {
 					if (ipAddress.IsIPv4()) {
 						// IPv4 - Use SendARP
 						auto* ipv4 = ipAddress.AsIPv4();
+						if (!ipv4) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER,
+								L"IpAddress version is IPv4 but variant does not hold an IPv4 value");
+							return false;
+						}
 						ULONG macAddr[2] = {};
 						ULONG macAddrLen = 6;
 
@@ -208,6 +241,11 @@ namespace ShadowStrike {
 
 						// Get IPv6 bytes for comparison
 						auto* ipv6 = ipAddress.AsIPv6();
+						if (!ipv6) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER,
+								L"IpAddress version is IPv6 but variant does not hold an IPv6 value");
+							return false;
+						}
 						std::array<uint8_t, 16> targetBytes = ipv6->bytes;
 
 						// Search for matching IPv6 address
@@ -266,6 +304,11 @@ namespace ShadowStrike {
 						std::unique_ptr<std::remove_pointer_t<HANDLE>, IcmpDeleter> icmpGuard(hIcmpFile);
 
 						auto* ipv6 = ipAddress.AsIPv6();
+						if (!ipv6) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER,
+								L"IpAddress version is IPv6 but variant does not hold an IPv6 value");
+							return false;
+						}
 						std::array<uint8_t, 16> targetBytes = ipv6->bytes;
 
 						sockaddr_in6 sourceAddr{};
@@ -292,6 +335,11 @@ namespace ShadowStrike {
 					else if (ipAddress.IsIPv4()) {
 						//for ipv4 sendarp already updates the neighbor cache
 						auto* ipv4 = ipAddress.AsIPv4();
+						if (!ipv4) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER,
+								L"IpAddress version is IPv4 but variant does not hold an IPv4 value");
+							return false;
+						}
 						ULONG macAddr[2] = {};
 						ULONG macAddrLen = 6;
 						::SendARP(Internal::HostToNetwork32(ipv4->ToUInt32()), 0, macAddr, &macAddrLen);
