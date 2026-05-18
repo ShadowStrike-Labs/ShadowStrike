@@ -256,27 +256,39 @@ public:
 
     void NotifyProgress(const ProgUpdateProgress& prog)
     {
-        std::lock_guard lock(m_callbackMutex);
-        if (m_progressCallback) {
-            try { m_progressCallback(prog); }
+        ProgProgressCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_progressCallback;
+        }
+        if (cb) {
+            try { cb(prog); }
             catch (...) { SS_LOG_WARN(kLogCategory, L"Progress callback threw exception"); }
         }
     }
 
     void NotifyCompletion(const ProgUpdateResult& result)
     {
-        std::lock_guard lock(m_callbackMutex);
-        if (m_completionCallback) {
-            try { m_completionCallback(result); }
+        ProgCompletionCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_completionCallback;
+        }
+        if (cb) {
+            try { cb(result); }
             catch (...) { SS_LOG_WARN(kLogCategory, L"Completion callback threw exception"); }
         }
     }
 
     void NotifyError(const std::string& message, int code)
     {
-        std::lock_guard lock(m_callbackMutex);
-        if (m_errorCallback) {
-            try { m_errorCallback(message, code); }
+        ErrorCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_errorCallback;
+        }
+        if (cb) {
+            try { cb(message, code); }
             catch (...) { SS_LOG_WARN(kLogCategory, L"Error callback threw exception"); }
         }
     }
@@ -333,6 +345,23 @@ public:
             std::error_code ec;
             if (!fs::exists(componentPath, ec) || ec) continue;
 
+            // Refuse to follow reparse points in the install directory:
+            // an attacker who can drop a junction there could otherwise
+            // have us hash and report arbitrary system files as part of
+            // the ShadowStrike install footprint.
+            {
+                FU::Error fErr;
+                FU::FileStat fst{};
+                if (FU::Stat(componentPath.wstring(), fst, &fErr) &&
+                    fst.isReparsePoint)
+                {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Refusing reparse-point component path: %ls",
+                        componentPath.wstring().c_str());
+                    continue;
+                }
+            }
+
             ComponentInfo info;
             info.type = def.type;
             info.displayName = def.displayName;
@@ -370,10 +399,14 @@ public:
 
     [[nodiscard]] bool StopService()
     {
-        std::lock_guard lock(m_callbackMutex);
-        if (m_serviceControlCallback) {
+        ServiceControlCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_serviceControlCallback;
+        }
+        if (cb) {
             try {
-                return m_serviceControlCallback(true);
+                return cb(true);
             }
             catch (...) {
                 SS_LOG_ERROR(kLogCategory, L"ServiceControlCallback (stop) threw exception");
@@ -386,10 +419,14 @@ public:
 
     [[nodiscard]] bool StartService()
     {
-        std::lock_guard lock(m_callbackMutex);
-        if (m_serviceControlCallback) {
+        ServiceControlCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_serviceControlCallback;
+        }
+        if (cb) {
             try {
-                return m_serviceControlCallback(false);
+                return cb(false);
             }
             catch (...) {
                 SS_LOG_ERROR(kLogCategory, L"ServiceControlCallback (start) threw exception");
@@ -418,11 +455,17 @@ public:
         }
 
         // In a complete implementation, download package from downloadUrl.
-        // Transport is not configured — log and return status based on local staging.
+        // Until a transport is wired in, refuse to proceed when the package
+        // metadata declares a remote source: trusting whatever bytes
+        // happen to be on disk would let an attacker who can write to the
+        // staging directory substitute the package entirely.
         if (!package.downloadUrl.empty()) {
-            SS_LOG_WARN(kLogCategory,
-                L"HTTP download transport not configured — package must be pre-staged. URL: %hs",
-                package.downloadUrl.c_str());
+            SS_LOG_ERROR(kLogCategory,
+                L"Package %hs requires remote fetch (URL set) but no "
+                L"transport is configured — refusing to install from local "
+                L"staging contents",
+                package.packageId.c_str());
+            return false;
         }
 
         // Verify that the staging directory has content from a pre-staged drop.
@@ -451,47 +494,70 @@ public:
 
     [[nodiscard]] bool ValidateStagedFiles(const ProgramPackage& package)
     {
+        // Fail-closed posture: signature verification, content hashing and
+        // anti-downgrade are mandatory. None of these checks may be skipped
+        // because of missing inputs or a missing verifier — that has been
+        // the source of real-world update-channel hijacks elsewhere.
         if (!UpdateVerifier::HasInstance() ||
             !UpdateVerifier::Instance().IsInitialized())
         {
-            SS_LOG_WARN(kLogCategory,
-                L"UpdateVerifier not available — skipping full package verification");
+            SS_LOG_ERROR(kLogCategory,
+                L"UpdateVerifier is not initialized — refusing to apply "
+                L"unverified package (fail closed)");
+            return false;
         }
-        else {
-            // Verify package signature.
-            if (!package.signature.empty()) {
-                auto result = UpdateVerifier::Instance().VerifyPackageFull(
-                    m_stagingDir, package.signature);
-                if (!result.isValid) {
-                    SS_LOG_ERROR(kLogCategory,
-                        L"Package signature verification failed: %hs",
-                        result.errorMessage.c_str());
-                    return false;
-                }
-                SS_LOG_INFO(kLogCategory, L"Package signature verified successfully");
-            }
 
-            // Verify hash if provided.
-            if (!package.checksum.empty()) {
-                if (!UpdateVerifier::Instance().VerifyHash(
-                        m_stagingDir, package.checksum))
-                {
-                    SS_LOG_ERROR(kLogCategory,
-                        L"Package checksum verification failed");
-                    return false;
-                }
+        if (package.signature.empty()) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Package %hs has no signature — refusing to install",
+                package.packageId.c_str());
+            return false;
+        }
+        {
+            auto result = UpdateVerifier::Instance().VerifyPackageFull(
+                m_stagingDir, package.signature);
+            if (!result.isValid) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Package signature verification failed: %hs",
+                    result.errorMessage.c_str());
+                return false;
             }
+            SS_LOG_INFO(kLogCategory, L"Package signature verified successfully");
+        }
 
-            // Anti-downgrade check.
-            if (!package.newVersion.versionString.empty()) {
-                if (!UpdateVerifier::Instance().ValidateVersionSequence(
-                        package.newVersion.versionString))
-                {
-                    SS_LOG_ERROR(kLogCategory,
-                        L"Version sequence validation failed — possible downgrade attack");
-                    return false;
-                }
+        if (package.checksum.empty()) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Package %hs has no checksum — refusing to install",
+                package.packageId.c_str());
+            return false;
+        }
+        if (!UpdateVerifier::Instance().VerifyHash(
+                m_stagingDir, package.checksum))
+        {
+            SS_LOG_ERROR(kLogCategory,
+                L"Package checksum verification failed");
+            return false;
+        }
+
+        // Anti-downgrade. ValidateVersionSequence consults the persisted
+        // policy floor; CompareVersions compares against the live install.
+        // Both must be satisfied — even if policy state is missing the
+        // local comparison catches a same-or-older version.
+        if (!package.newVersion.versionString.empty()) {
+            if (!UpdateVerifier::Instance().ValidateVersionSequence(
+                    package.newVersion.versionString))
+            {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Version sequence validation failed — possible downgrade attack");
+                return false;
             }
+        }
+        if (CompareVersions(package.newVersion, m_currentVersion) <= 0) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing downgrade or same-version reinstall: new=%hs current=%hs",
+                package.newVersion.versionString.c_str(),
+                m_currentVersion.versionString.c_str());
+            return false;
         }
 
         SS_LOG_INFO(kLogCategory, L"Staged files validation passed");
@@ -511,16 +577,66 @@ public:
             return true;
         }
 
-        // Back up the existing file before replacement.
+        // Refuse to move/launch a reparse point: an attacker who can write
+        // to the staging dir could otherwise turn the staged "file" into a
+        // junction to a system binary and have us copy it over the live
+        // install (or, worse, invoke it as the Installer).
+        {
+            FU::Error fErr;
+            FU::FileStat fst{};
+            if (FU::Stat(stagedPath.wstring(), fst, &fErr) && fst.isReparsePoint) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Refusing reparse-point staged file for component %hs",
+                    def.displayName);
+                return false;
+            }
+        }
+        if (fs::is_symlink(stagedPath, ec) && !ec) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing symlink staged file for component %hs",
+                def.displayName);
+            return false;
+        }
+
+        // Back up the existing file before replacement. Honor
+        // maxBackupVersions by rotating older copies aside instead of
+        // overwriting a single .bak slot — this is what protects rollback.
         if (fs::exists(targetPath, ec) && !ec) {
-            fs::path backupPath = m_backupDir / def.fileName;
             if (!FU::CreateDirectories(m_backupDir.wstring())) {
                 SS_LOG_ERROR(kLogCategory, L"Failed to create backup directory: %ls",
                              m_backupDir.wstring().c_str());
                 return false;
             }
+            const std::uint32_t maxBackups =
+                m_config.maxBackupVersions > 0 ? m_config.maxBackupVersions : 1u;
+
+            // Rotate: drop oldest, shift N-1 -> N, ..., 1 -> 2, current -> 1.
+            const fs::path oldestPath =
+                m_backupDir / (std::wstring(def.fileName) + L".bak."
+                               + std::to_wstring(maxBackups));
+            std::error_code rmEc;
+            fs::remove(oldestPath, rmEc); // best-effort
+
+            for (std::uint32_t i = maxBackups; i > 1; --i) {
+                fs::path from = m_backupDir / (std::wstring(def.fileName)
+                    + L".bak." + std::to_wstring(i - 1));
+                fs::path to   = m_backupDir / (std::wstring(def.fileName)
+                    + L".bak." + std::to_wstring(i));
+                std::error_code mEc;
+                if (fs::exists(from, mEc) && !mEc) {
+                    fs::rename(from, to, mEc);
+                    if (mEc) {
+                        SS_LOG_WARN(kLogCategory,
+                            L"Backup rotation rename %ls -> %ls failed: %hs",
+                            from.wstring().c_str(), to.wstring().c_str(),
+                            mEc.message().c_str());
+                    }
+                }
+            }
+            fs::path freshBackup = m_backupDir
+                / (std::wstring(def.fileName) + L".bak.1");
             std::error_code copyEc;
-            fs::copy_file(targetPath, backupPath,
+            fs::copy_file(targetPath, freshBackup,
                           fs::copy_options::overwrite_existing, copyEc);
             if (copyEc) {
                 SS_LOG_ERROR(kLogCategory, L"Failed to back up %ls: %hs",
@@ -605,17 +721,41 @@ public:
             return true;
         }
 
-        // Installer method — execute staged installer silently.
+        // Installer method — execute staged installer silently. The staged
+        // path is attacker-influenced in the general case (anyone who can
+        // write to the staging directory) so we (a) require a valid
+        // Authenticode signature on the installer image before launching
+        // it and (b) pass lpApplicationName explicitly and a quoted
+        // command line to defeat unquoted-path / search-order hijacks.
         if (package.installMethod == InstallMethod::Installer) {
-            std::wstring cmdLine = stagedPath.wstring()
-                + L" /S /SILENT /VERYSILENT /norestart";
+            if (!UpdateVerifier::HasInstance() ||
+                !UpdateVerifier::Instance().IsInitialized())
+            {
+                SS_LOG_ERROR(kLogCategory,
+                    L"UpdateVerifier unavailable — refusing to launch installer %ls",
+                    def.fileName);
+                return false;
+            }
+            if (!UpdateVerifier::Instance().VerifyAuthenticode(stagedPath)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Authenticode verification failed for installer %ls — aborting",
+                    def.fileName);
+                return false;
+            }
+
+            const std::wstring appName = stagedPath.wstring();
+            std::wstring cmdLine;
+            cmdLine.reserve(appName.size() + 64);
+            cmdLine.push_back(L'"');
+            cmdLine.append(appName);
+            cmdLine.append(L"\" /S /SILENT /VERYSILENT /norestart");
 
             STARTUPINFOW si{};
             si.cb = sizeof(si);
             PROCESS_INFORMATION pi{};
 
             BOOL created = ::CreateProcessW(
-                nullptr,
+                appName.c_str(),
                 cmdLine.data(),
                 nullptr,
                 nullptr,
@@ -1505,8 +1645,12 @@ bool ProgramUpdater::ApplyPackage(const ProgramPackage& package)
 
     bool success = m_impl->ExecuteUpdate(package);
 
-    m_impl->m_status = success ? ProgUpdaterStatus::Running
-                               : ProgUpdaterStatus::Running;
+    // ExecuteUpdate already drives m_updateState; the public m_status
+    // returns to Running unconditionally afterwards so a failed update
+    // does not leave the updater permanently stuck in Updating. The
+    // success/failure outcome is reflected on m_updateState and via the
+    // ProgUpdateResult returned by callbacks.
+    m_impl->m_status = ProgUpdaterStatus::Running;
 
     return success;
 }
@@ -1815,16 +1959,33 @@ bool ProgramUpdater::ScheduleReboot(uint32_t delayMinutes)
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    ::LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege",
-                            &tp.Privileges[0].Luid);
-    ::AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr);
+    if (!::LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege",
+                                 &tp.Privileges[0].Luid))
+    {
+        SS_LOG_LAST_ERROR(kLogCategory,
+            L"LookupPrivilegeValueW failed for SeShutdownPrivilege");
+        ::CloseHandle(hToken);
+        return false;
+    }
+    if (!::AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr)) {
+        SS_LOG_LAST_ERROR(kLogCategory,
+            L"AdjustTokenPrivileges failed for SeShutdownPrivilege");
+        ::CloseHandle(hToken);
+        return false;
+    }
     DWORD privErr = ::GetLastError();
     ::CloseHandle(hToken);
 
+    if (privErr == ERROR_NOT_ALL_ASSIGNED) {
+        SS_LOG_ERROR(kLogCategory,
+            L"SeShutdownPrivilege not held by caller — refusing to schedule reboot");
+        return false;
+    }
     if (privErr != ERROR_SUCCESS) {
-        SS_LOG_WARN(kLogCategory,
-            L"AdjustTokenPrivileges returned error %u — reboot may fail",
+        SS_LOG_ERROR(kLogCategory,
+            L"AdjustTokenPrivileges reported error %u — refusing to schedule reboot",
             privErr);
+        return false;
     }
 
     BOOL ok = ::InitiateSystemShutdownExW(
