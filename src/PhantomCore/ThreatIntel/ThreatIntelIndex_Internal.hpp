@@ -174,60 +174,27 @@ namespace ThreatIntel {
 }
 
 /**
- * @brief Normalize domain name (lowercase, trim whitespace)
- * 
- * Uses locale-independent character handling for security.
- * @note Consider using Format::ToLowerASCII and Format::TrimWhitespace for new code.
- * 
+ * @brief Normalize domain name for index lookup and storage
+ *
+ * Delegates to the canonical Format::NormalizeDomainName implementation, which
+ * performs whitespace trimming, ASCII lowercase conversion, and trailing-dot
+ * removal (RFC 1035 root-label canonicalization). Using the canonical helper
+ * here keeps insert-side and lookup-side hashing in lock-step so that bloom
+ * filters and the underlying tries never disagree on the canonical form.
+ *
+ * Format::NormalizeDomainName may allocate; failures from std::bad_alloc
+ * propagate as an empty string via the noexcept boundary (callers already
+ * treat an empty normalized domain as a lookup miss).
+ *
  * @param domain Domain name to normalize
- * @return Normalized domain string
+ * @return Normalized domain string (empty on allocation failure)
  */
 [[nodiscard]] inline std::string NormalizeDomain(std::string_view domain) noexcept {
-    // Use Format utilities for trimming and lowercase
-    std::string_view trimmed = Format::TrimWhitespace(domain);
-    return Format::ToLowerCase(trimmed);
-}
-
-/**
- * @brief Normalize domain name (locale-independent implementation)
- * 
- * Alternative implementation with explicit whitespace handling.
- * Kept for compatibility with existing callers.
- * 
- * @param domain Domain name to normalize
- * @return Normalized domain string
- */
-[[nodiscard]] inline std::string NormalizeDomainLegacy(std::string_view domain) noexcept {
-    std::string result;
-    result.reserve(domain.size());
-
-    // Skip leading whitespace (locale-independent)
-    size_t start = 0;
-    while (start < domain.size()) {
-        const char c = domain[start];
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\v' && c != '\f') {
-            break;
-        }
-        ++start;
+    try {
+        return Format::NormalizeDomainName(domain);
+    } catch (...) {
+        return std::string{};
     }
-
-    // Convert to lowercase and remove trailing whitespace
-    for (size_t i = start; i < domain.size(); ++i) {
-        const char c = domain[i];
-        // Check for whitespace (locale-independent)
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f') {
-            break;
-        }
-        // Lowercase conversion (ASCII only, safe for domains)
-        if (c >= 'A' && c <= 'Z') {
-            result.push_back(static_cast<char>(c + ('a' - 'A')));
-        }
-        else {
-            result.push_back(c);
-        }
-    }
-
-    return result;
 }
 
 // ============================================================================
