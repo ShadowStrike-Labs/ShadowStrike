@@ -195,34 +195,34 @@ namespace ShadowStrike {
                 }
 
                 const uint32_t range = max - min;
-
-                // Prevent division by zero (shouldn't happen given min < max check)
                 if (range == 0) {
                     return min;
                 }
 
-                // Calculate rejection threshold to avoid modulo bias
-                // We reject values >= limit to ensure uniform distribution
+                // Calculate rejection threshold to avoid modulo bias.
+                // Reject values >= limit to ensure uniform distribution.
                 const uint32_t limit = (UINT32_MAX / range) * range;
 
+                // Call Generate() directly rather than NextUInt32(err) so that
+                // an RNG failure is observable even when the caller did not
+                // supply an Error pointer (NextUInt32(err) returns 0 on failure
+                // which is indistinguishable from a real zero result).
                 uint32_t val = 0;
-                uint32_t iterations = 0;
-
-                do {
-                    val = NextUInt32(err);
-                    ++iterations;
-
-                    // Safety limit to prevent infinite loop on RNG failure
-                    if (iterations > MAX_REJECTION_ITERATIONS) {
-                        if (err != nullptr) {
-                            err->SetWin32Error(ERROR_TIMEOUT,
-                                L"Random range generation exceeded iteration limit");
-                        }
+                for (uint32_t iter = 0; iter <= MAX_REJECTION_ITERATIONS; ++iter) {
+                    if (!Generate(reinterpret_cast<uint8_t*>(&val), sizeof(val), err)) {
+                        // Generate already populated err on failure.
                         return min;
                     }
-                } while (val >= limit);
+                    if (val < limit) {
+                        return min + (val % range);
+                    }
+                }
 
-                return min + (val % range);
+                if (err != nullptr) {
+                    err->SetWin32Error(ERROR_TIMEOUT,
+                        L"Random range generation exceeded iteration limit");
+                }
+                return min;
             }
 
             uint64_t SecureRandom::NextUInt64(uint64_t min, uint64_t max, Error* err) noexcept {
@@ -232,7 +232,6 @@ namespace ShadowStrike {
                 }
 
                 const uint64_t range = max - min;
-
                 if (range == 0) {
                     return min;
                 }
@@ -241,22 +240,20 @@ namespace ShadowStrike {
                 const uint64_t limit = (UINT64_MAX / range) * range;
 
                 uint64_t val = 0;
-                uint32_t iterations = 0;
-
-                do {
-                    val = NextUInt64(err);
-                    ++iterations;
-
-                    if (iterations > MAX_REJECTION_ITERATIONS) {
-                        if (err != nullptr) {
-                            err->SetWin32Error(ERROR_TIMEOUT,
-                                L"Random range generation exceeded iteration limit");
-                        }
+                for (uint32_t iter = 0; iter <= MAX_REJECTION_ITERATIONS; ++iter) {
+                    if (!Generate(reinterpret_cast<uint8_t*>(&val), sizeof(val), err)) {
                         return min;
                     }
-                } while (val >= limit);
+                    if (val < limit) {
+                        return min + (val % range);
+                    }
+                }
 
-                return min + (val % range);
+                if (err != nullptr) {
+                    err->SetWin32Error(ERROR_TIMEOUT,
+                        L"Random range generation exceeded iteration limit");
+                }
+                return min;
             }
 
             std::string SecureRandom::GenerateAlphanumeric(size_t length, Error* err) noexcept {
@@ -275,11 +272,16 @@ namespace ShadowStrike {
                 try {
                     out.reserve(length);
 
+                    // Use a local Error so that RNG failures are observable
+                    // even when the caller did not supply one. Without this,
+                    // NextUInt32 returns 0 on failure and we would silently
+                    // emit a string of 'alphanum[0]' characters.
+                    Error localErr;
+                    Error& probe = (err != nullptr) ? *err : localErr;
+
                     for (size_t i = 0; i < length; ++i) {
-                        const uint32_t idx = NextUInt32(0, static_cast<uint32_t>(alphaLen), err);
-                        // Abort immediately if RNG failed — NextUInt32 returns min (0)
-                        // on failure, producing predictable 'alphanum[0]' characters.
-                        if (err != nullptr && err->HasError()) {
+                        const uint32_t idx = NextUInt32(0, static_cast<uint32_t>(alphaLen), &probe);
+                        if (probe.HasError()) {
                             if (out.capacity() > 0) {
                                 SecureWipeMemory(out.data(), out.capacity());
                             }
