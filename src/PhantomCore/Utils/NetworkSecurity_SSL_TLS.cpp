@@ -119,22 +119,52 @@ namespace ShadowStrike {
 					};
 				}
 
-				// Helper to extract Common Name from certificate subject
+				// Helper to extract Common Name from certificate subject.
+				//
+				// SslCertificateInfo::subject is populated via CertGetNameStringW with
+				// CERT_NAME_SIMPLE_DISPLAY_TYPE, which already resolves to a single
+				// display string (typically the CN itself, not a full DN).  However,
+				// some certificates legitimately produce DN-formatted output with a
+				// leading "CN=" attribute.  Accept both forms safely.
 				inline std::wstring ExtractCommonName(const wchar_t* subject) noexcept {
 					if (!subject) return L"";
 
-					std::wstring str(subject);
-					size_t cnPos = str.find(L"CN=");
-					if (cnPos == std::wstring::npos) return L"";
+					std::wstring_view view(subject);
 
-					cnPos += 3; // Skip "CN="
-					size_t endPos = str.find(L',', cnPos);
+					// Trim whitespace from the candidate string.
+					auto trimmed = Internal::TrimWhitespace(view);
+					if (trimmed.empty()) return L"";
 
-					if (endPos == std::wstring::npos) {
-						return str.substr(cnPos);
+					// Look for an attribute boundary preceding "CN=" so we only match
+					// the actual Common Name attribute and not, e.g., "OU=...CN=..."
+					// embedded inside another attribute value.
+					constexpr std::wstring_view kCn = L"CN=";
+					size_t cnPos = std::wstring_view::npos;
+					for (size_t i = 0; i + kCn.size() <= trimmed.size(); ++i) {
+						if (i != 0) {
+							const wchar_t prev = trimmed[i - 1];
+							if (prev != L',' && prev != L';' && !Internal::IsWhitespace(prev)) {
+								continue;
+							}
+						}
+						if (trimmed.compare(i, kCn.size(), kCn) == 0) {
+							cnPos = i;
+							break;
+						}
 					}
 
-					return str.substr(cnPos, endPos - cnPos);
+					if (cnPos == std::wstring_view::npos) {
+						// Not a DN — treat the entire trimmed string as the CN.
+						return std::wstring(trimmed);
+					}
+
+					cnPos += kCn.size();
+					size_t endPos = trimmed.find_first_of(L",;", cnPos);
+					std::wstring_view cn = (endPos == std::wstring_view::npos)
+						? trimmed.substr(cnPos)
+						: trimmed.substr(cnPos, endPos - cnPos);
+
+					return std::wstring(Internal::TrimWhitespace(cn));
 				}
 
 				// Helper to check if hostname matches certificate CN or SAN (RFC 6125 compliant)
@@ -197,6 +227,46 @@ namespace ShadowStrike {
 						void operator()(HINTERNET h) const { if (h) ::WinHttpCloseHandle(h); }
 					};
 					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> sessionGuard(hSession);
+
+					// Enforce TLS 1.2 (and 1.3 when the SDK exposes the flag) as the
+					// minimum protocol — block SSL 2/3 and TLS 1.0/1.1 downgrade attempts
+					// while we negotiate with the remote endpoint to fetch its cert.
+					{
+						DWORD secureProtocols = 0;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2
+						secureProtocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#endif
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+						secureProtocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
+						if (secureProtocols != 0) {
+							if (!::WinHttpSetOption(hSession,
+								WINHTTP_OPTION_SECURE_PROTOCOLS,
+								&secureProtocols, sizeof(secureProtocols))) {
+								const DWORD lastErr = ::GetLastError();
+								// Older Windows builds may reject TLS 1.3 — fall back to TLS 1.2 only.
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2
+								DWORD fallback = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+								if (!::WinHttpSetOption(hSession,
+									WINHTTP_OPTION_SECURE_PROTOCOLS,
+									&fallback, sizeof(fallback))) {
+									Internal::SetError(err, ::GetLastError(),
+										L"Failed to pin TLS 1.2 minimum", L"GetSslCertificate");
+									SS_LOG_ERROR(L"NetworkSecurity",
+										L"WinHttpSetOption(SECURE_PROTOCOLS=TLS1.2) failed (err=%u)",
+										::GetLastError());
+									return false;
+								}
+								SS_LOG_DEBUG(L"NetworkSecurity",
+									L"TLS 1.3 unavailable (err=%u); pinned to TLS 1.2", lastErr);
+#else
+								Internal::SetError(err, lastErr,
+									L"Failed to pin TLS minimum protocol", L"GetSslCertificate");
+								return false;
+#endif
+							}
+						}
+					}
 
 					// Connect to server
 					std::wstring hostStr(hostname);
