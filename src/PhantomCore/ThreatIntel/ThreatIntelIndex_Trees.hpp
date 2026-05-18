@@ -72,6 +72,14 @@ namespace ShadowStrike {
 
             /// @brief Iterate over all entries
             /// @param callback Callback function(const HashValue& hash, const IndexValue& value)
+            /// @note The HashValue passed to the callback is reconstructed from
+            ///       the 64-bit B+Tree key and therefore always carries
+            ///       length == 8 regardless of the originating algorithm
+            ///       (SHA-256, SHA-1, MD5, etc.). Callers MUST rely on
+            ///       IndexValue::entryId to recover the full original hash via
+            ///       the entry table; do NOT treat HashValue::IsValid() as
+            ///       authoritative here, and do NOT compare the abbreviated
+            ///       HashValue against full-length hashes from other sources.
             void ForEach(const std::function<void(const HashValue&, const IndexValue&)>& callback) const;
 
             [[nodiscard]] size_t GetSize() const noexcept;

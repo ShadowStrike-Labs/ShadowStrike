@@ -506,9 +506,16 @@ bool HashBPlusTree::Insert(const HashValue& hash, const IndexValue& value) {
         if (!leaf->IsFull()) {
             InsertIntoLeaf(leaf, key, value);
         } else {
+            // Scope guard ensures m_root regains ownership of the (possibly
+            // reparented) root pointer even if SplitLeafAndInsert throws,
+            // preventing a leak of the entire tree on allocation failure.
             BNode* rawRoot = m_root.release();
+            struct RootGuard {
+                std::unique_ptr<BNode>& owner;
+                BNode** slot;
+                ~RootGuard() { owner.reset(*slot); }
+            } guard{ m_root, &rawRoot };
             SplitLeafAndInsert(rawRoot, leaf, key, value, m_lastLeaf, m_height, m_nodeCount);
-            m_root.reset(rawRoot);
         }
         
         // Update cache
@@ -1001,9 +1008,17 @@ bool GenericBPlusTree::Insert(uint64_t key, const IndexValue& value) {
         if (!leaf->IsFull()) {
             InsertIntoLeafGeneric(leaf, key, value);
         } else {
+            // Scope guard ensures m_root regains ownership of the (possibly
+            // reparented) root pointer even if SplitLeafAndInsertGeneric
+            // throws, preventing a leak of the entire tree on allocation
+            // failure.
             BNode* rawRoot = m_root.release();
+            struct RootGuard {
+                std::unique_ptr<BNode>& owner;
+                BNode** slot;
+                ~RootGuard() { owner.reset(*slot); }
+            } guard{ m_root, &rawRoot };
             SplitLeafAndInsertGeneric(rawRoot, leaf, key, value, m_lastLeaf, m_height, m_nodeCount);
-            m_root.reset(rawRoot);
         }
         
         m_cache.Put(key, value);
