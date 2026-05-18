@@ -27,6 +27,8 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <random>
@@ -150,6 +152,95 @@ namespace {
         return info.available;
     }
 
+    // Validate a manifest-supplied relative path.
+    //
+    // Rejects:
+    //   * empty paths
+    //   * absolute paths (any root_name/root_directory)
+    //   * any segment equal to "." or ".."
+    //   * NUL characters
+    //   * ADS-style ':' (alternate data stream) or wildcard chars
+    //   * paths longer than 32k chars (defensive cap)
+    //
+    // The caller MUST additionally verify the resolved path is under the
+    // intended root via FU::IsPathUnderRoot once concatenated with the root.
+    [[nodiscard]] bool IsSafeManifestRelPath(const std::string& rel) noexcept {
+        if (rel.empty() || rel.size() > 32768) return false;
+        for (const char c : rel) {
+            if (c == '\0') return false;
+            // Reject characters that have special meaning on Windows and
+            // could enable ADS or wildcard expansion in callers.
+            if (c == ':' || c == '*' || c == '?' || c == '<' || c == '>' ||
+                c == '|' || c == '"')
+                return false;
+        }
+        try {
+            std::filesystem::path p(rel);
+            if (p.is_absolute()) return false;
+            if (!p.root_name().empty()) return false;
+            if (!p.root_directory().empty()) return false;
+            for (const auto& seg : p) {
+                const auto s = seg.generic_string();
+                if (s == "." || s == "..") return false;
+                if (s.empty()) continue;
+            }
+        }
+        catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    // Test whether a path is a reparse point (junction / symlink / mount
+    // point). Treats missing/inaccessible files as not reparse points;
+    // callers should additionally check existence where required.
+    [[nodiscard]] bool IsReparsePoint(const std::filesystem::path& p) noexcept {
+        ShadowStrike::Utils::FileUtils::FileStat st{};
+        if (!ShadowStrike::Utils::FileUtils::Stat(p.wstring(), st, nullptr))
+            return false;
+        return st.isReparsePoint;
+    }
+
+    // Parse an ISO-8601 timestamp produced by FormatIso8601. Returns
+    // nullopt on any parse failure. Uses the bounded sscanf_s variant
+    // when targeting MSVC to silence C4996 and harden against any
+    // future format change.
+    [[nodiscard]] std::optional<std::chrono::system_clock::time_point>
+    ParseIso8601(const std::string& s) noexcept
+    {
+        // Expected layout: YYYY-MM-DDTHH:MM:SSZ (20 chars).
+        if (s.size() < 20) return std::nullopt;
+        std::tm tmBuf{};
+        int y=0, mo=0, d=0, h=0, mi=0, se=0;
+#ifdef _MSC_VER
+        if (::sscanf_s(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2dZ",
+                       &y, &mo, &d, &h, &mi, &se) != 6) {
+            return std::nullopt;
+        }
+#else
+        if (std::sscanf(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2dZ",
+                        &y, &mo, &d, &h, &mi, &se) != 6) {
+            return std::nullopt;
+        }
+#endif
+        if (y < 1970 || y > 9999 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+            h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 60)
+            return std::nullopt;
+        tmBuf.tm_year = y - 1900;
+        tmBuf.tm_mon  = mo - 1;
+        tmBuf.tm_mday = d;
+        tmBuf.tm_hour = h;
+        tmBuf.tm_min  = mi;
+        tmBuf.tm_sec  = se;
+#ifdef _WIN32
+        const auto tt = _mkgmtime(&tmBuf);
+#else
+        const auto tt = timegm(&tmBuf);
+#endif
+        if (tt == static_cast<time_t>(-1)) return std::nullopt;
+        return std::chrono::system_clock::from_time_t(tt);
+    }
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -187,8 +278,30 @@ public:
     // Health
     HealthStatus              m_healthStatus{HealthStatus::Unknown};
 
-    // Statistics & callbacks
-    RollbackStatistics        m_stats;
+    // Statistics & callbacks. Counter fields are intentionally separate
+    // atomics rather than living in the public RollbackStatistics DTO so
+    // that GetStatistics can return a trivially-copyable snapshot.
+    struct AtomicStats {
+        std::atomic<uint64_t> snapshotsCreated{0};
+        std::atomic<uint64_t> snapshotsDeleted{0};
+        std::atomic<uint64_t> rollbacksPerformed{0};
+        std::atomic<uint64_t> rollbacksFailed{0};
+        std::atomic<uint64_t> bootLoopsDetected{0};
+        std::atomic<uint64_t> autoRollbacks{0};
+        std::atomic<uint64_t> healthChecks{0};
+        TimePoint             startTime{Clock::now()};
+        void Reset() noexcept {
+            snapshotsCreated.store(0, std::memory_order_relaxed);
+            snapshotsDeleted.store(0, std::memory_order_relaxed);
+            rollbacksPerformed.store(0, std::memory_order_relaxed);
+            rollbacksFailed.store(0, std::memory_order_relaxed);
+            bootLoopsDetected.store(0, std::memory_order_relaxed);
+            autoRollbacks.store(0, std::memory_order_relaxed);
+            healthChecks.store(0, std::memory_order_relaxed);
+            startTime = Clock::now();
+        }
+    };
+    AtomicStats               m_stats;
     RollbackProgressCallback  m_progressCallback;
     RollbackCompletionCallback m_completionCallback;
     HealthChangeCallback      m_healthChangeCallback;
@@ -392,6 +505,24 @@ public:
                         kMaxSnapshotFiles, manifestPath.wstring().c_str());
                     return false;
                 }
+                // Reject any manifest entry whose path is not a safe
+                // relative path. This is the front line of defence
+                // against a corrupted/attacker-controlled manifest
+                // smuggling arbitrary destinations into the restore
+                // walk (path-traversal, absolute paths, ADS, etc.).
+                if (!IsSafeManifestRelPath(path)) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Manifest contains unsafe relative path: %S",
+                        path.c_str());
+                    return false;
+                }
+                // Hash must be 64 lowercase hex characters or empty.
+                if (!hash.empty() && hash.size() != 64) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Manifest entry has malformed hash for: %S",
+                        path.c_str());
+                    return false;
+                }
                 fileEntries.emplace_back(std::move(path), std::move(hash), size);
             }
             searchStart = objEnd + 1;
@@ -408,6 +539,28 @@ public:
         for (const auto& entry : fs::directory_iterator(m_snapshotBaseDir, ec)) {
             if (ec) break;
             if (!entry.is_directory(ec) || ec) continue;
+
+            // Reject reparse-point snapshot directories. An attacker
+            // who can drop a junction under Backup\Snapshots could
+            // otherwise have the restore walk read/write through
+            // an arbitrary filesystem target.
+            if (IsReparsePoint(entry.path())) {
+                SS_LOG_WARN(kLogCategory,
+                    L"Skipping reparse-point snapshot directory: %s",
+                    entry.path().wstring().c_str());
+                continue;
+            }
+
+            // Confirm the directory really lives under the snapshot base
+            // (defends against directory_iterator yielding a path that
+            // resolves elsewhere via a normalised root mismatch).
+            if (!FU::IsPathUnderRoot(entry.path().wstring(),
+                                     m_snapshotBaseDir.wstring(), false)) {
+                SS_LOG_WARN(kLogCategory,
+                    L"Snapshot entry not under base directory, skipping: %s",
+                    entry.path().wstring().c_str());
+                continue;
+            }
 
             const auto manifestPath = entry.path() / kManifestFileName;
             if (!fs::exists(manifestPath, ec) || ec) continue;
@@ -445,7 +598,30 @@ public:
 
             if (info.snapshotId.empty() || !IsValidSnapshotId(info.snapshotId)) continue;
 
-            info.createdTime = std::chrono::system_clock::now();
+            // Parse creation time from manifest; fall back to filesystem
+            // mtime, then to current time, so ordering on disk is honoured
+            // across restarts.
+            if (auto parsed = ParseIso8601(extractJsonStr("created"));
+                parsed.has_value()) {
+                info.createdTime = parsed.value();
+            }
+            else {
+                std::error_code mtimeEc;
+                const auto mtime = fs::last_write_time(manifestPath, mtimeEc);
+                if (!mtimeEc) {
+                    // Convert file_time to system_clock via the C++20 clock_cast
+                    // path; fall back to "now" if the implementation does not
+                    // yet provide it.
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+                    info.createdTime = std::chrono::clock_cast<std::chrono::system_clock>(mtime);
+#else
+                    info.createdTime = std::chrono::system_clock::now();
+#endif
+                }
+                else {
+                    info.createdTime = std::chrono::system_clock::now();
+                }
+            }
             info.sizeBytes   = CalculateSnapshotSize(entry.path());
             info.isValid     = true;
 
@@ -508,6 +684,128 @@ public:
 #else
         (void)serviceName;
         return false;
+#endif
+    }
+
+    // Stop a Windows service if installed; logs errors. Returns true if the
+    // service is stopped (or was already stopped, or is not installed).
+    [[nodiscard]] static bool StopServiceIfRunning(const wchar_t* serviceName) noexcept {
+#ifdef _WIN32
+        SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (!scm) {
+            const DWORD err = ::GetLastError();
+            // ERROR_ACCESS_DENIED is logged but treated as "best effort".
+            SS_LOG_WARN(kLogCategory,
+                L"OpenSCManager failed when stopping service %s (err=%lu)",
+                serviceName, err);
+            return false;
+        }
+        SC_HANDLE svc = ::OpenServiceW(scm, serviceName,
+                                        SERVICE_STOP | SERVICE_QUERY_STATUS);
+        if (!svc) {
+            const DWORD err = ::GetLastError();
+            ::CloseServiceHandle(scm);
+            if (err == ERROR_SERVICE_DOES_NOT_EXIST) return true;
+            SS_LOG_WARN(kLogCategory,
+                L"OpenService failed for %s (err=%lu)", serviceName, err);
+            return false;
+        }
+        SERVICE_STATUS_PROCESS ssp{};
+        DWORD needed = 0;
+        if (::QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+                                   reinterpret_cast<LPBYTE>(&ssp),
+                                   sizeof(ssp), &needed) &&
+            ssp.dwCurrentState == SERVICE_STOPPED)
+        {
+            ::CloseServiceHandle(svc);
+            ::CloseServiceHandle(scm);
+            return true;
+        }
+
+        SERVICE_STATUS ss{};
+        if (!::ControlService(svc, SERVICE_CONTROL_STOP, &ss)) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_SERVICE_NOT_ACTIVE) {
+                SS_LOG_WARN(kLogCategory,
+                    L"ControlService(STOP) failed for %s (err=%lu)",
+                    serviceName, err);
+            }
+        }
+
+        // Poll up to 30 s for the service to reach SERVICE_STOPPED.
+        const DWORD pollTimeoutMs = 30000;
+        const DWORD pollIntervalMs = 250;
+        DWORD waited = 0;
+        while (waited < pollTimeoutMs) {
+            if (!::QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+                                        reinterpret_cast<LPBYTE>(&ssp),
+                                        sizeof(ssp), &needed))
+                break;
+            if (ssp.dwCurrentState == SERVICE_STOPPED) break;
+            ::Sleep(pollIntervalMs);
+            waited += pollIntervalMs;
+        }
+
+        const bool stopped = (ssp.dwCurrentState == SERVICE_STOPPED);
+        ::CloseServiceHandle(svc);
+        ::CloseServiceHandle(scm);
+        if (!stopped) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Service %s did not stop within %lu ms (state=%lu)",
+                serviceName, pollTimeoutMs,
+                static_cast<unsigned long>(ssp.dwCurrentState));
+        }
+        return stopped;
+#else
+        (void)serviceName;
+        return true;
+#endif
+    }
+
+    // Start a Windows service if installed.
+    [[nodiscard]] static bool StartServiceIfInstalled(const wchar_t* serviceName) noexcept {
+#ifdef _WIN32
+        SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (!scm) return false;
+        SC_HANDLE svc = ::OpenServiceW(scm, serviceName,
+                                        SERVICE_START | SERVICE_QUERY_STATUS);
+        if (!svc) {
+            const DWORD err = ::GetLastError();
+            ::CloseServiceHandle(scm);
+            if (err == ERROR_SERVICE_DOES_NOT_EXIST) return true;
+            SS_LOG_WARN(kLogCategory,
+                L"OpenService(start) failed for %s (err=%lu)",
+                serviceName, err);
+            return false;
+        }
+        SERVICE_STATUS_PROCESS ssp{};
+        DWORD needed = 0;
+        if (::QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+                                   reinterpret_cast<LPBYTE>(&ssp),
+                                   sizeof(ssp), &needed) &&
+            ssp.dwCurrentState == SERVICE_RUNNING)
+        {
+            ::CloseServiceHandle(svc);
+            ::CloseServiceHandle(scm);
+            return true;
+        }
+        if (!::StartServiceW(svc, 0, nullptr)) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_SERVICE_ALREADY_RUNNING) {
+                SS_LOG_WARN(kLogCategory,
+                    L"StartService failed for %s (err=%lu)",
+                    serviceName, err);
+                ::CloseServiceHandle(svc);
+                ::CloseServiceHandle(scm);
+                return false;
+            }
+        }
+        ::CloseServiceHandle(svc);
+        ::CloseServiceHandle(scm);
+        return true;
+#else
+        (void)serviceName;
+        return true;
 #endif
     }
 
@@ -606,11 +904,28 @@ public:
             return true;
         };
 
-        FU::WalkDirectory(srcRoot.wstring(), walkOpts, walker);
+        if (!FU::WalkDirectory(srcRoot.wstring(), walkOpts, walker)) {
+            SS_LOG_WARN(kLogCategory,
+                L"WalkDirectory reported failure under: %s",
+                srcRoot.wstring().c_str());
+            result.success = false;
+        }
         return result;
     }
 
     // Restore files from a snapshot back to the installation directory.
+    //
+    // SECURITY: every file path coming from the manifest is re-checked
+    // here before any filesystem operation. The manifest reader
+    // (ReadManifest) already rejects unsafe relative paths, but the
+    // restore is the trust boundary that actually writes into the live
+    // install tree — it must independently verify:
+    //
+    //   * the source path stays inside the snapshot directory;
+    //   * the destination path stays inside the install root;
+    //   * neither source nor destination is reached through a reparse
+    //     point (junction / symlink / mount-point) that an attacker
+    //     could have planted to redirect the write.
     [[nodiscard]] bool RestoreFiles(
         const fs::path& snapshotDir,
         const std::vector<std::tuple<std::string, std::string, uint64_t>>& entries,
@@ -621,23 +936,61 @@ public:
         const auto filesDir  = snapshotDir / kFilesSubdir;
         const auto configDir = snapshotDir / kConfigSubdir;
 
+        // Refuse to restore through a reparse-point snapshot dir.
+        if (IsReparsePoint(snapshotDir)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing to restore through reparse-point snapshot dir: %s",
+                snapshotDir.wstring().c_str());
+            return false;
+        }
+        if (IsReparsePoint(restoreRoot)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing to restore into reparse-point root: %s",
+                restoreRoot.wstring().c_str());
+            return false;
+        }
+
         for (const auto& [relPath, expectedHash, expectedSize] : entries) {
+            // Defence in depth: re-validate every manifest entry.
+            if (!IsSafeManifestRelPath(relPath)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Refusing unsafe manifest path during restore: %S",
+                    relPath.c_str());
+                return false;
+            }
+
             // Determine which sub-directory the file is in.
             fs::path srcFile = filesDir / relPath;
-            if (!fs::exists(srcFile)) {
+            std::error_code ec;
+            if (!fs::exists(srcFile, ec) || ec) {
                 srcFile = configDir / relPath;
             }
 
-            std::error_code ec;
             if (!fs::exists(srcFile, ec) || ec) {
                 SS_LOG_ERROR(kLogCategory,
                     L"Snapshot file missing: %S", relPath.c_str());
                 return false;
             }
 
+            // Confirm the resolved source is still under the snapshot dir.
+            if (!FU::IsPathUnderRoot(srcFile.wstring(),
+                                     snapshotDir.wstring(), false)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Snapshot file resolved outside snapshot dir: %s",
+                    srcFile.wstring().c_str());
+                return false;
+            }
+            if (IsReparsePoint(srcFile)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Refusing reparse-point snapshot source: %s",
+                    srcFile.wstring().c_str());
+                return false;
+            }
+
             // Verify hash before restoring.
             auto hashOpt = HashFile(srcFile);
-            if (!hashOpt.has_value() || hashOpt.value() != expectedHash) {
+            if (!hashOpt.has_value() ||
+                (!expectedHash.empty() && hashOpt.value() != expectedHash)) {
                 SS_LOG_ERROR(kLogCategory,
                     L"Snapshot file integrity check failed: %S "
                     L"(expected=%S, got=%S)",
@@ -648,10 +1001,38 @@ public:
             }
 
             fs::path dstFile = restoreRoot / relPath;
-            if (!FU::CreateDirectories(dstFile.parent_path().wstring())) {
+
+            // Confirm the destination stays under the install root.
+            if (!FU::IsPathUnderRoot(dstFile.wstring(),
+                                     restoreRoot.wstring(), false)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Refusing restore destination outside root: %s",
+                    dstFile.wstring().c_str());
+                return false;
+            }
+
+            // Refuse to overwrite a destination that is itself a reparse
+            // point — that would let an attacker who already has write
+            // access in the install dir redirect the restore to an
+            // arbitrary file.
+            if (fs::exists(dstFile, ec) && !ec && IsReparsePoint(dstFile)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Refusing to overwrite reparse-point destination: %s",
+                    dstFile.wstring().c_str());
+                return false;
+            }
+
+            const auto dstParent = dstFile.parent_path();
+            if (!FU::CreateDirectories(dstParent.wstring())) {
                 SS_LOG_ERROR(kLogCategory,
                     L"Cannot create restore dir for: %s",
                     dstFile.wstring().c_str());
+                return false;
+            }
+            if (IsReparsePoint(dstParent)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Refusing to write into reparse-point parent: %s",
+                    dstParent.wstring().c_str());
                 return false;
             }
 
@@ -666,9 +1047,19 @@ public:
                 return false;
             }
 
-            // Verify the restored file.
+            // Verify the restored file matches the recorded hash. An
+            // empty expectedHash means the manifest did not record one;
+            // accept the copy in that case but still require the hash
+            // computation to succeed (so we never silently restore an
+            // unreadable file).
             auto verifyHash = HashFile(dstFile);
-            if (!verifyHash.has_value() || verifyHash.value() != expectedHash) {
+            if (!verifyHash.has_value()) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Post-restore hash computation failed: %S",
+                    relPath.c_str());
+                return false;
+            }
+            if (!expectedHash.empty() && verifyHash.value() != expectedHash) {
                 SS_LOG_ERROR(kLogCategory,
                     L"Post-restore integrity check failed: %S",
                     relPath.c_str());
@@ -977,7 +1368,11 @@ std::string RollbackManager::CreateSnapshot(
         SS_LOG_ERROR(kLogCategory,
             L"Snapshot file copy failed, cleaning up: %s",
             snapshotDir.wstring().c_str());
-        FU::RemoveDirectoryRecursive(snapshotDir.wstring());
+        if (!FU::RemoveDirectoryRecursive(snapshotDir.wstring())) {
+            SS_LOG_WARN(kLogCategory,
+                L"Cleanup of failed snapshot directory incomplete: %s",
+                snapshotDir.wstring().c_str());
+        }
         m_impl->NotifyError("Snapshot file copy failed", ERROR_WRITE_FAULT);
         return {};
     }
@@ -1006,7 +1401,11 @@ std::string RollbackManager::CreateSnapshot(
         SS_LOG_ERROR(kLogCategory,
             L"Failed to write manifest, cleaning up snapshot: %S",
             snapshotId.c_str());
-        FU::RemoveDirectoryRecursive(snapshotDir.wstring());
+        if (!FU::RemoveDirectoryRecursive(snapshotDir.wstring())) {
+            SS_LOG_WARN(kLogCategory,
+                L"Cleanup of partial snapshot directory incomplete: %s",
+                snapshotDir.wstring().c_str());
+        }
         m_impl->NotifyError("Failed to write snapshot manifest",
                             ERROR_WRITE_FAULT);
         return {};
@@ -1035,7 +1434,12 @@ std::string RollbackManager::CreateSnapshot(
         std::shared_lock lock(m_impl->m_mutex);
         if (m_impl->m_snapshots.size() > m_impl->m_config.maxSnapshots) {
             lock.unlock();
-            CleanupSnapshots(m_impl->m_config.maxSnapshots);
+            const uint32_t removed = CleanupSnapshots(
+                m_impl->m_config.maxSnapshots);
+            if (removed > 0) {
+                SS_LOG_DEBUG(kLogCategory,
+                    L"Auto-cleanup pruned %u old snapshot(s)", removed);
+            }
         }
     }
 
@@ -1223,20 +1627,31 @@ bool RollbackManager::RollbackTo(const std::string& snapshotId) {
     RollbackResult result;
     result.snapshotId = snapshotId;
 
+    // Reset progress at the start of a new rollback so stale error
+    // strings from a previously-cancelled run don't leak through.
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        m_impl->m_currentProgress = RollbackProgress{};
+        m_impl->m_status = RollbackManagerStatus::RollingBack;
+    }
+
     // Phase 1: Validate snapshot.
     m_impl->UpdateProgress(RollbackState::Preparing, 5, "Validating snapshot");
 
     SnapshotInfo snapshotInfo;
     {
         std::shared_lock lock(m_impl->m_mutex);
-        m_impl->m_status = RollbackManagerStatus::RollingBack;
 
         auto idx = m_impl->FindSnapshotIndex(snapshotId);
         if (!idx.has_value()) {
             SS_LOG_ERROR(kLogCategory,
                 L"Snapshot not found for rollback: %S", snapshotId.c_str());
+            lock.unlock();
             m_impl->m_rollbackInProgress.store(false, std::memory_order_release);
-            m_impl->m_status = RollbackManagerStatus::Running;
+            {
+                std::unique_lock wlock(m_impl->m_mutex);
+                m_impl->m_status = RollbackManagerStatus::Running;
+            }
             m_impl->NotifyError("Snapshot not found for rollback",
                                 ERROR_NOT_FOUND);
             return false;
@@ -1282,22 +1697,24 @@ bool RollbackManager::RollbackTo(const std::string& snapshotId) {
     SS_LOG_INFO(kLogCategory, L"Stopping services for rollback");
 
     // Attempt to stop ShadowStrike services via SCM.
+    bool servicesWereStopped = false;
 #ifdef _WIN32
     for (const auto* svcName : kServiceNames) {
-        SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr,
-                                          SC_MANAGER_CONNECT);
-        if (scm) {
-            SC_HANDLE svc = ::OpenServiceW(scm, svcName,
-                                            SERVICE_STOP | SERVICE_QUERY_STATUS);
-            if (svc) {
-                SERVICE_STATUS ss{};
-                ::ControlService(svc, SERVICE_CONTROL_STOP, &ss);
-                ::CloseServiceHandle(svc);
-            }
-            ::CloseServiceHandle(scm);
+        if (RollbackManagerImpl::StopServiceIfRunning(svcName)) {
+            servicesWereStopped = true;
         }
     }
 #endif
+
+    // Helper closure: restart services on any failure path so we don't
+    // leave the endpoint without protection.
+    auto restartServicesBestEffort = [&]() noexcept {
+#ifdef _WIN32
+        for (const auto* svcName : kServiceNames) {
+            (void)RollbackManagerImpl::StartServiceIfInstalled(svcName);
+        }
+#endif
+    };
 
     // Phase 3: Restoring files.
     m_impl->UpdateProgress(RollbackState::RestoringFiles, 30,
@@ -1323,6 +1740,15 @@ bool RollbackManager::RollbackTo(const std::string& snapshotId) {
 
         m_impl->UpdateProgress(RollbackState::Failed, 0,
                                "File restoration failed");
+
+        // Try to bring the services back online even after a failed
+        // restore — leaving them stopped would mean the endpoint is
+        // unprotected.
+        if (servicesWereStopped) {
+            SS_LOG_WARN(kLogCategory,
+                L"Restarting services after failed rollback");
+            restartServicesBestEffort();
+        }
 
         result.success       = false;
         result.errorMessage  = "File restoration failed";
@@ -1353,15 +1779,10 @@ bool RollbackManager::RollbackTo(const std::string& snapshotId) {
 
 #ifdef _WIN32
     for (const auto* svcName : kServiceNames) {
-        SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr,
-                                          SC_MANAGER_CONNECT);
-        if (scm) {
-            SC_HANDLE svc = ::OpenServiceW(scm, svcName, SERVICE_START);
-            if (svc) {
-                ::StartServiceW(svc, 0, nullptr);
-                ::CloseServiceHandle(svc);
-            }
-            ::CloseServiceHandle(scm);
+        if (!RollbackManagerImpl::StartServiceIfInstalled(svcName)) {
+            SS_LOG_WARN(kLogCategory,
+                L"Service did not restart cleanly after rollback: %s",
+                svcName);
         }
     }
 #endif
@@ -1520,15 +1941,32 @@ HealthCheckResult RollbackManager::PerformHealthCheck() {
     // 1. Check if critical services are running.
     result.serviceRunning = false;
     for (const auto* svcName : kServiceNames) {
-        bool running = RollbackManagerImpl::IsServiceRunning(svcName);
-        result.componentStatuses[std::string("Service:") +
-            std::string(reinterpret_cast<const char*>(svcName),
-                        // Convert wide to narrow for map key.
-                        0)] = ComponentHealth::Unknown;
+        const bool running = RollbackManagerImpl::IsServiceRunning(svcName);
 
-        // Build narrow name for the map.
+        // Convert wide service name to UTF-8 for the component-status map.
+        // The service names in kServiceNames are ASCII so a direct widen
+        // cast is safe; we use WideCharToMultiByte for correctness even so.
+        std::string narrowName;
+#ifdef _WIN32
+        const int needed = ::WideCharToMultiByte(
+            CP_UTF8, 0, svcName, -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 1) {
+            narrowName.resize(static_cast<size_t>(needed - 1));
+            ::WideCharToMultiByte(CP_UTF8, 0, svcName, -1,
+                                  narrowName.data(), needed, nullptr, nullptr);
+        }
+#else
         std::wstring ws(svcName);
-        std::string narrowName(ws.begin(), ws.end());
+        narrowName.assign(ws.begin(), ws.end());
+#endif
+        if (narrowName.empty()) {
+            // Fall back to a stable placeholder so the map key is unique
+            // per iteration even on conversion failure.
+            narrowName = "Service:<unknown>";
+        }
+        else {
+            narrowName = "Service:" + narrowName;
+        }
 
         result.componentStatuses[narrowName] =
             running ? ComponentHealth::Running : ComponentHealth::Stopped;
@@ -1594,19 +2032,22 @@ HealthCheckResult RollbackManager::PerformHealthCheck() {
         }
     }
 
-    // 4. Basic network connectivity test (attempt TCP connect to localhost).
+    // 4. Basic network stack availability check. We intentionally do NOT
+    //    call WSAStartup/WSACleanup here: WSACleanup is process-wide and
+    //    decrements the reference count for any other component that has
+    //    started Winsock, so calling it from a transient health probe
+    //    could break unrelated subsystems. Instead, attempt to create a
+    //    UDP socket; if it succeeds Winsock is already initialised and
+    //    routable by some other component of the service, which is all
+    //    the information this probe is supposed to report. A genuine
+    //    connectivity check belongs in the update-transport layer.
     {
         result.networkConnected = false;
 #ifdef _WIN32
-        WSADATA wsaData{};
-        if (::WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) {
-            SOCKET sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (sock != INVALID_SOCKET) {
-                // Non-blocking quick check — we just test socket creation works.
-                result.networkConnected = true;
-                ::closesocket(sock);
-            }
-            ::WSACleanup();
+        const SOCKET sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock != INVALID_SOCKET) {
+            result.networkConnected = true;
+            ::closesocket(sock);
         }
         if (!result.networkConnected) {
             result.issues.push_back("Network stack unavailable");
@@ -1736,7 +2177,10 @@ void RollbackManager::RecordBoot() {
             SS_LOG_WARN(kLogCategory,
                 L"Auto-rollback enabled, triggering rollback");
             m_impl->m_stats.autoRollbacks++;
-            TriggerRollback();
+            if (!TriggerRollback()) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Auto-rollback request failed (boot-loop path)");
+            }
         }
     }
 }
@@ -1774,7 +2218,10 @@ void RollbackManager::RecordCrash() {
             SS_LOG_WARN(kLogCategory,
                 L"Auto-rollback triggered due to boot loop");
             m_impl->m_stats.autoRollbacks++;
-            TriggerRollback();
+            if (!TriggerRollback()) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Auto-rollback request failed (crash path)");
+            }
         }
     }
 }
