@@ -687,4 +687,4 @@ namespace ShadowStrike {
 
 		} // namespace NetworkUtils
 	} // namespace Utils
-} // namespace ShadowStrike} // namespace ShadowStrike
+} // namespace ShadowStrike

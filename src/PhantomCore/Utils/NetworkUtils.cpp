@@ -190,11 +190,24 @@ namespace ShadowStrike {
 							replyBufferSize = 65535;
 						}
 						std::vector<uint8_t> replyBuffer(replyBufferSize);
-						
+
+						// Honour caller-supplied TTL and DontFragment.  Without this,
+						// TraceRoute (which varies TTL per hop) cannot observe
+						// intermediate routers and PMTU-discovery callers cannot set
+						// the DF bit.
+						IP_OPTION_INFORMATION ipOpts{};
+						ipOpts.Ttl = (options.ttl == 0)
+							? static_cast<UCHAR>(128)
+							: static_cast<UCHAR>((std::min)(options.ttl, static_cast<uint32_t>(255)));
+						ipOpts.Tos = 0;
+						ipOpts.Flags = options.dontFragment ? IP_FLAG_DF : 0;
+						ipOpts.OptionsSize = 0;
+						ipOpts.OptionsData = nullptr;
+
 						DWORD replyCount = ::IcmpSendEcho(icmpGuard.handle,
 							Internal::HostToNetwork32(ipv4->ToUInt32()),
 							sendData.data(), static_cast<WORD>(sendData.size()),
-							nullptr,
+							&ipOpts,
 							replyBuffer.data(), static_cast<DWORD>(replyBuffer.size()),
 							timeoutMs);
 
@@ -251,11 +264,22 @@ namespace ShadowStrike {
 							replyBufferSize = 65535;
 						}
 						std::vector<uint8_t> replyBuffer(replyBufferSize);
-						
+
+						// Honour caller-supplied hop limit (IPv6 TTL).  Icmp6SendEcho2
+						// reads only the Ttl/Flags/Tos fields of IP_OPTION_INFORMATION.
+						IP_OPTION_INFORMATION ip6Opts{};
+						ip6Opts.Ttl = (options.ttl == 0)
+							? static_cast<UCHAR>(128)
+							: static_cast<UCHAR>((std::min)(options.ttl, static_cast<uint32_t>(255)));
+						ip6Opts.Tos = 0;
+						ip6Opts.Flags = options.dontFragment ? IP_FLAG_DF : 0;
+						ip6Opts.OptionsSize = 0;
+						ip6Opts.OptionsData = nullptr;
+
 						DWORD replyCount = ::Icmp6SendEcho2(icmpGuard.handle, nullptr, nullptr, nullptr,
 							&sourceAddr, &destAddr,
 							sendData.data(), static_cast<WORD>(sendData.size()),
-							nullptr,
+							&ip6Opts,
 							replyBuffer.data(), static_cast<DWORD>(replyBuffer.size()),
 							timeoutMs);
 
@@ -595,8 +619,18 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				bandwidth.currentDownloadBps = (current.bytesReceived - previous.bytesReceived) / duration;
-				bandwidth.currentUploadBps = (current.bytesSent - previous.bytesSent) / duration;
+				// MIB_IFROW counters are 32-bit on the Win32 surface and may wrap on
+				// high-throughput links, and adapter sets can also change between
+				// snapshots (resulting in current < previous when an interface
+				// disappears).  Clamp to zero rather than producing a near-UINT64_MAX
+				// value that callers would interpret as terabit-class throughput.
+				const uint64_t rxDelta = (current.bytesReceived >= previous.bytesReceived)
+					? (current.bytesReceived - previous.bytesReceived) : 0ULL;
+				const uint64_t txDelta = (current.bytesSent >= previous.bytesSent)
+					? (current.bytesSent - previous.bytesSent) : 0ULL;
+
+				bandwidth.currentDownloadBps = rxDelta / static_cast<uint64_t>(duration);
+				bandwidth.currentUploadBps = txDelta / static_cast<uint64_t>(duration);
 
 				return true;
 			}
@@ -917,12 +951,15 @@ namespace ShadowStrike {
 
 					for (int validCode : smtpCodes) {
 						if (codeNum == validCode) {
-							// Check if it's a 220 Greeting containing "SMTP"
+							// Check if it's a 220 Greeting containing "SMTP".
+							// data.data() is NOT null-terminated; use a bounded search
+							// instead of strstr to avoid reading past the buffer.
 							if (codeNum == 220 && data.size() >= 10) {
-								// Search for "SMTP" in the greeting banner (case-insensitive not required for protocol keywords)
-								// Searching for "SMTP" covers "ESMTP" since the latter contains the substring
+								constexpr size_t kBannerScan = 256;
+								const size_t scanLen = (std::min)(data.size(), kBannerScan);
 								const char* rawData = reinterpret_cast<const char*>(data.data());
-								if (std::strstr(rawData, "SMTP") != nullptr) {
+								const std::string_view banner(rawData, scanLen);
+								if (banner.find("SMTP") != std::string_view::npos) {
 									return true;
 								}
 							}
