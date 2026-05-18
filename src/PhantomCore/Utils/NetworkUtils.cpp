@@ -110,6 +110,29 @@ namespace ShadowStrike {
 					Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed");
 					return false;
 				}
+
+				// Pin TLS 1.2 and TLS 1.3 only.  WinHttpOpen defaults to whatever the
+				// Schannel system policy permits, which on older Windows still allows
+				// TLS 1.0/1.1.  We accept TLS 1.3 + TLS 1.2 first, fall back to TLS 1.2
+				// only if 1.3 is unknown to the host headers, and refuse to operate
+				// otherwise so that the call cannot silently downgrade.
+				DWORD secureProtocols = 0;
+#if defined(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2) && defined(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3)
+				secureProtocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#elif defined(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2)
+				secureProtocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#endif
+				if (secureProtocols == 0 ||
+					!::WinHttpSetOption(m_session, WINHTTP_OPTION_SECURE_PROTOCOLS,
+						&secureProtocols, sizeof(secureProtocols))) {
+					const DWORD lastErr = ::GetLastError();
+					SS_LOG_ERROR(L"NetworkUtils", L"WinHttpSetOption(SECURE_PROTOCOLS) failed err=%lu", lastErr);
+					Internal::SetError(err, lastErr == 0 ? ERROR_NOT_SUPPORTED : lastErr,
+						L"Failed to pin TLS 1.2+ on WinHTTP session");
+					::WinHttpCloseHandle(m_session);
+					m_session = nullptr;
+					return false;
+				}
 				return true;
 			}
 

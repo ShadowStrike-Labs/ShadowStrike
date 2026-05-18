@@ -105,6 +105,18 @@ namespace ShadowStrike {
 						return false;
 					}
 
+					// Reject embedded NUL/CR/LF/control characters in the URL.  WinHttpCrackUrl
+					// is generally tolerant, but a payload containing CRLF can be smuggled
+					// past length validation and used for request-smuggling against poorly
+					// behaved upstreams, while embedded NUL silently truncates the host when
+					// the URL is later copied through C string interfaces.
+					for (wchar_t ch : url) {
+						if (ch == L'\0' || ch == L'\r' || ch == L'\n' || (ch > 0 && ch < 0x20)) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"URL contains NUL or control characters");
+							return false;
+						}
+					}
+
 					WinHttpSession session;
 					if (!session.Open(options.userAgent, err)) {
 						return false;
@@ -208,8 +220,9 @@ namespace ShadowStrike {
 						std::wstring result;
 						result.reserve(value.size());
 						for (wchar_t ch : value) {
-							// Strip CR (0x0D) and LF (0x0A) characters to prevent injection
-							if (ch != L'\r' && ch != L'\n') {
+							// Strip CR (0x0D), LF (0x0A) and NUL to prevent header injection
+							// and silent truncation by length-counted WinHTTP APIs.
+							if (ch != L'\r' && ch != L'\n' && ch != L'\0') {
 								result.push_back(ch);
 							}
 						}
@@ -220,8 +233,10 @@ namespace ShadowStrike {
 						std::wstring result;
 						result.reserve(name.size());
 						for (wchar_t ch : name) {
-							// Header names must not contain CR, LF, or colon (except at the end which we add)
-							if (ch != L'\r' && ch != L'\n' && ch != L':') {
+							// Header names: strip CR/LF, NUL, the colon separator, and any
+							// surrounding whitespace would terminate the field-name token.
+							if (ch != L'\r' && ch != L'\n' && ch != L'\0' &&
+								ch != L':' && ch != L' ' && ch != L'\t') {
 								result.push_back(ch);
 							}
 						}
@@ -416,6 +431,25 @@ namespace ShadowStrike {
 					if (destStr.find(L"..") != std::wstring::npos) {
 						SS_LOG_ERROR(L"NetworkUtils", L"Path traversal detected in download destination");
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Path traversal in destination path");
+						return false;
+					}
+
+					// Reject pre-existing symlinks at the destination.  If an attacker can
+					// pre-create a symlink in a writable directory pointing to a sensitive
+					// file, an unprivileged downloader would otherwise overwrite the link
+					// target.  We require the destination to either not exist or to be a
+					// regular file.
+					std::error_code destSymEc;
+					if (std::filesystem::is_symlink(destPath, destSymEc)) {
+						SS_LOG_ERROR(L"NetworkUtils", L"Symlink detected at download destination");
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Symlinks not allowed for download destination");
+						return false;
+					}
+					std::error_code destExistsEc;
+					if (std::filesystem::exists(destPath, destExistsEc) &&
+						!std::filesystem::is_regular_file(destPath, destExistsEc)) {
+						SS_LOG_ERROR(L"NetworkUtils", L"Download destination exists and is not a regular file");
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Download destination must be a regular file");
 						return false;
 					}
 
