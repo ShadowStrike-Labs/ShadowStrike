@@ -794,6 +794,32 @@ namespace ShadowStrike {
 		// JSON Utilities
 		// ============================================================================
 
+		std::wstring Logger::SanitizeForPlainText(const std::wstring& s) {
+			// Defend the plain-text sinks (console, file, EventLog) against log
+			// injection: a hostile payload containing CR/LF or other control bytes
+			// could otherwise forge additional log lines or break parsers that
+			// split on newline. JSON output goes through EscapeJson and is safe.
+			std::wstring out;
+			out.reserve(s.size());
+			for (const wchar_t c : s) {
+				switch (c) {
+				case L'\r': out += L"\\r"; break;
+				case L'\n': out += L"\\n"; break;
+				case L'\t': out += L"\\t"; break;
+				default:
+					if (c < 0x20 || c == 0x7F) {
+						wchar_t buf[8];
+						_snwprintf_s(buf, _TRUNCATE, L"\\x%02x", static_cast<unsigned>(c) & 0xFFu);
+						out += buf;
+					}
+					else {
+						out += c;
+					}
+				}
+			}
+			return out;
+		}
+
 		std::wstring Logger::EscapeJson(const std::wstring& s) {
 			std::wstring out;
 			out.reserve(s.size() + 16);
@@ -837,7 +863,7 @@ namespace ShadowStrike {
 
 			if (!item.category.empty()) {
 				s += L" [";
-				s += item.category;
+				s += SanitizeForPlainText(item.category);
 				s += L"]";
 			}
 
@@ -853,13 +879,13 @@ namespace ShadowStrike {
 			// Source location
 			if (inclSrcLoc && !item.file.empty()) {
 				s += L" ";
-				s += item.file;
+				s += SanitizeForPlainText(item.file);
 				s += L":";
 				s += std::to_wstring(item.line);
 
 				if (!item.function.empty()) {
 					s += L" ";
-					s += item.function;
+					s += SanitizeForPlainText(item.function);
 				}
 			}
 
@@ -956,7 +982,7 @@ namespace ShadowStrike {
 
 			std::wstring line = jsonLinesCfg
 				? FormatAsJson(item, inclProcTid, inclSrcLoc)
-				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + item.message);
+				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + SanitizeForPlainText(item.message));
 			line += L"\r\n";
 
 			// Integer overflow check BEFORE cast
@@ -1213,7 +1239,7 @@ namespace ShadowStrike {
 
 			std::wstring line = jsonLinesCfg
 				? FormatAsJson(item, inclProcTid, inclSrcLoc)
-				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + item.message);
+				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + SanitizeForPlainText(item.message));
 			line += L"\r\n";
 
 			// Convert to UTF-8 for portable, human-readable log files
@@ -1313,7 +1339,7 @@ namespace ShadowStrike {
 
 			const std::wstring payload = jsonLinesCfg
 				? FormatAsJson(item, inclProcTid, inclSrcLoc)
-				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + item.message);
+				: (FormatPrefix(item, inclProcTid, inclSrcLoc) + SanitizeForPlainText(item.message));
 			const wchar_t* strings[1] = { payload.c_str() };
 			::ReportEventW(m_eventSrc, type, 0, 0, nullptr, 1, 0, strings, nullptr);
 #endif

@@ -378,6 +378,7 @@ namespace ShadowStrike {
 			[[nodiscard]] std::wstring FormatPrefix(const LogItem& item, bool inclProcTid, bool inclSrcLoc) const;
 			[[nodiscard]] std::wstring FormatAsJson(const LogItem& item, bool inclProcTid, bool inclSrcLoc) const;
 			[[nodiscard]] static std::wstring EscapeJson(const std::wstring& s);
+			[[nodiscard]] static std::wstring SanitizeForPlainText(const std::wstring& s);
 
 			void OpenLogFileIfNeeded();
 			void RotateIfNeeded(size_t nextWriteBytes);
