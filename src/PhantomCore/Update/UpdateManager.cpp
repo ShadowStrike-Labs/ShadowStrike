@@ -26,6 +26,7 @@
 #include "RollbackManager.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../Utils/FileUtils.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -46,6 +47,32 @@ constexpr size_t kMaxAvailablePkgs  = 4096;
 
 namespace HU = ::ShadowStrike::Utils::HashUtils;
 namespace SU = ::ShadowStrike::Utils::StringUtils;
+namespace FU = ::ShadowStrike::Utils::FileUtils;
+
+// Reparse-point check used to refuse following symlinks/junctions in
+// the configured staging directory.
+[[nodiscard]] bool IsReparsePoint(const std::filesystem::path& p) noexcept {
+    FU::FileStat st{};
+    if (!FU::Stat(p.wstring(), st)) return false;
+    return st.isReparsePoint;
+}
+
+// Map a coarse UpdateType to the matching SignatureDatabaseType for the
+// signature-family. Returns nullopt if the type does not correspond to a
+// signature database (e.g. Program, Driver, ...).
+[[nodiscard]] std::optional<::ShadowStrike::Update::SignatureDatabaseType>
+SignatureDbTypeFor(::ShadowStrike::Update::UpdateType type) noexcept
+{
+    using UT = ::ShadowStrike::Update::UpdateType;
+    using DT = ::ShadowStrike::Update::SignatureDatabaseType;
+    switch (type) {
+    case UT::Signature:  return DT::Main;
+    case UT::Heuristics: return DT::Heuristic;
+    case UT::Whitelist:  return DT::URLs;     // closest semantic mapping
+    case UT::Patterns:   return DT::Patterns;
+    default:             return std::nullopt;
+    }
+}
 
 [[nodiscard]] std::string FormatIso8601(
     const std::chrono::system_clock::time_point& tp) noexcept
@@ -163,6 +190,13 @@ public:
     mutable std::shared_mutex      m_mutex;
     UpdateModuleStatus             m_moduleStatus{UpdateModuleStatus::Uninitialized};
     std::atomic<bool>              m_initialized{false};
+
+    // Single-writer gate for ApplyPackageInternal — claimed via CAS so
+    // two concurrent StartUpdate/StartAllUpdates calls cannot both enter
+    // the apply path. m_status alone is not enough: the racy
+    // IsUpdateInProgress()-then-apply pattern allows both callers to pass
+    // the gate.
+    std::atomic<bool>              m_applyInFlight{false};
 
     // Available packages discovered by last CheckForUpdates
     std::vector<UpdatePackage>     m_availablePackages;
@@ -532,7 +566,29 @@ public:
             if (SignatureUpdater::HasInstance() &&
                 SignatureUpdater::Instance().IsInitialized())
             {
-                applySuccess = SignatureUpdater::Instance().UpdateSignatures();
+                // Dispatch to the specific signature database matching
+                // the package.type instead of running the entire enabled
+                // set; otherwise a single-package Apply triggers updates
+                // across unrelated databases.
+                const auto dbType = SignatureDbTypeFor(package.type);
+                if (!dbType.has_value()) {
+                    result.errorMessage =
+                        "No SignatureDatabaseType mapping for UpdateType " +
+                        std::string(GetUpdateTypeName(package.type));
+                    SS_LOG_ERROR(kLogCategory,
+                        L"No db-type mapping for UpdateType %S",
+                        std::string(GetUpdateTypeName(package.type)).c_str());
+                    applySuccess = false;
+                }
+                else {
+                    applySuccess = SignatureUpdater::Instance()
+                                       .UpdateDatabase(*dbType);
+                    if (!applySuccess) {
+                        result.errorMessage =
+                            "SignatureUpdater::UpdateDatabase failed for " +
+                            std::string(GetUpdateTypeName(package.type));
+                    }
+                }
             }
             else {
                 result.errorMessage = "SignatureUpdater not available";
@@ -575,7 +631,33 @@ public:
             }
             else {
             auto stagingPath = m_config.stagingDirectory / package.packageId;
-            if (fs::exists(stagingPath, ec) && !ec) {
+
+            // Defence-in-depth: enforce that the composed stagingPath
+            // remains under m_config.stagingDirectory (lexical + symlink
+            // resolution) and that it is not itself a reparse point.
+            if (!FU::IsPathUnderRoot(stagingPath.wstring(),
+                                     m_config.stagingDirectory.wstring(),
+                                     true))
+            {
+                applySuccess = false;
+                result.errorMessage =
+                    "Staged path escapes staging directory: " + package.packageId;
+                SS_LOG_ERROR(kLogCategory,
+                    L"SECURITY: stagingPath '%s' escapes staging root for package '%S'",
+                    stagingPath.wstring().c_str(),
+                    package.packageId.c_str());
+            }
+            else if (fs::exists(stagingPath, ec) && !ec &&
+                     IsReparsePoint(stagingPath))
+            {
+                applySuccess = false;
+                result.errorMessage =
+                    "Staged package is a reparse point: " + package.packageId;
+                SS_LOG_ERROR(kLogCategory,
+                    L"SECURITY: Refusing reparse-point staged package '%S'",
+                    package.packageId.c_str());
+            }
+            else if (fs::exists(stagingPath, ec) && !ec) {
                 // Verify if verifier is available
                 if (UpdateVerifier::HasInstance() &&
                     UpdateVerifier::Instance().IsInitialized() &&
@@ -919,7 +1001,9 @@ bool UpdateManager::Initialize(const ::ShadowStrike::Update::UpdateConfiguration
         m_impl->m_config = config;
     }
 
-    // Ensure staging directory exists
+    // Ensure staging directory exists and refuse to follow reparse points.
+    // A symlink/junction under stagingDirectory would let an attacker
+    // redirect downloaded packages outside the controlled tree.
     if (!m_impl->m_config.stagingDirectory.empty()) {
         std::error_code ec;
         fs::create_directories(m_impl->m_config.stagingDirectory, ec);
@@ -927,11 +1011,22 @@ bool UpdateManager::Initialize(const ::ShadowStrike::Update::UpdateConfiguration
             SS_LOG_WARN(kLogCategory,
                 L"Could not create staging directory: %S", ec.message().c_str());
         }
+        if (IsReparsePoint(m_impl->m_config.stagingDirectory)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing to use staging directory '%s' (reparse point)",
+                m_impl->m_config.stagingDirectory.wstring().c_str());
+            std::unique_lock lk(m_impl->m_mutex);
+            m_impl->m_moduleStatus = UpdateModuleStatus::Error;
+            return false;
+        }
     }
 
     // Initialize all sub-modules
     if (!m_impl->InitializeSubModules()) {
         SS_LOG_ERROR(kLogCategory, L"One or more sub-modules failed to initialize");
+        // Tear down whatever sub-modules did come up so that we do not
+        // leak partially-initialised singletons.
+        m_impl->ShutdownSubModules();
         std::unique_lock lk(m_impl->m_mutex);
         m_impl->m_moduleStatus = UpdateModuleStatus::Error;
         return false;
@@ -1123,6 +1218,14 @@ std::optional<UpdatePackage> UpdateManager::CheckForUpdate(UpdateType type) {
         std::error_code ec;
         auto stagingDir = m_impl->m_config.stagingDirectory;
         if (!stagingDir.empty() && fs::exists(stagingDir, ec) && !ec) {
+            // Refuse to follow a symlink/junction at stagingDir to avoid
+            // enumerating a directory outside the controlled tree.
+            if (IsReparsePoint(stagingDir)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"CheckForUpdate: staging directory '%s' is a reparse point",
+                    stagingDir.wstring().c_str());
+                return std::nullopt;
+            }
             for (const auto& entry : fs::directory_iterator(stagingDir, ec)) {
                 if (ec) break;
                 if (!entry.is_regular_file(ec)) continue;
@@ -1176,6 +1279,24 @@ bool UpdateManager::StartUpdate(const std::string& packageId) {
         SS_LOG_ERROR(kLogCategory, L"StartUpdate(packageId) called but not initialized");
         return false;
     }
+
+    // Claim the apply-slot atomically. If another caller is already in
+    // ApplyPackageInternal we refuse rather than racing them through it.
+    bool expected = false;
+    if (!m_impl->m_applyInFlight.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        SS_LOG_WARN(kLogCategory,
+            L"StartUpdate('%S') rejected: another update is already applying",
+            packageId.c_str());
+        return false;
+    }
+    // RAII release of the slot on any exit path.
+    struct ApplyGuard {
+        std::atomic<bool>& flag;
+        ~ApplyGuard() { flag.store(false, std::memory_order_release); }
+    } guard{m_impl->m_applyInFlight};
 
     if (IsUpdateInProgress()) {
         SS_LOG_WARN(kLogCategory,
@@ -1238,6 +1359,23 @@ bool UpdateManager::StartAllUpdates() {
         SS_LOG_ERROR(kLogCategory, L"StartAllUpdates called but not initialized");
         return false;
     }
+
+    // Claim the apply-slot atomically for the entire batch. This avoids
+    // a race where two concurrent StartAllUpdates / StartUpdate callers
+    // each iterate the package list and both pass IsUpdateInProgress().
+    bool expected = false;
+    if (!m_impl->m_applyInFlight.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        SS_LOG_WARN(kLogCategory,
+            L"StartAllUpdates rejected: another update is already applying");
+        return false;
+    }
+    struct ApplyGuard {
+        std::atomic<bool>& flag;
+        ~ApplyGuard() { flag.store(false, std::memory_order_release); }
+    } guard{m_impl->m_applyInFlight};
 
     std::vector<UpdatePackage> packages;
     {
