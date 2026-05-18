@@ -206,8 +206,16 @@ namespace ShadowStrike {
 				}
 
 				std::string narrow(sizeNeeded, '\0');
-				WideCharToMultiByte(CP_UTF8, 0, str.data(), static_cast<int>(str.size()),
+				const int written = WideCharToMultiByte(CP_UTF8, 0, str.data(),
+					static_cast<int>(str.size()),
 					&narrow[0], sizeNeeded, nullptr, nullptr);
+				if (written <= 0 || written != sizeNeeded) {
+					// Conversion failed or produced an unexpected length.
+					// Wipe whatever may have been partially written before clearing.
+					SecureWipeMemory(narrow.data(), narrow.size());
+					Clear();
+					return;
+				}
 
 				// Copy to secure buffer
 				Assign(narrow);
