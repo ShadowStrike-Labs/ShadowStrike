@@ -88,6 +88,21 @@ namespace ShadowStrike {
 
 			} // namespace Internal
 
+			namespace {
+				// Reject hostnames carrying embedded NUL or ASCII control characters.
+				// std::wstring built from a std::wstring_view preserves embedded NULs,
+				// but DnsQuery_W / getaddrinfo consume a C string and would silently
+				// truncate at the first NUL, hiding the rest of the payload from
+				// validation.  Length cap is enforced separately by callers.
+				[[nodiscard]] inline bool IsAcceptableHostname(std::wstring_view host) noexcept {
+					for (wchar_t c : host) {
+						if (c == L'\0') return false;
+						if (c < 0x20 || c == 0x7F) return false;
+					}
+					return true;
+				}
+			} // anonymous namespace
+
 
 
 			// ============================================================================
@@ -102,6 +117,10 @@ namespace ShadowStrike {
 					// Validate hostname length to prevent buffer overflow attacks
 					if (hostname.empty() || hostname.size() > 255) {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid hostname length");
+						return false;
+					}
+					if (!IsAcceptableHostname(hostname)) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Hostname contains NUL or control characters");
 						return false;
 					}
 
@@ -313,6 +332,10 @@ namespace ShadowStrike {
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid hostname length");
 						return false;
 					}
+					if (!IsAcceptableHostname(hostname)) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Hostname contains NUL or control characters");
+						return false;
+					}
 
 					SS_LOG_DEBUG(L"NetworkUtils", L"QueryDns type=%u host_len=%zu", static_cast<unsigned>(type), hostname.size());
 					std::wstring hostStr(hostname);
@@ -396,12 +419,14 @@ namespace ShadowStrike {
 					DWORD recordCount = 0;
 
 					for (PDNS_RECORDW pRec = dnsRecordGuard.ptr; pRec != nullptr && recordCount < kMaxDnsRecords; pRec = pRec->pNext, ++recordCount) {
-						// Skip records that fail DNSSEC validation if we requested it
-						if (options.dnssec && (pRec->Flags.DW & 0x0020) == 0) {
-							// DNSREC_DNSSEC_CHECKING (0x20) not set — record not validated
-							// Skip ALL unvalidated records — answer section is the critical attack surface
-							continue;
-						}
+						// NOTE: DnsQuery_W with DNS_QUERY_DNSSEC_OK delegates validation
+						// to the Windows DNS resolver, which returns DNS_INFO_NO_RECORDS
+						// on validation failure (handled above).  Per-record filtering
+						// against pRec->Flags.DW would require a user-mode "validated"
+						// bit that Windows does not expose; the previous implementation
+						// matched 0x0020, which is the Section bit-field, not a DNSSEC
+						// status, and therefore silently discarded every record when
+						// options.dnssec was set.  Trust the resolver here instead.
 
 						DnsRecord rec;
 						rec.name = pRec->pName ? pRec->pName : L"";
