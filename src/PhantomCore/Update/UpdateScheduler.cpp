@@ -542,6 +542,10 @@ public:
     std::atomic<bool>             m_triggerFlag{ false };
     CheckTrigger                  m_pendingTrigger{ CheckTrigger::Scheduled };
 
+    // Serialises Start()/Stop() so concurrent callers cannot both attempt
+    // to assign m_thread (which would std::terminate on a joinable thread).
+    std::mutex                    m_lifecycleMutex;
+
     // ---- Cached system state --------------------------------------------
     SystemState                   m_cachedSystemState;
     TimePoint                     m_lastSystemStateQuery;
@@ -683,16 +687,45 @@ public:
         SS_LOG_INFO(kLogCategory, L"Scheduler thread started");
 
         while (!m_stopFlag.load(std::memory_order_acquire)) {
+            // Snapshot interval under lock — m_interval is mutated by
+            // SetInterval() and would otherwise be a data race in wait_for.
+            std::chrono::hours waitInterval;
+            bool isPaused = false;
+            {
+                std::shared_lock lock(m_mutex);
+                waitInterval = m_interval;
+                isPaused = (m_schedulerState == SchedulerState::Paused);
+            }
+
             // Sleep / wait for trigger or interval expiry.
             {
                 std::unique_lock cvLock(m_cvMutex);
-                m_cv.wait_for(cvLock, m_interval, [this] {
+                m_cv.wait_for(cvLock, waitInterval, [this] {
                     return m_stopFlag.load(std::memory_order_acquire) ||
                            m_triggerFlag.load(std::memory_order_acquire);
                 });
             }
 
             if (m_stopFlag.load(std::memory_order_acquire)) break;
+
+            // Re-evaluate pause after waking: if Paused (and this is not
+            // a manual trigger), park until resumed. Pause must actually
+            // suppress check execution — otherwise the thread runs checks
+            // while the public API reports Paused state.
+            {
+                std::shared_lock lock(m_mutex);
+                isPaused = (m_schedulerState == SchedulerState::Paused);
+            }
+            if (isPaused && !m_triggerFlag.load(std::memory_order_acquire)) {
+                std::unique_lock cvLock(m_cvMutex);
+                m_cv.wait(cvLock, [this] {
+                    if (m_stopFlag.load(std::memory_order_acquire)) return true;
+                    if (m_triggerFlag.load(std::memory_order_acquire)) return true;
+                    std::shared_lock lock(m_mutex);
+                    return m_schedulerState != SchedulerState::Paused;
+                });
+                if (m_stopFlag.load(std::memory_order_acquire)) break;
+            }
 
             // Determine trigger type.
             CheckTrigger trigger = CheckTrigger::Scheduled;
@@ -932,6 +965,10 @@ void UpdateScheduler::Start() {
         return;
     }
 
+    // Serialise lifecycle transitions so two callers cannot race to assign
+    // m_thread (which would terminate on a joinable thread).
+    std::lock_guard lifecycle(m_impl->m_lifecycleMutex);
+
     {
         std::shared_lock lock(m_impl->m_mutex);
         if (m_impl->m_schedulerState == SchedulerState::Running ||
@@ -967,6 +1004,9 @@ void UpdateScheduler::Start() {
 
 void UpdateScheduler::Stop() {
     if (!m_impl) return;
+
+    // Serialise against Start() — see m_lifecycleMutex rationale.
+    std::lock_guard lifecycle(m_impl->m_lifecycleMutex);
 
     {
         std::shared_lock lock(m_impl->m_mutex);
@@ -1010,16 +1050,18 @@ void UpdateScheduler::Pause() {
 void UpdateScheduler::Resume() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) return;
 
-    std::unique_lock lock(m_impl->m_mutex);
-    if (m_impl->m_schedulerState != SchedulerState::Paused) {
-        SS_LOG_DEBUG(kLogCategory, L"Resume() called but scheduler is not paused");
-        return;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        if (m_impl->m_schedulerState != SchedulerState::Paused) {
+            SS_LOG_DEBUG(kLogCategory, L"Resume() called but scheduler is not paused");
+            return;
+        }
+
+        m_impl->SetState(SchedulerState::Running);
+        m_impl->m_status = SchedulerStatus::Running;
     }
 
-    m_impl->SetState(SchedulerState::Running);
-    m_impl->m_status = SchedulerStatus::Running;
-
-    lock.unlock();
+    // Wake the worker thread so it observes the new state.
     m_impl->m_cv.notify_all();
 
     SS_LOG_INFO(kLogCategory, L"Scheduler resumed");
