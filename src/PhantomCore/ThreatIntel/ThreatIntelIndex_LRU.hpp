@@ -132,12 +132,27 @@ namespace ThreatIntel {
                         return;
                     }
 
-                    // Create new node
-                    CacheNode* node = new CacheNode(key, value);
+                    // Allocate the node under a guard so that any throw from the
+                    // subsequent map insertion does not leak the node. The
+                    // unique_ptr owns the node until we have a confirmed slot in
+                    // the map; only then is ownership transferred to the linked
+                    // list which manages it from that point on.
+                    std::unique_ptr<CacheNode> guard(new CacheNode(key, value));
 
-                    // Add to front
-                    AddToFront(node);
-                    m_map[key] = node;
+                    // operator[] / emplace may throw std::bad_alloc when growing
+                    // the bucket array. Performing the map insertion before
+                    // touching the intrusive list keeps the list invariant intact
+                    // on failure (the partially-constructed node is destroyed by
+                    // the guard during stack unwinding).
+                    auto [insertedIt, inserted] = m_map.emplace(key, guard.get());
+                    if (!inserted) {
+                        // Should be unreachable: we already checked find() above
+                        // and hold the exclusive lock. Treat as best-effort no-op.
+                        return;
+                    }
+
+                    CacheNode* node = guard.release();
+                    AddToFront(node);  // noexcept: pure pointer manipulation
 
                     // Evict if over capacity
                     while (m_map.size() > m_capacity && m_tail != nullptr) {
@@ -149,7 +164,8 @@ namespace ThreatIntel {
                     }
                 }
                 catch (const std::bad_alloc&) {
-                    // Ignore - cache is best effort
+                    // Ignore - cache is best effort. The unique_ptr guard above
+                    // ensures any partially-constructed node is reclaimed.
                 }
             }
 
