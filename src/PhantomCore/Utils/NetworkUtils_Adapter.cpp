@@ -86,6 +86,69 @@ namespace ShadowStrike {
 					return htonl(host);
 				}
 
+				// Bounded retry helper for size-then-fetch MIB queries.  The single
+				// "ask size, allocate, fetch" idiom races: if the table grows between
+				// the two calls (which is common on dynamic systems) the second call
+				// returns ERROR_INSUFFICIENT_BUFFER and the caller fails spuriously.
+				// Retries up to kMaxRetries times and caps the allocation at kMaxBytes
+				// to bound worst-case memory pressure under hostile conditions.
+				template <typename FetchFn>
+				inline DWORD FetchMibTable(std::vector<uint8_t>& buffer, FetchFn fetch) noexcept {
+					constexpr int kMaxRetries = 5;
+					constexpr ULONG kMaxBytes = 64 * 1024 * 1024; // 64 MiB hard cap
+					ULONG size = 0;
+					DWORD result = fetch(nullptr, &size);
+					for (int i = 0; i < kMaxRetries; ++i) {
+						if (result != ERROR_INSUFFICIENT_BUFFER && result != ERROR_BUFFER_OVERFLOW) {
+							return result;
+						}
+						if (size == 0 || size > kMaxBytes) {
+							return ERROR_INSUFFICIENT_BUFFER;
+						}
+						try {
+							buffer.assign(size, 0);
+						} catch (...) {
+							return ERROR_NOT_ENOUGH_MEMORY;
+						}
+						ULONG inOut = size;
+						result = fetch(buffer.data(), &inOut);
+						size = inOut;
+					}
+					return result;
+				}
+
+				// Resolve the appropriate interface index for a next-hop address.
+				// Without this, CreateIpForwardEntry/CreateIpNetEntry would be issued
+				// with an unset/zero interface index and rejected by the IP helper.
+				inline DWORD ResolveBestInterfaceIndex(const IpAddress& target, DWORD& ifIndexOut) noexcept {
+					ifIndexOut = 0;
+					if (target.IsIPv4()) {
+						auto* v4 = target.AsIPv4();
+						if (!v4) return ERROR_INVALID_PARAMETER;
+						IPAddr addr = static_cast<IPAddr>(HostToNetwork32(v4->ToUInt32()));
+						DWORD ifIdx = 0;
+						DWORD rc = ::GetBestInterface(addr, &ifIdx);
+						if (rc == NO_ERROR) {
+							ifIndexOut = ifIdx;
+						}
+						return rc;
+					}
+					if (target.IsIPv6()) {
+						auto* v6 = target.AsIPv6();
+						if (!v6) return ERROR_INVALID_PARAMETER;
+						SOCKADDR_IN6 sa6{};
+						sa6.sin6_family = AF_INET6;
+						std::memcpy(&sa6.sin6_addr, v6->bytes.data(), 16);
+						DWORD ifIdx = 0;
+						DWORD rc = ::GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&sa6), &ifIdx);
+						if (rc == NO_ERROR) {
+							ifIndexOut = ifIdx;
+						}
+						return rc;
+					}
+					return ERROR_INVALID_PARAMETER;
+				}
+
 				// RAII guard for BSTR — prevents SysAllocString memory leaks
 				struct BstrGuard {
 					BSTR bstr;
@@ -113,16 +176,29 @@ namespace ShadowStrike {
 					adapters.clear();
 					SS_LOG_DEBUG(L"NetworkUtils", L"GetNetworkAdapters enumeration started");
 
-					ULONG bufferSize = 15000;
+					constexpr ULONG kInitialSize = 15000;
+					constexpr ULONG kMaxSize = 8 * 1024 * 1024; // 8 MiB
+					constexpr int kMaxRetries = 5;
+					ULONG bufferSize = kInitialSize;
 					std::vector<uint8_t> buffer(bufferSize);
+					ULONG ret = ERROR_BUFFER_OVERFLOW;
 
-					ULONG ret = ::GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
-						nullptr, reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &bufferSize);
-
-					if (ret == ERROR_BUFFER_OVERFLOW) {
-						buffer.resize(bufferSize);
-						ret = ::GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
-							nullptr, reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &bufferSize);
+					// Retry loop: bounded to defend against pathological churn while
+					// still tolerating ordinary adapter set changes between calls.
+					for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+						ret = ::GetAdaptersAddresses(AF_UNSPEC,
+							GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
+							nullptr,
+							reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()),
+							&bufferSize);
+						if (ret != ERROR_BUFFER_OVERFLOW) {
+							break;
+						}
+						if (bufferSize == 0 || bufferSize > kMaxSize) {
+							ret = ERROR_INSUFFICIENT_BUFFER;
+							break;
+						}
+						buffer.assign(bufferSize, 0);
 					}
 
 					if (ret != NO_ERROR) {
@@ -1444,8 +1520,17 @@ namespace ShadowStrike {
 						uint32_t mask = prefixLength == 0 ? 0 : (~0U << (32 - prefixLength));
 						route.dwForwardMask = Internal::HostToNetwork32(mask);
 
+						// Resolve interface index from gateway; CreateIpForwardEntry
+						// rejects routes with an unset/zero interface index.
+						DWORD ifIndex = 0;
+						DWORD rcIf = Internal::ResolveBestInterfaceIndex(gateway, ifIndex);
+						if (rcIf != NO_ERROR || ifIndex == 0) {
+							Internal::SetError(err, rcIf == NO_ERROR ? ERROR_NOT_FOUND : rcIf,
+								L"AddRoute could not resolve interface for IPv4 gateway");
+							return false;
+						}
 						route.dwForwardPolicy = 0;
-						route.dwForwardIfIndex = 0; // Let system choose interface
+						route.dwForwardIfIndex = ifIndex;
 						route.dwForwardType = MIB_IPROUTE_TYPE_INDIRECT;
 						route.dwForwardProto = MIB_IPPROTO_NETMGMT;
 						route.dwForwardAge = 0;
@@ -1487,6 +1572,25 @@ namespace ShadowStrike {
 						route.NextHop.si_family = AF_INET6;
 						const auto& gwBytes = gwIpv6->bytes;
 						std::memcpy(route.NextHop.Ipv6.sin6_addr.u.Byte, gwBytes.data(), 16);
+
+						// Resolve outgoing interface from the next-hop gateway and
+						// translate it to a NET_LUID; CreateIpForwardEntry2 rejects
+						// rows whose InterfaceLuid/InterfaceIndex are both zero.
+						DWORD ifIndex = 0;
+						DWORD rcIf = Internal::ResolveBestInterfaceIndex(gateway, ifIndex);
+						if (rcIf != NO_ERROR || ifIndex == 0) {
+							Internal::SetError(err, rcIf == NO_ERROR ? ERROR_NOT_FOUND : rcIf,
+								L"AddRoute could not resolve interface for IPv6 gateway");
+							return false;
+						}
+						NET_LUID luid{};
+						DWORD rcLuid = ::ConvertInterfaceIndexToLuid(ifIndex, &luid);
+						if (rcLuid != NO_ERROR) {
+							Internal::SetError(err, rcLuid, L"ConvertInterfaceIndexToLuid failed");
+							return false;
+						}
+						route.InterfaceIndex = ifIndex;
+						route.InterfaceLuid = luid;
 
 						route.Protocol = MIB_IPPROTO_NETMGMT;
 						route.Metric = 1;
@@ -1531,13 +1635,11 @@ namespace ShadowStrike {
 						uint32_t mask = prefixLength == 0 ? 0 : (~0U << (32 - prefixLength));
 						route.dwForwardMask = Internal::HostToNetwork32(mask);
 
-						// Find matching route in table
-						ULONG size = 0;
-#pragma warning(suppress: 6387)
-						::GetIpForwardTable(nullptr, &size, FALSE);
-
-						std::vector<uint8_t> buffer(size);
-						DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+						// Find matching route in table (bounded retry against TOCTOU)
+						std::vector<uint8_t> buffer;
+						DWORD result = Internal::FetchMibTable(buffer, [](uint8_t* p, ULONG* s) -> DWORD {
+							return ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(p), s, FALSE);
+						});
 
 						if (result != NO_ERROR) {
 							Internal::SetError(err, result, L"GetIpForwardTable failed");
@@ -1652,13 +1754,11 @@ namespace ShadowStrike {
 					}
 
 					if (destination.IsIPv4()) {
-						// IPv4 Route Modification
-						ULONG size = 0;
-#pragma warning(suppress: 6387)
-						::GetIpForwardTable(nullptr, &size, FALSE);
-
-						std::vector<uint8_t> buffer(size);
-						DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+						// IPv4 Route Modification (bounded retry against TOCTOU)
+						std::vector<uint8_t> buffer;
+						DWORD result = Internal::FetchMibTable(buffer, [](uint8_t* p, ULONG* s) -> DWORD {
+							return ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(p), s, FALSE);
+						});
 
 						if (result != NO_ERROR) {
 							Internal::SetError(err, result, L"GetIpForwardTable failed");
@@ -1757,13 +1857,11 @@ namespace ShadowStrike {
 				try {
 					entries.clear();
 
-					// IPv4 ARP Table
-					ULONG size = 0;
-#pragma warning(suppress: 6387)
-					::GetIpNetTable(nullptr, &size, FALSE);
-
-					std::vector<uint8_t> buffer(size);
-					DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+					// IPv4 ARP Table (bounded retry against TOCTOU)
+					std::vector<uint8_t> buffer;
+					DWORD result = Internal::FetchMibTable(buffer, [](uint8_t* p, ULONG* s) -> DWORD {
+						return ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(p), s, FALSE);
+					});
 
 					if (result == NO_ERROR) {
 						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
@@ -1849,29 +1947,22 @@ namespace ShadowStrike {
 
 						auto* ipv4 = ipAddress.AsIPv4();
 						row.dwAddr = Internal::HostToNetwork32(ipv4->ToUInt32());
-						row.dwIndex = 0; // Will need to find appropriate interface
 						row.dwPhysAddrLen = 6;
 						std::memcpy(row.bPhysAddr, macBytes.data(), 6);
 						row.Type = MIB_IPNET_TYPE_STATIC;
 
-						// Find appropriate interface index
-						ULONG tableSize = 0;
-#pragma warning(suppress: 6387)
-						::GetIpNetTable(nullptr, &tableSize, FALSE);
-
-						std::vector<uint8_t> buffer(tableSize);
-						if (::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &tableSize, FALSE) == NO_ERROR) {
-							auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
-							if (pTable->dwNumEntries > 0) {
-								// Use first interface index as default
-								row.dwIndex = pTable->table[0].dwIndex;
-							}
-						}
-
-						if (row.dwIndex == 0) {
-							Internal::SetError(err, ERROR_NOT_FOUND, L"No valid interface found");
+						// Resolve the correct interface for the target IP via the
+						// routing table.  The previous implementation grabbed the
+						// first arbitrary index out of the existing ARP cache, which
+						// is almost always the wrong adapter.
+						DWORD ifIndex = 0;
+						DWORD rcIf = Internal::ResolveBestInterfaceIndex(ipAddress, ifIndex);
+						if (rcIf != NO_ERROR || ifIndex == 0) {
+							Internal::SetError(err, rcIf == NO_ERROR ? ERROR_NOT_FOUND : rcIf,
+								L"AddArpEntry could not resolve interface for IPv4 target");
 							return false;
 						}
+						row.dwIndex = ifIndex;
 
 						DWORD result = ::CreateIpNetEntry(&row);
 						if (result != NO_ERROR) {
@@ -1898,22 +1989,24 @@ namespace ShadowStrike {
 						row.IsRouter = FALSE;
 						row.IsUnreachable = FALSE;
 
-						// Find appropriate interface
-						PMIB_IPNET_TABLE2 pTable6 = nullptr;
-						DWORD result = ::GetIpNetTable2(AF_INET6, &pTable6);
-
-						if (result == NO_ERROR && pTable6 && pTable6->NumEntries > 0) {
-							row.InterfaceIndex = pTable6->Table[0].InterfaceIndex;
-							row.InterfaceLuid = pTable6->Table[0].InterfaceLuid;
-							::FreeMibTable(pTable6);
-						}
-						else {
-							if (pTable6) ::FreeMibTable(pTable6);
-							Internal::SetError(err, ERROR_NOT_FOUND, L"No valid IPv6 interface found");
+						// Resolve the correct interface for the IPv6 target.
+						DWORD ifIndex = 0;
+						DWORD rcIf = Internal::ResolveBestInterfaceIndex(ipAddress, ifIndex);
+						if (rcIf != NO_ERROR || ifIndex == 0) {
+							Internal::SetError(err, rcIf == NO_ERROR ? ERROR_NOT_FOUND : rcIf,
+								L"AddArpEntry could not resolve interface for IPv6 target");
 							return false;
 						}
+						NET_LUID luid{};
+						DWORD rcLuid = ::ConvertInterfaceIndexToLuid(ifIndex, &luid);
+						if (rcLuid != NO_ERROR) {
+							Internal::SetError(err, rcLuid, L"ConvertInterfaceIndexToLuid failed");
+							return false;
+						}
+						row.InterfaceIndex = ifIndex;
+						row.InterfaceLuid = luid;
 
-						result = ::CreateIpNetEntry2(&row);
+						DWORD result = ::CreateIpNetEntry2(&row);
 						if (result != NO_ERROR) {
 							Internal::SetError(err, result, L"CreateIpNetEntry2 failed");
 							return false;
@@ -1935,13 +2028,11 @@ namespace ShadowStrike {
 			bool DeleteArpEntry(const IpAddress& ipAddress, Error* err) noexcept {
 				try {
 					if (ipAddress.IsIPv4()) {
-						// IPv4 ARP Entry Deletion
-						ULONG size = 0;
-#pragma warning(suppress: 6387)
-						::GetIpNetTable(nullptr, &size, FALSE);
-
-						std::vector<uint8_t> buffer(size);
-						DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+						// IPv4 ARP Entry Deletion (bounded retry against TOCTOU)
+						std::vector<uint8_t> buffer;
+						DWORD result = Internal::FetchMibTable(buffer, [](uint8_t* p, ULONG* s) -> DWORD {
+							return ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(p), s, FALSE);
+						});
 
 						if (result != NO_ERROR) {
 							Internal::SetError(err, result, L"GetIpNetTable failed");
@@ -2031,13 +2122,11 @@ namespace ShadowStrike {
 				try {
 					bool success = true;
 
-					// Flush IPv4 ARP Cache
-					ULONG size = 0;
-#pragma warning(suppress: 6387)
-					::GetIpNetTable(nullptr, &size, FALSE);
-
-					std::vector<uint8_t> buffer(size);
-					DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+					// Flush IPv4 ARP Cache (bounded retry against TOCTOU)
+					std::vector<uint8_t> buffer;
+					DWORD result = Internal::FetchMibTable(buffer, [](uint8_t* p, ULONG* s) -> DWORD {
+						return ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(p), s, FALSE);
+					});
 
 					if (result == NO_ERROR) {
 						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
@@ -2095,13 +2184,11 @@ namespace ShadowStrike {
 				try {
 					bool success = true;
 
-					// Flush IPv4 ARP Cache for specific interface
-					ULONG size = 0;
-#pragma warning(suppress: 6387)
-					::GetIpNetTable(nullptr, &size, FALSE);
-
-					std::vector<uint8_t> buffer(size);
-					DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+					// Flush IPv4 ARP Cache for specific interface (bounded retry against TOCTOU)
+					std::vector<uint8_t> buffer;
+					DWORD result = Internal::FetchMibTable(buffer, [](uint8_t* p, ULONG* s) -> DWORD {
+						return ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(p), s, FALSE);
+					});
 
 					if (result == NO_ERROR) {
 						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
