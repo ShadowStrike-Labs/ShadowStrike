@@ -86,6 +86,63 @@ namespace ShadowStrike {
 					return htonl(host);
 				}
 
+				// Strip embedded userinfo (user[:password]@) from a proxy server
+				// specification before it ever reaches the logger.  The server field
+				// can legitimately carry credentials in URI form and they must never
+				// be written to the structured log sink.  Operates on a copy.
+				inline std::wstring RedactProxyServerForLog(std::wstring_view server) noexcept {
+					std::wstring out;
+					out.reserve(server.size());
+					size_t cursor = 0;
+					while (cursor < server.size()) {
+						size_t segEnd = server.find(L';', cursor);
+						if (segEnd == std::wstring_view::npos) segEnd = server.size();
+						std::wstring_view segment = server.substr(cursor, segEnd - cursor);
+						size_t equals = segment.find(L'=');
+						size_t hostStart = (equals == std::wstring_view::npos) ? 0 : equals + 1;
+						std::wstring_view prefix = segment.substr(0, hostStart);
+						std::wstring_view host = segment.substr(hostStart);
+						size_t at = host.find(L'@');
+						out.append(prefix);
+						if (at != std::wstring_view::npos) {
+							out.append(L"<redacted>@");
+							out.append(host.substr(at + 1));
+						} else {
+							out.append(host);
+						}
+						if (segEnd < server.size()) {
+							out.push_back(L';');
+							cursor = segEnd + 1;
+						} else {
+							cursor = segEnd;
+						}
+					}
+					return out;
+				}
+
+				// Accept only http/https schemes for proxy auto-configuration URLs.
+				// file://, javascript:, data: and similar schemes can lead to local-file
+				// disclosure or code execution inside the PAC JScript host on every
+				// outbound request.
+				inline bool IsAcceptableProxyAutoConfigUrl(std::wstring_view url) noexcept {
+					if (url.empty() || url.size() > 4096) return false;
+					for (wchar_t ch : url) {
+						if (ch == L'\0' || ch == L'\r' || ch == L'\n' || (ch > 0 && ch < 0x20)) {
+							return false;
+						}
+					}
+					constexpr std::wstring_view kHttp  = L"http://";
+					constexpr std::wstring_view kHttps = L"https://";
+					auto startsWithICase = [](std::wstring_view s, std::wstring_view p) noexcept {
+						if (s.size() < p.size()) return false;
+						for (size_t i = 0; i < p.size(); ++i) {
+							if (::towlower(s[i]) != ::towlower(p[i])) return false;
+						}
+						return true;
+					};
+					return startsWithICase(url, kHttp) || startsWithICase(url, kHttps);
+				}
+
 			} // namespace Internal
 
 		// ============================================================================
@@ -144,7 +201,20 @@ namespace ShadowStrike {
 			bool SetSystemProxySettings(const ProxyInfo& proxy, Error* err) noexcept {
 				try {
 					SS_LOG_WARN(L"NetworkUtils", L"SetSystemProxySettings modifying system proxy — enabled=%d server=%ls",
-						proxy.enabled ? 1 : 0, proxy.server.c_str());
+						proxy.enabled ? 1 : 0, Internal::RedactProxyServerForLog(proxy.server).c_str());
+
+					// Reject auto-configuration URLs that are not plain HTTP(S).  The
+					// PAC engine evaluates JScript fetched from this URL on every
+					// outbound request, so a file://, javascript: or data: URL here
+					// would amount to durable code execution in the Schannel/WinHTTP
+					// host context.
+					if (!proxy.autoConfigUrl.empty() &&
+						!Internal::IsAcceptableProxyAutoConfigUrl(proxy.autoConfigUrl)) {
+						SS_LOG_ERROR(L"NetworkUtils", L"Rejecting non-http(s) AutoConfigURL scheme");
+						Internal::SetError(err, ERROR_INVALID_PARAMETER,
+							L"AutoConfigURL must use http:// or https://");
+						return false;
+					}
 
 					// Internet Settings registry path
 					constexpr wchar_t REG_PATH[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
@@ -270,7 +340,14 @@ namespace ShadowStrike {
 					WINHTTP_AUTOPROXY_OPTIONS autoProxyOptions = {};
 					autoProxyOptions.dwFlags = WINHTTP_AUTOPROXY_AUTO_DETECT;
 					autoProxyOptions.dwAutoDetectFlags = WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
-					autoProxyOptions.fAutoLogonIfChallenged = TRUE;
+					// Per Microsoft's WinHTTP guidance, fAutoLogonIfChallenged must be
+					// FALSE on the first WinHttpGetProxyForUrl call.  Leaving it TRUE
+					// causes the resolver to silently transmit the caller's NTLM
+					// credentials to whatever host the PAC discovery process locates,
+					// which is exactly what a malicious WPAD responder targets.  If
+					// the call fails with ERROR_WINHTTP_LOGIN_FAILURE, callers can
+					// retry explicitly.
+					autoProxyOptions.fAutoLogonIfChallenged = FALSE;
 
 					// Check for PAC file - RAII guard for IE proxy config
 					WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieProxyConfig{};
@@ -287,9 +364,13 @@ namespace ShadowStrike {
 					IeProxyConfigCleanup ieConfigGuard{ &ieProxyConfig };
 
 					if (::WinHttpGetIEProxyConfigForCurrentUser(&ieProxyConfig)) {
-						if (ieProxyConfig.lpszAutoConfigUrl) {
+						if (ieProxyConfig.lpszAutoConfigUrl &&
+							Internal::IsAcceptableProxyAutoConfigUrl(ieProxyConfig.lpszAutoConfigUrl)) {
 							autoProxyOptions.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
 							autoProxyOptions.lpszAutoConfigUrl = ieProxyConfig.lpszAutoConfigUrl;
+						} else if (ieProxyConfig.lpszAutoConfigUrl) {
+							SS_LOG_WARN(L"NetworkUtils",
+								L"Ignoring IE-supplied AutoConfigURL with unsupported scheme");
 						}
 					}
 
