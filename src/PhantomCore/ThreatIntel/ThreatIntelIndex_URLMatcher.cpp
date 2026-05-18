@@ -120,7 +120,9 @@ void AhoCorasickAutomaton::AddPattern(std::string_view pattern, const IndexValue
         return;
     }
     
-    if (m_states.size() + pattern.size() > MAX_STATES) {
+    // Overflow-safe capacity check: pattern.size() is bounded by
+    // MAX_URL_PATTERN_LENGTH so the addition cannot wrap on size_t.
+    if (m_states.size() > MAX_STATES - pattern.size()) {
         return;
     }
     
@@ -132,6 +134,14 @@ void AhoCorasickAutomaton::AddPattern(std::string_view pattern, const IndexValue
         
         int32_t nextState = m_states[currentState]->transitions[c];
         
+        // Guard against shortcut transitions left behind by a previous Build().
+        // Real trie edges always lead to a state at a strictly greater index
+        // than the parent. Anything pointing backwards (or to root) is a
+        // failure-link shortcut and MUST be treated as "no transition" here.
+        if (nextState <= currentState) {
+            nextState = -1;
+        }
+        
         if (nextState == -1) {
             // Create new state
             nextState = static_cast<int32_t>(m_states.size());
@@ -142,11 +152,15 @@ void AhoCorasickAutomaton::AddPattern(std::string_view pattern, const IndexValue
         currentState = nextState;
     }
     
-    // Mark terminal state and store output
-    m_states[currentState]->isTerminal = true;
+    // Mark terminal state and store output. Count only the first time a path
+    // becomes terminal; subsequent calls overwrite the output without drifting
+    // the pattern counter.
+    if (!m_states[currentState]->isTerminal) {
+        m_states[currentState]->isTerminal = true;
+        ++m_patternCount;
+    }
     m_states[currentState]->output = value;
     
-    ++m_patternCount;
     m_built = false;
 }
 
@@ -168,7 +182,7 @@ void AhoCorasickAutomaton::RebuildFrom(
     // Re-add all patterns (lock already held, call unlocked internals)
     for (const auto& [pat, val] : patterns) {
         if (pat.empty() || pat.size() > MAX_URL_PATTERN_LENGTH) continue;
-        if (m_states.size() + pat.size() > MAX_STATES) break;
+        if (m_states.size() > MAX_STATES - pat.size()) break;
 
         int32_t cur = 0;
         for (size_t i = 0; i < pat.size(); ++i) {
@@ -181,9 +195,11 @@ void AhoCorasickAutomaton::RebuildFrom(
             }
             cur = next;
         }
-        m_states[cur]->isTerminal = true;
+        if (!m_states[cur]->isTerminal) {
+            m_states[cur]->isTerminal = true;
+            ++m_patternCount;
+        }
         m_states[cur]->output = val;
-        ++m_patternCount;
     }
 
     // Now run BFS to build failure links (same logic as Build, but under same lock)
@@ -364,7 +380,9 @@ bool AhoCorasickAutomaton::Contains(std::string_view pattern) const {
         const uint8_t c = static_cast<uint8_t>(pattern[i]);
         const int32_t nextState = m_states[currentState]->transitions[c];
         
-        if (nextState <= 0) {
+        // Reject failure-link shortcuts (transition that doesn't lead forward
+        // in the trie). Only real trie edges advance to a higher state index.
+        if (nextState <= currentState) {
             return false;
         }
         
@@ -387,8 +405,8 @@ void AhoCorasickAutomaton::Remove(std::string_view pattern) {
         const uint8_t c = static_cast<uint8_t>(pattern[i]);
         const int32_t nextState = m_states[currentState]->transitions[c];
         
-        if (nextState <= 0) {
-            return;  // Pattern not found
+        if (nextState <= currentState) {
+            return;  // Pattern not found (or only reachable via failure link)
         }
         
         currentState = nextState;
@@ -419,14 +437,32 @@ void AhoCorasickAutomaton::Clear() {
 URLPatternMatcher::URLPatternMatcher()
     : m_automaton()
     , m_patterns()
+    , m_patternIndex()
     , m_needsRebuild(false) {
+}
+
+/**
+ * @brief Ensure the automaton reflects m_patterns. Caller MUST hold m_mutex
+ *        in unique (writer) mode.
+ *
+ * Performs a full rebuild via AhoCorasickAutomaton::RebuildFrom so that we
+ * always start from a clean state — incremental Build() on top of an already
+ * built automaton is unsafe because failure-link shortcuts overwrite the
+ * underlying trie edges.
+ */
+void URLPatternMatcher::EnsureBuiltLocked() {
+    if (m_needsRebuild || !m_automaton.IsBuilt()) {
+        m_automaton.RebuildFrom(m_patterns);
+        m_needsRebuild = false;
+    }
 }
 
 /**
  * @brief Add a URL pattern to the matcher
  * @param urlPattern URL pattern to add
  * @param value Index value for this pattern
- * @return true if added successfully
+ * @return true if newly inserted, false if duplicate (value still updated)
+ *         or rejected (invalid size / allocation failure)
  */
 bool URLPatternMatcher::AddPattern(std::string_view urlPattern, const IndexValue& value) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
@@ -435,20 +471,28 @@ bool URLPatternMatcher::AddPattern(std::string_view urlPattern, const IndexValue
         return false;
     }
     
-    // Check for duplicates (URL-8)
-    for (auto& [existing, existingVal] : m_patterns) {
-        if (existing == urlPattern) {
-            existingVal = value;
+    try {
+        // O(1) duplicate check via auxiliary hash index.
+        std::string key(urlPattern);
+        auto it = m_patternIndex.find(key);
+        if (it != m_patternIndex.end()) {
+            // Update the stored value but do NOT report as new insert.
+            m_patterns[it->second].second = value;
             m_needsRebuild = true;
             return false;
         }
-    }
-    
-    try {
-        m_patterns.emplace_back(std::string(urlPattern), value);
-        m_automaton.AddPattern(urlPattern, value);
-        m_needsRebuild = true;
         
+        const size_t idx = m_patterns.size();
+        m_patterns.emplace_back(std::move(key), value);
+        try {
+            m_patternIndex.emplace(m_patterns[idx].first, idx);
+        }
+        catch (...) {
+            // Roll back the pattern vector so the two stay in sync.
+            m_patterns.pop_back();
+            throw;
+        }
+        m_needsRebuild = true;
         return true;
     }
     catch (const std::bad_alloc&) {
@@ -458,14 +502,7 @@ bool URLPatternMatcher::AddPattern(std::string_view urlPattern, const IndexValue
 
 void URLPatternMatcher::Build() {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
-    
-    if (m_needsRebuild || !m_automaton.IsBuilt()) {
-        // Always do a full rebuild from m_patterns to avoid the
-        // infinite-loop bug where filled shortcut transitions are
-        // mistaken for real trie edges on subsequent Build() calls.
-        m_automaton.RebuildFrom(m_patterns);
-        m_needsRebuild = false;
-    }
+    EnsureBuiltLocked();
 }
 
 /**
@@ -477,30 +514,37 @@ bool URLPatternMatcher::Insert(std::string_view urlPattern, const IndexValue& va
 
 /**
  * @brief Lookup a URL and return the first match
- * @param url URL to lookup
- * @param outValue Output parameter for result
- * @return true if found, false otherwise
+ *
+ * Hot read path: takes a shared lock and skips rebuild if not needed. Falls
+ * back to an exclusive lock only when the automaton is stale.
  */
 bool URLPatternMatcher::Lookup(std::string_view url, IndexValue& outValue) {
     if (url.empty() || url.size() > MAX_URL_SEARCH_LENGTH) {
         return false;
     }
     
-    // Hold exclusive lock for the entire operation to avoid TOCTOU
-    std::unique_lock<std::shared_mutex> lock(m_mutex);
-    
-    if (m_needsRebuild || !m_automaton.IsBuilt()) {
-        m_automaton.RebuildFrom(m_patterns);
-        m_needsRebuild = false;
+    // Fast path: no rebuild required, multiple readers may proceed concurrently.
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        if (!m_needsRebuild && m_automaton.IsBuilt()) {
+            auto matches = m_automaton.Search(url);
+            if (!matches.empty()) {
+                outValue = matches.front();
+                return true;
+            }
+            return false;
+        }
     }
     
-    auto matches = m_automaton.Search(url);
+    // Slow path: rebuild required. Promote to exclusive lock and re-check.
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    EnsureBuiltLocked();
     
+    auto matches = m_automaton.Search(url);
     if (!matches.empty()) {
         outValue = matches.front();
         return true;
     }
-    
     return false;
 }
 
@@ -514,22 +558,26 @@ std::vector<IndexValue> URLPatternMatcher::Match(std::string_view url) {
         return {};
     }
     
-    std::unique_lock<std::shared_mutex> lock(m_mutex);
-    
-    if (m_needsRebuild || !m_automaton.IsBuilt()) {
-        m_automaton.RebuildFrom(m_patterns);
-        m_needsRebuild = false;
+    // Fast path: shared lock when no rebuild is pending.
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        if (!m_needsRebuild && m_automaton.IsBuilt()) {
+            return m_automaton.Search(url);
+        }
     }
     
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    EnsureBuiltLocked();
     return m_automaton.Search(url);
 }
 
 bool URLPatternMatcher::Contains(std::string_view pattern) const {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
-    // Use m_patterns as the authoritative membership check,
-    // NOT the automaton (whose filled transitions cause false positives)
-    return std::any_of(m_patterns.begin(), m_patterns.end(),
-        [&pattern](const auto& p) { return p.first == pattern; });
+    // O(1) membership check using the authoritative side index. Heterogeneous
+    // lookup avoids constructing a temporary string when string_view alone
+    // would suffice — but std::unordered_map<std::string,...> requires a
+    // string key to hash with the default hasher, so accept the allocation.
+    return m_patternIndex.find(std::string(pattern)) != m_patternIndex.end();
 }
 
 bool URLPatternMatcher::Remove(std::string_view pattern) {
@@ -539,17 +587,25 @@ bool URLPatternMatcher::Remove(std::string_view pattern) {
         return false;
     }
     
-    // Check m_patterns (authoritative), not the automaton
-    auto it = std::find_if(m_patterns.begin(), m_patterns.end(),
-        [&pattern](const auto& p) { return p.first == pattern; });
-    
-    if (it == m_patterns.end()) {
+    auto it = m_patternIndex.find(std::string(pattern));
+    if (it == m_patternIndex.end()) {
         return false;
     }
     
-    m_patterns.erase(it);
-    m_needsRebuild = true;
+    const size_t idx = it->second;
+    const size_t last = m_patterns.size() - 1;
     
+    if (idx != last) {
+        // Swap-and-pop: O(1) removal. Re-point the surviving entry's index
+        // entry to its new slot before the original entry is erased so
+        // we never observe a dangling index.
+        m_patterns[idx] = std::move(m_patterns[last]);
+        m_patternIndex[m_patterns[idx].first] = idx;
+    }
+    m_patterns.pop_back();
+    m_patternIndex.erase(it);
+    
+    m_needsRebuild = true;
     return true;
 }
 
@@ -558,18 +614,20 @@ void URLPatternMatcher::Clear() {
     
     m_automaton.Clear();
     m_patterns.clear();
+    m_patternIndex.clear();
     m_needsRebuild = false;
 }
 
 size_t URLPatternMatcher::GetPatternCount() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
-    return m_automaton.GetPatternCount();
+    // Authoritative source is m_patterns. The automaton's own counter is
+    // only accurate immediately after a rebuild; m_patterns reflects pending
+    // Insert/Remove operations before any deferred rebuild fires.
+    return m_patterns.size();
 }
 
 size_t URLPatternMatcher::GetStateCount() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
-    // Return actual number of states in the Aho-Corasick automaton
-    // Each state represents a unique prefix seen during pattern addition
     return m_automaton.GetStateCount();
 }
 
@@ -584,6 +642,10 @@ size_t URLPatternMatcher::GetMemoryUsage() const noexcept {
     
     // Vector overhead
     patternBytes += m_patterns.capacity() * sizeof(std::pair<std::string, IndexValue>);
+    
+    // Secondary index overhead (approximate per-bucket node cost)
+    constexpr size_t APPROX_INDEX_NODE = sizeof(std::pair<std::string, size_t>) + 3 * sizeof(void*);
+    patternBytes += m_patternIndex.size() * APPROX_INDEX_NODE;
     
     // Automaton states (approximate)
     // Each state has 256 transitions (int32_t each) + failure link + output

@@ -38,6 +38,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ShadowStrike {
@@ -133,9 +134,18 @@ namespace ShadowStrike {
 
         private:
             AhoCorasickAutomaton m_automaton;
+            // Authoritative pattern list. Index in this vector is the value
+            // stored in m_patternIndex for O(1) lookup / removal (swap-and-pop).
             std::vector<std::pair<std::string, IndexValue>> m_patterns;
+            // Secondary index: pattern -> position in m_patterns. Maintained
+            // atomically with m_patterns under m_mutex (exclusive).
+            std::unordered_map<std::string, size_t> m_patternIndex;
             bool m_needsRebuild = false;
             mutable std::shared_mutex m_mutex;
+
+            // Ensure the automaton is in sync with m_patterns. Caller must hold
+            // m_mutex in unique mode. Idempotent.
+            void EnsureBuiltLocked();
         };
 
         // Template implementation (must be in header)
