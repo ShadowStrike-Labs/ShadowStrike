@@ -194,11 +194,16 @@ namespace ThreatIntel {
 
             case IOCType::Domain:
                 if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    // Get domain string from view
-                    std::string_view domain = m_impl->view->GetString(
+                    // Get domain string from view and canonicalize so the trie key
+                    // and bloom-filter hash match the form that LookupDomain uses.
+                    std::string_view rawDomain = m_impl->view->GetString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
+                    const std::string domain = NormalizeDomain(rawDomain);
+                    if (domain.empty()) {
+                        break;  // Allocation failure or empty input: treat as soft failure
+                    }
 
                     IndexValue indexValue(entry.entryId, entryOffset);
                     success = m_impl->domainIndex->Insert(domain, indexValue);
@@ -357,11 +362,15 @@ namespace ThreatIntel {
 
             case IOCType::Domain:
                 if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    // Get domain string from view
-                    std::string_view domain = m_impl->view->GetString(
+                    // Canonicalize before lookup so the key matches what Insert stored.
+                    std::string_view rawDomain = m_impl->view->GetString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
+                    const std::string domain = NormalizeDomain(rawDomain);
+                    if (domain.empty()) {
+                        break;
+                    }
 
                     // Enterprise-grade: Use real Remove implementation
                     if (m_impl->domainIndex->Remove(domain)) {
@@ -487,11 +496,14 @@ namespace ThreatIntel {
                 break;
             case IOCType::Domain:
                 if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view domain = m_impl->view->GetString(
+                    std::string_view rawDomain = m_impl->view->GetString(
                         oldEntry.value.stringRef.stringOffset,
                         oldEntry.value.stringRef.stringLength
                     );
-                    removalSucceeded = m_impl->domainIndex->Remove(domain);
+                    const std::string domain = NormalizeDomain(rawDomain);
+                    if (!domain.empty()) {
+                        removalSucceeded = m_impl->domainIndex->Remove(domain);
+                    }
                 }
                 break;
             case IOCType::URL:
@@ -597,10 +609,14 @@ namespace ThreatIntel {
                 break;
             case IOCType::Domain:
                 if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view domain = m_impl->view->GetString(
+                    std::string_view rawDomain = m_impl->view->GetString(
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
+                    const std::string domain = NormalizeDomain(rawDomain);
+                    if (domain.empty()) {
+                        break;
+                    }
                     IndexValue indexValue(newEntry.entryId, newEntryOffset);
                     insertSucceeded = m_impl->domainIndex->Insert(domain, indexValue);
                     if (insertSucceeded) {
@@ -694,9 +710,12 @@ namespace ThreatIntel {
                     break;
                 case IOCType::Domain:
                     if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto d = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                        auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
-                        rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                        const std::string d = NormalizeDomain(rawDomain);
+                        if (!d.empty()) {
+                            rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                        }
                     }
                     break;
                 case IOCType::URL:
@@ -802,11 +821,12 @@ namespace ThreatIntel {
                     break;
                 case IOCType::Domain:
                     if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view domain = m_impl->view->GetString(
+                        std::string_view rawDomain = m_impl->view->GetString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
-                        if (m_impl->domainIndex->Remove(domain)) {
+                        const std::string domain = NormalizeDomain(rawDomain);
+                        if (!domain.empty() && m_impl->domainIndex->Remove(domain)) {
                             if (m_impl->stats.domainEntries > 0) --m_impl->stats.domainEntries;
                             removed = true;
                         }
@@ -929,9 +949,12 @@ namespace ThreatIntel {
                     break;
                 case IOCType::Domain:
                     if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto d = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                        auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
-                        removeSuccess = m_impl->domainIndex->Remove(d);
+                        const std::string d = NormalizeDomain(rawDomain);
+                        if (!d.empty()) {
+                            removeSuccess = m_impl->domainIndex->Remove(d);
+                        }
                     }
                     break;
                 case IOCType::URL:
@@ -995,10 +1018,13 @@ namespace ThreatIntel {
                     break;
                 case IOCType::Domain:
                     if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto d = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
+                        auto rawDomain = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
-                        IndexValue indexValue(newEntry.entryId, newOffset);
-                        insertSuccess = m_impl->domainIndex->Insert(d, indexValue);
+                        const std::string d = NormalizeDomain(rawDomain);
+                        if (!d.empty()) {
+                            IndexValue indexValue(newEntry.entryId, newOffset);
+                            insertSuccess = m_impl->domainIndex->Insert(d, indexValue);
+                        }
                     }
                     break;
                 case IOCType::URL:
@@ -1059,8 +1085,11 @@ namespace ThreatIntel {
                         break;
                     case IOCType::Domain:
                         if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            auto d = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
-                            rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                            auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                            const std::string d = NormalizeDomain(rawDomain);
+                            if (!d.empty()) {
+                                rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                            }
                         }
                         break;
                     case IOCType::URL:
@@ -1174,8 +1203,12 @@ namespace ThreatIntel {
 
                 case IOCType::Domain:
                     if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view domain = m_impl->view->GetString(
+                        std::string_view rawDomain = m_impl->view->GetString(
                             entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
+                        const std::string domain = NormalizeDomain(rawDomain);
+                        if (domain.empty()) {
+                            break;
+                        }
                         IndexValue indexValue(entry.entryId, entryOffset);
                         success = m_impl->domainIndex->Insert(domain, indexValue);
                         if (success) {
@@ -1378,9 +1411,13 @@ namespace ThreatIntel {
                 case IOCType::Domain:
                     if (m_impl->domainIndex && m_impl->view && 
                         entry.value.stringRef.stringOffset > 0) {
-                        std::string_view domain = m_impl->view->GetString(
+                        std::string_view rawDomain = m_impl->view->GetString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength);
+                        const std::string domain = NormalizeDomain(rawDomain);
+                        if (domain.empty()) {
+                            break;
+                        }
                         IndexValue indexValue(entry.entryId, entryOffset);
                         success = m_impl->domainIndex->Insert(domain, indexValue);
                         if (success) {
@@ -1555,9 +1592,13 @@ namespace ThreatIntel {
                     case IOCType::Domain:
                         if (m_impl->domainIndex && m_impl->view && 
                             entry.value.stringRef.stringOffset > 0) {
-                            std::string_view domain = m_impl->view->GetString(
+                            std::string_view rawDomain = m_impl->view->GetString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength);
+                            const std::string domain = NormalizeDomain(rawDomain);
+                            if (domain.empty()) {
+                                break;
+                            }
                             IndexValue indexValue(entry.entryId, entryOffset);
                             success = m_impl->domainIndex->Insert(domain, indexValue);
                             if (success) {
