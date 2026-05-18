@@ -201,6 +201,9 @@ namespace ShadowStrike {
 #ifndef STATUS_INVALID_DEVICE_STATE
 #define STATUS_INVALID_DEVICE_STATE ((NTSTATUS)0xC0000184L)
 #endif
+#ifndef STATUS_NOT_SUPPORTED
+#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BBL)
+#endif
 
 // SHA-3 BCrypt algorithm name — added in Windows 10 1903 (SDK 10.0.18362).
 // Define here so code compiles against older SDKs; BCryptOpenAlgorithmProvider
@@ -689,9 +692,38 @@ namespace ShadowStrike {
 				resetState();
 
 #ifdef _WIN32
+				// Reject pathological key sizes early. BCryptCreateHash takes a
+				// ULONG and a 1 MiB ceiling is far above any sane HMAC key
+				// length (RFC 2104 already recommends pre-hashing keys longer
+				// than the block size); an oversize key here is either a bug
+				// or a hostile caller trying to coax integer truncation.
+				constexpr size_t kMaxHmacKey = 1u << 20;
+				if (keyLen > kMaxHmacKey || keyLen > static_cast<size_t>(MAXULONG)) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->ntstatus = STATUS_INVALID_PARAMETER;
+					}
+					SS_LOG_ERROR(L"HashUtils",
+					             L"Hmac::Init: refused oversize key (%zu bytes)", keyLen);
+					return false;
+				}
+
 				if (!ensureProviderReady(err)) return false;
 
 				AlgProv& ap = GetProv(m_alg);
+
+				// HMAC provider may be unavailable (e.g. SHA-3 HMAC on older
+				// Windows). Fail explicitly rather than dereferencing a null
+				// algorithm handle later.
+				if (!ap.hAlgHmac) {
+					if (err) {
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->ntstatus = STATUS_NOT_SUPPORTED;
+					}
+					SS_LOG_ERROR(L"HashUtils",
+					             L"Hmac::Init: HMAC provider unavailable for algorithm");
+					return false;
+				}
 
 				// Allocate HMAC object buffer
 				m_objLen = ap.objLenHmac;
@@ -1021,11 +1053,18 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Open file with sequential scan hint for optimal I/O
+				// Open file with sequential scan hint and reparse-point handling.
+				// FILE_FLAG_OPEN_REPARSE_POINT prevents a symlink/junction at
+				// `path` from silently redirecting the hash to an
+				// attacker-chosen file; we then refuse to compute over a
+				// reparse point body itself (its on-disk contents do not
+				// represent what the caller asked us to hash). Callers that
+				// genuinely want to follow a link must resolve it themselves.
 				HANDLE h = CreateFileW(pathStr.c_str(), GENERIC_READ,
 				                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				                       nullptr, OPEN_EXISTING,
-				                       FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+				                       FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT,
+				                       nullptr);
 				if (h == INVALID_HANDLE_VALUE) {
 					if (err) err->win32 = GetLastError();
 					SS_LOG_LAST_ERROR(L"HashUtils", L"ComputeFile: CreateFileW failed: %ls", pathStr.c_str());
@@ -1040,6 +1079,26 @@ namespace ShadowStrike {
 					HandleGuard(const HandleGuard&) = delete;
 					HandleGuard& operator=(const HandleGuard&) = delete;
 				} guard(h);
+
+				// Reject reparse points / directories using the opened handle
+				// (TOCTOU-safe — we already own the kernel object).
+				BY_HANDLE_FILE_INFORMATION info{};
+				if (!GetFileInformationByHandle(h, &info)) {
+					if (err) err->win32 = GetLastError();
+					SS_LOG_LAST_ERROR(L"HashUtils", L"ComputeFile: GetFileInformationByHandle failed");
+					return false;
+				}
+				if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+					if (err) err->win32 = ERROR_DIRECTORY;
+					return false;
+				}
+				if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+					if (err) err->win32 = ERROR_CANT_ACCESS_FILE;
+					SS_LOG_WARN(L"HashUtils",
+					            L"ComputeFile: refusing reparse point target: %ls",
+					            pathStr.c_str());
+					return false;
+				}
 
 				// Check file size against maximum limit to prevent DoS
 				LARGE_INTEGER fileSize;
@@ -1079,7 +1138,12 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Read and hash file in chunks
+				// Read and hash file in chunks. We track the accumulated byte
+				// count because the file is opened with FILE_SHARE_WRITE; an
+				// attacker with write access could grow the file past the
+				// limit after the initial GetFileSizeEx check, so we re-bound
+				// here against MAX_HASH_FILE_SIZE.
+				uint64_t totalRead = 0;
 				for (;;) {
 					DWORD bytesRead = 0;
 					BOOL ok = ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()),
@@ -1092,6 +1156,15 @@ namespace ShadowStrike {
 
 					// EOF reached
 					if (bytesRead == 0) break;
+
+					totalRead += bytesRead;
+					if (totalRead > MAX_HASH_FILE_SIZE) {
+						if (err) err->win32 = ERROR_FILE_TOO_LARGE;
+						SS_LOG_ERROR(L"HashUtils",
+						             L"ComputeFile: file grew past %llu byte limit during read",
+						             static_cast<unsigned long long>(MAX_HASH_FILE_SIZE));
+						return false;
+					}
 
 					// Update hash with chunk
 					if (!hasher.Update(buf.data(), bytesRead, err)) {
