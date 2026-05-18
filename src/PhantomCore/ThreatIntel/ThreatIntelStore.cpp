@@ -65,8 +65,12 @@
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/Timer.hpp"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 
 #include <algorithm>
@@ -1832,7 +1836,15 @@ bool ThreatIntelStore::AddFeed(const FeedConfiguration& config) noexcept
 
     }
     catch (const std::exception& ex) {
-        // Log error...
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Failed to add feed configuration: %S",
+            ex.what()
+        );
         return false;
     }
 }
@@ -2197,9 +2209,18 @@ void ThreatIntelStore::StartFeedUpdates() noexcept {
             L"Starting automatic feed updates"
         );
         
-        // Start the feed manager's background sync
-        // The feed manager has internal scheduling based on each feed's sync interval
-        m_impl->feedManager->Start();
+        // Start the feed manager's background sync. It has internal scheduling based on each feed's sync interval.
+        if (!m_impl->feedManager->Start()) {
+            Utils::Logger::Instance().LogEx(
+                Utils::LogLevel::Error,
+                L"ThreatIntelStore",
+                __FILEW__,
+                __LINE__,
+                __FUNCTIONW__,
+                L"Feed manager rejected automatic update start"
+            );
+            return;
+        }
         
         // Update store statistics to reflect feed activity
         m_impl->stats.activeFeedsCount = GetAllFeedStatuses().size();
@@ -4005,7 +4026,18 @@ void ThreatIntelStore::Flush() noexcept {
     }
 
     if (m_impl->index) {
-        m_impl->index->Flush();
+        const StoreError flushResult = m_impl->index->Flush();
+        if (!flushResult.IsSuccess()) {
+            Utils::Logger::Instance().LogEx(
+                Utils::LogLevel::Warn,
+                L"ThreatIntelStore",
+                __FILEW__,
+                __LINE__,
+                __FUNCTIONW__,
+                L"Threat intelligence index flush failed: %S",
+                flushResult.GetFullMessage().c_str()
+            );
+        }
     }
 }
 
