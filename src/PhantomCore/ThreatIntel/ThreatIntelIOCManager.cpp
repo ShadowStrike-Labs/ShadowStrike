@@ -293,6 +293,43 @@ namespace {
     return std::min(hwThreads, maxThreads);
 }
 
+/**
+ * @brief Build a canonical deduplication key for an IOC entry.
+ * @details Delegates to ThreatIntelDatabase::FormatIOCValueForIndex so the dedup
+ *          key matches the canonical representation used by the database index
+ *          (Format::FormatIPv4, Format::FormatIPv6, Format::FormatHashString, or
+ *          strref:offset:length for string-pool-backed types). Centralising key
+ *          construction prevents drift between the optimistic check, the
+ *          under-lock recheck and the post-allocate insertion in AddIOC.
+ *
+ *          KNOWN LIMITATION: string-pool-backed IOC types (Domain/URL/Email/
+ *          CertFingerprint/JA3/JA3S/RegistryKey/ProcessName/MutexName/NamedPipe)
+ *          are keyed by stringOffset+stringLength, not by content. Two
+ *          semantically equal IOCs stored at distinct pool offsets are not
+ *          deduplicated at this layer — the importer must canonicalise and
+ *          intern the string before allocating the entry. Resolving this
+ *          requires a string-pool read API and is tracked separately.
+ */
+[[nodiscard]] inline std::string BuildDedupKey(const IOCEntry& entry) noexcept {
+    return ThreatIntelDatabase::FormatIOCValueForIndex(entry);
+}
+
+// ============================================================================
+// RESOURCE CAPS - DoS protection against malicious or runaway feeds
+// ============================================================================
+
+/// Maximum forward edges a single source entry may hold in the relationship graph.
+/// Prevents unbounded fan-out from a single adversarial node.
+constexpr size_t MAX_RELATIONSHIPS_PER_ENTRY = 4096;
+
+/// Hard cap on nodes visited during relationship BFS traversal.
+/// Bounds worst-case latency of GetRelatedIOCs / FindPath on pathological graphs.
+constexpr size_t MAX_RELATIONSHIP_TRAVERSAL_NODES = 65'536;
+
+/// Maximum versions retained per IOC entry. Older versions are dropped FIFO.
+/// Bounds memory growth from repeated updates to the same entry.
+constexpr size_t MAX_VERSIONS_PER_ENTRY = 1024;
+
 } // anonymous namespace
 
 // ============================================================================
@@ -339,9 +376,10 @@ public:
             }
         }
         
-        // Validate reputation and confidence enums are in valid range
-        // ReputationLevel and ConfidenceLevel are enums with defined values
-        if (static_cast<uint8_t>(entry.reputation) > static_cast<uint8_t>(ReputationLevel::Malicious)) {
+        // Validate reputation and confidence enums are in valid range.
+        // Reputation max enumerant is Maximum (100) — Critical (90) and Maximum (100)
+        // are above Malicious (70) and must be accepted. Confidence max is Confirmed (95).
+        if (static_cast<uint8_t>(entry.reputation) > static_cast<uint8_t>(ReputationLevel::Maximum)) {
             errorMessage = "Invalid reputation value";
             return false;
         }
@@ -618,54 +656,109 @@ private:
 class IOCRelationshipGraph {
 public:
     /**
-     * @brief Add relationship
+     * @brief Add relationship.
+     * @return true if a new edge was inserted; false if rejected (self-loop,
+     *         zero endpoint, fan-out cap reached) or already present (dedup).
+     * @details Enforces non-zero endpoints, rejects self-loops, deduplicates
+     *          identical (source, target, type) edges, and caps per-node
+     *          fan-out at MAX_RELATIONSHIPS_PER_ENTRY to prevent unbounded
+     *          memory growth from adversarial or buggy feeds.
      */
-    void AddRelationship(const IOCRelationship& relationship) noexcept {
+    [[nodiscard]] bool AddRelationship(const IOCRelationship& relationship) noexcept {
+        // Reject zero endpoints (entryId 0 is reserved/invalid).
+        if (relationship.sourceEntryId == 0 || relationship.targetEntryId == 0) {
+            return false;
+        }
+        // Reject self-loops — a node cannot be related to itself.
+        if (relationship.sourceEntryId == relationship.targetEntryId) {
+            return false;
+        }
+        
         std::lock_guard lock(m_mutex);
         
+        auto& forwardEdges = m_graph[relationship.sourceEntryId];
+        
+        // Fan-out cap: refuse new edges once a node already has the maximum.
+        if (forwardEdges.size() >= MAX_RELATIONSHIPS_PER_ENTRY) {
+            return false;
+        }
+        
+        // Dedupe: skip if an edge with the same target and type already exists.
+        for (const auto& existing : forwardEdges) {
+            if (existing.targetEntryId == relationship.targetEntryId &&
+                existing.relationType == relationship.relationType) {
+                return false;
+            }
+        }
+        
         // Add forward edge
-        m_graph[relationship.sourceEntryId].push_back(relationship);
+        forwardEdges.push_back(relationship);
         
         // Add reverse edge for bidirectional queries
-        IOCRelationship reverse = relationship;
-        reverse.sourceEntryId = relationship.targetEntryId;
-        reverse.targetEntryId = relationship.sourceEntryId;
-        m_reverseGraph[relationship.targetEntryId].push_back(reverse);
+        auto& reverseEdges = m_reverseGraph[relationship.targetEntryId];
+        if (reverseEdges.size() < MAX_RELATIONSHIPS_PER_ENTRY) {
+            IOCRelationship reverse = relationship;
+            reverse.sourceEntryId = relationship.targetEntryId;
+            reverse.targetEntryId = relationship.sourceEntryId;
+            reverseEdges.push_back(reverse);
+        }
+        
+        return true;
     }
     
     /**
-     * @brief Remove relationship
+     * @brief Remove relationship.
+     * @return Number of forward edges removed (0 if none matched). The caller
+     *         can use this to keep aggregated statistics consistent.
      */
-    void RemoveRelationship(
+    [[nodiscard]] size_t RemoveRelationship(
         uint64_t sourceId,
         uint64_t targetId,
         IOCRelationType type
     ) noexcept {
         std::lock_guard lock(m_mutex);
         
-        // Remove from forward graph
-        auto& edges = m_graph[sourceId];
-        edges.erase(
-            std::remove_if(edges.begin(), edges.end(),
-                [targetId, type](const IOCRelationship& rel) {
-                    return rel.targetEntryId == targetId &&
-                           (type == IOCRelationType::Unknown || rel.relationType == type);
-                }
-            ),
-            edges.end()
-        );
+        size_t removed = 0;
         
-        // Remove from reverse graph
-        auto& reverseEdges = m_reverseGraph[targetId];
-        reverseEdges.erase(
-            std::remove_if(reverseEdges.begin(), reverseEdges.end(),
-                [sourceId, type](const IOCRelationship& rel) {
-                    return rel.targetEntryId == sourceId &&
-                           (type == IOCRelationType::Unknown || rel.relationType == type);
-                }
-            ),
-            reverseEdges.end()
-        );
+        // Remove from forward graph
+        auto fwdIt = m_graph.find(sourceId);
+        if (fwdIt != m_graph.end()) {
+            auto& edges = fwdIt->second;
+            const auto before = edges.size();
+            edges.erase(
+                std::remove_if(edges.begin(), edges.end(),
+                    [targetId, type](const IOCRelationship& rel) {
+                        return rel.targetEntryId == targetId &&
+                               (type == IOCRelationType::Unknown || rel.relationType == type);
+                    }
+                ),
+                edges.end()
+            );
+            removed = before - edges.size();
+            if (edges.empty()) {
+                m_graph.erase(fwdIt);
+            }
+        }
+        
+        // Remove from reverse graph (mirror edges have targetEntryId == sourceId)
+        auto revIt = m_reverseGraph.find(targetId);
+        if (revIt != m_reverseGraph.end()) {
+            auto& reverseEdges = revIt->second;
+            reverseEdges.erase(
+                std::remove_if(reverseEdges.begin(), reverseEdges.end(),
+                    [sourceId, type](const IOCRelationship& rel) {
+                        return rel.targetEntryId == sourceId &&
+                               (type == IOCRelationType::Unknown || rel.relationType == type);
+                    }
+                ),
+                reverseEdges.end()
+            );
+            if (reverseEdges.empty()) {
+                m_reverseGraph.erase(revIt);
+            }
+        }
+        
+        return removed;
     }
     
     /**
@@ -705,12 +798,17 @@ public:
     /**
      * @brief Find shortest path between two IOCs
      * @details Uses BFS for unweighted shortest path. Uses sentinel value for parent tracking
-     *          to properly handle entry ID 0.
+     *          to properly handle entry ID 0. Bounded by MAX_RELATIONSHIP_TRAVERSAL_NODES
+     *          to cap worst-case traversal on pathological graphs.
      */
     [[nodiscard]] std::vector<uint64_t> FindPath(
         uint64_t sourceId,
         uint64_t targetId
     ) const noexcept {
+        if (sourceId == 0 || targetId == 0) {
+            return {};
+        }
+        
         std::shared_lock lock(m_mutex);
         
         // Use optional to properly track parent without conflicting with valid entry ID 0
@@ -724,6 +822,11 @@ public:
         parent[sourceId] = std::nullopt; // Source has no parent (sentinel)
         
         while (!queue.empty()) {
+            // DoS guard: bail out if traversal exceeds the global cap.
+            if (visited.size() >= MAX_RELATIONSHIP_TRAVERSAL_NODES) {
+                return {};
+            }
+            
             const uint64_t current = queue.front();
             queue.pop();
             
@@ -752,6 +855,10 @@ public:
                         visited.insert(rel.targetEntryId);
                         parent[rel.targetEntryId] = current;
                         queue.push(rel.targetEntryId);
+                        
+                        if (visited.size() >= MAX_RELATIONSHIP_TRAVERSAL_NODES) {
+                            return {};
+                        }
                     }
                 }
             }
@@ -783,6 +890,8 @@ public:
 private:
     /**
      * @brief BFS traversal for related IOCs
+     * @details Caps total visited nodes at MAX_RELATIONSHIP_TRAVERSAL_NODES to
+     *          bound worst-case latency and memory on pathological graphs.
      */
     void TraverseBFS(
         uint64_t startId,
@@ -792,12 +901,18 @@ private:
         std::vector<uint64_t>& related
     ) const noexcept {
         if (maxDepth == 0) return;
+        if (startId == 0) return;
         
         std::queue<std::pair<uint64_t, uint32_t>> queue;
         queue.push({startId, 0});
         visited.insert(startId);
         
         while (!queue.empty()) {
+            // DoS guard: stop expanding once the visited set hits the cap.
+            if (visited.size() >= MAX_RELATIONSHIP_TRAVERSAL_NODES) {
+                break;
+            }
+            
             const auto [currentId, depth] = queue.front();
             queue.pop();
             
@@ -815,6 +930,10 @@ private:
                     visited.insert(rel.targetEntryId);
                     related.push_back(rel.targetEntryId);
                     queue.push({rel.targetEntryId, depth + 1});
+                    
+                    if (visited.size() >= MAX_RELATIONSHIP_TRAVERSAL_NODES) {
+                        return;
+                    }
                 }
             }
         }
@@ -841,28 +960,44 @@ private:
 class IOCVersionControl {
 public:
     /**
-     * @brief Add version entry with automatic version numbering
+     * @brief Add version entry with automatic version numbering.
+     * @details Always assigns a strictly monotonic version number (max existing + 1)
+     *          regardless of any value the caller pre-populates. The per-entry chain
+     *          is capped at MAX_VERSIONS_PER_ENTRY; once reached, the oldest version
+     *          is dropped FIFO to bound memory growth from repeated updates.
      */
     void AddVersion(IOCVersionEntry version) noexcept {
+        if (version.entryId == 0) {
+            return; // Reject invalid entry ID rather than create orphan history.
+        }
+        
         std::lock_guard lock(m_mutex);
         
         auto& versions = m_versions[version.entryId];
         
-        // Auto-assign next version number if not already set
-        if (version.version == 0 || versions.empty()) {
-            version.version = static_cast<uint32_t>(versions.size() + 1);
-        } else {
-            // Find the highest version and increment
-            uint32_t maxVersion = 0;
-            for (const auto& v : versions) {
-                if (v.version > maxVersion) {
-                    maxVersion = v.version;
-                }
+        // Auto-assign strictly monotonic version number (caller's value is ignored).
+        uint32_t maxVersion = 0;
+        for (const auto& v : versions) {
+            if (v.version > maxVersion) {
+                maxVersion = v.version;
             }
-            version.version = maxVersion + 1;
+        }
+        version.version = maxVersion + 1;
+        
+        // Cap chain length: drop oldest entry FIFO when at capacity. The
+        // version numbers stay monotonic; older audit records are pruned.
+        if (versions.size() >= MAX_VERSIONS_PER_ENTRY) {
+            // Find and erase the entry with the lowest version number.
+            auto oldest = std::min_element(versions.begin(), versions.end(),
+                [](const IOCVersionEntry& a, const IOCVersionEntry& b) {
+                    return a.version < b.version;
+                });
+            if (oldest != versions.end()) {
+                versions.erase(oldest);
+            }
         }
         
-        versions.push_back(version);
+        versions.push_back(std::move(version));
     }
     
     /**
@@ -1118,39 +1253,8 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     
     // Deduplication check
     if (!options.skipDeduplication) {
-        // Extract value string for deduplication
-        std::string valueStr;
-        switch (entry.type) {
-            case IOCType::IPv4: {
-                // Use octets array for consistent representation
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                    entry.value.ipv4.octets[0],
-                    entry.value.ipv4.octets[1],
-                    entry.value.ipv4.octets[2],
-                    entry.value.ipv4.octets[3]
-                );
-                valueStr = buf;
-                break;
-            }
-            case IOCType::FileHash:
-                // Convert hash bytes to hex string
-                for (size_t i = 0; i < entry.value.hash.length; ++i) {
-                    char buf[3];
-                    snprintf(buf, sizeof(buf), "%02x", entry.value.hash.data[i]);
-                    valueStr += buf;
-                }
-                break;
-            default: {
-                // For string-based types, hash the meaningful fields only
-                // (stringOffset + stringLength + patternOffset + patternLength),
-                // NOT the 56-byte uninitialized padding.
-                valueStr = std::to_string(static_cast<uint32_t>(entry.type)) + ":"
-                    + std::to_string(entry.value.stringRef.stringOffset) + ":"
-                    + std::to_string(entry.value.stringRef.stringLength);
-                break;
-            }
-        }
+        // Build canonical dedup key (delegates to database canonical formatter).
+        const std::string valueStr = BuildDedupKey(entry);
         
         if (!valueStr.empty()) {
             const auto duplicateId = m_impl->deduplicator->CheckDuplicate(
@@ -1214,29 +1318,7 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     // IOC-5 fix: re-check dedup under the exclusive lock to close the TOCTOU
     // window between the optimistic check above and this write lock acquisition.
     if (!options.skipDeduplication) {
-        std::string recheckStr;
-        switch (entry.type) {
-            case IOCType::IPv4: {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                    entry.value.ipv4.octets[0], entry.value.ipv4.octets[1],
-                    entry.value.ipv4.octets[2], entry.value.ipv4.octets[3]);
-                recheckStr = buf;
-                break;
-            }
-            case IOCType::FileHash:
-                for (size_t i = 0; i < entry.value.hash.length; ++i) {
-                    char buf[3];
-                    snprintf(buf, sizeof(buf), "%02x", entry.value.hash.data[i]);
-                    recheckStr += buf;
-                }
-                break;
-            default:
-                recheckStr = std::to_string(static_cast<uint32_t>(entry.type)) + ":"
-                    + std::to_string(entry.value.stringRef.stringOffset) + ":"
-                    + std::to_string(entry.value.stringRef.stringLength);
-                break;
-        }
+        const std::string recheckStr = BuildDedupKey(entry);
         if (!recheckStr.empty()) {
             const auto dup = m_impl->deduplicator->CheckDuplicate(entry.type, recheckStr);
             if (dup.has_value()) {
@@ -1271,39 +1353,12 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     
     // Update deduplication index (if applicable)
     if (!options.skipDeduplication) {
-        std::string valueStr;
-        // Extract value string for deduplication index
-        switch (newEntry.type) {
-            case IOCType::IPv4: {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                    newEntry.value.ipv4.octets[0],
-                    newEntry.value.ipv4.octets[1],
-                    newEntry.value.ipv4.octets[2],
-                    newEntry.value.ipv4.octets[3]
-                );
-                valueStr = buf;
-                break;
-            }
-            case IOCType::FileHash:
-                // Convert hash bytes to hex string
-                for (size_t i = 0; i < newEntry.value.hash.length; ++i) {
-                    char buf[3];
-                    snprintf(buf, sizeof(buf), "%02x", newEntry.value.hash.data[i]);
-                    valueStr += buf;
-                }
-                break;
-            default: {
-                // For string-based types, hash the meaningful fields only
-                valueStr = std::to_string(static_cast<uint32_t>(newEntry.type)) + ":"
-                    + std::to_string(newEntry.value.stringRef.stringOffset) + ":"
-                    + std::to_string(newEntry.value.stringRef.stringLength);
-                break;
-            }
-        }
-        
+        const std::string valueStr = BuildDedupKey(newEntry);
         if (!valueStr.empty()) {
-            m_impl->deduplicator->Add(newEntry.type, valueStr, newEntry.entryId);
+            // Discard the [[nodiscard]] bool: failure here only means the entry
+            // isn't indexed for fast-path lookups; the entry itself was stored
+            // successfully and remains discoverable via the linear FindIOC scan.
+            (void)m_impl->deduplicator->Add(newEntry.type, valueStr, newEntry.entryId);
         }
     }
     
@@ -2195,6 +2250,12 @@ bool ThreatIntelIOCManager::AddRelationship(
         return false;
     }
     
+    // Pre-validate endpoints — the graph also enforces this, but we short-circuit
+    // here to avoid building a relationship struct we'd then discard.
+    if (sourceId == 0 || targetId == 0 || sourceId == targetId) {
+        return false;
+    }
+    
     IOCRelationship relationship;
     relationship.sourceEntryId = sourceId;
     relationship.targetEntryId = targetId;
@@ -2203,9 +2264,13 @@ bool ThreatIntelIOCManager::AddRelationship(
     relationship.createdTime = GetCurrentTimestamp();
     relationship.source = ThreatIntelSource::InternalAnalysis;
     
-    m_impl->relationshipGraph->AddRelationship(relationship);
-    m_impl->stats.totalRelationships.fetch_add(1, std::memory_order_relaxed);
+    if (!m_impl->relationshipGraph->AddRelationship(relationship)) {
+        // Rejected by graph (self-loop, dedup hit, or fan-out cap) — do NOT
+        // increment the global relationship counter; it would drift permanently.
+        return false;
+    }
     
+    m_impl->stats.totalRelationships.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -2218,9 +2283,21 @@ bool ThreatIntelIOCManager::RemoveRelationship(
         return false;
     }
     
-    m_impl->relationshipGraph->RemoveRelationship(sourceId, targetId, relationType);
-    m_impl->stats.totalRelationships.fetch_sub(1, std::memory_order_relaxed);
+    if (sourceId == 0 || targetId == 0) {
+        return false;
+    }
     
+    const size_t removed = m_impl->relationshipGraph->RemoveRelationship(
+        sourceId, targetId, relationType
+    );
+    
+    if (removed == 0) {
+        return false;
+    }
+    
+    // Adjust the global counter by the number of edges actually removed so the
+    // atomic stays consistent with the graph and never underflows.
+    m_impl->stats.totalRelationships.fetch_sub(removed, std::memory_order_relaxed);
     return true;
 }
 
@@ -3070,10 +3147,22 @@ bool ThreatIntelIOCManager::MergeDuplicates(
     // Step 6: Redirect relationships from merge entry to keep entry
     // -------------------------------------------------------------------------
     auto mergeRelationships = m_impl->relationshipGraph->GetRelationships(mergeEntryId);
+    size_t redirected = 0;
     for (const auto& rel : mergeRelationships) {
         IOCRelationship newRel = rel;
         newRel.sourceEntryId = keepEntryId;
-        m_impl->relationshipGraph->AddRelationship(newRel);
+        // Best-effort redirect; failures (self-loop after redirect, fan-out cap)
+        // are silently dropped. The merge entry is being deleted anyway so the
+        // worst case is a relationship that simply no longer exists.
+        if (m_impl->relationshipGraph->AddRelationship(newRel)) {
+            ++redirected;
+        }
+    }
+    // Reflect the net delta in the global counter: old edges (which will be
+    // removed when the merge entry is deleted) are exchanged for `redirected`
+    // new edges. Original edges remain counted until the entry is removed.
+    if (redirected > 0) {
+        m_impl->stats.totalRelationships.fetch_add(redirected, std::memory_order_relaxed);
     }
     
     // -------------------------------------------------------------------------
@@ -3750,7 +3839,10 @@ bool ThreatIntelIOCManager::Optimize() noexcept {
         }
         
         if (!valueStr.empty()) {
-            m_impl->deduplicator->Add(entry->type, valueStr, entry->entryId);
+            // [[nodiscard]] discarded intentionally: failure to index a single
+            // entry during rebuild leaves it discoverable via linear scan only;
+            // the optimize pass continues so partial indexes remain valid.
+            (void)m_impl->deduplicator->Add(entry->type, valueStr, entry->entryId);
         }
     }
     
