@@ -534,19 +534,19 @@ public:
     ) noexcept {
         UnifiedLookupOptions opts;
         
-        // Map lookup tier depth based on cache settings
+        // Map lookup tier depth based on cache settings. When the caller
+        // opts out of the cache entirely, cacheResult is forced off so a
+        // later "updateCache" flag cannot resurrect cache writes.
         if (!storeOpts.useCache) {
             opts.maxLookupTiers = 3;  // Skip cache tier
             opts.cacheResult = false;
         } else {
             opts.maxLookupTiers = 4;  // Use all local tiers including cache
+            opts.cacheResult = storeOpts.updateCache;
         }
         
         // Map confidence threshold
         opts.minConfidence = storeOpts.minConfidenceThreshold;
-        
-        // Map cache behavior
-        opts.cacheResult = storeOpts.updateCache;
         
         // Map metadata inclusion
         opts.includeMetadata = storeOpts.includeMetadata;
@@ -1428,6 +1428,7 @@ bool ThreatIntelStore::AddIOC(const IOCEntry& entry) noexcept {
 
     bool success = false;
     StoreEvent event;
+    IOCEntry entryCopy = entry;  // Copy for post-lock cache invalidation
     {
         std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
@@ -1448,6 +1449,24 @@ bool ThreatIntelStore::AddIOC(const IOCEntry& entry) noexcept {
     } // rwLock released
 
     if (success) {
+        // Invalidate any stale (in particular: negative) cache entry so the
+        // newly-added IOC is visible on the next lookup. Mirrors UpdateIOC.
+        if (m_impl->cache) {
+            switch (entryCopy.type) {
+                case IOCType::FileHash:
+                    m_impl->cache->Remove(CacheKey(entryCopy.value.hash));
+                    break;
+                case IOCType::IPv4:
+                    m_impl->cache->Remove(CacheKey(entryCopy.value.ipv4));
+                    break;
+                case IOCType::IPv6:
+                    m_impl->cache->Remove(CacheKey(entryCopy.value.ipv6));
+                    break;
+                default:
+                    break;  // String-based types expire via TTL
+            }
+        }
+
         m_impl->FireEvent(event);
     }
 
@@ -1575,15 +1594,21 @@ size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept
     }
 
     size_t added = 0;
+    // Track entries successfully added so we can invalidate their cache
+    // entries after releasing the rwLock (Remove takes its own internal
+    // synchronization and we must not hold rwLock across it).
+    std::vector<size_t> addedIndices;
     StoreEvent event;
     {
         std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
         IOCAddOptions addOpts;
-        for (const auto& entry : entries) {
-            auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+        addedIndices.reserve(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            auto opResult = m_impl->iocManager->AddIOC(entries[i], addOpts);
             if (opResult.success) {
                 ++added;
+                addedIndices.push_back(i);
             }
         }
 
@@ -1598,6 +1623,24 @@ size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept
     } // rwLock released
 
     if (added > 0) {
+        if (m_impl->cache) {
+            for (size_t idx : addedIndices) {
+                const auto& e = entries[idx];
+                switch (e.type) {
+                    case IOCType::FileHash:
+                        m_impl->cache->Remove(CacheKey(e.value.hash));
+                        break;
+                    case IOCType::IPv4:
+                        m_impl->cache->Remove(CacheKey(e.value.ipv4));
+                        break;
+                    case IOCType::IPv6:
+                        m_impl->cache->Remove(CacheKey(e.value.ipv6));
+                        break;
+                    default:
+                        break;  // String-based types expire via TTL
+                }
+            }
+        }
         m_impl->FireEvent(event);
     }
 
@@ -1621,13 +1664,16 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
     }
     
     bool shouldFireEvent = false;
+    std::vector<size_t> mutatedIndices;
     StoreEvent event;
     {
         std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
         
         IOCAddOptions addOpts;
+        mutatedIndices.reserve(entries.size());
         
-        for (const auto& entry : entries) {
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto& entry = entries[i];
             // Validate entry before processing
             if (entry.type == IOCType::Unknown || entry.type == IOCType::Reserved) {
                 ++result.skippedEntries;
@@ -1652,6 +1698,7 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
                 auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
                 if (opResult.success) {
                     ++result.updatedEntries;
+                    mutatedIndices.push_back(i);
                 } else {
                     ++result.errorCount;
                 }
@@ -1660,6 +1707,7 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
                 auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
                 if (opResult.success) {
                     ++result.newEntries;
+                    mutatedIndices.push_back(i);
                 } else {
                     ++result.errorCount;
                 }
@@ -1678,6 +1726,27 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
             event.iocType = std::nullopt;
         }
     } // rwLock released
+
+    // Invalidate cache entries for every successfully added or updated IOC so
+    // stale negative or pre-update cache rows cannot mask the new state.
+    if (!mutatedIndices.empty() && m_impl->cache) {
+        for (size_t idx : mutatedIndices) {
+            const auto& e = entries[idx];
+            switch (e.type) {
+                case IOCType::FileHash:
+                    m_impl->cache->Remove(CacheKey(e.value.hash));
+                    break;
+                case IOCType::IPv4:
+                    m_impl->cache->Remove(CacheKey(e.value.ipv4));
+                    break;
+                case IOCType::IPv6:
+                    m_impl->cache->Remove(CacheKey(e.value.ipv6));
+                    break;
+                default:
+                    break;  // String-based types expire via TTL
+            }
+        }
+    }
 
     if (shouldFireEvent) {
         m_impl->FireEvent(event);
