@@ -101,6 +101,21 @@ namespace ShadowStrike {
 						return false;
 					}
 
+					// Reject embedded NUL / CR / LF / ASCII control characters.  Without this
+					// check, std::wstring(url).c_str() silently truncates the URL at the
+					// first NUL and hands the prefix to WinHttpCrackUrl, allowing a host
+					// like "attacker.com\0@victim.com" to be cracked as "attacker.com"
+					// while a length-aware caller still sees the full string.  CR/LF would
+					// likewise enable smuggling into any downstream textual HTTP path.
+					for (wchar_t ch : url) {
+						if (ch == L'\0' || ch == L'\r' || ch == L'\n' || (ch > 0 && ch < 0x20)) {
+							SS_LOG_WARN(L"NetworkUtils", L"ParseUrl rejected URL with control character");
+							Internal::SetError(err, ERROR_INVALID_PARAMETER,
+								L"URL contains NUL or control characters");
+							return false;
+						}
+					}
+
 					URL_COMPONENTS urlComp{};
 					urlComp.dwStructSize = sizeof(urlComp);
 
