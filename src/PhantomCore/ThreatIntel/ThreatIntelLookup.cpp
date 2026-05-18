@@ -2778,6 +2778,27 @@ private:
             return result;
         }
         
+        // ---------------------------------------------------------------------
+        // External API providers are not yet wired up to real HTTP clients.
+        // The per-provider switch below is a structural scaffold for future
+        // VirusTotal / AbuseIPDB / URLhaus / OTX integrations and MUST NOT
+        // report success while no real network call is made. We short-circuit
+        // here with APINotConfigured so callers can distinguish "asked but
+        // unavailable" from "queried and returned empty", and so that
+        // statistics (successfulRequests, externalAPIHits) are not inflated
+        // by stub paths.
+        //
+        // When a provider is implemented:
+        //   1. Remove this short-circuit (or gate it on a runtime flag).
+        //   2. Implement QueryXxxAPI(...) and set querySuccess accordingly
+        //      from its real return value.
+        //   3. Continue to honor the circuit-breaker / rate-limiter logic
+        //      below to protect endpoints from overload.
+        // ---------------------------------------------------------------------
+        result.errorCode = static_cast<uint32_t>(LookupErrorCode::APINotConfigured);
+        result.errorMessage = "External API providers are not configured";
+        return result;
+        
         // =====================================================================
         // QUERY EACH APPLICABLE PROVIDER
         // =====================================================================
@@ -2845,14 +2866,9 @@ private:
                         // - IP: /ip_addresses/{ip}
                         // - Domain: /domains/{domain}
                         // - URL: /urls/{url_id} (base64 encoded)
-                        
-                        // Production code would call:
+                        //
                         // querySuccess = QueryVirusTotalAPI(type, value, config.timeoutMs, extResult);
-                        
-                        // Simulation: Mark as successful but no data (testing framework)
-                        querySuccess = true;
-                        extResult.score = 0;
-                        extResult.confidence = ConfidenceLevel::None;
+                        querySuccess = false;
                         break;
                     }
                     
@@ -2862,17 +2878,8 @@ private:
                         // Auth: Key header
                         // Rate: 1000 requests/day (free)
                         //
-                        // Parameters:
-                        // - ipAddress: The IP to check
-                        // - maxAgeInDays: How far back to check (1-365)
-                        // - verbose: Include detailed reports
-                        
-                        // Production code would call:
                         // querySuccess = QueryAbuseIPDBAPI(value, config.timeoutMs, extResult);
-                        
-                        querySuccess = true;
-                        extResult.score = 0;
-                        extResult.confidence = ConfidenceLevel::None;
+                        querySuccess = false;
                         break;
                     }
                     
@@ -2880,17 +2887,9 @@ private:
                         // URLhaus API implementation framework
                         // URL: https://urlhaus-api.abuse.ch/v1/url/
                         // Auth: None (public API)
-                        // Rate: Reasonable use (no hard limit)
                         //
-                        // POST data: url={encoded_url}
-                        // Response includes: threat type, tags, first/last seen
-                        
-                        // Production code would call:
                         // querySuccess = QueryURLhausAPI(value, config.timeoutMs, extResult);
-                        
-                        querySuccess = true;
-                        extResult.score = 0;
-                        extResult.confidence = ConfidenceLevel::None;
+                        querySuccess = false;
                         break;
                     }
                     
@@ -2898,21 +2897,14 @@ private:
                         // OTX DirectConnect API implementation framework
                         // URL: https://otx.alienvault.com/api/v1/indicators/{type}/{ioc}
                         // Auth: X-OTX-API-KEY header
-                        // Rate: 10000 requests/hour (with key)
                         //
-                        // Types: IPv4, IPv6, domain, hostname, url, file (hash)
-                        // Returns: pulse_info, general, geo, malware, etc.
-                        
-                        // Production code would call:
                         // querySuccess = QueryOTXAPI(type, value, config.timeoutMs, extResult);
-                        
-                        querySuccess = true;
-                        extResult.score = 0;
-                        extResult.confidence = ConfidenceLevel::None;
+                        querySuccess = false;
                         break;
                     }
                     
                     default:
+                        querySuccess = false;
                         break;
                 }
                 
@@ -3340,9 +3332,9 @@ public:
         ThreatIntelIOCManager* iocManager,
         ReputationCache* cache
     ) noexcept {
-        std::lock_guard lock(m_mutex);
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
         
-        if (m_initialized) {
+        if (m_initialized.load(std::memory_order_acquire)) {
             return false;
         }
         
@@ -3374,7 +3366,7 @@ public:
     }
     
     void Shutdown() noexcept {
-        std::lock_guard lock(m_mutex);
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
         
         if (!m_initialized.load(std::memory_order_acquire)) {
             return;
@@ -3408,9 +3400,11 @@ public:
             return result;
         }
         
-        // Acquire lock to prevent Shutdown from destroying m_engine while in use
-        std::lock_guard<std::mutex> lookupLock(m_mutex);
-        if (!m_initialized.load(std::memory_order_acquire)) {
+        // Acquire shared lock to keep m_engine alive for the duration of this
+        // lookup while allowing other concurrent lookups to proceed in parallel.
+        // Initialize/Shutdown/UpdateConfiguration take a unique_lock.
+        std::shared_lock<std::shared_mutex> lookupLock(m_mutex);
+        if (UNLIKELY(!m_initialized.load(std::memory_order_acquire))) {
             ThreatLookupResult result;
             result.errorCode = static_cast<uint32_t>(LookupErrorCode::NotInitialized);
             result.errorMessage = GetErrorDescription(LookupErrorCode::NotInitialized);
@@ -3448,7 +3442,16 @@ public:
         batchResult.totalProcessed = values.size();
         batchResult.results.reserve(values.size());
         
-        if (UNLIKELY(!m_initialized || values.empty())) {
+        if (UNLIKELY(!m_initialized.load(std::memory_order_acquire) || values.empty())) {
+            return batchResult;
+        }
+
+        // Acquire shared lock to keep m_engine / m_optimizer alive for the
+        // duration of the batch. Without this, a concurrent Shutdown could
+        // destroy the engine mid-iteration (UAF in the per-value lookups
+        // below or in the std::execution::par_unseq lambda).
+        std::shared_lock<std::shared_mutex> batchLock(m_mutex);
+        if (UNLIKELY(!m_initialized.load(std::memory_order_acquire))) {
             return batchResult;
         }
         
@@ -3562,7 +3565,7 @@ public:
     }
     
     void UpdateConfiguration(const LookupConfig& config) noexcept {
-        std::lock_guard lock(m_mutex);
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_config = config;
     }
     
@@ -3880,8 +3883,12 @@ private:
     // Statistics
     LookupStatistics m_statistics;
     
-    // Synchronization
-    mutable std::mutex m_mutex;
+    // Synchronization.
+    // Reader/writer mutex: ExecuteLookup/ExecuteBatchLookup acquire shared
+    // ownership so they can run concurrently on disjoint cache shards and
+    // index nodes. Initialize/Shutdown/UpdateConfiguration acquire exclusive
+    // ownership because they tear down or replace m_engine/m_optimizer.
+    mutable std::shared_mutex m_mutex;
     std::atomic<bool> m_initialized{false};
 };
 
@@ -4182,114 +4189,30 @@ size_t ThreatIntelLookup::WarmCache(size_t count) noexcept {
     if (!m_impl->IsInitialized()) {
         return 0;
     }
-    
-    // =========================================================================
-    // ENTERPRISE CACHE WARMING STRATEGY
-    // =========================================================================
-    // Pre-load the most frequently accessed and highest-threat IOCs into cache
-    // to minimize cold-start latency. Strategy:
-    // 1. Load recent malicious entries (highest priority)
-    // 2. Load frequently accessed entries (from access statistics)
-    // 3. Load critical infrastructure protection entries
-    
-    size_t warmedCount = 0;
-    const auto startTime = std::chrono::high_resolution_clock::now();
-    
-    // Get store and cache from impl
-    const auto& config = m_impl->GetConfiguration();
-    (void)config;  // May be used for warming configuration
-    
-    // =========================================================================
-    // PHASE 1: Warm with High-Threat IOCs
-    // =========================================================================
-    // Query database for recently seen malicious entries
-    // These are most likely to be queried during scanning
-    
-    // Define warming priorities
-    constexpr std::array<ReputationLevel, 3> priorityReputations = {
-        ReputationLevel::Malicious,
-        ReputationLevel::Critical,
-        ReputationLevel::HighRisk
-    };
-    
-    // Define priority IOC types (hashes and IPs are most common in scanning)
-    constexpr std::array<IOCType, 4> priorityTypes = {
-        IOCType::FileHash,
-        IOCType::IPv4,
-        IOCType::IPv6,
-        IOCType::Domain
-    };
-    
-    // Calculate entries per category
-    const size_t entriesPerReputation = count / (priorityReputations.size() * priorityTypes.size());
-    
-    // For each reputation level and IOC type, query recent entries
-    // Note: Full implementation would use ThreatIntelStore::GetTopEntries()
-    // For now, we warm the cache using the IOC manager if available
-    
-    // Warm entries count (placeholder - actual implementation requires
-    // ThreatIntelStore to expose enumeration methods)
-    warmedCount = 0;
-    
-    // =========================================================================
-    // PHASE 2: Update Statistics
-    // =========================================================================
-    const auto endTime = std::chrono::high_resolution_clock::now();
-    const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        endTime - startTime
-    ).count();
-    
-    // Log warming results (in production, use proper logging)
-    (void)durationMs;
-    (void)entriesPerReputation;
-    
-    return warmedCount;
+
+    // Cache warming requires bulk enumeration of high-priority IOCs (top
+    // reputations / recently seen entries). The Store/IOCManager do not yet
+    // expose a stable enumeration API for this hot path, so we return 0
+    // rather than fabricate a warmed-entry count. When such an API lands,
+    // implement warming here using
+    //   - ReputationLevel::Malicious / Critical / HighRisk priority order
+    //   - IOCType::FileHash / IPv4 / IPv6 / Domain priority order
+    //   - up to `count` total entries
+    // and ensure each entry is inserted through ReputationCache::Insert with
+    // an appropriate TTL.
+    (void)count;
+    return 0;
 }
 
 void ThreatIntelLookup::InvalidateCacheEntry(IOCType type, std::string_view value) noexcept {
     if (!m_impl->IsInitialized()) {
         return;
     }
-    
-    // =========================================================================
-    // ENTERPRISE CACHE INVALIDATION
-    // =========================================================================
-    // Invalidate entry from all cache tiers:
-    // 1. Shared ReputationCache
-    // 2. All thread-local caches (best effort)
-    
-    // Create cache key for the entry
+
+    // Invalidate the shared ReputationCache entry. Thread-local caches are
+    // not directly addressable from this thread; they rely on their per-entry
+    // TTL and lazy revalidation to drop stale values.
     CacheKey key(type, value);
-    
-    // =========================================================================
-    // TIER 1: Invalidate from Shared Cache
-    // =========================================================================
-    // Get cache from impl internals
-    // Note: We need access to m_cache which is in impl
-    // Use the impl's method to access cache operations
-    
-    // The impl tracks the cache pointer internally
-    // We need to expose a method or access it directly
-    
-    // For now, perform invalidation through the cache's Remove method
-    // This requires exposing cache access in impl
-    
-    // =========================================================================
-    // TIER 2: Notify Thread-Local Caches
-    // =========================================================================
-    // Thread-local caches can't be directly accessed from other threads
-    // Options for cross-thread invalidation:
-    // 1. Set a "dirty" flag that threads check on next access
-    // 2. Use a lock-free invalidation queue
-    // 3. Let TTL naturally expire the entry
-    
-    // For enterprise deployment, we use a combination:
-    // - Short TTL for frequently changing data
-    // - Lazy invalidation on access (check entry timestamp)
-    
-    // Mark key as invalid in a shared invalidation set
-    // Thread-local caches check this set before returning cached results
-    
     m_impl->InvalidateCacheEntry(key);
 }
 
@@ -4297,48 +4220,17 @@ void ThreatIntelLookup::ClearAllCaches() noexcept {
     if (!m_impl->IsInitialized()) {
         return;
     }
-    
-    // =========================================================================
-    // ENTERPRISE CACHE CLEARING
-    // =========================================================================
-    // Clear all cache tiers completely. This is a heavy operation
-    // typically used during:
-    // - Major feed updates
-    // - Database migrations
-    // - Security incidents requiring fresh lookups
-    // - Memory pressure relief
-    
-    // =========================================================================
-    // PHASE 1: Clear Thread-Local Caches
-    // =========================================================================
-    // Iterate through all thread-local caches and clear them
-    // This is done through the impl's internal tracking
-    
-    // Note: This clears caches for threads that have registered
-    // Threads that haven't accessed the lookup yet won't have caches
-    
-    // =========================================================================
-    // PHASE 2: Clear Shared ReputationCache
-    // =========================================================================
-    // Clear the main shared cache including bloom filter
-    
-    // =========================================================================
-    // PHASE 3: Reset Statistics
-    // =========================================================================
-    // Optionally reset cache statistics for fresh baseline
-    
-    // =========================================================================
-    // PHASE 1+2: Clear All Caches
-    // =========================================================================
+
+    // Clear thread-local caches first so that any subsequent lookup on this
+    // or other threads cannot satisfy a request from a now-stale local copy
+    // that would have been re-validated against a still-populated shared
+    // cache.
     m_impl->ClearAllThreadLocalCaches();
     m_impl->ClearSharedCache();
-    
-    // =========================================================================
-    // PHASE 4: Force Garbage Collection
-    // =========================================================================
-    // Hint to OS that memory can be reclaimed
+
 #ifdef _WIN32
-    // Windows: Trim working set to release memory
+    // Hint to the OS that the working set can be trimmed after a large
+    // eviction. This is advisory only.
     SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_MAX, SIZE_MAX);
 #endif
 }
