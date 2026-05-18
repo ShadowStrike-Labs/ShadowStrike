@@ -53,6 +53,7 @@
 #include <functional>
 #include <filesystem>
 #include <chrono>
+#include <memory>
 
 namespace ShadowStrike::Update {
 
@@ -87,12 +88,17 @@ struct TransportResult {
 
 /**
  * @brief Metadata about a remote package available for download.
+ *
+ * @note `checksum` is lowercase hexadecimal SHA-256 of the on-the-wire
+ *       package bytes (64 hex characters). It is treated as opaque by
+ *       the transport and re-verified by the caller after fetch; the
+ *       transport never trusts it.
  */
 struct RemotePackageInfo {
     std::string packageId;
     std::string version;
     uint64_t    size       = 0;
-    std::string checksum;          ///< SHA-256 hex
+    std::string checksum;          ///< Lowercase SHA-256 hex (64 chars)
     std::string downloadUrl;
     bool        isDelta    = false;
     bool        isMandatory = false;
@@ -111,8 +117,21 @@ using TransportProgressCallback = std::function<void(const TransportProgress&)>;
  * Implementations handle the actual data transfer mechanism while the
  * Update module handles verification, patching, and rollback.
  *
- * Thread safety: Implementations must be safe for concurrent calls
- * to different methods. A single FetchPackage call is NOT reentrant.
+ * Thread safety:
+ *   - All methods may be invoked concurrently from different threads.
+ *   - A single FetchPackage call is NOT reentrant and must not be invoked
+ *     concurrently from multiple threads against the same instance.
+ *   - CancelFetch may be called from any thread at any time, including
+ *     while FetchPackage is in progress.
+ *   - Configuration mutators (e.g. SetStagingDirectory on
+ *     LocalFolderTransport) may be invoked concurrently with read
+ *     operations; implementations are responsible for internal
+ *     synchronisation.
+ *
+ * Trust model:
+ *   - The transport surface is treated as untrusted. Size, checksum and
+ *     other metadata returned here MUST be re-verified by the caller
+ *     against authenticated package metadata before the bytes are used.
  */
 class IUpdateTransport {
 public:
@@ -216,8 +235,11 @@ public:
 
     /**
      * @brief Get current staging directory path.
+     *
+     * Returns a copy under internal lock so the result is safe to use
+     * even if another thread races with SetStagingDirectory.
      */
-    [[nodiscard]] const fs::path& GetStagingDirectory() const noexcept;
+    [[nodiscard]] fs::path GetStagingDirectory() const;
 
 private:
     struct Impl;

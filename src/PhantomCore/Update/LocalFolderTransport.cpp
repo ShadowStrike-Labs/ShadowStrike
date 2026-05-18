@@ -366,8 +366,10 @@ void LocalFolderTransport::SetStagingDirectory(const fs::path& dir) {
     SS_LOG_INFO(kLogCategory, L"Staging directory updated: %s", dir.wstring().c_str());
 }
 
-const fs::path& LocalFolderTransport::GetStagingDirectory() const noexcept {
-    // No lock needed — caller should not race with SetStagingDirectory
+fs::path LocalFolderTransport::GetStagingDirectory() const {
+    // Hold the shared lock so concurrent SetStagingDirectory cannot tear
+    // the std::filesystem::path while we copy it.
+    std::shared_lock lock(m_impl->mtx);
     return m_impl->stagingDir;
 }
 
