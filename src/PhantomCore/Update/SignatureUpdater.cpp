@@ -48,6 +48,33 @@ constexpr size_t   kMaxCallbackCount    = 64;
 namespace HU = ::ShadowStrike::Utils::HashUtils;
 namespace FU = ::ShadowStrike::Utils::FileUtils;
 
+// Reparse-point check used to refuse following symlinks/junctions in
+// trusted database / staging / backup roots.
+[[nodiscard]] bool IsReparsePoint(const std::filesystem::path& p) noexcept {
+    FU::FileStat st{};
+    if (!FU::Stat(p.wstring(), st)) return false;
+    return st.isReparsePoint;
+}
+
+// Validate a single path-component identifier that came from an
+// untrusted package manifest (e.g. DeltaPatchInfo::patchId). Rejects
+// any value that could escape the staging directory or break filesystem
+// invariants on Windows.
+[[nodiscard]] bool IsSafePatchId(const std::string& id) noexcept {
+    if (id.empty() || id.size() > 256) return false;
+    for (const unsigned char c : id) {
+        if (c < 0x20) return false;
+        switch (c) {
+        case '/': case '\\': case ':': case '*': case '?':
+        case '"': case '<':  case '>': case '|':
+            return false;
+        default: break;
+        }
+    }
+    if (id == "." || id == "..") return false;
+    return true;
+}
+
 // Format a system_clock time_point as ISO-8601 string.
 [[nodiscard]] std::string FormatIso8601(
     const std::chrono::system_clock::time_point& tp) noexcept
@@ -340,8 +367,51 @@ public:
 
         result.newVersion = package.targetVersion;
 
+        // -- Monotonicity / downgrade defence ---------------------------------
+        // We refuse any package whose targetVersion.versionNumber is not
+        // strictly greater than the currently-installed version, unless
+        // no version is currently installed (oldVersion.versionNumber == 0
+        // AND the package type was not in m_versions). This blocks the
+        // classic "ship a stale, but still validly-signed, signature pack
+        // to disarm detection" attack.
+        if (result.oldVersion.versionNumber != 0 &&
+            package.targetVersion.versionNumber <= result.oldVersion.versionNumber)
+        {
+            result.errorMessage =
+                "Refusing downgrade: targetVersion (" +
+                std::to_string(package.targetVersion.versionNumber) +
+                ") <= currentVersion (" +
+                std::to_string(result.oldVersion.versionNumber) + ")";
+            result.success = false;
+            m_stats.updatesFailed++;
+            SS_LOG_ERROR(kLogCategory,
+                L"Downgrade rejected for type %S: %llu -> %llu",
+                std::string(GetDatabaseTypeName(package.type)).c_str(),
+                static_cast<unsigned long long>(result.oldVersion.versionNumber),
+                static_cast<unsigned long long>(package.targetVersion.versionNumber));
+            NotifyError(result.errorMessage, -14);
+            return result;
+        }
+
         auto dbPath = GetDatabasePath(package.type);
         auto stagingPath = GetStagingPath(package.type);
+
+        // -- Reparse-point defence on trusted roots ---------------------------
+        // The database and staging roots are configured at Initialize-time
+        // but could be mutated on disk between calls; refuse to operate if
+        // either has been replaced by a junction/symlink.
+        if (IsReparsePoint(m_config.databaseDirectory) ||
+            IsReparsePoint(m_config.stagingDirectory))
+        {
+            result.errorMessage =
+                "Database or staging directory is a reparse point";
+            result.success = false;
+            m_stats.updatesFailed++;
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing update: reparse point detected on trusted root");
+            NotifyError(result.errorMessage, -15);
+            return result;
+        }
 
         // --- State: Checking ---
         TransitionState(SigUpdateState::Checking);
@@ -384,12 +454,68 @@ public:
 
             for (size_t i = 0; i < package.deltaPatches.size(); ++i) {
                 const auto& patch = package.deltaPatches[i];
+
+                // Untrusted: patchId comes from the package manifest and
+                // is used as a path component. Reject anything that could
+                // escape stagingDirectory or break Windows path rules.
+                if (!IsSafePatchId(patch.patchId)) {
+                    result.errorMessage =
+                        "Unsafe delta patch identifier: " + patch.patchId;
+                    result.success = false;
+                    m_stats.updatesFailed++;
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Rejected delta patch id (path traversal / invalid chars)");
+                    NotifyError(result.errorMessage, -2);
+                    return result;
+                }
+
                 auto patchFile = m_config.stagingDirectory / patch.patchId;
+
+                // Final containment check after lexical composition.
+                if (!FU::IsPathUnderRoot(patchFile.wstring(),
+                        m_config.stagingDirectory.wstring(), true))
+                {
+                    result.errorMessage =
+                        "Delta patch path escapes staging directory: " + patch.patchId;
+                    result.success = false;
+                    m_stats.updatesFailed++;
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Delta patch path escapes staging root");
+                    NotifyError(result.errorMessage, -2);
+                    return result;
+                }
 
                 if (!fs::exists(patchFile, ec) || ec) {
                     result.errorMessage = "Delta patch file missing: " + patch.patchId;
                     result.success = false;
                     m_stats.updatesFailed++;
+                    NotifyError(result.errorMessage, -2);
+                    return result;
+                }
+
+                if (IsReparsePoint(patchFile)) {
+                    result.errorMessage =
+                        "Delta patch file is a reparse point: " + patch.patchId;
+                    result.success = false;
+                    m_stats.updatesFailed++;
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Delta patch file is a reparse point — rejected");
+                    NotifyError(result.errorMessage, -2);
+                    return result;
+                }
+
+                // Per-patch size cap (defence-in-depth — fail fast before
+                // engaging the delta engine on attacker-sized inputs).
+                const auto patchSz = fs::file_size(patchFile, ec);
+                if (ec || patchSz == 0 || patchSz > kMaxPackageSize) {
+                    result.errorMessage =
+                        "Delta patch file size invalid or exceeds cap: " + patch.patchId;
+                    result.success = false;
+                    m_stats.updatesFailed++;
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Delta patch size invalid (size=%llu, cap=%llu)",
+                        static_cast<unsigned long long>(patchSz),
+                        static_cast<unsigned long long>(kMaxPackageSize));
                     NotifyError(result.errorMessage, -2);
                     return result;
                 }
@@ -473,8 +599,29 @@ public:
                 NotifyError(result.errorMessage, -7);
                 return result;
             }
-            result.bytesDownloaded = fs::file_size(stagingPath, ec);
-            if (ec) result.bytesDownloaded = 0;
+            if (IsReparsePoint(stagingPath)) {
+                result.errorMessage = "Staged package is a reparse point";
+                result.success = false;
+                m_stats.updatesFailed++;
+                SS_LOG_ERROR(kLogCategory,
+                    L"Staged package is a reparse point — rejected");
+                NotifyError(result.errorMessage, -7);
+                return result;
+            }
+            const auto stagedSz = fs::file_size(stagingPath, ec);
+            if (ec || stagedSz == 0 || stagedSz > kMaxDatabaseFileSize) {
+                result.errorMessage =
+                    "Staged package size invalid or exceeds cap";
+                result.success = false;
+                m_stats.updatesFailed++;
+                SS_LOG_ERROR(kLogCategory,
+                    L"Staged package size invalid (size=%llu, cap=%llu)",
+                    static_cast<unsigned long long>(stagedSz),
+                    static_cast<unsigned long long>(kMaxDatabaseFileSize));
+                NotifyError(result.errorMessage, -7);
+                return result;
+            }
+            result.bytesDownloaded = stagedSz;
             m_stats.fullDownloads++;
         }
         else {
@@ -486,8 +633,23 @@ public:
                 NotifyError(result.errorMessage, -8);
                 return result;
             }
-            result.bytesDownloaded = fs::file_size(stagingPath, ec);
-            if (ec) result.bytesDownloaded = 0;
+            if (IsReparsePoint(stagingPath)) {
+                result.errorMessage = "Staged incremental package is a reparse point";
+                result.success = false;
+                m_stats.updatesFailed++;
+                NotifyError(result.errorMessage, -8);
+                return result;
+            }
+            const auto stagedSz = fs::file_size(stagingPath, ec);
+            if (ec || stagedSz == 0 || stagedSz > kMaxDatabaseFileSize) {
+                result.errorMessage =
+                    "Staged incremental package size invalid or exceeds cap";
+                result.success = false;
+                m_stats.updatesFailed++;
+                NotifyError(result.errorMessage, -8);
+                return result;
+            }
+            result.bytesDownloaded = stagedSz;
         }
 
         UpdateProgress(package.type, SigUpdateState::Patching, 70,
@@ -535,26 +697,38 @@ public:
             }
         }
 
-        // Signature verification via UpdateVerifier
+        // Signature verification via UpdateVerifier — FAIL CLOSED.
+        // If the verifier is present and initialized, the staged file MUST
+        // pass Authenticode verification. We will not install an unsigned
+        // (or invalidly-signed) signature database on the basis of a
+        // self-derived hash. The hash check above only proves the bytes
+        // weren't corrupted in transit; only Authenticode proves origin.
         if (UpdateVerifier::HasInstance() &&
             UpdateVerifier::Instance().IsInitialized())
         {
             if (!UpdateVerifier::Instance().VerifyAuthenticode(stagingPath)) {
-                SS_LOG_WARN(kLogCategory,
-                    L"Authenticode verification failed or unavailable for staged file; "
-                    L"proceeding with hash verification only for type %S",
+                result.errorMessage =
+                    "Authenticode verification failed for staged database";
+                result.success = false;
+                m_stats.updatesFailed++;
+                SS_LOG_ERROR(kLogCategory,
+                    L"Authenticode verification FAILED for type %S — rejecting update",
                     std::string(GetDatabaseTypeName(package.type)).c_str());
+                NotifyError(result.errorMessage, -16);
+                return result;
             }
+            SS_LOG_DEBUG(kLogCategory,
+                L"Authenticode verification passed for type %S",
+                std::string(GetDatabaseTypeName(package.type)).c_str());
         }
-
-        // Size validation
-        auto stagedSize = fs::file_size(stagingPath, ec);
-        if (!ec && stagedSize > kMaxDatabaseFileSize) {
-            result.errorMessage = "Staged database exceeds maximum allowed size";
-            result.success = false;
-            m_stats.updatesFailed++;
-            NotifyError(result.errorMessage, -12);
-            return result;
+        else {
+            // Verifier not configured at all — emit a high-visibility
+            // warning so the operator notices, but do not block (matches
+            // existing behaviour for unconfigured deployments).
+            SS_LOG_WARN(kLogCategory,
+                L"UpdateVerifier not initialized; installing staged database "
+                L"of type %S without Authenticode verification — operator action required",
+                std::string(GetDatabaseTypeName(package.type)).c_str());
         }
 
         UpdateProgress(package.type, SigUpdateState::Validating, 85,
@@ -867,11 +1041,25 @@ bool SignatureUpdater::Initialize(const SignatureUpdaterConfiguration& config) {
             m_impl->m_status = SigUpdaterStatus::Error;
             return false;
         }
+        if (IsReparsePoint(config.databaseDirectory)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing to initialize: database directory is a reparse point: %s",
+                config.databaseDirectory.wstring().c_str());
+            m_impl->m_status = SigUpdaterStatus::Error;
+            return false;
+        }
     }
     if (!config.stagingDirectory.empty()) {
         fs::create_directories(config.stagingDirectory, ec);
         if (ec) {
             SS_LOG_ERROR(kLogCategory, L"Failed to create staging directory: %s",
+                config.stagingDirectory.wstring().c_str());
+            m_impl->m_status = SigUpdaterStatus::Error;
+            return false;
+        }
+        if (IsReparsePoint(config.stagingDirectory)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing to initialize: staging directory is a reparse point: %s",
                 config.stagingDirectory.wstring().c_str());
             m_impl->m_status = SigUpdaterStatus::Error;
             return false;
@@ -1039,16 +1227,17 @@ bool SignatureUpdater::UpdateSignatures() {
             continue;
         }
 
-        // Build a package descriptor from the staged file
+        // Build a package descriptor from the staged file.
+        // NOTE: do not derive targetVersion.checksum from the staged file
+        // itself — verifying a file against a hash computed from that
+        // same file is a no-op. ApplyPackageInternal will rely on
+        // Authenticode (UpdateVerifier) as the authenticity boundary
+        // when no manifest-derived hash is available.
         SignaturePackage pkg;
         pkg.packageId = std::string(GetDatabaseTypeName(dbType)) + "_update";
         pkg.type = dbType;
         pkg.method = UpdateMethod::Full;
 
-        auto hashOpt = HashFileSha256(stagingPath);
-        if (hashOpt) {
-            pkg.targetVersion.checksum = *hashOpt;
-        }
         pkg.targetVersion.type = dbType;
         pkg.targetVersion.sizeBytes = fs::file_size(stagingPath, ec);
         if (ec) pkg.targetVersion.sizeBytes = 0;
@@ -1128,10 +1317,7 @@ bool SignatureUpdater::UpdateDatabase(SignatureDatabaseType type) {
     pkg.type = type;
     pkg.method = UpdateMethod::Full;
 
-    auto hashOpt = HashFileSha256(stagingPath);
-    if (hashOpt) {
-        pkg.targetVersion.checksum = *hashOpt;
-    }
+    // See note in UpdateSignatures(): no self-derived hash.
     pkg.targetVersion.type = type;
     pkg.targetVersion.sizeBytes = fs::file_size(stagingPath, ec);
     if (ec) pkg.targetVersion.sizeBytes = 0;
@@ -1516,11 +1702,26 @@ bool SignatureUpdater::CreateBackup(SignatureDatabaseType type) {
             fs::copy_options::overwrite_existing, ec);
     }
 
-    // Update backup metadata
-    auto verIt = m_impl->m_versions.find(type);
-    if (verIt != m_impl->m_versions.end()) {
+    // Update backup metadata. Record the checksum of the *backup file*
+    // (not the live m_versions entry, which may be stale) so that a
+    // future RestoreFromBackup can cross-check integrity at restore time
+    // rather than trusting whatever was on disk by then.
+    {
+        DatabaseVersion backupVer;
+        auto verIt = m_impl->m_versions.find(type);
+        if (verIt != m_impl->m_versions.end()) {
+            backupVer = verIt->second;
+        }
+        backupVer.type = type;
+        if (auto h = HashFileSha256(backupFile); h.has_value()) {
+            backupVer.checksum = *h;
+        }
+        std::error_code szEc;
+        backupVer.sizeBytes = fs::file_size(backupFile, szEc);
+        if (szEc) backupVer.sizeBytes = 0;
+
         auto& backupList = m_impl->m_backups[type];
-        backupList.insert(backupList.begin(), verIt->second);
+        backupList.insert(backupList.begin(), std::move(backupVer));
         if (backupList.size() > maxBackups) {
             backupList.resize(maxBackups);
         }
@@ -1583,13 +1784,40 @@ bool SignatureUpdater::RestoreFromBackup(SignatureDatabaseType type,
         return false;
     }
 
-    // Verify backup integrity
-    auto hashOpt = HashFileSha256(backupFile);
-    if (!hashOpt) {
+    // Verify backup file integrity by cross-checking against the stored
+    // checksum (recorded at CreateBackup-time). A self-derived hash with
+    // nothing to compare to is meaningless, so we look up the expected
+    // hash from m_backups (newest-first) and require an exact match.
+    auto actualHashOpt = HashFileSha256(backupFile);
+    if (!actualHashOpt) {
         SS_LOG_ERROR(kLogCategory,
-            L"Failed to verify backup file integrity for type %S",
+            L"Failed to compute hash of backup file for type %S",
             std::string(GetDatabaseTypeName(type)).c_str());
         return false;
+    }
+    {
+        const auto bIt = m_impl->m_backups.find(type);
+        if (bIt != m_impl->m_backups.end() &&
+            backupIndex < bIt->second.size())
+        {
+            const auto& expected = bIt->second[backupIndex].checksum;
+            if (!expected.empty()) {
+                const auto& actual = *actualHashOpt;
+                if (expected.size() != actual.size() ||
+                    !HU::Equal(
+                        reinterpret_cast<const uint8_t*>(actual.data()),
+                        reinterpret_cast<const uint8_t*>(expected.data()),
+                        actual.size()))
+                {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Backup checksum mismatch for type %S — refusing restore",
+                        std::string(GetDatabaseTypeName(type)).c_str());
+                    m_impl->NotifyError(
+                        "Backup integrity check failed", -21);
+                    return false;
+                }
+            }
+        }
     }
 
     // Restore: copy backup over current database
