@@ -393,17 +393,31 @@ namespace ShadowStrike {
 								return false;  // Prevent DoS via huge array allocation
 							}
 
+							// When expanding the array to reach `idx`, fill
+							// placeholder slots with the container kind the
+							// NEXT token requires. Without this look-ahead we
+							// would fill with objects and then fail the
+							// subsequent `is_array` / `is_object` check.
+							const bool nextIsIndex = (i + 1 < tokens.size()) &&
+								isArrayIndex(tokens[i + 1]);
+							const Json placeholder = nextIsIndex ? Json::array() : Json::object();
+
 							// Expand array if needed
 							while (cur->size() <= idx) {
-								cur->push_back(Json::object());
+								cur->push_back(placeholder);
 							}
 							cur = &(*cur)[idx];
 						}
 						else {
+							// Look ahead to determine what type to create for
+							// `tok`. The previous bound (`tokens.size() - 1`)
+							// excluded the final token, which silently broke
+							// paths whose final segment is an array index
+							// (e.g. "a.b[0]") — the intermediate parent was
+							// created as an object instead of an array.
+							const bool nextIsIndex = (i + 1 < tokens.size()) &&
+								isArrayIndex(tokens[i + 1]);
 							if (!cur->contains(tok)) {
-								// Look ahead to determine what type to create
-								const bool nextIsIndex = (i + 1 < tokens.size() - 1) &&
-									isArrayIndex(tokens[i + 1]);
 								(*cur)[tok] = nextIsIndex ? Json::array() : Json::object();
 							}
 							cur = &(*cur)[tok];

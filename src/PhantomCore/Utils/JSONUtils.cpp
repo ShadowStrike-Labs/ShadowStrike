@@ -36,6 +36,8 @@
 #include <random>
 #include <cstring>
 
+#include "FileUtils.hpp"
+
 #ifdef _WIN32
 #  ifndef NOMINMAX
 #    define NOMINMAX
@@ -465,6 +467,23 @@ namespace ShadowStrike {
 						return false;
 					}
 
+					// Refuse to load through a symlink/junction. We can't fix
+					// the TOCTOU between this check and the ifstream open
+					// without a CreateFileW + GetFileInformationByHandle dance,
+					// but the symlink_status probe catches the common case of
+					// a configured config-path pointing at attacker storage.
+					{
+						std::error_code stEc;
+						const auto sym = std::filesystem::symlink_status(path, stEc);
+						if (!stEc) {
+							if (std::filesystem::is_symlink(sym)) {
+								setIoErr(err, "Refusing to load JSON through a symlink",
+								         path);
+								return false;
+							}
+						}
+					}
+
 					// Get file size via filesystem (fast check)
 					std::error_code ec;
 					const uintmax_t fsz = std::filesystem::file_size(path, ec);
@@ -473,11 +492,13 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					// Apply size limits
-					constexpr size_t MAX_SAFE_JSON_SIZE = 100ULL * 1024 * 1024;  // 100MB hard limit
+					// Apply size limits. MAX_JSON_SIZE is the absolute ceiling
+					// declared in the public header; respect that exclusively
+					// instead of duplicating the constant locally where the
+					// two could silently drift.
 					const size_t effectiveMax = (maxBytes > 0)
-						? std::min(maxBytes, MAX_SAFE_JSON_SIZE)
-						: MAX_SAFE_JSON_SIZE;
+						? std::min(maxBytes, MAX_JSON_SIZE)
+						: MAX_JSON_SIZE;
 
 					if (fsz > static_cast<uintmax_t>(effectiveMax)) {
 						setIoErr(err, "File too large", path,
@@ -666,107 +687,78 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					// Ensure parent directory exists
-					const auto dir = path.parent_path().empty()
-						? std::filesystem::current_path()
-						: path.parent_path();
-
-					std::error_code ec;
-					std::filesystem::create_directories(dir, ec);
-
-					// Helper: write optional BOM + content to an ofstream
-					auto writeContent = [&](std::ofstream& ofs) -> bool {
-						if (opt.writeBOM) {
-							static constexpr char BOM[3] = {
-								static_cast<char>(static_cast<unsigned char>(0xEF)),
-								static_cast<char>(static_cast<unsigned char>(0xBB)),
-								static_cast<char>(static_cast<unsigned char>(0xBF))
-							};
-							ofs.write(BOM, 3);
-							if (!ofs) return false;
+					// Prepend UTF-8 BOM into the buffer rather than writing it
+					// separately so the atomic write path treats the whole
+					// payload as a single durable unit.
+					if (opt.writeBOM) {
+						static constexpr char kBom[3] = {
+							static_cast<char>(static_cast<unsigned char>(0xEF)),
+							static_cast<char>(static_cast<unsigned char>(0xBB)),
+							static_cast<char>(static_cast<unsigned char>(0xBF))
+						};
+						try {
+							content.insert(0, kBom, sizeof(kBom));
 						}
-						ofs.write(content.data(),
-						          static_cast<std::streamsize>(content.size()));
-						if (!ofs) return false;
-						ofs.flush();
-						return static_cast<bool>(ofs);
-					};
+						catch (const std::bad_alloc&) {
+							setIoErr(err, "Out of memory adding UTF-8 BOM", path);
+							return false;
+						}
+					}
 
 					if (opt.atomicReplace) {
-						// Generate secure temporary file name
-						const auto now = std::chrono::high_resolution_clock::now()
-						                 .time_since_epoch().count();
-
-						std::random_device rd;
-						uint64_t randomId = 0;
-
-						try {
-							std::mt19937_64 rng(
-								static_cast<uint64_t>(now) ^
-								static_cast<uint64_t>(rd()));
-							std::uniform_int_distribution<uint64_t> dist;
-							randomId = dist(rng);
-						}
-						catch (...) {
-							randomId = static_cast<uint64_t>(now);
-						}
-
-						std::wostringstream tempNameStream;
-						tempNameStream << L".tmp." << std::hex << now
-						               << L"_" << randomId << L".json";
-						const auto tmp = dir / tempNameStream.str();
-
-						// Write to temporary file
-						{
-							std::ofstream ofs(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
-							if (!ofs) {
-								setIoErr(err, "Failed to create temp file", tmp);
-								return false;
-							}
-
-							if (!writeContent(ofs)) {
-								setIoErr(err, "Failed to write temp file", tmp);
-								std::filesystem::remove(tmp, ec);
-								return false;
-							}
-
-							ofs.close();
-						}
-
-						// Atomic replace
-#ifdef _WIN32
-						if (!MoveFileExW(tmp.c_str(), path.c_str(),
-						                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-							const DWORD lastErr = GetLastError();
-							setIoErr(err, "MoveFileExW failed", path,
-							         "Error code: " + std::to_string(
-							             static_cast<unsigned long>(lastErr)));
-							std::filesystem::remove(tmp, ec);
+						// Delegate to FileUtils, which performs:
+						//  - CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT on the
+						//    temp sibling (prevents symlink redirection of
+						//    the temp write),
+						//  - cryptographically randomised temp suffixes,
+						//  - ReplaceFileW for ACL/object-id preservation on
+						//    the final swap, falling back to MoveFileExW only
+						//    when ReplaceFileW cannot apply (cross-volume /
+						//    first-create).
+						// This collapses three independently-audited security
+						// properties into the one hardened call site.
+						const std::wstring wpath = path.wstring();
+						FileUtils::Error fuErr;
+						const auto* bytes =
+							reinterpret_cast<const std::byte*>(content.data());
+						if (!FileUtils::WriteAllBytesAtomic(wpath, bytes,
+						                                    content.size(), &fuErr)) {
+							setIoErr(err, "Atomic JSON write failed", path,
+							         "win32=" + std::to_string(
+							             static_cast<unsigned long>(fuErr.win32)) +
+							         (fuErr.message.empty()
+							              ? std::string()
+							              : (": " + fuErr.message)));
 							return false;
 						}
-#else
-						// POSIX rename() atomically replaces destination
-						std::filesystem::rename(tmp, path, ec);
-						if (ec) {
-							setIoErr(err, "Failed to rename temp file", path, ec.message());
-							std::filesystem::remove(tmp, ec);
-							return false;
-						}
-#endif
 					}
 					else {
+						// Ensure parent directory exists for non-atomic path.
+						const auto dir = path.parent_path().empty()
+							? std::filesystem::current_path()
+							: path.parent_path();
+						std::error_code ec;
+						std::filesystem::create_directories(dir, ec);
+
 						// Non-atomic: write directly to destination (no temp file)
-						std::ofstream ofs(path, std::ios::out | std::ios::binary | std::ios::trunc);
+						std::ofstream ofs(path,
+						                  std::ios::out | std::ios::binary | std::ios::trunc);
 						if (!ofs) {
 							setIoErr(err, "Failed to open file for write", path);
 							return false;
 						}
 
-						if (!writeContent(ofs)) {
+						ofs.write(content.data(),
+						          static_cast<std::streamsize>(content.size()));
+						if (!ofs) {
 							setIoErr(err, "Failed to write file", path);
 							return false;
 						}
-
+						ofs.flush();
+						if (!ofs) {
+							setIoErr(err, "Failed to flush file", path);
+							return false;
+						}
 						ofs.close();
 					}
 
