@@ -464,8 +464,20 @@ namespace ShadowStrike {
 							return false;
 						}
 
-						// Enforce minimum iterations (OWASP 2023)
-						if (iterations < 1000) iterations = 600000;
+						// Enforce iteration count in a sane range. Silently raising a small
+						// 'iterations' field to a different value would change the derived key
+						// and trigger a downstream PKCS7 padding failure that surfaces to the
+						// user as 'wrong password'. Reject out-of-range counts up front so the
+						// caller sees an unambiguous "invalid file" error.
+						constexpr uint32_t kMinIterations = 10000;
+						constexpr uint32_t kMaxIterations = 10000000;
+						if (iterations < kMinIterations || iterations > kMaxIterations) {
+							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Encrypted key iteration count out of range"; }
+							SecureWipeMemory(salt.data(), salt.size());
+							SecureWipeMemory(iv.data(), iv.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
+							return false;
+						}
 
 						KDFParams kdfParams{};
 						kdfParams.algorithm = KDFAlgorithm::PBKDF2_SHA256;
