@@ -134,6 +134,8 @@ namespace ShadowStrike {
 				bool IsLinkLocal() const noexcept;
 				bool IsSiteLocal() const noexcept;
 				bool IsUniqueLocal() const noexcept;
+				bool IsIPv4Mapped() const noexcept;
+				bool IsIPv4Compatible() const noexcept;
 
 				bool operator==(const IPv6Address& other) const noexcept {
 					return bytes == other.bytes;

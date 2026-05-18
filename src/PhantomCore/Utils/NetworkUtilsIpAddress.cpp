@@ -364,6 +364,13 @@ namespace ShadowStrike {
 			}
 
 			bool IPv6Address::IsLoopback() const noexcept {
+				// IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96) IPv6 addresses
+				// embed an IPv4 address in the trailing 32 bits.  Without normalising
+				// here, a URL such as http://[::ffff:127.0.0.1]/ slips past SSRF
+				// allow-lists that screen IP literals against IsLoopback().
+				if (IsIPv4Mapped() || IsIPv4Compatible()) {
+					return bytes[12] == 127;
+				}
 				// ::1 (RFC 4291)
 				for (size_t i = 0; i < 15; ++i) {
 					if (bytes[i] != 0) return false;
@@ -372,15 +379,27 @@ namespace ShadowStrike {
 			}
 
 			bool IPv6Address::IsPrivate() const noexcept {
+				if (IsIPv4Mapped() || IsIPv4Compatible()) {
+					const IPv4Address embedded{ std::array<uint8_t, 4>{ bytes[12], bytes[13], bytes[14], bytes[15] } };
+					return embedded.IsPrivate();
+				}
 				return IsUniqueLocal();
 			}
 
 			bool IPv6Address::IsMulticast() const noexcept {
+				if (IsIPv4Mapped() || IsIPv4Compatible()) {
+					const IPv4Address embedded{ std::array<uint8_t, 4>{ bytes[12], bytes[13], bytes[14], bytes[15] } };
+					return embedded.IsMulticast();
+				}
 				// ff00::/8 (RFC 4291)
 				return bytes[0] == 0xFF;
 			}
 
 			bool IPv6Address::IsLinkLocal() const noexcept {
+				if (IsIPv4Mapped() || IsIPv4Compatible()) {
+					const IPv4Address embedded{ std::array<uint8_t, 4>{ bytes[12], bytes[13], bytes[14], bytes[15] } };
+					return embedded.IsLinkLocal();
+				}
 				// fe80::/10 (RFC 4291)
 				return bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80;
 			}
@@ -393,6 +412,28 @@ namespace ShadowStrike {
 			bool IPv6Address::IsUniqueLocal() const noexcept {
 				// fc00::/7 (RFC 4193)
 				return (bytes[0] & 0xFE) == 0xFC;
+			}
+
+			bool IPv6Address::IsIPv4Mapped() const noexcept {
+				// ::ffff:0:0/96 — RFC 4291 IPv4-mapped IPv6 address
+				for (size_t i = 0; i < 10; ++i) {
+					if (bytes[i] != 0) return false;
+				}
+				return bytes[10] == 0xFF && bytes[11] == 0xFF;
+			}
+
+			bool IPv6Address::IsIPv4Compatible() const noexcept {
+				// ::/96 (deprecated by RFC 4291 but still semantically an IPv4 form;
+				// exclude ::, ::1 and IPv4-mapped so each category stays exclusive).
+				for (size_t i = 0; i < 12; ++i) {
+					if (bytes[i] != 0) return false;
+				}
+				// Exclude unspecified (::) and loopback (::1) which are handled directly.
+				const uint32_t tail = (static_cast<uint32_t>(bytes[12]) << 24) |
+					(static_cast<uint32_t>(bytes[13]) << 16) |
+					(static_cast<uint32_t>(bytes[14]) << 8) |
+					 static_cast<uint32_t>(bytes[15]);
+				return tail != 0u && tail != 1u;
 			}
 
 			// ============================================================================
