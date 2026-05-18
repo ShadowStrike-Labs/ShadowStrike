@@ -474,6 +474,71 @@ namespace ThreatIntel {
             // Enterprise-grade atomic update with rollback on failure
             // First, attempt removal of old entry
             bool removalSucceeded = false;
+            const auto lookupExistingIndexValue = [this](const IOCEntry& entry, IndexValue& value) noexcept -> bool {
+                switch (entry.type) {
+                case IOCType::IPv4:
+                    return m_impl->ipv4Index && m_impl->ipv4Index->Lookup(entry.value.ipv4, value);
+                case IOCType::IPv6:
+                    return m_impl->ipv6Index && m_impl->ipv6Index->Lookup(entry.value.ipv6, value);
+                case IOCType::FileHash: {
+                    const size_t algoIndex = static_cast<size_t>(entry.value.hash.algorithm);
+                    return algoIndex < m_impl->hashIndexes.size() &&
+                        m_impl->hashIndexes[algoIndex] &&
+                        m_impl->hashIndexes[algoIndex]->Lookup(entry.value.hash, value);
+                }
+                case IOCType::Domain:
+                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        const auto rawDomain = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset,
+                            entry.value.stringRef.stringLength
+                        );
+                        const std::string domain = NormalizeDomain(rawDomain);
+                        return !domain.empty() && m_impl->domainIndex->Lookup(domain, value);
+                    }
+                    return false;
+                case IOCType::URL:
+                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        const auto url = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset,
+                            entry.value.stringRef.stringLength
+                        );
+                        return m_impl->urlIndex->Lookup(url, value);
+                    }
+                    return false;
+                case IOCType::Email:
+                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        const auto email = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset,
+                            entry.value.stringRef.stringLength
+                        );
+                        return m_impl->emailIndex->Lookup(email, value);
+                    }
+                    return false;
+                default:
+                    if (m_impl->genericIndex) {
+                        uint64_t key = 0;
+                        if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            const auto stringValue = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength
+                            );
+                            key = HashString(stringValue);
+                        } else {
+                            std::memcpy(&key, entry.value.raw, sizeof(key));
+                        }
+                        return m_impl->genericIndex->Lookup(key, value);
+                    }
+                    return false;
+                }
+            };
+            IndexValue originalOldIndexValue;
+            if (!lookupExistingIndexValue(oldEntry, originalOldIndexValue) ||
+                originalOldIndexValue.entryId != oldEntry.entryId) {
+                return StoreError::WithMessage(
+                    ThreatIntelError::EntryNotFound,
+                    "Old entry not found for update"
+                );
+            }
 
             switch (oldEntry.type) {
             case IOCType::IPv4:
@@ -687,24 +752,23 @@ namespace ThreatIntel {
             if (!insertSucceeded) {
                 // Rollback: re-insert old entry to prevent data loss
                 bool rollbackOk = false;
-                IndexValue oldIndexValue(oldEntry.entryId, 0);  // offset=0 signals needs-resolution
 
                 switch (oldEntry.type) {
                 case IOCType::IPv4:
                     if (m_impl->ipv4Index) {
-                        rollbackOk = m_impl->ipv4Index->Insert(oldEntry.value.ipv4, oldIndexValue);
+                        rollbackOk = m_impl->ipv4Index->Insert(oldEntry.value.ipv4, originalOldIndexValue);
                     }
                     break;
                 case IOCType::IPv6:
                     if (m_impl->ipv6Index) {
-                        rollbackOk = m_impl->ipv6Index->Insert(oldEntry.value.ipv6, oldIndexValue);
+                        rollbackOk = m_impl->ipv6Index->Insert(oldEntry.value.ipv6, originalOldIndexValue);
                     }
                     break;
                 case IOCType::FileHash:
                     if (!m_impl->hashIndexes.empty()) {
                         size_t algoIndex = static_cast<size_t>(oldEntry.value.hash.algorithm);
                         if (algoIndex < m_impl->hashIndexes.size() && m_impl->hashIndexes[algoIndex]) {
-                            rollbackOk = m_impl->hashIndexes[algoIndex]->Insert(oldEntry.value.hash, oldIndexValue);
+                            rollbackOk = m_impl->hashIndexes[algoIndex]->Insert(oldEntry.value.hash, originalOldIndexValue);
                         }
                     }
                     break;
@@ -714,7 +778,7 @@ namespace ThreatIntel {
                             oldEntry.value.stringRef.stringLength);
                         const std::string d = NormalizeDomain(rawDomain);
                         if (!d.empty()) {
-                            rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                            rollbackOk = m_impl->domainIndex->Insert(d, originalOldIndexValue);
                         }
                     }
                     break;
@@ -722,14 +786,14 @@ namespace ThreatIntel {
                     if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                         auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
-                        rollbackOk = m_impl->urlIndex->Insert(u, oldIndexValue);
+                        rollbackOk = m_impl->urlIndex->Insert(u, originalOldIndexValue);
                     }
                     break;
                 case IOCType::Email:
                     if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                         auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
-                        rollbackOk = m_impl->emailIndex->Insert(e, oldIndexValue);
+                        rollbackOk = m_impl->emailIndex->Insert(e, originalOldIndexValue);
                     }
                     break;
                 default:
@@ -742,7 +806,7 @@ namespace ThreatIntel {
                         } else {
                             std::memcpy(&key, oldEntry.value.raw, sizeof(uint64_t));
                         }
-                        rollbackOk = m_impl->genericIndex->Insert(key, oldIndexValue);
+                        rollbackOk = m_impl->genericIndex->Insert(key, originalOldIndexValue);
                     }
                     break;
                 }
@@ -930,6 +994,69 @@ namespace ThreatIntel {
                 // For batch operations, we inline the logic to avoid lock overhead
                 bool removeSuccess = false;
                 bool insertSuccess = false;
+                const auto lookupExistingIndexValue = [this](const IOCEntry& entry, IndexValue& value) noexcept -> bool {
+                    switch (entry.type) {
+                    case IOCType::IPv4:
+                        return m_impl->ipv4Index && m_impl->ipv4Index->Lookup(entry.value.ipv4, value);
+                    case IOCType::IPv6:
+                        return m_impl->ipv6Index && m_impl->ipv6Index->Lookup(entry.value.ipv6, value);
+                    case IOCType::FileHash: {
+                        const size_t algoIndex = static_cast<size_t>(entry.value.hash.algorithm);
+                        return algoIndex < m_impl->hashIndexes.size() &&
+                            m_impl->hashIndexes[algoIndex] &&
+                            m_impl->hashIndexes[algoIndex]->Lookup(entry.value.hash, value);
+                    }
+                    case IOCType::Domain:
+                        if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            const auto rawDomain = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength
+                            );
+                            const std::string domain = NormalizeDomain(rawDomain);
+                            return !domain.empty() && m_impl->domainIndex->Lookup(domain, value);
+                        }
+                        return false;
+                    case IOCType::URL:
+                        if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            const auto url = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength
+                            );
+                            return m_impl->urlIndex->Lookup(url, value);
+                        }
+                        return false;
+                    case IOCType::Email:
+                        if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            const auto email = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength
+                            );
+                            return m_impl->emailIndex->Lookup(email, value);
+                        }
+                        return false;
+                    default:
+                        if (m_impl->genericIndex) {
+                            uint64_t key = 0;
+                            if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                                const auto stringValue = m_impl->view->GetString(
+                                    entry.value.stringRef.stringOffset,
+                                    entry.value.stringRef.stringLength
+                                );
+                                key = HashString(stringValue);
+                            } else {
+                                std::memcpy(&key, entry.value.raw, sizeof(key));
+                            }
+                            return m_impl->genericIndex->Lookup(key, value);
+                        }
+                        return false;
+                    }
+                };
+                IndexValue originalOldIndexValue;
+                if (!lookupExistingIndexValue(oldEntry, originalOldIndexValue) ||
+                    originalOldIndexValue.entryId != oldEntry.entryId) {
+                    ++failCount;
+                    continue;
+                }
 
                 // Inline remove
                 switch (oldEntry.type) {
@@ -1067,20 +1194,19 @@ namespace ThreatIntel {
                 else {
                     // Insert failed after successful remove - attempt rollback
                     bool rollbackOk = false;
-                    IndexValue oldIndexValue(oldEntry.entryId, 0);
 
                     switch (oldEntry.type) {
                     case IOCType::IPv4:
-                        if (m_impl->ipv4Index) rollbackOk = m_impl->ipv4Index->Insert(oldEntry.value.ipv4, oldIndexValue);
+                        if (m_impl->ipv4Index) rollbackOk = m_impl->ipv4Index->Insert(oldEntry.value.ipv4, originalOldIndexValue);
                         break;
                     case IOCType::IPv6:
-                        if (m_impl->ipv6Index) rollbackOk = m_impl->ipv6Index->Insert(oldEntry.value.ipv6, oldIndexValue);
+                        if (m_impl->ipv6Index) rollbackOk = m_impl->ipv6Index->Insert(oldEntry.value.ipv6, originalOldIndexValue);
                         break;
                     case IOCType::FileHash:
                         if (!m_impl->hashIndexes.empty()) {
                             size_t idx = static_cast<size_t>(oldEntry.value.hash.algorithm);
                             if (idx < m_impl->hashIndexes.size() && m_impl->hashIndexes[idx])
-                                rollbackOk = m_impl->hashIndexes[idx]->Insert(oldEntry.value.hash, oldIndexValue);
+                                rollbackOk = m_impl->hashIndexes[idx]->Insert(oldEntry.value.hash, originalOldIndexValue);
                         }
                         break;
                     case IOCType::Domain:
@@ -1088,20 +1214,20 @@ namespace ThreatIntel {
                             auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
                             const std::string d = NormalizeDomain(rawDomain);
                             if (!d.empty()) {
-                                rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                                rollbackOk = m_impl->domainIndex->Insert(d, originalOldIndexValue);
                             }
                         }
                         break;
                     case IOCType::URL:
                         if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                             auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
-                            rollbackOk = m_impl->urlIndex->Insert(u, oldIndexValue);
+                            rollbackOk = m_impl->urlIndex->Insert(u, originalOldIndexValue);
                         }
                         break;
                     case IOCType::Email:
                         if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                             auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
-                            rollbackOk = m_impl->emailIndex->Insert(e, oldIndexValue);
+                            rollbackOk = m_impl->emailIndex->Insert(e, originalOldIndexValue);
                         }
                         break;
                     default:
@@ -1113,7 +1239,7 @@ namespace ThreatIntel {
                             } else {
                                 std::memcpy(&key, oldEntry.value.raw, sizeof(uint64_t));
                             }
-                            rollbackOk = m_impl->genericIndex->Insert(key, oldIndexValue);
+                            rollbackOk = m_impl->genericIndex->Insert(key, originalOldIndexValue);
                         }
                         break;
                     }
