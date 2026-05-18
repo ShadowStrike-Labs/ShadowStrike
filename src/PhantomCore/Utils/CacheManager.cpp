@@ -513,7 +513,9 @@ namespace ShadowStrike {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             catch (const std::system_error& ex) {
-                SS_LOG_ERROR(L"CacheManager", L"Failed to start maintenance thread : ",ex.what());
+                SS_LOG_ERROR(L"CacheManager",
+                    L"Failed to start maintenance thread: %ls",
+                    ::ShadowStrike::Utils::Logger::NarrowToWideTLS(ex.what(), 2));
                 m_shutdown.store(true, std::memory_order_release);
                 return;
             }
@@ -1186,7 +1188,9 @@ namespace ShadowStrike {
                     }
                     catch (const std::exception& ex) {
                         // Log but continue - maintenance failure should not crash the thread
-                        SS_LOG_WARN(L"CacheManager", L"Maintenance exception occurred");
+                        SS_LOG_WARN(L"CacheManager",
+                            L"Maintenance exception: %ls",
+                            ::ShadowStrike::Utils::Logger::NarrowToWideTLS(ex.what(), 2));
                     }
                     catch (...) {
                         // Swallow unknown exceptions to keep thread alive
@@ -1248,7 +1252,9 @@ namespace ShadowStrike {
                 }
             }
             catch (const std::exception& ex) {
-                SS_LOG_WARN(L"CacheManager", L"performMaintenance failed");
+                SS_LOG_WARN(L"CacheManager",
+                    L"performMaintenance failed: %ls",
+                    ::ShadowStrike::Utils::Logger::NarrowToWideTLS(ex.what(), 2));
             }
             catch (...) {
                 // Swallow unknown exceptions
@@ -1661,11 +1667,24 @@ namespace ShadowStrike {
             const std::wstring canonicalPath(canonical);
 
             // PATH TRAVERSAL PROTECTION:
-            // Ensure canonicalized path is still within base directory
-            if (canonicalPath.size() < baseDir.size() ||
+            // Ensure canonicalized path is still within base directory.
+            // We also require the character immediately following the base
+            // directory prefix to be a path separator so that a base directory
+            // like "C:\Cache" cannot accidentally match "C:\CacheEvil\...".
+            if (canonicalPath.size() <= baseDir.size() ||
                 _wcsnicmp(canonicalPath.c_str(), baseDir.c_str(), baseDir.size()) != 0) {
                 SS_LOG_WARN(L"CacheManager", L"Path traversal attempt blocked");
                 return L"";
+            }
+
+            // Boundary character must be a path separator (unless baseDir
+            // already ended with one, in which case the prefix check covered it).
+            if (!baseDir.empty() && baseDir.back() != L'\\' && baseDir.back() != L'/') {
+                const wchar_t boundary = canonicalPath[baseDir.size()];
+                if (boundary != L'\\' && boundary != L'/') {
+                    SS_LOG_WARN(L"CacheManager", L"Path traversal attempt blocked");
+                    return L"";
+                }
             }
 
             return canonicalPath;
