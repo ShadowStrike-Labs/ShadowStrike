@@ -60,13 +60,17 @@ public:
 
     /// @brief Check if the underlying store is initialised and usable.
     [[nodiscard]] bool IsInitialized() const noexcept {
-        return m_store != nullptr && m_initialized.load(std::memory_order_acquire);
+        return m_store.load(std::memory_order_acquire) != nullptr;
     }
 
     /// @brief Bind to an already-initialised ThreatIntelStore.
+    ///
+    /// Single source of truth: the atomic store pointer. A non-null pointer
+    /// means "ready"; nullptr means "not bound". This eliminates the prior
+    /// race where readers could observe m_initialized==true with a stale
+    /// m_store value (or vice versa).
     void Bind(ThreatIntelStore* store) noexcept {
-        m_store = store;
-        m_initialized.store(store != nullptr, std::memory_order_release);
+        m_store.store(store, std::memory_order_release);
     }
 
     // ========================================================================
@@ -85,17 +89,18 @@ public:
         double& outRiskScore,
         std::string& outThreatName) const noexcept
     {
-        if (!IsInitialized()) return false;
-        try {
-            auto result = m_store->LookupHash("SHA256", sha256);
-            if (result.IsMalicious()) {
-                outRiskScore = static_cast<double>(result.score);
-                // IOCEntry is a packed binary struct without string threatName;
-                // derive name from category + source.
-                outThreatName.clear();
-                return true;
-            }
-        } catch (...) {}
+        auto* store = m_store.load(std::memory_order_acquire);
+        if (store == nullptr) return false;
+
+        // ThreatIntelStore::LookupHash is noexcept; no try/catch required.
+        const auto result = store->LookupHash("SHA256", sha256);
+        if (result.IsMalicious()) {
+            outRiskScore = static_cast<double>(result.score);
+            // IOCEntry is a packed binary struct without a string threatName;
+            // callers derive a display name from category + source separately.
+            outThreatName.clear();
+            return true;
+        }
         return false;
     }
 
@@ -104,34 +109,40 @@ public:
     // ========================================================================
 
     [[nodiscard]] StoreLookupResult LookupURL(std::string_view url) const noexcept {
-        if (!IsInitialized()) return {};
-        return m_store->LookupURL(url);
+        auto* store = m_store.load(std::memory_order_acquire);
+        if (store == nullptr) return {};
+        return store->LookupURL(url);
     }
 
     [[nodiscard]] StoreLookupResult LookupIP(std::string_view ip) const noexcept {
-        if (!IsInitialized()) return {};
-        return m_store->LookupIPv4(ip);
+        auto* store = m_store.load(std::memory_order_acquire);
+        if (store == nullptr) return {};
+        return store->LookupIPv4(ip);
     }
 
     [[nodiscard]] StoreLookupResult LookupDomain(std::string_view domain) const noexcept {
-        if (!IsInitialized()) return {};
-        return m_store->LookupDomain(domain);
+        auto* store = m_store.load(std::memory_order_acquire);
+        if (store == nullptr) return {};
+        return store->LookupDomain(domain);
     }
 
     [[nodiscard]] StoreLookupResult LookupHash(
         std::string_view algorithm,
         std::string_view hashValue) const noexcept
     {
-        if (!IsInitialized()) return {};
-        return m_store->LookupHash(algorithm, hashValue);
+        auto* store = m_store.load(std::memory_order_acquire);
+        if (store == nullptr) return {};
+        return store->LookupHash(algorithm, hashValue);
     }
 
 private:
     ThreatIntelManager() = default;
     ~ThreatIntelManager() = default;
 
-    ThreatIntelStore* m_store{nullptr};
-    std::atomic<bool> m_initialized{false};
+    // Single atomic pointer is both the "ready" flag and the target. Readers
+    // load once with acquire semantics and operate on the local copy, so a
+    // concurrent Bind(nullptr) cannot tear an in-flight lookup.
+    std::atomic<ThreatIntelStore*> m_store{nullptr};
 };
 
 }  // namespace ThreatIntel
