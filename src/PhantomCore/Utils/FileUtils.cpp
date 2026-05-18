@@ -182,6 +182,34 @@ namespace ShadowStrike {
                     return std::wstring();
                 }
 
+                // Reject device-namespace paths that bypass standard filesystem
+                // scoping (\\?\GLOBALROOT\, \\?\Device\, \\.\ DosDevices, etc.).
+                // Long path prefixes for drive-letter (\\?\C:\) and UNC
+                // (\\?\UNC\) remain allowed.
+                {
+                    auto starts_with_ci = [](std::wstring_view s, std::wstring_view prefix) noexcept {
+                        if (s.size() < prefix.size()) return false;
+                        for (std::size_t i = 0; i < prefix.size(); ++i) {
+                            wchar_t a = s[i];
+                            wchar_t b = prefix[i];
+                            if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+                            if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+                            if (a != b) return false;
+                        }
+                        return true;
+                    };
+                    if (starts_with_ci(input, L"\\\\?\\GLOBALROOT") ||
+                        starts_with_ci(input, L"\\\\?\\Device\\") ||
+                        starts_with_ci(input, L"\\\\.\\") ||
+                        starts_with_ci(input, L"\\??\\")) {
+                        if (err) {
+                            err->win32 = ERROR_ACCESS_DENIED;
+                            err->message = "Device-namespace path is not permitted";
+                        }
+                        return std::wstring();
+                    }
+                }
+
                 // Windows forbidden filename characters (except colon for drive letters)
                 // Allow '?' and '*' only within the \\?\ long path prefix
                 std::wstring_view checkTarget = input;
@@ -647,42 +675,39 @@ namespace ShadowStrike {
                 const std::wstring dir = (pos == std::wstring::npos) ? L"" : p.substr(0, pos);
                 const std::wstring file = (pos == std::wstring::npos) ? p : p.substr(pos + 1);
 
-                // Create unique file name using GUID
+                // 16 cryptographically-random bytes (32 hex chars) for uniqueness.
+                // CoCreateGuid is preferred (produces version-4 GUIDs from BCrypt
+                // internally), but it can fail without COM init. BCryptGenRandom
+                // is the unconditional fallback; tickcount+counter is NOT used
+                // because predictable temp names enable pre-creation attacks.
+                wchar_t suffix[33] = { 0 };
+                bool haveSuffix = false;
+
                 GUID guid{};
-                const HRESULT hr = CoCreateGuid(&guid);
-                if (FAILED(hr)) {
-                    SS_LOG_ERROR(L"FileUtils", L"MakeTempSibling: CoCreateGuid failed with HRESULT: 0x%08lX", hr);
-                    // Fallback: use timestamp + counter for uniqueness
-                    static std::atomic<uint32_t> counter{ 0 };
-                    const uint64_t ts = GetTickCount64();
-                    const uint32_t cnt = counter.fetch_add(1, std::memory_order_relaxed);
-                    
-                    std::wstring tmp;
-                    try {
-                        tmp.reserve(p.size() + 32);
-                        if (!dir.empty()) {
-                            tmp.append(dir);
-                            tmp.push_back(L'\\');
-                        }
-                        tmp.append(L".~");
-                        tmp.append(file);
-                        tmp.append(L"_");
-                        wchar_t fallbackStr[32];
-                        swprintf_s(fallbackStr, L"%llX_%08X", ts, cnt);
-                        tmp.append(fallbackStr);
-                        tmp.append(L".tmp");
-                    }
-                    catch (const std::exception&) {
+                if (SUCCEEDED(CoCreateGuid(&guid))) {
+                    swprintf_s(suffix, L"%08lX%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X",
+                        guid.Data1, guid.Data2, guid.Data3,
+                        guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+                        guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+                    haveSuffix = true;
+                }
+                if (!haveSuffix) {
+                    uint8_t rnd[16] = { 0 };
+                    NTSTATUS st = BCryptGenRandom(nullptr, rnd, sizeof(rnd),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                    if (!NT_SUCCESS(st)) {
+                        SS_LOG_ERROR(L"FileUtils", L"MakeTempSibling: BCryptGenRandom failed: 0x%08lX",
+                            static_cast<unsigned long>(st));
                         return std::wstring();
                     }
-                    return tmp;
+                    static const wchar_t kHex[] = L"0123456789ABCDEF";
+                    for (int i = 0; i < 16; ++i) {
+                        suffix[i * 2 + 0] = kHex[(rnd[i] >> 4) & 0x0F];
+                        suffix[i * 2 + 1] = kHex[rnd[i] & 0x0F];
+                    }
+                    suffix[32] = 0;
+                    haveSuffix = true;
                 }
-
-                wchar_t guidStr[40];
-                swprintf_s(guidStr, L"%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-                    guid.Data1, guid.Data2, guid.Data3,
-                    guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
-                    guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
 
                 std::wstring tmp;
                 try {
@@ -694,7 +719,7 @@ namespace ShadowStrike {
                     tmp.append(L".~");
                     tmp.append(file);
                     tmp.append(L"_");
-                    tmp.append(guidStr);
+                    tmp.append(suffix);
                     tmp.append(L".tmp");
                 }
                 catch (const std::exception&) {
@@ -725,15 +750,6 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                const std::wstring tmp = MakeTempSibling(dst);
-                if (tmp.empty()) {
-                    if (err) {
-                        err->win32 = ERROR_OUTOFMEMORY;
-                        err->message = "Failed to generate temp filename";
-                    }
-                    return false;
-                }
-
                 // Create parent directories if needed
                 const auto lastSep = dst.find_last_of(L"\\/");
                 if (lastSep != std::wstring::npos) {
@@ -743,25 +759,58 @@ namespace ShadowStrike {
                     }
                 }
 
-                const std::wstring longTmp = AddLongPathPrefix(tmp);
-                if (longTmp.empty()) {
-                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                // Open the temp file with CREATE_NEW so we never overwrite an
+                // existing file (and never follow a pre-planted reparse point
+                // that could redirect the write to a victim path). On the rare
+                // collision (random suffix already exists) we regenerate a new
+                // name and retry up to kMaxTempAttempts times.
+                constexpr int kMaxTempAttempts = 5;
+                std::wstring tmp;
+                std::wstring longTmp;
+                HANDLE h = INVALID_HANDLE_VALUE;
+                for (int attempt = 0; attempt < kMaxTempAttempts; ++attempt) {
+                    tmp = MakeTempSibling(dst);
+                    if (tmp.empty()) {
+                        if (err) {
+                            err->win32 = ERROR_OUTOFMEMORY;
+                            err->message = "Failed to generate temp filename";
+                        }
+                        return false;
+                    }
+                    longTmp = AddLongPathPrefix(tmp);
+                    if (longTmp.empty()) {
+                        if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                        return false;
+                    }
+                    h = CreateFileW(
+                        longTmp.c_str(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_READ,
+                        nullptr,
+                        CREATE_NEW,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH |
+                            FILE_FLAG_OPEN_REPARSE_POINT,
+                        nullptr
+                    );
+                    if (h != INVALID_HANDLE_VALUE) {
+                        break;
+                    }
+                    const DWORD ec = GetLastError();
+                    if (ec == ERROR_FILE_EXISTS || ec == ERROR_ALREADY_EXISTS) {
+                        // Name collision (or an attacker pre-planted the path);
+                        // pick a fresh random name and try again.
+                        continue;
+                    }
+                    if (err) err->win32 = ec;
+                    SS_LOG_LAST_ERROR(L"FileUtils", L"WriteAllBytesAtomic: CreateFileW failed: %s", longTmp.c_str());
                     return false;
                 }
 
-                HANDLE h = CreateFileW(
-                    longTmp.c_str(),
-                    GENERIC_WRITE,
-                    FILE_SHARE_READ,
-                    nullptr,
-                    CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-                    nullptr
-                );
-
                 if (h == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"WriteAllBytesAtomic: CreateFileW failed: %s", longTmp.c_str());
+                    if (err) {
+                        err->win32 = ERROR_FILE_EXISTS;
+                        err->message = "Exhausted temp file name attempts";
+                    }
                     return false;
                 }
 
@@ -852,9 +901,43 @@ namespace ShadowStrike {
 
                 const std::wstring longSrc = AddLongPathPrefix(srcPath);
                 const std::wstring longDst = AddLongPathPrefix(dstPath);
-                if (!MoveFileExW(longSrc.c_str(), longDst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                if (longSrc.empty() || longDst.empty()) {
+                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                    return false;
+                }
+
+                // Prefer ReplaceFileW: it is atomic on the same volume, it
+                // preserves the destination ACL / attributes / object id, and
+                // it refuses to operate across volumes. When the destination
+                // does not yet exist, ReplaceFileW returns ERROR_FILE_NOT_FOUND
+                // and we fall back to MoveFileExW with REPLACE_EXISTING |
+                // WRITE_THROUGH, which is also our portability fallback for
+                // cross-volume replacements.
+                if (ReplaceFileW(longDst.c_str(), longSrc.c_str(), nullptr,
+                                 REPLACEFILE_WRITE_THROUGH |
+                                     REPLACEFILE_IGNORE_MERGE_ERRORS,
+                                 nullptr, nullptr)) {
+                    return true;
+                }
+                const DWORD replaceErr = GetLastError();
+                if (replaceErr != ERROR_FILE_NOT_FOUND &&
+                    replaceErr != ERROR_PATH_NOT_FOUND &&
+                    replaceErr != ERROR_UNABLE_TO_MOVE_REPLACEMENT &&
+                    replaceErr != ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 &&
+                    replaceErr != ERROR_NOT_SAME_DEVICE) {
+                    if (err) err->win32 = replaceErr;
+                    SS_LOG_LAST_ERROR(L"FileUtils",
+                        L"ReplaceFileAtomic: ReplaceFileW failed: %s -> %s",
+                        longSrc.c_str(), longDst.c_str());
+                    return false;
+                }
+
+                if (!MoveFileExW(longSrc.c_str(), longDst.c_str(),
+                                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                     if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"ReplaceFileAtomic: MoveFileExW failed: %s -> %s", longSrc.c_str(), longDst.c_str());
+                    SS_LOG_LAST_ERROR(L"FileUtils",
+                        L"ReplaceFileAtomic: MoveFileExW failed: %s -> %s",
+                        longSrc.c_str(), longDst.c_str());
                     return false;
                 }
                 return true;
@@ -887,15 +970,30 @@ namespace ShadowStrike {
                     return false;
                 }
 
+                // Detach any long-path prefix (\\?\ or \\?\UNC\) for the
+                // structural validation pass; we re-add it just before each
+                // CreateDirectoryW call. Otherwise the colon-position check
+                // below rejects every callsite that has already attached
+                // \\?\C:\... (notably WriteAllBytesAtomic).
+                std::wstring prefix;
+                std::wstring body = d;
+                if (body.starts_with(L"\\\\?\\UNC\\")) {
+                    prefix = L"\\\\?\\UNC\\";
+                    body.erase(0, prefix.size());
+                } else if (body.starts_with(L"\\\\?\\")) {
+                    prefix = L"\\\\?\\";
+                    body.erase(0, prefix.size());
+                }
+
                 // Path traversal attack prevention - reject ".." as a path component
                 // Check for ".." preceded by separator/start and followed by separator/end
                 {
                     size_t pos = 0;
-                    while ((pos = d.find(L"..", pos)) != std::wstring::npos) {
+                    while ((pos = body.find(L"..", pos)) != std::wstring::npos) {
                         const bool atStart = (pos == 0);
-                        const bool afterSep = (pos > 0 && (d[pos - 1] == L'\\' || d[pos - 1] == L'/'));
-                        const bool atEnd = (pos + 2 == d.size());
-                        const bool beforeSep = (pos + 2 < d.size() && (d[pos + 2] == L'\\' || d[pos + 2] == L'/'));
+                        const bool afterSep = (pos > 0 && (body[pos - 1] == L'\\' || body[pos - 1] == L'/'));
+                        const bool atEnd = (pos + 2 == body.size());
+                        const bool beforeSep = (pos + 2 < body.size() && (body[pos + 2] == L'\\' || body[pos + 2] == L'/'));
 
                         if ((atStart || afterSep) && (atEnd || beforeSep)) {
                             if (err) {
@@ -911,13 +1009,13 @@ namespace ShadowStrike {
 
                 // Windows invalid filename characters
                 constexpr wchar_t invalidChars[] = L"<>\"|?*";
-                if (d.find_first_of(invalidChars) != std::wstring::npos) {
+                if (body.find_first_of(invalidChars) != std::wstring::npos) {
                     if (err) err->win32 = ERROR_INVALID_NAME;
                     return false;
                 }
 
                 // Validate colon placement (only valid at position 1 for drive letter)
-                size_t colonPos = d.find(L':');
+                size_t colonPos = body.find(L':');
                 while (colonPos != std::wstring::npos) {
                     if (colonPos != 1) {
                         if (err) {
@@ -927,28 +1025,30 @@ namespace ShadowStrike {
                         SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Invalid colon position in path");
                         return false;
                     }
-                    colonPos = d.find(L':', colonPos + 1);
+                    colonPos = body.find(L':', colonPos + 1);
                 }
 
                 std::wstring cur;
                 try {
                     // Reserve space for long path prefix
-                    cur.reserve(d.size() + LONG_PATH_PREFIX.size() + 8);
+                    cur.reserve(body.size() + LONG_PATH_PREFIX.size() + 8);
                 }
                 catch (const std::bad_alloc&) {
                     if (err) err->win32 = ERROR_NOT_ENOUGH_MEMORY;
                     return false;
                 }
 
-                for (size_t i = 0; i < d.size(); ++i) {
-                    wchar_t c = d[i];
+                for (size_t i = 0; i < body.size(); ++i) {
+                    wchar_t c = body[i];
                     // Normalize separators
                     if (c == L'/') c = L'\\';
                     cur.push_back(c);
 
                     // Create intermediate directories (skip drive root like "C:\")
                     if (c == L'\\' && cur.size() > 3) {
-                        const std::wstring longp = AddLongPathPrefix(cur);
+                        const std::wstring longp = prefix.empty()
+                            ? AddLongPathPrefix(cur)
+                            : (prefix + cur);
                         if (!CreateDirectoryW(longp.c_str(), nullptr)) {
                             const DWORD ec = GetLastError();
                             if (ec != ERROR_ALREADY_EXISTS) {
@@ -961,7 +1061,9 @@ namespace ShadowStrike {
                 }
 
                 // Create final directory
-                const std::wstring longp = AddLongPathPrefix(d);
+                const std::wstring longp = prefix.empty()
+                    ? AddLongPathPrefix(body)
+                    : (prefix + body);
                 if (!CreateDirectoryW(longp.c_str(), nullptr)) {
                     const DWORD ec = GetLastError();
                     if (ec != ERROR_ALREADY_EXISTS) {
@@ -1330,11 +1432,23 @@ namespace ShadowStrike {
                             streamName = streamName.substr(0, dataPos);
                         }
 
-                        // Security: reject embedded nulls (could indicate attack)
-                        if (streamName.find(L'\0') != std::wstring::npos) {
-                            if (err && err->win32 == 0) {
+                        // Reject stream names that contain control characters
+                        // we know cannot appear in a legitimate ADS name. The
+                        // earlier embedded-NUL test was effectively dead because
+                        // cStreamName is a NUL-terminated array and any embedded
+                        // NUL would have already truncated the wstring on
+                        // construction; this check catches the actual cases
+                        // (CR/LF/TAB or stripped DEL) that would corrupt log
+                        // output or downstream parsers.
+                        bool badControl = false;
+                        for (wchar_t ch : streamName) {
+                            if (ch != 0 && ch < 0x20) { badControl = true; break; }
+                            if (ch == 0x7F) { badControl = true; break; }
+                        }
+                        if (badControl) {
+                            if (err) {
                                 err->win32 = ERROR_INVALID_DATA;
-                                err->message = "Stream name contains embedded NUL";
+                                err->message = "Stream name contains control bytes";
                             }
                             return false;
                         }
@@ -1547,15 +1661,21 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                // Open with exclusive access and delete-on-close
-                // This prevents race conditions where file could be swapped
+                // Open with exclusive access and delete-on-close.
+                // FILE_FLAG_OPEN_REPARSE_POINT is mandatory: without it a
+                // pre-planted symlink at `path` would redirect the secure
+                // erase to an arbitrary file the attacker chose. We re-check
+                // the reparse attribute below and refuse to wipe a reparse
+                // point body (their on-disk representation is small metadata,
+                // not the data the caller intends to scrub).
                 HANDLE h = CreateFileW(
                     longp.c_str(),
                     GENERIC_READ | GENERIC_WRITE | DELETE,
                     0,  // Exclusive access - no sharing
                     nullptr,
                     OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE |
+                        FILE_FLAG_OPEN_REPARSE_POINT,
                     nullptr
                 );
 
@@ -1575,8 +1695,9 @@ namespace ShadowStrike {
                     ~HandleGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
                 } guard{ h };
 
-                // Verify it's actually a file (not directory) using handle
-                // This is TOCTOU-safe since we have exclusive access
+                // Verify it's actually a file (not directory, not reparse
+                // point) using the handle we just opened. This is TOCTOU-safe
+                // because we own an exclusive, non-sharing handle.
                 BY_HANDLE_FILE_INFORMATION fileInfo{};
                 if (!GetFileInformationByHandle(h, &fileInfo)) {
                     if (err) err->win32 = GetLastError();
@@ -1588,6 +1709,16 @@ namespace ShadowStrike {
                         err->win32 = ERROR_ACCESS_DENIED;
                         err->message = "Target is a directory";
                     }
+                    return false;
+                }
+                if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    if (err) {
+                        err->win32 = ERROR_ACCESS_DENIED;
+                        err->message = "Refusing to secure-erase a reparse point";
+                    }
+                    SS_LOG_WARN(L"FileUtils",
+                        L"SecureEraseFile: refusing reparse point target: %s",
+                        longp.c_str());
                     return false;
                 }
 
