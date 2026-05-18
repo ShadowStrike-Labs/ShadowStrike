@@ -13,6 +13,7 @@
 #include "PhantomCore/Utils/Logger.hpp"
 #include "PhantomCore/Utils/HashUtils.hpp"
 #include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
 
 #include <fstream>
 #include <atomic>
@@ -22,9 +23,101 @@
 
 namespace ShadowStrike::Update {
 
+namespace FU = ShadowStrike::Utils::FileUtils;
+
 static constexpr const wchar_t* kLogCategory = L"LocalTransport";
 static constexpr size_t kCopyBufferSize = 64 * 1024;  // 64 KB copy chunks
 static constexpr size_t kMaxManifestSize = 4 * 1024 * 1024;  // 4 MB limit
+
+// Refuse files reached through a reparse point (symlink / junction / mount
+// point). The local transport must never give an attacker a primitive to
+// redirect reads or writes to arbitrary paths in the filesystem.
+[[nodiscard]] static bool IsReparsePoint(const fs::path& p) {
+    FU::Error err;
+    FU::FileStat st{};
+    if (!FU::Stat(p.wstring(), st, &err) || !st.exists) return false;
+    return st.isReparsePoint;
+}
+
+// Resolve `url` against `stagingDir` and verify the resulting path is
+// contained inside the staging directory after lexical and weak-canonical
+// normalisation. This blocks `..` traversal and absolute-path escapes
+// supplied through the transport URL.
+[[nodiscard]] static bool ResolveAndContain(const fs::path& stagingDir,
+                                            std::string_view url,
+                                            fs::path& outResolved,
+                                            std::string& outError) {
+    if (stagingDir.empty()) {
+        outError = "Staging directory not configured";
+        return false;
+    }
+    if (url.empty()) {
+        outError = "Empty package URL";
+        return false;
+    }
+    fs::path rel(std::string{url});
+    if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) {
+        outError = "Absolute paths are not accepted by LocalFolderTransport";
+        return false;
+    }
+    // Lexical reject of any ".." segment before touching the filesystem.
+    for (const auto& part : rel) {
+        if (part == L"..") {
+            outError = "Parent-directory traversal rejected";
+            return false;
+        }
+    }
+
+    fs::path combined = stagingDir / rel;
+    std::error_code ec;
+    fs::path canonStaging = fs::weakly_canonical(stagingDir, ec);
+    if (ec) canonStaging = stagingDir.lexically_normal();
+    fs::path canonResolved = fs::weakly_canonical(combined, ec);
+    if (ec) canonResolved = combined.lexically_normal();
+
+    // Lexical containment check on the normalised forms.
+    auto stagingStr  = canonStaging.lexically_normal().wstring();
+    auto resolvedStr = canonResolved.lexically_normal().wstring();
+    if (!stagingStr.empty() && stagingStr.back() != L'\\' &&
+        stagingStr.back() != L'/') {
+        stagingStr.push_back(L'\\');
+    }
+    if (resolvedStr.size() < stagingStr.size() ||
+        _wcsnicmp(resolvedStr.c_str(), stagingStr.c_str(),
+                  stagingStr.size()) != 0) {
+        outError = "Resolved path escapes staging directory";
+        return false;
+    }
+
+    outResolved = canonResolved;
+    return true;
+}
+
+// Parse a single `key=value` field from a manifest. Only matches the key
+// when it appears at the very start of a line so substrings like
+// "x_mandatory=true" or "notversion=1.0" do not poison the result.
+[[nodiscard]] static std::optional<std::string> FindManifestField(
+    std::string_view content, std::string_view key)
+{
+    const std::string needle = std::string(key) + "=";
+    size_t pos = 0;
+    while (pos <= content.size()) {
+        size_t hit = content.find(needle, pos);
+        if (hit == std::string::npos) return std::nullopt;
+        const bool atStart =
+            (hit == 0) || content[hit - 1] == '\n' || content[hit - 1] == '\r';
+        if (atStart) {
+            size_t valStart = hit + needle.size();
+            size_t end = content.find('\n', valStart);
+            if (end == std::string::npos) end = content.size();
+            std::string val(content.substr(valStart, end - valStart));
+            if (!val.empty() && val.back() == '\r') val.pop_back();
+            return val;
+        }
+        pos = hit + 1;
+    }
+    return std::nullopt;
+}
 
 // ============================================================================
 // PIMPL Implementation
@@ -107,6 +200,16 @@ std::vector<RemotePackageInfo> LocalFolderTransport::QueryAvailablePackages(
         }
         if (!entry.is_regular_file(ec) || ec) continue;
 
+        // Refuse reparse-point entries — a junction or symlink in the
+        // staging directory would let an attacker advertise system files
+        // (or files outside staging) as packages.
+        if (IsReparsePoint(entry.path())) {
+            SS_LOG_WARN(kLogCategory,
+                L"Skipping reparse-point entry in staging dir: %s",
+                entry.path().wstring().c_str());
+            continue;
+        }
+
         const auto ext = entry.path().extension().wstring();
         bool isPackage = false;
         for (const auto& pext : kPackageExtensions) {
@@ -154,25 +257,21 @@ std::vector<RemotePackageInfo> LocalFolderTransport::QueryAvailablePackages(
         // Check for accompanying .manifest with version info
         auto manifestPath = entry.path();
         manifestPath.replace_extension(L".manifest");
-        if (fs::exists(manifestPath, ec) && !ec) {
+        if (fs::exists(manifestPath, ec) && !ec &&
+            !IsReparsePoint(manifestPath))
+        {
             auto manifestSize = fs::file_size(manifestPath, ec);
             if (!ec && manifestSize > 0 && manifestSize < kMaxManifestSize) {
                 std::ifstream mf(manifestPath, std::ios::binary);
                 if (mf) {
                     std::string content(static_cast<size_t>(manifestSize), '\0');
                     mf.read(content.data(), static_cast<std::streamsize>(manifestSize));
-                    // Simple key=value parsing for version and mandatory flag
-                    if (auto pos = content.find("version="); pos != std::string::npos) {
-                        auto start = pos + 8;
-                        auto end   = content.find('\n', start);
-                        if (end == std::string::npos) end = content.size();
-                        info.version = content.substr(start, end - start);
-                        // Trim CR
-                        if (!info.version.empty() && info.version.back() == '\r')
-                            info.version.pop_back();
+                    if (auto v = FindManifestField(content, "version")) {
+                        info.version = std::move(*v);
                     }
-                    if (content.find("mandatory=true") != std::string::npos)
-                        info.isMandatory = true;
+                    if (auto m = FindManifestField(content, "mandatory")) {
+                        info.isMandatory = (*m == "true" || *m == "1");
+                    }
                 }
             }
         }
@@ -199,27 +298,50 @@ TransportResult LocalFolderTransport::FetchPackage(
     TransportResult result;
     const auto startTime = std::chrono::steady_clock::now();
 
-    // Resolve source path
+    // Resolve and contain source path. Only relative paths inside the
+    // staging directory are accepted; '..' segments, absolute paths and
+    // reparse-point traversal are all rejected before any I/O.
     fs::path sourcePath;
     {
         std::shared_lock lock(m_impl->mtx);
-        sourcePath = fs::path(std::string(url));
-
-        // If url is not absolute, resolve relative to staging dir
-        if (!sourcePath.is_absolute()) {
-            sourcePath = m_impl->stagingDir / sourcePath;
+        const fs::path stagingSnapshot = m_impl->stagingDir;
+        std::string err;
+        if (!ResolveAndContain(stagingSnapshot, url, sourcePath, err)) {
+            result.errorMessage = err;
+            result.errorCode    = ERROR_INVALID_NAME;
+            SS_LOG_ERROR(kLogCategory,
+                L"FetchPackage rejected URL '%hs': %hs",
+                std::string(url).c_str(), err.c_str());
+            return result;
         }
     }
 
     SS_LOG_INFO(kLogCategory, L"FetchPackage: %s -> %s",
         sourcePath.wstring().c_str(), destination.wstring().c_str());
 
+    if (IsReparsePoint(sourcePath)) {
+        result.errorMessage = "Source is a reparse point";
+        result.errorCode    = ERROR_INVALID_NAME;
+        SS_LOG_ERROR(kLogCategory,
+            L"Refusing to fetch reparse point: %s",
+            sourcePath.wstring().c_str());
+        return result;
+    }
+
     // Validate source
     std::error_code ec;
     if (!fs::exists(sourcePath, ec) || ec) {
-        result.errorMessage = "Source file not found: " + sourcePath.string();
+        result.errorMessage = "Source file not found";
         result.errorCode    = ERROR_FILE_NOT_FOUND;
         SS_LOG_ERROR(kLogCategory, L"Source not found: %s", sourcePath.wstring().c_str());
+        return result;
+    }
+
+    if (!fs::is_regular_file(sourcePath, ec) || ec) {
+        result.errorMessage = "Source is not a regular file";
+        result.errorCode    = ERROR_INVALID_NAME;
+        SS_LOG_ERROR(kLogCategory, L"Source is not regular: %s",
+            sourcePath.wstring().c_str());
         return result;
     }
 
@@ -231,16 +353,35 @@ TransportResult LocalFolderTransport::FetchPackage(
         return result;
     }
 
-    // Ensure destination directory exists
+    // Ensure destination directory exists; refuse to write into a path
+    // whose final directory component is a reparse point.
     auto destDir = destination.parent_path();
     if (!destDir.empty()) {
         fs::create_directories(destDir, ec);
         if (ec) {
-            result.errorMessage = "Cannot create destination directory: " + ec.message();
+            result.errorMessage = "Cannot create destination directory";
             result.errorCode    = ERROR_PATH_NOT_FOUND;
             SS_LOG_ERROR(kLogCategory, L"Cannot create dest dir: %hs", ec.message().c_str());
             return result;
         }
+        if (IsReparsePoint(destDir)) {
+            result.errorMessage = "Destination directory is a reparse point";
+            result.errorCode    = ERROR_INVALID_NAME;
+            SS_LOG_ERROR(kLogCategory,
+                L"Refusing to write into reparse-point directory: %s",
+                destDir.wstring().c_str());
+            return result;
+        }
+    }
+    // If the destination already exists, refuse to follow a reparse point
+    // (which would let an attacker redirect the write to an arbitrary file).
+    if (fs::exists(destination, ec) && !ec && IsReparsePoint(destination)) {
+        result.errorMessage = "Destination path is a reparse point";
+        result.errorCode    = ERROR_INVALID_NAME;
+        SS_LOG_ERROR(kLogCategory,
+            L"Refusing to overwrite reparse-point destination: %s",
+            destination.wstring().c_str());
+        return result;
     }
 
     // Open source and destination
