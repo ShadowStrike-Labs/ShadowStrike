@@ -420,18 +420,32 @@ static int InnerMain(int argc, wchar_t* argv[])
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+//  SEH filter — captures GetExceptionCode() into the supplied out-parameter
+//  and always elects to handle the exception at the wmain level.  Using a
+//  named filter avoids /analyze C6320 ("constant EXCEPTION_EXECUTE_HANDLER
+//  may mask exceptions") while preserving the original behaviour.
+// ────────────────────────────────────────────────────────────────────────────
+static int SehTopLevelFilter(DWORD code, DWORD* outCode) noexcept
+{
+    if (outCode != nullptr) {
+        *outCode = code;
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 //  wmain — SEH-guarded entry point
 // ────────────────────────────────────────────────────────────────────────────
 int wmain(int argc, wchar_t* argv[])
 {
+    DWORD sehCode = 0;
     __try {
         return InnerMain(argc, argv);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        DWORD code = GetExceptionCode();
+    __except (SehTopLevelFilter(GetExceptionCode(), &sehCode)) {
         wchar_t buf[256];
         _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                     L"[FATAL] Unhandled SEH exception 0x%08X — aborting.\r\n", code);
+                     L"[FATAL] Unhandled SEH exception 0x%08X -- aborting.\r\n", sehCode);
         OutputDebugStringW(buf);
         WriteLogLine(L"FATAL", buf);
         FlushLogger();

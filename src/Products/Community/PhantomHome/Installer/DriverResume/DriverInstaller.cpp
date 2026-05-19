@@ -44,6 +44,13 @@
 
 #pragma comment(lib, "wintrust.lib")
 
+// winreg.h carries an SAL annotation on RegOpenKeyExW's ulOptions parameter
+// (declared with a "value" annotation on what /analyze treats as a numeric
+// constant) that triggers C6553 from /analyze /sdl on every caller.  The
+// warning is in the SDK header, not our code; suppress it at TU scope so the
+// installer can be built clean under /W4 /WX /analyze.
+#pragma warning(disable: 6553)
+
 #include <string>
 #include <cstdio>
 #include <cstdint>
@@ -97,6 +104,26 @@ static std::wstring BuildSystemDriverPath()
     path += kSystem32Drivers;
     path += kDriverSysName;
     return path;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  StripExtendedLengthPrefix
+//  Returns a pointer past a leading "\\?\" prefix, or the original pointer
+//  if no prefix is present.  Used solely for volume-path comparison: the
+//  source path is stored with the "\\?\" prefix for long-path safety, but
+//  GetVolumePathNameW returns the prefix iff the input has it.  Without
+//  normalisation a true same-volume copy would be misclassified as cross-
+//  volume and rejected.
+// ────────────────────────────────────────────────────────────────────────────
+static const wchar_t* StripExtendedLengthPrefix(const wchar_t* p) noexcept
+{
+    if (p != nullptr &&
+        p[0] == L'\\' && p[1] == L'\\' &&
+        p[2] == L'?'  && p[3] == L'\\')
+    {
+        return p + 4;
+    }
+    return p;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -338,19 +365,27 @@ DWORD CopyDriverBinary(const std::wstring& srcPath, std::wstring& dstPath)
     // --- Step 3: Verify source and destination are on the same volume.
     //     MoveFileExW is only atomic (kernel rename) on NTFS within one volume.
     //     Across volumes it degrades to copy+delete, which is not atomic.
+    //
+    //     The source path is stored with a "\\?\" extended-length prefix (for
+    //     long-path safety) while the destination path is not.  GetVolumePathNameW
+    //     preserves whichever form the caller supplied, so we must strip the
+    //     prefix before string-comparing the two volume roots — otherwise every
+    //     install would be misclassified as cross-volume.
     {
         wchar_t srcVol[MAX_PATH + 1]  = {};
         wchar_t dstVol[MAX_PATH + 1]  = {};
-        bool samePath = GetVolumePathNameW(srcPath.c_str(), srcVol, MAX_PATH) &&
-                        GetVolumePathNameW(dstPath.c_str(), dstVol, MAX_PATH);
-        if (!samePath || _wcsicmp(srcVol, dstVol) != 0) {
+        bool gotBoth = GetVolumePathNameW(srcPath.c_str(), srcVol, MAX_PATH) &&
+                       GetVolumePathNameW(dstPath.c_str(), dstVol, MAX_PATH);
+        const wchar_t* srcVolNorm = StripExtendedLengthPrefix(srcVol);
+        const wchar_t* dstVolNorm = StripExtendedLengthPrefix(dstVol);
+        if (!gotBoth || _wcsicmp(srcVolNorm, dstVolNorm) != 0) {
             // Source and destination are on different volumes.
             // MoveFileExW would perform a non-atomic copy+delete, which is unsafe.
             // This configuration is not expected in any standard Windows install;
             // fail loudly so the condition is visible rather than silently unsafe.
             LOG_ERROR(L"Source volume '%ls' != destination volume '%ls'. "
                       L"Cross-volume rename is not atomic. Aborting.",
-                      srcVol, dstVol);
+                      srcVolNorm, dstVolNorm);
             return ERROR_NOT_SAME_DEVICE;
         }
     }
@@ -497,17 +532,23 @@ DWORD CreateDriverService(SC_HANDLE hScm, const std::wstring& sysDst)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  ConfigureMinifilterRegistry
-//  Key paths match PhantomSensor.INF [PhantomSensor.AddRegistry]:
-//    HKR,"Parameters\Instances","DefaultInstance" (relative to service key)
-//    HKR,"Parameters\Instances\%DefaultInstance%","Altitude"
-//    HKR,"Parameters\Instances\%DefaultInstance%","Flags"
+//
+//  FltMgr reads the canonical minifilter registry locations:
+//    HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Instances
+//    HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Instances\<instance>
+//
+//  Note that some legacy INF files use HKR,"Parameters\Instances",... — that
+//  layout is NOT consulted by FltMgr and a minifilter registered there will
+//  silently fail FilterLoad / FltRegisterFilter.  We always write the
+//  canonical path here regardless of what an alternative INF-driven flow
+//  may have produced; the values match the InstallDriver.cmd helper.
 // ────────────────────────────────────────────────────────────────────────────
 DWORD ConfigureMinifilterRegistry()
 {
-    constexpr wchar_t kSvcParameters[] =
-        L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\Parameters\\Instances";
+    constexpr wchar_t kSvcInstances[] =
+        L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\Instances";
     constexpr wchar_t kSvcInstance[] =
-        L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\Parameters\\Instances\\"
+        L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\Instances\\"
         L"PhantomSensor Instance";
 
     auto OpenOrCreate = [](const wchar_t* subKey) -> RegKeyGuard {
@@ -522,11 +563,11 @@ DWORD ConfigureMinifilterRegistry()
         return RegKeyGuard{hk};
     };
 
-    // Parameters\Instances – DefaultInstance value
+    // Instances – DefaultInstance value
     {
-        RegKeyGuard hInst = OpenOrCreate(kSvcParameters);
+        RegKeyGuard hInst = OpenOrCreate(kSvcInstances);
         if (!hInst.valid()) {
-            LOG_ERROR(L"Failed to create key: %ls (0x%08X)", kSvcParameters, GetLastError());
+            LOG_ERROR(L"Failed to create key: %ls (0x%08X)", kSvcInstances, GetLastError());
             return GetLastError() ? GetLastError() : ERROR_FUNCTION_FAILED;
         }
 
@@ -664,6 +705,8 @@ DWORD SetInstallCompleteMarker()
 // ────────────────────────────────────────────────────────────────────────────
 //  ClearRunOnceEntry
 // ────────────────────────────────────────────────────────────────────────────
+#pragma warning(push)
+#pragma warning(disable: 6553)
 DWORD ClearRunOnceEntry()
 {
     HKEY hk = nullptr;
@@ -688,10 +731,13 @@ DWORD ClearRunOnceEntry()
 
     return ERROR_SUCCESS;
 }
+#pragma warning(pop)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  UninstallDriver
 // ────────────────────────────────────────────────────────────────────────────
+#pragma warning(push)
+#pragma warning(disable: 6553)
 DWORD UninstallDriver(SC_HANDLE hScm)
 {
     LOG_INFO(L"Beginning driver uninstall...");
@@ -731,15 +777,16 @@ DWORD UninstallDriver(SC_HANDLE hScm)
     RegDeleteKeyExW(
         HKEY_LOCAL_MACHINE,
         L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\"
-        L"Parameters\\Instances\\PhantomSensor Instance",
+        L"Instances\\PhantomSensor Instance",
         KEY_WOW64_64KEY, 0);
     RegDeleteKeyExW(
         HKEY_LOCAL_MACHINE,
-        L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\Parameters\\Instances",
+        L"SYSTEM\\CurrentControlSet\\Services\\PhantomSensor\\Instances",
         KEY_WOW64_64KEY, 0);
 
     LOG_INFO(L"Driver uninstall complete.");
     return ERROR_SUCCESS;
 }
+#pragma warning(pop)
 
 } // namespace ShadowStrike::Installer

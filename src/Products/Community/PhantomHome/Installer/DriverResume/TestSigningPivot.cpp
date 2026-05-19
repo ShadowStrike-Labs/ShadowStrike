@@ -38,6 +38,13 @@
 #endif
 #include <Windows.h>
 
+// winreg.h (Win SDK 10.0.26100) declares RegOpenKeyExW with a SAL
+// "_Param_" annotation on ulOptions that /analyze /sdl flags as C6553
+// ("value annotation is not valid for value type").  The annotation is
+// inside the SDK header, not our code; suppress at TU scope so the
+// installer can build clean under /analyze /sdl /WX.
+#pragma warning(disable: 6553)
+
 #include <string>
 #include <string_view>
 #include <vector>
@@ -60,9 +67,14 @@ void Log(const wchar_t* level, const wchar_t* fmt, ...);
 namespace {
 
 struct PipeReaderContext {
-    HANDLE  hReadPipe = INVALID_HANDLE_VALUE;
-    std::string output;        // Accumulated bytes (UTF-8 / ANSI)
-    DWORD   error = ERROR_SUCCESS;
+    HANDLE       hReadPipe = INVALID_HANDLE_VALUE;
+    std::string  output;        // Accumulated bytes (UTF-8 / ANSI)
+    DWORD        error = ERROR_SUCCESS;
+    // Hard cap on captured output to bound memory in the unlikely event the
+    // spawned tool produces a runaway stream.  4 MB is far beyond any
+    // legitimate bcdedit output and prevents a tampered substitute binary
+    // from exhausting RAM.
+    static constexpr std::size_t kMaxOutputBytes = 4u * 1024u * 1024u;
 };
 
 DWORD WINAPI PipeReaderThread(LPVOID lpParam)
@@ -76,7 +88,17 @@ DWORD WINAPI PipeReaderThread(LPVOID lpParam)
         DWORD bytesRead = 0;
         BOOL  ok = ReadFile(ctx->hReadPipe, buf, kBufSize, &bytesRead, nullptr);
         if (ok && bytesRead > 0) {
-            ctx->output.append(buf, bytesRead);
+            const std::size_t room =
+                (ctx->output.size() < PipeReaderContext::kMaxOutputBytes)
+                ? (PipeReaderContext::kMaxOutputBytes - ctx->output.size())
+                : 0;
+            const std::size_t take =
+                (bytesRead < room) ? static_cast<std::size_t>(bytesRead) : room;
+            if (take > 0) {
+                ctx->output.append(buf, take);
+            }
+            // If we've hit the cap, keep draining to allow the child to exit
+            // (closing the write end), but discard further bytes.
         } else {
             // ERROR_BROKEN_PIPE / ERROR_HANDLE_EOF signal normal EOF.
             DWORD e = GetLastError();
@@ -111,8 +133,10 @@ namespace ShadowStrike::Installer {
 [[nodiscard]] static DWORD SpawnAndCapture(
     const std::wstring& cmdLine,
     std::string&        outStdout,
+    DWORD&              outExitCode,
     DWORD               timeoutMs = 30'000)
 {
+    outExitCode = STILL_ACTIVE;
     // Create anonymous pipe for child stdout.
     SECURITY_ATTRIBUTES sa{};
     sa.nLength              = sizeof(sa);
@@ -164,12 +188,22 @@ namespace ShadowStrike::Installer {
 
     SIZE_T attrListSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attrListSize);
+    if (attrListSize == 0) {
+        // Defence in depth: a zero size would yield a zero-byte allocation
+        // and a nullptr data() pointer.  /analyze flags the subsequent
+        // attribute-list calls otherwise; this branch should be unreachable
+        // on any supported Windows version.
+        LOG_ERROR(L"InitializeProcThreadAttributeList reported zero buffer size.");
+        return ERROR_FUNCTION_FAILED;
+    }
     std::vector<BYTE> attrListBuf(attrListSize);
     auto* pAttrList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrListBuf.data());
-    if (!InitializeProcThreadAttributeList(pAttrList, 1, 0, &attrListSize)) {
+    if (pAttrList == nullptr ||
+        !InitializeProcThreadAttributeList(pAttrList, 1, 0, &attrListSize))
+    {
         DWORD err = GetLastError();
         LOG_ERROR(L"InitializeProcThreadAttributeList failed (0x%08X)", err);
-        return err;
+        return err ? err : ERROR_FUNCTION_FAILED;
     }
 
     bool attrUpdated = UpdateProcThreadAttribute(
@@ -246,13 +280,34 @@ namespace ShadowStrike::Installer {
     if (waitResult == WAIT_TIMEOUT) {
         LOG_ERROR(L"Process '%ls' timed out after %lu ms. Terminating.", cmdLine.c_str(), timeoutMs);
         TerminateProcess(hProc.get(), ERROR_TIMEOUT);
+        // After TerminateProcess the kernel closes all child handles
+        // including its copy of the pipe write-end, so ReadFile on hRead
+        // will return EOF.  Wait for the reader to fully drain before we
+        // let the on-stack PipeReaderContext leave scope.
+        WaitForSingleObject(hProc.get(), 5'000);
     }
 
-    // Wait for the reader thread to drain remaining output (give it 5s extra).
-    WaitForSingleObject(hReaderThread.get(), 5'000);
+    // Wait for the reader thread to drain remaining output.  We must wait
+    // indefinitely (after capping the wait above) because the
+    // PipeReaderContext lives on this stack frame — detaching the thread
+    // would create a use-after-free window if ReadFile is still pending.
+    // The pipe is guaranteed to reach EOF because (a) the parent's write
+    // handle was already closed and (b) the child process is now exited.
+    if (hReaderThread.valid()) {
+        if (WaitForSingleObject(hReaderThread.get(), 5'000) == WAIT_TIMEOUT) {
+            // Last-resort recovery: force ReadFile to fail by closing the
+            // read end, then wait without bound for the thread to exit.
+            // CancelSynchronousIo would be cleaner but is only effective
+            // from the owning thread; closing the handle unblocks
+            // any pending I/O on it.
+            hRead = HandleGuard{};
+            WaitForSingleObject(hReaderThread.get(), INFINITE);
+        }
+    }
 
     DWORD exitCode = 1;
     GetExitCodeProcess(hProc.get(), &exitCode);
+    outExitCode = exitCode;
 
     if (waitResult == WAIT_TIMEOUT)
         return ERROR_TIMEOUT;
@@ -269,6 +324,8 @@ namespace ShadowStrike::Installer {
 //  Consensus: both the BCD registry value AND bcdedit /enum output are checked.
 //  If either is inaccessible, the other is used with a warning.
 // ────────────────────────────────────────────────────────────────────────────
+#pragma warning(push)
+#pragma warning(disable: 6553)
 DWORD QueryTestSigningState(bool& outIsOn)
 {
     outIsOn = false;
@@ -318,18 +375,36 @@ DWORD QueryTestSigningState(bool& outIsOn)
             cmdLine += L"\\bcdedit.exe\" /enum {current} /v";
 
             std::string bcdeditOutput;
-            DWORD err = SpawnAndCapture(cmdLine, bcdeditOutput, 15'000);
+            DWORD       bcdeditExit = 1;
+            DWORD err = SpawnAndCapture(cmdLine, bcdeditOutput, bcdeditExit, 15'000);
             if (err != ERROR_SUCCESS) {
                 LOG_WARN(L"SpawnAndCapture(bcdedit) returned 0x%08X; "
                          L"falling back to registry only.", err);
+            } else if (bcdeditExit != 0) {
+                LOG_WARN(L"bcdedit /enum exited with %lu; falling back to registry only.",
+                         bcdeditExit);
             } else {
-                // Case-insensitive search for "testsigning" field with value "Yes"
+                // Find the "testsigning" field and inspect its value on the
+                // SAME LINE.  The previous implementation searched the entire
+                // output for "yes" anywhere, which falsely matched unrelated
+                // fields ("bootmenupolicy ... Yes", localized output, etc.)
+                // and would mis-report testsigning as ON.
                 std::string lower = bcdeditOutput;
-                for (auto& c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                for (auto& c : lower)
+                    c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 
-                bcdeditSaysOn  = (lower.find("testsigning") != std::string::npos &&
-                                   lower.find("yes")         != std::string::npos);
                 bcdeditReadable = true;
+                bcdeditSaysOn   = false;
+
+                std::size_t pos = lower.find("testsigning");
+                if (pos != std::string::npos) {
+                    // Examine from "testsigning" to the next line terminator.
+                    std::size_t eol = lower.find_first_of("\r\n", pos);
+                    if (eol == std::string::npos)
+                        eol = lower.size();
+                    std::string_view line(lower.data() + pos, eol - pos);
+                    bcdeditSaysOn = (line.find("yes") != std::string_view::npos);
+                }
                 LOG_INFO(L"bcdedit: testsigning=%ls",
                          bcdeditSaysOn ? L"Yes" : L"No");
             }
@@ -360,6 +435,7 @@ DWORD QueryTestSigningState(bool& outIsOn)
 
     return ERROR_SUCCESS;
 }
+#pragma warning(pop)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  EnableTestSigning
@@ -382,18 +458,29 @@ DWORD EnableTestSigning()
     LOG_INFO(L"Enabling testsigning: %ls", cmdLine.c_str());
 
     std::string output;
-    DWORD err = SpawnAndCapture(cmdLine, output, 15'000);
+    DWORD       bcdeditExit = 1;
+    DWORD err = SpawnAndCapture(cmdLine, output, bcdeditExit, 15'000);
     if (err != ERROR_SUCCESS) {
         LOG_ERROR(L"EnableTestSigning: SpawnAndCapture failed (0x%08X).", err);
         return err;
     }
 
-    // bcdedit writes success as "The operation completed successfully."
-    if (output.find("successfully") == std::string::npos) {
-        LOG_WARN(L"bcdedit output did not contain 'successfully'. "
-                 L"Output: %.256hs", output.c_str());
-    } else {
+    // The bcdedit exit code is the authoritative signal.  The "successfully"
+    // substring check is locale-dependent (non-English Windows produces a
+    // translated message) and previously caused the installer to proceed
+    // with reboot pivot even when bcdedit had returned a non-zero status.
+    if (bcdeditExit != 0) {
+        LOG_ERROR(L"bcdedit /set testsigning on exited with %lu. "
+                  L"Output (truncated): %.256hs",
+                  bcdeditExit, output.c_str());
+        return ERROR_FUNCTION_FAILED;
+    }
+
+    if (output.find("successfully") != std::string::npos) {
         LOG_INFO(L"bcdedit /set testsigning on succeeded.");
+    } else {
+        // Non-English Windows: exit code 0 is sufficient, message will differ.
+        LOG_INFO(L"bcdedit /set testsigning on returned exit 0 (locale-translated message).");
     }
 
     return ERROR_SUCCESS;
@@ -407,6 +494,7 @@ DWORD EnableTestSigning()
 DWORD WriteRunOnceStage2(const std::wstring& exePath)
 {
     HKEY hk = nullptr;
+#pragma warning(suppress: 6553)
     LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                             L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
                             0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hk);
@@ -483,6 +571,11 @@ DWORD ScheduleReboot()
     //                 SHTDN_REASON_FLAG_PLANNED
     constexpr DWORD kReason = 0x00040003 | 0x80000000;
 
+    // C28159 ("rearchitect to avoid reboot") is a design-level /analyze
+    // advisory; this installer's contract is precisely to schedule a reboot
+    // after enabling testsigning, so the suggestion does not apply here.
+#pragma warning(push)
+#pragma warning(disable: 28159)
     if (!InitiateSystemShutdownExW(
             nullptr,    // local machine
             const_cast<LPWSTR>(kMessage),
@@ -495,6 +588,7 @@ DWORD ScheduleReboot()
         LOG_ERROR(L"InitiateSystemShutdownExW failed (0x%08X)", err);
         return err;
     }
+#pragma warning(pop)
 
     LOG_INFO(L"System restart scheduled in 60 seconds.");
     return ERROR_SUCCESS;
