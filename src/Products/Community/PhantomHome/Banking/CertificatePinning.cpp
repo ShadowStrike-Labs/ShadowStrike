@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <deque>
 #include <cctype>
+#include <limits>
 
 // Link against Crypt32.lib
 #pragma comment(lib, "crypt32.lib")
@@ -70,6 +71,9 @@ std::atomic<bool> CertificatePinning::s_instanceCreated{false};
 namespace {
 
     constexpr const wchar_t* LOG_CAT = L"CertPinning";
+    constexpr size_t MAX_PIN_DATABASE_BYTES = 4 * 1024 * 1024;
+    constexpr size_t MAX_CT_LOG_DATABASE_BYTES = 4 * 1024 * 1024;
+    constexpr size_t MAX_CT_LOGS = 4096;
 
     template <typename T>
     [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
@@ -92,10 +96,65 @@ namespace {
     // Case-insensitive ASCII lowercase for domain normalization
     std::string NormalizeDomain(std::string_view domain) {
         std::string result(domain);
+        while (!result.empty() && result.back() == '.') {
+            result.pop_back();
+        }
         for (auto& c : result) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
         }
         return result;
+    }
+
+    [[nodiscard]] bool IsValidDomainPattern(std::string_view domain) noexcept {
+        if (domain.empty() || domain.size() > 253) return false;
+        bool wildcardSeen = false;
+        size_t labelLength = 0;
+        for (size_t i = 0; i < domain.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(domain[i]);
+            if (c == '*') {
+                if (i != 0 || domain.size() < 3 || domain[1] != '.') return false;
+                wildcardSeen = true;
+                labelLength = 1;
+                continue;
+            }
+            if (c == '.') {
+                if (labelLength == 0 || labelLength > 63) return false;
+                labelLength = 0;
+                continue;
+            }
+            const bool isAlnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                 (c >= '0' && c <= '9');
+            if (!isAlnum && c != '-') return false;
+            ++labelLength;
+        }
+        return labelLength > 0 && labelLength <= 63 && (!wildcardSeen || domain.size() > 2);
+    }
+
+    [[nodiscard]] std::string EscapeJsonStr(std::string_view s) {
+        std::string out;
+        out.reserve(s.size() + 16);
+        for (char c : s) {
+            switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8]{};
+                    (void)std::snprintf(buf, sizeof(buf), "\\u%04x",
+                        static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+                break;
+            }
+        }
+        return out;
     }
 
     // Wildcard domain matching (e.g. *.bank.com matches www.bank.com)
@@ -212,6 +271,11 @@ public:
 
     bool Initialize(const CertificatePinningConfiguration& config) {
         std::unique_lock lock(m_mutex);
+        if (!config.IsValid()) {
+            SS_LOG_ERROR(LOG_CAT, L"Initialize rejected invalid certificate pinning configuration.");
+            m_status = ModuleStatus::Error;
+            return false;
+        }
         if (m_status == ModuleStatus::Running) {
             // Already running — apply config update path instead of silently returning
             m_config = config;
@@ -233,7 +297,12 @@ public:
 
         // Load bypass domains (normalized)
         for (const auto& d : config.bypassDomains) {
-            m_bypassDomains.push_back(NormalizeDomain(d));
+            const std::string normalized = NormalizeDomain(d);
+            if (IsValidDomainPattern(normalized)) {
+                m_bypassDomains.push_back(normalized);
+            } else {
+                SS_LOG_WARN(LOG_CAT, L"Rejected invalid bypass domain during initialization.");
+            }
         }
 
         // Load built-in pins
@@ -280,20 +349,34 @@ public:
         std::unique_lock lock(m_mutex);
 
         const std::string normDomain = NormalizeDomain(pin.domain);
+        if (!IsValidDomainPattern(normDomain)) {
+            SS_LOG_WARN(LOG_CAT, L"Rejected certificate pin with invalid domain pattern.");
+            return;
+        }
+        if (pin.hashAlgorithm != PinHashAlgorithm::SHA256 ||
+            pin.pinType != PinType::SPKI) {
+            SS_LOG_WARN(LOG_CAT, L"Rejected unsupported certificate pin type/algorithm.");
+            return;
+        }
+        std::vector<uint8_t> decoded;
+        if (!Utils::CryptoUtils::Base64::Decode(pin.pinHash, decoded) ||
+            decoded.size() != CertPinningConstants::PIN_HASH_LENGTH) {
+            SS_LOG_WARN(LOG_CAT, L"Rejected certificate pin with invalid SHA-256 pin hash.");
+            return;
+        }
 
-        // Enforce per-domain limit
+        auto existing = m_pinStore.find(normDomain);
+        if (existing == m_pinStore.end() &&
+            m_pinStore.size() >= CertPinningConstants::MAX_PINNED_DOMAINS) {
+            SS_LOG_WARN(LOG_CAT, L"Global pinned domain limit reached (max %zu). Rejecting.",
+                        CertPinningConstants::MAX_PINNED_DOMAINS);
+            return;
+        }
+
         auto& domainPins = m_pinStore[normDomain];
         if (domainPins.size() >= CertPinningConstants::MAX_PINS_PER_DOMAIN) {
             SS_LOG_WARN(LOG_CAT, L"Pin limit reached for domain (max %zu). Rejecting new pin.",
                         CertPinningConstants::MAX_PINS_PER_DOMAIN);
-            return;
-        }
-
-        // Enforce global domain limit
-        if (m_pinStore.size() >= CertPinningConstants::MAX_PINNED_DOMAINS &&
-            domainPins.empty()) {
-            SS_LOG_WARN(LOG_CAT, L"Global pinned domain limit reached (max %zu). Rejecting.",
-                        CertPinningConstants::MAX_PINNED_DOMAINS);
             return;
         }
 
@@ -339,6 +422,11 @@ public:
         result.domain = domain;
         result.validationTime = std::chrono::system_clock::now();
         auto start = Clock::now();
+        CertificatePinningConfiguration localConfig;
+        {
+            std::shared_lock lock(m_mutex);
+            localConfig = m_config;
+        }
 
         m_stats.totalValidations.fetch_add(1, std::memory_order_relaxed);
 
@@ -390,7 +478,7 @@ public:
 
         if (hasExpiredCert) {
             result.status = CertificateStatus::Expired;
-            result.action = (m_config.mode >= PinningMode::Enforce)
+            result.action = (localConfig.mode >= PinningMode::Enforce)
                 ? ValidationAction::Block : ValidationAction::Warn;
             if (result.action == ValidationAction::Block) {
                 m_stats.connectionsBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -408,11 +496,11 @@ public:
         if (leaf.keySize > 0) {
             bool weakKey = false;
             if (leaf.keyAlgorithm.find("RSA") != std::string::npos &&
-                leaf.keySize < m_config.minRSAKeySize) {
+                leaf.keySize < localConfig.minRSAKeySize) {
                 weakKey = true;
             }
             if (leaf.keyAlgorithm.find("EC") != std::string::npos &&
-                leaf.keySize < m_config.minECKeySize) {
+                leaf.keySize < localConfig.minECKeySize) {
                 weakKey = true;
             }
             if (weakKey) {
@@ -455,11 +543,11 @@ public:
                 result.errorDetails = "Certificate pinning violation for " + domain;
                 m_stats.pinMismatches.fetch_add(1, std::memory_order_relaxed);
 
-                if (m_config.mode == PinningMode::Enforce ||
-                    m_config.mode == PinningMode::Strict) {
+                if (localConfig.mode == PinningMode::Enforce ||
+                    localConfig.mode == PinningMode::Strict) {
                     result.action = ValidationAction::Block;
                     m_stats.connectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-                } else if (m_config.mode == PinningMode::ReportOnly) {
+                } else if (localConfig.mode == PinningMode::ReportOnly) {
                     result.action = ValidationAction::Warn;
                 } else {
                     result.action = ValidationAction::Allow;
@@ -481,8 +569,8 @@ public:
         // No pins = allow (no enforcement possible without pins)
 
         // 7. Revocation Check
-        if (m_config.enableRevocationChecking &&
-            m_config.revocationMethod != RevocationMethod::None) {
+        if (localConfig.enableRevocationChecking &&
+            localConfig.revocationMethod != RevocationMethod::None) {
             auto revStatus = CheckRevocationImpl(leaf);
             if (revStatus == CertificateStatus::Revoked) {
                 result.status = CertificateStatus::Revoked;
@@ -494,7 +582,7 @@ public:
                 return FinalizeResult(result, start);
             }
             if (revStatus == CertificateStatus::OCSPError &&
-                !m_config.allowRevocationSoftFail) {
+                !localConfig.allowRevocationSoftFail) {
                 result.status = CertificateStatus::OCSPError;
                 result.action = ValidationAction::Block;
                 result.errorDetails = "Revocation check failed (hard-fail policy)";
@@ -504,7 +592,7 @@ public:
         }
 
         // 8. Certificate Transparency Check
-        if (m_config.enableCTChecking && m_config.mode == PinningMode::Strict) {
+        if (localConfig.enableCTChecking && localConfig.mode == PinningMode::Strict) {
             bool ctValid = ValidateCTImpl(leaf);
             result.isCTValid = ctValid;
             if (!ctValid) {
@@ -571,6 +659,14 @@ public:
         );
 
         if (!pCertContext) return std::nullopt;
+        struct CertContextGuard {
+            PCCERT_CONTEXT ctx{nullptr};
+            ~CertContextGuard() noexcept {
+                if (ctx) {
+                    CertFreeCertificateContext(ctx);
+                }
+            }
+        } certGuard{pCertContext};
 
         CertificateInfo info;
         info.rawData = der;
@@ -688,7 +784,6 @@ public:
             }
         }
 
-        CertFreeCertificateContext(pCertContext);
         return info;
     }
 
@@ -726,8 +821,7 @@ public:
                 cb(result);
             } catch (const std::exception& ex) {
                 SS_LOG_ERROR(LOG_CAT,
-                    L"Exception in violation callback: user callback threw.");
-                (void)ex;
+                    L"Exception in violation callback: %hs", ex.what());
             } catch (...) {
                 SS_LOG_ERROR(LOG_CAT,
                     L"Unknown exception in violation callback.");
@@ -745,8 +839,10 @@ public:
             if (!cb) continue;
             try {
                 cb(message, code);
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(LOG_CAT, L"Exception in error callback: %hs", ex.what());
             } catch (...) {
-                SS_LOG_ERROR(LOG_CAT, L"Exception in error callback.");
+                SS_LOG_ERROR(LOG_CAT, L"Unknown exception in error callback.");
             }
         }
     }
@@ -815,13 +911,18 @@ public:
         chainPara.cbSize = sizeof(CERT_CHAIN_PARA);
         chainPara.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
 
+        CertificatePinningConfiguration localConfig;
+        {
+            std::shared_lock lock(m_mutex);
+            localConfig = m_config;
+        }
         DWORD flags = 0;
-        if (m_config.revocationMethod == RevocationMethod::OCSP ||
-            m_config.revocationMethod == RevocationMethod::Both) {
+        if (localConfig.revocationMethod == RevocationMethod::OCSP ||
+            localConfig.revocationMethod == RevocationMethod::Both) {
             flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN;
         }
-        if (m_config.revocationMethod == RevocationMethod::CRL ||
-            m_config.revocationMethod == RevocationMethod::Both) {
+        if (localConfig.revocationMethod == RevocationMethod::CRL ||
+            localConfig.revocationMethod == RevocationMethod::Both) {
             flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN;
         }
 
@@ -961,6 +1062,21 @@ public:
                          bool isBackup = false)
     {
         const std::string normDomain = NormalizeDomain(domain);
+        if (!IsValidDomainPattern(normDomain)) {
+            SS_LOG_WARN(LOG_CAT, L"Built-in pin rejected due to invalid domain.");
+            return;
+        }
+        std::vector<uint8_t> decoded;
+        if (!Utils::CryptoUtils::Base64::Decode(b64Hash, decoded) ||
+            decoded.size() != CertPinningConstants::PIN_HASH_LENGTH) {
+            SS_LOG_WARN(LOG_CAT, L"Built-in pin rejected due to invalid hash.");
+            return;
+        }
+        auto& pins = m_pinStore[normDomain];
+        if (pins.size() >= CertPinningConstants::MAX_PINS_PER_DOMAIN) {
+            SS_LOG_WARN(LOG_CAT, L"Built-in pin limit reached for domain.");
+            return;
+        }
         CertificatePin pin;
         pin.domain = normDomain;
         pin.pinHash = b64Hash;
@@ -971,7 +1087,7 @@ public:
         pin.createdAt = std::chrono::system_clock::now();
 
         // Called during init while lock is already held, or internally
-        m_pinStore[normDomain].push_back(std::move(pin));
+        pins.push_back(std::move(pin));
     }
 
     // ========================================================================
@@ -990,7 +1106,7 @@ public:
         }
 
         // Cap file size to prevent abuse
-        if (jsonText.size() > 4 * 1024 * 1024) {
+        if (jsonText.size() > MAX_PIN_DATABASE_BYTES) {
             SS_LOG_ERROR(LOG_CAT, L"Pin database file exceeds 4MB size limit.");
             return false;
         }
@@ -1024,16 +1140,27 @@ public:
             pin.expectedIssuer = entry.value("issuer", "");
             pin.createdAt = std::chrono::system_clock::now();
 
-            if (pin.domain.empty() || pin.pinHash.empty()) continue;
-
-            // Validate base64 encoding of pin hash
-            std::vector<uint8_t> decoded;
-            if (!CryptoUtils::Base64::Decode(pin.pinHash, decoded) || decoded.empty()) {
-                SS_LOG_WARN(LOG_CAT,
-                    L"Skipping pin with invalid base64 hash for domain.");
+            if (pin.domain.empty() || pin.pinHash.empty() ||
+                !IsValidDomainPattern(pin.domain) ||
+                pin.pinType != PinType::SPKI ||
+                pin.hashAlgorithm != PinHashAlgorithm::SHA256) {
                 continue;
             }
 
+            // Validate base64 encoding of pin hash
+            std::vector<uint8_t> decoded;
+            if (!CryptoUtils::Base64::Decode(pin.pinHash, decoded) ||
+                decoded.size() != CertPinningConstants::PIN_HASH_LENGTH) {
+                SS_LOG_WARN(LOG_CAT,
+                    L"Skipping pin with invalid SHA-256 pin hash for domain.");
+                continue;
+            }
+
+            if (m_pinStore.find(pin.domain) == m_pinStore.end() &&
+                m_pinStore.size() >= CertPinningConstants::MAX_PINNED_DOMAINS) {
+                SS_LOG_WARN(LOG_CAT, L"Global pinned domain limit reached while loading pins.");
+                break;
+            }
             auto& domainPins = m_pinStore[pin.domain];
             if (domainPins.size() < CertPinningConstants::MAX_PINS_PER_DOMAIN) {
                 domainPins.push_back(std::move(pin));
@@ -1100,6 +1227,10 @@ public:
             SS_LOG_ERROR(LOG_CAT, L"Failed to read CT logs file.");
             return false;
         }
+        if (jsonText.size() > MAX_CT_LOG_DATABASE_BYTES) {
+            SS_LOG_ERROR(LOG_CAT, L"CT logs file exceeds 4MB size limit.");
+            return false;
+        }
 
         Json doc;
         Utils::JSON::Error parseErr{};
@@ -1117,6 +1248,10 @@ public:
         m_trustedCTLogs.clear();
 
         for (const auto& entry : doc["logs"]) {
+            if (m_trustedCTLogs.size() >= MAX_CT_LOGS) {
+                SS_LOG_WARN(LOG_CAT, L"Trusted CT log limit reached while loading file.");
+                break;
+            }
             CTLogEntry log;
             log.logId = entry.value("log_id", "");
             log.logName = entry.value("description", "");
@@ -1168,10 +1303,12 @@ void CertificatePinning::Shutdown() {
 }
 
 bool CertificatePinning::IsInitialized() const noexcept {
+    std::shared_lock lock(m_impl->m_mutex);
     return m_impl->m_status == ModuleStatus::Running;
 }
 
 ModuleStatus CertificatePinning::GetStatus() const noexcept {
+    std::shared_lock lock(m_impl->m_mutex);
     return m_impl->m_status;
 }
 
@@ -1186,7 +1323,12 @@ bool CertificatePinning::UpdateConfiguration(const CertificatePinningConfigurati
     // Update bypass domains
     m_impl->m_bypassDomains.clear();
     for (const auto& d : config.bypassDomains) {
-        m_impl->m_bypassDomains.push_back(NormalizeDomain(d));
+        const std::string normalized = NormalizeDomain(d);
+        if (IsValidDomainPattern(normalized)) {
+            m_impl->m_bypassDomains.push_back(normalized);
+        } else {
+            SS_LOG_WARN(LOG_CAT, L"Rejected invalid bypass domain in configuration update.");
+        }
     }
 
     SS_LOG_INFO(LOG_CAT, L"Configuration updated.");
@@ -1238,6 +1380,11 @@ void CertificatePinning::AddSPKIPin(const std::string& domain,
                                       const std::string& spkiHash,
                                       bool isBackup)
 {
+    const std::string normalizedDomain = NormalizeDomain(domain);
+    if (!IsValidDomainPattern(normalizedDomain)) {
+        SS_LOG_ERROR(LOG_CAT, L"Rejected SPKI pin: invalid domain pattern.");
+        return;
+    }
     // Validate the hash is valid base64 before adding
     std::vector<uint8_t> decoded;
     if (!Utils::CryptoUtils::Base64::Decode(spkiHash, decoded) || decoded.empty()) {
@@ -1251,7 +1398,7 @@ void CertificatePinning::AddSPKIPin(const std::string& domain,
     }
 
     CertificatePin pin;
-    pin.domain = NormalizeDomain(domain);
+    pin.domain = normalizedDomain;
     pin.pinHash = spkiHash;
     pin.pinType = PinType::SPKI;
     pin.hashAlgorithm = PinHashAlgorithm::SHA256;
@@ -1319,12 +1466,17 @@ ValidationResult CertificatePinning::ValidateCertificateChain(
     result.domain = domain;
     result.validationTime = std::chrono::system_clock::now();
     auto start = Clock::now();
+    auto finalizeLocal = [&result, start]() -> ValidationResult {
+        result.validationDuration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
+        return result;
+    };
 
     if (chain.empty()) {
         result.status = CertificateStatus::ParseError;
         result.action = ValidationAction::Block;
         result.errorDetails = "Empty certificate chain";
-        return result;
+        return finalizeLocal();
     }
 
     result.certificateChain = chain;
@@ -1338,7 +1490,7 @@ ValidationResult CertificatePinning::ValidateCertificateChain(
             result.status = CertificateStatus::Expired;
             result.errorDetails = "Certificate expired: " + cert.subject;
             result.action = ValidationAction::Block;
-            return result;
+            return finalizeLocal();
         }
     }
 
@@ -1365,13 +1517,13 @@ ValidationResult CertificatePinning::ValidateCertificateChain(
             result.status = CertificateStatus::PinMismatch;
             result.action = ValidationAction::Block;
             result.errorDetails = "Pin mismatch for " + domain;
-            return result;
+            return finalizeLocal();
         }
     }
 
     result.status = CertificateStatus::Valid;
     result.action = ValidationAction::Allow;
-    return result;
+    return finalizeLocal();
 }
 
 bool CertificatePinning::CheckPinMatch(
@@ -1411,6 +1563,9 @@ CertificateStatus CertificatePinning::CheckRevocation(
 std::optional<CertificateInfo> CertificatePinning::ParseCertificate(
     std::span<const uint8_t> derData) const
 {
+    if (derData.empty() || derData.size() > CertPinningConstants::MAX_CERTIFICATE_SIZE) {
+        return std::nullopt;
+    }
     std::vector<uint8_t> data(derData.begin(), derData.end());
     return m_impl->ParseCert(data);
 }
@@ -1424,6 +1579,9 @@ std::vector<CertificateInfo> CertificatePinning::ParseCertificateChain(
 Hash256 CertificatePinning::CalculateSPKIHash(
     std::span<const uint8_t> derData) const
 {
+    if (derData.empty() || derData.size() > CertPinningConstants::MAX_CERTIFICATE_SIZE) {
+        return Hash256{};
+    }
     auto info = ParseCertificate(derData);
     if (info) return info->spkiSha256;
     return Hash256{};
@@ -1433,7 +1591,9 @@ Hash256 CertificatePinning::CalculateFingerprint(
     std::span<const uint8_t> derData) const
 {
     Hash256 fingerprint{};
-    if (derData.empty()) return fingerprint;
+    if (derData.empty() || derData.size() > CertPinningConstants::MAX_CERTIFICATE_SIZE) {
+        return fingerprint;
+    }
 
     Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
     if (hasher.Init() &&
@@ -1462,7 +1622,15 @@ bool CertificatePinning::LoadTrustedCTLogs(const std::filesystem::path& path) {
 }
 
 void CertificatePinning::AddTrustedCTLog(const CTLogEntry& log) {
+    if (log.logId.empty() || log.logOperator.empty()) {
+        SS_LOG_WARN(LOG_CAT, L"Rejected invalid CT log entry.");
+        return;
+    }
     std::unique_lock lock(m_impl->m_mutex);
+    if (m_impl->m_trustedCTLogs.size() >= MAX_CT_LOGS) {
+        SS_LOG_WARN(LOG_CAT, L"Trusted CT log limit reached.");
+        return;
+    }
     m_impl->m_trustedCTLogs.push_back(log);
     SS_LOG_DEBUG(LOG_CAT, L"Added trusted CT log: %hs", log.logName.c_str());
 }
@@ -1479,6 +1647,10 @@ std::vector<CTLogEntry> CertificatePinning::GetTrustedCTLogs() const {
 void CertificatePinning::AddBypassDomain(const std::string& domain) {
     std::unique_lock lock(m_impl->m_mutex);
     const std::string norm = NormalizeDomain(domain);
+    if (!IsValidDomainPattern(norm)) {
+        SS_LOG_WARN(LOG_CAT, L"Rejected invalid bypass domain.");
+        return;
+    }
     // Prevent duplicates
     auto it = std::find(m_impl->m_bypassDomains.begin(),
                         m_impl->m_bypassDomains.end(), norm);
@@ -1668,7 +1840,14 @@ bool CertificateInfo::IsNotYetValid() const noexcept {
 int32_t CertificateInfo::GetDaysUntilExpiry() const noexcept {
     auto diff = notAfter - std::chrono::system_clock::now();
     auto hours = std::chrono::duration_cast<std::chrono::hours>(diff).count();
-    return static_cast<int32_t>(hours / 24);
+    const auto days = hours / 24;
+    if (days > (std::numeric_limits<int32_t>::max)()) {
+        return (std::numeric_limits<int32_t>::max)();
+    }
+    if (days < (std::numeric_limits<int32_t>::min)()) {
+        return (std::numeric_limits<int32_t>::min)();
+    }
+    return static_cast<int32_t>(days);
 }
 
 bool ValidationResult::IsValid() const noexcept {
@@ -1683,25 +1862,25 @@ bool ValidationResult::IsValid() const noexcept {
 std::string CertificatePin::ToJson() const {
     std::ostringstream ss;
     // Manual JSON to avoid header dependency on nlohmann in struct methods
-    ss << "{\"domain\":\"" << domain
-       << "\",\"pinHash\":\"" << pinHash
+    ss << "{\"domain\":\"" << EscapeJsonStr(domain)
+       << "\",\"pinHash\":\"" << EscapeJsonStr(pinHash)
        << "\",\"pinType\":" << static_cast<unsigned>(pinType)
        << ",\"hashAlgorithm\":" << static_cast<unsigned>(hashAlgorithm)
        << ",\"isBackup\":" << (isBackup ? "true" : "false")
-       << ",\"source\":\"" << source
-       << "\",\"expectedIssuer\":\"" << expectedIssuer
+       << ",\"source\":\"" << EscapeJsonStr(source)
+       << "\",\"expectedIssuer\":\"" << EscapeJsonStr(expectedIssuer)
        << "\"}";
     return ss.str();
 }
 
 std::string CertificateInfo::ToJson() const {
     std::ostringstream ss;
-    ss << "{\"subject\":\"" << subject
-       << "\",\"issuer\":\"" << issuer
-       << "\",\"serialNumber\":\"" << serialNumber
-       << "\",\"keyAlgorithm\":\"" << keyAlgorithm
+    ss << "{\"subject\":\"" << EscapeJsonStr(subject)
+       << "\",\"issuer\":\"" << EscapeJsonStr(issuer)
+       << "\",\"serialNumber\":\"" << EscapeJsonStr(serialNumber)
+       << "\",\"keyAlgorithm\":\"" << EscapeJsonStr(keyAlgorithm)
        << "\",\"keySize\":" << keySize
-       << ",\"signatureAlgorithm\":\"" << signatureAlgorithm
+       << ",\"signatureAlgorithm\":\"" << EscapeJsonStr(signatureAlgorithm)
        << "\",\"isCA\":" << (isCA ? "true" : "false")
        << ",\"daysUntilExpiry\":" << GetDaysUntilExpiry()
        << ",\"fingerprint\":\"" << Utils::HashUtils::ToHexLower(sha256Fingerprint.data(), sha256Fingerprint.size())
@@ -1711,15 +1890,15 @@ std::string CertificateInfo::ToJson() const {
 
 std::string ValidationResult::ToJson() const {
     std::ostringstream ss;
-    ss << "{\"domain\":\"" << domain
+    ss << "{\"domain\":\"" << EscapeJsonStr(domain)
        << "\",\"status\":\"" << GetCertificateStatusName(status)
        << "\",\"action\":\"" << GetValidationActionName(action)
        << "\",\"isPinMatch\":" << (isPinMatch ? "true" : "false")
        << ",\"isMitMDetected\":" << (isMitMDetected ? "true" : "false")
        << ",\"isCTValid\":" << (isCTValid ? "true" : "false")
        << ",\"isRevoked\":" << (isRevoked ? "true" : "false")
-       << ",\"actualHash\":\"" << actualHash
-       << "\",\"errorDetails\":\"" << errorDetails
+       << ",\"actualHash\":\"" << EscapeJsonStr(actualHash)
+       << "\",\"errorDetails\":\"" << EscapeJsonStr(errorDetails)
        << "\",\"validationDurationMs\":" << validationDuration.count()
        << ",\"chainLength\":" << certificateChain.size()
        << "}";
