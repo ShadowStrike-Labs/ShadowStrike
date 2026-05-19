@@ -20,9 +20,13 @@
 #include <atomic>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
+#include <vector>
 
 // ── Own header ────────────────────────────────────────────────────────────────
 #include "AmsiProvider.hpp"
@@ -46,6 +50,7 @@ namespace {
 
 constexpr const wchar_t* kLogCategory   = L"AmsiProvider";
 constexpr ULONGLONG      kMaxContentSize = 64ULL * 1024 * 1024;  // 64 MiB cap
+constexpr ULONG          kAmsiReadChunkSize = 1UL * 1024 * 1024;  // 1 MiB bounded COM reads
 
 // IID for IAntimalwareProvider (from amsi.h / SDK)
 // {b2cabfe3-fe04-42b1-a5df-08d483d4d125}
@@ -53,6 +58,71 @@ static const IID IID_IAntimalwareProvider_local = {
     0xb2cabfe3, 0xfe04, 0x42b1,
     { 0xa5, 0xdf, 0x08, 0xd4, 0x83, 0xd4, 0xd1, 0x25 }
 };
+
+[[nodiscard]] bool ReadAmsiContent(IAmsiStream& stream,
+                                   ULONGLONG contentSize,
+                                   std::vector<std::uint8_t>& out) noexcept {
+    out.clear();
+
+    if (contentSize == 0) {
+        return true;
+    }
+
+    if (contentSize > kMaxContentSize ||
+        contentSize > static_cast<ULONGLONG>(std::numeric_limits<std::size_t>::max())) {
+        SS_LOG_WARN(kLogCategory,
+            L"ReadAmsiContent: content size %llu bytes exceeds bounded scan limits",
+            static_cast<unsigned long long>(contentSize));
+        return false;
+    }
+
+    try {
+        out.resize(static_cast<std::size_t>(contentSize));
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(kLogCategory,
+            L"ReadAmsiContent: unable to allocate %llu-byte AMSI scan buffer",
+            static_cast<unsigned long long>(contentSize));
+        return false;
+    }
+
+    ULONGLONG offset = 0;
+    while (offset < contentSize) {
+        const ULONGLONG remaining = contentSize - offset;
+        const ULONG request = static_cast<ULONG>(
+            (remaining < kAmsiReadChunkSize) ? remaining : kAmsiReadChunkSize);
+
+        ULONG bytesRead = 0;
+        const HRESULT hr = stream.Read(
+            offset,
+            request,
+            out.data() + static_cast<std::size_t>(offset),
+            &bytesRead);
+
+        if (FAILED(hr)) {
+            SS_LOG_WARN(kLogCategory,
+                L"ReadAmsiContent: IAmsiStream::Read failed at offset %llu hr=0x%08X",
+                static_cast<unsigned long long>(offset),
+                static_cast<unsigned>(hr));
+            out.clear();
+            return false;
+        }
+
+        if (bytesRead == 0 || bytesRead > request ||
+            bytesRead > static_cast<ULONG>(contentSize - offset)) {
+            SS_LOG_WARN(kLogCategory,
+                L"ReadAmsiContent: invalid read size %lu at offset %llu (requested %lu)",
+                bytesRead,
+                static_cast<unsigned long long>(offset),
+                request);
+            out.clear();
+            return false;
+        }
+
+        offset += bytesRead;
+    }
+
+    return true;
+}
 
 }  // namespace
 
@@ -72,6 +142,7 @@ struct AmsiProvider::Impl {
     // Detection infrastructure (initialised once in Initialize())
     std::unique_ptr<SignatureStore::SignatureStore>  sigStore;
     std::unique_ptr<ThreatIntel::ThreatIntelStore>  threatIntel;
+    mutable std::shared_mutex                        lifecycleMutex;
     bool                                            initialized{false};
 };
 
@@ -100,14 +171,42 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::QueryInterface(REFIID riid, void** ppv) 
 }
 
 ULONG STDMETHODCALLTYPE AmsiProvider::AddRef() {
-    return m_impl->refCount.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    ULONG current = m_impl->refCount.load(std::memory_order_acquire);
+    for (;;) {
+        if (current == std::numeric_limits<ULONG>::max()) {
+            SS_LOG_ERROR(kLogCategory, L"AddRef: COM reference count overflow refused");
+            return current;
+        }
+        if (m_impl->refCount.compare_exchange_weak(
+                current,
+                current + 1u,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return current + 1u;
+        }
+    }
 }
 
 ULONG STDMETHODCALLTYPE AmsiProvider::Release() {
-    const ULONG prev =
-        m_impl->refCount.fetch_sub(1u, std::memory_order_acq_rel);
-    if (prev == 1u) delete this;
-    return prev - 1u;
+    ULONG current = m_impl->refCount.load(std::memory_order_acquire);
+    for (;;) {
+        if (current == 0u) {
+            SS_LOG_ERROR(kLogCategory, L"Release: COM reference count underflow refused");
+            return 0u;
+        }
+
+        const ULONG next = current - 1u;
+        if (m_impl->refCount.compare_exchange_weak(
+                current,
+                next,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            if (next == 0u) {
+                delete this;
+            }
+            return next;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,11 +215,20 @@ ULONG STDMETHODCALLTYPE AmsiProvider::Release() {
 
 HRESULT STDMETHODCALLTYPE AmsiProvider::DisplayName(LPWSTR* displayName) {
     if (!displayName) return E_INVALIDARG;
+    *displayName = nullptr;
     const wchar_t* kName = L"ShadowStrike PhantomHome AMSI Provider";
     const size_t   kLen  = wcslen(kName) + 1u;
     *displayName = static_cast<LPWSTR>(CoTaskMemAlloc(kLen * sizeof(wchar_t)));
     if (!*displayName) return E_OUTOFMEMORY;
-    wcscpy_s(*displayName, kLen, kName);
+    const errno_t copyResult = wcscpy_s(*displayName, kLen, kName);
+    if (copyResult != 0) {
+        CoTaskMemFree(*displayName);
+        *displayName = nullptr;
+        SS_LOG_ERROR(kLogCategory,
+            L"DisplayName: wcscpy_s failed errno=%d",
+            static_cast<int>(copyResult));
+        return E_FAIL;
+    }
     return S_OK;
 }
 
@@ -148,35 +256,20 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::Scan(IAmsiStream* stream,
 
     m_impl->scans.fetch_add(1u, std::memory_order_relaxed);
 
-    // ── Read content address ──────────────────────────────────────────────────
-    PBYTE contentAddr = nullptr;
-    ULONG retData     = 0;
-    HRESULT hr = stream->GetAttribute(
-        AMSI_ATTRIBUTE_CONTENT_ADDRESS,
-        static_cast<ULONG>(sizeof(PBYTE)),
-        reinterpret_cast<PBYTE>(&contentAddr),
-        &retData);
-    if (FAILED(hr) || !contentAddr) {
-        SS_LOG_WARN(kLogCategory,
-            L"Scan: GetAttribute(CONTENT_ADDRESS) failed hr=0x%08X; "
-            L"treating content as clean",
-            static_cast<unsigned>(hr));
-        m_impl->clean.fetch_add(1u, std::memory_order_relaxed);
-        return S_OK;
-    }
-
     // ── Read content size ─────────────────────────────────────────────────────
     ULONGLONG contentSize = 0;
-    hr = stream->GetAttribute(
+    ULONG retData = 0;
+    HRESULT hr = stream->GetAttribute(
         AMSI_ATTRIBUTE_CONTENT_SIZE,
         static_cast<ULONG>(sizeof(ULONGLONG)),
         reinterpret_cast<PBYTE>(&contentSize),
         &retData);
-    if (FAILED(hr)) {
+    if (FAILED(hr) || retData != sizeof(contentSize)) {
         SS_LOG_WARN(kLogCategory,
-            L"Scan: GetAttribute(CONTENT_SIZE) failed hr=0x%08X; "
+            L"Scan: GetAttribute(CONTENT_SIZE) failed hr=0x%08X retData=%lu; "
             L"treating content as clean",
-            static_cast<unsigned>(hr));
+            static_cast<unsigned>(hr),
+            retData);
         m_impl->clean.fetch_add(1u, std::memory_order_relaxed);
         return S_OK;
     }
@@ -191,8 +284,21 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::Scan(IAmsiStream* stream,
         return S_OK;
     }
 
-    const std::span<const uint8_t> bytes(
-        contentAddr, static_cast<size_t>(contentSize));
+    std::shared_lock lifecycleLock(m_impl->lifecycleMutex);
+    if (!m_impl->initialized) {
+        SS_LOG_WARN(kLogCategory,
+            L"Scan: provider is not initialized; returning NOT_DETECTED");
+        m_impl->clean.fetch_add(1u, std::memory_order_relaxed);
+        return S_OK;
+    }
+
+    std::vector<std::uint8_t> content;
+    if (!ReadAmsiContent(*stream, contentSize, content)) {
+        m_impl->clean.fetch_add(1u, std::memory_order_relaxed);
+        return S_OK;
+    }
+
+    const std::span<const uint8_t> bytes(content.data(), content.size());
 
     // ── Compute SHA-256 ───────────────────────────────────────────────────────
     std::string sha256Hex;
@@ -329,6 +435,7 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::Scan(IAmsiStream* stream,
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool AmsiProvider::Initialize() {
+    std::unique_lock lifecycleLock(m_impl->lifecycleMutex);
     if (m_impl->initialized) return true;
 
     // SignatureStore — best-effort; provider still functions without it
@@ -353,6 +460,7 @@ bool AmsiProvider::Initialize() {
 }
 
 void AmsiProvider::Shutdown() noexcept {
+    std::unique_lock lifecycleLock(m_impl->lifecycleMutex);
     m_impl->threatIntel.reset();
     m_impl->sigStore.reset();
     m_impl->initialized = false;
