@@ -128,6 +128,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <limits>
 #include <regex>
 #include <unordered_set>
 
@@ -1122,24 +1123,50 @@ public:
                 return false;
             }
 
+            // SECURITY: ensure the HKEY is released on every exit path,
+            // including exceptions thrown from StringUtils / Logger below.
+            struct HKeyGuard {
+                HKEY h{};
+                explicit HKeyGuard(HKEY k) noexcept : h(k) {}
+                ~HKeyGuard() { if (h) ::RegCloseKey(h); }
+                HKeyGuard(const HKeyGuard&) = delete;
+                HKeyGuard& operator=(const HKeyGuard&) = delete;
+            } hKeyGuard{hKey};
+
+            const auto setStringValue = [&](LPCWSTR name, const std::wstring& value) -> bool {
+                const LONG rc = RegSetValueExW(hKey, name, 0, REG_SZ,
+                    reinterpret_cast<const BYTE*>(value.c_str()),
+                    static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+                if (rc != ERROR_SUCCESS) {
+                    Logger::Error("OutlookScanner: RegSetValueExW failed for add-in value (rc={})", rc);
+                    return false;
+                }
+                return true;
+            };
+
             // Set FriendlyName
-            std::wstring friendlyName = StringUtils::ToWide(OutlookConstants::ADDIN_NAME);
-            RegSetValueExW(hKey, L"FriendlyName", 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(friendlyName.c_str()),
-                static_cast<DWORD>((friendlyName.size() + 1) * sizeof(wchar_t)));
+            const std::wstring friendlyName = StringUtils::ToWide(OutlookConstants::ADDIN_NAME);
+            if (!setStringValue(L"FriendlyName", friendlyName)) {
+                m_addinStatus = AddinStatus::Error;
+                return false;
+            }
 
             // Set LoadBehavior = 3 (load at startup)
-            DWORD loadBehavior = 3;
-            RegSetValueExW(hKey, L"LoadBehavior", 0, REG_DWORD,
+            const DWORD loadBehavior = 3;
+            const LONG rcLoadBehavior = RegSetValueExW(hKey, L"LoadBehavior", 0, REG_DWORD,
                 reinterpret_cast<const BYTE*>(&loadBehavior), sizeof(DWORD));
+            if (rcLoadBehavior != ERROR_SUCCESS) {
+                Logger::Error("OutlookScanner: RegSetValueExW(LoadBehavior) failed (rc={})", rcLoadBehavior);
+                m_addinStatus = AddinStatus::Error;
+                return false;
+            }
 
             // Set Description
-            std::wstring description = L"ShadowStrike Email Security Scanner";
-            RegSetValueExW(hKey, L"Description", 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(description.c_str()),
-                static_cast<DWORD>((description.size() + 1) * sizeof(wchar_t)));
-
-            RegCloseKey(hKey);
+            const std::wstring description = L"ShadowStrike Email Security Scanner";
+            if (!setStringValue(L"Description", description)) {
+                m_addinStatus = AddinStatus::Error;
+                return false;
+            }
 
             m_addinStatus = AddinStatus::Ready;
 
@@ -1717,7 +1744,14 @@ public:
             }
 
             int count = countOpt.value();
-            if (attachmentIndex == 0 || static_cast<int>(attachmentIndex) > count) {
+            // SECURITY: attachmentIndex is size_t; comparing the casted-to-int
+            // form against count would wrap to negative for huge indices and
+            // silently bypass the bound check, passing a bogus value into the
+            // 1-based collection accessor. Compare in the wider domain first.
+            if (attachmentIndex == 0 ||
+                count < 0 ||
+                attachmentIndex > static_cast<size_t>(count) ||
+                attachmentIndex > static_cast<size_t>(std::numeric_limits<int>::max())) {
                 Logger::Error("ExtractAttachment: Index {} out of range (count={})", attachmentIndex, count);
                 return std::nullopt;
             }
@@ -1890,55 +1924,111 @@ public:
                 return results;
             }
 
-            // Get Items collection from the folder
-            CComPtr<IDispatch> pItems = GetDispatchObjectProperty(pFolder, DISPID_ITEMS);
-            if (!pItems) {
-                Logger::Error("ScanFolder: Could not obtain Items collection for folder: {}", folderPath);
-                return results;
-            }
+            // Walk the folder tree depth-first. Recursion was previously not
+            // implemented even when callers passed recursive=true, so child
+            // folders (e.g. nested archive folders under Inbox) were silently
+            // skipped. We bound the depth to defeat malformed/circular MAPI
+            // hierarchies that could otherwise blow the stack.
+            constexpr int kMaxFolderDepth = 16;
+            ScanFolderItemsRecursive(pFolder, recursive, /*depth=*/0,
+                                     kMaxFolderDepth, folderPath, results);
 
-            auto countOpt = GetDispatchIntProperty(pItems, DISPID_COUNT);
-            if (!countOpt.has_value() || countOpt.value() <= 0) {
-                Logger::Info("ScanFolder: Folder '{}' is empty", folderPath);
-                return results;
-            }
-
-            int itemCount = std::min(countOpt.value(), static_cast<int>(MAX_FOLDER_SCAN_ITEMS));
-            Logger::Info("ScanFolder: Scanning {} items in folder '{}'", itemCount, folderPath);
-
-            results.reserve(static_cast<size_t>(itemCount));
-
-            // Iterate items (Outlook collections are 1-based)
-            for (int i = 1; i <= itemCount; ++i) {
-                CComPtr<IDispatch> pItem = GetCollectionItem(pItems, i);
-                if (!pItem) continue;
-
-                // Verify this is a MailItem (MessageClass starts with "IPM.Note")
-                auto msgClass = GetDispatchStringProperty(pItem, DISPID_MESSAGECLASS);
-                if (!msgClass.has_value() || msgClass->find("IPM.Note") != 0) {
-                    continue; // Skip non-mail items (calendar, task, etc.)
-                }
-
-                auto mailInfo = ExtractMailItemInfo(pItem);
-                if (!mailInfo.has_value()) continue;
-
-                EmailScanResult scanResult;
-                {
-                    std::shared_lock lock(m_mutex);
-                    scanResult = ScanMailItemInternal(mailInfo.value());
-                }
-                m_stats.totalScanned++;
-                results.push_back(std::move(scanResult));
-            }
-
-            Logger::Info("ScanFolder: Completed scan of folder '{}' — {}/{} items scanned",
-                folderPath, results.size(), itemCount);
+            Logger::Info("ScanFolder: Completed scan of folder '{}' (recursive={}) — {} items collected",
+                folderPath, recursive ? "true" : "false", results.size());
 
         } catch (const std::exception& e) {
             Logger::Error("ScanFolder - Exception: {}", e.what());
         }
 
         return results;
+    }
+
+    void ScanFolderItemsRecursive(const CComPtr<IDispatch>& pFolder,
+                                  bool recursive,
+                                  int depth,
+                                  int maxDepth,
+                                  const std::string& displayPath,
+                                  std::vector<EmailScanResult>& results) {
+        if (!pFolder || depth > maxDepth) {
+            if (depth > maxDepth) {
+                Logger::Warn("ScanFolder: folder recursion depth limit ({}) hit at '{}'",
+                             maxDepth, displayPath);
+            }
+            return;
+        }
+
+        try {
+            CComPtr<IDispatch> pItems = GetDispatchObjectProperty(pFolder, DISPID_ITEMS);
+            if (pItems) {
+                auto countOpt = GetDispatchIntProperty(pItems, DISPID_COUNT);
+                if (countOpt.has_value() && countOpt.value() > 0) {
+                    // Respect MAX_FOLDER_SCAN_ITEMS *globally* across the walk
+                    // rather than per-folder so a malicious mailbox cannot
+                    // amplify cost by spreading items over many subfolders.
+                    const size_t remaining = (results.size() >= MAX_FOLDER_SCAN_ITEMS)
+                        ? 0
+                        : (MAX_FOLDER_SCAN_ITEMS - results.size());
+                    const int itemCount = std::min(
+                        countOpt.value(),
+                        static_cast<int>(std::min<size_t>(remaining,
+                            static_cast<size_t>(std::numeric_limits<int>::max()))));
+
+                    if (itemCount > 0) {
+                        results.reserve(results.size() + static_cast<size_t>(itemCount));
+
+                        for (int i = 1; i <= itemCount; ++i) {
+                            CComPtr<IDispatch> pItem = GetCollectionItem(pItems, i);
+                            if (!pItem) continue;
+
+                            auto msgClass = GetDispatchStringProperty(pItem, DISPID_MESSAGECLASS);
+                            if (!msgClass.has_value() || msgClass->find("IPM.Note") != 0) {
+                                continue; // Skip non-mail items
+                            }
+
+                            auto mailInfo = ExtractMailItemInfo(pItem);
+                            if (!mailInfo.has_value()) continue;
+
+                            EmailScanResult scanResult;
+                            {
+                                std::shared_lock lock(m_mutex);
+                                scanResult = ScanMailItemInternal(mailInfo.value());
+                            }
+                            m_stats.totalScanned++;
+                            results.push_back(std::move(scanResult));
+                        }
+                    }
+                }
+            }
+
+            if (!recursive || results.size() >= MAX_FOLDER_SCAN_ITEMS) {
+                return;
+            }
+
+            CComPtr<IDispatch> pSubfolders = GetDispatchObjectProperty(pFolder, DISPID_FOLDERS);
+            if (!pSubfolders) return;
+
+            auto subCountOpt = GetDispatchIntProperty(pSubfolders, DISPID_COUNT);
+            if (!subCountOpt.has_value() || subCountOpt.value() <= 0) return;
+
+            const int subCount = subCountOpt.value();
+            for (int i = 1; i <= subCount; ++i) {
+                if (results.size() >= MAX_FOLDER_SCAN_ITEMS) break;
+                CComPtr<IDispatch> pSubfolder = GetCollectionItem(pSubfolders, i);
+                if (!pSubfolder) continue;
+
+                std::string subDisplay = displayPath;
+                auto nameOpt = GetDispatchStringProperty(pSubfolder, DISPID_FOLDERNAME);
+                if (nameOpt.has_value() && !nameOpt->empty()) {
+                    subDisplay += '/';
+                    subDisplay += *nameOpt;
+                }
+                ScanFolderItemsRecursive(pSubfolder, recursive, depth + 1,
+                                         maxDepth, subDisplay, results);
+            }
+        } catch (const std::exception& e) {
+            Logger::Error("ScanFolder recursive walk - Exception at '{}': {}",
+                          displayPath, e.what());
+        }
     }
 
     // ========================================================================
@@ -2142,8 +2232,12 @@ public:
 
             // Save the modified mail item
             if (removedCount > 0) {
-                InvokeDispatchMethod(pMailItem, DISPID_SAVE);
-                m_stats.attachmentsStripped += removedCount;
+                if (!InvokeDispatchMethod(pMailItem, DISPID_SAVE)) {
+                    Logger::Warn("StripAttachments: DISPID_SAVE failed for entryId={}; in-memory removals "
+                                 "may not have been persisted to the store", entryId);
+                } else {
+                    m_stats.attachmentsStripped += removedCount;
+                }
             }
 
             Logger::Info("StripAttachments: Removed {}/{} attachments from entryId={}",
@@ -2697,9 +2791,18 @@ private:
                     auto subjectOpt = GetDispatchStringProperty(pMailItem, DISPID_SUBJECT);
                     std::string currentSubject = subjectOpt.value_or("");
                     std::string tagged = StringUtils::ToNarrow(wTag) + currentSubject;
-                    SetDispatchStringProperty(pMailItem, DISPID_SUBJECT,
-                        StringUtils::ToWide(tagged));
-                    InvokeDispatchMethod(pMailItem, DISPID_SAVE);
+                    if (!SetDispatchStringProperty(pMailItem, DISPID_SUBJECT,
+                                                   StringUtils::ToWide(tagged))) {
+                        Logger::Warn("ProcessMailEvent: subject tagging failed (subject={}, sender={})",
+                                     mailInfo.subject, mailInfo.senderEmail);
+                        break;
+                    }
+                    if (!InvokeDispatchMethod(pMailItem, DISPID_SAVE)) {
+                        Logger::Warn("ProcessMailEvent: DISPID_SAVE after tag failed "
+                                     "(subject={}, sender={}); modification will not persist",
+                                     mailInfo.subject, mailInfo.senderEmail);
+                        break;
+                    }
 
                     Logger::Info("ProcessMailEvent: Tagged item subject (subject={}, sender={})",
                         mailInfo.subject, mailInfo.senderEmail);
@@ -2715,7 +2818,11 @@ private:
                             pJunkFolder = m_pJunkFolder;
                         }
                         if (pJunkFolder) {
-                            MoveMailItemToFolder(pMailItem, pJunkFolder);
+                            if (!MoveMailItemToFolder(pMailItem, pJunkFolder)) {
+                                Logger::Warn("ProcessMailEvent: move to junk failed "
+                                             "(subject={}, sender={})",
+                                             mailInfo.subject, mailInfo.senderEmail);
+                            }
                         }
                     }
                     Logger::Info("ProcessMailEvent: Blocked item (subject={}, sender={})",
