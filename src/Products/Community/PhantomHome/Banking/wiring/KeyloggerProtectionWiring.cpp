@@ -119,10 +119,31 @@ struct KeyloggerProtectionRegistrar final {
                         case HomeProtectionMode::Aggressive:
                             klMode = KLMode::Aggressive;
                             break;
-                        default:
-                            break;
+                        case HomeProtectionMode::Off:
+                            SS_LOG_ERROR(kLogCategory,
+                                L"KeyloggerProtection: setMode(Off) must be routed through orchestrator disable");
+                            return false;
                     }
-                    KeyloggerProtection::Instance().SetProtectionMode(klMode);
+
+                    auto& protection = KeyloggerProtection::Instance();
+                    auto config = protection.GetConfiguration();
+                    config.protectionMode    = klMode;
+                    config.enableHookDetection      = true;
+                    config.enableAPIMonitoring      = true;
+                    config.enableClipboardProtection= true;
+                    config.enableInputEncryption    = (mode != HomeProtectionMode::Passive);
+                    config.enableScreenshotProtection = (mode != HomeProtectionMode::Passive);
+                    config.blockGlobalHooks         = (mode != HomeProtectionMode::Passive);
+                    config.terminateKeyloggers      = (mode == HomeProtectionMode::Aggressive);
+                    config.protectAllPasswordFields = true;
+                    config.autoClipboardClear       = (mode != HomeProtectionMode::Passive);
+
+                    if (!protection.UpdateConfiguration(config)) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"KeyloggerProtection: UpdateConfiguration rejected mode=%u",
+                            static_cast<unsigned>(mode));
+                        return false;
+                    }
                     return ApplyModeThresholds("KeyloggerProtection", mode);
                 },
 
@@ -133,7 +154,8 @@ struct KeyloggerProtectionRegistrar final {
                     ProtectionModeMask(HomeProtectionMode::Aggressive)
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"KeyloggerProtectionWiring: static registration failed\n");
         }
     }
 };
