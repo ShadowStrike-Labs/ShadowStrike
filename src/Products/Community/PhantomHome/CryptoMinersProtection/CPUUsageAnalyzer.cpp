@@ -282,26 +282,74 @@ bool ProcessUsesLargePages(HANDLE hProcess) {
 
 /**
  * @brief Generate a non-predictable correlation identifier for high-load events.
+ *
+ * Primary path uses CoCreateGuid for cryptographic-quality uniqueness.
+ * Fallback path produces a monotonic, process-local identifier so every event
+ * still carries a non-empty, traceable correlator even on COM failure
+ * (e.g., apartment uninitialised, OS resource exhaustion).
  */
 std::string GenerateEventId() {
     GUID guid{};
-    if (FAILED(::CoCreateGuid(&guid))) {
-        return {};
+    if (SUCCEEDED(::CoCreateGuid(&guid))) {
+        return std::format(
+            "CPU_EVENT_{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            guid.Data1,
+            guid.Data2,
+            guid.Data3,
+            guid.Data4[0],
+            guid.Data4[1],
+            guid.Data4[2],
+            guid.Data4[3],
+            guid.Data4[4],
+            guid.Data4[5],
+            guid.Data4[6],
+            guid.Data4[7]);
     }
 
-    return std::format(
-        "CPU_EVENT_{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        guid.Data1,
-        guid.Data2,
-        guid.Data3,
-        guid.Data4[0],
-        guid.Data4[1],
-        guid.Data4[2],
-        guid.Data4[3],
-        guid.Data4[4],
-        guid.Data4[5],
-        guid.Data4[6],
-        guid.Data4[7]);
+    static std::atomic<uint64_t> s_fallbackCounter{ 0 };
+    const uint64_t seq = s_fallbackCounter.fetch_add(1, std::memory_order_relaxed);
+    const auto nowTicks = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count());
+    return std::format("CPU_EVENT_FB-{:016X}-{:016X}", nowTicks, seq);
+}
+
+/**
+ * @brief Enumerate live threads and bucket them by owning PID in a single pass.
+ *
+ * Prior implementation enumerated all system threads for every tracked process
+ * within a sample tick. With MAX_TRACKED_PROCESSES tracked PIDs that path was
+ * O(threads × processes) per tick. This helper collapses it to a single
+ * O(threads) pass per tick, exposing a hash-map lookup to callers.
+ *
+ * On snapshot failure returns an empty map; callers must tolerate a missing
+ * PID (treated as zero-thread for that tick rather than failing the sample).
+ */
+[[nodiscard]] std::unordered_map<uint32_t, uint32_t> BuildThreadCountMap() {
+    std::unordered_map<uint32_t, uint32_t> counts;
+
+    ScopedHandle hThreadSnap(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+    if (!hThreadSnap) {
+        return counts;
+    }
+
+    THREADENTRY32 te32{};
+    te32.dwSize = sizeof(THREADENTRY32);
+
+    if (!Thread32First(hThreadSnap.get(), &te32)) {
+        return counts;
+    }
+
+    do {
+        if (te32.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) +
+                          sizeof(te32.th32OwnerProcessID) &&
+            te32.th32OwnerProcessID != 0) {
+            ++counts[te32.th32OwnerProcessID];
+        }
+        te32.dwSize = sizeof(THREADENTRY32);
+    } while (Thread32Next(hThreadSnap.get(), &te32));
+
+    return counts;
 }
 
 } // anonymous namespace
@@ -1011,13 +1059,23 @@ public:
                 return;
             }
 
+            // Single-pass thread enumeration per tick keeps per-sample work
+            // linear in total thread count rather than threads × processes.
+            const auto threadCounts = BuildThreadCountMap();
+
             PROCESSENTRY32W pe32;
             pe32.dwSize = sizeof(PROCESSENTRY32W);
 
             if (Process32FirstW(hSnapshot.get(), &pe32)) {
                 do {
                     if (pe32.th32ProcessID > 4) {
-                        CollectProcessSample(pe32.th32ProcessID, pe32.szExeFile, systemDeltaMs);
+                        uint32_t threadCount = 0;
+                        if (auto it = threadCounts.find(pe32.th32ProcessID);
+                            it != threadCounts.end()) {
+                            threadCount = it->second;
+                        }
+                        CollectProcessSample(pe32.th32ProcessID, pe32.szExeFile,
+                            systemDeltaMs, threadCount);
                     }
                 } while (Process32NextW(hSnapshot.get(), &pe32));
             }
@@ -1430,9 +1488,26 @@ private:
                 }
                 m_highLoadEvents.push_back(event);
 
-                // Cap dedup map to prevent unbounded growth
-                if (m_lastAlertedPids.size() < kMaxAlertedPids) {
-                    m_lastAlertedPids[event.signature.processId] = now;
+                // Bounded dedup map: evict the oldest entry when full so newly
+                // observed PIDs always receive debounce protection (prior
+                // behaviour silently dropped the insert, causing repeated
+                // callbacks for any PID that arrived after saturation).
+                const uint32_t pid = event.signature.processId;
+                if (auto it = m_lastAlertedPids.find(pid);
+                    it != m_lastAlertedPids.end()) {
+                    it->second = now;
+                } else {
+                    if (m_lastAlertedPids.size() >= kMaxAlertedPids) {
+                        auto oldest = m_lastAlertedPids.begin();
+                        for (auto cand = std::next(oldest);
+                             cand != m_lastAlertedPids.end(); ++cand) {
+                            if (cand->second < oldest->second) {
+                                oldest = cand;
+                            }
+                        }
+                        m_lastAlertedPids.erase(oldest);
+                    }
+                    m_lastAlertedPids.emplace(pid, now);
                 }
             }
 
@@ -1461,7 +1536,8 @@ private:
 
     void CollectProcessSample(uint32_t pid,
                               const std::wstring& processName,
-                              uint64_t systemDeltaMs) {
+                              uint64_t systemDeltaMs,
+                              uint32_t threadCount) {
         try {
             ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
             if (!hProcess) {
@@ -1470,6 +1546,7 @@ private:
 
             ProcessTracker::ProcessSample sample;
             sample.timestamp = std::chrono::system_clock::now();
+            sample.threadCount = threadCount;
 
             // Get CPU time
             uint64_t processStartTimeRaw = 0;
@@ -1495,26 +1572,6 @@ private:
                             100.0;
                         sample.cpuPercent = std::min(100.0, std::max(0.0, sample.cpuPercent));
                     }
-                }
-            }
-
-            // Get thread count with RAII snapshot
-            {
-                ScopedHandle hThreadSnap(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
-                if (hThreadSnap) {
-                    THREADENTRY32 te32;
-                    te32.dwSize = sizeof(THREADENTRY32);
-
-                    uint32_t threadCount = 0;
-                    if (Thread32First(hThreadSnap.get(), &te32)) {
-                        do {
-                            if (te32.th32OwnerProcessID == pid) {
-                                threadCount++;
-                            }
-                        } while (Thread32Next(hThreadSnap.get(), &te32));
-                    }
-
-                    sample.threadCount = threadCount;
                 }
             }
 
@@ -1568,19 +1625,34 @@ private:
 
     void InitializePDH() {
         if (PdhOpenQueryA(NULL, 0, &m_pdhQuery) != ERROR_SUCCESS) {
+            m_pdhQuery = NULL;
             Utils::Logger::Warn("CPUUsageAnalyzer: Failed to open PDH query");
             return;
         }
 
         // Add counter for each core
         for (uint32_t i = 0; i < m_processorCount; ++i) {
-            HCOUNTER hCounter;
+            HCOUNTER hCounter = NULL;
             std::string path = std::format("\\Processor({})\\% Processor Time", i);
 
             if (PdhAddCounterA(m_pdhQuery, path.c_str(), 0, &hCounter) == ERROR_SUCCESS) {
                 m_pdhCounters.push_back(hCounter);
             }
         }
+
+        if (m_pdhCounters.empty()) {
+            // No usable counters — release the query handle so GetPerCoreCPUUsage
+            // does not perform pointless PdhCollectQueryData calls on every tick.
+            Utils::Logger::Warn(
+                "CPUUsageAnalyzer: PDH query opened but no per-core counters could be added; "
+                "per-core telemetry disabled");
+            PdhCloseQuery(m_pdhQuery);
+            m_pdhQuery = NULL;
+            return;
+        }
+
+        Utils::Logger::Info("CPUUsageAnalyzer: PDH initialised with {} per-core counters",
+            m_pdhCounters.size());
 
         // Initial collection to prime the counters
         PdhCollectQueryData(m_pdhQuery);
