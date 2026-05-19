@@ -1206,7 +1206,13 @@ public:
 
             // Auto-register native host if enabled
             if (m_config.autoRegisterNativeHost && m_config.enableNativeMessaging) {
-                RegisterNativeHostImpl();
+                if (!RegisterNativeHostImpl()) {
+                    // Best-effort: native messaging is an optional surface.
+                    // Failure here must not block initialisation but must be
+                    // logged so operators can spot deployment gaps.
+                    Logger::Warn("ThunderbirdScanner::Impl: native host auto-registration failed; "
+                                 "native messaging will be unavailable until manually registered");
+                }
             }
 
             m_initialized.store(true, std::memory_order_release);
@@ -1793,9 +1799,19 @@ public:
                     currentHeaderKey.clear();
                     currentHeaderValue.clear();
 
-                    // Parse From_ line
-                    std::string from, date;
-                    ParseMboxFromLine(line, from, date);
+                    // Parse From_ envelope line and seed the message with
+                    // the envelope sender / delivery date. Real From: / Date:
+                    // headers, when present, will override these later; the
+                    // envelope acts as a hardened fallback for header-stripped
+                    // mbox entries.
+                    {
+                        std::string envFrom;
+                        std::string envDate;
+                        if (ParseMboxFromLine(line, envFrom, envDate)) {
+                            if (!envFrom.empty()) currentMessage.from = std::move(envFrom);
+                            if (!envDate.empty()) currentMessage.date = std::move(envDate);
+                        }
+                    }
 
                     currentOffset += lineSize;
                     continue;
