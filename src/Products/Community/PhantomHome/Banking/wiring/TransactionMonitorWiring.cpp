@@ -108,6 +108,55 @@ struct TransactionMonitorRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    auto& monitor = TransactionMonitor::Instance();
+                    auto config = monitor.GetConfiguration();
+
+                    switch (mode) {
+                        case ProtectionMode::Passive:
+                            config.enableDOMMonitoring               = true;
+                            config.enableNetworkValidation           = true;
+                            config.enableUIPayloadVerification       = true;
+                            config.enableVelocityAnalysis            = true;
+                            config.enableBeneficiaryTracking         = true;
+                            config.enableGeographicAnalysis          = true;
+                            config.blockSuspiciousTransactions       = false;
+                            config.requireNewBeneficiaryConfirmation = false;
+                            config.anomalyConfidenceThreshold        = 0.85;
+                            break;
+                        case ProtectionMode::Balanced:
+                            config.enableDOMMonitoring               = true;
+                            config.enableNetworkValidation           = true;
+                            config.enableUIPayloadVerification       = true;
+                            config.enableVelocityAnalysis            = true;
+                            config.enableBeneficiaryTracking         = true;
+                            config.enableGeographicAnalysis          = true;
+                            config.blockSuspiciousTransactions       = true;
+                            config.requireNewBeneficiaryConfirmation = true;
+                            config.anomalyConfidenceThreshold        = 0.70;
+                            break;
+                        case ProtectionMode::Aggressive:
+                            config.enableDOMMonitoring               = true;
+                            config.enableNetworkValidation           = true;
+                            config.enableUIPayloadVerification       = true;
+                            config.enableVelocityAnalysis            = true;
+                            config.enableBeneficiaryTracking         = true;
+                            config.enableGeographicAnalysis          = true;
+                            config.blockSuspiciousTransactions       = true;
+                            config.requireNewBeneficiaryConfirmation = true;
+                            config.anomalyConfidenceThreshold        = 0.55;
+                            break;
+                        case ProtectionMode::Off:
+                            SS_LOG_ERROR(kLogCategory,
+                                L"TransactionMonitor: setMode(Off) must be routed through orchestrator disable");
+                            return false;
+                    }
+
+                    if (!monitor.UpdateConfiguration(config)) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"TransactionMonitor: UpdateConfiguration rejected mode=%u",
+                            static_cast<unsigned>(mode));
+                        return false;
+                    }
                     return ApplyModeThresholds("TransactionMonitor", mode);
                 },
 
@@ -118,7 +167,8 @@ struct TransactionMonitorRegistrar final {
                     ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"TransactionMonitorWiring: static registration failed\n");
         }
     }
 };
