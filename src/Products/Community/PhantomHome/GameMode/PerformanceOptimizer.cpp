@@ -1336,6 +1336,10 @@ void PerformanceOptimizer::Shutdown() {
     try {
         // Step 1: Signal monitoring thread to stop (no lock needed; atomic)
         m_impl->m_monitoringActive.store(false, std::memory_order_release);
+        // Wake the monitoring thread immediately. Without this notify the
+        // thread would sleep on m_monitoringStopCv up to m_monitoringIntervalMs
+        // (clamped to 60s) before observing the stop request, stalling Shutdown.
+        m_impl->m_monitoringStopCv.notify_all();
 
         // Step 2: Join monitoring thread outside of m_mutex to avoid
         // deadlock with the monitoring thread's own lock acquisitions
