@@ -43,6 +43,7 @@
 #include <thread>
 #include <deque>
 #include <cmath>
+#include <limits>
 
 // Windows networking — required for GetExtendedTcpTable / MIB_TCPTABLE_OWNER_PID
 #include <iphlpapi.h>
@@ -69,6 +70,7 @@ constexpr size_t MIN_NOP_SLED_LENGTH = 16;
 
 /// Memory read chunk size for scanning
 constexpr SIZE_T MEM_SCAN_CHUNK = 4096;
+constexpr DWORD MAX_TCP_TABLE_BYTES = 32U * 1024U * 1024U;
 
 template <typename T>
 [[nodiscard]] T AtomicValueLoadRelaxed(const T& value) noexcept {
@@ -168,6 +170,20 @@ constexpr const wchar_t* PERSISTENCE_RUN_KEYS[] = {
     std::ostringstream oss;
     oss << "BTD-" << std::hex << std::uppercase << ticks << "-" << pid;
     return oss.str();
+}
+
+[[nodiscard]] bool AdvanceRegionAddress(uint8_t*& address, const MEMORY_BASIC_INFORMATION& mbi) noexcept {
+    const auto base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    if (mbi.RegionSize == 0 ||
+        mbi.RegionSize > (std::numeric_limits<uintptr_t>::max)() - base) {
+        return false;
+    }
+    const auto next = base + mbi.RegionSize;
+    if (next <= reinterpret_cast<uintptr_t>(address)) {
+        return false;
+    }
+    address = reinterpret_cast<uint8_t*>(next);
+    return true;
 }
 
 } // anonymous namespace
@@ -550,7 +566,7 @@ public:
     }
 
     void Shutdown() noexcept {
-        Stop();
+        (void)Stop();
 
         std::unique_lock lock(m_mutex);
         if (!m_initialized.load(std::memory_order_relaxed)) return;
@@ -601,7 +617,15 @@ public:
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
         if (m_config.enableRealTimeProtection) {
-            m_scanThread = std::thread(&BankingTrojanDetectorImpl::ScanningLoop, this);
+            try {
+                m_scanThread = std::thread(&BankingTrojanDetectorImpl::ScanningLoop, this);
+            } catch (const std::exception& ex) {
+                m_running.store(false, std::memory_order_release);
+                m_status.store(ModuleStatus::Error, std::memory_order_release);
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to start scanning thread: %hs", ex.what());
+                return false;
+            }
         }
 
         return true;
@@ -913,16 +937,21 @@ public:
             return {};
         }
 
-        const auto canonicalTarget = std::filesystem::weakly_canonical(path);
+        std::error_code pathEc;
+        const auto canonicalTarget = std::filesystem::weakly_canonical(path, pathEc);
+        if (pathEc) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"AnalyzeProcessByPath rejected non-canonical path: %ls (%hs)",
+                path.c_str(), pathEc.message().c_str());
+            return {};
+        }
         for (const auto pid : pids) {
             auto procPath = Utils::ProcessUtils::GetProcessPath(pid);
             if (procPath.has_value()) {
-                try {
-                    if (std::filesystem::weakly_canonical(procPath.value()) == canonicalTarget) {
-                        return AnalyzeProcess(pid);
-                    }
-                } catch (...) {
-                    // Path canonicalization may fail for inaccessible processes
+                std::error_code procEc;
+                if (std::filesystem::weakly_canonical(procPath.value(), procEc) == canonicalTarget &&
+                    !procEc) {
+                    return AnalyzeProcess(pid);
                 }
             }
         }
@@ -1063,9 +1092,7 @@ public:
             }
 
             // Advance to next region, guarding against wraparound
-            const auto nextAddr = reinterpret_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-            if (nextAddr <= address) break;
-            address = nextAddr;
+            if (!AdvanceRegionAddress(address, mbi)) break;
             ++regionsScanned;
         }
 
@@ -1192,16 +1219,10 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Hook restoration requested for %hs in PID %u — requires elevated PROCESS_VM_WRITE",
                      hook.functionName.c_str(), processId);
 
-        // Write original prologue bytes back
-        // This requires PROCESS_VM_WRITE | PROCESS_VM_OPERATION access
-        // which needs SeDebugPrivilege for protected processes
-        return Utils::ProcessUtils::WriteProcessMemory(
-            static_cast<Utils::ProcessUtils::ProcessId>(processId),
-            reinterpret_cast<void*>(hook.originalAddress),
-            nullptr, 0, nullptr);
-        // Note: full restoration requires reading the on-disk image to get
-        // original bytes, which is handled by the caller or a higher-level
-        // remediation workflow.
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Hook restore is refused without verified original prologue bytes for %hs in PID %u (module base=%p)",
+            hook.functionName.c_str(), processId, moduleBase.value());
+        return false;
     }
 
     // ========================================================================
@@ -1277,9 +1298,7 @@ public:
                 }
             }
 
-            const auto nextAddr = reinterpret_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-            if (nextAddr <= addr) break;
-            addr = nextAddr;
+            if (!AdvanceRegionAddress(addr, mbi)) break;
             ++regionsScanned;
         }
 
@@ -1303,17 +1322,41 @@ public:
 
         // Use GetExtendedTcpTable to get per-process TCP connections
         DWORD tableSize = 0;
-        ::GetExtendedTcpTable(nullptr, &tableSize, FALSE, AF_INET,
-                              TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
-        if (tableSize == 0) return results;
+        DWORD status = ::GetExtendedTcpTable(nullptr, &tableSize, FALSE, AF_INET,
+                                             TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+        if (status != ERROR_INSUFFICIENT_BUFFER || tableSize == 0 ||
+            tableSize > MAX_TCP_TABLE_BYTES) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"GetExtendedTcpTable size query rejected: status=%lu bytes=%lu",
+                status, tableSize);
+            return results;
+        }
 
         std::vector<uint8_t> tableBuffer(tableSize);
-        if (::GetExtendedTcpTable(tableBuffer.data(), &tableSize, FALSE, AF_INET,
-                                  TCP_TABLE_OWNER_PID_CONNECTIONS, 0) != NO_ERROR) {
+        status = ::GetExtendedTcpTable(tableBuffer.data(), &tableSize, FALSE, AF_INET,
+                                       TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+        if (status == ERROR_INSUFFICIENT_BUFFER && tableSize > 0 &&
+            tableSize <= MAX_TCP_TABLE_BYTES) {
+            tableBuffer.resize(tableSize);
+            status = ::GetExtendedTcpTable(tableBuffer.data(), &tableSize, FALSE, AF_INET,
+                                           TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+        }
+        if (status != NO_ERROR || tableSize < sizeof(DWORD)) {
             return results;
         }
 
         const auto* tcpTable = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(tableBuffer.data());
+        const size_t maxRowsBySize =
+            (tableSize >= offsetof(MIB_TCPTABLE_OWNER_PID, table))
+                ? ((tableSize - offsetof(MIB_TCPTABLE_OWNER_PID, table)) /
+                   sizeof(MIB_TCPROW_OWNER_PID))
+                : 0;
+        if (tcpTable->dwNumEntries > maxRowsBySize) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"TCP table row count exceeds buffer bounds: rows=%lu max=%zu",
+                tcpTable->dwNumEntries, maxRowsBySize);
+            return results;
+        }
         auto& tiMgr = ThreatIntel::ThreatIntelManager::Instance();
 
         for (DWORD i = 0; i < tcpTable->dwNumEntries && results.size() < BankingTrojanConstants::MAX_C2_SERVERS; ++i) {
@@ -1471,9 +1514,7 @@ public:
                 }
             }
 
-            const auto nextAddr = reinterpret_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-            if (nextAddr <= addr) break;
-            addr = nextAddr;
+            if (!AdvanceRegionAddress(addr, mbi)) break;
             ++scanned;
         }
 
@@ -1503,8 +1544,12 @@ public:
                 static_cast<Utils::ProcessUtils::ProcessId>(processId), 1, &err)) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to terminate PID %u during quarantine", processId);
             // Attempt resume if terminate failed so we don't leave it suspended
-            Utils::ProcessUtils::ResumeProcess(
-                static_cast<Utils::ProcessUtils::ProcessId>(processId));
+            if (!Utils::ProcessUtils::ResumeProcess(
+                    static_cast<Utils::ProcessUtils::ProcessId>(processId), &err)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to resume PID %u after quarantine termination failure: %hs",
+                    processId, err.message.c_str());
+            }
             return false;
         }
 
@@ -1745,7 +1790,7 @@ public:
                         if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) break;
 
                         if (IsBrowserProcess(proc.name)) {
-                            AnalyzeProcess(proc.pid);
+                            (void)AnalyzeProcess(proc.pid);
                         }
                     }
                 }
@@ -1890,6 +1935,8 @@ private:
             try { cb(result); }
             catch (const std::exception& ex) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Detection callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Detection callback threw unknown exception");
             }
         }
     }
@@ -1903,7 +1950,11 @@ private:
         }
         if (cb) {
             try { cb(msg, code); }
-            catch (...) { /* swallow — cannot let error callback crash */ }
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Error callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Error callback threw unknown exception");
+            }
         }
     }
 
