@@ -147,8 +147,11 @@ struct UniqueHandle {
 }
 
 [[nodiscard]] std::string ToLowerUtf8(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
+    // ASCII-only fold. UTF-8 continuation bytes (>= 0x80) MUST pass through
+    // unchanged so multi-byte sequences are not corrupted; case-folding of
+    // upstream wide strings is already done via ToLowerWide.
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) -> char {
+        return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + ('a' - 'A')) : static_cast<char>(ch);
     });
     return value;
 }
@@ -531,10 +534,10 @@ struct ProcessRecord {
         return false;
     }
 
-    std::array<uint8_t, kReadChunkSize> buffer{};
+    auto buffer = std::make_unique<std::array<uint8_t, kReadChunkSize>>();
     DWORD bytesRead = 0;
-    while (::ReadFile(fileHandle.Get(), buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr) && bytesRead > 0) {
-        if (!hasher.Update(buffer.data(), bytesRead)) {
+    while (::ReadFile(fileHandle.Get(), buffer->data(), static_cast<DWORD>(buffer->size()), &bytesRead, nullptr) && bytesRead > 0) {
+        if (!hasher.Update(buffer->data(), bytesRead)) {
             return false;
         }
     }
@@ -579,8 +582,36 @@ struct SignatureResult {
     LONG status = ::WinVerifyTrust(nullptr, &policyGuid, &trustData);
     result.isSigned = (status == ERROR_SUCCESS);
 
+    // Catalog signature fallback — many legitimate binaries are catalog-signed,
+    // not embedded-signed. Skipping this generates false positives on system images.
+    if (!result.isSigned) {
+        HANDLE hCatFile = ::CreateFileW(filePath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (hCatFile != INVALID_HANDLE_VALUE) {
+            UniqueHandle catFile(hCatFile);
+            HCATADMIN hCatAdmin = nullptr;
+            if (::CryptCATAdminAcquireContext2(&hCatAdmin, nullptr, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
+                DWORD hashSize = 0;
+                if (::CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, catFile.Get(), &hashSize, nullptr, 0) &&
+                    hashSize > 0 && hashSize <= 64) {
+                    std::vector<BYTE> hashBytes(hashSize);
+                    if (::CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, catFile.Get(), &hashSize, hashBytes.data(), 0)) {
+                        HCATINFO hCatInfo = ::CryptCATAdminEnumCatalogFromHash(
+                            hCatAdmin, hashBytes.data(), hashSize, 0, nullptr);
+                        if (hCatInfo) {
+                            result.isSigned = true;
+                            ::CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+                        }
+                    }
+                }
+                ::CryptCATAdminReleaseContext(hCatAdmin, 0);
+            }
+        }
+    }
+
     // Extract signer name from the trust provider state
-    if (result.isSigned) {
+    if (status == ERROR_SUCCESS) {
         CRYPT_PROVIDER_DATA* provData = ::WTHelperProvDataFromStateData(trustData.hWVTStateData);
         if (provData) {
             CRYPT_PROVIDER_SGNR* signer = ::WTHelperGetProvSignerFromChain(provData, 0, FALSE, 0);
@@ -667,10 +698,11 @@ struct SignatureResult {
     }
 
     file.seekg(0, std::ios::end);
-    const auto size = static_cast<size_t>(file.tellg());
-    if (size == 0) {
+    const auto rawSize = file.tellg();
+    if (!file || rawSize <= std::ifstream::pos_type(0)) {
         return matches;
     }
+    const auto size = static_cast<size_t>(static_cast<std::streamoff>(rawSize));
 
     const auto boundedSize = std::min(size, kMaxSignatureScanBytes);
     std::string buffer(boundedSize, '\0');
@@ -882,10 +914,10 @@ public:
     bool m_initializedGpu{false};
     bool m_initializedBrowser{false};
     bool m_initializedPool{false};
-    bool m_startedCpu{false};
-    bool m_startedGpu{false};
-    bool m_startedBrowser{false};
-    bool m_startedPool{false};
+    std::atomic<bool> m_startedCpu{false};
+    std::atomic<bool> m_startedGpu{false};
+    std::atomic<bool> m_startedBrowser{false};
+    std::atomic<bool> m_startedPool{false};
 
     uint32_t m_healthCheckFailures{0};
     static constexpr uint32_t kMaxHealthFailuresBeforeRestart = 3;
@@ -1039,19 +1071,30 @@ void CryptoMinerDetectorImpl::Shutdown() {
     (void)Stop();
 
     std::unique_lock lock(m_stateMutex);
-    if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
-        m_status.store(ModuleStatus::Uninitialized, std::memory_order_release);
-        return;
-    }
-
+    const bool wasInitialized = m_initialized.exchange(false, std::memory_order_acq_rel);
     lock.unlock();
 
+    // Always drain in-flight operations, even on a redundant Shutdown — a
+    // caller may have observed initialized==true and entered ActiveOperation
+    // before another thread cleared the flag.
     {
         std::unique_lock operationsLock(m_operationMutex);
         m_operationCv.wait(operationsLock, [this]() {
             return m_activeOperations.load(std::memory_order_acquire) == 0;
         });
     }
+
+    if (!wasInitialized) {
+        m_status.store(ModuleStatus::Uninitialized, std::memory_order_release);
+        return;
+    }
+
+    // Unregister our callbacks first so in-flight sub-detector worker threads
+    // cannot re-enter this impl after we begin tearing down sub-detector state.
+    if (m_poolDetector)    { m_poolDetector->UnregisterCallbacks(); }
+    if (m_browserDetector) { m_browserDetector->UnregisterCallbacks(); }
+    if (m_gpuDetector)     { m_gpuDetector->UnregisterCallbacks(); }
+    if (m_cpuDetector)     { m_cpuDetector->UnregisterCallbacks(); }
 
     if (m_initializedPool && m_poolDetector) {
         m_poolDetector->Shutdown();
@@ -1075,10 +1118,10 @@ void CryptoMinerDetectorImpl::Shutdown() {
     m_initializedGpu = false;
     m_initializedBrowser = false;
     m_initializedPool = false;
-    m_startedCpu = false;
-    m_startedGpu = false;
-    m_startedBrowser = false;
-    m_startedPool = false;
+    m_startedCpu.store(false, std::memory_order_release);
+    m_startedGpu.store(false, std::memory_order_release);
+    m_startedBrowser.store(false, std::memory_order_release);
+    m_startedPool.store(false, std::memory_order_release);
     m_healthCheckFailures = 0;
     {
         std::unique_lock detLock(m_detectionsMutex);
@@ -1113,6 +1156,13 @@ void CryptoMinerDetectorImpl::Shutdown() {
 // ============================================================================
 
 void CryptoMinerDetectorImpl::WireSubDetectorCallbacks() {
+    // Clear any prior registrations to prevent duplicate fan-out across
+    // Initialize/Shutdown cycles (sub-detector singletons retain callbacks).
+    if (m_cpuDetector)     { m_cpuDetector->UnregisterCallbacks(); }
+    if (m_gpuDetector)     { m_gpuDetector->UnregisterCallbacks(); }
+    if (m_poolDetector)    { m_poolDetector->UnregisterCallbacks(); }
+    if (m_browserDetector) { m_browserDetector->UnregisterCallbacks(); }
+
     if (m_cpuDetector) {
         m_cpuDetector->RegisterHighLoadCallback(
             [this](const HighLoadEvent& event) { OnCPUHighLoad(event); });
@@ -1314,7 +1364,7 @@ bool CryptoMinerDetectorImpl::Start() {
 
     if (m_cpuDetector) {
         if (m_cpuDetector->Start()) {
-            m_startedCpu = true;
+            m_startedCpu.store(true, std::memory_order_release);
             ++startedCount;
         } else {
             Utils::Logger::Warn("CryptoMinerDetector: CPUUsageAnalyzer failed to start — degrading");
@@ -1324,7 +1374,7 @@ bool CryptoMinerDetectorImpl::Start() {
 
     if (m_gpuDetector) {
         if (m_gpuDetector->Start()) {
-            m_startedGpu = true;
+            m_startedGpu.store(true, std::memory_order_release);
             ++startedCount;
         } else {
             Utils::Logger::Warn("CryptoMinerDetector: GPUMiningDetector failed to start — degrading");
@@ -1334,7 +1384,7 @@ bool CryptoMinerDetectorImpl::Start() {
 
     if (m_poolDetector) {
         if (m_poolDetector->Start()) {
-            m_startedPool = true;
+            m_startedPool.store(true, std::memory_order_release);
             ++startedCount;
         } else {
             Utils::Logger::Warn("CryptoMinerDetector: PoolConnectionDetector failed to start — degrading");
@@ -1343,7 +1393,7 @@ bool CryptoMinerDetectorImpl::Start() {
     }
 
     // BrowserMinerDetector is scan-on-demand (no Start/Stop API)
-    m_startedBrowser = m_browserDetector != nullptr;
+    m_startedBrowser.store(m_browserDetector != nullptr, std::memory_order_release);
 
     if (startedCount == 0 && failedCount > 0) {
         InvokeErrorCallbacks("all sub-detectors failed to start", ERROR_GEN_FAILURE);
@@ -1380,19 +1430,19 @@ bool CryptoMinerDetectorImpl::Stop() {
         m_monitorThread.join();
     }
 
-    if (m_startedPool && m_poolDetector) {
+    if (m_startedPool.load(std::memory_order_acquire) && m_poolDetector) {
         (void)m_poolDetector->Stop();
     }
-    if (m_startedGpu && m_gpuDetector) {
+    if (m_startedGpu.load(std::memory_order_acquire) && m_gpuDetector) {
         (void)m_gpuDetector->Stop();
     }
-    if (m_startedCpu && m_cpuDetector) {
+    if (m_startedCpu.load(std::memory_order_acquire) && m_cpuDetector) {
         (void)m_cpuDetector->Stop();
     }
 
-    m_startedCpu = false;
-    m_startedGpu = false;
-    m_startedPool = false;
+    m_startedCpu.store(false, std::memory_order_release);
+    m_startedGpu.store(false, std::memory_order_release);
+    m_startedPool.store(false, std::memory_order_release);
     m_status.store(m_initialized.load(std::memory_order_acquire) ? ModuleStatus::Stopped : ModuleStatus::Uninitialized,
         std::memory_order_release);
     return true;
@@ -1690,7 +1740,12 @@ bool CryptoMinerDetectorImpl::DetectGPUMining(uint32_t processId, MinerDetection
             result.algorithm = MapGpuAlgorithm(gpuProcess.suspectedAlgorithm);
             result.minerName = result.minerFamily != MinerFamily::Unknown ? std::string(GetMinerFamilyName(result.minerFamily)) : "GPU Miner";
 
-            if (gpuProcess.isSuspectedMiner || gpuProcess.isComputeIntensive || gpuProcess.gpuUtilization >= m_config.gpuUsageThreshold) {
+            double gpuThresholdSnap = 0.0;
+            {
+                std::shared_lock cfgLock(m_stateMutex);
+                gpuThresholdSnap = m_config.gpuUsageThreshold;
+            }
+            if (gpuProcess.isSuspectedMiner || gpuProcess.isComputeIntensive || gpuProcess.gpuUtilization >= gpuThresholdSnap) {
                 detected = true;
             }
         }
@@ -1859,7 +1914,12 @@ bool CryptoMinerDetectorImpl::DetectBehavioralMining(uint32_t processId, MinerDe
         }
     }
 
-    if (result.resourceStats.cpuUsagePercent >= m_config.cpuUsageThreshold) {
+    double cpuThresholdSnap = 0.0;
+    {
+        std::shared_lock cfgLock(m_stateMutex);
+        cpuThresholdSnap = m_config.cpuUsageThreshold;
+    }
+    if (result.resourceStats.cpuUsagePercent >= cpuThresholdSnap) {
         score += 20;
     }
     if (!result.poolAddresses.empty()) {
@@ -2213,7 +2273,14 @@ std::vector<BrowserMinerInfo> CryptoMinerDetectorImpl::ScanBrowsersInternal() co
 
 void CryptoMinerDetectorImpl::AnalyzeSystemResourcesInternal() {
     const auto stats = GetResourceUsageInternal();
-    if (stats.cpuUsagePercent >= m_config.cpuUsageThreshold || stats.gpuUsagePercent >= m_config.gpuUsageThreshold) {
+    double cpuThresh = 0.0;
+    double gpuThresh = 0.0;
+    {
+        std::shared_lock cfgLock(m_stateMutex);
+        cpuThresh = m_config.cpuUsageThreshold;
+        gpuThresh = m_config.gpuUsageThreshold;
+    }
+    if (stats.cpuUsagePercent >= cpuThresh || stats.gpuUsagePercent >= gpuThresh) {
         PublishResourceAnomaly(stats);
     }
 }
@@ -2409,7 +2476,7 @@ bool CryptoMinerDetectorImpl::LoadPoolBlacklistInternal(const std::filesystem::p
     if (m_poolDetector) {
         (void)m_poolDetector->LoadPoolBlacklist(path);
     }
-    return true;
+    return entriesLoaded > 0;
 }
 
 void CryptoMinerDetectorImpl::AddPoolToBlacklistInternal(const MiningPoolInfo& poolInfo) {
@@ -2449,7 +2516,7 @@ bool CryptoMinerDetectorImpl::BlockPoolConnectionInternal(const std::string& poo
     info.name = normalized;
     info.isMalicious = true;
     AddPoolToBlacklistInternal(info);
-    return blocked || !normalized.empty();
+    return blocked;
 }
 
 bool CryptoMinerDetectorImpl::TerminateMinerInternal(uint32_t processId) const {
@@ -2656,13 +2723,34 @@ MiningAlgorithm CryptoMinerDetectorImpl::DetectAlgorithm(const std::wstring& com
 
 Cryptocurrency CryptoMinerDetectorImpl::DetectCryptocurrency(const std::wstring& commandLine) const {
     const auto lower = ToLowerUtf8(WideToUtf8(ToLowerWide(commandLine)));
-    if (lower.find("xmr") != std::string::npos || lower.find("monero") != std::string::npos) return Cryptocurrency::Monero;
-    if (lower.find("eth") != std::string::npos || lower.find("ethereum") != std::string::npos) return Cryptocurrency::Ethereum;
-    if (lower.find("etc") != std::string::npos || lower.find("ethereumclassic") != std::string::npos) return Cryptocurrency::EthClassic;
-    if (lower.find("btc") != std::string::npos || lower.find("bitcoin") != std::string::npos) return Cryptocurrency::Bitcoin;
-    if (lower.find("ltc") != std::string::npos || lower.find("litecoin") != std::string::npos) return Cryptocurrency::Litecoin;
-    if (lower.find("rvn") != std::string::npos || lower.find("ravencoin") != std::string::npos) return Cryptocurrency::Ravencoin;
-    if (lower.find("zec") != std::string::npos || lower.find("zcash") != std::string::npos) return Cryptocurrency::Zcash;
+    // Token-boundary matches to avoid false positives on substrings like
+    // "Bluetooth" → Ethereum or "methods" → Ethereum. Match a token when it
+    // appears as a standalone word, flag value, or explicit currency name.
+    auto containsToken = [&](std::string_view longForm, std::string_view shortToken) -> bool {
+        if (lower.find(longForm) != std::string::npos) {
+            return true;
+        }
+        constexpr std::string_view kSeparators = " =:/-,";
+        size_t pos = 0;
+        while ((pos = lower.find(shortToken, pos)) != std::string::npos) {
+            const bool leftOk  = (pos == 0) || kSeparators.find(lower[pos - 1]) != std::string_view::npos;
+            const size_t end   = pos + shortToken.size();
+            const bool rightOk = (end == lower.size()) || kSeparators.find(lower[end]) != std::string_view::npos;
+            if (leftOk && rightOk) {
+                return true;
+            }
+            pos = end;
+        }
+        return false;
+    };
+
+    if (containsToken("monero", "xmr")) return Cryptocurrency::Monero;
+    if (containsToken("ethereum", "eth")) return Cryptocurrency::Ethereum;
+    if (containsToken("ethereumclassic", "etc")) return Cryptocurrency::EthClassic;
+    if (containsToken("bitcoin", "btc")) return Cryptocurrency::Bitcoin;
+    if (containsToken("litecoin", "ltc")) return Cryptocurrency::Litecoin;
+    if (containsToken("ravencoin", "rvn")) return Cryptocurrency::Ravencoin;
+    if (containsToken("zcash", "zec")) return Cryptocurrency::Zcash;
     if (lower.find("ergo") != std::string::npos) return Cryptocurrency::Ergo;
     return Cryptocurrency::Unknown;
 }
@@ -2714,26 +2802,29 @@ void CryptoMinerDetectorImpl::MonitorLoop() {
         // Periodic sub-detector health check
         if (Clock::now() >= nextHealthCheck) {
             bool anyFailed = false;
-            if (m_startedCpu && m_cpuDetector &&
+            if (m_startedCpu.load(std::memory_order_acquire) && m_cpuDetector &&
                 m_cpuDetector->GetStatus() == ModuleStatus::Error) {
                 Utils::Logger::Warn("CryptoMinerDetector: CPUUsageAnalyzer health check failed — restarting");
                 (void)m_cpuDetector->Stop();
-                m_startedCpu = m_cpuDetector->Start();
-                anyFailed = !m_startedCpu;
+                const bool restarted = m_cpuDetector->Start();
+                m_startedCpu.store(restarted, std::memory_order_release);
+                anyFailed = !restarted;
             }
-            if (m_startedGpu && m_gpuDetector &&
+            if (m_startedGpu.load(std::memory_order_acquire) && m_gpuDetector &&
                 m_gpuDetector->GetStatus() == ModuleStatus::Error) {
                 Utils::Logger::Warn("CryptoMinerDetector: GPUMiningDetector health check failed — restarting");
                 (void)m_gpuDetector->Stop();
-                m_startedGpu = m_gpuDetector->Start();
-                anyFailed = anyFailed || !m_startedGpu;
+                const bool restarted = m_gpuDetector->Start();
+                m_startedGpu.store(restarted, std::memory_order_release);
+                anyFailed = anyFailed || !restarted;
             }
-            if (m_startedPool && m_poolDetector &&
+            if (m_startedPool.load(std::memory_order_acquire) && m_poolDetector &&
                 m_poolDetector->GetStatus() == ModuleStatus::Error) {
                 Utils::Logger::Warn("CryptoMinerDetector: PoolConnectionDetector health check failed — restarting");
                 (void)m_poolDetector->Stop();
-                m_startedPool = m_poolDetector->Start();
-                anyFailed = anyFailed || !m_startedPool;
+                const bool restarted = m_poolDetector->Start();
+                m_startedPool.store(restarted, std::memory_order_release);
+                anyFailed = anyFailed || !restarted;
             }
 
             if (anyFailed) {
@@ -2836,22 +2927,38 @@ bool CryptoMinerDetector::UpdateConfiguration(const CryptoMinerDetectorConfigura
         return false;
     }
 
-    std::unique_lock lock(m_impl->m_stateMutex);
-    const auto oldBlacklistPath = m_impl->m_config.poolBlacklistPath;
-    m_impl->m_config = config;
+    // Snapshot sub-detector pointers and update our own state under the lock,
+    // then release the lock BEFORE calling into sub-detectors so a sub-detector
+    // callback that re-enters ActiveOperation cannot self-deadlock against
+    // m_stateMutex (unique held → shared re-take is UB on std::shared_mutex).
+    std::wstring oldBlacklistPath;
+    CPUUsageAnalyzer*       cpuDet  = nullptr;
+    GPUMiningDetector*      gpuDet  = nullptr;
+    BrowserMinerDetector*   brwDet  = nullptr;
+    PoolConnectionDetector* poolDet = nullptr;
     {
-        std::unique_lock wlLock(m_impl->m_whitelistMutex);
-        m_impl->m_whitelistedProcessNames.clear();
-        m_impl->m_whitelistedPools.clear();
-        for (const auto& name : config.whitelistedApplications) {
-            m_impl->m_whitelistedProcessNames.insert(ToLowerWide(name));
-        }
-        for (const auto& pool : config.whitelistedPools) {
-            m_impl->m_whitelistedPools.insert(TrimAndNormalizeHost(pool));
+        std::unique_lock lock(m_impl->m_stateMutex);
+        oldBlacklistPath = m_impl->m_config.poolBlacklistPath;
+        m_impl->m_config = config;
+        cpuDet  = m_impl->m_cpuDetector;
+        gpuDet  = m_impl->m_gpuDetector;
+        brwDet  = m_impl->m_browserDetector;
+        poolDet = m_impl->m_poolDetector;
+        {
+            std::unique_lock wlLock(m_impl->m_whitelistMutex);
+            m_impl->m_whitelistedProcessNames.clear();
+            m_impl->m_whitelistedPools.clear();
+            for (const auto& name : config.whitelistedApplications) {
+                m_impl->m_whitelistedProcessNames.insert(ToLowerWide(name));
+            }
+            for (const auto& pool : config.whitelistedPools) {
+                m_impl->m_whitelistedPools.insert(TrimAndNormalizeHost(pool));
+            }
         }
     }
 
-    // Reload pool blacklist if path changed
+    // Reload pool blacklist if path changed (no stateMutex held here so
+    // sub-detector callbacks cannot deadlock against our own helpers).
     if (config.poolBlacklistPath != oldBlacklistPath) {
         {
             std::unique_lock poolLock(m_impl->m_poolMutex);
@@ -2863,26 +2970,26 @@ bool CryptoMinerDetector::UpdateConfiguration(const CryptoMinerDetectorConfigura
         }
     }
 
-    if (m_impl->m_cpuDetector) {
+    if (cpuDet) {
         CPUUsageAnalyzerConfiguration cpuConfig{};
         cpuConfig.highUsageThreshold = config.cpuUsageThreshold;
         cpuConfig.miningThreshold = std::max(0.0, std::min(config.cpuUsageThreshold, 100.0));
         cpuConfig.observationWindowSecs = config.sustainedUsageTriggerSecs;
         cpuConfig.verboseLogging = config.verboseLogging;
-        if (!m_impl->m_cpuDetector->UpdateConfiguration(cpuConfig)) {
+        if (!cpuDet->UpdateConfiguration(cpuConfig)) {
             Utils::Logger::Warn("CryptoMinerDetector: CPUUsageAnalyzer config update failed");
         }
     }
-    if (m_impl->m_gpuDetector) {
+    if (gpuDet) {
         GPUMiningDetectorConfiguration gpuConfig{};
         gpuConfig.gpuLoadThreshold = config.gpuUsageThreshold;
         gpuConfig.verboseLogging = config.verboseLogging;
         gpuConfig.whitelistedApplications = config.whitelistedApplications;
-        if (!m_impl->m_gpuDetector->UpdateConfiguration(gpuConfig)) {
+        if (!gpuDet->UpdateConfiguration(gpuConfig)) {
             Utils::Logger::Warn("CryptoMinerDetector: GPUMiningDetector config update failed");
         }
     }
-    if (m_impl->m_browserDetector) {
+    if (brwDet) {
         BrowserMinerDetectorConfiguration browserConfig{};
         browserConfig.blockKnownDomains = config.blockStratumProtocol;
         browserConfig.enableDomainBlocking = config.blockStratumProtocol;
@@ -2890,18 +2997,18 @@ bool CryptoMinerDetector::UpdateConfiguration(const CryptoMinerDetectorConfigura
         browserConfig.terminateMiningWorkers = false;
         browserConfig.whitelistedDomains = config.whitelistedDomains;
         browserConfig.verboseLogging = config.verboseLogging;
-        if (!m_impl->m_browserDetector->UpdateConfiguration(browserConfig)) {
+        if (!brwDet->UpdateConfiguration(browserConfig)) {
             Utils::Logger::Warn("CryptoMinerDetector: BrowserMinerDetector config update failed");
         }
     }
-    if (m_impl->m_poolDetector) {
+    if (poolDet) {
         PoolConnectionDetectorConfiguration poolConfig{};
         poolConfig.blockStratumTraffic = config.blockStratumProtocol;
         poolConfig.blockMaliciousPools = config.blockStratumProtocol;
         poolConfig.poolBlacklistPath = config.poolBlacklistPath;
         poolConfig.whitelistedPools = config.whitelistedPools;
         poolConfig.verboseLogging = config.verboseLogging;
-        if (!m_impl->m_poolDetector->UpdateConfiguration(poolConfig)) {
+        if (!poolDet->UpdateConfiguration(poolConfig)) {
             Utils::Logger::Warn("CryptoMinerDetector: PoolConnectionDetector config update failed");
         }
     }
@@ -2974,12 +3081,12 @@ std::vector<BrowserMinerInfo> CryptoMinerDetector::ScanBrowsers() {
 }
 
 bool CryptoMinerDetector::ScanBrowserScript(const std::string& scriptContent) {
-    if (!m_impl || !m_impl->m_browserDetector) {
+    if (!m_impl) {
         return false;
     }
 
     CryptoMinerDetectorImpl::ActiveOperation operation(*m_impl);
-    if (!operation.Acquired()) {
+    if (!operation.Acquired() || !m_impl->m_browserDetector) {
         return false;
     }
 
@@ -3020,12 +3127,12 @@ bool CryptoMinerDetector::ScanBrowserScript(const std::string& scriptContent) {
 }
 
 bool CryptoMinerDetector::ScanWASMModule(std::span<const uint8_t> wasmData) {
-    if (!m_impl || !m_impl->m_browserDetector) {
+    if (!m_impl) {
         return false;
     }
 
     CryptoMinerDetectorImpl::ActiveOperation operation(*m_impl);
-    if (!operation.Acquired()) {
+    if (!operation.Acquired() || !m_impl->m_browserDetector) {
         return false;
     }
 
@@ -3073,7 +3180,11 @@ bool CryptoMinerDetector::DetectStratumProtocol(std::span<const uint8_t> payload
         return false;
     }
     CryptoMinerDetectorImpl::ActiveOperation operation(*m_impl);
-    return operation.Acquired() && m_impl->m_poolDetector && m_impl->m_poolDetector->IsStratumTraffic(payload);
+    if (!operation.Acquired()) {
+        return false;
+    }
+    auto* pool = m_impl->m_poolDetector;
+    return pool != nullptr && pool->IsStratumTraffic(payload);
 }
 
 std::vector<MinerNetworkConnection> CryptoMinerDetector::GetActiveMiningConnections() const {
@@ -3469,6 +3580,8 @@ std::string_view GetMinerTypeName(MinerType type) noexcept {
         case MinerType::BotnetMiner: return "Botnet Miner";
         case MinerType::CloudMiner: return "Cloud Miner";
         case MinerType::HybridMiner: return "Hybrid Miner";
+        case MinerType::NetworkMiner: return "Network Miner";
+        case MinerType::Unknown:
         default: return "Unknown";
     }
 }
