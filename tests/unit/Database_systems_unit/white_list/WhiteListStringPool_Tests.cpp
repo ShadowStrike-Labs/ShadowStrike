@@ -297,6 +297,39 @@ TEST_F(StringPoolTest, Initialize_ValidView_Success) {
     EXPECT_EQ(pool->GetStringCount(), 0);
 }
 
+TEST_F(StringPoolTest, EnableWriteMode_AfterInitialize_AllowsAppend) {
+    {
+        StringPool writer;
+        uint64_t used = 0;
+        ASSERT_TRUE(writer.CreateNew(poolBaseAddress, poolSize, used).IsSuccess());
+        ASSERT_TRUE(writer.AddWideString(L"first").has_value());
+    }
+
+    ASSERT_TRUE(CreateMemoryMappedView(poolBaseAddress, poolSize));
+    ASSERT_TRUE(pool->Initialize(view, 0, poolSize).IsSuccess());
+
+    pool->EnableWriteMode(poolBaseAddress, poolSize);
+
+    auto secondOffset = pool->AddWideString(L"second");
+    ASSERT_TRUE(secondOffset.has_value());
+    EXPECT_GT(*secondOffset, 32u);
+}
+
+TEST_F(StringPoolTest, GetString_MissingTerminator_ReturnsEmpty) {
+    constexpr uint64_t headerSize = 32;
+    ASSERT_GE(poolSize, headerSize + 3);
+
+    std::fill(buffer.begin(), buffer.end(), 0);
+    *reinterpret_cast<uint64_t*>(buffer.data()) = headerSize + 3;
+    *reinterpret_cast<uint64_t*>(buffer.data() + 8) = 1;
+    std::memcpy(buffer.data() + headerSize, "abc", 3);
+
+    ASSERT_TRUE(CreateMemoryMappedView(buffer.data(), poolSize));
+    ASSERT_TRUE(pool->Initialize(view, 0, poolSize).IsSuccess());
+
+    EXPECT_TRUE(pool->GetString(static_cast<uint32_t>(headerSize), 3).empty());
+}
+
 TEST_F(StringPoolTest, Initialize_InvalidView_ReturnsError) {
     MemoryMappedView invalidView{}; // All null/zero
     StoreError err = pool->Initialize(invalidView, 0, poolSize);

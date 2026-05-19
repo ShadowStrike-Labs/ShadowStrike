@@ -168,6 +168,26 @@ TEST_F(WhitelistStoreTest, Load_Writable_Success) {
     EXPECT_FALSE(store->IsReadOnly());
 }
 
+TEST_F(WhitelistStoreTest, Load_Writable_AllowsPathAppendAfterReopen) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    ASSERT_TRUE(store->AddPath(
+        L"C:\\Program Files\\VendorOne",
+        PathMatchMode::Prefix,
+        WhitelistReason::TrustedVendor).IsSuccess());
+    ASSERT_TRUE(store->Save().IsSuccess());
+    store->Close();
+
+    store = std::make_unique<WhitelistStore>();
+    ASSERT_TRUE(store->Load(dbPath, false).IsSuccess());
+
+    auto appendResult = store->AddPath(
+        L"C:\\Program Files\\VendorTwo",
+        PathMatchMode::Prefix,
+        WhitelistReason::TrustedVendor);
+    ASSERT_TRUE(appendResult.IsSuccess()) << appendResult.message;
+    EXPECT_TRUE(store->IsPathWhitelisted(L"C:\\Program Files\\VendorTwo\\app.exe").found);
+}
+
 TEST_F(WhitelistStoreTest, Load_NonExistentFile_Fails) {
     StoreError err = store->Load(L"C:\\NonExistentPath\\missing.db");
     
@@ -217,6 +237,18 @@ TEST_F(WhitelistStoreTest, RemoveHash_ExistingEntry_Success) {
     EXPECT_FALSE(store->IsHashWhitelisted(hash).found);
 }
 
+TEST_F(WhitelistStoreTest, RemoveHash_RebuildIndices_DoesNotResurrectEntry) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+
+    HashValue hash = CreateHash("remove_rebuild");
+    ASSERT_TRUE(store->AddHash(hash, WhitelistReason::UserApproved).IsSuccess());
+    ASSERT_TRUE(store->RemoveHash(hash).IsSuccess());
+    ASSERT_TRUE(store->RebuildIndices().IsSuccess());
+
+    EXPECT_EQ(store->GetEntryCount(), 0);
+    EXPECT_FALSE(store->IsHashWhitelisted(hash).found);
+}
+
 TEST_F(WhitelistStoreTest, Persistence_SaveAndLoad_PreservesData) {
     // 1. Create and populate
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
@@ -261,6 +293,31 @@ TEST_F(WhitelistStoreTest, AddPath_ExactMatch_Success) {
     // Different path should fail
     auto res2 = store->IsPathWhitelisted(L"C:\\Windows\\System32\\calc.exe");
     EXPECT_FALSE(res2.found);
+}
+
+TEST_F(WhitelistStoreTest, RemovePath_RebuildIndices_DoesNotResurrectEntry) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+
+    constexpr std::wstring_view trustedPath = L"C:\\Program Files\\TrustedApp";
+    ASSERT_TRUE(store->AddPath(trustedPath, PathMatchMode::Prefix, WhitelistReason::TrustedVendor).IsSuccess());
+    ASSERT_TRUE(store->RemovePath(trustedPath, PathMatchMode::Prefix).IsSuccess());
+    ASSERT_TRUE(store->RebuildIndices().IsSuccess());
+
+    EXPECT_EQ(store->GetEntryCount(), 0);
+    EXPECT_FALSE(store->IsPathWhitelisted(L"C:\\Program Files\\TrustedApp\\bin\\app.exe").found);
+}
+
+TEST_F(WhitelistStoreTest, AddPublisher_PreservesPublisherEntryType) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+
+    ASSERT_TRUE(store->AddPublisher(
+        L"ShadowStrike Security",
+        WhitelistReason::TrustedVendor,
+        L"Publisher trust").IsSuccess());
+
+    auto result = store->IsPublisherWhitelisted(L"ShadowStrike Security");
+    ASSERT_TRUE(result.found);
+    EXPECT_EQ(result.type, WhitelistEntryType::Publisher);
 }
 
 TEST_F(WhitelistStoreTest, AddPath_PrefixMatch_Success) {
