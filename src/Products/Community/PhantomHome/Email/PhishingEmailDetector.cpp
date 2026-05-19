@@ -433,7 +433,8 @@ std::string PhishingAnalysisResult::ToJson() const {
 // PIMPL IMPLEMENTATION
 // ============================================================================
 
-struct PhishingEmailDetectorImpl {
+class PhishingEmailDetectorImpl {
+public:
     // Thread synchronization
     mutable std::shared_mutex m_mutex;
 
@@ -1241,6 +1242,38 @@ PhishingAnalysisResult PhishingEmailDetector::AnalyzeEmail(
             }
 
             result.senderAnalysis = m_impl->AnalyzeSenderInternal(sender, displayName, headers);
+            result.senderAnalysis.replyTo = replyTo;
+
+            // SECURITY: Reply-To domain mismatch is one of the most reliable
+            // BEC / phishing indicators. If Reply-To is provided and points
+            // to a different registered domain than the From sender, raise
+            // the SuspiciousReplyTo indicator and bump the risk score so the
+            // verdict logic can escalate accordingly. We deliberately
+            // compare only the domain portion to avoid false positives on
+            // alias addresses within the same domain.
+            if (!replyTo.empty() && !sender.empty()) {
+                auto domainOf = [](const std::string& addr) -> std::string {
+                    const auto lt = addr.rfind('<');
+                    const auto gt = addr.rfind('>');
+                    std::string a = (lt != std::string::npos && gt != std::string::npos && gt > lt)
+                        ? addr.substr(lt + 1, gt - lt - 1) : addr;
+                    const auto at = a.rfind('@');
+                    if (at == std::string::npos) return {};
+                    std::string d = a.substr(at + 1);
+                    std::transform(d.begin(), d.end(), d.begin(),
+                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    return d;
+                };
+                const std::string fromDom  = domainOf(sender);
+                const std::string replyDom = domainOf(replyTo);
+                if (!fromDom.empty() && !replyDom.empty() && fromDom != replyDom) {
+                    result.indicators.hasMismatchedSender = true;
+                    result.indicators.allIndicators |= PhishingIndicator::SuspiciousReplyTo;
+                    result.riskScore = std::min(100, result.riskScore + 25);
+                    result.senderAnalysis.riskScore =
+                        std::min(100, result.senderAnalysis.riskScore + 25);
+                }
+            }
         }
 
         m_impl->m_status.store(ModuleStatus::Running, std::memory_order_release);
