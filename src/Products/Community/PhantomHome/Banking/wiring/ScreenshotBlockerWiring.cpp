@@ -107,6 +107,58 @@ struct ScreenshotBlockerRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    auto& blocker = ScreenshotBlocker::Instance();
+                    auto config = blocker.GetConfiguration();
+
+                    switch (mode) {
+                        case ProtectionMode::Passive:
+                            config.enableDisplayAffinity        = true;
+                            config.enableGDIHooks               = true;
+                            config.enableDirectXHooks           = false;
+                            config.enableClipboardFiltering     = false;
+                            config.enablePrintScreenBlocking    = false;
+                            config.enableOverlayObfuscation     = false;
+                            config.autoSanitizeClipboard        = false;
+                            config.autoProtectPasswordFields    = false;
+                            config.useEnhancedAffinity          = true;
+                            config.allowAccessibilityTools      = true;
+                            break;
+                        case ProtectionMode::Balanced:
+                            config.enableDisplayAffinity        = true;
+                            config.enableGDIHooks               = true;
+                            config.enableDirectXHooks           = true;
+                            config.enableClipboardFiltering     = true;
+                            config.enablePrintScreenBlocking    = true;
+                            config.enableOverlayObfuscation     = false;
+                            config.autoSanitizeClipboard        = true;
+                            config.autoProtectPasswordFields    = true;
+                            config.useEnhancedAffinity          = true;
+                            config.allowAccessibilityTools      = true;
+                            break;
+                        case ProtectionMode::Aggressive:
+                            config.enableDisplayAffinity        = true;
+                            config.enableGDIHooks               = true;
+                            config.enableDirectXHooks           = true;
+                            config.enableClipboardFiltering     = true;
+                            config.enablePrintScreenBlocking    = true;
+                            config.enableOverlayObfuscation     = true;
+                            config.autoSanitizeClipboard        = true;
+                            config.autoProtectPasswordFields    = true;
+                            config.useEnhancedAffinity          = true;
+                            config.allowAccessibilityTools      = false;
+                            break;
+                        case ProtectionMode::Off:
+                            SS_LOG_ERROR(kLogCategory,
+                                L"ScreenshotBlocker: setMode(Off) must be routed through orchestrator disable");
+                            return false;
+                    }
+
+                    if (!blocker.UpdateConfiguration(config)) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"ScreenshotBlocker: UpdateConfiguration rejected mode=%u",
+                            static_cast<unsigned>(mode));
+                        return false;
+                    }
                     return ApplyModeThresholds("ScreenshotBlocker", mode);
                 },
 
@@ -117,7 +169,8 @@ struct ScreenshotBlockerRegistrar final {
                     ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"ScreenshotBlockerWiring: static registration failed\n");
         }
     }
 };
