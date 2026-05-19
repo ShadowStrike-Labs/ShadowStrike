@@ -68,7 +68,7 @@ struct BankingTrojanDetectorRegistrar final {
                         return true;
                     } catch (const std::exception& e) {
                         SS_LOG_ERROR(kLogCategory,
-                            L"BankingTrojanDetector: Initialize() threw: %hs", e.what());
+                            L"BankingTrojanDetector: Initialize() threw: %S", e.what());
                         return false;
                     } catch (...) {
                         SS_LOG_ERROR(kLogCategory,
@@ -87,7 +87,7 @@ struct BankingTrojanDetectorRegistrar final {
                         return true;
                     } catch (const std::exception& e) {
                         SS_LOG_ERROR(kLogCategory,
-                            L"BankingTrojanDetector: Start() threw: %hs", e.what());
+                            L"BankingTrojanDetector: Start() threw: %S", e.what());
                         return false;
                     } catch (...) {
                         SS_LOG_ERROR(kLogCategory,
@@ -101,7 +101,7 @@ struct BankingTrojanDetectorRegistrar final {
                         BankingTrojanDetector::Instance().Shutdown();
                     } catch (const std::exception& e) {
                         SS_LOG_ERROR(kLogCategory,
-                            L"BankingTrojanDetector: Shutdown() threw: %hs", e.what());
+                            L"BankingTrojanDetector: Shutdown() threw: %S", e.what());
                     } catch (...) {
                         SS_LOG_ERROR(kLogCategory,
                             L"BankingTrojanDetector: Shutdown() threw unknown exception");
@@ -109,6 +109,46 @@ struct BankingTrojanDetectorRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    auto& detector = BankingTrojanDetector::Instance();
+                    auto config = detector.GetConfiguration();
+
+                    switch (mode) {
+                        case ProtectionMode::Passive:
+                            config.enableRealTimeProtection = true;
+                            config.autoQuarantine = false;
+                            config.autoTerminate = false;
+                            config.blockC2 = false;
+                            config.threatScoreThreshold = 75.0;
+                            config.confidenceThreshold = 0.85;
+                            break;
+                        case ProtectionMode::Balanced:
+                            config.enableRealTimeProtection = true;
+                            config.autoQuarantine = true;
+                            config.autoTerminate = false;
+                            config.blockC2 = true;
+                            config.threatScoreThreshold = 60.0;
+                            config.confidenceThreshold = 0.70;
+                            break;
+                        case ProtectionMode::Aggressive:
+                            config.enableRealTimeProtection = true;
+                            config.autoQuarantine = true;
+                            config.autoTerminate = true;
+                            config.blockC2 = true;
+                            config.threatScoreThreshold = 45.0;
+                            config.confidenceThreshold = 0.55;
+                            break;
+                        case ProtectionMode::Off:
+                            SS_LOG_ERROR(kLogCategory,
+                                L"BankingTrojanDetector: setMode(Off) must be routed through orchestrator disable");
+                            return false;
+                    }
+
+                    if (!detector.UpdateConfiguration(config)) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"BankingTrojanDetector: UpdateConfiguration rejected mode=%u",
+                            static_cast<unsigned>(mode));
+                        return false;
+                    }
                     return ApplyModeThresholds("BankingTrojanDetector", mode);
                 },
 
@@ -119,7 +159,8 @@ struct BankingTrojanDetectorRegistrar final {
                     ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"BankingTrojanDetectorWiring: static registration failed\n");
         }
     }
 };
