@@ -48,6 +48,18 @@
 
 namespace ShadowStrike::Utils {
 
+namespace {
+void DecrementAtomicFloor(std::atomic<size_t>& value, size_t decrement) noexcept {
+    size_t current = value.load(std::memory_order_relaxed);
+    while (current > 0) {
+        const size_t next = (current > decrement) ? (current - decrement) : 0;
+        if (value.compare_exchange_weak(current, next, std::memory_order_release, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+} // namespace
+
 //=============================================================================
 // ThreadPoolConfig Implementation
 //=============================================================================
@@ -418,12 +430,14 @@ size_t PriorityTaskQueue::GetMaxSize() const noexcept {
  * 
  * Uses swap idiom for efficient clearing.
  */
-void PriorityTaskQueue::Clear() {
+size_t PriorityTaskQueue::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     
     // Clear the queue by swapping with empty queue (efficient)
+    const size_t clearedCount = queue_.size();
     std::priority_queue<TaskWrapper, std::vector<TaskWrapper>, TaskComparator> emptyQueue;
     std::swap(queue_, emptyQueue);
+    return clearedCount;
 }
 
 /**
@@ -883,6 +897,7 @@ WorkerThread::WorkerThread(
     std::vector<std::unique_ptr<WorkerThread>>& allWorkers,
     const ThreadPoolConfig& config,
     std::atomic<size_t>& pendingTasks,
+    TaskStatistics& taskStats,
     std::mutex& taskNotifyMutex,
     std::condition_variable& taskNotifyCV,
     ETWTracingManager* etwManager /*= nullptr*/
@@ -892,6 +907,7 @@ WorkerThread::WorkerThread(
     , allWorkers_(allWorkers)
     , config_(config)
     , pendingTasks_(pendingTasks)
+    , taskStats_(taskStats)
     , taskNotifyMutex_(taskNotifyMutex)
     , taskNotifyCV_(taskNotifyCV)
     , etwManager_(etwManager)
@@ -926,7 +942,7 @@ void WorkerThread::Start() {
     
     // Wait for thread to initialize and set its system thread ID
     // This ensures GetSystemThreadId() returns valid value after Start() returns
-    while (systemThreadId_ == 0) {
+    while (systemThreadId_.load(std::memory_order_acquire) == 0) {
         std::this_thread::yield();
     }
 }
@@ -1006,7 +1022,7 @@ size_t WorkerThread::GetThreadId() const noexcept {
  * @return System thread ID, or 0 if thread not yet started.
  */
 DWORD WorkerThread::GetSystemThreadId() const noexcept {
-    return systemThreadId_;
+    return systemThreadId_.load(std::memory_order_acquire);
 }
 
 /**
@@ -1063,7 +1079,7 @@ void WorkerThread::SetAffinity(DWORD_PTR affinityMask) {
  */
 void WorkerThread::WorkerLoop() {
     // Initialize thread - capture system thread ID immediately
-    systemThreadId_ = ::GetCurrentThreadId();
+    systemThreadId_.store(::GetCurrentThreadId(), std::memory_order_release);
     
     // Set descriptive thread name for debugger visibility
     std::wstring threadName = std::format(
@@ -1090,7 +1106,7 @@ void WorkerThread::WorkerLoop() {
     // Log thread creation via ETW
     LogETWEvent(
         ETWEventId::ThreadCreated,
-        std::format(L"Worker thread {} started (TID: {})", threadId_, systemThreadId_),
+        std::format(L"Worker thread {} started (TID: {})", threadId_, GetSystemThreadId()),
         ETWLevel::Information
     );
     
@@ -1149,31 +1165,10 @@ void WorkerThread::WorkerLoop() {
  * Work stealing enables better load balancing across workers.
  */
 bool WorkerThread::TryStealWork(TaskWrapper& task) {
-    // Early exit if work stealing is disabled
-    if (!config_.enableWorkStealing) {
-        return false;
-    }
-    
-    // Try to steal from other workers' queues
-    for (auto& worker : allWorkers_) {
-        // Skip self
-        if (worker.get() == this) {
-            continue;
-        }
-        
-        // Skip workers that aren't running
-        if (!worker->IsRunning()) {
-            continue;
-        }
-        
-        // Attempt to steal a task from this worker's global queue reference
-        auto stolenTask = worker->globalQueue_.Steal();
-        if (stolenTask) {
-            task = std::move(stolenTask.value());
-            return true;
-        }
-    }
-    
+    (void)task;
+    // DESIGN: Workers currently share a single global priority queue. Traversing
+    // allWorkers_ here races with pool resize/destruction and provides no useful
+    // extra work source, so stealing is disabled until per-worker queues exist.
     return false;
 }
 
@@ -1198,9 +1193,10 @@ void WorkerThread::ExecuteTask(TaskWrapper& task) {
                 std::format(L"Task {} cancelled before execution", task.GetContext().taskId),
                 ETWLevel::Warning
             );
-            
+             
             busy_.store(false, std::memory_order_release);
-            pendingTasks_.fetch_sub(1, std::memory_order_release);
+            taskStats_.cancelledCount.fetch_add(1, std::memory_order_relaxed);
+            DecrementAtomicFloor(pendingTasks_, 1);
             return;
         }
         
@@ -1212,7 +1208,7 @@ void WorkerThread::ExecuteTask(TaskWrapper& task) {
         );
         
         // Execute the task
-        task.Execute();
+        const bool taskSucceeded = task.Execute();
         
         // Calculate execution time
         const auto endTime = std::chrono::steady_clock::now();
@@ -1226,6 +1222,28 @@ void WorkerThread::ExecuteTask(TaskWrapper& task) {
             std::memory_order_relaxed
         );
         tasksProcessed_.fetch_add(1, std::memory_order_relaxed);
+        if (taskSucceeded) {
+            taskStats_.completedCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        else {
+            taskStats_.failedCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (task.GetContext().timeout && executionTime > *task.GetContext().timeout) {
+            taskStats_.timedOutCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        taskStats_.totalExecutionTimeMs.fetch_add(static_cast<uint64_t>(executionTime.count()), std::memory_order_relaxed);
+        const auto waitTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+            startTime - task.GetContext().enqueueTime);
+        taskStats_.totalWaitTimeMs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(0, waitTime.count())), std::memory_order_relaxed);
+        uint64_t minExpected = taskStats_.minExecutionTimeMs.load(std::memory_order_relaxed);
+        const uint64_t elapsedMs = static_cast<uint64_t>(executionTime.count());
+        while (elapsedMs < minExpected &&
+               !taskStats_.minExecutionTimeMs.compare_exchange_weak(minExpected, elapsedMs, std::memory_order_relaxed)) {
+        }
+        uint64_t maxExpected = taskStats_.maxExecutionTimeMs.load(std::memory_order_relaxed);
+        while (elapsedMs > maxExpected &&
+               !taskStats_.maxExecutionTimeMs.compare_exchange_weak(maxExpected, elapsedMs, std::memory_order_relaxed)) {
+        }
         
         // Log task completion
         LogETWEvent(
@@ -1274,7 +1292,7 @@ void WorkerThread::ExecuteTask(TaskWrapper& task) {
     
     // Always clear busy flag and decrement pending count
     busy_.store(false, std::memory_order_release);
-    pendingTasks_.fetch_sub(1, std::memory_order_release);
+    DecrementAtomicFloor(pendingTasks_, 1);
 }
 
 /**
@@ -1328,7 +1346,7 @@ void WorkerThread::LogETWEvent(
         std::wstring formattedMessage = std::format(
             L"[Worker-{}:TID-{}] {}",
             threadId_,
-            systemThreadId_,
+            GetSystemThreadId(),
             message
         );
 
@@ -1475,12 +1493,20 @@ void ThreadPool::Shutdown(bool waitForCompletion) {
 
     LogETWEvent(ETWEventId::ThreadPoolDestroyed, L"ThreadPool shutting down", ETWLevel::Information);
 
+    paused_.store(false, std::memory_order_release);
+    {
+        std::shared_lock<std::shared_mutex> lock(workersMutex_);
+        for (auto& worker : workers_) {
+            worker->Resume();
+        }
+    }
+
     // Handle pending tasks
     if (waitForCompletion) {
         WaitForAll();
     }
     else {
-        globalQueue_.Clear();
+        ClearQueue();
     }
     
     // Wake up all workers so they can see shutdown flag and exit
@@ -1739,20 +1765,12 @@ bool ThreadPool::IsQueueEmpty() const noexcept {
  *          Only queued tasks are removed.
  */
 void ThreadPool::ClearQueue() {
-    const size_t clearedCount = globalQueue_.Size();
-    globalQueue_.Clear();
+    const size_t clearedCount = globalQueue_.Clear();
     perfMetrics_.currentQueueSize.store(0, std::memory_order_release);
     
-    // Safely decrement pending tasks count
     if (clearedCount > 0) {
-        // Use compare-exchange to avoid underflow
-        size_t expected = pendingTasks_.load(std::memory_order_relaxed);
-        while (expected > 0) {
-            const size_t newValue = (expected >= clearedCount) ? (expected - clearedCount) : 0;
-            if (pendingTasks_.compare_exchange_weak(expected, newValue, std::memory_order_release)) {
-                break;
-            }
-        }
+        taskStats_.cancelledCount.fetch_add(static_cast<uint64_t>(clearedCount), std::memory_order_relaxed);
+        DecrementAtomicFloor(pendingTasks_, clearedCount);
     }
 }
 
@@ -2026,6 +2044,7 @@ void ThreadPool::CreateWorkerThreads(size_t count) {
                 workers_,
                 config_,
                 pendingTasks_,
+                taskStats_,
                 taskNotifyMutex_,
                 taskNotifyCV_,
                 etwManager_.get()

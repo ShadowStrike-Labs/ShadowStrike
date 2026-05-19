@@ -550,9 +550,9 @@ public:
      * @brief Execute the task
      * @note Sets the promise with result or exception
      */
-    void Execute() {
+    [[nodiscard]] bool Execute() {
         if (!function_) {
-            return; // Invalid task
+            return false; // Invalid task
         }
         
         try {
@@ -565,12 +565,14 @@ public:
                 auto result = function_(context_);
                 promise_->set_value(std::move(result));
             }
+            return true;
         } catch (...) {
             try {
                 promise_->set_exception(std::current_exception());
             } catch (...) {
                 // Promise already satisfied - ignore
             }
+            return false;
         }
     }
     
@@ -634,15 +636,16 @@ public:
      */
     template<typename ResultType>
     explicit TaskWrapper(Task<ResultType> task)
-        : executor_([t = std::move(task)]() mutable { t.Execute(); })
-        , context_(task.GetContext())
+        : context_(task.GetContext())
+        , executor_([t = std::move(task)]() mutable { return t.Execute(); })
     {}
     
     /** Execute the wrapped task */
-    void Execute() {
+    [[nodiscard]] bool Execute() {
         if (executor_) {
-            executor_();
+            return executor_();
         }
+        return false;
     }
     
     /** @return Const reference to task context */
@@ -671,8 +674,8 @@ public:
     }
     
 private:
-    std::function<void()> executor_;
     TaskContext context_;
+    std::function<bool()> executor_;
 };
 
 // ============================================================================
@@ -699,7 +702,7 @@ public:
     [[nodiscard]] bool IsFull() const noexcept;
     [[nodiscard]] size_t GetMaxSize() const noexcept;
     
-    void Clear();
+    [[nodiscard]] size_t Clear();
     void SetMaxSize(size_t maxSize);
     
 private:
@@ -730,6 +733,7 @@ public:
         std::vector<std::unique_ptr<WorkerThread>>& allWorkers,
         const ThreadPoolConfig& config,
         std::atomic<size_t>& pendingTasks,
+        TaskStatistics& taskStats,
         std::mutex& taskNotifyMutex,
         std::condition_variable& taskNotifyCV,
         ETWTracingManager* etwManager = nullptr
@@ -779,12 +783,13 @@ private:
     ETWTracingManager* etwManager_;
 
     std::atomic<size_t>& pendingTasks_;
+    TaskStatistics& taskStats_;
     
     // Shared task notification (owned by ThreadPool)
     std::mutex& taskNotifyMutex_;
     std::condition_variable& taskNotifyCV_;
     
-    DWORD systemThreadId_{0};
+    std::atomic<DWORD> systemThreadId_{0};
     std::chrono::steady_clock::time_point lastActivityTime_;
     
     // Performance tracking
@@ -1255,7 +1260,10 @@ auto ThreadPool::SubmitCancellable(
     if (shutdown_.load(std::memory_order_acquire)) {
         throw std::runtime_error("ThreadPool is shut down");
     }
-    
+    if (!cancellationToken) {
+        cancellationToken = CreateCancellationToken();
+    }
+     
     // Create task context with cancellation token
     TaskContext context(priority, std::move(description), location);
     context.taskId = nextTaskId_.fetch_add(1, std::memory_order_relaxed);
@@ -1321,7 +1329,7 @@ void ThreadPool::ParallelFor(
         return;
     }
 
-    const size_t threadCount = GetThreadCount();
+    const size_t threadCount = std::max<size_t>(1, GetThreadCount());
     const IndexType range = end - start;
     const IndexType chunkSize = std::max(IndexType(1), range / static_cast<IndexType>(threadCount));
 
@@ -1346,7 +1354,7 @@ void ThreadPool::ParallelFor(
     }
 
     for (auto& future : futures) {
-        future.wait();
+        future.get();
     }
 }
 template<typename ResultType>
