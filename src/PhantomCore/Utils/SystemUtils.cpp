@@ -233,6 +233,16 @@ namespace SystemUtils {
             }
         }
 
+        [[nodiscard]] bool ContainsUnsafeDisplayText(std::wstring_view value) noexcept {
+            for (wchar_t ch : value) {
+                if (ch == L'\0' || ch == L'\r' || ch == L'\n' ||
+                    (ch < 0x20 && ch != L'\t')) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /**
          * @brief Safely checks if current process is running under WOW64
          * @param[out] isWow64 Set to true if running under WOW64
@@ -306,15 +316,25 @@ namespace SystemUtils {
                 return false;
             }
 
-            // Calculate string length (bufferSize includes null terminator, is in bytes)
-            size_t charCount = bufferSize / sizeof(wchar_t);
-            if (charCount > 0 && buffer[charCount - 1] == L'\0') {
-                charCount--;
+            if ((bufferSize % sizeof(wchar_t)) != 0) {
+                SS_LOG_WARN(L"SystemUtils", L"Registry string has invalid byte length");
+                return false;
             }
 
-            // Bounds check
-            if (charCount >= kMaxRegistryValueSize) {
-                charCount = kMaxRegistryValueSize - 1;
+            // Calculate string length (bufferSize includes null terminator, is in bytes)
+            size_t charCount = bufferSize / sizeof(wchar_t);
+            if (charCount == 0 || charCount > kMaxRegistryValueSize) {
+                return false;
+            }
+            if (buffer[charCount - 1] != L'\0') {
+                SS_LOG_WARN(L"SystemUtils", L"Registry string is not null terminated");
+                return false;
+            }
+            --charCount;
+
+            if (ContainsUnsafeDisplayText(std::wstring_view{ buffer, charCount })) {
+                SS_LOG_WARN(L"SystemUtils", L"Registry string contains unsafe control characters");
+                return false;
             }
 
             try {
@@ -431,7 +451,9 @@ namespace SystemUtils {
         out.isWow64Process = isWow64;
 
         SYSTEM_INFO sysInfo{};
-        GetBasicSystemInfo(sysInfo);
+        if (!GetBasicSystemInfo(sysInfo)) {
+            SS_LOG_WARN(L"SystemUtils", L"Native system information query failed");
+        }
         out.is64BitOS = (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ||
                          sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ||
                          sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_IA64);
@@ -474,7 +496,9 @@ namespace SystemUtils {
 
         // Get basic system info for architecture
         SYSTEM_INFO sysInfo{};
-        GetBasicSystemInfo(sysInfo);
+        if (!GetBasicSystemInfo(sysInfo)) {
+            SS_LOG_WARN(L"SystemUtils", L"Native system information query failed");
+        }
         try {
             out.architecture = ArchitectureToString(sysInfo.wProcessorArchitecture);
         } catch (...) {
