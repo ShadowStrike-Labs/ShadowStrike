@@ -40,6 +40,7 @@
 #include <string>
 #include <cstring>
 #include <vector>
+#include <limits>
 
 namespace ShadowStrike {
     namespace Utils {
@@ -300,12 +301,39 @@ namespace ShadowStrike {
              * @return true if file exists
              */
             static inline bool file_exists(std::wstring_view path) noexcept {
-                if (path.empty()) return false;
-                
+                if (path.empty() || path.size() > 32767) return false;
+
+                for (wchar_t ch : path) {
+                    if (ch == L'\0' || (ch < L' ' && ch != L'\t')) {
+                        return false;
+                    }
+                }
+
                 try {
                     std::wstring pathCopy(path);
-                    DWORD attrs = ::GetFileAttributesW(pathCopy.c_str());
-                    return (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+                    const DWORD attrs = ::GetFileAttributesW(pathCopy.c_str());
+                    if (attrs == INVALID_FILE_ATTRIBUTES ||
+                        (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+                        return false;
+                    }
+
+                    HANDLE hFile = ::CreateFileW(
+                        pathCopy.c_str(),
+                        FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                        nullptr);
+                    if (hFile == INVALID_HANDLE_VALUE) {
+                        return false;
+                    }
+
+                    BY_HANDLE_FILE_INFORMATION info{};
+                    const BOOL ok = ::GetFileInformationByHandle(hFile, &info);
+                    ::CloseHandle(hFile);
+                    return ok &&
+                        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
                 }
                 catch (...) {
                     return false;
@@ -319,6 +347,55 @@ namespace ShadowStrike {
 
             // Maximum allowed size for signer info buffer (8MB limit to prevent DoS via malformed files)
             static constexpr DWORD kMaxSignerInfoSize = 8 * 1024 * 1024;
+
+            static inline bool is_hex_catalog_member_tag(std::wstring_view tag, bool allowWeakHash) noexcept {
+                if (tag.empty() || (tag.size() % 2U) != 0U || tag.size() > 128U) {
+                    return false;
+                }
+                if (!allowWeakHash && tag.size() < 64U) {
+                    return false;
+                }
+                for (wchar_t ch : tag) {
+                    const bool isHex =
+                        (ch >= L'0' && ch <= L'9') ||
+                        (ch >= L'A' && ch <= L'F') ||
+                        (ch >= L'a' && ch <= L'f');
+                    if (!isHex) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            static inline bool is_weak_signature_oid(LPCSTR oid) noexcept {
+                if (!oid) {
+                    return true;
+                }
+                return std::strcmp(oid, "1.2.840.113549.1.1.2") == 0 ||   // md2WithRSAEncryption
+                       std::strcmp(oid, "1.2.840.113549.1.1.3") == 0 ||   // md4WithRSAEncryption
+                       std::strcmp(oid, "1.2.840.113549.1.1.4") == 0 ||   // md5WithRSAEncryption
+                       std::strcmp(oid, szOID_RSA_SHA1RSA) == 0 ||
+                       std::strcmp(oid, szOID_OIWSEC_sha1RSASign) == 0 ||
+                       std::strcmp(oid, "1.2.840.10045.4.1") == 0 ||      // ecdsa-with-SHA1
+                       std::strcmp(oid, "1.2.840.10040.4.3") == 0 ||      // dsa-with-SHA1
+                       std::strcmp(oid, szOID_X957_SHA1DSA) == 0;
+            }
+
+            static inline bool check_certificate_signature_strength(
+                PCCERT_CONTEXT cert,
+                bool allowWeakAlgorithms,
+                Error* err) noexcept {
+                if (!cert || !cert->pCertInfo) {
+                    set_err(err, "Certificate signature strength check: invalid certificate", ERROR_INVALID_PARAMETER);
+                    return false;
+                }
+                LPCSTR oid = cert->pCertInfo->SignatureAlgorithm.pszObjId;
+                if (is_weak_signature_oid(oid) && !allowWeakAlgorithms) {
+                    set_err(err, "Weak certificate signature algorithm is not permitted", ERROR_INVALID_DATA);
+                    return false;
+                }
+                return true;
+            }
 
             /**
              * @brief DER/ASN.1 decode helper.
@@ -665,6 +742,9 @@ namespace ShadowStrike {
                     return false;
                 }
                 info.isEKUValid = true;
+                if (!check_certificate_signature_strength(leaf.p, allowWeakAlgos_, err)) {
+                    return false;
+                }
 
                 // Timestamp via countersignature (RFC3161 or legacy)
                 // Fallback to current time check if countersignature absent
@@ -757,6 +837,10 @@ namespace ShadowStrike {
                     set_err(err, "VerifyCatalogSignature: empty catalog path");
                     return false;
                 }
+                if (!is_hex_catalog_member_tag(fileHash, allowWeakAlgos_)) {
+                    set_err(err, "VerifyCatalogSignature: invalid or weak catalog member hash", ERROR_INVALID_PARAMETER);
+                    return false;
+                }
 
                 if (!file_exists(catalogPath)) {
                     set_err(err, "VerifyCatalogSignature: catalog not found");
@@ -843,7 +927,8 @@ namespace ShadowStrike {
 
                     // Get signer info size
                     DWORD cbSigner = 0;
-                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner) || cbSigner == 0) {
+                    if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner)
+                        || cbSigner == 0 || cbSigner > kMaxSignerInfoSize) {
                         set_err(err, "CryptMsgGetParam signer size failed (catalog)", GetLastError());
                         return false;
                     }
@@ -889,6 +974,9 @@ namespace ShadowStrike {
                     return false;
                 }
                 info.isEKUValid = true;
+                if (!check_certificate_signature_strength(leaf.p, allowWeakAlgos_, err)) {
+                    return false;
+                }
 
                 // Timestamp validation (use current time as fallback for catalogs)
                 FILETIME signTime{};
@@ -902,7 +990,7 @@ namespace ShadowStrike {
                 if (!ValidateTimestamp(signTime, leaf.p, err)) {
                     return false;
                 }
-                info.isTimestampValid = true;
+                info.isTimestampValid = false;
                 info.signTime = signTime;
 
                 // Chain + revocation policy
@@ -975,7 +1063,7 @@ namespace ShadowStrike {
                 );
 
                 if (!okPolicy || policyStatus.dwError != 0) {
-                    set_err(err, "Revocation/authenticode policy failed");
+                    set_err(err, "Revocation/authenticode policy failed", policyStatus.dwError);
                     return false;
                 }
 
@@ -1026,7 +1114,7 @@ namespace ShadowStrike {
                 );
 
                 if (!okPolicy || policyStatus.dwError != 0) {
-                    set_err(err, "Authenticode chain policy failed");
+                    set_err(err, "Authenticode chain policy failed", policyStatus.dwError);
                     return false;
                 }
 
@@ -1183,6 +1271,9 @@ namespace ShadowStrike {
                     return false;
                 }
                 info.isEKUValid = true;
+                if (!check_certificate_signature_strength(leaf.p, allowWeakAlgos_, err)) {
+                    return false;
+                }
 
                 // Timestamp validation (use system time as fallback)
                 FILETIME signTime{};
@@ -1196,7 +1287,7 @@ namespace ShadowStrike {
                 if (!ValidateTimestamp(signTime, leaf.p, err)) {
                     return false;
                 }
-                info.isTimestampValid = true;
+                info.isTimestampValid = false;
                 info.signTime = signTime;
 
                 // Chain + revocation validation
@@ -1318,6 +1409,7 @@ namespace ShadowStrike {
 
                 // EKU check (catalogs are code signed; enforce EKU)
                 if (!CheckCodeSigningEKU(leaf.p, err)) return false;
+                if (!check_certificate_signature_strength(leaf.p, allowWeakAlgos_, err)) return false;
 
                 // Chain + revocation policy
                 if (!ValidateCertificateChain(leaf.p, err)) return false;
@@ -1686,6 +1778,9 @@ namespace ShadowStrike {
 
                     // Check EKU (informational - doesn't affect inclusion in results)
                     meta.isEKUValid = CheckCodeSigningEKU(leafGuard.p, nullptr);
+                    if (!check_certificate_signature_strength(leafGuard.p, allowWeakAlgos_, nullptr)) {
+                        meta.isEKUValid = false;
+                    }
 
                     // Note: For telemetry/inventory purposes, we don't validate chain/revocation here
                     // as this is just metadata extraction, not trust verification
@@ -1812,6 +1907,9 @@ namespace ShadowStrike {
 
                     // EKU validation
                     if (!CheckCodeSigningEKU(leafGuard.p, nullptr)) {
+                        continue;
+                    }
+                    if (!check_certificate_signature_strength(leafGuard.p, allowWeakAlgos_, nullptr)) {
                         continue;
                     }
 
@@ -1961,7 +2059,8 @@ namespace ShadowStrike {
 
                 // Get signer info size
                 DWORD cbSigner = 0;
-                if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner) || cbSigner == 0) {
+                if (!CryptMsgGetParam(msgGuard.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSigner) ||
+                    cbSigner == 0 || cbSigner > kMaxSignerInfoSize) {
                     set_err(err, "CryptMsgGetParam signer size failed (LoadCatalogSigner)", GetLastError());
                     return false;
                 }
@@ -2028,7 +2127,8 @@ namespace ShadowStrike {
 
                 // Get the relevant signer info size
                 DWORD cbSigner = 0;
-                if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, signerIndex, nullptr, &cbSigner) || cbSigner == 0) {
+                if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, signerIndex, nullptr, &cbSigner) ||
+                    cbSigner == 0 || cbSigner > kMaxSignerInfoSize) {
                     set_err(err, "CMSG_SIGNER_INFO size query failed");
                     return false;
                 }
@@ -2069,36 +2169,33 @@ namespace ShadowStrike {
                         const CRYPT_ATTR_BLOB& blob = attr.rgValue[0];
 
                         // Open the RFC3161 token as a separate message
-                        HCRYPTMSG hTsMsg = CryptMsgOpenToDecode(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                        HCRYPTMSG hTsMsgRaw = CryptMsgOpenToDecode(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
                             0, 0, 0, nullptr, nullptr);
-                        if (!hTsMsg) { set_err(err, "CryptMsgOpenToDecode(TST) failed"); continue; }
+                        CryptMsgRAII tsMsg{ hTsMsgRaw };
+                        if (!tsMsg) { set_err(err, "CryptMsgOpenToDecode(TST) failed"); continue; }
 
-                        BOOL upd = CryptMsgUpdate(hTsMsg, blob.pbData, blob.cbData, TRUE);
+                        BOOL upd = CryptMsgUpdate(tsMsg.get(), blob.pbData, blob.cbData, TRUE);
                         if (!upd) {
                             set_err(err, "CryptMsgUpdate(TST) failed");
-                            CryptMsgClose(hTsMsg);
                             continue;
                         }
 
                         // Get signer info of the TST (index 0)
                         DWORD cbTsSigner = 0;
-                        CryptMsgGetParam(hTsMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbTsSigner);
+                        CryptMsgGetParam(tsMsg.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbTsSigner);
                         if (cbTsSigner == 0 || cbTsSigner > kMaxSignerInfoSize) {
                             set_err(err, "TST signer info size invalid or exceeds limit");
-                            CryptMsgClose(hTsMsg);
                             continue;
                         }
                         std::vector<BYTE> tsSignerBuf;
                         try { tsSignerBuf.resize(cbTsSigner); }
                         catch (...) {
                             set_err(err, "TST signer info allocation failed");
-                            CryptMsgClose(hTsMsg);
                             continue;
                         }
                         auto* tsSI = reinterpret_cast<CMSG_SIGNER_INFO*>(tsSignerBuf.data());
-                        if (!CryptMsgGetParam(hTsMsg, CMSG_SIGNER_INFO_PARAM, 0, tsSI, &cbTsSigner)) {
+                        if (!CryptMsgGetParam(tsMsg.get(), CMSG_SIGNER_INFO_PARAM, 0, tsSI, &cbTsSigner)) {
                             set_err(err, "CMSG_SIGNER_INFO(TST) fetch failed");
-                            CryptMsgClose(hTsMsg);
                             continue;
                         }
 
@@ -2113,8 +2210,7 @@ namespace ShadowStrike {
                                 if (decode_object(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, X509_CHOICE_OF_TIME,
                                     a2.rgValue[0].pbData, a2.rgValue[0].cbData, decoded)) {
                                     if (decoded.size() >= sizeof(FILETIME)) {
-                                        auto* pFileTime = reinterpret_cast<FILETIME*>(decoded.data());
-                                        tsFT = *pFileTime;  // Store in tsFT for consistency
+                                        std::memcpy(&tsFT, decoded.data(), sizeof(tsFT));
                                         gotTime = true;
                                     }
                                 }
@@ -2124,15 +2220,14 @@ namespace ShadowStrike {
                         // Alternative: extract genTime from RFC3161 TSTInfo (requires full ASN.1 parse)
                         // Using CryptMsgGetParam(CMSG_CONTENT_PARAM) gives SignedData content
                         DWORD cbContent = 0;
-                        if (!gotTime && CryptMsgGetParam(hTsMsg, CMSG_CONTENT_PARAM, 0, nullptr, &cbContent) && cbContent) {
+                        if (!gotTime && CryptMsgGetParam(tsMsg.get(), CMSG_CONTENT_PARAM, 0, nullptr, &cbContent) && cbContent) {
                             std::vector<BYTE> content(cbContent);
-                            if (CryptMsgGetParam(hTsMsg, CMSG_CONTENT_PARAM, 0, content.data(), &cbContent)) {
+                            if (CryptMsgGetParam(tsMsg.get(), CMSG_CONTENT_PARAM, 0, content.data(), &cbContent)) {
                                 // content contains SignedData - look for TSTInfo
                                 // Full ASN.1 parse required; if signingTime not found, fallback to legacy
                             }
                         }
 
-                        CryptMsgClose(hTsMsg);
                         if (gotTime) {
                             outSignTime = tsFT;
                             return true;
@@ -2173,14 +2268,12 @@ namespace ShadowStrike {
                             const CRYPT_ATTRIBUTE& a3 = auth.rgAttr[k];
                             if (!a3.cValue || !a3.rgValue) continue;
                             if (a3.pszObjId && std::strcmp(a3.pszObjId, OID_SIGNING_TIME) == 0) {
-                                // Convert X509_CHOICE_OF_TIME � SYSTEMTIME � FILETIME
+                                // X509_CHOICE_OF_TIME decodes directly to FILETIME.
                                 std::vector<BYTE> decoded;
                                 if (decode_object(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, X509_CHOICE_OF_TIME,
                                     a3.rgValue[0].pbData, a3.rgValue[0].cbData, decoded)) {
-                                    SYSTEMTIME* pst = reinterpret_cast<SYSTEMTIME*>(decoded.data());
-                                    FILETIME ft{};
-                                    if (SystemTimeToFileTime(pst, &ft)) {
-                                        tsFT = ft;
+                                    if (decoded.size() >= sizeof(FILETIME)) {
+                                        std::memcpy(&tsFT, decoded.data(), sizeof(tsFT));
                                         gotTime = true;
                                     }
                                 }
@@ -2210,13 +2303,19 @@ namespace ShadowStrike {
                 SYSTEMTIME stNow{};
                 GetSystemTime(&stNow);
                 FILETIME ftNow{};
-                SystemTimeToFileTime(&stNow, &ftNow);
+                if (!SystemTimeToFileTime(&stNow, &ftNow)) {
+                    return false;
+                }
 
                 ULARGE_INTEGER now{}, ts{};
                 now.LowPart = ftNow.dwLowDateTime; now.HighPart = ftNow.dwHighDateTime;
                 ts.LowPart = signTime.dwLowDateTime; ts.HighPart = signTime.dwHighDateTime;
 
-                ULONGLONG graceTicks = static_cast<ULONGLONG>(tsGraceSeconds_) * 10'000'000ULL; // seconds to 100ns
+                const ULONGLONG kMaxGraceSeconds = 365ULL * 24ULL * 60ULL * 60ULL;
+                const ULONGLONG graceSeconds = (tsGraceSeconds_ > kMaxGraceSeconds)
+                    ? kMaxGraceSeconds
+                    : static_cast<ULONGLONG>(tsGraceSeconds_);
+                ULONGLONG graceTicks = graceSeconds * 10'000'000ULL; // seconds to 100ns
 
                 // Overflow-safe lower bound: ts + grace < now  =>  ts < now - grace (when safe)
                 if (now.QuadPart > graceTicks) {
@@ -2369,7 +2468,8 @@ namespace ShadowStrike {
             }
 
             void PEFileSignatureVerifier::SetTimestampGraceSeconds(uint32_t seconds) noexcept {
-                tsGraceSeconds_ = seconds;
+                constexpr uint32_t kMaxGraceSeconds = 365U * 24U * 60U * 60U;
+                tsGraceSeconds_ = (seconds > kMaxGraceSeconds) ? kMaxGraceSeconds : seconds;
             }
             uint32_t PEFileSignatureVerifier::GetTimestampGraceSeconds() const noexcept {
                 return tsGraceSeconds_;
