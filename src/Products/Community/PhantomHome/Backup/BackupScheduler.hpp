@@ -490,7 +490,7 @@ struct SchedulerStatistics {
     std::atomic<uint64_t> successfulRuns{0};
     std::atomic<uint64_t> currentQueueSize{0};
     std::atomic<uint64_t> maxQueueSize{0};
-    std::array<std::atomic<uint64_t>, 8> byThrottleReason{};
+    std::array<std::atomic<uint64_t>, 9> byThrottleReason{};
     std::atomic<TimePoint> startTime{Clock::now()};
     
     void Reset() noexcept;
@@ -507,7 +507,7 @@ struct SchedulerStatisticsSnapshot {
     uint64_t successfulRuns;
     uint64_t currentQueueSize;
     uint64_t maxQueueSize;
-    std::array<uint64_t, 8> byThrottleReason;
+    std::array<uint64_t, 9> byThrottleReason;
     TimePoint startTime;
 };
 

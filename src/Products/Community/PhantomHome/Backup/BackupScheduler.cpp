@@ -47,6 +47,7 @@
 #include <queue>
 #include <charconv>
 #include <ctime>
+#include <limits>
 
 // ============================================================================
 // WINDOWS SDK
@@ -112,6 +113,18 @@ namespace {
         std::ostringstream oss;
         oss << std::hex << ts << "-" << seq;
         return oss.str();
+    }
+
+    void IncrementThrottleCounter(SchedulerStatistics& stats,
+                                  ThrottleReason reason) noexcept {
+        const size_t index = static_cast<size_t>(reason);
+        if (index >= stats.byThrottleReason.size()) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"IncrementThrottleCounter: invalid throttle reason index %zu",
+                index);
+            return;
+        }
+        stats.byThrottleReason[index].fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -235,6 +248,7 @@ bool SchedulerConfiguration::IsValid() const noexcept {
     if (!throttleConditions.IsValid()) return false;
     if (checkIntervalSeconds == 0) return false;
     if (maxQueueSize == 0) return false;
+    if (allowParallel && (maxParallel == 0 || maxParallel > maxQueueSize)) return false;
     return true;
 }
 
@@ -272,10 +286,19 @@ public:
         InitializeCpuBaseline();
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
-        m_running.store(true, std::memory_order_release);
+        m_running.store(m_config.enabled, std::memory_order_release);
 
         if (m_config.enabled) {
-            m_thread = std::thread(&BackupSchedulerImpl::SchedulerLoop, this);
+            try {
+                m_thread = std::thread(&BackupSchedulerImpl::SchedulerLoop, this);
+            } catch (const std::exception& ex) {
+                m_running.store(false, std::memory_order_release);
+                m_status.store(ModuleStatus::Error, std::memory_order_release);
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Initialize: failed to start scheduler thread: %hs",
+                    ex.what());
+                return false;
+            }
         }
 
         SS_LOG_INFO(LOG_CATEGORY,
@@ -288,7 +311,11 @@ public:
     void Shutdown() {
         {
             std::unique_lock lock(m_mutex);
-            if (!m_running.load(std::memory_order_acquire)) return;
+            const auto status = m_status.load(std::memory_order_acquire);
+            if (status == ModuleStatus::Stopped ||
+                status == ModuleStatus::Uninitialized) {
+                return;
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"Shutting down scheduler");
             m_running.store(false, std::memory_order_release);
             m_status.store(ModuleStatus::Stopping, std::memory_order_release);
@@ -338,13 +365,27 @@ public:
             SS_LOG_WARN(LOG_CATEGORY, L"Scheduler already running");
             return;
         }
+        if (m_thread.joinable()) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Cannot start: previous scheduler thread is still joinable");
+            return;
+        }
         if (m_status.load(std::memory_order_relaxed) == ModuleStatus::Uninitialized) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Cannot start: not initialized");
             return;
         }
         m_running.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
-        m_thread = std::thread(&BackupSchedulerImpl::SchedulerLoop, this);
+        try {
+            m_thread = std::thread(&BackupSchedulerImpl::SchedulerLoop, this);
+        } catch (const std::exception& ex) {
+            m_running.store(false, std::memory_order_release);
+            m_status.store(ModuleStatus::Error, std::memory_order_release);
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Start: failed to start scheduler thread: %hs",
+                ex.what());
+            return;
+        }
         SS_LOG_INFO(LOG_CATEGORY, L"Scheduler started");
     }
 
@@ -537,6 +578,7 @@ public:
     }
 
     void FireTrigger(TriggerType type, const std::map<std::string, std::string>& context) {
+        (void)context;
         std::vector<QueuedBackup> newItems;
         QueueCallback queueCb;
         {
@@ -932,8 +974,7 @@ public:
             }
             if (throttleReason != ThrottleReason::None && throttleCb) {
                 throttleCb(throttleReason);
-                m_stats.byThrottleReason[static_cast<size_t>(throttleReason)]
-                    .fetch_add(1, std::memory_order_relaxed);
+                IncrementThrottleCounter(m_stats, throttleReason);
             }
             for (const auto& q : toDispatch) {
                 if (dispatchCb) {
@@ -1297,15 +1338,25 @@ private:
             return 0;
         }
 
-        uint64_t idleDelta = idle.QuadPart - prevIdle;
-        uint64_t kernelDelta = kernel.QuadPart - prevKernel;
-        uint64_t userDelta = user.QuadPart - prevUser;
-        uint64_t totalDelta = kernelDelta + userDelta;
+        if (idle.QuadPart < prevIdle || kernel.QuadPart < prevKernel ||
+            user.QuadPart < prevUser) {
+            return 0;
+        }
+
+        const uint64_t idleDelta = idle.QuadPart - prevIdle;
+        const uint64_t kernelDelta = kernel.QuadPart - prevKernel;
+        const uint64_t userDelta = user.QuadPart - prevUser;
+        if ((std::numeric_limits<uint64_t>::max)() - kernelDelta < userDelta) {
+            return 0;
+        }
+        const uint64_t totalDelta = kernelDelta + userDelta;
 
         if (totalDelta == 0) return 0;
 
         // Kernel time includes idle time
-        uint64_t busyDelta = totalDelta - idleDelta;
+        const uint64_t busyDelta = (totalDelta > idleDelta)
+            ? (totalDelta - idleDelta)
+            : 0;
         return static_cast<int>((busyDelta * 100) / totalDelta);
     }
 
