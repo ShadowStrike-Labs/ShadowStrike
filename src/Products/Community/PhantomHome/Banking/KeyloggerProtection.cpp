@@ -48,6 +48,8 @@
 #include <filesystem>
 #include <random>
 #include <condition_variable>
+#include <bcrypt.h>
+#include <limits>
 
 // ============================================================================
 // WINDOWS SDK
@@ -61,6 +63,7 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace ShadowStrike {
 namespace Banking {
@@ -141,6 +144,10 @@ namespace {
 
     std::string WStringToString(const std::wstring& wstr) {
         if (wstr.empty()) return {};
+        if (wstr.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+            SS_LOG_WARN(LOG_CATEGORY, L"WStringToString rejected oversized string");
+            return {};
+        }
         int size_needed = WideCharToMultiByte(
             CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()),
             nullptr, 0, nullptr, nullptr);
@@ -165,16 +172,22 @@ namespace {
 
     // Generate a cryptographically-seeded unique event ID
     std::string GenerateEventId() {
-        static thread_local std::mt19937_64 rng([] {
-            std::random_device rd;
-            return rd();
-        }());
-        auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-        uint64_t rand_part = rng();
+        uint64_t randomParts[2]{};
+        NTSTATUS status = BCryptGenRandom(
+            nullptr,
+            reinterpret_cast<PUCHAR>(randomParts),
+            static_cast<ULONG>(sizeof(randomParts)),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status < 0) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"GenerateEventId: BCryptGenRandom failed status=0x%08X",
+                static_cast<unsigned>(status));
+            return {};
+        }
         std::ostringstream oss;
         oss << std::hex << std::setfill('0')
-            << std::setw(16) << static_cast<uint64_t>(ts) << "-"
-            << std::setw(16) << rand_part;
+            << std::setw(16) << randomParts[0] << "-"
+            << std::setw(16) << randomParts[1];
         return oss.str();
     }
 
@@ -430,7 +443,7 @@ public:
     }
 
     void Shutdown() {
-        Stop();
+        (void)Stop();
         std::unique_lock lock(m_mutex);
 
         {
@@ -472,7 +485,15 @@ public:
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
         if (m_config.enableHookDetection || m_config.enableAPIMonitoring) {
-            m_monitorThread = std::thread(&KeyloggerProtectionImpl::MonitorLoop, this);
+            try {
+                m_monitorThread = std::thread(&KeyloggerProtectionImpl::MonitorLoop, this);
+            } catch (const std::exception& ex) {
+                m_running.store(false, std::memory_order_release);
+                m_status.store(ModuleStatus::Error, std::memory_order_release);
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to start monitor thread: %S", ex.what());
+                return false;
+            }
         }
 
         SS_LOG_INFO(LOG_CATEGORY, L"KeyloggerProtection started (hookDetection=%d, apiMon=%d, clipboard=%d)",
@@ -500,7 +521,11 @@ public:
             for (const auto& win : m_protectedWindows) {
                 HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(win.windowHandle));
                 if (::IsWindow(hwnd)) {
-                    ::SetWindowDisplayAffinity(hwnd, WDA_NONE);
+                    if (!::SetWindowDisplayAffinity(hwnd, WDA_NONE)) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"Failed to clear display affinity for window 0x%llX, error=%lu",
+                            win.windowHandle, ::GetLastError());
+                    }
                 }
             }
             m_protectedWindows.clear();
@@ -548,7 +573,12 @@ public:
             return false;
         }
 
-        if (m_protectedWindows.size() >= KeyloggerConstants::MAX_PROTECTED_WINDOWS) {
+        auto it = std::find_if(m_protectedWindows.begin(), m_protectedWindows.end(),
+            [windowHandle](const KeyloggerProtectedWindow& p) {
+                return p.windowHandle == windowHandle;
+            });
+        if (it == m_protectedWindows.end() &&
+            m_protectedWindows.size() >= KeyloggerConstants::MAX_PROTECTED_WINDOWS) {
             SS_LOG_ERROR(LOG_CATEGORY,
                          L"Cannot protect window 0x%llX: max protected windows (%zu) reached",
                          windowHandle, KeyloggerConstants::MAX_PROTECTED_WINDOWS);
@@ -593,10 +623,6 @@ public:
         info.protectionEnabled = true;
 
         // Insert or update (keyed by window handle)
-        auto it = std::find_if(m_protectedWindows.begin(), m_protectedWindows.end(),
-            [windowHandle](const KeyloggerProtectedWindow& p) {
-                return p.windowHandle == windowHandle;
-            });
         if (it != m_protectedWindows.end()) {
             *it = std::move(info);
         } else {
@@ -697,7 +723,10 @@ public:
             SS_LOG_WARN(LOG_CATEGORY, L"ClearClipboard: EmptyClipboard failed, error=%lu",
                         ::GetLastError());
         }
-        ::CloseClipboard();
+        if (!::CloseClipboard()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ClearClipboard: CloseClipboard failed, error=%lu",
+                        ::GetLastError());
+        }
         SS_LOG_DEBUG(LOG_CATEGORY, L"Clipboard cleared");
     }
 
@@ -756,6 +785,12 @@ public:
         }
 
         do {
+            if (detections.size() >= KeyloggerConstants::MAX_MONITORED_PROCESSES) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ScanProcessesForHooks reached detection cap=%zu",
+                    KeyloggerConstants::MAX_MONITORED_PROCESSES);
+                break;
+            }
             // Skip System/Idle
             if (pe32.th32ProcessID <= 4) continue;
 
@@ -764,7 +799,6 @@ public:
 
             std::wstring exeName(pe32.szExeFile);
             {
-                std::shared_lock lock(m_mutex);
                 bool nameWhitelisted = std::any_of(
                     config.whitelistedProcesses.begin(),
                     config.whitelistedProcesses.end(),
@@ -777,6 +811,10 @@ public:
             if (IsSuspiciousProcess(pe32.th32ProcessID, exeName)) {
                 KeyloggerDetectionEvent event{};
                 event.eventId = GenerateEventId();
+                if (event.eventId.empty()) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Skipping detection because event ID generation failed");
+                    continue;
+                }
                 event.processId = pe32.th32ProcessID;
                 event.processName = exeName;
                 event.detectionTime = Now();
@@ -791,24 +829,21 @@ public:
                 }
 
                 // Determine action based on protection mode
-                {
-                    std::shared_lock lock(m_mutex);
-                    switch (m_config.protectionMode) {
-                        case ProtectionMode::Aggressive:
-                            event.actionTaken = m_config.terminateKeyloggers
-                                ? DetectionAction::Terminate
-                                : DetectionAction::Block;
-                            break;
-                        case ProtectionMode::Protect:
-                            event.actionTaken = DetectionAction::Block;
-                            break;
-                        case ProtectionMode::Monitor:
-                            event.actionTaken = DetectionAction::Alert;
-                            break;
-                        default:
-                            event.actionTaken = DetectionAction::None;
-                            break;
-                    }
+                switch (config.protectionMode) {
+                    case ProtectionMode::Aggressive:
+                        event.actionTaken = config.terminateKeyloggers
+                            ? DetectionAction::Terminate
+                            : DetectionAction::Block;
+                        break;
+                    case ProtectionMode::Protect:
+                        event.actionTaken = DetectionAction::Block;
+                        break;
+                    case ProtectionMode::Monitor:
+                        event.actionTaken = DetectionAction::Alert;
+                        break;
+                    default:
+                        event.actionTaken = DetectionAction::None;
+                        break;
                 }
 
                 m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
@@ -920,6 +955,13 @@ public:
         BYTE valueData[2048]{};
 
         for (DWORD index = 0; ; ++index) {
+            if (detections.size() >= KeyloggerConstants::MAX_MONITORED_PROCESSES) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ScanSingleRunKey reached detection cap=%zu for key=%.*s",
+                    KeyloggerConstants::MAX_MONITORED_PROCESSES,
+                    static_cast<int>(std::min<size_t>(subKey.size(), 256)), subKey.data());
+                break;
+            }
             DWORD nameLen = MAX_PATH;
             DWORD dataLen = sizeof(valueData);
             DWORD type = 0;
@@ -928,6 +970,13 @@ public:
                                      nullptr, &type, valueData, &dataLen);
             if (status != ERROR_SUCCESS) break;
             if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+            if (dataLen == 0 || (dataLen % sizeof(wchar_t)) != 0) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Skipping malformed registry value in %.*s: byteLength=%lu",
+                    static_cast<int>(std::min<size_t>(subKey.size(), 256)),
+                    subKey.data(), dataLen);
+                continue;
+            }
 
             std::wstring path(reinterpret_cast<const wchar_t*>(valueData),
                               dataLen / sizeof(wchar_t));
@@ -939,6 +988,10 @@ public:
                 if (WideContainsCaseInsensitive(path, frag)) {
                     KeyloggerDetectionEvent event{};
                     event.eventId = GenerateEventId();
+                    if (event.eventId.empty()) {
+                        SS_LOG_ERROR(LOG_CATEGORY, L"Skipping registry detection because event ID generation failed");
+                        break;
+                    }
                     event.keyloggerType = KeyloggerType::SoftwareHook;
                     event.severity = ThreatSeverity::High;
                     event.confidence = 0.8;
@@ -964,6 +1017,7 @@ public:
 
     std::vector<KeyboardHookInfo> ScanKeyboardHooks() {
         std::vector<KeyboardHookInfo> hooks;
+        hooks.reserve(std::min<size_t>(KeyloggerConstants::MAX_TRACKED_HOOKS, 32));
 
         ScopedHandle hSnapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
         if (!hSnapshot.IsValid()) {
@@ -979,9 +1033,17 @@ public:
         do {
             if (pe32.th32ProcessID <= 4) continue;
             auto perProcess = ScanProcessHooks(pe32.th32ProcessID);
+            const size_t remaining = KeyloggerConstants::MAX_TRACKED_HOOKS - hooks.size();
+            if (remaining == 0) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ScanKeyboardHooks reached hook cap=%zu",
+                    KeyloggerConstants::MAX_TRACKED_HOOKS);
+                break;
+            }
+            const size_t toMove = std::min(remaining, perProcess.size());
             hooks.insert(hooks.end(),
                          std::make_move_iterator(perProcess.begin()),
-                         std::make_move_iterator(perProcess.end()));
+                         std::make_move_iterator(perProcess.begin() + static_cast<std::ptrdiff_t>(toMove)));
         } while (::Process32NextW(hSnapshot.Get(), &pe32));
 
         return hooks;
@@ -1025,6 +1087,12 @@ public:
             if (procPath.has_value()) info.processPath = procPath.value();
 
             hooks.push_back(std::move(info));
+            if (hooks.size() >= KeyloggerConstants::MAX_TRACKED_HOOKS) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ScanProcessHooks reached hook cap=%zu for PID=%u",
+                    KeyloggerConstants::MAX_TRACKED_HOOKS, processId);
+                break;
+            }
         } while (::Module32NextW(modSnap.Get(), &me32));
 
         return hooks;
@@ -1042,8 +1110,11 @@ public:
 
             // Check path-based whitelist
             if (!hook.processPath.empty()) {
+                std::error_code ec;
+                std::filesystem::path normalized = std::filesystem::weakly_canonical(hook.processPath, ec);
+                std::wstring comparablePath = ec ? hook.processPath : normalized.wstring();
                 for (const auto& path : m_whitelistedPaths) {
-                    if (_wcsicmp(hook.processPath.c_str(), path.c_str()) == 0) return true;
+                    if (_wcsicmp(comparablePath.c_str(), path.c_str()) == 0) return true;
                 }
             }
         }
@@ -1066,20 +1137,15 @@ public:
 
     bool BlockHook(const KeyboardHookInfo& hook) {
         if (hook.hookHandle != 0) {
-            HHOOK hHook = reinterpret_cast<HHOOK>(static_cast<uintptr_t>(hook.hookHandle));
-            if (::UnhookWindowsHookEx(hHook)) {
-                m_stats.hooksBlocked.fetch_add(1, std::memory_order_relaxed);
-                SS_LOG_INFO(LOG_CATEGORY,
-                            L"Blocked hook: handle=0x%llX pid=%u module=%s",
-                            hook.hookHandle, hook.processId, hook.moduleName.c_str());
-                return true;
-            }
             SS_LOG_WARN(LOG_CATEGORY,
-                        L"UnhookWindowsHookEx failed for handle 0x%llX, error=%lu",
-                        hook.hookHandle, ::GetLastError());
+                L"Refusing to unhook unverified hook handle=0x%llX pid=%u module=%s",
+                hook.hookHandle, hook.processId, hook.moduleName.c_str());
+            return false;
         }
 
-        // If we can't unhook (no handle or cross-process), log the limitation
+        // DESIGN: Hook inventory here is heuristic. Only a hook handle returned by
+        // this process from SetWindowsHookEx can be safely passed to
+        // UnhookWindowsHookEx; fabricated cross-process values are not remediated.
         SS_LOG_WARN(LOG_CATEGORY,
                     L"Cannot directly unhook pid=%u module=%s (cross-process hook requires kernel driver)",
                     hook.processId, hook.moduleName.c_str());
@@ -1179,8 +1245,11 @@ public:
         // Check path whitelist
         auto procPath = Utils::ProcessUtils::GetProcessPath(static_cast<Utils::ProcessUtils::ProcessId>(processId));
         if (procPath.has_value()) {
+            std::error_code ec;
+            std::filesystem::path normalized = std::filesystem::weakly_canonical(procPath.value(), ec);
+            std::wstring comparablePath = ec ? procPath.value() : normalized.wstring();
             for (const auto& path : m_whitelistedPaths) {
-                if (_wcsicmp(procPath.value().c_str(), path.c_str()) == 0) return true;
+                if (_wcsicmp(comparablePath.c_str(), path.c_str()) == 0) return true;
             }
         }
 
@@ -1195,10 +1264,25 @@ public:
     }
 
     void AddPathToWhitelist(const std::filesystem::path& path, const std::string& reason) {
+        if (path.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"AddPathToWhitelist rejected empty path");
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::path normalized = std::filesystem::weakly_canonical(path, ec);
+        if (ec) {
+            normalized = std::filesystem::absolute(path, ec);
+        }
+        if (ec || normalized.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"AddPathToWhitelist rejected non-canonical path, error=%lu",
+                static_cast<unsigned long>(ec.value()));
+            return;
+        }
         std::unique_lock lock(m_mutex);
-        m_whitelistedPaths.insert(path.wstring());
+        m_whitelistedPaths.insert(normalized.wstring());
         SS_LOG_INFO(LOG_CATEGORY, L"Added path to whitelist: %s (reason: %S)",
-                    path.c_str(), reason.c_str());
+                    normalized.c_str(), reason.c_str());
     }
 
     void RemoveFromWhitelist(uint32_t processId) {
@@ -1423,8 +1507,12 @@ private:
         if (cb) {
             try {
                 cb(message, code);
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Error callback threw while reporting code=%d: %S", code, ex.what());
             } catch (...) {
-                // Swallowing here is intentional - we cannot recurse on error callbacks
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Error callback threw unknown exception while reporting code=%d", code);
             }
         }
     }
@@ -1456,6 +1544,13 @@ private:
                                      nullptr, &type, valueData, &dataLen);
             if (status != ERROR_SUCCESS) break;
             if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+            if (dataLen == 0 || (dataLen % sizeof(wchar_t)) != 0) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Skipping malformed persistence value in %.*s: byteLength=%lu",
+                    static_cast<int>(std::min<size_t>(subKey.size(), 256)),
+                    subKey.data(), dataLen);
+                continue;
+            }
 
             std::wstring path(reinterpret_cast<const wchar_t*>(valueData),
                               dataLen / sizeof(wchar_t));
@@ -1567,7 +1662,11 @@ KeyloggerProtectionConfiguration KeyloggerProtection::GetConfiguration() const {
 void KeyloggerProtection::SetProtectionMode(ProtectionMode mode) {
     auto config = GetConfiguration();
     config.protectionMode = mode;
-    UpdateConfiguration(config);
+    if (!UpdateConfiguration(config)) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"SetProtectionMode rejected mode=%u",
+            static_cast<unsigned>(mode));
+    }
 }
 
 ProtectionMode KeyloggerProtection::GetProtectionMode() const noexcept {
@@ -1639,7 +1738,16 @@ std::vector<ClipboardThreatInfo> KeyloggerProtection::GetClipboardAccessEvents()
 
 bool KeyloggerProtection::ShowVirtualKeyboard() {
     // Launch the Windows on-screen keyboard as a protected virtual input surface
-    HINSTANCE result = ::ShellExecuteW(nullptr, L"open", L"osk.exe",
+    wchar_t systemDir[MAX_PATH]{};
+    UINT systemDirLen = ::GetSystemDirectoryW(systemDir, static_cast<UINT>(std::size(systemDir)));
+    if (systemDirLen == 0 || systemDirLen >= std::size(systemDir)) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Failed to resolve System32 directory for virtual keyboard, error=%lu",
+            ::GetLastError());
+        return false;
+    }
+    std::filesystem::path oskPath = std::filesystem::path(systemDir) / L"osk.exe";
+    HINSTANCE result = ::ShellExecuteW(nullptr, L"open", oskPath.c_str(),
                                        nullptr, nullptr, SW_SHOW);
     bool ok = reinterpret_cast<uintptr_t>(result) > 32;
     if (ok) {
@@ -1654,8 +1762,12 @@ bool KeyloggerProtection::ShowVirtualKeyboard() {
 void KeyloggerProtection::HideVirtualKeyboard() {
     HWND hwnd = ::FindWindowW(L"OSKMainClass", nullptr);
     if (hwnd) {
-        ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        SS_LOG_DEBUG(LOG_CATEGORY, L"Virtual keyboard close requested");
+        if (::PostMessageW(hwnd, WM_CLOSE, 0, 0)) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"Virtual keyboard close requested");
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Virtual keyboard close request failed, error=%lu", ::GetLastError());
+        }
     }
 }
 
@@ -1671,6 +1783,12 @@ std::vector<KeyloggerDetectionEvent> KeyloggerProtection::DetectKeyloggers() {
 KeyloggerDetectionEvent KeyloggerProtection::ScanProcess(uint32_t processId) {
     KeyloggerDetectionEvent event{};
     event.eventId = GenerateEventId();
+    if (event.eventId.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ScanProcess: event ID generation failed for PID=%u", processId);
+        event.description = "Event ID generation failed";
+        event.severity = ThreatSeverity::None;
+        return event;
+    }
     event.processId = processId;
     event.detectionTime = Now();
 
