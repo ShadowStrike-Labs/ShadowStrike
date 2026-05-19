@@ -49,6 +49,7 @@
 #include <thread>
 #include <future>
 #include <condition_variable>
+#include <limits>
 #include <winioctl.h>
 
 namespace ShadowStrike {
@@ -75,6 +76,7 @@ namespace {
 
     /// Maximum completed sync results to retain in memory
     constexpr size_t MAX_COMPLETED_RESULTS = 256;
+    constexpr size_t MAX_SYNC_FILE_ENUMERATION = 10'000'000;
 
     // Gear hash table for FastCDC (deterministic LCG generation)
     constexpr std::array<uint64_t, 256> GEAR_MATRIX = []() {
@@ -166,11 +168,10 @@ namespace {
             nullptr, buf.data(), static_cast<ULONG>(buf.size()),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (status < 0) {
-            // Fallback: entropy from RDTSC + thread ID + high-res clock
-            auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
-            std::memcpy(buf.data(), &now, sizeof(now));
-            std::memcpy(buf.data() + 8, &tid, sizeof(tid));
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"GenerateSecureSyncId: BCryptGenRandom failed status=0x%08X",
+                static_cast<unsigned>(status));
+            return {};
         }
         return BytesToHex(buf.data(), buf.size());
     }
@@ -186,6 +187,45 @@ namespace {
             vol += L':';
         }
         return vol;
+    }
+
+    [[nodiscard]] bool IsValidDosVolumePath(const std::wstring& path) noexcept {
+        if (path.size() == 6 && path.substr(0, 4) == L"\\\\.\\" &&
+            path[5] == L':' && ((path[4] >= L'A' && path[4] <= L'Z') ||
+                                (path[4] >= L'a' && path[4] <= L'z'))) {
+            return true;
+        }
+        if ((path.size() == 2 || path.size() == 3) &&
+            ((path[0] >= L'A' && path[0] <= L'Z') ||
+             (path[0] >= L'a' && path[0] <= L'z')) &&
+            path[1] == L':' &&
+            (path.size() == 2 || path[2] == L'\\')) {
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] uint64_t SaturatingAddU64(uint64_t lhs, uint64_t rhs) noexcept {
+        if (rhs > (std::numeric_limits<uint64_t>::max)() - lhs) {
+            return (std::numeric_limits<uint64_t>::max)();
+        }
+        return lhs + rhs;
+    }
+
+    [[nodiscard]] bool PathContainsOrEquals(const fs::path& parent, const fs::path& child) {
+        const std::wstring parentNative = parent.native();
+        const std::wstring childNative = child.native();
+        if (_wcsicmp(parentNative.c_str(), childNative.c_str()) == 0) {
+            return true;
+        }
+        if (childNative.size() <= parentNative.size()) {
+            return false;
+        }
+        if (_wcsnicmp(childNative.c_str(), parentNative.c_str(), parentNative.size()) != 0) {
+            return false;
+        }
+        wchar_t boundary = childNative[parentNative.size()];
+        return boundary == L'\\' || boundary == L'/';
     }
 
 }  // anonymous namespace
@@ -525,11 +565,54 @@ public:
         }
 
         try {
+            if (!options.IsValid()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"StartSync rejected: invalid chunking options");
+                return "";
+            }
+            std::error_code ec;
+            if (source.empty() || !fs::exists(source, ec) || ec) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"StartSync rejected: source does not exist: %ls",
+                    source.c_str());
+                return "";
+            }
+            if (vault.empty()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"StartSync rejected: vault path is empty");
+                return "";
+            }
+            fs::path canonicalSource = fs::weakly_canonical(source, ec);
+            if (ec) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"StartSync rejected: cannot canonicalize source %ls (%hs)",
+                    source.c_str(), ec.message().c_str());
+                return "";
+            }
+            ec.clear();
+            fs::path canonicalVault = fs::weakly_canonical(vault, ec);
+            if (ec) {
+                canonicalVault = fs::absolute(vault, ec);
+            }
+            if (ec) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"StartSync rejected: cannot canonicalize vault %ls (%hs)",
+                    vault.c_str(), ec.message().c_str());
+                return "";
+            }
+            if (PathContainsOrEquals(canonicalSource, canonicalVault) ||
+                PathContainsOrEquals(canonicalVault, canonicalSource)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"StartSync rejected: source and vault paths overlap");
+                return "";
+            }
+
             std::string syncId = GenerateSecureSyncId();
+            if (syncId.empty()) {
+                return "";
+            }
             auto context = std::make_shared<SyncContext>();
             context->syncId = syncId;
-            context->sourcePath = source;
-            context->vaultPath = vault;
+            context->sourcePath = canonicalSource;
+            context->vaultPath = canonicalVault;
             context->chunkingOptions = options;
             context->startTime = Clock::now();
             context->progress.syncId = syncId;
@@ -542,9 +625,18 @@ public:
             }
 
             // Launch worker thread; captured shared_ptr keeps context alive.
-            context->worker = std::thread([this, context]() {
-                runSync(context);
-            });
+            try {
+                context->worker = std::thread([this, context]() {
+                    runSync(context);
+                });
+            } catch (const std::exception& ex) {
+                std::unique_lock lock(m_mutex);
+                m_activeSyncs.erase(syncId);
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"StartSync: failed to create worker thread: %hs",
+                    ex.what());
+                return "";
+            }
 
             SS_LOG_INFO(LOG_CATEGORY, L"Started sync %hs: %ls -> %ls",
                 syncId.c_str(), source.c_str(), vault.c_str());
@@ -562,7 +654,10 @@ public:
         auto it = m_activeSyncs.find(syncId);
         if (it != m_activeSyncs.end()) {
             it->second->cancelFlag.store(true, std::memory_order_release);
-            it->second->progress.status = SyncStatus::Cancelled;
+            {
+                std::lock_guard stateLock(it->second->stateMutex);
+                it->second->progress.status = SyncStatus::Cancelled;
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"Cancelling sync %hs", syncId.c_str());
             return true;
         }
@@ -574,8 +669,11 @@ public:
         auto it = m_activeSyncs.find(syncId);
         if (it != m_activeSyncs.end()) {
             it->second->pauseFlag.store(true, std::memory_order_release);
-            it->second->progress.status = SyncStatus::Pending;
-            it->second->progress.phase = "Paused";
+            {
+                std::lock_guard stateLock(it->second->stateMutex);
+                it->second->progress.status = SyncStatus::Pending;
+                it->second->progress.phase = "Paused";
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"Paused sync %hs", syncId.c_str());
             return true;
         }
@@ -595,30 +693,45 @@ public:
     }
 
     [[nodiscard]] std::optional<SyncProgress> GetProgress(const std::string& syncId) noexcept {
-        std::shared_lock lock(m_mutex);
-        auto it = m_activeSyncs.find(syncId);
-        if (it != m_activeSyncs.end()) {
-            return it->second->progress;
+        std::shared_ptr<SyncContext> ctx;
+        {
+            std::shared_lock lock(m_mutex);
+            auto it = m_activeSyncs.find(syncId);
+            if (it != m_activeSyncs.end()) {
+                ctx = it->second;
+            }
+        }
+        if (ctx) {
+            std::lock_guard stateLock(ctx->stateMutex);
+            return ctx->progress;
         }
         return std::nullopt;
     }
 
     [[nodiscard]] std::optional<SyncResult> GetResult(const std::string& syncId) noexcept {
-        std::shared_lock lock(m_mutex);
+        std::shared_ptr<SyncContext> active;
+        {
+            std::shared_lock lock(m_mutex);
+            auto ait = m_activeSyncs.find(syncId);
+            if (ait != m_activeSyncs.end()) {
+                active = ait->second;
+            } else {
+                auto cit = m_completedSyncs.find(syncId);
+                if (cit != m_completedSyncs.end()) {
+                    return cit->second;
+                }
+            }
+        }
+
         // Check active syncs first (might still be running or just completed)
-        auto ait = m_activeSyncs.find(syncId);
-        if (ait != m_activeSyncs.end()) {
-            if (ait->second->progress.status == SyncStatus::Completed ||
-                ait->second->progress.status == SyncStatus::Failed ||
-                ait->second->progress.status == SyncStatus::Cancelled) {
-                return ait->second->result;
+        if (active) {
+            std::lock_guard stateLock(active->stateMutex);
+            if (active->progress.status == SyncStatus::Completed ||
+                active->progress.status == SyncStatus::Failed ||
+                active->progress.status == SyncStatus::Cancelled) {
+                return active->result;
             }
             return std::nullopt;
-        }
-        // Check completed history
-        auto cit = m_completedSyncs.find(syncId);
-        if (cit != m_completedSyncs.end()) {
-            return cit->second;
         }
         return std::nullopt;
     }
@@ -715,6 +828,12 @@ public:
         std::vector<FileChangeRecord> changes;
 #ifdef _WIN32
         try {
+            if (!IsValidDosVolumePath(volumePath)) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"GetUSNChanges: invalid DOS volume path: %ls",
+                    volumePath.c_str());
+                return changes;
+            }
             std::wstring devPath = NormalizeVolumePath(volumePath);
             HANDLE hVolume = CreateFileW(
                 devPath.c_str(),
@@ -776,6 +895,17 @@ public:
 
                 while (remaining > 0 && recordPtr->RecordLength > 0 &&
                        recordPtr->RecordLength <= remaining) {
+                    const DWORD fileNameEnd =
+                        static_cast<DWORD>(recordPtr->FileNameOffset) +
+                        static_cast<DWORD>(recordPtr->FileNameLength);
+                    if (recordPtr->FileNameOffset < sizeof(USN_RECORD_V2) ||
+                        fileNameEnd > recordPtr->RecordLength ||
+                        (recordPtr->FileNameLength % sizeof(wchar_t)) != 0) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"GetUSNChanges: malformed USN record skipped");
+                        break;
+                    }
+
                     FileChangeRecord rec;
                     std::wstring fname(
                         reinterpret_cast<const wchar_t*>(
@@ -901,12 +1031,17 @@ public:
         std::vector<ChunkDescriptor> chunks;
 
         try {
+            if (!options.IsValid()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"ChunkData rejected invalid chunking options");
+                return chunks;
+            }
             std::vector<size_t> boundaries;
 
             if (options.algorithm == ChunkingAlgorithm::Fixed) {
                 size_t offset = 0;
                 while (offset < data.size()) {
-                    size_t next = std::min(offset + options.avgChunkSize, data.size());
+                    const size_t remaining = data.size() - offset;
+                    size_t next = offset + std::min(options.avgChunkSize, remaining);
                     boundaries.push_back(next);
                     offset = next;
                 }
@@ -991,6 +1126,7 @@ public:
         uint64_t total = m_stats.totalBytesProcessed.load(std::memory_order_relaxed);
         uint64_t saved = m_stats.bytesSavedByDedup.load(std::memory_order_relaxed);
         if (total == 0) return 1.0;
+        if (saved >= total) return static_cast<double>(total);
         return static_cast<double>(total) / static_cast<double>(total - saved);
     }
 
@@ -1072,6 +1208,7 @@ public:
         std::span<const uint8_t> data,
         ChunkHashAlgorithm algorithm
     ) noexcept {
+        (void)algorithm;
         std::array<uint8_t, 32> hash{};
 
         // Use SHA-256 via the existing BCrypt-backed Hasher for all chunk hash
@@ -1239,6 +1376,7 @@ private:
         std::atomic<bool> pauseFlag{false};
         std::mutex pauseMutex;
         std::condition_variable pauseCv;
+        std::mutex stateMutex;
         SyncProgress progress;
         SyncResult result;
         std::thread worker;
@@ -1249,7 +1387,10 @@ private:
     // ========================================================================
 
     void runSync(std::shared_ptr<SyncContext> ctx) noexcept {
-        ctx->progress.status = SyncStatus::Scanning;
+        {
+            std::lock_guard stateLock(ctx->stateMutex);
+            ctx->progress.status = SyncStatus::Scanning;
+        }
         notifyProgress(ctx);
 
         try {
@@ -1260,9 +1401,12 @@ private:
             if (ec) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Cannot create vault chunk dir: %ls (%hs)",
                     chunkDir.c_str(), ec.message().c_str());
-                ctx->progress.status = SyncStatus::Failed;
-                ctx->result.status = SyncStatus::Failed;
-                ctx->result.errors.push_back("Cannot create vault directory: " + ec.message());
+                {
+                    std::lock_guard stateLock(ctx->stateMutex);
+                    ctx->progress.status = SyncStatus::Failed;
+                    ctx->result.status = SyncStatus::Failed;
+                    ctx->result.errors.push_back("Cannot create vault directory: " + ec.message());
+                }
                 m_stats.failedSyncs.fetch_add(1, std::memory_order_relaxed);
                 finishSync(ctx);
                 return;
@@ -1277,11 +1421,20 @@ private:
                 if (ec) { ec.clear(); continue; }
                 if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
                 if (entry.is_symlink(ec)) { ec.clear(); continue; }
+                if (files.size() >= MAX_SYNC_FILE_ENUMERATION) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Sync file enumeration limit reached (%zu)",
+                        MAX_SYNC_FILE_ENUMERATION);
+                    break;
+                }
                 files.push_back(entry.path());
             }
 
-            ctx->progress.totalFiles = files.size();
-            ctx->progress.phase = "Processing files";
+            {
+                std::lock_guard stateLock(ctx->stateMutex);
+                ctx->progress.totalFiles = files.size();
+                ctx->progress.phase = "Processing files";
+            }
 
             // 2. Process each file
             for (const auto& file : files) {
@@ -1291,23 +1444,31 @@ private:
                 waitIfPaused(ctx);
                 if (ctx->cancelFlag.load(std::memory_order_acquire)) break;
 
-                ctx->progress.currentFile = file;
-                ctx->progress.status = SyncStatus::Chunking;
+                {
+                    std::lock_guard stateLock(ctx->stateMutex);
+                    ctx->progress.currentFile = file;
+                    ctx->progress.status = SyncStatus::Chunking;
+                }
                 notifyProgress(ctx);
 
                 processFile(file, ctx);
 
-                ctx->progress.filesProcessed++;
-                if (ctx->progress.totalFiles > 0) {
-                    ctx->progress.percentComplete = static_cast<int>(
-                        (ctx->progress.filesProcessed * 100) / ctx->progress.totalFiles);
+                {
+                    std::lock_guard stateLock(ctx->stateMutex);
+                    ctx->progress.filesProcessed++;
+                    if (ctx->progress.totalFiles > 0) {
+                        ctx->progress.percentComplete = static_cast<int>(
+                            (ctx->progress.filesProcessed * 100) / ctx->progress.totalFiles);
+                    }
                 }
             }
 
             if (ctx->cancelFlag.load(std::memory_order_acquire)) {
+                std::lock_guard stateLock(ctx->stateMutex);
                 ctx->progress.status = SyncStatus::Cancelled;
                 ctx->result.status = SyncStatus::Cancelled;
             } else {
+                std::lock_guard stateLock(ctx->stateMutex);
                 ctx->progress.status = SyncStatus::Completed;
                 ctx->result.status = SyncStatus::Completed;
                 m_stats.successfulSyncs.fetch_add(1, std::memory_order_relaxed);
@@ -1316,9 +1477,12 @@ private:
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Sync %hs failed: %hs",
                 ctx->syncId.c_str(), ex.what());
-            ctx->progress.status = SyncStatus::Failed;
-            ctx->result.status = SyncStatus::Failed;
-            ctx->result.errors.push_back(ex.what());
+            {
+                std::lock_guard stateLock(ctx->stateMutex);
+                ctx->progress.status = SyncStatus::Failed;
+                ctx->result.status = SyncStatus::Failed;
+                ctx->result.errors.push_back(ex.what());
+            }
             m_stats.failedSyncs.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1327,22 +1491,30 @@ private:
     }
 
     void finishSync(std::shared_ptr<SyncContext> ctx) noexcept {
-        ctx->result.endTime = std::chrono::system_clock::now();
-        auto elapsed = Clock::now() - ctx->startTime;
-        ctx->result.duration = std::chrono::duration_cast<std::chrono::seconds>(elapsed);
-        ctx->result.syncId = ctx->syncId;
+        SyncResult resultSnapshot;
+        {
+            std::lock_guard stateLock(ctx->stateMutex);
+            ctx->result.endTime = std::chrono::system_clock::now();
+            auto elapsed = Clock::now() - ctx->startTime;
+            ctx->result.duration = std::chrono::duration_cast<std::chrono::seconds>(elapsed);
+            ctx->result.syncId = ctx->syncId;
 
-        // Compute dedup and compression ratios
-        if (ctx->result.bytesScanned > 0) {
-            uint64_t afterDedup = ctx->result.bytesScanned -
-                m_stats.bytesSavedByDedup.load(std::memory_order_relaxed);
-            ctx->result.bytesAfterDedup = afterDedup;
-            ctx->result.dedupRatio = static_cast<double>(ctx->result.bytesScanned) /
-                static_cast<double>(std::max(afterDedup, uint64_t{1}));
-            if (ctx->result.bytesStored > 0) {
-                ctx->result.compressionRatio = static_cast<double>(afterDedup) /
-                    static_cast<double>(ctx->result.bytesStored);
+            // Compute dedup and compression ratios
+            if (ctx->result.bytesScanned > 0) {
+                const uint64_t globalSaved =
+                    m_stats.bytesSavedByDedup.load(std::memory_order_relaxed);
+                const uint64_t afterDedup = (globalSaved >= ctx->result.bytesScanned)
+                    ? 0
+                    : (ctx->result.bytesScanned - globalSaved);
+                ctx->result.bytesAfterDedup = afterDedup;
+                ctx->result.dedupRatio = static_cast<double>(ctx->result.bytesScanned) /
+                    static_cast<double>(std::max(afterDedup, uint64_t{1}));
+                if (ctx->result.bytesStored > 0) {
+                    ctx->result.compressionRatio = static_cast<double>(afterDedup) /
+                        static_cast<double>(ctx->result.bytesStored);
+                }
             }
+            resultSnapshot = ctx->result;
         }
 
         notifyProgress(ctx);
@@ -1351,7 +1523,15 @@ private:
         {
             std::shared_lock lock(m_callbackMutex);
             if (m_completionCallback) {
-                m_completionCallback(ctx->result);
+                try {
+                    m_completionCallback(resultSnapshot);
+                } catch (const std::exception& ex) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Completion callback threw: %hs", ex.what());
+                } catch (...) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Completion callback threw unknown exception");
+                }
             }
         }
 
@@ -1360,7 +1540,7 @@ private:
         // This thread is about to return; all member accesses above are done.
         {
             std::unique_lock lock(m_mutex);
-            m_completedSyncs[ctx->syncId] = ctx->result;
+            m_completedSyncs[ctx->syncId] = resultSnapshot;
             if (m_completedSyncs.size() > MAX_COMPLETED_RESULTS) {
                 m_completedSyncs.erase(m_completedSyncs.begin());
             }
@@ -1419,15 +1599,30 @@ private:
                      static_cast<std::streamsize>(fileSize));
             size_t bytesRead = static_cast<size_t>(ifs.gcount());
             if (bytesRead == 0) return;
+            if (bytesRead != fileSize) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Short read while processing %ls: expected %zu bytes, read %zu",
+                    file.c_str(), fileSize, bytesRead);
+                notifyError("Short read while processing file: " + file.string(), -3);
+                return;
+            }
 
-            ctx->result.bytesScanned += bytesRead;
-            ctx->result.filesScanned++;
+            {
+                std::lock_guard stateLock(ctx->stateMutex);
+                ctx->result.bytesScanned = SaturatingAddU64(
+                    ctx->result.bytesScanned, static_cast<uint64_t>(bytesRead));
+                ctx->result.filesScanned = SaturatingAddU64(ctx->result.filesScanned, 1);
+            }
             m_stats.totalBytesProcessed.fetch_add(bytesRead, std::memory_order_relaxed);
 
             auto chunks = ChunkData(
                 std::span<const uint8_t>(buffer.data(), bytesRead),
                 ctx->chunkingOptions);
-            ctx->result.chunksCreated += chunks.size();
+            {
+                std::lock_guard stateLock(ctx->stateMutex);
+                ctx->result.chunksCreated = SaturatingAddU64(
+                    ctx->result.chunksCreated, static_cast<uint64_t>(chunks.size()));
+            }
             m_stats.totalChunksCreated.fetch_add(chunks.size(), std::memory_order_relaxed);
 
             // Read configured compression algorithm
@@ -1442,7 +1637,11 @@ private:
 
                 if (ChunkExists(chunk.hash)) {
                     chunk.isDeduplicated = true;
-                    ctx->result.chunksDeduplicated++;
+                    {
+                        std::lock_guard stateLock(ctx->stateMutex);
+                        ctx->result.chunksDeduplicated =
+                            SaturatingAddU64(ctx->result.chunksDeduplicated, 1);
+                    }
                     m_stats.totalChunksDeduplicated.fetch_add(1, std::memory_order_relaxed);
                     m_stats.bytesSavedByDedup.fetch_add(chunk.originalSize, std::memory_order_relaxed);
                     m_stats.duplicateChunks.fetch_add(1, std::memory_order_relaxed);
@@ -1466,12 +1665,22 @@ private:
                         std::min(compressed.size(), static_cast<size_t>(UINT32_MAX)));
                     chunk.compression = compAlg;
 
-                    // Write chunk to vault
-                    writeChunkToVault(chunk, compressed, ctx->vaultPath);
+                    // Write chunk to vault before advertising it in the dedup index.
+                    if (!writeChunkToVault(chunk, compressed, ctx->vaultPath)) {
+                        notifyError("Failed to persist backup chunk for file: " + file.string(), -4);
+                        continue;
+                    }
 
-                    AddChunkToIndex(chunk);
+                    if (!AddChunkToIndex(chunk)) {
+                        notifyError("Failed to index backup chunk for file: " + file.string(), -5);
+                        continue;
+                    }
 
-                    ctx->result.bytesStored += chunk.compressedSize;
+                    {
+                        std::lock_guard stateLock(ctx->stateMutex);
+                        ctx->result.bytesStored = SaturatingAddU64(
+                            ctx->result.bytesStored, chunk.compressedSize);
+                    }
                     m_stats.totalBytesStored.fetch_add(chunk.compressedSize, std::memory_order_relaxed);
 
                     if (chunk.originalSize > chunk.compressedSize) {
@@ -1489,7 +1698,17 @@ private:
                     // Notify chunk callback
                     {
                         std::shared_lock lock(m_callbackMutex);
-                        if (m_chunkCallback) m_chunkCallback(chunk);
+                        if (m_chunkCallback) {
+                            try {
+                                m_chunkCallback(chunk);
+                            } catch (const std::exception& ex) {
+                                SS_LOG_WARN(LOG_CATEGORY,
+                                    L"Chunk callback threw: %hs", ex.what());
+                            } catch (...) {
+                                SS_LOG_WARN(LOG_CATEGORY,
+                                    L"Chunk callback threw unknown exception");
+                            }
+                        }
                     }
                 }
             }
@@ -1505,7 +1724,7 @@ private:
     // VAULT I/O
     // ========================================================================
 
-    void writeChunkToVault(
+    [[nodiscard]] bool writeChunkToVault(
         const ChunkDescriptor& chunk,
         const std::vector<uint8_t>& data,
         const fs::path& vaultPath
@@ -1518,21 +1737,30 @@ private:
             fs::create_directories(subdir, ec);
             if (ec) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Cannot create chunk subdir: %hs", ec.message().c_str());
-                return;
+                return false;
             }
 
             fs::path chunkPath = subdir / hashHex;
-            if (fs::exists(chunkPath, ec)) return;  // Content-addressable: already stored
+            if (fs::exists(chunkPath, ec)) return true;  // Content-addressable: already stored
 
             std::ofstream ofs(chunkPath, std::ios::binary);
             if (!ofs) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Cannot create chunk file: %ls", chunkPath.c_str());
-                return;
+                return false;
             }
             ofs.write(reinterpret_cast<const char*>(data.data()),
                       static_cast<std::streamsize>(data.size()));
+            ofs.flush();
+            if (!ofs) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to write complete chunk file: %ls",
+                    chunkPath.c_str());
+                return false;
+            }
+            return true;
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"writeChunkToVault exception: %hs", ex.what());
+            return false;
         }
     }
 
@@ -1553,6 +1781,12 @@ private:
             ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
             ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
             ifs.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (!ifs) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Dedup index header is truncated: %ls",
+                    m_config.dedupIndexPath.c_str());
+                return;
+            }
 
             if (magic != DEDUP_INDEX_MAGIC || version != DEDUP_INDEX_VERSION) {
                 SS_LOG_WARN(LOG_CATEGORY,
@@ -1613,6 +1847,19 @@ private:
                 ofs.write(reinterpret_cast<const char*>(&entry.storageOffset), sizeof(entry.storageOffset));
                 ofs.write(reinterpret_cast<const char*>(&entry.size), sizeof(entry.size));
                 ofs.write(reinterpret_cast<const char*>(&entry.refCount), sizeof(entry.refCount));
+                if (!ofs) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Failed while writing dedup index entry to %ls",
+                        m_config.dedupIndexPath.c_str());
+                    return;
+                }
+            }
+            ofs.flush();
+            if (!ofs) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Failed to flush dedup index to %ls",
+                    m_config.dedupIndexPath.c_str());
+                return;
             }
 
             SS_LOG_INFO(LOG_CATEGORY, L"Saved %u dedup index entries to %ls",
@@ -1628,10 +1875,20 @@ private:
     // ========================================================================
 
     void notifyProgress(std::shared_ptr<SyncContext> ctx) noexcept {
+        SyncProgress snapshot;
+        {
+            std::lock_guard stateLock(ctx->stateMutex);
+            snapshot = ctx->progress;
+        }
         std::shared_lock lock(m_callbackMutex);
         if (m_progressCallback) {
-            try { m_progressCallback(ctx->progress); }
-            catch (...) { /* callback must not propagate exceptions */ }
+            try { m_progressCallback(snapshot); }
+            catch (const std::exception& ex) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Progress callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Progress callback threw unknown exception");
+            }
         }
     }
 
@@ -1639,7 +1896,12 @@ private:
         std::shared_lock lock(m_callbackMutex);
         if (m_errorCallback) {
             try { m_errorCallback(msg, code); }
-            catch (...) {}
+            catch (const std::exception& ex) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Error callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Error callback threw unknown exception");
+            }
         }
     }
 
