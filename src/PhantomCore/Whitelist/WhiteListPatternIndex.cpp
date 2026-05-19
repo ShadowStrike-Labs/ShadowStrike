@@ -135,6 +135,9 @@ constexpr size_t SAFE_MAX_TRIE_DEPTH = 512;
 /// @brief Maximum Windows path length (UNC paths)
 constexpr size_t MAX_WINDOWS_PATH_LENGTH = 32767;
 
+/// @brief Hard cap for path records loaded into memory from a mapped store.
+constexpr uint64_t MAX_PATH_RECORDS_IN_MEMORY = 250'000;
+
 /// @brief Prefetch distance for trie node traversal
 constexpr size_t TRIE_PREFETCH_DISTANCE = 2;
 
@@ -1164,20 +1167,20 @@ StoreError PathIndex::Initialize(
         );
     }
     
-    m_view = &view;
-    m_baseAddress = nullptr; // Read-only mode
-    m_indexOffset = offset;
-    m_indexSize = size;
-    
     // Minimum header size for hybrid model
     // Header layout: root offset (8) + pathCount (8) + nodeCount (8) + recordCount (8) + reserved (32) = 64 bytes
-    constexpr uint64_t MIN_HEADER_SIZE = 64;
+    constexpr uint64_t MIN_HEADER_SIZE = 80;
     if (size < MIN_HEADER_SIZE) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
-            "Path index section too small for header"
+            "Path index section too small for header and record count"
         );
     }
+
+    m_view = &view;
+    m_baseAddress = nullptr;
+    m_indexOffset = offset;
+    m_indexSize = size;
     
     // Read legacy header fields for backwards compatibility
     const auto* rootPtr = view.GetAt<uint64_t>(offset);
@@ -1204,8 +1207,12 @@ StoreError PathIndex::Initialize(
     if (loadError.code != WhitelistStoreError::Success) {
         SS_LOG_ERROR(L"Whitelist", L"PathIndex::Initialize: LoadRecordsFromStorage failed: %S",
             loadError.message.c_str());
-        // Non-fatal: continue with empty index
         m_pathRecords.clear();
+        m_view = nullptr;
+        m_indexOffset = 0;
+        m_indexSize = 0;
+        m_rootOffset = 0;
+        return loadError;
     }
     
     // Step 2: Rebuild HeapTrieNode index from loaded records
@@ -1245,8 +1252,16 @@ void PathIndex::EnableWriteMode(void* baseAddress, uint64_t size) noexcept {
         SS_LOG_WARN(L"Whitelist", L"PathIndex::EnableWriteMode called with null base address");
         return;
     }
+
+    constexpr uint64_t MIN_WRITABLE_SIZE = 80;
+    if (size < MIN_WRITABLE_SIZE) {
+        SS_LOG_WARN(L"Whitelist", L"PathIndex::EnableWriteMode rejected undersized index section");
+        return;
+    }
     
     m_baseAddress = baseAddress;
+    // m_baseAddress is the start of the path-index section, not the file base.
+    m_indexOffset = 0;
     m_indexSize = size;
     
     SS_LOG_DEBUG(L"Whitelist", L"PathIndex write mode enabled, size: %llu", size);
@@ -2347,7 +2362,7 @@ StoreError PathIndex::Clear() noexcept {
         // STEP 4: Zero the memory-mapped header for consistency
         // ====================================================================
         if (m_baseAddress) {
-            auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
+            auto* base = static_cast<uint8_t*>(m_baseAddress);
             
             // Zero header + record count region (80 bytes)
             constexpr uint64_t CLEAR_SIZE = 80;
@@ -3011,8 +3026,8 @@ StoreError PathIndex::FlushRecordsToStorage() noexcept {
         );
     }
     
-    // PI-14 fix: Write to correct offset by adding m_indexOffset to base
-    auto* basePtr = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
+    // m_baseAddress is section-relative in writable mode.
+    auto* basePtr = static_cast<uint8_t*>(m_baseAddress);
     
     try {
         // Write record count
@@ -3092,13 +3107,14 @@ StoreError PathIndex::LoadRecordsFromStorage() noexcept {
     
     const uint64_t recordCount = *countPtr;
     
-    // Validate record count is reasonable
-    constexpr uint64_t MAX_RECORDS = 100'000'000; // 100 million max
-    if (recordCount > MAX_RECORDS) {
+    // Validate record count against both policy and physical section capacity.
+    const uint64_t maxRecordsBySection =
+        (m_indexSize - RECORDS_START_OFFSET) / static_cast<uint64_t>(sizeof(PathEntryRecord));
+    if (recordCount > MAX_PATH_RECORDS_IN_MEMORY || recordCount > maxRecordsBySection) {
         SS_LOG_ERROR(L"Whitelist", L"LoadRecordsFromStorage: invalid record count %llu", recordCount);
         return StoreError::WithMessage(
             WhitelistStoreError::IndexCorrupted,
-            "Record count exceeds maximum"
+            "Record count exceeds path index capacity"
         );
     }
     
@@ -3147,6 +3163,34 @@ StoreError PathIndex::LoadRecordsFromStorage() noexcept {
             );
         }
         
+        auto isSafeRecord = [](const PathEntryRecord& record) noexcept -> bool {
+            if (!record.IsValid()) {
+                return false;
+            }
+            if (record.matchMode > static_cast<uint8_t>(PathMatchMode::Regex)) {
+                return false;
+            }
+            if ((record.flags & ~uint8_t{0x01}) != 0) {
+                return false;
+            }
+            if (record.IsDeleted()) {
+                return true;
+            }
+            if (record.pathLength == 0 || record.pathLength > PathEntryRecord::MAX_PATH_LENGTH) {
+                return false;
+            }
+            for (uint16_t i = 0; i < record.pathLength; ++i) {
+                const auto ch = static_cast<unsigned char>(record.path[i]);
+                if (ch == 0 || ch < 0x20) {
+                    return false;
+                }
+            }
+            const uint32_t expectedHash = ComputeFNV1aHash(
+                reinterpret_cast<const uint8_t*>(record.path),
+                record.pathLength);
+            return expectedHash == record.pathHash;
+        };
+
         uint64_t validCount = 0;
         uint64_t invalidCount = 0;
         
@@ -3154,14 +3198,9 @@ StoreError PathIndex::LoadRecordsFromStorage() noexcept {
             const PathEntryRecord& record = recordsBase[i];
             
             // Validate record
-            if (!record.IsValid()) {
+            if (!isSafeRecord(record)) {
                 ++invalidCount;
                 SS_LOG_WARN(L"Whitelist", L"LoadRecordsFromStorage: invalid record at index %llu", i);
-                
-                // Add placeholder to maintain index alignment
-                PathEntryRecord placeholder{};
-                placeholder.flags = 0x01; // Mark as deleted
-                m_pathRecords.push_back(placeholder);
                 continue;
             }
             
