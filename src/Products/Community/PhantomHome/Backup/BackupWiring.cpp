@@ -53,34 +53,39 @@
 
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 
-#include <ShlObj.h>   // SHGetKnownFolderPath, FOLDERID_LocalAppData
+#include <ShlObj.h>   // SHGetKnownFolderPath, FOLDERID_ProgramData
 #include <filesystem>
+#include <string>
 
 namespace {
 
 constexpr const wchar_t* kLogCategory = L"BackupWiring";
 
-/// @brief Resolve a default vault path under %LOCALAPPDATA%\ShadowStrike.
-/// Falls back to a temp-based path if SHGetKnownFolderPath fails.
+/// @brief Resolve a default vault path under %ProgramData%\ShadowStrike.
+/// Falls back to the canonical ProgramData path if SHGetKnownFolderPath fails.
 [[nodiscard]] std::filesystem::path ResolveDefaultVaultPath() noexcept {
     try {
-        PWSTR appDataRaw = nullptr;
-        HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &appDataRaw);
-        if (SUCCEEDED(hr) && appDataRaw) {
+        PWSTR programDataRaw = nullptr;
+        HRESULT hr = SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &programDataRaw);
+        if (SUCCEEDED(hr) && programDataRaw) {
             std::filesystem::path vaultPath =
-                std::filesystem::path(appDataRaw) / L"ShadowStrike" / L".ShadowStrikeVault";
-            CoTaskMemFree(appDataRaw);
+                std::filesystem::path(programDataRaw) / L"ShadowStrike" / L".ShadowStrikeVault";
+            CoTaskMemFree(programDataRaw);
             return vaultPath;
         }
-        if (appDataRaw) CoTaskMemFree(appDataRaw);
-    } catch (...) { /* fall through */ }
-
-    // Fallback: use temp directory
-    std::error_code ec;
-    auto tmp = std::filesystem::temp_directory_path(ec);
-    if (!ec) {
-        return tmp / L"ShadowStrike" / L".ShadowStrikeVault";
+        if (programDataRaw) CoTaskMemFree(programDataRaw);
+        SS_LOG_WARN(kLogCategory,
+            L"ResolveDefaultVaultPath: SHGetKnownFolderPath(FOLDERID_ProgramData) failed hr=0x%08X",
+            static_cast<unsigned>(hr));
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory,
+            L"ResolveDefaultVaultPath: exception while resolving ProgramData: %hs",
+            ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory,
+            L"ResolveDefaultVaultPath: unknown exception while resolving ProgramData");
     }
+
     return L"C:\\ProgramData\\ShadowStrike\\.ShadowStrikeVault";
 }
 
@@ -98,6 +103,8 @@ struct BackupWiringRegistrar final {
 
             HomeProductOrchestrator::Instance().RegisterModule(ModuleDescriptor{
                 .name             = "BackupManager",
+                .displayName      = "Secure Backup Vault",
+                .group            = "Backup",
                 .enabledConfigKey = "Home/Backup/Enabled",
                 .phase            = ModulePhase::Background,
 
@@ -184,8 +191,14 @@ struct BackupWiringRegistrar final {
                     ProtectionModeMask(ProtectionMode::Off)     |
                     ProtectionModeMask(ProtectionMode::Balanced)
             });
+        } catch (const std::exception& ex) {
+            const std::string message =
+                std::string("BackupWiringRegistrar failed during static initialization: ") +
+                ex.what() + "\n";
+            OutputDebugStringA(message.c_str());
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            OutputDebugStringW(
+                L"BackupWiringRegistrar failed during static initialization: unknown exception\n");
         }
     }
 };
