@@ -475,9 +475,9 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
     return buffer;
 }
 
-[[nodiscard]] std::string IpV6ToString(const UCHAR bytes[16]) {
+[[nodiscard]] std::string IpV6ToString(const UCHAR (&bytes)[16]) {
     IN6_ADDR address{};
-    std::copy_n(bytes, 16, address.u.Byte);
+    std::copy_n(static_cast<const UCHAR*>(bytes), 16, address.u.Byte);
 
     char buffer[INET6_ADDRSTRLEN] = {};
     if (::InetNtopA(AF_INET6, &address, buffer, static_cast<DWORD>(std::size(buffer))) == nullptr) {
@@ -530,25 +530,57 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
     std::vector<EnumeratedConnection> results;
 
     auto appendRows = [&](ULONG family) {
+        // GetExtendedTcpTable requires a size-then-fetch dance. The table can
+        // grow between calls (new connections), so we retry with the new size
+        // a bounded number of times to avoid going blind for a polling cycle.
+        constexpr int kMaxAttempts = 6;
+        std::vector<std::byte> buffer;
         DWORD bufferSize = 0;
-        const DWORD query = ::GetExtendedTcpTable(nullptr,
-            &bufferSize,
-            FALSE,
-            family,
-            TCP_TABLE_OWNER_PID_ALL,
-            0);
+        DWORD status = ERROR_INSUFFICIENT_BUFFER;
 
-        if (query != ERROR_INSUFFICIENT_BUFFER || bufferSize == 0) {
-            return;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            DWORD probeSize = bufferSize;
+            const DWORD query = ::GetExtendedTcpTable(buffer.empty() ? nullptr : buffer.data(),
+                &probeSize,
+                FALSE,
+                family,
+                TCP_TABLE_OWNER_PID_ALL,
+                0);
+
+            if (query == NO_ERROR) {
+                status = NO_ERROR;
+                bufferSize = probeSize;
+                break;
+            }
+
+            if (query != ERROR_INSUFFICIENT_BUFFER || probeSize == 0) {
+                status = query;
+                break;
+            }
+
+            // Grow slightly beyond the reported size to absorb table churn.
+            if (probeSize > (std::numeric_limits<DWORD>::max)() - 4096U) {
+                status = ERROR_ARITHMETIC_OVERFLOW;
+                break;
+            }
+            bufferSize = probeSize + 4096U;
+            try {
+                buffer.assign(static_cast<size_t>(bufferSize), std::byte{});
+            } catch (const std::bad_alloc&) {
+                Utils::Logger::Error(
+                    "PoolConnectionDetector: GetExtendedTcpTable allocation failed ({} bytes)",
+                    bufferSize);
+                return;
+            }
         }
 
-        std::vector<std::byte> buffer(bufferSize);
-        if (::GetExtendedTcpTable(buffer.data(),
-            &bufferSize,
-            FALSE,
-            family,
-            TCP_TABLE_OWNER_PID_ALL,
-            0) != NO_ERROR) {
+        if (status != NO_ERROR || buffer.empty()) {
+            if (status != NO_ERROR) {
+                Utils::Logger::Warn(
+                    "PoolConnectionDetector: GetExtendedTcpTable(family={}) failed with status {}",
+                    static_cast<unsigned>(family),
+                    static_cast<unsigned>(status));
+            }
             return;
         }
 
@@ -684,7 +716,24 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
     }
 
     endpoint.pathAndQuery = ToLowerUtf8(endpoint.pathAndQuery);
-    endpoint.valid = !endpoint.host.empty() && endpoint.host.size() <= kMaxHostnameLength;
+
+    // Restrict the host to a conservative ASCII subset: DNS letters/digits/
+    // hyphen/dot, plus the characters valid inside an IPv6 literal (we already
+    // stripped the surrounding brackets). This blocks CRLF/log-injection,
+    // embedded NULs, whitespace, and Unicode homoglyphs/IDN smuggling that
+    // would otherwise corrupt the blacklist and bypass HasDotBoundarySuffix.
+    const bool hostCharsOk = !endpoint.host.empty() &&
+        endpoint.host.size() <= kMaxHostnameLength &&
+        std::all_of(endpoint.host.begin(), endpoint.host.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') ||
+                   c == '-' || c == '.' || c == ':';
+        }) &&
+        endpoint.host.front() != '-' && endpoint.host.front() != '.' &&
+        endpoint.host.back()  != '-' &&
+        endpoint.host.find("..") == std::string::npos;
+
+    endpoint.valid = hostCharsOk;
     return endpoint;
 }
 
@@ -984,13 +1033,29 @@ public:
 };
 
 bool PoolConnectionDetectorImpl::Initialize(const PoolConnectionDetectorConfiguration& config) {
-    if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-        return true;
+    // Gate concurrent / repeated Initialize() through the status atomic so that
+    // a second caller cannot observe m_initialized==true before the maps are
+    // actually populated, and so SelfTest() (or any test path) cannot latch the
+    // detector in a way that silently no-ops the real production Initialize().
+    ModuleStatus expected = ModuleStatus::Uninitialized;
+    if (!m_status.compare_exchange_strong(expected,
+            ModuleStatus::Initializing,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        if (expected == ModuleStatus::Running || expected == ModuleStatus::Paused) {
+            return m_initialized.load(std::memory_order_acquire);
+        }
+        if (expected == ModuleStatus::Initializing) {
+            // Another thread is currently initializing; do not double-initialize.
+            return false;
+        }
+        // Stopped / Error / Stopping: allow re-initialization by claiming the slot.
+        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
     }
 
     if (!config.IsValid()) {
-        m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Error, std::memory_order_release);
+        m_initialized.store(false, std::memory_order_release);
         Utils::Logger::Error("PoolConnectionDetector: rejected invalid configuration");
         return false;
     }
@@ -1001,7 +1066,7 @@ bool PoolConnectionDetectorImpl::Initialize(const PoolConnectionDetectorConfigur
             m_config = config;
         }
 
-        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
+        // Status was already set to Initializing above; redundant store removed.
         // ThreatIntel accessed via singleton directly — no raw pointer stored.
 
         {
@@ -1022,6 +1087,8 @@ bool PoolConnectionDetectorImpl::Initialize(const PoolConnectionDetectorConfigur
         RefreshBlacklistState(config);
 
         m_statistics.Reset();
+        // Publish "ready" only after every backing store is populated.
+        m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
         Utils::Logger::Info("PoolConnectionDetector: initialized with {} known pool indicators",
             m_knownPools.size());
@@ -1040,6 +1107,16 @@ void PoolConnectionDetectorImpl::Shutdown() {
     }
 
     m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+
+    // Drain callbacks first under their own lock so no new invocation chain
+    // can start once we begin tearing down backing maps. We do not invoke
+    // callbacks while holding this lock — they are simply discarded.
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        m_connectionCallbacks.clear();
+        m_stratumCallbacks.clear();
+        m_errorCallbacks.clear();
+    }
 
     {
         std::unique_lock lock(m_connectionsMutex);
@@ -1062,15 +1139,12 @@ void PoolConnectionDetectorImpl::Shutdown() {
         std::unique_lock lock(m_whitelistMutex);
         m_whitelistedPools.clear();
     }
-    {
-        std::lock_guard lock(m_callbacksMutex);
-        m_connectionCallbacks.clear();
-        m_stratumCallbacks.clear();
-        m_errorCallbacks.clear();
-    }
 
     // ThreatIntel accessed via singleton — no raw pointer to clear.
-    m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+    // Reset back to Uninitialized so the detector can be cleanly re-initialized
+    // after Shutdown (e.g. test/restart paths). Leaving it at Stopped would
+    // force callers through the CAS reclaim path on Initialize().
+    m_status.store(ModuleStatus::Uninitialized, std::memory_order_release);
 }
 
 bool PoolConnectionDetectorImpl::IsStratumTrafficInternal(std::span<const uint8_t> payload) {
@@ -1166,11 +1240,15 @@ std::optional<StratumMessage> PoolConnectionDetectorImpl::ParseStratumMessageInt
         message.method = json["method"].get<std::string>();
         message.command = ParseStratumCommand(ToLowerUtf8(message.method));
         if (json.contains("params")) {
-            message.params = SanitizeBoundedText(json["params"].dump(), kMaxJsonMessageBytes);
+            message.params = SanitizeBoundedText(
+                json["params"].dump(-1, ' ', false, Json::error_handler_t::replace),
+                kMaxJsonMessageBytes);
         }
     } else if (json.contains("result")) {
         message.isRequest = false;
-        message.result = SanitizeBoundedText(json["result"].dump(), kMaxJsonMessageBytes);
+        message.result = SanitizeBoundedText(
+            json["result"].dump(-1, ' ', false, Json::error_handler_t::replace),
+            kMaxJsonMessageBytes);
     }
 
     if (json.contains("error") && !json["error"].is_null()) {
@@ -1178,7 +1256,9 @@ std::optional<StratumMessage> PoolConnectionDetectorImpl::ParseStratumMessageInt
         if (json["error"].is_object() && json["error"].contains("message") && json["error"]["message"].is_string()) {
             message.errorMessage = SanitizeBoundedText(json["error"]["message"].get<std::string>(), 256);
         } else {
-            message.errorMessage = SanitizeBoundedText(json["error"].dump(), 256);
+            message.errorMessage = SanitizeBoundedText(
+                json["error"].dump(-1, ' ', false, Json::error_handler_t::replace),
+                256);
         }
     }
 
@@ -1263,8 +1343,8 @@ std::optional<PoolEndpointInfo> PoolConnectionDetectorImpl::GetPoolInfoInternal(
         info.threatIntelSource = "builtin-malicious-pool-host";
         maliciousIndicator = true;
         endpointIndicator = true;
-    } else if (const auto it = FindMatchingPoolHostname(parsed.host, PoolSignatures::KNOWN_POOL_HOSTNAMES); it.has_value()) {
-        info.poolName = it.value();
+    } else if (const auto known = FindMatchingPoolHostname(parsed.host, PoolSignatures::KNOWN_POOL_HOSTNAMES); known.has_value()) {
+        info.poolName = known.value();
         info.status = PoolStatus::KnownPublic;
         info.threatIntelSource = "builtin-known-pool-host";
         endpointIndicator = true;
@@ -1462,9 +1542,17 @@ std::optional<std::string> PoolConnectionDetectorImpl::ExtractWorkerNameInternal
             }
             if (std::strcmp(key, "worker") == 0 || std::strcmp(key, "rig") == 0 || std::strcmp(key, "workername") == 0) {
                 const std::string worker = TrimCopy(params[key].get<std::string>());
-                if (!worker.empty() && worker.size() <= kMaxWorkerNameLength) {
-                    return worker;
+                if (worker.empty() || worker.size() > kMaxWorkerNameLength) {
+                    continue;
                 }
+                // Apply the same restrictive character set as ExtractWorkerCandidate
+                // to defeat log/JSON injection from hostile pool payloads.
+                if (!std::all_of(worker.begin(), worker.end(), [](unsigned char c) {
+                        return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
+                    })) {
+                    continue;
+                }
+                return worker;
             }
         }
     }
@@ -1601,7 +1689,8 @@ void PoolConnectionDetectorImpl::AddRecentDetection(const PoolConnectionInfo& co
 
 std::vector<PoolConnectionInfo> PoolConnectionDetectorImpl::CollectConnections(std::optional<uint32_t> processId) {
     const ModuleStatus status = m_status.load(std::memory_order_acquire);
-    if (!m_initialized.load(std::memory_order_acquire) || status == ModuleStatus::Stopped || status == ModuleStatus::Stopping || status == ModuleStatus::Paused) {
+    if (!m_initialized.load(std::memory_order_acquire) ||
+        status != ModuleStatus::Running) {
         return {};
     }
 
@@ -1759,6 +1848,9 @@ bool PoolConnectionDetectorImpl::IsBlacklistedInternal(const std::string& addres
     }
 
     std::shared_lock lock(m_blacklistMutex);
+    if (m_blacklistedPools.empty()) {
+        return false;
+    }
     if (m_blacklistedPools.contains(parsed.host)) {
         return true;
     }
@@ -1766,11 +1858,15 @@ bool PoolConnectionDetectorImpl::IsBlacklistedInternal(const std::string& addres
         return true;
     }
 
-    if (!IsIpLiteral(parsed.host)) {
-        for (const auto& indicator : m_blacklistedPools) {
-            if (indicator.find(':') == std::string::npos && HasDotBoundarySuffix(parsed.host, indicator)) {
-                return true;
-            }
+    // Suffix scan is only meaningful for multi-label DNS names; skip for IPs
+    // and single-label hostnames to bound hot-path cost.
+    if (parsed.host.find('.') == std::string::npos || IsIpLiteral(parsed.host)) {
+        return false;
+    }
+
+    for (const auto& indicator : m_blacklistedPools) {
+        if (indicator.find(':') == std::string::npos && HasDotBoundarySuffix(parsed.host, indicator)) {
+            return true;
         }
     }
 
@@ -1784,6 +1880,9 @@ bool PoolConnectionDetectorImpl::IsWhitelistedInternal(const std::string& addres
     }
 
     std::shared_lock lock(m_whitelistMutex);
+    if (m_whitelistedPools.empty()) {
+        return false;
+    }
     if (m_whitelistedPools.contains(parsed.host)) {
         return true;
     }
@@ -1791,11 +1890,13 @@ bool PoolConnectionDetectorImpl::IsWhitelistedInternal(const std::string& addres
         return true;
     }
 
-    if (!IsIpLiteral(parsed.host)) {
-        for (const auto& indicator : m_whitelistedPools) {
-            if (indicator.find(':') == std::string::npos && HasDotBoundarySuffix(parsed.host, indicator)) {
-                return true;
-            }
+    if (parsed.host.find('.') == std::string::npos || IsIpLiteral(parsed.host)) {
+        return false;
+    }
+
+    for (const auto& indicator : m_whitelistedPools) {
+        if (indicator.find(':') == std::string::npos && HasDotBoundarySuffix(parsed.host, indicator)) {
+            return true;
         }
     }
 
@@ -1864,11 +1965,30 @@ bool PoolConnectionDetectorImpl::LoadPoolBlacklistInternal(const std::filesystem
         return false;
     }
 
+    // Defence in depth: cap whole-file size in addition to whatever the
+    // FileUtils layer enforces. 4 MiB is far above any legitimate IOC feed.
+    constexpr size_t kMaxBlacklistFileBytes = 4U * 1024U * 1024U;
+    if (content.size() > kMaxBlacklistFileBytes) {
+        Utils::Logger::Error(
+            "PoolConnectionDetector: blacklist {} rejected — file too large ({} bytes)",
+            path.string(),
+            content.size());
+        return false;
+    }
+
+    constexpr size_t kMaxBlacklistLineBytes = 4096;
     std::istringstream stream(content);
     std::string line;
     size_t added = 0;
 
     while (std::getline(stream, line)) {
+        if (line.size() > kMaxBlacklistLineBytes) {
+            Utils::Logger::Warn(
+                "PoolConnectionDetector: blacklist {} contains an oversized line ({} bytes) — skipped",
+                path.string(),
+                line.size());
+            continue;
+        }
         line = TrimCopy(line);
         if (line.empty() || line[0] == '#') {
             continue;
@@ -1935,7 +2055,8 @@ void PoolConnectionDetectorImpl::InvokeErrorCallbacks(const std::string& message
 
 std::string PoolConnectionDetectorImpl::GenerateDetectionId() const {
     static std::atomic<uint64_t> counter{0};
-    const auto tick = SystemClock::now().time_since_epoch().count();
+    const auto tick = static_cast<uint64_t>(
+        SystemClock::now().time_since_epoch().count());
     return std::format("PDET-{:016X}-{:08X}", tick, counter.fetch_add(1, std::memory_order_relaxed));
 }
 
@@ -2005,13 +2126,17 @@ bool PoolConnectionDetector::Start() {
         return false;
     }
 
-    const ModuleStatus current = m_impl->m_status.load(std::memory_order_acquire);
-    if (current == ModuleStatus::Stopping || current == ModuleStatus::Error) {
-        return false;
+    // Only legal transitions are Paused -> Running, or no-op when already
+    // Running. Refuse Stopping, Stopped, Error, Initializing — those require
+    // a fresh Initialize() to pass through the CAS gate.
+    ModuleStatus expected = ModuleStatus::Paused;
+    if (m_impl->m_status.compare_exchange_strong(expected,
+            ModuleStatus::Running,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return true;
     }
-
-    m_impl->m_status.store(ModuleStatus::Running, std::memory_order_release);
-    return true;
+    return m_impl->m_status.load(std::memory_order_acquire) == ModuleStatus::Running;
 }
 
 bool PoolConnectionDetector::Stop() {
@@ -2019,7 +2144,22 @@ bool PoolConnectionDetector::Stop() {
         return false;
     }
 
-    m_impl->m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+    // Atomically transition Running/Paused -> Stopping so a racing Start()
+    // cannot wedge the detector back into Running mid-stop.
+    ModuleStatus expected = ModuleStatus::Running;
+    if (!m_impl->m_status.compare_exchange_strong(expected,
+            ModuleStatus::Stopping,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        expected = ModuleStatus::Paused;
+        if (!m_impl->m_status.compare_exchange_strong(expected,
+                ModuleStatus::Stopping,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+    }
+
     {
         std::unique_lock lock(m_impl->m_connectionsMutex);
         m_impl->m_activeConnections.clear();
@@ -2246,12 +2386,19 @@ std::vector<PoolDetectionResult> PoolConnectionDetector::GetRecentDetections(siz
 }
 
 bool PoolConnectionDetector::SelfTest() {
-    PoolConnectionDetectorConfiguration config;
-    config.blockMaliciousPools = true;
-    config.logStratumMessages = false;
+    // Preserve any pre-existing initialization so that the diagnostic self-test
+    // does not silently clobber a live production configuration, and conversely
+    // does not leak the test configuration into production after it returns.
+    const bool wasAlreadyInitialized = IsInitialized();
 
-    if (!Initialize(config)) {
-        return false;
+    if (!wasAlreadyInitialized) {
+        PoolConnectionDetectorConfiguration config;
+        config.blockMaliciousPools = true;
+        config.logStratumMessages = false;
+
+        if (!Initialize(config)) {
+            return false;
+        }
     }
 
     const std::string sample = R"({"id":1,"method":"mining.authorize","params":["0x0123456789abcdef0123456789abcdef01234567.worker","x"]})";
@@ -2263,10 +2410,16 @@ bool PoolConnectionDetector::SelfTest() {
     const auto worker = ExtractWorkerName(payload);
     const auto knownPool = GetPoolInfo("stratum+ssl://pool.supportxmr.com:443");
 
-    return stratumDetected &&
+    const bool ok = stratumDetected &&
         parsed.has_value() && parsed->command == StratumCommand::Authorize &&
         wallet.has_value() && worker.has_value() &&
         knownPool.has_value() && knownPool->requiresTLS;
+
+    if (!wasAlreadyInitialized) {
+        Shutdown();
+    }
+
+    return ok;
 }
 
 std::string PoolConnectionDetector::GetVersionString() noexcept {
@@ -2331,29 +2484,38 @@ std::string PoolDetectorStatistics::ToJson() const {
 }
 
 bool PoolConnectionDetectorConfiguration::IsValid() const noexcept {
-    if (monitorPorts.size() > 1024 || whitelistedPools.size() > PoolDetectorConstants::MAX_KNOWN_POOLS) {
-        return false;
-    }
-
-    std::set<uint16_t> uniquePorts;
-    for (const auto port : monitorPorts) {
-        if (port == 0 || !uniquePorts.insert(port).second) {
+    try {
+        if (monitorPorts.size() > 1024 || whitelistedPools.size() > PoolDetectorConstants::MAX_KNOWN_POOLS) {
             return false;
         }
-    }
 
-    if (poolBlacklistPath.size() > Utils::FileUtils::MAX_REASONABLE_PATH_LENGTH) {
-        return false;
-    }
+        std::set<uint16_t> uniquePorts;
+        for (const auto port : monitorPorts) {
+            if (port == 0 || !uniquePorts.insert(port).second) {
+                return false;
+            }
+        }
 
-    for (const auto& entry : whitelistedPools) {
-        const ParsedEndpoint parsed = ParseEndpoint(entry);
-        if (!parsed.valid) {
+        if (poolBlacklistPath.size() > Utils::FileUtils::MAX_REASONABLE_PATH_LENGTH) {
             return false;
         }
-    }
 
-    return true;
+        for (const auto& entry : whitelistedPools) {
+            if (entry.size() > 4096) {
+                return false;
+            }
+            const ParsedEndpoint parsed = ParseEndpoint(entry);
+            if (!parsed.valid) {
+                return false;
+            }
+        }
+
+        return true;
+    } catch (...) {
+        // Hostile or oversized configuration must never propagate as a
+        // terminate(); treat allocation/parse failures as "invalid".
+        return false;
+    }
 }
 
 std::string PoolEndpointInfo::ToJson() const {
@@ -2368,7 +2530,7 @@ std::string PoolEndpointInfo::ToJson() const {
         {"isBlacklisted", isBlacklisted},
         {"threatIntelSource", threatIntelSource}
     };
-    return json.dump(2);
+    return json.dump(2, ' ', false, Json::error_handler_t::replace);
 }
 
 std::string PoolConnectionInfo::ToJson() const {
@@ -2394,7 +2556,7 @@ std::string PoolConnectionInfo::ToJson() const {
         {"sharesRejected", sharesRejected},
         {"durationSecs", durationSecs}
     };
-    return json.dump(2);
+    return json.dump(2, ' ', false, Json::error_handler_t::replace);
 }
 
 std::string StratumMessage::ToJson() const {
@@ -2425,7 +2587,7 @@ std::string StratumMessage::ToJson() const {
         {"errorMessage", errorMessage},
         {"rawMessagePreview", SanitizeBoundedText(rawMessage, 256)}
     };
-    return json.dump(2);
+    return json.dump(2, ' ', false, Json::error_handler_t::replace);
 }
 
 std::string PoolDetectionResult::ToJson() const {
@@ -2442,7 +2604,7 @@ std::string PoolDetectionResult::ToJson() const {
         {"wasBlocked", wasBlocked},
         {"connectionInfo", connectionJson}
     };
-    return json.dump(2);
+    return json.dump(2, ' ', false, Json::error_handler_t::replace);
 }
 
 std::string_view GetPoolProtocolTypeName(PoolProtocolType type) noexcept {
