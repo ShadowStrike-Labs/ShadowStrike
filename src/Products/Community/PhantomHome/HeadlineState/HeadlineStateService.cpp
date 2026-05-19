@@ -44,6 +44,14 @@ namespace ShadowStrike::Products::Home::HeadlineState {
 
 namespace {
 constexpr const wchar_t* kLog = L"HeadlineStateService";
+
+// Static liveness guard for callbacks registered with sibling singletons
+// (RecommendationsEngine, PgtiFeedManager).  Those singletons are Meyers'
+// singletons too, and static destruction order across translation units is
+// unspecified.  If a callback fires after our destructor has run, this flag
+// prevents the lambda from dereferencing freed PIMPL state (UAF).  We never
+// reset it back to true after a shutdown — the process is exiting.
+std::atomic<bool> g_serviceAlive{false};
 }
 
 // ============================================================================
@@ -229,11 +237,15 @@ HeadlineStateService& HeadlineStateService::Instance() noexcept
 HeadlineStateService::HeadlineStateService()
     : m_impl(std::make_unique<Impl>())
 {
+    g_serviceAlive.store(true, std::memory_order_release);
 }
 
 HeadlineStateService::~HeadlineStateService()
 {
     Stop();
+    // Block any further callback re-entry from sibling singletons that may
+    // outlive us.  PIMPL state is about to be destroyed.
+    g_serviceAlive.store(false, std::memory_order_release);
 }
 
 // ============================================================================
@@ -247,12 +259,22 @@ void HeadlineStateService::Start()
     }
 
     // Subscribe to RecommendationsEngine so we recompute on any change.
+    // The lambda checks g_serviceAlive to defend against post-destruction
+    // delivery during static-destructor ordering at process exit.
     Recommendations::RecommendationsEngine::Instance().RegisterChangedCallback(
-        [this]{ ForceRecompute(); });
+        [this]{
+            if (g_serviceAlive.load(std::memory_order_acquire)) {
+                ForceRecompute();
+            }
+        });
 
     // Subscribe to PgtiFeedManager so feed health changes trigger recompute.
     ThreatIntel::PgtiFeedManager::Instance().RegisterStatusChangedCallback(
-        [this]{ ForceRecompute(); });
+        [this]{
+            if (g_serviceAlive.load(std::memory_order_acquire)) {
+                ForceRecompute();
+            }
+        });
 
     m_impl->worker = std::jthread([this](std::stop_token st) {
         m_impl->WorkerLoop(std::move(st));
@@ -290,6 +312,9 @@ HeadlineSnapshot HeadlineStateService::Snapshot() const
 
 void HeadlineStateService::ForceRecompute()
 {
+    if (!m_impl) {
+        return;
+    }
     {
         std::unique_lock<std::mutex> lk(m_impl->recomputeMtx);
         m_impl->recomputeRequested = true;
