@@ -37,10 +37,27 @@ namespace {
 
 constexpr const wchar_t* kLogCategory = L"AmsiWiring";
 
+// Custom deleter that honours the COM reference-count contract. AmsiProvider
+// is heap-allocated through CreateAmsiProvider() with refCount == 1; tearing
+// it down therefore requires Release(), NOT operator delete. This guarantees
+// that any in-process consumer that has called QueryInterface()/AddRef() is
+// the last to drop the reference and trigger the actual destruction.
+struct AmsiProviderComReleaser final {
+    void operator()(ShadowStrike::Products::Home::AmsiProvider* p) const noexcept {
+        if (p != nullptr) {
+            (void)p->Release();
+        }
+    }
+};
+
+using AmsiProviderHandle =
+    std::unique_ptr<ShadowStrike::Products::Home::AmsiProvider,
+                    AmsiProviderComReleaser>;
+
 // One provider instance for this process. The mutex serializes orchestrator
 // mode/shutdown callbacks; the provider itself handles concurrent AMSI scans.
-std::mutex g_providerMutex;
-std::unique_ptr<ShadowStrike::Products::Home::AmsiProvider> g_provider;
+std::mutex          g_providerMutex;
+AmsiProviderHandle  g_provider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -62,8 +79,25 @@ struct AmsiProviderRegistrar final {
                         std::lock_guard lock(g_providerMutex);
                         if (g_provider) return true;
 
-                        auto provider =
-                            std::make_unique<ShadowStrike::Products::Home::AmsiProvider>();
+                        IAntimalwareProvider* rawProvider = nullptr;
+                        const HRESULT hr = CreateAmsiProvider(&rawProvider);
+                        if (FAILED(hr) || rawProvider == nullptr) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CreateAmsiProvider failed hr=0x%08X",
+                                static_cast<unsigned>(hr));
+                            if (rawProvider != nullptr) {
+                                (void)rawProvider->Release();
+                            }
+                            return false;
+                        }
+
+                        // CreateAmsiProvider yields the underlying concrete
+                        // type with COM refCount == 1; downcast is safe
+                        // because the factory is the sole producer of this
+                        // pointer and never returns any other implementation.
+                        AmsiProviderHandle provider(
+                            static_cast<AmsiProvider*>(rawProvider));
+
                         if (!provider->Initialize()) {
                             SS_LOG_ERROR(kLogCategory,
                                 L"AmsiProvider::Initialize() returned false");
@@ -75,7 +109,7 @@ struct AmsiProviderRegistrar final {
                             SS_LOG_WARN(kLogCategory,
                                 L"AMSI COM registration failed; provider will "
                                 L"still scan in-process but may not intercept "
-                                 L"third-party AMSI clients");
+                                L"third-party AMSI clients");
                         }
                         g_provider = std::move(provider);
                         SS_LOG_INFO(kLogCategory,
@@ -107,6 +141,9 @@ struct AmsiProviderRegistrar final {
                         std::lock_guard lock(g_providerMutex);
                         if (g_provider) {
                             g_provider->Shutdown();
+                            // ComReleaser invokes Release(); the object is
+                            // destroyed once the last outstanding COM
+                            // reference (if any) is dropped.
                             g_provider.reset();
                         }
                         SS_LOG_INFO(kLogCategory, L"AmsiProvider shut down");

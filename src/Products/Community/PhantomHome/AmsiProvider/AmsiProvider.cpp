@@ -34,7 +34,9 @@
 // ── PhantomCore infrastructure ────────────────────────────────────────────────
 #include "PhantomCore/Utils/Logger.hpp"
 #include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Config/ConfigManager.hpp"
 #include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureFormat.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelStore.hpp"
 #include "PhantomCore/AI/PhantomCortex.hpp"
 
@@ -51,6 +53,24 @@ namespace {
 constexpr const wchar_t* kLogCategory   = L"AmsiProvider";
 constexpr ULONGLONG      kMaxContentSize = 64ULL * 1024 * 1024;  // 64 MiB cap
 constexpr ULONG          kAmsiReadChunkSize = 1UL * 1024 * 1024;  // 1 MiB bounded COM reads
+
+// ConfigManager key naming the on-disk signatures database used by the
+// SignatureStore. When the key is absent or empty, hash/pattern scanning is
+// silently disabled and the provider relies on ThreatIntel + AI only.
+constexpr const char* kSignatureDbPathKey = "Phantom/SignatureStore/DatabasePath";
+
+// Minimal PE header probe: PhantomCortex::AnalyzeFile() is a PE-only path
+// (extracts PE features). Passing non-PE script bytes wastes CPU and produces
+// an unreliable benign-with-error verdict. We only invoke the model when the
+// payload begins with the "MZ" DOS header and is large enough to plausibly
+// hold an IMAGE_DOS_HEADER + IMAGE_NT_HEADERS pair.
+constexpr std::size_t kMinPeProbeSize = 64u;
+
+[[nodiscard]] bool LooksLikePeImage(std::span<const std::uint8_t> bytes) noexcept {
+    return bytes.size() >= kMinPeProbeSize &&
+           bytes[0] == static_cast<std::uint8_t>('M') &&
+           bytes[1] == static_cast<std::uint8_t>('Z');
+}
 
 // IID for IAntimalwareProvider (from amsi.h / SDK)
 // {b2cabfe3-fe04-42b1-a5df-08d483d4d125}
@@ -339,11 +359,16 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::Scan(IAmsiStream* stream,
     }
 
     // ── PhantomCortex AI scan ─────────────────────────────────────────────────
+    // DESIGN: AnalyzeFile() is the PE classifier path; it extracts PE features
+    // and rejects non-PE payloads with a Benign/zero-confidence verdict. AMSI
+    // delivers mostly scripts (PowerShell, VBA, JS) which would always be
+    // misclassified as benign here, so we gate the call on a PE probe.
     AI::CortexVerdict cortexVerdict;
     bool              aiScanned = false;
 
     if ((mode == ProtectionMode::Balanced ||
          mode == ProtectionMode::Aggressive) &&
+        LooksLikePeImage(bytes) &&
         AI::PhantomCortex::Instance().IsOperational()) {
         cortexVerdict = AI::PhantomCortex::Instance().AnalyzeFile(bytes);
         aiScanned     = true;
@@ -438,8 +463,41 @@ bool AmsiProvider::Initialize() {
     std::unique_lock lifecycleLock(m_impl->lifecycleMutex);
     if (m_impl->initialized) return true;
 
-    // SignatureStore — best-effort; provider still functions without it
+    // SignatureStore — best-effort; provider still functions without it.
+    // Default-construction alone leaves IsInitialized()==false (and therefore
+    // ScanBuffer() returns a no-op result), so the store MUST be opened
+    // against the on-disk signatures database. The DB path is taken from
+    // ConfigManager; absent/empty path or open failure are non-fatal.
     m_impl->sigStore = std::make_unique<SignatureStore::SignatureStore>();
+    {
+        auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+        const std::wstring sigDbPath =
+            cfg.GetValue<std::wstring>(std::string(kSignatureDbPathKey), std::wstring{});
+
+        if (sigDbPath.empty()) {
+            SS_LOG_INFO(kLogCategory,
+                L"Initialize: signature database path not configured "
+                L"('%hs' is empty); hash/pattern scanning will be skipped",
+                kSignatureDbPathKey);
+            m_impl->sigStore.reset();
+        } else {
+            const auto sigStatus =
+                m_impl->sigStore->Initialize(sigDbPath, /*readOnly=*/true);
+            if (!sigStatus.IsSuccess()) {
+                SS_LOG_WARN(kLogCategory,
+                    L"Initialize: SignatureStore::Initialize('%ls') failed "
+                    L"code=%u win32=%lu; hash/pattern scanning disabled",
+                    sigDbPath.c_str(),
+                    static_cast<unsigned>(sigStatus.code),
+                    static_cast<unsigned long>(sigStatus.win32Error));
+                m_impl->sigStore.reset();
+            } else {
+                SS_LOG_INFO(kLogCategory,
+                    L"Initialize: SignatureStore opened (path='%ls')",
+                    sigDbPath.c_str());
+            }
+        }
+    }
 
     // ThreatIntelStore — best-effort; null out if init fails
     m_impl->threatIntel =
