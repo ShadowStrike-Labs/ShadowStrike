@@ -1745,11 +1745,18 @@ bool EmailProtectionImpl::ValidateReleaseToken(
 {
     // Validate token format (must be SHA-256 hex string)
     if (token.length() != 64) {
+        Utils::Logger::Error("EmailProtection: release token format invalid (len={}) "
+                             "principal='{}'",
+                             token.length(),
+                             EmailParsing::RedactForLog(releasedBy));
         return false;
     }
 
     for (char c : token) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            Utils::Logger::Error("EmailProtection: release token contains non-hex character; "
+                                 "principal='{}'",
+                                 EmailParsing::RedactForLog(releasedBy));
             return false;
         }
     }
@@ -1759,6 +1766,12 @@ bool EmailProtectionImpl::ValidateReleaseToken(
     std::unique_lock lock(m_releaseTokensMutex);
     auto it = m_releaseTokens.find(token);
     if (it == m_releaseTokens.end()) {
+        // SECURITY: surface the failed validation attempt in the audit log
+        // with the requesting principal so SOC analysts can detect token
+        // bruteforce / replay attempts. The token itself is not logged.
+        Utils::Logger::Warn("EmailProtection: release token rejected (unknown or already consumed) "
+                            "principal='{}'",
+                            EmailParsing::RedactForLog(releasedBy));
         return false;
     }
 
@@ -1771,11 +1784,17 @@ bool EmailProtectionImpl::ValidateReleaseToken(
     if (elapsed > TOKEN_VALIDITY_MS) {
         // Token expired - remove it
         m_releaseTokens.erase(it);
+        Utils::Logger::Warn("EmailProtection: release token expired (elapsed_ms={}) "
+                            "principal='{}'",
+                            elapsed,
+                            EmailParsing::RedactForLog(releasedBy));
         return false;
     }
 
     // Token is valid - atomically consume it to prevent replay attacks
     m_releaseTokens.erase(it);
+    Utils::Logger::Info("EmailProtection: release token consumed; principal='{}'",
+                        EmailParsing::RedactForLog(releasedBy));
     return true;
 }
 
@@ -2546,6 +2565,26 @@ void EmailProtectionImpl::SecureDeleteFile(const fs::path& filePath)
 {
     try {
         if (!fs::exists(filePath)) {
+            return;
+        }
+
+        // SECURITY: refuse to operate on a symlink or any non-regular file.
+        // Quarantine entries are always plain files written by this service;
+        // a symlink/junction/reparse point in the quarantine directory is by
+        // definition an attempted redirection. Doing this check on the
+        // original path (not the canonicalised one) is intentional: the
+        // canonicalisation step would have followed the link.
+        std::error_code symEc;
+        if (fs::is_symlink(filePath, symEc) || symEc) {
+            Utils::Logger::Error("EmailProtection: refusing secure-delete on reparse/symlink path '{}'",
+                                 filePath.string());
+            return;
+        }
+        std::error_code statEc;
+        const auto preStatus = fs::status(filePath, statEc);
+        if (statEc || !fs::is_regular_file(preStatus)) {
+            Utils::Logger::Error("EmailProtection: refusing secure-delete on non-regular file '{}'",
+                                 filePath.string());
             return;
         }
 
