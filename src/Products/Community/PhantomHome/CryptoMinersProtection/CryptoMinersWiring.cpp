@@ -74,8 +74,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::CryptoMinerDetector::Instance()
-                            .Initialize();
+                        if (!ShadowStrike::CryptoMiners::CryptoMinerDetector::Instance().Initialize()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CryptoMinerDetector: Initialize() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"CryptoMinerDetector: Initialize() threw: %hs", ex.what());
@@ -89,8 +93,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .start = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::CryptoMinerDetector::Instance()
-                            .Start();
+                        if (!ShadowStrike::CryptoMiners::CryptoMinerDetector::Instance().Start()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CryptoMinerDetector: Start() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"CryptoMinerDetector: Start() threw: %hs", ex.what());
@@ -116,6 +124,48 @@ struct CryptoMinersModuleRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Off) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CryptoMinerDetector: setMode(Off) must be routed through orchestrator disable");
+                        return false;
+                    }
+                    try {
+                        auto& detector = ShadowStrike::CryptoMiners::CryptoMinerDetector::Instance();
+                        auto config = detector.GetConfiguration();
+                        switch (mode) {
+                            case ProtectionMode::Passive:
+                                config.terminateOnDetection = false;
+                                config.blockStratumProtocol = false;
+                                config.alertOnDetection     = true;
+                                break;
+                            case ProtectionMode::Balanced:
+                                config.terminateOnDetection = false;
+                                config.blockStratumProtocol = true;
+                                config.alertOnDetection     = true;
+                                break;
+                            case ProtectionMode::Aggressive:
+                                config.terminateOnDetection = true;
+                                config.blockStratumProtocol = true;
+                                config.alertOnDetection     = true;
+                                break;
+                            case ProtectionMode::Off:
+                                return false;  // unreachable; guarded above
+                        }
+                        if (!detector.UpdateConfiguration(config)) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CryptoMinerDetector: UpdateConfiguration rejected mode=%u",
+                                static_cast<unsigned>(mode));
+                            return false;
+                        }
+                    } catch (const std::exception& ex) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CryptoMinerDetector: setMode threw: %hs", ex.what());
+                        return false;
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CryptoMinerDetector: setMode threw unknown exception");
+                        return false;
+                    }
                     return ApplyModeThresholds("CryptoMinerDetector", mode);
                 },
 
@@ -136,8 +186,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::BrowserMinerDetector::Instance()
-                            .Initialize();
+                        if (!ShadowStrike::CryptoMiners::BrowserMinerDetector::Instance().Initialize()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"BrowserMinerDetector: Initialize() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"BrowserMinerDetector: Initialize() threw: %hs", ex.what());
@@ -169,6 +223,48 @@ struct CryptoMinersModuleRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Off) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"BrowserMinerDetector: setMode(Off) must be routed through orchestrator disable");
+                        return false;
+                    }
+                    try {
+                        auto& detector = ShadowStrike::CryptoMiners::BrowserMinerDetector::Instance();
+                        auto config = detector.GetConfiguration();
+                        switch (mode) {
+                            case ProtectionMode::Passive:
+                                config.enableDomainBlocking = false;
+                                config.blockKnownDomains    = false;
+                                config.confidenceThreshold  = 0.85;
+                                break;
+                            case ProtectionMode::Balanced:
+                                config.enableDomainBlocking = true;
+                                config.blockKnownDomains    = true;
+                                config.confidenceThreshold  = 0.70;
+                                break;
+                            case ProtectionMode::Aggressive:
+                                config.enableDomainBlocking = true;
+                                config.blockKnownDomains    = true;
+                                config.confidenceThreshold  = 0.55;
+                                break;
+                            case ProtectionMode::Off:
+                                return false;  // unreachable; guarded above
+                        }
+                        if (!detector.UpdateConfiguration(config)) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"BrowserMinerDetector: UpdateConfiguration rejected mode=%u",
+                                static_cast<unsigned>(mode));
+                            return false;
+                        }
+                    } catch (const std::exception& ex) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"BrowserMinerDetector: setMode threw: %hs", ex.what());
+                        return false;
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"BrowserMinerDetector: setMode threw unknown exception");
+                        return false;
+                    }
                     return ApplyModeThresholds("BrowserMinerDetector", mode);
                 },
 
@@ -189,8 +285,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::CPUUsageAnalyzer::Instance()
-                            .Initialize();
+                        if (!ShadowStrike::CryptoMiners::CPUUsageAnalyzer::Instance().Initialize()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CPUUsageAnalyzer: Initialize() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"CPUUsageAnalyzer: Initialize() threw: %hs", ex.what());
@@ -204,8 +304,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .start = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::CPUUsageAnalyzer::Instance()
-                            .Start();
+                        if (!ShadowStrike::CryptoMiners::CPUUsageAnalyzer::Instance().Start()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CPUUsageAnalyzer: Start() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"CPUUsageAnalyzer: Start() threw: %hs", ex.what());
@@ -231,6 +335,48 @@ struct CryptoMinersModuleRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Off) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CPUUsageAnalyzer: setMode(Off) must be routed through orchestrator disable");
+                        return false;
+                    }
+                    try {
+                        auto& analyzer = ShadowStrike::CryptoMiners::CPUUsageAnalyzer::Instance();
+                        auto config = analyzer.GetConfiguration();
+                        switch (mode) {
+                            case ProtectionMode::Passive:
+                                config.miningThreshold               = 90.0;
+                                config.enableAlgorithmFingerprinting = false;
+                                config.monitorBackgroundOnly         = true;
+                                break;
+                            case ProtectionMode::Balanced:
+                                config.miningThreshold               = 75.0;
+                                config.enableAlgorithmFingerprinting = true;
+                                config.monitorBackgroundOnly         = false;
+                                break;
+                            case ProtectionMode::Aggressive:
+                                config.miningThreshold               = 60.0;
+                                config.enableAlgorithmFingerprinting = true;
+                                config.monitorBackgroundOnly         = false;
+                                break;
+                            case ProtectionMode::Off:
+                                return false;  // unreachable; guarded above
+                        }
+                        if (!analyzer.UpdateConfiguration(config)) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CPUUsageAnalyzer: UpdateConfiguration rejected mode=%u",
+                                static_cast<unsigned>(mode));
+                            return false;
+                        }
+                    } catch (const std::exception& ex) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CPUUsageAnalyzer: setMode threw: %hs", ex.what());
+                        return false;
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CPUUsageAnalyzer: setMode threw unknown exception");
+                        return false;
+                    }
                     return ApplyModeThresholds("CPUUsageAnalyzer", mode);
                 },
 
@@ -251,8 +397,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::GPUMiningDetector::Instance()
-                            .Initialize();
+                        if (!ShadowStrike::CryptoMiners::GPUMiningDetector::Instance().Initialize()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"GPUMiningDetector: Initialize() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"GPUMiningDetector: Initialize() threw: %hs", ex.what());
@@ -266,8 +416,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .start = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::GPUMiningDetector::Instance()
-                            .Start();
+                        if (!ShadowStrike::CryptoMiners::GPUMiningDetector::Instance().Start()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"GPUMiningDetector: Start() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"GPUMiningDetector: Start() threw: %hs", ex.what());
@@ -293,6 +447,48 @@ struct CryptoMinersModuleRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Off) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"GPUMiningDetector: setMode(Off) must be routed through orchestrator disable");
+                        return false;
+                    }
+                    try {
+                        auto& detector = ShadowStrike::CryptoMiners::GPUMiningDetector::Instance();
+                        auto config = detector.GetConfiguration();
+                        switch (mode) {
+                            case ProtectionMode::Passive:
+                                config.terminateMiningProcesses = false;
+                                config.detectDAGAllocation      = true;
+                                config.gpuLoadThreshold         = 95.0;
+                                break;
+                            case ProtectionMode::Balanced:
+                                config.terminateMiningProcesses = false;
+                                config.detectDAGAllocation      = true;
+                                config.gpuLoadThreshold         = 80.0;
+                                break;
+                            case ProtectionMode::Aggressive:
+                                config.terminateMiningProcesses = true;
+                                config.detectDAGAllocation      = true;
+                                config.gpuLoadThreshold         = 65.0;
+                                break;
+                            case ProtectionMode::Off:
+                                return false;  // unreachable; guarded above
+                        }
+                        if (!detector.UpdateConfiguration(config)) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"GPUMiningDetector: UpdateConfiguration rejected mode=%u",
+                                static_cast<unsigned>(mode));
+                            return false;
+                        }
+                    } catch (const std::exception& ex) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"GPUMiningDetector: setMode threw: %hs", ex.what());
+                        return false;
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"GPUMiningDetector: setMode threw unknown exception");
+                        return false;
+                    }
                     return ApplyModeThresholds("GPUMiningDetector", mode);
                 },
 
@@ -313,8 +509,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::PoolConnectionDetector::Instance()
-                            .Initialize();
+                        if (!ShadowStrike::CryptoMiners::PoolConnectionDetector::Instance().Initialize()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"PoolConnectionDetector: Initialize() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"PoolConnectionDetector: Initialize() threw: %hs", ex.what());
@@ -328,8 +528,12 @@ struct CryptoMinersModuleRegistrar final {
 
                 .start = []() -> bool {
                     try {
-                        return ShadowStrike::CryptoMiners::PoolConnectionDetector::Instance()
-                            .Start();
+                        if (!ShadowStrike::CryptoMiners::PoolConnectionDetector::Instance().Start()) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"PoolConnectionDetector: Start() returned false");
+                            return false;
+                        }
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"PoolConnectionDetector: Start() threw: %hs", ex.what());
@@ -355,6 +559,51 @@ struct CryptoMinersModuleRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    if (mode == ProtectionMode::Off) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"PoolConnectionDetector: setMode(Off) must be routed through orchestrator disable");
+                        return false;
+                    }
+                    try {
+                        auto& detector = ShadowStrike::CryptoMiners::PoolConnectionDetector::Instance();
+                        auto config = detector.GetConfiguration();
+                        switch (mode) {
+                            case ProtectionMode::Passive:
+                                config.blockStratumTraffic        = false;
+                                config.blockMaliciousPools        = false;
+                                config.enableDeepPacketInspection = false;
+                                config.extractWalletAddresses     = false;
+                                break;
+                            case ProtectionMode::Balanced:
+                                config.blockStratumTraffic        = true;
+                                config.blockMaliciousPools        = true;
+                                config.enableDeepPacketInspection = true;
+                                config.extractWalletAddresses     = true;
+                                break;
+                            case ProtectionMode::Aggressive:
+                                config.blockStratumTraffic        = true;
+                                config.blockMaliciousPools        = true;
+                                config.enableDeepPacketInspection = true;
+                                config.extractWalletAddresses     = true;
+                                break;
+                            case ProtectionMode::Off:
+                                return false;  // unreachable; guarded above
+                        }
+                        if (!detector.UpdateConfiguration(config)) {
+                            SS_LOG_ERROR(kLogCategory,
+                                L"PoolConnectionDetector: UpdateConfiguration rejected mode=%u",
+                                static_cast<unsigned>(mode));
+                            return false;
+                        }
+                    } catch (const std::exception& ex) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"PoolConnectionDetector: setMode threw: %hs", ex.what());
+                        return false;
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"PoolConnectionDetector: setMode threw unknown exception");
+                        return false;
+                    }
                     return ApplyModeThresholds("PoolConnectionDetector", mode);
                 },
 
@@ -366,7 +615,8 @@ struct CryptoMinersModuleRegistrar final {
             });
 
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"CryptoMinersWiring: static registration failed\n");
         }
     }
 };
