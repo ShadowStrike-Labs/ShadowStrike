@@ -62,6 +62,7 @@
 #include <numeric>
 #include <regex>
 #include <cstring>
+#include <random>
 
 // ============================================================================
 // WINDOWS INCLUDES
@@ -673,9 +674,14 @@ public:
     // SCANNING
     // ========================================================================
 
+    // DESIGN: nestedDepth carries the current archive-recursion depth across
+    // ScanAttachment <-> ExtractAndScanArchive cycles so the configured
+    // maxArchiveDepth actually bounds the recursion. Public Scan APIs always
+    // pass 0; nested invocations propagate currentDepth+1.
     [[nodiscard]] AttachmentScanResult ScanAttachmentImpl(
         const fs::path& path,
-        const AttachmentScanConfig& config
+        const AttachmentScanConfig& config,
+        size_t nestedDepth = 0
     ) {
         AttachmentScanResult result;
         result.fileName = path.filename().string();
@@ -683,6 +689,20 @@ public:
         result.scanTime = system_clock::now();
 
         const auto scanStart = steady_clock::now();
+
+        // DESIGN: RAII guard restores module status to Running after the scan
+        // regardless of return path or exception, fixing a stuck-Scanning state
+        // bug where the trailing m_status.store after the try/catch block was
+        // unreachable because both branches returned earlier.
+        struct StatusGuard {
+            std::atomic<ModuleStatus>& s;
+            bool initialized;
+            ~StatusGuard() noexcept {
+                if (initialized) {
+                    s.store(ModuleStatus::Running, std::memory_order_release);
+                }
+            }
+        } statusGuard{m_status, m_initialized.load(std::memory_order_acquire)};
 
         try {
             m_status.store(ModuleStatus::Scanning, std::memory_order_release);
@@ -695,8 +715,18 @@ public:
                 return result;
             }
 
-            // Check file size
-            result.fileSize = fs::file_size(path);
+            // Check file size (use error_code variant; fs::file_size throws
+            // on directories/broken symlinks which would surface as a generic
+            // ScanError with no diagnostic).
+            std::error_code szEc;
+            const auto rawSize = fs::file_size(path, szEc);
+            if (szEc) {
+                result.verdict = AttachmentVerdict::ScanError;
+                result.errorMessage = "file_size failed: " + szEc.message();
+                m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
+                return result;
+            }
+            result.fileSize = static_cast<size_t>(rawSize);
             if (result.fileSize > AttachmentConstants::MAX_ATTACHMENT_SIZE) {
                 result.verdict = AttachmentVerdict::SizeLimitExceeded;
                 result.riskScore = 50;
@@ -818,8 +848,9 @@ public:
                     result.riskScore += 30;
                 }
 
-                // Extract and scan archive
-                auto extractResult = ExtractAndScanArchiveImpl(path, config, 0);
+                // Extract and scan archive (propagate nestedDepth so the
+                // maxArchiveDepth bound is actually enforced across recursion).
+                auto extractResult = ExtractAndScanArchiveImpl(path, config, nestedDepth);
                 result.nestedFiles = extractResult.nestedFiles;
                 result.archiveDepth = extractResult.maxDepth;
 
@@ -895,11 +926,9 @@ public:
             m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
 
             InvokeErrorCallback(e.what(), -1);
-            m_status.store(ModuleStatus::Running, std::memory_order_release);
             return result;
         }
-
-        m_status.store(ModuleStatus::Running, std::memory_order_release);
+        // statusGuard restores ModuleStatus::Running here.
     }
 
     [[nodiscard]] AttachmentScanResult ScanBufferImpl(
@@ -1006,11 +1035,27 @@ public:
         }
 
         try {
-            // Create extraction directory
+            // SECURITY: temp extraction dirs must be unpredictable and
+            // unique-per-call. Using std::hash of the archive path is both
+            // collision-prone (two distinct attachments can collide and
+            // cross-contaminate) and predictable, opening TOCTOU / symlink
+            // races where an attacker pre-creates the path.
+            std::array<uint64_t, 2> rnd{};
+            {
+                std::random_device rd;
+                rnd[0] = (static_cast<uint64_t>(rd()) << 32) | rd();
+                rnd[1] = (static_cast<uint64_t>(rd()) << 32) | rd();
+            }
             fs::path extractDir = m_config.tempExtractionPath /
-                std::format("extract_{}", std::hash<std::string>{}(archivePath.string()));
+                std::format("extract_{:016x}{:016x}", rnd[0], rnd[1]);
 
-            fs::create_directories(extractDir);
+            std::error_code mkEc;
+            fs::create_directories(extractDir, mkEc);
+            if (mkEc) {
+                Logger::Error("AttachmentScanner: Failed to create extraction dir '{}': {}",
+                    extractDir.string(), mkEc.message());
+                return result;
+            }
 
             // Use ArchiveExtractor infrastructure
             auto& extractor = Core::FileSystem::ArchiveExtractor::Instance();
@@ -1022,10 +1067,18 @@ public:
                     archivePath.string());
             }
 
-            // Enumerate extracted files from the output directory
+            // Enumerate extracted files from the output directory.
+            // SECURITY: refuse to follow symlinks so a malicious archive
+            // cannot pivot the scan outside extractDir via crafted links.
             std::vector<fs::path> extractedFiles;
             for (const auto& entry : fs::recursive_directory_iterator(extractDir,
                      fs::directory_options::skip_permission_denied)) {
+                std::error_code symEc;
+                if (entry.is_symlink(symEc) || symEc) {
+                    Logger::Warn("AttachmentScanner: Skipping symlink/unreadable entry '{}'",
+                        entry.path().string());
+                    continue;
+                }
                 if (entry.is_regular_file()) {
                     extractedFiles.push_back(entry.path());
                 }
@@ -1039,7 +1092,14 @@ public:
                 NestedFileInfo nestedInfo;
                 nestedInfo.fileName = extractedPath.filename().string();
                 nestedInfo.relativePath = fs::relative(extractedPath, extractDir).string();
-                nestedInfo.fileSize = fs::file_size(extractedPath);
+                std::error_code szEc;
+                const auto rawSize = fs::file_size(extractedPath, szEc);
+                if (szEc) {
+                    Logger::Warn("AttachmentScanner: file_size failed for '{}': {}",
+                        extractedPath.string(), szEc.message());
+                    continue;
+                }
+                nestedInfo.fileSize = static_cast<size_t>(rawSize);
                 totalExtractedSize += nestedInfo.fileSize;
 
                 // Zip bomb detection
@@ -1054,11 +1114,12 @@ public:
                 nestedInfo.fileType = DetectFileTypeImpl(extractedPath);
                 nestedInfo.isHighRisk = IsHighRiskExtensionImpl(extractedPath.extension().string());
 
-                // Scan nested file
+                // Scan nested file. Pass currentDepth+1 so the configured
+                // maxArchiveDepth bound is enforced across recursive cycles.
                 AttachmentScanConfig nestedConfig = config;
                 nestedConfig.depth = ScanDepth::Standard;  // Don't do deep scans on nested
 
-                auto nestedResult = ScanAttachmentImpl(extractedPath, nestedConfig);
+                auto nestedResult = ScanAttachmentImpl(extractedPath, nestedConfig, currentDepth + 1);
                 nestedInfo.verdict = nestedResult.verdict;
                 nestedInfo.threatName = nestedResult.threatName;
 
@@ -1069,11 +1130,11 @@ public:
             }
 
             // Clean up extraction directory
-            try {
-                fs::remove_all(extractDir);
-            } catch (const std::exception& e) {
+            std::error_code rmEc;
+            fs::remove_all(extractDir, rmEc);
+            if (rmEc) {
                 Logger::Warn("AttachmentScanner: Failed to clean up extraction dir '{}': {}",
-                            extractDir.string(), e.what());
+                            extractDir.string(), rmEc.message());
             }
 
         } catch (const std::exception& e) {
@@ -1119,37 +1180,40 @@ public:
                 return false;  // Empty archive, not encrypted
             }
 
-            // RAR5: signature 0x526172211A0700 with encryption header flag
+            // RAR signature 0x526172211A07 followed by version byte at index 6:
+            //   0x00 => RAR4, 0x01 => RAR5.
             if (bytesRead >= 14 &&
                 header[0] == 0x52 && header[1] == 0x61 &&
                 header[2] == 0x72 && header[3] == 0x21 &&
                 header[4] == 0x1A && header[5] == 0x07) {
-                // RAR4: encryption flag is in header flags at offset 10
-                if (header[5] == 0x00 && bytesRead >= 13) {
+                // RAR4: encryption flag is HEAD_FLAGS bit 0x0080 at offset 10
+                if (header[6] == 0x00) {
                     uint16_t headFlags = 0;
                     std::memcpy(&headFlags, &header[10], sizeof(headFlags));
-                    return (headFlags & 0x04) != 0;  // ENCRYPT flag
+                    return (headFlags & 0x0080) != 0;  // MHD_PASSWORD
                 }
-                // RAR5: check encryption record in header - flag at byte 7 area
-                if (header[5] == 0x01 && bytesRead >= 14) {
-                    // RAR5 uses encryption flag in archive header flags
+                // RAR5: encryption header presence is signaled by archive
+                // header flag 0x0004 (encrypted header). Conservative parse
+                // of vint flags at offset 8 onward; treat low bits as flags.
+                if (header[6] == 0x01) {
                     uint32_t archFlags = 0;
-                    std::memcpy(&archFlags, &header[10], sizeof(archFlags));
-                    return (archFlags & 0x0001) != 0;
+                    std::memcpy(&archFlags, &header[8], sizeof(archFlags));
+                    return (archFlags & 0x0004) != 0;
                 }
                 return false;
             }
 
-            // 7z: signature 37 7A BC AF 27 1C, check for password header
+            // 7z: signature 37 7A BC AF 27 1C.
+            // Detecting encryption reliably requires full LZMA2/7z metadata
+            // parsing which is out of scope here. Returning true would
+            // false-positive every 7z attachment when blockPasswordProtected
+            // is on; return false (unknown) and let downstream extractor
+            // detect the actual password-required condition at extract time.
             if (bytesRead >= 32 &&
                 header[0] == 0x37 && header[1] == 0x7A &&
                 header[2] == 0xBC && header[3] == 0xAF &&
                 header[4] == 0x27 && header[5] == 0x1C) {
-                // 7z encrypted archives cannot be reliably detected from headers alone
-                // without the full 7z SDK. Log and return conservative result.
-                Logger::Warn("AttachmentScanner: 7z archive detected - encryption status "
-                             "requires 7z SDK for definitive check. Treating as potentially encrypted.");
-                return true;  // Conservative: flag for further inspection
+                return false;
             }
 
             return false;
@@ -1499,16 +1563,21 @@ void AttachmentScanner::Shutdown() {
                 archivePath.string());
         }
 
-        // Enumerate extracted files from the output directory
+        // Enumerate extracted files from the output directory.
+        // SECURITY: refuse to follow symlinks to prevent scan pivot escape.
         std::vector<NestedFileInfo> nestedFiles;
         for (const auto& dirEntry : fs::recursive_directory_iterator(extractTo,
                  fs::directory_options::skip_permission_denied)) {
+            std::error_code symEc;
+            if (dirEntry.is_symlink(symEc) || symEc) continue;
             if (!dirEntry.is_regular_file()) continue;
 
             NestedFileInfo info;
             info.fileName = dirEntry.path().filename().string();
             info.relativePath = fs::relative(dirEntry.path(), extractTo).string();
-            info.fileSize = fs::file_size(dirEntry.path());
+            std::error_code szEc;
+            const auto rawSize = fs::file_size(dirEntry.path(), szEc);
+            info.fileSize = szEc ? 0U : static_cast<size_t>(rawSize);
             info.fileType = m_impl->DetectFileTypeImpl(dirEntry.path());
             info.isHighRisk = IsHighRiskExtensionImpl(dirEntry.path().extension().string());
             nestedFiles.push_back(info);
