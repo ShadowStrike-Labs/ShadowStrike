@@ -20,7 +20,7 @@
  *   HKCR\CLSID\{6F2E9D28-4A1C-4B3E-8E1F-0C7A6F0DA1FF}
  *       (Default)  = L"ShadowStrike PhantomHome AMSI Provider"
  *       InprocServer32
- *           (Default)       = <path to ShadowStrikePhantomService.exe>
+ *           (Default)       = <path to the containing AMSI provider DLL>
  *           ThreadingModel  = L"Both"
  *
  * @note Requires elevation (SeBackupPrivilege / Administrator token).
@@ -39,8 +39,9 @@ namespace Home {
  * @brief Write AMSI provider COM registration into HKLM / HKCR.
  *
  * Idempotent — safe to call on repeated service starts.
- * The server path written to InprocServer32 is the currently executing
- * module's full path (GetModuleFileNameW with nullptr handle).
+ * The server path written to InprocServer32 is the containing module's full
+ * path. Registration fails closed if the provider is linked into an EXE,
+ * because AMSI loads providers as in-process COM DLL servers.
  *
  * @return true on success; false if any registry operation failed.
  *         Access-denied conditions are logged with explicit "requires
