@@ -2036,6 +2036,18 @@ HWND OverlayProtection::CreateSecureOverlay(
             return nullptr;
         }
 
+        // Snapshot config fields under m_mutex BEFORE taking m_windowsMutex.
+        // m_config is mutated by UpdateConfiguration() under m_mutex and is not
+        // safe to read while holding only m_windowsMutex (it embeds a vector
+        // whose assignment is non-atomic). Lock ordering: m_mutex -> m_windowsMutex.
+        bool clickThrough = false;
+        uint8_t opacity = 255;
+        {
+            std::shared_lock cfgLock(m_impl->m_mutex);
+            clickThrough = m_impl->m_config.defaultClickThrough;
+            opacity = m_impl->m_config.defaultOpacity;
+        }
+
         std::unique_lock lock(m_impl->m_windowsMutex);
 
         if (m_impl->m_overlayWindows.size() >= MAX_OVERLAY_WINDOWS) {
@@ -2048,7 +2060,7 @@ HWND OverlayProtection::CreateSecureOverlay(
 
         // Create layered topmost window (using runtime-generated class name)
         DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE;
-        if (m_impl->m_config.defaultClickThrough) {
+        if (clickThrough) {
             exStyle |= WS_EX_TRANSPARENT;
         }
 
@@ -2073,7 +2085,7 @@ HWND OverlayProtection::CreateSecureOverlay(
         }
 
         // Set layered window attributes
-        SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), m_impl->m_config.defaultOpacity,
+        SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), opacity,
                                   LWA_ALPHA);
 
         // Store window info
@@ -2083,8 +2095,8 @@ HWND OverlayProtection::CreateSecureOverlay(
         info.position = position;
         info.width = width;
         info.height = height;
-        info.opacity = m_impl->m_config.defaultOpacity;
-        info.isClickThrough = m_impl->m_config.defaultClickThrough;
+        info.opacity = opacity;
+        info.isClickThrough = clickThrough;
         info.isTopmost = true;
         info.createdTime = std::chrono::system_clock::now();
 
@@ -2233,6 +2245,15 @@ OverlayIntegrityStatus OverlayProtection::CheckIntegrity() {
             }
         }
 
+        // Snapshot config under m_mutex BEFORE taking m_windowsMutex
+        // (lock ordering: m_mutex -> m_windowsMutex). m_config is not safe to
+        // read lock-free while UpdateConfiguration() may be running.
+        bool enableHookDetection = false;
+        {
+            std::shared_lock cfgLock(m_impl->m_mutex);
+            enableHookDetection = m_impl->m_config.enableHookDetection;
+        }
+
         // Check windows
         {
             std::shared_lock lock(m_impl->m_windowsMutex);
@@ -2253,7 +2274,7 @@ OverlayIntegrityStatus OverlayProtection::CheckIntegrity() {
         }
 
         // Check hooks
-        if (m_impl->m_config.enableHookDetection) {
+        if (enableHookDetection) {
             auto hooks = m_impl->ScanForHooksInternal();
             for (const auto& hook : hooks) {
                 if (!hook.isWhitelisted && !hook.isKnownOverlay) {
