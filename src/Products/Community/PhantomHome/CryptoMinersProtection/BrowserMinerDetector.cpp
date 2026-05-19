@@ -793,8 +793,6 @@ public:
     void AnalyzeWASMImports(std::span<const uint8_t> sectionData, WASMAnalysisResult& result) const;
     void AnalyzeWASMExports(std::span<const uint8_t> sectionData, WASMAnalysisResult& result) const;
     [[nodiscard]] bool IsValidWASM(std::span<const uint8_t> data) const;
-    [[nodiscard]] bool HasCryptoInstructions(std::span<const uint8_t> wasmBinary);
-    [[nodiscard]] double CalculateLoopDensity(std::span<const uint8_t> wasmBinary);
     [[nodiscard]] static uint64_t DecodeLEB128(const uint8_t*& ptr, const uint8_t* end) noexcept;
     [[nodiscard]] WASMInstructionStats AnalyzeCodeSection(std::span<const uint8_t> sectionData) const;
 
@@ -1763,85 +1761,6 @@ bool BrowserMinerDetectorImpl::IsValidWASM(
     return cursor == end;
 }
 
-bool BrowserMinerDetectorImpl::HasCryptoInstructions(
-    std::span<const uint8_t> wasmBinary)
-{
-    if (!IsValidWASM(wasmBinary)) {
-        return false;
-    }
-
-    const uint8_t* cursor = wasmBinary.data() + 8;
-    const uint8_t* end = wasmBinary.data() + wasmBinary.size();
-    WASMInstructionStats aggregate{};
-
-    while (cursor < end) {
-        const uint8_t sectionId = *cursor++;
-        const uint64_t sectionSize = DecodeLEB128(cursor, end);
-        if (sectionSize == std::numeric_limits<uint64_t>::max() ||
-            sectionSize > static_cast<uint64_t>(end - cursor)) {
-            return false;
-        }
-
-        if (sectionId == kWasmSectionCode) {
-            const WASMInstructionStats stats = AnalyzeCodeSection(
-                std::span<const uint8_t>(cursor, static_cast<size_t>(sectionSize)));
-            if (!stats.structurallyValid) {
-                return false;
-            }
-            aggregate.xorCount += stats.xorCount;
-            aggregate.mulCount += stats.mulCount;
-            aggregate.rotateCount += stats.rotateCount;
-            aggregate.totalInstructions += stats.totalInstructions;
-            aggregate.sequenceScore = std::min<uint32_t>(100U, aggregate.sequenceScore + stats.sequenceScore);
-        }
-
-        cursor += static_cast<size_t>(sectionSize);
-    }
-
-    return aggregate.sequenceScore >= 50U ||
-           (aggregate.xorCount >= 32U && aggregate.mulCount >= 32U && aggregate.rotateCount >= 8U);
-}
-
-double BrowserMinerDetectorImpl::CalculateLoopDensity(
-    std::span<const uint8_t> wasmBinary)
-{
-    if (!IsValidWASM(wasmBinary)) {
-        return 0.0;
-    }
-
-    const uint8_t* cursor = wasmBinary.data() + 8;
-    const uint8_t* end = wasmBinary.data() + wasmBinary.size();
-    uint64_t totalInstructions = 0;
-    uint64_t loopCount = 0;
-
-    while (cursor < end) {
-        const uint8_t sectionId = *cursor++;
-        const uint64_t sectionSize = DecodeLEB128(cursor, end);
-        if (sectionSize == std::numeric_limits<uint64_t>::max() ||
-            sectionSize > static_cast<uint64_t>(end - cursor)) {
-            return 0.0;
-        }
-
-        if (sectionId == kWasmSectionCode) {
-            const WASMInstructionStats stats = AnalyzeCodeSection(
-                std::span<const uint8_t>(cursor, static_cast<size_t>(sectionSize)));
-            if (!stats.structurallyValid) {
-                return 0.0;
-            }
-            totalInstructions += stats.totalInstructions;
-            loopCount += stats.loopCount;
-        }
-
-        cursor += static_cast<size_t>(sectionSize);
-    }
-
-    if (totalInstructions == 0) {
-        return 0.0;
-    }
-
-    return static_cast<double>(loopCount) / static_cast<double>(totalInstructions);
-}
-
 WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
     std::span<const uint8_t> wasmBinary)
 {
@@ -1851,9 +1770,6 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
     if (!result.isValidWASM) {
         return result;
     }
-
-    result.hasCryptoInstructions = HasCryptoInstructions(wasmBinary);
-    result.loopDensityScore = CalculateLoopDensity(wasmBinary);
 
     const uint8_t* cursor = wasmBinary.data() + 8;
     const uint8_t* end = wasmBinary.data() + wasmBinary.size();
@@ -1911,6 +1827,23 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
 
         cursor = sectionEnd;
     }
+
+    // Derive crypto-instruction signal and loop density from the aggregated
+    // statistics produced by this single pass. Earlier revisions invoked
+    // HasCryptoInstructions and CalculateLoopDensity separately, each of which
+    // re-parsed the entire binary and re-ran AnalyzeCodeSection — yielding
+    // three full traversals per module on a path bounded only by maxWASMSize
+    // (up to 200 MB). Computing both signals from aggregateStats preserves
+    // the original thresholds while collapsing the work to one pass.
+    result.hasCryptoInstructions =
+        aggregateStats.sequenceScore >= 50U ||
+        (aggregateStats.xorCount >= 32U &&
+         aggregateStats.mulCount >= 32U &&
+         aggregateStats.rotateCount >= 8U);
+    result.loopDensityScore = (aggregateStats.totalInstructions == 0)
+        ? 0.0
+        : static_cast<double>(aggregateStats.loopCount) /
+          static_cast<double>(aggregateStats.totalInstructions);
 
     result.functionCount = aggregateStats.functionCount;
     
