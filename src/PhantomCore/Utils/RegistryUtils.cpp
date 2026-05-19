@@ -34,6 +34,9 @@ namespace ShadowStrike {
             // Internal Constants
             // ============================================================================
 
+            static void SetError(Error* err, DWORD code, std::wstring msg,
+                                 std::wstring_view key = {}, std::wstring_view value = {}) noexcept;
+
             namespace {
                 /// Maximum class name length (32K characters - reasonable limit)
                 constexpr DWORD kMaxClassNameLength = 32768;
@@ -49,6 +52,63 @@ namespace ShadowStrike {
                 
                 /// Maximum total multi-string size (characters, not bytes)
                 constexpr size_t kMaxMultiStringSize = MAXDWORD / sizeof(wchar_t);
+
+                [[nodiscard]] bool ContainsUnsafeRegistryText(std::wstring_view text) noexcept {
+                    for (wchar_t ch : text) {
+                        if (ch == L'\0' || (ch < L' ' && ch != L'\t')) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                [[nodiscard]] bool CopyRegistryText(
+                    std::wstring_view input,
+                    std::wstring& output,
+                    Error* err,
+                    std::wstring_view fieldName,
+                    bool allowEmpty = true) noexcept {
+                    output.clear();
+                    if ((!allowEmpty && input.empty()) || input.size() > 32767 || ContainsUnsafeRegistryText(input)) {
+                        SetError(err, ERROR_INVALID_NAME, L"Registry path or value name contains invalid characters", fieldName);
+                        return false;
+                    }
+                    try {
+                        output.assign(input.data(), input.size());
+                    }
+                    catch (const std::bad_alloc&) {
+                        SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed for registry text", fieldName);
+                        return false;
+                    }
+                    return true;
+                }
+
+                [[nodiscard]] bool ValidateRegistryStringData(
+                    std::wstring_view value,
+                    std::wstring_view valueName,
+                    Error* err) noexcept {
+                    if (ContainsUnsafeRegistryText(value)) {
+                        SetError(err, ERROR_INVALID_PARAMETER, L"Registry string data contains embedded NUL or control characters", L"", valueName);
+                        return false;
+                    }
+                    return true;
+                }
+
+                [[nodiscard]] bool ValidateRegistryFilePath(const std::filesystem::path& path, Error* err) noexcept {
+                    std::wstring text;
+                    try {
+                        text = path.wstring();
+                    }
+                    catch (...) {
+                        SetError(err, ERROR_INVALID_PARAMETER, L"Registry file path conversion failed");
+                        return false;
+                    }
+                    if (text.empty() || text.size() > 32767 || ContainsUnsafeRegistryText(text)) {
+                        SetError(err, ERROR_INVALID_NAME, L"Registry file path is empty or contains invalid characters");
+                        return false;
+                    }
+                    return true;
+                }
             }
 
             // ============================================================================
@@ -67,8 +127,8 @@ namespace ShadowStrike {
              * @param key Optional key path for context
              * @param value Optional value name for context
              */
-            static void SetError(Error* err, DWORD code, std::wstring msg, 
-                                std::wstring_view key = {}, std::wstring_view value = {}) noexcept {
+            static void SetError(Error* err, DWORD code, std::wstring msg,
+                                std::wstring_view key, std::wstring_view value) noexcept {
                 if (!err) return;
                 err->win32 = code;
                 err->message = std::move(msg);
@@ -120,10 +180,7 @@ namespace ShadowStrike {
 
                 // Convert subKey to null-terminated string
                 std::wstring sk;
-                try {
-                    sk = subKey;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed for subkey path");
+                if (!CopyRegistryText(subKey, sk, err, L"Open subkey")) {
                     return false;
                 }
 
@@ -152,10 +209,7 @@ namespace ShadowStrike {
 
                 // Convert subKey to null-terminated string
                 std::wstring sk;
-                try {
-                    sk = subKey;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed for subkey path");
+                if (!CopyRegistryText(subKey, sk, err, L"Create subkey")) {
                     return false;
                 }
 
@@ -327,10 +381,7 @@ namespace ShadowStrike {
 
                 // Convert value name to null-terminated string
                 std::wstring vn;
-                try {
-                    vn = valueName;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed for value name", L"", valueName);
+                if (!CopyRegistryText(valueName, vn, err, L"", true)) {
                     return false;
                 }
 
@@ -430,6 +481,11 @@ namespace ShadowStrike {
                     out.clear();
                     return true;
                 }
+                if ((buf.size() % sizeof(wchar_t)) != 0) {
+                    SetError(err, ERROR_INVALID_DATA, L"Registry string data has odd byte length", L"", valueName);
+                    out.clear();
+                    return false;
+                }
 
                 const wchar_t* ptr = reinterpret_cast<const wchar_t*>(buf.data());
                 size_t len = buf.size() / sizeof(wchar_t);
@@ -438,6 +494,9 @@ namespace ShadowStrike {
                 if (len > 0 && ptr[len - 1] == L'\0') --len;
 
                 out.assign(ptr, len);
+                if (const size_t nul = out.find(L'\0'); nul != std::wstring::npos) {
+                    out.resize(nul);
+                }
 
                 // Expand environment strings if needed
                 if (expand && actualType == ValueType::ExpandString && !out.empty()) {
@@ -495,9 +554,17 @@ namespace ShadowStrike {
                     //minimum is two nulls
                     return true;
                 }
+                if ((buf.size() % sizeof(wchar_t)) != 0) {
+                    SetError(err, ERROR_INVALID_DATA, L"Multi-string data has odd byte length", L"", valueName);
+                    return false;
+                }
 
                 const wchar_t* ptr = reinterpret_cast<const wchar_t*>(buf.data());
                 size_t len = buf.size() / sizeof(wchar_t);
+                if (len < 2 || ptr[len - 1] != L'\0' || ptr[len - 2] != L'\0') {
+                    SetError(err, ERROR_INVALID_DATA, L"Multi-string data is not double-null terminated", L"", valueName);
+                    return false;
+                }
 
                 // Parse multi-string format: "str1\0str2\0str3\0\0"
                 // Protect against malformed multi-string data
@@ -598,9 +665,12 @@ namespace ShadowStrike {
                 // Allocate with exception safety
                 std::wstring vn;
                 std::wstring val;
+                if (!CopyRegistryText(valueName, vn, err, L"", true) ||
+                    !ValidateRegistryStringData(value, valueName, err)) {
+                    return false;
+                }
                 try {
-                    vn = valueName;
-                    val = value;
+                    val.assign(value.data(), value.size());
                 } catch (const std::bad_alloc&) {
                     SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
                     return false;
@@ -642,9 +712,12 @@ namespace ShadowStrike {
                 // Allocate with exception safety
                 std::wstring vn;
                 std::wstring val;
+                if (!CopyRegistryText(valueName, vn, err, L"", true) ||
+                    !ValidateRegistryStringData(value, valueName, err)) {
+                    return false;
+                }
                 try {
-                    vn = valueName;
-                    val = value;
+                    val.assign(value.data(), value.size());
                 } catch (const std::bad_alloc&) {
                     SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
                     return false;
@@ -688,7 +761,7 @@ namespace ShadowStrike {
                 size_t totalSize = 0;
                 for (const auto& s : value) {
                     // Check for embedded nulls which would corrupt multi-string format
-                    if (s.find(L'\0') != std::wstring::npos) {
+                    if (ContainsUnsafeRegistryText(s)) {
                         SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string entry contains embedded null", L"", valueName);
                         SS_LOG_ERROR(L"RegistryUtils", L"WriteMultiString: String contains embedded null character");
                         return false;
@@ -702,10 +775,18 @@ namespace ShadowStrike {
                         return false;
                     }
                     
+                    if (s.size() + 1 > kMaxMultiStringSize - totalSize) {
+                        SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string size overflow", L"", valueName);
+                        return false;
+                    }
                     totalSize += s.size() + 1; // +1 for null terminator
                 }
-                
+                 
                 // Add final null terminator
+                if (totalSize == kMaxMultiStringSize) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string data too large", L"", valueName);
+                    return false;
+                }
                 totalSize += 1;
                 
                 // Check for size overflow (prevent DoS and DWORD overflow)
@@ -733,10 +814,7 @@ namespace ShadowStrike {
                 }
 
                 std::wstring vn;
-                try {
-                    vn = valueName;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                if (!CopyRegistryText(valueName, vn, err, L"", true)) {
                     return false;
                 }
                 const size_t byteSize = combined.size() * sizeof(wchar_t);
@@ -773,10 +851,7 @@ namespace ShadowStrike {
 
                 // Allocate with exception safety
                 std::wstring vn;
-                try {
-                    vn = valueName;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                if (!CopyRegistryText(valueName, vn, err, L"", true)) {
                     return false;
                 }
 
@@ -805,10 +880,7 @@ namespace ShadowStrike {
 
                 // Allocate with exception safety
                 std::wstring vn;
-                try {
-                    vn = valueName;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                if (!CopyRegistryText(valueName, vn, err, L"", true)) {
                     return false;
                 }
 
@@ -856,10 +928,7 @@ namespace ShadowStrike {
                 
                 // Allocate with exception safety
                 std::wstring vn;
-                try {
-                    vn = valueName;
-                } catch (const std::bad_alloc&) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                if (!CopyRegistryText(valueName, vn, err, L"", true)) {
                     return false;
                 }
 
@@ -879,8 +948,7 @@ namespace ShadowStrike {
                     return false;
                 }
                 std::wstring vn;
-                try { vn = valueName; } catch (...) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                if (!CopyRegistryText(valueName, vn, err, L"", true)) {
                     return false;
                 }
                 const LSTATUS st = RegDeleteValueW(m_key, vn.c_str());
@@ -898,8 +966,7 @@ namespace ShadowStrike {
                     return false;
                 }
                 std::wstring sk;
-                try { sk = subKey; } catch (...) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", subKey);
+                if (!CopyRegistryText(subKey, sk, err, subKey, false)) {
                     return false;
                 }
                 const LSTATUS st = RegDeleteKeyW(m_key, sk.c_str());
@@ -917,8 +984,7 @@ namespace ShadowStrike {
                     return false;
                 }
                 std::wstring sk;
-                try { sk = subKey; } catch (...) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", subKey);
+                if (!CopyRegistryText(subKey, sk, err, subKey, false)) {
                     return false;
                 }
                 const LSTATUS st = RegDeleteTreeW(m_key, sk.c_str());
@@ -1063,7 +1129,7 @@ namespace ShadowStrike {
             bool RegistryKey::ValueExists(std::wstring_view valueName) const noexcept {
                 if (!m_key) return false;
                 std::wstring vn;
-                try { vn = valueName; } catch (...) { return false; }
+                if (!CopyRegistryText(valueName, vn, nullptr, L"", true)) { return false; }
                 DWORD type = 0, size = 0;
                 const LSTATUS st = RegQueryValueExW(m_key, vn.c_str(), nullptr, &type, nullptr, &size);
                 return st == ERROR_SUCCESS;
@@ -1077,7 +1143,7 @@ namespace ShadowStrike {
                 
                 if (!m_key) return false;
                 std::wstring sk;
-                try { sk = subKey; } catch (...) { return false; }
+                if (!CopyRegistryText(subKey, sk, nullptr, subKey, false)) { return false; }
                 HKEY hTest = nullptr;
                 const LSTATUS st = RegOpenKeyExW(m_key, sk.c_str(), 0, KEY_READ, &hTest);
                 if (st == ERROR_SUCCESS && hTest) {
@@ -1106,6 +1172,9 @@ namespace ShadowStrike {
                     SetError(err, ERROR_INVALID_HANDLE, L"Invalid key handle");
                     return false;
                 }
+                if (!ValidateRegistryFilePath(path, err)) {
+                    return false;
+                }
 
                 // SE_BACKUP_NAME is necessary
                 if (!EnableBackupPrivilege(err)) {
@@ -1126,6 +1195,9 @@ namespace ShadowStrike {
             bool RegistryKey::RestoreFromFile(const std::filesystem::path& path, DWORD flags, Error* err) noexcept {
                 if (!m_key) {
                     SetError(err, ERROR_INVALID_HANDLE, L"Invalid key handle");
+                    return false;
+                }
+                if (!ValidateRegistryFilePath(path, err)) {
                     return false;
                 }
 
@@ -1174,6 +1246,11 @@ namespace ShadowStrike {
             }
 
             bool SplitPath(std::wstring_view fullPath, HKEY& rootKey, std::wstring& subKey) noexcept {
+                rootKey = nullptr;
+                subKey.clear();
+                if (fullPath.empty() || fullPath.size() > 32767 || ContainsUnsafeRegistryText(fullPath)) {
+                    return false;
+                }
                 const auto pos = fullPath.find(L'\\');
                 if (pos == std::wstring_view::npos) {
                     rootKey = ParseRootKey(fullPath);
@@ -1242,8 +1319,7 @@ namespace ShadowStrike {
 
             bool DeleteKey(HKEY hKeyRoot, std::wstring_view subKey, const OpenOptions& opt, Error* err) noexcept {
                 std::wstring sk;
-                try { sk = subKey; } catch (...) {
-                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", subKey);
+                if (!CopyRegistryText(subKey, sk, err, subKey, false)) {
                     return false;
                 }
                 const REGSAM sam = BuildAccessMask(opt) | DELETE;
