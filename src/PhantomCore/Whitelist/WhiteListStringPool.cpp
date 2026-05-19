@@ -370,6 +370,43 @@ StoreError StringPool::CreateNew(
     return StoreError::Success();
 }
 
+void StringPool::EnableWriteMode(void* baseAddress, uint64_t size) noexcept {
+    std::unique_lock lock(m_rwLock);
+
+    if (!baseAddress) {
+        SS_LOG_ERROR(L"Whitelist", L"StringPool::EnableWriteMode rejected null base address");
+        return;
+    }
+
+    if (size < HEADER_SIZE) {
+        SS_LOG_ERROR(L"Whitelist", L"StringPool::EnableWriteMode rejected undersized pool section");
+        return;
+    }
+
+    constexpr uint64_t MAX_POOL_SIZE = 4ULL * 1024 * 1024 * 1024;
+    if (size > MAX_POOL_SIZE) {
+        SS_LOG_ERROR(L"Whitelist", L"StringPool::EnableWriteMode rejected oversized pool section");
+        return;
+    }
+
+    auto* bytes = static_cast<uint8_t*>(baseAddress);
+    const auto usedValue = *reinterpret_cast<const uint64_t*>(bytes);
+    const auto countValue = *reinterpret_cast<const uint64_t*>(bytes + 8);
+    const uint64_t maxPossibleStrings = (size - HEADER_SIZE) / 2;
+
+    if (usedValue < HEADER_SIZE || usedValue > size || countValue > maxPossibleStrings) {
+        SS_LOG_ERROR(L"Whitelist",
+            L"StringPool::EnableWriteMode rejected corrupt header (used=%llu, count=%llu, size=%llu)",
+            usedValue, countValue, size);
+        return;
+    }
+
+    m_baseAddress = baseAddress;
+    m_totalSize = size;
+    m_usedSize.store(usedValue, std::memory_order_release);
+    m_stringCount.store(countValue, std::memory_order_release);
+}
+
 /**
  * @brief Retrieve a narrow (UTF-8) string from the pool
  * 
@@ -404,6 +441,14 @@ std::string_view StringPool::GetString(uint32_t offset, uint16_t length) const n
     if (endPos > usedSize) {
         return {};  // Offset beyond written data — would read uninitialized memory
     }
+
+    uint64_t terminatorEnd = 0;
+    if (!SafeAdd(endPos, static_cast<uint64_t>(1), terminatorEnd) ||
+        terminatorEnd > usedSize) {
+        return {};
+    }
+
+    const char* ptr = nullptr;
     
     if (m_view) {
         // Memory-mapped mode - validate within view bounds
@@ -415,25 +460,29 @@ std::string_view StringPool::GetString(uint32_t offset, uint16_t length) const n
         }
         
         // Validate against view size
-        if (absoluteEnd > m_view->fileSize) {
+        uint64_t absoluteTerminatorEnd = 0;
+        if (!SafeAdd(absoluteEnd, static_cast<uint64_t>(1), absoluteTerminatorEnd) ||
+            absoluteTerminatorEnd > m_view->fileSize) {
             return {};  // Would read past view end
         }
         
-        return m_view->GetString(absoluteOffset, length);
+        ptr = m_view->GetAt<char>(absoluteOffset);
     } else if (m_baseAddress) {
         // Writable mode - validate within pool bounds
-        if (endPos > m_totalSize) {
+        if (terminatorEnd > m_totalSize) {
             return {};  // Would read past pool end
         }
         
-        const char* ptr = reinterpret_cast<const char*>(
+        ptr = reinterpret_cast<const char*>(
             static_cast<const uint8_t*>(m_baseAddress) + offset
         );
-        return std::string_view(ptr, length);
     }
-    
-    // No storage configured
-    return {};
+
+    if (!ptr || ptr[length] != '\0') {
+        return {};
+    }
+
+    return std::string_view(ptr, length);
 }
 
 /**
@@ -479,6 +528,12 @@ std::wstring_view StringPool::GetWideString(uint32_t offset, uint16_t length) co
     if (endPos > usedSize) {
         return {};  // Offset beyond written data — would read uninitialized memory
     }
+
+    uint64_t terminatorEnd = 0;
+    if (!SafeAdd(endPos, static_cast<uint64_t>(sizeof(wchar_t)), terminatorEnd) ||
+        terminatorEnd > usedSize) {
+        return {};
+    }
     
     const wchar_t* ptr = nullptr;
     
@@ -491,14 +546,16 @@ std::wstring_view StringPool::GetWideString(uint32_t offset, uint16_t length) co
             return {};
         }
         
-        if (absoluteEnd > m_view->fileSize) {
+        uint64_t absoluteTerminatorEnd = 0;
+        if (!SafeAdd(absoluteEnd, static_cast<uint64_t>(sizeof(wchar_t)), absoluteTerminatorEnd) ||
+            absoluteTerminatorEnd > m_view->fileSize) {
             return {};
         }
         
         ptr = m_view->GetAt<wchar_t>(absoluteOffset);
     } else if (m_baseAddress) {
         // Writable mode - validate within pool bounds
-        if (endPos > m_totalSize) {
+        if (terminatorEnd > m_totalSize) {
             return {};
         }
         
@@ -510,6 +567,9 @@ std::wstring_view StringPool::GetWideString(uint32_t offset, uint16_t length) co
     if (ptr) {
         // Safe division for character count
         const size_t charCount = length / sizeof(wchar_t);
+        if (ptr[charCount] != L'\0') {
+            return {};
+        }
         return std::wstring_view(ptr, charCount);
     }
     
@@ -744,15 +804,6 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
         return std::nullopt;
     }
     
-    // SP-5: Zero alignment padding to prevent uninitialized memory leak to disk
-    if (alignedUsed > currentUsed) {
-        std::memset(
-            static_cast<uint8_t*>(m_baseAddress) + static_cast<size_t>(currentUsed),
-            0,
-            static_cast<size_t>(alignedUsed - currentUsed)
-        );
-    }
-    
     // Check if we have space (with overflow protection)
     uint64_t newUsed = 0;
     if (!SafeAdd(alignedUsed, static_cast<uint64_t>(charBytes), newUsed)) {
@@ -764,6 +815,21 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
         SS_LOG_WARN(L"Whitelist", L"StringPool: no space for wide string (%zu bytes, %llu/%llu used)",
             charBytes, alignedUsed, m_totalSize);
         return std::nullopt;
+    }
+
+    if (alignedUsed > m_totalSize) {
+        SS_LOG_WARN(L"Whitelist", L"StringPool: aligned offset exceeds pool size (%llu/%llu)",
+            alignedUsed, m_totalSize);
+        return std::nullopt;
+    }
+
+    // SP-5: Zero alignment padding to prevent uninitialized memory leak to disk.
+    if (alignedUsed > currentUsed) {
+        std::memset(
+            static_cast<uint8_t*>(m_baseAddress) + static_cast<size_t>(currentUsed),
+            0,
+            static_cast<size_t>(alignedUsed - currentUsed)
+        );
     }
     
     // Validate offset fits in uint32_t

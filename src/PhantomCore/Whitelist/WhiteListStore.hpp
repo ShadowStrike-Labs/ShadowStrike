@@ -1561,6 +1561,13 @@ public:
         uint64_t availableSize,
         uint64_t& usedSize
     ) noexcept;
+
+    /**
+     * @brief Enable writes after Initialize() loaded an existing mapped pool
+     * @param baseAddress Writable base address of the string-pool section
+     * @param size Size of the string-pool section in bytes
+     */
+    void EnableWriteMode(void* baseAddress, uint64_t size) noexcept;
     
     // ========================================================================
     // OPERATIONS

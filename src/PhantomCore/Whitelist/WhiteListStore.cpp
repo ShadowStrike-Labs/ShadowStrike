@@ -896,6 +896,11 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
                         header->stringPoolOffset,
                         header->stringPoolSize
                     );
+                    if (error.IsSuccess() && isWritableMode) {
+                        auto* poolBaseAddr = static_cast<uint8_t*>(m_mappedView.baseAddress) +
+                                             header->stringPoolOffset;
+                        m_stringPool->EnableWriteMode(poolBaseAddr, header->stringPoolSize);
+                    }
                 }
                 if (!error.IsSuccess()) {
                     SS_LOG_WARN(L"Whitelist", L"Failed to initialize string pool: %S",
