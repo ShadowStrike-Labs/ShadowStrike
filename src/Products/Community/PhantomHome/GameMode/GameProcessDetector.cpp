@@ -1375,7 +1375,18 @@ void GameProcessDetectorImpl::ProcessMonitoringTick() {
         for (const auto& [pid, game] : m_detectedGames) {
             ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
             if (!hProcess) {
-                exitedPids.push_back(pid);
+                // Distinguish "process no longer exists" from "we lack rights".
+                // Protected processes (e.g. anti-cheat) refuse OpenProcess even
+                // when alive; treating those as exited would generate spurious
+                // exit/re-detected cycles every poll. Only treat as exited when
+                // the PID is genuinely gone.
+                const DWORD err = GetLastError();
+                if (err == ERROR_INVALID_PARAMETER) {
+                    // PID is not a live process.
+                    exitedPids.push_back(pid);
+                }
+                // ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION / etc.: retain
+                // the entry; we cannot prove the process exited.
                 continue;
             }
 
@@ -2121,40 +2132,85 @@ std::string_view GetVRPlatformName(VRPlatform platform) noexcept {
     }
 }
 
-std::wstring GetLauncherInstallPath(LauncherType type) {
-    // Try registry lookup
-    for (const auto& launcher : LAUNCHER_DATABASE) {
-        if (launcher.type == type && !launcher.registryPath.empty()) {
 #ifdef _WIN32
-            // HKLM
-            {
-                ScopedRegKey hKey;
-                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, launcher.registryPath.c_str(),
-                                 0, KEY_READ, hKey.Put()) == ERROR_SUCCESS) {
-                    wchar_t buffer[MAX_PATH] = {};
-                    DWORD bufferSize = sizeof(buffer);
-                    if (RegQueryValueExW(hKey.Get(), launcher.registryValue.c_str(), nullptr,
-                                        nullptr, reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
-                        return buffer;
-                    }
-                }
-            }
+namespace {
 
-            // HKCU
-            {
-                ScopedRegKey hKey;
-                if (RegOpenKeyExW(HKEY_CURRENT_USER, launcher.registryPath.c_str(),
-                                 0, KEY_READ, hKey.Put()) == ERROR_SUCCESS) {
-                    wchar_t buffer[MAX_PATH] = {};
-                    DWORD bufferSize = sizeof(buffer);
-                    if (RegQueryValueExW(hKey.Get(), launcher.registryValue.c_str(), nullptr,
-                                        nullptr, reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
-                        return buffer;
-                    }
+/// @brief Safely read a REG_SZ / REG_EXPAND_SZ value from an open registry key.
+/// @details Validates the value type (refusing REG_DWORD, REG_BINARY, etc.),
+///          caps the buffer length, and guarantees a null-terminated result.
+///          Returns an empty wstring on any failure.
+[[nodiscard]] std::wstring ReadRegistryStringSafe(HKEY hKey, const wchar_t* valueName) noexcept {
+    if (!hKey || !valueName) {
+        return std::wstring{};
+    }
+
+    wchar_t buffer[MAX_PATH] = {};
+    DWORD bufferSize = sizeof(buffer);  // bytes
+    DWORD valueType = 0;
+
+    const LSTATUS status = RegQueryValueExW(hKey, valueName, nullptr,
+                                            &valueType,
+                                            reinterpret_cast<LPBYTE>(buffer),
+                                            &bufferSize);
+    if (status != ERROR_SUCCESS) {
+        return std::wstring{};
+    }
+
+    // Refuse non-string types: a REG_DWORD/REG_BINARY value would otherwise be
+    // reinterpreted as a wide-character string, returning garbage and risking
+    // a read past the actual written bytes when constructing std::wstring.
+    if (valueType != REG_SZ && valueType != REG_EXPAND_SZ) {
+        return std::wstring{};
+    }
+
+    // bufferSize is bytes written. Convert to wchar count and force null
+    // termination — RegQueryValueExW does not guarantee a terminator.
+    const DWORD wcharsWritten = bufferSize / static_cast<DWORD>(sizeof(wchar_t));
+    const DWORD wcharsMax = static_cast<DWORD>(std::size(buffer)) - 1;
+    const DWORD wcharsToUse = (wcharsWritten <= wcharsMax) ? wcharsWritten : wcharsMax;
+    buffer[wcharsToUse] = L'\0';
+
+    // Trim a trailing null already present in the count so std::wstring length
+    // does not include the terminator.
+    size_t len = wcharsToUse;
+    while (len > 0 && buffer[len - 1] == L'\0') {
+        --len;
+    }
+    return std::wstring(buffer, len);
+}
+
+}  // namespace
+#endif  // _WIN32
+
+std::wstring GetLauncherInstallPath(LauncherType type) {
+    for (const auto& launcher : LAUNCHER_DATABASE) {
+        if (launcher.type != type || launcher.registryPath.empty() ||
+            launcher.registryValue.empty()) {
+            continue;
+        }
+#ifdef _WIN32
+        // HKLM first, then HKCU. Type-validated and null-safe reads.
+        {
+            ScopedRegKey hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, launcher.registryPath.c_str(),
+                              0, KEY_READ, hKey.Put()) == ERROR_SUCCESS) {
+                std::wstring path = ReadRegistryStringSafe(hKey.Get(), launcher.registryValue.c_str());
+                if (!path.empty()) {
+                    return path;
                 }
             }
-#endif
         }
+        {
+            ScopedRegKey hKey;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, launcher.registryPath.c_str(),
+                              0, KEY_READ, hKey.Put()) == ERROR_SUCCESS) {
+                std::wstring path = ReadRegistryStringSafe(hKey.Get(), launcher.registryValue.c_str());
+                if (!path.empty()) {
+                    return path;
+                }
+            }
+        }
+#endif
     }
 
     return L"";
