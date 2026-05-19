@@ -4,8 +4,7 @@
  *
  * AGPL-3.0 — see LICENSE.txt
  *
- * Stub header — full TimeUtils implementation is planned.
- * Provides minimal time formatting used by Forensics/TimelineAnalyzer.
+ * Provides bounded UTC time formatting helpers used by timeline and telemetry code.
  */
 #pragma once
 
@@ -26,9 +25,13 @@ using Clock = std::chrono::system_clock;
     const auto tt = Clock::to_time_t(tp);
     std::tm utc{};
 #ifdef _WIN32
-    gmtime_s(&utc, &tt);
+    if (gmtime_s(&utc, &tt) != 0) {
+        return {};
+    }
 #else
-    gmtime_r(&tt, &utc);
+    if (gmtime_r(&tt, &utc) == nullptr) {
+        return {};
+    }
 #endif
     std::ostringstream oss;
     oss << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");

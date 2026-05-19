@@ -275,6 +275,28 @@ static inline bool isDigit(char c) noexcept {
     return c >= '0' && c <= '9';
 }
 
+static inline bool isSafeXmlName(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 255) {
+        return false;
+    }
+    const auto isAlpha = [](unsigned char c) noexcept {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    };
+    const auto isNameChar = [&](unsigned char c) noexcept {
+        return isAlpha(c) || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+    };
+    const unsigned char first = static_cast<unsigned char>(name.front());
+    if (!isAlpha(first) && first != '_') {
+        return false;
+    }
+    for (unsigned char c : name) {
+        if (!isNameChar(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 //=============================================================================
 // Path Parsing Types and Functions
 //=============================================================================
@@ -424,6 +446,13 @@ static void parsePathLike(std::string_view sv, std::vector<Step>& out) noexcept 
         
         // Remove the [N] from the name
         s.name = s.name.substr(0, lb);
+    }
+
+    for (const auto& s : out) {
+        if (!isSafeXmlName(s.name)) {
+            out.clear();
+            return;
+        }
     }
 
     } catch (...) {
@@ -905,32 +934,37 @@ bool SaveToFile(
                 (std::min)(content.size(), static_cast<size_t>(MAXDWORD)));
             DWORD written = 0;
             
-            BOOL writeOk = ::WriteFile(hFile, content.data(), toWrite, &written, nullptr);
-            totalWritten += written;
-            
-            // For files > 4GB (unlikely for XML but defensive)
-            if (writeOk && content.size() > static_cast<size_t>(written)) {
-                const char* remaining = content.data() + written;
-                size_t left = content.size() - written;
-                while (left > 0 && writeOk) {
-                    DWORD chunk = static_cast<DWORD>((std::min)(left, static_cast<size_t>(MAXDWORD)));
-                    writeOk = ::WriteFile(hFile, remaining, chunk, &written, nullptr);
-                    remaining += written;
-                    left -= written;
-                    totalWritten += written;
-                }
-            }
-
-            // Flush to disk
-            if (writeOk) {
-                ::FlushFileBuffers(hFile);
-            }
-            ::CloseHandle(hFile);
-
-            if (!writeOk || totalWritten != content.size()) {
-                ::DeleteFileW(tempPath.c_str());
-                setIoErr(err, "Failed to write temp file", tempPath);
-                return false;
+             BOOL writeOk = ::WriteFile(hFile, content.data(), toWrite, &written, nullptr);
+             totalWritten += written;
+             
+             // For files > 4GB (unlikely for XML but defensive)
+             if (writeOk && content.size() > static_cast<size_t>(written)) {
+                 const char* remaining = content.data() + written;
+                 size_t left = content.size() - written;
+                 while (left > 0 && writeOk) {
+                     DWORD chunk = static_cast<DWORD>((std::min)(left, static_cast<size_t>(MAXDWORD)));
+                     writeOk = ::WriteFile(hFile, remaining, chunk, &written, nullptr);
+                     if (writeOk && written == 0) {
+                         writeOk = FALSE;
+                         break;
+                     }
+                     remaining += written;
+                     left -= written;
+                     totalWritten += written;
+                 }
+             }
+ 
+             // Flush to disk
+             BOOL flushOk = TRUE;
+             if (writeOk) {
+                 flushOk = ::FlushFileBuffers(hFile);
+             }
+             ::CloseHandle(hFile);
+ 
+             if (!writeOk || !flushOk || totalWritten != content.size()) {
+                 ::DeleteFileW(tempPath.c_str());
+                 setIoErr(err, "Failed to write temp file", tempPath);
+                 return false;
             }
 
             // Atomic rename with write-through
@@ -978,12 +1012,16 @@ bool SaveToFile(
             // Non-atomic direct write (no temp file created)
             // ============================================================
             std::ofstream ofs(path, std::ios::out | std::ios::binary | std::ios::trunc);
-            if (!ofs) {
-                setIoErr(err, "Failed to open file for write", path);
-                return false;
-            }
-            
-            ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+             if (!ofs) {
+                 setIoErr(err, "Failed to open file for write", path);
+                 return false;
+             }
+             if (content.size() > static_cast<size_t>((std::numeric_limits<std::streamsize>::max)())) {
+                 setIoErr(err, "XML content exceeds stream write limit", path);
+                 return false;
+             }
+             
+             ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
             if (!ofs) {
                 setIoErr(err, "Failed to write file", path);
                 return false;
