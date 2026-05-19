@@ -66,7 +66,7 @@ struct CertificatePinningRegistrar final {
                         return true;
                     } catch (const std::exception& e) {
                         SS_LOG_ERROR(kLogCategory,
-                            L"CertificatePinning: Initialize() threw: %hs", e.what());
+                            L"CertificatePinning: Initialize() threw: %S", e.what());
                         return false;
                     } catch (...) {
                         SS_LOG_ERROR(kLogCategory,
@@ -86,7 +86,7 @@ struct CertificatePinningRegistrar final {
                         CertificatePinning::Instance().Shutdown();
                     } catch (const std::exception& e) {
                         SS_LOG_ERROR(kLogCategory,
-                            L"CertificatePinning: Shutdown() threw: %hs", e.what());
+                            L"CertificatePinning: Shutdown() threw: %S", e.what());
                     } catch (...) {
                         SS_LOG_ERROR(kLogCategory,
                             L"CertificatePinning: Shutdown() threw unknown exception");
@@ -106,10 +106,25 @@ struct CertificatePinningRegistrar final {
                         case ProtectionMode::Aggressive:
                             pinMode = PinningMode::Strict;
                             break;
-                        default:
-                            break;
+                        case ProtectionMode::Off:
+                            SS_LOG_ERROR(kLogCategory,
+                                L"CertificatePinning: setMode(Off) must be routed through orchestrator disable");
+                            return false;
                     }
-                    CertificatePinning::Instance().SetMode(pinMode);
+                    auto& pinning = CertificatePinning::Instance();
+                    auto config = pinning.GetConfiguration();
+                    config.mode = pinMode;
+                    config.enableCTChecking = true;
+                    config.enableRevocationChecking = true;
+                    config.allowRevocationSoftFail = (mode == ProtectionMode::Passive);
+                    config.blockWeakSignatures = (mode != ProtectionMode::Passive);
+
+                    if (!pinning.UpdateConfiguration(config)) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"CertificatePinning: UpdateConfiguration rejected mode=%u",
+                            static_cast<unsigned>(mode));
+                        return false;
+                    }
                     return ApplyModeThresholds("CertificatePinning", mode);
                 },
 
@@ -120,7 +135,8 @@ struct CertificatePinningRegistrar final {
                     ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"CertificatePinningWiring: static registration failed\n");
         }
     }
 };
