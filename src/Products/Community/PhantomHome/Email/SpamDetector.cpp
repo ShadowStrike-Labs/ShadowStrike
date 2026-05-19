@@ -1135,7 +1135,81 @@ public:
     // ========================================================================
 
     bool IsSpam(const std::string& headers, const std::string& body) {
-        auto result = Analyze("", body, "", {});
+        // SECURITY: previously this overload silently discarded the headers
+        // argument and passed empty subject/sender to Analyze, defeating
+        // any header-based heuristic. We parse the raw RFC-5322 header
+        // block here (handling LWS folding) for the From/Subject fields
+        // and a normalised header map, then defer to the full analyzer.
+        std::string subject;
+        std::string sender;
+        std::map<std::string, std::string> headerMap;
+
+        size_t pos = 0;
+        const size_t n = headers.size();
+        while (pos < n) {
+            size_t eol = headers.find('\n', pos);
+            std::string line = (eol == std::string::npos)
+                ? headers.substr(pos)
+                : headers.substr(pos, eol - pos);
+            pos = (eol == std::string::npos) ? n : eol + 1;
+
+            // Handle header folding: continuation lines start with WSP.
+            while (pos < n && (headers[pos] == ' ' || headers[pos] == '\t')) {
+                size_t e2 = headers.find('\n', pos);
+                std::string cont = (e2 == std::string::npos)
+                    ? headers.substr(pos)
+                    : headers.substr(pos, e2 - pos);
+                line += ' ';
+                line += cont;
+                pos = (e2 == std::string::npos) ? n : e2 + 1;
+            }
+
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos || colon == 0) continue;
+
+            std::string name = line.substr(0, colon);
+            std::string value = line.substr(colon + 1);
+            // Trim leading whitespace from value
+            size_t vs = 0;
+            while (vs < value.size() && (value[vs] == ' ' || value[vs] == '\t')) ++vs;
+            value.erase(0, vs);
+            // Reject embedded control characters to prevent log injection
+            // when the value is later forwarded into a logger.
+            value.erase(std::remove_if(value.begin(), value.end(),
+                [](unsigned char c) { return c == '\r' || c == '\n'; }),
+                value.end());
+
+            headerMap.emplace(name, value);
+
+            // Case-insensitive header name compare for the two we extract.
+            auto iequals = [](std::string_view a, std::string_view b) noexcept {
+                if (a.size() != b.size()) return false;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                        std::tolower(static_cast<unsigned char>(b[i]))) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (iequals(name, "Subject")) {
+                subject = value;
+            } else if (iequals(name, "From") && sender.empty()) {
+                // Prefer the angle-addr portion for the sender field.
+                const auto lt = value.rfind('<');
+                const auto gt = value.rfind('>');
+                if (lt != std::string::npos && gt != std::string::npos && gt > lt) {
+                    sender = value.substr(lt + 1, gt - lt - 1);
+                } else {
+                    sender = value;
+                }
+            }
+        }
+
+        auto result = Analyze(subject, body, sender, headerMap);
         return result.isSpam;
     }
 
@@ -1164,6 +1238,26 @@ public:
             if (!m_initialized) {
                 return result;
             }
+
+            // RFC-5322 header field names are case-insensitive. The caller's
+            // map is unordered with respect to case, so we *must not* use the
+            // plain std::map::find/count when probing for well-known fields.
+            const auto getHeader = [&headers](std::string_view name) noexcept
+                -> const std::string* {
+                for (const auto& [k, v] : headers) {
+                    if (k.size() != name.size()) continue;
+                    bool eq = true;
+                    for (size_t i = 0; i < k.size(); ++i) {
+                        if (std::tolower(static_cast<unsigned char>(k[i])) !=
+                            std::tolower(static_cast<unsigned char>(name[i]))) {
+                            eq = false;
+                            break;
+                        }
+                    }
+                    if (eq) return &v;
+                }
+                return nullptr;
+            };
 
             // Check whitelist/blacklist first
             if (!sender.empty()) {
@@ -1225,9 +1319,9 @@ public:
 
             // RBL check
             if (m_config.enableRBL) {
-                auto receivedIt = headers.find("Received");
-                if (receivedIt != headers.end()) {
-                    const std::string ipAddress = ExtractIPFromReceived(receivedIt->second);
+                const std::string* receivedVal = getHeader("Received");
+                if (receivedVal != nullptr) {
+                    const std::string ipAddress = ExtractIPFromReceived(*receivedVal);
                     if (!ipAddress.empty()) {
                         result.rblResults = m_rblChecker->CheckIP(ipAddress);
 
@@ -1248,9 +1342,9 @@ public:
             // Sender reputation
             if (!sender.empty()) {
                 std::string ipAddress;
-                auto receivedIt = headers.find("Received");
-                if (receivedIt != headers.end()) {
-                    ipAddress = ExtractIPFromReceived(receivedIt->second);
+                const std::string* receivedVal = getHeader("Received");
+                if (receivedVal != nullptr) {
+                    ipAddress = ExtractIPFromReceived(*receivedVal);
                 }
 
                 result.senderReputation = m_reputationTracker->GetReputation(sender, ipAddress);
@@ -1262,8 +1356,10 @@ public:
                 }
             }
 
-            // Header analysis
-            if (headers.empty() || !headers.count("Message-ID") || !headers.count("Date")) {
+            // Header analysis (case-insensitive: RFC-5322 §3.6 mandatory fields).
+            if (headers.empty() ||
+                getHeader("Message-ID") == nullptr ||
+                getHeader("Date") == nullptr) {
                 result.ruleScore += 15;
                 result.indicators |= SpamIndicator::MissingHeaders;
                 result.matchedRules.push_back("Missing required headers");
@@ -1326,6 +1422,13 @@ public:
             if (!result.matchedRules.empty()) {
                 m_stats.ruleHits.fetch_add(1, std::memory_order_relaxed);
             }
+
+            // SECURITY: release the lock before dispatching user-supplied
+            // callbacks. std::shared_mutex is non-recursive; a callback that
+            // re-enters SpamDetector (e.g. to query stats) would otherwise
+            // deadlock or invoke undefined behaviour. The callback manager
+            // itself owns its own synchronisation.
+            lock.unlock();
 
             // Invoke callback
             m_callbackManager->InvokeAnalysis(result);
