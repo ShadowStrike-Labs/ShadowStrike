@@ -1944,16 +1944,25 @@ bool GameModeManagerImpl::DetectFullscreenApps() {
         // Only consider processes that the detector knows about or
         // that are genuinely fullscreen and not in the blocklist
         if (IsProcessFullscreen(entry.th32ProcessID)) {
-            // Additional validation: check if GameProcessDetector recognizes this
+            // Additional validation: prefer processes the detector recognises.
+            // If the detector is available and reports this process is NOT a
+            // known game and NOT in the blocklist, fall back to the
+            // fullscreen-only heuristic but log the soft signal. If the
+            // detector throws we proceed with the heuristic as before.
             bool knownGame = false;
             try {
                 knownGame = GameProcessDetector::Instance().IsGameProcess(entry.th32ProcessID);
             } catch (...) {
-                // If detector unavailable, proceed with fullscreen-only heuristic
+                knownGame = false;
+            }
+            if (knownGame) {
+                Utils::Logger::Info("Fullscreen process recognised as game by detector: {} (PID: {})",
+                    Utils::StringUtils::WStringToString(processName),
+                    static_cast<unsigned int>(entry.th32ProcessID));
             }
 
             // If it passes the blocklist, it is either a known game or at
-            // least not a known non-game - allow proceeding
+            // least not a known non-game - allow proceeding.
             detectedPid = entry.th32ProcessID;
             detectedName = processName;
             detected = true;
