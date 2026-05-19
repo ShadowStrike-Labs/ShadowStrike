@@ -29,6 +29,7 @@
 #include <limits>
 #include <algorithm>
 #include <cstdarg>
+#include <cstring>
 #include <stdexcept>
 #include <type_traits>
 
@@ -202,52 +203,11 @@ namespace ShadowStrike {
                     return std::wstring{};
                 }
 
-                // First call: determine required buffer size (-1 = scan until null)
-                const int sizeNeeded = MultiByteToWideChar(
-                    CP_UTF8, 
-                    MB_ERR_INVALID_CHARS,
-                    utf8, 
-                    -1, 
-                    nullptr, 
-                    0
-                );
-
-                if (sizeNeeded <= 1) {
+                const size_t inputLength = strnlen_s(utf8, kMaxConversionSize + 1);
+                if (inputLength == 0 || inputLength > kMaxConversionSize) {
                     return std::wstring{};
                 }
-
-                // Security: prevent unbounded allocation from attacker-controlled input
-                if (static_cast<size_t>(sizeNeeded) > kMaxConversionSize / sizeof(wchar_t)) {
-                    return std::wstring{};
-                }
-
-                // String length excluding null terminator
-                const size_t strLen = static_cast<size_t>(sizeNeeded - 1);
-
-                // Single allocation: resize result, convert directly into buffer
-                // std::wstring guarantees space for strLen + 1 (null terminator)
-                std::wstring result;
-                try {
-                    result.resize(strLen);
-                }
-                catch (...) {
-                    return std::wstring{};
-                }
-
-                const int converted = MultiByteToWideChar(
-                    CP_UTF8, 
-                    MB_ERR_INVALID_CHARS,
-                    utf8, 
-                    -1, 
-                    result.data(), 
-                    sizeNeeded
-                );
-
-                if (converted <= 0 || converted != sizeNeeded) {
-                    return std::wstring{};
-                }
-
-                return result;
+                return ToWide(std::string_view{ utf8, inputLength });
             }
 
             // ============================================================================
@@ -711,10 +671,10 @@ namespace ShadowStrike {
                     return std::wstring{};
                 }
 
-                // Allocate buffer with exception safety
+                // Allocate buffer with one explicit terminator slot for the CRT formatter.
                 std::wstring result;
                 try {
-                    result.resize(static_cast<size_t>(needed));
+                    result.resize(static_cast<size_t>(needed) + 1U);
                 }
                 catch (const std::bad_alloc&) {
                     return std::wstring{};
@@ -724,7 +684,7 @@ namespace ShadowStrike {
                 // Note: _vsnwprintf_s requires buffer size including null terminator
                 const int written = _vsnwprintf_s(
                     result.data(), 
-                    result.size() + 1,  // Buffer size including null terminator
+                    result.size(),
                     static_cast<size_t>(needed),  // Max characters to write (excluding null)
                     fmt, 
                     args
@@ -735,10 +695,7 @@ namespace ShadowStrike {
                     return std::wstring{};
                 }
 
-                // Resize if less was written (shouldn't happen normally)
-                if (static_cast<size_t>(written) < result.size()) {
-                    result.resize(static_cast<size_t>(written));
-                }
+                result.resize(static_cast<size_t>(written));
 
                 return result;
             }
