@@ -47,8 +47,10 @@
 #include <iomanip>
 #include <thread>
 #include <algorithm>
+#include <cwctype>
 #include <future>
 #include <condition_variable>
+#include <limits>
 
 #include <rpc.h>
 #pragma comment(lib, "Rpcrt4.lib")
@@ -78,6 +80,143 @@ namespace {
     constexpr size_t VERIFY_TAG_SIZE = 32;
     // Maximum file enumeration count to prevent memory exhaustion
     constexpr size_t MAX_FILE_ENUMERATION = 10'000'000;
+
+    [[nodiscard]] bool IsHexDigit(char ch) noexcept {
+        return (ch >= '0' && ch <= '9') ||
+               (ch >= 'a' && ch <= 'f') ||
+               (ch >= 'A' && ch <= 'F');
+    }
+
+    [[nodiscard]] bool DecodeHexExact(std::string_view hex,
+                                      size_t expectedBytes,
+                                      std::vector<uint8_t>& out) {
+        out.clear();
+        if (hex.size() != expectedBytes * 2u) {
+            SS_LOG_ERROR(L"BackupManager",
+                L"DecodeHexExact: invalid hex length %zu, expected %zu",
+                hex.size(), expectedBytes * 2u);
+            return false;
+        }
+
+        out.reserve(expectedBytes);
+        for (size_t i = 0; i < hex.size(); i += 2u) {
+            if (!IsHexDigit(hex[i]) || !IsHexDigit(hex[i + 1u])) {
+                SS_LOG_ERROR(L"BackupManager",
+                    L"DecodeHexExact: non-hex character at offset %zu",
+                    i);
+                out.clear();
+                return false;
+            }
+            out.push_back(static_cast<uint8_t>(
+                std::stoul(std::string(hex.substr(i, 2u)), nullptr, 16)));
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::wstring LowerPathComponent(const fs::path& component) {
+        std::wstring text = component.native();
+        std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+        return text;
+    }
+
+    [[nodiscard]] bool PathStartsWith(const fs::path& candidate,
+                                      const fs::path& parent) {
+        const fs::path normalizedCandidate = candidate.lexically_normal();
+        const fs::path normalizedParent = parent.lexically_normal();
+        auto candidateIt = normalizedCandidate.begin();
+        const auto candidateEnd = normalizedCandidate.end();
+
+        for (const auto& parentPart : normalizedParent) {
+            if (candidateIt == candidateEnd) {
+                return false;
+            }
+            if (LowerPathComponent(*candidateIt) != LowerPathComponent(parentPart)) {
+                return false;
+            }
+            ++candidateIt;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool PathsEqualInsensitive(const fs::path& left,
+                                             const fs::path& right) {
+        const fs::path normalizedLeft = left.lexically_normal();
+        const fs::path normalizedRight = right.lexically_normal();
+        auto leftIt = normalizedLeft.begin();
+        auto rightIt = normalizedRight.begin();
+        const auto leftEnd = normalizedLeft.end();
+        const auto rightEnd = normalizedRight.end();
+
+        for (; leftIt != leftEnd && rightIt != rightEnd; ++leftIt, ++rightIt) {
+            if (LowerPathComponent(*leftIt) != LowerPathComponent(*rightIt)) {
+                return false;
+            }
+        }
+
+        return leftIt == leftEnd && rightIt == rightEnd;
+    }
+
+    [[nodiscard]] std::wstring SanitizePathSegment(std::wstring segment) {
+        for (auto& ch : segment) {
+            if (ch == L':' || ch == L'\\' || ch == L'/' || ch == L'\0') {
+                ch = L'_';
+            }
+        }
+        if (segment.empty() || segment == L"." || segment == L"..") {
+            return L"_";
+        }
+        return segment;
+    }
+
+    [[nodiscard]] bool IsSafeVaultRelativePath(const fs::path& path) {
+        if (path.empty() || path.is_absolute() || path.has_root_name() ||
+            path.has_root_directory()) {
+            return false;
+        }
+
+        for (const auto& part : path.lexically_normal()) {
+            const auto native = part.native();
+            if (native.empty() || native == L"." || native == L"..") {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    [[nodiscard]] fs::path BuildFallbackBackupPath(const fs::path& sourceFile) {
+        const fs::path normalized = sourceFile.lexically_normal();
+        fs::path safe;
+
+        if (normalized.has_root_name()) {
+            safe /= SanitizePathSegment(normalized.root_name().native());
+        }
+
+        for (const auto& part : normalized.relative_path()) {
+            const auto native = part.native();
+            if (native.empty() || native == L"." || native == L"..") {
+                continue;
+            }
+            safe /= SanitizePathSegment(native);
+        }
+
+        if (safe.empty()) {
+            safe = L"_";
+        }
+        return safe;
+    }
+
+    void AddSaturating(uint64_t& accumulator, uint64_t value, const wchar_t* context) noexcept {
+        if ((std::numeric_limits<uint64_t>::max)() - accumulator < value) {
+            accumulator = (std::numeric_limits<uint64_t>::max)();
+            SS_LOG_WARN(L"BackupManager",
+                L"%ls: byte counter saturated at UINT64_MAX", context);
+            return;
+        }
+        accumulator += value;
+    }
 
     std::string EscapeJson(const std::string& s) {
         std::ostringstream o;
@@ -181,16 +320,18 @@ namespace {
     {
         std::error_code ec;
         fs::path relative = fs::relative(sourceFile, sourceRoot, ec);
-        if (ec || relative.empty() || relative.native().starts_with(L"..")) {
-            // Cannot compute relative path; use drive_letter/full_path structure
-            std::wstring full = sourceFile.wstring();
-            // Replace : with _ for drive letters (C:\foo -> C_\foo)
-            for (auto& ch : full) {
-                if (ch == L':') ch = L'_';
-            }
-            return fs::path(full);
+        if (!ec && IsSafeVaultRelativePath(relative)) {
+            return relative.lexically_normal();
         }
-        return relative;
+
+        const fs::path fallback = BuildFallbackBackupPath(sourceFile);
+        if (!IsSafeVaultRelativePath(fallback)) {
+            SS_LOG_ERROR(L"BackupManager",
+                L"BuildRelativeBackupPath: failed to construct safe vault-relative path for %ls",
+                sourceFile.c_str());
+            return fs::path(L"_");
+        }
+        return fallback;
     }
 
     // Constant-time comparison for verification tags
@@ -661,6 +802,9 @@ public:
             return {};
         }
 
+        fs::path vaultPath;
+        bool vaultEncrypted = false;
+        Utils::CryptoUtils::SecureByteBuffer threadKey;
         {
             std::shared_lock lock(m_mutex);
             if (m_status != ModuleStatus::Running) {
@@ -671,6 +815,22 @@ public:
                 NotifyError("Vault is not ready (status=" +
                             std::string(GetVaultStatusName(m_vaultInfo.status)) + ")", 103);
                 return {};
+            }
+            vaultPath = m_vaultInfo.path;
+            vaultEncrypted = m_vaultInfo.isEncrypted;
+            if (vaultEncrypted && m_vaultKey.Empty()) {
+                NotifyError("Encrypted vault is not unlocked", 109);
+                return {};
+            }
+            if (vaultEncrypted) {
+                threadKey.Resize(m_vaultKey.Size());
+                if (!threadKey.Empty()) {
+                    threadKey.CopyFrom(m_vaultKey.Data(), m_vaultKey.Size());
+                }
+                if (threadKey.Empty()) {
+                    NotifyError("Failed to snapshot vault encryption key", 110);
+                    return {};
+                }
             }
         }
 
@@ -683,17 +843,19 @@ public:
             }
 
             // Ensure source is not inside the vault (prevent recursive backup)
-            fs::path canonSource = fs::weakly_canonical(source.path, ec);
-            fs::path canonVault = fs::weakly_canonical(m_vaultInfo.path, ec);
-            if (!ec) {
-                auto [srcEnd, vaultEnd] = std::mismatch(
-                    canonVault.begin(), canonVault.end(),
-                    canonSource.begin(), canonSource.end());
-                if (srcEnd == canonVault.end()) {
-                    NotifyError("Source path is inside vault (recursive backup prevented): " +
-                                source.path.string(), 105);
-                    return {};
-                }
+            std::error_code sourceEc;
+            std::error_code vaultEc;
+            const fs::path canonSource = fs::weakly_canonical(source.path, sourceEc);
+            const fs::path canonVault = fs::weakly_canonical(vaultPath, vaultEc);
+            if (sourceEc || vaultEc) {
+                NotifyError("Unable to canonicalize backup source or vault path", 105);
+                return {};
+            }
+
+            if (PathStartsWith(canonSource, canonVault)) {
+                NotifyError("Source path is inside vault (recursive backup prevented): " +
+                            source.path.string(), 105);
+                return {};
             }
         }
 
@@ -712,7 +874,7 @@ public:
         bp.startTime = std::chrono::system_clock::now();
         bp.sources = sources;
         bp.label = label;
-        bp.isEncrypted = m_vaultInfo.isEncrypted;
+        bp.isEncrypted = vaultEncrypted;
 
         {
             std::unique_lock lock(m_mutex);
@@ -745,20 +907,11 @@ public:
             m_activeBackups[backupId] = std::move(progress);
         }
 
-        // Copy key for thread-safe usage (the key is needed in the worker thread)
-        Utils::CryptoUtils::SecureByteBuffer threadKey;
-        if (m_vaultInfo.isEncrypted && !m_vaultKey.Empty()) {
-            threadKey.Resize(m_vaultKey.Size());
-            if (!threadKey.Empty()) {
-                threadKey.CopyFrom(m_vaultKey.Data(), m_vaultKey.Size());
-            }
-        }
-
         // Launch worker thread (managed, not detached)
         std::unique_lock lock(m_mutex);
         m_workerThreads.emplace_back(
-            [this, backupId, sources, opState, key = std::move(threadKey)]() mutable {
-                PerformBackup(backupId, sources, opState, key);
+            [this, backupId, sources, vaultPath, vaultEncrypted, opState, key = std::move(threadKey)]() mutable {
+                PerformBackup(backupId, sources, vaultPath, vaultEncrypted, opState, key);
                 key.Clear();
             }
         );
@@ -768,6 +921,8 @@ public:
 
     void PerformBackup(const std::string& backupId,
                        const std::vector<BackupSource>& sources,
+                       const fs::path& vaultPath,
+                       bool vaultEncrypted,
                        std::shared_ptr<BackupOperationState> opState,
                        const Utils::CryptoUtils::SecureByteBuffer& encKey)
     {
@@ -825,7 +980,7 @@ public:
 
                             fileList.push_back({it->path(), source.path, fsize});
                             totalFiles++;
-                            totalBytes += fsize;
+                            AddSaturating(totalBytes, fsize, L"PerformBackup recursive scan");
                         }
                     }
                 } else {
@@ -837,9 +992,14 @@ public:
                             if (!source.followSymlinks && it->is_symlink(ec)) continue;
                             auto fsize = it->file_size(ec);
                             if (ec) { fsize = 0; ec.clear(); }
+                            if (fileList.size() >= MAX_FILE_ENUMERATION) {
+                                SS_LOG_WARN(L"BackupManager", L"File enumeration limit reached (%zu)",
+                                            MAX_FILE_ENUMERATION);
+                                break;
+                            }
                             fileList.push_back({it->path(), source.path, fsize});
                             totalFiles++;
-                            totalBytes += fsize;
+                            AddSaturating(totalBytes, fsize, L"PerformBackup directory scan");
                         }
                     }
                 }
@@ -848,7 +1008,7 @@ public:
                 if (ec) { fsize = 0; ec.clear(); }
                 fileList.push_back({source.path, source.path.parent_path(), fsize});
                 totalFiles++;
-                totalBytes += fsize;
+                AddSaturating(totalBytes, fsize, L"PerformBackup file scan");
             }
         }
 
@@ -895,14 +1055,14 @@ public:
                 if (skip) {
                     filesSkipped++;
                     processedFiles++;
-                    processedBytes += entry.size;
+                    AddSaturating(processedBytes, entry.size, L"PerformBackup skipped bytes");
                     continue;
                 }
             }
 
             try {
                 std::error_code ec;
-                fs::path backupDir = m_vaultInfo.path / backupId / "data";
+                fs::path backupDir = vaultPath / backupId / "data";
                 fs::create_directories(backupDir, ec);
                 if (ec) {
                     throw std::runtime_error("Failed to create backup directory: " + ec.message());
@@ -928,7 +1088,7 @@ public:
                     destFile = destFile.parent_path() / (stem + "_" + suffix + ext);
                 }
 
-                if (m_vaultInfo.isEncrypted && !encKey.Empty()) {
+                if (vaultEncrypted) {
                     // Encrypt the file using CryptoUtils infrastructure
                     fs::path encDest = destFile;
                     encDest += L".enc";
@@ -937,8 +1097,10 @@ public:
                             entry.fullPath.wstring(), encDest.wstring(),
                             encKey.Data(), encKey.Size(), &cryptErr))
                     {
+                        const std::string cryptoMessage =
+                            Utils::StringUtils::ToNarrow(cryptErr.message);
                         throw std::runtime_error("Encryption failed: " +
-                            std::string(cryptErr.message.begin(), cryptErr.message.end()));
+                            (cryptoMessage.empty() ? "unknown crypto error" : cryptoMessage));
                     }
                     filesBackedUp++;
                 } else {
@@ -959,7 +1121,7 @@ public:
             }
 
             processedFiles++;
-            processedBytes += entry.size;
+            AddSaturating(processedBytes, entry.size, L"PerformBackup processed bytes");
         }
 
         // ---- Phase 3: Finalize ----
@@ -1393,7 +1555,28 @@ public:
             }
 
             m_vaultInfo.vaultId = j.value("vaultId", "");
-            m_vaultInfo.path = j.value("path", "");
+            if (m_vaultInfo.vaultId.empty()) {
+                SS_LOG_ERROR(L"BackupManager", L"Vault metadata missing vaultId");
+                return false;
+            }
+
+            const fs::path configuredVaultPath = m_config.defaultVault.vaultPath;
+            const fs::path storedVaultPath = j.value("path", "");
+            if (!storedVaultPath.empty()) {
+                std::error_code configuredEc;
+                std::error_code storedEc;
+                const fs::path configuredCanonical =
+                    fs::weakly_canonical(configuredVaultPath, configuredEc);
+                const fs::path storedCanonical =
+                    fs::weakly_canonical(storedVaultPath, storedEc);
+                if (!configuredEc && !storedEc &&
+                    !PathsEqualInsensitive(configuredCanonical, storedCanonical)) {
+                    SS_LOG_WARN(L"BackupManager",
+                        L"Vault metadata path differs from configured vault path; "
+                        L"using configured path to prevent metadata path redirection");
+                }
+            }
+            m_vaultInfo.path = configuredVaultPath;
             auto timeVal = j.value("creationTime", 0LL);
             m_vaultInfo.creationTime = std::chrono::system_clock::time_point(
                 std::chrono::seconds(timeVal));
@@ -1416,22 +1599,11 @@ public:
                     return false;
                 }
 
-                // Hex decode salt
-                m_vaultSalt.clear();
-                m_vaultSalt.reserve(saltHex.size() / 2);
-                for (size_t i = 0; i + 1 < saltHex.size(); i += 2) {
-                    auto byte = static_cast<uint8_t>(
-                        std::stoul(saltHex.substr(i, 2), nullptr, 16));
-                    m_vaultSalt.push_back(byte);
-                }
-
-                // Hex decode verify tag
-                m_vaultVerifyTag.clear();
-                m_vaultVerifyTag.reserve(tagHex.size() / 2);
-                for (size_t i = 0; i + 1 < tagHex.size(); i += 2) {
-                    auto byte = static_cast<uint8_t>(
-                        std::stoul(tagHex.substr(i, 2), nullptr, 16));
-                    m_vaultVerifyTag.push_back(byte);
+                if (!DecodeHexExact(saltHex, SALT_SIZE, m_vaultSalt) ||
+                    !DecodeHexExact(tagHex, VERIFY_TAG_SIZE, m_vaultVerifyTag)) {
+                    SS_LOG_ERROR(L"BackupManager",
+                        L"Encrypted vault metadata contains invalid salt or verification tag");
+                    return false;
                 }
             }
 
