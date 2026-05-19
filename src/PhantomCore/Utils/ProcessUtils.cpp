@@ -350,29 +350,22 @@ namespace ShadowStrike {
                 [[nodiscard]] bool QueryFullImagePath(HANDLE hProcess, std::wstring& path) noexcept {
                     path.clear();
                     if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return false;
-                    
+                     
                     try {
-                        DWORD len = MAX_PATH;
-                        std::wstring tmp(len, L'\0');
-                        
-                        if (!QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) {
-                            const DWORD lastErr = GetLastError();
-                            if (lastErr == ERROR_INSUFFICIENT_BUFFER && len > 0 && len < kMaxPathLength) {
-                                tmp.resize(static_cast<size_t>(len) + 1);
-                                len = static_cast<DWORD>(tmp.size());
-                                if (!QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) {
-                                    return false;
+                        for (DWORD capacity = MAX_PATH; capacity <= kMaxPathLength; capacity *= 2U) {
+                            std::wstring tmp(capacity, L'\0');
+                            DWORD len = capacity;
+                            if (QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) {
+                                if (len > 0 && len < capacity) {
+                                    tmp.resize(len);
+                                    path = std::move(tmp);
+                                    return true;
                                 }
+                                continue;
                             }
-                            else {
+                            if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
                                 return false;
                             }
-                        }
-                        
-                        if (len > 0 && len < tmp.size()) {
-                            tmp.resize(len);
-                            path = std::move(tmp);
-                            return true;
                         }
                         return false;
                     } catch (...) {
@@ -511,6 +504,117 @@ namespace ShadowStrike {
                  */
                 [[nodiscard]] inline uint64_t GetTickCount64Ms() noexcept {
                     return GetTickCount64();
+                }
+
+                [[nodiscard]] bool IsReadableProtection(DWORD protect) noexcept {
+                    if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+                        return false;
+                    }
+                    const DWORD effective = protect & 0xFFU;
+                    return effective == PAGE_READONLY ||
+                        effective == PAGE_READWRITE ||
+                        effective == PAGE_WRITECOPY ||
+                        effective == PAGE_EXECUTE_READ ||
+                        effective == PAGE_EXECUTE_READWRITE ||
+                        effective == PAGE_EXECUTE_WRITECOPY;
+                }
+
+                [[nodiscard]] bool IsRemoteRangeReadable(HANDLE hProcess, const void* address, SIZE_T size) noexcept {
+                    if (!hProcess || hProcess == INVALID_HANDLE_VALUE || !address || size == 0) {
+                        return false;
+                    }
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (::VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+                        return false;
+                    }
+                    if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
+                        return false;
+                    }
+                    const auto base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                    const auto addr = reinterpret_cast<uintptr_t>(address);
+                    if (addr < base) {
+                        return false;
+                    }
+                    const SIZE_T offset = static_cast<SIZE_T>(addr - base);
+                    return offset <= mbi.RegionSize && size <= (mbi.RegionSize - offset);
+                }
+
+                [[nodiscard]] bool QueryThreadSuspendCount(HANDLE hThread, ULONG& suspendCount) noexcept {
+                    suspendCount = 0;
+                    if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+                        return false;
+                    }
+                    using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                    static auto NtQIT = reinterpret_cast<NtQIT_t>(
+                        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+                    if (!NtQIT) {
+                        return false;
+                    }
+                    const NTSTATUS st = NtQIT(hThread, 35 /*ThreadSuspendCount*/,
+                        &suspendCount, sizeof(suspendCount), nullptr);
+                    return st >= 0;
+                }
+
+                [[nodiscard]] bool ResolveExistingDllPath(
+                    std::wstring_view dllPath,
+                    std::wstring& fullPath,
+                    Error* err) noexcept {
+                    fullPath.clear();
+                    if (dllPath.empty() || dllPath.size() > kMaxPathLength) {
+                        SetWin32Error(err, L"ResolveExistingDllPath", ERROR_INVALID_PARAMETER,
+                            L"DLL path is empty or exceeds the Windows path limit.");
+                        return false;
+                    }
+                    for (wchar_t ch : dllPath) {
+                        if (ch == L'\0' || (ch < L' ' && ch != L'\t')) {
+                            SetWin32Error(err, L"ResolveExistingDllPath", ERROR_INVALID_NAME,
+                                L"DLL path contains embedded NUL or control characters.");
+                            return false;
+                        }
+                    }
+
+                    FileUtils::Error fileErr{};
+                    std::wstring normalized = FileUtils::NormalizePath(dllPath, false, &fileErr);
+                    if (normalized.empty()) {
+                        SetWin32Error(err, L"ResolveExistingDllPath",
+                            fileErr.win32 != ERROR_SUCCESS ? fileErr.win32 : ERROR_INVALID_NAME,
+                            L"DLL path normalization failed.");
+                        return false;
+                    }
+
+                    const std::wstring lowerName = ToLower(BaseName(normalized));
+                    if (lowerName.size() < 5 || lowerName.rfind(L".dll") != lowerName.size() - 4) {
+                        SetWin32Error(err, L"ResolveExistingDllPath", ERROR_BAD_EXE_FORMAT,
+                            L"Only .dll files may be injected.");
+                        return false;
+                    }
+
+                    HANDLE hFile = ::CreateFileW(normalized.c_str(),
+                        FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                        nullptr);
+                    if (hFile == INVALID_HANDLE_VALUE) {
+                        SetWin32Error(err, L"CreateFileW(DLL)");
+                        return false;
+                    }
+                    auto fileGuard = make_unique_handle(hFile);
+
+                    BY_HANDLE_FILE_INFORMATION info{};
+                    if (!::GetFileInformationByHandle(fileGuard.get(), &info)) {
+                        SetWin32Error(err, L"GetFileInformationByHandle(DLL)");
+                        return false;
+                    }
+                    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+                        SetWin32Error(err, L"ResolveExistingDllPath", ERROR_ACCESS_DENIED,
+                            L"DLL path must be a regular file and must not be a reparse point.");
+                        return false;
+                    }
+
+                    fullPath = std::move(normalized);
+                    return true;
                 }
 
                 /**
@@ -1342,7 +1446,9 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
 
         PEB32 peb32{};
         SIZE_T read = 0;
-        if (!::ReadProcessMemory(ph.Get(), peb32Address, &peb32, sizeof(peb32), &read)) {
+        if (!IsRemoteRangeReadable(ph.Get(), peb32Address, sizeof(peb32)) ||
+            !::ReadProcessMemory(ph.Get(), peb32Address, &peb32, sizeof(peb32), &read) ||
+            read != sizeof(peb32)) {
             SetWin32Error(err, L"ReadProcessMemory(PEB32)");
             return std::nullopt;
         }
@@ -1354,9 +1460,10 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         }
 
         RTL_USER_PROCESS_PARAMETERS32 params32{};
-        if (!::ReadProcessMemory(ph.Get(),
-            reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(peb32.ProcessParameters)),
-            &params32, sizeof(params32), &read)) {
+        auto* processParameters32 = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(peb32.ProcessParameters));
+        if (!IsRemoteRangeReadable(ph.Get(), processParameters32, sizeof(params32)) ||
+            !::ReadProcessMemory(ph.Get(), processParameters32, &params32, sizeof(params32), &read) ||
+            read != sizeof(params32)) {
             SetWin32Error(err, L"ReadProcessMemory(RTL_USER_PROCESS_PARAMETERS32)");
             return std::nullopt;
         }
@@ -1371,9 +1478,15 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
             return std::nullopt;
 		}
 
+        auto* commandLine32 = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(params32.CommandLine.Buffer));
+        if (!IsRemoteRangeReadable(ph.Get(), commandLine32, params32.CommandLine.Length)) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
+                L"WOW64 command line buffer is not readable.");
+            return std::nullopt;
+        }
+
         std::wstring cmdLine(params32.CommandLine.Length / sizeof(wchar_t), L'\0');
-        if (!::ReadProcessMemory(ph.Get(),
-            reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(params32.CommandLine.Buffer)),
+        if (!::ReadProcessMemory(ph.Get(), commandLine32,
             cmdLine.data(), params32.CommandLine.Length, &read)) {
             SetWin32Error(err, L"ReadProcessMemory(CommandLine32)");
             return std::nullopt;
@@ -1410,7 +1523,9 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
 
         PEB_INTERNAL peb{};
         
-        if (!::ReadProcessMemory(ph.Get(), pbi.PebBaseAddress, &peb, sizeof(peb), &read)) {
+        if (!IsRemoteRangeReadable(ph.Get(), pbi.PebBaseAddress, sizeof(peb)) ||
+            !::ReadProcessMemory(ph.Get(), pbi.PebBaseAddress, &peb, sizeof(peb), &read) ||
+            read != sizeof(peb)) {
             SetWin32Error(err, L"ReadProcessMemory(PEB)");
             return std::nullopt;
         }
@@ -1422,7 +1537,9 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         }
 
         RTL_USER_PROCESS_PARAMETERS_INTERNAL params{};
-        if (!::ReadProcessMemory(ph.Get(), peb.ProcessParameters, &params, sizeof(params), &read)) {
+        if (!IsRemoteRangeReadable(ph.Get(), peb.ProcessParameters, sizeof(params)) ||
+            !::ReadProcessMemory(ph.Get(), peb.ProcessParameters, &params, sizeof(params), &read) ||
+            read != sizeof(params)) {
             SetWin32Error(err, L"ReadProcessMemory(RTL_USER_PROCESS_PARAMETERS)");
             return std::nullopt;
         }
@@ -1441,27 +1558,9 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
             return std::wstring{};
         }
 
-        //Probe read access before allocating memory
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!::VirtualQueryEx(ph.Get(), params.CommandLine.Buffer, &mbi, sizeof(mbi))) {
-            SetWin32Error(err, L"VirtualQueryEx(CommandLine)");
-            return std::nullopt;
-        }
-
-        //Check if memory region is readable
-        if (!(mbi.State == MEM_COMMIT &&
-            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))) {
+        if (!IsRemoteRangeReadable(ph.Get(), params.CommandLine.Buffer, params.CommandLine.Length)) {
             SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
                 L"Command line buffer is not readable");
-            return std::nullopt;
-        }
-
-        // Check if the entire buffer is within the valid region
-        if (params.CommandLine.Length > mbi.RegionSize -
-            (reinterpret_cast<uintptr_t>(params.CommandLine.Buffer) -
-                reinterpret_cast<uintptr_t>(mbi.BaseAddress))) {
-            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_DATA,
-                L"Command line buffer exceeds memory region");
             return std::nullopt;
         }
 
@@ -1725,12 +1824,6 @@ bool IsProcessSuspended(ProcessId pid, Error* /*err*/) noexcept {
     }
     auto snapGuard = make_unique_handle(hSnap);
 
-    // Query suspend count via NtQueryInformationThread(ThreadSuspendCount = 35)
-    // instead of actually suspending threads (which can deadlock target processes).
-    using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    static auto NtQIT = reinterpret_cast<NtQIT_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-
     THREADENTRY32 te{};
     te.dwSize = sizeof(te);
     bool anyThread = false;
@@ -1743,14 +1836,13 @@ bool IsProcessSuspended(ProcessId pid, Error* /*err*/) noexcept {
                 HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
                 if (hThread) {
                     auto threadGuard = make_unique_handle(hThread);
-                    if (NtQIT) {
-                        ULONG suspendCount = 0;
-                        NTSTATUS st = NtQIT(threadGuard.get(), 35 /*ThreadSuspendCount*/,
-                            &suspendCount, sizeof(suspendCount), nullptr);
-                        if (st >= 0 && suspendCount == 0) {
+                    ULONG suspendCount = 0;
+                    if (QueryThreadSuspendCount(threadGuard.get(), suspendCount)) {
+                        if (suspendCount == 0) {
                             anyRunning = true;
                         }
-                    } else {
+                    }
+                    else {
                         anyRunning = true;
                     }
                 } else {
@@ -1978,20 +2070,8 @@ std::optional<void*> GetModuleExportAddress(ProcessId pid, std::wstring_view mod
 }
 
 bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
-    // Validate DLL path exists and is accessible
-    if (dllPath.empty()) {
-        SetWin32Error(err, L"InjectDLL", ERROR_INVALID_PARAMETER, L"DLL path cant be empty.");
-        return false;
-    }
-
-    DWORD attrs = GetFileAttributesW(std::wstring(dllPath).c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        SetWin32Error(err, L"InjectDLL", ERROR_FILE_NOT_FOUND, L"failed to find the DLL file.");
-        return false;
-    }
-
-    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-        SetWin32Error(err, L"InjectDLL", ERROR_DIRECTORY, L"The specified path is a directory.");
+    std::wstring fullPathString;
+    if (!ResolveExistingDllPath(dllPath, fullPathString, err)) {
         return false;
     }
 
@@ -2020,14 +2100,6 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     if (isCurrentWow64 != isTargetWow64) {
         SetWin32Error(err, L"InjectDLL", ERROR_BAD_EXE_FORMAT,
             L"Architectures are incompatible.");
-        return false;
-    }
-
-    // Get full path to DLL
-    wchar_t fullPath[MAX_PATH * 2] = {};
-    DWORD len = GetFullPathNameW(std::wstring(dllPath).c_str(), MAX_PATH * 2, fullPath, nullptr);
-    if (len == 0 || len >= MAX_PATH * 2) {
-        SetWin32Error(err, L"GetFullPathNameW");
         return false;
     }
 
@@ -2089,7 +2161,7 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
 
     //  NOW WE HAVE EXCLUSIVE ACCESS - CHECK AGAIN
     std::vector<ProcessModuleInfo> modules;
-    std::wstring targetDllName = BaseName(fullPath);
+    std::wstring targetDllName = BaseName(fullPathString);
 
     if (EnumerateProcessModules(pid, modules, nullptr)) {
         for (const auto& mod : modules) {
@@ -2102,7 +2174,7 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     }
 
     //  ALLOCATE MEMORY (now under mutex protection)
-    size_t pathSize = (wcslen(fullPath) + 1) * sizeof(wchar_t);
+    const size_t pathSize = (fullPathString.size() + 1U) * sizeof(wchar_t);
     void* remoteMemory = ::VirtualAllocEx(ph.Get(), nullptr, pathSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
@@ -2127,7 +2199,7 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
 
     // Write DLL path to remote process
     SIZE_T written = 0;
-    if (!::WriteProcessMemory(ph.Get(), remoteMemory, fullPath, pathSize, &written) ||
+    if (!::WriteProcessMemory(ph.Get(), remoteMemory, fullPathString.c_str(), pathSize, &written) ||
         written != pathSize) {
         SetWin32Error(err, L"WriteProcessMemory");
         return false;
@@ -2168,8 +2240,6 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     DWORD waitResult = WaitForSingleObject(hThread, 10000);
     if (waitResult != WAIT_OBJECT_0) {
         if (waitResult == WAIT_TIMEOUT) {
-            //  TRY TO TERMINATE HUNG THREAD
-            ::TerminateThread(hThread, ERROR_TIMEOUT);
             SetWin32Error(err, L"InjectDLL", ERROR_TIMEOUT,
                 L"DLL loading process timed out.");
         }
@@ -2256,13 +2326,20 @@ bool EjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
 
     // Prevent ejection of critical system modules
     wchar_t winDir[MAX_PATH] = {};
-    GetWindowsDirectoryW(winDir, MAX_PATH);
+    const UINT winDirLen = GetWindowsDirectoryW(winDir, MAX_PATH);
+    if (winDirLen == 0 || winDirLen >= MAX_PATH) {
+        SetWin32Error(err, L"GetWindowsDirectoryW");
+        return false;
+    }
     std::wstring winDirLower = ToLower(std::wstring(winDir));
+    if (!winDirLower.empty() && winDirLower.back() != L'\\') {
+        winDirLower.push_back(L'\\');
+    }
 
     for (const auto& mod : modules) {
         if (ToLower(mod.name) == ToLower(targetDllName)) {
             std::wstring modPathLower = ToLower(mod.path);
-            if (modPathLower.find(winDirLower) == 0) {
+            if (!winDirLower.empty() && modPathLower.find(winDirLower) == 0) {
                 SetWin32Error(err, L"EjectDLL", ERROR_ACCESS_DENIED,
                     L"We are not allowing to export the system Dlls.");
                 return false;
@@ -2402,14 +2479,9 @@ bool EnumerateProcessThreads(ProcessId pid, std::vector<ProcessThreadInfo>& thre
                     ti.userTime = ut;
                 }
                 
-                // Check if suspended (only if not current thread)
-                const ThreadId currentTid = ::GetCurrentThreadId();
-                if (te.th32ThreadID != currentTid) {
-                    const DWORD prev = ::SuspendThread(hThread);
-                    if (prev != static_cast<DWORD>(-1)) {
-                        ti.isSuspended = (prev > 0);
-                        ::ResumeThread(hThread);
-                    }
+                ULONG suspendCount = 0;
+                if (QueryThreadSuspendCount(threadGuard.get(), suspendCount)) {
+                    ti.isSuspended = (suspendCount > 0);
                 }
             }
             
@@ -2446,17 +2518,9 @@ std::optional<ProcessThreadInfo> GetThreadInfo(ThreadId tid, Error* err) noexcep
         ti.userTime = ut;
     }
     
-    // Check suspended state (avoid suspending current thread)
-    const ThreadId currentTid = ::GetCurrentThreadId();
-    if (tid != currentTid) {
-        const DWORD prev = ::SuspendThread(hThread);
-        if (prev != static_cast<DWORD>(-1)) {
-            ti.isSuspended = (prev > 0);
-            ::ResumeThread(hThread);
-        }
-    }
-    else {
-        ti.isSuspended = false;
+    ULONG suspendCount = 0;
+    if (QueryThreadSuspendCount(threadGuard.get(), suspendCount)) {
+        ti.isSuspended = (suspendCount > 0);
     }
     
     return ti;
