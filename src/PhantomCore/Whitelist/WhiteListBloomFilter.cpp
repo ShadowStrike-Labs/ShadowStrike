@@ -856,7 +856,6 @@ double BloomFilter::EstimatedFillRate() const noexcept {
     // This is important for accurate fill rate calculation during concurrent access
     std::atomic_thread_fence(std::memory_order_acquire);
     
-    // Get pointer to bits
     const uint64_t* bits = nullptr;
     size_t wordCount = 0;
     
@@ -864,11 +863,10 @@ double BloomFilter::EstimatedFillRate() const noexcept {
         bits = m_mappedBits;
         wordCount = (m_bitCount + 63ULL) / 64ULL;
     } else if (!m_bits.empty()) {
-        bits = reinterpret_cast<const uint64_t*>(m_bits.data());
         wordCount = m_bits.size();
     }
     
-    if (!bits || wordCount == 0) {
+    if ((m_isMemoryMapped && !bits) || wordCount == 0) {
         return 0.0;
     }
     
