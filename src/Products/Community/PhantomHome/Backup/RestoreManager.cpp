@@ -56,6 +56,7 @@
 #include <deque>
 #include <condition_variable>
 #include <stack>
+#include <limits>
 
 namespace ShadowStrike {
 namespace Backup {
@@ -75,23 +76,14 @@ namespace {
     constexpr size_t kMaxPathComponent = 255;
     constexpr size_t kMaxRestoreErrors = 10000;
     constexpr size_t kMaxRollbackJournalEntries = 500000;
+    constexpr size_t kMaxBackupFileEnumeration = 10'000'000;
     constexpr std::chrono::seconds kShutdownTimeout{30};
 
     [[nodiscard]] std::string GenerateId() {
         UUID uuid{};
         if (UuidCreate(&uuid) != RPC_S_OK) {
-            SS_LOG_ERROR(L"RestoreManager", L"UuidCreate failed, generating fallback ID");
-            std::random_device rd;
-            std::mt19937_64 gen(rd());
-            std::uniform_int_distribution<uint64_t> dis;
-            std::ostringstream oss;
-            oss << std::hex << std::setfill('0')
-                << std::setw(8) << (dis(gen) & 0xFFFFFFFF) << "-"
-                << std::setw(4) << (dis(gen) & 0xFFFF) << "-"
-                << std::setw(4) << (dis(gen) & 0xFFFF) << "-"
-                << std::setw(4) << (dis(gen) & 0xFFFF) << "-"
-                << std::setw(12) << (dis(gen) & 0xFFFFFFFFFFFF);
-            return oss.str();
+            SS_LOG_ERROR(L"RestoreManager", L"UuidCreate failed; refusing weak restore ID fallback");
+            return {};
         }
         RPC_CSTR szUuid = nullptr;
         if (UuidToStringA(&uuid, &szUuid) != RPC_S_OK || !szUuid) {
@@ -103,21 +95,57 @@ namespace {
         return s;
     }
 
+    [[nodiscard]] bool PathContainsOrEquals(const fs::path& parent, const fs::path& child) {
+        const std::wstring parentNative = parent.native();
+        const std::wstring childNative = child.native();
+        if (_wcsicmp(parentNative.c_str(), childNative.c_str()) == 0) {
+            return true;
+        }
+        if (childNative.size() <= parentNative.size()) {
+            return false;
+        }
+        if (_wcsnicmp(childNative.c_str(), parentNative.c_str(), parentNative.size()) != 0) {
+            return false;
+        }
+        const wchar_t boundary = childNative[parentNative.size()];
+        return boundary == L'\\' || boundary == L'/';
+    }
+
+    [[nodiscard]] bool IsSafeRelativePath(const fs::path& path) noexcept {
+        if (path.empty() || path.is_absolute() || path.has_root_path()) {
+            return false;
+        }
+        for (const auto& component : path) {
+            const std::wstring name = component.native();
+            if (name.empty() || name == L"." || name == L".." ||
+                name.find(L'\0') != std::wstring::npos ||
+                name.size() > kMaxPathComponent) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] uint64_t SaturatingAddU64(uint64_t lhs, uint64_t rhs) noexcept {
+        if (rhs > (std::numeric_limits<uint64_t>::max)() - lhs) {
+            return (std::numeric_limits<uint64_t>::max)();
+        }
+        return lhs + rhs;
+    }
+
     // Path traversal & symlink attack mitigation.
     // Returns true if the path is safe (no traversal above root, no reparse points in chain).
     [[nodiscard]] bool IsPathSafe(const fs::path& target, const fs::path& allowedRoot) noexcept {
         try {
             // Normalize both paths to canonical form for comparison
-            fs::path normalTarget = fs::weakly_canonical(target);
-            fs::path normalRoot = fs::weakly_canonical(allowedRoot);
+            std::error_code ec;
+            fs::path normalTarget = fs::weakly_canonical(target, ec);
+            if (ec) return false;
+            fs::path normalRoot = fs::weakly_canonical(allowedRoot, ec);
+            if (ec) return false;
 
-            // Check that target is under the allowed root
-            auto [rootEnd, targetPos] = std::mismatch(
-                normalRoot.begin(), normalRoot.end(),
-                normalTarget.begin(), normalTarget.end());
-
-            if (rootEnd != normalRoot.end()) {
-                return false;  // target is not under allowedRoot
+            if (!PathContainsOrEquals(normalRoot, normalTarget)) {
+                return false;
             }
 
             // Check individual path components for ".." that survived normalization
@@ -133,15 +161,17 @@ namespace {
 
             // Check for reparse points (symlinks/junctions) in the existing portion of the path
             fs::path existing = normalTarget;
+            std::vector<fs::path> chain;
             while (!existing.empty() && existing != existing.root_path()) {
-                std::error_code ec;
-                if (fs::exists(existing, ec) && !ec) {
-                    if (fs::is_symlink(existing, ec) && !ec) {
-                        return false;  // Symlink in path — potential attack vector
-                    }
-                    break;  // Found the deepest existing component
-                }
+                chain.push_back(existing);
                 existing = existing.parent_path();
+            }
+            for (const auto& p : chain) {
+                std::error_code linkEc;
+                if (fs::exists(p, linkEc) && !linkEc &&
+                    fs::is_symlink(p, linkEc) && !linkEc) {
+                    return false;
+                }
             }
 
             return true;
@@ -168,13 +198,33 @@ namespace {
     {
         std::vector<fs::path> files;
         try {
-            if (!fs::exists(backupDataDir) || !fs::is_directory(backupDataDir)) {
+            std::error_code ec;
+            const fs::path canonicalRoot = fs::weakly_canonical(backupDataDir, ec);
+            if (ec || !fs::exists(canonicalRoot, ec) || ec ||
+                !fs::is_directory(canonicalRoot, ec) || ec) {
                 return files;
             }
             // Recurse into subdirectories — backup preserves directory structure
-            for (const auto& entry : fs::recursive_directory_iterator(backupDataDir)) {
-                if (entry.is_regular_file()) {
-                    files.push_back(entry.path());
+            for (const auto& entry : fs::recursive_directory_iterator(
+                     canonicalRoot, fs::directory_options::skip_permission_denied, ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (files.size() >= kMaxBackupFileEnumeration) {
+                    SS_LOG_WARN(L"RestoreManager",
+                        L"Backup enumeration limit reached (%zu files)",
+                        kMaxBackupFileEnumeration);
+                    break;
+                }
+                const fs::path p = entry.path();
+                if (!PathContainsOrEquals(canonicalRoot, fs::weakly_canonical(p, ec)) || ec) {
+                    ec.clear();
+                    continue;
+                }
+                if (entry.is_symlink(ec) && !ec) {
+                    continue;
+                }
+                ec.clear();
+                if (entry.is_regular_file(ec) && !ec) {
+                    files.push_back(p);
                 }
             }
         } catch (const std::exception& e) {
@@ -322,17 +372,43 @@ public:
     void JoinAllWorkers() {
         // Collect threads to join outside the mutex
         std::vector<std::thread> threadsToJoin;
+        const auto currentThreadId = std::this_thread::get_id();
         {
             std::unique_lock lock(m_mutex);
-            for (auto& [id, t] : m_workerThreads) {
-                if (t.joinable()) {
-                    threadsToJoin.push_back(std::move(t));
+            for (auto it = m_workerThreads.begin(); it != m_workerThreads.end(); ) {
+                if (it->second.joinable() && it->second.get_id() != currentThreadId) {
+                    threadsToJoin.push_back(std::move(it->second));
+                    it = m_workerThreads.erase(it);
+                } else if (!it->second.joinable()) {
+                    it = m_workerThreads.erase(it);
+                } else {
+                    ++it;
                 }
             }
-            m_workerThreads.clear();
         }
         for (auto& t : threadsToJoin) {
             t.join();
+        }
+    }
+
+    void JoinCompletedWorkers() {
+        std::vector<std::thread> threadsToJoin;
+        const auto currentThreadId = std::this_thread::get_id();
+        {
+            std::unique_lock lock(m_mutex);
+            for (auto it = m_workerThreads.begin(); it != m_workerThreads.end(); ) {
+                const bool stillActive = m_activeRestores.find(it->first) != m_activeRestores.end();
+                const bool isCurrentThread = it->second.get_id() == currentThreadId;
+                if (!stillActive && !isCurrentThread && it->second.joinable()) {
+                    threadsToJoin.push_back(std::move(it->second));
+                    it = m_workerThreads.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& thread : threadsToJoin) {
+            thread.join();
         }
     }
 
@@ -374,6 +450,8 @@ public:
                         const std::vector<RestoreTarget>& targets,
                         const RestoreOptions& options)
     {
+        JoinCompletedWorkers();
+
         if (m_status != RestoreModuleStatus::Ready &&
             m_status != RestoreModuleStatus::Restoring) {
             NotifyError("RestoreManager is not initialized", 104);
@@ -413,9 +491,20 @@ public:
         }
 
         // Launch tracked thread (NOT detached — safe lifetime management)
-        std::thread worker([this, restoreId, backupId, targets, options, cancelFlag]() {
-            PerformRestore(restoreId, backupId, targets, options, cancelFlag);
-        });
+        std::thread worker;
+        try {
+            worker = std::thread([this, restoreId, backupId, targets, options, cancelFlag]() {
+                PerformRestore(restoreId, backupId, targets, options, cancelFlag);
+            });
+        } catch (const std::exception& ex) {
+            std::unique_lock lock(m_mutex);
+            m_activeRestores.erase(restoreId);
+            m_rollbackJournals.erase(restoreId);
+            m_cancelFlags.erase(restoreId);
+            SS_LOG_ERROR(L"RestoreManager",
+                L"Failed to launch restore worker: %hs", ex.what());
+            return {};
+        }
 
         {
             std::unique_lock lock(m_mutex);
@@ -449,9 +538,12 @@ public:
         }
 
         const fs::path backupDataDir = vaultPath / backupId / "data";
+        fs::path canonicalBackupDataDir;
         {
             std::error_code ec;
-            if (!fs::exists(backupDataDir, ec) || ec) {
+            canonicalBackupDataDir = fs::weakly_canonical(backupDataDir, ec);
+            if (ec || !fs::exists(canonicalBackupDataDir, ec) || ec ||
+                !fs::is_directory(canonicalBackupDataDir, ec) || ec) {
                 std::string msg = "Backup data directory not found: " + backupDataDir.string();
                 SS_LOG_ERROR(L"RestoreManager", L"%hs", msg.c_str());
                 FinishRestore(restoreId, backupId, operationStart, RestoreStatus::Failed,
@@ -461,7 +553,7 @@ public:
         }
 
         // Enumerate available backup files
-        auto backupFiles = EnumerateBackupFiles(backupDataDir);
+        auto backupFiles = EnumerateBackupFiles(canonicalBackupDataDir);
         if (backupFiles.empty()) {
             FinishRestore(restoreId, backupId, operationStart, RestoreStatus::Failed,
                           0, 0, 0, 0, {}, {"No files found in backup"});
@@ -474,7 +566,11 @@ public:
         // with identical basenames in different subdirectories.
         std::unordered_map<std::wstring, fs::path> backupFileMap;
         for (const auto& bf : backupFiles) {
-            auto relPath = fs::relative(bf, backupDataDir);
+            std::error_code ec;
+            auto relPath = fs::relative(bf, canonicalBackupDataDir, ec);
+            if (ec || !IsSafeRelativePath(relPath)) {
+                continue;
+            }
             backupFileMap[relPath.wstring()] = bf;
         }
 
@@ -506,6 +602,12 @@ public:
             std::vector<const fs::path*> filesToRestore;
             if (!target.sourcePath.empty() && !target.isDirectory) {
                 // Selective single-file restore: match by relative path within backup
+                if (!IsSafeRelativePath(target.sourcePath)) {
+                    std::string msg = "Unsafe source path rejected: " + target.sourcePath.string();
+                    errors.push_back(msg);
+                    SS_LOG_WARN(L"RestoreManager", L"%hs", msg.c_str());
+                    continue;
+                }
                 auto relKey = target.sourcePath.wstring();
                 auto it = backupFileMap.find(relKey);
                 if (it == backupFileMap.end()) {
@@ -552,7 +654,14 @@ public:
                 const fs::path& srcFile = *srcFilePtr;
                 // Preserve original directory structure: compute the vault-
                 // relative path and recreate it under the restore target.
-                fs::path relPath = fs::relative(srcFile, backupDataDir);
+                std::error_code relEc;
+                fs::path relPath = fs::relative(srcFile, canonicalBackupDataDir, relEc);
+                if (relEc || !IsSafeRelativePath(relPath)) {
+                    std::string msg = "Unsafe backup-relative restore path rejected: " + srcFile.string();
+                    errors.push_back(msg);
+                    filesFailed++;
+                    continue;
+                }
                 fs::path destPath = targetDir / relPath;
 
                 // Ensure parent directories exist for nested files
@@ -672,7 +781,12 @@ public:
                         filesFailed++;
                         // Attempt to clean up the bad restore
                         Utils::FileUtils::Error rmErr;
-                        Utils::FileUtils::RemoveFile(destPath.wstring(), &rmErr);
+                        if (!Utils::FileUtils::RemoveFile(destPath.wstring(), &rmErr) &&
+                            rmErr.hasError()) {
+                            SS_LOG_WARN(L"RestoreManager",
+                                L"Failed to remove failed restore output %ls: %hs",
+                                destPath.c_str(), rmErr.message.c_str());
+                        }
                         if (!options.continueOnError) break;
                         continue;
                     }
@@ -691,10 +805,14 @@ public:
 
                 filesRestored++;
                 std::error_code ec;
-                bytesRestored += fs::file_size(destPath, ec);
+                const uint64_t restoredSize = fs::file_size(destPath, ec);
+                if (!ec) {
+                    bytesRestored = SaturatingAddU64(bytesRestored, restoredSize);
+                }
 
                 // Update progress
-                const uint64_t totalProcessed = filesRestored + filesSkipped + filesFailed;
+                const uint64_t totalProcessed = SaturatingAddU64(
+                    SaturatingAddU64(filesRestored, filesSkipped), filesFailed);
                 int pct = (totalFiles > 0)
                     ? static_cast<int>((totalProcessed * 100) / totalFiles)
                     : 0;
@@ -751,7 +869,7 @@ public:
         result.filesFailed = filesFailed;
         result.conflicts = conflicts;
         result.errors = errors;
-        result.verificationPassed = (filesFailed == 0 && !errors.empty() == false);
+        result.verificationPassed = (filesFailed == 0 && errors.empty());
 
         // Update statistics
         m_stats.totalRestores++;
@@ -807,14 +925,26 @@ public:
     [[nodiscard]] bool CopyFileAtomic(const fs::path& src, const fs::path& dest) {
         try {
             // Write to temp file first, then atomically rename
-            fs::path tempDest = dest;
-            tempDest += L".ss_restore_tmp";
+            if (!dest.has_parent_path() || !IsPathSafe(dest, dest.parent_path())) {
+                SS_LOG_ERROR(L"RestoreManager",
+                    L"CopyFileAtomic rejected unsafe destination: %ls", dest.c_str());
+                return false;
+            }
+            const std::string tempId = GenerateId();
+            if (tempId.empty()) {
+                SS_LOG_ERROR(L"RestoreManager", L"CopyFileAtomic failed to generate temp ID");
+                return false;
+            }
+            fs::path tempDest = dest.parent_path() /
+                (dest.filename().wstring() + L".ss_restore_" +
+                 Utils::StringUtils::ToWide(tempId) + L".tmp");
 
             std::error_code ec;
             fs::copy_file(src, tempDest, fs::copy_options::overwrite_existing, ec);
             if (ec) {
                 SS_LOG_ERROR(L"RestoreManager", L"copy_file failed: %hs -> %ls (ec=%d)",
                              src.string().c_str(), tempDest.c_str(), ec.value());
+                ec.clear();
                 fs::remove(tempDest, ec);
                 return false;
             }
@@ -824,10 +954,12 @@ public:
             if (ec) {
                 // Fallback: if rename fails (cross-volume), try direct overwrite
                 fs::copy_file(tempDest, dest, fs::copy_options::overwrite_existing, ec);
+                const bool copied = !ec;
+                ec.clear();
                 fs::remove(tempDest, ec);
-                if (ec) {
+                if (!copied) {
                     SS_LOG_ERROR(L"RestoreManager", L"Failed atomic restore to %ls",
-                                 dest.c_str());
+                                  dest.c_str());
                     return false;
                 }
             }
@@ -842,9 +974,17 @@ public:
         try {
             DWORD attrs = ::GetFileAttributesW(path.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
-                ::SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                if (!::SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY)) {
+                    SS_LOG_WARN(L"RestoreManager",
+                        L"Failed to clear read-only attribute on %ls (gle=%lu)",
+                        path.c_str(), ::GetLastError());
+                }
             }
-        } catch (...) {}
+        } catch (const std::exception& ex) {
+            SS_LOG_WARN(L"RestoreManager",
+                L"ClearReadOnlyAttribute exception for %ls: %hs",
+                path.c_str(), ex.what());
+        }
     }
 
     void RestoreTimestamps(const fs::path& src, const fs::path& dest) {
@@ -854,16 +994,45 @@ public:
             HANDLE hDest = ::CreateFileW(dest.c_str(), FILE_WRITE_ATTRIBUTES,
                 FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (hDest != INVALID_HANDLE_VALUE) {
-                ::SetFileTime(hDest, &creation, &lastAccess, &lastWrite);
+                if (!::SetFileTime(hDest, &creation, &lastAccess, &lastWrite)) {
+                    SS_LOG_WARN(L"RestoreManager",
+                        L"SetFileTime failed for %ls (gle=%lu)",
+                        dest.c_str(), ::GetLastError());
+                }
                 ::CloseHandle(hDest);
+            } else {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"CreateFileW(FILE_WRITE_ATTRIBUTES) failed for %ls (gle=%lu)",
+                    dest.c_str(), ::GetLastError());
             }
+        } else {
+            SS_LOG_WARN(L"RestoreManager",
+                L"Could not read source timestamps for %ls: %hs",
+                src.c_str(), err.message.c_str());
         }
     }
 
     void RestoreAttributes(const fs::path& src, const fs::path& dest) {
         DWORD attrs = ::GetFileAttributesW(src.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES) {
-            ::SetFileAttributesW(dest.c_str(), attrs);
+            constexpr DWORD kRestorableAttributes =
+                FILE_ATTRIBUTE_READONLY |
+                FILE_ATTRIBUTE_HIDDEN |
+                FILE_ATTRIBUTE_SYSTEM |
+                FILE_ATTRIBUTE_ARCHIVE |
+                FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
+                FILE_ATTRIBUTE_OFFLINE |
+                FILE_ATTRIBUTE_TEMPORARY;
+            const DWORD safeAttrs = attrs & kRestorableAttributes;
+            if (!::SetFileAttributesW(dest.c_str(), safeAttrs)) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"SetFileAttributesW failed for %ls (gle=%lu)",
+                    dest.c_str(), ::GetLastError());
+            }
+        } else {
+            SS_LOG_WARN(L"RestoreManager",
+                L"GetFileAttributesW failed for %ls (gle=%lu)",
+                src.c_str(), ::GetLastError());
         }
     }
 
@@ -885,7 +1054,10 @@ public:
                 return (srcTime < dstTime) ? ConflictResolution::Overwrite
                                            : ConflictResolution::Skip;
             }
-        } catch (...) {}
+        } catch (const std::exception& ex) {
+            SS_LOG_WARN(L"RestoreManager",
+                L"ResolveTimestampConflict exception: %hs", ex.what());
+        }
         return ConflictResolution::Skip;
     }
 
@@ -995,6 +1167,8 @@ public:
                 return cbs.back()(conflict);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"RestoreManager", L"Conflict callback threw: %hs", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"RestoreManager", L"Conflict callback threw unknown exception");
             }
         }
         return ConflictResolution::Skip;
@@ -1011,6 +1185,8 @@ public:
                 if (!cb(entry)) return false;
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"RestoreManager", L"File callback threw: %hs", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"RestoreManager", L"File callback threw unknown exception");
             }
         }
         return true;
@@ -1103,7 +1279,15 @@ public:
             cbs = m_progressCallbacks;
         }
         for (const auto& cb : cbs) {
-            try { cb(p); } catch (...) {}
+            try {
+                cb(p);
+            } catch (const std::exception& ex) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"Progress callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"Progress callback threw unknown exception");
+            }
         }
     }
 
@@ -1114,7 +1298,15 @@ public:
             cbs = m_completionCallbacks;
         }
         for (const auto& cb : cbs) {
-            try { cb(r); } catch (...) {}
+            try {
+                cb(r);
+            } catch (const std::exception& ex) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"Completion callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"Completion callback threw unknown exception");
+            }
         }
     }
 
@@ -1126,7 +1318,15 @@ public:
             cbs = m_errorCallbacks;
         }
         for (const auto& cb : cbs) {
-            try { cb(msg, code); } catch (...) {}
+            try {
+                cb(msg, code);
+            } catch (const std::exception& ex) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"Error callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"Error callback threw unknown exception");
+            }
         }
     }
 };
@@ -1367,15 +1567,30 @@ std::vector<BackupFileEntry> RestoreManager::GetFileVersions(const fs::path& fil
 
         fs::path backupDataDir = vaultInfo.path / bp.backupId / "data";
         std::error_code ec;
-        if (!fs::exists(backupDataDir, ec) || ec) continue;
+        const fs::path canonicalBackupDataDir = fs::weakly_canonical(backupDataDir, ec);
+        if (ec || !fs::exists(canonicalBackupDataDir, ec) || ec) continue;
 
         // Search for matching file in this backup's data dir (recurse into subdirectories)
-        for (const auto& entry : fs::recursive_directory_iterator(backupDataDir, ec)) {
+        size_t enumerated = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(
+                 canonicalBackupDataDir, fs::directory_options::skip_permission_denied, ec)) {
             if (ec) break;
-            if (!entry.is_regular_file()) continue;
+            if (++enumerated > kMaxBackupFileEnumeration) {
+                SS_LOG_WARN(L"RestoreManager",
+                    L"GetFileVersions enumeration limit reached");
+                break;
+            }
+            if (!entry.is_regular_file(ec) || ec) {
+                ec.clear();
+                continue;
+            }
 
             // Match by relative path or filename for backwards compatibility
-            auto relPath = fs::relative(entry.path(), backupDataDir);
+            auto relPath = fs::relative(entry.path(), canonicalBackupDataDir, ec);
+            if (ec || !IsSafeRelativePath(relPath)) {
+                ec.clear();
+                continue;
+            }
             std::wstring entryName = relPath.filename().wstring();
             if (relPath.wstring() == filePath.wstring() ||
                 entryName == targetFilename ||
@@ -1448,22 +1663,39 @@ std::vector<BackupFileEntry> RestoreManager::ListBackupFiles(const std::string& 
 
     fs::path backupDataDir = vaultInfo.path / backupId / "data";
     std::error_code ec;
-    if (!fs::exists(backupDataDir, ec) || ec) return entries;
+    const fs::path canonicalBackupDataDir = fs::weakly_canonical(backupDataDir, ec);
+    if (ec || !fs::exists(canonicalBackupDataDir, ec) || ec) return entries;
 
     // If a subdirectory filter is supplied, browse that subdirectory.
-    fs::path browseDir = backupDataDir;
+    fs::path browseDir = canonicalBackupDataDir;
     if (!directory.empty()) {
-        browseDir = backupDataDir / directory;
-        if (!fs::exists(browseDir, ec) || ec) return entries;
+        if (!IsSafeRelativePath(directory)) {
+            SS_LOG_WARN(L"RestoreManager",
+                L"Unsafe backup browse directory rejected: %ls", directory.c_str());
+            return entries;
+        }
+        browseDir = canonicalBackupDataDir / directory;
+        browseDir = fs::weakly_canonical(browseDir, ec);
+        if (ec || !PathContainsOrEquals(canonicalBackupDataDir, browseDir) ||
+            !fs::exists(browseDir, ec) || ec) return entries;
     }
 
-    for (const auto& entry : fs::recursive_directory_iterator(browseDir, ec)) {
+    for (const auto& entry : fs::recursive_directory_iterator(
+             browseDir, fs::directory_options::skip_permission_denied, ec)) {
         if (ec) break;
-        if (!entry.is_regular_file() && !entry.is_directory()) continue;
+        const bool isRegular = entry.is_regular_file(ec);
+        if (ec) { ec.clear(); continue; }
+        const bool isDirectory = entry.is_directory(ec);
+        if (ec) { ec.clear(); continue; }
+        if (!isRegular && !isDirectory) continue;
 
         BackupFileEntry bfe;
-        bfe.path = fs::relative(entry.path(), backupDataDir);
-        bfe.isDirectory = entry.is_directory();
+        bfe.path = fs::relative(entry.path(), canonicalBackupDataDir, ec);
+        if (ec || !IsSafeRelativePath(bfe.path)) {
+            ec.clear();
+            continue;
+        }
+        bfe.isDirectory = isDirectory;
         if (!bfe.isDirectory) {
             bfe.size = entry.file_size(ec);
             bfe.compressedSize = bfe.size;
@@ -1511,9 +1743,18 @@ std::vector<uint8_t> RestoreManager::PreviewFile(const std::string& backupId,
     if (vaultInfo.path.empty()) return {};
 
     // Use full relative path within backup (not just filename)
-    fs::path fullPath = vaultInfo.path / backupId / "data" / filePath;
+    if (!IsSafeRelativePath(filePath)) {
+        SS_LOG_WARN(L"RestoreManager",
+            L"Unsafe preview path rejected: %ls", filePath.c_str());
+        return {};
+    }
+    fs::path backupDataDir = vaultInfo.path / backupId / "data";
     std::error_code ec;
-    if (!fs::exists(fullPath, ec) || ec) return {};
+    const fs::path canonicalBackupDataDir = fs::weakly_canonical(backupDataDir, ec);
+    if (ec) return {};
+    fs::path fullPath = fs::weakly_canonical(canonicalBackupDataDir / filePath, ec);
+    if (ec || !PathContainsOrEquals(canonicalBackupDataDir, fullPath) ||
+        !fs::exists(fullPath, ec) || ec) return {};
 
     uint64_t fileSize = fs::file_size(fullPath, ec);
     if (ec) return {};
@@ -1619,14 +1860,17 @@ bool RestoreManager::VerifyFileIntegrity(const fs::path& filePath,
 // ============================================================================
 
 bool RestoreManager::RollbackRestore(const std::string& restoreId) {
-    std::unique_lock lock(m_impl->m_mutex);
-    auto jIt = m_impl->m_rollbackJournals.find(restoreId);
-    if (jIt == m_impl->m_rollbackJournals.end() || jIt->second.empty()) {
-        SS_LOG_WARN(L"RestoreManager", L"No rollback journal for %hs", restoreId.c_str());
-        return false;
+    std::deque<RestoreManagerImpl::FileOperation> journal;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        auto jIt = m_impl->m_rollbackJournals.find(restoreId);
+        if (jIt == m_impl->m_rollbackJournals.end() || jIt->second.empty()) {
+            SS_LOG_WARN(L"RestoreManager", L"No rollback journal for %hs", restoreId.c_str());
+            return false;
+        }
+        journal = std::move(jIt->second);
+        m_impl->m_rollbackJournals.erase(jIt);
     }
-
-    auto& journal = jIt->second;
     SS_LOG_INFO(L"RestoreManager", L"Rolling back restore %hs (%zu operations)",
                 restoreId.c_str(), journal.size());
 
@@ -1685,7 +1929,6 @@ bool RestoreManager::RollbackRestore(const std::string& restoreId) {
         fs::remove_all(vaultInfo.path / ".rollback" / restoreId, ec);
     }
 
-    m_impl->m_rollbackJournals.erase(jIt);
     m_impl->m_stats.rollbacksPerformed++;
 
     SS_LOG_INFO(L"RestoreManager", L"Rollback %hs complete: %llu ok, %llu failed",
