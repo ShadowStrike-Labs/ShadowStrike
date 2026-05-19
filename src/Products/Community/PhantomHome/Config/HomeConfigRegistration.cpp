@@ -6,14 +6,16 @@
 #include "HomeConfigRegistration.hpp"
 #include "PhantomCore/Config/ConfigManager.hpp"
 #include "PhantomCore/Config/ProfileManager.hpp"
-#include "PhantomCore/Config/SettingsManager.hpp"
+
+#include <type_traits>
+#include <vector>
 
 namespace ShadowStrike::Products::PhantomHome::Config {
 
-using CM = ShadowStrike::Config::ConfigManager;
+using CM   = ShadowStrike::Config::ConfigManager;
 using ProfM = ShadowStrike::Config::ProfileManager;
-using SM = ShadowStrike::Config::SettingsManager;
 using Meta = ShadowStrike::Config::ConfigKeyMetadata;
+using VT   = ShadowStrike::Config::ValueType;
 
 // ============================================================================
 // HELPER
@@ -21,35 +23,76 @@ using Meta = ShadowStrike::Config::ConfigKeyMetadata;
 
 namespace {
 
-template<typename T>
-bool RegKey(const std::string& key, const std::string& category,
-            const std::string& displayName, const T& defaultValue,
-            bool sensitive = false) {
+// DESIGN: Map the C++ default-value type to the ConfigManager ValueType enum at
+// compile time so RegisterKeyMetadata can perform type-checked validation. The
+// variant alone does not communicate the *intended* value type for the slot.
+template <typename T>
+[[nodiscard]] constexpr VT DeduceValueType() noexcept {
+    if constexpr (std::is_same_v<T, bool>)                            return VT::Boolean;
+    else if constexpr (std::is_same_v<T, int32_t>)                    return VT::Integer;
+    else if constexpr (std::is_same_v<T, int64_t>)                    return VT::Integer;
+    else if constexpr (std::is_same_v<T, uint32_t>)                   return VT::UInteger;
+    else if constexpr (std::is_same_v<T, uint64_t>)                   return VT::UInteger;
+    else if constexpr (std::is_same_v<T, double>)                     return VT::Float;
+    else if constexpr (std::is_same_v<T, std::string>)                return VT::String;
+    else if constexpr (std::is_same_v<T, std::wstring>)               return VT::WString;
+    else if constexpr (std::is_same_v<T, std::vector<std::string>>)   return VT::StringList;
+    else if constexpr (std::is_same_v<T, std::vector<int64_t>>)       return VT::IntList;
+    else                                                              return VT::Unknown;
+}
+
+template <typename T>
+[[nodiscard]] bool RegKey(const std::string& key, const std::string& category,
+                          const std::string& displayName, const T& defaultValue,
+                          bool sensitive = false) {
+    auto& cm = CM::Instance();
+
+    // Idempotent: a second registration (e.g. recovery restart, test harness)
+    // is a NOP rather than a hard failure. The first registration wins.
+    if (cm.GetKeyMetadata(key).has_value()) {
+        return true;
+    }
+
     Meta meta{};
-    meta.key = key;
-    meta.category = category;
-    meta.displayName = displayName;
+    meta.key          = key;
+    meta.category     = category;
+    meta.displayName  = displayName;
+    meta.valueType    = DeduceValueType<T>();
     meta.defaultValue = ShadowStrike::Config::ConfigValue(defaultValue);
-    meta.isSensitive = sensitive;
-    if (!CM::Instance().RegisterKeyMetadata(meta)) {
+    meta.isSensitive  = sensitive;
+    if (!cm.RegisterKeyMetadata(meta)) {
         Utils::Logger::Error("[Home Config] Failed to register key '{}'", key);
         return false;
     }
     return true;
 }
 
-template<typename T>
-bool RegKeyRange(const std::string& key, const std::string& category,
-                 const std::string& displayName, const T& defaultValue,
-                 const T& minVal, const T& maxVal) {
+template <typename T>
+[[nodiscard]] bool RegKeyRange(const std::string& key, const std::string& category,
+                               const std::string& displayName, const T& defaultValue,
+                               const T& minVal, const T& maxVal) {
+    static_assert(std::is_arithmetic_v<T>,
+                  "RegKeyRange<T>: numeric range only meaningful for arithmetic T");
+
+    if (!(minVal <= maxVal)) {
+        Utils::Logger::Error("[Home Config] Invalid range for key '{}': min > max", key);
+        return false;
+    }
+
+    auto& cm = CM::Instance();
+    if (cm.GetKeyMetadata(key).has_value()) {
+        return true;
+    }
+
     Meta meta{};
-    meta.key = key;
-    meta.category = category;
-    meta.displayName = displayName;
+    meta.key          = key;
+    meta.category     = category;
+    meta.displayName  = displayName;
+    meta.valueType    = DeduceValueType<T>();
     meta.defaultValue = ShadowStrike::Config::ConfigValue(defaultValue);
-    meta.minValue = static_cast<double>(minVal);
-    meta.maxValue = static_cast<double>(maxVal);
-    if (!CM::Instance().RegisterKeyMetadata(meta)) {
+    meta.minValue     = static_cast<double>(minVal);
+    meta.maxValue     = static_cast<double>(maxVal);
+    if (!cm.RegisterKeyMetadata(meta)) {
         Utils::Logger::Error("[Home Config] Failed to register key '{}' (range [{}, {}])",
                              key, minVal, maxVal);
         return false;
@@ -275,7 +318,22 @@ bool RegKeyRange(const std::string& key, const std::string& category,
     using SystemProfile = ShadowStrike::Config::SystemProfile;
     using ProfileDef = ShadowStrike::Config::ProfileDefinition;
 
+    auto& pm = ProfM::Instance();
     bool ok = true;
+
+    // DESIGN: Each preset registration is idempotent. A second invocation
+    // (recovery restart, test harness) must not return failure for an already
+    // present profile; UpdateCustomProfile() is used to refresh state.
+    const auto registerOrUpdate = [&](const ProfileDef& def, const std::string& key) -> bool {
+        if (pm.GetCustomProfile(key).has_value()) {
+            if (!pm.UpdateCustomProfile(key, def)) {
+                Utils::Logger::Warn("[Home Config] UpdateCustomProfile('{}') failed", key);
+                return false;
+            }
+            return true;
+        }
+        return pm.CreateCustomProfile(def);
+    };
 
     // Standard Profile — balanced for everyday use
     {
@@ -297,7 +355,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
         standard.scan.heuristicLevel = 2;
         standard.scan.cloudLookupEnabled = true;
 
-        ok &= ProfM::Instance().CreateCustomProfile(standard);
+        ok &= registerOrUpdate(standard, standard.customName);
     }
 
     // Gaming Profile — minimal disruption during games
@@ -324,7 +382,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
         gaming.notifications.soundEnabled = false;
         gaming.notifications.showScanProgress = false;
 
-        ok &= ProfM::Instance().CreateCustomProfile(gaming);
+        ok &= registerOrUpdate(gaming, gaming.customName);
     }
 
     // Silent Profile — no user disruption at all
@@ -351,7 +409,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
         silent.notifications.soundEnabled = false;
         silent.notifications.showScanProgress = false;
 
-        ok &= ProfM::Instance().CreateCustomProfile(silent);
+        ok &= registerOrUpdate(silent, silent.customName);
     }
 
     // Low Resource Profile — for older/weaker machines
@@ -374,7 +432,7 @@ bool RegKeyRange(const std::string& key, const std::string& category,
         lowRes.scan.heuristicLevel = 0; // Signatures only
         lowRes.scan.cloudLookupEnabled = true;
 
-        ok &= ProfM::Instance().CreateCustomProfile(lowRes);
+        ok &= registerOrUpdate(lowRes, lowRes.customName);
     }
 
     if (!ok) {
@@ -507,8 +565,8 @@ bool RegKeyRange(const std::string& key, const std::string& category,
     bool anyFailure = false;
 
     for (const auto& key : allKeys) {
-        if (key.size() >= kHomePrefix.size() &&
-            key.compare(0, kHomePrefix.size(), kHomePrefix) == 0) {
+        const std::string_view kv{key};
+        if (kv.starts_with(kHomePrefix)) {
             if (!cm.ResetKeyToDefault(key)) {
                 Utils::Logger::Warn("[Home Config] Failed to reset key '{}'", key);
                 anyFailure = true;
