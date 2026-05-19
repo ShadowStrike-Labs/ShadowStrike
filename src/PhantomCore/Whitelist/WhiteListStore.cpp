@@ -165,6 +165,35 @@ template<typename T>
 #endif
 }
 
+[[nodiscard]] constexpr bool IsSupportedPathMatchMode(PathMatchMode mode) noexcept {
+    switch (mode) {
+        case PathMatchMode::Exact:
+        case PathMatchMode::Prefix:
+        case PathMatchMode::Suffix:
+        case PathMatchMode::Contains:
+        case PathMatchMode::Glob:
+        case PathMatchMode::Regex:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void RetireUnindexedEntry(WhitelistEntry* entry) noexcept {
+    if (!entry) {
+        return;
+    }
+
+    entry->type = WhitelistEntryType::Reserved;
+    entry->flags = entry->flags | WhitelistFlags::Revoked;
+    entry->hashLength = 0;
+    entry->pathOffset = 0;
+    entry->pathLength = 0;
+    entry->descriptionOffset = 0;
+    entry->descriptionLength = 0;
+    SecureZeroMemory(entry->hashData.data(), entry->hashData.size());
+}
+
 } // anonymous namespace
 
 
@@ -466,6 +495,15 @@ void WhitelistStore::Close() noexcept {
     
     // Save if not read-only (best effort)
     if (!m_readOnly.load(std::memory_order_acquire)) {
+        if (m_pathIndex) {
+            const auto pathFlush = m_pathIndex->Flush();
+            if (!pathFlush.IsSuccess() &&
+                pathFlush.code != WhitelistStoreError::ReadOnlyDatabase) {
+                SS_LOG_WARN(L"Whitelist", L"Failed to flush path index on close: %S",
+                    pathFlush.message.c_str());
+            }
+        }
+
         StoreError error;
         if (!MemoryMapping::FlushView(m_mappedView, error)) {
             SS_LOG_WARN(L"Whitelist", L"Failed to flush database on close: %S",
@@ -514,6 +552,15 @@ void WhitelistStore::CloseInternal() noexcept {
 
     // Flush if writable (best effort)
     if (!m_readOnly.load(std::memory_order_acquire)) {
+        if (m_pathIndex) {
+            const auto pathFlush = m_pathIndex->Flush();
+            if (!pathFlush.IsSuccess() &&
+                pathFlush.code != WhitelistStoreError::ReadOnlyDatabase) {
+                SS_LOG_WARN(L"Whitelist", L"Failed to flush path index on internal close: %S",
+                    pathFlush.message.c_str());
+            }
+        }
+
         StoreError error;
         if (!MemoryMapping::FlushView(m_mappedView, error)) {
             SS_LOG_WARN(L"Whitelist", L"Failed to flush database on close: %S",
@@ -571,6 +618,13 @@ StoreError WhitelistStore::Save() noexcept {
             WhitelistStoreError::ReadOnlyDatabase,
             "Cannot save read-only database"
         );
+    }
+
+    if (m_pathIndex) {
+        const auto pathFlush = m_pathIndex->Flush();
+        if (!pathFlush.IsSuccess()) {
+            return pathFlush;
+        }
     }
     
     // ========================================================================
@@ -1642,9 +1696,16 @@ StoreError WhitelistStore::AddHash(
     }
     
     std::unique_lock lock(m_globalLock);
+
+    if (!m_hashIndex) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Hash index not available"
+        );
+    }
     
     // Check for duplicate
-    if (m_hashIndex && m_hashIndex->Contains(hash)) {
+    if (m_hashIndex->Contains(hash)) {
         return StoreError::WithMessage(
             WhitelistStoreError::DuplicateEntry,
             "Hash already exists in whitelist"
@@ -1731,17 +1792,20 @@ StoreError WhitelistStore::AddHash(
     
     const uintptr_t entryAddr = reinterpret_cast<uintptr_t>(entry);
     const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(m_mappedView.baseAddress);
-    const uintptr_t endAddr = baseAddr + m_mappedView.fileSize;
+    uint64_t checkedEntryEnd = 0;
     
     // Validate entry is within mapped bounds (both lower and upper)
     if (entryAddr < baseAddr) {
+        RetireUnindexedEntry(entry);
         return StoreError::WithMessage(
             WhitelistStoreError::IndexCorrupted,
             "Entry address below mapped base"
         );
     }
     
-    if (entryAddr + sizeof(WhitelistEntry) > endAddr) {
+    if (!SafeAdd(static_cast<uint64_t>(entryAddr - baseAddr), sizeof(WhitelistEntry), checkedEntryEnd) ||
+        checkedEntryEnd > m_mappedView.fileSize) {
+        RetireUnindexedEntry(entry);
         return StoreError::WithMessage(
             WhitelistStoreError::IndexCorrupted,
             "Entry address exceeds mapped bounds"
@@ -1754,6 +1818,7 @@ StoreError WhitelistStore::AddHash(
     if (m_hashIndex) {
         auto err = m_hashIndex->Insert(hash, entryOffset);
         if (!err.IsSuccess()) {
+            RetireUnindexedEntry(entry);
             return err;
         }
     }
@@ -1944,6 +2009,27 @@ StoreError WhitelistStore::AddPath(
             "Path exceeds maximum length"
         );
     }
+
+    if (!IsSupportedPathMatchMode(matchMode)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidEntry,
+            "Unsupported path match mode"
+        );
+    }
+
+    if (!m_stringPool) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "String pool not available"
+        );
+    }
+
+    if (!m_pathIndex) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Path index not available"
+        );
+    }
     
     // Validate description length
     constexpr size_t MAX_DESCRIPTION_LENGTH = 32767;
@@ -1955,6 +2041,28 @@ StoreError WhitelistStore::AddPath(
     }
     
     std::unique_lock lock(m_globalLock);
+
+    if (!m_stringPool) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "String pool not available"
+        );
+    }
+
+    if (!m_pathIndex) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Path index not available"
+        );
+    }
+
+    const auto pathOffset = m_stringPool->AddWideString(path);
+    if (!pathOffset.has_value()) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Failed to persist path in string pool"
+        );
+    }
     
     // Allocate entry
     auto* entry = AllocateEntry();
@@ -1989,23 +2097,17 @@ StoreError WhitelistStore::AddPath(
     entry->policyId = policyId;
     entry->SetHitCount(0);
     
-    // Add path to string pool with safe length calculation
-    if (m_stringPool) {
-        auto pathOffset = m_stringPool->AddWideString(path);
-        if (pathOffset.has_value()) {
-            entry->pathOffset = *pathOffset;
-            // Safe byte length calculation with overflow check
-            const size_t pathLen = path.length();
-            constexpr size_t MAX_PATH_CHARS = UINT16_MAX / sizeof(wchar_t);
-            if (pathLen <= MAX_PATH_CHARS) {
-                entry->pathLength = static_cast<uint16_t>(pathLen * sizeof(wchar_t));
-            } else {
-                entry->pathLength = UINT16_MAX;
-                SS_LOG_WARN(L"Whitelist", L"Path length truncated to max");
-            }
-        } else {
-            SS_LOG_WARN(L"Whitelist", L"Failed to add path to string pool");
-        }
+    entry->pathOffset = *pathOffset;
+    const size_t pathLen = path.length();
+    constexpr size_t MAX_PATH_CHARS = UINT16_MAX / sizeof(wchar_t);
+    if (pathLen <= MAX_PATH_CHARS) {
+        entry->pathLength = static_cast<uint16_t>(pathLen * sizeof(wchar_t));
+    } else {
+        RetireUnindexedEntry(entry);
+        return StoreError::WithMessage(
+            WhitelistStoreError::PathTooLong,
+            "Path byte length exceeds entry record capacity"
+        );
     }
     
     // Add description with safe length calculation
@@ -2033,17 +2135,20 @@ StoreError WhitelistStore::AddPath(
     
     const uintptr_t entryAddr = reinterpret_cast<uintptr_t>(entry);
     const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(m_mappedView.baseAddress);
-    const uintptr_t endAddr = baseAddr + m_mappedView.fileSize;
+    uint64_t checkedEntryEnd = 0;
     
     // Validate entry is within mapped bounds (both lower and upper)
     if (entryAddr < baseAddr) {
+        RetireUnindexedEntry(entry);
         return StoreError::WithMessage(
             WhitelistStoreError::IndexCorrupted,
             "Entry address below mapped base"
         );
     }
     
-    if (entryAddr + sizeof(WhitelistEntry) > endAddr) {
+    if (!SafeAdd(static_cast<uint64_t>(entryAddr - baseAddr), sizeof(WhitelistEntry), checkedEntryEnd) ||
+        checkedEntryEnd > m_mappedView.fileSize) {
+        RetireUnindexedEntry(entry);
         return StoreError::WithMessage(
             WhitelistStoreError::IndexCorrupted,
             "Entry address exceeds mapped bounds"
@@ -2053,11 +2158,10 @@ StoreError WhitelistStore::AddPath(
     const uint64_t entryOffset = static_cast<uint64_t>(entryAddr - baseAddr);
     
     // Add to path index
-    if (m_pathIndex) {
-        auto err = m_pathIndex->Insert(path, matchMode, entryOffset);
-        if (!err.IsSuccess()) {
-            return err;
-        }
+    auto err = m_pathIndex->Insert(path, matchMode, entryOffset);
+    if (!err.IsSuccess()) {
+        RetireUnindexedEntry(entry);
+        return err;
     }
     
     // Add to path bloom filter
@@ -2071,8 +2175,8 @@ StoreError WhitelistStore::AddPath(
                 pathHash *= 1099511628211ULL;
             }
             m_pathBloomFilter->Add(pathHash);
-        } catch (const std::exception&) {
-            // Bloom filter update failed - non-critical
+    } catch (const std::exception&) {
+            SS_LOG_WARN(L"Whitelist", L"Path bloom filter update failed for new path entry");
         }
     }
     
@@ -2112,6 +2216,20 @@ StoreError WhitelistStore::AddPublisher(
     uint64_t expirationTime,
     uint32_t policyId
 ) noexcept {
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::ReadOnlyDatabase,
+            "Cannot modify read-only database"
+        );
+    }
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Store not initialized"
+        );
+    }
+
     // Validate publisher name
     if (publisherName.empty()) {
         return StoreError::WithMessage(
@@ -2119,8 +2237,132 @@ StoreError WhitelistStore::AddPublisher(
             "Empty publisher name"
         );
     }
-    
-    return AddPath(publisherName, PathMatchMode::Exact, reason, description, expirationTime, policyId);
+
+    constexpr size_t MAX_PUBLISHER_LENGTH = 1024;
+    if (publisherName.length() > MAX_PUBLISHER_LENGTH) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::PathTooLong,
+            "Publisher name exceeds maximum length"
+        );
+    }
+
+    if (!m_stringPool) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "String pool not available"
+        );
+    }
+
+    if (!m_pathIndex) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Path index not available"
+        );
+    }
+
+    std::unique_lock lock(m_globalLock);
+
+    if (!m_stringPool) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "String pool not available"
+        );
+    }
+
+    if (!m_pathIndex) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Path index not available"
+        );
+    }
+
+    const auto publisherOffset = m_stringPool->AddWideString(publisherName);
+    if (!publisherOffset.has_value()) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Failed to persist publisher name in string pool"
+        );
+    }
+
+    auto* entry = AllocateEntry();
+    if (!entry) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Failed to allocate publisher entry"
+        );
+    }
+
+    std::memset(entry, 0, sizeof(WhitelistEntry));
+
+    entry->entryId = GetNextEntryId();
+    entry->type = WhitelistEntryType::Publisher;
+    entry->reason = reason;
+    entry->matchMode = PathMatchMode::Exact;
+    entry->flags = WhitelistFlags::Enabled;
+    entry->pathOffset = *publisherOffset;
+    entry->pathLength = static_cast<uint16_t>(publisherName.length() * sizeof(wchar_t));
+    entry->expirationTime = expirationTime;
+    if (expirationTime > 0) {
+        entry->flags = entry->flags | WhitelistFlags::HasExpiration;
+    }
+    entry->policyId = policyId;
+    entry->SetHitCount(0);
+
+    const auto now = std::chrono::system_clock::now();
+    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    entry->createdTime = static_cast<uint64_t>(std::max<int64_t>(0, epoch));
+    entry->modifiedTime = entry->createdTime;
+
+    if (!description.empty()) {
+        const auto descOffset = m_stringPool->AddWideString(description);
+        if (descOffset.has_value()) {
+            entry->descriptionOffset = *descOffset;
+            constexpr size_t MAX_DESC_CHARS = UINT16_MAX / sizeof(wchar_t);
+            if (description.length() <= MAX_DESC_CHARS) {
+                entry->descriptionLength = static_cast<uint16_t>(description.length() * sizeof(wchar_t));
+            }
+        }
+    }
+
+    if (!m_mappedView.baseAddress || m_mappedView.fileSize == 0) {
+        RetireUnindexedEntry(entry);
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Invalid mapped view"
+        );
+    }
+
+    const uintptr_t entryAddr = reinterpret_cast<uintptr_t>(entry);
+    const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(m_mappedView.baseAddress);
+    uint64_t entryOffset = 0;
+    if (entryAddr < baseAddr ||
+        !SafeAdd(static_cast<uint64_t>(entryAddr - baseAddr), sizeof(WhitelistEntry), entryOffset) ||
+        entryOffset > m_mappedView.fileSize) {
+        RetireUnindexedEntry(entry);
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Publisher entry address exceeds mapped bounds"
+        );
+    }
+    entryOffset = static_cast<uint64_t>(entryAddr - baseAddr);
+
+    const auto indexResult = m_pathIndex->Insert(publisherName, PathMatchMode::Exact, entryOffset);
+    if (!indexResult.IsSuccess()) {
+        RetireUnindexedEntry(entry);
+        return indexResult;
+    }
+
+    auto* mutableHeader = const_cast<WhitelistDatabaseHeader*>(GetHeader());
+    if (mutableHeader && mutableHeader->totalPublisherEntries < UINT64_MAX) {
+        ++mutableHeader->totalPublisherEntries;
+    }
+
+    UpdateHeaderStats();
+    ClearCacheUnsafe();
+
+    SS_LOG_INFO(L"Whitelist", L"Added publisher entry: ID=%llu", entry->entryId);
+
+    return StoreError::Success();
 }
 
 StoreError WhitelistStore::RemoveEntry(uint64_t entryId) noexcept {
@@ -2231,7 +2473,8 @@ StoreError WhitelistStore::RemoveEntry(uint64_t entryId) noexcept {
             indexError = m_hashIndex->Remove(hash);
         }
     } else if (foundEntry->type == WhitelistEntryType::FilePath ||
-               foundEntry->type == WhitelistEntryType::ProcessPath) {
+               foundEntry->type == WhitelistEntryType::ProcessPath ||
+               foundEntry->type == WhitelistEntryType::Publisher) {
         // Remove from path index
         if (m_pathIndex && foundEntry->pathOffset > 0 && m_stringPool) {
             auto pathView = m_stringPool->GetWideString(
@@ -2321,18 +2564,25 @@ StoreError WhitelistStore::RemoveHash(const HashValue& hash) noexcept {
         );
     }
     
-    std::unique_lock lock(m_globalLock);
-    
     if (m_hashIndex) {
-        auto result = m_hashIndex->Remove(hash);
-        if (result.IsSuccess()) {
-            // Update header counter to maintain consistency with GetEntryCount()
-            auto* mutableHeader = m_mappedView.GetAtMutable<WhitelistDatabaseHeader>(0);
-            if (mutableHeader && mutableHeader->totalHashEntries > 0) {
-                --mutableHeader->totalHashEntries;
-            }
+        const auto entryOffset = m_hashIndex->Lookup(hash);
+        if (!entryOffset.has_value()) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::EntryNotFound,
+                "Hash entry not found"
+            );
         }
-        return result;
+
+        const auto* entry = m_mappedView.GetAt<WhitelistEntry>(*entryOffset);
+        if (!entry || entry->type != WhitelistEntryType::FileHash ||
+            HasFlag(entry->flags, WhitelistFlags::Revoked)) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::EntryNotFound,
+                "Hash index points to an invalid or revoked entry"
+            );
+        }
+
+        return RemoveEntry(entry->entryId);
     }
     
     return StoreError::WithMessage(
@@ -2366,18 +2616,34 @@ StoreError WhitelistStore::RemovePath(
         );
     }
     
-    std::unique_lock lock(m_globalLock);
-    
     if (m_pathIndex) {
-        auto result = m_pathIndex->Remove(path, matchMode);
-        if (result.IsSuccess()) {
-            // Update header counter to maintain consistency with GetEntryCount()
-            auto* mutableHeader = m_mappedView.GetAtMutable<WhitelistDatabaseHeader>(0);
-            if (mutableHeader && mutableHeader->totalPathEntries > 0) {
-                --mutableHeader->totalPathEntries;
+        const std::wstring normalizedInput = Format::NormalizePath(path);
+        auto entryOffsets = m_pathIndex->Lookup(path, matchMode);
+        for (uint64_t entryOffset : entryOffsets) {
+            const auto* entry = m_mappedView.GetAt<WhitelistEntry>(entryOffset);
+            if (!entry || HasFlag(entry->flags, WhitelistFlags::Revoked) ||
+                (entry->type != WhitelistEntryType::FilePath &&
+                 entry->type != WhitelistEntryType::ProcessPath &&
+                 entry->type != WhitelistEntryType::Publisher) ||
+                entry->matchMode != matchMode ||
+                !m_stringPool) {
+                continue;
+            }
+
+            const auto storedPath = m_stringPool->GetWideString(entry->pathOffset, entry->pathLength);
+            if (storedPath.empty()) {
+                continue;
+            }
+
+            if (storedPath == path || Format::NormalizePath(storedPath) == normalizedInput) {
+                return RemoveEntry(entry->entryId);
             }
         }
-        return result;
+
+        return StoreError::WithMessage(
+            WhitelistStoreError::EntryNotFound,
+            "Path entry not found"
+        );
     }
     
     return StoreError::WithMessage(
@@ -2528,17 +2794,21 @@ StoreError WhitelistStore::BatchAdd(
         
         // Calculate entry offset with full bounds validation
         if (!m_mappedView.baseAddress || m_mappedView.fileSize == 0) {
+            RetireUnindexedEntry(newEntry);
             ++failed;
             continue;
         }
         
         const uintptr_t entryAddr = reinterpret_cast<uintptr_t>(newEntry);
         const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(m_mappedView.baseAddress);
-        const uintptr_t endAddr = baseAddr + m_mappedView.fileSize;
         
         // Validate entry is within mapped bounds
-        if (entryAddr < baseAddr || entryAddr + sizeof(WhitelistEntry) > endAddr) {
+        uint64_t checkedEntryEnd = 0;
+        if (entryAddr < baseAddr ||
+            !SafeAdd(static_cast<uint64_t>(entryAddr - baseAddr), sizeof(WhitelistEntry), checkedEntryEnd) ||
+            checkedEntryEnd > m_mappedView.fileSize) {
             SS_LOG_ERROR(L"Whitelist", L"BatchAdd: entry allocation out of bounds");
+            RetireUnindexedEntry(newEntry);
             ++failed;
             continue;
         }
@@ -2549,6 +2819,12 @@ StoreError WhitelistStore::BatchAdd(
         StoreError indexResult = StoreError::Success();
         
         if (newEntry->type == WhitelistEntryType::FileHash) {
+            if (!m_hashIndex) {
+                RetireUnindexedEntry(newEntry);
+                ++failed;
+                continue;
+            }
+
             // Add to hash index and bloom filter with validated hash length
             if (newEntry->hashLength > 0 && newEntry->hashLength <= newEntry->hashData.size()) {
                 HashValue hash = HashValue::Create(newEntry->hashAlgorithm,
@@ -2559,18 +2835,23 @@ StoreError WhitelistStore::BatchAdd(
                     m_hashBloomFilter->Add(hash.FastHash());
                 }
                 
-                if (m_hashIndex) {
-                    indexResult = m_hashIndex->Insert(hash, entryOffset);
-                }
+                indexResult = m_hashIndex->Insert(hash, entryOffset);
             } else {
+                RetireUnindexedEntry(newEntry);
                 ++failed;
                 continue;
             }
         } else if (newEntry->type == WhitelistEntryType::FilePath ||
                    newEntry->type == WhitelistEntryType::ProcessPath) {
+            if (!m_pathIndex || !m_stringPool) {
+                RetireUnindexedEntry(newEntry);
+                ++failed;
+                continue;
+            }
+
             // Path entries need path from string pool
             // For batch, we assume paths are already stored
-            if (m_pathIndex && newEntry->pathOffset > 0 && m_stringPool) {
+            if (newEntry->pathOffset > 0) {
                 auto pathView = m_stringPool->GetWideString(
                     newEntry->pathOffset,
                     newEntry->pathLength);
@@ -2585,7 +2866,17 @@ StoreError WhitelistStore::BatchAdd(
                         m_pathBloomFilter->Add(pathHash);
                     }
                     indexResult = m_pathIndex->Insert(pathView, newEntry->matchMode, entryOffset);
+                } else {
+                    indexResult = StoreError::WithMessage(
+                        WhitelistStoreError::InvalidEntry,
+                        "Batch path entry references an invalid string"
+                    );
                 }
+            } else {
+                indexResult = StoreError::WithMessage(
+                    WhitelistStoreError::InvalidEntry,
+                    "Batch path entry has no string-pool offset"
+                );
             }
         }
         
@@ -2626,7 +2917,7 @@ StoreError WhitelistStore::BatchAdd(
             }
         } else {
             ++failed;
-            // Could rollback entry allocation here for strict transaction
+            RetireUnindexedEntry(newEntry);
         }
     }
     
@@ -5728,6 +6019,11 @@ WhitelistEntry* WhitelistStore::AllocateEntry() noexcept {
         SS_LOG_ERROR(L"Whitelist", L"Entry data section not configured");
         return nullptr;
     }
+
+    if (header->entryDataSize < sizeof(WhitelistEntry)) {
+        SS_LOG_ERROR(L"Whitelist", L"Entry data section smaller than one entry");
+        return nullptr;
+    }
     
     std::lock_guard lock(m_entryAllocMutex);
     
@@ -5738,17 +6034,24 @@ WhitelistEntry* WhitelistStore::AllocateEntry() noexcept {
         SS_LOG_ERROR(L"Whitelist", L"Entry offset overflow");
         return nullptr;
     }
-    const uint64_t entryOffset = header->entryDataOffset + currentUsed;
+    uint64_t entryOffset = 0;
+    if (!SafeAdd(header->entryDataOffset, currentUsed, entryOffset)) {
+        SS_LOG_ERROR(L"Whitelist", L"Entry offset overflow");
+        return nullptr;
+    }
     
-    // Check if there's space for new entry
-    if (currentUsed > header->entryDataSize - sizeof(WhitelistEntry)) {
+    // Check if there's space for new entry without unsigned underflow.
+    if (currentUsed > header->entryDataSize ||
+        sizeof(WhitelistEntry) > header->entryDataSize - currentUsed) {
         SS_LOG_ERROR(L"Whitelist", L"Entry data section full (used: %llu, size: %llu)",
             currentUsed, header->entryDataSize);
         return nullptr;
     }
     
     // Validate offset is within mapped view
-    if (entryOffset + sizeof(WhitelistEntry) > m_mappedView.fileSize) {
+    uint64_t entryEnd = 0;
+    if (!SafeAdd(entryOffset, sizeof(WhitelistEntry), entryEnd) ||
+        entryEnd > m_mappedView.fileSize) {
         SS_LOG_ERROR(L"Whitelist", L"Entry allocation exceeds file bounds");
         return nullptr;
     }
@@ -5764,7 +6067,11 @@ WhitelistEntry* WhitelistStore::AllocateEntry() noexcept {
     std::memset(entry, 0, sizeof(WhitelistEntry));
     
     // Update used size with overflow check
-    const uint64_t newUsed = currentUsed + sizeof(WhitelistEntry);
+    uint64_t newUsed = 0;
+    if (!SafeAdd(currentUsed, sizeof(WhitelistEntry), newUsed)) {
+        SS_LOG_ERROR(L"Whitelist", L"Entry size overflow");
+        return nullptr;
+    }
     if (newUsed > header->entryDataSize) {
         SS_LOG_ERROR(L"Whitelist", L"Entry size calculation error");
         return nullptr;
