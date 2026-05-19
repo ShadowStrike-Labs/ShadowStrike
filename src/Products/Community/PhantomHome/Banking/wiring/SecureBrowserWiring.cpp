@@ -94,6 +94,41 @@ struct SecureBrowserRegistrar final {
                 },
 
                 .setMode = [](ProtectionMode mode) -> bool {
+                    using ::ShadowStrike::Banking::SecurityLevel;
+                    auto& browser = SecureBrowser::Instance();
+                    auto config = browser.GetConfiguration();
+
+                    switch (mode) {
+                        case ProtectionMode::Passive:
+                            config.defaultSecurityLevel    = SecurityLevel::Enhanced;
+                            config.enableAutoProtection    = false;
+                            config.enableIntegrityMonitoring = true;
+                            config.terminateOnCompromise   = false;
+                            break;
+                        case ProtectionMode::Balanced:
+                            config.defaultSecurityLevel    = SecurityLevel::High;
+                            config.enableAutoProtection    = true;
+                            config.enableIntegrityMonitoring = true;
+                            config.terminateOnCompromise   = true;
+                            break;
+                        case ProtectionMode::Aggressive:
+                            config.defaultSecurityLevel    = SecurityLevel::Maximum;
+                            config.enableAutoProtection    = true;
+                            config.enableIntegrityMonitoring = true;
+                            config.terminateOnCompromise   = true;
+                            break;
+                        case ProtectionMode::Off:
+                            SS_LOG_ERROR(kLogCategory,
+                                L"SecureBrowser: setMode(Off) must be routed through orchestrator disable");
+                            return false;
+                    }
+
+                    if (!browser.UpdateConfiguration(config)) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"SecureBrowser: UpdateConfiguration rejected mode=%u",
+                            static_cast<unsigned>(mode));
+                        return false;
+                    }
                     return ApplyModeThresholds("SecureBrowser", mode);
                 },
 
@@ -104,7 +139,8 @@ struct SecureBrowserRegistrar final {
                     ProtectionModeMask(ProtectionMode::Aggressive)
             });
         } catch (...) {
-            // Static-init-time: logger may not be available. Swallow silently.
+            ::OutputDebugStringW(
+                L"SecureBrowserWiring: static registration failed\n");
         }
     }
 };
