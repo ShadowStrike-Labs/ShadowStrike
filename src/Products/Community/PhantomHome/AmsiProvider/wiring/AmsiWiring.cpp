@@ -22,7 +22,9 @@
 // ── Standard library before Logger.hpp ───────────────────────────────────────
 #include <format>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 // ── PhantomHome infrastructure ────────────────────────────────────────────────
 #include "Products/Community/PhantomHome/HomeProductOrchestrator.hpp"
@@ -35,10 +37,10 @@ namespace {
 
 constexpr const wchar_t* kLogCategory = L"AmsiWiring";
 
-// Raw pointer to the one AmsiProvider instance for this process.
-// Lifetime: created in initialize(), destroyed in shutdown().
-// Not a smart pointer to avoid vtable-in-destructor ordering issues.
-ShadowStrike::Products::Home::AmsiProvider* g_provider = nullptr;
+// One provider instance for this process. The mutex serializes orchestrator
+// mode/shutdown callbacks; the provider itself handles concurrent AMSI scans.
+std::mutex g_providerMutex;
+std::unique_ptr<ShadowStrike::Products::Home::AmsiProvider> g_provider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -57,22 +59,25 @@ struct AmsiProviderRegistrar final {
 
                 .initialize = []() -> bool {
                     try {
+                        std::lock_guard lock(g_providerMutex);
                         if (g_provider) return true;
-                        g_provider = new ShadowStrike::Products::Home::AmsiProvider();
-                        if (!g_provider->Initialize()) {
-                            delete g_provider;
-                            g_provider = nullptr;
+
+                        auto provider =
+                            std::make_unique<ShadowStrike::Products::Home::AmsiProvider>();
+                        if (!provider->Initialize()) {
                             SS_LOG_ERROR(kLogCategory,
                                 L"AmsiProvider::Initialize() returned false");
                             return false;
                         }
+
                         // Best-effort COM registration; non-fatal if it fails
                         if (!RegisterAmsiProvider()) {
                             SS_LOG_WARN(kLogCategory,
                                 L"AMSI COM registration failed; provider will "
                                 L"still scan in-process but may not intercept "
-                                L"third-party AMSI clients");
+                                 L"third-party AMSI clients");
                         }
+                        g_provider = std::move(provider);
                         SS_LOG_INFO(kLogCategory,
                             L"AmsiProvider module initialised");
                         return true;
@@ -95,11 +100,14 @@ struct AmsiProviderRegistrar final {
 
                 .shutdown = []() noexcept {
                     try {
-                        UnregisterAmsiProvider();
+                        if (!UnregisterAmsiProvider()) {
+                            SS_LOG_WARN(kLogCategory,
+                                L"AMSI COM unregistration reported a non-fatal failure");
+                        }
+                        std::lock_guard lock(g_providerMutex);
                         if (g_provider) {
                             g_provider->Shutdown();
-                            delete g_provider;
-                            g_provider = nullptr;
+                            g_provider.reset();
                         }
                         SS_LOG_INFO(kLogCategory, L"AmsiProvider shut down");
                     } catch (const std::exception& ex) {
@@ -114,9 +122,16 @@ struct AmsiProviderRegistrar final {
                 .setMode = [](ShadowStrike::Products::Home::ProtectionMode m)
                     -> bool {
                     try {
-                        if (g_provider) g_provider->SetMode(m);
-                        return ShadowStrike::Products::Home::ApplyModeThresholds(
+                        const bool thresholdsApplied =
+                            ShadowStrike::Products::Home::ApplyModeThresholds(
                             "AmsiProvider", m);
+                        if (!thresholdsApplied) {
+                            return false;
+                        }
+
+                        std::lock_guard lock(g_providerMutex);
+                        if (g_provider) g_provider->SetMode(m);
+                        return true;
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"setMode() threw: %hs", ex.what());
@@ -135,8 +150,14 @@ struct AmsiProviderRegistrar final {
                         ShadowStrike::Products::Home::ProtectionMode::Aggressive),
             });
 
+        } catch (const std::exception& ex) {
+            const std::string message =
+                std::string("AmsiProviderRegistrar failed during static initialization: ") +
+                ex.what() + "\n";
+            OutputDebugStringA(message.c_str());
         } catch (...) {
-            // Static-init-time: logger may not be ready — silently swallow.
+            OutputDebugStringW(
+                L"AmsiProviderRegistrar failed during static initialization: unknown exception\n");
         }
     }
 };
