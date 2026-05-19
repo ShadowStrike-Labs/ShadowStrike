@@ -104,6 +104,9 @@ inline constexpr size_t CACHE_LINE_SIZE_LOCAL = 64;
 /// @brief Index header size in bytes
 inline constexpr uint64_t INDEX_HEADER_SIZE = 64;
 
+/// @brief B+Tree node offsets are serialized as uint32_t in on-disk nodes.
+inline constexpr uint64_t MAX_SERIALIZED_INDEX_SIZE = UINT32_MAX;
+
 /// @brief Maximum traversal depth to prevent infinite loops from corruption
 inline constexpr uint32_t SAFE_MAX_TREE_DEPTH = 32;
 
@@ -583,23 +586,19 @@ template<typename ArrayType, typename KeyType>
         return false;
     }
     
-    // HI-6 fix: always check boundary ordering in release builds
-    if (node->isLeaf && node->keyCount > 1) {
-        if (node->keys[0] > node->keys[node->keyCount - 1]) {
-            return false;
-        }
-    }
-
-    // Full sort-order verification (debug only — O(n) per node)
-#ifndef NDEBUG
-    if (node->isLeaf && node->keyCount > 1) {
+    // Full sort-order verification is intentionally enabled in release builds:
+    // index files are hostile input and sorted-key invariants gate safe search.
+    if (node->keyCount > 1) {
         for (uint32_t i = 0; i + 1 < node->keyCount; ++i) {
             if (node->keys[i] >= node->keys[i + 1]) {
                 return false;
             }
         }
     }
-#endif
+    
+    if (!node->isLeaf && node->keyCount == 0) {
+        return false;
+    }
     
     return true;
 }
@@ -820,57 +819,119 @@ StoreError HashIndex::Initialize(
         );
     }
     
-    // Minimum size check
     constexpr uint64_t HEADER_SIZE = 64;
-    if (size < HEADER_SIZE) {
+    const uint64_t minIndexSize = HEADER_SIZE + static_cast<uint64_t>(sizeof(BPlusTreeNode));
+    if (size < minIndexSize) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
-            "Index section too small for header"
+            "Index section too small for header and root node"
         );
     }
-    
-    m_view = &view;
-    m_baseAddress = nullptr;  // Read-only mode
-    m_indexOffset = offset;
-    m_indexSize = size;
-    
-    // Read root node offset from first 8 bytes
+
+    if (size > MAX_SERIALIZED_INDEX_SIZE) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Index section exceeds 32-bit serialized node offset limit"
+        );
+    }
+
     const auto* rootPtr = view.GetAt<uint64_t>(offset);
-    if (!rootPtr) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexCorrupted,
-            "Failed to read root node offset"
-        );
-    }
-    
-    m_rootOffset = *rootPtr;
-    
-    // Validate root offset
-    if (m_rootOffset >= size) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexCorrupted,
-            "Root offset exceeds index size"
-        );
-    }
-    
-    // Read metadata with null checks
     const auto* nodeCountPtr = view.GetAt<uint64_t>(offset + 8);
     const auto* entryCountPtr = view.GetAt<uint64_t>(offset + 16);
     const auto* nextNodePtr = view.GetAt<uint64_t>(offset + 24);
     const auto* depthPtr = view.GetAt<uint32_t>(offset + 32);
-    
-    if (nodeCountPtr) {
-        m_nodeCount.store(*nodeCountPtr, std::memory_order_relaxed);
+
+    if (!rootPtr || !nodeCountPtr || !entryCountPtr || !nextNodePtr || !depthPtr) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Failed to read hash index metadata"
+        );
     }
-    if (entryCountPtr) {
-        m_entryCount.store(*entryCountPtr, std::memory_order_relaxed);
+
+    auto isValidNodeOffset = [size](uint64_t nodeOffset) noexcept -> bool {
+        if (nodeOffset < INDEX_HEADER_SIZE || nodeOffset >= size) {
+            return false;
+        }
+        if ((nodeOffset - INDEX_HEADER_SIZE) % sizeof(BPlusTreeNode) != 0) {
+            return false;
+        }
+        uint64_t nodeEnd = 0;
+        return SafeAdd(nodeOffset, static_cast<uint64_t>(sizeof(BPlusTreeNode)), nodeEnd) &&
+               nodeEnd <= size;
+    };
+
+    const uint64_t rootOffset = *rootPtr;
+    const uint64_t nodeCount = *nodeCountPtr;
+    const uint64_t entryCount = *entryCountPtr;
+    const uint64_t nextNodeOffset = *nextNodePtr;
+    const uint32_t treeDepth = *depthPtr;
+    const uint64_t maxNodesBySection =
+        (size - INDEX_HEADER_SIZE) / static_cast<uint64_t>(sizeof(BPlusTreeNode));
+
+    if (!isValidNodeOffset(rootOffset)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Root offset is not a valid B+Tree node offset"
+        );
     }
-    if (nextNodePtr) {
-        m_nextNodeOffset = *nextNodePtr;
+
+    if (nodeCount == 0 || nodeCount > maxNodesBySection) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Node count exceeds hash index section capacity"
+        );
     }
-    if (depthPtr) {
-        m_treeDepth = std::min(*depthPtr, MAX_TREE_DEPTH);
+
+    if (nextNodeOffset < minIndexSize || nextNodeOffset > size ||
+        ((nextNodeOffset - INDEX_HEADER_SIZE) % sizeof(BPlusTreeNode)) != 0) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Next node offset is outside valid hash index bounds"
+        );
     }
+
+    const uint64_t allocatedNodeSlots =
+        (nextNodeOffset - INDEX_HEADER_SIZE) / static_cast<uint64_t>(sizeof(BPlusTreeNode));
+    if (nodeCount > allocatedNodeSlots) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Node count exceeds allocated hash index node slots"
+        );
+    }
+
+    uint64_t maxEntries = 0;
+    if (!SafeMul(nodeCount, static_cast<uint64_t>(BPlusTreeNode::MAX_KEYS), maxEntries) ||
+        entryCount > maxEntries) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Entry count exceeds hash index node capacity"
+        );
+    }
+
+    if (treeDepth == 0 || treeDepth > MAX_TREE_DEPTH || treeDepth > nodeCount) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Hash index tree depth is outside valid bounds"
+        );
+    }
+
+    const auto* rootNode = view.GetAt<BPlusTreeNode>(offset + rootOffset);
+    if (!ValidateNodeIntegrity(rootNode, BPlusTreeNode::MAX_KEYS)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Root node failed hash index integrity validation"
+        );
+    }
+
+    m_view = &view;
+    m_baseAddress = nullptr;
+    m_indexOffset = offset;
+    m_indexSize = size;
+    m_rootOffset = rootOffset;
+    m_nodeCount.store(nodeCount, std::memory_order_relaxed);
+    m_entryCount.store(entryCount, std::memory_order_relaxed);
+    m_nextNodeOffset = nextNodeOffset;
+    m_treeDepth = treeDepth;
     
     SS_LOG_DEBUG(L"Whitelist", 
         L"HashIndex initialized: %llu nodes, %llu entries, depth %u",
@@ -900,6 +961,15 @@ void HashIndex::EnableWriteMode(void* baseAddress, uint64_t size) noexcept {
     
     if (!baseAddress) {
         SS_LOG_WARN(L"Whitelist", L"HashIndex::EnableWriteMode called with null base address");
+        return;
+    }
+
+    if (size < INDEX_HEADER_SIZE + static_cast<uint64_t>(sizeof(BPlusTreeNode)) ||
+        size > MAX_SERIALIZED_INDEX_SIZE ||
+        m_rootOffset < INDEX_HEADER_SIZE ||
+        m_rootOffset >= size ||
+        m_nextNodeOffset > size) {
+        SS_LOG_WARN(L"Whitelist", L"HashIndex::EnableWriteMode rejected inconsistent index bounds");
         return;
     }
     
@@ -934,11 +1004,11 @@ StoreError HashIndex::CreateNew(
         );
     }
     
-    // Validate available size won't cause overflow in subsequent calculations
-    if (availableSize > static_cast<uint64_t>(INT64_MAX)) {
+    // Serialized node links are uint32_t; reject sections that cannot be addressed safely.
+    if (availableSize > MAX_SERIALIZED_INDEX_SIZE) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
-            "Available size exceeds maximum supported value"
+            "Available size exceeds 32-bit serialized node offset limit"
         );
     }
     
@@ -2156,7 +2226,9 @@ StoreError HashIndex::BatchInsert(
                 // Check if key would fall in current leaf range
                 const uint64_t leafMinKey = currentLeaf->keys[0];
                 const uint64_t leafMaxKey = currentLeaf->keys[currentLeaf->keyCount - 1];
-                needNewLeaf = (key < leafMinKey || key > leafMaxKey + 1);
+                // Re-find for keys outside the current leaf. Avoid leafMaxKey + 1
+                // because UINT64_MAX is a valid key and would wrap.
+                needNewLeaf = (key < leafMinKey || key > leafMaxKey);
             }
             
             if (needNewLeaf) {
@@ -2184,8 +2256,8 @@ StoreError HashIndex::BatchInsert(
             // Check for duplicate
             uint32_t existingIdx = 0;
             if (BinarySearchExact(currentLeaf->keys, currentLeaf->keyCount, key, existingIdx)) {
-                // Update existing entry (upsert semantics)
-                currentLeaf->children[existingIdx] = static_cast<uint32_t>(offset);
+                // FastHash collisions are possible; never overwrite an existing
+                // key in the index without a full-hash comparison at store level.
                 ++duplicateCount;
                 ++successCount;
                 continue;
@@ -2273,7 +2345,7 @@ StoreError HashIndex::BatchInsert(
             // Check for duplicate
             uint32_t existingIdx = 0;
             if (BinarySearchExact(leaf->keys, leaf->keyCount, key, existingIdx)) {
-                leaf->children[existingIdx] = static_cast<uint32_t>(offset);
+                // FastHash collisions are possible; preserve the existing target.
                 ++duplicateCount;
                 ++successCount;
                 continue;
