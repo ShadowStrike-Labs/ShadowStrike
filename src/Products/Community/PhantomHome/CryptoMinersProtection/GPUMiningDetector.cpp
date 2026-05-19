@@ -43,6 +43,7 @@
 #include <deque>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -76,6 +77,8 @@ constexpr DWORD kPdhWarmupMs = 120;
 constexpr size_t kMaxRecentDetections = 100;
 constexpr size_t kMaxHistorySamples = 96;
 constexpr size_t kMaxDagDirectoryEntries = 512;
+constexpr size_t kMaxPdhCountersPerKind = 4096;
+constexpr size_t kMaxPdhCountersTotal  = 12288;
 constexpr double kComputeDetectionFloor = 60.0;
 constexpr double kIntermittentDetectionFloor = 45.0;
 constexpr double kGraphicsFalsePositiveFloor = 35.0;
@@ -156,6 +159,18 @@ const std::vector<std::wstring> kDagFilePatterns = {
         return 0.0;
     }
     return std::clamp(value, 0.0, 100.0);
+}
+
+[[nodiscard]] uint64_t SafeDoubleToU64(double value) noexcept {
+    if (!std::isfinite(value) || value <= 0.0) {
+        return 0U;
+    }
+    // 2^64 is exactly representable in double; anything >= it is out of range.
+    constexpr double kU64Ceiling = 18446744073709551616.0;
+    if (value >= kU64Ceiling) {
+        return (std::numeric_limits<uint64_t>::max)();
+    }
+    return static_cast<uint64_t>(value);
 }
 
 [[nodiscard]] uint64_t MakeLuidKey(const LUID& luid) noexcept {
@@ -447,7 +462,7 @@ public:
         if (m_handle != nullptr && m_handle != INVALID_HANDLE_VALUE) {
             ::CloseHandle(m_handle);
         }
-        m_handle = h;
+        m_handle = (h == INVALID_HANDLE_VALUE) ? nullptr : h;
     }
 
     [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
@@ -475,11 +490,18 @@ struct CounterRegistration {
     size_t offset = 0;
 
     while (offset < buffer.size() && buffer[offset] != L'\0') {
-        const std::wstring value(&buffer[offset]);
-        offset += value.size() + 1;
-        if (!value.empty()) {
-            values.push_back(value);
+        const size_t remaining = buffer.size() - offset;
+        const wchar_t* const start = buffer.data() + offset;
+        const wchar_t* const terminator = ::wmemchr(start, L'\0', remaining);
+        if (terminator == nullptr) {
+            // Malformed multi-sz: missing terminator within the buffer. Refuse to over-read.
+            break;
         }
+        const size_t length = static_cast<size_t>(terminator - start);
+        if (length != 0U) {
+            values.emplace_back(start, length);
+        }
+        offset += length + 1U;
     }
 
     return values;
@@ -899,15 +921,21 @@ public:
             return false;
         }
 
-        const bool alreadyInitialized = m_initialized.exchange(true, std::memory_order_acq_rel);
-        if (alreadyInitialized) {
-            Utils::Logger::Warn("GPUMiningDetector: already initialized");
-            std::unique_lock lock(m_mutex);
-            m_config = config;
-            return true;
+        // Reserve the Initializing state via CAS so concurrent Initialize calls serialize cleanly,
+        // and IsInitialized() remains false until we have fully succeeded.
+        ModuleStatus expected = ModuleStatus::Uninitialized;
+        if (!m_status.compare_exchange_strong(
+                expected, ModuleStatus::Initializing,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (m_initialized.load(std::memory_order_acquire)) {
+                Utils::Logger::Warn("GPUMiningDetector: already initialized");
+                std::unique_lock lock(m_mutex);
+                m_config = config;
+                return true;
+            }
+            Utils::Logger::Error("GPUMiningDetector: initialization rejected (concurrent transition in progress)");
+            return false;
         }
-
-        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         try {
             {
@@ -931,6 +959,7 @@ public:
                 m_lastScanTime = Clock::now();
             }
 
+            m_initialized.store(true, std::memory_order_release);
             m_status.store(ModuleStatus::Stopped, std::memory_order_release);
             Utils::Logger::Info(
                 "GPUMiningDetector: initialized (devices={}, nvml={}, adl={})",
@@ -1026,14 +1055,16 @@ public:
     }
 
     [[nodiscard]] bool Stop() {
-        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
-        m_stopRequested.store(true, std::memory_order_release);
-        m_monitorCv.notify_all();
-
         std::thread threadToJoin;
         {
             std::unique_lock monitorLock(m_monitorMutex);
             m_monitorStateCv.wait(monitorLock, [this]() noexcept { return !m_monitorTransitionInProgress; });
+            m_monitorTransitionInProgress = true;
+
+            m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+            m_stopRequested.store(true, std::memory_order_release);
+            m_monitorCv.notify_all();
+
             if (m_monitorThread.joinable()) {
                 threadToJoin = std::move(m_monitorThread);
             }
@@ -1043,9 +1074,14 @@ public:
             threadToJoin.join();
         }
 
-        if (IsInitialized()) {
-            m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+        {
+            std::lock_guard monitorLock(m_monitorMutex);
+            m_monitorTransitionInProgress = false;
+            if (IsInitialized()) {
+                m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+            }
         }
+        m_monitorStateCv.notify_all();
         return true;
     }
 
@@ -1170,12 +1206,10 @@ public:
     }
 
     [[nodiscard]] bool IsNVMLAvailable() const noexcept {
-        std::shared_lock lock(m_mutex);
         return m_nvmlAvailable.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] bool IsADLAvailable() const noexcept {
-        std::shared_lock lock(m_mutex);
         return m_adlAvailable.load(std::memory_order_acquire);
     }
 
@@ -1208,10 +1242,21 @@ public:
             return false;
         }
 
-        // Capture identity via the pinned handle (not PID) to avoid races
+        // Capture identity via the pinned handle (not PID) to avoid PID reuse races.
+        auto queryPathByHandle = [](HANDLE h) -> std::optional<std::wstring> {
+            std::wstring buffer(32768U, L'\0');
+            DWORD size = static_cast<DWORD>(buffer.size());
+            if (::QueryFullProcessImageNameW(h, 0, buffer.data(), &size) == FALSE || size == 0U) {
+                return std::nullopt;
+            }
+            buffer.resize(size);
+            return buffer;
+        };
+
+        const auto originalPathW = queryPathByHandle(pinnedHandle.Get());
         const auto originalPath = Utils::ProcessUtils::GetProcessPath(processId, nullptr);
         const auto originalName = Utils::ProcessUtils::GetProcessName(processId, nullptr);
-        if (!originalPath && !originalName) {
+        if (!originalPathW && !originalPath && !originalName) {
             Utils::Logger::Warn("GPUMiningDetector: refusing to terminate PID {} because identity could not be verified", processId);
             return false;
         }
@@ -1222,12 +1267,14 @@ public:
             return false;
         }
 
-        // Revalidate identity using the SAME pinned handle — if the process exited
-        // and PID was recycled, the handle still points to the original (now-exited) process,
-        // and GetProcessPath will fail or return the original path, not the new process's path.
+        // Revalidate via the SAME pinned handle. If PID was recycled, the handle still
+        // references the original kernel object; QueryFullProcessImageNameW on the handle
+        // either still returns the original path or fails because the process exited.
+        const auto revalidatedPathW = queryPathByHandle(pinnedHandle.Get());
         const auto revalidatedPath = Utils::ProcessUtils::GetProcessPath(processId, nullptr);
         const auto revalidatedName = Utils::ProcessUtils::GetProcessName(processId, nullptr);
-        if ((originalPath && revalidatedPath && *originalPath != *revalidatedPath) ||
+        if ((originalPathW && revalidatedPathW && *originalPathW != *revalidatedPathW) ||
+            (originalPath && revalidatedPath && *originalPath != *revalidatedPath) ||
             (originalName && revalidatedName && *originalName != *revalidatedName) ||
             Utils::ProcessUtils::IsProcessCritical(processId, nullptr) ||
             Utils::ProcessUtils::IsProcessProtected(processId, nullptr)) {
@@ -1363,11 +1410,17 @@ private:
                     continue;
                 }
 
-                m_status.store(ModuleStatus::Scanning, std::memory_order_release);
+                ModuleStatus expectedRunning = ModuleStatus::Running;
+                (void)m_status.compare_exchange_strong(
+                    expectedRunning, ModuleStatus::Scanning,
+                    std::memory_order_acq_rel, std::memory_order_acquire);
                 auto scanResult = ExecuteScan(true);
                 (void)scanResult;
                 if (!m_stopRequested.load(std::memory_order_acquire)) {
-                    m_status.store(ModuleStatus::Running, std::memory_order_release);
+                    ModuleStatus expectedScanning = ModuleStatus::Scanning;
+                    (void)m_status.compare_exchange_strong(
+                        expectedScanning, ModuleStatus::Running,
+                        std::memory_order_acq_rel, std::memory_order_acquire);
                 }
             } catch (const std::exception& ex) {
                 m_status.store(ModuleStatus::Error, std::memory_order_release);
@@ -1469,10 +1522,21 @@ private:
         }
 
         std::vector<CounterRegistration> counters;
-        counters.reserve(enginePaths.size() + dedicatedPaths.size() + sharedPaths.size());
+        const size_t reserveHint = (std::min)(
+            kMaxPdhCountersTotal,
+            enginePaths.size() + dedicatedPaths.size() + sharedPaths.size());
+        counters.reserve(reserveHint);
 
         auto registerPaths = [&](const std::vector<std::wstring>& paths, const wchar_t* counterName) {
-            for (const auto& path : paths) {
+            const size_t perKindLimit = (std::min)(paths.size(), kMaxPdhCountersPerKind);
+            for (size_t i = 0; i < perKindLimit; ++i) {
+                if (counters.size() >= kMaxPdhCountersTotal) {
+                    Utils::Logger::Warn(
+                        "GPUMiningDetector: PDH counter cap reached ({}); truncating telemetry to bound memory",
+                        kMaxPdhCountersTotal);
+                    return;
+                }
+                const auto& path = paths[i];
                 CounterRegistration registration;
                 registration.path = path;
                 registration.instance = ExtractInstanceFromPdhPath(path);
@@ -1522,10 +1586,10 @@ private:
                 AccumulateEngineValue(process, category, metric);
                 snapshot.engineTelemetryAvailable = true;
             } else if (registration.counterName == L"Dedicated Usage") {
-                process.dedicatedBytes = static_cast<uint64_t>(std::max(0.0, *value));
+                process.dedicatedBytes = SafeDoubleToU64(*value);
                 snapshot.processMemoryTelemetryAvailable = true;
             } else if (registration.counterName == L"Shared Usage") {
-                process.sharedBytes = static_cast<uint64_t>(std::max(0.0, *value));
+                process.sharedBytes = SafeDoubleToU64(*value);
                 snapshot.processMemoryTelemetryAvailable = true;
             }
         }
@@ -1551,6 +1615,7 @@ private:
     [[nodiscard]] GPUProcessInfo BuildProcessInfo(
         const ProcessTelemetry& telemetry,
         const GPUMiningDetectorConfiguration& config,
+        uint64_t deviceMemoryTotalBytes,
         bool& dagDetected) const
     {
         GPUProcessInfo process;
@@ -1590,9 +1655,15 @@ private:
             dagDetected = FindDagFileSizeInternal(telemetry.pid).has_value();
         }
 
+        const double processMemoryPercent = (deviceMemoryTotalBytes > 0U)
+            ? ClampPercent(
+                (static_cast<double>(process.vramUsedBytes) * 100.0) /
+                static_cast<double>(deviceMemoryTotalBytes))
+            : 0.0;
+
         process.suspectedAlgorithm = DetectAlgorithmFromPattern(
             process.computeLoadPercent,
-            0.0,
+            processMemoryPercent,
             process.vramUsedBytes,
             dagDetected);
 
@@ -1813,7 +1884,7 @@ private:
                 for (const auto& [_, processTelemetry] : telemetry.processes) {
                     try {
                         bool processDagDetected = false;
-                        GPUProcessInfo processInfo = BuildProcessInfo(processTelemetry, config, processDagDetected);
+                        GPUProcessInfo processInfo = BuildProcessInfo(processTelemetry, config, device.memoryTotalBytes, processDagDetected);
                         dagDetected = dagDetected || processDagDetected;
                         if (processInfo.gpuUtilization > 0.0 || processInfo.vramUsedBytes > 0U) {
                             processes.push_back(std::move(processInfo));
@@ -1911,7 +1982,7 @@ private:
                 for (const auto& [_, processTelemetry] : telemetry.processes) {
                     try {
                         bool processDagDetected = false;
-                        GPUProcessInfo processInfo = BuildProcessInfo(processTelemetry, configSnapshot, processDagDetected);
+                        GPUProcessInfo processInfo = BuildProcessInfo(processTelemetry, configSnapshot, device.memoryTotalBytes, processDagDetected);
                         dagDetected = dagDetected || processDagDetected;
                         if (processInfo.gpuUtilization > 0.0 || processInfo.vramUsedBytes > 0U) {
                             processes.push_back(std::move(processInfo));
