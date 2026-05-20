@@ -799,7 +799,8 @@ public:
             if (IsTrackingCookieInternal(cookie)) {
                 // Check specific categories
                 std::string lowerDomain = cookie.domain;
-                std::transform(lowerDomain.begin(), lowerDomain.end(), lowerDomain.begin(), ::tolower);
+                std::transform(lowerDomain.begin(), lowerDomain.end(), lowerDomain.begin(),
+                    [](unsigned char ch) noexcept { return static_cast<char>(std::tolower(ch)); });
 
                 if (lowerDomain.find("facebook") != std::string::npos ||
                     lowerDomain.find("twitter") != std::string::npos ||
@@ -823,7 +824,8 @@ public:
 
             // Check essential
             std::string lowerName = cookie.name;
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                [](unsigned char ch) noexcept { return static_cast<char>(std::tolower(ch)); });
 
             if (lowerName.find("session") != std::string::npos ||
                 lowerName.find("csrf") != std::string::npos ||
@@ -956,10 +958,13 @@ public:
                     // Exact domain-suffix match (case-insensitive)
                     std::string lowerDomain = domain;
                     std::string lowerPattern = entry.domainPattern;
+                    auto toLowerChar = [](unsigned char ch) noexcept {
+                        return static_cast<char>(std::tolower(ch));
+                    };
                     std::transform(lowerDomain.begin(), lowerDomain.end(),
-                                   lowerDomain.begin(), ::tolower);
+                                   lowerDomain.begin(), toLowerChar);
                     std::transform(lowerPattern.begin(), lowerPattern.end(),
-                                   lowerPattern.begin(), ::tolower);
+                                   lowerPattern.begin(), toLowerChar);
 
                     if (lowerDomain == lowerPattern ||
                         (lowerDomain.size() > lowerPattern.size() &&
@@ -1018,9 +1023,29 @@ bool CookieManager::Initialize(const CookieConfiguration& config) {
         std::unique_lock lock(m_impl->m_mutex);
 
         if (m_impl->m_status != ModuleStatus::Uninitialized &&
-            m_impl->m_status != ModuleStatus::Stopped) {
+            m_impl->m_status != ModuleStatus::Stopped &&
+            m_impl->m_status != ModuleStatus::Error) {
             Utils::Logger::Warn("CookieManager: Already initialized");
             return false;
+        }
+
+        // If recovering from a prior failed Initialize, clear residual state
+        // before retrying so partial trackers/whitelist/config from the failed
+        // attempt do not contaminate the new run.
+        if (m_impl->m_status == ModuleStatus::Error) {
+            {
+                std::unique_lock trackerLock(m_impl->m_trackerMutex);
+                m_impl->m_trackers.clear();
+            }
+            {
+                std::unique_lock whitelistLock(m_impl->m_whitelistMutex);
+                m_impl->m_whitelist.clear();
+            }
+            {
+                std::unique_lock profileLock(m_impl->m_profileMutex);
+                m_impl->m_browserProfiles.clear();
+            }
+            m_impl->m_status = ModuleStatus::Uninitialized;
         }
 
         // Validate configuration
@@ -1034,7 +1059,9 @@ bool CookieManager::Initialize(const CookieConfiguration& config) {
 
         // Load tracker database if specified
         if (!config.trackerDatabasePath.empty() && fs::exists(config.trackerDatabasePath)) {
-            ImportTrackerList(config.trackerDatabasePath);
+            if (!ImportTrackerList(config.trackerDatabasePath)) {
+                Utils::Logger::Warn("CookieManager: ImportTrackerList failed for configured tracker database; continuing without it");
+            }
         }
 
         // Load custom trackers
@@ -1162,7 +1189,8 @@ std::vector<BrowserCookie> CookieManager::GetAllCookies() {
         auto firefoxCookies = GetCookies(BrowserType::Firefox);
         allCookies.insert(allCookies.end(), firefoxCookies.begin(), firefoxCookies.end());
 
-        m_impl->m_stats.totalCookiesScanned += allCookies.size();
+        // Note: totalCookiesScanned is incremented per-browser inside GetCookies();
+        // re-adding allCookies.size() here would double-count.
 
         Utils::Logger::Info("CookieManager: Enumerated {} total cookies", allCookies.size());
 
@@ -1619,15 +1647,46 @@ bool CookieManager::RemoveTracker(const std::string& trackerId) {
 
 bool CookieManager::ImportTrackerList(const fs::path& listPath) {
     try {
-        if (!fs::exists(listPath)) {
-            Utils::Logger::Error("CookieManager: Tracker list not found: {}", listPath.string());
+        // Validate input path: must be a regular file, must canonicalize without
+        // traversal escape, and must not exceed the configured size cap. This
+        // hardens the importer against path-injection and resource-exhaustion.
+        std::error_code ec;
+        fs::path canonical = fs::weakly_canonical(listPath, ec);
+        if (ec || canonical.empty()) {
+            Utils::Logger::Error("CookieManager: ImportTrackerList rejected unresolvable path");
             return false;
         }
 
-        std::ifstream file(listPath);
+        for (const auto& part : canonical) {
+            if (part == L"..") {
+                Utils::Logger::Error("CookieManager: ImportTrackerList rejected path containing traversal segments");
+                return false;
+            }
+        }
+
+        if (!fs::is_regular_file(canonical, ec) || ec) {
+            Utils::Logger::Error("CookieManager: ImportTrackerList rejected non-regular file: {}",
+                                 canonical.string());
+            return false;
+        }
+
+        constexpr std::uintmax_t kMaxTrackerFileBytes = 64ull * 1024ull * 1024ull;
+        const std::uintmax_t fileSize = fs::file_size(canonical, ec);
+        if (ec || fileSize > kMaxTrackerFileBytes) {
+            Utils::Logger::Error("CookieManager: ImportTrackerList rejected oversized or unreadable file");
+            return false;
+        }
+
+        std::ifstream file(canonical);
         if (!file) {
             return false;
         }
+
+        // Monotonic counter across all imports — prevents tracker-ID collisions
+        // when ImportTrackerList is invoked multiple times during a process
+        // lifetime (the previous "imported" loop variable reset to zero per
+        // call and silently overwrote earlier entries in m_trackers).
+        static std::atomic<std::uint64_t> s_importedTotal{0};
 
         size_t imported = 0;
         std::string line;
@@ -1640,12 +1699,18 @@ bool CookieManager::ImportTrackerList(const fs::path& listPath) {
 
             // Parse tracker entry (simple format: domain pattern)
             TrackerInfo tracker;
-            tracker.trackerId = "IMPORTED-" + std::to_string(imported);
+            const std::uint64_t serial =
+                s_importedTotal.fetch_add(1, std::memory_order_relaxed);
+            tracker.trackerId = "IMPORTED-" + std::to_string(serial);
             tracker.domainPattern = line;
             tracker.category = CookieCategory::Tracking;
             tracker.isActive = true;
 
-            AddTracker(tracker);
+            if (!AddTracker(tracker)) {
+                Utils::Logger::Warn("CookieManager: ImportTrackerList: AddTracker rejected entry {}",
+                                    tracker.trackerId);
+                continue;
+            }
             ++imported;
 
             if (imported >= CookieConstants::MAX_TRACKER_LIST) {
@@ -1857,7 +1922,6 @@ uint64_t CookieManager::DeleteExpiredCookies() {
 
     try {
         auto allCookies = GetAllCookies();
-        auto now = std::chrono::system_clock::now();
 
         for (const auto& cookie : allCookies) {
             if (cookie.IsExpired()) {
@@ -2016,6 +2080,9 @@ std::vector<DomainCookieSummary> CookieManager::GetDomainSummaries() {
             if (IsTrackerDomain(domain)) {
                 std::shared_lock lock(m_impl->m_trackerMutex);
                 for (const auto& [id, tracker] : m_impl->m_trackers) {
+                    if (tracker.domainPattern.empty()) {
+                        continue;  // empty pattern would match every domain
+                    }
                     if (domain.find(tracker.domainPattern) != std::string::npos) {
                         summary.trackerInfo = tracker;
                         break;
@@ -2274,7 +2341,10 @@ bool CookieManager::SelfTest() {
                 return false;
             }
 
-            RemoveFromWhitelist("TEST-001");
+            if (!RemoveFromWhitelist("TEST-001")) {
+                Utils::Logger::Error("CookieManager: Self-test failed (whitelist remove)");
+                return false;
+            }
         }
 
         Utils::Logger::Info("CookieManager: Self-test PASSED");
