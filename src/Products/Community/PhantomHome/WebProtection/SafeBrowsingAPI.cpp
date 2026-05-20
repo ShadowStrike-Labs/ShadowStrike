@@ -331,17 +331,17 @@ public:
     [[nodiscard]] bool Initialize(const SafeBrowsingConfig& config, ThreatIntelLookup* lookup) {
         std::unique_lock lock(m_mutex);
 
-        if (m_status == SafeBrowsingStatus::Running) {
+        if (m_status.load(std::memory_order_acquire) == SafeBrowsingStatus::Running) {
             SB_LOG_WARN("Already initialized");
             return true;
         }
 
-        m_status = SafeBrowsingStatus::Initializing;
+        m_status.store(SafeBrowsingStatus::Initializing, std::memory_order_release);
 
         // Validate configuration
         if (!config.IsValid()) {
             SB_LOG_ERROR("Invalid configuration");
-            m_status = SafeBrowsingStatus::Error;
+            m_status.store(SafeBrowsingStatus::Error, std::memory_order_release);
             return false;
         }
 
@@ -355,28 +355,29 @@ public:
 
         // Set up threat intelligence integration
         if (lookup) {
-            m_threatLookup = lookup;
+            m_threatLookup.store(lookup, std::memory_order_release);
             m_ownsLookup = false;
             SB_LOG_INFO("Using provided ThreatIntelLookup instance");
         } else {
-            m_threatLookup = nullptr;
+            m_threatLookup.store(nullptr, std::memory_order_release);
             m_ownsLookup = false;
             SB_LOG_WARN("No ThreatIntelLookup available - running in degraded mode");
-            m_status = SafeBrowsingStatus::Degraded;
+            m_status.store(SafeBrowsingStatus::Degraded, std::memory_order_release);
         }
 
-        // Initialize caches
+        // Initialize caches (must hold cache mutex separately).
         if (m_config.enableLocalCache) {
+            std::unique_lock cacheLock(m_cacheMutex);
             ClearCacheInternal();
             SB_LOG_INFO("Cache initialized with max size: {}", m_config.maxCacheEntries);
         }
 
-        if (m_status != SafeBrowsingStatus::Degraded) {
-            m_status = SafeBrowsingStatus::Running;
+        if (m_status.load(std::memory_order_acquire) != SafeBrowsingStatus::Degraded) {
+            m_status.store(SafeBrowsingStatus::Running, std::memory_order_release);
         }
 
         SB_LOG_INFO("SafeBrowsingAPI initialized successfully (Status: {})",
-                    GetStatusName(m_status));
+                    GetStatusName(m_status.load(std::memory_order_acquire)));
         return true;
     }
 
@@ -384,13 +385,17 @@ public:
         {
             std::unique_lock lock(m_mutex);
 
-            if (m_status == SafeBrowsingStatus::Stopped ||
-                m_status == SafeBrowsingStatus::Uninitialized) {
+            const SafeBrowsingStatus cur = m_status.load(std::memory_order_acquire);
+            if (cur == SafeBrowsingStatus::Stopped ||
+                cur == SafeBrowsingStatus::Uninitialized) {
                 return;
             }
 
-            // Clear caches
-            ClearCacheInternal();
+            // Clear caches under the cache mutex (separate from m_mutex).
+            {
+                std::unique_lock cacheLock(m_cacheMutex);
+                ClearCacheInternal();
+            }
 
             // Clear callbacks
             {
@@ -398,11 +403,13 @@ public:
                 m_threatCallbacks.clear();
             }
 
-            if (m_ownsLookup && m_threatLookup) {
-                m_threatLookup = nullptr;
-            }
+            // Always drop the ThreatIntelLookup pointer, whether we owned it
+            // or not. The caller may destroy their lookup right after Shutdown
+            // returns, so any pointer left in m_threatLookup would dangle.
+            m_threatLookup.store(nullptr, std::memory_order_release);
+            m_ownsLookup = false;
 
-            m_status = SafeBrowsingStatus::Stopped;
+            m_status.store(SafeBrowsingStatus::Stopped, std::memory_order_release);
         }
 
         WaitForCallbackTasks();
@@ -410,12 +417,13 @@ public:
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
-        return m_status == SafeBrowsingStatus::Running ||
-               m_status == SafeBrowsingStatus::Degraded;
+        const SafeBrowsingStatus s = m_status.load(std::memory_order_acquire);
+        return s == SafeBrowsingStatus::Running ||
+               s == SafeBrowsingStatus::Degraded;
     }
 
     [[nodiscard]] SafeBrowsingStatus GetStatus() const noexcept {
-        return m_status;
+        return m_status.load(std::memory_order_acquire);
     }
 
     // ========================================================================
@@ -447,6 +455,23 @@ public:
             return result;
         }
 
+        // Snapshot config under shared_lock so concurrent UpdateConfig cannot
+        // tear reads of failClosed / cacheTTL / thresholds during this lookup.
+        SafeBrowsingConfig cfg;
+        SafeBrowsingStatus status;
+        {
+            std::shared_lock lock(m_mutex);
+            cfg = m_config;
+            status = m_status.load(std::memory_order_acquire);
+        }
+
+        if (status != SafeBrowsingStatus::Running && status != SafeBrowsingStatus::Degraded) {
+            result.isSafe = !cfg.failClosed;
+            result.details = "SafeBrowsingAPI not active";
+            m_stats.lookupErrors++;
+            return result;
+        }
+
         std::string urlStr(url);
 
         // Normalize URL for consistent caching
@@ -456,7 +481,7 @@ public:
         m_stats.urlLookups++;
 
         // 1. Check local cache
-        if (m_config.enableLocalCache) {
+        if (cfg.enableLocalCache) {
             if (auto cached = GetFromCache(normalizedUrl)) {
                 m_stats.cacheHits++;
                 cached->source = LookupSource::Cache;
@@ -468,21 +493,22 @@ public:
         }
 
         // 2. Perform threat intelligence lookup
-        if (m_threatLookup) {
+        ThreatIntelLookup* lookup = m_threatLookup.load(std::memory_order_acquire);
+        if (lookup) {
             try {
                 UnifiedLookupOptions options;
                 options.includeMetadata = true;
-                options.minConfidence = static_cast<uint8_t>(m_config.minConfidenceThreshold);
+                options.minConfidence = static_cast<uint8_t>(cfg.minConfidenceThreshold);
 
-                auto tiResult = m_threatLookup->LookupURL(normalizedUrl, options);
-                MapThreatResultToSafeBrowsing(tiResult, result);
+                auto tiResult = lookup->LookupURL(normalizedUrl, options);
+                MapThreatResultToSafeBrowsing(tiResult, result, cfg);
                 result.source = LookupSource::ThreatIntel;
             } catch (const std::exception& e) {
                 SB_LOG_ERROR("ThreatIntel lookup failed: {}", e.what());
                 m_stats.lookupErrors++;
 
                 // Fail-closed or fail-open based on config
-                if (m_config.failClosed) {
+                if (cfg.failClosed) {
                     result.isSafe = false;
                     result.isSuspicious = true;
                     result.details = "Lookup failed - blocking due to fail-closed policy";
@@ -504,8 +530,8 @@ public:
         UpdateStatistics(result);
 
         // 5. Cache the result
-        if (m_config.enableLocalCache) {
-            AddToCache(normalizedUrl, result);
+        if (cfg.enableLocalCache) {
+            AddToCache(normalizedUrl, result, cfg);
         }
 
         // 6. Notify callbacks if threat detected
@@ -516,7 +542,7 @@ public:
         result.latencyUs = GetElapsedUs(startTime);
         m_stats.totalProcessingTimeUs += result.latencyUs;
 
-        if (m_config.verboseLogging) {
+        if (cfg.verboseLogging) {
             SB_LOG_DEBUG("URL check: {} -> Safe={}, Latency={} us",
                         urlStr, result.isSafe, result.latencyUs);
         }
@@ -605,6 +631,21 @@ public:
             return result;
         }
 
+        SafeBrowsingConfig cfg;
+        SafeBrowsingStatus status;
+        {
+            std::shared_lock lock(m_mutex);
+            cfg = m_config;
+            status = m_status.load(std::memory_order_acquire);
+        }
+
+        if (status != SafeBrowsingStatus::Running && status != SafeBrowsingStatus::Degraded) {
+            result.isSafe = !cfg.failClosed;
+            result.details = "SafeBrowsingAPI not active";
+            m_stats.lookupErrors++;
+            return result;
+        }
+
         std::string domainStr(domain);
 
         // Normalize domain
@@ -616,7 +657,7 @@ public:
 
         // Check cache
         std::string cacheKey = "domain:" + domainStr;
-        if (m_config.enableLocalCache) {
+        if (cfg.enableLocalCache) {
             if (auto cached = GetFromCache(cacheKey)) {
                 m_stats.cacheHits++;
                 cached->source = LookupSource::Cache;
@@ -628,18 +669,19 @@ public:
         }
 
         // Perform lookup
-        if (m_threatLookup) {
+        ThreatIntelLookup* lookup = m_threatLookup.load(std::memory_order_acquire);
+        if (lookup) {
             try {
                 UnifiedLookupOptions options;
                 options.includeMetadata = true;
 
-                auto tiResult = m_threatLookup->LookupDomain(domainStr, options);
-                MapThreatResultToSafeBrowsing(tiResult, result);
+                auto tiResult = lookup->LookupDomain(domainStr, options);
+                MapThreatResultToSafeBrowsing(tiResult, result, cfg);
                 result.source = LookupSource::ThreatIntel;
             } catch (const std::exception& e) {
                 SB_LOG_ERROR("Domain lookup failed: {}", e.what());
                 m_stats.lookupErrors++;
-                result.isSafe = !m_config.failClosed;
+                result.isSafe = !cfg.failClosed;
             }
         }
 
@@ -648,8 +690,8 @@ public:
 
         UpdateStatistics(result);
 
-        if (m_config.enableLocalCache) {
-            AddToCache(cacheKey, result);
+        if (cfg.enableLocalCache) {
+            AddToCache(cacheKey, result, cfg);
         }
 
         result.latencyUs = GetElapsedUs(startTime);
@@ -702,17 +744,55 @@ public:
             return result;
         }
 
+        // Validate hash is pure hex and has a length matching a known digest
+        // (MD5=32, SHA1=40, SHA256=64). Rejecting non-hex up front prevents
+        // attacker-controlled cache poisoning via arbitrary string keys and
+        // shields the downstream ThreatIntelLookup from malformed input.
+        if (hash.length() != 32 && hash.length() != 40 && hash.length() != 64) {
+            result.details = "Hash has unsupported length";
+            m_stats.lookupErrors++;
+            return result;
+        }
+        for (char c : hash) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            if (!((uc >= '0' && uc <= '9') ||
+                  (uc >= 'a' && uc <= 'f') ||
+                  (uc >= 'A' && uc <= 'F'))) {
+                result.details = "Hash contains non-hex characters";
+                m_stats.lookupErrors++;
+                return result;
+            }
+        }
+
+        SafeBrowsingConfig cfg;
+        SafeBrowsingStatus status;
+        {
+            std::shared_lock lock(m_mutex);
+            cfg = m_config;
+            status = m_status.load(std::memory_order_acquire);
+        }
+
+        if (status != SafeBrowsingStatus::Running && status != SafeBrowsingStatus::Degraded) {
+            result.isSafe = !cfg.failClosed;
+            result.details = "SafeBrowsingAPI not active";
+            m_stats.lookupErrors++;
+            return result;
+        }
+
         std::string hashStr(hash);
 
-        // Normalize hash (lowercase)
-        std::transform(hashStr.begin(), hashStr.end(), hashStr.begin(), ::tolower);
+        // Normalize hash (lowercase). Cast via unsigned char to avoid
+        // signed-char undefined behaviour and the implicit-narrowing warning
+        // from the bare ::tolower function pointer.
+        std::transform(hashStr.begin(), hashStr.end(), hashStr.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
         m_stats.totalLookups++;
         m_stats.hashLookups++;
 
         // Check cache
         std::string cacheKey = "hash:" + hashStr;
-        if (m_config.enableLocalCache) {
+        if (cfg.enableLocalCache) {
             if (auto cached = GetFromCache(cacheKey)) {
                 m_stats.cacheHits++;
                 cached->source = LookupSource::Cache;
@@ -724,25 +804,26 @@ public:
         }
 
         // Perform lookup
-        if (m_threatLookup) {
+        ThreatIntelLookup* lookup = m_threatLookup.load(std::memory_order_acquire);
+        if (lookup) {
             try {
                 UnifiedLookupOptions options;
                 options.includeMetadata = true;
 
-                auto tiResult = m_threatLookup->LookupHash(hashStr, options);
-                MapThreatResultToSafeBrowsing(tiResult, result);
+                auto tiResult = lookup->LookupHash(hashStr, options);
+                MapThreatResultToSafeBrowsing(tiResult, result, cfg);
                 result.source = LookupSource::ThreatIntel;
             } catch (const std::exception& e) {
                 SB_LOG_ERROR("Hash lookup failed: {}", e.what());
                 m_stats.lookupErrors++;
-                result.isSafe = !m_config.failClosed;
+                result.isSafe = !cfg.failClosed;
             }
         }
 
         UpdateStatistics(result);
 
-        if (m_config.enableLocalCache) {
-            AddToCache(cacheKey, result);
+        if (cfg.enableLocalCache) {
+            AddToCache(cacheKey, result, cfg);
         }
 
         result.latencyUs = GetElapsedUs(startTime);
@@ -787,8 +868,10 @@ public:
 
         m_config = config;
 
-        // Clear cache if disabled
+        // Clear cache if disabled. Must acquire the cache mutex; m_mutex does
+        // not protect cache contents.
         if (!m_config.enableLocalCache) {
+            std::unique_lock cacheLock(m_cacheMutex);
             ClearCacheInternal();
         }
 
@@ -816,10 +899,18 @@ public:
     }
 
     void PreloadCache(std::span<const std::string> urls) {
-        SB_LOG_INFO("Preloading {} URLs into cache", urls.size());
+        // Bound the preload to prevent an attacker (or a misconfigured caller)
+        // from forcing an unbounded number of synchronous lookups in a single
+        // call, which would otherwise saturate the threat-intel pipeline.
+        constexpr size_t kPreloadCap = 4096;
+        const size_t count = std::min(urls.size(), kPreloadCap);
+        if (urls.size() > kPreloadCap) {
+            SB_LOG_WARN("PreloadCache truncated from {} to {} entries", urls.size(), kPreloadCap);
+        }
+        SB_LOG_INFO("Preloading {} URLs into cache", count);
 
-        for (const auto& url : urls) {
-            CheckUrl(url);
+        for (size_t i = 0; i < count; ++i) {
+            (void)CheckUrl(urls[i]);
         }
 
         SB_LOG_INFO("Cache preload complete");
@@ -894,10 +985,15 @@ public:
         }
 
         // Test 3: Check cache operations
-        if (m_config.enableLocalCache) {
+        bool cacheEnabled;
+        {
+            std::shared_lock lock(m_mutex);
+            cacheEnabled = m_config.enableLocalCache;
+        }
+        if (cacheEnabled) {
             std::string testUrl = "https://selftest.example.com/test123";
-            CheckUrl(testUrl);  // First call - cache miss
-            CheckUrl(testUrl);  // Second call - should be cache hit
+            (void)CheckUrl(testUrl);  // First call - cache miss
+            (void)CheckUrl(testUrl);  // Second call - should be cache hit
 
             if (m_stats.cacheHits.load() == 0) {
                 SB_LOG_ERROR("Self-test failed: Cache not working");
@@ -934,10 +1030,17 @@ private:
     mutable std::shared_mutex m_callbackMutex;
     mutable std::mutex m_callbackTaskMutex;
 
-    SafeBrowsingStatus m_status{SafeBrowsingStatus::Uninitialized};
+    // m_status is read lock-free from IsInitialized()/GetStatus() (both
+    // noexcept and called from hot paths). Make it atomic so concurrent
+    // Initialize/Shutdown publish state without tearing.
+    std::atomic<SafeBrowsingStatus> m_status{SafeBrowsingStatus::Uninitialized};
     SafeBrowsingConfig m_config;
 
-    ThreatIntelLookup* m_threatLookup{nullptr};
+    // ThreatIntelLookup is owned by the caller (we never delete it). Storing as
+    // an atomic guarantees the pointer is published/cleared atomically across
+    // Initialize/Shutdown and any concurrent CheckXxx caller, so we cannot tear
+    // a partial write and cannot read a stale pointer after Shutdown.
+    std::atomic<ThreatIntelLookup*> m_threatLookup{nullptr};
     bool m_ownsLookup{false};
 
     // LRU Cache
@@ -966,26 +1069,60 @@ private:
     [[nodiscard]] std::string NormalizeUrl(const std::string& url) const {
         std::string normalized = url;
 
-        // Remove trailing slash
-        if (!normalized.empty() && normalized.back() == '/') {
-            normalized.pop_back();
+        // 1. Drop fragment: phishing payloads commonly stuff junk after '#' so
+        //    https://evil.com/login#a and https://evil.com/login#b
+        //    must collapse to the same cache key.
+        auto hashPos = normalized.find('#');
+        if (hashPos != std::string::npos) {
+            normalized.erase(hashPos);
         }
 
-        // Lowercase protocol and domain
+        // 2. Lowercase scheme and authority. We only lowercase up to the
+        //    path so query strings (which are case-sensitive in many backends)
+        //    are preserved.
         size_t protocolEnd = normalized.find("://");
+        size_t authorityEnd = std::string::npos;
         if (protocolEnd != std::string::npos) {
-            size_t pathStart = normalized.find('/', protocolEnd + 3);
-            size_t domainEnd = (pathStart != std::string::npos) ? pathStart : normalized.length();
+            size_t authStart = protocolEnd + 3;
+            size_t pathStart = normalized.find('/', authStart);
+            size_t queryStart = normalized.find('?', authStart);
+            authorityEnd = std::min(pathStart, queryStart);
+            if (authorityEnd == std::string::npos) {
+                authorityEnd = normalized.length();
+            }
 
-            std::transform(normalized.begin(), normalized.begin() + domainEnd,
-                          normalized.begin(), ::tolower);
+            // 3. Strip RFC 3986 userinfo from the authority. Failing to do
+            //    this lets "https://paypal.com@evil.com/" produce a cache key
+            //    distinct from "https://evil.com/" and lets it slip past
+            //    threat-intel domain lookups that hash on the host alone.
+            auto at = normalized.find('@', authStart);
+            if (at != std::string::npos && at < authorityEnd) {
+                normalized.erase(authStart, (at - authStart) + 1);
+                authorityEnd -= (at - authStart) + 1;
+            }
+
+            std::transform(normalized.begin(), normalized.begin() + authorityEnd,
+                          normalized.begin(),
+                          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        }
+
+        // 4. Remove trailing slash from the path (but never from the bare
+        //    authority — "https://evil.com/" already has the slash directly
+        //    after authority, which we keep as-is).
+        if (normalized.size() > 1 && normalized.back() == '/') {
+            // Only strip if there is actually a path beyond the authority.
+            if (authorityEnd != std::string::npos &&
+                authorityEnd < normalized.size() - 1) {
+                normalized.pop_back();
+            }
         }
 
         return normalized;
     }
 
     void MapThreatResultToSafeBrowsing(const ThreatLookupResult& tiResult,
-                                       SafeBrowsingResult& result) {
+                                       SafeBrowsingResult& result,
+                                       const SafeBrowsingConfig& cfg) {
         result.isSafe = tiResult.IsSafe();
         result.isMalicious = tiResult.IsMalicious();
         result.isSuspicious = tiResult.IsSuspicious();
@@ -1032,17 +1169,17 @@ private:
         }
 
         // Apply configuration-based blocking
-        if (result.isMalicious && m_config.blockKnownMalware) {
+        if (result.isMalicious && cfg.blockKnownMalware) {
             result.isSafe = false;
         }
-        if (result.isSuspicious && m_config.blockSuspicious &&
-            result.confidence >= m_config.minConfidenceThreshold) {
+        if (result.isSuspicious && cfg.blockSuspicious &&
+            result.confidence >= cfg.minConfidenceThreshold) {
             result.isSafe = false;
         }
-        if (result.isPhishing && m_config.enablePhishingProtection) {
+        if (result.isPhishing && cfg.enablePhishingProtection) {
             result.isSafe = false;
         }
-        if (result.isPUA && m_config.enablePUADetection) {
+        if (result.isPUA && cfg.enablePUADetection) {
             result.isSafe = false;
         }
     }
@@ -1201,7 +1338,8 @@ private:
         return it->second->second.result;
     }
 
-    void AddToCache(const std::string& key, const SafeBrowsingResult& result) {
+    void AddToCache(const std::string& key, const SafeBrowsingResult& result,
+                    const SafeBrowsingConfig& cfg) {
         std::unique_lock lock(m_cacheMutex);
 
         auto it = m_cache.find(key);
@@ -1209,13 +1347,13 @@ private:
             // Update existing
             it->second->second.result = result;
             it->second->second.expiration =
-                std::chrono::steady_clock::now() + m_config.cacheTTL;
+                std::chrono::steady_clock::now() + cfg.cacheTTL;
             m_lruList.splice(m_lruList.begin(), m_lruList, it->second);
             return;
         }
 
         // Evict if full
-        while (m_cache.size() >= m_config.maxCacheEntries && !m_lruList.empty()) {
+        while (m_cache.size() >= cfg.maxCacheEntries && !m_lruList.empty()) {
             auto last = m_lruList.end();
             --last;
             m_cache.erase(last->first);
@@ -1225,7 +1363,7 @@ private:
         // Add new
         CacheEntry entry;
         entry.result = result;
-        entry.expiration = std::chrono::steady_clock::now() + m_config.cacheTTL;
+        entry.expiration = std::chrono::steady_clock::now() + cfg.cacheTTL;
 
         m_lruList.push_front({key, entry});
         m_cache[key] = m_lruList.begin();
