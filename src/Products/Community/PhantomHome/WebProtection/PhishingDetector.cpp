@@ -173,6 +173,18 @@ namespace {
         return result;
     }
 
+    // Strip "userinfo@" prefix from URL authority component (RFC 3986 section 3.2.1).
+    // A common phishing vector is "https://paypal.com@evil.com/" where the actual host
+    // is "evil.com" but a naive parser would extract "paypal.com@evil.com" and surface
+    // the brand name. We discard everything up to and including the LAST '@' in the
+    // authority (preserving credentials inside paths is not a concern here, since we
+    // operate on the authority component only).
+    std::string StripUserInfoFromAuthority(const std::string& authority) {
+        auto at = authority.rfind('@');
+        if (at == std::string::npos) return authority;
+        return authority.substr(at + 1);
+    }
+
     // Extract the registrable domain (last two labels) from a full domain
     std::string ExtractRegistrableDomain(const std::string& domain) {
         auto pos = domain.rfind('.');
@@ -262,6 +274,14 @@ public:
             return result;
         }
 
+        // Snapshot config under shared_lock so concurrent UpdateConfiguration cannot
+        // tear reads of thresholds / feature toggles during the rest of this analysis.
+        PhishingDetectorConfiguration cfg;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            cfg = m_config;
+        }
+
         // Parse URL components
         std::regex urlRegex(R"(^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?)",
                             std::regex_constants::ECMAScript);
@@ -274,20 +294,53 @@ public:
         std::string scheme    = urlMatch[2].str();
         std::string authority = urlMatch[4].str();
 
-        // Separate host:port
-        auto colonPos = authority.rfind(':');
-        if (colonPos != std::string::npos && colonPos > 0) {
-            std::string portStr = authority.substr(colonPos + 1);
-            bool isPort = !portStr.empty() && std::all_of(portStr.begin(), portStr.end(), ::isdigit);
-            if (isPort) {
-                result.urlAnalysis.domain = authority.substr(0, colonPos);
-                result.urlAnalysis.port   = static_cast<uint16_t>(std::stoul(portStr));
-                result.urlAnalysis.hasPort = true;
+        // RFC 3986: discard userinfo. Failing to do this allows
+        // "https://paypal.com@evil.com/" to be misclassified as targeting paypal.
+        authority = StripUserInfoFromAuthority(authority);
+
+        // Separate host:port. Guard against IPv6 literals "[::1]:443" and against
+        // overflow of stoul on attacker-controlled digit runs.
+        if (!authority.empty() && authority.front() == '[') {
+            auto closeBracket = authority.find(']');
+            if (closeBracket != std::string::npos) {
+                result.urlAnalysis.domain = authority.substr(1, closeBracket - 1);
+                if (closeBracket + 1 < authority.size() && authority[closeBracket + 1] == ':') {
+                    std::string portStr = authority.substr(closeBracket + 2);
+                    if (!portStr.empty() && portStr.size() <= 5 &&
+                        std::all_of(portStr.begin(), portStr.end(), ::isdigit)) {
+                        unsigned long parsed = 0;
+                        try { parsed = std::stoul(portStr); } catch (...) { parsed = 0; }
+                        if (parsed > 0 && parsed <= 65535) {
+                            result.urlAnalysis.port = static_cast<uint16_t>(parsed);
+                            result.urlAnalysis.hasPort = true;
+                        }
+                    }
+                }
             } else {
                 result.urlAnalysis.domain = authority;
             }
         } else {
-            result.urlAnalysis.domain = authority;
+            auto colonPos = authority.rfind(':');
+            if (colonPos != std::string::npos && colonPos > 0) {
+                std::string portStr = authority.substr(colonPos + 1);
+                bool digitsOnly = !portStr.empty() && portStr.size() <= 5 &&
+                                  std::all_of(portStr.begin(), portStr.end(), ::isdigit);
+                if (digitsOnly) {
+                    unsigned long parsed = 0;
+                    try { parsed = std::stoul(portStr); } catch (...) { parsed = 0; }
+                    if (parsed > 0 && parsed <= 65535) {
+                        result.urlAnalysis.domain  = authority.substr(0, colonPos);
+                        result.urlAnalysis.port    = static_cast<uint16_t>(parsed);
+                        result.urlAnalysis.hasPort = true;
+                    } else {
+                        result.urlAnalysis.domain = authority.substr(0, colonPos);
+                    }
+                } else {
+                    result.urlAnalysis.domain = authority;
+                }
+            } else {
+                result.urlAnalysis.domain = authority;
+            }
         }
 
         result.urlAnalysis.normalizedUrl = url;
@@ -454,7 +507,7 @@ public:
         // ----------------------------------------------------------------
         // 9. Threat Intelligence Check
         // ----------------------------------------------------------------
-        if (m_config.checkThreatIntel) {
+        if (cfg.checkThreatIntel) {
             auto& tiMgr = ThreatIntel::ThreatIntelManager::Instance();
             if (tiMgr.IsInitialized()) {
                 auto urlLookup = tiMgr.LookupURL(url);
@@ -491,11 +544,11 @@ public:
         // 10. Calculate Final Verdict
         // ----------------------------------------------------------------
         if (result.verdict != PhishingVerdict::KnownBad) {
-            if (result.score >= m_config.phishingThreshold) {
+            if (result.score >= cfg.phishingThreshold) {
                 result.isPhishing = true;
                 result.verdict = PhishingVerdict::Phishing;
                 result.reason  = "Multiple phishing indicators detected";
-            } else if (result.score >= m_config.suspiciousThreshold) {
+            } else if (result.score >= cfg.suspiciousThreshold) {
                 result.verdict = PhishingVerdict::Suspicious;
                 result.reason  = "Suspicious characteristics detected";
             }
@@ -865,10 +918,12 @@ public:
                 structural += std::string(elem.tag) + ":" + std::to_string(elem.count) + ";";
             }
             structural += "len:" + std::to_string(html.size());
-            hasher.Update(structural.data(), structural.size());
-            std::string fpHash;
-            hasher.FinalHex(fpHash);
-            result.faviconHash = fpHash; // Reusing field for structure fingerprint
+            if (hasher.Update(structural.data(), structural.size())) {
+                std::string fpHash;
+                if (hasher.FinalHex(fpHash)) {
+                    result.faviconHash = std::move(fpHash);
+                }
+            }
         }
 
         return result;
@@ -1010,24 +1065,35 @@ bool PhishingDetector::Initialize(const PhishingDetectorConfiguration& config) {
     }
     m_impl->m_config = config;
 
+    // Clear any state from a prior Initialize/Shutdown cycle so re-initialization
+    // is deterministic and cannot leak brands or callbacks from a previous config.
+    m_impl->m_protectedBrands.clear();
+
     // Populate brand-to-domain mapping from defaults
     for (const auto& entry : kDefaultBrandDomains) {
+        if (m_impl->m_protectedBrands.size() >= MAX_PROTECTED_BRANDS) break;
         std::vector<std::string> domains(entry.domains.begin(), entry.domains.end());
         m_impl->m_protectedBrands[entry.brand] = std::move(domains);
     }
 
-    // Merge additional brands from config
+    // Merge additional brands from config (with hard cap enforcement)
+    size_t skipped = 0;
     for (const auto& brand : config.protectedBrands) {
         std::string lowerBrand = NarrowToLowerPD(brand);
-        if (m_impl->m_protectedBrands.find(lowerBrand) == m_impl->m_protectedBrands.end()) {
-            // Not in defaults; generate domain from brand name
-            m_impl->m_protectedBrands[lowerBrand] = {lowerBrand + ".com"};
+        if (lowerBrand.empty()) continue;
+        if (m_impl->m_protectedBrands.find(lowerBrand) != m_impl->m_protectedBrands.end()) {
+            continue;
         }
+        if (m_impl->m_protectedBrands.size() >= MAX_PROTECTED_BRANDS) {
+            ++skipped;
+            continue;
+        }
+        m_impl->m_protectedBrands[lowerBrand] = {lowerBrand + ".com"};
     }
 
-    if (m_impl->m_protectedBrands.size() > MAX_PROTECTED_BRANDS) {
-        Logger::Warn("PhishingDetector: brand count {} exceeds limit {}, truncating",
-                     m_impl->m_protectedBrands.size(), MAX_PROTECTED_BRANDS);
+    if (skipped > 0) {
+        Logger::Warn("PhishingDetector: skipped {} configured brands; protected-brand cap ({}) reached",
+                     skipped, MAX_PROTECTED_BRANDS);
     }
 
     Logger::Info("PhishingDetector: initialized with threshold={}, {} protected brands",
@@ -1037,8 +1103,17 @@ bool PhishingDetector::Initialize(const PhishingDetectorConfiguration& config) {
 }
 
 void PhishingDetector::Shutdown() {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_status = ModuleStatus::Stopped;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        m_impl->m_status = ModuleStatus::Stopped;
+        m_impl->m_protectedBrands.clear();
+    }
+    {
+        std::unique_lock cblock(m_impl->m_callbackMutex);
+        m_impl->m_detectionCallbacks.clear();
+        m_impl->m_brandCallbacks.clear();
+        m_impl->m_errorCallbacks.clear();
+    }
     Logger::Info("PhishingDetector: shutdown complete");
 }
 
@@ -1051,6 +1126,10 @@ ModuleStatus PhishingDetector::GetStatus() const noexcept {
 }
 
 bool PhishingDetector::UpdateConfiguration(const PhishingDetectorConfiguration& config) {
+    if (!config.IsValid()) {
+        Logger::Error("PhishingDetector: UpdateConfiguration rejected invalid configuration");
+        return false;
+    }
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config = config;
     return true;
@@ -1062,6 +1141,16 @@ PhishingDetectorConfiguration PhishingDetector::GetConfiguration() const {
 }
 
 PhishingScore PhishingDetector::AnalyzeURL(const std::string& url) {
+    if (m_impl->m_status != ModuleStatus::Running) {
+        // Refuse to analyse before Initialize or after Shutdown so we do not
+        // touch lazily-initialised state (protected brands, ThreatIntel) and
+        // do not mutate statistics from a module that is not active.
+        PhishingScore inactive;
+        inactive.verdict = PhishingVerdict::Safe;
+        inactive.reason  = "PhishingDetector not initialized";
+        return inactive;
+    }
+
     m_impl->m_stats.totalAnalyzed++;
 
     auto score = m_impl->AnalyzeURLInternal(url);
@@ -1107,8 +1196,14 @@ PhishingScore PhishingDetector::AnalyzePageContent(const std::string& url, const
 
     PhishingScore score = AnalyzeURL(url);
 
+    PhishingDetectorConfiguration cfg;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        cfg = m_impl->m_config;
+    }
+
     // Form analysis
-    if (m_impl->m_config.enableFormAnalysis) {
+    if (cfg.enableFormAnalysis) {
         m_impl->m_stats.loginFormsAnalyzed++;
         auto formRes = m_impl->AnalyzeFormsInternal(html);
         score.formAnalysis = formRes;
@@ -1136,7 +1231,7 @@ PhishingScore PhishingDetector::AnalyzePageContent(const std::string& url, const
     }
 
     // Re-evaluate verdict after content analysis
-    if (score.score >= m_impl->m_config.phishingThreshold && score.verdict != PhishingVerdict::KnownBad) {
+    if (score.score >= cfg.phishingThreshold && score.verdict != PhishingVerdict::KnownBad) {
         score.isPhishing = true;
         score.verdict = PhishingVerdict::Phishing;
     }
@@ -1146,11 +1241,17 @@ PhishingScore PhishingDetector::AnalyzePageContent(const std::string& url, const
 
 PhishingScore PhishingDetector::AnalyzeFull(
         const std::string& url, const std::string& html, const std::vector<uint8_t>& screenshot) {
-
+    (void)screenshot;
     PhishingScore score = AnalyzePageContent(url, html);
 
+    PhishingDetectorConfiguration cfg;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        cfg = m_impl->m_config;
+    }
+
     // Visual / structural analysis
-    if (m_impl->m_config.enableVisualAnalysis) {
+    if (cfg.enableVisualAnalysis) {
         auto visualRes = m_impl->AnalyzeVisualInternal(url, html);
         score.visualAnalysis = visualRes;
 
@@ -1168,7 +1269,7 @@ PhishingScore PhishingDetector::AnalyzeFull(
     }
 
     // Certificate analysis
-    if (m_impl->m_config.enableCertificateAnalysis) {
+    if (cfg.enableCertificateAnalysis) {
         m_impl->m_stats.certificatesChecked++;
         auto certRes = m_impl->AnalyzeCertificateInternal(url);
         score.certificateAnalysis = certRes;
@@ -1204,7 +1305,7 @@ PhishingScore PhishingDetector::AnalyzeFull(
 
     // Final verdict recalculation
     score.confidence = static_cast<int>(std::clamp(score.score * 100.0, 0.0, 100.0));
-    if (score.score >= m_impl->m_config.phishingThreshold && score.verdict != PhishingVerdict::KnownBad) {
+    if (score.score >= cfg.phishingThreshold && score.verdict != PhishingVerdict::KnownBad) {
         score.isPhishing = true;
         score.verdict = PhishingVerdict::Phishing;
     }

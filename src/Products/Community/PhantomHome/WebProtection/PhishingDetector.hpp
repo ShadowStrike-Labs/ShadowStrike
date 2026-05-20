@@ -185,10 +185,12 @@ namespace PhishingDetectorConstants {
         "fedex", "ups", "dhl", "usps"
     };
 
-    /// @brief Homograph characters (Cyrillic lookalikes)
+    /// @brief Homograph characters (Cyrillic lookalikes).
+    /// Use explicit \\u escapes — bare non-ASCII chars in a source file rely on
+    /// the file encoding and trigger C4066 (multi-byte truncated to wchar_t).
     inline constexpr wchar_t HOMOGRAPH_CHARS[][2] = {
-        {L'а', L'a'}, {L'е', L'e'}, {L'о', L'o'}, {L'р', L'p'},
-        {L'с', L'c'}, {L'х', L'x'}, {L'у', L'y'}, {L'і', L'i'}
+        {L'\u0430', L'a'}, {L'\u0435', L'e'}, {L'\u043E', L'o'}, {L'\u0440', L'p'},
+        {L'\u0441', L'c'}, {L'\u0445', L'x'}, {L'\u0443', L'y'}, {L'\u0456', L'i'}
     };
 
 }  // namespace PhishingDetectorConstants
