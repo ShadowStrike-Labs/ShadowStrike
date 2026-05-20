@@ -296,6 +296,72 @@ namespace {
     constexpr double kObfuscationEntropyThreshold = 5.8;
     constexpr size_t kLongLineThreshold = 5000;
 
+    // ------------------------------------------------------------------
+    // ZIP entry-path safety
+    // ------------------------------------------------------------------
+    //
+    // The XPI format is a regular ZIP archive whose paths must be treated
+    // as fully untrusted. A weak substring check (`filename.find("..")`)
+    // is insufficient because:
+    //   * `..` may appear as part of a legitimate file segment (e.g.
+    //     `..suspicious.txt`) and is harmless there;
+    //   * a true traversal attack uses a real ".." path *segment* combined
+    //     with separators, or absolute paths, or Windows drive letters,
+    //     or backslash separators, or NUL-stuffed segments.
+    //
+    // This helper enforces the union of those rules and additionally
+    // verifies, after path normalization, that the resolved target is
+    // strictly contained inside `destPath`.
+    [[nodiscard]] bool IsZipEntryPathSafe(const std::string& zipName,
+                                          const fs::path& destPath,
+                                          fs::path& outResolved) {
+        if (zipName.empty()) return false;
+        if (zipName.size() > 4096) return false;          // sanity cap
+        if (zipName.front() == '/' || zipName.front() == '\\') return false;
+        if (zipName.find('\0') != std::string::npos) return false;
+        if (zipName.find('\\') != std::string::npos) return false;  // ZIP uses '/'
+        if (zipName.size() >= 2 &&
+            std::isalpha(static_cast<unsigned char>(zipName[0])) &&
+            zipName[1] == ':') {
+            return false;  // drive-letter absolute path
+        }
+
+        // Reject any ".." appearing as its own path segment.
+        size_t start = 0;
+        while (start < zipName.size()) {
+            size_t slash = zipName.find('/', start);
+            std::string segment = zipName.substr(start,
+                slash == std::string::npos ? std::string::npos : slash - start);
+            if (segment == ".." || segment == ".") return false;
+            if (segment.empty() && slash != std::string::npos) {
+                // empty segment from "//" — reject to avoid platform ambiguity
+                return false;
+            }
+            if (slash == std::string::npos) break;
+            start = slash + 1;
+        }
+
+        std::error_code ec;
+        fs::path destAbs = fs::weakly_canonical(destPath, ec);
+        if (ec) destAbs = destPath.lexically_normal();
+        fs::path candidate = (destPath / zipName).lexically_normal();
+
+        // Confirm that `candidate` is strictly under `destAbs`.
+        auto destStr = destAbs.native();
+        auto candStr = candidate.native();
+        if (candStr.size() < destStr.size()) return false;
+        if (candStr.compare(0, destStr.size(), destStr) != 0) return false;
+        if (candStr.size() > destStr.size()) {
+            auto sep = candStr[destStr.size()];
+            if (sep != fs::path::preferred_separator && sep != L'/' && sep != L'\\') {
+                return false;
+            }
+        }
+
+        outResolved = std::move(candidate);
+        return true;
+    }
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -498,6 +564,21 @@ public:
         AddonScanResult result;
         m_stats.totalScanned++;
 
+        // Snapshot every policy flag we will consult during the scan so the
+        // hot path does not race with UpdateConfiguration. Capturing into
+        // locals also rules out the "TOCTOU between two `m_config.X` reads"
+        // class of bug where verification reads `verifySignatures=true` but
+        // the later `flagUnsigned` read picks up a half-applied update.
+        bool cfgVerifySignatures = false;
+        bool cfgFlagUnsigned = false;
+        bool cfgAnalyzeCode = false;
+        {
+            std::shared_lock lock(m_mutex);
+            cfgVerifySignatures = m_config.verifySignatures;
+            cfgFlagUnsigned = m_config.flagUnsigned;
+            cfgAnalyzeCode = m_config.analyzeCode;
+        }
+
         result.info.addonPath = xpiPath;
 
         // Compute file hash
@@ -539,12 +620,12 @@ public:
         }
 
         // Signature verification
-        if (m_config.verifySignatures) {
+        if (cfgVerifySignatures) {
             result.info.signature = VerifySignature(xpiPath);
             if (result.info.signature.status != SignatureStatus::Valid) {
                 result.issues.push_back("Add-on signature is " +
                     std::string(GetSignatureStatusName(result.info.signature.status)));
-                if (m_config.flagUnsigned &&
+                if (cfgFlagUnsigned &&
                     result.info.signature.status == SignatureStatus::Missing) {
                     if (result.verdict == AddonVerdict::Unknown) {
                         result.verdict = AddonVerdict::Unsigned;
@@ -576,7 +657,7 @@ public:
 
         // Code analysis (on extracted temp directory)
         // For XPI, we re-analyze if the info was extracted
-        if (m_config.analyzeCode && extractedInfo) {
+        if (cfgAnalyzeCode && extractedInfo) {
             // Analyze code from the addon path if it's a directory,
             // otherwise we already got analysis during extraction
             result.codeAnalysis = extractedInfo->codeAnalysis;
@@ -661,7 +742,12 @@ public:
         }
 
         // Code analysis
-        if (m_config.analyzeCode) {
+        bool cfgAnalyzeCodeFolder = false;
+        {
+            std::shared_lock lock(m_mutex);
+            cfgAnalyzeCodeFolder = m_config.analyzeCode;
+        }
+        if (cfgAnalyzeCodeFolder) {
             result.codeAnalysis = AnalyzeCode(folderPath);
         }
 
@@ -704,10 +790,21 @@ public:
     std::optional<ExtractedAddonData> ExtractAndAnalyzeXpi(const fs::path& xpiPath) {
         ExtractedAddonData data;
 
+        // Snapshot the two policy fields this function reads so a concurrent
+        // UpdateConfiguration cannot tear the size limit between the cap
+        // check and the eventual allocation.
+        size_t cfgMaxXpiSize = 0;
+        bool cfgAnalyzeCode = false;
+        {
+            std::shared_lock lock(m_mutex);
+            cfgMaxXpiSize = m_config.maxXpiSize;
+            cfgAnalyzeCode = m_config.analyzeCode;
+        }
+
         // Read entire XPI file into memory (with size cap)
         try {
             auto fileSize = fs::file_size(xpiPath);
-            if (fileSize > m_config.maxXpiSize) {
+            if (fileSize > cfgMaxXpiSize) {
                 Logger::Warn("FirefoxAddonScanner: XPI exceeds size limit: {} bytes",
                     fileSize);
                 return std::nullopt;
@@ -807,7 +904,11 @@ public:
                                 data.manifest.id = data.manifest.geckoId;
                                 data.type = AddonType::WebExtension;
                             }
-                        } catch (...) {}
+                        } catch (const std::exception& e) {
+                            Logger::Warn(
+                                "FirefoxAddonScanner: in-XPI manifest.json parse failed for {}: {}",
+                                xpiPath.string(), e.what());
+                        }
                     }
                 }
             }
@@ -842,7 +943,7 @@ public:
             }
 
             // In-memory JS analysis on STORED entries
-            if (m_config.analyzeCode) {
+            if (cfgAnalyzeCode) {
                 for (const auto& entry : entries) {
                     if (entry.compressionMethod != kZipMethodStored) continue;
                     if (entry.filename.size() < 3) continue;
@@ -1096,9 +1197,20 @@ public:
         std::vector<fs::path> profiles;
 
         for (const auto& basePathStr : FirefoxAddonConstants::FIREFOX_PROFILE_PATHS) {
-            char expandedPath[MAX_PATH]{};
-            std::string envPath = "%USERPROFILE%" + std::string(basePathStr);
-            if (!ExpandEnvironmentStringsA(envPath.c_str(), expandedPath, MAX_PATH)) {
+            // The literal `basePathStr` is pure ASCII (see FIREFOX_PROFILE_PATHS
+            // in the header), so a direct char->wchar copy is loss-free.
+            // ExpandEnvironmentStringsW is required because %USERPROFILE% can
+            // resolve to a path containing non-ASCII characters on locale-aware
+            // installations; the ANSI variant silently corrupts those.
+            std::wstring envPath = L"%USERPROFILE%";
+            for (const char* p = basePathStr; *p; ++p) {
+                envPath.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
+            }
+
+            wchar_t expandedPath[MAX_PATH]{};
+            DWORD expandedLen = ExpandEnvironmentStringsW(
+                envPath.c_str(), expandedPath, MAX_PATH);
+            if (expandedLen == 0 || expandedLen > MAX_PATH) {
                 continue;
             }
 
@@ -1304,12 +1416,20 @@ private:
             return AddonVerdict::Suspicious;
         }
 
+        bool cfgFlagUnsigned = false;
+        bool cfgFlagSideloaded = false;
+        {
+            std::shared_lock lock(m_mutex);
+            cfgFlagUnsigned = m_config.flagUnsigned;
+            cfgFlagSideloaded = m_config.flagSideloaded;
+        }
+
         if (result.info.signature.status == SignatureStatus::Missing &&
-            m_config.flagUnsigned) {
+            cfgFlagUnsigned) {
             return AddonVerdict::Unsigned;
         }
 
-        if (result.info.isSideloaded && m_config.flagSideloaded) {
+        if (result.info.isSideloaded && cfgFlagSideloaded) {
             return AddonVerdict::Sideloaded;
         }
 
@@ -1335,15 +1455,27 @@ private:
     }
 
     void NotifyScanResult(const AddonScanResult& result) {
-        std::unique_lock lock(m_cbMutex);
-        for (const auto& cb : m_scanCallbacks) {
+        // Snapshot under the callback mutex then drop the lock; invoking
+        // user callbacks while holding m_cbMutex would deadlock the moment a
+        // callback tries to Register/Unregister another callback on the
+        // same scanner instance.
+        std::vector<AddonScanResultCallback> snapshot;
+        {
+            std::unique_lock lock(m_cbMutex);
+            snapshot = m_scanCallbacks;
+        }
+        for (const auto& cb : snapshot) {
             try { cb(result); } catch (...) {}
         }
     }
 
     void NotifyMalicious(const FirefoxAddonInfo& info) {
-        std::unique_lock lock(m_cbMutex);
-        for (const auto& cb : m_maliciousCallbacks) {
+        std::vector<MaliciousAddonCallback> snapshot;
+        {
+            std::unique_lock lock(m_cbMutex);
+            snapshot = m_maliciousCallbacks;
+        }
+        for (const auto& cb : snapshot) {
             try { cb(info); } catch (...) {}
         }
     }
@@ -1638,8 +1770,14 @@ bool ExtractXpi(const fs::path& xpiPath, const fs::path& destPath) {
             if (entry.filename.empty()) continue;
             if (entry.filename.back() == '/') continue;  // Directory entry
 
-            // Security: prevent path traversal
-            if (entry.filename.find("..") != std::string::npos) continue;
+            // Security: prevent path traversal — see IsZipEntryPathSafe for the
+            // full rule-set (substring check on ".." alone is bypassable).
+            fs::path outPath;
+            if (!IsZipEntryPathSafe(entry.filename, destPath, outPath)) {
+                Logger::Warn("FirefoxAddonScanner: rejected unsafe XPI entry path '{}'",
+                    entry.filename);
+                continue;
+            }
 
             // Size guard
             if (totalExtracted + entry.uncompressedSize >
@@ -1648,7 +1786,6 @@ bool ExtractXpi(const fs::path& xpiPath, const fs::path& destPath) {
                 break;
             }
 
-            fs::path outPath = destPath / entry.filename;
             if (ExtractEntryToFile(zipData, entry, outPath)) {
                 totalExtracted += entry.uncompressedSize;
                 anyExtracted = true;
