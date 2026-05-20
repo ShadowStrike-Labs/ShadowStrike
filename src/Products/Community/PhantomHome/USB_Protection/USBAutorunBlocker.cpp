@@ -869,15 +869,27 @@ public:
                 std::filesystem::create_directory(vaccinePath);
             }
 
-            // Apply Hidden+System+ReadOnly attributes
-            ::SetFileAttributesW(vaccinePath.c_str(),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY);
+            // Apply Hidden+System+ReadOnly attributes. A failure here leaves
+            // a writable vaccine folder that malware can replace with a real
+            // autorun.inf — we must surface this, not silently claim success.
+            if (!::SetFileAttributesW(vaccinePath.c_str(),
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY)) {
+                const DWORD attrErr = ::GetLastError();
+                result.success = false;
+                result.status = VaccinationStatus::PartiallyVaccinated;
+                result.errorMessage = "SetFileAttributesW failed (error " +
+                    std::to_string(attrErr) + ")";
+                m_stats.vaccinationFailures.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_ERROR(LOG_CAT,
+                    L"Vaccination folder attributes could not be applied on %hs (error %lu)",
+                    driveRoot.c_str(), attrErr);
+            } else {
+                result.success = true;
+                result.status = VaccinationStatus::Vaccinated;
+                m_stats.drivesVaccinated.fetch_add(1, std::memory_order_relaxed);
 
-            result.success = true;
-            result.status = VaccinationStatus::Vaccinated;
-            m_stats.drivesVaccinated.fetch_add(1, std::memory_order_relaxed);
-
-            SS_LOG_INFO(LOG_CAT, L"Drive vaccinated: %hs", driveRoot.c_str());
+                SS_LOG_INFO(LOG_CAT, L"Drive vaccinated: %hs", driveRoot.c_str());
+            }
 
         } catch (const std::exception& e) {
             result.success = false;
@@ -936,8 +948,13 @@ public:
             try {
                 std::filesystem::path vp =
                     std::filesystem::path(driveRoot) / AutorunConstants::VACCINE_FOLDER_NAME;
-                ::SetFileAttributesW(vp.c_str(),
-                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY);
+                if (!::SetFileAttributesW(vp.c_str(),
+                        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY)) {
+                    SS_LOG_WARN(LOG_CAT,
+                        L"RepairVaccination: SetFileAttributesW failed for %hs (error %lu)",
+                        driveRoot.c_str(), ::GetLastError());
+                    return false;
+                }
                 SS_LOG_INFO(LOG_CAT, L"Vaccination repaired for %hs", driveRoot.c_str());
                 return true;
             } catch (...) {}
