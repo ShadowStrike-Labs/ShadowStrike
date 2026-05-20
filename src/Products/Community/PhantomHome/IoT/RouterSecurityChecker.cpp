@@ -1099,8 +1099,9 @@ RouterSecurityReport RouterSecurityCheckerImpl::AuditGatewaySyncInternal(
         m_statistics.highIssuesFound.fetch_add(report.GetHighIssueCount(), std::memory_order_relaxed);
 
         report.status = AssessmentStatus::Completed;
+        // startTime is a local const captured at function entry: read directly.
         report.assessmentDuration = std::chrono::duration_cast<std::chrono::seconds>(
-            SystemClock::now() - AtomicValueLoadRelaxed(startTime));
+            SystemClock::now() - startTime);
 
         // Cache report
         {
@@ -2184,9 +2185,24 @@ RouterCheckerConfiguration RouterSecurityChecker::GetConfiguration() const {
 std::future<RouterSecurityReport> RouterSecurityChecker::AuditGateway(
     const std::string& gatewayIP)
 {
-    return std::async(std::launch::async, [this, gatewayIP]() {
-        return AuditGatewaySync(gatewayIP, m_impl->m_config.defaultAssessmentConfig);
-    });
+    if (!m_impl) {
+        std::promise<RouterSecurityReport> p;
+        p.set_value(RouterSecurityReport{});
+        return p.get_future();
+    }
+
+    // Snapshot the assessment config under the configuration lock so that
+    // a concurrent UpdateConfiguration cannot race with the async read.
+    RouterAssessmentConfig snapshotCfg;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        snapshotCfg = m_impl->m_config.defaultAssessmentConfig;
+    }
+
+    return std::async(std::launch::async,
+        [this, gatewayIP, cfg = std::move(snapshotCfg)]() {
+            return AuditGatewaySync(gatewayIP, cfg);
+        });
 }
 
 RouterSecurityReport RouterSecurityChecker::AuditGatewaySync(
