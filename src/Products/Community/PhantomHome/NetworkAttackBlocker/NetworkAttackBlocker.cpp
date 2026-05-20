@@ -81,8 +81,20 @@ struct NetworkAttackBlocker::Impl {
     mutable std::shared_mutex   ringMutex;
     std::deque<NabEvent>        ring;
 
-    std::uint64_t               threatCallbackId{0};
-    bool                        running{false};
+    std::atomic<std::uint64_t>  threatCallbackId{0};
+    std::atomic<bool>           running{false};
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Safe bit-position for a NabThreatKind enumerator (clamps to Count-1 to
+    // guarantee the shift in `1u << pos` is well-defined regardless of the
+    // caller-supplied enum value).
+    // ─────────────────────────────────────────────────────────────────────────
+    [[nodiscard]] static constexpr std::uint32_t SafeBitIndex(NabThreatKind k) noexcept {
+        const auto v = static_cast<std::uint32_t>(k);
+        constexpr std::uint32_t maxIdx =
+            static_cast<std::uint32_t>(NabThreatKind::Count) - 1u;
+        return (v <= maxIdx) ? v : maxIdx;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Map ThreatIndicator → NabThreatKind
@@ -95,11 +107,14 @@ struct NetworkAttackBlocker::Impl {
         case ThreatIndicator::LATERAL_MOVEMENT:  return NabThreatKind::BruteForce;
         case ThreatIndicator::DNS_TUNNELING:     return NabThreatKind::DnsSpoof;
         case ThreatIndicator::ICMP_TUNNELING:    return NabThreatKind::Flood;
+        case ThreatIndicator::DOMAIN_GENERATION: return NabThreatKind::DnsSpoof;
+        case ThreatIndicator::TOR_USAGE:         return NabThreatKind::SuspiciousOutbound;
+        case ThreatIndicator::CRYPTO_MINING:     return NabThreatKind::SuspiciousOutbound;
         case ThreatIndicator::BOTNET_ACTIVITY:   return NabThreatKind::C2Beacon;
         case ThreatIndicator::EXPLOIT_TRAFFIC:   return NabThreatKind::ExploitBeacon;
-        case ThreatIndicator::CRYPTO_MINING:     return NabThreatKind::SuspiciousOutbound;
-        default:                                 return NabThreatKind::SuspiciousOutbound;
+        case ThreatIndicator::NONE:              return NabThreatKind::SuspiciousOutbound;
         }
+        return NabThreatKind::SuspiciousOutbound;
     }
 
     static double ExtractSeverity(
@@ -158,8 +173,7 @@ struct NetworkAttackBlocker::Impl {
 
         // Per-detector overlay check
         {
-            const std::uint32_t bit =
-                1u << static_cast<std::uint32_t>(kind);
+            const std::uint32_t bit = 1u << SafeBitIndex(kind);
             if (!(detectorMask.load(std::memory_order_relaxed) & bit)) return;
         }
 
@@ -284,17 +298,27 @@ bool NetworkAttackBlocker::Initialize() noexcept {
 }
 
 bool NetworkAttackBlocker::Start() noexcept {
-    if (m_impl->running) return true;
-
-    if (!NetworkMonitor::HasInstance()) {
-        SS_LOG_WARN(kLogCategory,
-            L"Start: NetworkMonitor singleton not yet available; "
-            L"threat callbacks will not be registered");
-        return true;  // Non-fatal — module loads, callbacks registered later
+    // Idempotent + concurrency-safe: only one thread proceeds past the CAS.
+    bool expected = false;
+    if (!m_impl->running.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return true;  // Already running.
     }
 
-    m_impl->threatCallbackId =
-        NetworkMonitor::Instance().RegisterThreatDetectionCallback(
+    if (!NetworkMonitor::HasInstance()) {
+        SS_LOG_ERROR(kLogCategory,
+            L"Start: NetworkMonitor singleton not available; cannot subscribe "
+            L"to threat callbacks. NetworkAttackBlocker requires PhantomCore "
+            L"NetworkMonitor to be initialised before PhantomHome modules start");
+        m_impl->running.store(false, std::memory_order_release);
+        return false;
+    }
+
+    uint64_t cbId = 0;
+    try {
+        cbId = NetworkMonitor::Instance().RegisterThreatDetectionCallback(
             [this](uint64_t connId,
                    ThreatIndicator ind,
                    const std::variant<BeaconingAnalysis,
@@ -302,28 +326,56 @@ bool NetworkAttackBlocker::Start() noexcept {
                                       PortScanAnalysis>& analysis) {
                 m_impl->OnThreatDetected(connId, ind, analysis);
             });
-
-    if (m_impl->threatCallbackId == 0) {
+    } catch (const std::exception& ex) {
         SS_LOG_ERROR(kLogCategory,
-            L"Start: RegisterThreatDetectionCallback returned 0; "
-            L"threat detection unavailable for this session");
+            L"Start: RegisterThreatDetectionCallback threw: %hs", ex.what());
+        m_impl->running.store(false, std::memory_order_release);
+        return false;
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory,
+            L"Start: RegisterThreatDetectionCallback threw unknown exception");
+        m_impl->running.store(false, std::memory_order_release);
         return false;
     }
 
-    m_impl->running = true;
+    if (cbId == 0) {
+        SS_LOG_ERROR(kLogCategory,
+            L"Start: RegisterThreatDetectionCallback returned 0; "
+            L"threat detection unavailable for this session");
+        m_impl->running.store(false, std::memory_order_release);
+        return false;
+    }
+
+    m_impl->threatCallbackId.store(cbId, std::memory_order_release);
     SS_LOG_INFO(kLogCategory,
         L"Start: subscribed to NetworkMonitor (threatCbId=%llu)",
-        static_cast<unsigned long long>(m_impl->threatCallbackId));
+        static_cast<unsigned long long>(cbId));
     return true;
 }
 
 void NetworkAttackBlocker::Stop() noexcept {
-    if (!m_impl->running) return;
+    // Atomically claim the stop transition; second concurrent Stop() is a no-op.
+    bool expected = true;
+    if (!m_impl->running.compare_exchange_strong(
+            expected, false,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
 
-    if (NetworkMonitor::HasInstance() && m_impl->threatCallbackId) {
-        NetworkMonitor::Instance().UnregisterCallback(
-            m_impl->threatCallbackId);
-        m_impl->threatCallbackId = 0;
+    const std::uint64_t cbId =
+        m_impl->threatCallbackId.exchange(0, std::memory_order_acq_rel);
+
+    if (cbId != 0 && NetworkMonitor::HasInstance()) {
+        try {
+            NetworkMonitor::Instance().UnregisterCallback(cbId);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Stop: UnregisterCallback threw: %hs", ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Stop: UnregisterCallback threw unknown exception");
+        }
     }
 
     {
@@ -331,9 +383,9 @@ void NetworkAttackBlocker::Stop() noexcept {
         m_impl->ring.clear();
     }
 
-    m_impl->running = false;
     SS_LOG_INFO(kLogCategory,
-        L"Stop: unsubscribed from NetworkMonitor");
+        L"Stop: unsubscribed from NetworkMonitor (cbId=%llu)",
+        static_cast<unsigned long long>(cbId));
 }
 
 void NetworkAttackBlocker::Shutdown() noexcept {
@@ -346,8 +398,12 @@ void NetworkAttackBlocker::Shutdown() noexcept {
 
 void NetworkAttackBlocker::SetMode(ProtectionMode m) noexcept {
     m_impl->mode.store(m, std::memory_order_release);
-    SS_LOG_INFO(kLogCategory, L"SetMode → %hs",
-        HomeProductOrchestrator::ToString(m).data());
+    const std::string_view name = HomeProductOrchestrator::ToString(m);
+    // Use width-bounded %.*hs because std::string_view is not guaranteed
+    // null-terminated; ToString() returns literal-backed views but we stay
+    // strictly correct regardless of source.
+    SS_LOG_INFO(kLogCategory, L"SetMode → %.*hs",
+        static_cast<int>(name.size()), name.data());
 }
 
 ProtectionMode NetworkAttackBlocker::Mode() const noexcept {
@@ -360,6 +416,14 @@ ProtectionMode NetworkAttackBlocker::Mode() const noexcept {
 
 void NetworkAttackBlocker::SetDetectorEnabled(NabThreatKind kind,
                                                bool enabled) noexcept {
+    if (static_cast<std::uint32_t>(kind) >=
+        static_cast<std::uint32_t>(NabThreatKind::Count)) {
+        SS_LOG_WARN(kLogCategory,
+            L"SetDetectorEnabled: kind=%u out of range [0,%u); request ignored",
+            static_cast<unsigned>(kind),
+            static_cast<unsigned>(NabThreatKind::Count));
+        return;
+    }
     const std::uint32_t bit = 1u << static_cast<std::uint32_t>(kind);
     if (enabled)
         m_impl->detectorMask.fetch_or(bit, std::memory_order_release);
@@ -368,6 +432,10 @@ void NetworkAttackBlocker::SetDetectorEnabled(NabThreatKind kind,
 }
 
 bool NetworkAttackBlocker::IsDetectorEnabled(NabThreatKind kind) const noexcept {
+    if (static_cast<std::uint32_t>(kind) >=
+        static_cast<std::uint32_t>(NabThreatKind::Count)) {
+        return false;
+    }
     const std::uint32_t bit = 1u << static_cast<std::uint32_t>(kind);
     return (m_impl->detectorMask.load(std::memory_order_acquire) & bit) != 0u;
 }
@@ -379,7 +447,7 @@ bool NetworkAttackBlocker::IsDetectorEnabled(NabThreatKind kind) const noexcept 
 NetworkAttackBlocker::AggregateStatus
 NetworkAttackBlocker::GetStatus() const {
     AggregateStatus s;
-    s.healthy          = m_impl->running;
+    s.healthy          = m_impl->running.load(std::memory_order_acquire);
     s.eventsTotal      =
         m_impl->eventsTotal.load(std::memory_order_relaxed);
     s.eventsBlocked24h =
