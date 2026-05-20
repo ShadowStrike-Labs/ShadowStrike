@@ -699,7 +699,10 @@ bool MicrophoneGuardImpl::Initialize(
         m_whitelistStore = std::make_shared<Whitelist::WhitelistStore>();
 
         // Enumerate audio devices
-        RefreshDevicesInternal();
+        if (!RefreshDevicesInternal()) {
+            Utils::Logger::Warn(
+                "MicrophoneGuard: initial audio-device enumeration returned no devices");
+        }
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
@@ -1140,6 +1143,14 @@ bool MicrophoneGuardImpl::BlockAudioForProcessInternal(uint32_t pid) {
         }
 
         std::unique_lock lock(m_blockedMutex);
+        // Hostile-PID-flood cap: caller can't grow the set without bound.
+        constexpr size_t kMaxBlockedPids = 4096;
+        if (m_blockedProcesses.size() >= kMaxBlockedPids &&
+            m_blockedProcesses.find(pid) == m_blockedProcesses.end()) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: blocked-process set full ({})", kMaxBlockedPids);
+            return false;
+        }
         m_blockedProcesses.insert(pid);
 
         Utils::Logger::Info("MicrophoneGuard: Blocked audio for PID {}", pid);
@@ -1178,6 +1189,13 @@ bool MicrophoneGuardImpl::MuteAudioForProcessInternal(uint32_t pid) {
         }
 
         std::unique_lock lock(m_mutedMutex);
+        constexpr size_t kMaxMutedPids = 4096;
+        if (m_mutedProcesses.size() >= kMaxMutedPids &&
+            m_mutedProcesses.find(pid) == m_mutedProcesses.end()) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: muted-process set full ({})", kMaxMutedPids);
+            return false;
+        }
         m_mutedProcesses.insert(pid);
 
         Utils::Logger::Info("MicrophoneGuard: Muted audio for PID {}", pid);
@@ -1202,11 +1220,82 @@ bool MicrophoneGuardImpl::AddToWhitelistInternal(
             Utils::Logger::Error("MicrophoneGuard: Empty entry ID");
             return false;
         }
+        if (entry.processPattern.empty()) {
+            Utils::Logger::Error("MicrophoneGuard: Empty process pattern");
+            return false;
+        }
+
+        // Hostile-input caps. Reject oversized fields and control characters
+        // to prevent log/JSON corruption and memory bloat.
+        constexpr size_t kMaxIdLen        = 128;
+        constexpr size_t kMaxPatternLen   = 260;
+        constexpr size_t kMaxPublisherLen = 256;
+        constexpr size_t kMaxNotesLen     = 512;
+        constexpr size_t kSha256HexLen    = 64;
+        if (entry.entryId.size()        > kMaxIdLen        ||
+            entry.processPattern.size() > kMaxPatternLen   ||
+            entry.publisher.size()      > kMaxPublisherLen ||
+            entry.notes.size()          > kMaxNotesLen     ||
+            entry.addedBy.size()        > kMaxPublisherLen ||
+            (!entry.sha256Hash.empty() && entry.sha256Hash.size() != kSha256HexLen)) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: whitelist entry rejected (oversized/invalid field)");
+            return false;
+        }
+
+        // Reject embedded NUL or non-printable control characters in narrow
+        // strings (allow tab but not \r/\n/\0 which would corrupt log lines).
+        auto safe = [](const std::string& s) noexcept -> bool {
+            for (unsigned char c : s) {
+                if (c == 0) return false;
+                if (c < 0x20 && c != 0x09) return false;
+                if (c == 0x7F) return false;
+            }
+            return true;
+        };
+        if (!safe(entry.entryId) || !safe(entry.processPattern) ||
+            !safe(entry.publisher) || !safe(entry.notes) || !safe(entry.addedBy)) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: whitelist entry rejected (control characters)");
+            return false;
+        }
+
+        // SHA256 hash, if provided, must be 64 hex digits.
+        if (!entry.sha256Hash.empty()) {
+            for (unsigned char c : entry.sha256Hash) {
+                const bool isHex =
+                    (c >= '0' && c <= '9') ||
+                    (c >= 'a' && c <= 'f') ||
+                    (c >= 'A' && c <= 'F');
+                if (!isHex) {
+                    Utils::Logger::Error(
+                        "MicrophoneGuard: whitelist entry rejected (non-hex sha256)");
+                    return false;
+                }
+            }
+        }
+
+        if (entry.allowFromHour.has_value() &&
+            (*entry.allowFromHour < 0 || *entry.allowFromHour > 23)) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: whitelist entry rejected (allowFromHour out of range)");
+            return false;
+        }
+        if (entry.allowToHour.has_value() &&
+            (*entry.allowToHour < 0 || *entry.allowToHour > 23)) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: whitelist entry rejected (allowToHour out of range)");
+            return false;
+        }
 
         std::unique_lock lock(m_whitelistMutex);
 
-        if (m_whitelist.size() >= MicrophoneConstants::MAX_WHITELIST) {
-            Utils::Logger::Error("MicrophoneGuard: Whitelist full");
+        // Capacity cap applies only to NEW inserts: existing entries remain
+        // editable when the whitelist is at capacity.
+        const bool isUpdate = m_whitelist.find(entry.entryId) != m_whitelist.end();
+        if (!isUpdate && m_whitelist.size() >= MicrophoneConstants::MAX_WHITELIST) {
+            Utils::Logger::Error("MicrophoneGuard: Whitelist full ({})",
+                                 MicrophoneConstants::MAX_WHITELIST);
             return false;
         }
 
@@ -1249,14 +1338,25 @@ bool MicrophoneGuardImpl::IsProcessWhitelistedInternal(
     const std::string& processName,
     const fs::path& processPath)
 {
+    // Windows file names are case-insensitive; comparing case-sensitively would
+    // let an attacker spoof "EXPLORER.EXE" past a whitelist of "explorer.exe".
+    auto toLower = [](std::string s) noexcept {
+        for (auto& c : s) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            c = static_cast<char>(std::tolower(uc));
+        }
+        return s;
+    };
+    const std::string processNameLower = toLower(processName);
+
     std::shared_lock lock(m_whitelistMutex);
 
     for (const auto& [id, entry] : m_whitelist) {
         if (!entry.enabled) continue;
         if (!entry.IsCurrentlyAllowed()) continue;
 
-        // Check process name pattern
-        if (entry.processPattern == processName) {
+        // Check process name pattern (case-insensitive)
+        if (toLower(entry.processPattern) == processNameLower) {
             // Check signature if required
             if (entry.requireSigned && !processPath.empty()) {
                 if (!VerifySignature(processPath)) {
@@ -1264,10 +1364,10 @@ bool MicrophoneGuardImpl::IsProcessWhitelistedInternal(
                 }
             }
 
-            // Check hash if specified
+            // Check hash if specified (case-insensitive hex compare)
             if (!entry.sha256Hash.empty() && !processPath.empty()) {
                 std::string hash = ComputeFileSha256Hex(processPath.wstring());
-                if (hash.empty() || hash != entry.sha256Hash) {
+                if (hash.empty() || toLower(hash) != toLower(entry.sha256Hash)) {
                     continue;
                 }
             }
@@ -1397,7 +1497,10 @@ AudioRiskLevel MicrophoneGuardImpl::AnalyzeProcessInternal(uint32_t processId) {
 
         // Check if process is running from suspicious location
         std::string pathStr = fsPath.string();
-        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::tolower);
+        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(),
+            [](unsigned char c) noexcept -> char {
+                return static_cast<char>(std::tolower(c));
+            });
 
         if (pathStr.find("\\temp\\") != std::string::npos ||
             pathStr.find("\\appdata\\local\\temp") != std::string::npos) {
@@ -1414,7 +1517,10 @@ AudioRiskLevel MicrophoneGuardImpl::AnalyzeProcessInternal(uint32_t processId) {
 
         // Check process name patterns (known RAT patterns)
         std::string lowerName = processName;
-        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+            [](unsigned char c) noexcept -> char {
+                return static_cast<char>(std::tolower(c));
+            });
 
         if (lowerName.find("remote") != std::string::npos ||
             lowerName.find("vnc") != std::string::npos ||
@@ -1516,6 +1622,13 @@ void MicrophoneGuardImpl::MonitorThreadFunc() {
         } catch (const std::exception& e) {
             Utils::Logger::Error("MicrophoneGuard: Monitoring error - {}",
                                (e.what()));
+            // Back-off to avoid a tight error spin if the failure is persistent.
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(MicrophoneConstants::POLLING_INTERVAL_MS));
+        } catch (...) {
+            Utils::Logger::Error("MicrophoneGuard: Monitoring error - unknown exception");
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(MicrophoneConstants::POLLING_INTERVAL_MS));
         }
     }
 
@@ -1925,6 +2038,27 @@ bool MicrophoneGuard::AllowProcessTemporarily(
         auto expiration = SystemClock::now() + duration;
 
         std::unique_lock lock(m_impl->m_temporaryMutex);
+        constexpr size_t kMaxTemporaryGrants = 4096;
+        const auto existing = m_impl->m_temporaryAccess.find(processId);
+        if (existing == m_impl->m_temporaryAccess.end() &&
+            m_impl->m_temporaryAccess.size() >= kMaxTemporaryGrants) {
+            // Best-effort GC of expired entries before refusing.
+            const auto now = SystemClock::now();
+            for (auto it = m_impl->m_temporaryAccess.begin();
+                 it != m_impl->m_temporaryAccess.end();) {
+                if (it->second <= now) {
+                    it = m_impl->m_temporaryAccess.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (m_impl->m_temporaryAccess.size() >= kMaxTemporaryGrants) {
+                Utils::Logger::Error(
+                    "MicrophoneGuard: temporary-access table full ({})",
+                    kMaxTemporaryGrants);
+                return false;
+            }
+        }
         m_impl->m_temporaryAccess[processId] = expiration;
 
         Utils::Logger::Info("MicrophoneGuard: Temporary access granted to PID {} for {} seconds",
@@ -1976,7 +2110,11 @@ bool MicrophoneGuard::ImportDefaultTrustedApps() {
             entry.addedTime = SystemClock::now();
             entry.notes = "Default trusted application";
 
-            m_impl->AddToWhitelistInternal(entry);
+            if (!m_impl->AddToWhitelistInternal(entry)) {
+                Utils::Logger::Warn(
+                    "MicrophoneGuard: failed to import default trusted app: {}",
+                    appName);
+            }
         }
 
         Utils::Logger::Info("MicrophoneGuard: Imported {} default trusted apps",
@@ -2151,13 +2289,19 @@ bool MicrophoneGuard::SelfTest() {
         }
 
         // Test 5: Protection control
-        SetGlobalMute(true);
+        if (!SetGlobalMute(true)) {
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - SetGlobalMute(true)");
+            return false;
+        }
         if (!IsGloballyMuted()) {
             Utils::Logger::Error("MicrophoneGuard: Self-test failed - Global mute");
             return false;
         }
 
-        SetGlobalMute(false);
+        if (!SetGlobalMute(false)) {
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - SetGlobalMute(false)");
+            return false;
+        }
         if (IsGloballyMuted()) {
             Utils::Logger::Error("MicrophoneGuard: Self-test failed - Global unmute");
             return false;
@@ -2350,7 +2494,10 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
                     // Heuristic device type detection from friendly name
                     std::string lowerName = device.friendlyName;
                     std::transform(lowerName.begin(), lowerName.end(),
-                                   lowerName.begin(), ::tolower);
+                                   lowerName.begin(),
+                        [](unsigned char c) noexcept -> char {
+                            return static_cast<char>(std::tolower(c));
+                        });
 
                     if (lowerName.find("bluetooth") != std::string::npos) {
                         device.type = AudioDeviceType::Bluetooth;
