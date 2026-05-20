@@ -1232,7 +1232,10 @@ public:
 
                 std::string hostname = aname;
                 std::transform(hostname.begin(), hostname.end(),
-                               hostname.begin(), ::tolower);
+                               hostname.begin(),
+                               [](unsigned char ch) {
+                                   return static_cast<char>(std::tolower(ch));
+                               });
 
                 // Strip .local suffix for mDNS names
                 if (auto dotLocal = hostname.rfind(".local");
@@ -1485,7 +1488,8 @@ public:
     void GenerateScanSummary(std::chrono::system_clock::time_point startTime) {
         IoTScanResultSummary summary;
         summary.status = ScanStatus::Completed;
-        summary.startTime = AtomicValueLoadRelaxed(startTime);
+        // startTime is a by-value parameter: not shared, no need for atomic_ref.
+        summary.startTime = startTime;
         summary.endTime = std::chrono::system_clock::now();
         summary.duration = std::chrono::duration_cast<std::chrono::seconds>(
             summary.endTime - summary.startTime);
@@ -1563,7 +1567,10 @@ public:
             }
             iface.macAddress = macStream.str();
             std::transform(iface.macAddress.begin(), iface.macAddress.end(),
-                           iface.macAddress.begin(), ::toupper);
+                           iface.macAddress.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::toupper(ch));
+                           });
 
             iface.interfaceIndex = adapter->Index;
             iface.isConnected = (iface.ipv4Address != "0.0.0.0" && !iface.ipv4Address.empty());
@@ -2621,7 +2628,10 @@ void IoTScanStatistics::Reset() noexcept {
     }
 
     std::string prefix = mac.substr(0, 8);
-    std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::toupper);
+    std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::toupper(ch));
+                   });
 
     for (const auto& entry : MAC_VENDORS) {
         if (prefix == entry.prefix) {
