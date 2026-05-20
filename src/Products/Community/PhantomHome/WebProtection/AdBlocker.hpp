@@ -667,9 +667,6 @@ private:
 /// @brief Parse cosmetic rule
 [[nodiscard]] std::optional<CosmeticFilterRule> ParseCosmeticRule(const std::string& rule);
 
-/// @brief Check if request is third-party
-[[nodiscard]] bool IsThirdParty(const std::string& requestUrl, const std::string& pageUrl);
-
 }  // namespace WebBrowser
 }  // namespace ShadowStrike
 

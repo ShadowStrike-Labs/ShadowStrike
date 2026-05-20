@@ -578,7 +578,24 @@ public:
         result.url = url;
         auto start = Clock::now();
 
-        if (!IsInitialized() || !m_config.enabled) {
+        if (!IsInitialized()) {
+            result.action = FilterAction::Allow;
+            return result;
+        }
+
+        // Snapshot mutable configuration and callback under shared lock so
+        // hot-path reads do not race with UpdateConfiguration / Register*Callback.
+        bool configEnabled = false;
+        bool networkFilteringEnabled = false;
+        AdBlockCallback blockCallback;
+        {
+            std::shared_lock lock(m_mutex);
+            configEnabled = m_config.enabled;
+            networkFilteringEnabled = m_config.enableNetworkFiltering;
+            blockCallback = m_blockCallback;
+        }
+
+        if (!configEnabled) {
             result.action = FilterAction::Allow;
             return result;
         }
@@ -599,12 +616,15 @@ public:
         std::string urlDomain = GetDomainFromUrl(url);
         bool isThirdPartyReq = !pageUrl.empty() && IsCrossOrigin(url, pageUrl);
 
-        // 1. Check whitelist (page domain)
-        if (IsWhitelistedInternal(pageDomain)) {
-            result.action = FilterAction::Allow;
-            m_stats.allowedRequests++;
-            result.matchTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
-            return result;
+        // 1. Check whitelist (page domain) — needs shared lock to traverse m_whitelist
+        {
+            std::shared_lock lock(m_mutex);
+            if (IsWhitelistedInternal(pageDomain)) {
+                result.action = FilterAction::Allow;
+                m_stats.allowedRequests++;
+                result.matchTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
+                return result;
+            }
         }
 
         // 2. Check common ad domains for fast-path blocking
@@ -615,13 +635,16 @@ public:
                 m_stats.blockedRequests++;
                 m_stats.malvertisementBlocked++;
                 result.matchTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
-                if (m_blockCallback) m_blockCallback(url, result);
+                // Invoke snapshot callback OUTSIDE any lock to avoid reentrant deadlock
+                if (blockCallback) {
+                    try { blockCallback(url, result); } catch (...) {}
+                }
                 return result;
             }
         }
 
         // 3. Check network rules using domain index + global rules
-        if (m_config.enableNetworkFiltering) {
+        if (networkFilteringEnabled) {
             std::shared_lock lock(m_mutex);
             bool blocked = false;
             std::optional<NetworkFilterRule> matchingRule;
@@ -727,12 +750,15 @@ public:
                 result.action = FilterAction::Block;
                 result.matchedRule = matchingRule;
                 m_stats.blockedRequests++;
-
-                if (m_blockCallback) {
-                    m_blockCallback(url, result);
-                }
-
                 result.matchTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
+
+                // Release the shared lock BEFORE invoking user callback to avoid
+                // reentrant deadlock if the callback calls back into the AdBlocker
+                // (e.g. AddCustomRule requires the unique lock).
+                lock.unlock();
+                if (blockCallback) {
+                    try { blockCallback(url, result); } catch (...) {}
+                }
                 return result;
             }
 
@@ -831,6 +857,17 @@ public:
     // ========================================================================
 
     bool AddCustomRuleInternal(const std::string& ruleText) {
+        // Apply the same hardening as filter-list file parsing: cap length,
+        // reject embedded line breaks (smuggling) and non-UTF-8 input.
+        if (ruleText.empty() || ruleText.size() > MAX_FILTER_RULE_LENGTH) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Custom rule rejected: empty or exceeds length cap");
+            return false;
+        }
+        if (ContainsEmbeddedLineBreak(ruleText) || !IsStrictUtf8(ruleText)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Custom rule rejected: invalid UTF-8 or smuggled newline");
+            return false;
+        }
+
         auto netRule = ParseNetworkRule(ruleText);
         if (netRule) {
             netRule->ruleId = m_nextRuleId++;
@@ -939,11 +976,28 @@ public:
         listInfo->status = FilterListStatus::Loading;
         SS_LOG_INFO(LOG_CATEGORY, L"Filter list registered for URL: %hs", url.c_str());
 
-        // Attempt to load from local cache path if available
+        // Attempt to load from local cache path if available.
+        // LoadFilterListFromFileInternal acquires the unique lock itself and may
+        // emplace_back() into m_filterLists, invalidating `listInfo`. Capture the
+        // values we need BEFORE unlocking, and re-locate the entry by URL after
+        // re-acquiring the lock.
         if (!listInfo->localPath.empty()) {
+            const std::string localPathCopy = listInfo->localPath;
+            const std::string listIdCopy   = listInfo->listId;
             lock.unlock();
-            bool loaded = LoadFilterListFromFileInternal(listInfo->localPath, listInfo->listId);
+            const bool loaded = LoadFilterListFromFileInternal(localPathCopy, listIdCopy);
             lock.lock();
+
+            // Re-locate the entry by URL (iterator/pointer may have been invalidated).
+            listInfo = nullptr;
+            for (auto& info : m_filterLists) {
+                if (info.url == url) { listInfo = &info; break; }
+            }
+            if (!listInfo) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Filter list entry lost after reload: %hs", url.c_str());
+                return false;
+            }
+
             if (loaded) {
                 listInfo->status = FilterListStatus::Loaded;
                 listInfo->lastUpdate = std::chrono::system_clock::now();
