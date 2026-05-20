@@ -62,10 +62,61 @@
 // SHARED CONFIG KEY PREFIX FOR ALWAYS-ALLOW PERSISTENCE
 // ============================================================================
 namespace {
-constexpr const char*    kAllowKeyPrefix  = "Home/ZeroTrust/AlwaysAllow/";
-constexpr const wchar_t* kLogCat          = L"ZeroTrustPromptQueue.Home";
-constexpr const wchar_t* kLogCatCore      = L"ZeroTrustPromptQueue.Core";
+constexpr const char*    kAllowKeyPrefix     = "Home/ZeroTrust/AlwaysAllow/";
+constexpr const char*    kAllowPubKeyPrefix  = "Home/ZeroTrust/AlwaysAllowPub/";
+constexpr const wchar_t* kLogCat             = L"ZeroTrustPromptQueue.Home";
+constexpr const wchar_t* kLogCatCore         = L"ZeroTrustPromptQueue.Core";
+
+// Defensive caps on user-controlled strings inside PromptItems. The hot path
+// gets these from the process-execution hook and they must not be trusted to
+// have any particular length. Caps are generous (well above MAX_PATH and the
+// typical Authenticode subject) but bound worst-case allocations.
+constexpr std::size_t kMaxImagePathChars     = 32768;   ///< 64 KiB UTF-16.
+constexpr std::size_t kMaxPublisherChars     = 1024;    ///< 2 KiB UTF-16.
+
+// FNV-1a 64-bit digest of a wide string. Used to derive stable, ASCII-only
+// ConfigManager keys from arbitrary user paths/publishers.
+[[nodiscard]] inline std::string Fnv1aHexW(std::wstring_view s) noexcept {
+    std::uint64_t h = 14695981039346656037ULL;
+    for (wchar_t c : s) {
+        h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(c));
+        h *= 1099511628211ULL;
+    }
+    char buf[17]{};
+    (void)std::snprintf(buf, sizeof(buf), "%016llX",
+                        static_cast<unsigned long long>(h));
+    return std::string(buf);
 }
+
+[[nodiscard]] inline std::string WideToUtf8(std::wstring_view ws) {
+    if (ws.empty()) return {};
+    const int needed = ::WideCharToMultiByte(CP_UTF8, 0,
+        ws.data(), static_cast<int>(ws.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<std::size_t>(needed), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()),
+        out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+[[nodiscard]] inline std::wstring Utf8ToWide(std::string_view s) {
+    if (s.empty()) return {};
+    const int needed = ::MultiByteToWideChar(CP_UTF8, 0,
+        s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0) return {};
+    std::wstring out(static_cast<std::size_t>(needed), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+        out.data(), needed);
+    return out;
+}
+
+inline void TruncateInPlace(std::wstring& s, std::size_t maxChars) {
+    if (s.size() > maxChars) {
+        s.resize(maxChars);
+    }
+}
+} // namespace
 
 // ============================================================================
 // ─── PART 1: PhantomCore::ZeroTrustPromptQueue implementation ───────────────
@@ -278,6 +329,14 @@ ZeroTrustPromptQueue::~ZeroTrustPromptQueue() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 std::uint64_t ZeroTrustPromptQueue::Enqueue(ZeroTrustPromptItem&& item) {
+    // ------------------------------------------------------------------
+    // Defensive length caps on user-controlled strings sourced from the
+    // process-execution hook. This bounds worst-case allocation regardless
+    // of what the kernel hook hands us.
+    // ------------------------------------------------------------------
+    TruncateInPlace(item.imagePath,        kMaxImagePathChars);
+    TruncateInPlace(item.publisherSubject, kMaxPublisherChars);
+
     // If the item already carries a Core-assigned ID (bridge path), preserve it.
     // Otherwise generate a fresh monotonic ID.
     if (item.id == 0) {
@@ -301,6 +360,15 @@ std::uint64_t ZeroTrustPromptQueue::Enqueue(ZeroTrustPromptItem&& item) {
     {
         std::scoped_lock lock(m_impl->m_mutex);
 
+        // Once Stop() has been signalled, no further items may enter the queue:
+        // there is no consumer to drain them and they would leak until process
+        // teardown.
+        if (m_impl->m_stopped) {
+            SS_LOG_WARN(kLogCat,
+                L"ZeroTrustPromptQueue.Home: Enqueue() rejected — queue stopped");
+            return 0;
+        }
+
         m_impl->PruneExpiredLocked();
 
         // If still at capacity, evict the oldest item.
@@ -318,6 +386,23 @@ std::uint64_t ZeroTrustPromptQueue::Enqueue(ZeroTrustPromptItem&& item) {
 
     m_impl->m_cv.notify_all();
     return assignedId;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool ZeroTrustPromptQueue::SetProcessSessionId(std::uint64_t id,
+                                                std::uint32_t sessionId) {
+    if (id == 0) {
+        return false;
+    }
+    std::scoped_lock lock(m_impl->m_mutex);
+    for (auto& item : m_impl->m_queue) {
+        if (item.id == id) {
+            item.processSessionId = sessionId;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -421,54 +506,89 @@ bool ZeroTrustPromptQueue::Resolve(std::uint64_t id, UserChoice choice) {
                 }
             }
 
-            // Persist to ConfigManager.
-            if (::ShadowStrike::Config::ConfigManager::HasInstance()) {
+            // ----------------------------------------------------------------
+            // Persistence policy.
+            //
+            // Path-based AlwaysAllow is intentionally NOT persisted to
+            // ConfigManager for unsigned binaries. Without a publisher subject
+            // we cannot bind the user's trust decision to anything other than
+            // the literal pathname; an attacker who can later drop a different
+            // binary at the same path would inherit the allow-list entry, and
+            // process-launch hot path has no hash to verify against.
+            //
+            // For signed binaries we persist BOTH:
+            //   - the image-path entry (so subsequent launches of the exact
+            //     same trusted binary go through the fast path), and
+            //   - the publisher-subject entry (so any signed binary from the
+            //     same trusted publisher is honoured).
+            //
+            // AlwaysBlock is in-memory only by spec.
+            // ----------------------------------------------------------------
+            const bool persist =
+                ::ShadowStrike::Config::ConfigManager::HasInstance()
+                && !publisherSubject.empty();
+
+            if (persist) {
                 auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
                 using Layer = ::ShadowStrike::Config::ConfigLayer;
 
-                // Build a stable key by hashing the path string.
-                // We use a deterministic encoding: base64-ish hex of wchar bytes.
-                // For simplicity, we store the narrow UTF-8 form as a config value
-                // under a sanitised key.
-                std::string key = kAllowKeyPrefix;
-                // Encode image path as a hex digest to avoid invalid key chars.
-                {
-                    std::uint64_t h = 14695981039346656037ULL; // FNV-1a offset basis
-                    for (wchar_t c : imagePath) {
-                        h ^= static_cast<std::uint64_t>(c);
-                        h *= 1099511628211ULL;
+                if (!imagePath.empty()) {
+                    const std::string key     = std::string(kAllowKeyPrefix)
+                                                + Fnv1aHexW(imagePath);
+                    const std::string keyPath = key + "_path";
+
+                    if (!cfg.SetValue<bool>(key, true, Layer::User)) {
+                        SS_LOG_WARN(kLogCat,
+                            L"ZeroTrustPromptQueue.Home: ConfigManager.SetValue(allow key) failed");
                     }
-                    char buf[20]{};
-                    snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(h));
-                    key += buf;
+                    const std::string narrowPath = WideToUtf8(imagePath);
+                    if (!narrowPath.empty()) {
+                        if (!cfg.SetValue<std::string>(keyPath, narrowPath, Layer::User)) {
+                            SS_LOG_WARN(kLogCat,
+                                L"ZeroTrustPromptQueue.Home: ConfigManager.SetValue(path key) failed");
+                        }
+                    }
                 }
 
-                if (!cfg.SetValue<bool>(key, true, Layer::User)) {
-                    SS_LOG_WARN(kLogCat,
-                        L"ZeroTrustPromptQueue.Home: ConfigManager.SetValue(allow key) failed");
-                }
-                // Store the readable path as a sibling key for diagnostics.
-                const std::string keyPath = key + "_path";
-                // Convert to narrow for storage.
-                const int needed = ::WideCharToMultiByte(CP_UTF8, 0,
-                    imagePath.data(), static_cast<int>(imagePath.size()),
-                    nullptr, 0, nullptr, nullptr);
-                if (needed > 0) {
-                    std::string narrow(static_cast<std::size_t>(needed), '\0');
-                    ::WideCharToMultiByte(CP_UTF8, 0, imagePath.data(),
-                        static_cast<int>(imagePath.size()),
-                        narrow.data(), needed, nullptr, nullptr);
-                    if (!cfg.SetValue<std::string>(keyPath, narrow, Layer::User)) {
+                // Publisher subject sibling. Lets the user honour any signed
+                // binary from the same publisher after restart.
+                {
+                    const std::string pubKey     = std::string(kAllowPubKeyPrefix)
+                                                   + Fnv1aHexW(publisherSubject);
+                    const std::string pubKeyPath = pubKey + "_pub";
+
+                    if (!cfg.SetValue<bool>(pubKey, true, Layer::User)) {
                         SS_LOG_WARN(kLogCat,
-                            L"ZeroTrustPromptQueue.Home: ConfigManager.SetValue(path key) failed");
+                            L"ZeroTrustPromptQueue.Home: ConfigManager.SetValue(publisher key) failed");
+                    }
+                    const std::string narrowPub = WideToUtf8(publisherSubject);
+                    if (!narrowPub.empty()) {
+                        if (!cfg.SetValue<std::string>(pubKeyPath, narrowPub, Layer::User)) {
+                            SS_LOG_WARN(kLogCat,
+                                L"ZeroTrustPromptQueue.Home: ConfigManager.SetValue(publisher path key) failed");
+                        }
                     }
                 }
+            } else if (!::ShadowStrike::Config::ConfigManager::HasInstance()) {
+                SS_LOG_WARN(kLogCat,
+                    L"ZeroTrustPromptQueue.Home: AlwaysAllow not persisted "
+                    L"(ConfigManager unavailable); session-only");
+            } else {
+                // Unsigned binary path. The in-memory allow-list still applies
+                // for the current process lifetime, but we do not persist a
+                // pathname-only allow rule (binary-swap replay risk).
+                SS_LOG_WARN(kLogCat,
+                    L"ZeroTrustPromptQueue.Home: AlwaysAllow kept session-only — "
+                    L"unsigned binary at '%.128ls' (no publisher to bind to)",
+                    imagePath.c_str());
             }
 
             SS_LOG_INFO(kLogCat,
                 L"ZeroTrustPromptQueue.Home: id=%llu AlwaysAllow registered "
-                L"for '%.128ls'",
-                static_cast<unsigned long long>(id), imagePath.c_str());
+                L"for '%.128ls' (persisted=%hs)",
+                static_cast<unsigned long long>(id),
+                imagePath.c_str(),
+                persist ? "true" : "false");
             break;
         }
 
@@ -545,44 +665,70 @@ void ZeroTrustPromptQueue::LoadPersistedAllowList() {
 
     auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
 
-    // Enumerate all values under the AlwaysAllow prefix.
-    // Each entry has a hex-digest key (bool=true) and a <key>_path sibling
-    // (string = narrow UTF-8 path). We read the path siblings.
+    // Pull a snapshot of the User layer once. GetAllValues() may take its own
+    // locks inside ConfigManager; keep this off-hot-path and outside our own
+    // queue mutex so we never lock-order-invert against the hot path.
     const auto all = cfg.GetAllValues(
         ::ShadowStrike::Config::ConfigLayer::User);
 
-    std::size_t loaded = 0;
+    const std::string allowPrefix    = kAllowKeyPrefix;
+    const std::string allowPubPrefix = kAllowPubKeyPrefix;
+    constexpr std::string_view kPathSuffix = "_path";
+    constexpr std::string_view kPubSuffix  = "_pub";
+
+    std::size_t loadedPaths = 0;
+    std::size_t loadedPubs  = 0;
+
     {
         std::scoped_lock lock(m_impl->m_mutex);
         for (const auto& [key, val] : all) {
-            // We look for keys ending in "_path" under our prefix.
-            if (key.rfind(kAllowKeyPrefix, 0) != 0) continue;
-            if (key.size() < 5
-                || key.substr(key.size() - 5) != "_path") continue;
-
-            // Extract the stored narrow path.
             const auto* strPtr = std::get_if<std::string>(&val);
             if (!strPtr || strPtr->empty()) continue;
 
-            // Convert from narrow UTF-8 to wide.
-            const int needed = ::MultiByteToWideChar(CP_UTF8, 0,
-                strPtr->data(), static_cast<int>(strPtr->size()),
-                nullptr, 0);
-            if (needed <= 0) continue;
+            // Image-path siblings: "<allowPrefix><digest>_path" → narrow UTF-8 path.
+            if (key.size() >= allowPrefix.size() + kPathSuffix.size()
+                && key.compare(0, allowPrefix.size(), allowPrefix) == 0
+                && key.compare(key.size() - kPathSuffix.size(),
+                               kPathSuffix.size(), kPathSuffix) == 0)
+            {
+                // Cap on load to defend against a tampered config file.
+                if (strPtr->size() > kMaxImagePathChars * 4 /* UTF-8 worst-case */) {
+                    SS_LOG_WARN(kLogCat,
+                        L"ZeroTrustPromptQueue.Home: persisted path entry exceeds cap; skipped");
+                    continue;
+                }
+                std::wstring wpath = Utf8ToWide(*strPtr);
+                if (wpath.empty()) continue;
+                TruncateInPlace(wpath, kMaxImagePathChars);
+                m_impl->m_alwaysAllowPaths.insert(std::move(wpath));
+                ++loadedPaths;
+                continue;
+            }
 
-            std::wstring wpath(static_cast<std::size_t>(needed), L'\0');
-            ::MultiByteToWideChar(CP_UTF8, 0, strPtr->data(),
-                static_cast<int>(strPtr->size()),
-                wpath.data(), needed);
-
-            m_impl->m_alwaysAllowPaths.insert(std::move(wpath));
-            ++loaded;
+            // Publisher-subject siblings: "<allowPubPrefix><digest>_pub" → narrow UTF-8 subject.
+            if (key.size() >= allowPubPrefix.size() + kPubSuffix.size()
+                && key.compare(0, allowPubPrefix.size(), allowPubPrefix) == 0
+                && key.compare(key.size() - kPubSuffix.size(),
+                               kPubSuffix.size(), kPubSuffix) == 0)
+            {
+                if (strPtr->size() > kMaxPublisherChars * 4) {
+                    SS_LOG_WARN(kLogCat,
+                        L"ZeroTrustPromptQueue.Home: persisted publisher entry exceeds cap; skipped");
+                    continue;
+                }
+                std::wstring wpub = Utf8ToWide(*strPtr);
+                if (wpub.empty()) continue;
+                TruncateInPlace(wpub, kMaxPublisherChars);
+                m_impl->m_alwaysAllowPublishers.insert(std::move(wpub));
+                ++loadedPubs;
+                continue;
+            }
         }
     }
 
     SS_LOG_INFO(kLogCat,
-        L"ZeroTrustPromptQueue.Home: Loaded %zu persisted always-allow path(s)",
-        loaded);
+        L"ZeroTrustPromptQueue.Home: Loaded %zu always-allow path(s), %zu publisher(s)",
+        loadedPaths, loadedPubs);
 }
 
 void ZeroTrustPromptQueue::Stop() {
@@ -610,19 +756,13 @@ static std::uint64_t BridgeEnqueueToHomeQueue(PromptEntry entry) {
     item.imagePath    = entry.imagePath;
     item.score        = entry.computedTrust;
     item.createdAt    = entry.createdAt;
+    item.publisherSubject = Utf8ToWide(entry.publisher);
 
-    // Convert narrow publisher to wide.
-    if (!entry.publisher.empty()) {
-        const int needed = ::MultiByteToWideChar(CP_UTF8, 0,
-            entry.publisher.data(), static_cast<int>(entry.publisher.size()),
-            nullptr, 0);
-        if (needed > 0) {
-            item.publisherSubject.resize(static_cast<std::size_t>(needed));
-            ::MultiByteToWideChar(CP_UTF8, 0,
-                entry.publisher.data(), static_cast<int>(entry.publisher.size()),
-                item.publisherSubject.data(), needed);
-        }
-    }
+    // Apply defensive caps before the Home queue does, so the WARN below
+    // (if Home::Enqueue rejects a stopped queue / full queue) does not
+    // ride on an oversize buffer.
+    TruncateInPlace(item.imagePath,        kMaxImagePathChars);
+    TruncateInPlace(item.publisherSubject, kMaxPublisherChars);
 
     return HomeQueue::Instance().Enqueue(std::move(item));
 }

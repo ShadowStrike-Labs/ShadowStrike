@@ -125,6 +125,18 @@ public:
      */
     [[nodiscard]] std::uint64_t Enqueue(ZeroTrustPromptItem&& item);
 
+    /**
+     * @brief Attach a Windows session ID to a previously enqueued item.
+     *
+     * Used by the PhantomHome adapter to enrich bridge-created prompt items
+     * (whose PhantomCore source lacks the session field) with the session id
+     * captured at the PhantomHome Evaluate() call site. Idempotent.
+     *
+     * @return true if the item was found and updated; false if the id is no
+     *         longer present (evicted/expired/resolved).
+     */
+    bool SetProcessSessionId(std::uint64_t id, std::uint32_t sessionId);
+
     // ---- Consumer side (called by the UI service thread) -------------------
 
     /**
