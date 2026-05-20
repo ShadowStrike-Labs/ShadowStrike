@@ -723,40 +723,82 @@ private:
         SS_LOG_WARN(LOG_CATEGORY, L"Blocking device: %hs", devicePath.c_str());
 
 #ifdef _WIN32
-        HDEVINFO devInfo = SetupDiGetClassDevsA(
-            nullptr, devicePath.c_str(), nullptr,
-            DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
+        if (devicePath.empty() || devicePath.size() > kMaxUsbPathLength) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"BlockDevice rejected: device path length out of range");
+            return false;
+        }
 
+        // Build an empty device-info set, then attach the specific device
+        // interface so we can resolve its SP_DEVINFO_DATA. Passing the
+        // interface path as Enumerator to SetupDiGetClassDevsA — as the
+        // previous implementation did — never matches because Enumerator
+        // expects a PnP enumerator string (e.g. "USB"), not an interface
+        // path; the disable request therefore silently failed.
+        const std::wstring widePath = Utils::StringUtils::ToWide(devicePath);
+        if (widePath.empty()) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"BlockDevice rejected: invalid wide path");
+            return false;
+        }
+
+        HDEVINFO devInfo = SetupDiCreateDeviceInfoList(nullptr, nullptr);
         if (devInfo == INVALID_HANDLE_VALUE) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to get device info for blocking");
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"BlockDevice: SetupDiCreateDeviceInfoList failed (error %lu)",
+                ::GetLastError());
+            return false;
+        }
+
+        SP_DEVICE_INTERFACE_DATA ifaceData{};
+        ifaceData.cbSize = sizeof(ifaceData);
+        if (!SetupDiOpenDeviceInterfaceW(devInfo, widePath.c_str(), 0, &ifaceData)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"BlockDevice: SetupDiOpenDeviceInterfaceW failed (error %lu)",
+                ::GetLastError());
+            SetupDiDestroyDeviceInfoList(devInfo);
             return false;
         }
 
         SP_DEVINFO_DATA devInfoData{};
-        devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-
-        bool success = false;
-        if (SetupDiEnumDeviceInfo(devInfo, 0, &devInfoData)) {
-            SP_PROPCHANGE_PARAMS propChange{};
-            propChange.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
-            propChange.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-            propChange.StateChange = DICS_DISABLE;
-            propChange.Scope = DICS_FLAG_GLOBAL;
-            propChange.HwProfile = 0;
-
-            if (SetupDiSetClassInstallParamsA(devInfo, &devInfoData,
-                    &propChange.ClassInstallHeader, sizeof(propChange))) {
-                success = SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &devInfoData);
-            }
+        devInfoData.cbSize = sizeof(devInfoData);
+        DWORD requiredSize = 0;
+        // We do not need the interface detail; this call populates devInfoData
+        // even when the detail buffer is NULL/too small.
+        SetupDiGetDeviceInterfaceDetailW(devInfo, &ifaceData,
+            nullptr, 0, &requiredSize, &devInfoData);
+        const DWORD detailErr = ::GetLastError();
+        if (detailErr != ERROR_INSUFFICIENT_BUFFER && detailErr != ERROR_SUCCESS) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"BlockDevice: SetupDiGetDeviceInterfaceDetailW failed (error %lu)",
+                detailErr);
+            SetupDiDeleteDeviceInterfaceData(devInfo, &ifaceData);
+            SetupDiDestroyDeviceInfoList(devInfo);
+            return false;
         }
 
+        bool success = false;
+        SP_PROPCHANGE_PARAMS propChange{};
+        propChange.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+        propChange.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        propChange.StateChange = DICS_DISABLE;
+        propChange.Scope = DICS_FLAG_GLOBAL;
+        propChange.HwProfile = 0;
+
+        if (SetupDiSetClassInstallParamsW(devInfo, &devInfoData,
+                &propChange.ClassInstallHeader, sizeof(propChange))) {
+            success = SetupDiCallClassInstaller(DIF_PROPERTYCHANGE,
+                devInfo, &devInfoData) != FALSE;
+        }
+
+        const DWORD finalErr = success ? ERROR_SUCCESS : ::GetLastError();
+        SetupDiDeleteDeviceInterfaceData(devInfo, &ifaceData);
         SetupDiDestroyDeviceInfoList(devInfo);
 
         if (success) {
             m_stats.attacksBlocked++;
             SS_LOG_INFO(LOG_CATEGORY, L"Device blocked successfully");
         } else {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to block device: %lu", GetLastError());
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to block device: %lu", finalErr);
         }
 
         return success;
@@ -889,7 +931,10 @@ private:
         SS_LOG_INFO(LOG_CATEGORY, L"Clearing input buffer");
 
 #ifdef _WIN32
-        while (true) {
+        // Cap the drain so an attacker injecting keystrokes faster than we can
+        // dequeue them cannot pin this thread inside ClearInputBuffer forever.
+        constexpr unsigned kMaxDrainIterations = 4096;
+        for (unsigned i = 0; i < kMaxDrainIterations; ++i) {
             MSG msg;
             if (!PeekMessageW(&msg, nullptr, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE)) {
                 break;
@@ -967,15 +1012,23 @@ private:
         }
 
         wchar_t buffer[256] = {0};
+        // HidD_Get*String guarantees buffer-bytes argument matches sizeof(buffer),
+        // but on failure or driver misbehaviour the buffer may be left without
+        // a terminator. Always reseat the final wchar_t to L'\0' before the
+        // narrow conversion to prevent an OOB read in StringUtils::ToNarrow.
+        constexpr size_t kHidStringMax = (sizeof(buffer) / sizeof(buffer[0])) - 1;
         if (HidD_GetManufacturerString(hDevice, buffer, sizeof(buffer))) {
+            buffer[kHidStringMax] = L'\0';
             descriptor.manufacturer = SanitizeHostileUsbString(Utils::StringUtils::ToNarrow(buffer));
         }
 
         if (HidD_GetProductString(hDevice, buffer, sizeof(buffer))) {
+            buffer[kHidStringMax] = L'\0';
             descriptor.product = SanitizeHostileUsbString(Utils::StringUtils::ToNarrow(buffer));
         }
 
         if (HidD_GetSerialNumberString(hDevice, buffer, sizeof(buffer))) {
+            buffer[kHidStringMax] = L'\0';
             descriptor.serialNumber = SanitizeHostileUsbString(Utils::StringUtils::ToNarrow(buffer));
         }
 
