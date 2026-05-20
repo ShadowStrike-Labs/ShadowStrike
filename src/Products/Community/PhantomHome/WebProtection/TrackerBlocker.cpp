@@ -420,16 +420,16 @@ public:
     [[nodiscard]] bool Initialize(const TrackerBlockerConfiguration& config) {
         std::unique_lock lock(m_mutex);
 
-        if (m_status == ModuleStatus::Running) {
+        if (m_status.load(std::memory_order_acquire) == ModuleStatus::Running) {
             TB_LOG_WARN("Already initialized");
             return true;
         }
 
-        m_status = ModuleStatus::Initializing;
+        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         if (!config.IsValid()) {
             TB_LOG_ERROR("Invalid configuration");
-            m_status = ModuleStatus::Error;
+            m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
 
@@ -459,7 +459,7 @@ public:
             StartUpdateThread();
         }
 
-        m_status = ModuleStatus::Running;
+        m_status.store(ModuleStatus::Running, std::memory_order_release);
         TB_LOG_INFO("TrackerBlocker initialized with {} rules", m_rules.size());
         return true;
     }
@@ -471,10 +471,11 @@ public:
     void Shutdown() {
         {
             std::unique_lock lock(m_mutex);
-            if (m_status == ModuleStatus::Stopped || m_status == ModuleStatus::Uninitialized) {
+            const ModuleStatus cur = m_status.load(std::memory_order_acquire);
+            if (cur == ModuleStatus::Stopped || cur == ModuleStatus::Uninitialized) {
                 return;
             }
-            m_status = ModuleStatus::Stopping;
+            m_status.store(ModuleStatus::Stopping, std::memory_order_release);
         }
 
         StopUpdateThread();
@@ -482,18 +483,18 @@ public:
         {
             std::unique_lock lock(m_mutex);
             ClearAllInternal();
-            m_status = ModuleStatus::Stopped;
+            m_status.store(ModuleStatus::Stopped, std::memory_order_release);
         }
 
         TB_LOG_INFO("TrackerBlocker shutdown complete");
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
-        return m_status == ModuleStatus::Running;
+        return m_status.load(std::memory_order_acquire) == ModuleStatus::Running;
     }
 
     [[nodiscard]] ModuleStatus GetStatus() const noexcept {
-        return m_status;
+        return m_status.load(std::memory_order_acquire);
     }
 
     // ========================================================================
@@ -524,6 +525,7 @@ public:
     }
 
     [[nodiscard]] BlockerMode GetMode() const noexcept {
+        std::shared_lock lock(m_mutex);
         return m_config.mode;
     }
 
@@ -539,6 +541,7 @@ public:
     }
 
     [[nodiscard]] bool IsCategoryBlocked(TrackerCategory category) const noexcept {
+        std::shared_lock lock(m_mutex);
         return HasCategory(m_config.blockedCategories, category);
     }
 
@@ -551,25 +554,51 @@ public:
         BlockResult result;
         result.decision = BlockDecision::Allow;
 
-        // Check if disabled
-        if (m_config.mode == BlockerMode::Disabled) {
+        // Gate the entire filtering path on a Running status. Initialize() and
+        // Shutdown() publish via m_status.store with release ordering; we read
+        // with acquire here. UpdateConfiguration/SetMode also keep the module
+        // in Running.
+        const ModuleStatus status = m_status.load(std::memory_order_acquire);
+        if (status != ModuleStatus::Running &&
+            status != ModuleStatus::Degraded) {
+            result.reason = "Module not running";
+            result.processingTimeUs = GetElapsedUs(startTime);
+            return result;
+        }
+
+        // Validate URL length up front to bound work and prevent
+        // denial-of-service via oversized strings before any allocation.
+        if (request.url.size() > TrackerBlockerConstants::MAX_URL_LENGTH) {
+            result.reason = "URL exceeds maximum length";
+            result.processingTimeUs = GetElapsedUs(startTime);
+            return result;
+        }
+
+        // Snapshot the configuration under shared_lock so that the entire
+        // filtering pipeline operates on a consistent view even if a writer
+        // calls SetConfiguration/SetMode mid-request. The shared lock is then
+        // held for the rule/whitelist/blocklist read-only traversals that
+        // follow, since std::shared_mutex is non-recursive on Windows and the
+        // helpers (IsWhitelistedInternal, IsDomainBlockedInternal,
+        // MatchRulesLocked, GetDomainCategory, StripTrackingParamsInternal)
+        // assume the caller holds at least a shared lock.
+        TrackerBlockerConfiguration cfg;
+        {
+            std::shared_lock lock(m_mutex);
+            cfg = m_config;
+        }
+
+        // Check if disabled (configuration-level kill switch).
+        if (cfg.mode == BlockerMode::Disabled) {
             result.processingTimeUs = GetElapsedUs(startTime);
             return result;
         }
 
         m_stats.totalRequests++;
 
-        // 1. Check whitelist first
-        if (IsWhitelistedInternal(request.url)) {
-            m_stats.whitelistExceptions++;
-            m_stats.totalAllowed++;
-            result.reason = "Whitelisted";
-            result.processingTimeUs = GetElapsedUs(startTime);
-            return result;
-        }
-
-        // 2. Check URL cache
-        if (m_config.enableCache) {
+        // The cache uses its own mutex (m_cacheMutex) and never re-enters
+        // m_mutex, so it's safe to consult it before taking the shared lock.
+        if (cfg.enableCache) {
             if (auto cached = GetFromCache(request.url)) {
                 m_stats.cacheHits++;
                 cached->fromCache = true;
@@ -586,73 +615,89 @@ public:
             m_stats.cacheMisses++;
         }
 
-        // 3. Quick bloom filter check
         std::string domain = ExtractDomainInternal(request.url);
-        if (m_config.enableBloomFilter && m_bloomFilter) {
-            if (!m_bloomFilter->MightContain(domain)) {
-                // Definitely not in blocklist
-                result.decision = BlockDecision::Allow;
-                result.processingTimeUs = GetElapsedUs(startTime);
-                m_stats.totalAllowed++;
 
-                if (m_config.enableCache) {
-                    AddToCache(request.url, result);
-                }
+        bool bloomQuickAllow = false;
+        {
+            std::shared_lock lock(m_mutex);
+
+            // 1. Whitelist
+            if (IsWhitelistedInternal(request.url)) {
+                m_stats.whitelistExceptions++;
+                m_stats.totalAllowed++;
+                result.reason = "Whitelisted";
+                result.processingTimeUs = GetElapsedUs(startTime);
                 return result;
             }
-            m_stats.bloomFilterHits++;
-        }
 
-        // 4. Check domain blocklist
-        if (IsDomainBlockedInternal(domain)) {
-            result.decision = BlockDecision::Block;
-            result.matchedPattern = domain;
-            result.category = GetDomainCategory(domain);
-            result.reason = "Blocked domain";
-            result.shouldLog = true;
-
-            UpdateBlockStats(result.category);
-            LogBlockedRequest(request, result);
-        }
-
-        // 5. Check URL patterns
-        if (result.decision == BlockDecision::Allow) {
-            auto matchResult = MatchRules(request);
-            if (matchResult.has_value()) {
-                result = *matchResult;
+            // 2. Bloom filter quick reject
+            if (cfg.enableBloomFilter && m_bloomFilter) {
+                if (!m_bloomFilter->MightContain(domain)) {
+                    result.decision = BlockDecision::Allow;
+                    m_stats.totalAllowed++;
+                    bloomQuickAllow = true;
+                } else {
+                    m_stats.bloomFilterHits++;
+                }
             }
-        }
 
-        // 6. Apply URL modification if needed
-        if (result.decision == BlockDecision::Allow && m_config.stripTrackingParams) {
-            std::string modifiedUrl = StripTrackingParamsInternal(request.url);
-            if (modifiedUrl != request.url) {
-                result.decision = BlockDecision::Modify;
-                result.modifiedUrl = modifiedUrl;
-                result.reason = "Tracking parameters stripped";
-                m_stats.totalModified++;
+            if (!bloomQuickAllow) {
+                // 3. Domain blocklist
+                if (IsDomainBlockedInternal(domain)) {
+                    result.decision = BlockDecision::Block;
+                    result.matchedPattern = domain;
+                    result.category = GetDomainCategory(domain);
+                    result.reason = "Blocked domain";
+                    result.shouldLog = true;
+
+                    UpdateBlockStats(result.category);
+                    LogBlockedRequest(request, result);
+                }
+
+                // 4. URL pattern rules
+                if (result.decision == BlockDecision::Allow) {
+                    auto matchResult = MatchRulesLocked(request, cfg);
+                    if (matchResult.has_value()) {
+                        result = *matchResult;
+                    }
+                }
+
+                // 5. Tracking-parameter stripping (reads m_trackingParams)
+                if (result.decision == BlockDecision::Allow && cfg.stripTrackingParams) {
+                    std::string modifiedUrl = StripTrackingParamsInternal(request.url);
+                    if (modifiedUrl != request.url) {
+                        result.decision = BlockDecision::Modify;
+                        result.modifiedUrl = modifiedUrl;
+                        result.reason = "Tracking parameters stripped";
+                        m_stats.totalModified++;
+                    }
+                }
             }
-        }
+        } // release shared_lock
 
-        // 7. Monitor mode - log but don't block
-        if (m_config.mode == BlockerMode::Monitor && result.decision == BlockDecision::Block) {
+        // 6. Monitor mode - log but don't block (only when we actually evaluated rules)
+        if (!bloomQuickAllow &&
+            cfg.mode == BlockerMode::Monitor &&
+            result.decision == BlockDecision::Block) {
             result.decision = BlockDecision::AllowLogged;
             result.reason = "Monitor mode: " + result.reason;
         }
 
-        // 8. Update statistics
-        if (result.decision == BlockDecision::Block) {
-            m_stats.totalBlocked++;
-        } else if (result.decision != BlockDecision::Modify) {
-            m_stats.totalAllowed++;
+        // 7. Statistics (skip if bloom quick-allow already counted)
+        if (!bloomQuickAllow) {
+            if (result.decision == BlockDecision::Block) {
+                m_stats.totalBlocked++;
+            } else if (result.decision != BlockDecision::Modify) {
+                m_stats.totalAllowed++;
+            }
         }
 
-        // 9. Cache result
-        if (m_config.enableCache) {
+        // 8. Cache result (m_cacheMutex)
+        if (cfg.enableCache) {
             AddToCache(request.url, result);
         }
 
-        // 10. Notify callbacks
+        // 9. Callbacks (m_callbackMutex)
         if (result.decision == BlockDecision::Block || result.decision == BlockDecision::AllowLogged) {
             NotifyBlockCallbacks(request, result);
         }
@@ -671,8 +716,8 @@ public:
         request.type = type;
         request.initiatorDomain = std::string(initiatorDomain);
 
-        // Parse URL components
-        ParseUrlInternal(url, request.domain, request.path, request.queryString);
+        // Parse URL components (failure tolerated; downstream uses defaults)
+        (void)ParseUrlInternal(url, request.domain, request.path, request.queryString);
 
         // Determine if third-party
         if (!initiatorDomain.empty()) {
@@ -709,16 +754,29 @@ public:
             return std::string(referrer);
         }
 
-        // Cross-origin - return only origin
-        size_t schemeEnd = std::string(referrer).find("://");
-        if (schemeEnd != std::string::npos) {
-            size_t pathStart = std::string(referrer).find('/', schemeEnd + 3);
-            if (pathStart != std::string::npos) {
-                return std::string(referrer.substr(0, pathStart));
-            }
+        // Cross-origin - reconstruct scheme + canonical host (no userinfo, no
+        // path, no query, no fragment). Building the origin from the canonical
+        // ExtractDomainInternal output prevents userinfo-spoof leaks of the
+        // form "https://victim.com@attacker.example/".
+        if (refDomain.empty()) {
+            return "";
         }
 
-        return std::string(referrer);
+        std::string scheme;
+        const size_t schemeEnd = referrer.find("://");
+        if (schemeEnd != std::string_view::npos) {
+            scheme.assign(referrer.substr(0, schemeEnd));
+        } else {
+            scheme = "https";
+        }
+        // Strict scheme allowlist: only http/https referrers are passed through.
+        if (scheme != "http" && scheme != "https") {
+            return "";
+        }
+        std::string origin;
+        origin.reserve(scheme.size() + 3 + refDomain.size() + 1);
+        origin.append(scheme).append("://").append(refDomain).append("/");
+        return origin;
     }
 
     // ========================================================================
@@ -788,6 +846,9 @@ public:
         std::string line;
 
         while (std::getline(stream, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
             if (line.size() > TrackerBlockerConstants::MAX_PATTERN_LENGTH ||
                 ContainsEmbeddedLineBreak(line) ||
                 !IsStrictUtf8(line)) {
@@ -914,11 +975,23 @@ public:
     }
 
     void UpdateAllBlocklists() {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, info] : m_blocklists) {
-            if (!info.updateUrl.empty()) {
-                UpdateBlocklist(id);
+        // Snapshot the list of update-eligible blocklist IDs under the lock,
+        // then release before calling UpdateBlocklist(). UpdateBlocklist also
+        // takes m_mutex and std::shared_mutex on Windows is non-recursive even
+        // for shared lockers (SRWLock returns to user-mode unspecified state on
+        // re-entry), so we MUST drop the lock before re-entering.
+        std::vector<std::string> idsToUpdate;
+        {
+            std::shared_lock lock(m_mutex);
+            idsToUpdate.reserve(m_blocklists.size());
+            for (const auto& [id, info] : m_blocklists) {
+                if (!info.updateUrl.empty()) {
+                    idsToUpdate.push_back(id);
+                }
             }
+        }
+        for (const auto& id : idsToUpdate) {
+            (void)UpdateBlocklist(id);
         }
     }
 
@@ -947,8 +1020,24 @@ public:
 
         std::string ruleId = rule.id.empty() ? GenerateRuleId() : rule.id;
         m_rules[ruleId] = rule;
-        m_rules[ruleId].id = ruleId;
-        m_rules[ruleId].createdAt = Clock::now();
+        auto& stored = m_rules[ruleId];
+        stored.id = ruleId;
+        stored.createdAt = Clock::now();
+
+        // Eagerly compile UrlRegex while holding the exclusive lock so that
+        // MatchRules can run under a shared lock without ever needing to
+        // mutate the rule (which would be a data race across readers).
+        // Malformed patterns disable the rule rather than throwing in the
+        // request hot path.
+        if (stored.type == RuleType::UrlRegex) {
+            try {
+                stored.compiledRegex = std::regex(stored.pattern, std::regex::icase);
+            } catch (const std::regex_error& ex) {
+                TB_LOG_ERROR("Invalid regex pattern '{}' rejected: {}",
+                             stored.pattern, ex.what());
+                stored.enabled = false;
+            }
+        }
 
         // Add to bloom filter if domain rule
         if (rule.type == RuleType::Domain || rule.type == RuleType::DomainSuffix) {
@@ -1157,20 +1246,23 @@ public:
     [[nodiscard]] std::string ExportReport() const {
         json report;
         report["statistics"] = json::parse(GetStatistics().ToJson());
-        report["ruleCount"] = m_rules.size();
-        report["whitelistCount"] = m_whitelist.size();
-        report["blocklistCount"] = m_blocklists.size();
+        {
+            std::shared_lock lock(m_mutex);
+            report["ruleCount"] = m_rules.size();
+            report["whitelistCount"] = m_whitelist.size();
+            report["blocklistCount"] = m_blocklists.size();
 
-        json blocklists = json::array();
-        for (const auto& [id, info] : m_blocklists) {
-            json bl;
-            bl["id"] = info.id;
-            bl["name"] = info.name;
-            bl["ruleCount"] = info.ruleCount;
-            bl["enabled"] = info.enabled;
-            blocklists.push_back(bl);
+            json blocklists = json::array();
+            for (const auto& [id, info] : m_blocklists) {
+                json bl;
+                bl["id"] = info.id;
+                bl["name"] = info.name;
+                bl["ruleCount"] = info.ruleCount;
+                bl["enabled"] = info.enabled;
+                blocklists.push_back(bl);
+            }
+            report["blocklists"] = blocklists;
         }
-        report["blocklists"] = blocklists;
 
         return report.dump(2);
     }
@@ -1214,8 +1306,14 @@ public:
     }
 
     void PreloadCache(const std::vector<std::string>& domains) {
-        for (const auto& domain : domains) {
-            ShouldBlockUrl(domain, RequestType::Document, {});
+        constexpr size_t kPreloadCap = 4096;
+        if (domains.size() > kPreloadCap) {
+            TB_LOG_WARN("PreloadCache truncated: requested {} > cap {}",
+                        domains.size(), kPreloadCap);
+        }
+        const size_t limit = std::min(domains.size(), kPreloadCap);
+        for (size_t i = 0; i < limit; ++i) {
+            (void)ShouldBlockUrl(domains[i], RequestType::Document, {});
         }
     }
 
@@ -1262,7 +1360,7 @@ public:
         }
 
         // Test 4: Check whitelist
-        WhitelistDomain("whitelisted.example.com");
+        (void)WhitelistDomain("whitelisted.example.com");
         result = ShouldBlockUrl("https://whitelisted.example.com/",
                                 RequestType::Document, {});
         if (result.decision == BlockDecision::Block) {
@@ -1271,8 +1369,8 @@ public:
         }
 
         // Cleanup
-        RemoveRule("test-tracker.example.com");
-        RemoveFromWhitelist("whitelisted.example.com");
+        (void)RemoveRule("test-tracker.example.com");
+        (void)RemoveFromWhitelist("whitelisted.example.com");
 
         TB_LOG_INFO("Self-test passed");
         return true;
@@ -1297,7 +1395,9 @@ private:
     mutable std::shared_mutex m_logMutex;
     mutable std::shared_mutex m_callbackMutex;
 
-    ModuleStatus m_status{ModuleStatus::Uninitialized};
+    // m_status is read lock-free from IsInitialized()/GetStatus(); atomic so
+    // Initialize/Shutdown publishing is visible to concurrent callers.
+    std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
     TrackerBlockerConfiguration m_config;
 
     // Rules and blocklists
@@ -1395,7 +1495,7 @@ private:
 
     [[nodiscard]] static std::string ExtractDomainInternal(std::string_view url) {
         std::string domain, path, query;
-        ParseUrlInternal(url, domain, path, query);
+        (void)ParseUrlInternal(url, domain, path, query);
         return domain;
     }
 
@@ -1403,7 +1503,10 @@ private:
                                                     std::string_view initiatorDomain) {
         std::string urlDomain = ExtractDomainInternal(url);
         std::string initDomain(initiatorDomain);
-        std::transform(initDomain.begin(), initDomain.end(), initDomain.begin(), ::tolower);
+        std::transform(initDomain.begin(), initDomain.end(), initDomain.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
 
         if (urlDomain == initDomain) {
             return false;
@@ -1480,14 +1583,21 @@ private:
         return TrackerCategory::UnknownTracker;
     }
 
-    [[nodiscard]] std::optional<BlockResult> MatchRules(const WebRequest& request) {
-        std::shared_lock lock(m_mutex);
+    // Caller MUST hold m_mutex in at least shared mode for the duration of
+    // this call. The rule store and bloom filter must not be mutated by the
+    // current thread while iterating. We do NOT acquire m_mutex internally
+    // because std::shared_mutex is non-recursive (SRWLock on Windows) and
+    // ShouldBlock already holds a shared lock spanning the full filtering
+    // pipeline.
+    [[nodiscard]] std::optional<BlockResult> MatchRulesLocked(
+        const WebRequest& request,
+        const TrackerBlockerConfiguration& cfg) const {
 
         for (const auto& [id, rule] : m_rules) {
             if (!rule.enabled) continue;
 
             // Check category blocking
-            if (!HasCategory(m_config.blockedCategories, rule.category)) {
+            if (!HasCategory(cfg.blockedCategories, rule.category)) {
                 continue;
             }
 
@@ -1527,14 +1637,15 @@ private:
                     break;
 
                 case RuleType::UrlRegex:
-                    if (!rule.compiledRegex.has_value()) {
+                    // compiledRegex is populated under unique_lock in
+                    // AddRuleLocked. Under shared_lock we only read it.
+                    if (rule.compiledRegex.has_value()) {
                         try {
-                            rule.compiledRegex = std::regex(rule.pattern, std::regex::icase);
+                            matched = std::regex_search(request.url, *rule.compiledRegex);
                         } catch (...) {
-                            continue;
+                            matched = false;
                         }
                     }
-                    matched = std::regex_search(request.url, *rule.compiledRegex);
                     break;
 
                 default:
@@ -1547,8 +1658,12 @@ private:
                     return std::nullopt;  // Allow
                 }
 
-                // Increment hit count
-                const_cast<BlockRule&>(rule).hitCount++;
+                // Increment hit count (atomic). hitCount is declared
+                // non-mutable in BlockRule, so we const_cast the atomic itself
+                // (not the whole rule) to invoke fetch_add. This is well
+                // defined since hitCount's storage is not const.
+                const_cast<std::atomic<uint64_t>&>(rule.hitCount)
+                    .fetch_add(1, std::memory_order_relaxed);
 
                 BlockResult result;
                 result.decision = BlockDecision::Block;
@@ -1687,6 +1802,9 @@ private:
             std::string line;
 
             while (std::getline(file, line)) {
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
                 if (line.size() > TrackerBlockerConstants::MAX_PATTERN_LENGTH ||
                     ContainsEmbeddedLineBreak(line) ||
                     !IsStrictUtf8(line)) {
@@ -1705,7 +1823,7 @@ private:
                         TB_LOG_WARN("Reached maximum blocklist rule count; stopping parse");
                         break;
                     }
-                    AddRuleLocked(rule);
+                    (void)AddRuleLocked(rule);
                     ruleCount++;
                 }
             }
@@ -1929,21 +2047,46 @@ private:
     }
 
     void StartUpdateThread() {
-        m_stopUpdate = false;
+        m_stopUpdate.store(false, std::memory_order_release);
         m_updateThread = std::thread([this]() {
-            while (!m_stopUpdate) {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(m_config.updateIntervalMs));
+            // Sleep in short slices (POLL_INTERVAL) so Shutdown() returns
+            // promptly even when updateIntervalMs is configured to hours.
+            // Reading m_config.updateIntervalMs here is racy vs writers but
+            // we sample once per cycle and clamp to a sane minimum.
+            constexpr auto POLL_INTERVAL = std::chrono::milliseconds(250);
+            constexpr uint32_t MIN_UPDATE_MS = 1000;
+            while (!m_stopUpdate.load(std::memory_order_acquire)) {
+                uint32_t intervalMs;
+                {
+                    std::shared_lock lock(m_mutex);
+                    intervalMs = m_config.updateIntervalMs;
+                }
+                if (intervalMs < MIN_UPDATE_MS) {
+                    intervalMs = MIN_UPDATE_MS;
+                }
+                auto remaining = std::chrono::milliseconds(intervalMs);
+                while (remaining.count() > 0 &&
+                       !m_stopUpdate.load(std::memory_order_acquire)) {
+                    auto slice = std::min<std::chrono::milliseconds>(remaining, POLL_INTERVAL);
+                    std::this_thread::sleep_for(slice);
+                    remaining -= slice;
+                }
 
-                if (m_stopUpdate) break;
+                if (m_stopUpdate.load(std::memory_order_acquire)) break;
 
-                UpdateAllBlocklists();
+                try {
+                    UpdateAllBlocklists();
+                } catch (const std::exception& ex) {
+                    TB_LOG_ERROR("UpdateAllBlocklists threw: {}", ex.what());
+                } catch (...) {
+                    TB_LOG_ERROR("UpdateAllBlocklists threw unknown exception");
+                }
             }
         });
     }
 
     void StopUpdateThread() {
-        m_stopUpdate = true;
+        m_stopUpdate.store(true, std::memory_order_release);
         if (m_updateThread.joinable()) {
             m_updateThread.join();
         }
