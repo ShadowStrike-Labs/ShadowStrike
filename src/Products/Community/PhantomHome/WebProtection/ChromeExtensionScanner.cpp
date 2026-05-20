@@ -190,6 +190,18 @@ namespace {
     // Maximum lines above which long-line check triggers
     constexpr size_t kLongLineThreshold = 5000;
 
+    // Chrome/Chromium extension IDs are 32 lowercase characters in [a-p] — the
+    // result of base16 over a SHA-256 digest mapped 0..15 -> 'a'..'p'. Any other
+    // shape is either spoofed, a directory name unrelated to a real extension,
+    // or attacker-controlled.
+    [[nodiscard]] bool IsValidChromeExtensionId(std::string_view id) noexcept {
+        if (id.size() != 32) return false;
+        for (char c : id) {
+            if (c < 'a' || c > 'p') return false;
+        }
+        return true;
+    }
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -389,11 +401,22 @@ ChromeExtensionScannerImpl::GetConfiguration() const {
 std::vector<ExtensionScanResult> ChromeExtensionScannerImpl::ScanAll() {
     std::vector<ExtensionScanResult> results;
 
+    // Snapshot browser-selection flags under shared_lock to avoid racing with
+    // UpdateConfiguration. The lock is released before any filesystem work.
+    bool sChrome = false, sEdge = false, sBrave = false, sOpera = false;
+    {
+        std::shared_lock lock(m_mutex);
+        sChrome = m_config.scanChrome;
+        sEdge   = m_config.scanEdge;
+        sBrave  = m_config.scanBrave;
+        sOpera  = m_config.scanOpera;
+    }
+
     std::vector<ChromiumBrowser> browsers;
-    if (m_config.scanChrome) browsers.push_back(ChromiumBrowser::Chrome);
-    if (m_config.scanEdge)   browsers.push_back(ChromiumBrowser::Edge);
-    if (m_config.scanBrave)  browsers.push_back(ChromiumBrowser::Brave);
-    if (m_config.scanOpera)  browsers.push_back(ChromiumBrowser::Opera);
+    if (sChrome) browsers.push_back(ChromiumBrowser::Chrome);
+    if (sEdge)   browsers.push_back(ChromiumBrowser::Edge);
+    if (sBrave)  browsers.push_back(ChromiumBrowser::Brave);
+    if (sOpera)  browsers.push_back(ChromiumBrowser::Opera);
 
     for (auto browser : browsers) {
         auto browserResults = ScanBrowser(browser);
@@ -409,6 +432,14 @@ std::vector<ExtensionScanResult>
 ChromeExtensionScannerImpl::ScanBrowser(ChromiumBrowser browser) {
     std::vector<ExtensionScanResult> results;
 
+    // Snapshot blockMalicious under lock; the remaining hot-path flags are
+    // snapshot inside ScanExtension.
+    bool blockMalicious = false;
+    {
+        std::shared_lock lock(m_mutex);
+        blockMalicious = m_config.blockMalicious;
+    }
+
     auto extensions = DiscoverExtensions(browser);
     m_stats.totalScanned += extensions.size();
 
@@ -419,6 +450,9 @@ ChromeExtensionScannerImpl::ScanBrowser(ChromiumBrowser browser) {
         result.info.profileName = ext.profileName;
         if (result.info.source == ExtensionSource::Unknown) {
             result.info.source = ext.source;
+        }
+        if (result.info.id.empty()) {
+            result.info.id = ext.id;
         }
 
         auto verdictIdx = static_cast<size_t>(result.verdict);
@@ -444,8 +478,13 @@ ChromeExtensionScannerImpl::ScanBrowser(ChromiumBrowser browser) {
 
         if (result.verdict == ExtensionVerdict::Malicious) {
             NotifyMalicious(result.info);
-            if (m_config.blockMalicious) {
+            // Guard BlockExtension against empty/malformed IDs so a manifest
+            // parse failure cannot poison the block set with a junk entry.
+            if (blockMalicious && IsValidChromeExtensionId(result.info.id)) {
                 BlockExtension(result.info.id);
+            } else if (blockMalicious) {
+                Logger::Warn("ChromeExtensionScanner: declining to block malicious extension with malformed id '{}'",
+                             result.info.id);
             }
         }
     }
@@ -457,6 +496,15 @@ ExtensionScanResult
 ChromeExtensionScannerImpl::ScanExtension(const fs::path& extensionPath) {
     auto start = Clock::now();
     ExtensionScanResult result;
+
+    // Snapshot per-extension config flags under shared_lock.
+    bool analyzeCodeFlag = false;
+    bool checkTI = false;
+    {
+        std::shared_lock lock(m_mutex);
+        analyzeCodeFlag = m_config.analyzeCode;
+        checkTI         = m_config.checkThreatIntel;
+    }
 
     // 1. Manifest analysis
     result.info = AnalyzeFolder(extensionPath);
@@ -475,7 +523,7 @@ ChromeExtensionScannerImpl::ScanExtension(const fs::path& extensionPath) {
     }
 
     // 3. Code analysis (if enabled and manifest parsed successfully)
-    if (m_config.analyzeCode && result.info.manifest.manifestVersion > 0) {
+    if (analyzeCodeFlag && result.info.manifest.manifestVersion > 0) {
         result.codeAnalysis = AnalyzeCode(extensionPath);
     }
 
@@ -487,7 +535,7 @@ ChromeExtensionScannerImpl::ScanExtension(const fs::path& extensionPath) {
         result.verdict = ExtensionVerdict::Safe;
     } else {
         // 5. ThreatIntel check against extension file hashes
-        if (m_config.checkThreatIntel) {
+        if (checkTI) {
             CheckThreatIntel(result);
         }
 
@@ -579,6 +627,18 @@ CodeAnalysisResult
 ChromeExtensionScannerImpl::AnalyzeCode(const fs::path& extensionPath) {
     CodeAnalysisResult result;
 
+    // Snapshot the size cap under shared_lock; UpdateConfiguration may race.
+    uint64_t maxCodeSize = 0;
+    {
+        std::shared_lock lock(m_mutex);
+        maxCodeSize = static_cast<uint64_t>(m_config.maxCodeSizeToAnalyze);
+    }
+    if (maxCodeSize == 0) {
+        // Cap reads to a defensive default rather than analyzing every byte
+        // discovered on disk when the config has been zeroed.
+        maxCodeSize = 16ull * 1024ull * 1024ull;
+    }
+
     try {
         for (const auto& entry : fs::recursive_directory_iterator(extensionPath,
                 fs::directory_options::skip_permission_denied)) {
@@ -587,7 +647,7 @@ ChromeExtensionScannerImpl::AnalyzeCode(const fs::path& extensionPath) {
             if (entry.path().extension() != ".js") continue;
 
             const auto fileSize = entry.file_size();
-            if (fileSize == 0 || fileSize > m_config.maxCodeSizeToAnalyze) continue;
+            if (fileSize == 0 || fileSize > maxCodeSize) continue;
 
             result.totalJsFiles++;
             result.totalCodeSize += fileSize;
@@ -903,30 +963,39 @@ ChromeExtensionScannerImpl::CalculateRiskLevel(const ExtensionScanResult& result
 // ============================================================================
 
 fs::path ChromeExtensionScannerImpl::GetBrowserUserDataPath(ChromiumBrowser browser) {
-    char path[MAX_PATH]{};
-    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, path))) {
-        fs::path localAppData(path);
-
-        switch (browser) {
-            case ChromiumBrowser::Chrome:
-                return localAppData / "Google" / "Chrome" / "User Data";
-            case ChromiumBrowser::Edge:
-                return localAppData / "Microsoft" / "Edge" / "User Data";
-            case ChromiumBrowser::Brave:
-                return localAppData / "BraveSoftware" / "Brave-Browser" / "User Data";
-            case ChromiumBrowser::Opera: {
-                char roamingPath[MAX_PATH]{};
-                if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA,
-                                                nullptr, 0, roamingPath))) {
-                    return fs::path(roamingPath) / "Opera Software" / "Opera Stable";
-                }
-                break;
-            }
-            case ChromiumBrowser::Vivaldi:
-                return localAppData / "Vivaldi" / "User Data";
-            default:
-                break;
+    // SHGetFolderPathA is ANSI and the deprecated API; SHGetKnownFolderPath
+    // returns a wide path that survives non-ASCII usernames and is the modern
+    // shell-folder API.
+    auto resolveKnown = [](REFKNOWNFOLDERID id) -> fs::path {
+        PWSTR raw = nullptr;
+        if (FAILED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw)) || raw == nullptr) {
+            if (raw) CoTaskMemFree(raw);
+            return {};
         }
+        fs::path p{raw};
+        CoTaskMemFree(raw);
+        return p;
+    };
+
+    fs::path localAppData = resolveKnown(FOLDERID_LocalAppData);
+    if (localAppData.empty()) return {};
+
+    switch (browser) {
+        case ChromiumBrowser::Chrome:
+            return localAppData / L"Google" / L"Chrome" / L"User Data";
+        case ChromiumBrowser::Edge:
+            return localAppData / L"Microsoft" / L"Edge" / L"User Data";
+        case ChromiumBrowser::Brave:
+            return localAppData / L"BraveSoftware" / L"Brave-Browser" / L"User Data";
+        case ChromiumBrowser::Opera: {
+            fs::path roaming = resolveKnown(FOLDERID_RoamingAppData);
+            if (roaming.empty()) return {};
+            return roaming / L"Opera Software" / L"Opera Stable";
+        }
+        case ChromiumBrowser::Vivaldi:
+            return localAppData / L"Vivaldi" / L"User Data";
+        default:
+            break;
     }
     return {};
 }
@@ -1014,6 +1083,15 @@ ChromeExtensionScannerImpl::DiscoverExtensions(ChromiumBrowser browser) {
 
                 std::string id = entry.path().filename().string();
 
+                // Reject directory names that are not real Chrome extension IDs
+                // (32 chars in [a-p]). Attacker-planted folders with arbitrary
+                // names cannot enter the scan pipeline.
+                if (!IsValidChromeExtensionId(id)) {
+                    Logger::Warn("ChromeExtensionScanner: skipping malformed extension directory '{}' in profile {}",
+                                 id, profile.string());
+                    continue;
+                }
+
                 // Find latest version directory (lexicographic sort)
                 fs::path latestVerDir;
                 for (const auto& verEntry : fs::directory_iterator(entry.path())) {
@@ -1057,6 +1135,10 @@ bool ChromeExtensionScannerImpl::IsExtensionBlocked(const std::string& id) const
 }
 
 bool ChromeExtensionScannerImpl::BlockExtension(const std::string& id) {
+    if (!IsValidChromeExtensionId(id)) {
+        Logger::Warn("ChromeExtensionScanner: BlockExtension rejected malformed id '{}'", id);
+        return false;
+    }
     std::unique_lock lock(m_mutex);
     m_blockedExtensions.insert(id);
     m_allowedExtensions.erase(id);
@@ -1065,6 +1147,10 @@ bool ChromeExtensionScannerImpl::BlockExtension(const std::string& id) {
 }
 
 bool ChromeExtensionScannerImpl::AllowExtension(const std::string& id) {
+    if (!IsValidChromeExtensionId(id)) {
+        Logger::Warn("ChromeExtensionScanner: AllowExtension rejected malformed id '{}'", id);
+        return false;
+    }
     std::unique_lock lock(m_mutex);
     m_allowedExtensions.insert(id);
     m_blockedExtensions.erase(id);
