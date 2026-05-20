@@ -49,9 +49,9 @@
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
-#include <regex>
 #include <cmath>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -140,6 +140,26 @@ const std::vector<std::string> IP_GEOLOCATION_DOMAINS = {
     "geolocation-db.com",
     "api.iplocation.net"
 };
+
+// Hostile-input caps. These are independent of header-exposed limits to allow
+// in-cpp tightening without ABI breakage.
+constexpr size_t MAX_BLOCKED_DOMAINS = 4096;     // Cap blocked-domain set
+constexpr size_t MAX_WHITELIST_ENTRIES = 1024;   // Cap whitelist size
+constexpr size_t MAX_ROUTES = 256;               // Cap stored routes
+constexpr size_t MAX_STRING_ID_LEN = 128;        // Cap user-supplied IDs
+constexpr size_t MAX_STRING_NAME_LEN = 256;      // Cap user-supplied names
+constexpr size_t MAX_PROCESS_PATTERN_LEN = 260;  // Cap process patterns
+
+/// @brief Reject strings containing embedded NULs or non-printable control chars.
+[[nodiscard]] bool IsSafePrintableNarrow(const std::string& s) noexcept {
+    for (unsigned char c : s) {
+        if (c == 0) return false;
+        // Allow tab (0x09); reject other ASCII control codes.
+        if (c < 0x20 && c != 0x09) return false;
+        if (c == 0x7F) return false;
+    }
+    return true;
+}
 
 } // anonymous namespace
 
@@ -870,6 +890,22 @@ bool LocationPrivacyImpl::AddRoute(const MockRoute& route) {
             return false;
         }
 
+        if (route.routeId.size() > MAX_STRING_ID_LEN ||
+            route.name.size() > MAX_STRING_NAME_LEN) {
+            Utils::Logger::Error(
+                "Route rejected: routeId/name exceeds length cap "
+                "(id={}, name={})",
+                route.routeId.size(), route.name.size());
+            return false;
+        }
+
+        if (!IsSafePrintableNarrow(route.routeId) ||
+            !IsSafePrintableNarrow(route.name)) {
+            Utils::Logger::Error(
+                "Route rejected: routeId/name contains control characters");
+            return false;
+        }
+
         if (route.waypoints.empty()) {
             Utils::Logger::Error("Route must have waypoints");
             return false;
@@ -880,6 +916,14 @@ bool LocationPrivacyImpl::AddRoute(const MockRoute& route) {
             return false;
         }
 
+        // Validate every waypoint to prevent NaN/out-of-range injection.
+        for (const auto& wp : route.waypoints) {
+            if (!wp.IsValid()) {
+                Utils::Logger::Error("Route rejected: invalid waypoint");
+                return false;
+            }
+        }
+
         // Check if route already exists
         auto it = std::find_if(m_routes.begin(), m_routes.end(),
             [&route](const MockRoute& r) { return r.routeId == route.routeId; });
@@ -887,6 +931,12 @@ bool LocationPrivacyImpl::AddRoute(const MockRoute& route) {
         if (it != m_routes.end()) {
             *it = route;
         } else {
+            if (m_routes.size() >= MAX_ROUTES) {
+                Utils::Logger::Error(
+                    "AddRoute rejected: route table at capacity ({})",
+                    MAX_ROUTES);
+                return false;
+            }
             m_routes.push_back(route);
         }
 
@@ -977,18 +1027,59 @@ bool LocationPrivacyImpl::AddGeofence(const GeofenceRegion& region) {
             return false;
         }
 
-        if (m_geofences.size() >= LocationConstants::MAX_GEOFENCE_REGIONS) {
-            Utils::Logger::Error("Maximum geofence regions reached");
+        if (region.regionId.size() > MAX_STRING_ID_LEN ||
+            region.name.size() > MAX_STRING_NAME_LEN ||
+            region.description.size() > MAX_STRING_NAME_LEN) {
+            Utils::Logger::Error(
+                "Geofence rejected: id/name/description exceeds length cap");
             return false;
         }
 
-        // Check if region already exists
+        if (!IsSafePrintableNarrow(region.regionId) ||
+            !IsSafePrintableNarrow(region.name) ||
+            !IsSafePrintableNarrow(region.description)) {
+            Utils::Logger::Error(
+                "Geofence rejected: id/name/description contains control characters");
+            return false;
+        }
+
+        // Validate geometry to prevent NaN/inf or out-of-range coords.
+        if (!region.center.IsValid()) {
+            Utils::Logger::Error("Geofence rejected: invalid center coordinate");
+            return false;
+        }
+        if (region.shape == GeofenceShape::Circle) {
+            if (!std::isfinite(region.radiusMeters) ||
+                region.radiusMeters <= 0.0 ||
+                region.radiusMeters > 20'037'500.0 /* half Earth circumference */) {
+                Utils::Logger::Error(
+                    "Geofence rejected: invalid radius ({} m)",
+                    region.radiusMeters);
+                return false;
+            }
+        }
+        for (const auto& boundary : region.boundaries) {
+            if (!boundary.IsValid()) {
+                Utils::Logger::Error("Geofence rejected: invalid boundary point");
+                return false;
+            }
+        }
+
+        // Check if region already exists - updates are always permitted.
         auto it = std::find_if(m_geofences.begin(), m_geofences.end(),
             [&region](const GeofenceRegion& r) { return r.regionId == region.regionId; });
 
         if (it != m_geofences.end()) {
             *it = region;
         } else {
+            // Capacity check applies only to new inserts so existing entries
+            // remain editable when the table is at capacity.
+            if (m_geofences.size() >= LocationConstants::MAX_GEOFENCE_REGIONS) {
+                Utils::Logger::Error(
+                    "Maximum geofence regions reached ({})",
+                    LocationConstants::MAX_GEOFENCE_REGIONS);
+                return false;
+            }
             m_geofences.push_back(region);
         }
 
@@ -1262,6 +1353,24 @@ bool LocationPrivacyImpl::AddToWhitelist(const LocationWhitelistEntry& entry) {
             return false;
         }
 
+        if (entry.entryId.size() > MAX_STRING_ID_LEN ||
+            entry.processPattern.size() > MAX_PROCESS_PATTERN_LEN ||
+            entry.reason.size() > MAX_STRING_NAME_LEN ||
+            entry.addedBy.size() > MAX_STRING_NAME_LEN) {
+            Utils::Logger::Error(
+                "Whitelist entry rejected: a field exceeds the length cap");
+            return false;
+        }
+
+        if (!IsSafePrintableNarrow(entry.entryId) ||
+            !IsSafePrintableNarrow(entry.processPattern) ||
+            !IsSafePrintableNarrow(entry.reason) ||
+            !IsSafePrintableNarrow(entry.addedBy)) {
+            Utils::Logger::Error(
+                "Whitelist entry rejected: control characters in input");
+            return false;
+        }
+
         // Validate time restriction hours
         if (entry.allowFromHour.has_value() &&
             (*entry.allowFromHour < 0 || *entry.allowFromHour > 23)) {
@@ -1281,6 +1390,12 @@ bool LocationPrivacyImpl::AddToWhitelist(const LocationWhitelistEntry& entry) {
         if (it != m_whitelist.end()) {
             *it = entry;
         } else {
+            if (m_whitelist.size() >= MAX_WHITELIST_ENTRIES) {
+                Utils::Logger::Error(
+                    "AddToWhitelist rejected: whitelist at capacity ({})",
+                    MAX_WHITELIST_ENTRIES);
+                return false;
+            }
             m_whitelist.push_back(entry);
         }
 
@@ -1356,11 +1471,24 @@ bool LocationPrivacyImpl::BlockIPGeolocation(bool block) {
 bool LocationPrivacyImpl::AddBlockedGeolocationDomain(const std::string& domain) {
     std::unique_lock lock(m_mutex);
 
-    if (domain.empty()) {
+    // SanitizeDomain enforces length cap (253), rejects NUL/path-traversal,
+    // lowercases and strips leading/trailing dots. Returns empty on rejection.
+    std::string normalized = SanitizeDomain(domain);
+    if (normalized.empty()) {
+        Utils::Logger::Error(
+            "AddBlockedGeolocationDomain rejected: input failed sanitization");
         return false;
     }
 
-    m_blockedDomains.insert(domain);
+    if (m_blockedDomains.size() >= MAX_BLOCKED_DOMAINS &&
+        m_blockedDomains.find(normalized) == m_blockedDomains.end()) {
+        Utils::Logger::Error(
+            "AddBlockedGeolocationDomain rejected: domain table at capacity ({})",
+            MAX_BLOCKED_DOMAINS);
+        return false;
+    }
+
+    m_blockedDomains.insert(std::move(normalized));
     Utils::Logger::Info("Blocked geolocation domain added");
     return true;
 }
@@ -1527,7 +1655,7 @@ bool LocationPrivacyImpl::SelfTest() {
         Utils::Logger::Info("✓ Mock location test passed");
 
         // Cleanup
-        RemoveGeofence(testRegion.regionId);
+        (void)RemoveGeofence(testRegion.regionId);
         ClearMockLocation();
 
         Utils::Logger::Info("All LocationPrivacy self-tests passed!");
@@ -1741,19 +1869,24 @@ std::string LocationPrivacyImpl::GetProcessNameFromPid(uint32_t pid) {
                                   static_cast<DWORD>(pid));
     if (!hProcess) return {};
 
-    wchar_t exePath[MAX_PATH] = {};
-    DWORD pathSize = MAX_PATH;
-    BOOL ok = QueryFullProcessImageNameW(hProcess, 0, exePath, &pathSize);
+    // Use UNICODE_STRING_MAX_CHARS (32768) to support \\?\-style long paths.
+    // QueryFullProcessImageNameW writes the actual length to pathSize on success.
+    constexpr DWORD kPathCap = 32768;
+    std::vector<wchar_t> exePath(kPathCap, L'\0');
+    DWORD pathSize = kPathCap;
+    BOOL ok = QueryFullProcessImageNameW(hProcess, 0, exePath.data(), &pathSize);
     CloseHandle(hProcess);
 
-    if (!ok || pathSize == 0) return {};
+    if (!ok || pathSize == 0 || pathSize > kPathCap) return {};
 
     // Extract filename from full path
-    std::wstring_view fullPath(exePath, pathSize);
+    std::wstring_view fullPath(exePath.data(), pathSize);
     auto pos = fullPath.find_last_of(L"\\/");
     std::wstring_view fileName = (pos != std::wstring_view::npos)
                                      ? fullPath.substr(pos + 1)
                                      : fullPath;
+
+    if (fileName.empty()) return {};
 
     // Convert wide string to UTF-8
     int needed = WideCharToMultiByte(CP_UTF8, 0, fileName.data(),
@@ -1761,9 +1894,10 @@ std::string LocationPrivacyImpl::GetProcessNameFromPid(uint32_t pid) {
     if (needed <= 0) return {};
 
     std::string result(static_cast<size_t>(needed), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, fileName.data(),
+    int written = WideCharToMultiByte(CP_UTF8, 0, fileName.data(),
         static_cast<int>(fileName.size()), result.data(), needed,
         nullptr, nullptr);
+    if (written <= 0) return {};
 
     return result;
 }
