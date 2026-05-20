@@ -71,7 +71,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <thread>
-#include <regex>
+#include <condition_variable>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -735,6 +735,19 @@ public:
      */
     [[nodiscard]] bool ActivateKillSwitch() {
         try {
+            // Idempotent: if already active, no-op (prevents WFP engine handle leak
+            // on repeat activations from monitor thread + manual API calls).
+            if (m_killSwitchActive.load(std::memory_order_acquire)) {
+                ::ShadowStrike::Utils::Logger::Debug("ActivateKillSwitch: already active, ignoring");
+                return true;
+            }
+
+            // Defensive: close any stale engine handle (should be nullptr here).
+            if (m_wfpEngine) {
+                ::FwpmEngineClose0(m_wfpEngine);
+                m_wfpEngine = nullptr;
+            }
+
             ::ShadowStrike::Utils::Logger::Info("Activating kill switch");
 
             // Open WFP engine
@@ -747,6 +760,7 @@ public:
 
             if (result != ERROR_SUCCESS) {
                 ::ShadowStrike::Utils::Logger::Error("Failed to open WFP engine: error={}", result);
+                m_wfpEngine = nullptr;
                 return false;
             }
 
@@ -1053,6 +1067,20 @@ public:
      */
     [[nodiscard]] bool BlockWebRTCInternal() {
         try {
+            // Idempotent: if already blocked, no-op (prevents WFP engine handle leak
+            // and duplicate registry writes on repeat calls).
+            if (m_webRTCBlocked.load(std::memory_order_acquire)) {
+                ::ShadowStrike::Utils::Logger::Debug("BlockWebRTC: already blocked, ignoring");
+                return true;
+            }
+
+            // Defensive: close any stale WebRTC engine handle (should be nullptr).
+            if (m_webRtcWfpEngine) {
+                ::FwpmSubLayerDeleteByKey0(m_webRtcWfpEngine, &SHADOWSTRIKE_WEBRTC_SUBLAYER_GUID);
+                ::FwpmEngineClose0(m_webRtcWfpEngine);
+                m_webRtcWfpEngine = nullptr;
+            }
+
             ::ShadowStrike::Utils::Logger::Info("Blocking WebRTC leaks");
             bool anySuccess = false;
 
@@ -1580,7 +1608,10 @@ public:
                         newStatus != VPNStatus::Connected &&
                         currentKillSwitchMode != KillSwitchMode::Disabled) {
 
-                        ActivateKillSwitch();
+                        if (!ActivateKillSwitch()) {
+                            ::ShadowStrike::Utils::Logger::Error(
+                                "Monitor: kill switch auto-activation failed on VPN drop");
+                        }
                         m_stats.vpnDisconnections.fetch_add(1, std::memory_order_relaxed);
                     }
 
@@ -1591,8 +1622,9 @@ public:
                     }
                 }
 
-                // Periodic leak check
-                CheckForLeaksInternal();
+                // Periodic leak check — discarded vector is intentional;
+                // events are surfaced through callbacks and recorded internally.
+                (void)CheckForLeaksInternal();
 
             } catch (const std::exception& e) {
                 ::ShadowStrike::Utils::Logger::Error("Monitoring thread error: {}", e.what());
@@ -2018,23 +2050,30 @@ void IPLeakProtection::StopVPNMonitoring() {
 [[nodiscard]] std::vector<IPLeakEvent> IPLeakProtection::GetRecentLeaks(size_t limit) {
     std::shared_lock lock(m_impl->m_mutex);
 
-    std::vector<IPLeakEvent> leaks = m_impl->m_recentLeaks;
-    if (leaks.size() > limit) {
-        leaks.resize(limit);
+    // History is appended chronologically (oldest at front, newest at back).
+    // Callers asking for "recent" events expect the newest N, so copy the
+    // tail rather than truncating the head.
+    const auto& src = m_impl->m_recentLeaks;
+    if (limit == 0 || src.empty()) {
+        return {};
     }
-
-    return leaks;
+    if (src.size() <= limit) {
+        return src;
+    }
+    return std::vector<IPLeakEvent>(src.end() - static_cast<std::ptrdiff_t>(limit), src.end());
 }
 
 [[nodiscard]] std::vector<KillSwitchEvent> IPLeakProtection::GetKillSwitchEvents(size_t limit) {
     std::shared_lock lock(m_impl->m_mutex);
 
-    std::vector<KillSwitchEvent> events = m_impl->m_killSwitchEvents;
-    if (events.size() > limit) {
-        events.resize(limit);
+    const auto& src = m_impl->m_killSwitchEvents;
+    if (limit == 0 || src.empty()) {
+        return {};
     }
-
-    return events;
+    if (src.size() <= limit) {
+        return src;
+    }
+    return std::vector<KillSwitchEvent>(src.end() - static_cast<std::ptrdiff_t>(limit), src.end());
 }
 
 void IPLeakProtection::ClearHistory() {
@@ -2102,19 +2141,72 @@ void IPLeakProtection::ClearHistory() {
 }
 
 [[nodiscard]] bool IPLeakProtection::AddAllowedLocalNetwork(const std::string& cidr) {
-    if (cidr.empty() || cidr.size() > 512) {
-        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: invalid CIDR");
+    if (cidr.empty() || cidr.size() > 64) {
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: invalid CIDR length");
         return false;
     }
 
-    // Basic CIDR format validation (must contain '/')
-    if (cidr.find('/') == std::string::npos) {
-        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: CIDR must contain '/' separator");
+    // Reject embedded NULs / control characters and any non-CIDR token.
+    for (unsigned char c : cidr) {
+        if (c == 0 || c < 0x20 || c == 0x7F) {
+            ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: CIDR contains control characters");
+            return false;
+        }
+    }
+
+    const auto slashPos = cidr.find('/');
+    if (slashPos == std::string::npos || slashPos == 0 || slashPos == cidr.size() - 1) {
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: CIDR must be ADDRESS/PREFIX");
+        return false;
+    }
+
+    const std::string addrPart = cidr.substr(0, slashPos);
+    const std::string prefixPart = cidr.substr(slashPos + 1);
+
+    // Validate prefix is purely numeric and within the bounds for the family.
+    if (prefixPart.empty() || prefixPart.size() > 3) {
+        return false;
+    }
+    for (unsigned char c : prefixPart) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    int prefix = 0;
+    try {
+        prefix = std::stoi(prefixPart);
+    } catch (...) {
+        return false;
+    }
+
+    // Validate address via inet_pton; family determines max prefix length.
+    bool addrValid = false;
+    bool isV6 = (addrPart.find(':') != std::string::npos);
+    if (isV6) {
+        IN6_ADDR ip6{};
+        addrValid = (::inet_pton(AF_INET6, addrPart.c_str(), &ip6) == 1);
+        if (addrValid && (prefix < 0 || prefix > 128)) {
+            return false;
+        }
+    } else {
+        IN_ADDR ip4{};
+        addrValid = (::inet_pton(AF_INET, addrPart.c_str(), &ip4) == 1);
+        if (addrValid && (prefix < 0 || prefix > 32)) {
+            return false;
+        }
+    }
+    if (!addrValid) {
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: CIDR address invalid");
         return false;
     }
 
     std::unique_lock lock(m_impl->m_mutex);
     auto& networks = m_impl->m_config.allowedLocalNetworks;
+
+    if (networks.size() >= 1000) {
+        ::ShadowStrike::Utils::Logger::Warn("AddAllowedLocalNetwork: list at capacity");
+        return false;
+    }
 
     if (std::find(networks.begin(), networks.end(), cidr) != networks.end()) {
         return true;
@@ -2584,7 +2676,7 @@ void IPLeakStatistics::Reset() noexcept {
         if (ip.substr(0, 3) == "10.") return true;
         if (ip.substr(0, 8) == "192.168.") return true;
         if (ip.substr(0, 4) == "127.") return true;
-        if (ip.substr(0, 7) == "169.254") return true;  // link-local
+        if (ip.substr(0, 8) == "169.254.") return true;  // link-local (RFC 3927)
 
         // 172.16.0.0 - 172.31.255.255
         if (ip.size() >= 6 && ip.substr(0, 4) == "172.") {
