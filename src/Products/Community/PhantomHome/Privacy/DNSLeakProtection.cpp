@@ -73,6 +73,8 @@
 #include <thread>
 #include <fstream>
 #include <condition_variable>
+#include <limits>
+#include <cstdint>
 
 #pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -92,6 +94,46 @@ namespace {
     void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
         std::atomic_ref<T>(target).store(value, std::memory_order_relaxed);
     }
+
+    /// @brief RAII guard for an opened HKEY. Closes the handle on scope exit
+    /// even when intermediate registry operations throw. Movable but not
+    /// copyable to preserve unique ownership semantics.
+    class RegistryKeyGuard {
+    public:
+        RegistryKeyGuard() noexcept = default;
+        explicit RegistryKeyGuard(HKEY key) noexcept : m_key(key) {}
+
+        RegistryKeyGuard(const RegistryKeyGuard&) = delete;
+        RegistryKeyGuard& operator=(const RegistryKeyGuard&) = delete;
+
+        RegistryKeyGuard(RegistryKeyGuard&& other) noexcept : m_key(other.m_key) {
+            other.m_key = nullptr;
+        }
+        RegistryKeyGuard& operator=(RegistryKeyGuard&& other) noexcept {
+            if (this != &other) {
+                Reset();
+                m_key = other.m_key;
+                other.m_key = nullptr;
+            }
+            return *this;
+        }
+
+        ~RegistryKeyGuard() noexcept { Reset(); }
+
+        [[nodiscard]] HKEY Get() const noexcept { return m_key; }
+        [[nodiscard]] HKEY* Receive() noexcept { Reset(); return &m_key; }
+        [[nodiscard]] explicit operator bool() const noexcept { return m_key != nullptr; }
+
+        void Reset() noexcept {
+            if (m_key) {
+                ::RegCloseKey(m_key);
+                m_key = nullptr;
+            }
+        }
+
+    private:
+        HKEY m_key = nullptr;
+    };
 
     using namespace ShadowStrike::Privacy;
 
@@ -739,8 +781,16 @@ public:
             }
 
             auto endTime = std::chrono::steady_clock::now();
-            response.responseTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 endTime - startTime).count();
+            // Clamp to the uint32_t storage in DNSResponse — a single DNS RTT cannot
+            // realistically exceed ~49 days; clamping is defensive against the
+            // duration_cast result being negative or overflowing on pathological clocks.
+            response.responseTimeMs = (elapsedMs < 0)
+                ? 0u
+                : (elapsedMs > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())
+                    ? std::numeric_limits<std::uint32_t>::max()
+                    : static_cast<std::uint32_t>(elapsedMs));
 
         } catch (const std::exception& e) {
             Utils::Logger::Error("DNS query failed: {}", e.what());
@@ -1045,17 +1095,15 @@ public:
                         L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\"
                         + saved.adapterGuid;
 
-                    HKEY hKey = nullptr;
+                    HKEY hRawKey = nullptr;
                     if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(),
-                                        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                        // RAII guard to prevent handle leak on exception
-                        auto keyGuard = [&hKey]() { if (hKey) { ::RegCloseKey(hKey); hKey = nullptr; } };
-                        struct KeyGuardRAII { decltype(keyGuard)& fn; ~KeyGuardRAII() { fn(); } } keyCleanup{keyGuard};
+                                        0, KEY_READ, &hRawKey) == ERROR_SUCCESS) {
+                        RegistryKeyGuard hKey(hRawKey);
 
                         wchar_t nameServer[512] = {};
                         DWORD size = sizeof(nameServer);
                         DWORD type = 0;
-                        if (::RegQueryValueExW(hKey, L"NameServer", nullptr, &type,
+                        if (::RegQueryValueExW(hKey.Get(), L"NameServer", nullptr, &type,
                                 reinterpret_cast<BYTE*>(nameServer), &size) == ERROR_SUCCESS
                             && type == REG_SZ) {
                             saved.dnsServers = Utils::StringUtils::ToNarrow(nameServer);
@@ -1137,9 +1185,21 @@ DNSLeakProtection::~DNSLeakProtection() {
         std::unique_lock lock(m_impl->m_mutex);
 
         if (m_impl->m_status != ModuleStatus::Uninitialized &&
-            m_impl->m_status != ModuleStatus::Stopped) {
+            m_impl->m_status != ModuleStatus::Stopped &&
+            m_impl->m_status != ModuleStatus::Error) {
             Utils::Logger::Warn("DNSLeakProtection already initialized");
             return false;
+        }
+
+        // Allow recovery from a previously failed Initialize: a half-initialized
+        // instance left in Error state should be retryable instead of permanently
+        // refusing further attempts.
+        if (m_impl->m_status == ModuleStatus::Error) {
+            m_impl->m_savedAdapterDns.clear();
+            m_impl->m_savedDnsServers.clear();
+            m_impl->m_recentLeaks.clear();
+            m_impl->m_recentHijacks.clear();
+            m_impl->m_status = ModuleStatus::Uninitialized;
         }
 
         m_impl->m_status = ModuleStatus::Initializing;
@@ -1438,12 +1498,18 @@ void DNSLeakProtection::StopMonitoring() {
 [[nodiscard]] std::vector<DNSLeakEvent> DNSLeakProtection::GetRecentLeaks(size_t limit) {
     std::shared_lock lock(m_impl->m_mutex);
 
-    std::vector<DNSLeakEvent> leaks = m_impl->m_recentLeaks;
-    if (leaks.size() > limit) {
-        leaks.resize(limit);
+    const auto& source = m_impl->m_recentLeaks;
+    if (limit == 0 || source.empty()) {
+        return {};
     }
-
-    return leaks;
+    if (source.size() <= limit) {
+        return source;
+    }
+    // Keep the most recent `limit` entries (the tail of the chronologically
+    // appended history) — a plain resize() would silently drop the newest
+    // events and surface stale ones.
+    return std::vector<DNSLeakEvent>(source.end() - static_cast<std::ptrdiff_t>(limit),
+                                     source.end());
 }
 
 // ============================================================================
@@ -1487,9 +1553,9 @@ void DNSLeakProtection::StopMonitoring() {
                 L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\"
                 + saved.adapterGuid;
 
-            HKEY hKey = nullptr;
+            HKEY hRawKey = nullptr;
             LSTATUS status = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(),
-                0, KEY_SET_VALUE, &hKey);
+                0, KEY_SET_VALUE, &hRawKey);
 
             if (status != ERROR_SUCCESS) {
                 Utils::Logger::Error("RestoreDNS: Failed to open registry for adapter '{}', error={}",
@@ -1498,13 +1564,15 @@ void DNSLeakProtection::StopMonitoring() {
                 continue;
             }
 
+            RegistryKeyGuard hKey(hRawKey);
+
             // Write the NameServer value (comma-separated IP list matching original)
             std::wstring wServers = Utils::StringUtils::ToWide(saved.dnsServers);
-            status = ::RegSetValueExW(hKey, L"NameServer", 0, REG_SZ,
+            status = ::RegSetValueExW(hKey.Get(), L"NameServer", 0, REG_SZ,
                 reinterpret_cast<const BYTE*>(wServers.c_str()),
                 static_cast<DWORD>((wServers.length() + 1) * sizeof(wchar_t)));
 
-            ::RegCloseKey(hKey);
+            hKey.Reset();
 
             if (status != ERROR_SUCCESS) {
                 Utils::Logger::Error("RestoreDNS: Failed to write DNS for adapter '{}', error={}",
@@ -1534,12 +1602,16 @@ void DNSLeakProtection::StopMonitoring() {
 [[nodiscard]] std::vector<DNSHijackAlert> DNSLeakProtection::GetRecentHijackAlerts(size_t limit) {
     std::shared_lock lock(m_impl->m_mutex);
 
-    std::vector<DNSHijackAlert> alerts = m_impl->m_recentHijacks;
-    if (alerts.size() > limit) {
-        alerts.resize(limit);
+    const auto& source = m_impl->m_recentHijacks;
+    if (limit == 0 || source.empty()) {
+        return {};
     }
-
-    return alerts;
+    if (source.size() <= limit) {
+        return source;
+    }
+    // Keep most recent `limit` entries — see GetRecentLeaks for rationale.
+    return std::vector<DNSHijackAlert>(source.end() - static_cast<std::ptrdiff_t>(limit),
+                                       source.end());
 }
 
 // ============================================================================
