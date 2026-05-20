@@ -21,6 +21,7 @@
 #include <array>
 #include <chrono>
 #include <future>
+#include <thread>
 
 namespace ShadowStrike {
 namespace Products {
@@ -195,18 +196,26 @@ bool HomeProductOrchestrator::InitializeLocked() noexcept {
         // must not be able to freeze the orchestrator's sequential phase
         // loop — that leaves every subsequent module un-registered and the
         // UI stuck on "Loading protection modules...". On timeout we mark
-        // the module Failed, log forensically, and continue. The detached
-        // future keeps the worker thread alive so the slow call can finish
-        // in the background without leaking a handle into our scope.
+        // the module Failed, log forensically, and continue.
+        //
+        // We deliberately use std::packaged_task on a detached std::thread
+        // rather than std::async(std::launch::async). The future returned
+        // by async-launched policy blocks in its destructor until the worker
+        // completes, which defeats the timeout. A packaged_task future has
+        // no such waiting behaviour, and the detached thread carries no
+        // handle that needs cleanup from our scope. This avoids any raw
+        // new / heap leak.
         constexpr auto kInitBudget = std::chrono::seconds(15);
         try {
-            auto fut = std::async(std::launch::async, [fn = desc.initialize]() -> bool {
+            std::packaged_task<bool()> task([fn = desc.initialize]() -> bool {
                 try {
                     return fn ? fn() : false;
                 } catch (...) {
                     return false;
                 }
             });
+            std::future<bool> fut = task.get_future();
+            std::thread(std::move(task)).detach();
 
             if (fut.wait_for(kInitBudget) == std::future_status::ready) {
                 ok = fut.get();
@@ -217,11 +226,10 @@ bool HomeProductOrchestrator::InitializeLocked() noexcept {
                 SS_LOG_ERROR(kLogCategory,
                     L"Module '%hs' Initialize() timed out after 15s; continuing without it",
                     desc.name.c_str());
-                // Detach — let the blocked call finish in the background.
-                // Its result is discarded. We deliberately never touch the
-                // future again to avoid blocking in ~future().
-                auto* leaked = new std::future<bool>(std::move(fut));
-                (void)leaked;
+                // fut goes out of scope here without blocking (packaged_task
+                // future does not own the worker thread the way async does).
+                // The detached worker may still finish later; its result is
+                // silently discarded by the packaged_task shared state.
             }
         } catch (const std::exception& e) {
             ok = false;
@@ -503,6 +511,34 @@ void HomeProductOrchestrator::SetModuleState(ModuleRecord& rec,
     rec.lastTransition = std::chrono::steady_clock::now();
 }
 
+void HomeProductOrchestrator::RecomputeRunStateLocked() noexcept {
+    // Caller holds m_lifecycleMutex. We only read the registry here.
+    bool anyRunning = false;
+    bool anyInitialized = false;
+    try {
+        std::shared_lock regLock(m_registryMutex);
+        for (const auto& rec : m_modules) {
+            if (rec.state == ModuleState::Running) {
+                anyRunning = true;
+                anyInitialized = true;
+            } else if (rec.state == ModuleState::Initialized) {
+                anyInitialized = true;
+            }
+        }
+    } catch (...) {
+        // shared_lock construction can theoretically throw system_error;
+        // if it does, leave the atomics untouched rather than publish a
+        // partially computed view. The next successful recompute will
+        // converge them again.
+        SS_LOG_ERROR(kLogCategory,
+            L"RecomputeRunStateLocked: registry lock acquisition failed; "
+            L"IsRunning()/IsInitialized() may be stale until next recompute");
+        return;
+    }
+    m_running.store(anyRunning, std::memory_order_release);
+    m_initialized.store(anyInitialized, std::memory_order_release);
+}
+
 bool HomeProductOrchestrator::SetModuleEnabled(std::string_view name, bool enabled) noexcept {
     std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
 
@@ -605,6 +641,7 @@ bool HomeProductOrchestrator::SetModuleEnabled(std::string_view name, bool enabl
                 }
             }
         }
+        RecomputeRunStateLocked();
         return ok;
     } else {
         // Disable: shutdown if running.
@@ -614,6 +651,7 @@ bool HomeProductOrchestrator::SetModuleEnabled(std::string_view name, bool enabl
             if (idx < m_modules.size()) {
                 SetModuleState(m_modules[idx], ModuleState::Disabled);
             }
+            RecomputeRunStateLocked();
             return true;  // Already not running.
         }
 
@@ -637,6 +675,7 @@ bool HomeProductOrchestrator::SetModuleEnabled(std::string_view name, bool enabl
                     L"Module '%hs' disabled and stopped", desc.name.c_str());
             }
         }
+        RecomputeRunStateLocked();
         return true;
     }
 }
@@ -699,6 +738,7 @@ void HomeProductOrchestrator::PauseAllModules() noexcept {
     }
 
     m_paused.store(true, std::memory_order_release);
+    RecomputeRunStateLocked();
     SS_LOG_INFO(kLogCategory, L"PhantomHome protection paused (%zu modules quiesced)",
                 m_pausedModuleNames.size());
 }
@@ -786,6 +826,7 @@ void HomeProductOrchestrator::ResumeAllModules() noexcept {
 
     m_pausedModuleNames.clear();
     m_paused.store(false, std::memory_order_release);
+    RecomputeRunStateLocked();
     SS_LOG_INFO(kLogCategory, L"PhantomHome protection resumed");
 }
 
@@ -898,6 +939,7 @@ bool HomeProductOrchestrator::SetModuleMode(std::string_view name,
 
         SS_LOG_INFO(kLogCategory,
             L"Module '%hs' set to Off (disabled and quiesced)", desc.name.c_str());
+        RecomputeRunStateLocked();
         return true;
     }
 
@@ -1055,6 +1097,7 @@ bool HomeProductOrchestrator::SetModuleMode(std::string_view name,
     SS_LOG_INFO(kLogCategory,
         L"Module '%hs' protection mode set to %hs",
         desc.name.c_str(), std::string(ToString(mode)).c_str());
+    RecomputeRunStateLocked();
     return true;
 }
 

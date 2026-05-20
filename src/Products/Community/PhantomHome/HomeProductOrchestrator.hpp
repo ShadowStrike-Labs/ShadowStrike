@@ -343,6 +343,15 @@ private:
     [[nodiscard]] bool StartLocked() noexcept;
     void ShutdownLocked() noexcept;
 
+    /// @brief Recompute m_initialized / m_running atomics from current module
+    ///        states. Caller must hold m_lifecycleMutex; acquires a shared
+    ///        lock on m_registryMutex internally. Used after any code path
+    ///        that flips one or more module states so the public IsRunning()
+    ///        / IsInitialized() queries reflect reality (e.g. disabling the
+    ///        last Running module via SetModuleEnabled, PauseAllModules,
+    ///        ResumeAllModules, SetModuleMode(Off)).
+    void RecomputeRunStateLocked() noexcept;
+
     /// @brief Reads "Home/<name>/Mode" from ConfigManager and applies it.
     ///        Must be called under m_lifecycleMutex with the module Running.
     ///        No-op if the key is absent or the mode equals the current one.

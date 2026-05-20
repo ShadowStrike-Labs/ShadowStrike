@@ -57,6 +57,37 @@ struct ModeThresholdValues {
 }  // namespace
 
 bool ApplyModeThresholds(std::string_view moduleName, ProtectionMode mode) {
+    // Defense in depth: the orchestrator passes ModuleDescriptor::name which
+    // is validated on RegisterModule (non-empty), but ApplyModeThresholds is
+    // also reachable as the fall-back from descriptor.setMode == nullptr,
+    // and may eventually be reached from IPC / policy layers. A malformed
+    // module name (empty, containing '/', '\\', whitespace control chars,
+    // or absurdly long) would produce a corrupted ConfigManager key path
+    // such as "Home//Sensitivity" or "Home/a/b/Sensitivity", which would
+    // either silently desync from the orchestrator's key convention or
+    // collide with unrelated subtrees.
+    constexpr std::size_t kMaxModuleNameLen = 128;
+    if (moduleName.empty()) {
+        SS_LOG_ERROR(kLogCategory,
+            L"ApplyModeThresholds: empty moduleName rejected");
+        return false;
+    }
+    if (moduleName.size() > kMaxModuleNameLen) {
+        SS_LOG_ERROR(kLogCategory,
+            L"ApplyModeThresholds: moduleName length %zu exceeds %zu; rejected",
+            moduleName.size(), kMaxModuleNameLen);
+        return false;
+    }
+    for (const char c : moduleName) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F || c == '/' || c == '\\') {
+            SS_LOG_ERROR(kLogCategory,
+                L"ApplyModeThresholds: moduleName contains invalid character 0x%02X; rejected",
+                static_cast<unsigned>(uc));
+            return false;
+        }
+    }
+
     if (mode == ProtectionMode::Off) {
         SS_LOG_ERROR(kLogCategory,
             L"ApplyModeThresholds '%hs': called with ProtectionMode::Off — "
