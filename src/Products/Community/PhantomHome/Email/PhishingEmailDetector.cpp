@@ -621,9 +621,29 @@ public:
                 }
             }
 
-            auto dmarcIt = headers.find("DMARC");
-            if (dmarcIt != headers.end()) {
-                result.dmarcPass = (dmarcIt->second.find("pass") != std::string::npos);
+            // DMARC results are reported in Authentication-Results (RFC 7489
+            // §6.7 / RFC 8601), NOT in a stand-alone "DMARC" field. Probing
+            // for headers.find("DMARC") meant DMARC was effectively never
+            // evaluated and the detector silently lost an authoritative spoof
+            // signal. Re-resolve Authentication-Results here (the DKIM block
+            // above scoped its iterator to a nested if) and look for the
+            // canonical 'dmarc=' token forms.
+            {
+                auto authForDmarcIt = headers.find("Authentication-Results");
+                if (authForDmarcIt != headers.end()) {
+                    const auto& authValue = authForDmarcIt->second;
+                    if (authValue.find("dmarc=pass") != std::string::npos) {
+                        result.dmarcPass = true;
+                    } else if (authValue.find("dmarc=fail") != std::string::npos ||
+                               authValue.find("dmarc=temperror") != std::string::npos ||
+                               authValue.find("dmarc=permerror") != std::string::npos ||
+                               authValue.find("dmarc=bestguesspass") != std::string::npos ||
+                               authValue.find("dmarc=none") != std::string::npos) {
+                        // Any non-pass disposition is treated as not-passing
+                        // so downstream risk scoring escalates spoof attempts.
+                        result.dmarcPass = false;
+                    }
+                }
             }
 
             // Check return path
