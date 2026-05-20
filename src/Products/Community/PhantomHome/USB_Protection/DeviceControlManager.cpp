@@ -1487,6 +1487,95 @@ std::string TimeCondition::ToJson() const {
 // USER CONDITION IMPLEMENTATION (C2 FIX: Group membership checking)
 // ============================================================================
 
+namespace {
+    // RAII guard for HANDLE values closed via ::CloseHandle.
+    struct AutoHandle {
+        HANDLE h{nullptr};
+        AutoHandle() = default;
+        explicit AutoHandle(HANDLE handle) noexcept : h(handle) {}
+        ~AutoHandle() {
+            if (h && h != INVALID_HANDLE_VALUE) {
+                ::CloseHandle(h);
+            }
+        }
+        AutoHandle(const AutoHandle&) = delete;
+        AutoHandle& operator=(const AutoHandle&) = delete;
+        [[nodiscard]] bool IsValid() const noexcept {
+            return h && h != INVALID_HANDLE_VALUE;
+        }
+    };
+
+    // RAII guard for LocalAlloc()-allocated buffers (SID storage).
+    struct AutoLocal {
+        HLOCAL p{nullptr};
+        AutoLocal() = default;
+        explicit AutoLocal(HLOCAL ptr) noexcept : p(ptr) {}
+        ~AutoLocal() {
+            if (p) ::LocalFree(p);
+        }
+        AutoLocal(const AutoLocal&) = delete;
+        AutoLocal& operator=(const AutoLocal&) = delete;
+        [[nodiscard]] PSID AsSid() const noexcept {
+            return static_cast<PSID>(p);
+        }
+    };
+
+    // Resolve groupName to a SID, then verify whether the *current process
+    // identity* is a member of that group. CheckTokenMembership requires an
+    // impersonation token; passing a primary token returned by
+    // OpenProcessToken would fail with ERROR_NO_IMPERSONATION_TOKEN and
+    // return isMember==FALSE for every group, silently bypassing both
+    // denied-group enforcement and allowed-group restrictions. We therefore
+    // duplicate the process token into SecurityImpersonation here.
+    //
+    // Returns std::nullopt when the lookup or membership check could not be
+    // completed (treated as inconclusive by the caller); returns the boolean
+    // membership result on success.
+    [[nodiscard]] std::optional<bool> IsCurrentUserInGroup(
+            const std::wstring& groupNameWide) noexcept {
+        HANDLE rawProcessToken = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE, &rawProcessToken)) {
+            return std::nullopt;
+        }
+        AutoHandle processToken(rawProcessToken);
+
+        HANDLE rawImpToken = nullptr;
+        if (!::DuplicateToken(processToken.h, SecurityImpersonation, &rawImpToken)) {
+            return std::nullopt;
+        }
+        AutoHandle impersonationToken(rawImpToken);
+
+        DWORD sidSize = 0;
+        DWORD domainSize = 0;
+        SID_NAME_USE sidUse{};
+        ::LookupAccountNameW(nullptr, groupNameWide.c_str(),
+            nullptr, &sidSize, nullptr, &domainSize, &sidUse);
+        if (sidSize == 0 || sidSize > 64 * 1024) {
+            return std::nullopt;
+        }
+
+        AutoLocal sidStorage(::LocalAlloc(LPTR, sidSize));
+        if (!sidStorage.p) {
+            return std::nullopt;
+        }
+        auto domainBuf = std::make_unique<wchar_t[]>(domainSize ? domainSize : 1);
+
+        if (!::LookupAccountNameW(nullptr, groupNameWide.c_str(),
+                sidStorage.AsSid(), &sidSize,
+                domainBuf.get(), &domainSize, &sidUse)) {
+            return std::nullopt;
+        }
+
+        BOOL isMember = FALSE;
+        if (!::CheckTokenMembership(impersonationToken.h,
+                sidStorage.AsSid(), &isMember)) {
+            return std::nullopt;
+        }
+        return isMember != FALSE;
+    }
+}
+
 bool UserCondition::AllowsCurrentUser() const {
     if (!enabled) return true;
 
@@ -1506,39 +1595,16 @@ bool UserCondition::AllowsCurrentUser() const {
         }
     }
 
-    // C2 FIX: Check denied groups using Windows API
-    if (!deniedGroups.empty()) {
-        HANDLE hToken = NULL;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-            for (const auto& deniedGroup : deniedGroups) {
-                std::wstring groupNameWide = Utils::StringUtils::ToWide(deniedGroup);
-                
-                // Convert group name to SID
-                PSID pSid = NULL;
-                DWORD sidSize = 0;
-                DWORD domainSize = 0;
-                SID_NAME_USE sidUse;
-                
-                // First call to get sizes
-                LookupAccountNameW(NULL, groupNameWide.c_str(), NULL, &sidSize, NULL, &domainSize, &sidUse);
-                
-                if (sidSize > 0) {
-                    pSid = (PSID)LocalAlloc(LPTR, sidSize);
-                    auto domainBuf = std::make_unique<wchar_t[]>(domainSize);
-                    
-                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainBuf.get(), &domainSize, &sidUse)) {
-                        BOOL isMember = FALSE;
-                        if (CheckTokenMembership(hToken, pSid, &isMember) && isMember) {
-                            LocalFree(pSid);
-                            CloseHandle(hToken);
-                            return false;  // User is in denied group
-                        }
-                    }
-                    
-                    LocalFree(pSid);
-                }
-            }
-            CloseHandle(hToken);
+    // C2 FIX: Check denied groups using Windows API.
+    // Membership must be evaluated against an impersonation token — see
+    // IsCurrentUserInGroup helper above.
+    for (const auto& deniedGroup : deniedGroups) {
+        std::wstring groupNameWide = Utils::StringUtils::ToWide(deniedGroup);
+        if (groupNameWide.empty()) continue;
+
+        auto membership = IsCurrentUserInGroup(groupNameWide);
+        if (membership && *membership) {
+            return false;  // User is in denied group
         }
     }
 
@@ -1557,39 +1623,16 @@ bool UserCondition::AllowsCurrentUser() const {
     // C2 FIX: Check allowed groups using Windows API
     if (!allowedGroups.empty()) {
         bool foundInGroup = false;
-        
-        HANDLE hToken = NULL;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-            for (const auto& allowedGroup : allowedGroups) {
-                std::wstring groupNameWide = Utils::StringUtils::ToWide(allowedGroup);
-                
-                PSID pSid = NULL;
-                DWORD sidSize = 0;
-                DWORD domainSize = 0;
-                SID_NAME_USE sidUse;
-                
-                // First call to get sizes
-                LookupAccountNameW(NULL, groupNameWide.c_str(), NULL, &sidSize, NULL, &domainSize, &sidUse);
-                
-                if (sidSize > 0) {
-                    pSid = (PSID)LocalAlloc(LPTR, sidSize);
-                    auto domainBuf = std::make_unique<wchar_t[]>(domainSize);
-                    
-                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainBuf.get(), &domainSize, &sidUse)) {
-                        BOOL isMember = FALSE;
-                        if (CheckTokenMembership(hToken, pSid, &isMember) && isMember) {
-                            foundInGroup = true;
-                            LocalFree(pSid);
-                            break;
-                        }
-                    }
-                    
-                    LocalFree(pSid);
-                }
+        for (const auto& allowedGroup : allowedGroups) {
+            std::wstring groupNameWide = Utils::StringUtils::ToWide(allowedGroup);
+            if (groupNameWide.empty()) continue;
+
+            auto membership = IsCurrentUserInGroup(groupNameWide);
+            if (membership && *membership) {
+                foundInGroup = true;
+                break;
             }
-            CloseHandle(hToken);
         }
-        
         if (!foundInGroup) return false;
     }
 
