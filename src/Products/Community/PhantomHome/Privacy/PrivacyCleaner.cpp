@@ -375,9 +375,9 @@ private:
     bool DeleteFileSecurely(const fs::path& filePath, SecureEraseMethod method);
     bool OverwriteFile(const fs::path& filePath, uint8_t pattern);
     bool OverwriteFileRandom(const fs::path& filePath);
-    void DoD_5220_22_M_Erase(const fs::path& filePath);
-    void GutmannErase(const fs::path& filePath);
-    void NIST_800_88_Erase(const fs::path& filePath);
+    [[nodiscard]] bool DoD_5220_22_M_Erase(const fs::path& filePath);
+    [[nodiscard]] bool GutmannErase(const fs::path& filePath);
+    [[nodiscard]] bool NIST_800_88_Erase(const fs::path& filePath);
 
     std::vector<CleanTarget> ScanChromiumBrowser(BrowserType browser, BrowserDataType dataTypes);
     std::vector<CleanTarget> ScanFirefox(BrowserDataType dataTypes);
@@ -465,10 +465,23 @@ bool PrivacyCleanerImpl::Initialize(const CleanerConfiguration& config) {
 
         m_config = config;
 
-        // Initialize preserved domains (case-insensitive via ASCII lowercase)
+        // Initialize preserved domains (sanitized via shared helper)
         m_preservedDomains.clear();
+        constexpr size_t kMaxPreservedDomains = 4096;
         for (const auto& domain : m_config.preservedCookieDomains) {
-            m_preservedDomains.insert(ToLowerAscii(domain));
+            if (m_preservedDomains.size() >= kMaxPreservedDomains) {
+                SS_LOG_WARN(L"PrivacyCleaner",
+                    L"Initialize: preserved-domain cap reached (%zu); remainder dropped",
+                    kMaxPreservedDomains);
+                break;
+            }
+            std::string sanitized = ::ShadowStrike::Privacy::SanitizeDomain(domain);
+            if (!sanitized.empty()) {
+                m_preservedDomains.insert(std::move(sanitized));
+            } else {
+                SS_LOG_WARN(L"PrivacyCleaner",
+                    L"Initialize: dropped malformed preserved domain entry");
+            }
         }
 
         // Load schedules
@@ -546,8 +559,18 @@ bool PrivacyCleanerImpl::UpdateConfiguration(const CleanerConfiguration& config)
 
     // Synchronize derived state from new configuration
     m_preservedDomains.clear();
+    constexpr size_t kMaxPreservedDomainsUC = 4096;
     for (const auto& domain : m_config.preservedCookieDomains) {
-        m_preservedDomains.insert(ToLowerAscii(domain));
+        if (m_preservedDomains.size() >= kMaxPreservedDomainsUC) {
+            SS_LOG_WARN(L"PrivacyCleaner",
+                L"UpdateConfiguration: preserved-domain cap reached (%zu); remainder dropped",
+                kMaxPreservedDomainsUC);
+            break;
+        }
+        std::string sanitized = ::ShadowStrike::Privacy::SanitizeDomain(domain);
+        if (!sanitized.empty()) {
+            m_preservedDomains.insert(std::move(sanitized));
+        }
     }
     m_schedules = m_config.schedules;
 
@@ -923,7 +946,14 @@ CleanResultDetails PrivacyCleanerImpl::CleanTempFiles(std::chrono::hours olderTh
     try {
 #ifdef _WIN32
         wchar_t tempPath[MAX_PATH] = {};
-        GetTempPathW(MAX_PATH, tempPath);
+        DWORD tplen = ::GetTempPathW(MAX_PATH, tempPath);
+        if (tplen == 0 || tplen >= MAX_PATH) {
+            SS_LOG_ERROR(L"PrivacyCleaner",
+                L"CleanTempFiles: GetTempPathW failed (err=%lu)", ::GetLastError());
+            result.result = CleanResult::Error;
+            result.errors.push_back("GetTempPathW failed");
+            return result;
+        }
 
         fs::path tempDir = tempPath;
         std::error_code ec;
@@ -1304,6 +1334,45 @@ bool PrivacyCleanerImpl::AddSchedule(const CleanSchedule& schedule) {
     std::unique_lock lock(m_mutex);
 
     try {
+        // Validate schedule ID is non-empty and bounded
+        if (schedule.scheduleId.empty()) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"AddSchedule: empty schedule ID");
+            return false;
+        }
+        constexpr size_t kMaxScheduleIdLen = 128;
+        if (schedule.scheduleId.size() > kMaxScheduleIdLen) {
+            SS_LOG_ERROR(L"PrivacyCleaner",
+                L"AddSchedule: schedule ID exceeds %zu chars", kMaxScheduleIdLen);
+            return false;
+        }
+        for (unsigned char c : schedule.scheduleId) {
+            if (c < 0x20 || c == 0x7F) {
+                SS_LOG_ERROR(L"PrivacyCleaner",
+                    L"AddSchedule: schedule ID contains control characters");
+                return false;
+            }
+        }
+
+        // Validate time-of-day / day-of-week bounds for daily/weekly schedules.
+        if (schedule.hourOfDay < 0 || schedule.hourOfDay > 23) {
+            SS_LOG_ERROR(L"PrivacyCleaner",
+                L"AddSchedule: hourOfDay %d out of range [0,23]", schedule.hourOfDay);
+            return false;
+        }
+        if (schedule.dayOfWeek < 0 || schedule.dayOfWeek > 6) {
+            SS_LOG_ERROR(L"PrivacyCleaner",
+                L"AddSchedule: dayOfWeek %d out of range [0,6]", schedule.dayOfWeek);
+            return false;
+        }
+
+        // Cap to prevent unbounded schedule list growth.
+        constexpr size_t kMaxSchedules = 256;
+        if (m_schedules.size() >= kMaxSchedules) {
+            SS_LOG_ERROR(L"PrivacyCleaner",
+                L"AddSchedule: schedule list full (%zu)", kMaxSchedules);
+            return false;
+        }
+
         // Reject duplicate schedule IDs
         for (const auto& existing : m_schedules) {
             if (existing.scheduleId == schedule.scheduleId) {
@@ -1311,12 +1380,6 @@ bool PrivacyCleanerImpl::AddSchedule(const CleanSchedule& schedule) {
                     schedule.scheduleId.c_str());
                 return false;
             }
-        }
-
-        // Validate schedule ID is non-empty
-        if (schedule.scheduleId.empty()) {
-            SS_LOG_ERROR(L"PrivacyCleaner", L"AddSchedule: empty schedule ID");
-            return false;
         }
 
         m_schedules.push_back(schedule);
@@ -1425,9 +1488,28 @@ bool PrivacyCleanerImpl::AddPreservedDomain(const std::string& domain) {
         return false;
     }
 
+    // Normalize and validate via shared sanitizer (caps length, rejects NUL /
+    // path traversal, lowercases). Empty result == rejection.
+    std::string sanitized = ::ShadowStrike::Privacy::SanitizeDomain(domain);
+    if (sanitized.empty()) {
+        SS_LOG_WARN(L"PrivacyCleaner",
+            L"AddPreservedDomain: rejected malformed domain (length/charset)");
+        return false;
+    }
+
     std::unique_lock lock(m_mutex);
-    auto lowered = ToLowerAscii(domain);
-    auto [_, inserted] = m_preservedDomains.insert(std::move(lowered));
+
+    // Cap preserved-domain set to prevent unbounded growth from hostile callers.
+    constexpr size_t kMaxPreservedDomains = 4096;
+    if (m_preservedDomains.size() >= kMaxPreservedDomains &&
+        m_preservedDomains.find(sanitized) == m_preservedDomains.end()) {
+        SS_LOG_ERROR(L"PrivacyCleaner",
+            L"AddPreservedDomain: preserved-domain set full (%zu)",
+            kMaxPreservedDomains);
+        return false;
+    }
+
+    auto [_, inserted] = m_preservedDomains.insert(std::move(sanitized));
     if (inserted) {
         SS_LOG_INFO(L"PrivacyCleaner", L"Added preserved domain: %hs", domain.c_str());
     }
@@ -1435,8 +1517,12 @@ bool PrivacyCleanerImpl::AddPreservedDomain(const std::string& domain) {
 }
 
 bool PrivacyCleanerImpl::RemovePreservedDomain(const std::string& domain) {
+    std::string sanitized = ::ShadowStrike::Privacy::SanitizeDomain(domain);
+    if (sanitized.empty()) {
+        return false;
+    }
     std::unique_lock lock(m_mutex);
-    auto it = m_preservedDomains.find(ToLowerAscii(domain));
+    auto it = m_preservedDomains.find(sanitized);
     if (it != m_preservedDomains.end()) {
         m_preservedDomains.erase(it);
         SS_LOG_INFO(L"PrivacyCleaner", L"Removed preserved domain: %hs", domain.c_str());
@@ -1573,15 +1659,15 @@ bool PrivacyCleanerImpl::DeleteFileSecurely(const fs::path& filePath, SecureEras
                 break;
 
             case SecureEraseMethod::DoD_5220_22_M:
-                DoD_5220_22_M_Erase(filePath);
+                if (!DoD_5220_22_M_Erase(filePath)) return false;
                 break;
 
             case SecureEraseMethod::Gutmann:
-                GutmannErase(filePath);
+                if (!GutmannErase(filePath)) return false;
                 break;
 
             case SecureEraseMethod::NIST_800_88:
-                NIST_800_88_Erase(filePath);
+                if (!NIST_800_88_Erase(filePath)) return false;
                 break;
 
             case SecureEraseMethod::Random:
@@ -1684,31 +1770,35 @@ bool PrivacyCleanerImpl::OverwriteFileRandom(const fs::path& filePath) {
     }
 }
 
-void PrivacyCleanerImpl::DoD_5220_22_M_Erase(const fs::path& filePath) {
-    // DoD 5220.22-M: Pass 1 (0xFF), Pass 2 (0x00), Pass 3 (random)
-    OverwriteFile(filePath, 0xFF);
-    OverwriteFile(filePath, 0x00);
-    OverwriteFileRandom(filePath);
+bool PrivacyCleanerImpl::DoD_5220_22_M_Erase(const fs::path& filePath) {
+    // DoD 5220.22-M: Pass 1 (0xFF), Pass 2 (0x00), Pass 3 (random).
+    // Abort on first pass failure so the caller does NOT proceed to remove
+    // the file with potentially-recoverable contents still on disk.
+    if (!OverwriteFile(filePath, 0xFF)) return false;
+    if (!OverwriteFile(filePath, 0x00)) return false;
+    if (!OverwriteFileRandom(filePath)) return false;
+    return true;
 }
 
-void PrivacyCleanerImpl::GutmannErase(const fs::path& filePath) {
+bool PrivacyCleanerImpl::GutmannErase(const fs::path& filePath) {
     // Gutmann 35-pass: 4 random + 27 deterministic + 4 random
     for (int i = 0; i < 4; ++i) {
-        OverwriteFileRandom(filePath);
+        if (!OverwriteFileRandom(filePath)) return false;
     }
 
     for (const auto pattern : GUTMANN_DETERMINISTIC_PATTERNS) {
-        OverwriteFile(filePath, pattern);
+        if (!OverwriteFile(filePath, pattern)) return false;
     }
 
     for (int i = 0; i < 4; ++i) {
-        OverwriteFileRandom(filePath);
+        if (!OverwriteFileRandom(filePath)) return false;
     }
+    return true;
 }
 
-void PrivacyCleanerImpl::NIST_800_88_Erase(const fs::path& filePath) {
+bool PrivacyCleanerImpl::NIST_800_88_Erase(const fs::path& filePath) {
     // NIST 800-88 Clear: Single pass with zeros
-    OverwriteFile(filePath, 0x00);
+    return OverwriteFile(filePath, 0x00);
 }
 
 bool PrivacyCleanerImpl::CleanChromiumCache(const fs::path& profilePath) {
@@ -1749,7 +1839,10 @@ bool PrivacyCleanerImpl::CleanChromiumCookies(const fs::path& profilePath) {
     // Also clean Cookies-journal if present
     fs::path journalPath = profilePath / "Cookies-journal";
     if (fs::exists(journalPath, ec) && !ec) {
-        DeleteFileSecurely(journalPath, m_config.defaultEraseMethod);
+        if (!DeleteFileSecurely(journalPath, m_config.defaultEraseMethod)) {
+            SS_LOG_WARN(L"PrivacyCleaner",
+                L"CleanChromiumCookies: failed to securely erase Cookies-journal");
+        }
     }
 
     if (deleted) {
@@ -2004,7 +2097,12 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanTempFiles() {
 #ifdef _WIN32
     try {
         wchar_t tempPath[MAX_PATH] = {};
-        GetTempPathW(MAX_PATH, tempPath);
+        DWORD tplen = ::GetTempPathW(MAX_PATH, tempPath);
+        if (tplen == 0 || tplen >= MAX_PATH) {
+            SS_LOG_WARN(L"PrivacyCleaner",
+                L"ScanTempFiles: GetTempPathW failed (err=%lu)", ::GetLastError());
+            return targets;
+        }
 
         std::error_code ec;
         fs::path temp = tempPath;
@@ -2173,8 +2271,12 @@ bool PrivacyCleanerImpl::IsPathExcluded(const fs::path& path) {
 }
 
 bool PrivacyCleanerImpl::IsDomainPreserved(const std::string& domain) {
+    std::string sanitized = ::ShadowStrike::Privacy::SanitizeDomain(domain);
+    if (sanitized.empty()) {
+        return false;
+    }
     std::shared_lock lock(m_mutex);
-    return m_preservedDomains.find(ToLowerAscii(domain)) != m_preservedDomains.end();
+    return m_preservedDomains.find(sanitized) != m_preservedDomains.end();
 }
 
 void PrivacyCleanerImpl::NotifyProgress(const std::string& item, int percent) {
