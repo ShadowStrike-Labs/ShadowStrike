@@ -681,8 +681,15 @@ std::optional<USBDeviceInfo> USBDeviceMonitorImpl::GetDeviceInfoFromPnP(const st
     }
 
     info.deviceId = SanitizeUsbField("USB\\VID_" + info.vendorId + "&PID_" + info.productId, 128);
-    info.classCode = 0x08;
-    info.subclassCode = 0x06;
+    // Class/subclass cannot be reliably inferred from a PnP interface path
+    // alone — leaving them hard-coded to MassStorage (0x08/0x06) caused every
+    // arriving USB device, including HID keyboards/mice and cameras, to be
+    // classified and policy-evaluated as removable storage. Until a proper
+    // SetupDi-based class lookup is wired in, report the device class as
+    // Unknown so downstream policy decisions do not act on a fabricated
+    // classification.
+    info.classCode = 0x00;
+    info.subclassCode = 0x00;
     info.type = ClassifyDeviceType(info.classCode, info.subclassCode);
 
     return info;
@@ -998,8 +1005,14 @@ bool USBDeviceMonitorImpl::SafeEjectDevice(const std::string& driveLetter) {
         return false;
     }
 
+    // The Win32 volume device name accepted by IOCTL_STORAGE_EJECT_MEDIA is
+    // "\\.\X:" (no trailing backslash). Appending a backslash here would
+    // make CreateFileW open the volume's root *directory* and the eject
+    // IOCTL would fail with ERROR_INVALID_FUNCTION.
     std::wstring volumePath = L"\\\\.\\" + NarrowToWide(driveLetter);
-    if (volumePath.back() == L':') volumePath += L'\\';
+    if (!volumePath.empty() && volumePath.back() == L'\\') {
+        volumePath.pop_back();
+    }
 
     HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hVolume == INVALID_HANDLE_VALUE) {
@@ -1097,8 +1110,62 @@ bool USBDeviceMonitorImpl::RemoveFromWhitelist(const std::string& serialOrVidPid
 }
 
 bool USBDeviceMonitorImpl::AddToBlacklist(const std::string& serialOrVidPid) {
+    // Accepts either:
+    //   * A VID/PID specifier containing "VID_XXXX" and "PID_YYYY"
+    //     (hex, case-insensitive) — pushed onto blacklistedVidPid.
+    //   * Anything else — pushed onto whitelistedSerials' blacklist sibling
+    //     is not modelled in the policy schema, so we reject and log.
+    auto findHexAfter = [](const std::string& s, const char* token,
+                           uint16_t& outValue) -> bool {
+        const size_t tokLen = std::char_traits<char>::length(token);
+        for (size_t i = 0; i + tokLen <= s.size(); ++i) {
+            bool match = true;
+            for (size_t k = 0; k < tokLen; ++k) {
+                char a = static_cast<char>(::toupper(static_cast<unsigned char>(s[i + k])));
+                char b = static_cast<char>(::toupper(static_cast<unsigned char>(token[k])));
+                if (a != b) { match = false; break; }
+            }
+            if (!match) continue;
+            const size_t start = i + tokLen;
+            const size_t end = std::min(start + 4, s.size());
+            if (end <= start) return false;
+            std::string hex = s.substr(start, end - start);
+            for (char c : hex) {
+                if (!::isxdigit(static_cast<unsigned char>(c))) return false;
+            }
+            try {
+                outValue = static_cast<uint16_t>(std::stoul(hex, nullptr, 16));
+            } catch (...) {
+                return false;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    const bool hasVid = findHexAfter(serialOrVidPid, "VID_", vid);
+    const bool hasPid = findHexAfter(serialOrVidPid, "PID_", pid);
+
+    if (!hasVid || !hasPid) {
+        SS_LOG_WARN(L"USBMonitor",
+            L"AddToBlacklist rejected: input %hs is not a parseable VID_XXXX&PID_YYYY specifier",
+            serialOrVidPid.c_str());
+        return false;
+    }
+
     std::unique_lock lock(m_mutex);
-    SS_LOG_INFO(L"USBMonitor", L"Added to blacklist: %hs", serialOrVidPid.c_str());
+    auto& blist = m_config.policy.blacklistedVidPid;
+    const std::pair<uint16_t, uint16_t> entry{vid, pid};
+    if (std::find(blist.begin(), blist.end(), entry) != blist.end()) {
+        return false;
+    }
+    blist.push_back(entry);
+    SS_LOG_INFO(L"USBMonitor",
+        L"Added to blacklist: VID_%04X&PID_%04X (input=%hs)",
+        static_cast<unsigned>(vid), static_cast<unsigned>(pid),
+        serialOrVidPid.c_str());
     return true;
 }
 
