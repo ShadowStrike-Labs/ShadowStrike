@@ -553,7 +553,44 @@ public:
         result.requestId = request.requestId;
         auto start = Clock::now();
 
-        if (!IsInitialized() || !m_config.enabled) {
+        if (!IsInitialized()) {
+            return result;
+        }
+
+        // Snapshot configuration, parental settings and callbacks under shared_lock
+        // so the hot path does not race with UpdateConfiguration / SetParentalControls
+        // / Register*Callback. Copying these small structs once is far cheaper than
+        // the per-field unlocked reads they replace, and removes the prior racing-
+        // `std::function` invocations entirely.
+        bool                       cfgEnabled = false;
+        bool                       cfgEnableParental = false;
+        bool                       cfgEnablePhishing = false;
+        bool                       cfgBlockMalware = false;
+        bool                       cfgEnableAds = false;
+        bool                       cfgEnableTrackers = false;
+        std::unordered_set<URLCategory> cfgBlockedCategories;
+        bool                       safeSearchSnap = false;
+        ParentalControlSettings    parentalSnap;
+        PreNavigationCallback      preNavCb;
+        NavigationCallback         navCb;
+        BlockCallback              blockCb;
+        {
+            std::shared_lock lock(m_mutex);
+            cfgEnabled              = m_config.enabled;
+            cfgEnableParental       = m_config.enableParentalControls;
+            cfgEnablePhishing       = m_config.enablePhishingDetection;
+            cfgBlockMalware         = m_config.blockMalwareDomains;
+            cfgEnableAds            = m_config.enableAdBlocking;
+            cfgEnableTrackers       = m_config.enableTrackerBlocking;
+            cfgBlockedCategories    = m_config.blockedCategories;
+            safeSearchSnap          = m_safeSearchEnforced;
+            parentalSnap            = m_parentalSettings;
+            preNavCb                = m_preNavCallback;
+            navCb                   = m_navCallback;
+            blockCb                 = m_blockCallback;
+        }
+
+        if (!cfgEnabled) {
             return result;
         }
 
@@ -579,9 +616,11 @@ public:
             return result;
         }
 
-        // 1. Pre-navigation callback
-        if (m_preNavCallback) {
-            if (!m_preNavCallback(request)) {
+        // 1. Pre-navigation callback (invoked OUTSIDE any lock)
+        if (preNavCb) {
+            bool allowed = true;
+            try { allowed = preNavCb(request); } catch (...) { allowed = true; }
+            if (!allowed) {
                 result.action = NavigationAction::Block;
                 result.blockReasons = BlockReason::PolicyViolation;
                 result.threatName = "Blocked by pre-navigation callback";
@@ -604,13 +643,13 @@ public:
             result.threatName = "Blocked by custom blocklist policy";
             result.blockPageUrl = BrowserConstants::BLOCK_PAGE_URL;
             m_stats.blockedNavigations++;
-            NotifyBlock(request.url, BlockReason::CustomBlocklist);
+            InvokeBlockCallback(blockCb, request.url, BlockReason::CustomBlocklist);
             result.processingTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
             return result;
         }
 
         // 4. Parental controls
-        if (m_config.enableParentalControls && m_parentalSettings.enabled) {
+        if (cfgEnableParental && parentalSnap.enabled) {
             // Time-based restriction check
             auto now = std::chrono::system_clock::now();
             auto tt = std::chrono::system_clock::to_time_t(now);
@@ -621,7 +660,7 @@ public:
             localtime_r(&tt, &localTm);
 #endif
             int currentHour = localTm.tm_hour;
-            if (currentHour >= 0 && currentHour < 24 && !m_parentalSettings.hourlyAccess[static_cast<size_t>(currentHour)]) {
+            if (currentHour >= 0 && currentHour < 24 && !parentalSnap.hourlyAccess[static_cast<size_t>(currentHour)]) {
                 result.action = NavigationAction::Block;
                 result.blockReasons = BlockReason::TimeRestriction;
                 result.threatName = "Access restricted during this time period";
@@ -632,7 +671,7 @@ public:
             }
 
             // Check blocked domains in parental settings
-            for (const auto& blocked : m_parentalSettings.blockedDomains) {
+            for (const auto& blocked : parentalSnap.blockedDomains) {
                 if (DomainEndsWith(domain, ToLower(blocked))) {
                     result.action = NavigationAction::Block;
                     result.blockReasons = BlockReason::CategoryBlocked;
@@ -644,8 +683,8 @@ public:
                 }
             }
 
-            // Category-based blocking
-            if (IsCategoryBlocked(domain)) {
+            // Category-based blocking (parental categories evaluated against snapshot)
+            if (IsCategoryBlockedFromSnapshot(domain, parentalSnap)) {
                 result.action = NavigationAction::Block;
                 result.blockReasons = BlockReason::CategoryBlocked;
                 result.threatName = "Category blocked by parental controls";
@@ -657,12 +696,12 @@ public:
         }
 
         // 5. Safe search enforcement
-        if (m_safeSearchEnforced) {
+        if (safeSearchSnap) {
             EnforceSafeSearchOnUrl(request.url, domain);
         }
 
         // 6. Phishing / malware check via SafeBrowsingAPI
-        if (m_config.enablePhishingDetection || m_config.blockMalwareDomains) {
+        if (cfgEnablePhishing || cfgBlockMalware) {
             auto& safeBrowsing = SafeBrowsingAPI::Instance();
             auto sbResult = safeBrowsing.CheckUrl(request.url);
 
@@ -674,7 +713,7 @@ public:
                 result.blockPageUrl = BrowserConstants::BLOCK_PAGE_URL;
                 m_stats.malwareBlocked++;
                 m_stats.blockedNavigations++;
-                NotifyBlock(request.url, BlockReason::Malware);
+                InvokeBlockCallback(blockCb, request.url, BlockReason::Malware);
                 result.processingTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
                 return result;
             }
@@ -687,7 +726,7 @@ public:
                 result.blockPageUrl = BrowserConstants::BLOCK_PAGE_URL;
                 m_stats.phishingBlocked++;
                 m_stats.blockedNavigations++;
-                NotifyBlock(request.url, BlockReason::Phishing);
+                InvokeBlockCallback(blockCb, request.url, BlockReason::Phishing);
                 result.processingTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
                 return result;
             }
@@ -702,7 +741,7 @@ public:
         }
 
         // 7. Phishing detector (heuristic analysis)
-        if (m_config.enablePhishingDetection) {
+        if (cfgEnablePhishing) {
             auto& phishing = PhishingDetector::Instance();
             if (phishing.IsPhishing(request.url)) {
                 result.action = NavigationAction::Block;
@@ -712,14 +751,14 @@ public:
                 result.blockPageUrl = BrowserConstants::BLOCK_PAGE_URL;
                 m_stats.phishingBlocked++;
                 m_stats.blockedNavigations++;
-                NotifyBlock(request.url, BlockReason::Phishing);
+                InvokeBlockCallback(blockCb, request.url, BlockReason::Phishing);
                 result.processingTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
                 return result;
             }
         }
 
         // 8. Ad blocking
-        if (m_config.enableAdBlocking) {
+        if (cfgEnableAds) {
             if (AdBlocker::Instance().ShouldBlock(request.url)) {
                 result.action = NavigationAction::Block;
                 result.blockReasons = BlockReason::Advertising;
@@ -732,7 +771,7 @@ public:
         }
 
         // 9. Tracker blocking
-        if (m_config.enableTrackerBlocking) {
+        if (cfgEnableTrackers) {
             auto trackerDecision = TrackerBlocker::Instance().ShouldBlockUrl(request.url);
             if (trackerDecision.decision == BlockDecision::Block) {
                 result.action = NavigationAction::Block;
@@ -745,11 +784,11 @@ public:
             }
         }
 
-        // 10. Category-based blocking (from config)
-        if (!m_config.blockedCategories.empty()) {
+        // 10. Category-based blocking (from snapshot config)
+        if (!cfgBlockedCategories.empty()) {
             URLCategory cat = CategorizeByDomain(domain);
             if (cat != URLCategory::Unknown &&
-                m_config.blockedCategories.find(cat) != m_config.blockedCategories.end()) {
+                cfgBlockedCategories.find(cat) != cfgBlockedCategories.end()) {
                 result.action = NavigationAction::Block;
                 result.blockReasons = BlockReason::CategoryBlocked;
                 result.category = cat;
@@ -764,8 +803,8 @@ public:
         result.processingTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
         m_stats.allowedNavigations++;
 
-        if (m_navCallback) {
-            m_navCallback(request, result);
+        if (navCb) {
+            try { navCb(request, result); } catch (...) {}
         }
 
         return result;
@@ -776,7 +815,21 @@ public:
         result.downloadId = download.downloadId;
         auto start = Clock::now();
 
-        if (!IsInitialized() || !m_config.enableDownloadScanning) {
+        if (!IsInitialized()) {
+            return result;
+        }
+
+        // Snapshot config flag and callback under shared_lock to avoid race with
+        // UpdateConfiguration / RegisterDownloadCallback.
+        bool             cfgEnableDownloadScanning = false;
+        DownloadCallback dlCb;
+        {
+            std::shared_lock lock(m_mutex);
+            cfgEnableDownloadScanning = m_config.enableDownloadScanning;
+            dlCb = m_downloadCallback;
+        }
+
+        if (!cfgEnableDownloadScanning) {
             return result;
         }
 
@@ -793,7 +846,7 @@ public:
             result.threatName = sbResult.threatName.empty() ? "Malicious download source" : sbResult.threatName;
             result.riskScore = sbResult.threatScore;
             m_stats.downloadsBlocked++;
-            if (m_downloadCallback) m_downloadCallback(download, result);
+            if (dlCb) { try { dlCb(download, result); } catch (...) {} }
             result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
             return result;
         }
@@ -838,7 +891,7 @@ public:
         }
 
         if (result.verdict != DownloadVerdict::Safe && result.verdict != DownloadVerdict::Unknown) {
-            if (m_downloadCallback) m_downloadCallback(download, result);
+            if (dlCb) { try { dlCb(download, result); } catch (...) {} }
         }
 
         result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
@@ -1033,6 +1086,7 @@ public:
         fs::path manifestDir;
         HKEY rootKey = HKEY_CURRENT_USER;
         std::wstring regPath;
+        const char* allowedExtensionId = nullptr;
 
         switch (browser) {
             case BrowserType::Chrome:
@@ -1040,13 +1094,15 @@ public:
             case BrowserType::Vivaldi:
                 regPath = L"SOFTWARE\\Google\\Chrome\\NativeMessagingHosts\\";
                 regPath += Utils::StringUtils::ToWide(BrowserConstants::NATIVE_HOST_NAME);
+                allowedExtensionId = BrowserConstants::CHROME_EXTENSION_ID;
                 break;
             case BrowserType::Edge:
                 regPath = L"SOFTWARE\\Microsoft\\Edge\\NativeMessagingHosts\\";
                 regPath += Utils::StringUtils::ToWide(BrowserConstants::NATIVE_HOST_NAME);
+                allowedExtensionId = BrowserConstants::CHROME_EXTENSION_ID;
                 break;
             case BrowserType::Firefox: {
-                // Firefox uses a JSON manifest in AppData
+                // Firefox uses a JSON manifest in AppData (no registry entry)
                 wchar_t appData[MAX_PATH] = {};
                 if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) > 0) {
                     manifestDir = fs::path(appData) / L"Mozilla" / L"NativeMessagingHosts";
@@ -1059,31 +1115,86 @@ public:
                 return false;
         }
 
-        // Write registry key for Chromium-based browsers
+        // Chromium-based browsers: write the manifest JSON to disk AND register the
+        // registry pointer that names it. The original implementation only wrote the
+        // registry entry, leaving the manifest file missing and breaking installation.
         if (!regPath.empty()) {
+            wchar_t modulePath[MAX_PATH] = {};
+            if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"GetModuleFileNameW failed during extension install: %lu",
+                             GetLastError());
+                return false;
+            }
+            fs::path hostExePath = fs::path(modulePath).parent_path() / L"ShadowStrikeNativeHost.exe";
+            fs::path manifestPath = hostExePath.parent_path() / L"native_messaging_manifest.json";
+
+            // 1. Write the manifest JSON next to the native host executable.
+            {
+                std::error_code ec;
+                fs::create_directories(manifestPath.parent_path(), ec);
+                if (ec) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                                 L"Failed to create native messaging manifest directory: %hs",
+                                 ec.message().c_str());
+                    return false;
+                }
+
+                std::ofstream ofs(manifestPath, std::ios::binary | std::ios::trunc);
+                if (!ofs.is_open()) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                                 L"Failed to open Chromium native messaging manifest for write: %ls",
+                                 manifestPath.c_str());
+                    return false;
+                }
+
+                const std::string allowedOriginPrefix = "chrome-extension://";
+                const std::string allowedOrigin =
+                    allowedExtensionId
+                        ? (allowedOriginPrefix + std::string(allowedExtensionId) + "/")
+                        : std::string{};
+
+                ofs << "{\n"
+                    << "  \"name\": \"" << BrowserConstants::NATIVE_HOST_NAME << "\",\n"
+                    << "  \"description\": \"ShadowStrike Browser Protection\",\n"
+                    << "  \"path\": \"" << EscapeJson(hostExePath.string()) << "\",\n"
+                    << "  \"type\": \"stdio\",\n"
+                    << "  \"allowed_origins\": [\"" << EscapeJson(allowedOrigin) << "\"]\n"
+                    << "}\n";
+                ofs.close();
+                if (ofs.fail()) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                                 L"Stream error while writing Chromium native messaging manifest: %ls",
+                                 manifestPath.c_str());
+                    return false;
+                }
+            }
+
+            // 2. Register the manifest pointer under HKCU.
             HKEY hKey = nullptr;
             LONG res = RegCreateKeyExW(rootKey, regPath.c_str(), 0, nullptr,
                                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr);
-            if (res == ERROR_SUCCESS && hKey) {
-                // Get current module path for the native host executable
-                wchar_t modulePath[MAX_PATH] = {};
-                GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-                fs::path hostExePath = fs::path(modulePath).parent_path() / L"ShadowStrikeNativeHost.exe";
-                std::wstring hostPath = hostExePath.wstring();
-
-                // Write manifest path as default value
-                fs::path manifestPath = hostExePath.parent_path() / L"native_messaging_manifest.json";
-                std::wstring manifestPathStr = manifestPath.wstring();
-                RegSetValueExW(hKey, nullptr, 0, REG_SZ,
-                               reinterpret_cast<const BYTE*>(manifestPathStr.c_str()),
-                               static_cast<DWORD>((manifestPathStr.size() + 1) * sizeof(wchar_t)));
-                RegCloseKey(hKey);
-
-                SS_LOG_INFO(LOG_CATEGORY, L"Registered native messaging host for %ls", exeName.c_str());
-                return true;
+            if (res != ERROR_SUCCESS || hKey == nullptr) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                             L"Failed to create registry key for native messaging host: %ld", res);
+                return false;
             }
-            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to create registry key for native messaging host: %ld", res);
-            return false;
+
+            const std::wstring manifestPathStr = manifestPath.wstring();
+            const LONG setRes = RegSetValueExW(
+                hKey, nullptr, 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(manifestPathStr.c_str()),
+                static_cast<DWORD>((manifestPathStr.size() + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+
+            if (setRes != ERROR_SUCCESS) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                             L"RegSetValueExW failed for native messaging host manifest: %ld", setRes);
+                return false;
+            }
+
+            SS_LOG_INFO(LOG_CATEGORY, L"Registered native messaging host for %ls (manifest: %ls)",
+                        exeName.c_str(), manifestPath.c_str());
+            return true;
         }
 
         // Firefox: write JSON manifest file
@@ -1091,19 +1202,24 @@ public:
             std::error_code ec;
             fs::create_directories(manifestDir, ec);
             if (ec) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to create Firefox native messaging directory");
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to create Firefox native messaging directory: %hs",
+                             ec.message().c_str());
                 return false;
             }
 
             fs::path manifestFile = manifestDir / (std::string(BrowserConstants::NATIVE_HOST_NAME) + ".json");
-            std::ofstream ofs(manifestFile);
+            std::ofstream ofs(manifestFile, std::ios::binary | std::ios::trunc);
             if (!ofs.is_open()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to write Firefox native messaging manifest");
                 return false;
             }
 
             wchar_t modulePath[MAX_PATH] = {};
-            GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+            if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"GetModuleFileNameW failed during Firefox install: %lu",
+                             GetLastError());
+                return false;
+            }
             fs::path hostExePath = fs::path(modulePath).parent_path() / L"ShadowStrikeNativeHost.exe";
 
             ofs << "{\n"
@@ -1114,6 +1230,12 @@ public:
                 << "  \"allowed_extensions\": [\"" << BrowserConstants::FIREFOX_EXTENSION_ID << "\"]\n"
                 << "}\n";
             ofs.close();
+            if (ofs.fail()) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                             L"Stream error while writing Firefox native messaging manifest: %ls",
+                             manifestFile.c_str());
+                return false;
+            }
 
             SS_LOG_INFO(LOG_CATEGORY, L"Wrote Firefox native messaging manifest to %ls", manifestFile.c_str());
             return true;
@@ -1219,12 +1341,14 @@ public:
     // ========================================================================
 
     bool EnforceSafeSearchInternal(bool enable) {
+        std::unique_lock lock(m_mutex);
         m_safeSearchEnforced = enable;
         SS_LOG_INFO(LOG_CATEGORY, L"Safe search enforcement %ls", enable ? L"enabled" : L"disabled");
         return true;
     }
 
     bool IsSafeSearchEnforcedInternal() const noexcept {
+        std::shared_lock lock(m_mutex);
         return m_safeSearchEnforced;
     }
 
@@ -1264,14 +1388,21 @@ public:
     // ========================================================================
 
     bool AddToBlocklistInternal(const std::string& domain) {
+        const std::string normalized = NormalizeDomainCandidate(domain);
+        if (normalized.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"AddToBlocklist rejected: malformed domain candidate");
+            return false;
+        }
         std::unique_lock lock(m_mutex);
-        m_blocklist.insert(ToLower(domain));
+        m_blocklist.insert(normalized);
         return true;
     }
 
     bool RemoveFromBlocklistInternal(const std::string& domain) {
+        const std::string normalized = NormalizeDomainCandidate(domain);
+        if (normalized.empty()) return false;
         std::unique_lock lock(m_mutex);
-        return m_blocklist.erase(ToLower(domain)) > 0;
+        return m_blocklist.erase(normalized) > 0;
     }
 
     bool IsInBlocklistInternal(const std::string& domain) const {
@@ -1286,14 +1417,21 @@ public:
     }
 
     bool AddToAllowlistInternal(const std::string& domain) {
+        const std::string normalized = NormalizeDomainCandidate(domain);
+        if (normalized.empty()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"AddToAllowlist rejected: malformed domain candidate");
+            return false;
+        }
         std::unique_lock lock(m_mutex);
-        m_allowlist.insert(ToLower(domain));
+        m_allowlist.insert(normalized);
         return true;
     }
 
     bool RemoveFromAllowlistInternal(const std::string& domain) {
+        const std::string normalized = NormalizeDomainCandidate(domain);
+        if (normalized.empty()) return false;
         std::unique_lock lock(m_mutex);
-        return m_allowlist.erase(ToLower(domain)) > 0;
+        return m_allowlist.erase(normalized) > 0;
     }
 
     bool IsInAllowlistInternal(const std::string& domain) const {
@@ -1383,9 +1521,19 @@ public:
     // ========================================================================
 
     void NotifyBlock(const std::string& url, BlockReason reason) {
-        if (m_blockCallback) {
-            m_blockCallback(url, reason);
+        // Snapshot callback under lock, invoke without holding lock.
+        BlockCallback cb;
+        {
+            std::shared_lock lock(m_mutex);
+            cb = m_blockCallback;
         }
+        InvokeBlockCallback(cb, url, reason);
+    }
+
+    // Helper: invoke a snapshot block callback safely outside of any lock.
+    void InvokeBlockCallback(const BlockCallback& cb, const std::string& url, BlockReason reason) noexcept {
+        if (!cb) return;
+        try { cb(url, reason); } catch (...) {}
     }
 
     bool IsCategoryBlocked(const std::string& domain) {
@@ -1395,6 +1543,16 @@ public:
         if (cat == URLCategory::Unknown) return false;
 
         return m_parentalSettings.blockedCategories.count(cat) > 0;
+    }
+
+    // Snapshot variant: evaluates against a previously-captured ParentalControlSettings,
+    // avoiding any further lock acquisition during the navigation hot path.
+    [[nodiscard]] bool IsCategoryBlockedFromSnapshot(const std::string& domain,
+                                                     const ParentalControlSettings& snap) const {
+        if (snap.blockedCategories.empty()) return false;
+        URLCategory cat = CategorizeByDomain(domain);
+        if (cat == URLCategory::Unknown) return false;
+        return snap.blockedCategories.count(cat) > 0;
     }
 
     void EnforceSafeSearchOnUrl(const std::string& url, const std::string& domain) {
