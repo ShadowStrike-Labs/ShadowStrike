@@ -240,7 +240,11 @@ struct PgtiFeedManager::Impl {
             // that if a feed has not reported a pull in >2× its interval,
             // we mark it Degraded to surface the issue in the UI.
             const auto now = std::chrono::system_clock::now();
-            bool anyChanged = false;
+
+            // Collect feeds that flipped to Degraded so we can broadcast
+            // outside the mutex (BroadcastFeedUpdated must never be invoked
+            // while holding `mutex` — ServiceCommunicator may re-enter).
+            std::vector<std::string> degraded;
 
             {
                 std::unique_lock lock(mutex);
@@ -255,7 +259,12 @@ struct PgtiFeedManager::Impl {
                         && statuses[i].health == PgtiFeedStatus::Health::Healthy)
                     {
                         statuses[i].health = PgtiFeedStatus::Health::Degraded;
-                        anyChanged = true;
+                        try {
+                            degraded.push_back(descriptors[i].id);
+                        } catch (...) {
+                            // OOM on push_back — the in-memory transition is
+                            // still recorded; UI broadcast is best-effort.
+                        }
                         SS_LOG_WARN(kLog,
                             L"PgtiFeedManager: feed '%hs' has not pulled in >2× interval; marking Degraded.",
                             descriptors[i].id.c_str());
@@ -263,7 +272,10 @@ struct PgtiFeedManager::Impl {
                 }
             }
 
-            if (anyChanged) {
+            for (const auto& id : degraded) {
+                BroadcastFeedUpdated(id, PgtiFeedStatus::Health::Degraded);
+            }
+            if (!degraded.empty()) {
                 FireCallbacks();
             }
         }
