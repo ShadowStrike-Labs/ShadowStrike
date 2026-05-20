@@ -77,6 +77,7 @@
 #include <iomanip>
 #include <fstream>
 #include <random>
+#include <array>
 #include <thread>
 #include <condition_variable>
 #include <cctype>
@@ -462,7 +463,7 @@ private:
 
     // Random generator for incident IDs
     mutable std::mutex m_rngMutex;
-    std::mt19937_64 m_rng{std::random_device{}()};
+    std::mt19937_64 m_rng;
 
     // Infrastructure references
     PatternStore::PatternStore* m_patternStore = nullptr;
@@ -474,6 +475,16 @@ private:
 // ============================================================================
 
 DataLeakProtectionImpl::DataLeakProtectionImpl() {
+    // Fully seed the 64-bit Mersenne Twister from the OS entropy source. The
+    // previous `std::random_device{}()` invocation supplied only 32 bits to a
+    // ~20 kbit state, leaving the generator distinguishable from random and
+    // unsuitable for unguessable incident IDs.
+    std::random_device rd;
+    std::array<std::uint32_t, std::mt19937_64::state_size> seedData{};
+    std::generate(seedData.begin(), seedData.end(), std::ref(rd));
+    std::seed_seq seq(seedData.begin(), seedData.end());
+    m_rng.seed(seq);
+
     ::ShadowStrike::Utils::Logger::Info("[DataLeakProtection] Instance created");
 }
 
@@ -681,11 +692,21 @@ DLPScanResult DataLeakProtectionImpl::ScanBuffer(const std::vector<uint8_t>& buf
         return {};
     }
 
-    if (!m_config.enabled) {
+    // Snapshot config under a brief shared lock so concurrent
+    // UpdateConfiguration() cannot tear the read.
+    bool enabled = false;
+    std::size_t maxContentSize = 0;
+    {
+        std::shared_lock cfgLock(m_mutex);
+        enabled = m_config.enabled;
+        maxContentSize = m_config.maxContentSize;
+    }
+
+    if (!enabled) {
         return {};
     }
 
-    if (buffer.empty() || buffer.size() > m_config.maxContentSize) {
+    if (buffer.empty() || buffer.size() > maxContentSize) {
         return {};
     }
 
@@ -700,11 +721,19 @@ DLPScanResult DataLeakProtectionImpl::ScanString(const std::string& content) {
         return {};
     }
 
-    if (!m_config.enabled) {
+    bool enabled = false;
+    std::size_t maxContentSize = 0;
+    {
+        std::shared_lock cfgLock(m_mutex);
+        enabled = m_config.enabled;
+        maxContentSize = m_config.maxContentSize;
+    }
+
+    if (!enabled) {
         return {};
     }
 
-    if (content.empty() || content.size() > m_config.maxContentSize) {
+    if (content.empty() || content.size() > maxContentSize) {
         return {};
     }
 
@@ -726,14 +755,29 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
         return {};
     }
 
-    if (!m_config.enabled) {
+    // Snapshot configuration once at function entry. Holding the lock across
+    // filesystem I/O would serialize unrelated scanners, while reading
+    // m_config without synchronization races with UpdateConfiguration().
+    bool enabled = false;
+    std::size_t maxContentSize = 0;
+    std::vector<std::string> excludedExtensions;
+    std::vector<std::string> excludedPaths;
+    {
+        std::shared_lock cfgLock(m_mutex);
+        enabled = m_config.enabled;
+        maxContentSize = m_config.maxContentSize;
+        excludedExtensions = m_config.excludedExtensions;
+        excludedPaths = m_config.excludedPaths;
+    }
+
+    if (!enabled) {
         return {};
     }
 
     try {
         // Check excluded extensions first (no filesystem access needed)
         std::string ext = filePath.extension().string();
-        for (const auto& excluded : m_config.excludedExtensions) {
+        for (const auto& excluded : excludedExtensions) {
             if (NarrowIEquals(ext, excluded)) {
                 return {};
             }
@@ -741,7 +785,7 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
 
         // Check excluded paths
         std::string pathStr = filePath.string();
-        for (const auto& excluded : m_config.excludedPaths) {
+        for (const auto& excluded : excludedPaths) {
             if (pathStr.find(excluded) != std::string::npos) {
                 return {};
             }
@@ -761,8 +805,8 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
             return {};
         }
         auto fileSize = static_cast<size_t>(tellPos);
-        if (fileSize == 0 || fileSize > m_config.maxContentSize) {
-            if (fileSize > m_config.maxContentSize) {
+        if (fileSize == 0 || fileSize > maxContentSize) {
+            if (fileSize > maxContentSize) {
                 ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] File too large for DLP scan: {} bytes", fileSize);
             }
             return {};
@@ -819,11 +863,23 @@ DLPScanResult DataLeakProtectionImpl::ScanClipboard() {
 }
 
 bool DataLeakProtectionImpl::HasSensitiveData(const std::string& content) {
-    if (!m_initialized.load(std::memory_order_acquire) || !m_config.enabled) {
+    if (!m_initialized.load(std::memory_order_acquire)) {
         return false;
     }
 
-    if (content.empty() || content.size() > m_config.maxContentSize) {
+    bool enabled = false;
+    std::size_t maxContentSize = 0;
+    {
+        std::shared_lock cfgLock(m_mutex);
+        enabled = m_config.enabled;
+        maxContentSize = m_config.maxContentSize;
+    }
+
+    if (!enabled) {
+        return false;
+    }
+
+    if (content.empty() || content.size() > maxContentSize) {
         return false;
     }
 
@@ -858,7 +914,7 @@ bool DataLeakProtectionImpl::HasSensitiveData(const std::string& content) {
 DLPScanResult DataLeakProtectionImpl::AnalyzeOutboundData(
     const std::vector<uint8_t>& data,
     ChannelType channel,
-    const std::string& destination) {
+    [[maybe_unused]] const std::string& destination) {
 
     if (!m_initialized.load(std::memory_order_acquire)) {
         return {};
@@ -913,7 +969,7 @@ DLPScanResult DataLeakProtectionImpl::AnalyzeOutboundData(
 
 bool DataLeakProtectionImpl::ShouldBlockUpload(
     const fs::path& filePath,
-    const std::string& destination) {
+    [[maybe_unused]] const std::string& destination) {
 
     auto result = ScanFile(filePath);
 
