@@ -604,8 +604,12 @@ bool WebcamProtectorImpl::Initialize(
 
         m_config = config;
 
-        // Enumerate camera devices
-        RefreshDevicesInternal();
+        // Enumerate camera devices. Failure here is non-fatal — the module
+        // can still serve callbacks/policy; log and continue.
+        if (!RefreshDevicesInternal()) {
+            SS_LOG_WARN(L"WebcamProtector",
+                L"Initialize: initial device enumeration failed; continuing");
+        }
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
@@ -997,15 +1001,87 @@ bool WebcamProtectorImpl::AddToWhitelistInternal(
     const CameraWhitelistEntry& entry)
 {
     try {
+        // ----- Field validation (defends against hostile callers) -----
+        constexpr size_t kMaxIdLen      = 128;
+        constexpr size_t kMaxPatternLen = 260;   // matches MAX_PATH-ish
+        constexpr size_t kMaxPubLen     = 256;
+        constexpr size_t kMaxNotesLen   = 1024;
+
         if (entry.entryId.empty()) {
-            SS_LOG_ERROR(L"WebcamProtector", L"Empty entry ID");
+            SS_LOG_ERROR(L"WebcamProtector", L"AddToWhitelist: empty entry ID");
+            return false;
+        }
+        if (entry.entryId.size() > kMaxIdLen) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: entry ID exceeds %zu chars", kMaxIdLen);
+            return false;
+        }
+        if (entry.processPattern.empty() ||
+            entry.processPattern.size() > kMaxPatternLen) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: invalid processPattern length");
+            return false;
+        }
+        if (entry.publisher.size() > kMaxPubLen ||
+            entry.notes.size() > kMaxNotesLen) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: publisher/notes field exceeds bounds");
+            return false;
+        }
+
+        // Reject embedded NUL / control characters in textual fields.
+        auto rejectControl = [](const std::string& s) noexcept {
+            for (unsigned char c : s) {
+                if (c == 0 || (c < 0x20 && c != '\t')) return true;
+            }
+            return false;
+        };
+        if (rejectControl(entry.entryId) || rejectControl(entry.processPattern) ||
+            rejectControl(entry.publisher) || rejectControl(entry.notes)) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: control characters in entry");
+            return false;
+        }
+
+        // If a SHA-256 hash is supplied, validate it is exactly 64 hex chars.
+        if (!entry.sha256Hash.empty()) {
+            if (entry.sha256Hash.size() != 64) {
+                SS_LOG_ERROR(L"WebcamProtector",
+                    L"AddToWhitelist: sha256Hash must be 64 hex chars");
+                return false;
+            }
+            for (unsigned char c : entry.sha256Hash) {
+                if (!std::isxdigit(c)) {
+                    SS_LOG_ERROR(L"WebcamProtector",
+                        L"AddToWhitelist: sha256Hash contains non-hex char");
+                    return false;
+                }
+            }
+        }
+
+        // Validate hour-of-day bounds when supplied.
+        if (entry.allowFromHour.has_value() &&
+            (entry.allowFromHour.value() < 0 || entry.allowFromHour.value() > 23)) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: allowFromHour out of range [0,23]");
+            return false;
+        }
+        if (entry.allowToHour.has_value() &&
+            (entry.allowToHour.value() < 0 || entry.allowToHour.value() > 23)) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: allowToHour out of range [0,23]");
             return false;
         }
 
         std::unique_lock lock(m_whitelistMutex);
 
-        if (m_whitelist.size() >= WebcamConstants::MAX_WHITELIST) {
-            SS_LOG_ERROR(L"WebcamProtector", L"Whitelist full");
+        // Cap is only enforced for NEW inserts; updating an existing entry
+        // when the table is already at capacity must still succeed.
+        if (m_whitelist.find(entry.entryId) == m_whitelist.end() &&
+            m_whitelist.size() >= WebcamConstants::MAX_WHITELIST) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"AddToWhitelist: whitelist full (%zu)",
+                static_cast<size_t>(WebcamConstants::MAX_WHITELIST));
             return false;
         }
 
@@ -1046,14 +1122,25 @@ bool WebcamProtectorImpl::IsProcessWhitelistedInternal(
     const std::string& processName,
     const fs::path& processPath)
 {
+    // Windows process names are case-insensitive. Lowercase the candidate
+    // once so an attacker cannot bypass the whitelist by case-spoofing
+    // (e.g. "TEAMS.EXE" vs whitelisted "teams.exe").
+    std::string nameLc = processName;
+    std::transform(nameLc.begin(), nameLc.end(), nameLc.begin(),
+        [](unsigned char c) noexcept { return static_cast<char>(std::tolower(c)); });
+
     std::shared_lock lock(m_whitelistMutex);
 
     for (const auto& [id, entry] : m_whitelist) {
         if (!entry.enabled) continue;
         if (!entry.IsCurrentlyAllowed()) continue;
 
-        // Check process name pattern
-        if (entry.processPattern == processName) {
+        // Case-insensitive comparison of process name pattern
+        std::string patternLc = entry.processPattern;
+        std::transform(patternLc.begin(), patternLc.end(), patternLc.begin(),
+            [](unsigned char c) noexcept { return static_cast<char>(std::tolower(c)); });
+
+        if (patternLc == nameLc) {
             // Check signature if required
             if (entry.requireSigned && !processPath.empty()) {
                 if (!VerifySignature(processPath)) {
@@ -1069,7 +1156,13 @@ bool WebcamProtectorImpl::IsProcessWhitelistedInternal(
                         processPath.wstring(), hashBytes)) {
                     continue;
                 }
-                if (BytesToHex(hashBytes) != entry.sha256Hash) {
+                // Case-insensitive hex comparison against stored hash.
+                std::string storedLc = entry.sha256Hash;
+                std::transform(storedLc.begin(), storedLc.end(), storedLc.begin(),
+                    [](unsigned char c) noexcept {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                if (BytesToHex(hashBytes) != storedLc) {
                     continue;
                 }
             }
@@ -1181,9 +1274,13 @@ CameraRiskLevel WebcamProtectorImpl::AnalyzeProcessInternal(uint32_t processId) 
             risk = CameraRiskLevel::Low;
         }
 
-        // Check if process is running from suspicious location
+        // Check if process is running from suspicious location. Use an
+        // unsigned-char lambda to avoid the int->char narrowing diagnostic
+        // (C4244) when ::tolower(int) is passed into std::transform over
+        // a std::string.
         std::string pathStr = processPath.string();
-        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::tolower);
+        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(),
+            [](unsigned char c) noexcept { return static_cast<char>(std::tolower(c)); });
 
         if (pathStr.find("\\temp\\") != std::string::npos ||
             pathStr.find("\\appdata\\local\\temp") != std::string::npos) {
@@ -1198,10 +1295,14 @@ CameraRiskLevel WebcamProtectorImpl::AnalyzeProcessInternal(uint32_t processId) 
             }
         }
 
-        // Check process name patterns (known RAT patterns)
-        if (processName.find("remote") != std::string::npos ||
-            processName.find("vnc") != std::string::npos ||
-            processName.find("rdp") != std::string::npos) {
+        // Check process name patterns (known RAT patterns). Process names on
+        // Windows are case-insensitive, so lowercase before substring match.
+        std::string lowerName = processName;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+            [](unsigned char c) noexcept { return static_cast<char>(std::tolower(c)); });
+        if (lowerName.find("remote") != std::string::npos ||
+            lowerName.find("vnc") != std::string::npos ||
+            lowerName.find("rdp") != std::string::npos) {
             risk = std::max(risk, CameraRiskLevel::Medium);
         }
 
@@ -1592,6 +1693,7 @@ bool WebcamProtector::ImportDefaultTrustedApps() {
     if (!m_impl) return false;
 
     try {
+        size_t added = 0;
         for (const auto& appName : WebcamConstants::DEFAULT_TRUSTED_APPS) {
             CameraWhitelistEntry entry;
             entry.entryId = std::string("DEFAULT_") + appName;
@@ -1602,11 +1704,17 @@ bool WebcamProtector::ImportDefaultTrustedApps() {
             entry.addedTime = SystemClock::now();
             entry.notes = "Default trusted application";
 
-            m_impl->AddToWhitelistInternal(entry);
+            if (!m_impl->AddToWhitelistInternal(entry)) {
+                SS_LOG_WARN(L"WebcamProtector",
+                    L"ImportDefaultTrustedApps: failed to add '%hs'", appName);
+            } else {
+                ++added;
+            }
         }
 
-        SS_LOG_INFO(L"WebcamProtector", L"Imported %zu default trusted apps",
-                          std::size(WebcamConstants::DEFAULT_TRUSTED_APPS));
+        SS_LOG_INFO(L"WebcamProtector",
+            L"Imported %zu of %zu default trusted apps",
+            added, std::size(WebcamConstants::DEFAULT_TRUSTED_APPS));
 
         return true;
 
@@ -1803,7 +1911,10 @@ bool WebcamProtector::SelfTest() {
                 return false;
             }
             bool found = IsProcessWhitelisted("__selftest_dummy__.exe", fs::path{});
-            RemoveFromWhitelist("__SS_SELFTEST__");
+            if (!RemoveFromWhitelist("__SS_SELFTEST__")) {
+                SS_LOG_WARN(L"WebcamProtector",
+                    L"Self-test: failed to remove transient whitelist entry");
+            }
             if (!found) {
                 SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - whitelist lookup");
                 return false;
@@ -1813,19 +1924,29 @@ bool WebcamProtector::SelfTest() {
         // Test 4: Camera block/unblock (restores original state)
         {
             bool wasBlocked = IsCameraBlocked();
-            SetCameraBlocked(true);
+            if (!SetCameraBlocked(true)) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - SetCameraBlocked(true)");
+                return false;
+            }
             if (!IsCameraBlocked()) {
                 SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - block camera");
-                SetCameraBlocked(wasBlocked);
+                (void)SetCameraBlocked(wasBlocked);
                 return false;
             }
-            SetCameraBlocked(false);
+            if (!SetCameraBlocked(false)) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - SetCameraBlocked(false)");
+                (void)SetCameraBlocked(wasBlocked);
+                return false;
+            }
             if (IsCameraBlocked()) {
                 SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - unblock camera");
-                SetCameraBlocked(wasBlocked);
+                (void)SetCameraBlocked(wasBlocked);
                 return false;
             }
-            SetCameraBlocked(wasBlocked);
+            if (!SetCameraBlocked(wasBlocked)) {
+                SS_LOG_WARN(L"WebcamProtector",
+                    L"Self-test: failed to restore prior blocked state");
+            }
         }
 
         // Test 5: Statistics snapshot
