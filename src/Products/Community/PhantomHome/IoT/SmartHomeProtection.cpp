@@ -1086,7 +1086,7 @@ void SmartHomeProtectionImpl::GenerateAlert(
                 m_alertRateLimit.clear();  // Reset on overflow
             }
 
-            m_alerts.push_back(std::move(alert));
+            m_alerts.push_back(alert);
             if (m_alerts.size() > MAX_ALERTS) {
                 m_alerts.pop_front();
             }
@@ -1094,21 +1094,11 @@ void SmartHomeProtectionImpl::GenerateAlert(
 
         m_statistics.alertsGenerated.fetch_add(1, std::memory_order_relaxed);
 
-        // Re-read the alert from the deque for callback (we moved it above)
-        SmartHomeAlert alertCopy;
-        {
-            std::shared_lock lock(m_alertsMutex);
-            if (!m_alerts.empty()) {
-                alertCopy = m_alerts.back();
-            }
-        }
-
         ::ShadowStrike::Utils::Logger::Warn("SmartHomeProtection: Alert generated - {} [{}]",
-                          alertCopy.title,
-                          
-                              std::string(GetAlertSeverityName(alertCopy.severity)));
+                          alert.title,
+                          std::string(GetAlertSeverityName(alert.severity)));
 
-        InvokeAlertCallbacks(alertCopy);
+        InvokeAlertCallbacks(alert);
 
     } catch (const std::exception& e) {
         ::ShadowStrike::Utils::Logger::Error("SmartHomeProtection: Failed to generate alert - {}",
