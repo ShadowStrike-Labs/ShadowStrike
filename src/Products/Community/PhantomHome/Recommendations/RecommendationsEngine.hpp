@@ -19,7 +19,7 @@
  *   - Dismissals are persisted in ConfigManager under
  *     "Home/Recommendations/dismissed/<id>" with a timestamp; they expire
  *     after 7 days so tiles can re-surface if still valid.
- *   - Broadcasts RecommendationsChanged (CommandType::RecommendationsChanged=106)
+ *   - Broadcasts RecommendationsChanged (CommandType::RecommendationsChanged=107)
  *     via ServiceCommunicator::BroadcastEvent when the active set changes.
  *
  * @author ShadowStrike Security Team
@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>

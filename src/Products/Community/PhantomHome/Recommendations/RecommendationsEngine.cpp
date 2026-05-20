@@ -50,10 +50,13 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ShadowStrike::Products::Home::Recommendations {
@@ -227,8 +230,6 @@ std::optional<Recommendation> EvalR6_HighBlockRate() noexcept
         using namespace ::ShadowStrike::PhantomHome::Reports;
 
         // Query recent entries (up to 256) and filter by timestamp in C++.
-        ReportQuery q;
-        q.max_entries = 256;
         const auto entries = HomeReportsStore::Instance().GetRecent(256);
 
         const auto cutoff = std::chrono::system_clock::now() - std::chrono::hours{24};
@@ -477,6 +478,7 @@ void RecommendationsEngine::Dismiss(std::string_view id)
     PersistDismissal(id);
 
     bool changed = false;
+    std::size_t count = 0;
     {
         std::unique_lock lock(m_impl->mutex);
         const auto prev = m_impl->active.size();
@@ -484,15 +486,11 @@ void RecommendationsEngine::Dismiss(std::string_view id)
             std::remove_if(m_impl->active.begin(), m_impl->active.end(),
                 [&](const Recommendation& r){ return r.id == id; }),
             m_impl->active.end());
-        changed = m_impl->active.size() != prev;
+        count = m_impl->active.size();
+        changed = count != prev;
     }
 
     if (changed) {
-        std::size_t count = 0;
-        {
-            std::shared_lock lock(m_impl->mutex);
-            count = m_impl->active.size();
-        }
         m_impl->BroadcastChanged(count);
         m_impl->FireCallbacks();
     }
