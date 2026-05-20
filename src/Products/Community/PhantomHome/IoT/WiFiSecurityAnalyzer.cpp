@@ -763,6 +763,7 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
     try {
         auto networks = QueryNetworksWLAN();
         std::vector<WiFiNetworkInfo> newNetworks;
+        std::vector<WiFiNetworkInfo> threatenedNetworks;
         std::vector<WiFiSecurityThreat> allThreats;
 
         {
@@ -803,14 +804,20 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
                 }
 
                 if (network.threats != WiFiThreatType::None) {
-                    auto threats = CheckNetworkSecurity(network);
-                    allThreats.insert(allThreats.end(),
-                        std::make_move_iterator(threats.begin()),
-                        std::make_move_iterator(threats.end()));
+                    // CheckNetworkSecurity acquires shared_lock(m_mutex); std::shared_mutex
+                    // is not recursive, so it MUST be invoked after releasing the unique_lock.
+                    threatenedNetworks.push_back(network);
                 }
             }
 
             m_stats.currentNetworksTracked = static_cast<uint32_t>(m_trackedNetworks.size());
+        }
+
+        for (const auto& net : threatenedNetworks) {
+            auto threats = CheckNetworkSecurity(net);
+            allThreats.insert(allThreats.end(),
+                std::make_move_iterator(threats.begin()),
+                std::make_move_iterator(threats.end()));
         }
 
         for (const auto& net : newNetworks) {
@@ -1250,8 +1257,15 @@ void WiFiSecurityAnalyzerImpl::ProcessMonitoringTick() {
     // Perform scan
     ScanNearbyNetworks();
 
+    // Snapshot config under shared_lock — UpdateConfiguration may race this thread
+    bool evilTwinEnabled = false;
+    {
+        std::shared_lock lock(m_mutex);
+        evilTwinEnabled = m_config.enableEvilTwinDetection;
+    }
+
     // Check for evil twins
-    if (m_config.enableEvilTwinDetection) {
+    if (evilTwinEnabled) {
         auto result = DetectEvilTwin();
         if (result.detected) {
             m_stats.evilTwinsDetected++;
