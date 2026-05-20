@@ -87,11 +87,20 @@ struct NetworkAttackBlockerRegistrar final {
                 .setMode = [](ProtectionMode m) -> bool {
                     try {
                         NetworkAttackBlocker::Instance().SetMode(m);
+                        if (m == ProtectionMode::Off) {
+                            // ApplyModeThresholds refuses Off; the SetMode call
+                            // above already drives the runtime into Off state.
+                            return true;
+                        }
                         return ApplyModeThresholds("NetworkAttackBlocker", m);
                     } catch (const std::exception& ex) {
                         SS_LOG_ERROR(kLogCategory,
                             L"NetworkAttackBlocker: setMode() threw: %hs",
                             ex.what());
+                        return false;
+                    } catch (...) {
+                        SS_LOG_ERROR(kLogCategory,
+                            L"NetworkAttackBlocker: setMode() threw unknown");
                         return false;
                     }
                 },
