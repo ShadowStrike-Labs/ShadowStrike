@@ -114,6 +114,51 @@ namespace {
         return result;
     }
 
+    // RFC 8259 minimal JSON string escape. Any string that originates from
+    // attacker-controlled data (URL, filename, threat name, publisher, ...)
+    // MUST pass through this before being emitted into a JSON payload.
+    std::string JsonEscape(std::string_view in) {
+        std::string out;
+        out.reserve(in.size() + 8);
+        for (unsigned char c : in) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (c < 0x20) {
+                        char buf[8];
+                        (void)std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        out += buf;
+                    } else {
+                        out += static_cast<char>(c);
+                    }
+            }
+        }
+        return out;
+    }
+
+    // Validate a caller-supplied quarantine identifier: defeats path traversal,
+    // alternate data streams, drive-letter swaps and Unicode separators. Only
+    // accepts the GUID-style strings produced by GenerateUUID().
+    bool IsValidQuarantineId(std::string_view id) noexcept {
+        if (id.empty() || id.size() > 128) return false;
+        for (char c : id) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            const bool ok =
+                (uc >= '0' && uc <= '9') ||
+                (uc >= 'a' && uc <= 'z') ||
+                (uc >= 'A' && uc <= 'Z') ||
+                uc == '-' || uc == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
     std::string GenerateUUID() {
         GUID guid{};
         if (FAILED(CoCreateGuid(&guid))) {
@@ -171,6 +216,9 @@ namespace {
     static constexpr uint8_t kMagicISO[]    = { 0x43, 0x44, 0x30, 0x30, 0x31 };
     static constexpr uint8_t kMagicOLE[]    = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
 
+    // ISO 9660 magic lives at file offset 32769 ("CD001" of size 5).
+    // It is handled by a dedicated branch below rather than via this table;
+    // table entries are reserved for offset-zero signatures only.
     static const MagicEntry kMagicTable[] = {
         { kMagicPE,    sizeof(kMagicPE),    0, "application/x-dosexec",            "PE/COFF Executable"  },
         { kMagicPDF,   sizeof(kMagicPDF),   0, "application/pdf",                  "PDF Document"        },
@@ -185,7 +233,6 @@ namespace {
         { kMagicGIF89, sizeof(kMagicGIF89), 0, "image/gif",                        "GIF Image"           },
         { kMagicBMP,   sizeof(kMagicBMP),   0, "image/bmp",                        "BMP Image"           },
         { kMagicCAB,   sizeof(kMagicCAB),   0, "application/vnd.ms-cab-compressed","Cabinet Archive"     },
-        { kMagicISO,   32769,               0, "application/x-iso9660-image",      "ISO Disk Image"      },
         { kMagicOLE,   sizeof(kMagicOLE),   0, "application/x-ole-storage",        "OLE Compound (DOC/XLS/PPT)" },
     };
 
@@ -219,7 +266,6 @@ namespace {
         }
 
         for (const auto& entry : kMagicTable) {
-            if (entry.offset == 32769) continue; // Already handled
             if (bytesRead >= entry.offset + entry.length) {
                 if (std::memcmp(header + entry.offset, entry.signature, entry.length) == 0) {
                     result.mimeType = entry.mimeType;
@@ -307,11 +353,17 @@ namespace {
             return result;
         }
 
-        DWORD peOffset = dosHeader->e_lfanew;
-        if (peOffset + sizeof(IMAGE_NT_HEADERS64) > bytesRead) {
+        // e_lfanew is a signed LONG and attacker-controlled. Reject negative
+        // values and any value that would push the NT headers past the end of
+        // the cached header buffer. Use subtraction to avoid integer overflow.
+        const LONG signedPeOffset = dosHeader->e_lfanew;
+        if (signedPeOffset < 0 ||
+            static_cast<DWORD>(signedPeOffset) > bytesRead ||
+            (bytesRead - static_cast<DWORD>(signedPeOffset)) < sizeof(IMAGE_NT_HEADERS64)) {
             CloseHandle(hFile);
             return result;
         }
+        const DWORD peOffset = static_cast<DWORD>(signedPeOffset);
 
         // Validate PE signature
         auto* ntHeaders32 = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buf.data() + peOffset);
@@ -326,13 +378,23 @@ namespace {
         WORD numSections = ntHeaders32->FileHeader.NumberOfSections;
         if (numSections > 96) numSections = 96; // Cap to prevent abuse
 
-        // Locate section headers
-        DWORD sectionTableOffset = peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)
-                                   + ntHeaders32->FileHeader.SizeOfOptionalHeader;
+        // Locate section headers - guard against integer overflow in offsets
+        // computed from attacker-controlled SizeOfOptionalHeader.
+        const DWORD optHeaderSize = ntHeaders32->FileHeader.SizeOfOptionalHeader;
+        const uint64_t sectionTableOffset64 =
+            static_cast<uint64_t>(peOffset) + sizeof(DWORD) +
+            sizeof(IMAGE_FILE_HEADER) + optHeaderSize;
+        if (sectionTableOffset64 > bytesRead) {
+            CloseHandle(hFile);
+            return result;
+        }
+        const DWORD sectionTableOffset = static_cast<DWORD>(sectionTableOffset64);
 
         for (WORD i = 0; i < numSections; ++i) {
-            DWORD off = sectionTableOffset + i * sizeof(IMAGE_SECTION_HEADER);
-            if (off + sizeof(IMAGE_SECTION_HEADER) > bytesRead) break;
+            const uint64_t off64 = static_cast<uint64_t>(sectionTableOffset) +
+                                   static_cast<uint64_t>(i) * sizeof(IMAGE_SECTION_HEADER);
+            if (off64 + sizeof(IMAGE_SECTION_HEADER) > bytesRead) break;
+            const DWORD off = static_cast<DWORD>(off64);
             auto* section = reinterpret_cast<const IMAGE_SECTION_HEADER*>(buf.data() + off);
             char name[9]{};
             std::memcpy(name, section->Name, 8);
@@ -591,6 +653,8 @@ private:
     DownloadVerdict AnalyzeFile(const fs::path& path, const std::string& hash, FileAnalysisResult& analysis);
     void NotifyCallbacks(const DownloadScanResult& result, const fs::path& filePath, const std::string& sourceUrl);
     void RememberProcessedFile(const std::string& path);
+    bool HasProcessedFile(const std::string& path) const;
+    void TrackMonitorScan(std::future<DownloadScanResult> fut);
 
     mutable std::shared_mutex m_mutex;
     DownloadBlockerConfiguration m_config;
@@ -602,8 +666,10 @@ private:
     std::atomic<bool> m_stopThread{false};
     HANDLE m_stopEvent = nullptr;
     std::vector<fs::path> m_monitoredDirs;
+    mutable std::mutex m_processedMutex;
     std::unordered_set<std::string> m_processedFiles;
     std::deque<std::string> m_processedFileOrder;
+    std::vector<std::future<DownloadScanResult>> m_pendingMonitorScans;
 
     // Policy
     std::unordered_set<std::string> m_blockedExtensions;
@@ -648,7 +714,8 @@ MaliciousDownloadBlockerImpl::~MaliciousDownloadBlockerImpl() {
 bool MaliciousDownloadBlockerImpl::Initialize(const DownloadBlockerConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
-    if (m_status == ModuleStatus::Running) {
+    const ModuleStatus prior = m_status.load(std::memory_order_acquire);
+    if (prior == ModuleStatus::Running) {
         return true;
     }
 
@@ -715,6 +782,10 @@ void MaliciousDownloadBlockerImpl::Shutdown() {
 }
 
 bool MaliciousDownloadBlockerImpl::UpdateConfiguration(const DownloadBlockerConfiguration& config) {
+    if (!config.IsValid()) {
+        Logger::Error("DownloadBlocker: UpdateConfiguration rejected invalid configuration");
+        return false;
+    }
     std::unique_lock lock(m_mutex);
     m_config = config;
 
@@ -977,7 +1048,7 @@ std::future<DownloadScanResult> MaliciousDownloadBlockerImpl::ScanFileAsync(
 // ============================================================================
 
 DownloadVerdict MaliciousDownloadBlockerImpl::AnalyzeFile(
-        const fs::path& path, const std::string& hash, FileAnalysisResult& analysis) {
+        const fs::path& path, [[maybe_unused]] const std::string& hash, FileAnalysisResult& analysis) {
 
     std::string ext = NarrowToLower(path.extension().string());
 
@@ -1108,6 +1179,21 @@ void MaliciousDownloadBlockerImpl::StopMonitoring() {
         m_monitorThread.join();
     }
 
+    // Drain in-flight monitor-scan futures so their async destructors cannot
+    // block a later Shutdown / module unload.
+    {
+        std::vector<std::future<DownloadScanResult>> drained;
+        {
+            std::lock_guard lock(m_processedMutex);
+            drained.swap(m_pendingMonitorScans);
+        }
+        for (auto& f : drained) {
+            if (f.valid()) {
+                try { f.wait_for(std::chrono::seconds(30)); } catch (...) {}
+            }
+        }
+    }
+
     m_isMonitoring.store(false, std::memory_order_release);
     Logger::Info("DownloadBlocker: directory monitoring stopped");
 }
@@ -1124,6 +1210,11 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
             if (hDir != INVALID_HANDLE_VALUE) {
                 CancelIoEx(hDir, nullptr);
                 CloseHandle(hDir);
+                hDir = INVALID_HANDLE_VALUE;
+            }
+            if (overlapped.hEvent) {
+                CloseHandle(overlapped.hEvent);
+                overlapped.hEvent = nullptr;
             }
         }
 
@@ -1133,6 +1224,7 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
             : hDir(o.hDir), dirPath(std::move(o.dirPath)),
               buffer(std::move(o.buffer)), overlapped(o.overlapped) {
             o.hDir = INVALID_HANDLE_VALUE;
+            o.overlapped.hEvent = nullptr;
         }
         WatchEntry& operator=(WatchEntry&&) = delete;
 
@@ -1214,9 +1306,9 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
                         if (IsTemporaryDownloadFile(p)) continue;
                         std::string pathStr = p.string();
 
-                        if (m_processedFiles.find(pathStr) == m_processedFiles.end()) {
+                        if (!HasProcessedFile(pathStr)) {
                             if (WaitForFileReady(p, std::chrono::milliseconds(2000))) {
-                                ScanFileAsync(p, "");
+                                TrackMonitorScan(ScanFileAsync(p, ""));
                                 RememberProcessedFile(pathStr);
                             }
                         }
@@ -1283,9 +1375,9 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
                     if (!IsTemporaryDownloadFile(fullPath) && fs::is_regular_file(fullPath)) {
                         std::string pathStr = fullPath.string();
 
-                        if (m_processedFiles.find(pathStr) == m_processedFiles.end()) {
+                        if (!HasProcessedFile(pathStr)) {
                             if (WaitForFileReady(fullPath, std::chrono::milliseconds(3000))) {
-                                ScanFileAsync(fullPath, "");
+                                TrackMonitorScan(ScanFileAsync(fullPath, ""));
                                 RememberProcessedFile(pathStr);
                             }
                         }
@@ -1308,16 +1400,34 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
             nullptr, &watch->overlapped, nullptr);
     }
 
-    // Cleanup events
-    for (const auto& w : watches) {
-        if (w->overlapped.hEvent) {
-            CloseHandle(w->overlapped.hEvent);
-            w->overlapped.hEvent = nullptr;
-        }
+    // Cleanup events handled by ~WatchEntry RAII below as `watches` unwinds.
+}
+
+bool MaliciousDownloadBlockerImpl::HasProcessedFile(const std::string& path) const {
+    std::lock_guard lock(m_processedMutex);
+    return m_processedFiles.find(path) != m_processedFiles.end();
+}
+
+void MaliciousDownloadBlockerImpl::TrackMonitorScan(std::future<DownloadScanResult> fut) {
+    std::lock_guard lock(m_processedMutex);
+    // Drop already-completed futures so the vector does not grow unbounded.
+    m_pendingMonitorScans.erase(
+        std::remove_if(m_pendingMonitorScans.begin(), m_pendingMonitorScans.end(),
+            [](std::future<DownloadScanResult>& f) {
+                return !f.valid() ||
+                       f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+            }),
+        m_pendingMonitorScans.end());
+    if (m_pendingMonitorScans.size() < MAX_SCAN_QUEUE_SIZE) {
+        m_pendingMonitorScans.push_back(std::move(fut));
     }
+    // else: drop the future; ~future on std::async(launch::async) would block,
+    // which is the precise hazard we are eliminating. The scan has already
+    // started; we just stop tracking it.
 }
 
 void MaliciousDownloadBlockerImpl::RememberProcessedFile(const std::string& path) {
+    std::lock_guard lock(m_processedMutex);
     if (!m_processedFiles.insert(path).second) {
         return;
     }
@@ -1377,10 +1487,31 @@ bool MaliciousDownloadBlockerImpl::QuarantineFile(const fs::path& filePath) {
     }
 
     std::string uuid = GenerateUUID();
+    if (!IsValidQuarantineId(uuid)) {
+        // Defensive: GenerateUUID can only return alphanumeric+hyphen, but
+        // re-validate to prove the destination filename is safe.
+        Logger::Error("DownloadBlocker: generated UUID failed validation");
+        return false;
+    }
     fs::path dest = quarantinePath / (uuid + ".quarantine");
 
     try {
-        fs::create_directories(quarantinePath);
+        std::error_code ec;
+        fs::create_directories(quarantinePath, ec);
+        if (ec) {
+            Logger::Error("DownloadBlocker: cannot create quarantine dir: {}", ec.message());
+            return false;
+        }
+        // Verify the resolved destination still lives inside quarantinePath.
+        const fs::path normRoot = fs::weakly_canonical(quarantinePath, ec);
+        const fs::path normDest = fs::weakly_canonical(dest, ec);
+        if (!ec) {
+            auto rel = normDest.lexically_relative(normRoot).native();
+            if (rel.empty() || rel.rfind(L"..", 0) == 0) {
+                Logger::Error("DownloadBlocker: refusing quarantine destination outside root");
+                return false;
+            }
+        }
         fs::rename(filePath, dest);
         m_stats.quarantinedDownloads++;
         Logger::Info("DownloadBlocker: quarantined {} -> {}", Utils::StringUtils::ToNarrow(filePath.wstring()),
@@ -1394,6 +1525,10 @@ bool MaliciousDownloadBlockerImpl::QuarantineFile(const fs::path& filePath) {
 }
 
 bool MaliciousDownloadBlockerImpl::RestoreFromQuarantine(const std::string& quarantineId) {
+    if (!IsValidQuarantineId(quarantineId)) {
+        Logger::Warn("DownloadBlocker: rejecting malformed quarantineId");
+        return false;
+    }
     fs::path quarantinePath;
     {
         std::shared_lock lock(m_mutex);
@@ -1402,6 +1537,16 @@ bool MaliciousDownloadBlockerImpl::RestoreFromQuarantine(const std::string& quar
     if (quarantinePath.empty()) return false;
 
     fs::path quarantinedFile = quarantinePath / (quarantineId + ".quarantine");
+    std::error_code ec;
+    const fs::path normRoot = fs::weakly_canonical(quarantinePath, ec);
+    const fs::path normFile = fs::weakly_canonical(quarantinedFile, ec);
+    if (!ec) {
+        auto rel = normFile.lexically_relative(normRoot).native();
+        if (rel.empty() || rel.rfind(L"..", 0) == 0) {
+            Logger::Warn("DownloadBlocker: rejecting quarantine path outside root");
+            return false;
+        }
+    }
     if (!fs::exists(quarantinedFile)) {
         Logger::Warn("DownloadBlocker: quarantine file not found: {}", quarantineId);
         return false;
@@ -1414,6 +1559,10 @@ bool MaliciousDownloadBlockerImpl::RestoreFromQuarantine(const std::string& quar
 }
 
 bool MaliciousDownloadBlockerImpl::DeleteFromQuarantine(const std::string& quarantineId) {
+    if (!IsValidQuarantineId(quarantineId)) {
+        Logger::Warn("DownloadBlocker: rejecting malformed quarantineId");
+        return false;
+    }
     fs::path quarantinePath;
     {
         std::shared_lock lock(m_mutex);
@@ -1422,12 +1571,21 @@ bool MaliciousDownloadBlockerImpl::DeleteFromQuarantine(const std::string& quara
     if (quarantinePath.empty()) return false;
 
     fs::path quarantinedFile = quarantinePath / (quarantineId + ".quarantine");
+    std::error_code ec;
+    const fs::path normRoot = fs::weakly_canonical(quarantinePath, ec);
+    const fs::path normFile = fs::weakly_canonical(quarantinedFile, ec);
+    if (!ec) {
+        auto rel = normFile.lexically_relative(normRoot).native();
+        if (rel.empty() || rel.rfind(L"..", 0) == 0) {
+            Logger::Warn("DownloadBlocker: rejecting quarantine path outside root");
+            return false;
+        }
+    }
     if (!fs::exists(quarantinedFile)) {
         Logger::Warn("DownloadBlocker: quarantine file not found for deletion: {}", quarantineId);
         return false;
     }
 
-    std::error_code ec;
     fs::remove(quarantinedFile, ec);
     if (ec) {
         Logger::Error("DownloadBlocker: failed to delete quarantined file: {}", ec.message());
@@ -1885,13 +2043,13 @@ std::vector<fs::path> GetDefaultDownloadDirectories() {
 
 std::string DownloadInfo::ToJson() const {
     std::ostringstream j;
-    j << R"({"downloadId":")" << downloadId
-      << R"(","filePath":")" << filePath.string()
-      << R"(","sourceUrl":")" << sourceUrl
-      << R"(","mimeType":")" << mimeType
+    j << R"({"downloadId":")" << JsonEscape(downloadId)
+      << R"(","filePath":")" << JsonEscape(filePath.string())
+      << R"(","sourceUrl":")" << JsonEscape(sourceUrl)
+      << R"(","mimeType":")" << JsonEscape(mimeType)
       << R"(","fileSize":)" << fileSize
-      << R"(,"extension":")" << extension
-      << R"(","sha256":")" << sha256
+      << R"(,"extension":")" << JsonEscape(extension)
+      << R"(","sha256":")" << JsonEscape(sha256)
       << R"(","browserPid":)" << browserPid
       << R"(,"isPartial":)" << (isPartial ? "true" : "false")
       << "}";
@@ -1900,13 +2058,13 @@ std::string DownloadInfo::ToJson() const {
 
 std::string FileAnalysisResult::ToJson() const {
     std::ostringstream j;
-    j << R"({"detectedType":")" << detectedType
-      << R"(","mimeType":")" << mimeType
+    j << R"({"detectedType":")" << JsonEscape(detectedType)
+      << R"(","mimeType":")" << JsonEscape(mimeType)
       << R"(","isExecutable":)" << (isExecutable ? "true" : "false")
       << R"(,"isArchive":)" << (isArchive ? "true" : "false")
       << R"(,"hasSignature":)" << (hasSignature ? "true" : "false")
       << R"(,"signatureValid":)" << (signatureValid ? "true" : "false")
-      << R"(,"publisher":")" << publisher
+      << R"(,"publisher":")" << JsonEscape(publisher)
       << R"(","entropy":)" << entropy
       << R"(,"isPacked":)" << (isPacked ? "true" : "false")
       << R"(,"importCount":)" << importCount
@@ -1931,7 +2089,7 @@ std::string ReputationResult::ToJson() const {
 std::string SandboxResult::ToJson() const {
     std::ostringstream j;
     j << R"({"wasSandboxed":)" << (wasSandboxed ? "true" : "false")
-      << R"(,"verdict":")" << GetDownloadVerdictName(verdict)
+      << R"(,"verdict":")" << JsonEscape(GetDownloadVerdictName(verdict))
       << R"(","sandboxScore":)" << sandboxScore
       << R"(,"analysisDurationMs":)" << analysisDuration.count()
       << "}";
@@ -1940,14 +2098,14 @@ std::string SandboxResult::ToJson() const {
 
 std::string DownloadScanResult::ToJson() const {
     std::ostringstream j;
-    j << R"({"downloadId":")" << downloadId
-      << R"(","verdict":")" << GetDownloadVerdictName(verdict)
-      << R"(","action":")" << GetDownloadActionName(action)
-      << R"(","status":")" << GetDownloadStatusName(status)
+    j << R"({"downloadId":")" << JsonEscape(downloadId)
+      << R"(","verdict":")" << JsonEscape(GetDownloadVerdictName(verdict))
+      << R"(","action":")" << JsonEscape(GetDownloadActionName(action))
+      << R"(","status":")" << JsonEscape(GetDownloadStatusName(status))
       << R"(","isClean":)" << (isClean ? "true" : "false")
       << R"(,"shouldBlock":)" << (shouldBlock ? "true" : "false")
       << R"(,"riskScore":)" << riskScore
-      << R"(,"threatName":")" << threatName
+      << R"(,"threatName":")" << JsonEscape(threatName)
       << R"(","scanDurationUs":)" << scanDuration.count()
       << R"(,"fileAnalysis":)" << fileAnalysis.ToJson()
       << R"(,"reputation":)" << reputation.ToJson()
