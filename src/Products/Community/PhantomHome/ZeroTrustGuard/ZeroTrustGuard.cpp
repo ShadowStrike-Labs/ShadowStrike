@@ -64,6 +64,11 @@ constexpr double kThresholdBalanced   = 0.70;
 constexpr double kThresholdAggressive = 0.85;
 constexpr double kZeroTrustThreshold  = 0.999;
 
+// Defensive caps on user-controlled strings sourced from the process-execution
+// hook. Mirror the caps inside ZeroTrustPromptQueue.cpp.
+constexpr std::size_t kMaxImagePathChars = 32768;
+constexpr std::size_t kMaxPublisherChars = 1024;
+
 /// @brief Clamp a double to [0.0, 1.0].
 [[nodiscard]] inline double Clamp01(double v) noexcept {
     return (v < 0.0) ? 0.0 : (v > 1.0) ? 1.0 : v;
@@ -211,6 +216,10 @@ void SyncCoreEngine(const ZeroTrustConfig& cfg) {
 
 struct ZeroTrustGuard::Impl {
     mutable std::shared_mutex    m_mutex;
+    // Serializes SetMode() calls so the Core::ApplyMode → m_config reload
+    // sequence cannot interleave with another SetMode() and leave the Core
+    // engine pinned to one mode while m_impl->m_config reflects another.
+    std::mutex                   m_modeChangeMutex;
     ZeroTrustConfig              m_config;
     ::ShadowStrike::Products::Home::ProtectionMode m_mode{
         ::ShadowStrike::Products::Home::ProtectionMode::Off};
@@ -246,7 +255,14 @@ ZeroTrustGuard::~ZeroTrustGuard() {
 // ============================================================================
 
 bool ZeroTrustGuard::Initialize() {
-    if (m_impl->m_initialized.load(std::memory_order_acquire)) {
+    // CAS so two concurrent Initialize() calls cannot both run the ConfigManager
+    // load / PromptQueue load below. Loser returns true (idempotent contract).
+    bool expected = false;
+    if (!m_impl->m_initialized.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+    {
         return true;
     }
 
@@ -254,9 +270,12 @@ bool ZeroTrustGuard::Initialize() {
 
     // Initialize the PhantomCore engine first.
     if (!::ShadowStrike::PhantomCore::RealTime::ZeroTrust::ZeroTrustGuard::Instance()
-            .Initialize()) {
+            .Initialize())
+    {
         SS_LOG_ERROR(kLogCategory,
             L"ZeroTrustGuard.Home: PhantomCore ZeroTrustGuard::Initialize() failed");
+        // Roll back the CAS so a future caller can retry initialization.
+        m_impl->m_initialized.store(false, std::memory_order_release);
         return false;
     }
 
@@ -277,8 +296,6 @@ bool ZeroTrustGuard::Initialize() {
 
     // Load persisted always-allow entries into the prompt queue.
     ZeroTrustPromptQueue::Instance().LoadPersistedAllowList();
-
-    m_impl->m_initialized.store(true, std::memory_order_release);
 
     SS_LOG_INFO(kLogCategory,
         L"ZeroTrustGuard.Home: Initialized (threshold=%.3f, ztMode=%hs, "
@@ -379,6 +396,17 @@ ZeroTrustConfig ZeroTrustGuard::GetConfig() const {
 void ZeroTrustGuard::SetMode(::ShadowStrike::Products::Home::ProtectionMode m) {
     using ::ShadowStrike::Products::Home::ProtectionMode;
 
+    // Serialize concurrent SetMode() calls end-to-end. Without this the
+    // Core::ApplyMode(A) / Core::ApplyMode(B) sequence can interleave with
+    // the Home snapshot update under m_mutex, leaving the Core engine pinned
+    // to one mode while the Home snapshot reflects another. m_modeChangeMutex
+    // is held across both the Core call and the Home snapshot write so the
+    // (Core <-> Home) pair always advances atomically with respect to other
+    // SetMode() callers. It is intentionally a different mutex from m_mutex
+    // so that concurrent Evaluate()/GetConfig()/Mode() readers do not block
+    // behind a Core::ApplyMode() round trip.
+    std::scoped_lock modeChangeLock(m_impl->m_modeChangeMutex);
+
     SS_LOG_INFO(kLogCategory,
         L"ZeroTrustGuard.Home: SetMode -> %hs",
         std::string(::ShadowStrike::Products::Home::HomeProductOrchestrator::ToString(m)).c_str());
@@ -433,16 +461,30 @@ ZeroTrustDecision ZeroTrustGuard::Evaluate(const ZeroTrustInputs& in,
     using Verdict    = ::ShadowStrike::PhantomCore::RealTime::ZeroTrust::Verdict;
 
     // ------------------------------------------------------------------
+    // 0. Defensive caps on user-controlled string inputs sourced from the
+    //    process-execution hook. Without these the wstring/UTF-8 allocations
+    //    below scale with whatever the kernel hook (or a malicious PEB
+    //    edit) hands us. The caps mirror those enforced in the prompt queue.
+    //    Always-allow / always-deny membership and the Core decision are all
+    //    evaluated against the capped views so the hot path's worst-case
+    //    allocation is bounded.
+    // ------------------------------------------------------------------
+    const std::wstring_view imagePathCapped =
+        in.imagePath.substr(0, std::min<std::size_t>(in.imagePath.size(), kMaxImagePathChars));
+    const std::wstring_view publisherCapped =
+        in.publisherSubject.substr(0, std::min<std::size_t>(in.publisherSubject.size(), kMaxPublisherChars));
+
+    // ------------------------------------------------------------------
     // 1. Always-allow / always-deny fast-path (no scoring required).
     //    These are populated via UI resolution (AlwaysAllow/AlwaysBlock).
     // ------------------------------------------------------------------
     auto& promptQueue = ZeroTrustPromptQueue::Instance();
 
-    if (promptQueue.IsAlwaysAllowed(in.imagePath, in.publisherSubject)) {
+    if (promptQueue.IsAlwaysAllowed(imagePathCapped, publisherCapped)) {
         if (outScore) *outScore = 1.0;
         return ZeroTrustDecision::Allow;
     }
-    if (promptQueue.IsAlwaysDenied(in.imagePath)) {
+    if (promptQueue.IsAlwaysDenied(imagePathCapped)) {
         if (outScore) *outScore = 0.0;
         return ZeroTrustDecision::Block;
     }
@@ -453,8 +495,8 @@ ZeroTrustDecision ZeroTrustGuard::Evaluate(const ZeroTrustInputs& in,
     //    not hold the view beyond the Decide() call so ownership is safe.
     // ------------------------------------------------------------------
     CoreInputs coreIn;
-    coreIn.imagePath            = std::wstring(in.imagePath);
-    coreIn.publisherSubject     = WideToNarrow(in.publisherSubject);
+    coreIn.imagePath            = std::wstring(imagePathCapped);
+    coreIn.publisherSubject     = WideToNarrow(publisherCapped);
     coreIn.publisherSigned      = in.publisherSigned;
     coreIn.publisherTrusted     = in.publisherTrusted;
     coreIn.reputationScore      = in.reputation;
@@ -497,8 +539,8 @@ ZeroTrustDecision ZeroTrustGuard::Evaluate(const ZeroTrustInputs& in,
             // If we reach here, the behavior is Prompt — enqueue to the
             // PhantomHome-facing UI queue.
             ZeroTrustPromptItem item;
-            item.imagePath        = std::wstring(in.imagePath);
-            item.publisherSubject = std::wstring(in.publisherSubject);
+            item.imagePath        = std::wstring(imagePathCapped);
+            item.publisherSubject = std::wstring(publisherCapped);
             item.processSessionId = in.processSessionId;
             item.score            = result.computedTrust;
             item.createdAt        = std::chrono::system_clock::now();
@@ -512,7 +554,7 @@ ZeroTrustDecision ZeroTrustGuard::Evaluate(const ZeroTrustInputs& in,
                 SS_LOG_WARN(kLogCategory,
                     L"ZeroTrustGuard.Home: PromptQueue full — "
                     L"falling back to Block for '%.128ls'",
-                    std::wstring(in.imagePath).c_str());
+                    std::wstring(imagePathCapped).c_str());
                 return ZeroTrustDecision::Block;
             }
 
