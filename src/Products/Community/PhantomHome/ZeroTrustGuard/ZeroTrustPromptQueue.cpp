@@ -166,9 +166,17 @@ std::uint64_t ZeroTrustPromptQueue::Enqueue(PromptEntry entry) {
         entry.createdAt = std::chrono::system_clock::now();
     }
 
-    // Bridge to the PhantomHome UI queue.
-    BridgeEnqueueToHomeQueue(entry);
-
+    // Insert into the Core-side queue FIRST. If we bridge to the Home queue
+    // before the Core push, a UI thread that immediately dequeues the Home
+    // item and calls Home::Resolve() will route Answer(id) into Core::Answer()
+    // while this Core::Enqueue() is still mid-bridge — Answer() scans the not-
+    // yet-populated m_queue, fails to find the id, logs WARN, and returns
+    // false. The user's decision is then never propagated to any WaitFor()
+    // caller that is currently blocked on this id, which silently degrades to
+    // PromptAnswer::Timeout at the WaitFor() deadline. Pushing into the Core
+    // queue before the bridge call closes that window: by the time the Home
+    // queue notifies consumers, the matching Core entry is already visible to
+    // Answer().
     {
         std::scoped_lock lock(m_impl->m_mutex);
 
@@ -177,8 +185,14 @@ std::uint64_t ZeroTrustPromptQueue::Enqueue(PromptEntry entry) {
             m_impl->m_queue.pop_front();
         }
 
-        m_impl->m_queue.push_back(std::move(entry));
+        m_impl->m_queue.push_back(entry);
     }
+
+    // Bridge to the PhantomHome UI queue. The bridge takes its own copy so
+    // moving entry here is unsafe (we still need entry.id/etc. for the Core
+    // queue insert above, which is done by value-copy into the deque, but we
+    // also keep entry alive in case logging needs it after the bridge call).
+    BridgeEnqueueToHomeQueue(entry);
 
     m_impl->m_cv.notify_all();
     return id;
