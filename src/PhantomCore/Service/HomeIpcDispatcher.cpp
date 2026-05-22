@@ -1344,9 +1344,13 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 case PgtiFeedStatus::Health::Failed:   healthStr = "failed";   break;
                 case PgtiFeedStatus::Health::Disabled: healthStr = "disabled"; break;
             }
+            const auto lastSuccessTs = std::chrono::duration_cast<std::chrono::seconds>(
+                s.lastSuccess.time_since_epoch()).count();
             items.push_back({
                 {"id",            s.id},
                 {"health",        healthStr},
+                {"enabled",       s.health != PgtiFeedStatus::Health::Disabled},
+                {"lastSuccessTs", lastSuccessTs},
                 {"entriesLoaded", s.entriesLoaded},
                 {"latencyMs",     s.latencyMs},
                 {"lastErrorCode", s.lastErrorCode}

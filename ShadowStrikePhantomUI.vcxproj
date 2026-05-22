@@ -135,6 +135,9 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\SettingsViewModel.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\PgtiViewModel.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -170,6 +173,9 @@
     <ClCompile Include="$(IntDir)moc_SettingsViewModel.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_SettingsViewModel.cpp')">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="$(IntDir)moc_PgtiViewModel.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_PgtiViewModel.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="$(IntDir)moc_PerfBudget.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_PerfBudget.cpp')">true</ExcludedFromBuild>
     </ClCompile>
@@ -197,6 +203,7 @@
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\QuarantineModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ReportsModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\SettingsViewModel.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\PgtiViewModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\WindowActivator.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\IPC\Messages.hpp" />
@@ -240,6 +247,11 @@
       <Message>MOC SettingsViewModel.hpp</Message>
       <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_SettingsViewModel.cpp" "%(FullPath)"</Command>
       <Outputs>$(IntDir)moc_SettingsViewModel.cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\PgtiViewModel.hpp">
+      <Message>MOC PgtiViewModel.hpp</Message>
+      <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_PgtiViewModel.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)moc_PgtiViewModel.cpp</Outputs>
     </CustomBuild>
     <CustomBuild Include="src\Products\Community\PhantomHome\UI\PerfBudget\PerfBudget.hpp">
       <Message>MOC PerfBudget.hpp</Message>

@@ -96,6 +96,7 @@
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/ReportsModel.hpp>
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/SettingsViewModel.hpp>
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/ModulesListModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/PgtiViewModel.hpp>
 
 // ShadowStrike — single-instance activation bridge
 #include <Products/Community/PhantomHome/UI/Client/WindowActivator.hpp>
@@ -407,6 +408,7 @@ int main(int argc, char* argv[])
     ReportsModel        reportsModel;
     SettingsViewModel   settingsViewModel;
     ModulesListModel    modulesListModel;
+    PgtiViewModel       pgtiViewModel;
 
     // ── Step 12: QML engine ────────────────────────────────────────────────
     QQmlApplicationEngine engine;
@@ -446,6 +448,7 @@ int main(int argc, char* argv[])
     ctx->setContextProperty(QStringLiteral("reportsModel"),        &reportsModel);
     ctx->setContextProperty(QStringLiteral("settingsViewModel"),   &settingsViewModel);
     ctx->setContextProperty(QStringLiteral("modulesListModel"),    &modulesListModel);
+    ctx->setContextProperty(QStringLiteral("pgtiViewModel"),       &pgtiViewModel);
 
     // initialRoute is a plain string — read once by Main.qml at Component.onCompleted.
     ctx->setContextProperty(QStringLiteral("initialRoute"),
@@ -528,7 +531,7 @@ int main(int argc, char* argv[])
         // Forward action args to the appropriate ViewModel.
         if (startArgs.quickScan) {
             QMetaObject::invokeMethod(&scanViewModel,
-                                      "startQuickScan",
+                                      "startFastScan",
                                       Qt::QueuedConnection);
         } else if (startArgs.fullScan) {
             QMetaObject::invokeMethod(&scanViewModel,
