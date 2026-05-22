@@ -57,6 +57,8 @@ Item {
     SequentialAnimation {
         id: pulseAnim
         running: {
+            if (Theme.reducedMotion)
+                return false
             if (typeof perfBudget !== "undefined" && perfBudget !== null && perfBudget.animationsPaused)
                 return false
             return true

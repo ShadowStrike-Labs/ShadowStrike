@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls.Basic
 import ShadowStrike.Theming
 import ShadowStrike.Accessibility
 
@@ -11,7 +10,9 @@ Item {
     signal toggled(bool newValue)
 
     implicitWidth:  labelText.length > 0 ? track.width + Theme.spacingS + lbl.implicitWidth : track.width
-    implicitHeight: track.height
+    implicitHeight: Math.max(track.height, 28)
+    opacity: root.enabled ? 1.0 : Theme.disabledOpacity
+    Behavior on opacity { NumberAnimation { duration: Theme.motionFast; easing.type: Theme.easingType } }
 
     Row {
         spacing: Theme.spacingS
@@ -22,10 +23,9 @@ Item {
             width:  44
             height: 24
             radius: 12
-            color: root.checked ? Qt.rgba(Theme.accentCyan.r, Theme.accentCyan.g, Theme.accentCyan.b, 0.25)
-                                : Qt.rgba(Theme.textMuted.r, Theme.textMuted.g, Theme.textMuted.b, 0.25)
+            color: root.checked ? Theme.stateFill("on") : Theme.stateFill("off")
             border.color: root.checked ? Theme.accentCyan : Theme.textMuted
-            border.width: 1.5
+            border.width: Theme.highContrast ? 2 : 1.5
 
             Behavior on color        { ColorAnimation { duration: Theme.motionBase; easing.type: Theme.easingType } }
             Behavior on border.color { ColorAnimation { duration: Theme.motionBase; easing.type: Theme.easingType } }
@@ -53,6 +53,7 @@ Item {
                 anchors.margins: -3
                 radius: thumb.radius + 3
                 color: "transparent"
+                visible: !Theme.highContrast
                 border.color: root.checked ? Qt.rgba(Theme.accentCyan.r, Theme.accentCyan.g, Theme.accentCyan.b, 0.45) : "transparent"
                 border.width: 3
                 Behavior on border.color { ColorAnimation { duration: Theme.motionBase; easing.type: Theme.easingType } }
@@ -61,7 +62,9 @@ Item {
             MouseArea {
                 id: trackArea
                 anchors.fill: parent
-                hoverEnabled: true
+                enabled: root.enabled
+                hoverEnabled: root.enabled
+                cursorShape: root.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                 onClicked: {
                     root.checked = !root.checked
                     root.toggled(root.checked)
@@ -84,15 +87,19 @@ Item {
     }
 
     Keys.onSpacePressed: {
-        root.checked = !root.checked
-        root.toggled(root.checked)
+        if (root.enabled) {
+            root.checked = !root.checked
+            root.toggled(root.checked)
+        }
     }
     Keys.onReturnPressed: {
-        root.checked = !root.checked
-        root.toggled(root.checked)
+        if (root.enabled) {
+            root.checked = !root.checked
+            root.toggled(root.checked)
+        }
     }
 
-    activeFocusOnTab: true
+    activeFocusOnTab: root.enabled
 
     Accessible.role:        Accessible.CheckBox
     Accessible.name:        root.labelText.length > 0 ? root.labelText : qsTr("Toggle")

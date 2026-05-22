@@ -14,11 +14,19 @@ Item {
         anchors.fill: parent
     }
 
-    // Entry animation: fade in + translate up
-    opacity: 0
-    y: 12
+    // Entry animation: fade in + translate up. Motion is disabled when the
+    // runtime performance/accessibility budget requests reduced motion.
+    opacity: Theme.reducedMotion ? 1 : 0
+    y: Theme.reducedMotion ? 0 : 12
 
-    Component.onCompleted: entryAnim.start()
+    Component.onCompleted: {
+        if (Theme.reducedMotion) {
+            root.opacity = 1
+            root.y = 0
+        } else {
+            entryAnim.start()
+        }
+    }
 
     ParallelAnimation {
         id: entryAnim

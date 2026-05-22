@@ -162,6 +162,8 @@ Item {
         interval: 6000
         repeat:   true
         running: {
+            if (Theme.reducedMotion)
+                return false
             if (typeof perfBudget !== "undefined" && perfBudget !== null && perfBudget.animationsPaused)
                 return false
             return root._strings.length > 1

@@ -9,21 +9,24 @@ Item {
     property alias text: label.text
     property bool   busy:    false
     property bool   enabled: true
+    property string accessibleName: label.text
     signal clicked()
 
-    implicitWidth:  Math.max(100, label.implicitWidth + Theme.spacingXL * 2)
-    implicitHeight: 36
+    implicitWidth:  Math.max(112, label.implicitWidth + Theme.spacingXL * 2)
+    implicitHeight: Theme.controlHeight
 
-    opacity: root.enabled ? 1.0 : 0.4
+    opacity: root.enabled ? 1.0 : Theme.disabledOpacity
     Behavior on opacity { NumberAnimation { duration: Theme.motionFast; easing.type: Theme.easingType } }
 
     Rectangle {
         id: bg
         anchors.fill: parent
         radius:       Theme.radiusMedium
-        color:        ma.containsMouse && root.enabled ? Theme.bgSurfaceAlt : "transparent"
-        border.color: root.enabled ? Qt.rgba(Theme.accentCyan.r, Theme.accentCyan.g, Theme.accentCyan.b, 0.55) : Theme.strokeSubtle
-        border.width: 1
+        color:        ma.containsMouse && root.enabled ? Theme.surfaceColor(false, true) : "transparent"
+        border.color: root.enabled
+                      ? (ma.containsMouse ? Theme.accentGlow : Qt.rgba(Theme.accentCyan.r, Theme.accentCyan.g, Theme.accentCyan.b, Theme.highContrast ? 1.0 : 0.62))
+                      : Theme.strokeSubtle
+        border.width: Theme.highContrast || bg.activeFocus ? 2 : 1
 
         Behavior on color        { ColorAnimation { duration: Theme.motionFast; easing.type: Theme.easingType } }
         Behavior on border.color { ColorAnimation { duration: Theme.motionFast; easing.type: Theme.easingType } }
@@ -31,7 +34,7 @@ Item {
         transform: Scale {
             origin.x: bg.width / 2
             origin.y: bg.height / 2
-            xScale: root.enabled ? (ma.pressed ? 0.98 : 1.0) : 1.0
+            xScale: root.enabled && !Theme.reducedMotion ? (ma.pressed ? 0.98 : 1.0) : 1.0
             yScale: xScale
             Behavior on xScale { NumberAnimation { duration: Theme.motionFast; easing.type: Theme.easingType } }
         }
@@ -72,6 +75,6 @@ Item {
     activeFocusOnTab: root.enabled
 
     Accessible.role:        Accessible.Button
-    Accessible.name:        label.text
+    Accessible.name:        root.accessibleName.length > 0 ? root.accessibleName : label.text
     Accessible.description: qsTr("Secondary action")
 }
