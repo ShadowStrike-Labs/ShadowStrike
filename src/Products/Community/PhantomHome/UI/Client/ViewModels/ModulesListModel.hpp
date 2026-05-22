@@ -62,7 +62,7 @@ public:
     /**
      * @brief Toggle a binary (on/off) module.
      *
-     * Internally maps enabled→Balanced(1), disabled→Off(0) so that binary
+     * Internally maps enabled->Balanced(2), disabled->Off(0) so that binary
      * modules integrate cleanly with the per-module mode framework.
      *
      * @param id      Module identifier.

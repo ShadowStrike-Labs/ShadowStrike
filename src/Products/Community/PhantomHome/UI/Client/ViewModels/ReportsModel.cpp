@@ -18,10 +18,12 @@
 
 #include "ReportsModel.hpp"
 
+#include <QDateTime>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QPointer>
 #include <QTextStream>
 
@@ -40,7 +42,7 @@ struct ReportEntry {
     QString severity;
     QString title;
     QString summary;
-    QString timestamp;    // ISO-8601
+    qint64  timestamp{0}; // Unix seconds for QML relative-time helpers
     QString actor;
     QString detailsJson;
 };
@@ -57,18 +59,70 @@ struct ReportsModel::Impl {
     QDateTime filterFrom;
     QDateTime filterTo;
 
+    [[nodiscard]] static QString SeverityToString(int severity) noexcept
+    {
+        switch (severity) {
+        case 0:  return QStringLiteral("info");
+        case 1:  return QStringLiteral("low");
+        case 2:  return QStringLiteral("medium");
+        case 3:  return QStringLiteral("high");
+        case 4:  return QStringLiteral("critical");
+        default: return QStringLiteral("unknown");
+        }
+    }
+
+    [[nodiscard]] static QString TypeFromKind(int kind) noexcept
+    {
+        switch (kind) {
+        case 1:  return QStringLiteral("scan");
+        case 2:  return QStringLiteral("block");
+        case 3:  return QStringLiteral("quarantine");
+        case 4:  return QStringLiteral("update");
+        case 5:  return QStringLiteral("policy");
+        case 6:  return QStringLiteral("module");
+        default: return QStringLiteral("unknown");
+        }
+    }
+
+    [[nodiscard]] static QString IdFromJson(const QJsonValue& value) noexcept
+    {
+        if (value.isString()) {
+            return value.toString();
+        }
+        if (value.isDouble()) {
+            return QString::number(static_cast<qulonglong>(value.toDouble(0.0)));
+        }
+        return {};
+    }
+
     [[nodiscard]] static ReportEntry EntryFromJson(const QJsonObject& obj) noexcept
     {
         ReportEntry e;
-        e.id          = obj.value(QLatin1String("id")).toString();
-        e.type        = obj.value(QLatin1String("type")).toString();
-        e.severity    = obj.value(QLatin1String("severity")).toString();
+        e.id          = IdFromJson(obj.value(QLatin1String("id")));
+        e.type        = obj.value(QLatin1String("type")).toString(
+            TypeFromKind(obj.value(QLatin1String("kind")).toInt(0)));
+        const QJsonValue severityValue = obj.value(QLatin1String("severity"));
+        e.severity    = severityValue.isString()
+            ? severityValue.toString()
+            : SeverityToString(severityValue.toInt(0));
         e.title       = obj.value(QLatin1String("title")).toString();
-        e.summary     = obj.value(QLatin1String("summary")).toString();
-        e.timestamp   = obj.value(QLatin1String("timestamp")).toString();
-        e.actor       = obj.value(QLatin1String("actor")).toString();
+        e.summary     = obj.value(QLatin1String("summary")).toString(
+            obj.value(QLatin1String("description")).toString());
+        const QJsonValue legacyTimestamp = obj.value(QLatin1String("timestamp"));
+        if (legacyTimestamp.isDouble()) {
+            e.timestamp = static_cast<qint64>(legacyTimestamp.toDouble(0.0));
+        } else {
+            const qint64 timestampMs = static_cast<qint64>(
+                obj.value(QLatin1String("timestampMs")).toDouble(0.0));
+            e.timestamp = timestampMs > 0 ? timestampMs / 1000 : 0;
+        }
+        e.actor       = obj.value(QLatin1String("actor")).toString(
+            obj.value(QLatin1String("module")).toString());
         // Store the detail sub-object as compact JSON for QML / detail views.
-        const QJsonObject details = obj.value(QLatin1String("details")).toObject();
+        QJsonObject details = obj.value(QLatin1String("details")).toObject();
+        if (details.isEmpty()) {
+            details = obj;
+        }
         if (!details.isEmpty())
             e.detailsJson = QString::fromUtf8(
                 QJsonDocument(details).toJson(QJsonDocument::Compact));
@@ -78,8 +132,24 @@ struct ReportsModel::Impl {
     [[nodiscard]] QJsonObject buildFilter() const
     {
         QJsonObject f;
-        if (!filterCategory.isEmpty())
-            f[QLatin1String("category")] = filterCategory;
+        if (!filterCategory.isEmpty()) {
+            const QString c = filterCategory.toLower();
+            int kind = 0;
+            if (c == QLatin1String("detection")) {
+                kind = 2;
+            } else if (c == QLatin1String("block")) {
+                kind = 2;
+            } else if (c == QLatin1String("quarantine")) {
+                kind = 3;
+            } else if (c == QLatin1String("scan")) {
+                kind = 1;
+            } else if (c == QLatin1String("pgti")) {
+                kind = 0;
+            }
+            if (kind > 0) {
+                f[QLatin1String("category")] = kind;
+            }
+        }
         if (filterFrom.isValid())
             f[QLatin1String("from")] = filterFrom.toString(Qt::ISODate);
         if (filterTo.isValid())
@@ -200,7 +270,7 @@ void ReportsModel::exportCsv(const QUrl& destination)
             << csvEscape(e.severity)  << ','
             << csvEscape(e.title)     << ','
             << csvEscape(e.summary)   << ','
-            << csvEscape(e.timestamp) << ','
+            << csvEscape(QString::number(e.timestamp)) << ','
             << csvEscape(e.actor)     << '\n';
     }
 
@@ -236,8 +306,9 @@ void ReportsModel::doLoad(int offset)
                 return;
             }
 
-            const QJsonArray arr = r.payload.value(QLatin1String("reports")).toArray();
-            const bool moreAvail = r.payload.value(QLatin1String("hasMore")).toBool(false);
+            const QJsonArray arr = r.payload.value(QLatin1String("items")).toArray();
+            const bool moreAvail = r.payload.contains(QLatin1String("nextOffset"))
+                || (offset + arr.size() < r.payload.value(QLatin1String("total")).toInt(0));
 
             if (offset == 0) {
                 // Full reset (setFilter path or initial load)

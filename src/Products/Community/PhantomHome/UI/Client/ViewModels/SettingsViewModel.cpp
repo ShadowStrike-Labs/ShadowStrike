@@ -122,7 +122,7 @@ void SettingsViewModel::refreshAll()
             }
 
             const QJsonObject settings =
-                r.payload.value(QLatin1String("settings")).toObject();
+                r.payload.value(QLatin1String("values")).toObject();
 
             // Collect changed keys outside the lock, then emit signals
             // (signals must NOT be emitted while holding the mutex).

@@ -44,12 +44,13 @@ PageHost {
         return qsTr("%1d ago").arg(Math.floor(diff / 86400))
     }
 
-    /// ProtectionViewModel.globalMode (0=Off, 1=Balanced, 2=Aggressive) → label.
+    /// ProtectionViewModel.globalMode (0=Off, 1=Passive, 2=Balanced, 3=Aggressive) -> label.
     function modeName(mode) {
         switch (mode) {
         case 0:  return qsTr("Off")
-        case 1:  return qsTr("Balanced")
-        case 2:  return qsTr("Aggressive")
+        case 1:  return qsTr("Passive")
+        case 2:  return qsTr("Balanced")
+        case 3:  return qsTr("Aggressive")
         default: return qsTr("Unknown")
         }
     }
@@ -74,7 +75,7 @@ PageHost {
     /// ProtectionViewModel.globalMode → StatusChip state.
     function modeChipState(mode) {
         if (mode === 0) return "off"
-        if (mode === 2) return "warning"
+        if (mode === 1 || mode === 3) return "warning"
         return "on"
     }
 

@@ -20,6 +20,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QPointer>
 
 #include "../IPC/PipeClient.hpp"
@@ -40,7 +41,7 @@ struct QuarantineEntry {
     QString path;
     QString threat;
     qint64  size{0};           // bytes
-    QString quarantinedAt;     // ISO-8601
+    qint64  quarantinedAt{0};  // Unix seconds for QML relative-time helpers
     QString source;
 };
 
@@ -49,16 +50,38 @@ struct QuarantineEntry {
 struct QuarantineModel::Impl {
     QVector<QuarantineEntry> rows;
 
+    [[nodiscard]] static QString IdFromJson(const QJsonValue& value) noexcept
+    {
+        if (value.isString()) {
+            return value.toString();
+        }
+        if (value.isDouble()) {
+            return QString::number(static_cast<qulonglong>(value.toDouble(0.0)));
+        }
+        return {};
+    }
+
     [[nodiscard]] static QuarantineEntry EntryFromJson(const QJsonObject& obj) noexcept
     {
         QuarantineEntry e;
-        e.id            = obj.value(QLatin1String("id")).toString();
-        e.name          = obj.value(QLatin1String("name")).toString();
-        e.path          = obj.value(QLatin1String("path")).toString();
-        e.threat        = obj.value(QLatin1String("threat")).toString();
+        e.id            = IdFromJson(obj.value(QLatin1String("id")));
+        e.name          = obj.value(QLatin1String("fileName")).toString(
+            obj.value(QLatin1String("name")).toString());
+        e.path          = obj.value(QLatin1String("originalPath")).toString(
+            obj.value(QLatin1String("path")).toString());
+        e.threat        = obj.value(QLatin1String("threatName")).toString(
+            obj.value(QLatin1String("threat")).toString());
         e.size          = static_cast<qint64>(obj.value(QLatin1String("size")).toDouble(0.0));
-        e.quarantinedAt = obj.value(QLatin1String("quarantinedAt")).toString();
-        e.source        = obj.value(QLatin1String("source")).toString();
+        const QJsonValue legacyTimestamp = obj.value(QLatin1String("quarantinedAt"));
+        if (legacyTimestamp.isDouble()) {
+            e.quarantinedAt = static_cast<qint64>(legacyTimestamp.toDouble(0.0));
+        } else {
+            const qint64 timestampMs = static_cast<qint64>(
+                obj.value(QLatin1String("quarantinedAtMs")).toDouble(0.0));
+            e.quarantinedAt = timestampMs > 0 ? timestampMs / 1000 : 0;
+        }
+        e.source        = obj.value(QLatin1String("source")).toString(
+            QStringLiteral("PhantomCore quarantine"));
         return e;
     }
 

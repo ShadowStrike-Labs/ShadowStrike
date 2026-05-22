@@ -7,7 +7,7 @@
  * Layout:
  *   TopBar with Quarantine + PGTI navigation buttons
  *   Basic section:
- *     ModePillRow — global protection mode (Off/Balanced/Aggressive)
+ *     ModePillRow — global protection mode (Off/Passive/Balanced/Aggressive)
  *     Pause controls — duration selector popup
  *     Up to 5 priority ModuleCards (categories 0–2: Realtime, Behavioral, Network)
  *   Advanced section (collapsible, default collapsed):
@@ -19,7 +19,7 @@
  *   +4  Category    | +5 CurrentMode   | +6 SupportedModesMask
  *   +7  DetailPage  | +8 StatusHealth  | +9 StatusDetail  | +10 Binary
  *
- * ProtectionViewModel.globalMode: 0=Off, 1=Balanced, 2=Aggressive
+ * ProtectionViewModel.globalMode: 0=Off, 1=Passive, 2=Balanced, 3=Aggressive
  * ModePillRow index:              0=Off, 1=Passive,  2=Balanced, 3=Aggressive
  *
  * Context properties consumed (gated):
@@ -70,24 +70,14 @@ PageHost {
         }
     }
 
-    /// ProtectionViewModel globalMode (0=Off,1=Balanced,2=Aggressive)
-    /// → ModePillRow currentMode index (0=Off,1=Passive,2=Balanced,3=Aggressive).
+    /// ProtectionViewModel globalMode and ModePillRow both use ProtectionMode:
+    /// 0=Off, 1=Passive, 2=Balanced, 3=Aggressive.
     function _vmModeToUiMode(mode) {
-        switch (mode) {
-        case 0:  return 0   // Off → Off
-        case 1:  return 2   // Balanced → Balanced
-        case 2:  return 3   // Aggressive → Aggressive
-        default: return 0
-        }
+        return (mode >= 0 && mode <= 3) ? mode : 0
     }
     /// Reverse mapping: ModePillRow index → ProtectionViewModel globalMode.
     function _uiModeToVmMode(uiMode) {
-        switch (uiMode) {
-        case 0:  return 0   // Off → Off
-        case 2:  return 1   // Balanced → Balanced
-        case 3:  return 2   // Aggressive → Aggressive
-        default: return 0
-        }
+        return (uiMode >= 0 && uiMode <= 3) ? uiMode : 0
     }
 
     /// Read-only model role accessor (convenience wrapper).
@@ -178,10 +168,10 @@ PageHost {
                         }
 
                         // Global mode pill row
-                        // Off=bit0, Balanced=bit2, Aggressive=bit3; Passive (bit1) not offered globally.
+                        // Off=bit0, Passive=bit1, Balanced=bit2, Aggressive=bit3.
                         ModePillRow {
                             id:                 globalModePills
-                            supportedModesMask: 0b1101
+                            supportedModesMask: 0b1111
                             currentMode:        (typeof protectionViewModel !== "undefined")
                                                 ? root._vmModeToUiMode(protectionViewModel.globalMode) : 0
                             onModeChosen: (m) => {

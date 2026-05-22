@@ -48,7 +48,7 @@ class ScanViewModel final : public QObject {
     Q_PROPERTY(quint64 itemsScanned READ itemsScanned NOTIFY progressChanged)
     Q_PROPERTY(quint64 threatsFound READ threatsFound NOTIFY progressChanged)
     Q_PROPERTY(QString currentPath  READ currentPath  NOTIFY progressChanged)
-    Q_PROPERTY(quint64 scanId       READ scanId       NOTIFY stateChanged)
+    Q_PROPERTY(QString scanId       READ scanId       NOTIFY stateChanged)
 
 public:
     enum ScanState {
@@ -69,7 +69,7 @@ public:
     [[nodiscard]] quint64 itemsScanned() const noexcept;
     [[nodiscard]] quint64 threatsFound() const noexcept;
     [[nodiscard]] QString currentPath()  const noexcept;
-    [[nodiscard]] quint64 scanId()       const noexcept;
+    [[nodiscard]] QString scanId()       const noexcept;
 
     Q_INVOKABLE void startFastScan();
     Q_INVOKABLE void startFullScan();
@@ -99,7 +99,7 @@ public:
 signals:
     void stateChanged();
     void progressChanged();
-    void scanCompleted(quint64 id, quint64 threats);
+    void scanCompleted(QString id, quint64 threats);
     void requestError(QString code, QString message);
 
 private:

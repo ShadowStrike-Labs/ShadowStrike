@@ -20,6 +20,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QPointer>
 #include <QTimer>
 
@@ -46,7 +47,7 @@ struct ScanViewModel::Impl {
     quint64 itemsScanned{0};
     quint64 threatsFound{0};
     QString currentPath;
-    quint64 scanId{0};
+    QString scanId;
 
     // QTimer owned by unique_ptr; no Qt parent required because ScanViewModel's
     // destructor will reset m_impl, dropping the timer safely.
@@ -102,7 +103,7 @@ int     ScanViewModel::percent()      const noexcept { return m_impl->percent; }
 quint64 ScanViewModel::itemsScanned() const noexcept { return m_impl->itemsScanned; }
 quint64 ScanViewModel::threatsFound() const noexcept { return m_impl->threatsFound; }
 QString ScanViewModel::currentPath()  const noexcept { return m_impl->currentPath; }
-quint64 ScanViewModel::scanId()       const noexcept { return m_impl->scanId; }
+QString ScanViewModel::scanId()       const noexcept { return m_impl->scanId; }
 
 // ── Private helpers ──────────────────────────────────────────────────────────
 
@@ -130,8 +131,14 @@ void ScanViewModel::applyProgressUpdate(const QJsonObject& ev)
     m_impl->threatsFound = static_cast<quint64>(
         ev.value(QLatin1String("threatsFound")).toDouble(static_cast<double>(m_impl->threatsFound)));
     m_impl->currentPath  = ev.value(QLatin1String("currentPath")).toString(m_impl->currentPath);
-    m_impl->scanId       = static_cast<quint64>(
-        ev.value(QLatin1String("scanId")).toDouble(static_cast<double>(m_impl->scanId)));
+    if (ev.contains(QLatin1String("scanId"))) {
+        const QJsonValue idValue = ev.value(QLatin1String("scanId"));
+        if (idValue.isString()) {
+            m_impl->scanId = idValue.toString();
+        } else if (idValue.isDouble()) {
+            m_impl->scanId = QString::number(static_cast<qulonglong>(idValue.toDouble(0.0)));
+        }
+    }
 
     emit progressChanged();
 
@@ -170,7 +177,7 @@ void ScanViewModel::pollProgress()
 
     (void)PipeClient::Instance().SendAndExpect(
         CommandType::GetScanProgress,
-        QJsonObject{{QLatin1String("scanId"), static_cast<qint64>(m_impl->scanId)}},
+        QJsonObject{{QLatin1String("scanId"), m_impl->scanId}},
         [self = QPointer<ScanViewModel>(this)](const Response& r) {
             if (!self || !r.ok) return;
             self->applyProgressUpdate(r.payload);
@@ -187,6 +194,7 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
     m_impl->itemsScanned = 0;
     m_impl->threatsFound = 0;
     m_impl->currentPath.clear();
+    m_impl->scanId.clear();
     emit stateChanged();
     emit progressChanged();
 
@@ -201,8 +209,18 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
                 emit self->requestError(r.errorCode, r.errorMessage);
                 return;
             }
-            self->m_impl->scanId = static_cast<quint64>(
-                r.payload.value(QLatin1String("scanId")).toDouble(0.0));
+            const QJsonValue idValue = r.payload.value(QLatin1String("scanId"));
+            if (idValue.isString()) {
+                self->m_impl->scanId = idValue.toString();
+            } else if (idValue.isDouble()) {
+                self->m_impl->scanId = QString::number(static_cast<qulonglong>(idValue.toDouble(0.0)));
+            } else {
+                self->m_impl->state = Failed;
+                emit self->stateChanged();
+                emit self->requestError(QStringLiteral("invalid_response"),
+                                        QStringLiteral("StartScan response did not include scanId"));
+                return;
+            }
             self->m_impl->state = Running;
             emit self->stateChanged();
             self->m_impl->startPollTimer(kPollIntervalRunningMs);
@@ -213,12 +231,12 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
 
 void ScanViewModel::startFastScan()
 {
-    doStartScan(QJsonObject{{QLatin1String("type"), QLatin1String("fast")}});
+    doStartScan(QJsonObject{{QLatin1String("scope"), QLatin1String("fast")}});
 }
 
 void ScanViewModel::startFullScan()
 {
-    doStartScan(QJsonObject{{QLatin1String("type"), QLatin1String("full")}});
+    doStartScan(QJsonObject{{QLatin1String("scope"), QLatin1String("full")}});
 }
 
 void ScanViewModel::startCustomScan(const QStringList& paths)
@@ -227,7 +245,7 @@ void ScanViewModel::startCustomScan(const QStringList& paths)
     for (const QString& p : paths)
         arr.append(p);
     doStartScan(QJsonObject{
-        {QLatin1String("type"),  QLatin1String("custom")},
+        {QLatin1String("scope"), QLatin1String("custom")},
         {QLatin1String("paths"), arr}});
 }
 
@@ -262,7 +280,7 @@ void ScanViewModel::cancel()
 
     (void)PipeClient::Instance().SendAndExpect(
         kStopScanV2,
-        QJsonObject{{QLatin1String("scanId"), static_cast<qint64>(m_impl->scanId)}},
+        QJsonObject{{QLatin1String("scanId"), m_impl->scanId}},
         [self = QPointer<ScanViewModel>(this)](const Response& r) {
             if (!self) return;
             if (!r.ok) {

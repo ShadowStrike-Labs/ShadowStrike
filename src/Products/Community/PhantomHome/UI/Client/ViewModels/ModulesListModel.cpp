@@ -43,11 +43,11 @@ struct ModuleEntry {
     QString id;
     QString displayName;
     QString iconId;
-    QString category;
+    int     category{0};
     int     currentMode{0};
     int     supportedModesMask{0};
     QString detailPage;
-    QString statusHealth{QStringLiteral("healthy")};
+    int     statusHealth{0};
     QString statusDetail;
     bool    isBinary{false};
 };
@@ -58,18 +58,44 @@ struct ModulesListModel::Impl {
     QVector<ModuleEntry> rows;
     std::uint64_t        subToken{0};
 
+    [[nodiscard]] static int HealthFromJson(const QJsonObject& obj) noexcept
+    {
+        const QJsonValue explicitHealth = obj.value(QLatin1String("statusHealth"));
+        if (explicitHealth.isDouble()) {
+            return explicitHealth.toInt(0);
+        }
+
+        if (explicitHealth.isString()) {
+            const QString h = explicitHealth.toString().toLower();
+            if (h == QLatin1String("healthy") || h == QLatin1String("on")) return 0;
+            if (h == QLatin1String("atrisk") || h == QLatin1String("warning")) return 1;
+            if (h == QLatin1String("critical") || h == QLatin1String("failed")) return 2;
+            if (h == QLatin1String("off") || h == QLatin1String("disabled")) return -1;
+        }
+
+        switch (obj.value(QLatin1String("state")).toInt(0)) {
+        case 3:
+        case 4:  return 0;
+        case 5:  return 2;
+        case 2:
+        case 6:  return -1;
+        default: return 1;
+        }
+    }
+
     [[nodiscard]] static ModuleEntry EntryFromJson(const QJsonObject& obj) noexcept
     {
         ModuleEntry e;
         e.id                 = obj.value(QLatin1String("id")).toString();
         e.displayName        = obj.value(QLatin1String("displayName")).toString(e.id);
-        e.iconId             = obj.value(QLatin1String("iconId")).toString();
-        e.category           = obj.value(QLatin1String("category")).toString();
+        e.iconId             = obj.value(QLatin1String("iconId")).toString(QStringLiteral("shield"));
+        e.category           = obj.value(QLatin1String("category")).toInt(0);
         e.currentMode        = obj.value(QLatin1String("currentMode")).toInt(0);
         e.supportedModesMask = obj.value(QLatin1String("supportedModesMask")).toInt(0);
         e.detailPage         = obj.value(QLatin1String("detailPage")).toString();
-        e.statusHealth       = obj.value(QLatin1String("statusHealth")).toString(QStringLiteral("healthy"));
-        e.statusDetail       = obj.value(QLatin1String("statusDetail")).toString();
+        e.statusHealth       = HealthFromJson(obj);
+        e.statusDetail       = obj.value(QLatin1String("statusDetail")).toString(
+            obj.value(QLatin1String("lastError")).toString());
         e.isBinary           = obj.value(QLatin1String("binary")).toBool(false);
         return e;
     }
@@ -108,7 +134,7 @@ ModulesListModel::ModulesListModel(QObject* parent)
 
                 ModuleEntry& e = self->m_impl->rows[idx];
                 e.currentMode  = obj.value(QLatin1String("currentMode")).toInt(e.currentMode);
-                e.statusHealth = obj.value(QLatin1String("statusHealth")).toString(e.statusHealth);
+                e.statusHealth = Impl::HealthFromJson(obj);
                 e.statusDetail = obj.value(QLatin1String("statusDetail")).toString(e.statusDetail);
 
                 const QModelIndex mi = self->index(idx, 0);
@@ -219,7 +245,7 @@ void ModulesListModel::setModuleMode(const QString& id, int mode)
 
 void ModulesListModel::toggleBinaryModule(const QString& id, bool enabled)
 {
-    const int mode = enabled ? 1 : 0; // Balanced=1, Off=0
+    const int mode = enabled ? 2 : 0; // Balanced=2, Off=0
     (void)PipeClient::Instance().SendAndExpect(
         CommandType::SetModuleEnabled,
         QJsonObject{

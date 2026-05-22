@@ -21,7 +21,7 @@
  *        ShadowStrike service IPC layer.
  *
  * Exposes:
- *   - globalMode        — ProtectionMode as int (0=Off, 1=Balanced, 2=Aggressive)
+ *   - globalMode        — ProtectionMode as int (0=Off, 1=Passive, 2=Balanced, 3=Aggressive)
  *   - protectionPaused  — true while the protection engine is temporarily paused
  *   - headlineState     — "healthy" | "atRisk" | "critical"
  *   - criticalCount     — number of modules in critical state
@@ -68,7 +68,7 @@ public:
     /**
      * @brief Request a global protection mode change.
      *
-     * Sends UpdateConfig (30) with {key:"globalMode", value:<mode>}.
+     * Sends UpdateConfig (30) with {globalMode:<mode>}.
      * Property update is deferred until the service confirms; on failure
      * requestError is emitted and the property is not changed.
      */

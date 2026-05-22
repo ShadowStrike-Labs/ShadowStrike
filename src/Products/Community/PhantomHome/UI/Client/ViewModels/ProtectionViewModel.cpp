@@ -117,9 +117,7 @@ void ProtectionViewModel::setGlobalMode(int mode)
 {
     (void)PipeClient::Instance().SendAndExpect(
         CommandType::UpdateConfig,
-        QJsonObject{
-            {QLatin1String("key"),   QLatin1String("globalMode")},
-            {QLatin1String("value"), mode}},
+        QJsonObject{{QLatin1String("globalMode"), mode}},
         [self = QPointer<ProtectionViewModel>(this), mode](const Response& r) {
             if (!self) return;
             if (!r.ok) {

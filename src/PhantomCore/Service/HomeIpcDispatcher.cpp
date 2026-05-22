@@ -72,6 +72,7 @@
 
 // Standard library
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -80,6 +81,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -412,6 +414,11 @@ struct HomeIpcDispatcher::Impl {
         if (key.back() == '/') return false;
         return true;
     }
+
+    [[nodiscard]] static bool IsAllowedConfigPrefix(std::string_view prefix) noexcept {
+        if (prefix == "Home/") return true;
+        return IsAllowedConfigKey(prefix);
+    }
 };
 
 // ============================================================================
@@ -687,7 +694,7 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             prefix = Field<std::string>(prefix_j, "prefix").value_or("Home/");
         }
 
-        if (!Impl::IsAllowedConfigKey(prefix)) {
+        if (!Impl::IsAllowedConfigPrefix(prefix)) {
             svc.SendResponseEnvelope(clientId, CommandType::GetConfig, requestId,
                 MakeErrorResponse("forbidden_prefix",
                     "Only Home/* prefixes are readable").dump());
@@ -734,6 +741,32 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 {"currentMode", static_cast<int>(ms.currentMode)},
                 {"lastError",   ms.lastError}
             };
+
+            switch (ms.state) {
+            case ModuleState::Initialized:
+            case ModuleState::Running:
+                entry["statusHealth"] = 0;
+                entry["statusLabel"] = "healthy";
+                break;
+            case ModuleState::Failed:
+                entry["statusHealth"] = 2;
+                entry["statusLabel"] = "critical";
+                break;
+            case ModuleState::Disabled:
+            case ModuleState::Stopped:
+                entry["statusHealth"] = -1;
+                entry["statusLabel"] = "off";
+                break;
+            case ModuleState::Registered:
+            case ModuleState::Unregistered:
+            default:
+                entry["statusHealth"] = 1;
+                entry["statusLabel"] = "warning";
+                break;
+            }
+            if (!ms.lastError.empty()) {
+                entry["statusDetail"] = ms.lastError;
+            }
 
             if (const CatalogEntry* cat = catalog.FindById(ms.name)) {
                 entry["displayNameKey"]     = cat->displayNameKey;
@@ -1119,7 +1152,7 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             const auto qTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 e.quarantineTime.time_since_epoch()).count();
             items.push_back({
-                {"id",              e.entryId},
+                {"id",              std::to_string(e.entryId)},
                 {"originalPath",    WideToNarrow(e.originalPath)},
                 {"fileName",        WideToNarrow(e.fileName)},
                 {"threatName",      WideToNarrow(e.threatName)},
@@ -1164,8 +1197,27 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         auto& qm = QuarantineManager::Instance();
         bool  ok = false;
 
+        const auto ParseEntryId = [&j]() -> std::optional<std::uint64_t> {
+            if (const auto numericId = Field<std::uint64_t>(j, "id")) {
+                return numericId;
+            }
+            if (const auto stringId = Field<std::string>(j, "id")) {
+                if (stringId->empty()) {
+                    return std::nullopt;
+                }
+                std::uint64_t parsedId = 0;
+                const char* const first = stringId->data();
+                const char* const last = first + stringId->size();
+                const auto [ptr, ec] = std::from_chars(first, last, parsedId);
+                if (ec == std::errc{} && ptr == last) {
+                    return parsedId;
+                }
+            }
+            return std::nullopt;
+        };
+
         if (*action == "restore") {
-            const auto id = Field<std::uint64_t>(j, "id");
+            const auto id = ParseEntryId();
             if (!id) {
                 svc.SendResponseEnvelope(clientId, CommandType::QuarantineAction, requestId,
                     MakeErrorResponse("missing_field", "id required for restore").dump());
@@ -1175,7 +1227,7 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             req.entryId = *id;
             ok = qm.RestoreFile(req).IsSuccess();
         } else if (*action == "delete") {
-            const auto id = Field<std::uint64_t>(j, "id");
+            const auto id = ParseEntryId();
             if (!id) {
                 svc.SendResponseEnvelope(clientId, CommandType::QuarantineAction, requestId,
                     MakeErrorResponse("missing_field", "id required for delete").dump());
@@ -1246,7 +1298,7 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         for (std::size_t i = start; i < end; ++i) {
             const auto& e = all[i];
             items.push_back({
-                {"id",              e.id},
+                {"id",              std::to_string(e.id)},
                 {"timestampMs",     e.timestamp_unix_ms},
                 {"kind",            static_cast<std::uint32_t>(e.kind)},
                 {"severity",        static_cast<std::uint32_t>(e.severity)},
