@@ -645,7 +645,6 @@ PageHost {
                 width:  parent.width - Theme.spacingL * 2
                 active: root.pendingPrompts.length === 0
                 sourceComponent: EmptyState {
-                    icon:    "check"
                     title:   qsTr("No pending prompts")
                     message: qsTr("All recent execution decisions have been resolved.")
                 }
@@ -759,7 +758,7 @@ PageHost {
                 width:  parent.width - Theme.spacingL * 2
                 active: root.recentDecisions.length === 0
                 sourceComponent: EmptyState {
-                    icon:    "shield"
+                    iconSource: "qrc:/icons/shield.svg"
                     title:   qsTr("No recent decisions")
                     message: qsTr("Zero-Trust decisions will appear here as executables are evaluated.")
                 }

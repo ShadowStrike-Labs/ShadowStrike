@@ -20,7 +20,6 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import ShadowStrike.Theming 1.0
-import ShadowStrike.Accessibility 1.0
 import ShadowStrike.Components 1.0
 
 ApplicationWindow {
@@ -36,6 +35,25 @@ ApplicationWindow {
     // Theme-driven background — zero white flash on startup.
     color: Theme.bgDeep
 
+    property string serviceAuthFailureReason: ""
+    readonly property int serviceState:
+        (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient.state : 0
+    readonly property bool serviceConnected:
+        (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient.connected : false
+    readonly property bool serviceBannerVisible: !serviceConnected
+
+    function serviceStateLabel(state) {
+        switch (state) {
+        case 1:  return qsTr("Connecting to the ShadowStrike service…")
+        case 2:  return qsTr("Authenticating the service session…")
+        case 4:  return qsTr("Service connection interrupted; reconnecting…")
+        case 5:  return root.serviceAuthFailureReason.length > 0
+                    ? qsTr("Service authentication failed: %1").arg(root.serviceAuthFailureReason)
+                    : qsTr("Service authentication failed.")
+        default: return qsTr("ShadowStrike service is offline. Protection status may be stale.")
+        }
+    }
+
     // ── Single-instance activation ─────────────────────────────────────────
     Connections {
         target: windowActivator
@@ -43,6 +61,18 @@ ApplicationWindow {
             root.show();
             root.raise();
             root.requestActivate();
+        }
+    }
+
+    Connections {
+        target: pipeClient
+        function onAuthRejected(reason) {
+            root.serviceAuthFailureReason = reason || qsTr("AUTH_REJECTED")
+        }
+        function onStateChanged() {
+            if (pipeClient.connected) {
+                root.serviceAuthFailureReason = ""
+            }
         }
     }
 
@@ -81,6 +111,32 @@ ApplicationWindow {
                 pageTitle: d.currentTitle
             }
 
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: root.serviceBannerVisible ? 42 : 0
+                visible: root.serviceBannerVisible
+                color: root.serviceState === 5
+                       ? Qt.rgba(Theme.crit.r, Theme.crit.g, Theme.crit.b, 0.14)
+                       : Qt.rgba(Theme.warn.r, Theme.warn.g, Theme.warn.b, 0.12)
+                border.color: root.serviceState === 5 ? Theme.crit : Theme.warn
+                border.width: 1
+
+                Text {
+                    anchors {
+                        left: parent.left
+                        leftMargin: Theme.spacingM
+                        right: parent.right
+                        rightMargin: Theme.spacingM
+                        verticalCenter: parent.verticalCenter
+                    }
+                    text: root.serviceStateLabel(root.serviceState)
+                    color: Theme.textPrimary
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeLabel
+                    elide: Text.ElideRight
+                }
+            }
+
             // Page host — Loader that swaps the current page QML on navigate.
             // Wrapped in an Item so the outer sizing is governed by the
             // RowLayout attached properties (Layout.fill*), while the Loader
@@ -98,6 +154,11 @@ ApplicationWindow {
                     id: pageLoader
                     anchors.fill: parent
                     asynchronous: false
+                    onLoaded: {
+                        if (item && "stack" in item) {
+                            item.stack = stack
+                        }
+                    }
                     onStatusChanged: {
                         if (status === Loader.Error) {
                             console.warn("PageLoader failed to load source: " +
@@ -176,7 +237,8 @@ ApplicationWindow {
             "zerotrust":     "qrc:/qml/Pages/ZeroTrustDetailPage.qml",
             "pgti":          "qrc:/qml/Pages/PgtiDetailPage.qml",
             "quarantine":    "qrc:/qml/Pages/QuarantineSubroute.qml",
-            "reports":       "qrc:/qml/Pages/ReportsSubroute.qml"
+            "reports":       "qrc:/qml/Pages/ReportsSubroute.qml",
+            "settings":      "qrc:/qml/Pages/SettingsPage.qml"
         })
 
         function routeForUrl(url) {

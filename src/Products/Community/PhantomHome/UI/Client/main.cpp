@@ -66,6 +66,7 @@
 #include <QQmlContext>
 #include <QQuickWindow>
 #include <QTimer>
+#include <QMetaObject>
 #include <QStringList>
 
 // Qt — utilities
@@ -73,6 +74,8 @@
 #include <QtGlobal>
 #include <QQmlError>
 #include <QList>
+
+#include <cstring>
 
 // ShadowStrike — logger (must come after windows.h)
 #include <PhantomCore/Utils/Logger.hpp>
@@ -548,7 +551,8 @@ int main(int argc, char* argv[])
         if (startArgs.pauseProtection) {
             QMetaObject::invokeMethod(&protectionViewModel,
                                       "pauseProtection",
-                                      Qt::QueuedConnection);
+                                      Qt::QueuedConnection,
+                                      Q_ARG(int, 0));
         } else if (startArgs.resumeProtection) {
             QMetaObject::invokeMethod(&protectionViewModel,
                                       "resumeProtection",

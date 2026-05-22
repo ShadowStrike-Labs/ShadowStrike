@@ -4,7 +4,8 @@ import ShadowStrike.Theming
 Item {
     id: root
 
-    default property alias pageContent: host.children
+    default property alias pageContent: host.data
+    property var stack: null
 
     anchors.fill: parent
 

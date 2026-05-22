@@ -187,7 +187,7 @@ PageHost {
                     supportedModesMask: 0x3
                     onToggled: function(nowEnabled) {
                         if (typeof modulesListModel !== 'undefined') {
-                            modulesListModel.setEnabled(modelData.name, nowEnabled);
+                            modulesListModel.toggleBinaryModule(modelData.name, nowEnabled);
                         } else {
                             console.log("[PrivacyPage] toggle", modelData.name, "→", nowEnabled,
                                         "— modulesListModel not yet registered.");

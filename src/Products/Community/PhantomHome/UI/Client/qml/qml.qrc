@@ -84,6 +84,7 @@
         <file>Pages/QuarantineSubroute.qml</file>
         <file>Pages/ReportsSubroute.qml</file>
         <file>Pages/SecurityPage.qml</file>
+        <file>Pages/SettingsPage.qml</file>
         <file>Pages/ZeroTrustDetailPage.qml</file>
 
     </qresource>
