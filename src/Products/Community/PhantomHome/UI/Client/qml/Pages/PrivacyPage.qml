@@ -19,10 +19,10 @@ PageHost {
     // -------------------------------------------------------------------------
     // Privacy dashboard counters (updated by VM binding if available)
     // -------------------------------------------------------------------------
-    property int webcamAccessBlocked:    0
-    property int micAccessBlocked:       0
-    property int locationAccessBlocked:  0
-    property int cookiesBlocked:         0
+    property int webcamAccessBlocked:    typeof privacyViewModel !== 'undefined' ? privacyViewModel.webcamAccessBlocked : 0
+    property int micAccessBlocked:       typeof privacyViewModel !== 'undefined' ? privacyViewModel.micAccessBlocked : 0
+    property int locationAccessBlocked:  typeof privacyViewModel !== 'undefined' ? privacyViewModel.locationAccessBlocked : 0
+    property int cookiesBlocked:         typeof privacyViewModel !== 'undefined' ? privacyViewModel.cookiesBlocked : 0
 
     // -------------------------------------------------------------------------
     // Active privacy modules (if modulesListModel is not available, show static)
@@ -41,7 +41,7 @@ PageHost {
     // -------------------------------------------------------------------------
     // Recent privacy events (updated by VM binding if available)
     // -------------------------------------------------------------------------
-    property var recentPrivacyEvents: []
+    property var recentPrivacyEvents: typeof privacyViewModel !== 'undefined' ? privacyViewModel.recentPrivacyEvents : []
 
     // -------------------------------------------------------------------------
     // Scroll container
@@ -173,24 +173,35 @@ PageHost {
             // Prefer live modulesListModel filtered by category; fall back to static list.
             Repeater {
                 id:    modulesRepeater
-                model: root.staticPrivacyModules
+                model: (typeof privacyViewModel !== 'undefined' && privacyViewModel.modules.length > 0)
+                       ? privacyViewModel.modules
+                       : root.staticPrivacyModules
                 delegate: ModuleCard {
                     required property var modelData
                     width:              parent.width - Theme.spacingL * 2
-                    moduleName:         modelData.name
-                    displayName:        modelData.display
-                    description:        modelData.description
-                    iconSource:         modelData.icon
-                    state:              modelData.enabled ? "on" : "off"
+                    moduleName:         modelData.moduleId || modelData.name
+                    displayName:        modelData.displayName || modelData.display
+                    description:        modelData.description || ""
+                    iconSource:         modelData.iconSource || modelData.icon
+                    state:              modelData.state || (modelData.enabled ? "on" : "off")
                     enabled:            modelData.enabled
-                    currentMode:        1
-                    supportedModesMask: 0x3
+                    currentMode:        typeof modelData.currentMode === "number" ? modelData.currentMode : 1
+                    supportedModesMask: typeof modelData.supportedModesMask === "number" ? modelData.supportedModesMask : 0x3
                     onToggled: function(nowEnabled) {
-                        if (typeof modulesListModel !== 'undefined') {
-                            modulesListModel.toggleBinaryModule(modelData.name, nowEnabled);
+                        if (typeof privacyViewModel !== 'undefined') {
+                            privacyViewModel.setModuleEnabled(moduleName, nowEnabled);
+                        } else if (typeof modulesListModel !== 'undefined') {
+                            modulesListModel.toggleBinaryModule(moduleName, nowEnabled);
                         } else {
-                            console.log("[PrivacyPage] toggle", modelData.name, "→", nowEnabled,
+                            console.log("[PrivacyPage] toggle", moduleName, "→", nowEnabled,
                                         "— modulesListModel not yet registered.");
+                        }
+                    }
+                    onModeChosen: function(mode) {
+                        if (typeof privacyViewModel !== 'undefined') {
+                            privacyViewModel.setModuleMode(moduleName, mode);
+                        } else if (typeof modulesListModel !== 'undefined') {
+                            modulesListModel.setModuleMode(moduleName, mode);
                         }
                     }
                 }
@@ -245,7 +256,6 @@ PageHost {
                         if (typeof privacyViewModel !== 'undefined') {
                             privacyViewModel.runPrivacyCleanup();
                         } else {
-                            // TODO: wire to privacyViewModel.runPrivacyCleanup once the VM is authored.
                             console.log("[PrivacyPage] runPrivacyCleanup requested — privacyViewModel not registered.");
                         }
                     }
@@ -262,7 +272,6 @@ PageHost {
                         if (typeof privacyViewModel !== 'undefined') {
                             privacyViewModel.auditPermissions();
                         } else {
-                            // TODO: wire to privacyViewModel.auditPermissions once the VM is authored.
                             console.log("[PrivacyPage] auditPermissions requested — privacyViewModel not registered.");
                         }
                     }
@@ -279,7 +288,6 @@ PageHost {
                         if (typeof privacyViewModel !== 'undefined') {
                             privacyViewModel.openBrowserPrivacy();
                         } else {
-                            // TODO: wire to privacyViewModel.openBrowserPrivacy once the VM is authored.
                             console.log("[PrivacyPage] openBrowserPrivacy requested — privacyViewModel not registered.");
                         }
                     }

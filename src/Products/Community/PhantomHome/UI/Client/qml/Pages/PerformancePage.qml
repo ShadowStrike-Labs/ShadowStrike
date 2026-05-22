@@ -21,22 +21,34 @@ PageHost {
     // -------------------------------------------------------------------------
 
     // Power plan: 0=Quiet, 1=Balanced, 2=Performance
-    property int currentPowerPlan: 1
+    property int currentPowerPlan: typeof performanceViewModel !== 'undefined' ? performanceViewModel.currentPowerPlan : 1
+
+    property var impactMetrics: typeof performanceViewModel !== 'undefined'
+                                ? performanceViewModel.impactMetrics
+                                : [
+                                    { label: qsTr("TPM"),    pct: 2,  state: "on"  },
+                                    { label: qsTr("CPU"),    pct: 4,  state: "on"  },
+                                    { label: qsTr("Memory"), pct: 38, state: "warning" },
+                                ]
 
     // Upcoming scans model — caller may replace with a live model.
-    property var upcomingScansModel: [
-        { name: qsTr("Full system scan"),   scheduled: qsTr("Today, 11:00 PM") },
-        { name: qsTr("Quick scan"),         scheduled: qsTr("Tomorrow, 6:00 AM") },
-        { name: qsTr("Definitions update"), scheduled: qsTr("Tomorrow, 3:00 AM") },
-    ]
+    property var upcomingScansModel: typeof performanceViewModel !== 'undefined'
+                                      ? performanceViewModel.upcomingScansModel
+                                      : [
+                                          { name: qsTr("Full system scan"),   scheduled: qsTr("Today, 11:00 PM") },
+                                          { name: qsTr("Quick scan"),         scheduled: qsTr("Tomorrow, 6:00 AM") },
+                                          { name: qsTr("Definitions update"), scheduled: qsTr("Tomorrow, 3:00 AM") },
+                                      ]
 
     // Recent optimizations — positive-tone rows.
-    readonly property var recentOptimizations: [
-        { text: qsTr("Paused definitions update during gameplay"), time: qsTr("2 min ago"),   ok: true  },
-        { text: qsTr("Throttled background scanner"),              time: qsTr("14 min ago"),  ok: true  },
-        { text: qsTr("Deferred full scan during high CPU load"),   time: qsTr("1 hr ago"),    ok: true  },
-        { text: qsTr("Suspended telemetry sync during video call"),time: qsTr("3 hrs ago"),   ok: true  },
-    ]
+    property var recentOptimizations: typeof performanceViewModel !== 'undefined'
+                                      ? performanceViewModel.recentOptimizations
+                                      : [
+                                          { text: qsTr("Paused definitions update during gameplay"), time: qsTr("2 min ago"),   ok: true  },
+                                          { text: qsTr("Throttled background scanner"),              time: qsTr("14 min ago"),  ok: true  },
+                                          { text: qsTr("Deferred full scan during high CPU load"),   time: qsTr("1 hr ago"),    ok: true  },
+                                          { text: qsTr("Suspended telemetry sync during video call"),time: qsTr("3 hrs ago"),   ok: true  },
+                                      ]
 
     // Power plan labels — 3-mode subset: Quiet/Balanced/Performance.
     // ModePillRow uses a 4-mode bitmask (Off/Passive/Balanced/Aggressive),
@@ -100,11 +112,7 @@ PageHost {
                         width:   parent.width
 
                         Repeater {
-                            model: [
-                                { label: qsTr("TPM"),    pct: 2,  state: "on"  },
-                                { label: qsTr("CPU"),    pct: 4,  state: "on"  },
-                                { label: qsTr("Memory"), pct: 38, state: "warning" },
-                            ]
+                            model: root.impactMetrics
                             delegate: Column {
                                 spacing:       Theme.spacingXS
                                 width:         (parent.width - Theme.spacingM * 2) / 3
@@ -276,12 +284,10 @@ PageHost {
                         currentMode:      root.currentPowerPlan
                         supportedModesMask: root.powerPlanMask
                         onModeChosen: function(mode) {
-                            root.currentPowerPlan = mode;
-                            // Write-back via PerformanceViewModel if available.
                             if (typeof performanceViewModel !== 'undefined') {
                                 performanceViewModel.setPowerPlan(mode);
                             } else {
-                                // TODO: wire to performanceViewModel.setPowerPlan once the VM is authored.
+                                root.currentPowerPlan = mode;
                                 console.log("[PerformancePage] powerPlan changed to", mode,
                                             "— PerformanceViewModel not yet registered.");
                             }
@@ -386,7 +392,6 @@ PageHost {
                                         if (typeof performanceViewModel !== 'undefined') {
                                             performanceViewModel.rescheduleScan(modelData.name);
                                         } else {
-                                            // TODO: wire to performanceViewModel.rescheduleScan once the VM is authored.
                                             console.log("[PerformancePage] rescheduleScan requested for:", modelData.name,
                                                         "— PerformanceViewModel not yet registered.");
                                         }
