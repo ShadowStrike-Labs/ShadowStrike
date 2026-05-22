@@ -97,6 +97,7 @@
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/SettingsViewModel.hpp>
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/ModulesListModel.hpp>
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/PgtiViewModel.hpp>
+#include <Products/Community/PhantomHome/UI/Client/ViewModels/RecommendationsModel.hpp>
 #include <Products/Community/PhantomHome/UI/Client/ViewModels/ZeroTrustViewModel.hpp>
 
 // ShadowStrike — single-instance activation bridge
@@ -410,6 +411,7 @@ int main(int argc, char* argv[])
     SettingsViewModel   settingsViewModel;
     ModulesListModel    modulesListModel;
     PgtiViewModel       pgtiViewModel;
+    RecommendationsModel recommendationsViewModel;
     ZeroTrustViewModel  zeroTrustViewModel;
 
     // ── Step 12: QML engine ────────────────────────────────────────────────
@@ -451,6 +453,7 @@ int main(int argc, char* argv[])
     ctx->setContextProperty(QStringLiteral("settingsViewModel"),   &settingsViewModel);
     ctx->setContextProperty(QStringLiteral("modulesListModel"),    &modulesListModel);
     ctx->setContextProperty(QStringLiteral("pgtiViewModel"),       &pgtiViewModel);
+    ctx->setContextProperty(QStringLiteral("recommendationsViewModel"), &recommendationsViewModel);
     ctx->setContextProperty(QStringLiteral("zeroTrustViewModel"),  &zeroTrustViewModel);
 
     // initialRoute is a plain string — read once by Main.qml at Component.onCompleted.

@@ -138,6 +138,9 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\PgtiViewModel.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\RecommendationsModel.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ZeroTrustViewModel.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -179,6 +182,9 @@
     <ClCompile Include="$(IntDir)moc_PgtiViewModel.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_PgtiViewModel.cpp')">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="$(IntDir)moc_RecommendationsModel.cpp">
+      <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_RecommendationsModel.cpp')">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="$(IntDir)moc_ZeroTrustViewModel.cpp">
       <ExcludedFromBuild Condition="!Exists('$(IntDir)moc_ZeroTrustViewModel.cpp')">true</ExcludedFromBuild>
     </ClCompile>
@@ -210,6 +216,7 @@
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ReportsModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\SettingsViewModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\PgtiViewModel.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\RecommendationsModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ZeroTrustViewModel.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\IPC\PipeClient.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Client\WindowActivator.hpp" />
@@ -259,6 +266,11 @@
       <Message>MOC PgtiViewModel.hpp</Message>
       <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_PgtiViewModel.cpp" "%(FullPath)"</Command>
       <Outputs>$(IntDir)moc_PgtiViewModel.cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\RecommendationsModel.hpp">
+      <Message>MOC RecommendationsModel.hpp</Message>
+      <Command>"$(QtBin)\moc.exe" -DQ_OS_WIN -I"$(SolutionDir)src" -I"$(QtInc)" -I"$(QtInc)\QtCore" -I"$(QtInc)\QtGui" -I"$(QtInc)\QtQml" -o "$(IntDir)moc_RecommendationsModel.cpp" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)moc_RecommendationsModel.cpp</Outputs>
     </CustomBuild>
     <CustomBuild Include="src\Products\Community\PhantomHome\UI\Client\ViewModels\ZeroTrustViewModel.hpp">
       <Message>MOC ZeroTrustViewModel.hpp</Message>

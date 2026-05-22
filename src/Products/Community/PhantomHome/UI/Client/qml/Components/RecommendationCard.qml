@@ -11,6 +11,7 @@ Item {
     required property string detail
     required property string severity    // "info"|"warn"|"crit"
     required property string actionLabel
+    property bool dismissible: true
     signal actionClicked()
     signal dismissed()
 
@@ -106,13 +107,14 @@ Item {
                 id: closeBtn
                 iconSource: "qrc:/icons/close.svg"
                 tooltip:    qsTr("Dismiss")
+                visible:    root.dismissible
                 anchors.verticalCenter: parent.verticalCenter
                 onClicked: exitAnim.start()
             }
         }
     }
 
-    Keys.onDeletePressed: exitAnim.start()
+    Keys.onDeletePressed: if (root.dismissible) exitAnim.start()
     activeFocusOnTab: true
 
     Accessible.role:        Accessible.ListItem

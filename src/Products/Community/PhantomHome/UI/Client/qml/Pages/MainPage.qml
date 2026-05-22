@@ -30,6 +30,17 @@ import ShadowStrike.Accessibility
 PageHost {
     id: root
 
+    Connections {
+        target: (typeof recommendationsViewModel !== "undefined" &&
+                 recommendationsViewModel !== null)
+                ? recommendationsViewModel : null
+        function onNavigateToUrl(url) {
+            if (typeof stack !== "undefined" && url && url.length > 0) {
+                Qt.callLater(stack.push, url)
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
@@ -324,6 +335,7 @@ PageHost {
                         required property string detail
                         required property string severity
                         required property string actionLabel
+                        required property bool   dismissible
 
                         // The model may expose an 'id' role — capture via a
                         // context-local property to avoid the QML keyword clash.
@@ -345,6 +357,7 @@ PageHost {
                                          ? recDelegateHost.severity : "info"
                             actionLabel: recDelegateHost.actionLabel.length > 0
                                          ? recDelegateHost.actionLabel : qsTr("Fix")
+                            dismissible: recDelegateHost.dismissible
 
                             onActionClicked: {
                                 if (typeof recommendationsViewModel !== "undefined" &&
