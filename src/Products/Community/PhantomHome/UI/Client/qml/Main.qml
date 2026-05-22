@@ -115,6 +115,35 @@ ApplicationWindow {
         }
     }
 
+    // Compatibility navigation facade for pages that were originally authored
+    // against StackView. It preserves push/pop semantics while keeping the
+    // current lightweight Loader-based page host.
+    QtObject {
+        id: stack
+
+        property var history: []
+
+        function push(url) {
+            d.navigateToUrl(url, true)
+        }
+
+        function replace(url) {
+            d.navigateToUrl(url, false)
+        }
+
+        function pop() {
+            if (history.length === 0) {
+                d.navigateTo("security")
+                return
+            }
+
+            var nextHistory = history.slice()
+            var previousUrl = nextHistory.pop()
+            history = nextHistory
+            d.navigateToUrl(previousUrl, false)
+        }
+    }
+
     // ── Private navigation logic ───────────────────────────────────────────
     QtObject {
         id: d
@@ -150,9 +179,34 @@ ApplicationWindow {
             "reports":       "qrc:/qml/Pages/ReportsSubroute.qml"
         })
 
+        function routeForUrl(url) {
+            for (var key in routeMap) {
+                if (routeMap[key] === url) {
+                    return key
+                }
+            }
+            return currentRoute
+        }
+
+        function navigateToUrl(url, pushHistory) {
+            if (!url || url === "") {
+                return
+            }
+
+            if (pushHistory && pageLoader.source !== "" && pageLoader.source !== url) {
+                var nextHistory = stack.history.slice()
+                nextHistory.push(pageLoader.source)
+                stack.history = nextHistory
+            }
+
+            currentRoute = routeForUrl(url)
+            pageHostContainer.navigateTo(url)
+        }
+
         function navigateTo(route) {
             const url = routeMap[route];
             if (url !== undefined) {
+                stack.history = []
                 currentRoute = route;
                 pageHostContainer.navigateTo(url);
             }
