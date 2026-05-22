@@ -43,7 +43,8 @@ void ShutdownScriptsSubsystem() noexcept;
 // Extensions handled:
 //   .js / .jse / .mjs / .cjs                 -> JavaScriptScanner
 //   .vbs / .vbe / .wsf / .wsh / .hta         -> VBScriptScanner
-//   .py / .pyw / .pyc / .pyo / .pyz          -> PythonScriptScanner
+//   .py / .pyw / .pyc / .pyo / .pyz /
+//   .whl / .egg / .pyd                       -> PythonScriptScanner
 //   .doc / .docm / .xls / .xlsm / .ppt /
 //   .pptm / .docx / .xlsx / .pptx / .rtf     -> MacroDetector
 //
@@ -51,8 +52,14 @@ void ShutdownScriptsSubsystem() noexcept;
 // ============================================================================
 
 /**
- * @brief Scan a file that was just written/closed by @p pid. Returns
- *        @c true if a scanner returned a malicious verdict.
+ * @brief Scan a file that was just written/closed by @p pid.
+ * @param pid Originating process identifier from kernel/service dispatch.
+ * @param filePath Absolute or normalized path. Empty paths, embedded NULs,
+ *        control characters, and paths longer than 32767 UTF-16 code units
+ *        are rejected before scanner dispatch.
+ * @return @c true if a scanner returned a malicious verdict; @c false for
+ *         clean, unsupported, invalid, or scanner-error outcomes.
+ * @thread_safety Thread-safe; per-scanner implementations own their locks.
  */
 [[nodiscard]] bool DispatchFileScan(std::uint32_t pid,
                                     const std::wstring& filePath) noexcept;

@@ -231,6 +231,9 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
         return PythonVersion::Python27;
     }
 
+    // Python 3.0-3.4 legacy bytecode magics are still observed in frozen tools.
+    // The public enum preserves a single legacy-3.x bucket for these versions.
+    if (versionMagic >= 3000 && versionMagic <= 3319) return PythonVersion::Python30;
     // Python 3.5: 3350-3351
     if (versionMagic >= 3350 && versionMagic <= 3351) return PythonVersion::Python35;
     // Python 3.6: 3378-3379
@@ -258,6 +261,50 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
 // ============================================================================
 
 namespace {
+
+constexpr size_t kMaxLogFieldChars = 256;
+constexpr size_t kMaxFlaggedLineChars = 200;
+constexpr size_t kMaxExtractedBytecodeChars = 1 * 1024 * 1024;
+
+[[nodiscard]] bool IsValidExternalWideInput(std::wstring_view value) noexcept {
+    if (value.empty() || value.size() > PythonConstants::MAX_PATH_LENGTH) {
+        return false;
+    }
+    for (const wchar_t ch : value) {
+        if (ch == L'\0' || ch < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] std::wstring SanitizeWideForLog(std::wstring_view value,
+                                              size_t maxChars = kMaxLogFieldChars) {
+    std::wstring sanitized;
+    sanitized.reserve((std::min)(value.size(), maxChars));
+    for (const wchar_t ch : value) {
+        if (sanitized.size() >= maxChars) {
+            sanitized.append(L"...<truncated>");
+            break;
+        }
+        sanitized.push_back((ch == L'\0' || ch < 0x20) ? L'?' : ch);
+    }
+    return sanitized;
+}
+
+[[nodiscard]] std::string SanitizeNarrowForLog(std::string_view value,
+                                               size_t maxChars = kMaxLogFieldChars) {
+    std::string sanitized;
+    sanitized.reserve((std::min)(value.size(), maxChars));
+    for (const unsigned char ch : value) {
+        if (sanitized.size() >= maxChars) {
+            sanitized.append("...<truncated>");
+            break;
+        }
+        sanitized.push_back((ch < 0x20 || ch == 0x7F) ? '?' : static_cast<char>(ch));
+    }
+    return sanitized;
+}
 
 /// @brief Escape a string for safe JSON embedding. Handles backslashes,
 ///        quotes, control characters, and non-printable bytes.
@@ -315,6 +362,7 @@ void JsonEscapeInto(std::ostringstream& oss, std::string_view sv) {
     oss << "{";
     oss << "\"version\":\"" << GetPythonVersionName(version) << "\",";
     oss << "\"magicNumber\":" << magicNumber << ",";
+    oss << "\"headerFlags\":" << headerFlags << ",";
     oss << "\"timestamp\":" << timestamp << ",";
     oss << "\"sourceSize\":" << sourceSize << ",";
     oss << "\"codeObjectCount\":" << codeObjectCount << ",";
@@ -430,21 +478,21 @@ void JsonEscapeInto(std::ostringstream& oss, std::string_view sv) {
 }
 
 void PythonStatistics::Reset() noexcept {
-    totalScans.store(0);
-    maliciousDetected.store(0);
-    suspiciousDetected.store(0);
-    sourceFilesScanned.store(0);
-    bytecodeFilesScanned.store(0);
-    packedExecutablesScanned.store(0);
-    obfuscatedDetected.store(0);
-    decompileFailures.store(0);
-    extractionFailures.store(0);
-    totalBytesScanned.store(0);
+    totalScans.store(0, std::memory_order_relaxed);
+    maliciousDetected.store(0, std::memory_order_relaxed);
+    suspiciousDetected.store(0, std::memory_order_relaxed);
+    sourceFilesScanned.store(0, std::memory_order_relaxed);
+    bytecodeFilesScanned.store(0, std::memory_order_relaxed);
+    packedExecutablesScanned.store(0, std::memory_order_relaxed);
+    obfuscatedDetected.store(0, std::memory_order_relaxed);
+    decompileFailures.store(0, std::memory_order_relaxed);
+    extractionFailures.store(0, std::memory_order_relaxed);
+    totalBytesScanned.store(0, std::memory_order_relaxed);
     for (auto& count : byCategory) {
-        count.store(0);
+        count.store(0, std::memory_order_relaxed);
     }
     for (auto& count : byCapability) {
-        count.store(0);
+        count.store(0, std::memory_order_relaxed);
     }
     startTime = Clock::now();
 }
@@ -566,6 +614,8 @@ private:
     [[nodiscard]] bool DetectPyInstallerExe(std::span<const uint8_t> content);
     [[nodiscard]] bool DetectCxFreezeExe(std::span<const uint8_t> content);
     [[nodiscard]] bool DetectNuitkaExe(std::span<const uint8_t> content);
+    [[nodiscard]] bool DetectPy2Exe(std::span<const uint8_t> content);
+    [[nodiscard]] std::string ExtractBytecodeStrings(std::span<const uint8_t> content);
 
     [[nodiscard]] bool ValidatePath(std::wstring_view path) noexcept;
     [[nodiscard]] bool ValidatePathLength(std::wstring_view path) noexcept;
@@ -645,6 +695,8 @@ PythonScriptScannerImpl::s_dangerousPatterns = {
     {"shutil.rmtree", PythonCapability::FileOperations, 30, "Directory deletion"},
     {"os.chmod", PythonCapability::FileOperations, 15, "Permission change"},
     {"shutil.copy", PythonCapability::FileOperations, 10, "File copy"},
+    {"shutil.move", PythonCapability::FileOperations, 15, "File move"},
+    {"shutil.which", PythonCapability::SystemInfo, 10, "Executable discovery"},
 
     // Registry access (Windows)
     {"winreg.OpenKey", PythonCapability::RegistryAccess, 25, "Registry access"},
@@ -718,6 +770,11 @@ PythonScriptScannerImpl::s_dangerousPatterns = {
     {"compile(", PythonCapability::DynamicExecution, 35, "Dynamic compilation"},
     {"__import__", PythonCapability::DynamicExecution, 30, "Dynamic import"},
     {"importlib.import_module", PythonCapability::DynamicExecution, 25, "Dynamic import"},
+    {"pickle.loads", PythonCapability::DynamicExecution, 45, "Pickle deserialization"},
+    {"pickle.load", PythonCapability::DynamicExecution, 40, "Pickle deserialization"},
+    {"dill.loads", PythonCapability::DynamicExecution, 45, "Dill deserialization"},
+    {"joblib.load", PythonCapability::DynamicExecution, 35, "Joblib deserialization"},
+    {"dis.dis", PythonCapability::AntiDebug, 15, "Bytecode disassembly"},
 
     // Email
     {"smtplib.SMTP", PythonCapability::EmailAccess, 30, "SMTP connection"},
@@ -773,6 +830,11 @@ PythonScriptScannerImpl::s_dangerousPatterns = {
     {"bloodhound", PythonCapability::AttackFramework, 50, "BloodHound AD recon"},
     {"responder", PythonCapability::AttackFramework, 50, "Responder LLMNR/NBT-NS"},
     {"lazagne", PythonCapability::AttackFramework, 50, "LaZagne credential harvester"},
+    {"poshc2", PythonCapability::AttackFramework, 55, "PoshC2 framework"},
+    {"sliver", PythonCapability::AttackFramework, 55, "Sliver C2 framework"},
+    {"pupy", PythonCapability::AttackFramework, 50, "Pupy RAT framework"},
+    {"cobaltstrike", PythonCapability::AttackFramework, 55, "Cobalt Strike framework"},
+    {"beacon_config", PythonCapability::AttackFramework, 55, "Cobalt Strike beacon config"},
 
     // Reverse / bind shell patterns
     {"dup2", PythonCapability::ReverseShell, 40, "File descriptor duplication"},
@@ -800,7 +862,7 @@ const std::vector<std::string> PythonScriptScannerImpl::s_ratIndicators = {
     "reverse_shell", "bind_shell", "backdoor", "c2_server", "command_and_control",
     "execute_command", "shell_command", "remote_command", "RAT", "pupy",
     "meterpreter", "empire", "covenant", "quasar", "asyncrat",
-    "cobalt_strike", "beacon"  // Cobalt Strike Python beacons (T2)
+    "cobalt_strike", "cobaltstrike", "beacon", "poshc2", "sliver"  // C2/RAT frameworks (T2)
 };
 
 const std::vector<std::string> PythonScriptScannerImpl::s_ransomwareIndicators = {
@@ -843,16 +905,7 @@ PythonScriptScannerImpl::~PythonScriptScannerImpl() {
 }
 
 [[nodiscard]] bool PythonScriptScannerImpl::ValidatePath(std::wstring_view path) noexcept {
-    if (path.empty() || path.size() > PythonConstants::MAX_PATH_LENGTH) {
-        return false;
-    }
-    // Reject embedded NUL, control chars (0x00-0x1F except tab/newline which don't appear in paths)
-    for (const wchar_t ch : path) {
-        if (ch == L'\0' || (ch < 0x20 && ch != L'\t' && ch != L'\n')) {
-            return false;
-        }
-    }
-    return true;
+    return IsValidExternalWideInput(path);
 }
 
 // ============================================================================
@@ -957,6 +1010,7 @@ void PythonScriptScannerImpl::Shutdown() {
     }
 
     std::wstring widePath = path.wstring();
+    const std::wstring logPath = SanitizeWideForLog(widePath);
 
     // T1: Validate path (reject embedded NUL, control chars, excessive length)
     if (!ValidatePath(widePath)) {
@@ -976,16 +1030,16 @@ void PythonScriptScannerImpl::Shutdown() {
     // Check file exists
     Utils::FileUtils::Error fileErr;
     if (!Utils::FileUtils::Exists(widePath, &fileErr)) {
-        SS_LOG_ERROR(L"PythonScanner", L"File not found: %ls", widePath.c_str());
+        SS_LOG_ERROR(L"PythonScanner", L"File not found: %ls", logPath.c_str());
         result.status = PythonScanStatus::ErrorFileAccess;
-        NotifyError("File not found: " + path.string(), ERROR_FILE_NOT_FOUND);
+        NotifyError("File not found: " + SanitizeNarrowForLog(path.string()), ERROR_FILE_NOT_FOUND);
         return result;
     }
 
     // Get file stats
     Utils::FileUtils::FileStat fileStat;
     if (!Utils::FileUtils::Stat(widePath, fileStat, &fileErr)) {
-        SS_LOG_ERROR(L"PythonScanner", L"Failed to stat file: %ls", widePath.c_str());
+        SS_LOG_ERROR(L"PythonScanner", L"Failed to stat file: %ls", logPath.c_str());
         result.status = PythonScanStatus::ErrorFileAccess;
         return result;
     }
@@ -995,7 +1049,7 @@ void PythonScriptScannerImpl::Shutdown() {
     // Size check — use config snapshot, not m_config directly
     if (fileStat.size > configSnapshot.maxFileSize) {
         SS_LOG_WARN(L"PythonScanner", L"File too large (%llu bytes): %ls",
-                    static_cast<unsigned long long>(fileStat.size), widePath.c_str());
+                    static_cast<unsigned long long>(fileStat.size), logPath.c_str());
         result.status = PythonScanStatus::SkippedSizeLimit;
         return result;
     }
@@ -1009,8 +1063,15 @@ void PythonScriptScannerImpl::Shutdown() {
     //     preventing modification during read. Symlink handling is delegated to OS.
     std::vector<std::byte> content;
     if (!Utils::FileUtils::ReadAllBytes(widePath, content, &fileErr)) {
-        SS_LOG_ERROR(L"PythonScanner", L"Failed to read file: %ls", widePath.c_str());
+        SS_LOG_ERROR(L"PythonScanner", L"Failed to read file: %ls", logPath.c_str());
         result.status = PythonScanStatus::ErrorFileAccess;
+        return result;
+    }
+    if (content.size() > configSnapshot.maxFileSize) {
+        SS_LOG_WARN(L"PythonScanner",
+                    L"File grew beyond configured limit during read (%llu bytes): %ls",
+                    static_cast<unsigned long long>(content.size()), logPath.c_str());
+        result.status = PythonScanStatus::SkippedSizeLimit;
         return result;
     }
 
@@ -1029,14 +1090,14 @@ void PythonScriptScannerImpl::Shutdown() {
             case PythonArtifactType::Notebook: {
                 std::string source(reinterpret_cast<const char*>(content.data()), content.size());
                 result = AnalyzeSource(source, path.filename().string(), detectedType);
-                m_stats.sourceFilesScanned++;
+                m_stats.sourceFilesScanned.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
 
             case PythonArtifactType::BytecodePyc:
             case PythonArtifactType::OptimizedPyo: {
                 result = ScanBytecode(path);
-                m_stats.bytecodeFilesScanned++;
+                m_stats.bytecodeFilesScanned.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
 
@@ -1046,7 +1107,7 @@ void PythonScriptScannerImpl::Shutdown() {
             case PythonArtifactType::PackedPy2Exe:
             case PythonArtifactType::PackedBBFreeze: {
                 result = ScanPyInstallerExe(path);
-                m_stats.packedExecutablesScanned++;
+                m_stats.packedExecutablesScanned.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
 
@@ -1074,28 +1135,29 @@ void PythonScriptScannerImpl::Shutdown() {
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
     // Update statistics
-    m_stats.totalScans++;
-    m_stats.totalBytesScanned += result.fileSize;
+    m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
+    m_stats.totalBytesScanned.fetch_add(result.fileSize, std::memory_order_relaxed);
 
     if (result.isMalicious) {
-        m_stats.maliciousDetected++;
+        m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
     } else if (result.status == PythonScanStatus::Suspicious) {
-        m_stats.suspiciousDetected++;
+        m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (result.isObfuscated) {
-        m_stats.obfuscatedDetected++;
+        m_stats.obfuscatedDetected.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (static_cast<size_t>(result.category) < m_stats.byCategory.size()) {
-        m_stats.byCategory[static_cast<size_t>(result.category)]++;
+        m_stats.byCategory[static_cast<size_t>(result.category)].fetch_add(
+            1, std::memory_order_relaxed);
     }
 
     NotifyCallback(result);
 
     if (configSnapshot.verboseLogging) {
         SS_LOG_INFO(L"PythonScanner", L"Scan complete: %ls - Status: %d, Risk: %d",
-                    widePath.c_str(), static_cast<int>(result.status), result.riskScore);
+                    logPath.c_str(), static_cast<int>(result.status), result.riskScore);
     }
 
     return result;
@@ -1114,17 +1176,40 @@ void PythonScriptScannerImpl::Shutdown() {
         return result;
     }
 
+    PythonScannerConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+    if (source.size() > configSnapshot.maxFileSize) {
+        PythonScanResult result;
+        result.status = PythonScanStatus::SkippedSizeLimit;
+        result.fileSize = source.size();
+        result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - startTime);
+        return result;
+    }
+
     PythonScanResult result = AnalyzeSource(source, sourceName, PythonArtifactType::SourcePy);
 
     auto endTime = Clock::now();
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
-    m_stats.totalScans++;
-    m_stats.sourceFilesScanned++;
-    m_stats.totalBytesScanned += source.size();
+    m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
+    m_stats.sourceFilesScanned.fetch_add(1, std::memory_order_relaxed);
+    m_stats.totalBytesScanned.fetch_add(source.size(), std::memory_order_relaxed);
 
     if (result.isMalicious) {
-        m_stats.maliciousDetected++;
+        m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+    } else if (result.status == PythonScanStatus::Suspicious) {
+        m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result.isObfuscated) {
+        m_stats.obfuscatedDetected.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (static_cast<size_t>(result.category) < m_stats.byCategory.size()) {
+        m_stats.byCategory[static_cast<size_t>(result.category)].fetch_add(
+            1, std::memory_order_relaxed);
     }
 
     NotifyCallback(result);
@@ -1146,21 +1231,46 @@ void PythonScriptScannerImpl::Shutdown() {
         return result;
     }
 
+    PythonScannerConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+
     // Read executable
     std::wstring widePath = exePath.wstring();
-    std::vector<std::byte> content;
-    Utils::FileUtils::Error fileErr;
-
-    if (!Utils::FileUtils::ReadAllBytes(widePath, content, &fileErr)) {
+    const std::wstring logPath = SanitizeWideForLog(widePath);
+    if (!ValidatePath(widePath)) {
+        SS_LOG_ERROR(L"PythonScanner", L"Invalid packed Python artifact path");
         result.status = PythonScanStatus::ErrorFileAccess;
-        m_stats.extractionFailures++;
         return result;
     }
 
-    std::span<const uint8_t> contentSpan(
-        reinterpret_cast<const uint8_t*>(content.data()),
-        content.size()
-    );
+    std::vector<std::byte> content;
+    Utils::FileUtils::Error fileErr;
+    Utils::FileUtils::FileStat fileStat;
+    if (!Utils::FileUtils::Stat(widePath, fileStat, &fileErr)) {
+        SS_LOG_ERROR(L"PythonScanner", L"Failed to stat packed artifact: %ls", logPath.c_str());
+        result.status = PythonScanStatus::ErrorFileAccess;
+        return result;
+    }
+    if (fileStat.size > configSnapshot.maxFileSize) {
+        result.status = PythonScanStatus::SkippedSizeLimit;
+        result.fileSize = fileStat.size;
+        return result;
+    }
+
+    if (!Utils::FileUtils::ReadAllBytes(widePath, content, &fileErr)) {
+        result.status = PythonScanStatus::ErrorFileAccess;
+        m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+    if (content.size() > configSnapshot.maxFileSize) {
+        result.status = PythonScanStatus::SkippedSizeLimit;
+        result.fileSize = content.size();
+        return result;
+    }
+    result.fileSize = content.size();
 
     // Try to extract
     auto packedInfo = ExtractFromPacked(exePath);
@@ -1193,7 +1303,7 @@ void PythonScriptScannerImpl::Shutdown() {
     } else {
         // Extraction failed, do what we can
         result.status = PythonScanStatus::ErrorExtraction;
-        m_stats.extractionFailures++;
+        m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
 
         // Check for known malicious packed Python patterns
         std::string contentStr(reinterpret_cast<const char*>(content.data()),
@@ -1234,11 +1344,34 @@ void PythonScriptScannerImpl::Shutdown() {
 
     // Read bytecode
     std::wstring widePath = pycPath.wstring();
+    const std::wstring logPath = SanitizeWideForLog(widePath);
+    if (!ValidatePath(widePath)) {
+        SS_LOG_ERROR(L"PythonScanner", L"Invalid bytecode path");
+        result.status = PythonScanStatus::ErrorFileAccess;
+        return result;
+    }
+
     std::vector<std::byte> content;
     Utils::FileUtils::Error fileErr;
+    Utils::FileUtils::FileStat fileStat;
+    if (!Utils::FileUtils::Stat(widePath, fileStat, &fileErr)) {
+        SS_LOG_ERROR(L"PythonScanner", L"Failed to stat bytecode file: %ls", logPath.c_str());
+        result.status = PythonScanStatus::ErrorFileAccess;
+        return result;
+    }
+    if (fileStat.size > configSnapshot.maxFileSize) {
+        result.status = PythonScanStatus::SkippedSizeLimit;
+        result.fileSize = fileStat.size;
+        return result;
+    }
 
     if (!Utils::FileUtils::ReadAllBytes(widePath, content, &fileErr)) {
         result.status = PythonScanStatus::ErrorFileAccess;
+        return result;
+    }
+    if (content.size() > configSnapshot.maxFileSize) {
+        result.status = PythonScanStatus::SkippedSizeLimit;
+        result.fileSize = content.size();
         return result;
     }
 
@@ -1253,6 +1386,9 @@ void PythonScriptScannerImpl::Shutdown() {
     PythonBytecodeInfo bytecodeInfo;
     if (ParsePycHeader(contentSpan, bytecodeInfo)) {
         result.bytecodeInfo = bytecodeInfo;
+    } else {
+        result.status = PythonScanStatus::ErrorParsing;
+        return result;
     }
 
     // Try to decompile if enabled
@@ -1285,10 +1421,37 @@ void PythonScriptScannerImpl::Shutdown() {
                 result.bytecodeInfo->decompiledSource = *decompiledSource;
             }
         } else {
-            m_stats.decompileFailures++;
+            m_stats.decompileFailures.fetch_add(1, std::memory_order_relaxed);
             if (result.bytecodeInfo.has_value()) {
                 result.bytecodeInfo->decompileError = "Decompilation not available";
             }
+        }
+    }
+
+    // Enterprise-safe bytecode fallback: extract bounded printable strings from
+    // the marshal stream and run normal source heuristics over those strings.
+    // DESIGN: We never invoke Python unmarshalling, pickle, or marshal here.
+    std::string bytecodeStrings = ExtractBytecodeStrings(contentSpan);
+    if (!bytecodeStrings.empty()) {
+        PythonScanResult stringsResult = AnalyzeSource(
+            bytecodeStrings,
+            pycPath.filename().string(),
+            PythonArtifactType::BytecodePyc);
+        if (stringsResult.riskScore > result.riskScore) {
+            result.status = stringsResult.status;
+            result.isMalicious = stringsResult.isMalicious;
+            result.riskScore = stringsResult.riskScore;
+            result.category = stringsResult.category;
+            result.capabilities = stringsResult.capabilities;
+            result.detectedCapabilities = stringsResult.detectedCapabilities;
+            result.suspiciousImports = stringsResult.suspiciousImports;
+            result.allImports = stringsResult.allImports;
+            result.extractedIOCs = stringsResult.extractedIOCs;
+            result.flaggedLines = stringsResult.flaggedLines;
+            result.isObfuscated = stringsResult.isObfuscated;
+            result.obfuscationType = stringsResult.obfuscationType;
+            result.detectedFamily = stringsResult.detectedFamily;
+            result.threatName = stringsResult.threatName;
         }
     }
 
@@ -1298,19 +1461,23 @@ void PythonScriptScannerImpl::Shutdown() {
 [[nodiscard]] PythonArtifactType PythonScriptScannerImpl::DetectArtifactType(
     const std::filesystem::path& path) {
 
-    // T4: Path traversal mitigation: DetectArtifactType is called AFTER ScanFile
-    //     validates the path with ValidatePath (reject NUL, control chars, length > 32767).
-    //     FileUtils::ReadAllBytes (used below) performs additional Win32 validation.
-    //     No user-controlled symlinks are followed without OS validation.
+    // T4: Path traversal mitigation: DetectArtifactType validates the path
+    //     before any content sniffing and refuses oversized executable reads.
 
     std::wstring widePath = path.wstring();
+    if (!ValidatePath(widePath)) {
+        return PythonArtifactType::Unknown;
+    }
 
     // T1: Cap extension length before transform (attacker-controlled path)
     std::string ext = path.extension().string();
     if (ext.size() > 32) {  // Reasonable extension length limit
         ext = ext.substr(0, 32);
     }
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char ch) -> char {
+                       return static_cast<char>(std::tolower(ch));
+                   });
 
     // Check by extension first
     if (ext == ".py") return PythonArtifactType::SourcePy;
@@ -1319,9 +1486,16 @@ void PythonScriptScannerImpl::Shutdown() {
     if (ext == ".ipynb") return PythonArtifactType::Notebook;
     if (ext == ".egg" || ext == ".whl") return PythonArtifactType::EggZip;
     if (ext == ".pyz" || ext == ".pyzw") return PythonArtifactType::ZipApp;
+    if (ext == ".pyd") return PythonArtifactType::PackedPy2Exe;
 
     // Check by content for executables
-    if (ext == ".exe") {
+    if (ext == ".exe" || ext == ".pyd") {
+        Utils::FileUtils::FileStat fileStat;
+        Utils::FileUtils::Error statErr;
+        if (!Utils::FileUtils::Stat(widePath, fileStat, &statErr) ||
+            fileStat.size > PythonConstants::MAX_SCRIPT_SIZE) {
+            return PythonArtifactType::Unknown;
+        }
         std::vector<std::byte> header;
         Utils::FileUtils::Error fileErr;
 
@@ -1345,6 +1519,9 @@ void PythonScriptScannerImpl::Shutdown() {
                 }
                 if (DetectNuitkaExe(headerSpan)) {
                     return PythonArtifactType::PackedNuitka;
+                }
+                if (DetectPy2Exe(headerSpan)) {
+                    return PythonArtifactType::PackedPy2Exe;
                 }
             }
         }
@@ -1384,6 +1561,9 @@ void PythonScriptScannerImpl::Shutdown() {
 
     while (std::getline(iss, line) && lineNum < MAX_IMPORT_LINES) {
         lineNum++;
+        if (line.size() > 8192) {
+            line.resize(8192);
+        }
 
         // Skip comments
         size_t commentPos = line.find('#');
@@ -1421,7 +1601,9 @@ void PythonScriptScannerImpl::Shutdown() {
                         info.suspicionReason = "Known suspicious module";
                     }
 
-                    imports.push_back(info);
+                    if (imports.size() < 4096) {
+                        imports.push_back(info);
+                    }
                 }
             }
         }
@@ -1457,7 +1639,9 @@ void PythonScriptScannerImpl::Shutdown() {
                 }
             }
 
-            imports.push_back(info);
+            if (imports.size() < 4096) {
+                imports.push_back(info);
+            }
         }
     }
 
@@ -1495,8 +1679,13 @@ void PythonScriptScannerImpl::Shutdown() {
 
     // Requires external Python decompiler integration (pycdc/uncompyle6);
     // detection proceeds via bytecode pattern analysis instead.
+    const std::wstring widePath = pycPath.wstring();
+    if (!ValidatePath(widePath)) {
+        SS_LOG_WARN(L"PythonScanner", L"Bytecode decompilation rejected invalid path");
+        return std::nullopt;
+    }
     SS_LOG_DEBUG(L"PythonScanner", L"Bytecode decompilation requires pycdc/uncompyle6: %ls",
-                 pycPath.wstring().c_str());
+                 SanitizeWideForLog(widePath).c_str());
 
     return std::nullopt;
 }
@@ -1507,8 +1696,23 @@ void PythonScriptScannerImpl::Shutdown() {
     PackedPythonInfo info;
 
     std::wstring widePath = exePath.wstring();
-    std::vector<std::byte> content;
+    if (!ValidatePath(widePath)) {
+        info.extractionError = "Invalid path";
+        return info;
+    }
+
+    Utils::FileUtils::FileStat fileStat;
     Utils::FileUtils::Error fileErr;
+    if (!Utils::FileUtils::Stat(widePath, fileStat, &fileErr)) {
+        info.extractionError = "Failed to stat file";
+        return info;
+    }
+    if (fileStat.size > PythonConstants::MAX_SCRIPT_SIZE) {
+        info.extractionError = "File exceeds packed extraction safety limit";
+        return info;
+    }
+
+    std::vector<std::byte> content;
 
     if (!Utils::FileUtils::ReadAllBytes(widePath, content, &fileErr)) {
         info.extractionError = "Failed to read file";
@@ -1544,6 +1748,9 @@ void PythonScriptScannerImpl::Shutdown() {
     } else if (DetectNuitkaExe(contentSpan)) {
         info.packerType = PythonArtifactType::PackedNuitka;
         info.extractionError = "Nuitka is compiled, not extractable";
+    } else if (DetectPy2Exe(contentSpan)) {
+        info.packerType = PythonArtifactType::PackedPy2Exe;
+        info.extractionError = "py2exe extraction requires dedicated unpacking module";
     }
 
     return info;
@@ -1800,6 +2007,10 @@ void PythonScriptScannerImpl::ResetStatistics() {
         std::shared_lock lock(m_mutex);
         configSnapshot = m_config;
     }
+    if (source.size() > configSnapshot.maxFileSize) {
+        result.status = PythonScanStatus::SkippedSizeLimit;
+        return result;
+    }
 
     // Analyze imports
     result.allImports = AnalyzeImports(source);
@@ -1865,8 +2076,8 @@ void PythonScriptScannerImpl::ResetStatistics() {
 
                 auto statusStr = (result.status == PythonScanStatus::Malicious)
                     ? "MALICIOUS" : "SUSPICIOUS";
-                auto nameStr = result.threatName.empty()
-                    ? result.filePath.string() : result.threatName;
+                auto nameStr = SanitizeNarrowForLog(result.threatName.empty()
+                    ? result.filePath.string() : result.threatName);
                 auto familyStr = result.detectedFamily.empty()
                     ? std::string("unknown") : result.detectedFamily;
                 bool obfusc = (result.obfuscationType != PythonObfuscationType::None);
@@ -1900,15 +2111,15 @@ void PythonScriptScannerImpl::ResetStatistics() {
                 std::map<std::string, std::string> telemetry;
                 telemetry["module"]          = "PythonScriptScanner";
                 telemetry["status"]          = (result.status == PythonScanStatus::Malicious) ? "malicious" : "suspicious";
-                telemetry["threatName"]      = result.threatName;
+                telemetry["threatName"]      = SanitizeNarrowForLog(result.threatName);
                 telemetry["riskScore"]       = std::to_string(result.riskScore);
                 telemetry["sha256"]          = result.sha256;
-                telemetry["family"]          = result.detectedFamily;
+                telemetry["family"]          = SanitizeNarrowForLog(result.detectedFamily);
                 telemetry["category"]        = std::string(GetPythonThreatCategoryName(result.category));
                 telemetry["importCount"]     = std::to_string(result.suspiciousImports.size());
                 telemetry["sigCount"]        = std::to_string(result.matchedSignatures.size());
                 telemetry["obfuscated"]      = (result.obfuscationType != PythonObfuscationType::None) ? "true" : "false";
-                telemetry["filePath"]        = result.filePath.string();
+                telemetry["filePath"]        = SanitizeNarrowForLog(result.filePath.string());
 
                 Communication::TelemetryCollector::Instance().RecordCustom(
                     "python_threat_detection", telemetry);
@@ -2207,7 +2418,8 @@ void PythonScriptScannerImpl::ResetStatistics() {
 PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
 
     std::vector<std::pair<size_t, std::string>> flaggedLines;
-    std::string sourceStr(source);
+    std::string sourceStr(source.substr(
+        0, std::min(source.size(), PythonConstants::MAX_REGEX_INPUT_SIZE)));
     std::istringstream iss(sourceStr);
     std::string line;
     size_t lineNum = 0;
@@ -2221,8 +2433,7 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
             if (pattern.riskWeight >= 30) {
                 std::wstring widePattern = Utils::StringUtils::ToWide(pattern.pattern);
                 if (Utils::StringUtils::IContains(wideLine, widePattern)) {
-                    // Truncate long lines
-                    std::string truncated = line.substr(0, std::min(line.size(), size_t(200)));
+                    std::string truncated = SanitizeNarrowForLog(line, kMaxFlaggedLineChars);
                     flaggedLines.emplace_back(lineNum, truncated);
                     break;
                 }
@@ -2306,26 +2517,31 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
 
     // Detect version from magic
     outInfo.version = DetectPythonVersionFromMagic(outInfo.magicNumber);
+    if (outInfo.version == PythonVersion::Unknown) {
+        return false;
+    }
 
     // Python 2.7: magic(4) + timestamp(4)
     // Python 3.0-3.2: magic(4) + timestamp(4)
-    // Python 3.3+: magic(4) + bit_field(4) + timestamp(4) + source_size(4)
+    // Python 3.3+: magic(4) + bit_field(4) + timestamp/hash metadata(8)
 
     uint16_t versionVal = static_cast<uint16_t>(outInfo.version);
 
     if (outInfo.version == PythonVersion::Python27) {
         std::memcpy(&outInfo.timestamp, content.data() + 4, sizeof(uint32_t));
     } else if (versionVal >= 35) {
-        // Python 3.3+ header with bit_field
-        if (content.size() >= 16) {
+        if (content.size() < 16) {
+            return false;
+        }
+        std::memcpy(&outInfo.headerFlags, content.data() + 4, sizeof(uint32_t));
+        // PEP 552: bit 0 set means an 8-byte source hash follows the flags.
+        // No timestamp/source-size is present in that layout.
+        if ((outInfo.headerFlags & 0x1U) == 0) {
             std::memcpy(&outInfo.timestamp, content.data() + 8, sizeof(uint32_t));
             std::memcpy(&outInfo.sourceSize, content.data() + 12, sizeof(uint32_t));
         }
     } else {
-        // Python 3.0-3.2
-        if (content.size() >= 8) {
-            std::memcpy(&outInfo.timestamp, content.data() + 4, sizeof(uint32_t));
-        }
+        std::memcpy(&outInfo.timestamp, content.data() + 4, sizeof(uint32_t));
     }
 
     return true;
@@ -2403,11 +2619,71 @@ PythonScriptScannerImpl::FindFlaggedLines(std::string_view source) {
     return false;
 }
 
+[[nodiscard]] bool PythonScriptScannerImpl::DetectPy2Exe(
+    std::span<const uint8_t> content) {
+
+    if (content.size() < 1024) {
+        return false;
+    }
+
+    const size_t scanLimit = std::min(content.size(), size_t(50000));
+    const std::string_view contentView(
+        reinterpret_cast<const char*>(content.data()), scanLimit);
+
+    return contentView.find("py2exe") != std::string_view::npos ||
+           contentView.find("PY2EXE") != std::string_view::npos ||
+           contentView.find("library.zip") != std::string_view::npos;
+}
+
+[[nodiscard]] std::string PythonScriptScannerImpl::ExtractBytecodeStrings(
+    std::span<const uint8_t> content) {
+
+    std::string extracted;
+    extracted.reserve(std::min(content.size(), kMaxExtractedBytecodeChars));
+
+    std::string current;
+    current.reserve(128);
+
+    const size_t scanLimit = std::min(content.size(), PythonConstants::MAX_BYTECODE_STRINGS_SIZE);
+    for (size_t i = 0; i < scanLimit && extracted.size() < kMaxExtractedBytecodeChars; ++i) {
+        const unsigned char ch = content[i];
+        if (ch >= 0x20 && ch <= 0x7E) {
+            if (current.size() < 4096) {
+                current.push_back(static_cast<char>(ch));
+            }
+            continue;
+        }
+
+        if (current.size() >= PythonConstants::MIN_EXTRACTED_STRING_LENGTH) {
+            const size_t remaining = kMaxExtractedBytecodeChars - extracted.size();
+            if (current.size() + 1 <= remaining) {
+                extracted.append(current);
+                extracted.push_back('\n');
+            } else {
+                extracted.append(current.substr(0, remaining));
+            }
+        }
+        current.clear();
+    }
+
+    if (current.size() >= PythonConstants::MIN_EXTRACTED_STRING_LENGTH &&
+        extracted.size() < kMaxExtractedBytecodeChars) {
+        const size_t remaining = kMaxExtractedBytecodeChars - extracted.size();
+        extracted.append(current.substr(0, remaining));
+    }
+
+    return extracted;
+}
+
 void PythonScriptScannerImpl::NotifyCallback(const PythonScanResult& result) {
-    std::shared_lock lock(m_mutex);
-    if (m_resultCallback) {
+    ScanResultCallback callback;
+    {
+        std::shared_lock lock(m_mutex);
+        callback = m_resultCallback;
+    }
+    if (callback) {
         try {
-            m_resultCallback(result);
+            callback(result);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"PythonScanner", L"Callback exception: %hs", e.what());
         }
@@ -2415,10 +2691,14 @@ void PythonScriptScannerImpl::NotifyCallback(const PythonScanResult& result) {
 }
 
 void PythonScriptScannerImpl::NotifyError(const std::string& message, int code) {
-    std::shared_lock lock(m_mutex);
-    if (m_errorCallback) {
+    ErrorCallback callback;
+    {
+        std::shared_lock lock(m_mutex);
+        callback = m_errorCallback;
+    }
+    if (callback) {
         try {
-            m_errorCallback(message, code);
+            callback(message, code);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"PythonScanner", L"Error callback exception: %hs", e.what());
         }
@@ -2565,9 +2845,8 @@ void PythonScriptScanner::OnKernelProcessNotify(
 {
     if (!isCreate || !m_impl || !m_impl->IsInitialized()) return;
 
-    // T1: Validate path length before processing (attacker-controlled kernel input)
-    if (imagePath.size() > PythonConstants::MAX_PATH_LENGTH) {
-        SS_LOG_WARN(L"PythonScanner", L"OnKernelProcessNotify: path too long (%zu chars), ignoring",
+    if (!IsValidExternalWideInput(imagePath)) {
+        SS_LOG_WARN(L"PythonScanner", L"OnKernelProcessNotify: invalid path (%zu chars), ignoring",
             imagePath.size());
         return;
     }
@@ -2581,11 +2860,12 @@ void PythonScriptScanner::OnKernelProcessNotify(
 
     if (!isPython) return;
 
+    const std::wstring logImagePath = SanitizeWideForLog(imagePath);
     SS_LOG_INFO(L"PythonScanner",
         L"Kernel process notify: Python interpreter launched PID=%u "
         L"ParentPID=%u Path=%.*s",
         pid, parentPid,
-        static_cast<int>(imagePath.size()), imagePath.data());
+        static_cast<int>(logImagePath.size()), logImagePath.c_str());
 
     // Telemetry: Python process creation event
     if (Communication::TelemetryCollector::HasInstance()) {
@@ -2595,7 +2875,7 @@ void PythonScriptScanner::OnKernelProcessNotify(
             telemetry["event"]     = "python_process_created";
             telemetry["pid"]       = std::to_string(pid);
             telemetry["parentPid"] = std::to_string(parentPid);
-            telemetry["imagePath"] = Utils::StringUtils::ToNarrow(imagePath);
+            telemetry["imagePath"] = SanitizeNarrowForLog(Utils::StringUtils::ToNarrow(imagePath));
 
             Communication::TelemetryCollector::Instance().RecordCustom(
                 "python_process_notify", telemetry);
@@ -2612,9 +2892,8 @@ void PythonScriptScanner::OnKernelImageLoad(
 {
     if (!m_impl || !m_impl->IsInitialized()) return;
 
-    // T1: Validate path length before processing (attacker-controlled kernel input)
-    if (imagePath.size() > PythonConstants::MAX_PATH_LENGTH) {
-        SS_LOG_WARN(L"PythonScanner", L"OnKernelImageLoad: path too long (%zu chars), ignoring",
+    if (!IsValidExternalWideInput(imagePath)) {
+        SS_LOG_WARN(L"PythonScanner", L"OnKernelImageLoad: invalid path (%zu chars), ignoring",
             imagePath.size());
         return;
     }
@@ -2627,10 +2906,11 @@ void PythonScriptScanner::OnKernelImageLoad(
 
     if (!isPythonDll) return;
 
+    const std::wstring logImagePath = SanitizeWideForLog(imagePath);
     SS_LOG_DEBUG(L"PythonScanner",
         L"Kernel image load: Python DLL loaded in PID=%u Path=%.*s Base=0x%llX",
         pid,
-        static_cast<int>(imagePath.size()), imagePath.data(),
+        static_cast<int>(logImagePath.size()), logImagePath.c_str(),
         static_cast<unsigned long long>(imageBase));
 }
 
@@ -2643,13 +2923,14 @@ void PythonScriptScanner::OnKernelImageLoad(
         return false;
     }
 
-    // T1: Validate reason length before processing
+    // T1/T4: Validate and sanitize user-controlled reason before IPC/logging.
     if (reason.size() > PythonConstants::MAX_PATH_LENGTH) {
         SS_LOG_WARN(L"PythonScanner",
             L"RequestKernelProcessBlock: reason too long (%zu chars), truncating",
             reason.size());
         reason = reason.substr(0, 255);
     }
+    std::wstring safeReason = SanitizeWideForLog(reason, 255);
 
     auto& ipc = Communication::IPCManager::Instance();
     if (!ipc.IsFilterPortConnected()) {
@@ -2671,8 +2952,8 @@ void PythonScriptScanner::OnKernelImageLoad(
     req.msgType   = 0x35;
     req.targetPid = pid;
 
-    auto copyLen = (std::min)(reason.size(), static_cast<size_t>(255));
-    std::memcpy(req.reason, reason.data(), copyLen * sizeof(wchar_t));
+    auto copyLen = (std::min)(safeReason.size(), static_cast<size_t>(255));
+    std::memcpy(req.reason, safeReason.data(), copyLen * sizeof(wchar_t));
     req.reason[copyLen] = L'\0';
     req.reasonLen = static_cast<uint32_t>(copyLen);
 
@@ -2681,7 +2962,7 @@ void PythonScriptScanner::OnKernelImageLoad(
     SS_LOG_INFO(L"PythonScanner",
         L"Kernel process block request for PID=%u sent=%d reason=%.*s",
         pid, sent ? 1 : 0,
-        static_cast<int>(copyLen), reason.data());
+        static_cast<int>(copyLen), safeReason.c_str());
 
     return sent;
 }
@@ -2702,9 +2983,9 @@ void PythonScriptScanner::ReportDetectionToAlertSystem(
 
         std::string detail =
             "PythonScriptScanner PID=" + std::to_string(pid) +
-            " threat=" + (result.threatName.empty() ? "unknown" : result.threatName) +
+            " threat=" + (result.threatName.empty() ? "unknown" : SanitizeNarrowForLog(result.threatName)) +
             " risk=" + std::to_string(result.riskScore) +
-            " family=" + (result.detectedFamily.empty() ? "none" : result.detectedFamily) +
+            " family=" + (result.detectedFamily.empty() ? "none" : SanitizeNarrowForLog(result.detectedFamily)) +
             " sha256=" + (result.sha256.empty() ? "n/a" : result.sha256) +
             " imports=" + std::to_string(result.suspiciousImports.size()) +
             " sigs=" + std::to_string(result.matchedSignatures.size());
@@ -2729,13 +3010,13 @@ void PythonScriptScanner::ReportScanTelemetry(const PythonScanResult& result) {
     try {
         std::map<std::string, std::string> telemetry;
         telemetry["module"]       = "PythonScriptScanner";
-        telemetry["filePath"]     = result.filePath.string();
+        telemetry["filePath"]     = SanitizeNarrowForLog(result.filePath.string());
         telemetry["status"]       = (result.status == PythonScanStatus::Malicious) ? "malicious" :
                                     (result.status == PythonScanStatus::Suspicious) ? "suspicious" : "clean";
         telemetry["riskScore"]    = std::to_string(result.riskScore);
         telemetry["sha256"]       = result.sha256;
-        telemetry["threatName"]   = result.threatName;
-        telemetry["family"]       = result.detectedFamily;
+        telemetry["threatName"]   = SanitizeNarrowForLog(result.threatName);
+        telemetry["family"]       = SanitizeNarrowForLog(result.detectedFamily);
         telemetry["category"]     = std::string(GetPythonThreatCategoryName(result.category));
 
         Communication::TelemetryCollector::Instance().RecordCustom(

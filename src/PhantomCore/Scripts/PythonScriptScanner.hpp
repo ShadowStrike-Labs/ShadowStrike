@@ -404,6 +404,9 @@ struct PythonBytecodeInfo {
     
     /// @brief Magic number
     uint32_t magicNumber = 0;
+
+    /// @brief PEP 552 header flags (Python 3.7+ hash-based pyc metadata)
+    uint32_t headerFlags = 0;
     
     /// @brief Timestamp
     uint32_t timestamp = 0;
@@ -673,19 +676,42 @@ public:
     // SCANNING
     // ========================================================================
     
-    /// @brief Scan Python file (auto-detect type)
+    /**
+     * @brief Scan a Python-related file and auto-detect source, bytecode, archive, or packed executable content.
+     * @param path Filesystem path supplied by trusted service wiring or kernel event dispatch.
+     * @return Full scan result. On failure, state remains unchanged except monotonic statistics.
+     * @pre @p path must not contain embedded NUL/control characters and must be <= MAX_PATH_LENGTH.
+     * @post No script body is written to logs; file content is bounded by configuration before analysis.
+     * @thread_safety Thread-safe. Configuration is snapshotted under a shared lock.
+     */
     [[nodiscard]] PythonScanResult ScanFile(const std::filesystem::path& path);
     
-    /// @brief Scan Python source code
+    /**
+     * @brief Scan an in-memory Python source buffer.
+     * @param source User-controlled source bytes. The scanner never executes the buffer.
+     * @param sourceName Logical source name used for reporting only.
+     * @return Full scan result; returns SkippedSizeLimit if @p source exceeds configured bounds.
+     * @thread_safety Thread-safe. Callback invocation occurs outside internal locks.
+     */
     [[nodiscard]] PythonScanResult ScanSource(
         std::string_view source,
         const std::string& sourceName = "memory.py");
     
-    /// @brief Scan PyInstaller executable
+    /**
+     * @brief Scan a packed Python executable or Python-native binary artifact.
+     * @param exePath Path to the executable-like artifact.
+     * @return Full scan result with packed metadata when available.
+     * @pre Path validation is enforced before file I/O.
+     */
     [[nodiscard]] PythonScanResult ScanPyInstallerExe(
         const std::filesystem::path& exePath);
     
-    /// @brief Scan Python bytecode (.pyc)
+    /**
+     * @brief Scan Python bytecode (.pyc/.pyo) without executing or unmarshalling code objects.
+     * @param pycPath Path to bytecode artifact.
+     * @return Header metadata plus detection over bounded printable bytecode strings.
+     * @pre Path validation and configured size limits are enforced before reading.
+     */
     [[nodiscard]] PythonScanResult ScanBytecode(
         const std::filesystem::path& pycPath);
 
@@ -704,11 +730,11 @@ public:
     /// @brief Detect capabilities
     [[nodiscard]] PythonCapability DetectCapabilities(std::string_view source);
     
-    /// @brief Decompile bytecode
+    /// @brief Decompile bytecode when an approved offline decompiler backend is configured; otherwise returns nullopt.
     [[nodiscard]] std::optional<std::string> DecompileBytecode(
         const std::filesystem::path& pycPath);
     
-    /// @brief Extract from packed executable
+    /// @brief Extract metadata from a packed Python executable without writing files or executing payload code.
     [[nodiscard]] std::optional<PackedPythonInfo> ExtractFromPacked(
         const std::filesystem::path& exePath);
     

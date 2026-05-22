@@ -106,13 +106,25 @@ std::wstring ExtractLowerExtension(const std::wstring& path) noexcept {
     return ext;
 }
 
-constexpr std::size_t kMaxDispatchPathChars = 32768;
+constexpr std::size_t kMaxDispatchPathChars = 32767;
+
+[[nodiscard]] bool IsValidDispatchPath(const std::wstring& path) noexcept {
+    if (path.empty() || path.size() > kMaxDispatchPathChars) {
+        return false;
+    }
+    for (const wchar_t ch : path) {
+        if (ch == L'\0' || ch < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
 
 }  // namespace
 
 bool DispatchFileScan(std::uint32_t /*pid*/,
                       const std::wstring& filePath) noexcept {
-    if (filePath.empty() || filePath.size() > kMaxDispatchPathChars) {
+    if (!IsValidDispatchPath(filePath)) {
         return false;
     }
 

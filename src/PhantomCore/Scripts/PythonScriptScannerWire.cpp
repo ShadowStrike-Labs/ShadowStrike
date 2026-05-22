@@ -12,8 +12,26 @@
 #include "PythonScriptScanner.hpp"
 #include "../Utils/Logger.hpp"
 #include <filesystem>
+#include <string_view>
 
 namespace ShadowStrike::Scripts::Wiring::Internal {
+namespace {
+
+constexpr std::size_t kMaxPythonWirePathChars = 32767;
+
+[[nodiscard]] bool IsValidWirePath(std::wstring_view path) noexcept {
+    if (path.empty() || path.size() > kMaxPythonWirePathChars) {
+        return false;
+    }
+    for (const wchar_t ch : path) {
+        if (ch == L'\0' || ch < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
 
 bool PythonScriptScanner_Init() noexcept {
     try {
@@ -42,6 +60,10 @@ void PythonScriptScanner_Shutdown() noexcept {
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
                                   const std::wstring& lowerExt) noexcept {
     try {
+        if (!IsValidWirePath(filePath)) {
+            Utils::Logger::Warn("ScriptsWiring: rejected invalid Python scan path");
+            return false;
+        }
         std::filesystem::path p{filePath};
         PythonScanResult result{};
         if (lowerExt == L".pyc" || lowerExt == L".pyo") {
@@ -52,7 +74,9 @@ bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
         return result.isMalicious;
     } catch (const std::exception& e) {
         Utils::Logger::Warn("ScriptsWiring: Python ScanFile exception: {}", e.what());
-    } catch (...) {}
+    } catch (...) {
+        Utils::Logger::Warn("ScriptsWiring: Python ScanFile unknown exception");
+    }
     return false;
 }
 

