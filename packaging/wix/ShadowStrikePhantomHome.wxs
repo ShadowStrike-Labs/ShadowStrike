@@ -105,12 +105,12 @@
                             ResetPeriodInDays="1" />
       </ServiceInstall>
 
+      <!-- Do not start during MSI execution; endpoint service startup is
+           deferred to SCM delayed-auto-start after driver/runtime staging. -->
       <ServiceControl Id="SvcStartStop"
                       Name="ShadowStrikePhantomService"
-                      Start="install"
                       Stop="both"
-                      Remove="uninstall"
-                      Wait="yes" />
+                      Remove="uninstall" />
     </Component>
 
     <Component Id="TrayExecutable"

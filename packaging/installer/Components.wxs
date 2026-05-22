@@ -84,20 +84,17 @@
         ServiceControl:
         * Stop on both install (upgrade path) and uninstall.
         * Remove on uninstall.
-        * Start on install with Wait="no" so that a missing prerequisite
-          (e.g. VC++ 2015-2022 x64 runtime if the user launched the plain
-          .msi instead of the bundled .exe) does NOT roll back the whole
-          install.  Start="auto" + DelayedAutoStart=yes guarantees the
-          service still comes up on the next reboot, and the WixUI final
-          dialog directs the user to re-run the bundle if the initial
-          start attempt fails.
+        * Do NOT start during MSI execution. Endpoint services may depend on
+          driver resume, runtime DLL staging, reboot state, and SCM timing; an
+          immediate StartServices failure causes MSI error 1920 and rolls back
+          the install even though the files and service registration are valid.
+          Start="auto" + DelayedAutoStart lets SCM start the service after the
+          machine reaches a stable post-install state.
       -->
       <ServiceControl Id="SvcControl"
                       Name="ShadowStrikePhantomService"
-                      Start="install"
                       Stop="both"
-                      Remove="uninstall"
-                      Wait="no"/>
+                      Remove="uninstall"/>
 
     </Component>
 
