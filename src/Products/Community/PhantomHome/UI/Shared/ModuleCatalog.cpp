@@ -68,7 +68,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::RealtimeProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -81,7 +81,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::RealtimeProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -94,7 +94,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::RealtimeProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -107,7 +107,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::RealtimeProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -145,7 +145,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -158,7 +158,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -171,7 +171,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -184,7 +184,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -197,7 +197,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -210,7 +210,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -224,7 +224,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::NetworkSecurity,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -239,7 +239,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::WebAndEmail,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -252,7 +252,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::WebAndEmail,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -265,7 +265,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::WebAndEmail,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -278,7 +278,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::WebAndEmail,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -291,7 +291,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::WebAndEmail,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -304,7 +304,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::WebAndEmail,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -319,7 +319,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::PrivacyProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -332,7 +332,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::PrivacyProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -345,7 +345,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::PrivacyProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -358,7 +358,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::PrivacyProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -371,7 +371,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::PrivacyProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = true,   // schedule-driven on/off; no graduated intensity
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -386,7 +386,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::DataAndBackup,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -399,7 +399,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::DataAndBackup,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = true,   // on/off; no graduated intensity
-        .detailPage      = "BackupDetailPage.qml",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -416,7 +416,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -429,7 +429,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -442,7 +442,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -455,7 +455,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -468,7 +468,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -481,7 +481,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -496,7 +496,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -509,7 +509,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -522,7 +522,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -535,7 +535,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -550,7 +550,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -563,7 +563,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -578,7 +578,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -591,7 +591,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskFullSpectrum,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -604,7 +604,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -617,7 +617,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -630,7 +630,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -645,7 +645,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -658,7 +658,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -671,7 +671,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = false,
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 
@@ -684,7 +684,7 @@ ModuleCatalog::ModuleCatalog()
         .category        = ModuleCategory::SpecializedProtection,
         .supportedModesMask = kMaskOffBalanced,
         .binary          = true,  // on/off switch; performance mode has no graduated intensity
-        .detailPage      = "",
+        .detailPage      = "ModuleDetailPage.qml",
         .premium         = false,
     });
 

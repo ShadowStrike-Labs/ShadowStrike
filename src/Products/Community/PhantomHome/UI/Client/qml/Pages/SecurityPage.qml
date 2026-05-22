@@ -151,6 +151,34 @@ PageHost {
         return root._moduleCountByCategory(groupCategory) > 0 ? "on" : "loading"
     }
 
+    function _safeDetailPage(moduleId, detailPage) {
+        if (moduleId === "ZeroTrustGuard")
+            return "ZeroTrustDetailPage.qml"
+
+        var allowed = {
+            "ModuleDetailPage.qml": true,
+            "ZeroTrustDetailPage.qml": true,
+            "PgtiDetailPage.qml": true,
+            "PrivacyPage.qml": true,
+            "PerformancePage.qml": true
+        }
+        if (detailPage && allowed[detailPage])
+            return detailPage
+        return "ModuleDetailPage.qml"
+    }
+
+    function _openModuleDetail(moduleId, detailPage) {
+        if (typeof stack === "undefined" || stack === null || moduleId.length === 0)
+            return
+
+        var page = root._safeDetailPage(moduleId, detailPage)
+        if (typeof stack.openModuleDetail === "function") {
+            Qt.callLater(function() { stack.openModuleDetail(moduleId, page) })
+        } else {
+            Qt.callLater(stack.push, "qrc:/qml/Pages/" + page)
+        }
+    }
+
 
     Connections {
         target: (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient : null
@@ -566,15 +594,8 @@ PageHost {
                                                         moduleSlot._moduleId.length > 0)
                                                         root._modulesModel.setModuleMode(moduleSlot._moduleId, m)
                                                 }
-                                                onOpenDetail: {
-                                                    if (typeof stack === "undefined") return
-                                                    if (moduleSlot.detailPage.length > 0)
-                                                        Qt.callLater(stack.push, "qrc:/qml/Pages/" + moduleSlot.detailPage)
-                                                    else if (moduleSlot.category === 1)
-                                                        Qt.callLater(stack.push, "qrc:/qml/Pages/ZeroTrustDetailPage.qml")
-                                                    else if (moduleSlot.category === 5)
-                                                        Qt.callLater(stack.push, "qrc:/qml/Pages/PgtiDetailPage.qml")
-                                                }
+                                                onOpenDetail: root._openModuleDetail(moduleSlot._moduleId,
+                                                                                    moduleSlot.detailPage)
                                             }
                                         }
                                     }
@@ -713,10 +734,8 @@ PageHost {
                                         if (root._modulesModel !== null && advSlot._moduleId.length > 0)
                                             root._modulesModel.setModuleMode(advSlot._moduleId, m)
                                     }
-                                    onOpenDetail: {
-                                        if (advSlot.detailPage.length > 0 && typeof stack !== "undefined")
-                                            Qt.callLater(stack.push, "qrc:/qml/Pages/" + advSlot.detailPage)
-                                    }
+                                    onOpenDetail: root._openModuleDetail(advSlot._moduleId,
+                                                                        advSlot.detailPage)
                                 }
                             }
                         }

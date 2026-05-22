@@ -187,6 +187,26 @@ ApplicationWindow {
         id: stack
 
         property var history: []
+        property string detailModuleId: ""
+        property string detailModulePage: "ModuleDetailPage.qml"
+
+        function detailUrlFor(page) {
+            const allowed = {
+                "ModuleDetailPage.qml": true,
+                "ZeroTrustDetailPage.qml": true,
+                "PgtiDetailPage.qml": true,
+                "PrivacyPage.qml": true,
+                "PerformancePage.qml": true
+            }
+            const requested = (page && allowed[page]) ? page : "ModuleDetailPage.qml"
+            return "qrc:/qml/Pages/" + requested
+        }
+
+        function openModuleDetail(moduleId, page) {
+            detailModuleId = moduleId || ""
+            detailModulePage = page || "ModuleDetailPage.qml"
+            d.navigateToUrl(detailUrlFor(detailModulePage), true)
+        }
 
         function push(url) {
             d.navigateToUrl(url, true)
