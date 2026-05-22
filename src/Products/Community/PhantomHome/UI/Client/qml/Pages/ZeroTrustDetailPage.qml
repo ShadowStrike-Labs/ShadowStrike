@@ -39,37 +39,66 @@ PageHost {
     property var   recentDecisions:        []
 
     // -------------------------------------------------------------------------
-    // VM sync on load
+    // VM synchronization helpers
     // -------------------------------------------------------------------------
 
-    Component.onCompleted: {
-        if (typeof zeroTrustViewModel !== 'undefined') {
-            root.threshold              = zeroTrustViewModel.threshold              ?? root.threshold;
-            root.zeroTrustModeActive    = zeroTrustViewModel.zeroTrustModeActive    ?? false;
-            root.requirePublisherSigned = zeroTrustViewModel.requirePublisherSigned ?? true;
-            root.requireWhitelist       = zeroTrustViewModel.requireWhitelist       ?? false;
-            root.minReputation          = zeroTrustViewModel.minReputation          ?? 0.60;
-            root.minStaticBenign        = zeroTrustViewModel.minStaticBenign        ?? 0.70;
-            root.uncertainBehavior      = zeroTrustViewModel.uncertainBehavior      ?? 1;
-        }
-        if (typeof zeroTrustViewModel !== 'undefined') {
-            root.pendingPrompts = zeroTrustViewModel.prompts ?? [];
-        }
+    function vmAvailable() {
+        return typeof zeroTrustViewModel !== 'undefined' && zeroTrustViewModel !== null
     }
 
-    // -------------------------------------------------------------------------
-    // Helper: writes a VM property back if the VM is available.
-    // -------------------------------------------------------------------------
+    function syncConfigFromVm() {
+        if (!root.vmAvailable())
+            return
+
+        root.threshold              = zeroTrustViewModel.threshold
+        root.zeroTrustModeActive    = zeroTrustViewModel.zeroTrustModeActive
+        root.requirePublisherSigned = zeroTrustViewModel.requirePublisherSigned
+        root.requireWhitelist       = zeroTrustViewModel.requireWhitelist
+        root.minReputation          = zeroTrustViewModel.minReputation
+        root.minStaticBenign        = zeroTrustViewModel.minStaticBenign
+        root.uncertainBehavior      = zeroTrustViewModel.uncertainBehavior
+    }
+
+    function syncPromptsFromVm() {
+        root.pendingPrompts = root.vmAvailable() ? zeroTrustViewModel.prompts : []
+    }
+
+    Component.onCompleted: {
+        root.syncConfigFromVm()
+        root.syncPromptsFromVm()
+    }
+
     function vmSet(prop, val) {
-        if (typeof zeroTrustViewModel !== 'undefined') {
+        if (root.vmAvailable()) {
             zeroTrustViewModel[prop] = val;
         }
     }
 
     Connections {
-        target: (typeof zeroTrustViewModel !== 'undefined') ? zeroTrustViewModel : null
+        target: root.vmAvailable() ? zeroTrustViewModel : null
+        function onThresholdChanged() {
+            root.threshold = zeroTrustViewModel.threshold
+        }
+        function onZeroTrustModeActiveChanged() {
+            root.zeroTrustModeActive = zeroTrustViewModel.zeroTrustModeActive
+        }
+        function onRequirePublisherSignedChanged() {
+            root.requirePublisherSigned = zeroTrustViewModel.requirePublisherSigned
+        }
+        function onRequireWhitelistChanged() {
+            root.requireWhitelist = zeroTrustViewModel.requireWhitelist
+        }
+        function onMinReputationChanged() {
+            root.minReputation = zeroTrustViewModel.minReputation
+        }
+        function onMinStaticBenignChanged() {
+            root.minStaticBenign = zeroTrustViewModel.minStaticBenign
+        }
+        function onUncertainBehaviorChanged() {
+            root.uncertainBehavior = zeroTrustViewModel.uncertainBehavior
+        }
         function onPromptsChanged() {
-            root.pendingPrompts = zeroTrustViewModel.prompts ?? []
+            root.syncPromptsFromVm()
         }
     }
 
@@ -151,9 +180,6 @@ PageHost {
                         Accessible.role:        Accessible.Slider
                         Accessible.name:        qsTr("Trust threshold")
                         Accessible.description: qsTr("Use Up/Down to adjust by 0.01, Page Up/Down to adjust by 0.10")
-                        Accessible.minimumValue: 0
-                        Accessible.maximumValue: 100
-                        Accessible.currentValue: Math.round(root.threshold * 100)
                     }
 
                     // Threshold readout
@@ -369,9 +395,6 @@ PageHost {
                             activeFocusOnTab: true
                             Accessible.role:         Accessible.Slider
                             Accessible.name:         qsTr("Minimum reputation score")
-                            Accessible.minimumValue: 0
-                            Accessible.maximumValue: 100
-                            Accessible.currentValue: Math.round(root.minReputation * 100)
                         }
                     }
 
@@ -459,9 +482,6 @@ PageHost {
                             activeFocusOnTab: true
                             Accessible.role:         Accessible.Slider
                             Accessible.name:         qsTr("Minimum static benign score")
-                            Accessible.minimumValue: 0
-                            Accessible.maximumValue: 100
-                            Accessible.currentValue: Math.round(root.minStaticBenign * 100)
                         }
                     }
                 }

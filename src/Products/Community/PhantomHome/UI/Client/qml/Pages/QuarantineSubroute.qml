@@ -14,7 +14,7 @@
  *
  * Context properties consumed (gated):
  *   quarantineModel — QuarantineModel*
- *     roles: Id, Name, Path, Threat, Size, QuarantinedAt, Source
+ *     roles: itemId, name, path, threat, size, quarantinedAt, source
  *     Q_INVOKABLEs: refresh(), restore(id), deletePermanently(id), deleteAll()
  *     signals: actionCompleted(id, action), requestError(code, message)
  */
@@ -180,7 +180,7 @@ PageHost {
                     width:  quarantineList.width
                     height: rowContent.implicitHeight + 1   // +1 for divider
 
-                    required property string id
+                    required property string itemId
                     required property string name
                     required property string path
                     required property string threat
@@ -188,7 +188,7 @@ PageHost {
                     required property var    quarantinedAt
                     required property int    index
 
-                    readonly property bool _selected: root._isSelected(qRow.id)
+                    readonly property bool _selected: root._isSelected(qRow.itemId)
 
                     // Row background — highlights on hover or selection
                     Rectangle {
@@ -294,7 +294,7 @@ PageHost {
                             height: 30
                             onClicked: {
                                 if (typeof quarantineModel !== "undefined")
-                                    quarantineModel.restore(qRow.id)
+                                    quarantineModel.restore(qRow.itemId)
                             }
                         }
 
@@ -304,7 +304,7 @@ PageHost {
                             onClicked:  {
                                 // Use confirmation modal for single item deletion
                                 root._confirmAction = "deleteSingle"
-                                root._pendingDeleteId = qRow.id
+                                root._pendingDeleteId = qRow.itemId
                             }
                         }
                     }
@@ -328,19 +328,19 @@ PageHost {
 
                         onClicked: (mouse) => {
                             if (mouse.modifiers & Qt.ControlModifier || root._selectedCount > 0) {
-                                root._toggleSelect(qRow.id)
+                                root._toggleSelect(qRow.itemId)
                                 mouse.accepted = true
                             } else {
                                 mouse.accepted = false
                             }
                         }
                         onPressAndHold: {
-                            root._toggleSelect(qRow.id)
+                            root._toggleSelect(qRow.itemId)
                         }
                     }
 
                     activeFocusOnTab: true
-                    Keys.onSpacePressed: root._toggleSelect(qRow.id)
+                    Keys.onSpacePressed: root._toggleSelect(qRow.itemId)
 
                     FocusRing { target: qRow }
 

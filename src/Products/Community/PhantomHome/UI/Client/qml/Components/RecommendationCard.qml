@@ -6,7 +6,6 @@ import ShadowStrike.Accessibility
 Item {
     id: root
 
-    required property string id
     required property string title
     required property string detail
     required property string severity    // "info"|"warn"|"crit"

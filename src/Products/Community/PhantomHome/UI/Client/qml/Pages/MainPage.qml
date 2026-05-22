@@ -6,7 +6,7 @@
  *
  * Sections (top → bottom):
  *   1. Hero card     — HeroShield + HeadlineTicker + 3 status chips
- *   2. Fast Scan     — FastScanTile wired to scanViewModel + scan progress bar
+ *   2. Scans         — FastScanTile + full/custom scan actions wired to scanViewModel
  *   3. Recommendations — RecommendationCard list (gates on VM availability)
  *   4. Latest threats  — ThreatRow list (top 8 from reportsModel)
  *
@@ -29,6 +29,8 @@ import ShadowStrike.Accessibility
 
 PageHost {
     id: root
+
+    property string _customScanPath: ""
 
     Connections {
         target: (typeof recommendationsViewModel !== "undefined" &&
@@ -81,6 +83,10 @@ PageHost {
         if (st === 5)             return "critical"
         if (st === 4)             return "on"
         return "off"
+    }
+
+    function scanIsActive(st) {
+        return st === 1 || st === 2 || st === 3
     }
 
     /// ProtectionViewModel.globalMode → StatusChip state.
@@ -255,7 +261,7 @@ PageHost {
                         height:  4
                         radius:  2
                         visible: (typeof scanViewModel !== "undefined") &&
-                                 (scanViewModel.state === 1 || scanViewModel.state === 2)
+                                 root.scanIsActive(scanViewModel.state)
                         color:   Theme.strokeSubtle
 
                         Rectangle {
@@ -274,6 +280,83 @@ PageHost {
                                 enabled: !(typeof perfBudget !== "undefined" &&
                                            perfBudget !== null && perfBudget.animationsPaused)
                                 NumberAnimation { duration: Theme.motionBase; easing.type: Theme.easingType }
+                            }
+                        }
+                    }
+
+                    Column {
+                        width:   parent.width
+                        spacing: Theme.spacingXS
+                        visible: (typeof scanViewModel !== "undefined") &&
+                                 root.scanIsActive(scanViewModel.state)
+
+                        Text {
+                            text:           qsTr("%1 item(s) scanned, %2 threat(s) found")
+                                            .arg(scanViewModel.itemsScanned)
+                                            .arg(scanViewModel.threatsFound)
+                            color:          Theme.textMuted
+                            font.family:    Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeLabel
+                        }
+
+                        Text {
+                            visible:        scanViewModel.currentPath.length > 0
+                            text:           qsTr("Current: %1").arg(scanViewModel.currentPath)
+                            color:          Theme.textMuted
+                            font.family:    Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeMicro
+                            elide:          Text.ElideMiddle
+                            width:          parent.width
+                        }
+                    }
+
+                    Row {
+                        spacing: Theme.spacingS
+
+                        GhostButton {
+                            id:      fullScanButton
+                            text:    qsTr("Full Scan")
+                            enabled: typeof scanViewModel !== "undefined" &&
+                                     !root.scanIsActive(scanViewModel.state)
+                            onClicked: {
+                                if (typeof scanViewModel !== "undefined")
+                                    scanViewModel.startFullScan()
+                            }
+                        }
+
+                        TextField {
+                            id:              customScanPathField
+                            width:           Math.max(220, scanTile.width - fullScanButton.implicitWidth -
+                                                      customScanButton.implicitWidth - Theme.spacingS * 3)
+                            height:          32
+                            placeholderText: qsTr("Custom scan path")
+                            text:            root._customScanPath
+                            enabled:         typeof scanViewModel !== "undefined" &&
+                                             !root.scanIsActive(scanViewModel.state)
+                            selectByMouse:   true
+                            onTextChanged:   root._customScanPath = text
+
+                            background: Rectangle {
+                                radius:       Theme.radiusMedium
+                                color:        Theme.bgSurface
+                                border.color: customScanPathField.activeFocus
+                                              ? Theme.accentCyan : Theme.strokeSubtle
+                                border.width: customScanPathField.activeFocus ? 2 : 1
+                            }
+                        }
+
+                        GhostButton {
+                            id:      customScanButton
+                            text:    qsTr("Custom Scan")
+                            enabled: typeof scanViewModel !== "undefined" &&
+                                     !root.scanIsActive(scanViewModel.state) &&
+                                     root._customScanPath.trim().length > 0
+                            onClicked: {
+                                if (typeof scanViewModel !== "undefined") {
+                                    var path = root._customScanPath.trim()
+                                    if (path.length > 0)
+                                        scanViewModel.startCustomScan([path])
+                                }
                             }
                         }
                     }
@@ -425,7 +508,7 @@ PageHost {
                             required property string type
 
                             visible:         index < 8
-                            height:          visible ? (item ? item.implicitHeight : 56) : 0
+                            height:          visible ? (implicitHeight > 0 ? implicitHeight : 56) : 0
                             sourceComponent: index < 8 ? latestRowComp : null
 
                             Component {

@@ -14,8 +14,9 @@
  *   pgtiViewModel — exposes:
  *     feeds      — model with roles: feedId, displayName, health, lastSuccessTs,
  *                  latencyMs, entryCount, enabled
- *     refreshAll()      Q_INVOKABLE
- *     refreshFeed(id)   Q_INVOKABLE
+ *     refreshAll()              Q_INVOKABLE
+ *     refreshFeed(id)           Q_INVOKABLE
+ *     setFeedEnabled(id, bool)  Q_INVOKABLE
  *     loading           bool property
  */
 
@@ -59,6 +60,14 @@ PageHost {
     property string _selectedFeedId: ""
     property bool   _refreshAllBusy: false
 
+    function _feedCount() {
+        if (typeof pgtiViewModel === "undefined" || pgtiViewModel === null ||
+            pgtiViewModel.feeds === null) {
+            return 0
+        }
+        return pgtiViewModel.feeds.rowCount()
+    }
+
     // -------------------------------------------------------------------------
     // Layout
     // -------------------------------------------------------------------------
@@ -79,12 +88,17 @@ PageHost {
 
             PrimaryButton {
                 text:      qsTr("Refresh all")
-                busy:      root._refreshAllBusy
+                busy:      root._refreshAllBusy ||
+                           (typeof pgtiViewModel !== "undefined" &&
+                            pgtiViewModel !== null &&
+                            pgtiViewModel.loading)
+                enabled:   typeof pgtiViewModel !== "undefined" &&
+                           pgtiViewModel !== null &&
+                           !root._refreshAllBusy &&
+                           !pgtiViewModel.loading
                 onClicked: {
-                    if (typeof pgtiViewModel !== "undefined") {
-                        root._refreshAllBusy = true
-                        pgtiViewModel.refreshAll()
-                    }
+                    root._refreshAllBusy = true
+                    pgtiViewModel.refreshAll()
                 }
             }
         }
@@ -107,8 +121,7 @@ PageHost {
                     width: parent.width - Theme.spacingL * 2
                     subtitle: {
                         if (typeof pgtiViewModel === "undefined") return qsTr("Intelligence service unavailable")
-                        var cnt = (pgtiViewModel.feeds !== null) ? pgtiViewModel.feeds.rowCount() : 0
-                        return qsTr("%1 feed(s) configured").arg(cnt)
+                        return qsTr("%1 feed(s) configured").arg(root._feedCount())
                     }
                 }
 
@@ -119,7 +132,7 @@ PageHost {
                     sourceComponent: {
                         if (typeof pgtiViewModel === "undefined" || pgtiViewModel === null)
                             return pgtiUnavailableComp
-                        if (pgtiViewModel.feeds === null || pgtiViewModel.feeds.rowCount() === 0)
+                        if (root._feedCount() === 0)
                             return pgtiEmptyComp
                         return pgtiListComp
                     }
@@ -247,16 +260,14 @@ PageHost {
                     width: parent.width - Theme.spacingL * 2
                     visible: typeof pgtiViewModel !== "undefined" &&
                              pgtiViewModel !== null &&
-                             pgtiViewModel.feeds !== null &&
-                             pgtiViewModel.feeds.rowCount() > 0
+                             root._feedCount() > 0
                 }
 
                 Card {
                     width:   parent.width - Theme.spacingL * 2
                     visible: typeof pgtiViewModel !== "undefined" &&
                              pgtiViewModel !== null &&
-                             pgtiViewModel.feeds !== null &&
-                             pgtiViewModel.feeds.rowCount() > 0
+                             root._feedCount() > 0
 
                     Row {
                         width:   parent.width
@@ -266,18 +277,10 @@ PageHost {
                             id:      feedSelector
                             width:   parent.width - refreshSingleBtn.implicitWidth - parent.spacing
                             height:  36
-                            model:   {
-                                if (typeof pgtiViewModel === "undefined" || pgtiViewModel.feeds === null)
-                                    return []
-                                var ids = []
-                                var feeds = pgtiViewModel.feeds
-                                for (var i = 0; i < feeds.rowCount(); i++) {
-                                    var dn = feeds.data(feeds.index(i, 0), Qt.UserRole + 2) ?? ""
-                                    var fi = feeds.data(feeds.index(i, 0), Qt.UserRole + 1) ?? ""
-                                    ids.push(dn.length > 0 ? dn : fi)
-                                }
-                                return ids
-                            }
+                            model:   (typeof pgtiViewModel !== "undefined" && pgtiViewModel !== null)
+                                     ? pgtiViewModel.feeds : null
+                            textRole:  "displayName"
+                            valueRole: "feedId"
 
                             background: Rectangle {
                                 radius:       Theme.radiusMedium
@@ -294,12 +297,11 @@ PageHost {
                                 verticalAlignment: Text.AlignVCenter
                             }
 
-                            onCurrentIndexChanged: {
-                                if (typeof pgtiViewModel === "undefined" || pgtiViewModel.feeds === null) return
-                                var feeds = pgtiViewModel.feeds
-                                if (currentIndex >= 0 && currentIndex < feeds.rowCount()) {
-                                    root._selectedFeedId = feeds.data(feeds.index(currentIndex, 0), Qt.UserRole + 1) ?? ""
-                                }
+                            onCurrentValueChanged: {
+                                root._selectedFeedId = currentValue ? String(currentValue) : ""
+                            }
+                            Component.onCompleted: {
+                                root._selectedFeedId = currentValue ? String(currentValue) : ""
                             }
                         }
 

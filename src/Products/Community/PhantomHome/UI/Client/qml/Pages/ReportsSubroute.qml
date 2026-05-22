@@ -22,6 +22,7 @@
 
 import QtQuick
 import QtQuick.Controls.Basic
+import QtCore
 import ShadowStrike.Theming
 import ShadowStrike.Components
 import ShadowStrike.Accessibility
@@ -66,12 +67,23 @@ PageHost {
     }
 
     function _buildExportPath() {
-        // Attempt a platform-appropriate path.  The C++ side validates the URL
-        // and falls back to a safe location if this path is not writable.
-        var base = "shadowstrike-reports-" +
-                   Qt.formatDateTime(new Date(), "yyyyMMdd-HHmmss") + ".csv"
-        // Use a relative path; C++ resolves this against the application writable dir.
-        return Qt.resolvedUrl(base)
+        var fileName = "shadowstrike-reports-" +
+                       Qt.formatDateTime(new Date(), "yyyyMMdd-HHmmss") + ".csv"
+        var directory = String(StandardPaths.writableLocation(StandardPaths.DocumentsLocation))
+        if (!directory || directory.length === 0)
+            directory = String(StandardPaths.writableLocation(StandardPaths.AppDataLocation))
+        if (!directory || directory.length === 0)
+            return ""
+
+        var normalized = directory.replace(/\\/g, "/")
+        if (normalized.indexOf("file:///") !== 0) {
+            if (normalized.charAt(0) === "/" && normalized.charAt(2) === ":")
+                normalized = normalized.substring(1)
+            normalized = "file:///" + normalized
+        }
+        if (normalized.charAt(normalized.length - 1) !== "/")
+            normalized += "/"
+        return Qt.resolvedUrl(normalized + fileName)
     }
 
     // -------------------------------------------------------------------------
@@ -118,8 +130,11 @@ PageHost {
                          !root._exportBusy
                 onClicked: {
                     if (typeof reportsModel === "undefined") return
+                    var destination = root._buildExportPath()
+                    if (!destination || String(destination).length === 0)
+                        return
                     root._exportBusy = true
-                    reportsModel.exportCsv(root._buildExportPath())
+                    reportsModel.exportCsv(destination)
                 }
             }
         }
