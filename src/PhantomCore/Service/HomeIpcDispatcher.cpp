@@ -1497,6 +1497,22 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         SS_LOG_INFO(kLogCat, L"GetZeroTrustState clientId=%llu", clientId);
 
         const ZeroTrustConfig cfg = ZeroTrustGuard::Instance().GetConfig();
+        nlohmann::json prompts = nlohmann::json::array();
+        for (const auto& prompt : ZeroTrustPromptQueue::Instance().Snapshot()) {
+            const std::string path = WideToNarrow(prompt.imagePath);
+            std::string fileName = path;
+            const std::size_t slash = fileName.find_last_of("\\/");
+            if (slash != std::string::npos && slash + 1u < fileName.size()) {
+                fileName = fileName.substr(slash + 1u);
+            }
+            prompts.push_back({
+                {"promptId",   std::to_string(prompt.id)},
+                {"filePath",   path},
+                {"fileName",   fileName},
+                {"publisher",  WideToNarrow(prompt.publisherSubject)},
+                {"trustScore", prompt.score}
+            });
+        }
         nlohmann::json resp{
             {"ok",                     true},
             {"threshold",              cfg.threshold},
@@ -1506,7 +1522,8 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             {"minReputation",          cfg.minReputation},
             {"minStaticBenign",        cfg.minStaticBenign},
             {"uncertainBehavior",      static_cast<int>(cfg.uncertainBehavior)},
-            {"zeroTrustMode",          cfg.zeroTrustMode}
+            {"zeroTrustMode",          cfg.zeroTrustMode},
+            {"prompts",                std::move(prompts)}
         };
         svc.SendResponseEnvelope(clientId, CommandType::GetZeroTrustState, requestId,
             resp.dump());
@@ -1576,7 +1593,26 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         auto j = ParseOrReject(clientId, requestId, CommandType::AnswerZeroTrustPrompt, raw);
         if (j.is_discarded()) return;
 
-        const auto id     = Field<std::uint64_t>(j, "id");
+        const auto ParsePromptId = [&j]() -> std::optional<std::uint64_t> {
+            if (const auto numericId = Field<std::uint64_t>(j, "id")) {
+                return numericId;
+            }
+            if (const auto stringId = Field<std::string>(j, "id")) {
+                if (stringId->empty()) {
+                    return std::nullopt;
+                }
+                std::uint64_t parsedId = 0;
+                const char* const first = stringId->data();
+                const char* const last = first + stringId->size();
+                const auto [ptr, ec] = std::from_chars(first, last, parsedId);
+                if (ec == std::errc{} && ptr == last) {
+                    return parsedId;
+                }
+            }
+            return std::nullopt;
+        };
+
+        const auto id     = ParsePromptId();
         const auto choice = Field<std::string>(j, "choice");
         if (!id || !choice) {
             svc.SendResponseEnvelope(clientId, CommandType::AnswerZeroTrustPrompt, requestId,

@@ -33,7 +33,7 @@ PageHost {
     property real  minStaticBenign:        0.70
     // Uncertain behavior: 0=SilentAllow, 1=Prompt, 2=SilentBlock
     property int   uncertainBehavior:      1
-    // Pending prompts list (populated from zeroTrustPromptQueueModel if exposed)
+    // Pending prompts list (populated from zeroTrustViewModel.prompts)
     property var   pendingPrompts:         []
     // Recent decisions list
     property var   recentDecisions:        []
@@ -52,8 +52,8 @@ PageHost {
             root.minStaticBenign        = zeroTrustViewModel.minStaticBenign        ?? 0.70;
             root.uncertainBehavior      = zeroTrustViewModel.uncertainBehavior      ?? 1;
         }
-        if (typeof zeroTrustPromptQueueModel !== 'undefined') {
-            root.pendingPrompts = zeroTrustPromptQueueModel;
+        if (typeof zeroTrustViewModel !== 'undefined') {
+            root.pendingPrompts = zeroTrustViewModel.prompts ?? [];
         }
     }
 
@@ -63,6 +63,13 @@ PageHost {
     function vmSet(prop, val) {
         if (typeof zeroTrustViewModel !== 'undefined') {
             zeroTrustViewModel[prop] = val;
+        }
+    }
+
+    Connections {
+        target: (typeof zeroTrustViewModel !== 'undefined') ? zeroTrustViewModel : null
+        function onPromptsChanged() {
+            root.pendingPrompts = zeroTrustViewModel.prompts ?? []
         }
     }
 
@@ -673,10 +680,6 @@ PageHost {
                         }
 
                         Row {
-                            text:       modelData.trustScore !== undefined
-                                        ? qsTr("Trust score: %1").arg(Number(modelData.trustScore).toFixed(3))
-                                        : ""
-                            // Use Text directly:
                             Text {
                                 text:           modelData.trustScore !== undefined
                                                 ? qsTr("Trust score: %1").arg(Number(modelData.trustScore).toFixed(3))
