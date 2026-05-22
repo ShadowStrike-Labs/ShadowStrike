@@ -44,6 +44,20 @@ PageHost {
     property bool   _advancedExpanded: false
     property bool   _pauseMenuOpen:    false
 
+    readonly property bool _serviceConnected:
+        (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient.connected : false
+    readonly property int _serviceState:
+        (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient.state : 0
+    readonly property var _moduleGroups: [
+        { category: 0, title: qsTr("Realtime protection"), detail: qsTr("File, process, and memory shields") },
+        { category: 1, title: qsTr("Behavioral protection"), detail: qsTr("Zero Trust and runtime behavior sensors") },
+        { category: 2, title: qsTr("Network protection"), detail: qsTr("Web, firewall, and lateral-movement controls") },
+        { category: 3, title: qsTr("Privacy protection"), detail: qsTr("Camera, microphone, location, and browser privacy sensors") },
+        { category: 4, title: qsTr("Performance guardrails"), detail: qsTr("Endpoint impact, scan cadence, and battery-aware controls") },
+        { category: 5, title: qsTr("Threat intelligence"), detail: qsTr("PGTI feeds, reputation, and IOC enrichment") },
+        { category: 6, title: qsTr("Additional modules"), detail: qsTr("Other service-reported protection modules") }
+    ]
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
@@ -80,10 +94,74 @@ PageHost {
         return (uiMode >= 0 && uiMode <= 3) ? uiMode : 0
     }
 
+    function _serviceStateLabel(state) {
+        switch (state) {
+        case 1:  return qsTr("Connecting")
+        case 2:  return qsTr("Authenticating")
+        case 3:  return qsTr("Connected")
+        case 4:  return qsTr("Reconnecting")
+        case 5:  return qsTr("Authentication failed")
+        default: return qsTr("Offline")
+        }
+    }
+
     /// Read-only model role accessor (convenience wrapper).
     function _role(row, offset) {
         if (root._modulesModel === null) return undefined
         return root._modulesModel.data(root._modulesModel.index(row, 0), Qt.UserRole + offset)
+    }
+
+    function _moduleCount() {
+        return root._modulesModel === null ? 0 : root._modulesModel.rowCount()
+    }
+
+    function _categoryMatches(moduleCategory, groupCategory) {
+        if (groupCategory === 6)
+            return moduleCategory < 0 || moduleCategory > 5
+        return moduleCategory === groupCategory
+    }
+
+    function _moduleCountByCategory(groupCategory) {
+        if (root._modulesModel === null) return 0
+        var total = 0
+        for (var i = 0; i < root._modulesModel.rowCount(); ++i) {
+            var category = root._role(i, 4) ?? -1
+            if (root._categoryMatches(category, groupCategory))
+                total++
+        }
+        return total
+    }
+
+    function _moduleIssuesByCategory(groupCategory) {
+        if (root._modulesModel === null) return 0
+        var total = 0
+        for (var i = 0; i < root._modulesModel.rowCount(); ++i) {
+            var category = root._role(i, 4) ?? -1
+            var health = root._role(i, 8) ?? -1
+            if (root._categoryMatches(category, groupCategory) && (health === 1 || health === 2))
+                total++
+        }
+        return total
+    }
+
+    function _groupState(groupCategory) {
+        if (!root._serviceConnected) return "offline"
+        var issues = root._moduleIssuesByCategory(groupCategory)
+        if (issues > 0) return "warning"
+        return root._moduleCountByCategory(groupCategory) > 0 ? "on" : "loading"
+    }
+
+
+    Connections {
+        target: (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient : null
+        function onStateChanged() {
+            if (!root._serviceConnected)
+                return
+            if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null)
+                protectionViewModel.refresh()
+            if (root._modulesModel !== null)
+                root._modulesModel.refresh()
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -167,15 +245,61 @@ PageHost {
                             font.weight:    Theme.fontWeightMedium
                         }
 
+                        Flow {
+                            width:   parent.width
+                            spacing: Theme.spacingS
+
+                            StatusChip {
+                                state: root._serviceConnected ? "on" : "offline"
+                                label: qsTr("Service: %1").arg(root._serviceStateLabel(root._serviceState))
+                            }
+
+                            StatusChip {
+                                state: {
+                                    if (!root._serviceConnected) return "offline"
+                                    if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+                                        return "loading"
+                                    if (protectionViewModel.protectionPaused)
+                                        return "paused"
+                                    return protectionViewModel.globalMode === 0 ? "off" : "on"
+                                }
+                                label: qsTr("Global mode: %1").arg(
+                                           (root._serviceConnected && typeof protectionViewModel !== "undefined" &&
+                                            protectionViewModel !== null)
+                                           ? root._vmModeToUiMode(protectionViewModel.globalMode) === 0 ? qsTr("Off") :
+                                             root._vmModeToUiMode(protectionViewModel.globalMode) === 1 ? qsTr("Passive") :
+                                             root._vmModeToUiMode(protectionViewModel.globalMode) === 2 ? qsTr("Balanced") : qsTr("Aggressive")
+                                           : qsTr("Unavailable"))
+                            }
+
+                            StatusChip {
+                                state: {
+                                    if (!root._serviceConnected) return "offline"
+                                    if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+                                        return "loading"
+                                    return protectionViewModel.criticalCount > 0 ? "critical" :
+                                           (protectionViewModel.atRiskCount > 0 ? "warning" : "on")
+                                }
+                                label: qsTr("Open alerts: %1").arg(
+                                           (typeof protectionViewModel !== "undefined" && protectionViewModel !== null)
+                                           ? protectionViewModel.criticalCount + protectionViewModel.atRiskCount : 0)
+                            }
+                        }
+
                         // Global mode pill row
                         // Off=bit0, Passive=bit1, Balanced=bit2, Aggressive=bit3.
                         ModePillRow {
                             id:                 globalModePills
                             supportedModesMask: 0b1111
-                            currentMode:        (typeof protectionViewModel !== "undefined")
+                            currentMode:        (root._serviceConnected && typeof protectionViewModel !== "undefined" &&
+                                                protectionViewModel !== null)
                                                 ? root._vmModeToUiMode(protectionViewModel.globalMode) : 0
+                            enabled:            root._serviceConnected && typeof protectionViewModel !== "undefined" &&
+                                                protectionViewModel !== null
+                            opacity:            enabled ? 1.0 : 0.55
                             onModeChosen: (m) => {
-                                if (typeof protectionViewModel !== "undefined")
+                                if (root._serviceConnected && typeof protectionViewModel !== "undefined" &&
+                                    protectionViewModel !== null)
                                     protectionViewModel.setGlobalMode(root._uiModeToVmMode(m))
                             }
                         }
@@ -184,8 +308,8 @@ PageHost {
                         Item {
                             width:  parent.width
                             height: pauseRow.implicitHeight
-                            visible: (typeof protectionViewModel !== "undefined") &&
-                                     protectionViewModel.globalMode > 0
+                            visible: root._serviceConnected && typeof protectionViewModel !== "undefined" &&
+                                     protectionViewModel !== null && protectionViewModel.globalMode > 0
 
                             Row {
                                 id:      pauseRow
@@ -284,109 +408,177 @@ PageHost {
                 }
 
                 // -------------------------------------------------------------
-                // Priority module cards — categories 0/1/2 (top 5 only)
+                // Grouped module cards — live service-reported protection state
                 // -------------------------------------------------------------
                 SectionTitle {
-                    text:  qsTr("Core protection")
+                    text:  qsTr("Protection modules")
                     width: parent.width - Theme.spacingL * 2
+                    subtitle: root._serviceConnected
+                              ? qsTr("%1 module(s) reporting live state").arg(root._moduleCount())
+                              : qsTr("Waiting for the ShadowStrike service connection")
                 }
 
-                Flow {
-                    id:      priorityFlow
-                    width:   parent.width - Theme.spacingL * 2
-                    spacing: Theme.spacingM
-
-                    Repeater {
-                        id:    priorityRepeater
-                        model: {
-                            if (root._modulesModel === null) return 0
-                            var total = root._modulesModel.rowCount()
-                            var shown = 0
-                            for (var i = 0; i < total && shown < 5; i++) {
-                                var cat = root._role(i, 4)   // CategoryRole
-                                if (cat !== undefined && cat <= 2) shown++
-                            }
-                            return shown
-                        }
-
-                        delegate: Item {
-                            id:    prioritySlot
-                            required property int index
-
-                            // Locate the i-th module in categories 0/1/2
-                            readonly property int _row: {
-                                if (root._modulesModel === null) return -1
-                                var total = root._modulesModel.rowCount()
-                                var count = 0
-                                for (var i = 0; i < total; i++) {
-                                    var cat = root._role(i, 4)
-                                    if (cat !== undefined && cat <= 2) {
-                                        if (count === prioritySlot.index) return i
-                                        count++
-                                    }
-                                }
-                                return -1
-                            }
-
-                            width:  _row >= 0
-                                    ? Math.max(260, Math.floor(
-                                          (priorityFlow.width - Theme.spacingM) / 2))
-                                    : 0
-                            height: _row >= 0 ? priorityCard.implicitHeight : 0
-                            visible: _row >= 0
-
-                            ModuleCard {
-                                id:                 priorityCard
-                                width:              parent.width
-
-                                moduleName:         root._role(prioritySlot._row, 1)  ?? ""
-                                displayName:        root._role(prioritySlot._row, 2)  ?? qsTr("Module")
-                                iconSource:         "qrc:/icons/" + (root._role(prioritySlot._row, 3) ?? "Shield") + ".svg"
-                                currentMode:        root._role(prioritySlot._row, 5)  ?? 0
-                                supportedModesMask: root._role(prioritySlot._row, 6)  ?? 0b1111
-                                // detailPage from role +7; statusHealth from +8; statusDetail from +9; binary from +10
-                                state:              root._healthToState(root._role(prioritySlot._row, 8) ?? -1)
-                                enabled:            (root._role(prioritySlot._row, 5) ?? 0) > 0
-                                description:        root._role(prioritySlot._row, 9) ?? ""
-
-                                onToggled: (v) => {
-                                    var mid = root._role(prioritySlot._row, 1) ?? ""
-                                    if (root._modulesModel !== null && mid.length > 0)
-                                        root._modulesModel.toggleBinaryModule(mid, v)
-                                }
-                                onModeChosen: (m) => {
-                                    var mid = root._role(prioritySlot._row, 1) ?? ""
-                                    if (root._modulesModel !== null && mid.length > 0)
-                                        root._modulesModel.setModuleMode(mid, m)
-                                }
-                                onOpenDetail: {
-                                    var dp  = root._role(prioritySlot._row, 7) ?? ""
-                                    var cat = root._role(prioritySlot._row, 4) ?? -1
-                                    if (typeof stack === "undefined") return
-                                    if (dp.length > 0) {
-                                        Qt.callLater(stack.push, "qrc:/qml/Pages/" + dp)
-                                    } else if (cat === 1) {
-                                        // BehavioralSecurity category → ZeroTrust detail
-                                        Qt.callLater(stack.push, "qrc:/qml/Pages/ZeroTrustDetailPage.qml")
-                                    }
-                                }
-                            }
-                        }
+                Loader {
+                    width: parent.width - Theme.spacingL * 2
+                    sourceComponent: {
+                        if (!root._serviceConnected || root._modulesModel === null)
+                            return modulesOfflineComp
+                        if (root._moduleCount() === 0)
+                            return modulesLoadingComp
+                        return groupedModulesComp
                     }
+                }
 
-                    // Empty state when no priority modules are found
-                    Loader {
-                        width: priorityFlow.width
-                        sourceComponent: (priorityRepeater.count === 0 &&
-                                          root._modulesModel !== null)
-                                         ? priorityEmptyComp : null
-                        Component {
-                            id: priorityEmptyComp
-                            EmptyState {
-                                width:   parent ? parent.width : 400
-                                height:  80
-                                title:   qsTr("No modules available")
-                                message: qsTr("Protection modules will appear here once loaded.")
+                Component {
+                    id: modulesOfflineComp
+                    EmptyState {
+                        width:   parent ? parent.width : 400
+                        height:  112
+                        variant: "offline"
+                        title:   qsTr("Protection service unavailable")
+                        message: qsTr("Global and per-module controls will become active when ShadowStrike service reconnects.")
+                    }
+                }
+
+                Component {
+                    id: modulesLoadingComp
+                    EmptyState {
+                        width:   parent ? parent.width : 400
+                        height:  112
+                        variant: "loading"
+                        title:   qsTr("Loading protection modules")
+                        message: qsTr("Waiting for sensor health and module mode state from the service.")
+                    }
+                }
+
+                Component {
+                    id: groupedModulesComp
+                    Column {
+                        width:   parent ? parent.width : 400
+                        spacing: Theme.spacingM
+
+                        Repeater {
+                            model: root._moduleGroups
+                            delegate: Column {
+                                id: groupDelegate
+                                required property var modelData
+
+                                readonly property int groupCount: root._moduleCountByCategory(modelData.category)
+                                readonly property int issueCount: root._moduleIssuesByCategory(modelData.category)
+
+                                width:   parent.width
+                                spacing: Theme.spacingS
+                                visible: groupCount > 0
+                                height:  visible ? implicitHeight : 0
+
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.spacingS
+
+                                    Column {
+                                        width: parent.width - groupStatus.width - parent.spacing
+                                        spacing: Theme.spacingXS
+
+                                        Text {
+                                            width: parent.width
+                                            text:  groupDelegate.modelData.title
+                                            color: Theme.textPrimary
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSizeTitle
+                                            font.weight: Theme.fontWeightBold
+                                            elide: Text.ElideRight
+                                        }
+
+                                        Text {
+                                            width: parent.width
+                                            text:  groupDelegate.modelData.detail
+                                            color: Theme.textSecondary
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSizeLabel
+                                            wrapMode: Text.WordWrap
+                                            maximumLineCount: 2
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+
+                                    StatusChip {
+                                        id: groupStatus
+                                        state: root._groupState(groupDelegate.modelData.category)
+                                        label: groupDelegate.issueCount > 0
+                                               ? qsTr("%1 issue(s)").arg(groupDelegate.issueCount)
+                                               : qsTr("%1 module(s)").arg(groupDelegate.groupCount)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                }
+
+                                Flow {
+                                    width:   parent.width
+                                    spacing: Theme.spacingM
+
+                                    Repeater {
+                                        model: root._modulesModel
+                                        delegate: Item {
+                                            id: moduleSlot
+                                            required property int    index
+                                            required property string displayName
+                                            required property int    category
+                                            required property int    currentMode
+                                            required property int    supportedModesMask
+                                            required property int    statusHealth
+                                            required property string statusDetail
+                                            required property string detailPage
+                                            required property string iconId
+
+                                            readonly property bool _matchesGroup:
+                                                root._categoryMatches(category, groupDelegate.modelData.category)
+                                            readonly property string _moduleId: root._role(index, 1) ?? ""
+                                            readonly property int _colWidth: {
+                                                if (parent.width >= 900)
+                                                    return Math.floor((parent.width - Theme.spacingM * 2) / 3)
+                                                if (parent.width >= 580)
+                                                    return Math.floor((parent.width - Theme.spacingM) / 2)
+                                                return parent.width
+                                            }
+
+                                            width:   _matchesGroup ? _colWidth : 0
+                                            height:  _matchesGroup ? moduleCard.implicitHeight : 0
+                                            visible: _matchesGroup
+
+                                            ModuleCard {
+                                                id:                 moduleCard
+                                                width:              parent.width
+                                                moduleName:         moduleSlot._moduleId
+                                                displayName:        moduleSlot.displayName
+                                                iconSource:         "qrc:/icons/" + moduleSlot.iconId + ".svg"
+                                                state:              root._healthToState(moduleSlot.statusHealth)
+                                                enabled:            moduleSlot.currentMode > 0
+                                                currentMode:        moduleSlot.currentMode
+                                                supportedModesMask: moduleSlot.supportedModesMask
+                                                description:        moduleSlot.statusDetail
+
+                                                onToggled: (v) => {
+                                                    if (root._serviceConnected && root._modulesModel !== null &&
+                                                        moduleSlot._moduleId.length > 0)
+                                                        root._modulesModel.toggleBinaryModule(moduleSlot._moduleId, v)
+                                                }
+                                                onModeChosen: (m) => {
+                                                    if (root._serviceConnected && root._modulesModel !== null &&
+                                                        moduleSlot._moduleId.length > 0)
+                                                        root._modulesModel.setModuleMode(moduleSlot._moduleId, m)
+                                                }
+                                                onOpenDetail: {
+                                                    if (typeof stack === "undefined") return
+                                                    if (moduleSlot.detailPage.length > 0)
+                                                        Qt.callLater(stack.push, "qrc:/qml/Pages/" + moduleSlot.detailPage)
+                                                    else if (moduleSlot.category === 1)
+                                                        Qt.callLater(stack.push, "qrc:/qml/Pages/ZeroTrustDetailPage.qml")
+                                                    else if (moduleSlot.category === 5)
+                                                        Qt.callLater(stack.push, "qrc:/qml/Pages/PgtiDetailPage.qml")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -404,7 +596,7 @@ PageHost {
                         spacing: Theme.spacingS
 
                         Text {
-                            text:           qsTr("Advanced")
+                            text:           qsTr("Search all modules")
                             color:          Theme.textPrimary
                             font.family:    Theme.fontFamily
                             font.pixelSize: Theme.fontSizeTitle

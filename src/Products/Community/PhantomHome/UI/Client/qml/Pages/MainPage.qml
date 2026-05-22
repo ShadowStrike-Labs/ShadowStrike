@@ -32,6 +32,28 @@ PageHost {
 
     property string _customScanPath: ""
 
+    readonly property bool _serviceConnected:
+        (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient.connected : false
+    readonly property int _serviceState:
+        (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient.state : 0
+    readonly property var _modulesModel: {
+        if (typeof modulesListModel !== "undefined" && modulesListModel !== null)
+            return modulesListModel
+        if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null &&
+            typeof protectionViewModel.modules !== "undefined")
+            return protectionViewModel.modules
+        return null
+    }
+    readonly property var _moduleGroups: [
+        { category: 0, title: qsTr("Realtime"), detail: qsTr("File, process, and memory shields") },
+        { category: 1, title: qsTr("Behavioral"), detail: qsTr("Zero Trust and runtime behavior") },
+        { category: 2, title: qsTr("Network"), detail: qsTr("Web, firewall, and lateral-movement sensors") },
+        { category: 3, title: qsTr("Privacy"), detail: qsTr("Camera, microphone, location, and browser privacy") },
+        { category: 4, title: qsTr("Performance"), detail: qsTr("Scan scheduling and endpoint impact controls") },
+        { category: 5, title: qsTr("Threat intel"), detail: qsTr("PGTI feeds and reputation sources") },
+        { category: 6, title: qsTr("Other"), detail: qsTr("Additional protection modules") }
+    ]
+
     Connections {
         target: (typeof recommendationsViewModel !== "undefined" &&
                  recommendationsViewModel !== null)
@@ -40,6 +62,26 @@ PageHost {
             if (typeof stack !== "undefined" && url && url.length > 0) {
                 Qt.callLater(stack.push, url)
             }
+        }
+    }
+
+    Connections {
+        target: (typeof pipeClient !== "undefined" && pipeClient !== null) ? pipeClient : null
+        function onStateChanged() {
+            if (!root._serviceConnected)
+                return
+            if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null)
+                protectionViewModel.refresh()
+            if (root._modulesModel !== null)
+                root._modulesModel.refresh()
+            if (typeof recommendationsViewModel !== "undefined" && recommendationsViewModel !== null)
+                recommendationsViewModel.refresh()
+            if (typeof pgtiViewModel !== "undefined" && pgtiViewModel !== null)
+                pgtiViewModel.refreshAll()
+            if (typeof privacyViewModel !== "undefined" && privacyViewModel !== null)
+                privacyViewModel.refresh()
+            if (typeof performanceViewModel !== "undefined" && performanceViewModel !== null)
+                performanceViewModel.refresh()
         }
     }
 
@@ -57,6 +99,17 @@ PageHost {
         return qsTr("%1d ago").arg(Math.floor(diff / 86400))
     }
 
+    function serviceStateLabel(state) {
+        switch (state) {
+        case 1:  return qsTr("Connecting")
+        case 2:  return qsTr("Authenticating")
+        case 3:  return qsTr("Connected")
+        case 4:  return qsTr("Reconnecting")
+        case 5:  return qsTr("Authentication failed")
+        default: return qsTr("Offline")
+        }
+    }
+
     /// ProtectionViewModel.globalMode (0=Off, 1=Passive, 2=Balanced, 3=Aggressive) -> label.
     function modeName(mode) {
         switch (mode) {
@@ -64,6 +117,145 @@ PageHost {
         case 1:  return qsTr("Passive")
         case 2:  return qsTr("Balanced")
         case 3:  return qsTr("Aggressive")
+        default: return qsTr("Unknown")
+        }
+    }
+
+    function dashboardState() {
+        if (!root._serviceConnected)
+            return "unknown"
+        if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null &&
+            protectionViewModel.protectionPaused)
+            return "paused"
+        if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null)
+            return protectionViewModel.headlineState
+        return "unknown"
+    }
+
+    function dashboardPrimaryHeadline() {
+        if (!root._serviceConnected)
+            return qsTr("ShadowStrike service is offline")
+        if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+            return qsTr("Protection telemetry is loading")
+        if (protectionViewModel.protectionPaused)
+            return qsTr("Protection is paused")
+        var crit = protectionViewModel.criticalCount
+        var risk = protectionViewModel.atRiskCount
+        if (crit > 0) return qsTr("%1 critical issue(s) require action.").arg(crit)
+        if (risk > 0) return qsTr("%1 module(s) need your attention.").arg(risk)
+        return qsTr("Your device is protected")
+    }
+
+    function dashboardSecondaryHeadline() {
+        if (!root._serviceConnected)
+            return qsTr("Live protection state will refresh when the service reconnects.")
+        var modules = root._moduleCount()
+        var unhealthy = root._moduleCountByHealth(1) + root._moduleCountByHealth(2)
+        if (modules === 0)
+            return qsTr("Waiting for protection modules to report sensor health.")
+        if (unhealthy > 0)
+            return qsTr("%1 of %2 sensor(s) require review.").arg(unhealthy).arg(modules)
+        return qsTr("%1 protection sensor(s) are reporting healthy state.").arg(modules)
+    }
+
+    function moduleRole(row, offset) {
+        if (root._modulesModel === null) return undefined
+        return root._modulesModel.data(root._modulesModel.index(row, 0), Qt.UserRole + offset)
+    }
+
+    function _moduleCount() {
+        return root._modulesModel === null ? 0 : root._modulesModel.rowCount()
+    }
+
+    function _moduleCountByHealth(health) {
+        if (root._modulesModel === null) return 0
+        var total = 0
+        for (var i = 0; i < root._modulesModel.rowCount(); ++i) {
+            if ((root.moduleRole(i, 8) ?? -1) === health)
+                total++
+        }
+        return total
+    }
+
+    function _moduleCountByMode(mode) {
+        if (root._modulesModel === null) return 0
+        var total = 0
+        for (var i = 0; i < root._modulesModel.rowCount(); ++i) {
+            if ((root.moduleRole(i, 5) ?? 0) === mode)
+                total++
+        }
+        return total
+    }
+
+    function _categoryMatches(moduleCategory, groupCategory) {
+        if (groupCategory === 6)
+            return moduleCategory < 0 || moduleCategory > 5
+        return moduleCategory === groupCategory
+    }
+
+    function _moduleCountByCategory(groupCategory) {
+        if (root._modulesModel === null) return 0
+        var total = 0
+        for (var i = 0; i < root._modulesModel.rowCount(); ++i) {
+            var category = root.moduleRole(i, 4) ?? -1
+            if (root._categoryMatches(category, groupCategory))
+                total++
+        }
+        return total
+    }
+
+    function _moduleIssuesByCategory(groupCategory) {
+        if (root._modulesModel === null) return 0
+        var total = 0
+        for (var i = 0; i < root._modulesModel.rowCount(); ++i) {
+            var category = root.moduleRole(i, 4) ?? -1
+            var health = root.moduleRole(i, 8) ?? -1
+            if (root._categoryMatches(category, groupCategory) && (health === 1 || health === 2))
+                total++
+        }
+        return total
+    }
+
+    function _categoryState(groupCategory) {
+        if (!root._serviceConnected) return "offline"
+        var count = root._moduleCountByCategory(groupCategory)
+        if (count === 0) return "loading"
+        var issues = root._moduleIssuesByCategory(groupCategory)
+        if (issues > 0) return "warning"
+        return "on"
+    }
+
+    function _feedCount() {
+        if (typeof pgtiViewModel === "undefined" || pgtiViewModel === null || typeof pgtiViewModel.feeds === "undefined" || pgtiViewModel.feeds === null)
+            return 0
+        return pgtiViewModel.feeds.rowCount()
+    }
+
+    function _feedIssueCount() {
+        if (typeof pgtiViewModel === "undefined" || pgtiViewModel === null || typeof pgtiViewModel.feeds === "undefined" || pgtiViewModel.feeds === null)
+            return 0
+        var issues = 0
+        for (var i = 0; i < pgtiViewModel.feeds.rowCount(); ++i) {
+            var health = (pgtiViewModel.feeds.data(pgtiViewModel.feeds.index(i, 0), Qt.UserRole + 3) || "").toLowerCase()
+            var enabled = pgtiViewModel.feeds.data(pgtiViewModel.feeds.index(i, 0), Qt.UserRole + 7)
+            if (enabled && health !== "healthy")
+                issues++
+        }
+        return issues
+    }
+
+    function _privacyBlockedTotal() {
+        if (typeof privacyViewModel === "undefined" || privacyViewModel === null)
+            return 0
+        return privacyViewModel.webcamAccessBlocked + privacyViewModel.micAccessBlocked +
+               privacyViewModel.locationAccessBlocked + privacyViewModel.cookiesBlocked
+    }
+
+    function _performancePlanName(plan) {
+        switch (plan) {
+        case 0:  return qsTr("Balanced")
+        case 1:  return qsTr("Performance")
+        case 2:  return qsTr("Battery saver")
         default: return qsTr("Unknown")
         }
     }
@@ -126,11 +318,8 @@ PageHost {
             Card {
                 id:     heroCard
                 width:  parent.width - Theme.spacingL * 2
-                glow:   (typeof protectionViewModel !== "undefined") &&
-                         protectionViewModel.headlineState === "critical"
-                accent: (typeof protectionViewModel !== "undefined") &&
-                         protectionViewModel.headlineState === "critical"
-                         ? Theme.crit : Theme.accentCyan
+                glow:   root.dashboardState() === "critical"
+                accent: root.dashboardState() === "critical" ? Theme.crit : Theme.accentCyan
 
                 Row {
                     width:   parent.width
@@ -138,8 +327,7 @@ PageHost {
 
                     HeroShield {
                         id:    heroShield
-                        state: (typeof protectionViewModel !== "undefined")
-                               ? protectionViewModel.headlineState : "unknown"
+                        state: root.dashboardState()
                         width:  148; height: 148
                         anchors.verticalCenter: parent.verticalCenter
                     }
@@ -151,25 +339,9 @@ PageHost {
 
                         HeadlineTicker {
                             width: parent.width
-                            state: (typeof protectionViewModel !== "undefined")
-                                   ? protectionViewModel.headlineState : "unknown"
-
-                            primaryText: {
-                                if (typeof protectionViewModel === "undefined") return ""
-                                var crit = protectionViewModel.criticalCount
-                                var risk = protectionViewModel.atRiskCount
-                                if (crit > 0) return qsTr("%1 critical issue(s) require action.").arg(crit)
-                                if (risk > 0) return qsTr("%1 module(s) need your attention.").arg(risk)
-                                return ""
-                            }
-                            secondaryText: {
-                                if (typeof protectionViewModel === "undefined") return ""
-                                var crit = protectionViewModel.criticalCount
-                                var risk = protectionViewModel.atRiskCount
-                                if (crit > 0 && risk > 0)
-                                    return qsTr("%1 module(s) at risk.").arg(risk)
-                                return ""
-                            }
+                            state: root.dashboardState()
+                            primaryText: root.dashboardPrimaryHeadline()
+                            secondaryText: root.dashboardSecondaryHeadline()
                         }
 
                         // Status chip row
@@ -178,42 +350,43 @@ PageHost {
                             spacing: Theme.spacingS
 
                             StatusChip {
-                                state: (typeof protectionViewModel !== "undefined")
-                                       ? root.modeChipState(protectionViewModel.globalMode) : "off"
+                                state: root._serviceConnected
+                                       ? ((typeof protectionViewModel !== "undefined" && protectionViewModel !== null &&
+                                           protectionViewModel.protectionPaused) ? "paused" :
+                                          ((typeof protectionViewModel !== "undefined" && protectionViewModel !== null)
+                                           ? root.modeChipState(protectionViewModel.globalMode) : "loading"))
+                                       : "offline"
                                 label: qsTr("Protection: %1").arg(
-                                           (typeof protectionViewModel !== "undefined")
+                                           root._serviceConnected && typeof protectionViewModel !== "undefined" &&
+                                           protectionViewModel !== null
                                            ? root.modeName(protectionViewModel.globalMode)
-                                           : qsTr("Unknown"))
+                                           : root.serviceStateLabel(root._serviceState))
                             }
 
                             StatusChip {
-                                state: (typeof scanViewModel !== "undefined")
-                                       ? root.scanChipState(scanViewModel.state) : "off"
-                                label: {
-                                    if (typeof scanViewModel === "undefined")
-                                        return qsTr("Scan: Unknown")
-                                    var st = scanViewModel.state
-                                    if (st === 1 || st === 2)
-                                        return qsTr("Scanning: %1%").arg(scanViewModel.percent)
-                                    if (st === 4)
-                                        return qsTr("Last scan: clean")
-                                    if (st === 5)
-                                        return qsTr("Last scan: %1 threat(s)").arg(scanViewModel.threatsFound)
-                                    return qsTr("Last scan: pending")
-                                }
+                                state: root._serviceConnected
+                                       ? ((root._moduleCountByHealth(2) > 0) ? "critical" :
+                                          ((root._moduleCountByHealth(1) > 0) ? "warning" :
+                                           (root._moduleCount() > 0 ? "on" : "loading")))
+                                       : "offline"
+                                label: qsTr("Sensors: %1 healthy / %2 total").arg(root._moduleCountByHealth(0)).arg(root._moduleCount())
                             }
 
                             StatusChip {
                                 state: {
-                                    if (typeof protectionViewModel === "undefined") return "off"
-                                    return protectionViewModel.criticalCount > 0 ? "critical" : "on"
+                                    if (!root._serviceConnected) return "offline"
+                                    if (typeof reportsModel !== "undefined" && reportsModel !== null && reportsModel.loading)
+                                        return "loading"
+                                    if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+                                        return "loading"
+                                    return protectionViewModel.criticalCount > 0 ? "critical" :
+                                           (protectionViewModel.atRiskCount > 0 ? "warning" : "on")
                                 }
                                 label: {
-                                    if (typeof protectionViewModel === "undefined")
-                                        return qsTr("Threats blocked: —")
-                                    return qsTr("Threats blocked today: %1").arg(
-                                               protectionViewModel.criticalCount +
-                                               protectionViewModel.atRiskCount)
+                                    if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+                                        return qsTr("Alerts: loading")
+                                    return qsTr("Open alerts: %1").arg(protectionViewModel.criticalCount +
+                                                                      protectionViewModel.atRiskCount)
                                 }
                             }
                         }
@@ -222,7 +395,157 @@ PageHost {
             }
 
             // -----------------------------------------------------------------
-            // 2. Fast Scan card
+            // 2. Service and sensor health
+            // -----------------------------------------------------------------
+            SectionTitle {
+                text:  qsTr("Service & sensor health")
+                width: parent.width - Theme.spacingL * 2
+            }
+
+            Card {
+                width: parent.width - Theme.spacingL * 2
+
+                Flow {
+                    width:   parent.width
+                    spacing: Theme.spacingS
+
+                    StatusChip {
+                        state: root._serviceConnected ? "on" : "offline"
+                        label: qsTr("Service: %1").arg(root.serviceStateLabel(root._serviceState))
+                    }
+
+                    StatusChip {
+                        state: root._moduleCount() > 0 ? "on" : (root._serviceConnected ? "loading" : "offline")
+                        label: qsTr("Modules: %1 loaded").arg(root._moduleCount())
+                    }
+
+                    StatusChip {
+                        state: root._moduleCountByMode(0) > 0 ? "warning" : (root._moduleCount() > 0 ? "on" : "loading")
+                        label: qsTr("Disabled: %1").arg(root._moduleCountByMode(0))
+                    }
+
+                    StatusChip {
+                        state: root._privacyBlockedTotal() > 0 ? "warning" : "on"
+                        label: qsTr("Privacy blocks: %1").arg(root._privacyBlockedTotal())
+                    }
+
+                    StatusChip {
+                        state: root._feedIssueCount() > 0 ? "warning" : (root._feedCount() > 0 ? "on" : "loading")
+                        label: qsTr("PGTI feeds: %1").arg(root._feedCount())
+                    }
+
+                    StatusChip {
+                        state: (typeof performanceViewModel !== "undefined" && performanceViewModel !== null &&
+                                performanceViewModel.loading) ? "loading" : "info"
+                        label: qsTr("Performance: %1").arg(
+                                   (typeof performanceViewModel !== "undefined" && performanceViewModel !== null)
+                                   ? root._performancePlanName(performanceViewModel.currentPowerPlan)
+                                   : qsTr("Unknown"))
+                    }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // 3. Protection groups
+            // -----------------------------------------------------------------
+            SectionTitle {
+                text:  qsTr("Protection groups")
+                width: parent.width - Theme.spacingL * 2
+            }
+
+            Flow {
+                id:      groupFlow
+                width:   parent.width - Theme.spacingL * 2
+                spacing: Theme.spacingM
+
+                Repeater {
+                    model: root._moduleGroups
+                    delegate: Card {
+                        required property var modelData
+
+                        readonly property int groupCount: root._moduleCountByCategory(modelData.category)
+                        readonly property int groupIssues: root._moduleIssuesByCategory(modelData.category)
+
+                        width: Math.max(260, groupFlow.width >= 860
+                                   ? Math.floor((groupFlow.width - Theme.spacingM * 2) / 3)
+                                   : Math.floor((groupFlow.width - Theme.spacingM) / 2))
+                        visible: groupCount > 0 || !root._serviceConnected
+                        height: visible ? implicitHeight : 0
+                        interactive: true
+                        accessibleName: modelData.title
+
+                        Column {
+                            width:   parent.width
+                            spacing: Theme.spacingS
+
+                            Row {
+                                width: parent.width
+                                spacing: Theme.spacingS
+
+                                Text {
+                                    width: parent.width - groupChip.width - parent.spacing
+                                    text:  modelData.title
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSizeBody
+                                    font.weight: Theme.fontWeightBold
+                                    elide: Text.ElideRight
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                StatusChip {
+                                    id: groupChip
+                                    state: root._categoryState(modelData.category)
+                                    label: groupIssues > 0 ? qsTr("%1 issue(s)").arg(groupIssues)
+                                                           : qsTr("%1 sensor(s)").arg(groupCount)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            Text {
+                                width: parent.width
+                                text:  modelData.detail
+                                color: Theme.textSecondary
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSizeLabel
+                                wrapMode: Text.WordWrap
+                                maximumLineCount: 2
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (typeof stack !== "undefined")
+                                    Qt.callLater(stack.push, "qrc:/qml/Pages/SecurityPage.qml")
+                            }
+                        }
+                    }
+                }
+
+                Loader {
+                    width: groupFlow.width
+                    sourceComponent: (!root._serviceConnected || root._moduleCount() === 0) ? groupStateComp : null
+
+                    Component {
+                        id: groupStateComp
+                        EmptyState {
+                            width:   parent ? parent.width : 400
+                            height:  96
+                            variant: root._serviceConnected ? "loading" : "offline"
+                            title:   root._serviceConnected ? qsTr("Loading protection modules")
+                                                            : qsTr("Service offline")
+                            message: root._serviceConnected ? qsTr("Waiting for live sensor state from the service.")
+                                                            : qsTr("Module health will refresh when ShadowStrike service reconnects.")
+                        }
+                    }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // 4. Fast Scan card
             // -----------------------------------------------------------------
             Card {
                 width: parent.width - Theme.spacingL * 2
@@ -364,7 +687,7 @@ PageHost {
             }
 
             // -----------------------------------------------------------------
-            // 3. Recommendations
+            // 5. Recommendations
             // -----------------------------------------------------------------
             SectionTitle {
                 text:  qsTr("Recommendations")
@@ -373,9 +696,15 @@ PageHost {
 
             Loader {
                 width: parent.width - Theme.spacingL * 2
-                sourceComponent: (typeof recommendationsViewModel !== "undefined" &&
-                                  recommendationsViewModel !== null)
-                                 ? recListComponent : recEmptyComponent
+                sourceComponent: {
+                    if (!root._serviceConnected)
+                        return recUnavailableComponent
+                    if (typeof recommendationsViewModel === "undefined" || recommendationsViewModel === null)
+                        return recUnavailableComponent
+                    if (recommendationsViewModel.loading && recommendationsViewModel.rowCount() === 0)
+                        return recLoadingComponent
+                    return recListComponent
+                }
             }
 
             Component {
@@ -394,7 +723,10 @@ PageHost {
                     // Show empty state inside the list when model has no items
                     footer: Loader {
                         width: recList.width
-                        sourceComponent: (recList.count === 0) ? recInlineEmpty : null
+                        sourceComponent: (recList.count === 0 &&
+                                          typeof recommendationsViewModel !== "undefined" &&
+                                          recommendationsViewModel !== null &&
+                                          !recommendationsViewModel.loading) ? recInlineEmpty : null
 
                         Component {
                             id: recInlineEmpty
@@ -460,17 +792,29 @@ PageHost {
             }
 
             Component {
-                id: recEmptyComponent
+                id: recLoadingComponent
                 EmptyState {
                     width:   parent ? parent.width : 400
-                    height:  80
-                    title:   qsTr("All clear")
-                    message: qsTr("No recommendations at this time. Your device is well protected.")
+                    height:  96
+                    variant: "loading"
+                    title:   qsTr("Loading recommendations")
+                    message: qsTr("Retrieving live hardening guidance from the service.")
+                }
+            }
+
+            Component {
+                id: recUnavailableComponent
+                EmptyState {
+                    width:   parent ? parent.width : 400
+                    height:  96
+                    variant: "offline"
+                    title:   qsTr("Recommendations unavailable")
+                    message: qsTr("Hardening recommendations will refresh when ShadowStrike service reconnects.")
                 }
             }
 
             // -----------------------------------------------------------------
-            // 4. Latest activity — top 8 from reportsModel
+            // 6. Latest activity — top 8 from reportsModel
             // -----------------------------------------------------------------
             SectionTitle {
                 text:  qsTr("Latest activity")
@@ -530,7 +874,14 @@ PageHost {
 
                         footer: Loader {
                             width: latestList.width
-                            sourceComponent: latestList.count === 0 ? latestEmptyComp : null
+                            sourceComponent: {
+                                if (!root._serviceConnected)
+                                    return latestUnavailableComp
+                                if (typeof reportsModel !== "undefined" && reportsModel !== null &&
+                                    reportsModel.loading && latestList.count === 0)
+                                    return latestLoadingComp
+                                return latestList.count === 0 ? latestEmptyComp : null
+                            }
                             Component {
                                 id: latestEmptyComp
                                 EmptyState {
@@ -538,6 +889,28 @@ PageHost {
                                     height:  80
                                     title:   qsTr("No recent activity")
                                     message: qsTr("No threats have been detected recently.")
+                                }
+                            }
+
+                            Component {
+                                id: latestLoadingComp
+                                EmptyState {
+                                    width:   parent ? parent.width : 400
+                                    height:  80
+                                    variant: "loading"
+                                    title:   qsTr("Loading activity")
+                                    message: qsTr("Retrieving the latest protection events.")
+                                }
+                            }
+
+                            Component {
+                                id: latestUnavailableComp
+                                EmptyState {
+                                    width:   parent ? parent.width : 400
+                                    height:  80
+                                    variant: "offline"
+                                    title:   qsTr("Activity unavailable")
+                                    message: qsTr("Live alerts require a connection to the ShadowStrike service.")
                                 }
                             }
                         }
