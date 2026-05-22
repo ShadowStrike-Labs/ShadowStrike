@@ -11,7 +11,7 @@
 //   └─────────┴─────────────────────────────────┘
 //
 // Single-instance activation:
-//   windowActivator.activate → raise() + requestActivate()
+//   windowActivator.activate(commandLine) → raise() + requestActivate()
 //
 // Route navigation:
 //   initialRoute (context property, string) → StackView.replace(page)
@@ -54,10 +54,14 @@ ApplicationWindow {
         }
     }
 
+    function navigateToRoute(route) {
+        d.navigateTo(route)
+    }
+
     // ── Single-instance activation ─────────────────────────────────────────
     Connections {
         target: windowActivator
-        function onActivate() {
+        function onActivate(commandLine) {
             root.show();
             root.raise();
             root.requestActivate();

@@ -24,8 +24,9 @@
  *   for each connection:
  *     CreateNamedPipeW (overlapped)
  *     ConnectNamedPipe (overlapped — waitable on a stop event)
- *     ReadFile 4 bytes
- *     If payload == kActivateToken → QMetaObject::invokeMethod(activate, Queued)
+ *     ReadFile activation header
+ *     If payload == kLegacyActivateToken → emit activate("")
+ *     If payload == kActivationFrameMagic → read UTF-16LE command line and emit it
  *     DisconnectNamedPipe, loop
  *
  * All pipe operations are overlapped so the stop event can interrupt a
@@ -48,7 +49,10 @@
 
 #include <PhantomCore/Utils/Logger.hpp>
 
+#include <array>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace ShadowStrike::PhantomHome::UI {
 
@@ -86,6 +90,73 @@ private:
     HANDLE m_h;
 };
 
+[[nodiscard]] std::uint32_t ReadUInt32LE(const std::uint8_t* bytes) noexcept
+{
+    return static_cast<std::uint32_t>(bytes[0]) |
+           (static_cast<std::uint32_t>(bytes[1]) << 8u) |
+           (static_cast<std::uint32_t>(bytes[2]) << 16u) |
+           (static_cast<std::uint32_t>(bytes[3]) << 24u);
+}
+
+[[nodiscard]] bool ReadExact(HANDLE pipe,
+                             HANDLE stopEvent,
+                             void* destination,
+                             DWORD bytesToRead) noexcept
+{
+    auto* out = static_cast<std::uint8_t*>(destination);
+    DWORD totalRead = 0;
+
+    while (totalRead < bytesToRead) {
+        OVERLAPPED ov{};
+        UniqueHandle event{::CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        if (!event.valid()) {
+            SS_LOG_ERROR(L"PhantomHome.WindowActivator",
+                         L"CreateEventW for activation read failed (error=%lu)",
+                         ::GetLastError());
+            return false;
+        }
+        ov.hEvent = event.get();
+
+        DWORD bytesRead = 0;
+        const DWORD remaining = bytesToRead - totalRead;
+        if (!::ReadFile(pipe, out + totalRead, remaining, &bytesRead, &ov)) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                SS_LOG_WARN(L"PhantomHome.WindowActivator",
+                            L"ReadFile on activation pipe failed (error=%lu)", err);
+                return false;
+            }
+
+            const HANDLE waitHandles[2] = {ov.hEvent, stopEvent};
+            const DWORD waitResult = ::WaitForMultipleObjects(2, waitHandles, FALSE, 5000);
+            if (waitResult != WAIT_OBJECT_0) {
+                ::CancelIo(pipe);
+                if (waitResult == WAIT_TIMEOUT) {
+                    SS_LOG_WARN(L"PhantomHome.WindowActivator",
+                                L"Timed out while reading activation frame");
+                }
+                return false;
+            }
+
+            if (!::GetOverlappedResult(pipe, &ov, &bytesRead, FALSE)) {
+                SS_LOG_WARN(L"PhantomHome.WindowActivator",
+                            L"GetOverlappedResult for activation read failed (error=%lu)",
+                            ::GetLastError());
+                return false;
+            }
+        }
+
+        if (bytesRead == 0) {
+            SS_LOG_WARN(L"PhantomHome.WindowActivator",
+                        L"Activation pipe closed before the frame was complete");
+            return false;
+        }
+        totalRead += bytesRead;
+    }
+
+    return true;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -117,13 +188,12 @@ void WindowActivator::Stop() noexcept
 {
     m_stop.store(true, std::memory_order_release);
 
-    // If the server thread is blocked on ConnectNamedPipe or ReadFile we
-    // cannot cancel it directly from here without the pipe handle; however
-    // it checks m_stop between iterations and the OS will cancel outstanding
-    // overlapped I/O when the pipe handle goes out of scope.  The jthread
-    // destructor join() will block briefly until that happens.
     if (m_serverThread.joinable()) {
         m_serverThread.request_stop();
+        HANDLE wakePipe = ::CreateFileW(kPipeName, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (wakePipe != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(wakePipe);
+        }
         m_serverThread.join();
     }
 }
@@ -201,54 +271,57 @@ void WindowActivator::ServerLoop() noexcept
 
         if (m_stop.load(std::memory_order_acquire)) break;
 
-        // ── Read the activation token ──────────────────────────────────────
-        char    buf[sizeof(kActivateToken)] = {};
-        DWORD   bytesRead = 0;
-        OVERLAPPED rdOv{};
-        UniqueHandle rdEvent{::CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-        if (!rdEvent.valid()) {
+        // ── Read, validate and dispatch activation frame ───────────────────
+        std::array<char, 4> magic{};
+        if (!ReadExact(pipe.get(), stopEvent.get(), magic.data(),
+                       static_cast<DWORD>(magic.size()))) {
             ::DisconnectNamedPipe(pipe.get());
             continue;
         }
-        rdOv.hEvent = rdEvent.get();
 
-        if (!::ReadFile(pipe.get(), buf, static_cast<DWORD>(sizeof(buf)), &bytesRead, &rdOv)) {
-            const DWORD err = ::GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                const HANDLE waitHandles[2] = {rdOv.hEvent, stopEvent.get()};
-                const DWORD  waitResult = ::WaitForMultipleObjects(2, waitHandles, FALSE, 5000);
-                if (waitResult == WAIT_OBJECT_0) {
-                    ::GetOverlappedResult(pipe.get(), &rdOv, &bytesRead, FALSE);
-                } else {
-                    ::CancelIo(pipe.get());
-                    ::DisconnectNamedPipe(pipe.get());
-                    if (waitResult == WAIT_TIMEOUT) continue;
-                    break;  // Stop requested.
-                }
-            } else {
-                SS_LOG_WARN(L"PhantomHome.WindowActivator",
-                            L"ReadFile on activation pipe failed (error=%lu)", err);
+        QString commandLine;
+        bool validActivation = false;
+
+        if (std::memcmp(magic.data(), kLegacyActivateToken, sizeof(kLegacyActivateToken)) == 0) {
+            validActivation = true;
+        } else if (std::memcmp(magic.data(), kActivationFrameMagic, sizeof(kActivationFrameMagic)) == 0) {
+            std::array<std::uint8_t, 4> lengthBytes{};
+            if (!ReadExact(pipe.get(), stopEvent.get(), lengthBytes.data(),
+                           static_cast<DWORD>(lengthBytes.size()))) {
                 ::DisconnectNamedPipe(pipe.get());
                 continue;
             }
+
+            const std::uint32_t payloadBytes = ReadUInt32LE(lengthBytes.data());
+            if (payloadBytes > kMaxActivationPayloadBytes ||
+                (payloadBytes % sizeof(wchar_t)) != 0u) {
+                SS_LOG_WARN(L"PhantomHome.WindowActivator",
+                            L"Rejected activation payload length %lu bytes",
+                            payloadBytes);
+            } else {
+                std::vector<char> payload(payloadBytes);
+                if (payloadBytes == 0u ||
+                    ReadExact(pipe.get(), stopEvent.get(), payload.data(), payloadBytes)) {
+                    if (payloadBytes != 0u) {
+                        commandLine = QString::fromWCharArray(
+                            reinterpret_cast<const wchar_t*>(payload.data()),
+                            static_cast<int>(payloadBytes / sizeof(wchar_t)));
+                    }
+                    validActivation = true;
+                }
+            }
         }
 
-        // ── Validate and dispatch ──────────────────────────────────────────
-        if (bytesRead == sizeof(kActivateToken) &&
-            std::memcmp(buf, kActivateToken, sizeof(kActivateToken)) == 0)
-        {
+        if (validActivation) {
             SS_LOG_INFO(L"PhantomHome.WindowActivator",
                         L"Activation request received from second instance");
 
-            // Dispatch to the Qt main thread; safe to call from any thread.
             QMetaObject::invokeMethod(this,
-                                      &WindowActivator::activate,
+                                      [this, commandLine]() { emit activate(commandLine); },
                                       Qt::QueuedConnection);
         } else {
             SS_LOG_WARN(L"PhantomHome.WindowActivator",
-                        L"Received %lu bytes on activation pipe but token did not match; "
-                        L"ignoring (possible spoofing attempt)",
-                        bytesRead);
+                        L"Activation pipe frame magic did not match; ignoring request");
         }
 
         ::DisconnectNamedPipe(pipe.get());

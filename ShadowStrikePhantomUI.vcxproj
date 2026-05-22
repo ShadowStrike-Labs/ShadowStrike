@@ -412,9 +412,9 @@
     <ResourceCompile Include="src\Products\Community\PhantomHome\UI\Client\app.rc" />
   </ItemGroup>
 
-  <!-- Copy required Qt runtime DLLs next to the executable post-build. -->
+  <!-- Copy required Qt runtime DLLs, plugins, and Qt translations next to the executable post-build. -->
   <Target Name="DeployQtRuntime" AfterTargets="Link">
-    <Exec Command='"$(QtBin)\windeployqt.exe" --qmldir "$(SolutionDir)src\Products\Community\PhantomHome\UI\Client\qml" --no-translations --no-system-d3d-compiler --no-opengl-sw "$(OutDir)$(TargetName).exe"' IgnoreExitCode="true" />
+    <Exec Command='"$(QtBin)\windeployqt.exe" --qmldir "$(SolutionDir)src\Products\Community\PhantomHome\UI\Client\qml" --no-system-d3d-compiler --no-opengl-sw "$(OutDir)$(TargetName).exe"' />
   </Target>
 
   <!-- ====================================================================

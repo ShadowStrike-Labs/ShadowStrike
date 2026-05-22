@@ -5,10 +5,10 @@
 
 .DESCRIPTION
     Full automated pipeline:
-      1. MSBuild: PhantomCoreLib (if -RebuildLib) + service + UI
+      1. MSBuild: PhantomCoreLib (if -RebuildLib) + service + UI + tray
       2. Package: MSI → Bundle (wix build)
       3. Sign: packaging\signing\Sign-PhantomHome.ps1
-      4. Stage: copy installers to vm_shrd\PhantomHome\
+      4. Stage: copy installers and build artifacts to vm_shrd\PhantomHome\
       5. Submit job manifest to vm_shrd\auto\jobs\
       6. Poll vm_shrd\auto\results\<jobId>\status.json
       7. Print all collected log files to stdout
@@ -69,6 +69,68 @@ New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 function Log { param($Msg) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Msg" }
 function Die { param($Msg) Write-Error $Msg; exit 1 }
 
+function Require-File {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Label)
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        Die "$Label not found: $Path"
+    }
+}
+
+function Sync-QtRuntimeStaging {
+    $qtRoot = if ($env:Qt6_ROOT) { $env:Qt6_ROOT } else { 'C:\Qt\6.7.3\msvc2019_64' }
+    $qtBin  = Join-Path $qtRoot 'bin'
+    $deploy = Join-Path $qtBin  'windeployqt.exe'
+    Require-File -Path $deploy -Label 'windeployqt'
+
+    $uiExe = Join-Path $BinDir 'ShadowStrikePhantomUI.exe'
+    Require-File -Path $uiExe -Label 'PhantomHome UI executable'
+
+    New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
+    Log "Refreshing Qt runtime staging with windeployqt..."
+    & $deploy `
+        --qmldir (Join-Path $RepoRoot 'src\Products\Community\PhantomHome\UI\Client\qml') `
+        --dir $StagingDir `
+        --no-system-d3d-compiler `
+        --no-opengl-sw `
+        $uiExe
+    if ($LASTEXITCODE -ne 0) { Die "windeployqt staging failed" }
+}
+
+function Assert-QtHarvestSources {
+    $harvest = Join-Path $BuildDir 'QtHarvest.wxs'
+    Require-File -Path $harvest -Label 'QtHarvest.wxs'
+
+    $content = Get-Content $harvest -Raw
+    $matches = [regex]::Matches($content, 'Source="\$\(var\.StagingDir\)\\([^"]+)"')
+    $missing = New-Object System.Collections.Generic.List[string]
+
+    foreach ($m in $matches) {
+        $relative = $m.Groups[1].Value
+        $source = Join-Path $StagingDir $relative
+        if (-not (Test-Path $source -PathType Leaf)) {
+            $missing.Add($relative)
+            if ($missing.Count -ge 20) { break }
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        Die ("QtHarvest references missing staged runtime files: " + ($missing -join ', '))
+    }
+
+    Log "QtHarvest source validation passed ($($matches.Count) staged files)."
+}
+
+function Copy-ProductExecutablesToStaging {
+    foreach ($name in @('ShadowStrikePhantomService.exe',
+                       'ShadowStrikePhantomUI.exe',
+                       'ShadowStrikePhantomTray.exe')) {
+        $src = Join-Path $BinDir $name
+        Require-File -Path $src -Label $name
+        Copy-Item $src $StagingDir -Force
+    }
+    Log "Staged service, UI, and tray executables."
+}
+
 # ── BUILD ────────────────────────────────────────────────────────────────────
 if (-not $SkipBuild) {
     if ($RebuildLib) {
@@ -88,9 +150,16 @@ if (-not $SkipBuild) {
         /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
     if ($LASTEXITCODE -ne 0) { Die "UI build failed" }
 
-    # Update staging
-    Copy-Item (Join-Path $BinDir 'ShadowStrikePhantomService.exe') $StagingDir -Force
-    Log "Staged service EXE."
+    Log "Building PhantomHome Tray..."
+    & $MSBuild (Join-Path $RepoRoot 'ShadowStrikePhantomTray.vcxproj') `
+        /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+    if ($LASTEXITCODE -ne 0) { Die "Tray build failed" }
+
+    Sync-QtRuntimeStaging
+    Copy-ProductExecutablesToStaging
+    Assert-QtHarvestSources
+} else {
+    Assert-QtHarvestSources
 }
 
 # ── PACKAGE ──────────────────────────────────────────────────────────────────
@@ -135,11 +204,26 @@ New-Item -ItemType Directory -Force -Path $VmShared | Out-Null
 Copy-Item $BundleOut $VmShared -Force
 Copy-Item $MsiOut    $VmShared -Force
 
+$VmArtifacts = Join-Path $VmShared 'artifacts'
+New-Item -ItemType Directory -Force -Path $VmArtifacts | Out-Null
+foreach ($name in @('ShadowStrikePhantomService.exe',
+                   'ShadowStrikePhantomUI.exe',
+                   'ShadowStrikePhantomTray.exe')) {
+    $src = Join-Path $BinDir $name
+    if (Test-Path $src -PathType Leaf) {
+        Copy-Item $src $VmArtifacts -Force
+    }
+}
+
 $bundleHash = (Get-FileHash $BundleOut -Algorithm SHA256).Hash
 $msiHash    = (Get-FileHash $MsiOut    -Algorithm SHA256).Hash
-@("$bundleHash *ShadowStrikePhantom-Home-Setup.exe",
-  "$msiHash *ShadowStrikePhantom-Home-Setup.msi") |
-    Out-File (Join-Path $VmShared 'SHA256SUMS.txt') -Encoding ascii -Force
+$hashLines = @("$bundleHash *ShadowStrikePhantom-Home-Setup.exe",
+               "$msiHash *ShadowStrikePhantom-Home-Setup.msi")
+foreach ($artifact in Get-ChildItem $VmArtifacts -File -ErrorAction SilentlyContinue | Sort-Object Name) {
+    $hash = (Get-FileHash $artifact.FullName -Algorithm SHA256).Hash
+    $hashLines += "$hash *artifacts\$($artifact.Name)"
+}
+$hashLines | Out-File (Join-Path $VmShared 'SHA256SUMS.txt') -Encoding ascii -Force
 
 Log "Deployed — EXE: $bundleHash"
 Log "           MSI: $msiHash"

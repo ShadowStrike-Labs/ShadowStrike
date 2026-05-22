@@ -68,6 +68,7 @@
 #include <QTimer>
 #include <QMetaObject>
 #include <QStringList>
+#include <QVariant>
 
 // Qt — utilities
 #include <QLoggingCategory>
@@ -75,7 +76,10 @@
 #include <QQmlError>
 #include <QList>
 
+#include <cstdint>
+#include <cwchar>
 #include <cstring>
+#include <vector>
 
 // ShadowStrike — logger (must come after windows.h)
 #include <PhantomCore/Utils/Logger.hpp>
@@ -152,18 +156,9 @@ struct StartupArgs {
 // ---------------------------------------------------------------------------
 // Parse argv using the TrayUiArgs contract.
 // ---------------------------------------------------------------------------
-[[nodiscard]] StartupArgs ParseArgs() noexcept
+[[nodiscard]] StartupArgs ParseArgsFromArgv(int argc, LPWSTR* wargv) noexcept
 {
     StartupArgs args{};
-
-    int    argc  = 0;
-    LPWSTR*wargv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
-    if (!wargv) {
-        SS_LOG_WARN(L"PhantomHome.Main",
-                    L"CommandLineToArgvW failed (error=%lu); using defaults",
-                    ::GetLastError());
-        return args;
-    }
 
     for (int i = 1; i < argc; ++i) {
         const std::wstring_view arg{wargv[i]};
@@ -193,6 +188,42 @@ struct StartupArgs {
         }
     }
 
+    return args;
+}
+
+[[nodiscard]] StartupArgs ParseArgs() noexcept
+{
+    int    argc  = 0;
+    LPWSTR*wargv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
+    if (!wargv) {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"CommandLineToArgvW failed (error=%lu); using defaults",
+                    ::GetLastError());
+        return {};
+    }
+
+    const StartupArgs args = ParseArgsFromArgv(argc, wargv);
+    ::LocalFree(wargv);
+    return args;
+}
+
+[[nodiscard]] StartupArgs ParseArgsFromCommandLine(const QString& commandLine) noexcept
+{
+    if (commandLine.isEmpty()) {
+        return {};
+    }
+
+    const std::wstring raw = commandLine.toStdWString();
+    int argc = 0;
+    LPWSTR* wargv = ::CommandLineToArgvW(raw.c_str(), &argc);
+    if (!wargv) {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"CommandLineToArgvW failed for activation payload (error=%lu)",
+                    ::GetLastError());
+        return {};
+    }
+
+    const StartupArgs args = ParseArgsFromArgv(argc, wargv);
     ::LocalFree(wargv);
     return args;
 }
@@ -219,12 +250,48 @@ void SignalFirstInstance() noexcept
         return;
     }
 
+    const wchar_t* commandLine = ::GetCommandLineW();
+    const std::size_t chars = commandLine ? std::wcslen(commandLine) : 0u;
+    const std::size_t payloadBytes = chars * sizeof(wchar_t);
+
     DWORD written = 0;
-    const bool ok = ::WriteFile(pipe,
-                                WindowActivator::kActivateToken,
-                                static_cast<DWORD>(sizeof(WindowActivator::kActivateToken)),
-                                &written,
-                                nullptr) != FALSE;
+    bool ok = false;
+
+    if (payloadBytes <= WindowActivator::kMaxActivationPayloadBytes) {
+        std::vector<std::uint8_t> frame;
+        frame.resize(sizeof(WindowActivator::kActivationFrameMagic) +
+                     sizeof(std::uint32_t) +
+                     payloadBytes);
+
+        std::memcpy(frame.data(),
+                    WindowActivator::kActivationFrameMagic,
+                    sizeof(WindowActivator::kActivationFrameMagic));
+
+        const std::uint32_t payloadSize = static_cast<std::uint32_t>(payloadBytes);
+        frame[4] = static_cast<std::uint8_t>(payloadSize & 0xFFu);
+        frame[5] = static_cast<std::uint8_t>((payloadSize >> 8u) & 0xFFu);
+        frame[6] = static_cast<std::uint8_t>((payloadSize >> 16u) & 0xFFu);
+        frame[7] = static_cast<std::uint8_t>((payloadSize >> 24u) & 0xFFu);
+
+        if (payloadBytes != 0u) {
+            std::memcpy(frame.data() + 8u, commandLine, payloadBytes);
+        }
+
+        ok = ::WriteFile(pipe,
+                         frame.data(),
+                         static_cast<DWORD>(frame.size()),
+                         &written,
+                         nullptr) != FALSE;
+    } else {
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"Activation command line is %zu bytes; falling back to legacy token",
+                    payloadBytes);
+        ok = ::WriteFile(pipe,
+                         WindowActivator::kLegacyActivateToken,
+                         static_cast<DWORD>(sizeof(WindowActivator::kLegacyActivateToken)),
+                         &written,
+                         nullptr) != FALSE;
+    }
     if (!ok) {
         SS_LOG_WARN(L"PhantomHome.Main",
                     L"WriteFile to activation pipe failed (error=%lu)",
@@ -529,10 +596,83 @@ int main(int argc, char* argv[])
         }
     }
 
+    auto raiseRootWindow = [&engine]() noexcept {
+        const auto& roots = engine.rootObjects();
+        for (QObject* obj : roots) {
+            if (auto* win = qobject_cast<QQuickWindow*>(obj)) {
+                win->show();
+                win->raise();
+                win->requestActivate();
+                break;
+            }
+        }
+    };
+
+    auto navigateToRoute = [&engine](const QString& route) {
+        if (route.isEmpty()) {
+            return;
+        }
+
+        const auto& roots = engine.rootObjects();
+        for (QObject* obj : roots) {
+            if (QMetaObject::invokeMethod(obj,
+                                          "navigateToRoute",
+                                          Qt::QueuedConnection,
+                                          Q_ARG(QVariant, QVariant(route)))) {
+                return;
+            }
+        }
+
+        SS_LOG_WARN(L"PhantomHome.Main",
+                    L"Unable to dispatch tray route '%ls' to QML root",
+                    route.toStdWString().c_str());
+    };
+
+    auto applyStartupAction = [&](const StartupArgs& args) {
+        if (!args.initialRoute.isEmpty()) {
+            navigateToRoute(args.initialRoute);
+        } else if (args.checkForUpdates) {
+            navigateToRoute(QStringLiteral("settings"));
+        }
+
+        if (args.quickScan) {
+            QMetaObject::invokeMethod(&scanViewModel,
+                                      "startFastScan",
+                                      Qt::QueuedConnection);
+        } else if (args.fullScan) {
+            QMetaObject::invokeMethod(&scanViewModel,
+                                      "startFullScan",
+                                      Qt::QueuedConnection);
+        }
+
+        if (args.pauseProtection) {
+            QMetaObject::invokeMethod(&protectionViewModel,
+                                      "pauseProtection",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(int, 0));
+        } else if (args.resumeProtection) {
+            QMetaObject::invokeMethod(&protectionViewModel,
+                                      "resumeProtection",
+                                      Qt::QueuedConnection);
+        }
+
+        if (args.checkForUpdates) {
+            SS_LOG_INFO(L"PhantomHome.Main",
+                        L"Tray requested update check; routed user to Settings updates section");
+        }
+    };
+
+    QObject::connect(&windowActivator,
+                     &WindowActivator::activate,
+                     &app,
+                     [&](const QString& commandLine) {
+                         raiseRootWindow();
+                         applyStartupAction(ParseArgsFromCommandLine(commandLine));
+                     });
+
     // Apply minimized state and action args via a single-shot timer so the
     // window has completed its first paint before we manipulate it.
     QTimer::singleShot(0, [&]() {
-        // Minimized: hide the window immediately after the first frame.
         if (startArgs.minimized) {
             const auto& roots = engine.rootObjects();
             for (QObject* obj : roots) {
@@ -543,27 +683,7 @@ int main(int argc, char* argv[])
             }
         }
 
-        // Forward action args to the appropriate ViewModel.
-        if (startArgs.quickScan) {
-            QMetaObject::invokeMethod(&scanViewModel,
-                                      "startFastScan",
-                                      Qt::QueuedConnection);
-        } else if (startArgs.fullScan) {
-            QMetaObject::invokeMethod(&scanViewModel,
-                                      "startFullScan",
-                                      Qt::QueuedConnection);
-        }
-
-        if (startArgs.pauseProtection) {
-            QMetaObject::invokeMethod(&protectionViewModel,
-                                      "pauseProtection",
-                                      Qt::QueuedConnection,
-                                      Q_ARG(int, 0));
-        } else if (startArgs.resumeProtection) {
-            QMetaObject::invokeMethod(&protectionViewModel,
-                                      "resumeProtection",
-                                      Qt::QueuedConnection);
-        }
+        applyStartupAction(startArgs);
     });
 
     PerfBudget::EndStartupAndValidate();
