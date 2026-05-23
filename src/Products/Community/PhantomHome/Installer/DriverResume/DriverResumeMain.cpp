@@ -27,6 +27,10 @@
  *                  scheduled task for Stage 2, exits 3010
  *                  (ERROR_SUCCESS_REBOOT_REQUIRED). If already on, runs Stage 2
  *                  inline.
+ *   --stage1-msi   MSI-safe Stage 1 wrapper: performs the same work but maps
+ *                  the reboot-required 3010 result to success because Windows
+ *                  Installer treats EXE custom-action non-zero exits as
+ *                  failures/rollback. The MSI schedules the reboot explicitly.
  *
  *   --stage2       Called by the SYSTEM scheduled task after reboot. Installs
  *                  and loads the PhantomSensor minifilter driver.
@@ -66,6 +70,9 @@
 #include <string>
 #include <string_view>
 #include <mutex>
+#include <optional>
+#include <vector>
+#include <cwctype>
 
 #include "DriverInstaller.hpp"
 #include "TestSigningPivot.hpp"
@@ -209,6 +216,7 @@ void Log(const wchar_t* level, const wchar_t* fmt, ...)
 // ────────────────────────────────────────────────────────────────────────────
 [[nodiscard]] static int RunStage2();
 [[nodiscard]] static int RunStage1();
+[[nodiscard]] static int RunStage1Msi();
 [[nodiscard]] static int RunInstallNow();
 [[nodiscard]] static int RunStartService();
 [[nodiscard]] static int RunUninstall();
@@ -219,6 +227,133 @@ void Log(const wchar_t* level, const wchar_t* fmt, ...)
 static constexpr wchar_t kHomeServiceName[] = L"ShadowStrikePhantomService";
 static constexpr DWORD kHomeServiceStartTimeoutMs = 30000;
 static constexpr DWORD kHomeServicePollIntervalMs = 500;
+
+[[nodiscard]] static std::wstring GetInstallDirectory()
+{
+    const std::wstring ownPath = GetOwnExePath();
+    const std::wstring::size_type slash = ownPath.find_last_of(L"\\/");
+    if (ownPath.empty() || slash == std::wstring::npos) {
+        return {};
+    }
+    return ownPath.substr(0, slash);
+}
+
+[[nodiscard]] static std::wstring StripServiceBinaryArguments(std::wstring path)
+{
+    while (!path.empty() && iswspace(path.front())) {
+        path.erase(path.begin());
+    }
+
+    if (!path.empty() && path.front() == L'"') {
+        const auto endQuote = path.find(L'"', 1);
+        if (endQuote != std::wstring::npos) {
+            return path.substr(1, endQuote - 1);
+        }
+    }
+
+    const auto exePos = path.find(L".exe");
+    if (exePos != std::wstring::npos) {
+        return path.substr(0, exePos + 4);
+    }
+
+    return path;
+}
+
+[[nodiscard]] static std::optional<std::wstring> GetNormalizedFullPath(const std::wstring& path)
+{
+    if (path.empty()) {
+        return std::nullopt;
+    }
+
+    const DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (required == 0 || required > 32768) {
+        return std::nullopt;
+    }
+
+    std::wstring full(required, L'\0');
+    const DWORD written = GetFullPathNameW(path.c_str(), required, full.data(), nullptr);
+    if (written == 0 || written >= required) {
+        return std::nullopt;
+    }
+
+    full.resize(written);
+    return full;
+}
+
+[[nodiscard]] static bool SamePath(const std::wstring& lhs, const std::wstring& rhs)
+{
+    const std::optional<std::wstring> lhsFull = GetNormalizedFullPath(lhs);
+    const std::optional<std::wstring> rhsFull = GetNormalizedFullPath(rhs);
+    if (!lhsFull || !rhsFull) {
+        return false;
+    }
+    return _wcsicmp(lhsFull->c_str(), rhsFull->c_str()) == 0;
+}
+
+[[nodiscard]] static DWORD VerifyHomeServiceRegistered() noexcept
+{
+    using namespace ShadowStrike::Installer;
+
+    const std::wstring installDir = GetInstallDirectory();
+    if (installDir.empty()) {
+        LOG_ERROR(L"Cannot resolve install directory for service verification.");
+        return ERROR_INVALID_DATA;
+    }
+
+    std::wstring expectedBinary = installDir;
+    expectedBinary += L"\\ShadowStrikePhantomService.exe";
+    if (GetFileAttributesW(expectedBinary.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"Expected service binary is missing: '%ls' (0x%08X).",
+                  expectedBinary.c_str(), err);
+        return err;
+    }
+
+    ScHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm.valid()) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"OpenSCManagerW for service verification failed (0x%08X).", err);
+        return err;
+    }
+
+    ScHandleGuard svc(OpenServiceW(scm.get(), kHomeServiceName, SERVICE_QUERY_CONFIG));
+    if (!svc.valid()) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"Required service '%ls' is not registered in SCM (0x%08X).",
+                  kHomeServiceName, err);
+        return err;
+    }
+
+    DWORD bytesNeeded = 0;
+    QueryServiceConfigW(svc.get(), nullptr, 0, &bytesNeeded);
+    if (bytesNeeded == 0) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"QueryServiceConfigW size query failed for '%ls' (0x%08X).",
+                  kHomeServiceName, err);
+        return err;
+    }
+
+    std::vector<BYTE> storage(bytesNeeded);
+    auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(storage.data());
+    if (!QueryServiceConfigW(svc.get(), cfg, bytesNeeded, &bytesNeeded)) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"QueryServiceConfigW failed for '%ls' (0x%08X).",
+                  kHomeServiceName, err);
+        return err;
+    }
+
+    const std::wstring actualBinary =
+        StripServiceBinaryArguments(cfg->lpBinaryPathName ? cfg->lpBinaryPathName : L"");
+    if (!SamePath(actualBinary, expectedBinary)) {
+        LOG_ERROR(L"Service '%ls' binary path mismatch. Expected='%ls' Actual='%ls'.",
+                  kHomeServiceName, expectedBinary.c_str(), actualBinary.c_str());
+        return ERROR_BAD_CONFIGURATION;
+    }
+
+    LOG_INFO(L"Verified SCM service '%ls' registered with binary '%ls'.",
+             kHomeServiceName, expectedBinary.c_str());
+    return ERROR_SUCCESS;
+}
 
 [[nodiscard]] static DWORD StartHomeServiceBestEffort(const wchar_t* reason) noexcept
 {
@@ -414,8 +549,14 @@ static int RunStage1()
 
     LOG_INFO(L"=== Stage 1: TestSigning detection and reboot pivot ===");
 
+    DWORD err = VerifyHomeServiceRegistered();
+    if (err != ERROR_SUCCESS) {
+        LOG_ERROR(L"Service registration verification failed before Stage 1 (0x%08X).", err);
+        return kExitGenericFailure;
+    }
+
     bool testSigningOn = false;
-    DWORD err = QueryTestSigningState(testSigningOn);
+    err = QueryTestSigningState(testSigningOn);
     if (err != ERROR_SUCCESS) {
         LOG_WARN(L"QueryTestSigningState returned 0x%08X; treating as OFF.", err);
         testSigningOn = false;
@@ -450,6 +591,20 @@ static int RunStage1()
 
     LOG_INFO(L"Stage 1 complete. Reboot is required; returning 3010 for installer UI.");
     return kExitRebootRequired;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Stage 1 MSI wrapper
+// ────────────────────────────────────────────────────────────────────────────
+static int RunStage1Msi()
+{
+    const int result = RunStage1();
+    if (result == kExitRebootRequired) {
+        LOG_INFO(L"Stage 1 requires reboot; returning success to MSI. "
+                 L"The MSI ScheduleReboot action owns the user-visible restart prompt.");
+        return kExitSuccess;
+    }
+    return result;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -514,7 +669,7 @@ static int InnerMain(int argc, wchar_t* argv[])
 
     if (argc < 2) {
         LOG_ERROR(L"No mode argument. Usage: ShadowStrikeDriverResume.exe "
-                  L"[--stage1 | --stage2 | --install-now | --start-service | --uninstall]");
+                  L"[--stage1 | --stage1-msi | --stage2 | --install-now | --start-service | --uninstall]");
         FlushLogger();
         return kExitBadArgs;
     }
@@ -524,6 +679,8 @@ static int InnerMain(int argc, wchar_t* argv[])
 
     if (mode == L"--stage1")
         result = RunStage1();
+    else if (mode == L"--stage1-msi")
+        result = RunStage1Msi();
     else if (mode == L"--stage2")
         result = RunStage2();
     else if (mode == L"--install-now")

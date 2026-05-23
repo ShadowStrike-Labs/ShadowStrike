@@ -190,6 +190,11 @@
          TRAY AUTOSTART  (HKLM Run key – launches for every interactive user)
          Using HKLM so the tray starts regardless of which user logs in,
          consistent with a per-machine security product deployment.
+
+         Component GUID rationale: the HKLM Run value IS the KeyPath, so
+         component removal on uninstall guarantees the value is deleted.
+         Pair this with the InstallAnchor component below so the tray can
+         refuse to start as an orphan (see Tray\InstallProbe.cpp).
     ═══════════════════════════════════════════════════════════════════ -->
     <Component Id="CmpTrayAutostart"
                Directory="INSTALLFOLDER"
@@ -201,6 +206,39 @@
                      Type="string"
                      Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomTray.exe&quot;"
                      KeyPath="yes"/>
+    </Component>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         INSTALL ANCHOR  (read by the tray to validate it is not orphaned)
+         Writes HKLM\SOFTWARE\ShadowStrike\PhantomHome\Install\InstallFolder
+         = [INSTALLFOLDER].  The tray's InstallProbe checks (a) this value
+         exists and (b) its own GetModuleFileName resides under it.  If
+         either check fails the tray exits with code 2 and scrubs HKCU\Run.
+
+         Without this anchor a tray binary copied out of vm_shrd\... or
+         resurrected via stale HKCU\Run can run forever with no service
+         and no visible failure, exactly the bug we are closing.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Component Id="CmpInstallAnchor"
+               Directory="INSTALLFOLDER"
+               Guid="{3E2A8F11-0D6B-4A9C-8E2F-7C1B5A4D9E08}"
+               Bitness="always64">
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                     Name="InstallFolder"
+                     Type="string"
+                     Value="[INSTALLFOLDER]"
+                     KeyPath="yes"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                     Name="ProductVersion"
+                     Type="string"
+                     Value="$(var.ProductVersion)"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                     Name="ProductCode"
+                     Type="string"
+                     Value="[ProductCode]"/>
     </Component>
 
     <!-- ═══════════════════════════════════════════════════════════════════

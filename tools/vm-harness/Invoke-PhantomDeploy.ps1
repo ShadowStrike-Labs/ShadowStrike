@@ -52,6 +52,8 @@ $RepoRoot    = $PSScriptRoot | Split-Path | Split-Path  # tools\vm-harness -> to
 $BinDir      = Join-Path $RepoRoot 'bin\Release'
 $StagingDir  = Join-Path $RepoRoot 'build\installer\staging'
 $BuildDir    = Join-Path $RepoRoot 'build\installer'
+$MsiObjDir   = Join-Path $BuildDir 'obj\msi'
+$BundleObjDir = Join-Path $BuildDir 'obj\bundle'
 $PackageDir  = Join-Path $RepoRoot 'packaging\installer'
 $VmShared    = Join-Path $RepoRoot 'vm_shrd\PhantomHome'
 $AutoDir     = Join-Path $RepoRoot 'vm_shrd\auto'
@@ -61,6 +63,7 @@ $ResultsDir  = Join-Path $AutoDir  'results'
 $MSBuild     = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 $MsiOut      = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.msi'
 $BundleOut   = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.exe'
+$ProductVersion = '1.0.1.0'
 
 New-Item -ItemType Directory -Force -Path $JobsDir    | Out-Null
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
@@ -132,6 +135,57 @@ function Copy-ProductExecutablesToStaging {
     Log "Staged service, UI, and tray executables."
 }
 
+function Assert-MsiAuthoring {
+    param([Parameter(Mandatory)][string]$Path)
+
+    Require-File -Path $Path -Label 'PhantomHome MSI'
+
+    $assertDir = Join-Path ([IO.Path]::GetTempPath()) ("ss-msi-assert-{0}" -f ([Guid]::NewGuid()))
+    New-Item -ItemType Directory -Force -Path $assertDir | Out-Null
+    $decompiled = Join-Path $assertDir 'decompiled.wxs'
+
+    try {
+        wix msi decompile $Path -o $decompiled | Out-Null
+        if ($LASTEXITCODE -ne 0) { Die "MSI decompile failed during authoring assertion" }
+
+        $content = Get-Content $decompiled -Raw
+        $failures = New-Object System.Collections.Generic.List[string]
+
+        if ($content -notmatch ('<Package\b[\s\S]*?\bVersion="' + [regex]::Escape($ProductVersion) + '"')) {
+            $failures.Add("MSI package version is not $ProductVersion")
+        }
+        if ($content -notmatch '<ServiceInstall\b[\s\S]*?\bName="ShadowStrikePhantomService"') {
+            $failures.Add('ServiceInstall for ShadowStrikePhantomService is missing')
+        }
+        if ($content -notmatch '<ServiceDependency\b[^>]*\bId="Winmgmt"') {
+            $failures.Add('Winmgmt service dependency is missing')
+        }
+        if ($content -notmatch '<ServiceDependency\b[^>]*\bId="FltMgr"') {
+            $failures.Add('FltMgr service dependency is missing')
+        }
+        if ($content -match '<ServiceControl\b[^>]*\bName="ShadowStrikePhantomService"[^>]*\bStart="install"') {
+            $failures.Add('ServiceControl still starts ShadowStrikePhantomService during MSI install')
+        }
+        if ($content -notmatch '<CustomAction\b[^>]*\bId="ExecDriverInstallStg1"') {
+            $failures.Add('ExecDriverInstallStg1 custom action is missing')
+        }
+        if ($content -notmatch '--stage1-msi') {
+            $failures.Add('DriverResume MSI-safe stage1 command is missing')
+        }
+        if ($content -notmatch '<Component\b[^>]*\bId="CmpInstallAnchor"') {
+            $failures.Add('CmpInstallAnchor registry component is missing')
+        }
+
+        if ($failures.Count -gt 0) {
+            Die ("MSI authoring assertion failed: " + ($failures -join '; '))
+        }
+
+        Log "MSI authoring assertion passed."
+    } finally {
+        Remove-Item $assertDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ── BUILD ────────────────────────────────────────────────────────────────────
 if (-not $SkipBuild) {
     if ($RebuildLib) {
@@ -165,8 +219,10 @@ if (-not $SkipBuild) {
 
 # ── PACKAGE ──────────────────────────────────────────────────────────────────
 Log "Building MSI..."
+New-Item -ItemType Directory -Force -Path $MsiObjDir | Out-Null
 wix build -arch x64 `
-    -d ProductVersion=1.0.0.0 `
+    -intermediatefolder $MsiObjDir `
+    -d ProductVersion=$ProductVersion `
     -d BinDir=$BinDir `
     -d StagingDir=$StagingDir `
     -d InstallerDir=$PackageDir `
@@ -179,10 +235,13 @@ wix build -arch x64 `
     (Join-Path $BuildDir   'QtHarvest.wxs') `
     -o $MsiOut 2>&1 | Tee-Object -Variable wixOut
 if ($LASTEXITCODE -ne 0) { Die "MSI build failed" }
+Assert-MsiAuthoring -Path $MsiOut
 
 Log "Building Bundle..."
+New-Item -ItemType Directory -Force -Path $BundleObjDir | Out-Null
 wix build -arch x64 `
-    -d ProductVersion=1.0.0.0 `
+    -intermediatefolder $BundleObjDir `
+    -d ProductVersion=$ProductVersion `
     -d BinDir=$BinDir `
     -d InstallerDir=$PackageDir `
     -d MsiPath=$MsiOut `

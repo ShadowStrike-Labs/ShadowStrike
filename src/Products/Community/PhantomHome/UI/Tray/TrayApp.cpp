@@ -45,6 +45,7 @@
 #include "TrayMenu.hpp"
 #include "AutoRun.hpp"
 #include "TrayIpc.hpp"
+#include "InstallProbe.hpp"
 #include "PhantomCore/Utils/Logger.hpp"
 
 #pragma comment(lib, "dwmapi.lib")
@@ -545,6 +546,32 @@ int TrayApp::Run(HINSTANCE hInstance) {
     SS_LOG_INFO(kLogCategory, L"ShadowStrike Phantom Tray starting (PID=%lu)", GetCurrentProcessId());
 
     // -----------------------------------------------------------------
+    // Install probe — refuse to run as an orphan.
+    //
+    // The tray is a UI surface; if the MSI install anchor is absent OR
+    // the tray binary is running outside [INSTALLFOLDER], we are a
+    // stale residue (typically: hand-copied artifact from vm_shrd, or
+    // an HKCU\Run entry that survived a botched uninstall).  Exit hard,
+    // scrub our HKCU\Run self-heal value if we can, and never paint an
+    // icon that would mislead the operator into thinking the product
+    // is healthy.
+    // -----------------------------------------------------------------
+    {
+        const InstallProbeResult probe = ProbeInstall();
+        if (probe.state == InstallState::Orphaned) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Orphaned tray detected; refusing to start. "
+                L"Scrubbing HKCU\\Run autostart and exiting.");
+            (void)RemoveAutoRun();  // best-effort cleanup
+            if (comOwned) CoUninitialize();
+            return 2;  // distinct exit code for orphan refusal
+        }
+        // InstalledNoSvc is allowed to proceed, but the tray will paint
+        // the Offline icon and surface a balloon once the message loop
+        // is up (see post-CreateWindow block below).
+    }
+
+    // -----------------------------------------------------------------
     // Single-instance mutex
     // -----------------------------------------------------------------
     m_impl->hMutex.reset(CreateMutexW(nullptr, TRUE, kMutexName));
@@ -660,10 +687,28 @@ int TrayApp::Run(HINSTANCE hInstance) {
 
     // -----------------------------------------------------------------
     // HKCU\Run self-healing autorun registration (tray-autorun)
+    //
+    // Only register HKCU autostart when the install probe reported a
+    // valid, anchored installation.  Otherwise HKCU\Run becomes a
+    // resurrection vector that survives any future MSI uninstall.
     // -----------------------------------------------------------------
-    if (!EnsureAutoRun()) {
-        SS_LOG_WARN(kLogCategory,
-            L"Autorun registration failed; tray will not auto-start on next login.");
+    {
+        const InstallProbeResult probe = ProbeInstall();
+        if (probe.state == InstallState::Installed) {
+            if (!EnsureAutoRun()) {
+                SS_LOG_WARN(kLogCategory,
+                    L"Autorun registration failed; tray will not auto-start on next login.");
+            }
+        } else {
+            SS_LOG_WARN(kLogCategory,
+                L"Skipping HKCU\\Run self-heal: install state=%d", static_cast<int>(probe.state));
+            (void)RemoveAutoRun();
+            if (probe.state == InstallState::InstalledNoSvc) {
+                // Force Offline state and emit a one-shot balloon so the
+                // operator immediately sees the service is missing.
+                TrayApp::Instance().SetState(TrayState::Offline);
+            }
+        }
     }
 
     // -----------------------------------------------------------------

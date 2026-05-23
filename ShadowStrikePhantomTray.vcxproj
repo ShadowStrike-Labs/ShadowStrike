@@ -89,6 +89,7 @@
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Tray\TrayApp.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Tray\TrayMenu.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Tray\AutoRun.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\Tray\InstallProbe.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\UI\Tray\TrayIpc.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -98,6 +99,7 @@
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Tray\TrayIconIds.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Tray\TrayMenu.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Tray\AutoRun.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\Tray\InstallProbe.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Tray\Version.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Tray\TrayIpc.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\UI\Shared\TrayUiArgs.hpp" />

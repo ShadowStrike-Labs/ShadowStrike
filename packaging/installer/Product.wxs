@@ -7,7 +7,7 @@
 
   Build (from repo root):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.0.0 ^
+      -d ProductVersion=1.0.1.0 ^
       -d BinDir=bin\Release ^
       -d StagingDir=build\installer\staging ^
       -d InstallerDir=packaging\installer ^
@@ -36,6 +36,7 @@
       DowngradeErrorMessage prevents rolling back to an older release accidentally.
     -->
     <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="A newer version of [ProductName] is already installed. Downgrade is not supported."
         Schedule="afterInstallInitialize"/>
 
@@ -73,19 +74,22 @@
       pivot, missing reboot, or transient subsystem failure into MSI error 1920
       and rolls back a valid installation.  Instead, launch the hardened
       ShadowStrikeDriverResume helper as LocalSystem near the end of the execute
-      script.  The helper owns driver testsigning/stage2 work, returns
-      ERROR_SUCCESS_REBOOT_REQUIRED when a reboot is necessary, and writes diagnostics under
-      %ProgramData%\ShadowStrike\Logs.
+      script.  The helper owns driver testsigning/stage2 work and writes
+      diagnostics under %ProgramData%\ShadowStrike\Logs.  The MSI invokes the
+      stage1-msi wrapper so reboot-required does not rollback ServiceInstall;
+      ScheduleReboot below owns the user-visible restart prompt.
     -->
     <CustomAction Id="ExecDriverInstallStg1"
-                  Directory="INSTALLFOLDER"
-                  ExeCommand="ShadowStrikeDriverResume.exe --stage1"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="asyncWait"/>
+                    Directory="INSTALLFOLDER"
+                    ExeCommand="&quot;[#DriverResumeExe]&quot; --stage1-msi"
+                    Execute="deferred"
+                    Impersonate="no"
+                    Return="check"/>
     <InstallExecuteSequence>
       <Custom Action="ExecDriverInstallStg1"
               Before="InstallFinalize"
+              Condition="NOT Installed"/>
+      <ScheduleReboot After="ExecDriverInstallStg1"
               Condition="NOT Installed"/>
     </InstallExecuteSequence>
 
@@ -165,6 +169,9 @@
 
       <!-- Machine-wide Run-key entry that starts the tray on every logon. -->
       <ComponentRef Id="CmpTrayAutostart"/>
+
+      <!-- Install anchor read by the tray InstallProbe to detect orphan state. -->
+      <ComponentRef Id="CmpInstallAnchor"/>
 
       <!-- Start Menu shortcut for the UI. -->
       <ComponentRef Id="CmpStartMenuShortcut"/>

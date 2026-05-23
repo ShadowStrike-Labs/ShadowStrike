@@ -11,7 +11,7 @@
 
   Build (from repo root):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.0.0 ^
+      -d ProductVersion=1.0.1.0 ^
       -d BinDir=bin\Release ^
       -d InstallerDir=packaging\installer ^
       -d MsiPath=build\installer\ShadowStrikePhantom-Home-Setup.msi ^
@@ -39,8 +39,8 @@
       is invoked.
 
       ShowVersion="yes"      – display the product version in the bundle UI.
-      ShowRestartButton="yes" – if the MSI CA returns 3010, the bundle UI
-                                shows a "Restart" button rather than "Finish".
+      The chained MSI schedules a reboot when Stage 1 enables testsigning, so
+      Burn can surface the restart requirement without MSI rollback.
     -->
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
