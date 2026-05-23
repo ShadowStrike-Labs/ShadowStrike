@@ -84,17 +84,16 @@
         ServiceControl:
         * Stop on both install (upgrade path) and uninstall.
         * Remove on uninstall.
-        * Start on install without waiting for the service to finish full
-          protection initialization. The service must expose UI IPC immediately
-          and report degraded subsystem state itself instead of making MSI own
-          endpoint runtime readiness.
+        * Do NOT start during MSI StartServices. Endpoint service launch is
+          handled after InstallFinalize by ShadowStrikeDriverResume.exe, which
+          first stages driver/test-signing work and then starts the service via
+          SCM with detailed logs. This avoids MSI error 1920 while preserving a
+          production-grade startup path and diagnostics.
       -->
       <ServiceControl Id="SvcControl"
                       Name="ShadowStrikePhantomService"
-                      Start="install"
                       Stop="both"
-                      Remove="uninstall"
-                      Wait="no"/>
+                      Remove="uninstall"/>
 
     </Component>
 

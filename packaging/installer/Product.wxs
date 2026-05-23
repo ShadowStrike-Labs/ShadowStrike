@@ -65,6 +65,31 @@
     -->
     <ui:WixUI Id="WixUI_Minimal"/>
 
+    <!--
+      Post-install startup handoff:
+
+      Windows Installer must not own endpoint runtime readiness.  Starting a
+      SYSTEM service through the MSI StartServices action turns any slow driver
+      pivot, missing reboot, or transient subsystem failure into MSI error 1920
+      and rolls back a valid installation.  Instead, launch the hardened
+      ShadowStrikeDriverResume helper as LocalSystem near the end of the execute
+      script.  The helper owns driver testsigning/stage2 work, bounded
+      ShadowStrikePhantomService startup, and diagnostics under
+      %ProgramData%\ShadowStrike\Logs.
+    -->
+    <Property Id="REBOOT" Value="ReallySuppress"/>
+    <CustomAction Id="ExecDriverInstallStg1"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="ShadowStrikeDriverResume.exe --stage1"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="asyncNoWait"/>
+    <InstallExecuteSequence>
+      <Custom Action="ExecDriverInstallStg1"
+              Before="InstallFinalize"
+              Condition="NOT Installed"/>
+    </InstallExecuteSequence>
+
     <!-- ──────────────── Launch conditions ──────────────── -->
     <!-- Require 64-bit Windows 8.1 (6.3) or later. -->
     <Launch Condition="Installed OR (VersionNT64 &gt;= 603)"

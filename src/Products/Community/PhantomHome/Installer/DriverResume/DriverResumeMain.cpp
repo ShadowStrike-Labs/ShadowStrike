@@ -32,6 +32,10 @@
  *
  *   --install-now  Force immediate driver install (admin-only, no reboot pivot).
  *
+ *   --start-service
+ *                  Start ShadowStrikePhantomService through SCM with bounded
+ *                  diagnostics. Used for post-install triage and safe retries.
+ *
  *   --uninstall    Stop and remove the PhantomSensor driver service.
  *
  * Architecture guarantees:
@@ -205,7 +209,110 @@ void Log(const wchar_t* level, const wchar_t* fmt, ...)
 [[nodiscard]] static int RunStage2();
 [[nodiscard]] static int RunStage1();
 [[nodiscard]] static int RunInstallNow();
+[[nodiscard]] static int RunStartService();
 [[nodiscard]] static int RunUninstall();
+
+// ────────────────────────────────────────────────────────────────────────────
+//  PhantomHome user-mode service startup
+// ────────────────────────────────────────────────────────────────────────────
+static constexpr wchar_t kHomeServiceName[] = L"ShadowStrikePhantomService";
+static constexpr DWORD kHomeServiceStartTimeoutMs = 30000;
+static constexpr DWORD kHomeServicePollIntervalMs = 500;
+
+[[nodiscard]] static DWORD StartHomeServiceBestEffort(const wchar_t* reason) noexcept
+{
+    using namespace ShadowStrike::Installer;
+
+    LOG_INFO(L"Starting '%ls' via SCM (%ls).",
+             kHomeServiceName, reason ? reason : L"no reason");
+
+    ScHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm.valid()) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"OpenSCManagerW for home service start failed (0x%08X).", err);
+        return err;
+    }
+
+    ScHandleGuard svc(OpenServiceW(
+        scm.get(),
+        kHomeServiceName,
+        SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_INTERROGATE));
+    if (!svc.valid()) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"OpenServiceW('%ls') failed (0x%08X).",
+                  kHomeServiceName, err);
+        return err;
+    }
+
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD bytesNeeded = 0;
+    if (!QueryServiceStatusEx(svc.get(), SC_STATUS_PROCESS_INFO,
+                              reinterpret_cast<LPBYTE>(&ssp),
+                              sizeof(ssp), &bytesNeeded)) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"Initial QueryServiceStatusEx('%ls') failed (0x%08X).",
+                  kHomeServiceName, err);
+        return err;
+    }
+
+    if (ssp.dwCurrentState == SERVICE_RUNNING) {
+        LOG_INFO(L"Home service is already running (pid=%lu).", ssp.dwProcessId);
+        return ERROR_SUCCESS;
+    }
+
+    if (ssp.dwCurrentState != SERVICE_START_PENDING) {
+        if (!StartServiceW(svc.get(), 0, nullptr)) {
+            const DWORD err = GetLastError();
+            if (err != ERROR_SERVICE_ALREADY_RUNNING) {
+                LOG_ERROR(L"StartServiceW('%ls') failed immediately "
+                          L"(0x%08X, state=%lu, win32Exit=%lu, serviceExit=%lu).",
+                          kHomeServiceName, err, ssp.dwCurrentState,
+                          ssp.dwWin32ExitCode, ssp.dwServiceSpecificExitCode);
+                return err;
+            }
+        }
+    }
+
+    const ULONGLONG deadline = GetTickCount64() + kHomeServiceStartTimeoutMs;
+    for (;;) {
+        ZeroMemory(&ssp, sizeof(ssp));
+        bytesNeeded = 0;
+        if (!QueryServiceStatusEx(svc.get(), SC_STATUS_PROCESS_INFO,
+                                  reinterpret_cast<LPBYTE>(&ssp),
+                                  sizeof(ssp), &bytesNeeded)) {
+            const DWORD err = GetLastError();
+            LOG_ERROR(L"QueryServiceStatusEx('%ls') during start failed "
+                      L"(0x%08X).", kHomeServiceName, err);
+            return err;
+        }
+
+        if (ssp.dwCurrentState == SERVICE_RUNNING) {
+            LOG_INFO(L"Home service reached RUNNING (pid=%lu).", ssp.dwProcessId);
+            return ERROR_SUCCESS;
+        }
+
+        if (ssp.dwCurrentState == SERVICE_STOPPED) {
+            const DWORD err = ssp.dwWin32ExitCode != ERROR_SUCCESS
+                ? ssp.dwWin32ExitCode
+                : ERROR_SERVICE_NOT_ACTIVE;
+            LOG_ERROR(L"Home service stopped during startup "
+                      L"(win32Exit=%lu, serviceExit=%lu, checkpoint=%lu).",
+                      ssp.dwWin32ExitCode, ssp.dwServiceSpecificExitCode,
+                      ssp.dwCheckPoint);
+            return err;
+        }
+
+        if (GetTickCount64() >= deadline) {
+            LOG_ERROR(L"Timed out after %lu ms waiting for '%ls' to reach "
+                      L"RUNNING (state=%lu, checkpoint=%lu, waitHint=%lu).",
+                      kHomeServiceStartTimeoutMs, kHomeServiceName,
+                      ssp.dwCurrentState, ssp.dwCheckPoint, ssp.dwWaitHint);
+            return WAIT_TIMEOUT;
+        }
+
+        Sleep(kHomeServicePollIntervalMs);
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 //  Stage 2 — SCM create, sys copy, minifilter load
@@ -285,6 +392,13 @@ static int RunStage2()
     // 8. Clean up RunOnce entry (idempotent).
     (void)ClearRunOnceEntry();
 
+    const DWORD serviceErr = StartHomeServiceBestEffort(L"stage2 complete");
+    if (serviceErr != ERROR_SUCCESS) {
+        LOG_WARN(L"Home service did not reach RUNNING after Stage 2 "
+                 L"(0x%08X). The SCM delayed-auto-start and recovery policy "
+                 L"remain configured for the next boot/retry.", serviceErr);
+    }
+
     LOG_INFO(L"=== Stage 2 complete. ===");
     return kExitSuccess;
 }
@@ -337,6 +451,13 @@ static int RunStage1()
         return kExitGenericFailure;
     }
 
+    const DWORD serviceErr = StartHomeServiceBestEffort(L"stage1 reboot pending");
+    if (serviceErr != ERROR_SUCCESS) {
+        LOG_WARN(L"Home service did not reach RUNNING before reboot "
+                 L"(0x%08X). This is non-fatal because the service is "
+                 L"configured for delayed auto-start after reboot.", serviceErr);
+    }
+
     LOG_INFO(L"Stage 1 complete. System restart in 60 s. Returning 3010.");
     return kExitRebootRequired;
 }
@@ -348,6 +469,16 @@ static int RunInstallNow()
 {
     LOG_INFO(L"=== Mode: --install-now (forced immediate install) ===");
     return RunStage2();
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  --start-service
+// ────────────────────────────────────────────────────────────────────────────
+static int RunStartService()
+{
+    LOG_INFO(L"=== Mode: --start-service ===");
+    const DWORD err = StartHomeServiceBestEffort(L"explicit command");
+    return err == ERROR_SUCCESS ? kExitSuccess : kExitGenericFailure;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -393,7 +524,7 @@ static int InnerMain(int argc, wchar_t* argv[])
 
     if (argc < 2) {
         LOG_ERROR(L"No mode argument. Usage: ShadowStrikeDriverResume.exe "
-                  L"[--stage1 | --stage2 | --install-now | --uninstall]");
+                  L"[--stage1 | --stage2 | --install-now | --start-service | --uninstall]");
         FlushLogger();
         return kExitBadArgs;
     }
@@ -407,6 +538,8 @@ static int InnerMain(int argc, wchar_t* argv[])
         result = RunStage2();
     else if (mode == L"--install-now")
         result = RunInstallNow();
+    else if (mode == L"--start-service")
+        result = RunStartService();
     else if (mode == L"--uninstall")
         result = RunUninstall();
     else {

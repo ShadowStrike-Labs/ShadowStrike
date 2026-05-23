@@ -105,13 +105,12 @@
                             ResetPeriodInDays="1" />
       </ServiceInstall>
 
-      <!-- Start on install without blocking MSI on full endpoint readiness. -->
+      <!-- Do not use MSI StartServices; DriverResume owns post-install startup
+           after driver/runtime staging and writes explicit diagnostics. -->
       <ServiceControl Id="SvcStartStop"
                       Name="ShadowStrikePhantomService"
-                      Start="install"
                       Stop="both"
-                      Remove="uninstall"
-                      Wait="no" />
+                      Remove="uninstall" />
     </Component>
 
     <Component Id="TrayExecutable"
