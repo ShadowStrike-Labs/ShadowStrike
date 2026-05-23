@@ -169,6 +169,12 @@ function Assert-MsiAuthoring {
         if ($content -notmatch '<CustomAction\b[^>]*\bId="ExecDriverInstallStg1"') {
             $failures.Add('ExecDriverInstallStg1 custom action is missing')
         }
+        if ($content -notmatch '<CustomAction\b[^>]*\bId="ExecDriverInstallStg1"[^>]*\bFileRef="DriverResumeExe"') {
+            $failures.Add('ExecDriverInstallStg1 must run the installed DriverResumeExe file')
+        }
+        if ($content -notmatch '<CustomAction\b[^>]*\bId="ExecDriverInstallStg1"[^>]*\bReturn="ignore"') {
+            $failures.Add('ExecDriverInstallStg1 must ignore DriverResume exit code to prevent MSI rollback')
+        }
         if ($content -notmatch '--stage1-msi') {
             $failures.Add('DriverResume MSI-safe stage1 command is missing')
         }

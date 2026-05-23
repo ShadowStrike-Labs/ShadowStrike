@@ -75,16 +75,18 @@
       and rolls back a valid installation.  Instead, launch the hardened
       ShadowStrikeDriverResume helper as LocalSystem near the end of the execute
       script.  The helper owns driver testsigning/stage2 work and writes
-      diagnostics under %ProgramData%\ShadowStrike\Logs.  The MSI invokes the
-      stage1-msi wrapper so reboot-required does not rollback ServiceInstall;
-      ScheduleReboot below owns the user-visible restart prompt.
+      diagnostics under %ProgramData%\ShadowStrike\Logs.  The helper is run
+      from the installed DriverResume file and its exit code is intentionally
+      ignored: driver/test-signing staging must never rollback durable MSI
+      service registration.  ScheduleReboot below owns the user-visible restart
+      prompt.
     -->
     <CustomAction Id="ExecDriverInstallStg1"
-                    Directory="INSTALLFOLDER"
-                    ExeCommand="&quot;[#DriverResumeExe]&quot; --stage1-msi"
+                    FileRef="DriverResumeExe"
+                    ExeCommand="--stage1-msi"
                     Execute="deferred"
                     Impersonate="no"
-                    Return="check"/>
+                    Return="ignore"/>
     <InstallExecuteSequence>
       <Custom Action="ExecDriverInstallStg1"
               Before="InstallFinalize"
