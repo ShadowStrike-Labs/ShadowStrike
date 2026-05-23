@@ -73,17 +73,16 @@
       pivot, missing reboot, or transient subsystem failure into MSI error 1920
       and rolls back a valid installation.  Instead, launch the hardened
       ShadowStrikeDriverResume helper as LocalSystem near the end of the execute
-      script.  The helper owns driver testsigning/stage2 work, bounded
-      ShadowStrikePhantomService startup, and diagnostics under
+      script.  The helper owns driver testsigning/stage2 work, returns
+      ERROR_SUCCESS_REBOOT_REQUIRED when a reboot is necessary, and writes diagnostics under
       %ProgramData%\ShadowStrike\Logs.
     -->
-    <Property Id="REBOOT" Value="ReallySuppress"/>
     <CustomAction Id="ExecDriverInstallStg1"
                   Directory="INSTALLFOLDER"
                   ExeCommand="ShadowStrikeDriverResume.exe --stage1"
                   Execute="deferred"
                   Impersonate="no"
-                  Return="asyncNoWait"/>
+                  Return="asyncWait"/>
     <InstallExecuteSequence>
       <Custom Action="ExecDriverInstallStg1"
               Before="InstallFinalize"
@@ -100,10 +99,7 @@
 
     <!--
       Detect Visual C++ 2015-2022 x64 runtime.  The Minor build is bumped
-      with every servicing release, so we only test Installed=1.  If absent,
-      we do NOT block the install (the service simply won't start until the
-      runtime is present); we display a warning via WixUI so the user knows
-      to run the accompanying bundled .exe which chain-installs the runtime.
+      with every servicing release, so we only test Installed=1.
     -->
     <Property Id="VCREDIST2022X64INSTALLED" Secure="yes">
       <RegistrySearch Id="VcRedist2022X64Search"
@@ -113,6 +109,8 @@
                       Type="raw"
                       Bitness="always64"/>
     </Property>
+    <Launch Condition="Installed OR VCREDIST2022X64INSTALLED"
+            Message="ShadowStrike Phantom Home requires the Microsoft Visual C++ 2015-2022 x64 runtime. Run ShadowStrikePhantom-Home-Setup.exe so the bundled prerequisite is installed first."/>
 
     <!-- ──────────────── Directory tree ──────────────── -->
     <!--

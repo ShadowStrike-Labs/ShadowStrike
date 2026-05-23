@@ -68,7 +68,7 @@ static constexpr UINT kWmOpenUi = WM_USER + 0x2001;
 static constexpr UINT kWmUpdateIcon = WM_USER + 0x2002;
 
 static constexpr wchar_t kWindowClassName[] = L"ShadowStrike_Tray_MessageWindow";
-static constexpr wchar_t kMutexName[]       = L"Global\\ShadowStrike.PhantomHome.Tray";
+static constexpr wchar_t kMutexName[]       = L"Local\\ShadowStrike.PhantomHome.Tray";
 static constexpr wchar_t kUiExeName[]       = L"ShadowStrikePhantomUI.exe";
 static constexpr wchar_t kLogCategory[]     = L"TrayApp";
 

@@ -615,6 +615,9 @@ bool PipeClient::Impl::DoWrite(HANDLE hPipe, OVERLAPPED& ovlp,
 UniqueHandle PipeClient::Impl::AttemptConnect(std::stop_token stoken)
 {
     DWORD backoffMs = 250;
+    DWORD lastErr = ERROR_SUCCESS;
+    std::uint32_t repeatedDenied = 0;
+    std::uint32_t repeatedUnavailable = 0;
 
     while (!stoken.stop_requested()) {
         HANDLE h = CreateFileW(
@@ -638,12 +641,35 @@ UniqueHandle PipeClient::Impl::AttemptConnect(std::stop_token stoken)
             }
         } else {
             DWORD err = GetLastError();
+            if (err != lastErr) {
+                repeatedDenied = 0;
+                repeatedUnavailable = 0;
+                lastErr = err;
+            }
             if (err == ERROR_PIPE_BUSY) {
                 // Server has instances but all are busy; use the documented wait.
                 if (!WaitNamedPipeW(CommunicationConstants::PIPE_NAME, 2000)) {
                     SS_LOG_INFO(kLog, L"WaitNamedPipeW timed out — retrying.");
                 }
                 continue; // Retry without backoff increment.
+            }
+            if (err == ERROR_ACCESS_DENIED) {
+                ++repeatedDenied;
+                SS_LOG_ERROR(kLog,
+                    L"CreateFileW denied access to %ls (%lu) attempt=%u. "
+                    L"Service pipe ACL is blocking this user-session client.",
+                    CommunicationConstants::PIPE_NAME, err, repeatedDenied);
+                if (repeatedDenied >= 10) {
+                    TransitionState(PipeClientState::Fatal,
+                        L"Service refused IPC pipe access (ERROR_ACCESS_DENIED)");
+                    return {};
+                }
+            } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+                ++repeatedUnavailable;
+                if (repeatedUnavailable == 20) {
+                    TransitionState(PipeClientState::Disconnected,
+                        L"Service IPC pipe is not published; service is offline or failed startup");
+                }
             }
             SS_LOG_WARN(kLog, L"CreateFileW failed: %lu — backoff %lu ms.", err, backoffMs);
         }
@@ -1053,7 +1079,9 @@ void PipeClient::Impl::IoThreadProc(std::stop_token stoken)
 
     // Final cleanup.
     FailAllPending("stopped", "PipeClient I/O thread exited");
-    TransitionState(PipeClientState::Disconnected, L"I/O thread exited");
+    if (!m_fatalFlag.load(std::memory_order_acquire)) {
+        TransitionState(PipeClientState::Disconnected, L"I/O thread exited");
+    }
     SS_LOG_INFO(kLog, L"IoThreadProc exited.");
 }
 

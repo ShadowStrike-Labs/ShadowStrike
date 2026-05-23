@@ -298,6 +298,11 @@ private:
 
     // Stats
     CommunicatorStats m_stats;
+
+    // Set true on Start() so the first server pipe uses
+    // FILE_FLAG_FIRST_PIPE_INSTANCE. Subsequent instances omit the flag because
+    // active client connections keep earlier instances open by design.
+    std::atomic<bool> m_firstPipeInstance{true};
 };
 
 // ----------------------------------------------------------------------------
@@ -322,14 +327,16 @@ bool ServiceCommunicatorImpl::CreatePipeSecurityDescriptor() {
     //   D:P                        - Protected DACL (no inheritance from parent)
     //     (A;;GA;;;SY)             - SYSTEM: Generic All
     //     (A;;GA;;;BA)             - Built-in Administrators: Generic All
-    //   S:(ML;;NWNRNX;;;HI)        - Mandatory label: deny write/read/execute up
-    //                                from below HIGH integrity (blocks Medium IL
-    //                                processes spawned by a compromised admin
-    //                                shell that hasn't elevated).
-    // Deny everyone else implicitly. The mandatory label adds defense-in-depth
-    // against a Medium-IL attacker that already holds a token in the BA group.
+    //     (A;;GRGW;;;IU)           - Interactive users: client read/write only
+    //     (A;;GRGW;;;AU)           - Authenticated users: client read/write only
+    //   S:(ML;;NW;;;LW)            - Low-integrity clients cannot write up.
+    //
+    // The pipe DACL is not the trust boundary for Home UI access.  It only
+    // allows local user-session clients to reach AuthHandshake; the per-session
+    // IpcAuthToken and recorded pipe client session ID remain the authorization
+    // gate.  Denying Medium-IL users here breaks every non-elevated UI/tray.
     const wchar_t* sddl =
-        L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NWNRNX;;;HI)";
+        L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)(A;;GRGW;;;AU)S:(ML;;NW;;;LW)";
 
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl,
@@ -385,6 +392,7 @@ bool ServiceCommunicatorImpl::Start() {
 
     if (m_running) return true;
 
+    m_firstPipeInstance.store(true, std::memory_order_release);
     m_running = true;
     m_listenThread = std::thread(&ServiceCommunicatorImpl::ListenLoop, this);
 
@@ -451,9 +459,14 @@ void ServiceCommunicatorImpl::ListenLoop() {
             }
         }
 
+        const bool requireFirstInstance =
+            m_firstPipeInstance.load(std::memory_order_acquire);
+        const DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+                               (requireFirstInstance ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0);
+
         HANDLE hPipe = CreateNamedPipeW(
             CommunicationConstants::PIPE_NAME,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, // Bi-directional, Overlapped
+            openMode, // Bi-directional, overlapped; first instance is anti-squatting guarded.
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, // Message mode
             CommunicationConstants::MAX_CONCURRENT_CLIENTS,
             CommunicationConstants::OUT_BUFFER_SIZE,
@@ -463,12 +476,24 @@ void ServiceCommunicatorImpl::ListenLoop() {
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            SS_LOG_ERROR(L"IPC", L"CreateNamedPipe failed. Error: %lu", GetLastError());
+            const DWORD err = GetLastError();
+            SS_LOG_ERROR(L"IPC", L"CreateNamedPipe failed. Error: %lu", err);
+            if (requireFirstInstance &&
+                (err == ERROR_ACCESS_DENIED || err == ERROR_PIPE_BUSY)) {
+                SS_LOG_ERROR(L"IPC",
+                    L"First pipe instance for %ls was denied/busy; possible pipe squatting. Stopping IPC server.",
+                    CommunicationConstants::PIPE_NAME);
+                m_running = false;
+                break;
+            }
             if (m_stopEvent.IsValid() &&
                 WaitForSingleObject(m_stopEvent, 1000) == WAIT_OBJECT_0) {
                 break;
             }
             continue;
+        }
+        if (requireFirstInstance) {
+            m_firstPipeInstance.store(false, std::memory_order_release);
         }
 
         // RAII for the accept-side pipe handle until ownership transfers.

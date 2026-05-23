@@ -660,7 +660,7 @@ bool TrayIpc::GetState(TrayState& out) noexcept {
             // Expected payload shape:
             // { "ok": true, "health": "healthy"|"atRisk"|"critical",
             //   "globalMode": <int>, "paused": <bool>,
-            //   "pausedMinutesRemaining": <int> }
+            //   "pausedSecondsRemaining": <int> }
 
             const auto healthStr = j.value("health", std::string("unknown"));
             if      (healthStr == "healthy")  m_lastState.health = TrayState::Health::Healthy;
@@ -671,8 +671,10 @@ bool TrayIpc::GetState(TrayState& out) noexcept {
             m_lastState.globalMode            = static_cast<std::uint8_t>(
                                                     j.value("globalMode", 0));
             m_lastState.paused                = j.value("paused", false);
-            m_lastState.pausedMinutesRemaining= static_cast<std::uint32_t>(
-                                                    j.value("pausedMinutesRemaining", 0));
+            const std::uint32_t pausedSeconds = static_cast<std::uint32_t>(
+                j.value("pausedSecondsRemaining", j.value("pausedRemainingSec", 0)));
+            m_lastState.pausedMinutesRemaining = static_cast<std::uint32_t>(
+                (pausedSeconds + 59u) / 60u);
 
             out = m_lastState;
             return true;

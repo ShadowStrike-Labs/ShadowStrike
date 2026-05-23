@@ -23,12 +23,13 @@
  *
  * Execution modes (command-line argument):
  *   --stage1       Called by MSI deferred CA immediately after install.
- *                  Detects testsigning; if off, enables it, writes RunOnce,
- *                  schedules reboot, exits 3010 (ERROR_SUCCESS_REBOOT_REQUIRED).
- *                  If already on, runs Stage 2 inline.
+ *                  Detects testsigning; if off, enables it, registers a SYSTEM
+ *                  scheduled task for Stage 2, exits 3010
+ *                  (ERROR_SUCCESS_REBOOT_REQUIRED). If already on, runs Stage 2
+ *                  inline.
  *
- *   --stage2       Called by RunOnce after reboot. Installs and loads the
- *                  PhantomSensor minifilter driver.
+ *   --stage2       Called by the SYSTEM scheduled task after reboot. Installs
+ *                  and loads the PhantomSensor minifilter driver.
  *
  *   --install-now  Force immediate driver install (admin-only, no reboot pivot).
  *
@@ -389,8 +390,9 @@ static int RunStage2()
                  markerErr);
     }
 
-    // 8. Clean up RunOnce entry (idempotent).
+    // 8. Clean up legacy RunOnce and current scheduled-task pivots (idempotent).
     (void)ClearRunOnceEntry();
+    (void)DeleteStage2ScheduledTask();
 
     const DWORD serviceErr = StartHomeServiceBestEffort(L"stage2 complete");
     if (serviceErr != ERROR_SUCCESS) {
@@ -431,34 +433,22 @@ static int RunStage1()
         return kExitGenericFailure;
     }
 
-    // Register Stage 2 in RunOnce.
+    // Register Stage 2 as a SYSTEM scheduled task. HKLM RunOnce executes under
+    // an interactive user token and can be consumed before a privileged driver
+    // install succeeds, leaving the product permanently offline after reboot.
     std::wstring ownPath = GetOwnExePath();
     if (ownPath.empty()) {
-        LOG_ERROR(L"Cannot determine own exe path for RunOnce registration.");
+        LOG_ERROR(L"Cannot determine own exe path for Stage 2 task registration.");
         return kExitGenericFailure;
     }
 
-    err = WriteRunOnceStage2(ownPath);
+    err = RegisterStage2ScheduledTask(ownPath);
     if (err != ERROR_SUCCESS) {
-        LOG_ERROR(L"WriteRunOnceStage2 failed (0x%08X).", err);
+        LOG_ERROR(L"RegisterStage2ScheduledTask failed (0x%08X).", err);
         return kExitGenericFailure;
     }
 
-    // Schedule system restart.
-    err = ScheduleReboot();
-    if (err != ERROR_SUCCESS) {
-        LOG_ERROR(L"ScheduleReboot failed (0x%08X).", err);
-        return kExitGenericFailure;
-    }
-
-    const DWORD serviceErr = StartHomeServiceBestEffort(L"stage1 reboot pending");
-    if (serviceErr != ERROR_SUCCESS) {
-        LOG_WARN(L"Home service did not reach RUNNING before reboot "
-                 L"(0x%08X). This is non-fatal because the service is "
-                 L"configured for delayed auto-start after reboot.", serviceErr);
-    }
-
-    LOG_INFO(L"Stage 1 complete. System restart in 60 s. Returning 3010.");
+    LOG_INFO(L"Stage 1 complete. Reboot is required; returning 3010 for installer UI.");
     return kExitRebootRequired;
 }
 

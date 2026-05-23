@@ -87,6 +87,7 @@
 #include <condition_variable>
 #include <sstream>
 #include <iomanip>
+#include <iterator>
 
 namespace ShadowStrike {
 namespace Service {
@@ -170,17 +171,25 @@ public:
         if (m_initialized) return true;
 
         try {
-            // 1. Initialize Logging
-            Utils::LoggerConfig loggerConfig{};
-            loggerConfig.baseFileName = ServiceConstants::SERVICE_NAME;
-            loggerConfig.eventLogSource = ServiceConstants::SERVICE_NAME;
-            // Synchronous logging during Initialize so every line is durably
-            // flushed before the next Initialize() call — critical for
-            // diagnosing crashes in downstream modules. Async mode is
-            // re-enabled after the service reaches steady state (see Run()).
-            loggerConfig.async = false;
-            loggerConfig.flushLevel = Utils::LogLevel::Trace;
-            Utils::Logger::Instance().Initialize(loggerConfig);
+            // 1. Initialize Logging only if ServiceMain did not already do it.
+            // Reinitializing here used to move service logs back to the default
+            // relative "logs" directory (often System32\logs), hiding startup
+            // failures from the installer and VM triage workflow.
+            if (!Utils::Logger::Instance().IsInitialized()) {
+                Utils::LoggerConfig loggerConfig{};
+                wchar_t expanded[MAX_PATH]{};
+                if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike\\Logs",
+                                                 expanded,
+                                                 static_cast<DWORD>(std::size(expanded))) != 0) {
+                    loggerConfig.logDirectory = expanded;
+                }
+                loggerConfig.baseFileName = L"PhantomHome.Service";
+                loggerConfig.eventLogSource = ServiceConstants::SERVICE_NAME;
+                loggerConfig.toConsole = false;
+                loggerConfig.toEventLog = true;
+                loggerConfig.flushLevel = Utils::LogLevel::Trace;
+                Utils::Logger::Instance().Initialize(loggerConfig);
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service initializing...");
 
             // 2. Initialize ConfigManager (must be available before any module reads config)
@@ -475,9 +484,13 @@ public:
         }
     }
 
-    void Start() {
+    [[nodiscard]] bool Start() {
         std::unique_lock lock(m_mutex);
-        if (!m_initialized || m_running) return;
+        if (!m_initialized) {
+            SS_LOG_FATAL(LOG_CATEGORY, L"Start requested before successful initialization.");
+            return false;
+        }
+        if (m_running) return true;
 
         SS_LOG_INFO(LOG_CATEGORY, L"Starting services...");
 
@@ -485,12 +498,12 @@ public:
         Security::TamperProtection::Instance().SetEnabled(true);
         if (!RealTime::RealTimeProtection::Instance().Start()) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start RealTimeProtection");
-            return;
+            return false;
         }
         if (!Communication::IPCManager::Instance().Start()) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start IPCManager");
             RealTime::RealTimeProtection::Instance().Stop();
-            return;
+            return false;
         }
 
         // Start Communication subsystems
@@ -503,9 +516,15 @@ public:
         {
             auto& ipcSvc = ServiceCommunicator::Instance();
             if (!ipcSvc.Initialize()) {
-                SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunicator::Initialize() failed — HomeIpcDispatcher not installed");
+                SS_LOG_FATAL(LOG_CATEGORY, L"ServiceCommunicator::Initialize() failed — PhantomHome UI IPC unavailable");
+                Communication::IPCManager::Instance().Stop();
+                RealTime::RealTimeProtection::Instance().Stop();
+                return false;
             } else if (!ipcSvc.Start()) {
-                SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — HomeIpcDispatcher not installed");
+                SS_LOG_FATAL(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — PhantomHome UI IPC unavailable");
+                Communication::IPCManager::Instance().Stop();
+                RealTime::RealTimeProtection::Instance().Stop();
+                return false;
             } else {
                 HomeIpcDispatcher::Instance().Install(ipcSvc);
 
@@ -542,6 +561,7 @@ public:
         m_maintenanceThread = std::thread(&AntivirusServiceImpl::MaintenanceLoop, this);
 
         SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service is RUNNING");
+        return true;
     }
 
     void Stop() {
@@ -985,7 +1005,10 @@ bool AntivirusService::Run() {
             // Debug mode
             SS_LOG_INFO(LOG_CATEGORY, L"Running in console mode...");
             if (m_impl->Initialize()) {
-                m_impl->Start();
+                if (!m_impl->Start()) {
+                    SS_LOG_FATAL(LOG_CATEGORY, L"Console-mode service start failed.");
+                    return false;
+                }
 
                 SS_LOG_INFO(LOG_CATEGORY, L"Press Enter to stop...");
                 getchar();
@@ -1014,7 +1037,14 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
         nullptr
     );
 
-    if (!m_statusHandle) return;
+    if (!m_statusHandle) {
+        const DWORD err = GetLastError();
+        SS_LOG_FATAL(LOG_CATEGORY,
+                     L"RegisterServiceCtrlHandlerExW failed for %ls (0x%08X).",
+                     ServiceConstants::SERVICE_NAME,
+                     err);
+        return;
+    }
 
     // SCM kills a service if its wait-hint expires without a checkpoint bump.
     // Initialization touches signature DBs, kernel IPC, SHA-256 baselines and
@@ -1054,8 +1084,12 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
         return;
     }
 
-    // Start services
-    m_impl->Start();
+    // Start services. A core runtime failure must be visible to SCM instead of
+    // reporting SERVICE_RUNNING while the UI pipe and protection stack are down.
+    if (!m_impl->Start()) {
+        SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
+        return;
+    }
 
     SetServiceStatus(SERVICE_RUNNING);
 }

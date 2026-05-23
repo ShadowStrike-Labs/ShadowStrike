@@ -19,15 +19,15 @@
 
 /**
  * @file TestSigningPivot.hpp
- * @brief BCD test-signing detection and RunOnce reboot-pivot logic.
+ * @brief BCD test-signing detection and SYSTEM stage-2 reboot-pivot logic.
  *
  * Provides:
  *  - Detection of the Windows BCD "testsigning" boot option via
  *    (a) registry key HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Boot
  *        and (b) spawning bcdedit /enum {current} /v and parsing stdout.
  *  - Enablement of testsigning via CreateProcessW → bcdedit /set testsigning on.
- *  - Writing the Stage 2 RunOnce key so the driver installs after reboot.
- *  - Initiating a graceful system shutdown with InitiateSystemShutdownExW.
+ *  - Registering a SYSTEM scheduled task so the driver installs after reboot.
+ *  - Returning a reboot-required status to the MSI/Burn installer.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -76,16 +76,26 @@ namespace ShadowStrike::Installer {
 [[nodiscard]] DWORD EnableTestSigning();
 
 /**
- * @brief Write the Stage 2 command to HKLM RunOnce.
+ * @brief Register the Stage 2 command as a SYSTEM scheduled task.
  *
- * Key:  HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce
- * Name: "PhantomSensorDriverInstall"
- * Data: "<install_exe_path>" --stage2
+ * RunOnce executes in an interactive user token and is consumed before a failed
+ * elevated command can retry. The post-reboot driver install must therefore be
+ * owned by Task Scheduler and run as LocalSystem.
  *
  * @param stage2ExePath  Full path to ShadowStrikeDriverResume.exe.
  * @return ERROR_SUCCESS or a Win32 error code.
  */
-[[nodiscard]] DWORD WriteRunOnceStage2(const std::wstring& stage2ExePath);
+[[nodiscard]] DWORD RegisterStage2ScheduledTask(const std::wstring& stage2ExePath);
+
+/**
+ * @brief Remove the Stage 2 SYSTEM scheduled task after a successful pivot.
+ *
+ * Missing tasks are reported as non-fatal to callers so cleanup is idempotent
+ * across repaired installs and manual --stage2 invocations.
+ *
+ * @return ERROR_SUCCESS or a Win32 error code.
+ */
+[[nodiscard]] DWORD DeleteStage2ScheduledTask();
 
 /**
  * @brief Initiate a graceful system restart with a 60-second countdown.

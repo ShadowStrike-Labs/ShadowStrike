@@ -51,8 +51,10 @@
                       ErrorControl="normal"
                       Vital="yes"
                       Account="LocalSystem">
-        <!-- Ensure RPC subsystem is up before the service starts. -->
+        <!-- Ensure required Windows subsystems are up before the service starts. -->
         <ServiceDependency Id="RpcSs"/>
+        <ServiceDependency Id="Winmgmt"/>
+        <ServiceDependency Id="FltMgr"/>
       </ServiceInstall>
 
       <!--

@@ -123,7 +123,8 @@ function Assert-QtHarvestSources {
 function Copy-ProductExecutablesToStaging {
     foreach ($name in @('ShadowStrikePhantomService.exe',
                        'ShadowStrikePhantomUI.exe',
-                       'ShadowStrikePhantomTray.exe')) {
+                       'ShadowStrikePhantomTray.exe',
+                       'ShadowStrikeDriverResume.exe')) {
         $src = Join-Path $BinDir $name
         Require-File -Path $src -Label $name
         Copy-Item $src $StagingDir -Force
@@ -201,6 +202,8 @@ if (-not $SkipSign) {
 
 # ── DEPLOY TO vm_shrd ────────────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path $VmShared | Out-Null
+Remove-Item (Join-Path $VmShared '*.exe') -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $VmShared '*.msi') -Force -ErrorAction SilentlyContinue
 Copy-Item $BundleOut $VmShared -Force
 Copy-Item $MsiOut    $VmShared -Force
 
@@ -208,7 +211,8 @@ $VmArtifacts = Join-Path $VmShared 'artifacts'
 New-Item -ItemType Directory -Force -Path $VmArtifacts | Out-Null
 foreach ($name in @('ShadowStrikePhantomService.exe',
                    'ShadowStrikePhantomUI.exe',
-                   'ShadowStrikePhantomTray.exe')) {
+                   'ShadowStrikePhantomTray.exe',
+                   'ShadowStrikeDriverResume.exe')) {
     $src = Join-Path $BinDir $name
     if (Test-Path $src -PathType Leaf) {
         Copy-Item $src $VmArtifacts -Force

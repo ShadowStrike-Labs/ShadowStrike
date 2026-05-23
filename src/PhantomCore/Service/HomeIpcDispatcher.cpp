@@ -54,6 +54,9 @@
 #include "IpcAuthToken.hpp"
 #include "EventPush.hpp"
 
+#include <algorithm>
+#include <limits>
+
 // PhantomHome subsystems
 #include "../../Products/Community/PhantomHome/HomeProductOrchestrator.hpp"
 #include "../../Products/Community/PhantomHome/UI/Shared/ModuleCatalog.hpp"
@@ -543,14 +546,33 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         const auto& orch     = HomeProductOrchestrator::Instance();
         const bool  paused   = orch.IsPaused();
         const auto  modules  = orch.GetStatus();
+        const bool  running  = orch.IsRunning();
+        const bool  initialized = orch.IsInitialized();
         const int   gMode    = ConfigManager::Instance().GetValue<int>(
             "Home/GlobalMode", static_cast<int>(ProtectionMode::Balanced));
+        const auto failedCount = std::count_if(modules.begin(), modules.end(),
+            [](const auto& m) { return m.state == ModuleState::Failed; });
+        const std::string health = !running && !initialized
+            ? "critical"
+            : (failedCount == 0 ? "healthy" : "atRisk");
+        const auto rawPausedRemainingSec = impl->PauseRemainingSec();
+        const std::uint32_t pausedRemainingSec =
+            rawPausedRemainingSec <= 0
+                ? 0u
+                : (rawPausedRemainingSec > static_cast<decltype(rawPausedRemainingSec)>(
+                       std::numeric_limits<std::uint32_t>::max())
+                       ? std::numeric_limits<std::uint32_t>::max()
+                       : static_cast<std::uint32_t>(rawPausedRemainingSec));
 
         nlohmann::json resp{
             {"ok",                true},
+            {"health",            health},
             {"globalMode",        gMode},
             {"paused",            paused},
-            {"pausedRemainingSec", impl->PauseRemainingSec()},
+            {"pausedRemainingSec", pausedRemainingSec},
+            {"pausedSecondsRemaining", pausedRemainingSec},
+            {"pausedMinutesRemaining", static_cast<std::uint32_t>((pausedRemainingSec + 59u) / 60u)},
+            {"failedModulesCount", static_cast<std::uint32_t>(failedCount)},
             {"modulesCount",      static_cast<std::uint32_t>(modules.size())}
         };
         svc.SendResponseEnvelope(clientId, CommandType::GetStatus, requestId, resp.dump());

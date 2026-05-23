@@ -21,7 +21,7 @@
  * @brief BCD test-signing detection, enablement, and reboot pivot logic.
  *
  * Security design:
- *  - bcdedit.exe is always invoked via absolute path derived from
+ *  - bcdedit.exe and schtasks.exe are always invoked via absolute path derived from
  *    GetSystemDirectoryW — never via PATH search. This prevents DLL/binary
  *    hijacking via PATH manipulation.
  *  - SpawnAndCapture uses a dedicated reader thread with a hard timeout to
@@ -66,6 +66,8 @@ void Log(const wchar_t* level, const wchar_t* fmt, ...);
 // ────────────────────────────────────────────────────────────────────────────
 namespace {
 
+constexpr wchar_t kStage2TaskName[] = L"\\ShadowStrike\\PhantomSensorDriverInstall";
+
 struct PipeReaderContext {
     HANDLE       hReadPipe = INVALID_HANDLE_VALUE;
     std::string  output;        // Accumulated bytes (UTF-8 / ANSI)
@@ -108,6 +110,25 @@ DWORD WINAPI PipeReaderThread(LPVOID lpParam)
         }
     }
     return 0;
+}
+
+[[nodiscard]] DWORD BuildSystemToolPath(const wchar_t* toolName, std::wstring& outPath)
+{
+    if (toolName == nullptr || toolName[0] == L'\0') {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    wchar_t sysDir[MAX_PATH];
+    if (!GetSystemDirectoryW(sysDir, MAX_PATH)) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"GetSystemDirectoryW failed while resolving %ls (0x%08X)", toolName, err);
+        return err;
+    }
+
+    outPath.assign(sysDir);
+    outPath += L"\\";
+    outPath += toolName;
+    return ERROR_SUCCESS;
 }
 
 } // anonymous namespace
@@ -487,38 +508,82 @@ DWORD EnableTestSigning()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  WriteRunOnceStage2
-//  Writes: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce\
-//    PhantomSensorDriverInstall = "\"<exePath>\" --stage2"
+//  RegisterStage2ScheduledTask
+//  Creates a one-shot-on-boot SYSTEM task:
+//    "\ShadowStrike\PhantomSensorDriverInstall" -> "<exePath>" --stage2
 // ────────────────────────────────────────────────────────────────────────────
-DWORD WriteRunOnceStage2(const std::wstring& exePath)
+DWORD RegisterStage2ScheduledTask(const std::wstring& exePath)
 {
-    HKEY hk = nullptr;
-#pragma warning(suppress: 6553)
-    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
-                            0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hk);
-    if (rc != ERROR_SUCCESS) {
-        LOG_ERROR(L"RegOpenKeyExW RunOnce failed (%ld)", rc);
-        return static_cast<DWORD>(rc);
+    if (exePath.empty() || exePath.find(L'"') != std::wstring::npos) {
+        LOG_ERROR(L"RegisterStage2ScheduledTask rejected an empty or quoted executable path.");
+        return ERROR_INVALID_PARAMETER;
     }
 
-    RegKeyGuard key(hk);
-
-    // Build the RunOnce value: "<exePath>" --stage2
-    std::wstring value = L"\"";
-    value += exePath;
-    value += L"\" --stage2";
-
-    const DWORD cbValue = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
-    rc = RegSetValueExW(key.get(), L"PhantomSensorDriverInstall", 0, REG_SZ,
-                        reinterpret_cast<const BYTE*>(value.c_str()), cbValue);
-    if (rc != ERROR_SUCCESS) {
-        LOG_ERROR(L"RegSetValueExW RunOnce value failed (%ld)", rc);
-        return static_cast<DWORD>(rc);
+    std::wstring schtasksPath;
+    DWORD err = BuildSystemToolPath(L"schtasks.exe", schtasksPath);
+    if (err != ERROR_SUCCESS) {
+        return err;
     }
 
-    LOG_INFO(L"RunOnce entry written: '%ls'", value.c_str());
+    // schtasks requires the inner task command quotes to be escaped for the
+    // command-line parser. The executable path originates from GetModuleFileNameW
+    // and Windows paths cannot contain double quotes.
+    std::wstring cmdLine = L"\"";
+    cmdLine += schtasksPath;
+    cmdLine += L"\" /Create /TN \"";
+    cmdLine += kStage2TaskName;
+    cmdLine += L"\" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR \"\\\"";
+    cmdLine += exePath;
+    cmdLine += L"\\\" --stage2\" /F";
+
+    std::string output;
+    DWORD exitCode = 1;
+    err = SpawnAndCapture(cmdLine, output, exitCode, 30'000);
+    if (err != ERROR_SUCCESS) {
+        LOG_ERROR(L"schtasks /Create spawn failed (0x%08X).", err);
+        return err;
+    }
+    if (exitCode != 0) {
+        LOG_ERROR(L"schtasks /Create exited with %lu. Output (truncated): %.256hs",
+                  exitCode, output.c_str());
+        return ERROR_FUNCTION_FAILED;
+    }
+
+    LOG_INFO(L"Stage 2 scheduled task registered: %ls", kStage2TaskName);
+    return ERROR_SUCCESS;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  DeleteStage2ScheduledTask
+// ────────────────────────────────────────────────────────────────────────────
+DWORD DeleteStage2ScheduledTask()
+{
+    std::wstring schtasksPath;
+    DWORD err = BuildSystemToolPath(L"schtasks.exe", schtasksPath);
+    if (err != ERROR_SUCCESS) {
+        return err;
+    }
+
+    std::wstring cmdLine = L"\"";
+    cmdLine += schtasksPath;
+    cmdLine += L"\" /Delete /TN \"";
+    cmdLine += kStage2TaskName;
+    cmdLine += L"\" /F";
+
+    std::string output;
+    DWORD exitCode = 1;
+    err = SpawnAndCapture(cmdLine, output, exitCode, 30'000);
+    if (err != ERROR_SUCCESS) {
+        LOG_WARN(L"schtasks /Delete spawn failed (0x%08X).", err);
+        return err;
+    }
+    if (exitCode != 0) {
+        LOG_WARN(L"schtasks /Delete exited with %lu. Output (truncated): %.256hs",
+                 exitCode, output.c_str());
+        return ERROR_FUNCTION_FAILED;
+    }
+
+    LOG_INFO(L"Stage 2 scheduled task deleted: %ls", kStage2TaskName);
     return ERROR_SUCCESS;
 }
 

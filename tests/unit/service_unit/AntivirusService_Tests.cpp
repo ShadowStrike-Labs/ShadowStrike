@@ -51,8 +51,8 @@ TEST(AntivirusServiceTest, ServiceConstantsPreserveScmIdentityAndDependencyForma
     EXPECT_GT(SSS::ServiceConstants::SHUTDOWN_TIMEOUT_MS, 0u);
 
     const std::wstring dependencies(SSS::ServiceConstants::DEPENDENCIES,
-                                    SSS::ServiceConstants::DEPENDENCIES + 15);
-    EXPECT_EQ(dependencies, std::wstring(L"RpcSs\0Winmgmt\0\0", 15));
+                                    SSS::ServiceConstants::DEPENDENCIES + 22);
+    EXPECT_EQ(dependencies, std::wstring(L"RpcSs\0Winmgmt\0FltMgr\0\0", 22));
 }
 
 TEST(AntivirusServiceTest, ControlHandlerReturnsExpectedCodesForSafeCommands) {

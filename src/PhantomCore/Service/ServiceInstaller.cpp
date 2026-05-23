@@ -92,8 +92,9 @@ bool ServiceInstaller::Install() {
     config.delayedStart = true;
     config.enableRecovery = true;
 
-    // Dependencies: RPC is required for almost everything, WMI for management
-    config.dependencies = { L"RpcSs", L"Winmgmt" };
+    // Dependencies: RPC is required for service control, WMI for management,
+    // and FltMgr for PhantomSensor minifilter readiness.
+    config.dependencies = { L"RpcSs", L"Winmgmt", L"FltMgr" };
 
     return Install(config);
 }

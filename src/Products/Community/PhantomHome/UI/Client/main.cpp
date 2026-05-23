@@ -123,7 +123,7 @@
 // ============================================================================
 
 static constexpr wchar_t kSingleInstanceMutex[] =
-    L"Global\\ShadowStrike.PhantomHome.UI";
+    L"Local\\ShadowStrike.PhantomHome.UI";
 
 // ============================================================================
 // INTERNAL HELPERS
