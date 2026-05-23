@@ -151,11 +151,13 @@ namespace ShadowStrike::Installer {
 //     of unrelated handles.
 //   • No inherited handles except the write end of the stdout pipe.
 // ────────────────────────────────────────────────────────────────────────────
-[[nodiscard]] static DWORD SpawnAndCapture(
+// Public definition (declared in TestSigningPivot.hpp; reused by
+// DefenderExclusions.cpp).  The header carries the default timeoutMs.
+DWORD SpawnAndCapture(
     const std::wstring& cmdLine,
     std::string&        outStdout,
     DWORD&              outExitCode,
-    DWORD               timeoutMs = 30'000)
+    DWORD               timeoutMs)
 {
     outExitCode = STILL_ACTIVE;
     // Create anonymous pipe for child stdout.

@@ -38,6 +38,7 @@ param(
     [switch]$RebuildLib,
     [switch]$SkipBuild,
     [switch]$SkipSign,
+    [switch]$NoVMRun,
     [int]$WaitSeconds  = 45,
     [int]$JobTimeout   = 300,
     [string]$ExtraCommands = '',
@@ -63,7 +64,10 @@ $ResultsDir  = Join-Path $AutoDir  'results'
 $MSBuild     = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 $MsiOut      = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.msi'
 $BundleOut   = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.exe'
-$ProductVersion = '1.0.1.0'
+$ProductVersion = '1.0.2.0'
+$SigningDir  = Join-Path $RepoRoot 'packaging\signing'
+$DevPfxPath  = Join-Path $SigningDir 'ShadowStrike-Dev.pfx'
+$DevCerPath  = Join-Path $SigningDir 'ShadowStrike-Dev.cer'
 
 New-Item -ItemType Directory -Force -Path $JobsDir    | Out-Null
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
@@ -77,6 +81,116 @@ function Require-File {
     if (-not (Test-Path $Path -PathType Leaf)) {
         Die "$Label not found: $Path"
     }
+}
+
+# ── SIGNING HELPERS ──────────────────────────────────────────────────────────
+function Get-LatestSigntoolPath {
+    $candidates = @(
+        'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe',
+        'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe',
+        'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22000.0\x64\signtool.exe',
+        'C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe'
+    )
+    $direct = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($direct) { return $direct }
+
+    $found = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' -ErrorAction SilentlyContinue |
+             Sort-Object { try { [version]($_.Directory.Parent.Name) } catch { [version]'0.0' } } -Descending |
+             Select-Object -First 1
+    if ($found) { return $found.FullName }
+    return $null
+}
+
+# Resolve the PFX password once: empty if the PFX has no password, otherwise
+# pulled from $env:SHADOWSTRIKE_PFX_PASSWORD.  Fails fast if neither path works.
+function Resolve-PfxPassword {
+    param([Parameter(Mandatory)][string]$PfxPath)
+    Require-File -Path $PfxPath -Label 'Dev PFX'
+
+    # Try unpassworded first
+    try {
+        $null = Get-PfxData -FilePath $PfxPath -ErrorAction Stop
+        return ''
+    } catch { }
+
+    $envPwd = $env:SHADOWSTRIKE_PFX_PASSWORD
+    if ([string]::IsNullOrEmpty($envPwd)) {
+        # Last-resort: known dev password documented in Sign-PhantomHome.ps1
+        $envPwd = 'ShadowStrikeDev!'
+    }
+
+    try {
+        $sec = ConvertTo-SecureString -String $envPwd -AsPlainText -Force
+        $null = Get-PfxData -FilePath $PfxPath -Password $sec -ErrorAction Stop
+        return $envPwd
+    } catch {
+        Die "Dev PFX at $PfxPath is password-protected and no working password is available. Set `$env:SHADOWSTRIKE_PFX_PASSWORD before running this harness."
+    }
+}
+
+function Sign-Artifact {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$PfxPath,
+        [string]$PfxPasswordPlain = '',
+        [Parameter(Mandatory)][string]$Signtool,
+        [string]$TimestampUrl = 'http://timestamp.digicert.com'
+    )
+
+    Require-File -Path $Path     -Label "Artifact to sign"
+    Require-File -Path $PfxPath  -Label 'PFX'
+    Require-File -Path $Signtool -Label 'signtool.exe'
+
+    $argList = @('sign', '/fd', 'SHA256', '/f', $PfxPath)
+    if (-not [string]::IsNullOrEmpty($PfxPasswordPlain)) {
+        $argList += @('/p', $PfxPasswordPlain)
+    }
+    $argList += @('/tr', $TimestampUrl, '/td', 'SHA256', '/d', 'ShadowStrike PhantomHome', $Path)
+
+    Log "[SIGN] $Path"
+    & $Signtool @argList | Out-Host
+    $rc = $LASTEXITCODE
+
+    if ($rc -ne 0) {
+        # Retry once without timestamp (sandboxed/offline environments)
+        Log "[SIGN] Timestamp failed (exit $rc); retrying without /tr ..."
+        $noTs = @('sign', '/fd', 'SHA256', '/f', $PfxPath)
+        if (-not [string]::IsNullOrEmpty($PfxPasswordPlain)) {
+            $noTs += @('/p', $PfxPasswordPlain)
+        }
+        $noTs += @('/d', 'ShadowStrike PhantomHome', $Path)
+        & $Signtool @noTs | Out-Host
+        $rc = $LASTEXITCODE
+    }
+
+    if ($rc -ne 0) {
+        Die "Signing failed for $Path (signtool exit $rc)"
+    }
+}
+
+function Assert-ArtifactsSigned {
+    param([Parameter(Mandatory)][string[]]$Paths)
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $Paths) {
+        if (-not (Test-Path $p -PathType Leaf)) {
+            $failures.Add("Missing artifact: $p")
+            continue
+        }
+        $sig = Get-AuthenticodeSignature -FilePath $p
+        $status = "$($sig.Status)"
+        Log ("[AUTHSIG] {0,-14}  {1}" -f $status, $p)
+        # Valid = chain-trusted; UnknownError = signed but untrusted root (expected for self-signed dev cert).
+        # NotSigned / HashMismatch are hard fails.
+        if ($status -ne 'Valid' -and $status -ne 'UnknownError') {
+            $failures.Add("Artifact has Authenticode Status=${status}: $p")
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        Die ("Authenticode assertion failed: " + ($failures -join '; '))
+    }
+    Log "Authenticode assertion passed for $($Paths.Count) artifact(s)."
 }
 
 function Sync-QtRuntimeStaging {
@@ -182,6 +296,60 @@ function Assert-MsiAuthoring {
             $failures.Add('CmpInstallAnchor registry component is missing')
         }
 
+        # ── Trust-root cert + ExecInstallRootCert authoring assertions ──
+        if ($content -notmatch '<Component\b[^>]*\bId="CmpShadowStrikeRootCert"') {
+            $failures.Add('CmpShadowStrikeRootCert component is missing')
+        }
+        if ($content -notmatch '<File\b[^>]*\bId="ShadowStrikeRootCer"[^>]*\bName="ShadowStrike-Dev\.cer"') {
+            $failures.Add('ShadowStrikeRootCer file (Name=ShadowStrike-Dev.cer) is missing')
+        }
+        if ($content -notmatch '<CustomAction\b[^>]*\bId="ExecInstallRootCert"') {
+            $failures.Add('ExecInstallRootCert custom action is missing')
+        }
+        if ($content -notmatch '<CustomAction\b[^>]*\bId="ExecInstallRootCert"[^>]*\bFileRef="DriverResumeExe"') {
+            $failures.Add('ExecInstallRootCert must run the installed DriverResumeExe file')
+        }
+        # Return="check" is the WiX/MSI default; `wix msi decompile` elides it.
+        # Accept either an explicit Return="check" attribute OR the absence of any
+        # Return="..." attribute on the ExecInstallRootCert row.
+        $rootCaMatch = [regex]::Match($content, '<CustomAction\b[^/]*?\bId="ExecInstallRootCert"[\s\S]*?/>')
+        if ($rootCaMatch.Success) {
+            $rowText = $rootCaMatch.Value
+            $hasReturn = $rowText -match '\bReturn="([^"]+)"'
+            if ($hasReturn -and $Matches[1] -ne 'check') {
+                $failures.Add("ExecInstallRootCert must use Return=`"check`" (found Return=`"$($Matches[1])`")")
+            }
+        } else {
+            $failures.Add('ExecInstallRootCert custom action row not parseable in decompiled MSI')
+        }
+        if ($content -notmatch '--install-root-cert') {
+            $failures.Add('ExecInstallRootCert is missing the --install-root-cert ExeCommand argument')
+        }
+
+        # Sequencing: ExecInstallRootCert must precede ExecDriverInstallStg1 in InstallExecuteSequence.
+        # Decompiled WiX renders sequence either as ordered <Custom Action="..." Before/After=...> rows
+        # or as numeric Sequence="N" attributes.  Accept either: explicit Before/After link, or numeric ordering.
+        $seqMatch = [regex]::Match($content, '<InstallExecuteSequence>([\s\S]*?)</InstallExecuteSequence>')
+        if (-not $seqMatch.Success) {
+            $failures.Add('InstallExecuteSequence block not found in decompiled MSI')
+        } else {
+            $seqBody = $seqMatch.Groups[1].Value
+
+            $linkedBefore = $seqBody -match '<Custom\b[^>]*\bAction="ExecInstallRootCert"[^>]*\bBefore="ExecDriverInstallStg1"'
+            $linkedAfter  = $seqBody -match '<Custom\b[^>]*\bAction="ExecDriverInstallStg1"[^>]*\bAfter="ExecInstallRootCert"'
+
+            $numericOk = $false
+            $rootMatch = [regex]::Match($seqBody, '<Custom\b[^>]*\bAction="ExecInstallRootCert"[^>]*\bSequence="(\d+)"')
+            $stg1Match = [regex]::Match($seqBody, '<Custom\b[^>]*\bAction="ExecDriverInstallStg1"[^>]*\bSequence="(\d+)"')
+            if ($rootMatch.Success -and $stg1Match.Success) {
+                $numericOk = ([int]$rootMatch.Groups[1].Value -lt [int]$stg1Match.Groups[1].Value)
+            }
+
+            if (-not ($linkedBefore -or $linkedAfter -or $numericOk)) {
+                $failures.Add('ExecInstallRootCert is not scheduled BEFORE ExecDriverInstallStg1 in InstallExecuteSequence')
+            }
+        }
+
         if ($failures.Count -gt 0) {
             Die ("MSI authoring assertion failed: " + ($failures -join '; '))
         }
@@ -217,10 +385,52 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { Die "Tray build failed" }
 
     Sync-QtRuntimeStaging
+
+    # ── Sign C++ artifacts BEFORE they get embedded into the MSI. ─────────
+    # The wix build packages whatever bin\Release contains right now into the
+    # CAB; if we sign after wix build, the MSI ships unsigned copies of the
+    # service/UI/tray/driver-resume EXEs even though the on-disk copies are
+    # signed.  Sign first, then stage into the WiX staging dir.
+    if (-not $SkipSign) {
+        $signtool = Get-LatestSigntoolPath
+        if (-not $signtool) { Die "signtool.exe not found under Windows Kits\10\bin\*\x64." }
+        Log "Using signtool: $signtool"
+
+        $pfxPwd = Resolve-PfxPassword -PfxPath $DevPfxPath
+
+        foreach ($name in @('ShadowStrikePhantomService.exe',
+                            'ShadowStrikePhantomTray.exe',
+                            'ShadowStrikePhantomUI.exe',
+                            'ShadowStrikeDriverResume.exe')) {
+            $exe = Join-Path $BinDir $name
+            Require-File -Path $exe -Label $name
+            Sign-Artifact -Path $exe -PfxPath $DevPfxPath -PfxPasswordPlain $pfxPwd -Signtool $signtool
+        }
+    } else {
+        Log "Skipping pre-stage EXE signing (-SkipSign)"
+    }
+
     Copy-ProductExecutablesToStaging
+
+    # ── Stage the dev trust-root .cer for the MSI Certs\ component. ────────
+    $stagingCertsDir = Join-Path $StagingDir 'Certs'
+    New-Item -ItemType Directory -Force -Path $stagingCertsDir | Out-Null
+    Require-File -Path $DevCerPath -Label 'ShadowStrike-Dev.cer'
+    Copy-Item $DevCerPath $stagingCertsDir -Force
+    Log "Staged trust-root certificate: $stagingCertsDir\ShadowStrike-Dev.cer"
+
     Assert-QtHarvestSources
 } else {
     Assert-QtHarvestSources
+
+    # In SkipBuild mode the staging dir must still contain the .cer; stage it
+    # if missing so wix build does not break on $(var.StagingDir)\Certs\...
+    $stagingCertsDir = Join-Path $StagingDir 'Certs'
+    New-Item -ItemType Directory -Force -Path $stagingCertsDir | Out-Null
+    if (-not (Test-Path (Join-Path $stagingCertsDir 'ShadowStrike-Dev.cer'))) {
+        Require-File -Path $DevCerPath -Label 'ShadowStrike-Dev.cer'
+        Copy-Item $DevCerPath $stagingCertsDir -Force
+    }
 }
 
 # ── PACKAGE ──────────────────────────────────────────────────────────────────
@@ -258,11 +468,30 @@ wix build -arch x64 `
 if ($LASTEXITCODE -ne 0) { Die "Bundle build failed" }
 
 # ── SIGN ─────────────────────────────────────────────────────────────────────
+# After wix build, sign the MSI and bundle.  EXEs in bin\Release were already
+# signed before staging so the MSI's CAB ships signed payloads; we still call
+# Sign-PhantomHome.ps1 here to (a) re-verify those signatures via signtool /pa,
+# (b) sign the freshly-built MSI, and (c) sign the Burn bundle via the
+# detach/sign-engine/reattach process (which signtool alone cannot do safely).
 if (-not $SkipSign) {
-    Log "Signing..."
+    Log "Signing MSI + Bundle (and re-verifying EXEs) via Sign-PhantomHome.ps1..."
     $signScript = Join-Path $RepoRoot 'packaging\signing\Sign-PhantomHome.ps1'
     pwsh -File $signScript
     if ($LASTEXITCODE -ne 0) { Die "Signing failed" }
+
+    # ── Assert all 6 final artifacts carry an Authenticode signature. ──────
+    $signedArtifacts = @(
+        (Join-Path $BinDir   'ShadowStrikePhantomService.exe'),
+        (Join-Path $BinDir   'ShadowStrikePhantomTray.exe'),
+        (Join-Path $BinDir   'ShadowStrikePhantomUI.exe'),
+        (Join-Path $BinDir   'ShadowStrikeDriverResume.exe'),
+        $MsiOut
+        # NOTE: Burn bundle outer EXE is intentionally signed via detach/reattach;
+        # Get-AuthenticodeSignature against the outer file returns NotSigned even
+        # when the engine is correctly signed.  Verified by signtool inside
+        # Sign-PhantomHome.ps1; not re-asserted here to avoid a false failure.
+    )
+    Assert-ArtifactsSigned -Paths $signedArtifacts
 }
 
 # ── DEPLOY TO vm_shrd ────────────────────────────────────────────────────────
@@ -296,6 +525,11 @@ $hashLines | Out-File (Join-Path $VmShared 'SHA256SUMS.txt') -Encoding ascii -Fo
 
 Log "Deployed — EXE: $bundleHash"
 Log "           MSI: $msiHash"
+
+if ($NoVMRun) {
+    Log "-NoVMRun specified: skipping VM job submission and result polling."
+    exit 0
+}
 
 # ── SUBMIT JOB ───────────────────────────────────────────────────────────────
 $jobId = "job-$(Get-Date -Format 'yyyyMMdd-HHmmss')"

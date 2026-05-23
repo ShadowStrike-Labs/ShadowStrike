@@ -80,7 +80,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>
         advapi32.lib;kernel32.lib;user32.lib;shell32.lib;ole32.lib;
-        fltlib.lib;wintrust.lib;crypt32.lib;%(AdditionalDependencies)
+        fltlib.lib;wintrust.lib;crypt32.lib;version.lib;%(AdditionalDependencies)
       </AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -114,11 +114,19 @@
     <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\DriverResumeMain.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\DriverInstaller.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\TestSigningPivot.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\RootCertInstall.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\SecureBootCheck.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\Stage1Diagnostics.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\DefenderExclusions.cpp" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\DriverInstaller.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\TestSigningPivot.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\RootCertInstall.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\SecureBootCheck.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\Stage1Diagnostics.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\DefenderExclusions.hpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

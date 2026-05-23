@@ -8,6 +8,86 @@
 
 ---
 
+## Pre-flight requirements (VM)
+
+Before you do anything else on the target VM, the following gates must be cleared.
+Skipping any of them will cause the MSI to roll back at stage1 (driver work) and
+leave the VM in a dirty state.
+
+### 1. Disable Secure Boot in VM firmware
+
+The dev build is signed with a self-signed certificate.  Secure Boot will refuse
+to load the PhantomSensor minifilter against this cert, and the
+`ExecDriverInstallStg1` custom action will fail mid-install.
+
+| Hypervisor | How to disable |
+|------------|----------------|
+| Hyper-V    | VM Settings → Security → **uncheck** *Enable Secure Boot* |
+| VirtualBox | Machine → Settings → System → **disable** *Enable EFI (special OSes only)* (or keep EFI but ensure no Secure Boot variables are persisted) |
+| VMware Workstation / Fusion | VM → Settings → Options → Advanced → Boot Options → **uncheck** *Enable secure boot* |
+
+Take a snapshot AFTER disabling Secure Boot so subsequent QA passes start from
+a known-good firmware state.
+
+### 2. Run `Pre-Install-Check.ps1` as Administrator
+
+Copy `Pre-Install-Check.ps1` from the VM share (`vm_shrd\PhantomHome\`) into the VM
+and run it from an elevated PowerShell prompt:
+
+```powershell
+# Run as Administrator
+powershell.exe -ExecutionPolicy Bypass -File "C:\Users\Public\Desktop\Pre-Install-Check.ps1"
+```
+
+The script is **read-only** — it inspects the system but modifies nothing.
+
+**PASS criterion:** Script exits with code `0` and prints `All checks passed`.
+**FAIL criterion:** Exit code `1`.  Resolve any reported FAIL (typically: enable
+Administrator context, disable SecureBoot, free disk space) before continuing.
+
+`WARN` lines are advisory and do not block install (e.g., Defender real-time
+protection still on, prior install folder present from a previous run).
+
+### 3. Acceptable verification commands after install
+
+These commands are the canonical post-install smoke checks.  Each should return
+the indicated value within 60 seconds of the bundle EXE exiting.
+
+```powershell
+# Run as Administrator inside the VM
+
+# (a) Service is registered, Automatic, and Running.
+Get-Service ShadowStrikePhantomService | Select-Object Status, StartType
+
+# (b) Install anchor is set.
+Get-ItemProperty 'HKLM:\SOFTWARE\ShadowStrike\PhantomHome' -ErrorAction SilentlyContinue
+
+# (c) Trust-root cert was installed by ExecInstallRootCert.
+Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Subject -match 'ShadowStrike' } |
+    Select-Object Subject, Thumbprint, NotAfter
+
+# (d) Driver staging files exist.
+Test-Path 'C:\Program Files\ShadowStrike\Phantom\Drivers\PhantomSensor.sys'
+Test-Path 'C:\Program Files\ShadowStrike\Phantom\Certs\ShadowStrike-Dev.cer'
+
+# (e) Driver stage1 state file (consumed by the bootstrapper to decide reboot).
+Get-Content 'C:\ProgramData\ShadowStrike\State\driver-stage1.json' -ErrorAction SilentlyContinue
+
+# (f) Tray + UI processes (after first logon).
+Get-Process ShadowStrikePhantomTray, ShadowStrikePhantomUI -ErrorAction SilentlyContinue |
+    Select-Object Name, Id, StartTime
+
+# (g) Named pipe is accepting connections.
+[bool](Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue | Where-Object Name -like '*ShadowStrike*')
+
+# (h) No MSI rollback was recorded in the Application event log in the last hour.
+Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='MsiInstaller'; StartTime=(Get-Date).AddHours(-1) } -ErrorAction SilentlyContinue |
+    Where-Object { $_.Message -match 'rollback|1602|1603' } |
+    Select-Object TimeCreated, Id, Message
+```
+
+---
+
 ## Prerequisites
 
 | Item | Value |

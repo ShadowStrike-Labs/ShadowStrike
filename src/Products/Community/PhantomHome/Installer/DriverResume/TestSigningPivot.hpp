@@ -127,6 +127,7 @@ namespace ShadowStrike::Installer {
  */
 [[nodiscard]] DWORD SpawnAndCapture(const std::wstring& cmdLine,
                                      std::string&        output,
-                                     DWORD&              exitCode);
+                                     DWORD&              exitCode,
+                                     DWORD               timeoutMs = 30'000);
 
 } // namespace ShadowStrike::Installer

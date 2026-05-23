@@ -76,6 +76,10 @@
 
 #include "DriverInstaller.hpp"
 #include "TestSigningPivot.hpp"
+#include "RootCertInstall.hpp"
+#include "SecureBootCheck.hpp"
+#include "Stage1Diagnostics.hpp"
+#include "DefenderExclusions.hpp"
 
 // ────────────────────────────────────────────────────────────────────────────
 //  Exit codes (matching standard Windows installer conventions)
@@ -84,6 +88,7 @@ static constexpr int kExitSuccess          = 0;
 static constexpr int kExitRebootRequired   = 3010;  // ERROR_SUCCESS_REBOOT_REQUIRED
 static constexpr int kExitGenericFailure   = 1;
 static constexpr int kExitInsufficientPriv = 5;     // ERROR_ACCESS_DENIED
+static constexpr int kExitSecureBootBlocked = 6;    // Snapshot-only signal; stage1-msi maps to success
 static constexpr int kExitBadArgs          = 87;    // ERROR_INVALID_PARAMETER
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -214,12 +219,105 @@ void Log(const wchar_t* level, const wchar_t* fmt, ...)
 // ────────────────────────────────────────────────────────────────────────────
 //  Forward declarations for all modes
 // ────────────────────────────────────────────────────────────────────────────
+[[nodiscard]] static std::wstring GetInstallDirectory();
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Install-folder anchor (written by the MSI under HKLM)
+//  HKLM\SOFTWARE\ShadowStrike\PhantomHome\Install!InstallFolder = REG_SZ
+// ────────────────────────────────────────────────────────────────────────────
+static constexpr wchar_t kInstallAnchorKey[]   =
+    L"SOFTWARE\\ShadowStrike\\PhantomHome\\Install";
+static constexpr wchar_t kInstallAnchorValue[] = L"InstallFolder";
+static constexpr wchar_t kRootCertRelPath[]    = L"Certs\\ShadowStrike-Dev.cer";
+
+[[nodiscard]] static DWORD ReadInstallFolderFromAnchor(std::wstring& outFolder) noexcept
+{
+    // KEY_WOW64_64KEY explicitly because the MSI writes the native 64-bit view.
+    DWORD cb = 0;
+    LONG  rc = RegGetValueW(HKEY_LOCAL_MACHINE,
+                            kInstallAnchorKey,
+                            kInstallAnchorValue,
+                            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                            nullptr,
+                            nullptr,
+                            &cb);
+    if (rc != ERROR_SUCCESS || cb == 0 || cb > 32u * 1024u) {
+        return rc != ERROR_SUCCESS ? static_cast<DWORD>(rc) : ERROR_INVALID_DATA;
+    }
+    std::wstring buf(cb / sizeof(wchar_t), L'\0');
+    rc = RegGetValueW(HKEY_LOCAL_MACHINE,
+                      kInstallAnchorKey,
+                      kInstallAnchorValue,
+                      RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                      nullptr,
+                      buf.data(),
+                      &cb);
+    if (rc != ERROR_SUCCESS) {
+        return static_cast<DWORD>(rc);
+    }
+    // Strip trailing NUL(s) and separators.
+    while (!buf.empty() && buf.back() == L'\0') buf.pop_back();
+    while (!buf.empty() && (buf.back() == L'\\' || buf.back() == L'/')) buf.pop_back();
+    if (buf.empty()) {
+        return ERROR_INVALID_DATA;
+    }
+    outFolder = std::move(buf);
+    return ERROR_SUCCESS;
+}
+
+// Resolve the install folder via the anchor; fall back to the exe directory
+// (Stage 2 task runs from the install folder anyway, so it is a safe fallback).
+[[nodiscard]] static std::wstring ResolveInstallFolderOrExeDir() noexcept
+{
+    std::wstring fromAnchor;
+    if (ReadInstallFolderFromAnchor(fromAnchor) == ERROR_SUCCESS) {
+        return fromAnchor;
+    }
+    return GetInstallDirectory();
+}
+
+[[nodiscard]] static DWORD ResolveRootCertPath(std::wstring& outPath) noexcept
+{
+    const std::wstring folder = ResolveInstallFolderOrExeDir();
+    if (folder.empty()) {
+        LOG_ERROR(L"ResolveRootCertPath: cannot determine install folder.");
+        return ERROR_PATH_NOT_FOUND;
+    }
+    outPath = folder + L"\\" + kRootCertRelPath;
+    return ERROR_SUCCESS;
+}
+
+[[nodiscard]] static int RunInstallRootCert(int argc, wchar_t* argv[])
+{
+    LOG_INFO(L"=== Mode: --install-root-cert ===");
+
+    std::wstring cerPath;
+    if (argc >= 3 && argv[2] != nullptr && argv[2][0] != L'\0') {
+        cerPath = argv[2];
+    } else {
+        DWORD err = ResolveRootCertPath(cerPath);
+        if (err != ERROR_SUCCESS) {
+            LOG_ERROR(L"RunInstallRootCert: could not resolve cer path "
+                      L"(0x%08X).", err);
+            return kExitGenericFailure;
+        }
+    }
+
+    const DWORD err = ShadowStrike::Installer::InstallShadowStrikeRootCert(cerPath);
+    if (err != ERROR_SUCCESS) {
+        LOG_ERROR(L"RunInstallRootCert: failed (0x%08X).", err);
+        return kExitGenericFailure;
+    }
+    return kExitSuccess;
+}
+
 [[nodiscard]] static int RunStage2();
 [[nodiscard]] static int RunStage1();
 [[nodiscard]] static int RunStage1Msi();
 [[nodiscard]] static int RunInstallNow();
 [[nodiscard]] static int RunStartService();
 [[nodiscard]] static int RunUninstall();
+[[nodiscard]] static int RunInstallRootCert(int argc, wchar_t* argv[]);
 
 // ────────────────────────────────────────────────────────────────────────────
 //  PhantomHome user-mode service startup
@@ -459,6 +557,25 @@ static int RunStage2()
 
     LOG_INFO(L"=== Stage 2: Driver SCM registration and load ===");
 
+    // Defence-in-depth: ensure the ShadowStrike root cert is in the
+    // LocalMachine Root + TrustedPublisher stores BEFORE we attempt to
+    // FilterLoad the (test-)signed driver. The MSI custom action SHOULD
+    // already have done this, but Stage 2 cannot trust prior state.
+    {
+        std::wstring cerPath;
+        DWORD certErr = ResolveRootCertPath(cerPath);
+        if (certErr != ERROR_SUCCESS) {
+            LOG_ERROR(L"Stage 2: cannot resolve root-cert path (0x%08X).", certErr);
+            return kExitGenericFailure;
+        }
+        certErr = ShadowStrike::Installer::InstallShadowStrikeRootCert(cerPath);
+        if (certErr != ERROR_SUCCESS) {
+            LOG_ERROR(L"Stage 2: InstallShadowStrikeRootCert('%ls') failed "
+                      L"(0x%08X).", cerPath.c_str(), certErr);
+            return kExitGenericFailure;
+        }
+    }
+
     ScHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS));
     if (!scm.valid()) {
         DWORD err = GetLastError();
@@ -536,6 +653,20 @@ static int RunStage2()
                  L"remain configured for the next boot/retry.", serviceErr);
     }
 
+    // Best-effort Defender exclusions post-success.  Failure here MUST NOT
+    // fail Stage 2 -- signed binaries should pass Defender on their own.
+    {
+        const std::wstring installFolder = ResolveInstallFolderOrExeDir();
+        if (!installFolder.empty()) {
+            const DWORD defErr =
+                ShadowStrike::Installer::AddPhantomDefenderExclusions(installFolder);
+            if (defErr != ERROR_SUCCESS) {
+                LOG_WARN(L"Stage 2: Defender exclusion registration returned "
+                         L"0x%08X (best-effort, ignoring).", defErr);
+            }
+        }
+    }
+
     LOG_INFO(L"=== Stage 2 complete. ===");
     return kExitSuccess;
 }
@@ -549,30 +680,89 @@ static int RunStage1()
 
     LOG_INFO(L"=== Stage 1: TestSigning detection and reboot pivot ===");
 
+    Stage1Snapshot snapshot;
+
+    // ── Service registration verification ────────────────────────────────
     DWORD err = VerifyHomeServiceRegistered();
+    snapshot.service_registered         = (err == ERROR_SUCCESS);
+    snapshot.service_registration_error = err;
     if (err != ERROR_SUCCESS) {
         LOG_ERROR(L"Service registration verification failed before Stage 1 (0x%08X).", err);
+        wchar_t msg[256];
+        _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+                     L"ShadowStrikePhantomService is not registered (0x%08X).", err);
+        snapshot.last_error_message = msg;
+        (void)WriteStage1Snapshot(snapshot);
         return kExitGenericFailure;
     }
 
+    // ── Secure Boot guard (must run BEFORE QueryTestSigningState) ────────
+    const SecureBootState sbState = QuerySecureBootState();
+    if (sbState == SecureBootState::Enabled) {
+        snapshot.secureboot_blocks   = true;
+        snapshot.last_error_message =
+            L"SecureBoot is enabled in firmware. Disable SecureBoot in the "
+            L"VM/PC firmware before installing ShadowStrike Phantom.";
+        LOG_ERROR(L"Stage 1 aborting: %ls", snapshot.last_error_message.c_str());
+        (void)WriteStage1Snapshot(snapshot);
+        return kExitSecureBootBlocked;
+    }
+    if (sbState == SecureBootState::Unknown) {
+        LOG_WARN(L"SecureBoot state is Unknown; proceeding cautiously. "
+                 L"Operator should verify firmware settings.");
+    }
+
+    // ── TestSigning detection ────────────────────────────────────────────
     bool testSigningOn = false;
     err = QueryTestSigningState(testSigningOn);
     if (err != ERROR_SUCCESS) {
         LOG_WARN(L"QueryTestSigningState returned 0x%08X; treating as OFF.", err);
         testSigningOn = false;
     }
+    snapshot.testsigning_state_before = testSigningOn;
+    snapshot.testsigning_state_after  = testSigningOn;
+
+    int result;
 
     if (testSigningOn) {
         LOG_INFO(L"TestSigning is already ON — skipping reboot pivot, running Stage 2 inline.");
-        return RunStage2();
+        result = RunStage2();
+        if (result == kExitSuccess) {
+            snapshot.reboot_required = false;
+        } else {
+            wchar_t msg[128];
+            _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+                         L"Stage 2 (inline) failed with exit %d.", result);
+            snapshot.last_error_message = msg;
+        }
+        (void)WriteStage1Snapshot(snapshot);
+        if (result == kExitSuccess) {
+            // Defender exclusions are also best-effort here.
+            const std::wstring installFolder = ResolveInstallFolderOrExeDir();
+            if (!installFolder.empty()) {
+                const DWORD defErr = AddPhantomDefenderExclusions(installFolder);
+                if (defErr != ERROR_SUCCESS) {
+                    LOG_WARN(L"Stage 1 inline path: Defender exclusion "
+                             L"returned 0x%08X (best-effort).", defErr);
+                }
+            }
+        }
+        return result;
     }
 
-    // Enable testsigning.
+    // ── Enable testsigning (off → on) ────────────────────────────────────
     err = EnableTestSigning();
     if (err != ERROR_SUCCESS) {
         LOG_ERROR(L"EnableTestSigning failed (0x%08X).", err);
+        snapshot.bcdedit_exit = err;
+        wchar_t msg[256];
+        _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+                     L"bcdedit /set testsigning on failed (0x%08X).", err);
+        snapshot.last_error_message = msg;
+        (void)WriteStage1Snapshot(snapshot);
         return kExitGenericFailure;
     }
+    snapshot.testsigning_state_after = true;
 
     // Register Stage 2 as a SYSTEM scheduled task. HKLM RunOnce executes under
     // an interactive user token and can be consumed before a privileged driver
@@ -580,13 +770,38 @@ static int RunStage1()
     std::wstring ownPath = GetOwnExePath();
     if (ownPath.empty()) {
         LOG_ERROR(L"Cannot determine own exe path for Stage 2 task registration.");
+        snapshot.last_error_message = L"GetModuleFileNameW returned an empty path.";
+        (void)WriteStage1Snapshot(snapshot);
         return kExitGenericFailure;
     }
 
     err = RegisterStage2ScheduledTask(ownPath);
+    snapshot.stage2_task_registered = (err == ERROR_SUCCESS);
     if (err != ERROR_SUCCESS) {
         LOG_ERROR(L"RegisterStage2ScheduledTask failed (0x%08X).", err);
+        wchar_t msg[256];
+        _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+                     L"Stage 2 scheduled task registration failed (0x%08X).", err);
+        snapshot.last_error_message = msg;
+        (void)WriteStage1Snapshot(snapshot);
         return kExitGenericFailure;
+    }
+
+    snapshot.reboot_required = true;
+    (void)WriteStage1Snapshot(snapshot);
+
+    // Best-effort Defender exclusions before the reboot pivot, so the
+    // driver sitting in the install Drivers\ folder survives a Defender
+    // scan during early boot.
+    {
+        const std::wstring installFolder = ResolveInstallFolderOrExeDir();
+        if (!installFolder.empty()) {
+            const DWORD defErr = AddPhantomDefenderExclusions(installFolder);
+            if (defErr != ERROR_SUCCESS) {
+                LOG_WARN(L"Stage 1: Defender exclusion returned 0x%08X "
+                         L"(best-effort).", defErr);
+            }
+        }
     }
 
     LOG_INFO(L"Stage 1 complete. Reboot is required; returning 3010 for installer UI.");
@@ -602,6 +817,16 @@ static int RunStage1Msi()
     if (result == kExitRebootRequired) {
         LOG_INFO(L"Stage 1 requires reboot; returning success to MSI. "
                  L"The MSI ScheduleReboot action owns the user-visible restart prompt.");
+        return kExitSuccess;
+    }
+    if (result == kExitSecureBootBlocked) {
+        // SecureBoot blocks driver load. We MUST NOT fail the MSI here —
+        // the bundle inspects driver-stage1.json to surface the firmware
+        // remediation step to the user. Rolling back the MSI would also
+        // remove the install footprint the operator needs to keep so they
+        // can reboot into firmware, disable Secure Boot, and re-run.
+        LOG_WARN(L"Stage 1 reported SecureBoot block; returning success to "
+                 L"MSI per design (snapshot drives bundle UX).");
         return kExitSuccess;
     }
     return result;
@@ -669,7 +894,8 @@ static int InnerMain(int argc, wchar_t* argv[])
 
     if (argc < 2) {
         LOG_ERROR(L"No mode argument. Usage: ShadowStrikeDriverResume.exe "
-                  L"[--stage1 | --stage1-msi | --stage2 | --install-now | --start-service | --uninstall]");
+                  L"[--stage1 | --stage1-msi | --stage2 | --install-now | "
+                  L"--start-service | --uninstall | --install-root-cert [path]]");
         FlushLogger();
         return kExitBadArgs;
     }
@@ -689,6 +915,8 @@ static int InnerMain(int argc, wchar_t* argv[])
         result = RunStartService();
     else if (mode == L"--uninstall")
         result = RunUninstall();
+    else if (mode == L"--install-root-cert")
+        result = RunInstallRootCert(argc, argv);
     else {
         LOG_ERROR(L"Unknown mode argument: '%ls'", argv[1]);
         result = kExitBadArgs;

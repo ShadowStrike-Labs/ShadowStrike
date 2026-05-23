@@ -5,13 +5,29 @@
   Bundle UpgradeCode: {CCD11E3C-E8D9-461C-A8CC-BEE40AF19402}
   IMMUTABLE across all future bootstrapper releases.
 
+  Product/bundle version: 1.0.2.0
+    1.0.2.0 introduces the shipped trust-root certificate component
+    (CmpShadowStrikeRootCert) and the ExecInstallRootCert custom action that
+    imports it into LocalMachine\Root before the driver stage1 work runs.
+
+  Post-install behavior note (bootstrapper side, documentation only):
+    After the chained MSI completes, the bootstrapper reads
+      %ProgramData%\ShadowStrike\State\driver-stage1.json
+    to determine whether a reboot is required ("reboot_required": true|false)
+    and surface the user-visible restart prompt.  The actual JSON-reading
+    bootstrapper code lives outside this file; this comment exists so future
+    maintainers do not break the contract by renaming the state file or
+    moving its location.  The plain `<ScheduleReboot>` from MSI also bubbles
+    up via `bal:WixStandardBootstrapperApplication` by default, which is the
+    fallback path when the JSON is missing or malformed.
+
   Chain (in order):
     1. vc_redist.x64.exe  – Microsoft Visual C++ Redistributable (x64)
     2. ShadowStrikePhantom-Home-Setup.msi – the product MSI
 
   Build (from repo root):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.1.0 ^
+      -d ProductVersion=1.0.2.0 ^
       -d BinDir=bin\Release ^
       -d InstallerDir=packaging\installer ^
       -d MsiPath=build\installer\ShadowStrikePhantom-Home-Setup.msi ^

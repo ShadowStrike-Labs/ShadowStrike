@@ -34,6 +34,13 @@
     -->
     <DirectoryRef Id="INSTALLFOLDER">
       <Directory Id="DriversDir" Name="Drivers"/>
+      <!--
+        CertsDir: holds the ShadowStrike-Dev root certificate (.cer) that the
+        DriverResume helper imports into LocalMachine\Root before the driver
+        is loaded.  Required so the driver's Authenticode signature chain
+        validates on a clean VM that does not already trust the dev cert.
+      -->
+      <Directory Id="CertsDir" Name="Certs"/>
     </DirectoryRef>
 
     <!--
@@ -89,6 +96,31 @@
       <File Id="DriverResumeExe"
             Name="ShadowStrikeDriverResume.exe"
             Source="$(var.BinDir)\ShadowStrikeDriverResume.exe"
+            KeyPath="yes"/>
+
+    </Component>
+
+    <!--
+      ShadowStrike trust-root certificate.
+      Staged into [INSTALLFOLDER]\Certs\ShadowStrike-Dev.cer so the deferred
+      custom action ExecInstallRootCert (Product.wxs) can import it into the
+      LocalMachine Trusted Root store BEFORE the kernel driver is configured
+      to load.  Without this trust anchor the kernel will refuse to load the
+      minifilter and stage1 will fail.
+
+      Bitness always64 to keep the component view consistent with the rest of
+      the x64-only driver feature group.  KeyPath on the .cer ensures
+      Windows Installer tracks the certificate file and rolls back cleanly
+      on failure.
+    -->
+    <Component Id="CmpShadowStrikeRootCert"
+               Directory="CertsDir"
+               Guid="{F1A2B3C4-D5E6-47F8-9A0B-1C2D3E4F5063}"
+               Bitness="always64">
+
+      <File Id="ShadowStrikeRootCer"
+            Name="ShadowStrike-Dev.cer"
+            Source="$(var.StagingDir)\Certs\ShadowStrike-Dev.cer"
             KeyPath="yes"/>
 
     </Component>

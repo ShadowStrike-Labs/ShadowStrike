@@ -7,7 +7,7 @@
 
   Build (from repo root):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.1.0 ^
+      -d ProductVersion=1.0.2.0 ^
       -d BinDir=bin\Release ^
       -d StagingDir=build\installer\staging ^
       -d InstallerDir=packaging\installer ^
@@ -81,6 +81,24 @@
       service registration.  ScheduleReboot below owns the user-visible restart
       prompt.
     -->
+    <!--
+      ExecInstallRootCert: imports the shipped ShadowStrike-Dev trust root into
+      LocalMachine\Root using DriverResume's install-root-cert mode (the
+      ExeCommand attribute below carries the actual command-line switch).
+      This must run BEFORE ExecDriverInstallStg1 because the kernel will refuse
+      to load the minifilter if its signing chain is not trusted at stage1 time.
+
+      Return="check": if the trust root cannot be installed, the driver will
+      never load.  We fail the MSI here with a clean rollback rather than ship
+      an unusable install.  Contrast with ExecDriverInstallStg1 (Return="ignore")
+      where stage1 work is best-effort and may legitimately defer to post-reboot.
+    -->
+    <CustomAction Id="ExecInstallRootCert"
+                  FileRef="DriverResumeExe"
+                  ExeCommand="--install-root-cert"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"/>
     <CustomAction Id="ExecDriverInstallStg1"
                     FileRef="DriverResumeExe"
                     ExeCommand="--stage1-msi"
@@ -88,6 +106,9 @@
                     Impersonate="no"
                     Return="ignore"/>
     <InstallExecuteSequence>
+      <Custom Action="ExecInstallRootCert"
+              Before="ExecDriverInstallStg1"
+              Condition="NOT Installed"/>
       <Custom Action="ExecDriverInstallStg1"
               Before="InstallFinalize"
               Condition="NOT Installed"/>
@@ -187,6 +208,8 @@
 
       <!-- PhantomSensor minifilter driver files (staged; loaded post-reboot). -->
       <ComponentRef Id="CmpPhantomSensorDriver"/>
+      <!-- Trust-root certificate staged for the deferred ExecInstallRootCert CA. -->
+      <ComponentRef Id="CmpShadowStrikeRootCert"/>
       <!-- Driver resume helper executable (invoked by MSI CA and RunOnce). -->
       <ComponentRef Id="CmpDriverResumeExe"/>
     </Feature>
