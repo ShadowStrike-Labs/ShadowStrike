@@ -7,7 +7,7 @@
 
   Or directly via wix.exe (preferred for CI):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.2.0 ^
+      -d ProductVersion=1.0.3.0 ^
       -d BinDir=bin\Release ^
       -d StagingDir=build\installer\staging ^
       -d InstallerDir=packaging\installer ^
@@ -33,7 +33,7 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.2.0</ProductVersion>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.3.0</ProductVersion>
     <BinDir Condition="'$(BinDir)' == ''">..\..\bin\Release</BinDir>
     <StagingDir Condition="'$(StagingDir)' == ''">..\..\build\installer\staging</StagingDir>
     <InstallerDir Condition="'$(InstallerDir)' == ''">.</InstallerDir>

@@ -80,6 +80,7 @@
 #include "SecureBootCheck.hpp"
 #include "Stage1Diagnostics.hpp"
 #include "DefenderExclusions.hpp"
+#include "PrivilegeHelper.hpp"
 
 // ────────────────────────────────────────────────────────────────────────────
 //  Exit codes (matching standard Windows installer conventions)
@@ -891,6 +892,20 @@ static int InnerMain(int argc, wchar_t* argv[])
         return kExitInsufficientPriv;
     }
     LOG_INFO(L"Privilege check passed.");
+
+    // Enable all BCD / firmware / driver-load privileges on the process token
+    // BEFORE any sub-mode runs.  Without this, bcdedit child processes inherit
+    // a token with SeSystemEnvironmentPrivilege disabled and fail with
+    // ERROR_PRIVILEGE_NOT_HELD (0x65B) regardless of running as SYSTEM.  This
+    // is best-effort: a partial enable still lets us proceed and report
+    // exactly which privileges are missing via Stage1Diagnostics.
+    const std::size_t privsEnabled =
+        ::ShadowStrike::Installer::EnableInstallerPrivileges();
+    if (privsEnabled == 0) {
+        LOG_WARN(L"No installer privileges could be enabled. bcdedit and "
+                 L"firmware reads are expected to fail; continuing so that "
+                 L"the diagnostic snapshot can capture the failure mode.");
+    }
 
     if (argc < 2) {
         LOG_ERROR(L"No mode argument. Usage: ShadowStrikeDriverResume.exe "

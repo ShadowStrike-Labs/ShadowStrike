@@ -40,6 +40,101 @@ namespace {
 constexpr const wchar_t* kLogSource = L"ShadowStrike Phantom Service";
 
 // ---------------------------------------------------------------------------
+// Boot trace — written via direct CreateFileW (CREATE_ALWAYS with FILE_FLAG_
+// WRITE_THROUGH) at the very top of wmain(), BEFORE the async Logger is
+// initialised.  This lets post-mortem triage tell apart:
+//   (a) the SCM never spawned the service exe        → file does not exist;
+//   (b) the .exe was spawned but crashed before Run() → file exists with the
+//       "entry" line only;
+//   (c) Defender quarantined the .exe between MSI commit and SCM start → file
+//       does not exist AND DriverResume.<pid>.log shows no service start
+//       attempt either.
+// The file path is %ProgramData%\ShadowStrike\Logs\PhantomHome.Service.boot.log
+// (idempotent, recreated each launch) so the previous boot's trace is
+// preserved in the next file rotation only via journal copy; the file itself
+// is overwritten on every launch to avoid runaway growth.
+// ---------------------------------------------------------------------------
+void WriteBootTrace(const wchar_t* event, int argc, wchar_t** argv) noexcept {
+    wchar_t programData[MAX_PATH + 1] = {};
+    if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike\\Logs",
+                                    programData, MAX_PATH) == 0) {
+        return;
+    }
+
+    wchar_t parent[MAX_PATH + 1] = {};
+    if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike",
+                                    parent, MAX_PATH) != 0) {
+        (void)::CreateDirectoryW(parent, nullptr);
+    }
+    (void)::CreateDirectoryW(programData, nullptr);
+
+    wchar_t path[MAX_PATH + 1] = {};
+    if (::_snwprintf_s(path, _countof(path), _TRUNCATE,
+                       L"%ls\\PhantomHome.Service.boot.log", programData) < 0)
+    {
+        return;
+    }
+
+    const HANDLE h = ::CreateFileW(
+        path,
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    SYSTEMTIME st{};
+    ::GetSystemTime(&st);
+
+    wchar_t cmdLineSummary[512] = {};
+    int written = ::_snwprintf_s(
+        cmdLineSummary, _countof(cmdLineSummary), _TRUNCATE,
+        L"argc=%d arg0=%ls arg1=%ls",
+        argc,
+        (argc >= 1 && argv != nullptr && argv[0] != nullptr) ? argv[0] : L"<none>",
+        (argc >= 2 && argv != nullptr && argv[1] != nullptr) ? argv[1] : L"<none>");
+    if (written < 0) {
+        cmdLineSummary[0] = L'\0';
+    }
+
+    wchar_t line[1024] = {};
+    DWORD sessionId = 0;
+    (void)::ProcessIdToSessionId(::GetCurrentProcessId(), &sessionId);
+    written = ::_snwprintf_s(
+        line, _countof(line), _TRUNCATE,
+        L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ [BOOT] pid=%lu sid=%lu %ls %ls\r\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        ::GetCurrentProcessId(),
+        sessionId,
+        event,
+        cmdLineSummary);
+    if (written < 0) {
+        ::CloseHandle(h);
+        return;
+    }
+
+    // Append, then immediately fsync so a crash in the next millisecond
+    // cannot lose the trace.
+    int cbUtf8 = ::WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
+    if (cbUtf8 > 1) {
+        char buf[2048] = {};
+        const int cb = (cbUtf8 - 1 < static_cast<int>(sizeof(buf)))
+                       ? cbUtf8 - 1
+                       : static_cast<int>(sizeof(buf));
+        if (::WideCharToMultiByte(CP_UTF8, 0, line, -1, buf, cb, nullptr, nullptr) > 0) {
+            DWORD writtenBytes = 0;
+            (void)::WriteFile(h, buf, static_cast<DWORD>(cb), &writtenBytes, nullptr);
+            (void)::FlushFileBuffers(h);
+        }
+    }
+    ::CloseHandle(h);
+}
+
+// ---------------------------------------------------------------------------
 // Unhandled SEH filter — writes a synchronous crash marker to the log so a
 // silent access-violation or stack-overflow in a module's Initialize path is
 // visible in the next run's triage instead of a truncated log.
@@ -112,8 +207,15 @@ void InitialiseLogger() noexcept {
 }  // namespace
 
 extern "C" int wmain(int argc, wchar_t* argv[]) {
+    // Boot trace must be the FIRST observable side effect so we can tell, on
+    // VM triage, whether SCM (or Defender) even managed to spawn this exe.
+    // Written via a direct, synchronous CreateFileW so the trace survives an
+    // immediate crash in InitialiseLogger / static initialisers.
+    WriteBootTrace(L"wmain-entry", argc, argv);
+
     ::SetUnhandledExceptionFilter(ShadowStrikeUnhandledFilter);
     InitialiseLogger();
+    WriteBootTrace(L"logger-initialised", argc, argv);
 
     if (argc >= 2 && argv != nullptr && argv[1] != nullptr) {
         const std::wstring arg{argv[1]};
@@ -139,7 +241,9 @@ extern "C" int wmain(int argc, wchar_t* argv[]) {
 
     if (!::ShadowStrike::Service::AntivirusService::Instance().Run()) {
         ShadowStrike::Utils::Logger::Error("wmain: AntivirusService::Run returned false");
+        WriteBootTrace(L"AntivirusService-Run-returned-false", argc, argv);
         return 1;
     }
+    WriteBootTrace(L"AntivirusService-Run-returned-true", argc, argv);
     return 0;
 }

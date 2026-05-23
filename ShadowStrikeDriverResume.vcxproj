@@ -118,6 +118,7 @@
     <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\SecureBootCheck.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\Stage1Diagnostics.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\DefenderExclusions.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\PrivilegeHelper.cpp" />
   </ItemGroup>
 
   <ItemGroup>
@@ -127,6 +128,7 @@
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\SecureBootCheck.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\Stage1Diagnostics.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\DefenderExclusions.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\PrivilegeHelper.hpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

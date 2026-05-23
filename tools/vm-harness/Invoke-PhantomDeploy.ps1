@@ -64,7 +64,7 @@ $ResultsDir  = Join-Path $AutoDir  'results'
 $MSBuild     = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 $MsiOut      = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.msi'
 $BundleOut   = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.exe'
-$ProductVersion = '1.0.2.0'
+$ProductVersion = '1.0.3.0'
 $SigningDir  = Join-Path $RepoRoot 'packaging\signing'
 $DevPfxPath  = Join-Path $SigningDir 'ShadowStrike-Dev.pfx'
 $DevCerPath  = Join-Path $SigningDir 'ShadowStrike-Dev.cer'
@@ -361,28 +361,37 @@ function Assert-MsiAuthoring {
 }
 
 # ── BUILD ────────────────────────────────────────────────────────────────────
+# PreferredToolArchitecture=x64 forces the 64-bit-hosted cl.exe; the default
+# HostX86 toolchain runs out of heap on PhantomEmulator/JIT/JITCompiler.cpp
+# (large `std::array<RuntimeBlock, 4096>` value-init exceeds 32-bit cl's
+# compiler heap) and fails with C1060.
 if (-not $SkipBuild) {
     if ($RebuildLib) {
         Log "Building PhantomCoreLib..."
         & $MSBuild (Join-Path $RepoRoot 'PhantomCoreLib.vcxproj') `
-            /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+            /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /m /nologo /v:minimal
         if ($LASTEXITCODE -ne 0) { Die "PhantomCoreLib build failed" }
     }
 
     Log "Building PhantomHome Service..."
     & $MSBuild (Join-Path $RepoRoot 'ShadowStrikePhantomService.vcxproj') `
-        /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+        /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /m /nologo /v:minimal
     if ($LASTEXITCODE -ne 0) { Die "Service build failed" }
 
     Log "Building PhantomHome UI..."
     & $MSBuild (Join-Path $RepoRoot 'ShadowStrikePhantomUI.vcxproj') `
-        /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+        /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /m /nologo /v:minimal
     if ($LASTEXITCODE -ne 0) { Die "UI build failed" }
 
     Log "Building PhantomHome Tray..."
     & $MSBuild (Join-Path $RepoRoot 'ShadowStrikePhantomTray.vcxproj') `
-        /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+        /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /m /nologo /v:minimal
     if ($LASTEXITCODE -ne 0) { Die "Tray build failed" }
+
+    Log "Building PhantomHome DriverResume..."
+    & $MSBuild (Join-Path $RepoRoot 'ShadowStrikeDriverResume.vcxproj') `
+        /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /m /nologo /v:minimal
+    if ($LASTEXITCODE -ne 0) { Die "DriverResume build failed" }
 
     Sync-QtRuntimeStaging
 
