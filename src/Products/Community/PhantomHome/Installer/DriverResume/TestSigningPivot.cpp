@@ -51,6 +51,10 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <comdef.h>
+#include <taskschd.h>
+#include <wrl/client.h>
+
 #include "TestSigningPivot.hpp"
 #include "DriverInstaller.hpp"  // for HandleGuard, RegKeyGuard
 
@@ -461,8 +465,311 @@ DWORD QueryTestSigningState(bool& outIsOn)
 #pragma warning(pop)
 
 // ────────────────────────────────────────────────────────────────────────────
+//  EnableTestSigningViaScheduledTask
+//
+//  Fallback path for enabling BCD test-signing when the calling token cannot
+//  spawn bcdedit directly because SeSystemEnvironmentPrivilege is absent from
+//  the token.  This is the case when ShadowStrikeDriverResume.exe runs as a
+//  deferred MSI custom action (Execute="deferred" Impersonate="no"): the
+//  msiexec service token, although nominally LocalSystem, is restricted by
+//  the MSIServer service's RequiredPrivileges whitelist which omits
+//  SeSystemEnvironmentPrivilege.  bcdedit therefore exits with
+//  ERROR_PRIVILEGE_NOT_HELD (0x65B) even though every other condition is met.
+//
+//  Task Scheduler 2.0 tasks declared with TASK_LOGON_SERVICE_ACCOUNT +
+//  TASK_RUNLEVEL_HIGHEST run in a freshly-spawned process whose primary token
+//  is the unrestricted LocalSystem token — every privilege defined for SYSTEM,
+//  including SeSystemEnvironmentPrivilege, is present and enabled.  We
+//  therefore wrap the `bcdedit /set {current} testsigning on` invocation in a
+//  one-shot on-demand task, run it synchronously, and clean the task up.
+//
+//  Security:
+//    - The task action path is built from GetSystemDirectoryW (never PATH).
+//    - The task lives in the protected "\ShadowStrike\" folder created by the
+//      same installer; only LocalSystem can write there.
+//    - The task is deleted on every exit path (RAII deleter below) so we do
+//      not leave a SYSTEM-runnable bcdedit task on disk for an attacker to
+//      hijack.
+// ────────────────────────────────────────────────────────────────────────────
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+constexpr wchar_t kTestSigningTaskFolder[] = L"\\ShadowStrike";
+constexpr wchar_t kTestSigningTaskName[]   = L"PhantomTestSigningEnable";
+
+// Total wall-clock budget for the schtasks Run + poll loop.  bcdedit normally
+// completes in < 500 ms; we give it 60 s to tolerate slow VMs and Defender
+// scans of the spawned process.
+constexpr DWORD kTaskWaitTotalMs = 60'000;
+constexpr DWORD kTaskPollIntervalMs = 250;
+
+[[nodiscard]] DWORD EnableTestSigningViaTask()
+{
+    // Resolve absolute path to bcdedit.exe.  Never use PATH search.
+    wchar_t sysDir[MAX_PATH + 1] = {};
+    if (!GetSystemDirectoryW(sysDir, MAX_PATH)) {
+        DWORD err = GetLastError();
+        LOG_ERROR(L"EnableTestSigningViaTask: GetSystemDirectoryW failed (0x%08X).", err);
+        return err;
+    }
+    std::wstring bcdeditPath = sysDir;
+    bcdeditPath += L"\\bcdedit.exe";
+
+    // Initialise COM for this thread.  If the process already initialised
+    // COM in a different apartment, CoInitializeEx returns RPC_E_CHANGED_MODE
+    // — that is fine, we proceed without re-initialising / re-uninitialising.
+    const HRESULT coInitHr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool needsCoUninit = SUCCEEDED(coInitHr);
+    if (FAILED(coInitHr) && coInitHr != RPC_E_CHANGED_MODE) {
+        LOG_ERROR(L"EnableTestSigningViaTask: CoInitializeEx failed (0x%08lX).",
+                  static_cast<unsigned long>(coInitHr));
+        return static_cast<DWORD>(coInitHr);
+    }
+    struct CoUninitGuard {
+        bool active;
+        ~CoUninitGuard() noexcept { if (active) { ::CoUninitialize(); } }
+    } coGuard{ needsCoUninit };
+
+    // Initialise process-wide COM security if it has not already been set.
+    // RPC_E_TOO_LATE means another component already configured it; that is
+    // not an error for us — Task Scheduler simply uses the existing settings.
+    const HRESULT secHr = ::CoInitializeSecurity(
+        nullptr,
+        -1,
+        nullptr,
+        nullptr,
+        RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        nullptr,
+        0,
+        nullptr);
+    if (FAILED(secHr) && secHr != RPC_E_TOO_LATE) {
+        LOG_ERROR(L"EnableTestSigningViaTask: CoInitializeSecurity failed (0x%08lX).",
+                  static_cast<unsigned long>(secHr));
+        return static_cast<DWORD>(secHr);
+    }
+
+    ComPtr<ITaskService> pService;
+    HRESULT hr = ::CoCreateInstance(
+        CLSID_TaskScheduler,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&pService));
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: CoCreateInstance(TaskScheduler) failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    hr = pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t());
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: ITaskService::Connect failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    ComPtr<ITaskFolder> pRoot;
+    hr = pService->GetFolder(_bstr_t(L"\\"), &pRoot);
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: GetFolder(\\) failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    ComPtr<ITaskFolder> pFolder;
+    hr = pRoot->GetFolder(_bstr_t(kTestSigningTaskFolder), &pFolder);
+    if (FAILED(hr)) {
+        // Folder did not exist — create it.  An empty SDDL string means the
+        // folder inherits the parent's ACL (root is admins-only).
+        hr = pRoot->CreateFolder(_bstr_t(kTestSigningTaskFolder),
+                                  _variant_t(L""),
+                                  &pFolder);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"EnableTestSigningViaTask: CreateFolder(\\ShadowStrike) failed (0x%08lX).",
+                      static_cast<unsigned long>(hr));
+            return static_cast<DWORD>(hr);
+        }
+    }
+
+    // Remove any stale task from a prior failed run before re-registering.
+    (void)pFolder->DeleteTask(_bstr_t(kTestSigningTaskName), 0);
+
+    ComPtr<ITaskDefinition> pTask;
+    hr = pService->NewTask(0, &pTask);
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: NewTask failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    // ── Principal: SYSTEM, highest runlevel.  ServiceAccount logon type
+    //    causes the Task Scheduler service to spawn the task with the
+    //    unrestricted LocalSystem primary token (all privileges present).
+    {
+        ComPtr<IPrincipal> pPrincipal;
+        hr = pTask->get_Principal(&pPrincipal);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"EnableTestSigningViaTask: get_Principal failed (0x%08lX).",
+                      static_cast<unsigned long>(hr));
+            return static_cast<DWORD>(hr);
+        }
+        (void)pPrincipal->put_Id(_bstr_t(L"PhantomTestSigningPrincipal"));
+        (void)pPrincipal->put_LogonType(TASK_LOGON_SERVICE_ACCOUNT);
+        (void)pPrincipal->put_UserId(_bstr_t(L"SYSTEM"));
+        (void)pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+    }
+
+    // ── Settings: allow on-demand start, do not stop on battery, bound the
+    //    execution to two minutes so a hung bcdedit cannot wedge the task
+    //    indefinitely.
+    {
+        ComPtr<ITaskSettings> pSettings;
+        hr = pTask->get_Settings(&pSettings);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"EnableTestSigningViaTask: get_Settings failed (0x%08lX).",
+                      static_cast<unsigned long>(hr));
+            return static_cast<DWORD>(hr);
+        }
+        (void)pSettings->put_AllowDemandStart(VARIANT_TRUE);
+        (void)pSettings->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
+        (void)pSettings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
+        (void)pSettings->put_ExecutionTimeLimit(_bstr_t(L"PT2M"));
+        (void)pSettings->put_Hidden(VARIANT_TRUE);
+        (void)pSettings->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW);
+        (void)pSettings->put_Priority(4);
+    }
+
+    // ── Action: bcdedit /set {current} testsigning on
+    {
+        ComPtr<IActionCollection> pActions;
+        hr = pTask->get_Actions(&pActions);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"EnableTestSigningViaTask: get_Actions failed (0x%08lX).",
+                      static_cast<unsigned long>(hr));
+            return static_cast<DWORD>(hr);
+        }
+        ComPtr<IAction> pAction;
+        hr = pActions->Create(TASK_ACTION_EXEC, &pAction);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"EnableTestSigningViaTask: Actions::Create failed (0x%08lX).",
+                      static_cast<unsigned long>(hr));
+            return static_cast<DWORD>(hr);
+        }
+        ComPtr<IExecAction> pExec;
+        hr = pAction.As(&pExec);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"EnableTestSigningViaTask: IAction QI to IExecAction failed (0x%08lX).",
+                      static_cast<unsigned long>(hr));
+            return static_cast<DWORD>(hr);
+        }
+        (void)pExec->put_Path(_bstr_t(bcdeditPath.c_str()));
+        (void)pExec->put_Arguments(_bstr_t(L"/set {current} testsigning on"));
+    }
+
+    // ── Register the task (no triggers — fired exclusively via Run()).
+    ComPtr<IRegisteredTask> pRegistered;
+    hr = pFolder->RegisterTaskDefinition(
+        _bstr_t(kTestSigningTaskName),
+        pTask.Get(),
+        TASK_CREATE_OR_UPDATE,
+        _variant_t(L"SYSTEM"),
+        _variant_t(),
+        TASK_LOGON_SERVICE_ACCOUNT,
+        _variant_t(L""),
+        &pRegistered);
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: RegisterTaskDefinition failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    // RAII cleanup for the registered task: deleted on every exit path
+    // beyond this point regardless of success or failure.
+    struct DeleteOnExit {
+        ComPtr<ITaskFolder> folder;
+        ~DeleteOnExit() noexcept {
+            if (folder) {
+                (void)folder->DeleteTask(_bstr_t(kTestSigningTaskName), 0);
+            }
+        }
+    } cleanup{ pFolder };
+
+    // ── Run the task and wait for completion.
+    ComPtr<IRunningTask> pRunning;
+    hr = pRegistered->Run(_variant_t(), &pRunning);
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: IRegisteredTask::Run failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    TASK_STATE state = TASK_STATE_UNKNOWN;
+    DWORD elapsedMs = 0;
+    while (elapsedMs < kTaskWaitTotalMs) {
+        ::Sleep(kTaskPollIntervalMs);
+        elapsedMs += kTaskPollIntervalMs;
+
+        // Refresh may return SCHED_E_TASK_NOT_RUNNING once the task has
+        // completed — that is the expected terminal state, not a true error.
+        const HRESULT refreshHr = pRunning->Refresh();
+        const HRESULT stateHr   = pRunning->get_State(&state);
+        if (FAILED(stateHr)) {
+            LOG_WARN(L"EnableTestSigningViaTask: IRunningTask::get_State failed "
+                     L"(0x%08lX) after Refresh (0x%08lX).",
+                     static_cast<unsigned long>(stateHr),
+                     static_cast<unsigned long>(refreshHr));
+            break;
+        }
+        if (state != TASK_STATE_RUNNING && state != TASK_STATE_QUEUED) {
+            break;
+        }
+    }
+
+    if (state == TASK_STATE_RUNNING || state == TASK_STATE_QUEUED) {
+        LOG_ERROR(L"EnableTestSigningViaTask: bcdedit task did not complete within %lu ms.",
+                  kTaskWaitTotalMs);
+        // Best-effort terminate so we do not leave bcdedit running on cleanup.
+        (void)pRunning->Stop();
+        return ERROR_TIMEOUT;
+    }
+
+    LONG lastResult = -1;
+    hr = pRegistered->get_LastTaskResult(&lastResult);
+    if (FAILED(hr)) {
+        LOG_ERROR(L"EnableTestSigningViaTask: get_LastTaskResult failed (0x%08lX).",
+                  static_cast<unsigned long>(hr));
+        return static_cast<DWORD>(hr);
+    }
+
+    if (lastResult != 0) {
+        LOG_ERROR(L"EnableTestSigningViaTask: bcdedit (via scheduled task) "
+                  L"exited with %ld (0x%08lX).",
+                  lastResult,
+                  static_cast<unsigned long>(lastResult));
+        return ERROR_FUNCTION_FAILED;
+    }
+
+    LOG_INFO(L"EnableTestSigningViaTask: bcdedit succeeded via scheduled task "
+             L"(SYSTEM token with full privilege set).");
+    return ERROR_SUCCESS;
+}
+
+} // namespace
+
+// ────────────────────────────────────────────────────────────────────────────
 //  EnableTestSigning
 //  Runs: <System32>\bcdedit.exe /set {current} testsigning on
+//
+//  Strategy:
+//   1. Try direct spawn first. In contexts where the caller token has the
+//      full SYSTEM privilege set (services launched at boot, scheduled tasks)
+//      this is the fastest path and avoids touching Task Scheduler.
+//   2. On failure, fall back to EnableTestSigningViaTask(). MSI deferred
+//      custom actions inherit a restricted msiexec service token that lacks
+//      SeSystemEnvironmentPrivilege; bcdedit refuses to open the BCD store
+//      under that token. Tasks running as SYSTEM/HIGHEST get the unrestricted
+//      token and bcdedit succeeds.
 // ────────────────────────────────────────────────────────────────────────────
 DWORD EnableTestSigning()
 {
@@ -492,20 +799,31 @@ DWORD EnableTestSigning()
     // substring check is locale-dependent (non-English Windows produces a
     // translated message) and previously caused the installer to proceed
     // with reboot pivot even when bcdedit had returned a non-zero status.
-    if (bcdeditExit != 0) {
-        LOG_ERROR(L"bcdedit /set testsigning on exited with %lu. "
-                  L"Output (truncated): %.256hs",
-                  bcdeditExit, output.c_str());
-        return ERROR_FUNCTION_FAILED;
+    if (bcdeditExit == 0) {
+        if (output.find("successfully") != std::string::npos) {
+            LOG_INFO(L"bcdedit /set testsigning on succeeded.");
+        } else {
+            // Non-English Windows: exit code 0 is sufficient, message will differ.
+            LOG_INFO(L"bcdedit /set testsigning on returned exit 0 (locale-translated message).");
+        }
+        return ERROR_SUCCESS;
     }
 
-    if (output.find("successfully") != std::string::npos) {
-        LOG_INFO(L"bcdedit /set testsigning on succeeded.");
-    } else {
-        // Non-English Windows: exit code 0 is sufficient, message will differ.
-        LOG_INFO(L"bcdedit /set testsigning on returned exit 0 (locale-translated message).");
+    LOG_WARN(L"bcdedit /set testsigning on exited with %lu directly. "
+             L"Output (truncated): %.256hs",
+             bcdeditExit, output.c_str());
+    LOG_INFO(L"Falling back to Task Scheduler (LocalSystem with full privilege "
+             L"set) because the caller token likely lacks "
+             L"SeSystemEnvironmentPrivilege (e.g. MSI deferred custom action).");
+
+    const DWORD taskErr = EnableTestSigningViaTask();
+    if (taskErr != ERROR_SUCCESS) {
+        LOG_ERROR(L"EnableTestSigning: scheduled-task fallback also failed (0x%08X).",
+                  taskErr);
+        return taskErr;
     }
 
+    LOG_INFO(L"bcdedit /set testsigning on succeeded via scheduled-task fallback.");
     return ERROR_SUCCESS;
 }
 
