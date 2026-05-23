@@ -56,7 +56,7 @@ namespace {
     constexpr size_t kMaxStagedFiles = 10000;
 
     // Service names for ShadowStrike.
-    constexpr const wchar_t* kServiceName = L"ShadowStrikeService";
+    constexpr const wchar_t* kServiceName = L"ShadowStrikePhantomService";
 
     // Component filenames — map ComponentType to expected binary names.
     struct ComponentDef {
@@ -68,9 +68,9 @@ namespace {
     };
 
     constexpr ComponentDef kComponentDefs[] = {
-        { ShadowStrike::Update::ComponentType::Service,          L"ShadowStrikeService.exe", "ShadowStrike Service",          false, true  },
-        { ShadowStrike::Update::ComponentType::GUI,              L"ShadowStrikeGUI.exe",     "ShadowStrike GUI",              false, false },
-        { ShadowStrike::Update::ComponentType::Tray,             L"ShadowStrikeTray.exe",    "ShadowStrike Tray",             false, false },
+        { ShadowStrike::Update::ComponentType::Service,          L"ShadowStrikePhantomService.exe", "ShadowStrike Phantom Service", false, true  },
+        { ShadowStrike::Update::ComponentType::GUI,              L"ShadowStrikePhantomUI.exe",      "ShadowStrike Phantom UI",      false, false },
+        { ShadowStrike::Update::ComponentType::Tray,             L"ShadowStrikePhantomTray.exe",    "ShadowStrike Phantom Tray",    false, false },
         { ShadowStrike::Update::ComponentType::CLI,              L"ShadowStrikeCLI.exe",     "ShadowStrike CLI",              false, false },
         { ShadowStrike::Update::ComponentType::MinifilterDriver, L"ShadowStrikeMF.sys",      "ShadowStrike Minifilter Driver", true, true  },
         { ShadowStrike::Update::ComponentType::NetworkDriver,    L"ShadowStrikeNet.sys",     "ShadowStrike Network Driver",   true,  true  },
@@ -2547,4 +2547,3 @@ int CompareVersions(const ProgramVersion& a, const ProgramVersion& b)
 
 }  // namespace Update
 }  // namespace ShadowStrike
-

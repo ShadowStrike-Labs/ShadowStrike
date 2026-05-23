@@ -233,16 +233,16 @@ namespace RegistryProtectionConstants {
     
     inline constexpr std::array<std::wstring_view, 13> DEFAULT_PROTECTED_KEYS = {
         L"HKLM\\SOFTWARE\\ShadowStrike",
-        L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeService",
+        L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
         L"HKCU\\SOFTWARE\\ShadowStrike",
-        L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\ShadowStrikeService",
-        L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\ShadowStrikeService",
+        L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\ShadowStrikePhantomService",
+        L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\ShadowStrikePhantomService",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeService.exe",
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikePhantomService.exe",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeUI.exe",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeUpdater.exe"
     };

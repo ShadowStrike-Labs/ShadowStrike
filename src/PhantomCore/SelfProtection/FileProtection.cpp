@@ -1058,7 +1058,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     // Protect critical files
     std::vector<std::wstring> criticalFiles = {
         m_installationPath + L"\\ShadowStrike.exe",
-        m_installationPath + L"\\ShadowStrikeService.exe",
+        m_installationPath + L"\\ShadowStrikePhantomService.exe",
         m_installationPath + L"\\ShadowStrikeDriver.sys",
         m_installationPath + L"\\signatures.db",
         m_installationPath + L"\\config.xml"

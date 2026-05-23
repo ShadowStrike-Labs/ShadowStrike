@@ -73,9 +73,9 @@ namespace Service {
 // CONSTANTS
 // ============================================================================
 namespace ServiceConstants {
-    constexpr const wchar_t* SERVICE_NAME = L"ShadowStrikeService";
-    constexpr const wchar_t* DISPLAY_NAME = L"ShadowStrike Enterprise AV Service";
-    constexpr const wchar_t* DESCRIPTION = L"Provides enterprise-grade advanced threat protection against malware, ransomware, and zero-day exploits.";
+    constexpr const wchar_t* SERVICE_NAME = L"ShadowStrikePhantomService";
+    constexpr const wchar_t* DISPLAY_NAME = L"ShadowStrike Phantom Service";
+    constexpr const wchar_t* DESCRIPTION = L"Provides ShadowStrike Phantom Home real-time threat detection, behavioural analysis, and telemetry collection.";
     constexpr const wchar_t* DEPENDENCIES = L"RpcSs\0Winmgmt\0\0"; // Multiple string
     constexpr uint32_t SHUTDOWN_TIMEOUT_MS = 10000;
 }

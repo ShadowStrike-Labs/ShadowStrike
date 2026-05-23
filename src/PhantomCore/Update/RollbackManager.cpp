@@ -67,7 +67,7 @@ namespace {
 
     // Service names to check during health validation.
     constexpr const wchar_t* kServiceNames[] = {
-        L"ShadowStrikeService",
+        L"ShadowStrikePhantomService",
         L"ShadowStrikeSensor"
     };
 
@@ -2594,4 +2594,3 @@ uint64_t CalculateSnapshotSize(const fs::path& directory) {
 
 }  // namespace Update
 }  // namespace ShadowStrike
-

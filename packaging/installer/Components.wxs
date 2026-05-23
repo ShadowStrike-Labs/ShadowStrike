@@ -84,17 +84,17 @@
         ServiceControl:
         * Stop on both install (upgrade path) and uninstall.
         * Remove on uninstall.
-        * Do NOT start during MSI execution. Endpoint services may depend on
-          driver resume, runtime DLL staging, reboot state, and SCM timing; an
-          immediate StartServices failure causes MSI error 1920 and rolls back
-          the install even though the files and service registration are valid.
-          Start="auto" + DelayedAutoStart lets SCM start the service after the
-          machine reaches a stable post-install state.
+        * Start on install without waiting for the service to finish full
+          protection initialization. The service must expose UI IPC immediately
+          and report degraded subsystem state itself instead of making MSI own
+          endpoint runtime readiness.
       -->
       <ServiceControl Id="SvcControl"
                       Name="ShadowStrikePhantomService"
+                      Start="install"
                       Stop="both"
-                      Remove="uninstall"/>
+                      Remove="uninstall"
+                      Wait="no"/>
 
     </Component>
 

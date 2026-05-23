@@ -301,7 +301,7 @@ public:
         }
 
         // Add ShadowStrike processes to whitelist
-        m_whitelistedProcesses.insert(L"ShadowStrikeService.exe");
+        m_whitelistedProcesses.insert(L"ShadowStrikePhantomService.exe");
         m_whitelistedProcesses.insert(L"ShadowStrikeUI.exe");
         m_whitelistedProcesses.insert(L"ShadowStrikeUpdater.exe");
 
@@ -544,7 +544,7 @@ public:
         bool success = true;
 
         // Service keys
-        success &= ProtectKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeService",
+        success &= ProtectKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService",
             KeyProtectionType::Full, true);
         success &= ProtectKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver",
             KeyProtectionType::Full, true);
@@ -557,10 +557,10 @@ public:
 
         // Safe boot entries
         success &= ProtectKey(
-            L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\ShadowStrikeService",
+            L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\ShadowStrikePhantomService",
             KeyProtectionType::Full, true);
         success &= ProtectKey(
-            L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\ShadowStrikeService",
+            L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\ShadowStrikePhantomService",
             KeyProtectionType::Full, true);
 
         if (success) {
@@ -603,7 +603,7 @@ public:
 
         // IFEO debugger keys for ShadowStrike executables - critical EDR evasion vector
         static constexpr std::array<std::wstring_view, 3> kExecutables = {
-            L"ShadowStrikeService.exe",
+            L"ShadowStrikePhantomService.exe",
             L"ShadowStrikeUI.exe",
             L"ShadowStrikeUpdater.exe"
         };

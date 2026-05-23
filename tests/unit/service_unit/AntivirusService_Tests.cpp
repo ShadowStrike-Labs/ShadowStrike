@@ -46,8 +46,8 @@ TEST(AntivirusServiceTest, StatusReportExposesUninitializedServiceShape) {
 }
 
 TEST(AntivirusServiceTest, ServiceConstantsPreserveScmIdentityAndDependencyFormatting) {
-    EXPECT_STREQ(SSS::ServiceConstants::SERVICE_NAME, L"ShadowStrikeService");
-    EXPECT_STREQ(SSS::ServiceConstants::DISPLAY_NAME, L"ShadowStrike Enterprise AV Service");
+    EXPECT_STREQ(SSS::ServiceConstants::SERVICE_NAME, L"ShadowStrikePhantomService");
+    EXPECT_STREQ(SSS::ServiceConstants::DISPLAY_NAME, L"ShadowStrike Phantom Service");
     EXPECT_GT(SSS::ServiceConstants::SHUTDOWN_TIMEOUT_MS, 0u);
 
     const std::wstring dependencies(SSS::ServiceConstants::DEPENDENCIES,

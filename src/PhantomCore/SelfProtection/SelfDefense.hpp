@@ -224,7 +224,7 @@ namespace SelfDefenseConstants {
     // ========================================================================
     
     /// @brief Service name
-    inline constexpr std::wstring_view SERVICE_NAME = L"ShadowStrikeService";
+    inline constexpr std::wstring_view SERVICE_NAME = L"ShadowStrikePhantomService";
     
     /// @brief Driver service name
     inline constexpr std::wstring_view DRIVER_SERVICE_NAME = L"ShadowStrikeDriver";

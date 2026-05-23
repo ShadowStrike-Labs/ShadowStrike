@@ -873,7 +873,7 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
     SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectProcess(self)...");
     bool selfProtected = ProtectProcess(selfPid);
     SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: RegisterShadowStrikeComponent...");
-    RegisterShadowStrikeComponent(selfPid, "ShadowStrikeService");
+    RegisterShadowStrikeComponent(selfPid, "ShadowStrikePhantomService");
 
     // Track any critical protection failures
     bool degraded = !selfProtected;
@@ -2221,7 +2221,7 @@ std::vector<ProtectedRegistryKey> SelfDefenseImpl::GetAllProtectedRegistryKeys()
 
 bool SelfDefenseImpl::ProtectServiceRegistryKeys() {
     bool ok = true;
-    ok &= ProtectRegistryKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeService", true);
+    ok &= ProtectRegistryKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService", true);
     ok &= ProtectRegistryKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver", true);
     ok &= ProtectRegistryKey(L"HKLM\\SOFTWARE\\ShadowStrike", true);
     if (ok) {
@@ -3310,4 +3310,3 @@ ProtectedScope::~ProtectedScope() {
 
 }  // namespace Security
 }  // namespace ShadowStrike
-

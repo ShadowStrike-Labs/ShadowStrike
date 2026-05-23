@@ -1032,7 +1032,7 @@ public:
         // Protect critical files
         std::vector<std::wstring> criticalFiles = {
             L"ShadowStrike.exe",
-            L"ShadowStrikeService.exe",
+            L"ShadowStrikePhantomService.exe",
             L"SSEngine.dll",
             L"SSDriver.sys"
         };
