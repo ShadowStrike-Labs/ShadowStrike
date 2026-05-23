@@ -81,6 +81,11 @@
                      Name="DelayedAutostart"
                      Type="integer"
                      Value="1"/>
+      <RegistryValue Root="HKLM"
+                     Key="SYSTEM\CurrentControlSet\Services\ShadowStrikePhantomService"
+                     Name="AutoStartDelay"
+                     Type="integer"
+                     Value="15"/>
 
       <!--
         ServiceControl:

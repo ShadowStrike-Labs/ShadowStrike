@@ -615,9 +615,8 @@ bool PipeClient::Impl::DoWrite(HANDLE hPipe, OVERLAPPED& ovlp,
 UniqueHandle PipeClient::Impl::AttemptConnect(std::stop_token stoken)
 {
     DWORD backoffMs = 250;
-    DWORD lastErr = ERROR_SUCCESS;
-    std::uint32_t repeatedDenied = 0;
-    std::uint32_t repeatedUnavailable = 0;
+    const auto firstAttempt = std::chrono::steady_clock::now();
+    bool reportedUnavailable = false;
 
     while (!stoken.stop_requested()) {
         HANDLE h = CreateFileW(
@@ -641,35 +640,30 @@ UniqueHandle PipeClient::Impl::AttemptConnect(std::stop_token stoken)
             }
         } else {
             DWORD err = GetLastError();
-            if (err != lastErr) {
-                repeatedDenied = 0;
-                repeatedUnavailable = 0;
-                lastErr = err;
-            }
+            const auto elapsed = std::chrono::steady_clock::now() - firstAttempt;
             if (err == ERROR_PIPE_BUSY) {
                 // Server has instances but all are busy; use the documented wait.
                 if (!WaitNamedPipeW(CommunicationConstants::PIPE_NAME, 2000)) {
                     SS_LOG_INFO(kLog, L"WaitNamedPipeW timed out — retrying.");
                 }
-                continue; // Retry without backoff increment.
             }
             if (err == ERROR_ACCESS_DENIED) {
-                ++repeatedDenied;
                 SS_LOG_ERROR(kLog,
-                    L"CreateFileW denied access to %ls (%lu) attempt=%u. "
+                    L"CreateFileW denied access to %ls (%lu). "
                     L"Service pipe ACL is blocking this user-session client.",
-                    CommunicationConstants::PIPE_NAME, err, repeatedDenied);
-                if (repeatedDenied >= 10) {
+                    CommunicationConstants::PIPE_NAME, err);
+                if (elapsed >= std::chrono::seconds(30)) {
                     TransitionState(PipeClientState::Fatal,
                         L"Service refused IPC pipe access (ERROR_ACCESS_DENIED)");
                     return {};
                 }
-            } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
-                ++repeatedUnavailable;
-                if (repeatedUnavailable == 20) {
-                    TransitionState(PipeClientState::Disconnected,
-                        L"Service IPC pipe is not published; service is offline or failed startup");
-                }
+            }
+            if (!reportedUnavailable && elapsed >= std::chrono::seconds(15) &&
+                (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ||
+                 err == ERROR_PIPE_BUSY || err == ERROR_ACCESS_DENIED)) {
+                TransitionState(PipeClientState::Disconnected,
+                    L"Service IPC pipe unavailable; service offline, delayed, or failed startup");
+                reportedUnavailable = true;
             }
             SS_LOG_WARN(kLog, L"CreateFileW failed: %lu — backoff %lu ms.", err, backoffMs);
         }
@@ -698,8 +692,9 @@ bool PipeClient::Impl::PerformAuth(HANDLE hPipe, std::stop_token stoken)
     if (token.empty()) {
         SS_LOG_ERROR(kLog,
             L"IpcAuthToken::ReadForCurrentSession returned empty — "
-            L"cannot authenticate. Entering Fatal state.");
-        TransitionState(PipeClientState::Fatal, L"Auth token unavailable — cannot authenticate");
+            L"cannot authenticate yet. The service may still be provisioning the session token.");
+        TransitionState(PipeClientState::Disconnected,
+            L"Auth token unavailable; waiting for service session provisioning");
         return false;
     }
 
@@ -1042,8 +1037,16 @@ void PipeClient::Impl::IoThreadProc(std::stop_token stoken)
         TransitionState(PipeClientState::Authenticating, L"Pipe connected; authenticating");
 
         if (!PerformAuth(hPipe.get(), stoken)) {
-            // Fatal or stopped.
-            break;
+            if (stoken.stop_requested() ||
+                m_fatalFlag.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            TransitionState(PipeClientState::Reconnecting,
+                            L"Authentication prerequisites unavailable — retrying");
+            std::this_thread::sleep_for(std::chrono::milliseconds(reconnectBackoffMs));
+            reconnectBackoffMs = std::min(reconnectBackoffMs * 2, DWORD{5000});
+            continue;
         }
         if (stoken.stop_requested()) break;
 

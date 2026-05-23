@@ -219,6 +219,7 @@ private:
     bool ProcessMessage(CommandType cmd, const std::vector<uint8_t>& data, std::vector<uint8_t>& response);
     void ProcessV2Message(uint64_t clientId, uint32_t sessionId, CommandType cmd, uint64_t requestId, std::string_view json);
     bool CreatePipeSecurityDescriptor();
+    [[nodiscard]] ScopedHandle CreatePipeInstance(bool requireFirstInstance);
     void CleanupDisconnectedClients();
 
     // Performs a bounded-time overlapped WriteFile on an overlapped-mode
@@ -299,10 +300,10 @@ private:
     // Stats
     CommunicatorStats m_stats;
 
-    // Set true on Start() so the first server pipe uses
-    // FILE_FLAG_FIRST_PIPE_INSTANCE. Subsequent instances omit the flag because
-    // active client connections keep earlier instances open by design.
-    std::atomic<bool> m_firstPipeInstance{true};
+    // The first pipe instance is created synchronously in Start() so a squatted
+    // or otherwise unavailable pipe name is visible to SCM instead of becoming
+    // a silent RUNNING-without-IPC service state.
+    ScopedHandle m_primedPipe;
 };
 
 // ----------------------------------------------------------------------------
@@ -385,18 +386,59 @@ bool ServiceCommunicatorImpl::Initialize() {
     return true;
 }
 
+ScopedHandle ServiceCommunicatorImpl::CreatePipeInstance(bool requireFirstInstance) {
+    const DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+                           (requireFirstInstance ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0);
+
+    HANDLE hPipe = CreateNamedPipeW(
+        CommunicationConstants::PIPE_NAME,
+        openMode,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        CommunicationConstants::MAX_CONCURRENT_CLIENTS,
+        CommunicationConstants::OUT_BUFFER_SIZE,
+        CommunicationConstants::IN_BUFFER_SIZE,
+        0,
+        &m_sa
+    );
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        SS_LOG_ERROR(L"IPC",
+            L"CreateNamedPipeW(%ls, first=%u) failed. Error: %lu",
+            CommunicationConstants::PIPE_NAME,
+            requireFirstInstance ? 1u : 0u,
+            err);
+    }
+
+    return ScopedHandle(hPipe);
+}
+
 bool ServiceCommunicatorImpl::Start() {
     if (!m_initialized) {
         if (!Initialize()) return false;
     }
 
     if (m_running) return true;
+    if (m_stopEvent.IsValid()) {
+        ResetEvent(m_stopEvent);
+    }
 
-    m_firstPipeInstance.store(true, std::memory_order_release);
+    m_primedPipe = CreatePipeInstance(/*requireFirstInstance=*/true);
+    if (!m_primedPipe.IsValid()) {
+        const DWORD err = GetLastError();
+        SS_LOG_ERROR(L"IPC",
+            L"First IPC pipe instance for %ls could not be created (err=%lu). "
+            L"Refusing to report service readiness without Home IPC.",
+            CommunicationConstants::PIPE_NAME,
+            err);
+        return false;
+    }
+
     m_running = true;
     m_listenThread = std::thread(&ServiceCommunicatorImpl::ListenLoop, this);
 
-    SS_LOG_INFO(L"IPC", L"IPC Server started on %ls", CommunicationConstants::PIPE_NAME);
+    SS_LOG_INFO(L"IPC", L"IPC Server started on %ls; first pipe instance published.",
+                CommunicationConstants::PIPE_NAME);
     return true;
 }
 
@@ -459,45 +501,24 @@ void ServiceCommunicatorImpl::ListenLoop() {
             }
         }
 
-        const bool requireFirstInstance =
-            m_firstPipeInstance.load(std::memory_order_acquire);
-        const DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
-                               (requireFirstInstance ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0);
+        ScopedHandle pipeGuard;
+        if (m_primedPipe.IsValid()) {
+            pipeGuard = std::move(m_primedPipe);
+        } else {
+            pipeGuard = CreatePipeInstance(/*requireFirstInstance=*/false);
+        }
 
-        HANDLE hPipe = CreateNamedPipeW(
-            CommunicationConstants::PIPE_NAME,
-            openMode, // Bi-directional, overlapped; first instance is anti-squatting guarded.
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, // Message mode
-            CommunicationConstants::MAX_CONCURRENT_CLIENTS,
-            CommunicationConstants::OUT_BUFFER_SIZE,
-            CommunicationConstants::IN_BUFFER_SIZE,
-            0, // Default timeout
-            &m_sa
-        );
-
-        if (hPipe == INVALID_HANDLE_VALUE) {
+        if (!pipeGuard.IsValid()) {
             const DWORD err = GetLastError();
-            SS_LOG_ERROR(L"IPC", L"CreateNamedPipe failed. Error: %lu", err);
-            if (requireFirstInstance &&
-                (err == ERROR_ACCESS_DENIED || err == ERROR_PIPE_BUSY)) {
-                SS_LOG_ERROR(L"IPC",
-                    L"First pipe instance for %ls was denied/busy; possible pipe squatting. Stopping IPC server.",
-                    CommunicationConstants::PIPE_NAME);
-                m_running = false;
-                break;
-            }
             if (m_stopEvent.IsValid() &&
                 WaitForSingleObject(m_stopEvent, 1000) == WAIT_OBJECT_0) {
                 break;
             }
+            SS_LOG_WARN(L"IPC",
+                L"CreateNamedPipe retry scheduled after transient failure %lu.", err);
             continue;
         }
-        if (requireFirstInstance) {
-            m_firstPipeInstance.store(false, std::memory_order_release);
-        }
-
-        // RAII for the accept-side pipe handle until ownership transfers.
-        ScopedHandle pipeGuard(hPipe);
+        HANDLE hPipe = pipeGuard.handle;
 
         m_stats.connectionAttempts++;
 
@@ -595,14 +616,18 @@ void ServiceCommunicatorImpl::ListenLoop() {
                 ULONG sessionId = 0;
                 if (!GetNamedPipeClientSessionId(clientCtx->pipeHandle.handle,
                                                  &sessionId)) {
-                    SS_LOG_WARN(L"IPC",
-                        L"GetNamedPipeClientSessionId failed for client %llu (err=%lu); sessionId=0 assumed",
+                    SS_LOG_ERROR(L"IPC",
+                        L"GetNamedPipeClientSessionId failed for client %llu (err=%lu); rejecting connection",
                         clientCtx->clientId, GetLastError());
+                } else if (sessionId == 0) {
+                    SS_LOG_ERROR(L"IPC",
+                        L"Client %llu resolved to non-interactive session 0; rejecting connection",
+                        clientCtx->clientId);
+                } else {
+                    activeClient->sessionId = static_cast<std::uint32_t>(sessionId);
+                    m_activeClients.push_back(std::move(activeClient));
+                    added = true;
                 }
-                activeClient->sessionId = static_cast<std::uint32_t>(sessionId);
-
-                m_activeClients.push_back(std::move(activeClient));
-                added = true;
             }
         }
 

@@ -286,34 +286,27 @@ private:
 /// and ensures the parent directory exists.  Returns empty on any failure.
 [[nodiscard]] std::wstring ResolveTokenPathForSession(HANDLE hUserToken)
 {
-    // GetUserProfileDirectoryW — size query (first call with null buffer).
-    DWORD needed = 0;
-    ::GetUserProfileDirectoryW(hUserToken, nullptr, &needed);
-    if (needed < 2) {
-        SS_LOG_LAST_ERROR(kLogCat,
-            L"GetUserProfileDirectoryW size-query failed (returned %lu)", needed);
+    CoTaskWStr localAppData;
+    const HRESULT hr = ::SHGetKnownFolderPath(
+        FOLDERID_LocalAppData,
+        KF_FLAG_DEFAULT,
+        hUserToken,
+        localAppData.AddressOf()
+    );
+    if (FAILED(hr) || !localAppData.Valid()) {
+        SS_LOG_ERROR(kLogCat,
+            L"SHGetKnownFolderPath(FOLDERID_LocalAppData, session token) failed: hr=0x%08X",
+            static_cast<unsigned int>(hr));
         return {};
     }
 
-    std::wstring profileDir(static_cast<std::size_t>(needed), L'\0');
-    if (!::GetUserProfileDirectoryW(hUserToken, profileDir.data(), &needed)) {
-        SS_LOG_LAST_ERROR(kLogCat, L"GetUserProfileDirectoryW failed");
-        return {};
-    }
-    // needed now contains the character count including the null terminator.
-    while (!profileDir.empty() && profileDir.back() == L'\0')
-        profileDir.pop_back();
-
-    if (profileDir.empty()) {
-        SS_LOG_ERROR(kLogCat, L"GetUserProfileDirectoryW returned empty path");
-        return {};
-    }
-
-    // Construct: <profile>\AppData\Local\ShadowStrike
+    // Construct: <user LOCALAPPDATA>\ShadowStrike. Using the same known-folder
+    // API as the UI prevents service/client divergence under folder redirection
+    // and roaming profile policies.
     std::wstring tokenDir;
-    tokenDir.reserve(profileDir.size() + 64);
-    tokenDir  = profileDir;
-    tokenDir += L"\\AppData\\Local\\";
+    tokenDir.reserve(wcslen(localAppData.Get()) + 32);
+    tokenDir  = localAppData.Get();
+    tokenDir += L'\\';
     tokenDir += kTokenSubdir;
 
     // Create the directory; tolerate ERROR_ALREADY_EXISTS.

@@ -232,6 +232,8 @@ TrayIpc::~TrayIpc() noexcept {
 
     nlohmann::json payload = nlohmann::json::object();
     payload["token"] = token;
+    payload["protocolVersion"] = static_cast<std::uint32_t>(kProtocolVersion);
+    payload["clientBuild"] = "tray";
 
     const std::string payloadStr = payload.dump();
     const std::uint64_t reqId   = m_nextRequestId.fetch_add(1u, std::memory_order_relaxed);

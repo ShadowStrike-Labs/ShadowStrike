@@ -520,6 +520,18 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         if (!token || token->empty()) { sendErr("auth_failed", "Missing token"); return; }
 
         if (!IpcAuthToken::Verify(sessionId, *token)) {
+            if (sessionId != 0u && sessionId != 0xFFFFFFFFu) {
+                const std::string issued = IpcAuthToken::EnsureForSession(sessionId);
+                if (!issued.empty() && IpcAuthToken::Verify(sessionId, *token)) {
+                    svc.MarkClientAuthenticated(clientId);
+                    SS_LOG_INFO(kLogCat,
+                        L"AuthHandshake SUCCESS after cache self-heal clientId=%llu session=%u",
+                        clientId, sessionId);
+                    svc.SendResponseEnvelope(clientId, CommandType::AuthHandshake, requestId,
+                        nlohmann::json{{"ok", true}}.dump());
+                    return;
+                }
+            }
             SS_LOG_WARN(kLogCat, L"AuthHandshake FAILED clientId=%llu session=%u",
                 clientId, sessionId);
             sendErr("auth_failed", "Token mismatch");

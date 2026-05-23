@@ -81,6 +81,7 @@
 #include <tchar.h>
 #include <strsafe.h>
 #include <sddl.h>
+#include <wtsapi32.h>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -142,6 +143,31 @@ void ProvisionIpcAuthToken(std::uint32_t sessionId, const wchar_t* reason) noexc
         SS_LOG_ERROR(LOG_CATEGORY,
             L"IPC auth token provisioning threw unknown exception for session %u",
             sessionId);
+    }
+}
+
+void ProvisionInteractiveIpcAuthTokens(const wchar_t* reason) noexcept {
+    PWTS_SESSION_INFOW sessions = nullptr;
+    DWORD count = 0;
+    if (!::WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"WTSEnumerateSessionsW failed during IPC token provisioning (err=%lu)",
+            GetLastError());
+        const DWORD activeConsole = ::WTSGetActiveConsoleSessionId();
+        ProvisionIpcAuthToken(static_cast<std::uint32_t>(activeConsole), reason);
+        return;
+    }
+
+    struct WtsSessionGuard final {
+        PWTS_SESSION_INFOW ptr{};
+        ~WtsSessionGuard() noexcept { if (ptr) ::WTSFreeMemory(ptr); }
+    } guard{sessions};
+
+    for (DWORD i = 0; i < count; ++i) {
+        const auto state = sessions[i].State;
+        if (state == WTSActive || state == WTSConnected || state == WTSDisconnected) {
+            ProvisionIpcAuthToken(static_cast<std::uint32_t>(sessions[i].SessionId), reason);
+        }
     }
 }
 
@@ -526,14 +552,10 @@ public:
                 RealTime::RealTimeProtection::Instance().Stop();
                 return false;
             } else {
-                HomeIpcDispatcher::Instance().Install(ipcSvc);
-
-                // Provision per-session IPC auth token for the active console
-                // session so the first interactive UI launch can authenticate
-                // without waiting for a session-change event.
-                const DWORD activeConsole = ::WTSGetActiveConsoleSessionId();
-                ProvisionIpcAuthToken(static_cast<std::uint32_t>(activeConsole),
-                                      L"service-start");
+                // Provision every already-present interactive session. Services
+                // can start after the first user logon, in which case the SCM
+                // SESSIONCHANGE event may already be gone.
+                ProvisionInteractiveIpcAuthTokens(L"service-start");
             }
         }
 
