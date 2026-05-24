@@ -76,22 +76,33 @@ namespace ShadowStrike::Installer {
 
 static std::wstring GetOwnDirectory()
 {
-    // Use a dynamically-sized buffer to handle paths > MAX_PATH correctly.
-    DWORD needed = GetModuleFileNameW(nullptr, nullptr, 0);
-    if (needed == 0)
-        return {};
+    // GetModuleFileNameW(nullptr, nullptr, 0) does NOT report required size:
+    // it writes nothing, returns 0, and sets ERROR_INSUFFICIENT_BUFFER. The
+    // canonical pattern is to grow the buffer until the API stops truncating
+    // (signalled by returnedLen < bufferSize AND no ERROR_INSUFFICIENT_BUFFER).
+    // We cap at 32 KiB which is the documented Win32 path ceiling.
+    constexpr DWORD kInitial  = MAX_PATH;
+    constexpr DWORD kAbsCap   = 32 * 1024;  // 32 KiB = NT path ceiling.
 
-    std::wstring buf(static_cast<size_t>(needed) + 1, L'\0');
-    DWORD len = GetModuleFileNameW(nullptr, buf.data(), needed + 1);
-    if (len == 0 || len >= needed + 1)
-        return {};
-
-    buf.resize(len);
-    auto pos = buf.rfind(L'\\');
-    if (pos == std::wstring::npos)
-        return {};
-
-    return buf.substr(0, pos);
+    std::wstring buf;
+    for (DWORD cap = kInitial; cap <= kAbsCap; cap *= 2) {
+        buf.assign(static_cast<size_t>(cap), L'\0');
+        ::SetLastError(ERROR_SUCCESS);
+        const DWORD len = ::GetModuleFileNameW(nullptr, buf.data(), cap);
+        if (len == 0) {
+            return {};
+        }
+        if (len < cap && ::GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            buf.resize(len);
+            const auto pos = buf.rfind(L'\\');
+            if (pos == std::wstring::npos)
+                return {};
+            return buf.substr(0, pos);
+        }
+        // Buffer was too small; double and retry.
+    }
+    ::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    return {};
 }
 
 static std::wstring BuildSystemDriverPath()
