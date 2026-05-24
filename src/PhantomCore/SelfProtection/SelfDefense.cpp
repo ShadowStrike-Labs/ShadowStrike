@@ -2347,12 +2347,21 @@ bool SelfDefenseImpl::ProtectCodeSection() {
     std::vector<uint8_t> hash = ComputeSHA256(reinterpret_cast<const void*>(base), sz);
     if (hash.empty()) return false;
 
-    std::unique_lock lock(m_mutex);
-    m_codeSectionBase = base;
-    m_codeSectionSize = sz;
-    m_codeSectionHash = std::move(hash);
+    {
+        std::unique_lock lock(m_mutex);
+        m_codeSectionBase = base;
+        m_codeSectionSize = sz;
+        m_codeSectionHash = std::move(hash);
+    }
     SS_LOG_INFO(LOG_CATEGORY, L"Code section protected: base=0x%llX size=%zu",
                 static_cast<unsigned long long>(base), sz);
+    // NOTE: UpdateComponentStatus acquires m_mutex exclusively. m_mutex is a
+    // std::shared_mutex (non-recursive), so we MUST release the publish lock
+    // above before calling here or the service deadlocks during start-up
+    // (observed in 1.0.5.0 stack: SCM start times out at 30s while Thread N
+    // is parked on RtlAcquireSRWLockExclusiveContended inside
+    // UpdateComponentStatus, called from ProtectCodeSection still holding the
+    // same m_mutex).
     UpdateComponentStatus(ProtectionComponent::Memory, true, ComponentHealth::Healthy);
     return true;
 }

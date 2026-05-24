@@ -27,7 +27,7 @@
 
   Build (from repo root):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.5.0 ^
+      -d ProductVersion=1.0.6.0 ^
       -d BinDir=bin\Release ^
       -d InstallerDir=packaging\installer ^
       -d MsiPath=build\installer\ShadowStrikePhantom-Home-Setup.msi ^
