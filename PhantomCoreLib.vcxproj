@@ -303,6 +303,9 @@
     <ClCompile Include="src\PhantomCore\SelfProtection\SelfDefense.cpp" />
     <ClCompile Include="src\PhantomCore\SelfProtection\TamperProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Service\AntivirusService.cpp" />
+    <ClCompile Include="src\PhantomCore\Service\BootTrace.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Service\EventPush.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

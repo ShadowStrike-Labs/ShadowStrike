@@ -32,6 +32,7 @@
 
 #include "pch.h"
 #include "AntivirusService.hpp"
+#include "BootTrace.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
@@ -196,6 +197,7 @@ public:
 
         if (m_initialized) return true;
 
+        ::ShadowStrikeAppendBootTrace(L"impl-Initialize-enter");
         try {
             // 1. Initialize Logging only if ServiceMain did not already do it.
             // Reinitializing here used to move service logs back to the default
@@ -219,12 +221,15 @@ public:
             SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service initializing...");
 
             // 2. Initialize ConfigManager (must be available before any module reads config)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ConfigManager-enter");
             if (!Config::ConfigManager::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"ConfigManager initialization failed, using defaults");
                 // Non-fatal: modules will use hardcoded defaults
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ConfigManager-leave");
 
             // 3. Initialize Infrastructure
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreadPool-enter");
             if (!m_threadPool) {
                 Utils::ThreadPoolConfig threadPoolConfig{};
                 threadPoolConfig.minThreads = 4;
@@ -235,8 +240,10 @@ public:
 
             if (!m_threadPool->Initialize()) {
                 SS_LOG_FATAL(LOG_CATEGORY, L"Failed to initialize ThreadPool");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreadPool-FAIL");
                 return false;
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreadPool-leave");
 
             // 4. Configure Service Health Monitor (early, tracks init duration)
             ServiceMonitor::Instance().SetMaxMemoryLimit(1024ULL * 1024ULL * 1024ULL); // 1 GB limit
@@ -247,31 +254,37 @@ public:
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing security subsystems...");
 
             // Threat Intel (database-backed IOC store + facade binding)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-enter");
             if (!m_threatIntelStore) {
                 m_threatIntelStore = std::make_unique<ThreatIntel::ThreatIntelStore>();
             }
 
             if (!m_threatIntelStore->IsInitialized() && !m_threatIntelStore->Initialize()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize ThreatIntelStore");
-                // Continue? Depending on policy. Critical failure usually.
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-FAIL");
                 return false;
             }
 
             ThreatIntel::ThreatIntelManager::Instance().Bind(m_threatIntelStore.get());
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-leave");
 
             // CryptoManager (foundation — used by ConfigManager, CertificateValidator,
             // and secure IPC; must be available before other security modules)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-CryptoManager-enter");
             Security::CryptoManagerConfiguration cryptoConfig;
             cryptoConfig.enableHardwareAcceleration = true;
             cryptoConfig.enableSecureMemory = true;
             cryptoConfig.enableAuditLogging = true;
             if (!Security::CryptoManager::Instance().Initialize(cryptoConfig)) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize CryptoManager");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-CryptoManager-FAIL");
                 return false;
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-CryptoManager-leave");
 
             // Anti-Debug Protection (detect hostile analysis early, before
             // other self-defense modules expose their initialization surface)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-AntiDebug-enter");
             Security::AntiDebugConfiguration adConfig;
             adConfig.protectionLevel = Security::AntiDebugProtectionLevel::Enhanced;
             adConfig.monitoringMode = Security::MonitoringMode::Adaptive;
@@ -281,9 +294,11 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AntiDebug");
                 // Non-fatal: anti-debug degrades but service can continue
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-AntiDebug-leave");
 
             // Memory Protection (protect our process memory before tamper
             // protection starts its integrity monitoring)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-MemoryProtection-enter");
             Security::MemoryProtectionConfiguration memConfig;
             memConfig.level = Security::MemoryProtectionLevel::Enhanced;
             memConfig.enableCodeIntegrity = true;
@@ -302,24 +317,31 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize MemoryProtection");
                 // Non-fatal: memory protection degrades
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-MemoryProtection-leave");
 
             // Tamper Protection (Critical - protect self first)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TamperProtection-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing TamperProtection...");
             Security::TamperProtectionConfiguration tamperConfig;
             tamperConfig.mode = Security::TamperProtectionMode::Enforce;
             if (!Security::TamperProtection::Instance().Initialize(tamperConfig)) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize TamperProtection");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TamperProtection-FAIL");
                 return false;
             }
             SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection initialized — calling ProtectSelf");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TamperProtection-ProtectSelf-enter");
             if (!Security::TamperProtection::Instance().ProtectSelf()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"TamperProtection ProtectSelf failed");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TamperProtection-ProtectSelf-FAIL");
                 return false;
             }
             SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection ProtectSelf completed");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TamperProtection-leave");
 
             // Process Protection (must be initialized before RealTimeProtection
             // so the kernel HandleAlert bridge is ready when IPC starts)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProcessProtection-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing ProcessProtection...");
             Security::ProcessProtectionConfiguration ppConfig;
             if (!Security::ProcessProtection::Instance().Initialize(ppConfig)) {
@@ -329,12 +351,16 @@ public:
                 // Initialize() already protects our own PID internally.
                 // Attempt PPL elevation via kernel driver for maximum protection.
                 SS_LOG_INFO(LOG_CATEGORY, L"ProcessProtection initialized — attempting PPL elevation");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProcessProtection-ElevateToPPL-enter");
                 (void)Security::ProcessProtection::Instance().ElevateToPPL();
                 SS_LOG_INFO(LOG_CATEGORY, L"ProcessProtection PPL elevation attempt completed");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProcessProtection-ElevateToPPL-leave");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProcessProtection-leave");
 
             // Registry Protection (initializes kernel registry callback handler
             // and starts integrity monitoring before RealTimeProtection activates)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-RegistryProtection-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing RegistryProtection...");
             Security::RegistryProtectionConfiguration rpConfig;
             rpConfig.mode = Security::RegistryProtectionMode::Rollback;
@@ -348,9 +374,11 @@ public:
                 // Non-fatal: registry tamper detection degrades
             }
             SS_LOG_INFO(LOG_CATEGORY, L"RegistryProtection init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-RegistryProtection-leave");
 
             // File Protection (protect installation directory and databases
             // before Real-Time Protection opens its signature/pattern files)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-FileProtection-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing FileProtection...");
             Security::FileProtectionConfiguration fpConfig;
             fpConfig.mode = Security::FileProtectionMode::Protect;
@@ -362,9 +390,11 @@ public:
                 // Non-fatal: file tamper detection degrades
             }
             SS_LOG_INFO(LOG_CATEGORY, L"FileProtection init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-FileProtection-leave");
 
             // Digital Signature Validator (used by RealTimeProtection and
             // ProcessCreationMonitor for Authenticode verification)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-DigitalSignatureValidator-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing DigitalSignatureValidator...");
             Security::SignatureValidatorConfiguration dsvConfig;
             dsvConfig.enableCaching = true;
@@ -375,18 +405,22 @@ public:
                 // Non-fatal: signature validation degrades
             }
             SS_LOG_INFO(LOG_CATEGORY, L"DigitalSignatureValidator init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-DigitalSignatureValidator-leave");
 
             // Certificate Validator
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-CertificateValidator-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing CertificateValidator...");
             Security::CertificateValidatorConfiguration certConfig;
             if (!Security::CertificateValidator::Instance().Initialize(certConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize CertificateValidator");
             }
             SS_LOG_INFO(LOG_CATEGORY, L"CertificateValidator init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-CertificateValidator-leave");
 
             // SelfDefense (central orchestrator — coordinates all protection
             // modules, starts watchdog/heartbeat monitoring. Must be last in
             // the self-protection chain so all subsystems are ready.)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-SelfDefense-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing SelfDefense...");
             Security::SelfDefenseConfiguration sdConfig;
             sdConfig.level = Security::SelfDefenseLevel::Enhanced;
@@ -398,44 +432,62 @@ public:
                 // Non-fatal: watchdog/heartbeat monitoring degrades
             }
             SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-SelfDefense-leave");
 
             // AMSI Integration
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-AMSIIntegration-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing AMSIIntegration...");
             if (!Scripts::AMSIIntegration::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AMSIIntegration");
                 // Warning only, service can run without AMSI
             }
             SS_LOG_INFO(LOG_CATEGORY, L"AMSIIntegration init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-AMSIIntegration-leave");
 
             // 4. Initialize Communication
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-IPCManager-enter");
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing IPCManager...");
             if (!Communication::IPCManager::Instance().Initialize()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize IPCManager");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-IPCManager-FAIL");
                 return false;
             }
             SS_LOG_INFO(LOG_CATEGORY, L"IPCManager init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-IPCManager-leave");
 
             // Initialize Communication subsystems (singletons — all depend on IPCManager)
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-AlertSystem-enter");
             if (!Communication::AlertSystem::Instance().Initialize(Communication::AlertConfiguration{})) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AlertSystem");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-AlertSystem-leave");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TelemetryCollector-enter");
             if (!Communication::TelemetryCollector::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize TelemetryCollector");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-TelemetryCollector-leave");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-NotificationManager-enter");
             if (!Communication::NotificationManager::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize NotificationManager");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-NotificationManager-leave");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ReportGenerator-enter");
             if (!Communication::ReportGenerator::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize ReportGenerator");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ReportGenerator-leave");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ServiceCommunication-enter");
             if (!Communication::ServiceCommunication::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize ServiceCommunication");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ServiceCommunication-leave");
 
             // 5. Initialize Update Manager
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-UpdateManager-enter");
             if (!Update::UpdateManager::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize UpdateManager");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-UpdateManager-leave");
 
             // 6. Wire Update callbacks for hot-reload and telemetry
             if (Update::UpdateManager::Instance().IsInitialized()) {
@@ -492,28 +544,36 @@ public:
             //
             // Failure of a product extension is a hard error: we've already
             // committed resources and the user expects the product to be up.
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProductExtensions-enter");
             if (!ProductExtensions::Instance().InitializeProduct()) {
                 SS_LOG_FATAL(LOG_CATEGORY, L"Product extension initialization failed");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProductExtensions-FAIL");
                 return false;
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ProductExtensions-leave");
 
             m_initialized = true;
             SS_LOG_INFO(LOG_CATEGORY, L"Service initialization complete");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-leave-ok");
             return true;
 
         } catch (const std::exception& e) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Exception during initialization: %hs", e.what());
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-EXCEPTION-std");
             return false;
         } catch (...) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Unknown exception during initialization");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-EXCEPTION-unknown");
             return false;
         }
     }
 
     [[nodiscard]] bool Start() {
         std::unique_lock lock(m_mutex);
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-enter");
         if (!m_initialized) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Start requested before successful initialization.");
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-FAIL-not-initialized");
             return false;
         }
         if (m_running) return true;
@@ -521,53 +581,75 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Starting services...");
 
         // Start Subsystems
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-TamperProtection-SetEnabled-enter");
         Security::TamperProtection::Instance().SetEnabled(true);
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-TamperProtection-SetEnabled-leave");
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-RealTimeProtection-enter");
         if (!RealTime::RealTimeProtection::Instance().Start()) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start RealTimeProtection");
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-RealTimeProtection-FAIL");
             return false;
         }
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-RealTimeProtection-leave");
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-enter");
         if (!Communication::IPCManager::Instance().Start()) {
             SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start IPCManager");
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-FAIL");
             RealTime::RealTimeProtection::Instance().Stop();
             return false;
         }
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-leave");
 
         // Start Communication subsystems
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunication-enter");
         if (!Communication::ServiceCommunication::Instance().Start(true)) {
             SS_LOG_WARN(LOG_CATEGORY, L"ServiceCommunication failed to start; service telemetry channel degraded");
         }
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunication-leave");
 
         // Initialize and start the v2 IPC pipe server, then wire all PhantomHome
         // UI command handlers before any client can connect and send a verb.
         {
             auto& ipcSvc = ServiceCommunicator::Instance();
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Initialize-enter");
             if (!ipcSvc.Initialize()) {
                 SS_LOG_FATAL(LOG_CATEGORY, L"ServiceCommunicator::Initialize() failed — PhantomHome UI IPC unavailable");
+                ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Initialize-FAIL");
                 Communication::IPCManager::Instance().Stop();
                 RealTime::RealTimeProtection::Instance().Stop();
                 return false;
-            } else if (!ipcSvc.Start()) {
-                SS_LOG_FATAL(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — PhantomHome UI IPC unavailable");
-                Communication::IPCManager::Instance().Stop();
-                RealTime::RealTimeProtection::Instance().Stop();
-                return false;
-            } else {
-                // Provision every already-present interactive session. Services
-                // can start after the first user logon, in which case the SCM
-                // SESSIONCHANGE event may already be gone.
-                ProvisionInteractiveIpcAuthTokens(L"service-start");
             }
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Initialize-leave");
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Start-enter");
+            if (!ipcSvc.Start()) {
+                SS_LOG_FATAL(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — PhantomHome UI IPC unavailable");
+                ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Start-FAIL");
+                Communication::IPCManager::Instance().Stop();
+                RealTime::RealTimeProtection::Instance().Stop();
+                return false;
+            }
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Start-leave");
+            // Provision every already-present interactive session. Services
+            // can start after the first user logon, in which case the SCM
+            // SESSIONCHANGE event may already be gone.
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ProvisionInteractive-enter");
+            ProvisionInteractiveIpcAuthTokens(L"service-start");
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ProvisionInteractive-leave");
         }
 
         // Register AMSI provider
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-AMSI-RegisterProvider-enter");
         if (!Scripts::AMSIIntegration::Instance().RegisterProvider()) {
             SS_LOG_WARN(LOG_CATEGORY, L"AMSI provider registration failed; script scanning remains available through direct scanners");
         }
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-AMSI-RegisterProvider-leave");
 
         // Start health monitoring (all modules now initialized, heartbeat loop can begin)
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceMonitor-enter");
         if (!ServiceMonitor::Instance().StartMonitoring()) {
             SS_LOG_WARN(LOG_CATEGORY, L"Failed to start ServiceMonitor");
         }
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceMonitor-leave");
         // Prime heartbeats so monitors don't immediately flag a hang
         ServiceMonitor::Instance().UpdateHeartbeat();
         if (Security::SelfDefense::HasInstance() &&
@@ -580,9 +662,11 @@ public:
         m_running = true;
 
         // Start maintenance loop (heartbeat feeding, health monitoring, log flush)
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-MaintenanceThread-spawn");
         m_maintenanceThread = std::thread(&AntivirusServiceImpl::MaintenanceLoop, this);
 
         SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service is RUNNING");
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-leave-ok");
         return true;
     }
 
@@ -1053,6 +1137,7 @@ bool AntivirusService::Uninstall() {
 }
 
 void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
+    ::ShadowStrikeAppendBootTrace(L"OnStart-enter");
     m_statusHandle = RegisterServiceCtrlHandlerExW(
         ServiceConstants::SERVICE_NAME,
         ServiceCtrlHandler,
@@ -1065,8 +1150,10 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
                      L"RegisterServiceCtrlHandlerExW failed for %ls (0x%08X).",
                      ServiceConstants::SERVICE_NAME,
                      err);
+        ::ShadowStrikeAppendBootTrace(L"OnStart-RegisterServiceCtrlHandlerExW-FAIL");
         return;
     }
+    ::ShadowStrikeAppendBootTrace(L"OnStart-StatusHandle-registered");
 
     // SCM kills a service if its wait-hint expires without a checkpoint bump.
     // Initialization touches signature DBs, kernel IPC, SHA-256 baselines and
@@ -1078,6 +1165,7 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
     constexpr DWORD kPumpIntervalMs = 5000;
 
     SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
+    ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-START_PENDING-set");
 
     std::atomic<bool> initDone{false};
     std::thread pendingPump([this, &initDone]() {
@@ -1089,12 +1177,15 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
     });
 
     // Initialize subsystems (potentially long-running)
+    ::ShadowStrikeAppendBootTrace(L"OnStart-Initialize-call");
     bool initOk = false;
     try {
         initOk = m_impl->Initialize();
     } catch (...) {
         initOk = false;
     }
+    ::ShadowStrikeAppendBootTrace(initOk ? L"OnStart-Initialize-returned-ok"
+                                         : L"OnStart-Initialize-returned-FAIL");
 
     // Stop pump before transitioning to RUNNING / STOPPED so we don't race on
     // SetServiceStatus with the pump thread.
@@ -1102,18 +1193,30 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
     if (pendingPump.joinable()) pendingPump.join();
 
     if (!initOk) {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-STOPPED-init-failed");
         SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
         return;
     }
 
     // Start services. A core runtime failure must be visible to SCM instead of
     // reporting SERVICE_RUNNING while the UI pipe and protection stack are down.
-    if (!m_impl->Start()) {
+    ::ShadowStrikeAppendBootTrace(L"OnStart-Start-call");
+    bool startOk = false;
+    try {
+        startOk = m_impl->Start();
+    } catch (...) {
+        startOk = false;
+    }
+    ::ShadowStrikeAppendBootTrace(startOk ? L"OnStart-Start-returned-ok"
+                                          : L"OnStart-Start-returned-FAIL");
+    if (!startOk) {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-STOPPED-start-failed");
         SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
         return;
     }
 
     SetServiceStatus(SERVICE_RUNNING);
+    ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-RUNNING-set");
 }
 
 void AntivirusService::OnStop() {

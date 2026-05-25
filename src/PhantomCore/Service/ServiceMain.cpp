@@ -119,20 +119,33 @@ void WriteBootTrace(const wchar_t* event, int argc, wchar_t** argv) noexcept {
 
     // Append, then immediately fsync so a crash in the next millisecond
     // cannot lose the trace.
+    //
+    // BUG FIX: previously we passed cbMultiByte = cbUtf8 - 1, which is one
+    // byte short of what the first call (size query with cchWideChar = -1,
+    // i.e. *including* the terminator) reported.  That caused
+    // WideCharToMultiByte to fail with ERROR_INSUFFICIENT_BUFFER and return 0,
+    // so WriteFile never ran -> 0-byte PhantomHome.Service.boot.log on disk.
+    // We now pass the full reported size and write cbUtf8 - 1 bytes (excluding
+    // the trailing NUL) into the file.
     int cbUtf8 = ::WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
     if (cbUtf8 > 1) {
         char buf[2048] = {};
-        const int cb = (cbUtf8 - 1 < static_cast<int>(sizeof(buf)))
-                       ? cbUtf8 - 1
-                       : static_cast<int>(sizeof(buf));
-        if (::WideCharToMultiByte(CP_UTF8, 0, line, -1, buf, cb, nullptr, nullptr) > 0) {
+        const int cap = static_cast<int>(sizeof(buf));
+        const int outBytes = (cbUtf8 < cap) ? cbUtf8 : cap;
+        const int converted = ::WideCharToMultiByte(
+            CP_UTF8, 0, line, -1, buf, outBytes, nullptr, nullptr);
+        if (converted > 1) {
+            // converted includes the trailing NUL; skip it when writing.
+            const DWORD bytesToWrite = static_cast<DWORD>(converted - 1);
             DWORD writtenBytes = 0;
-            (void)::WriteFile(h, buf, static_cast<DWORD>(cb), &writtenBytes, nullptr);
+            (void)::WriteFile(h, buf, bytesToWrite, &writtenBytes, nullptr);
             (void)::FlushFileBuffers(h);
         }
     }
     ::CloseHandle(h);
 }
+
+// (BootTrace helper is defined out-of-line in BootTrace.cpp; see BootTrace.hpp.)
 
 // ---------------------------------------------------------------------------
 // Unhandled SEH filter — writes a synchronous crash marker to the log so a
