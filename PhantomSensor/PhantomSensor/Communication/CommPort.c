@@ -61,6 +61,18 @@ PsGetProcessInheritedFromUniqueProcessId(
     _In_ PEPROCESS Process
     );
 
+//
+// Forward declaration for the deferred-kex work-item routine. Required
+// before its alloc_text pragma below.
+//
+_Function_class_(FLT_GENERIC_WORKITEM_ROUTINE)
+static VOID FLTAPI
+ShadowStrikeDeliverKexWorker(
+    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
+    _In_ PFLT_FILTER FltObject,
+    _In_opt_ PVOID Context
+    );
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeCreateCommunicationPort)
 #pragma alloc_text(PAGE, ShadowStrikeCloseCommunicationPort)
@@ -68,6 +80,7 @@ PsGetProcessInheritedFromUniqueProcessId(
 #pragma alloc_text(PAGE, ShadowStrikeDisconnectNotify)
 #pragma alloc_text(PAGE, ShadowStrikeMessageNotify)
 #pragma alloc_text(PAGE, ShadowStrikeVerifyClient)
+#pragma alloc_text(PAGE, ShadowStrikeDeliverKexWorker)
 #pragma alloc_text(PAGE, ShadowStrikeRegisterProtectedProcess)
 #pragma alloc_text(PAGE, ShadowStrikeUnregisterProtectedProcess)
 #pragma alloc_text(PAGE, ShadowStrikeBuildFileScanRequest)
@@ -875,6 +888,126 @@ ShadowStrikeDrainMessageQueue(
     ShadowStrikeReleaseClientPort(clientRef);
 }
 
+// ============================================================================
+// DEFERRED KEY-EXCHANGE DELIVERY
+// ============================================================================
+//
+// FltSendMessage MUST NOT be issued from inside ShadowStrikeConnectNotify.
+// The calling user-mode thread is blocked inside FilterConnectCommunicationPort
+// and physically cannot service FilterGetMessage until ConnectNotify returns,
+// so a synchronous send from here will always wait the full timeout while
+// holding g_DriverData.ClientPortLock exclusive — wedging every minifilter
+// callback that needs the lock shared and freezing system I/O.
+//
+// Instead the kex blob is captured into a non-paged context and shipped via
+// an FltMgr generic work item that runs at PASSIVE_LEVEL after ConnectNotify
+// has returned and the lock has been released. The work item holds a slot
+// reference for the duration of the send so the port cannot be reclaimed
+// from under it; on failure it closes the port, surfacing a normal disconnect
+// to user-mode which then retries the handshake.
+//
+#define SHADOWSTRIKE_KEX_POOL_TAG  'xeCS'
+
+typedef struct _SHADOWSTRIKE_KEX_DELIVERY_CONTEXT {
+    PFLT_PORT                              ClientPort;
+    LONG                                   SlotIndex;
+    SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE      KexMessage;
+} SHADOWSTRIKE_KEX_DELIVERY_CONTEXT, *PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT;
+
+_Function_class_(FLT_GENERIC_WORKITEM_ROUTINE)
+static VOID FLTAPI
+ShadowStrikeDeliverKexWorker(
+    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
+    _In_ PFLT_FILTER FltObject,
+    _In_opt_ PVOID Context
+    )
+{
+    PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT ctx = (PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT)Context;
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
+    NTSTATUS status;
+    LARGE_INTEGER timeout;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(FltObject);
+
+    if (ctx == NULL) {
+        FltFreeGenericWorkItem(FltWorkItem);
+        return;
+    }
+
+    //
+    // Acquire a slot reference so the port can't be reclaimed underneath us.
+    // If the user-mode peer disconnected between ConnectNotify returning and
+    // this work item running, the slot will already be marked Disconnecting
+    // and the acquire will fail — drop the kex silently in that case.
+    //
+    status = ShadowStrikeAcquireClientPortBySlot(ctx->SlotIndex, &clientRef);
+    if (!NT_SUCCESS(status) || clientRef == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Kex delivery: slot %ld no longer connectable (0x%08X)\n",
+                   ctx->SlotIndex, status);
+        goto Cleanup;
+    }
+
+    //
+    // Confirm the slot still owns the same port. If the slot was reused for
+    // a different peer between queue and dispatch, do not send the kex to
+    // the new peer — its DH share is different.
+    //
+    if (clientRef->ClientPort != ctx->ClientPort) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Kex delivery: slot %ld port reused, skipping stale send\n",
+                   ctx->SlotIndex);
+        ShadowStrikeReleaseClientPort(clientRef);
+        goto Cleanup;
+    }
+
+    //
+    // 30-second timeout: by the time we run, user-mode's
+    // FilterConnectCommunicationPort has already returned and its receive
+    // worker is parked in FilterGetMessage. The kex must be the first
+    // message it sees — its IPC layer waits on this before unblocking the
+    // service start-up.
+    //
+    timeout.QuadPart = -300000000LL;
+
+    status = FltSendMessage(
+        g_DriverData.FilterHandle,
+        &ctx->ClientPort,
+        &ctx->KexMessage,
+        sizeof(ctx->KexMessage),
+        NULL, NULL,
+        &timeout
+    );
+
+    if (NT_SUCCESS(status)) {
+        //
+        // Publish the "encryption is live" flag so subsequent send paths
+        // (which gate on EncryptionEstablished) will start using it.
+        //
+        clientRef->EncryptionEstablished = TRUE;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Kex delivered for slot %ld\n", ctx->SlotIndex);
+        ShadowStrikeReleaseClientPort(clientRef);
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Kex delivery failed on slot %ld: 0x%08X — closing port\n",
+                   ctx->SlotIndex, status);
+        //
+        // Release our reference first, then close the port. FltCloseClientPort
+        // triggers DisconnectNotify which acquires the lock exclusive; we must
+        // not be holding any slot reference when it runs.
+        //
+        ShadowStrikeReleaseClientPort(clientRef);
+        FltCloseClientPort(g_DriverData.FilterHandle, &ctx->ClientPort);
+    }
+
+Cleanup:
+    RtlSecureZeroMemory(&ctx->KexMessage, sizeof(ctx->KexMessage));
+    ExFreePoolWithTag(ctx, SHADOWSTRIKE_KEX_POOL_TAG);
+    FltFreeGenericWorkItem(FltWorkItem);
+}
+
 NTSTATUS
 ShadowStrikeConnectNotify(
     _In_ PFLT_PORT ClientPort,
@@ -892,6 +1025,8 @@ ShadowStrikeConnectNotify(
     ULONG capabilities = 0;
     UCHAR imageHash[32] = {0};
     UINT32 connectionType = 0;
+    PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT kexCtx = NULL;
+    PFLT_GENERIC_WORKITEM kexWorkItem = NULL;
 
     PAGED_CODE();
 
@@ -1236,21 +1371,26 @@ ShadowStrikeConnectNotify(
             }
 
             //
-            // Send the key exchange message to the newly connected client.
-            // This happens inside the lock so the client port is guaranteed valid.
+            // Capture the key exchange message into a deferred-delivery
+            // context. We MUST NOT call FltSendMessage here — see the
+            // ShadowStrikeDeliverKexWorker comment above. Allocation happens
+            // under the lock so on failure we can fold cleanly into the
+            // existing encryption-failure teardown without re-acquiring it.
             //
-            LARGE_INTEGER kexTimeout;
-            kexTimeout.QuadPart = -50000000LL;  // 5 seconds
-            NTSTATUS kexSendStatus = FltSendMessage(
-                g_DriverData.FilterHandle,
-                &ClientPort,
-                &kexMsg,
-                sizeof(kexMsg),
-                NULL, NULL,
-                &kexTimeout
-            );
+            kexCtx = (PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                sizeof(*kexCtx),
+                SHADOWSTRIKE_KEX_POOL_TAG);
 
-            if (!NT_SUCCESS(kexSendStatus)) {
+            if (kexCtx != NULL) {
+                kexWorkItem = FltAllocateGenericWorkItem();
+                if (kexWorkItem == NULL) {
+                    ExFreePoolWithTag(kexCtx, SHADOWSTRIKE_KEX_POOL_TAG);
+                    kexCtx = NULL;
+                }
+            }
+
+            if (kexCtx == NULL || kexWorkItem == NULL) {
                 RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
                 RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
                 RtlSecureZeroMemory(ikm, sizeof(ikm));
@@ -1267,14 +1407,26 @@ ShadowStrikeConnectNotify(
 
                 ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
                 KeLeaveCriticalRegion();
-                return STATUS_ENCRYPTION_FAILED;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] Kex work-item allocation failed for slot %ld\n",
+                           slotIndex);
+                return STATUS_INSUFFICIENT_RESOURCES;
             }
 
+            kexCtx->ClientPort = ClientPort;
+            kexCtx->SlotIndex  = slotIndex;
+            RtlCopyMemory(&kexCtx->KexMessage, &kexMsg, sizeof(kexMsg));
             RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
-            g_ClientPortRefs[slotIndex].EncryptionEstablished = TRUE;
+
+            //
+            // EncryptionEstablished stays FALSE until the work item confirms
+            // the kex was delivered. Other kernel→user send paths gate on
+            // this flag and will either queue or refuse to send unencrypted.
+            //
+            g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                       "[ShadowStrike] Per-session encryption key derived for slot %ld\n",
+                       "[ShadowStrike] Per-session encryption key derived for slot %ld (kex delivery deferred)\n",
                        slotIndex);
         } else {
             //
@@ -1312,6 +1464,27 @@ ShadowStrikeConnectNotify(
 
     ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Queue deferred kex delivery NOW that the lock is released and the slot
+    // is published. The work item runs at PASSIVE_LEVEL on an FltMgr worker
+    // thread, calls FltSendMessage with a generous timeout, and on success
+    // flips EncryptionEstablished=TRUE for the slot. On failure it closes
+    // the client port, which surfaces a normal disconnect to user-mode.
+    //
+    // kexCtx / kexWorkItem are only non-NULL when key derivation succeeded
+    // (i.e. SizeOfContext indicated a kex-capable client). For clients that
+    // skip key derivation entirely, no kex is required.
+    //
+    if (kexCtx != NULL && kexWorkItem != NULL) {
+        FltQueueGenericWorkItem(
+            kexWorkItem,
+            g_DriverData.FilterHandle,
+            ShadowStrikeDeliverKexWorker,
+            DelayedWorkQueue,
+            kexCtx
+        );
+    }
 
     //
     // Return slot index as cookie (add 1 to avoid NULL)
