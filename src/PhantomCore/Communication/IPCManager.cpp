@@ -242,11 +242,55 @@ bool IPCManager::Initialize(const IPCConfiguration& config) {
 }
 
 bool IPCManager::Start(uint32_t workerThreadCount) {
-    IPCStatus expected = IPCStatus::Stopped;
-    if (!m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
-        Utils::Logger::Warn("[IPCManager] Cannot start - current status: {}",
-                            static_cast<int>(m_status.load()));
-        return false;
+    // Idempotent / robust state transition.
+    //
+    // Production deployments have shown that Start() can be invoked while the
+    // manager is still in `Initializing` (a concurrent path raced ahead of the
+    // Stopped store) or already `Running` (a previous Start partially
+    // completed and was retried after a non-fatal subsystem failure higher up
+    // in the service start chain).  Returning false in those cases tears down
+    // the entire service start path even though the IPC channel is, or will
+    // shortly be, perfectly usable.  Treat already-Running as success, wait a
+    // brief grace period for in-progress Initializing, and only reject from
+    // truly terminal states (Error / Stopping / Uninitialized).
+    {
+        IPCStatus expected = IPCStatus::Stopped;
+        if (!m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
+            IPCStatus current = m_status.load(std::memory_order_acquire);
+            if (current == IPCStatus::Running) {
+                Utils::Logger::Info("[IPCManager] Start() called while already Running - idempotent success");
+                return true;
+            }
+            if (current == IPCStatus::Initializing) {
+                // Brief bounded wait for a concurrent Initialize() to publish Stopped.
+                for (int spin = 0; spin < 50; ++spin) {  // up to ~500 ms
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    expected = IPCStatus::Stopped;
+                    if (m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
+                        current = IPCStatus::Stopped;
+                        break;
+                    }
+                    current = m_status.load(std::memory_order_acquire);
+                    if (current == IPCStatus::Running) {
+                        Utils::Logger::Info("[IPCManager] Concurrent Start() completed - idempotent success");
+                        return true;
+                    }
+                    if (current != IPCStatus::Initializing) {
+                        break;
+                    }
+                }
+                if (current != IPCStatus::Stopped) {
+                    Utils::Logger::Warn("[IPCManager] Cannot start - status stuck at {} after grace period",
+                                        static_cast<int>(current));
+                    return false;
+                }
+                // fall through with CAS already done above
+            } else {
+                Utils::Logger::Warn("[IPCManager] Cannot start - current status: {}",
+                                    static_cast<int>(current));
+                return false;
+            }
+        }
     }
 
     m_running.store(true, std::memory_order_release);
