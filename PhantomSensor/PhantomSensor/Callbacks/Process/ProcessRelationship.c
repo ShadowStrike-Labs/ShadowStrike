@@ -55,11 +55,17 @@
 #include "../../Behavioral/BehaviorEngine.h"
 
 //
-// Forward declarations for kernel exports not always in WDK headers
+// Forward declarations for kernel exports not always in WDK headers.
 //
-extern ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
-extern BOOLEAN PsIsSystemProcess(_In_ PEPROCESS Process);
-extern LONGLONG PsGetProcessCreateTimeQuadPart(_In_ PEPROCESS Process);
+// NOTE: PsGetProcessSessionId / PsIsSystemProcess / PsGetProcessCreateTimeQuadPart
+// are exported by ntoskrnl and are declared by recent WDK ntddk.h with
+// __declspec(dllimport).  Plain `extern` decls here conflict (C4273 -> /WX).
+// Use dllimport-qualified prototypes so we stay compatible with both old and
+// new WDK header revisions without expanding kernel pinvoke surface.
+//
+__declspec(dllimport) ULONG    NTAPI PsGetProcessSessionId(_In_ PEPROCESS Process);
+__declspec(dllimport) BOOLEAN  NTAPI PsIsSystemProcess(_In_ PEPROCESS Process);
+__declspec(dllimport) LONGLONG NTAPI PsGetProcessCreateTimeQuadPart(_In_ PEPROCESS Process);
 
 // ============================================================================
 // PRIVATE CONSTANTS

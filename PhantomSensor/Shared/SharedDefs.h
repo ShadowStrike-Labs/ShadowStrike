@@ -61,7 +61,7 @@
  * is known from registry; otherwise filename-only matching is used
  * with additional code-signing checks.
  */
-#define SHADOWSTRIKE_SERVICE_EXECUTABLE L"ShadowStrikeService.exe"
+#define SHADOWSTRIKE_SERVICE_EXECUTABLE L"ShadowStrikePhantomService.exe"
 
 // ============================================================================
 // FILTER ALTITUDE
