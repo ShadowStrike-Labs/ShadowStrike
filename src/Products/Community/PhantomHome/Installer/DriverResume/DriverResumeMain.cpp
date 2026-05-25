@@ -647,12 +647,24 @@ static int RunStage2()
     (void)ClearRunOnceEntry();
     (void)DeleteStage2ScheduledTask();
 
-    const DWORD serviceErr = StartHomeServiceBestEffort(L"stage2 complete");
-    if (serviceErr != ERROR_SUCCESS) {
-        LOG_WARN(L"Home service did not reach RUNNING after Stage 2 "
-                 L"(0x%08X). The SCM delayed-auto-start and recovery policy "
-                 L"remain configured for the next boot/retry.", serviceErr);
-    }
+    // FIX: Do NOT synchronously start ShadowStrikePhantomService here.
+    //
+    // The service is registered with Start=auto + DelayedAutostart=1 (see
+    // packaging/installer/Components.wxs), so SCM will start it ~2 minutes
+    // after boot when initial boot I/O pressure has subsided. Starting it
+    // here — immediately after FilterLoad, while the MSI is still finishing
+    // and the VMware host is under heavy I/O — has been observed to wedge
+    // the guest: the service spawns N worker threads that all hammer
+    // FilterConnectCommunicationPort against a freshly-loaded minifilter,
+    // producing a ConnectNotify storm that hard-hangs the system (grey
+    // screen, no BSOD, no minidump).
+    //
+    // The DELAYED_AUTO_START recovery policy and service registration set up
+    // earlier in this stage continue to govern start-up; if SCM fails to
+    // start the service it will retry per its recovery policy. The next
+    // explicit start happens at next boot, which is the desired behaviour.
+    LOG_INFO(L"Home service start deferred to SCM delayed-auto-start "
+             L"(prevents post-FilterLoad ConnectNotify storm on first boot).");
 
     // Best-effort Defender exclusions post-success.  Failure here MUST NOT
     // fail Stage 2 -- signed binaries should pass Defender on their own.

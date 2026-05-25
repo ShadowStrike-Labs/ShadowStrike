@@ -525,6 +525,10 @@ bool IPCManager::ConnectFilterPort() {
         }
     }
 
+    // Connect succeeded — reset reconnect back-off so the next disconnect
+    // starts retrying at the configured base interval, not at the cap.
+    m_reconnectBackoffMs.store(0, std::memory_order_relaxed);
+
     Utils::Logger::Info("[IPCManager] Successfully connected to filter port");
     return true;
 }
@@ -1244,16 +1248,72 @@ void IPCManager::WorkerRoutine() {
         // FIX [BUG #11]: Atomic snapshot of handle — prevents TOCTOU
         HANDLE hPort = m_hPort.load(std::memory_order_acquire);
         if (hPort == nullptr) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            std::shared_lock lock(m_impl->configMutex);
-            if (m_impl->config.autoReconnect && m_running.load()) {
-                lock.unlock();
-                if (!ConnectFilterPort()) {
-                    Utils::Logger::Debug("[IPCManager] Filter port reconnect attempt failed");
-                    m_impl->stats.errors++;
-                }
+            // FIX: Coordinated reconnect with exponential back-off.
+            // Previously every worker thread independently looped sleep(100ms)
+            // + ConnectFilterPort(), producing up to N×10 ConnectNotify calls
+            // per second against the kernel minifilter. During first-boot
+            // service start (driver freshly loaded, VMware host under I/O
+            // pressure) this storm wedged the guest. Now only one worker
+            // owns the reconnect claim at a time; the others idle until the
+            // port becomes available again.
+            bool expected = false;
+            if (!m_reconnectClaim.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel)) {
+                // Another worker is driving reconnect — wait passively.
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
             }
+
+            // Read configuration snapshot.
+            bool wantReconnect;
+            uint32_t baseDelayMs;
+            {
+                std::shared_lock lock(m_impl->configMutex);
+                wantReconnect = m_impl->config.autoReconnect &&
+                                m_running.load(std::memory_order_acquire);
+                baseDelayMs = m_impl->config.reconnectDelayMs;
+            }
+
+            if (!wantReconnect) {
+                m_reconnectClaim.store(false, std::memory_order_release);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // Compute current back-off (capped at 30 s) and wait. Use a
+            // chunked sleep so shutdown is observed promptly.
+            uint32_t backoff = m_reconnectBackoffMs.load(std::memory_order_relaxed);
+            if (backoff == 0) {
+                backoff = baseDelayMs > 0 ? baseDelayMs : 1000u;
+            }
+            constexpr uint32_t kReconnectBackoffCapMs = 30000u;
+            if (backoff > kReconnectBackoffCapMs) {
+                backoff = kReconnectBackoffCapMs;
+            }
+
+            for (uint32_t waited = 0;
+                 waited < backoff && m_running.load(std::memory_order_acquire);
+                 waited += 250) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+
+            if (!m_running.load(std::memory_order_acquire)) {
+                m_reconnectClaim.store(false, std::memory_order_release);
+                continue;
+            }
+
+            const bool ok = ConnectFilterPort();
+            if (!ok) {
+                Utils::Logger::Debug("[IPCManager] Filter port reconnect attempt failed");
+                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+                // Double the back-off (cap 30 s) for the next attempt.
+                uint32_t next = backoff * 2u;
+                if (next > kReconnectBackoffCapMs) next = kReconnectBackoffCapMs;
+                m_reconnectBackoffMs.store(next, std::memory_order_relaxed);
+            }
+            // Success path resets m_reconnectBackoffMs inside ConnectFilterPort.
+
+            m_reconnectClaim.store(false, std::memory_order_release);
             continue;
         }
 

@@ -835,7 +835,20 @@ private:
     // FilterConnectCommunicationPort race leaks port handles and can spawn
     // multiple primary FilterConnection / ThreatIntelPusher instances.
     mutable std::mutex m_connectMutex;
-    
+
+    // Reconnect coordination — ensures only one worker drives reconnects so
+    // we never hammer the kernel ConnectNotify path with N concurrent attempts
+    // (which has been observed to wedge VMware guests during first-boot
+    // service start while the minifilter is still warming up). Other workers
+    // back off and wait until m_hPort becomes non-null again.
+    std::atomic<bool> m_reconnectClaim{false};
+
+    // Current reconnect back-off (ms). Starts at config.reconnectDelayMs on
+    // first failure and doubles up to kReconnectBackoffCapMs. Reset to 0 on
+    // successful connect. Read/written only by the worker that owns the
+    // reconnect claim.
+    std::atomic<uint32_t> m_reconnectBackoffMs{0};
+
     // State
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_running{false};
