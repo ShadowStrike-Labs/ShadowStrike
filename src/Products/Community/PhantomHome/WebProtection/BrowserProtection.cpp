@@ -568,7 +568,7 @@ public:
         bool                       cfgBlockMalware = false;
         bool                       cfgEnableAds = false;
         bool                       cfgEnableTrackers = false;
-        std::unordered_set<URLCategory> cfgBlockedCategories;
+        std::set<URLCategory> cfgBlockedCategories;
         bool                       safeSearchSnap = false;
         ParentalControlSettings    parentalSnap;
         PreNavigationCallback      preNavCb;

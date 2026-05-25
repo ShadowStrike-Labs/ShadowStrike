@@ -592,33 +592,13 @@ public:
         }
         ::ShadowStrikeAppendBootTrace(L"impl-Start-RealTimeProtection-leave");
         ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-enter");
-        {
-            auto& ipcMgr = Communication::IPCManager::Instance();
-            ::ShadowStrikeAppendBootTrace(
-                ipcMgr.IsInitialized()
-                    ? L"impl-Start-IPCManager-precheck-initialized"
-                    : L"impl-Start-IPCManager-precheck-NOT-initialized");
-            if (!ipcMgr.Start()) {
-                // Non-fatal: the kernel event channel is degraded, but the
-                // PhantomHome UI IPC pipe, ServiceCommunicator, AlertSystem,
-                // and ServiceMonitor all operate independently of the
-                // FilterPort connection.  Marking the service as failed here
-                // produces the "ShadowStrike service is offline" banner in
-                // the UI and forces a full restart cycle even though every
-                // user-mode protection module is already running.  Log the
-                // condition, raise a degraded-channel event, and continue
-                // so the service reaches SERVICE_RUNNING and the UI can
-                // attach.  The IPC subsystem owns its own reconnect loop and
-                // will heal once the kernel side accepts our token.
-                SS_LOG_ERROR(LOG_CATEGORY,
-                    L"IPCManager::Start() returned false - kernel event channel "
-                    L"degraded. Service will continue with user-mode IPC only.");
-                ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-DEGRADED-continuing");
-                m_ipcManagerDegraded.store(true, std::memory_order_release);
-            } else {
-                ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-leave");
-            }
+        if (!Communication::IPCManager::Instance().Start()) {
+            SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start IPCManager");
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-FAIL");
+            RealTime::RealTimeProtection::Instance().Stop();
+            return false;
         }
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-leave");
 
         // Start Communication subsystems
         ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunication-enter");
@@ -1016,7 +996,6 @@ private:
     std::recursive_mutex m_mutex;
     bool m_initialized = false;
     bool m_running = false;
-    std::atomic<bool> m_ipcManagerDegraded{false};
     std::unique_ptr<Utils::ThreadPool> m_threadPool;
     std::unique_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
     std::thread m_maintenanceThread;

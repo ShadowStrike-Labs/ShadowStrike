@@ -32,6 +32,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../RealTime/MemoryProtection.hpp"
+#include "../Service/BootTrace.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -178,15 +179,25 @@ IPCManager::~IPCManager() {
 // ============================================================================
 
 bool IPCManager::Initialize(const IPCConfiguration& config) {
+    ::ShadowStrikeAppendBootTrace(L"ipc-Initialize-enter");
     IPCStatus expected = IPCStatus::Uninitialized;
     if (!m_status.compare_exchange_strong(expected, IPCStatus::Initializing)) {
+        IPCStatus current = m_status.load(std::memory_order_acquire);
+        wchar_t tag[80];
+        swprintf(tag, _countof(tag),
+                 L"ipc-Initialize-CAS-FAIL-status=%d-returning=%d",
+                 static_cast<int>(current),
+                 current != IPCStatus::Error ? 1 : 0);
+        ::ShadowStrikeAppendBootTrace(tag);
         Utils::Logger::Warn("[IPCManager] Already initialized (status: {})",
-                            static_cast<int>(m_status.load()));
-        return m_status.load() != IPCStatus::Error;
+                            static_cast<int>(current));
+        return current != IPCStatus::Error;
     }
+    ::ShadowStrikeAppendBootTrace(L"ipc-Initialize-CAS-ok");
 
     if (!config.IsValid()) {
         Utils::Logger::Error("[IPCManager] Invalid configuration provided");
+        ::ShadowStrikeAppendBootTrace(L"ipc-Initialize-config-INVALID");
         m_status.store(IPCStatus::Error);
         return false;
     }
@@ -202,6 +213,7 @@ bool IPCManager::Initialize(const IPCConfiguration& config) {
             buffer.reserve(IPCConstants::MAX_MESSAGE_SIZE);
         } catch (const std::bad_alloc& e) {
             Utils::Logger::Error("[IPCManager] Failed to allocate buffer pool: {}", e.what());
+            ::ShadowStrikeAppendBootTrace(L"ipc-Initialize-bufferpool-OOM");
             m_status.store(IPCStatus::Error);
             return false;
         }
@@ -219,6 +231,9 @@ bool IPCManager::Initialize(const IPCConfiguration& config) {
         if (m_hIOCP == nullptr) {
             DWORD error = GetLastError();
             Utils::Logger::Error("[IPCManager] Failed to create IOCP: {}", error);
+            wchar_t tag[80];
+            swprintf(tag, _countof(tag), L"ipc-Initialize-IOCP-FAIL-gle=%lu", error);
+            ::ShadowStrikeAppendBootTrace(tag);
             m_status.store(IPCStatus::Error);
             return false;
         }
@@ -231,6 +246,7 @@ bool IPCManager::Initialize(const IPCConfiguration& config) {
 
     m_impl->stats.startTime = Clock::now();
     m_status.store(IPCStatus::Stopped);
+    ::ShadowStrikeAppendBootTrace(L"ipc-Initialize-status-store-Stopped");
 
     Utils::Logger::Info("[IPCManager] Initialized successfully");
     Utils::Logger::Info("[IPCManager]   Filter port: {}",
@@ -242,56 +258,18 @@ bool IPCManager::Initialize(const IPCConfiguration& config) {
 }
 
 bool IPCManager::Start(uint32_t workerThreadCount) {
-    // Idempotent / robust state transition.
-    //
-    // Production deployments have shown that Start() can be invoked while the
-    // manager is still in `Initializing` (a concurrent path raced ahead of the
-    // Stopped store) or already `Running` (a previous Start partially
-    // completed and was retried after a non-fatal subsystem failure higher up
-    // in the service start chain).  Returning false in those cases tears down
-    // the entire service start path even though the IPC channel is, or will
-    // shortly be, perfectly usable.  Treat already-Running as success, wait a
-    // brief grace period for in-progress Initializing, and only reject from
-    // truly terminal states (Error / Stopping / Uninitialized).
-    {
-        IPCStatus expected = IPCStatus::Stopped;
-        if (!m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
-            IPCStatus current = m_status.load(std::memory_order_acquire);
-            if (current == IPCStatus::Running) {
-                Utils::Logger::Info("[IPCManager] Start() called while already Running - idempotent success");
-                return true;
-            }
-            if (current == IPCStatus::Initializing) {
-                // Brief bounded wait for a concurrent Initialize() to publish Stopped.
-                for (int spin = 0; spin < 50; ++spin) {  // up to ~500 ms
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    expected = IPCStatus::Stopped;
-                    if (m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
-                        current = IPCStatus::Stopped;
-                        break;
-                    }
-                    current = m_status.load(std::memory_order_acquire);
-                    if (current == IPCStatus::Running) {
-                        Utils::Logger::Info("[IPCManager] Concurrent Start() completed - idempotent success");
-                        return true;
-                    }
-                    if (current != IPCStatus::Initializing) {
-                        break;
-                    }
-                }
-                if (current != IPCStatus::Stopped) {
-                    Utils::Logger::Warn("[IPCManager] Cannot start - status stuck at {} after grace period",
-                                        static_cast<int>(current));
-                    return false;
-                }
-                // fall through with CAS already done above
-            } else {
-                Utils::Logger::Warn("[IPCManager] Cannot start - current status: {}",
-                                    static_cast<int>(current));
-                return false;
-            }
-        }
+    ::ShadowStrikeAppendBootTrace(L"ipc-Start-enter");
+    IPCStatus expected = IPCStatus::Stopped;
+    if (!m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
+        IPCStatus current = m_status.load(std::memory_order_acquire);
+        wchar_t tag[64];
+        swprintf(tag, _countof(tag), L"ipc-Start-CAS-FAIL-status=%d", static_cast<int>(current));
+        ::ShadowStrikeAppendBootTrace(tag);
+        Utils::Logger::Warn("[IPCManager] Cannot start - current status: {}",
+                            static_cast<int>(current));
+        return false;
     }
+    ::ShadowStrikeAppendBootTrace(L"ipc-Start-CAS-ok");
 
     m_running.store(true, std::memory_order_release);
 
@@ -302,11 +280,17 @@ bool IPCManager::Start(uint32_t workerThreadCount) {
 
     // Connect to filter port (driver communication)
     if (m_impl->config.enableFilterPort) {
+        ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-enter");
         if (!ConnectFilterPort()) {
+            ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-FAIL-nonfatal");
             Utils::Logger::Warn("[IPCManager] Filter port connection failed - "
                                "driver may not be loaded. Continuing anyway...");
             // Don't fail - we can still provide pipe/shared memory services
+        } else {
+            ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-ok");
         }
+    } else {
+        ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-disabled");
     }
 
     // Start worker threads
@@ -331,10 +315,18 @@ bool IPCManager::Start(uint32_t workerThreadCount) {
     }
 
     if (m_workerThreads.empty()) {
+        ::ShadowStrikeAppendBootTrace(L"ipc-Start-NoWorkers-FAIL");
         Utils::Logger::Error("[IPCManager] No worker threads created");
         m_running.store(false);
         m_status.store(IPCStatus::Error);
         return false;
+    }
+
+    {
+        wchar_t tag[80];
+        swprintf(tag, _countof(tag), L"ipc-Start-leave-workers=%zu",
+                 m_workerThreads.size());
+        ::ShadowStrikeAppendBootTrace(tag);
     }
 
     Utils::Logger::Info("[IPCManager] Started with {} worker threads",
