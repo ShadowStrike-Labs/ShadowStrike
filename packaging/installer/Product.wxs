@@ -7,7 +7,7 @@
 
   Build (from repo root):
     wix build -arch x64 ^
-      -d ProductVersion=1.0.12.0 ^
+      -d ProductVersion=1.0.17.0 ^
       -d BinDir=bin\Release ^
       -d StagingDir=build\installer\staging ^
       -d InstallerDir=packaging\installer ^

@@ -27,13 +27,13 @@ EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ShadowStrikePhantomUI", "ShadowStrikePhantomUI.vcxproj", "{B2C38F21-7A4D-4B1B-8F7D-0A0B4C1D2E02}"
 EndProject
-G
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Installer", "Installer", "{A3B7D0F1-5C2E-4891-B3A4-6D8E9F0C1234}"
 EndProject
 Project("{930C7802-8A8C-48F9-8165-68863BCCD9DD}") = "ShadowStrikePhantomHome", "packaging\installer\ShadowStrikePhantomHome.wixproj", "{D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456}"
 EndProject
 Project("{930C7802-8A8C-48F9-8165-68863BCCD9DD}") = "ShadowStrikePhantomHome-Bootstrapper", "packaging\installer\ShadowStrikePhantomHome-Bootstrapper.wixproj", "{E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567}"
-EndProjectlobal
+EndProject
+Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
 		Debug|x86 = Debug|x86
@@ -123,8 +123,9 @@ EndProjectlobal
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {C23E03CD-CBE2-4B14-B940-49C174575A9F}
 	EndGlobalSection
-GlobalSection(NestedProjects) = preSolution
-{D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456} = {A3B7D0F1-5C2E-4891-B3A4-6D8E9F0C1234}
-{E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567} = {A3B7D0F1-5C2E-4891-B3A4-6D8E9F0C1234}
-EndGlobalSectionEndGlobal
+	GlobalSection(NestedProjects) = preSolution
+		{D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456} = {A3B7D0F1-5C2E-4891-B3A4-6D8E9F0C1234}
+		{E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567} = {A3B7D0F1-5C2E-4891-B3A4-6D8E9F0C1234}
+	EndGlobalSection
+EndGlobal
 
