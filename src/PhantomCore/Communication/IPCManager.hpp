@@ -849,6 +849,27 @@ private:
     // reconnect claim.
     std::atomic<uint32_t> m_reconnectBackoffMs{0};
 
+    // Permanent-failure tracking for the filter port.
+    //
+    // ERROR_ACCESS_DENIED (0x80070005) from FilterConnectCommunicationPort is
+    // *structural* — the kernel port DACL rejected SYSTEM, or
+    // ShadowStrikeConnectNotify rejected this exe (wrong filename, wrong
+    // token, stale .sys on disk). Retrying does not help; only re-install,
+    // a service-identity fix, or a driver rebuild will. We therefore cap the
+    // streak at kAccessDeniedAttemptCeiling and transition IPCStatus::Error
+    // so the UI can surface an actionable, terminal failure rather than
+    // logging the same denial every second forever.
+    //
+    // m_accessDeniedStreak is incremented by the connect attempt; the gate
+    // m_filterPortPermanentlyDenied is exchanged once on transition so any
+    // worker can short-circuit. m_lastFilterPortHr is mutated only while
+    // m_connectMutex is held (the same critical section that wraps the
+    // FilterConnectCommunicationPort call), so does not need atomicity.
+    std::atomic<uint32_t> m_accessDeniedStreak{0};
+    std::atomic<bool>     m_filterPortPermanentlyDenied{false};
+    HRESULT               m_lastFilterPortHr{S_OK};
+    static constexpr uint32_t kAccessDeniedAttemptCeiling = 5;
+
     // State
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_running{false};

@@ -51,6 +51,88 @@
 namespace ShadowStrike {
 namespace Communication {
 
+namespace {
+
+// ----------------------------------------------------------------------------
+// Minifilter auto-load fallback
+//
+// PhantomSensor's SCM entry is registered as SERVICE_DEMAND_START (the only
+// start-type proven safe for this driver: SERVICE_SYSTEM_START causes a
+// bugcheck in early-boot DriverEntry context, tracked separately).  As a
+// consequence the kernel does NOT auto-load PhantomSensor at boot; only the
+// install-time FilterLoad call gets the driver into the filter manager and
+// it disappears again on reboot.
+//
+// To restore the minifilter on every boot, ShadowStrikePhantomService
+// (LocalSystem) calls FilterLoad here, just before the first
+// FilterConnectCommunicationPort attempt.  FilterLoad is idempotent
+// (ERROR_ALREADY_EXISTS == success) and is safe to invoke repeatedly from
+// reconnect paths.  SeLoadDriverPrivilege is enabled defensively because
+// LocalSystem holds the privilege but it may be present-but-disabled on
+// the token.
+// ----------------------------------------------------------------------------
+
+constexpr wchar_t kPhantomMinifilterName[] = L"PhantomSensor";
+
+[[nodiscard]] bool EnableTokenPrivilege(LPCWSTR privilegeName) noexcept {
+    HANDLE rawToken = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(),
+                            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                            &rawToken) || rawToken == nullptr) {
+        return false;
+    }
+
+    struct TokenGuard {
+        HANDLE h;
+        ~TokenGuard() { if (h) ::CloseHandle(h); }
+    } guard{rawToken};
+
+    LUID luid{};
+    if (!::LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!::AdjustTokenPrivileges(guard.h, FALSE, &tp,
+                                 sizeof(TOKEN_PRIVILEGES),
+                                 nullptr, nullptr)) {
+        return false;
+    }
+    // AdjustTokenPrivileges returns TRUE even if the privilege was not held;
+    // GetLastError() distinguishes the two cases.
+    return ::GetLastError() == ERROR_SUCCESS;
+}
+
+[[nodiscard]] HRESULT EnsurePhantomMinifilterLoaded() noexcept {
+    (void)EnableTokenPrivilege(SE_LOAD_DRIVER_NAME);
+
+    const HRESULT hr = ::FilterLoad(kPhantomMinifilterName);
+    if (SUCCEEDED(hr)) {
+        Utils::Logger::Info(
+            "[IPCManager] FilterLoad('PhantomSensor') succeeded");
+        return S_OK;
+    }
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        Utils::Logger::Debug(
+            "[IPCManager] Minifilter 'PhantomSensor' already loaded");
+        return S_OK;
+    }
+    // ERROR_SERVICE_DOES_NOT_EXIST means the SCM entry is missing — driver
+    // install never ran or was rolled back.  ERROR_PRIVILEGE_NOT_HELD means
+    // the service token lacks SeLoadDriverPrivilege (should not happen for
+    // LocalSystem).  Surface the exact code so triage doesn't guess.
+    Utils::Logger::Error(
+        "[IPCManager] FilterLoad('PhantomSensor') failed: 0x{:08X}",
+        static_cast<unsigned int>(hr));
+    return hr;
+}
+
+}  // namespace
+
 // ============================================================================
 // STATIC MEMBERS
 // ============================================================================
@@ -278,17 +360,29 @@ bool IPCManager::Start(uint32_t workerThreadCount) {
         ResetEvent(m_impl->shutdownEvent);
     }
 
-    // Connect to filter port (driver communication)
+    // BOOT-GRACE: defer first filter-port connect by 3 seconds.
+    //
+    // Previously Start() invoked ConnectFilterPort() synchronously here.
+    // On a clean install + first reboot the kernel minifilter is still
+    // warming up while ShadowStrikePhantomService is autoloading; a
+    // synchronous FilterConnectCommunicationPort against an unready port
+    // returns ERROR_FILE_NOT_FOUND and, if the port is being torn down
+    // mid-init, can wedge the service in FltMgr internals during the
+    // exact window that winlogon expects the SCM critical-service set to
+    // settle. Instead, prime the reconnect back-off so the worker
+    // routine's coordinated reconnect path (single claim, exponential
+    // back-off, ACCESS_DENIED ceiling already in place) drives the very
+    // first attempt 3 s into the future. Honors the 5-strike
+    // ACCESS_DENIED ceiling already implemented in ConnectFilterPort.
     if (m_impl->config.enableFilterPort) {
-        ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-enter");
-        if (!ConnectFilterPort()) {
-            ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-FAIL-nonfatal");
-            Utils::Logger::Warn("[IPCManager] Filter port connection failed - "
-                               "driver may not be loaded. Continuing anyway...");
-            // Don't fail - we can still provide pipe/shared memory services
-        } else {
-            ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-ok");
-        }
+        constexpr uint32_t kFilterPortFirstConnectGraceMs = 3000;
+        m_reconnectBackoffMs.store(kFilterPortFirstConnectGraceMs,
+                                   std::memory_order_release);
+        ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-deferred-3s");
+        Utils::Logger::Info(
+            "[IPCManager] Filter port first-connect deferred {} ms "
+            "(boot-grace; reconnect path handles the attempt)",
+            kFilterPortFirstConnectGraceMs);
     } else {
         ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-disabled");
     }
@@ -475,6 +569,22 @@ bool IPCManager::ConnectFilterPort() {
     Utils::Logger::Info("[IPCManager] Connecting to filter port: {}",
                         Utils::StringUtils::ToNarrow(portName));
 
+    // Ensure PhantomSensor minifilter is resident in the kernel before
+    // attempting the port connect.  The driver service is registered as
+    // SERVICE_DEMAND_START (SYSTEM_START triggers an early-boot bugcheck
+    // tracked separately), so without this call the filter is absent on
+    // every reboot and FilterConnectCommunicationPort fails with
+    // ERROR_FILE_NOT_FOUND / ERROR_ACCESS_DENIED.  Idempotent and cheap.
+    const HRESULT ensureHr = EnsurePhantomMinifilterLoaded();
+    if (FAILED(ensureHr)) {
+        m_lastFilterPortHr = ensureHr;
+        m_impl->NotifyError("Minifilter load failed",
+                            static_cast<int>(ensureHr));
+        // Fall through to FilterConnect: it may still succeed if the filter
+        // was loaded by another agent in the interim.  The connect failure
+        // path below carries the authoritative diagnostic for the user.
+    }
+
     // FIX [BUG #11]: Use temp handle — FilterConnectCommunicationPort writes
     // directly to &handle. Storing into atomic<HANDLE> address isn't portable.
     HANDLE hPortTemp = nullptr;
@@ -488,18 +598,71 @@ bool IPCManager::ConnectFilterPort() {
     );
 
     if (FAILED(hr)) {
-        Utils::Logger::Error("[IPCManager] FilterConnectCommunicationPort failed: 0x{:08X}",
-                             static_cast<unsigned int>(hr));
+        m_lastFilterPortHr = hr;
 
-        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
-            Utils::Logger::Error("[IPCManager] Driver port not found - is driver loaded?");
-        } else if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
-            Utils::Logger::Error("[IPCManager] Access denied - check service permissions");
+        if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
+            const uint32_t streak =
+                m_accessDeniedStreak.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+            // First N attempts log at error level; once we reach the ceiling
+            // we transition the IPCManager to a *terminal* error state and
+            // stop trying entirely. ACCESS_DENIED from the filter port is a
+            // structural denial (port DACL rejected SYSTEM, or the kernel
+            // ConnectNotify callback rejected this exe). Retrying does not
+            // help — only re-install, service-identity fix, or driver
+            // rebuild will. Continuing to hammer the kernel just pollutes
+            // logs and burns CPU.
+            if (streak <= kAccessDeniedAttemptCeiling) {
+                Utils::Logger::Error(
+                    "[IPCManager] FilterConnectCommunicationPort ACCESS_DENIED "
+                    "(attempt {}/{}) - driver port DACL rejected SYSTEM, or "
+                    "ConnectNotify rejected this exe ({}). Check driver DbgView "
+                    "for '[ShadowStrike] ConnectNotify DENY' log line.",
+                    streak, kAccessDeniedAttemptCeiling,
+                    Utils::StringUtils::ToNarrow(portName));
+            }
+
+            if (streak >= kAccessDeniedAttemptCeiling) {
+                if (!m_filterPortPermanentlyDenied.exchange(
+                        true, std::memory_order_acq_rel)) {
+                    Utils::Logger::Error(
+                        "[IPCManager] Filter port permanently denied after {} "
+                        "consecutive ACCESS_DENIED responses. Disabling further "
+                        "reconnect attempts. UI should surface 'Driver "
+                        "communication denied - service token / signed image "
+                        "mismatch - check ShadowStrikePhantomService.exe path "
+                        "and signature' (0x80070005).", streak);
+                    m_status.store(IPCStatus::Error, std::memory_order_release);
+                    m_impl->NotifyConnectionChange(
+                        ChannelType::FilterPort, ConnectionStatus::Error);
+                    m_impl->NotifyError(
+                        "Driver communication denied (0x80070005). The kernel "
+                        "driver rejected this service's identity. Re-run the "
+                        "installer or contact support.",
+                        static_cast<int>(hr));
+                }
+            }
+        } else if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+            // Transient: driver may still be coming up; keep trying.
+            Utils::Logger::Warn(
+                "[IPCManager] FilterConnectCommunicationPort: driver port not "
+                "yet present ({}). Will retry.",
+                Utils::StringUtils::ToNarrow(portName));
+        } else {
+            Utils::Logger::Error(
+                "[IPCManager] FilterConnectCommunicationPort failed: 0x{:08X}",
+                static_cast<unsigned int>(hr));
         }
 
-        m_impl->NotifyError("Filter port connection failed", hr);
+        m_impl->NotifyError("Filter port connection failed", static_cast<int>(hr));
         return false;
     }
+
+    // On success, reset the denial streak so a stale state from a previous
+    // boot cycle cannot poison this session.
+    m_accessDeniedStreak.store(0, std::memory_order_release);
+    m_filterPortPermanentlyDenied.store(false, std::memory_order_release);
+    m_lastFilterPortHr = S_OK;
 
     // Associate with IOCP for async operations
     if (m_hIOCP != nullptr) {
@@ -1284,6 +1447,19 @@ void IPCManager::WorkerRoutine() {
         // FIX [BUG #11]: Atomic snapshot of handle — prevents TOCTOU
         HANDLE hPort = m_hPort.load(std::memory_order_acquire);
         if (hPort == nullptr) {
+            // If the filter port has been *permanently* denied by the
+            // kernel driver, do not even attempt to reconnect — the only
+            // outcomes are wasted CPU and log spam. Sleep in short chunks
+            // so shutdown is still observed promptly.
+            if (m_filterPortPermanentlyDenied.load(std::memory_order_acquire)) {
+                for (uint32_t waited = 0;
+                     waited < 5000 && m_running.load(std::memory_order_acquire);
+                     waited += 250) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+                continue;
+            }
+
             // FIX: Coordinated reconnect with exponential back-off.
             // Previously every worker thread independently looped sleep(100ms)
             // + ConnectFilterPort(), producing up to N×10 ConnectNotify calls

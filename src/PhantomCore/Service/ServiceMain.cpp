@@ -9,13 +9,12 @@
  * @file ServiceMain.cpp
  * @brief Entry point for ShadowStrikePhantomService.exe.
  *
- * Responsibilities:
- *   - Initialise the process-wide Logger before any subsystem runs so that
- *     wiring static initialisers can emit diagnostics to %ProgramData%\ShadowStrike\Logs.
- *   - Dispatch CLI verbs --install / --uninstall (both require elevation).
- *   - Hand control to AntivirusService::Run() which registers with the SCM,
- *     brings up HomeProductOrchestrator + ServiceCommunicator +
- *     HomeIpcDispatcher and loops on the stop event.
+ * Boot-trace coverage: pre-wmain (.CRT$XCT static initializer in BootTrace.cpp),
+ * wmain-entry, every SetServiceStatus transition (via AntivirusService.cpp),
+ * unhandled SEH filter, std::terminate handler, _set_invalid_parameter_handler,
+ * _set_purecall_handler, atexit, and POSIX signal handlers. The trace is
+ * guaranteed to survive any subsequent crash because every write is
+ * FILE_FLAG_WRITE_THROUGH and the file is closed between writes.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -26,170 +25,142 @@
 #endif
 
 #include <windows.h>
+#include <crtdbg.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <cstdint>
+#include <exception>
 #include <format>
 #include <string>
 
 #include "AntivirusService.hpp"
+#include "BootTrace.hpp"
 #include "ServiceInstaller.hpp"
-#include "PhantomCore/Utils/Logger.hpp"
+#include "../Utils/Logger.hpp"
 
 namespace {
 
 constexpr const wchar_t* kLogSource = L"ShadowStrike Phantom Service";
 
 // ---------------------------------------------------------------------------
-// Boot trace — written via direct CreateFileW (CREATE_ALWAYS with FILE_FLAG_
-// WRITE_THROUGH) at the very top of wmain(), BEFORE the async Logger is
-// initialised.  This lets post-mortem triage tell apart:
-//   (a) the SCM never spawned the service exe        → file does not exist;
-//   (b) the .exe was spawned but crashed before Run() → file exists with the
-//       "entry" line only;
-//   (c) Defender quarantined the .exe between MSI commit and SCM start → file
-//       does not exist AND DriverResume.<pid>.log shows no service start
-//       attempt either.
-// The file path is %ProgramData%\ShadowStrike\Logs\PhantomHome.Service.boot.log
-// (idempotent, recreated each launch) so the previous boot's trace is
-// preserved in the next file rotation only via journal copy; the file itself
-// is overwritten on every launch to avoid runaway growth.
+// Process-wide failure-mode handlers. Each one emits a synchronous boot trace
+// to PhantomHome.Service.boot.log before relinquishing control, so even a
+// fatal failure inside a subsystem's static initializer or deep in
+// AntivirusServiceImpl::Initialize leaves a deterministic last-line marker
+// on disk for post-mortem triage.
 // ---------------------------------------------------------------------------
-void WriteBootTrace(const wchar_t* event, int argc, wchar_t** argv) noexcept {
-    wchar_t programData[MAX_PATH + 1] = {};
-    if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike\\Logs",
-                                    programData, MAX_PATH) == 0) {
-        return;
-    }
 
-    wchar_t parent[MAX_PATH + 1] = {};
-    if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike",
-                                    parent, MAX_PATH) != 0) {
-        (void)::CreateDirectoryW(parent, nullptr);
-    }
-    (void)::CreateDirectoryW(programData, nullptr);
-
-    wchar_t path[MAX_PATH + 1] = {};
-    if (::_snwprintf_s(path, _countof(path), _TRUNCATE,
-                       L"%ls\\PhantomHome.Service.boot.log", programData) < 0)
-    {
-        return;
-    }
-
-    const HANDLE h = ::CreateFileW(
-        path,
-        FILE_APPEND_DATA,
-        FILE_SHARE_READ,
-        nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    SYSTEMTIME st{};
-    ::GetSystemTime(&st);
-
-    wchar_t cmdLineSummary[512] = {};
-    int written = ::_snwprintf_s(
-        cmdLineSummary, _countof(cmdLineSummary), _TRUNCATE,
-        L"argc=%d arg0=%ls arg1=%ls",
-        argc,
-        (argc >= 1 && argv != nullptr && argv[0] != nullptr) ? argv[0] : L"<none>",
-        (argc >= 2 && argv != nullptr && argv[1] != nullptr) ? argv[1] : L"<none>");
-    if (written < 0) {
-        cmdLineSummary[0] = L'\0';
-    }
-
-    wchar_t line[1024] = {};
-    DWORD sessionId = 0;
-    (void)::ProcessIdToSessionId(::GetCurrentProcessId(), &sessionId);
-    written = ::_snwprintf_s(
-        line, _countof(line), _TRUNCATE,
-        L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ [BOOT] pid=%lu sid=%lu %ls %ls\r\n",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        ::GetCurrentProcessId(),
-        sessionId,
-        event,
-        cmdLineSummary);
-    if (written < 0) {
-        ::CloseHandle(h);
-        return;
-    }
-
-    // Append, then immediately fsync so a crash in the next millisecond
-    // cannot lose the trace.
-    //
-    // BUG FIX: previously we passed cbMultiByte = cbUtf8 - 1, which is one
-    // byte short of what the first call (size query with cchWideChar = -1,
-    // i.e. *including* the terminator) reported.  That caused
-    // WideCharToMultiByte to fail with ERROR_INSUFFICIENT_BUFFER and return 0,
-    // so WriteFile never ran -> 0-byte PhantomHome.Service.boot.log on disk.
-    // We now pass the full reported size and write cbUtf8 - 1 bytes (excluding
-    // the trailing NUL) into the file.
-    int cbUtf8 = ::WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
-    if (cbUtf8 > 1) {
-        char buf[2048] = {};
-        const int cap = static_cast<int>(sizeof(buf));
-        const int outBytes = (cbUtf8 < cap) ? cbUtf8 : cap;
-        const int converted = ::WideCharToMultiByte(
-            CP_UTF8, 0, line, -1, buf, outBytes, nullptr, nullptr);
-        if (converted > 1) {
-            // converted includes the trailing NUL; skip it when writing.
-            const DWORD bytesToWrite = static_cast<DWORD>(converted - 1);
-            DWORD writtenBytes = 0;
-            (void)::WriteFile(h, buf, bytesToWrite, &writtenBytes, nullptr);
-            (void)::FlushFileBuffers(h);
-        }
-    }
-    ::CloseHandle(h);
-}
-
-// (BootTrace helper is defined out-of-line in BootTrace.cpp; see BootTrace.hpp.)
-
-// ---------------------------------------------------------------------------
-// Unhandled SEH filter — writes a synchronous crash marker to the log so a
-// silent access-violation or stack-overflow in a module's Initialize path is
-// visible in the next run's triage instead of a truncated log.
-// ---------------------------------------------------------------------------
 LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
-    try {
-        DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
-        void* addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    DWORD code = 0;
+    void* addr = nullptr;
+    if (ep != nullptr && ep->ExceptionRecord != nullptr) {
+        code = ep->ExceptionRecord->ExceptionCode;
+        addr = ep->ExceptionRecord->ExceptionAddress;
+    }
+
+    wchar_t tag[256] = {};
+    (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                         L"unhandled-seh code=0x%08X addr=%p", code, addr);
+    ::ShadowStrikeAppendBootTrace(tag);
+
+    // Best-effort second-channel log; harmless if Logger is dead.
+    __try {
         ShadowStrike::Utils::Logger::Instance().Flush();
-        ::ShadowStrike::Utils::Logger::Error(
-            "FATAL unhandled SEH exception: code=0x{:08X} address={:p}",
+        ShadowStrike::Utils::Logger::Error(
+            "FATAL unhandled SEH: code=0x{:08X} addr={:p}",
             static_cast<unsigned>(code), addr);
         ShadowStrike::Utils::Logger::Instance().Flush();
-    } catch (...) {
-        // Best effort only; process is about to die.
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Process is dying; nothing useful to do.
     }
+
+    // Returning EXCEPTION_EXECUTE_HANDLER terminates the process normally.
+    // We deliberately do NOT return EXCEPTION_CONTINUE_SEARCH, which would
+    // let WER pop a dialog under Session 0 and pin the service forever.
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+void __cdecl ShadowStrikeTerminateHandler() noexcept {
+    ::ShadowStrikeAppendBootTrace(L"std-terminate");
+    ::abort();
+}
+
+void __cdecl ShadowStrikeInvalidParameter(
+    const wchar_t* expression, const wchar_t* function,
+    const wchar_t* file, unsigned int line, uintptr_t /*reserved*/) noexcept
+{
+    wchar_t tag[512] = {};
+    (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                         L"crt-invalid-parameter expr=%ls fn=%ls file=%ls line=%u",
+                         expression ? expression : L"<null>",
+                         function   ? function   : L"<null>",
+                         file       ? file       : L"<null>",
+                         line);
+    ::ShadowStrikeAppendBootTrace(tag);
+    ::abort();
+}
+
+void __cdecl ShadowStrikePurecall() noexcept {
+    ::ShadowStrikeAppendBootTrace(L"crt-pure-virtual-call");
+    ::abort();
+}
+
+void __cdecl ShadowStrikeAtExit() noexcept {
+    ::ShadowStrikeAppendBootTrace(L"atexit");
+}
+
+void __cdecl ShadowStrikeSignalHandler(int sig) noexcept {
+    wchar_t tag[64] = {};
+    (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE, L"signal sig=%d", sig);
+    ::ShadowStrikeAppendBootTrace(tag);
+    // Re-raise default to allow WER dump capture if configured.
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+void InstallProcessWideHandlers() noexcept {
+    // Suppress WER dialogs that would pin a Session 0 service forever.
+    ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+
+    ::SetUnhandledExceptionFilter(ShadowStrikeUnhandledFilter);
+    std::set_terminate(ShadowStrikeTerminateHandler);
+    _set_invalid_parameter_handler(ShadowStrikeInvalidParameter);
+    _set_purecall_handler(ShadowStrikePurecall);
+    (void)::atexit(ShadowStrikeAtExit);
+
+    ::signal(SIGABRT, ShadowStrikeSignalHandler);
+    ::signal(SIGFPE,  ShadowStrikeSignalHandler);
+    ::signal(SIGILL,  ShadowStrikeSignalHandler);
+    ::signal(SIGSEGV, ShadowStrikeSignalHandler);
+    ::signal(SIGTERM, ShadowStrikeSignalHandler);
+}
+
 std::wstring ResolveLogDirectory() noexcept {
+    // Logger may use env vars; that's tolerable because the boot trace is
+    // independent and uses a hard-coded \\?\C:\ProgramData\... path.
     wchar_t expanded[MAX_PATH]{};
     if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike\\Logs",
                                     expanded, MAX_PATH) == 0) {
-        return L"logs";
+        return L"\\\\?\\C:\\ProgramData\\ShadowStrike\\Logs";
     }
-
     wchar_t parent[MAX_PATH]{};
     if (::ExpandEnvironmentStringsW(L"%ProgramData%\\ShadowStrike",
                                     parent, MAX_PATH) != 0) {
         (void)::CreateDirectoryW(parent, nullptr);
     }
-
     if (!::CreateDirectoryW(expanded, nullptr)) {
         const DWORD err = ::GetLastError();
         if (err != ERROR_ALREADY_EXISTS) {
-            return L"logs";
+            return L"\\\\?\\C:\\ProgramData\\ShadowStrike\\Logs";
         }
     }
     return std::wstring{expanded};
 }
 
 void InitialiseLogger() noexcept {
+    ::ShadowStrikeAppendBootTrace(L"logger-Initialise-enter");
     try {
         using ::ShadowStrike::Utils::Logger;
         using ::ShadowStrike::Utils::LoggerConfig;
@@ -212,51 +183,67 @@ void InitialiseLogger() noexcept {
         cfg.includeProcThreadId = true;
 
         Logger::Instance().Initialize(cfg);
+        ::ShadowStrikeAppendBootTrace(L"logger-Initialise-ok");
     } catch (...) {
-        // Best-effort: Logger auto-inits on first call if we fail here.
+        ::ShadowStrikeAppendBootTrace(L"logger-Initialise-EXCEPTION");
     }
 }
 
 }  // namespace
 
 extern "C" int wmain(int argc, wchar_t* argv[]) {
-    // Boot trace must be the FIRST observable side effect so we can tell, on
-    // VM triage, whether SCM (or Defender) even managed to spawn this exe.
-    // Written via a direct, synchronous CreateFileW so the trace survives an
-    // immediate crash in InitialiseLogger / static initialisers.
-    WriteBootTrace(L"wmain-entry", argc, argv);
+    // The pre-wmain boot trace has already run from a .CRT$XCT initializer
+    // in BootTrace.cpp; this is the wmain-body trace.
+    {
+        wchar_t tag[512] = {};
+        (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                             L"wmain-entry argc=%d arg0=%ls arg1=%ls",
+                             argc,
+                             (argc >= 1 && argv && argv[0]) ? argv[0] : L"<none>",
+                             (argc >= 2 && argv && argv[1]) ? argv[1] : L"<none>");
+        ::ShadowStrikeAppendBootTrace(tag);
+    }
 
-    ::SetUnhandledExceptionFilter(ShadowStrikeUnhandledFilter);
+    InstallProcessWideHandlers();
+    ::ShadowStrikeAppendBootTrace(L"handlers-installed");
+
     InitialiseLogger();
-    WriteBootTrace(L"logger-initialised", argc, argv);
 
     if (argc >= 2 && argv != nullptr && argv[1] != nullptr) {
         const std::wstring arg{argv[1]};
         if (arg == L"--install" || arg == L"-install" || arg == L"/install") {
+            ::ShadowStrikeAppendBootTrace(L"verb-install-enter");
             if (!::ShadowStrike::Service::ServiceInstaller::Install()) {
                 ShadowStrike::Utils::Logger::Error(
                     "wmain --install: ServiceInstaller::Install returned false");
+                ::ShadowStrikeAppendBootTrace(L"verb-install-FAIL");
                 return 2;
             }
             ShadowStrike::Utils::Logger::Info("wmain --install: service registered");
+            ::ShadowStrikeAppendBootTrace(L"verb-install-ok");
             return 0;
         }
         if (arg == L"--uninstall" || arg == L"-uninstall" || arg == L"/uninstall") {
+            ::ShadowStrikeAppendBootTrace(L"verb-uninstall-enter");
             if (!::ShadowStrike::Service::ServiceInstaller::Uninstall()) {
                 ShadowStrike::Utils::Logger::Error(
                     "wmain --uninstall: ServiceInstaller::Uninstall returned false");
+                ::ShadowStrikeAppendBootTrace(L"verb-uninstall-FAIL");
                 return 3;
             }
             ShadowStrike::Utils::Logger::Info("wmain --uninstall: service removed");
+            ::ShadowStrikeAppendBootTrace(L"verb-uninstall-ok");
             return 0;
         }
     }
 
-    if (!::ShadowStrike::Service::AntivirusService::Instance().Run()) {
+    ::ShadowStrikeAppendBootTrace(L"pre-AntivirusService-Run");
+    const bool runOk = ::ShadowStrike::Service::AntivirusService::Instance().Run();
+    ::ShadowStrikeAppendBootTrace(runOk ? L"post-AntivirusService-Run-ok"
+                                        : L"post-AntivirusService-Run-FAIL");
+    if (!runOk) {
         ShadowStrike::Utils::Logger::Error("wmain: AntivirusService::Run returned false");
-        WriteBootTrace(L"AntivirusService-Run-returned-false", argc, argv);
         return 1;
     }
-    WriteBootTrace(L"AntivirusService-Run-returned-true", argc, argv);
     return 0;
 }

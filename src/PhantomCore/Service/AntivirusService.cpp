@@ -1053,17 +1053,28 @@ AntivirusService& AntivirusService::Instance() noexcept {
 
 AntivirusService::AntivirusService()
     : m_impl(std::make_unique<AntivirusServiceImpl>()) {
+    // Manual-reset stop event; pre-created so ServiceCtrlHandler can signal
+    // it the instant SCM delivers SERVICE_CONTROL_STOP, even if OnStart is
+    // still mid-flight.
+    m_stopEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     s_instanceCreated.store(true);
 }
 
-AntivirusService::~AntivirusService() = default;
+AntivirusService::~AntivirusService() {
+    if (m_stopEvent != nullptr) {
+        ::CloseHandle(m_stopEvent);
+        m_stopEvent = nullptr;
+    }
+}
 
 // ============================================================================
 // SCM ENTRY POINTS
 // ============================================================================
 
 void WINAPI AntivirusService::ServiceMain(DWORD argc, LPWSTR* argv) {
+    ::ShadowStrikeAppendBootTrace(L"ServiceMain-entry");
     Instance().OnStart(argc, argv);
+    ::ShadowStrikeAppendBootTrace(L"ServiceMain-OnStart-returned");
 }
 
 DWORD WINAPI AntivirusService::ServiceCtrlHandler(DWORD control, DWORD eventType, LPVOID eventData, LPVOID context) {
@@ -1100,15 +1111,29 @@ DWORD WINAPI AntivirusService::ServiceCtrlHandler(DWORD control, DWORD eventType
 // ============================================================================
 
 bool AntivirusService::Run() {
+    ::ShadowStrikeAppendBootTrace(L"AntivirusService::Run-enter");
+
     SERVICE_TABLE_ENTRYW dispatchTable[] = {
-        { const_cast<LPWSTR>(ServiceConstants::SERVICE_NAME), static_cast<LPSERVICE_MAIN_FUNCTIONW>(ServiceMain) },
+        { const_cast<LPWSTR>(ServiceConstants::SERVICE_NAME),
+          static_cast<LPSERVICE_MAIN_FUNCTIONW>(ServiceMain) },
         { nullptr, nullptr }
     };
 
-    if (!StartServiceCtrlDispatcherW(dispatchTable)) {
-        // If it failed, it might be running as a console app for debug
-        if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
-            // Debug mode
+    ::ShadowStrikeAppendBootTrace(L"pre-StartServiceCtrlDispatcherW");
+    const BOOL dispatched = ::StartServiceCtrlDispatcherW(dispatchTable);
+    const DWORD dispatchErr = dispatched ? ERROR_SUCCESS : ::GetLastError();
+    {
+        wchar_t tag[128] = {};
+        (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                             L"post-StartServiceCtrlDispatcherW rc=%d err=%lu",
+                             dispatched ? 1 : 0, dispatchErr);
+        ::ShadowStrikeAppendBootTrace(tag);
+    }
+
+    if (!dispatched) {
+        if (dispatchErr == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+            // Console-mode debug path (running outside SCM).
+            ::ShadowStrikeAppendBootTrace(L"Run-console-mode");
             SS_LOG_INFO(LOG_CATEGORY, L"Running in console mode...");
             if (m_impl->Initialize()) {
                 if (!m_impl->Start()) {
@@ -1122,6 +1147,7 @@ bool AntivirusService::Run() {
                 m_impl->Stop();
                 return true;
             }
+            return false;
         }
         return false;
     }
@@ -1138,6 +1164,9 @@ bool AntivirusService::Uninstall() {
 
 void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
     ::ShadowStrikeAppendBootTrace(L"OnStart-enter");
+    (void)argc;
+    (void)argv;
+
     m_statusHandle = RegisterServiceCtrlHandlerExW(
         ServiceConstants::SERVICE_NAME,
         ServiceCtrlHandler,
@@ -1155,72 +1184,129 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
     }
     ::ShadowStrikeAppendBootTrace(L"OnStart-StatusHandle-registered");
 
-    // SCM kills a service if its wait-hint expires without a checkpoint bump.
-    // Initialization touches signature DBs, kernel IPC, SHA-256 baselines and
-    // per-process/registry protection snapshots — easily tens of seconds on
-    // first start (cold disk cache, slow VMs, no AES-NI). Spin a dedicated
-    // heartbeat pump that keeps bumping the checkpoint every 5s with a
-    // generous 30s wait hint until initialization completes.
-    constexpr DWORD kInitWaitHintMs = 30000;
-    constexpr DWORD kPumpIntervalMs = 5000;
-
-    SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
+    // ------------------------------------------------------------------
+    // PHASE 1 — MUST COMPLETE IN < 1 SECOND
+    // ------------------------------------------------------------------
+    // Report SERVICE_START_PENDING with a tight wait-hint, then transition
+    // to SERVICE_RUNNING immediately. SCM marks autoload boot-critical
+    // services as "started" only when they reach RUNNING; winlogon waits
+    // on that for its Welcome → desktop transition under certain
+    // installations. Heavy initialization (signature DBs, kernel IPC,
+    // SHA-256 baselines, per-process/registry protection snapshots) is
+    // deferred to a background thread to avoid pinning winlogon for tens
+    // of seconds on slow VMs or cold disks.
+    constexpr DWORD kPhase1WaitHintMs = 2000;
+    SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, kPhase1WaitHintMs);
     ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-START_PENDING-set");
 
-    std::atomic<bool> initDone{false};
-    std::thread pendingPump([this, &initDone]() {
-        while (!initDone.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(kPumpIntervalMs));
-            if (initDone.load(std::memory_order_acquire)) break;
-            SetServiceStatus(SERVICE_START_PENDING, NO_ERROR, kInitWaitHintMs);
-        }
-    });
-
-    // Initialize subsystems (potentially long-running)
-    ::ShadowStrikeAppendBootTrace(L"OnStart-Initialize-call");
-    bool initOk = false;
-    try {
-        initOk = m_impl->Initialize();
-    } catch (...) {
-        initOk = false;
-    }
-    ::ShadowStrikeAppendBootTrace(initOk ? L"OnStart-Initialize-returned-ok"
-                                         : L"OnStart-Initialize-returned-FAIL");
-
-    // Stop pump before transitioning to RUNNING / STOPPED so we don't race on
-    // SetServiceStatus with the pump thread.
-    initDone.store(true, std::memory_order_release);
-    if (pendingPump.joinable()) pendingPump.join();
-
-    if (!initOk) {
-        ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-STOPPED-init-failed");
-        SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
-        return;
-    }
-
-    // Start services. A core runtime failure must be visible to SCM instead of
-    // reporting SERVICE_RUNNING while the UI pipe and protection stack are down.
-    ::ShadowStrikeAppendBootTrace(L"OnStart-Start-call");
-    bool startOk = false;
-    try {
-        startOk = m_impl->Start();
-    } catch (...) {
-        startOk = false;
-    }
-    ::ShadowStrikeAppendBootTrace(startOk ? L"OnStart-Start-returned-ok"
-                                          : L"OnStart-Start-returned-FAIL");
-    if (!startOk) {
-        ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-STOPPED-start-failed");
-        SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
-        return;
-    }
-
+    // Transition to RUNNING IMMEDIATELY — before any subsystem init. The
+    // ServiceCtrlHandler is already registered, the stop event is already
+    // created (in the constructor), so we can honor SERVICE_CONTROL_STOP
+    // even mid-init via OnStop signalling m_stopEvent.
     SetServiceStatus(SERVICE_RUNNING);
-    ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-RUNNING-set");
+    ::ShadowStrikeAppendBootTrace(L"OnStart-SCM-RUNNING-set-early");
+
+    // ------------------------------------------------------------------
+    // PHASE 2 — BACKGROUND INITIALIZATION
+    // ------------------------------------------------------------------
+    // Spawn a dedicated init thread. ServiceMain owns process lifetime by
+    // waiting on m_stopEvent below; the init thread does all heavy work.
+    // If init fails the thread signals m_stopEvent and reports STOPPED.
+    auto bootInitProc = [](LPVOID ctx) -> DWORD {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-enter");
+        auto* self = static_cast<AntivirusService*>(ctx);
+        bool initOk = false;
+        bool startOk = false;
+        try {
+            ::ShadowStrikeAppendBootTrace(L"OnStart-Initialize-call");
+            initOk = self->m_impl->Initialize();
+            ::ShadowStrikeAppendBootTrace(initOk ? L"OnStart-Initialize-returned-ok"
+                                                 : L"OnStart-Initialize-returned-FAIL");
+            if (initOk) {
+                ::ShadowStrikeAppendBootTrace(L"OnStart-Start-call");
+                startOk = self->m_impl->Start();
+                ::ShadowStrikeAppendBootTrace(startOk ? L"OnStart-Start-returned-ok"
+                                                      : L"OnStart-Start-returned-FAIL");
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_FATAL(LOG_CATEGORY,
+                         L"Exception in background init: %hs", e.what());
+            ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-EXCEPTION-std");
+        } catch (...) {
+            ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-EXCEPTION-unknown");
+        }
+
+        self->m_bootInitComplete.store(true, std::memory_order_release);
+
+        if (!initOk || !startOk) {
+            // Fatal background-init failure. Service has already reported
+            // SERVICE_RUNNING to SCM, so we cannot SetServiceStatus(STOPPED)
+            // straight from RUNNING without an explicit STOP_PENDING.
+            // Signal the stop event; ServiceMain wakes, performs orderly
+            // teardown, and reports STOPPED with ERROR_SERVICE_SPECIFIC_ERROR.
+            ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-signal-stop-on-failure");
+            self->m_serviceStatus.dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
+            self->m_serviceStatus.dwServiceSpecificExitCode = 1;
+            if (self->m_stopEvent != nullptr) {
+                ::SetEvent(self->m_stopEvent);
+            }
+        } else {
+            ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-leave-ok");
+        }
+        return 0;
+    };
+
+    m_bootInitThread = ::CreateThread(nullptr, 0, bootInitProc, this, 0, nullptr);
+    if (m_bootInitThread == nullptr) {
+        const DWORD err = ::GetLastError();
+        SS_LOG_FATAL(LOG_CATEGORY,
+                     L"Failed to spawn background init thread: 0x%08X", err);
+        ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-CreateThread-FAIL");
+        // Inline fallback so the service does not stay up with no protection.
+        bool initOk = false;
+        try { initOk = m_impl->Initialize(); } catch (...) {}
+        if (initOk) {
+            try { (void)m_impl->Start(); } catch (...) {}
+        }
+        if (!initOk) {
+            SetServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+            SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
+            return;
+        }
+    }
+
+    // CRITICAL: block the ServiceMain worker thread on the stop event so the
+    // process stays alive on a controlled signal, rather than depending on
+    // background worker threads (maintenance loop, IPC pump, ...) remaining
+    // alive. This is best-practice service hosting: if every worker thread
+    // exits unexpectedly, ServiceMain still owns the process lifetime via
+    // the stop event, and SCM never sees an unexplained STOPPED.
+    if (m_stopEvent != nullptr) {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-wait-on-stop-event");
+        (void)::WaitForSingleObject(m_stopEvent, INFINITE);
+        ::ShadowStrikeAppendBootTrace(L"OnStart-stop-event-signalled");
+    } else {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-stop-event-missing");
+    }
+
+    // Join background init thread before ServiceMain returns. After
+    // m_stopEvent is signalled the init thread may still be inside
+    // Initialize/Start; waiting prevents tearing down PIMPL while it's
+    // still touching subsystem singletons.
+    if (m_bootInitThread != nullptr) {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-join-enter");
+        (void)::WaitForSingleObject(m_bootInitThread, 30000);
+        ::CloseHandle(m_bootInitThread);
+        m_bootInitThread = nullptr;
+        ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-join-leave");
+    }
 }
 
 void AntivirusService::OnStop() {
     SetServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+    if (m_stopEvent != nullptr) {
+        ::SetEvent(m_stopEvent);
+    }
     m_impl->Stop();
     SetServiceStatus(SERVICE_STOPPED);
 }
@@ -1239,6 +1325,9 @@ void AntivirusService::OnContinue() {
 
 void AntivirusService::OnShutdown() {
     SetServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, ServiceConstants::SHUTDOWN_TIMEOUT_MS);
+    if (m_stopEvent != nullptr) {
+        ::SetEvent(m_stopEvent);
+    }
     m_impl->Stop();
     SetServiceStatus(SERVICE_STOPPED);
 }

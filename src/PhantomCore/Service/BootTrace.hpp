@@ -9,32 +9,39 @@
 
 /**
  * @file BootTrace.hpp
- * @brief Synchronous, write-through boot-trace channel for service startup.
+ * @brief Synchronous, write-through, env-var-free boot-trace channel.
  *
- * Background:
- *   ShadowStrikePhantomService runs a substantial chain of subsystem
- *   Initialize() / Start() calls before reporting SERVICE_RUNNING.  When any
- *   step blocks (kernel handle wait, LSA call, profile load, ACL build, ...),
- *   the SCM eventually escalates the failure mode to a hung START_PENDING
- *   service, which in turn delays Windows shutdown and produces the
- *   grey-screen reboot symptom we have been chasing.
+ * The trace file is always at the absolute literal path
+ *   \\?\C:\ProgramData\ShadowStrike\Logs\PhantomHome.Service.boot.log
  *
- *   The async Logger writes asynchronously and is itself initialised relatively
- *   late, so its on-disk file frequently does not contain the line that
- *   immediately preceded a hang.  This helper writes a single timestamped line
- *   to %ProgramData%\ShadowStrike\Logs\PhantomHome.Service.boot.log using
- *   FILE_APPEND_DATA + FILE_FLAG_WRITE_THROUGH so post-mortem triage on the
- *   target machine reliably shows the *last* stage the service reached.
+ * Rationale: under early service activation on certain Windows 11 builds,
+ * the LocalSystem token's environment block may not yet have %ProgramData%
+ * populated when ServiceMain begins.  Any env-var expansion here would
+ * silently produce an unexpanded literal "%ProgramData%\..." and the trace
+ * would be lost.  This module never reads environment variables.
+ *
+ * The trace is opened FILE_APPEND_DATA | FILE_FLAG_WRITE_THROUGH and closed
+ * after every write so a hang in the next instruction cannot lose the entry.
+ * All buffers are stack-allocated and bounded; no heap allocation, no C++
+ * exceptions, no static-initializer dependencies beyond the CRT.
+ *
+ * INSTALLED CHOKEPOINTS (see ServiceMain.cpp / AntivirusService.cpp):
+ *   pre-wmain  (.CRT$XCT static initializer)
+ *   wmain-entry
+ *   pre/post StartServiceCtrlDispatcherW
+ *   ServiceMain-entry
+ *   pre/post each SetServiceStatus(START_PENDING / RUNNING / STOPPED)
+ *   unhandled-SEH filter
+ *   std::set_terminate
+ *   _set_invalid_parameter_handler
+ *   _set_purecall_handler
+ *   atexit
  *
  * Usage:
- *   #include "BootTrace.hpp"
  *   ShadowStrikeAppendBootTrace(L"impl-initialize-enter");
  *
  *   Each stage tag should be a stable, grep-able identifier in kebab- or
- *   pascal-case.  Pass nullptr is a no-op.
- *
- *   Definition lives in ServiceMain.cpp (a single TU owns the on-disk file
- *   path constants and the WideCharToMultiByte buffer logic).
+ *   pascal-case.  Passing nullptr is harmless.
  */
 
-void ShadowStrikeAppendBootTrace(const wchar_t* stage) noexcept;
+extern "C" void ShadowStrikeAppendBootTrace(const wchar_t* stage) noexcept;

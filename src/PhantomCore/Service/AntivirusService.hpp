@@ -195,6 +195,24 @@ private:
     SERVICE_STATUS_HANDLE m_statusHandle{ nullptr };
     SERVICE_STATUS m_serviceStatus{ 0 };
 
+    // Manual-reset stop event. Signalled from OnStop / OnShutdown to release
+    // the ServiceMain worker thread which blocks on WaitForSingleObject after
+    // SERVICE_RUNNING is reported. Best-practice service hosting: process
+    // survival must not depend on background worker threads remaining alive.
+    HANDLE m_stopEvent{ nullptr };
+
+    // Boot-init worker. After winlogon-grey-screen hang triage (PhantomHome
+    // v1.0.13.0), heavy subsystem Initialize/Start is moved off ServiceMain.
+    // Phase 1 (synchronous in OnStart): RegisterServiceCtrlHandlerExW, create
+    // stop event, report SERVICE_RUNNING — must complete in < 1 s so SCM
+    // unblocks winlogon's Welcome → desktop transition. Phase 2 (this
+    // thread): all Impl::Initialize + Impl::Start work, including kernel
+    // filter port connect, ThreatIntel feed warm-up, ETW consumer, etc.
+    // Failure inside Phase 2 signals m_stopEvent and transitions SCM to
+    // STOPPED; success leaves the service in SERVICE_RUNNING.
+    HANDLE m_bootInitThread{ nullptr };
+    std::atomic<bool> m_bootInitComplete{ false };
+
     static std::atomic<bool> s_instanceCreated;
 };
 
