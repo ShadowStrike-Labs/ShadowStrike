@@ -439,6 +439,7 @@ public:
 
 private:
     mutable std::shared_mutex m_mutex;
+    mutable std::shared_mutex m_componentStatusMutex; ///< Exclusively guards m_componentStatuses. Split from m_mutex so high-frequency UpdateComponentStatus calls never contend with the heavy m_mutex held by ProtectCodeSection / SendHeartbeat / WatchdogThreadFunc / process-registry mutations. The earlier single-mutex design produced a confirmed start-up deadlock between the Initialize thread and the just-spawned watchdog (see service_hang.dmp triage).
     mutable std::shared_mutex m_callbackMutex;
     mutable std::shared_mutex m_historyMutex;
 
@@ -785,7 +786,16 @@ void SelfDefenseImpl::NotifyStatusCallbacks(ProtectionComponent comp, ComponentH
 
 void SelfDefenseImpl::UpdateComponentStatus(ProtectionComponent comp, bool active,
                                             ComponentHealth health, const std::string& error) {
-    std::unique_lock lock(m_mutex);
+    // Dedicated mutex (m_componentStatusMutex) — never m_mutex. UpdateComponentStatus
+    // is called from many callers that already hold m_mutex exclusively
+    // (ProtectProcess, ProtectFile, ProtectRegistryKey, ProtectService,
+    //  ProtectCodeSection, StartWatchdog, WatchdogThreadFunc, ...). Sharing
+    // a single shared_mutex (which is non-recursive) with those callers
+    // produced a confirmed Initialize-time deadlock: the just-spawned
+    // watchdog queued an exclusive writer on m_mutex behind the Initialize
+    // thread's ProtectCodeSection path, and any subsequent reader was
+    // blocked behind both writers indefinitely.
+    std::unique_lock lock(m_componentStatusMutex);
     auto& status = m_componentStatuses[comp];
     status.component = comp;
     status.isActive = active;
@@ -901,13 +911,16 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
     SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectServiceRegistryKeys...");
     ProtectServiceRegistryKeys();
 
-    // Start watchdog if enabled
-    if (config.enableWatchdog) {
-        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: StartWatchdog...");
-        if (!StartWatchdog()) degraded = true;
-    }
+    // Start watchdog LAST. The watchdog observes m_initialized==true and a
+    // fully-published module state before its first iteration; otherwise it
+    // could race with Initialize, queue an exclusive writer on m_mutex behind
+    // the in-progress init thread, and deadlock the service start-up.
+    // (See service_hang.dmp WinDbg verdict: Two exclusive writers contended
+    // on a non-recursive std::shared_mutex.)
 
-    // Protect code section if integrity monitoring enabled
+    // Protect code section if integrity monitoring enabled (must run BEFORE
+    // m_initialized.store(true) so any failure is folded into `degraded`
+    // before the public Initialized state goes live).
     if (config.enableIntegrityMonitoring) {
         SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: ProtectCodeSection...");
         if (!ProtectCodeSection()) degraded = true;
@@ -918,6 +931,16 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
     m_status.store(degraded ? ModuleStatus::Degraded : ModuleStatus::Running, std::memory_order_release);
     if (degraded) {
         SS_LOG_WARN(LOG_CATEGORY, L"Initialized in DEGRADED mode — some protections failed");
+    }
+
+    // Watchdog start is intentionally AFTER m_initialized.store(true) above.
+    if (config.enableWatchdog) {
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: StartWatchdog...");
+        if (!StartWatchdog()) {
+            degraded = true;
+            m_status.store(ModuleStatus::Degraded, std::memory_order_release);
+            SS_LOG_WARN(LOG_CATEGORY, L"StartWatchdog failed; module entering DEGRADED mode");
+        }
     }
 
     // Kernel bridge: sync protected processes and register alert handler
@@ -991,11 +1014,18 @@ void SelfDefenseImpl::ShutdownInternal() {
         m_protectedMemoryRegions.clear();
         m_whitelist.clear();
         m_threatResponsePolicy.clear();
-        m_componentStatuses.clear();
         m_heartbeatRecords.clear();
         m_codeSectionHash.clear();
         m_codeSectionBase = 0;
         m_codeSectionSize = 0;
+    }
+
+    // Component statuses live under their own mutex; clear separately so we
+    // never hold both m_mutex and m_componentStatusMutex on the same thread
+    // (preserves the strict lock-ordering invariant the deadlock fix relies on).
+    {
+        std::unique_lock lock(m_componentStatusMutex);
+        m_componentStatuses.clear();
     }
 
     // Clear callbacks
@@ -1931,7 +1961,7 @@ bool SelfDefenseImpl::IsServiceProtected() const {
 }
 
 ComponentStatus SelfDefenseImpl::GetServiceStatus() const {
-    std::shared_lock lock(m_mutex);
+    std::shared_lock lock(m_componentStatusMutex);
     auto it = m_componentStatuses.find(ProtectionComponent::Service);
     if (it != m_componentStatuses.end()) return it->second;
     ComponentStatus s;
@@ -1984,7 +2014,7 @@ bool SelfDefenseImpl::IsDriverProtected() const {
 }
 
 ComponentStatus SelfDefenseImpl::GetDriverStatus() const {
-    std::shared_lock lock(m_mutex);
+    std::shared_lock lock(m_componentStatusMutex);
     auto it = m_componentStatuses.find(ProtectionComponent::Driver);
     if (it != m_componentStatuses.end()) return it->second;
     ComponentStatus s;
@@ -2493,13 +2523,13 @@ bool SelfDefenseImpl::TriggerRecovery(ProtectionComponent component) {
 }
 
 ComponentHealth SelfDefenseImpl::GetComponentHealth(ProtectionComponent component) const {
-    std::shared_lock lock(m_mutex);
+    std::shared_lock lock(m_componentStatusMutex);
     auto it = m_componentStatuses.find(component);
     return (it != m_componentStatuses.end()) ? it->second.health : ComponentHealth::Unknown;
 }
 
 std::vector<ComponentStatus> SelfDefenseImpl::GetAllComponentStatuses() const {
-    std::shared_lock lock(m_mutex);
+    std::shared_lock lock(m_componentStatusMutex);
     std::vector<ComponentStatus> result;
     result.reserve(m_componentStatuses.size());
     for (const auto& [comp, status] : m_componentStatuses) {

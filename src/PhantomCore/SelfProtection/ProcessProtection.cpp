@@ -988,6 +988,48 @@ bool ProcessProtectionImpl::ProtectProcess(uint32_t processId) {
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // HARD EXCLUSION: critical OS processes are NEVER modified.
+    // ------------------------------------------------------------------
+    // ShadowStrike never opens, re-DACLs, or modifies the integrity
+    // level / token of winlogon, lsass, csrss, smss, wininit, or
+    // services.exe. Any SetSecurityInfo / SetThreadToken / WRITE_DAC /
+    // PROCESS_VM_OPERATION against these instantly destabilizes the
+    // user session — winlogon greys out, lsass fatal-errors the box,
+    // csrss tears down the session. We compare image-name (not just
+    // PID; PIDs are not stable across reboots and 4/8/etc. is a
+    // historical heuristic only) and short-circuit BEFORE any handle
+    // is opened against the target.
+    //
+    // The owned PID (this service's PID) is always allowed regardless,
+    // even though by definition it cannot match a critical OS image.
+    if (processId != GetCurrentProcessIdSafe()) {
+        static const wchar_t* const kCriticalOsImages[] = {
+            L"winlogon.exe",
+            L"lsass.exe",
+            L"csrss.exe",
+            L"smss.exe",
+            L"wininit.exe",
+            L"services.exe",
+        };
+        std::wstring targetName = GetProcessName(processId);
+        if (!targetName.empty()) {
+            std::wstring lower = targetName;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+            for (const wchar_t* critical : kCriticalOsImages) {
+                if (lower == critical) {
+                    Utils::Logger::Warn(
+                        "[ProcessProtection] REFUSED to protect critical OS "
+                        "process PID {} ({}) — modifying this process would "
+                        "destabilize the user session.",
+                        processId,
+                        Utils::StringUtils::ToNarrow(lower));
+                    return false;
+                }
+            }
+        }
+    }
+
     std::unique_lock lock(m_mutex);
 
     // Check if already protected
