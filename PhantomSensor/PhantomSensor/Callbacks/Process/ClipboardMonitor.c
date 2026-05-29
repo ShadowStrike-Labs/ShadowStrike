@@ -37,6 +37,59 @@
 #include "../../Exclusions/ExclusionManager.h"
 #include <ntstrsafe.h>
 
+// ============================================================================
+// BOOT-PHASE EARLY-BAIL HELPERS  (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// CbMonCheckProcessCreate runs inside the PsSetCreateProcessNotifyRoutineEx
+// hot path.  During boot it must NEVER scan or notify on the OS-critical
+// processes - their command lines / image names match nothing of interest
+// anyway, and any extra work amplifies the grey-screen risk window.
+//
+static FORCEINLINE BOOLEAN
+ShadowStrikeIsServiceConnected(VOID)
+{
+    return (g_DriverData.ConnectedClients > 0);
+}
+
+static const PCWSTR g_CbCriticalBootImages[] = {
+    L"\\smss.exe",      L"\\csrss.exe",  L"\\wininit.exe",
+    L"\\services.exe",  L"\\lsass.exe",  L"\\winlogon.exe",
+    L"\\userinit.exe",  L"\\explorer.exe", L"\\dwm.exe",
+    L"\\sihost.exe",    L"\\fontdrvhost.exe", L"\\LogonUI.exe",
+};
+
+static BOOLEAN
+ShadowStrikeCbIsCriticalBootImage(
+    _In_opt_ PCUNICODE_STRING ImageFileName
+    )
+{
+    ULONG i;
+    UNICODE_STRING needle;
+    UNICODE_STRING tail;
+
+    if (ImageFileName == NULL || ImageFileName->Buffer == NULL ||
+        ImageFileName->Length == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(g_CbCriticalBootImages); i++) {
+        RtlInitUnicodeString(&needle, g_CbCriticalBootImages[i]);
+        if (ImageFileName->Length < needle.Length) {
+            continue;
+        }
+        tail.Buffer = (PWCH)((PUCHAR)ImageFileName->Buffer +
+                             (ImageFileName->Length - needle.Length));
+        tail.Length = needle.Length;
+        tail.MaximumLength = needle.Length;
+        if (RtlEqualUnicodeString(&tail, &needle, TRUE)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, CbMonInitialize)
 #pragma alloc_text(PAGE, CbMonShutdown)
@@ -274,6 +327,18 @@ CbMonCheckProcessCreate(
     PAGED_CODE();
 
     if (CreateInfo == NULL) {
+        return CbIndicator_None;
+    }
+
+    //
+    // === WINLOGON GREY-SCREEN MITIGATION ===
+    // Never run command-line scanning on OS-critical boot processes, and
+    // never run during the pre-service-connection boot window.
+    //
+    if (ShadowStrikeCbIsCriticalBootImage(CreateInfo->ImageFileName)) {
+        return CbIndicator_None;
+    }
+    if (!ShadowStrikeIsServiceConnected()) {
         return CbIndicator_None;
     }
 

@@ -432,20 +432,54 @@ ScMonitorShutdown(VOID)
     KeMemoryBarrier();
 
     //
-    // Drain outstanding operations
+    // Drain outstanding operations.
     //
     KeClearEvent(&g_ScState.ShutdownEvent);
     ScpReleaseReference();
 
     //
-    // Wait INDEFINITELY for in-flight operations to drain.
-    // A timeout here would allow use-after-free when we free sub-modules
-    // and process contexts below. Under adversarial load, threads may be
-    // deep inside sub-module calls (NI reading process memory, CSA walking
-    // stacks). We MUST wait for them to finish.
+    // BUG #4 fix: previous code did an unbounded KeWaitForSingleObject with
+    // Timeout=NULL.  If any sub-module callback parks on a downed global
+    // rundown, this deadlocks the unload path forever and the OS reports a
+    // mystery hang.  We now poll with a bounded 5s timeout and after 60s of
+    // no progress trigger a controlled BugCheck — leaking is never an option
+    // for SyscallMonitor because freeing while callbacks run guarantees UAF.
     //
-    (VOID)KeWaitForSingleObject(
-        &g_ScState.ShutdownEvent, Executive, KernelMode, FALSE, NULL);
+    {
+        LARGE_INTEGER timeout;
+        ULONG attempts = 0;
+
+        for (;;) {
+            NTSTATUS waitStatus;
+
+            timeout.QuadPart = -((LONGLONG)5 * 10000000);  // 5 seconds
+            waitStatus = KeWaitForSingleObject(
+                &g_ScState.ShutdownEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                &timeout);
+
+            if (waitStatus == STATUS_SUCCESS) {
+                break;
+            }
+
+            ++attempts;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike-SC] Shutdown drain stalled: RefCount=%ld attempt=%lu/12\n",
+                ReadNoFence(&g_ScState.ReferenceCount),
+                attempts);
+
+            if (attempts >= 12) {  // 12 * 5s = 60s budget
+                KeBugCheckEx(
+                    DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                    (ULONG_PTR)ReadNoFence(&g_ScState.ReferenceCount),
+                    (ULONG_PTR)&g_ScState,
+                    (ULONG_PTR)&g_ScState.ShutdownEvent,
+                    (ULONG_PTR)0x5C0001u);  // sentinel: SC drain timeout
+            }
+        }
+    }
 
     //
     // Shutdown sub-modules in reverse initialization order

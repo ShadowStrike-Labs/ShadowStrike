@@ -1004,7 +1004,22 @@ ShadowTrackTransaction(
     transaction->Magic = SHADOW_KTM_TRANSACTION_MAGIC;
     RtlCopyMemory(&transaction->TransactionGuid, &TransactionGuid, sizeof(GUID));
     transaction->ProcessId = ProcessId;
-    transaction->ReferenceCount = 1;
+    //
+    // Initial reference count = 2:
+    //   - One reference owned by the LRU list (released by RemoveTailList paths
+    //     in ShadowEvictLruTransaction / ShadowCleanupTransactionEntries).
+    //   - One reference owned by the caller, mirroring the semantics of
+    //     ShadowFindKtmTransaction which also returns a referenced pointer.
+    //     The caller MUST call ShadowReleaseKtmTransaction exactly once.
+    //
+    // Setting this to 1 would cause a caller-side Release to drop the only
+    // reference to zero, freeing the transaction back to the lookaside list
+    // while its ListEntry is still linked into state->TransactionList.  The
+    // next allocation from the lookaside returns the same memory, RtlZeroMemory
+    // wipes the stale Flink/Blink, and the subsequent InsertHeadList sees a
+    // corrupted list and trips FAST_FAIL_CORRUPT_LIST_ENTRY (BSOD 0x139/3).
+    //
+    transaction->ReferenceCount = 2;
     transaction->RemovedFromList = FALSE;
 
     KeQuerySystemTime(&transaction->CreateTime);

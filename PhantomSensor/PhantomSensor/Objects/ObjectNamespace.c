@@ -822,6 +822,7 @@ ShadowpBuildSecurityDescriptor(
     ULONG selfRelativeSize = 0;
     SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
     SID_IDENTIFIER_AUTHORITY worldAuthority = SECURITY_WORLD_SID_AUTHORITY;
+    SID_IDENTIFIER_AUTHORITY mandatoryAuthority = SECURITY_MANDATORY_LABEL_AUTHORITY;
     PSID systemSid = NULL;
     PSID adminSid = NULL;
     PSID highILSid = NULL;
@@ -859,8 +860,16 @@ ShadowpBuildSecurityDescriptor(
         goto cleanup;
     }
 
+    //
+    // High Integrity Level SID must be built under
+    // SECURITY_MANDATORY_LABEL_AUTHORITY (16), NOT SECURITY_NT_AUTHORITY.
+    // RtlAddMandatoryAce validates the SID authority and returns
+    // STATUS_INVALID_SID (0xC0000078) when the wrong authority is used,
+    // which silently disables the mandatory-label hardening on the
+    // private namespace directory.
+    //
     status = ShadowpAllocateAndInitializeSid(
-        &ntAuthority, 1,
+        &mandatoryAuthority, 1,
         SECURITY_MANDATORY_HIGH_RID,
         0,
         &highILSid

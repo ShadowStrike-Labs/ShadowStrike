@@ -45,6 +45,9 @@
 #define BTD_MAX_PATTERN_SIZE            256
 #define BTD_HASH_SIZE                   32
 
+#define BTD_PATTERN_FLAG_NONE                  0x00000000UL
+#define BTD_PATTERN_FLAG_SUPPRESS_FOR_MS_INBOX 0x00000001UL
+
 // Severity score thresholds
 #define BTD_SEVERITY_LOW_THRESHOLD      25
 #define BTD_SEVERITY_MEDIUM_THRESHOLD   50
@@ -100,6 +103,7 @@ typedef struct _BTD_PATTERN_ENTRY {
     BTD_THREAT_TYPE ThreatType;
     CHAR ThreatName[64];
     ULONG SeverityScore;
+    ULONG Flags;
     LIST_ENTRY ListEntry;
 } BTD_PATTERN_ENTRY, *PBTD_PATTERN_ENTRY;
 
@@ -206,6 +210,7 @@ typedef struct _BTD_EMBEDDED_PATTERN {
     BTD_THREAT_TYPE Type;
     const CHAR* ThreatName;
     ULONG Severity;
+    ULONG Flags;
 } BTD_EMBEDDED_PATTERN;
 
 // Common bootkit/rootkit byte patterns
@@ -220,30 +225,30 @@ static const UCHAR g_Pattern_Callback_Remove[] = { 0x48, 0x8B, 0xCB, 0xE8, 0x00,
 
 static const BTD_EMBEDDED_PATTERN g_EmbeddedPatterns[] = {
     { g_Pattern_MBR_Overwrite, sizeof(g_Pattern_MBR_Overwrite),
-      BtdThreat_Bootkit, "MBR Overwrite Pattern", 95 },
+      BtdThreat_Bootkit, "MBR Overwrite Pattern", 95, BTD_PATTERN_FLAG_NONE },
 
     { g_Pattern_Int13Hook, sizeof(g_Pattern_Int13Hook),
-      BtdThreat_Bootkit, "BIOS Int13 Hook", 90 },
+      BtdThreat_Bootkit, "BIOS Int13 Hook", 90, BTD_PATTERN_FLAG_NONE },
 
     { g_Pattern_KernelPatch, sizeof(g_Pattern_KernelPatch),
-      BtdThreat_Rootkit, "Kernel Memory Patch", 85 },
+      BtdThreat_Rootkit, "Kernel Memory Patch", 85, BTD_PATTERN_FLAG_SUPPRESS_FOR_MS_INBOX },
 
     { g_Pattern_SSDT_Hook, sizeof(g_Pattern_SSDT_Hook),
-      BtdThreat_Rootkit, "SSDT Hook Pattern", 90 },
+      BtdThreat_Rootkit, "SSDT Hook Pattern", 90, BTD_PATTERN_FLAG_NONE },
 
     { g_Pattern_IDT_Hook, sizeof(g_Pattern_IDT_Hook),
-      BtdThreat_Rootkit, "IDT Hook Pattern", 90 },
+      BtdThreat_Rootkit, "IDT Hook Pattern", 90, BTD_PATTERN_FLAG_NONE },
 
     { g_Pattern_DKOM, sizeof(g_Pattern_DKOM),
-      BtdThreat_Rootkit, "DKOM Pattern", 85 },
+      BtdThreat_Rootkit, "DKOM Pattern", 85, BTD_PATTERN_FLAG_NONE },
 
     { g_Pattern_InlineHook, sizeof(g_Pattern_InlineHook),
-      BtdThreat_Rootkit, "Inline Hook Trampoline", 80 },
+      BtdThreat_Rootkit, "Inline Hook Trampoline", 80, BTD_PATTERN_FLAG_NONE },
 
     { g_Pattern_Callback_Remove, sizeof(g_Pattern_Callback_Remove),
-      BtdThreat_Rootkit, "Callback Removal Pattern", 85 },
+      BtdThreat_Rootkit, "Callback Removal Pattern", 85, BTD_PATTERN_FLAG_NONE },
 
-    { NULL, 0, BtdThreat_None, NULL, 0 }
+    { NULL, 0, BtdThreat_None, NULL, 0, BTD_PATTERN_FLAG_NONE }
 };
 
 // ============================================================================
@@ -268,6 +273,11 @@ BtdpMatchPattern(
     _In_ SIZE_T PatternSize,
     _In_ ULONG PatternOffset,
     _Out_opt_ PULONG MatchOffset
+    );
+
+static BOOLEAN
+BtdpIsMicrosoftInboxDriver(
+    _In_ PBDV_DRIVER_INFO DriverInfo
     );
 
 static NTSTATUS
@@ -423,6 +433,68 @@ BtdpMatchPattern(
     }
 
     return FALSE;
+}
+
+static BOOLEAN
+BtdpUnicodeContainsLiteralCi(
+    _In_ PCUNICODE_STRING Value,
+    _In_z_ PCWSTR Needle
+    )
+{
+    SIZE_T needleCch = 0;
+    SIZE_T valueCch;
+    SIZE_T i;
+    SIZE_T j;
+
+    if (Value == NULL || Value->Buffer == NULL || Value->Length == 0 || Needle == NULL) {
+        return FALSE;
+    }
+
+    while (Needle[needleCch] != UNICODE_NULL) {
+        needleCch++;
+        if (needleCch > 128) {
+            return FALSE;
+        }
+    }
+
+    if (needleCch == 0 || (Value->Length % sizeof(WCHAR)) != 0) {
+        return FALSE;
+    }
+
+    valueCch = Value->Length / sizeof(WCHAR);
+    if (valueCch < needleCch) {
+        return FALSE;
+    }
+
+    for (i = 0; i <= valueCch - needleCch; i++) {
+        for (j = 0; j < needleCch; j++) {
+            if (RtlUpcaseUnicodeChar(Value->Buffer[i + j]) !=
+                RtlUpcaseUnicodeChar(Needle[j])) {
+                break;
+            }
+        }
+
+        if (j == needleCch) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN
+BtdpIsMicrosoftInboxDriver(
+    _In_ PBDV_DRIVER_INFO DriverInfo
+    )
+{
+    if (DriverInfo == NULL || !DriverInfo->IsMicrosoftSigned) {
+        return FALSE;
+    }
+
+    return BtdpUnicodeContainsLiteralCi(&DriverInfo->DriverPath,
+                                        L"\\SystemRoot\\System32\\drivers\\") ||
+           BtdpUnicodeContainsLiteralCi(&DriverInfo->DriverPath,
+                                        L"\\Windows\\System32\\drivers\\");
 }
 
 /**
@@ -634,6 +706,7 @@ BtdpLoadEmbeddedPatterns(
         entry->PatternLength = g_EmbeddedPatterns[i].PatternLength;
         entry->ThreatType = g_EmbeddedPatterns[i].Type;
         entry->SeverityScore = g_EmbeddedPatterns[i].Severity;
+        entry->Flags = g_EmbeddedPatterns[i].Flags;
 
         RtlStringCbCopyA(entry->ThreatName, sizeof(entry->ThreatName),
                         g_EmbeddedPatterns[i].ThreatName);
@@ -902,6 +975,7 @@ BtdScanDriver(
     CHAR matchedThreatName[64] = {0};
     ULONG matchedSeverity = 0;
     ULONG matchedOffset = 0;
+    BOOLEAN isMicrosoftInboxDriver = FALSE;
 
     if (Detector == NULL ||
         !InterlockedCompareExchange(&Detector->Initialized, 1, 1) ||
@@ -913,6 +987,14 @@ BtdScanDriver(
     *Threat = NULL;
 
     InterlockedIncrement64(&Detector->Stats.ScansPerformed);
+    __try {
+        isMicrosoftInboxDriver = BtdpIsMicrosoftInboxDriver(DriverInfo);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        isMicrosoftInboxDriver = FALSE;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/BTD] Exception 0x%08X while validating Microsoft inbox driver path\n",
+            GetExceptionCode());
+    }
 
     //
     // Phase 1: BYOVD hash lookup (fast path)
@@ -999,6 +1081,11 @@ BtdScanDriver(
 
                 patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
 
+                if (((patternEntry->Flags & BTD_PATTERN_FLAG_SUPPRESS_FOR_MS_INBOX) != 0) &&
+                    isMicrosoftInboxDriver) {
+                    continue;
+                }
+
                 if (BtdpMatchPattern(
                         (const UCHAR*)ImageBase,
                         ImageSize,
@@ -1026,6 +1113,11 @@ BtdScanDriver(
                      entry = entry->Flink) {
 
                     patternEntry = CONTAINING_RECORD(entry, BTD_PATTERN_ENTRY, ListEntry);
+
+                    if (((patternEntry->Flags & BTD_PATTERN_FLAG_SUPPRESS_FOR_MS_INBOX) != 0) &&
+                        isMicrosoftInboxDriver) {
+                        continue;
+                    }
 
                     if (BtdpMatchPattern(
                             (const UCHAR*)ImageBase,

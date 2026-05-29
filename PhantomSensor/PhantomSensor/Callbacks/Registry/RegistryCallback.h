@@ -668,7 +668,9 @@ BOOLEAN
 ShadowStrikeDetectRansomwareRegistryBehavior(
     _In_ PCUNICODE_STRING KeyPath,
     _In_opt_ PCUNICODE_STRING ValueName,
-    _In_ SHADOWSTRIKE_REG_OPERATION Operation
+    _In_ SHADOWSTRIKE_REG_OPERATION Operation,
+    _In_opt_ PVOID Data,
+    _In_ ULONG DataSize
     );
 
 /**

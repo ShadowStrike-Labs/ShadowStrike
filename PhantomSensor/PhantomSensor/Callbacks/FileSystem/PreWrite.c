@@ -788,6 +788,8 @@ Return Value:
 
     *CompletionContext = NULL;
 
+    SHADOW_FS_BOOT_TRACE("PreWrite", "enter");
+
     InterlockedIncrement64(&g_PwState.Stats.TotalPreWriteCalls);
 
     //
@@ -904,6 +906,26 @@ Return Value:
 
             goto Cleanup;
         }
+    }
+
+    //
+    // ====================================================================
+    // BOOT-PHASE HARDENING (winlogon grey-screen mitigation)
+    // ====================================================================
+    //
+    // Boot-time writes are dominated by hive-load / paging activity that
+    // we are not interested in. Heavy analysis below (entropy scan,
+    // ransomware correlation, canary checks, behavior submissions) touches
+    // push locks and lookaside lists that may not be fully wired yet
+    // during boot. Self-protection above has already run; degrade the
+    // rest of the callback to a no-op for the boot window.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PreWrite", "skip-boot-phase");
+        FltReleaseFileNameInformation(NameInfo);
+        NameInfo = NULL;
+        PwpLeaveOperation();
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     // =========================================================================

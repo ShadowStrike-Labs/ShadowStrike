@@ -80,6 +80,74 @@ static const WCHAR* g_SensitiveServiceValues[] = {
 };
 
 // ============================================================================
+// DEFERRED IMAGE-LOAD RING BUFFER
+// ============================================================================
+//
+// PsSetLoadImageNotifyRoutine callbacks fire during the absolute earliest
+// boot window for EVERY kernel image load. The callback runs at
+// PASSIVE_LEVEL but it executes inline in the loading thread's context —
+// the load does not complete until the callback returns. Performing
+// synchronous SHA-256 hashing, Authenticode verification, and signature
+// database lookups inside this routine (as the v1.0.13.0 implementation
+// did) accumulates seconds of latency across boot-start drivers and
+// has been observed to delay smss/csrss/winlogon to the point of a
+// permanent grey Welcome screen on slow VMs.
+//
+// The fix: the callback NEVER blocks. It atomically copies a minimal,
+// fixed-size record into a non-paged ring buffer (no heap allocation in
+// the callback itself, no IPC, no global lock contention) and returns.
+// A dedicated system worker thread, started from ElamDriverInitialize,
+// dequeues entries and performs the full BdvVerifyDriver/BtdScanDriver
+// classification at its leisure. If the ring overflows under boot
+// pressure we drop and count — the kernel must not block boot to
+// observe a load.
+//
+
+#define ELAM_RING_SLOTS                  256u    // Power-of-two-ish, ~256 KB total
+#define ELAM_RING_NAME_CHARS             260u    // MAX_PATH-equivalent, fits all sane driver paths
+#define ELAM_RING_DRAIN_WAIT_MS          5000u   // Bounded wait during shutdown drain
+
+typedef struct _ELAM_IMAGE_LOAD_RECORD {
+    HANDLE   ProcessId;
+    PVOID    ImageBase;
+    SIZE_T   ImageSize;
+    BOOLEAN  SystemModeImage;
+    USHORT   ImageNameByteLength;                // bytes, not chars; may be 0
+    WCHAR    ImageName[ELAM_RING_NAME_CHARS];    // not necessarily NUL-terminated
+} ELAM_IMAGE_LOAD_RECORD, *PELAM_IMAGE_LOAD_RECORD;
+
+typedef struct _ELAM_IMAGE_RING {
+    KSPIN_LOCK Lock;                             // guards Head/Tail/Count
+    KEVENT     WakeEvent;                        // signalled when an entry is enqueued or stopping
+    LONG       Head;                             // next free slot (producer)
+    LONG       Tail;                             // next slot to drain (consumer)
+    LONG       Count;                            // currently-occupied slots
+    volatile LONG Dropped;                       // total records lost to overflow
+    volatile LONG Drained;                       // total records consumed by worker
+    volatile LONG Stop;                          // worker exit signal
+    PETHREAD   DrainThread;
+    ELAM_IMAGE_LOAD_RECORD Slots[ELAM_RING_SLOTS];
+} ELAM_IMAGE_RING, *PELAM_IMAGE_RING;
+
+static ELAM_IMAGE_RING* g_ImageRing = NULL;
+
+static VOID
+ElampDrainImageQueue(
+    _In_ PELAM_IMAGE_LOAD_RECORD Record
+    );
+
+static VOID
+ElampImageDrainWorker(
+    _In_ PVOID Context
+    );
+
+static NTSTATUS
+ElampImageRingStart(VOID);
+
+static VOID
+ElampImageRingStop(VOID);
+
+// ============================================================================
 // GLOBAL STATE
 // ============================================================================
 
@@ -253,6 +321,16 @@ ElamDriverInitialize(
     // Set default boot policy
     g_ElamGlobals.BootPolicy = ElamPolicyGoodUnknown;
 
+    // Bring the deferred image-load classification pipeline online BEFORE
+    // we publish Initialized=TRUE so the load-image callback may safely
+    // enqueue from the very first invocation.
+    status = ElampImageRingStart();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/ELAM] ElampImageRingStart failed: 0x%08X\n", status);
+        goto Cleanup;
+    }
+
     InterlockedExchange(&g_ElamGlobals.Initialized, TRUE);
 
     return STATUS_SUCCESS;
@@ -278,6 +356,12 @@ ElamDriverShutdown(VOID)
 
     // Unregister callbacks first
     ElamUnregisterCallback();
+
+    // Drain and tear down the deferred-classification ring AFTER
+    // callbacks are unregistered (so no new entries can be enqueued)
+    // but BEFORE we tear down BDV / BTD / ELCB — the drain worker
+    // depends on those subsystems for its final pass.
+    ElampImageRingStop();
 
     // Signal boot complete phase before shutdown
     if (g_ElamCallbacks != NULL) {
@@ -393,10 +477,16 @@ ElamUnregisterCallback(VOID)
 // ============================================================================
 
 /**
- * @brief Image load notification callback
+ * @brief Image load notification callback — ENQUEUE-ONLY.
  *
- * Called for every image loaded into the system.
- * We filter for kernel-mode drivers and classify them.
+ * Defensive contract for ELAM-altitude callbacks:
+ *   - No blocking, no waits, no IPC.
+ *   - No allocation larger than the stack frame.
+ *   - No acquisition of any lock not strictly required for the enqueue.
+ *
+ * The full classification path (BdvVerifyDriver / BtdScanDriver / hash
+ * lookups / ElamTakeRemediationAction) is invoked from
+ * ElampImageDrainWorker after the ring buffer is drained.
  */
 static VOID
 ElamImageLoadCallback(
@@ -405,44 +495,126 @@ ElamImageLoadCallback(
     _In_ PIMAGE_INFO ImageInfo
     )
 {
+    PELAM_IMAGE_RING ring;
+    KIRQL oldIrql;
+    LONG slotIdx;
+    PELAM_IMAGE_LOAD_RECORD slot;
+    USHORT nameBytes;
+
+    // Filter — kernel-mode images only (smss/csrss/wininit/winlogon DLL
+    // loads must not even hit the ring; they are not in scope and we
+    // never want to add a single instruction of latency to user-mode
+    // image loads).
+    if (ProcessId != NULL && ProcessId != (HANDLE)0) {
+        return;
+    }
+    if (ImageInfo == NULL || !ImageInfo->SystemModeImage) {
+        return;
+    }
+
+    ring = g_ImageRing;
+    if (ring == NULL) {
+        return;
+    }
+
+    // Only consume ring slots once the ELAM subsystem is fully initialized
+    // — otherwise the drain thread may not yet exist and we'd accumulate
+    // records that nobody processes.
+    if (!InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0)) {
+        return;
+    }
+
+    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    if (ring->Count >= (LONG)ELAM_RING_SLOTS) {
+        // Ring full — drop this record. Boot must not block on us.
+        KeReleaseSpinLock(&ring->Lock, oldIrql);
+        InterlockedIncrement(&ring->Dropped);
+        return;
+    }
+
+    slotIdx = ring->Head;
+    slot = &ring->Slots[slotIdx];
+
+    slot->ProcessId       = ProcessId;
+    slot->ImageBase       = ImageInfo->ImageBase;
+    slot->ImageSize       = ImageInfo->ImageSize;
+    slot->SystemModeImage = (BOOLEAN)(ImageInfo->SystemModeImage ? TRUE : FALSE);
+
+    nameBytes = 0;
+    if (FullImageName != NULL && FullImageName->Buffer != NULL) {
+        nameBytes = FullImageName->Length;
+        if (nameBytes > sizeof(slot->ImageName)) {
+            nameBytes = (USHORT)sizeof(slot->ImageName);
+        }
+        // Bounded stack-bounce copy. UNICODE_STRING.Buffer is guaranteed
+        // valid for the duration of the callback (caller owns it); we
+        // copy by value so subsequent drain-thread processing does not
+        // dereference caller memory.
+        if (nameBytes != 0) {
+            RtlCopyMemory(slot->ImageName, FullImageName->Buffer, nameBytes);
+        }
+    }
+    slot->ImageNameByteLength = nameBytes;
+
+    ring->Head = (slotIdx + 1) % (LONG)ELAM_RING_SLOTS;
+    ring->Count++;
+
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
+
+    // Signal the drain worker. KeSetEvent is callable at <= DISPATCH_LEVEL
+    // and PsSetLoadImageNotifyRoutine runs at PASSIVE_LEVEL, so this is
+    // unconditionally safe. IO_NO_INCREMENT — no thread priority boost.
+    KeSetEvent(&ring->WakeEvent, IO_NO_INCREMENT, FALSE);
+}
+
+// ============================================================================
+// DEFERRED CLASSIFICATION WORKER
+// ============================================================================
+
+/**
+ * @brief Perform the full ELAM classification on a queued image record.
+ *
+ * Called from ElampImageDrainWorker at PASSIVE_LEVEL with no locks held.
+ * This is where BdvVerifyDriver / BtdScanDriver / signature lookups /
+ * ElamTakeRemediationAction live — exactly the work that used to run
+ * inline in ElamImageLoadCallback and pinned boot.
+ */
+static VOID
+ElampDrainImageQueue(
+    _In_ PELAM_IMAGE_LOAD_RECORD Record
+    )
+{
     NTSTATUS status;
+    UNICODE_STRING fullImageName;
     PBDV_DRIVER_INFO driverInfo = NULL;
     PBTD_THREAT threat = NULL;
-    ELAM_BOOT_DRIVER_INFO bootInfo = {0};
+    ELAM_BOOT_DRIVER_INFO bootInfo;
     LARGE_INTEGER startTime, endTime;
     ELAM_DRIVER_CLASSIFICATION classification;
     LONGLONG elapsedMs;
 
-    // Only process kernel-mode images (ProcessId == 0 or NULL indicates kernel)
-    if (ProcessId != NULL && ProcessId != (HANDLE)0) {
+    if (Record->ImageNameByteLength == 0) {
+        return;
+    }
+    if (g_BootVerifier == NULL) {
         return;
     }
 
-    // Skip if not a driver image
-    if (!ImageInfo->SystemModeImage) {
-        return;
-    }
+    // Reconstruct UNICODE_STRING over the slot-local name copy. Length and
+    // MaximumLength are bounded by the slot size, so the rest of the
+    // pipeline is safe.
+    fullImageName.Buffer        = Record->ImageName;
+    fullImageName.Length        = Record->ImageNameByteLength;
+    fullImageName.MaximumLength = (USHORT)sizeof(Record->ImageName);
 
-    // Skip if no image name provided
-    if (FullImageName == NULL || FullImageName->Buffer == NULL) {
-        return;
-    }
-
-    // Skip if not initialized
-    if (!InterlockedCompareExchange(&g_ElamGlobals.Initialized, 0, 0) ||
-        g_BootVerifier == NULL) {
-        return;
-    }
-
-    // Record start time for performance measurement
     KeQuerySystemTimePrecise(&startTime);
 
-    // Verify the driver
     status = BdvVerifyDriver(
         g_BootVerifier,
-        FullImageName,
-        ImageInfo->ImageBase,
-        ImageInfo->ImageSize,
+        &fullImageName,
+        Record->ImageBase,
+        Record->ImageSize,
         &driverInfo
         );
 
@@ -450,29 +622,26 @@ ElamImageLoadCallback(
         InterlockedIncrement(&g_ElamGlobals.DriversUnknown);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "[ShadowStrike/ELAM] Driver verification failed for %wZ: 0x%08X\n",
-            FullImageName, status);
+            &fullImageName, status);
         return;
     }
 
-    // Scan for threats
-    status = BtdScanDriver(g_ThreatDetector, driverInfo, ImageInfo->ImageBase, ImageInfo->ImageSize, &threat);
+    status = BtdScanDriver(g_ThreatDetector, driverInfo,
+                           Record->ImageBase, Record->ImageSize, &threat);
 
-    // Build ELAM boot driver info structure
     RtlZeroMemory(&bootInfo, sizeof(ELAM_BOOT_DRIVER_INFO));
-    bootInfo.DriverPath = *FullImageName;
-    bootInfo.ImageBase = ImageInfo->ImageBase;
-    bootInfo.ImageSize = (ULONG)(min(ImageInfo->ImageSize, (SIZE_T)MAXULONG));
+    bootInfo.DriverPath = fullImageName;
+    bootInfo.ImageBase = Record->ImageBase;
+    bootInfo.ImageSize = (ULONG)(min(Record->ImageSize, (SIZE_T)MAXULONG));
     RtlCopyMemory(bootInfo.ImageHashSHA256, driverInfo->ImageHash, 32);
     RtlCopyMemory(bootInfo.AuthenticodeHashSHA256, driverInfo->AuthentiCodeHash, 32);
-    bootInfo.IsSigned = driverInfo->IsSigned;
-    bootInfo.IsSignatureValid = driverInfo->IsSigned;
+    bootInfo.IsSigned          = driverInfo->IsSigned;
+    bootInfo.IsSignatureValid  = driverInfo->IsSigned;
     bootInfo.IsMicrosoftSigned = driverInfo->IsMicrosoftSigned;
-    bootInfo.IsWHQLSigned = driverInfo->IsWhqlSigned;
+    bootInfo.IsWHQLSigned      = driverInfo->IsWhqlSigned;
 
-    // Perform final classification
     classification = ElamClassifyDriver(&bootInfo);
 
-    // Update statistics based on classification
     InterlockedIncrement(&g_ElamGlobals.DriversClassified);
 
     switch (classification) {
@@ -482,16 +651,12 @@ ElamImageLoadCallback(
 
         case ElamClassificationKnownBad:
             InterlockedIncrement(&g_ElamGlobals.DriversBad);
-
             if (threat != NULL) {
                 ElamTakeRemediationAction(threat, driverInfo);
             } else {
-                //
-                // No BTD threat but classified as bad by hash/cert â€” create one
-                //
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                     "[ShadowStrike/ELAM] KNOWN BAD driver detected: %wZ\n",
-                    FullImageName);
+                    &fullImageName);
                 InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
             }
             break;
@@ -499,30 +664,21 @@ ElamImageLoadCallback(
         case ElamClassificationUnknown:
         default:
             InterlockedIncrement(&g_ElamGlobals.DriversUnknown);
-
             if (g_ElamGlobals.BootPolicy == ElamPolicyGoodOnly) {
-                //
-                // Strict mode: unknown drivers are treated as threats
-                //
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                     "[ShadowStrike/ELAM] POLICY BLOCK (GoodOnly): unknown driver %wZ\n",
-                    FullImageName);
+                    &fullImageName);
                 InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
-
                 if (threat != NULL) {
                     threat->WasBlocked = TRUE;
-                    RtlStringCbCopyA(threat->ActionReason, sizeof(threat->ActionReason),
-                        "Blocked by GoodOnly boot policy");
+                    RtlStringCbCopyA(threat->ActionReason,
+                                     sizeof(threat->ActionReason),
+                                     "Blocked by GoodOnly boot policy");
                 }
             }
             break;
     }
 
-    //
-    // Feed classification results into the ELAMCallbacks tracking subsystem.
-    // Maps ELAM classification â†’ BDCB classification constants for the
-    // callback layer's policy engine and user notification pipeline.
-    //
     if (g_ElamCallbacks != NULL) {
         ULONG bdcbClass;
         BOOLEAN callbackAllow = TRUE;
@@ -535,45 +691,165 @@ ElamImageLoadCallback(
 
         ElcbProcessBootDriver(
             g_ElamCallbacks,
-            FullImageName,
-            NULL,               // RegistryPath not available in image load callback
-            ImageInfo->ImageBase,
-            ImageInfo->ImageSize,
+            &fullImageName,
+            NULL,
+            Record->ImageBase,
+            Record->ImageSize,
             bdcbClass,
             driverInfo->IsSigned,
             EcPhase_BeforeDriverInit,
             &callbackAllow
             );
 
-        // If the callback subsystem blocked the driver, update our stats
         if (!callbackAllow && classification != ElamClassificationKnownBad) {
             InterlockedIncrement(&g_ElamGlobals.DriversBlocked);
         }
     }
 
-    // Record elapsed time and log performance data
     KeQuerySystemTimePrecise(&endTime);
     elapsedMs = (endTime.QuadPart - startTime.QuadPart) / 10000;
 
     if (elapsedMs > ELAM_CLASSIFICATION_TIMEOUT_MS) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/ELAM] PERFORMANCE WARNING: classification of %wZ took %lld ms "
-            "(threshold=%u ms)\n",
-            FullImageName, elapsedMs, ELAM_CLASSIFICATION_TIMEOUT_MS);
+            "[ShadowStrike/ELAM] PERFORMANCE WARNING: deferred classification of %wZ "
+            "took %lld ms (threshold=%u ms)\n",
+            &fullImageName, elapsedMs, ELAM_CLASSIFICATION_TIMEOUT_MS);
     }
 
     if (g_ElamGlobals.VerboseLogging) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-            "[ShadowStrike/ELAM] Classified %wZ => %d (signed=%d) in %lld ms\n",
-            FullImageName, (int)classification, (int)bootInfo.IsSigned, elapsedMs);
+            "[ShadowStrike/ELAM] Classified %wZ => %d (signed=%d) in %lld ms (deferred)\n",
+            &fullImageName, (int)classification, (int)bootInfo.IsSigned, elapsedMs);
     }
 
-    // Release resources allocated by BDV (NOT BTD: threats stay in
-    // DetectedList so BtdGetThreats can enumerate them. BtdShutdown
-    // handles final cleanup of accumulated threats.)
     if (driverInfo != NULL) {
         BdvFreeDriverInfo(g_BootVerifier, driverInfo);
     }
+}
+
+/**
+ * @brief Drain worker — pops records from the ring and classifies them.
+ *        Runs at PASSIVE_LEVEL on a dedicated system thread.
+ */
+static VOID
+ElampImageDrainWorker(
+    _In_ PVOID Context
+    )
+{
+    PELAM_IMAGE_RING ring = (PELAM_IMAGE_RING)Context;
+    ELAM_IMAGE_LOAD_RECORD localCopy;
+    KIRQL oldIrql;
+    LONG slotIdx;
+
+    PAGED_CODE();
+
+    for (;;) {
+        // Wait for either an enqueue notification or shutdown.
+        KeWaitForSingleObject(&ring->WakeEvent, Executive, KernelMode, FALSE, NULL);
+        KeClearEvent(&ring->WakeEvent);
+
+        for (;;) {
+            // Pop one record under the spinlock.
+            KeAcquireSpinLock(&ring->Lock, &oldIrql);
+            if (ring->Count == 0) {
+                KeReleaseSpinLock(&ring->Lock, oldIrql);
+                break;
+            }
+            slotIdx = ring->Tail;
+            RtlCopyMemory(&localCopy, &ring->Slots[slotIdx], sizeof(localCopy));
+            ring->Tail = (slotIdx + 1) % (LONG)ELAM_RING_SLOTS;
+            ring->Count--;
+            KeReleaseSpinLock(&ring->Lock, oldIrql);
+
+            ElampDrainImageQueue(&localCopy);
+            InterlockedIncrement(&ring->Drained);
+        }
+
+        if (InterlockedCompareExchange(&ring->Stop, 0, 0) != 0) {
+            break;
+        }
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static NTSTATUS
+ElampImageRingStart(VOID)
+{
+    HANDLE threadHandle;
+    NTSTATUS status;
+    PELAM_IMAGE_RING ring;
+
+    ring = (PELAM_IMAGE_RING)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(ELAM_IMAGE_RING), ELAM_POOL_TAG);
+    if (ring == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(ring, sizeof(*ring));
+    KeInitializeSpinLock(&ring->Lock);
+    KeInitializeEvent(&ring->WakeEvent, NotificationEvent, FALSE);
+
+    g_ImageRing = ring;
+
+    status = PsCreateSystemThread(
+        &threadHandle,
+        THREAD_ALL_ACCESS,
+        NULL, NULL, NULL,
+        ElampImageDrainWorker,
+        ring
+        );
+    if (!NT_SUCCESS(status)) {
+        g_ImageRing = NULL;
+        ExFreePoolWithTag(ring, ELAM_POOL_TAG);
+        return status;
+    }
+
+    status = ObReferenceObjectByHandle(
+        threadHandle, THREAD_ALL_ACCESS, *PsThreadType,
+        KernelMode, (PVOID*)&ring->DrainThread, NULL);
+    ZwClose(threadHandle);
+
+    if (!NT_SUCCESS(status)) {
+        // Thread is created; ask it to stop. It will exit on first wake.
+        InterlockedExchange(&ring->Stop, 1);
+        KeSetEvent(&ring->WakeEvent, IO_NO_INCREMENT, FALSE);
+        // Without a thread reference we cannot wait synchronously; leak
+        // the ring deliberately — the kernel ELAM driver is unloaded
+        // only on system shutdown, by which point this is moot.
+        g_ImageRing = NULL;
+        return status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static VOID
+ElampImageRingStop(VOID)
+{
+    PELAM_IMAGE_RING ring = g_ImageRing;
+    LARGE_INTEGER timeout;
+
+    if (ring == NULL) {
+        return;
+    }
+
+    // Detach the ring pointer first so any in-flight callback returns
+    // without touching freed memory.
+    g_ImageRing = NULL;
+
+    InterlockedExchange(&ring->Stop, 1);
+    KeSetEvent(&ring->WakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (ring->DrainThread != NULL) {
+        // Bounded wait — we never want to wedge driver unload.
+        timeout.QuadPart = -((LONGLONG)ELAM_RING_DRAIN_WAIT_MS * 10000LL);
+        (void)KeWaitForSingleObject((PVOID)ring->DrainThread,
+                                    Executive, KernelMode, FALSE, &timeout);
+        ObDereferenceObject(ring->DrainThread);
+        ring->DrainThread = NULL;
+    }
+
+    ExFreePoolWithTag(ring, ELAM_POOL_TAG);
 }
 
 // ============================================================================

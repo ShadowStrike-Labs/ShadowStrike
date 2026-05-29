@@ -54,6 +54,18 @@
 #include "MemoryUtils.h"
 
 // ============================================================================
+// BOOT-PHASE GATE STATE
+// ============================================================================
+//
+// Definition of the boot-phase atomic flag declared in FileUtils.h. Starts
+// as 1 (boot phase active). The first pre-callback that observes the system
+// uptime to exceed SHADOW_FS_BOOT_PHASE_MS will clear this and from that
+// point on the inline guard short-circuits to FALSE for the lifetime of
+// this driver load.
+//
+volatile LONG g_ShadowFsBootPhaseActive = 1;
+
+// ============================================================================
 // ALLOC_PRAGMA - Page alignment for functions
 // ============================================================================
 

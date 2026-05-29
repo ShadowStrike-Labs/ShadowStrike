@@ -208,6 +208,86 @@ typedef struct _SHADOW_FILE_READ_CONTEXT {
 } SHADOW_FILE_READ_CONTEXT, *PSHADOW_FILE_READ_CONTEXT;
 
 // ============================================================================
+// BOOT-PHASE HARDENING (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// During Windows boot, the user-mode ShadowStrikePhantomService is either not
+// running yet or is mid-startup. Any synchronous user-mode IPC originating
+// from a filesystem pre-callback (e.g. FltSendMessage / SbSendScanRequest)
+// will block winlogon.exe / lsass.exe / userinit.exe on every system DLL load
+// and hang the system at the grey "Welcome" screen.
+//
+// Pre-callbacks MUST degrade to NON-BLOCKING no-ops for the first
+// SHADOW_FS_BOOT_PHASE_MS milliseconds of unbiased system uptime. Once the
+// boot window expires, the cached flag is cleared and subsequent calls reduce
+// to a single relaxed atomic load -- zero cost on the steady-state hot path.
+//
+// Unbiased interrupt time is used (not biased) because the boot window must
+// expire purely on active wall time, never advancing while the VM is paused.
+//
+#ifndef SHADOW_FS_BOOT_PHASE_MS
+#define SHADOW_FS_BOOT_PHASE_MS 120000ULL
+#endif
+
+//
+// Atomic gate. Defined in FileUtils.c. Starts at 1 (boot phase active);
+// flipped to 0 the first time ShadowFsIsBootPhase observes the unbiased
+// uptime to be >= SHADOW_FS_BOOT_PHASE_MS, after which the boot window is
+// permanently closed for the lifetime of this driver load.
+//
+extern volatile LONG g_ShadowFsBootPhaseActive;
+
+FORCEINLINE
+BOOLEAN
+ShadowFsIsBootPhase(
+    VOID
+    )
+{
+    LONG active;
+    ULONG64 uptime100ns;
+
+    active = ReadAcquire(&g_ShadowFsBootPhaseActive);
+    if (active == 0) {
+        return FALSE;
+    }
+
+    //
+    // KeQueryUnbiasedInterruptTime: safe at any IRQL, returns 100ns ticks of
+    // active (non-suspended) time since boot. Hot path: this is a tens-of-
+    // cycles read, no locks taken.
+    //
+    uptime100ns = KeQueryUnbiasedInterruptTime();
+    if (uptime100ns / 10000ULL >= SHADOW_FS_BOOT_PHASE_MS) {
+        //
+        // Boot window has elapsed. Latch the gate closed. Multiple racing
+        // threads may all do this -- harmless, write is idempotent and uses
+        // release semantics so the next ReadAcquire observes the close.
+        //
+        WriteRelease(&g_ShadowFsBootPhaseActive, 0);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+//
+// Conditional boot-phase trace. Emits to debugger ONLY on checked (DBG)
+// builds and ONLY while the boot window is open, so shipping builds pay
+// zero cost and steady-state ops never log.
+//
+#if DBG
+#define SHADOW_FS_BOOT_TRACE(tag, evt)                                          \
+    do {                                                                        \
+        if (ShadowFsIsBootPhase()) {                                            \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,                   \
+                       "[ShadowStrike-BootFS] " tag ": " evt "\n");             \
+        }                                                                       \
+    } while (0)
+#else
+#define SHADOW_FS_BOOT_TRACE(tag, evt) ((VOID)0)
+#endif
+
+// ============================================================================
 // INITIALIZATION / CLEANUP
 // ============================================================================
 

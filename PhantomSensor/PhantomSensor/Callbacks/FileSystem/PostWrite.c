@@ -72,6 +72,7 @@
 #include "../../ETW/ETWProvider.h"
 #include "../../ETW/TelemetryEvents.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Utilities/FileUtils.h"
 
 //
 // WPP Tracing - conditionally include if available
@@ -695,6 +696,15 @@ ShadowStrikePostWrite(
     // fields (push locks, hash table) before READY would be unsafe.
     //
     if (!SHADOWSTRIKE_IS_READY()) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    //
+    // BOOT-PHASE HARDENING: avoid lazy-init + lookaside allocations and
+    // entropy / behavior work during the winlogon grey-screen window.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PostWrite", "skip-boot-phase");
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 

@@ -880,10 +880,13 @@ ShadowStrikePreSetInformation(
     //
     *CompletionContext = NULL;
 
+    SHADOW_FS_BOOT_TRACE("PreSetInfo", "enter");
+
     //
     // Fast path: Check if driver is ready
     //
     if (!SHADOWSTRIKE_IS_READY()) {
+        SHADOW_FS_BOOT_TRACE("PreSetInfo", "skip-not-ready");
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -894,6 +897,34 @@ ShadowStrikePreSetInformation(
         if (PsipIsInitialized()) {
             InterlockedIncrement64(&g_PsiState.Stats.KernelModeSkips);
         }
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    // Fast path: Skip paging I/O. SetInformation paths used by the cache
+    // manager (e.g. EOF updates during paging writes) must not be filtered
+    // -- doing so deadlocks boot under memory pressure.
+    //
+    if (Data->Iopb != NULL &&
+        (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO) ||
+         FlagOn(Data->Iopb->IrpFlags, IRP_SYNCHRONOUS_PAGING_IO))) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    // ====================================================================
+    // BOOT-PHASE HARDENING (winlogon grey-screen mitigation)
+    // ====================================================================
+    //
+    // SetInformation during boot is dominated by trusted system-process
+    // SetEndOfFile / SetBasicInformation calls. Heavy work below (process
+    // context table, behavior engine, telemetry events, KTM tracking)
+    // touches subsystems that may not be fully wired during boot. Skip
+    // for the boot window; self-protection on opens (PreCreate) already
+    // gates tampering before SetInformation can run.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PreSetInfo", "skip-boot-phase");
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 

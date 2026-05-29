@@ -946,17 +946,44 @@ BeEngineShutdown(
     KeSetEvent(&g_BeState.WorkerWakeEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Wait for worker thread to exit
+    // Wait for worker thread to exit.
+    //
+    // BUG #6 fix: proceeding to free state while the worker is still alive is
+    // a guaranteed UAF.  The worker contends ERESOURCEs with PreAcquireSection
+    // and other callbacks, so a hang here indicates a deadlock we cannot
+    // recover from.  We escalate to a controlled BugCheck rather than silently
+    // freeing live state.  We give the worker a generous 30s — significantly
+    // more than any legitimate path — before declaring a hang.
     //
     if (g_BeState.WorkerThread != NULL) {
-        timeout.QuadPart = -100000000;  // 10 seconds
-        KeWaitForSingleObject(
+        NTSTATUS waitStatus;
+
+        timeout.QuadPart = -((LONGLONG)30 * 10000000);  // 30 seconds
+        waitStatus = KeWaitForSingleObject(
             g_BeState.WorkerThread,
             Executive,
             KernelMode,
             FALSE,
             &timeout
             );
+
+        if (waitStatus != STATUS_SUCCESS) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike-BE] CRITICAL: worker thread did not exit within 30s "
+                "(waitStatus=0x%08X, PendingEvents=%lu, ActiveChains=%lu) — "
+                "controlled BugCheck instead of UAF\n",
+                waitStatus,
+                g_BeState.PendingEventCount,
+                g_BeState.ActiveChainCount);
+
+            KeBugCheckEx(
+                DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                (ULONG_PTR)0xBE000001u,                       // sentinel: BE worker hang
+                (ULONG_PTR)g_BeState.WorkerThread,
+                (ULONG_PTR)waitStatus,
+                (ULONG_PTR)&g_BeState
+                );
+        }
 
         ObDereferenceObject(g_BeState.WorkerThread);
         g_BeState.WorkerThread = NULL;
@@ -1146,6 +1173,16 @@ BeEngineSubmitEvent(
             *Response = BehaviorResponse_Allow;
         }
         return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Boot-grace: never block the calling thread during driver boot phase.
+    // A blocking event submission can stall winlogon/lsass/csrss while the
+    // user-mode service is still spinning up. Drop to non-blocking; verdict
+    // defaults to Allow further down.
+    //
+    if (ShadowStrikeInBootGrace()) {
+        IsBlocking = FALSE;
     }
 
     //

@@ -160,6 +160,93 @@ static VOID PnpCleanupStaleContexts(VOID);
 // INTERNAL CONSTANTS
 // ============================================================================
 
+// ============================================================================
+// BOOT-PHASE EARLY-BAIL HELPERS  (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// Cold-boot ordering: smss -> csrss -> wininit -> services -> lsass ->
+// winlogon -> userinit -> explorer -> dwm/sihost/fontdrvhost/LogonUI.
+// Our user-mode service is started by the SCM AFTER services.exe is up;
+// the FilterPort connection is therefore unavailable when the OS critical
+// processes are being created.  Any synchronous IPC, blocking allocation,
+// or per-callback heavy work performed in this window stalls boot and is
+// observable as the Welcome-screen grey-out (winlogon stuck).
+//
+// These helpers provide a zero-allocation, zero-lock fast path that allows
+// the callback to complete in microseconds during early boot:
+//
+//   1. ShadowStrikeIsServiceConnected()      - user-mode service is up
+//   2. ShadowStrikeIsCriticalBootImageName() - target is an OS-critical exe
+//
+// Callbacks bail unconditionally when (1) is false and when (2) matches,
+// emitting only the minimum bookkeeping that does not perform IPC.
+//
+static FORCEINLINE BOOLEAN
+ShadowStrikeIsServiceConnected(VOID)
+{
+    // Mirrors SHADOWSTRIKE_USER_MODE_CONNECTED() in Globals.h.  Volatile
+    // read is sufficient - publication is performed under
+    // g_DriverData.ClientPortLock by ShadowStrikeConnectNotify().
+    return (g_DriverData.ConnectedClients > 0);
+}
+
+static const PCWSTR g_ShadowStrikeCriticalBootImages[] = {
+    L"\\smss.exe",
+    L"\\csrss.exe",
+    L"\\wininit.exe",
+    L"\\services.exe",
+    L"\\lsass.exe",
+    L"\\winlogon.exe",
+    L"\\userinit.exe",
+    L"\\explorer.exe",
+    L"\\dwm.exe",
+    L"\\sihost.exe",
+    L"\\fontdrvhost.exe",
+    L"\\LogonUI.exe",
+    L"\\Registry",         // System Registry process (Win10 1903+)
+    L"\\MemCompression",   // Memory compression system process
+};
+
+static BOOLEAN
+ShadowStrikeIsCriticalBootImageName(
+    _In_opt_ PCUNICODE_STRING ImageFileName
+    )
+/*++
+Routine Description:
+    Returns TRUE if the supplied NT path ends with the basename of one of
+    the documented OS-critical boot processes.  Case-insensitive suffix
+    match against a fixed list - no allocation, no locks, < 200 ns.
+--*/
+{
+    ULONG i;
+    UNICODE_STRING needle;
+    UNICODE_STRING tail;
+
+    if (ImageFileName == NULL ||
+        ImageFileName->Buffer == NULL ||
+        ImageFileName->Length == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(g_ShadowStrikeCriticalBootImages); i++) {
+        RtlInitUnicodeString(&needle, g_ShadowStrikeCriticalBootImages[i]);
+        if (ImageFileName->Length < needle.Length) {
+            continue;
+        }
+
+        tail.Buffer = (PWCH)((PUCHAR)ImageFileName->Buffer +
+                             (ImageFileName->Length - needle.Length));
+        tail.Length = needle.Length;
+        tail.MaximumLength = needle.Length;
+
+        if (RtlEqualUnicodeString(&tail, &needle, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 #define PN_POOL_TAG                     'TNPP'  // PPNT reversed
 #define PN_CONTEXT_POOL_TAG             'xCNP'  // PNCx
 #define PN_WORK_ITEM_TAG                'WKNP'  // PNWK
@@ -1043,6 +1130,43 @@ Arguments:
     }
 
     //
+    // === WINLOGON GREY-SCREEN MITIGATION (BOOT-PHASE EARLY BAIL) ===
+    //
+    // 1) Critical-OS-process fast path: smss/csrss/wininit/services/lsass/
+    //    winlogon/userinit/explorer/dwm/sihost/fontdrvhost/LogonUI MUST
+    //    start instantly.  We perform zero work, take no locks, allocate
+    //    no memory, and never call into BehaviorEngine/CommPort for these.
+    //    Termination (CreateInfo == NULL) is also fast-pathed: BehaviorEngine
+    //    has no state for these PIDs because we skipped Create, so calling
+    //    BeEngineProcessTerminate would only churn its hash table.
+    //
+    if (IsCreation && CreateInfo != NULL &&
+        ShadowStrikeIsCriticalBootImageName(CreateInfo->ImageFileName)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/ProcessNotify] CRITICAL-BOOT skip create PID=%lu\n",
+            HandleToULong(ProcessId));
+        InterlockedIncrement64(&g_ProcessMonitor.Stats.ProcessCreations);
+        SHADOWSTRIKE_INC_STAT(TotalProcessCreations);
+        return;
+    }
+
+    //
+    // 2) Service-not-connected fast path: during cold boot the user-mode
+    //    PhantomService is not yet started, so any FilterPort IPC would
+    //    block forever.  Drop the event - the throttle/exclusion engines
+    //    will re-baseline as soon as the service connects.
+    //
+    if (!ShadowStrikeIsServiceConnected()) {
+        if (IsCreation) {
+            InterlockedIncrement64(&g_ProcessMonitor.Stats.ProcessCreations);
+            SHADOWSTRIKE_INC_STAT(TotalProcessCreations);
+        } else {
+            InterlockedIncrement64(&g_ProcessMonitor.Stats.ProcessTerminations);
+        }
+        return;
+    }
+
+    //
     // Always increment raw statistics (even if not processing)
     //
     if (IsCreation) {
@@ -1068,9 +1192,9 @@ Arguments:
     }
 
     //
-    // Enter operation tracking via rundown protection
+    // Enter operation tracking via rundown protection (Process-class counter).
     //
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN_PROCESS()) {
         return;
     }
 
@@ -2243,7 +2367,7 @@ Cleanup:
 
     SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
                      SsPmMetric_CallbackLatencyUs, proc);
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
+    SHADOWSTRIKE_RELEASE_RUNDOWN_PROCESS();
 }
 
 

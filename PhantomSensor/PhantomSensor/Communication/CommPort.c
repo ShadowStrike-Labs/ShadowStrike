@@ -47,6 +47,7 @@
 #include "../../Shared/MessageTypes.h"
 #include "../../Shared/ErrorCodes.h"
 #include "../Context/InstanceContext.h"
+#include "../Utilities/FileUtils.h"
 
 //
 // PsGetProcessInheritedFromUniqueProcessId â€” exported by ntoskrnl.exe
@@ -119,8 +120,24 @@ static PENC_KEY g_ClientSessionEncKeys[SHADOWSTRIKE_MAX_CONNECTIONS];
 #define SHADOWSTRIKE_HMAC_KEY_SIZE     32
 #define SHADOWSTRIKE_HMAC_OUTPUT_SIZE  32
 
-static UCHAR   g_CommHmacKey[SHADOWSTRIKE_HMAC_KEY_SIZE] = {0};
-static BOOLEAN  g_CommHmacKeyReady = FALSE;
+static UCHAR g_CommHmacKey[SHADOWSTRIKE_HMAC_KEY_SIZE] = {0};
+static volatile LONG g_CommHmacKeyReady = 0;
+
+static __forceinline BOOLEAN
+ShadowStrikeIsCommHmacKeyReady(
+    VOID
+    )
+{
+    return (InterlockedCompareExchange(&g_CommHmacKeyReady, 0, 0) != 0);
+}
+
+static __forceinline VOID
+ShadowStrikeSetCommHmacKeyReady(
+    _In_ BOOLEAN Ready
+    )
+{
+    InterlockedExchange(&g_CommHmacKeyReady, Ready ? 1 : 0);
+}
 
 // ============================================================================
 // INTERNAL HELPER DECLARATIONS
@@ -510,45 +527,184 @@ ShadowStrikeCreateCommunicationPort(
     // Generate per-boot HMAC transport key BEFORE creating the port.
     //
     // SECURITY: FltCreateCommunicationPort publishes the port atomically;
-    // a connecting client could fire ConnectNotify (and produce its first
-    // send) before we finished generating the key — that would leave the
-    // initial messages without HMAC authentication.  Generating the key
-    // before port publication closes that window. Non-fatal on RNG failure
-    // (HMAC is then gracefully skipped, matching the documented contract).
+    // a connecting client could fire ConnectNotify immediately after the port
+    // becomes visible. Seed the mandatory transport secret first using the
+    // encryption manager's already-open RNG provider. If early-boot CNG is not
+    // ready yet, ConnectNotify will retry seeding and fail closed with
+    // STATUS_DEVICE_NOT_READY until strong randomness is available.
     //
     {
-        NTSTATUS keyStatus = BCryptGenRandom(
-            NULL,
-            g_CommHmacKey,
-            SHADOWSTRIKE_HMAC_KEY_SIZE,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG
-        );
+        PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
+        NTSTATUS keyStatus = (encMgr != NULL) ?
+            EncRandomBytes(encMgr, g_CommHmacKey, SHADOWSTRIKE_HMAC_KEY_SIZE) :
+            STATUS_DEVICE_NOT_READY;
+
         if (NT_SUCCESS(keyStatus)) {
-            g_CommHmacKeyReady = TRUE;
+            ShadowStrikeSetCommHmacKeyReady(TRUE);
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                        "[ShadowStrike] HMAC transport key generated\n");
         } else {
-            g_CommHmacKeyReady = FALSE;
+            ShadowStrikeSetCommHmacKeyReady(FALSE);
             RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] HMAC key generation failed (0x%08X) — "
-                       "transport HMAC will be skipped\n", keyStatus);
+                       "[ShadowStrike] HMAC key generation deferred (0x%08X) — "
+                       "mandatory encryption will reject clients until reseeded\n",
+                       keyStatus);
         }
     }
 
     //
-    // Create security descriptor that allows admin access only
+    // Build explicit, audit-grade security descriptor for the filter port.
     //
-    status = FltBuildDefaultSecurityDescriptor(
-        &securityDescriptor,
-        FLT_PORT_ALL_ACCESS
-    );
+    // Trustees:
+    //   - NT AUTHORITY\SYSTEM (S-1-5-18)        -> FLT_PORT_ALL_ACCESS (service)
+    //   - BUILTIN\Administrators (S-1-5-32-544) -> FLT_PORT_CONNECT    (diag tools)
+    //
+    // We do NOT use FltBuildDefaultSecurityDescriptor: its trustee set is
+    // implementation-defined and not auditable from a security-descriptor
+    // dump. Concretely building the DACL gives us a self-relative SD that
+    // a `!sd` in WinDbg (or an SDDL audit) reads exactly as the trustees
+    // we intend, immune to WDK behavior drift across versions.
+    //
+    // No Everyone-allow ACE is added: any token that is neither SYSTEM nor
+    // a member of Administrators is therefore implicitly denied by the
+    // standard NT access-check default-deny semantics. We deliberately do
+    // NOT add an Everyone-deny ACE: canonical ACL ordering places DENY
+    // ACEs before ALLOW ACEs, which would also deny SYSTEM/Admins
+    // (transitive members of Everyone).
+    //
+    {
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        PSID    systemSid = NULL;
+        PSID    adminsSid = NULL;
+        PACL    dacl      = NULL;
+        ULONG   daclSize  = 0;
+        ULONG   selfRelSize = 0;
+        SECURITY_DESCRIPTOR absoluteSd;
 
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] FltBuildDefaultSecurityDescriptor failed: 0x%08X\n",
-                   status);
-        return status;
+        securityDescriptor = NULL;
+
+        //
+        // Build LocalSystem SID (1 sub-authority).
+        //
+        status = CppAllocateAndInitializeSid(&ntAuth, 1,
+                                             SECURITY_LOCAL_SYSTEM_RID, &systemSid);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        //
+        // Built-in Administrators: S-1-5-32-544 (2 sub-authorities).
+        // CppAllocateAndInitializeSid only takes one sub-authority, so build
+        // it inline using the same kernel primitives.
+        //
+        {
+            ULONG sidLen = RtlLengthRequiredSid(2);
+            adminsSid = ExAllocatePool2(POOL_FLAG_PAGED, sidLen, COMMPORT_SID_POOL_TAG);
+            if (adminsSid == NULL) {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto SdCleanup;
+            }
+            status = RtlInitializeSid(adminsSid, &ntAuth, 2);
+            if (!NT_SUCCESS(status)) {
+                goto SdCleanup;
+            }
+            *RtlSubAuthoritySid(adminsSid, 0) = SECURITY_BUILTIN_DOMAIN_RID;
+            *RtlSubAuthoritySid(adminsSid, 1) = DOMAIN_ALIAS_RID_ADMINS;
+        }
+
+        //
+        // DACL size: ACL header + (ACCESS_ALLOWED_ACE - SidStart) * 2 + sizes
+        // of the two SIDs, rounded up to ULONG alignment.
+        //
+        daclSize = sizeof(ACL)
+                 + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(ULONG)) + RtlLengthSid(systemSid)
+                 + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(ULONG)) + RtlLengthSid(adminsSid);
+        daclSize = (daclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
+
+        dacl = ExAllocatePool2(POOL_FLAG_PAGED, daclSize, COMMPORT_SID_POOL_TAG);
+        if (dacl == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto SdCleanup;
+        }
+
+        status = RtlCreateAcl(dacl, daclSize, ACL_REVISION);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        //
+        // ALLOW SYSTEM all access, ALLOW Admins connect-only. No Everyone ACE.
+        //
+        status = RtlAddAccessAllowedAce(dacl, ACL_REVISION,
+                                        FLT_PORT_ALL_ACCESS, systemSid);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        status = RtlAddAccessAllowedAce(dacl, ACL_REVISION,
+                                        FLT_PORT_CONNECT, adminsSid);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        //
+        // Compose absolute SD, attach DACL, set owner to SYSTEM, then convert
+        // to self-relative form (required by OBJECT_ATTRIBUTES).
+        //
+        status = RtlCreateSecurityDescriptor(&absoluteSd,
+                                             SECURITY_DESCRIPTOR_REVISION);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        status = RtlSetDaclSecurityDescriptor(&absoluteSd, TRUE, dacl, FALSE);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        status = RtlSetOwnerSecurityDescriptor(&absoluteSd, systemSid, FALSE);
+        if (!NT_SUCCESS(status)) {
+            goto SdCleanup;
+        }
+
+        //
+        // Two-phase conversion: first ask for the required size, then
+        // allocate and convert.
+        //
+        status = RtlAbsoluteToSelfRelativeSD(&absoluteSd, NULL, &selfRelSize);
+        if (status != STATUS_BUFFER_TOO_SMALL) {
+            if (NT_SUCCESS(status)) {
+                status = STATUS_UNSUCCESSFUL;
+            }
+            goto SdCleanup;
+        }
+
+        securityDescriptor = ExAllocatePool2(POOL_FLAG_PAGED, selfRelSize,
+                                             COMMPORT_SID_POOL_TAG);
+        if (securityDescriptor == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto SdCleanup;
+        }
+
+        status = RtlAbsoluteToSelfRelativeSD(&absoluteSd,
+                                             securityDescriptor, &selfRelSize);
+
+    SdCleanup:
+        if (systemSid) ExFreePoolWithTag(systemSid, COMMPORT_SID_POOL_TAG);
+        if (adminsSid) ExFreePoolWithTag(adminsSid, COMMPORT_SID_POOL_TAG);
+        if (dacl)      ExFreePoolWithTag(dacl,      COMMPORT_SID_POOL_TAG);
+
+        if (!NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Build hardened SD failed: 0x%08X\n",
+                       status);
+            if (securityDescriptor) {
+                ExFreePoolWithTag(securityDescriptor, COMMPORT_SID_POOL_TAG);
+                securityDescriptor = NULL;
+            }
+            return status;
+        }
     }
 
     RtlInitUnicodeString(&portName, SHADOWSTRIKE_PORT_NAME);
@@ -575,7 +731,13 @@ ShadowStrikeCreateCommunicationPort(
         SHADOWSTRIKE_PORT_MAX_CONNECTIONS   // MaxConnections
     );
 
-    FltFreeSecurityDescriptor(securityDescriptor);
+    //
+    // Free the self-relative SD with the matching tag we allocated under.
+    // Note: this is NOT FltFreeSecurityDescriptor — that API is paired with
+    // FltBuildDefaultSecurityDescriptor, which we no longer use.
+    //
+    ExFreePoolWithTag(securityDescriptor, COMMPORT_SID_POOL_TAG);
+    securityDescriptor = NULL;
 
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -703,8 +865,8 @@ ShadowStrikeCloseCommunicationPort(
     //
     // Scrub HMAC key material from memory (crypto hygiene)
     //
+    ShadowStrikeSetCommHmacKeyReady(FALSE);
     RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
-    g_CommHmacKeyReady = FALSE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Communication port closed\n");
@@ -1047,8 +1209,16 @@ ShadowStrikeConnectNotify(
     //
     status = ShadowStrikeVerifyClient(clientProcessId, &capabilities, imageHash);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Client verification failed: PID=%p, status=0x%08X\n",
+        //
+        // Hard failure inside the verifier (PsLookupProcessByProcessId or
+        // SeLocateProcessImageName failed). Distinct from the "verified but
+        // minimal capabilities" denial below: this one logs the propagated
+        // NTSTATUS so post-mortem can distinguish the two ACCESS_DENIED
+        // sites observed by user-mode as a single 0x80070005.
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ConnectNotify DENY: VerifyClient hard-failed "
+                   "PID=%p status=0x%08X\n",
                    clientProcessId, status);
         return STATUS_ACCESS_DENIED;
     }
@@ -1056,10 +1226,13 @@ ShadowStrikeConnectNotify(
     //
     // Unverified clients (minimal capabilities) are denied connection.
     // Only clients that pass filename + SYSTEM token checks are allowed.
+    // ShadowStrikeVerifyClient has already emitted a precise DPFLTR_ERROR
+    // line identifying whether nameMatch or isSystem failed.
     //
     if (capabilities == (ULONG)ShadowStrikeCapMinimal) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Connection rejected: PID=%p failed verification\n",
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ConnectNotify DENY: PID=%p failed verification "
+                   "(see VerifyClient log above for nameMatch/isSystem detail)\n",
                    clientProcessId);
         return STATUS_ACCESS_DENIED;
     }
@@ -1152,44 +1325,76 @@ ShadowStrikeConnectNotify(
     //                                       the wire salt)
     //
     // Salt = random per session, Info = "ShadowStrike-KEX-v1" for domain
-    // separation.  If the per-boot secret is unavailable (RNG failure during
-    // port creation), we fall back to image-hash-only IKM rather than refuse
-    // service, but degraded operation is logged.
+    // separation. If the per-boot secret is unavailable, fail closed with
+    // STATUS_DEVICE_NOT_READY so user-mode retries instead of negotiating a
+    // weaker image-hash-only session.
     //
     {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
         BCRYPT_ALG_HANDLE hmacHandle = (encMgr != NULL) ?
             EncGetHmacAlgHandle(encMgr) : NULL;
+        BOOLEAN hmacHandleNull = (hmacHandle == NULL);
+        NTSTATUS nonceRandomStatus = STATUS_UNSUCCESSFUL;
+        NTSTATUS saltRandomStatus = STATUS_UNSUCCESSFUL;
+        NTSTATUS hmacKeySeedStatus = ShadowStrikeIsCommHmacKeyReady() ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
+        NTSTATUS hkdfStatus = STATUS_UNSUCCESSFUL;
+        NTSTATUS sessionKeyMaterialStatus = STATUS_UNSUCCESSFUL;
+        BOOLEAN sessionKeyAllZero = TRUE;
 
         //
         // Generate random salt for HKDF and nonce prefix for this session
         //
-        UCHAR hkdfSalt[32];
+        UCHAR hkdfSalt[32] = {0};
         UCHAR ikm[sizeof(imageHash) + SHADOWSTRIKE_HMAC_KEY_SIZE];
         ULONG ikmLength = sizeof(imageHash);
-        NTSTATUS keyStatus = BCryptGenRandom(
-            NULL,
-            g_ClientPortRefs[slotIndex].SessionNoncePrefix,
-            sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix),
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG
-        );
+        NTSTATUS keyStatus = STATUS_SUCCESS;
 
         RtlCopyMemory(ikm, imageHash, sizeof(imageHash));
-        if (g_CommHmacKeyReady) {
+
+        if (encMgr == NULL || hmacHandle == NULL) {
+            keyStatus = STATUS_DEVICE_NOT_READY;
+        }
+
+        if (NT_SUCCESS(keyStatus) && !ShadowStrikeIsCommHmacKeyReady()) {
+            hmacKeySeedStatus = EncRandomBytes(
+                encMgr,
+                g_CommHmacKey,
+                SHADOWSTRIKE_HMAC_KEY_SIZE
+            );
+            if (NT_SUCCESS(hmacKeySeedStatus)) {
+                ShadowStrikeSetCommHmacKeyReady(TRUE);
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                           "[ShadowStrike] HMAC transport key generated during ConnectNotify\n");
+            } else {
+                RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
+                keyStatus = STATUS_DEVICE_NOT_READY;
+            }
+        }
+
+        if (NT_SUCCESS(keyStatus) && ShadowStrikeIsCommHmacKeyReady()) {
             RtlCopyMemory(ikm + sizeof(imageHash), g_CommHmacKey,
                           SHADOWSTRIKE_HMAC_KEY_SIZE);
             ikmLength = sizeof(imageHash) + SHADOWSTRIKE_HMAC_KEY_SIZE;
+        } else if (NT_SUCCESS(keyStatus)) {
+            keyStatus = STATUS_DEVICE_NOT_READY;
         }
 
         if (NT_SUCCESS(keyStatus)) {
-            keyStatus = BCryptGenRandom(
-                NULL, hkdfSalt, sizeof(hkdfSalt),
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG
+            nonceRandomStatus = EncRandomBytes(
+                encMgr,
+                g_ClientPortRefs[slotIndex].SessionNoncePrefix,
+                sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix)
             );
+            keyStatus = nonceRandomStatus;
+        }
+
+        if (NT_SUCCESS(keyStatus)) {
+            saltRandomStatus = EncRandomBytes(encMgr, hkdfSalt, sizeof(hkdfSalt));
+            keyStatus = saltRandomStatus;
 
             if (NT_SUCCESS(keyStatus)) {
                 static const char hkdfInfo[] = "ShadowStrike-KEX-v1";
-                keyStatus = EncHkdfDerive(
+                hkdfStatus = EncHkdfDerive(
                     hmacHandle,
                     ikm, ikmLength,                 // IKM = imageHash || perBootSecret
                     hkdfSalt, sizeof(hkdfSalt),     // Salt = random
@@ -1197,11 +1402,11 @@ ShadowStrikeConnectNotify(
                     g_ClientPortRefs[slotIndex].SessionKey,
                     sizeof(g_ClientPortRefs[slotIndex].SessionKey)
                 );
+                keyStatus = hkdfStatus;
             }
         }
 
         if (NT_SUCCESS(keyStatus)) {
-            BOOLEAN sessionKeyAllZero = TRUE;
             ULONG keyByte = 0;
 
             for (keyByte = 0; keyByte < sizeof(g_ClientPortRefs[slotIndex].SessionKey); keyByte++) {
@@ -1215,7 +1420,7 @@ ShadowStrikeConnectNotify(
                 keyStatus = STATUS_ENCRYPTION_FAILED;
             } else {
                 PENC_KEY sessionCryptoKey = NULL;
-                NTSTATUS sessionKeyStatus = EncDeriveKey(
+                sessionKeyMaterialStatus = EncImportKey(
                     encMgr,
                     EncKeyType_Ephemeral,
                     EncAlgorithm_AES_256_GCM,
@@ -1224,14 +1429,14 @@ ShadowStrikeConnectNotify(
                     &sessionCryptoKey
                 );
 
-                if (NT_SUCCESS(sessionKeyStatus) && sessionCryptoKey != NULL) {
+                if (NT_SUCCESS(sessionKeyMaterialStatus) && sessionCryptoKey != NULL) {
                     g_ClientSessionEncKeys[slotIndex] = sessionCryptoKey;
                 } else {
                     if (sessionCryptoKey != NULL) {
                         ShadowStrikeReleaseSessionCryptoKey(&sessionCryptoKey);
                     }
-                    keyStatus = NT_SUCCESS(sessionKeyStatus) ? STATUS_ENCRYPTION_FAILED
-                                                             : sessionKeyStatus;
+                    keyStatus = NT_SUCCESS(sessionKeyMaterialStatus) ? STATUS_ENCRYPTION_FAILED
+                                                                     : sessionKeyMaterialStatus;
                 }
             }
         }
@@ -1242,8 +1447,8 @@ ShadowStrikeConnectNotify(
             //
             // Send key exchange message to user-mode.
             // The session key is wrapped (encrypted) using a Key-Wrapping-Key (KWK)
-            // derived from the same HKDF inputs. User-mode can derive the same KWK
-            // from its own executable hash + the salt we send here.
+            // derived from the verified executable hash + salt, matching the
+            // shared protocol and user-mode receiver.
             //
             // Build SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE with:
             //   - Salt: the HKDF salt (user-mode needs this to derive KWK)
@@ -1265,17 +1470,17 @@ ShadowStrikeConnectNotify(
             kexMsg.ProtocolFlags = SHADOWSTRIKE_KEX_PROTOCOL_FLAG_MANDATORY_ENCRYPTION;
 
             //
-            // Derive KWK (Key-Wrapping-Key) from the same dual-component IKM
-            // (imageHash || perBootSecret) used for the session key, so that
-            // a user-mode peer who can authenticate (image hash) and shares
-            // the per-boot secret out-of-band cannot be substituted by an
-            // attacker who only knows the deterministic image hash.
+            // Derive KWK (Key-Wrapping-Key) exactly as documented in the
+            // shared protocol and user-mode FilterConnection: HKDF over the
+            // verified client image hash. The random session key itself was
+            // derived above from imageHash || perBootSecret and is never sent
+            // in plaintext; KWK only protects the one-time local delivery.
             //
             UCHAR kwk[32] = {0};
             static const char kwkInfo[] = "ShadowStrike-KWK-v1";
             NTSTATUS kwkStatus = EncHkdfDerive(
                 hmacHandle,
-                ikm, ikmLength,
+                imageHash, sizeof(imageHash),
                 hkdfSalt, sizeof(hkdfSalt),
                 (PVOID)kwkInfo, sizeof(kwkInfo) - 1,
                 kwk, sizeof(kwk)
@@ -1289,7 +1494,7 @@ ShadowStrikeConnectNotify(
                 // bytes immediately after it.
                 //
                 PENC_KEY wrapKey = NULL;
-                NTSTATUS wrapKeyStatus = EncDeriveKey(
+                NTSTATUS wrapKeyStatus = EncImportKey(
                     encMgr, EncKeyType_Ephemeral, EncAlgorithm_AES_256_GCM,
                     kwk, sizeof(kwk), &wrapKey);
 
@@ -1439,11 +1644,29 @@ ShadowStrikeConnectNotify(
                 ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
             }
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Session key derivation diagnostics slot %ld: "
+                       "hmacHandleNull=%u hmacKeySeedStatus=0x%08X "
+                       "NonceRandomStatus=0x%08X BCryptGenRandomSaltStatus=0x%08X "
+                       "EncHkdfDeriveStatus=0x%08X sessionKeyAllZero=%u "
+                       "SessionKeyImportStatus=0x%08X\n",
+                       slotIndex,
+                       hmacHandleNull ? 1u : 0u,
+                       hmacKeySeedStatus,
+                       nonceRandomStatus,
+                       saltRandomStatus,
+                       hkdfStatus,
+                       sessionKeyAllZero ? 1u : 0u,
+                       sessionKeyMaterialStatus);
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] Session key derivation FAILED for slot %ld: 0x%08X "
                        "(connection rejected — encryption is mandatory)\n",
                        slotIndex, keyStatus);
 
             // Clean up slot
+            RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
+                                sizeof(g_ClientPortRefs[slotIndex].SessionKey));
+            RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
+                                sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
             RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
             g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
             RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
@@ -1451,7 +1674,7 @@ ShadowStrikeConnectNotify(
 
             ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
             KeLeaveCriticalRegion();
-            return STATUS_ENCRYPTION_FAILED;
+            return keyStatus;
         }
         RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
         RtlSecureZeroMemory(ikm, sizeof(ikm));
@@ -2501,6 +2724,23 @@ ShadowStrikeSendScanRequest(
     }
 
     //
+    // Boot-phase guards (defense-in-depth):
+    //   1. If the user-mode service has not registered any client yet, fail
+    //      fast with STATUS_PORT_DISCONNECTED instead of stalling inside
+    //      FltSendMessage with no listener.
+    //   2. During the first ~120 s of driver lifetime, hard-clamp the caller's
+    //      timeout to 250 ms so a misbehaving / slow user-mode reply cannot
+    //      stall winlogon/lsass/csrss DLL loads.
+    //
+    if (g_DriverData.ConnectedClients == 0) {
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        return STATUS_PORT_DISCONNECTED;
+    }
+    if (ShadowFsIsBootPhase() && TimeoutMs > 250) {
+        TimeoutMs = 250;
+    }
+
+    //
     // Check pending request limit before acquiring port
     //
     pendingCount = InterlockedIncrement(&g_DriverData.Stats.PendingRequests);
@@ -2583,7 +2823,7 @@ ShadowStrikeSendScanRequest(
                     // If HMAC will be applied, include the flag in the header
                     // BEFORE encryption so GCM AAD matches the on-wire header.
                     //
-                    if (g_CommHmacKeyReady) {
+                    if (ShadowStrikeIsCommHmacKeyReady()) {
                         ((PSHADOWSTRIKE_MESSAGE_HEADER)encBuf)->Flags |=
                             SHADOWSTRIKE_MSG_FLAG_HMAC;
                     }
@@ -2677,7 +2917,7 @@ ShadowStrikeSendScanRequest(
     // Use pre-opened HMAC handle via EncGetHmacAlgHandle to avoid
     // per-call BCryptOpenAlgorithmProvider overhead.
     //
-    if (g_CommHmacKeyReady) {
+    if (ShadowStrikeIsCommHmacKeyReady()) {
         ULONG authenticatedSize = sendSize + SHADOWSTRIKE_HMAC_OUTPUT_SIZE;
         PVOID authBuffer = ExAllocatePool2(
             POOL_FLAG_NON_PAGED, authenticatedSize, 'hmCP');
@@ -2784,6 +3024,16 @@ ShadowStrikeSendNotification(
 
     if (!g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
+    }
+
+    //
+    // Fast-path bail when no user-mode client has connected yet. Avoids
+    // allocating compression / encryption buffers and walking the port
+    // list during early boot before the service registers.
+    //
+    if (g_DriverData.ConnectedClients == 0) {
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        return STATUS_PORT_DISCONNECTED;
     }
 
     //
@@ -3090,6 +3340,15 @@ ShadowStrikeSendProcessNotification(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Boot-phase guard: no listener yet → fast bail. Avoids per-process
+    // boot storm hitting FltSendMessage with no client registered.
+    //
+    if (g_DriverData.ConnectedClients == 0) {
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        return STATUS_PORT_DISCONNECTED;
+    }
+
     if (!g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
     }
@@ -3295,7 +3554,11 @@ ShadowStrikeSendProcessNotification(
         }
 
         replyBufferSize = *ReplySize;
-        timeout.QuadPart = -(LONGLONG)g_DriverData.Config.ScanTimeoutMs * 10000LL;
+        {
+            ULONG _toMs = g_DriverData.Config.ScanTimeoutMs;
+            if (ShadowFsIsBootPhase() && _toMs > 250) _toMs = 250;
+            timeout.QuadPart = -(LONGLONG)_toMs * 10000LL;
+        }
 
         status = FltSendMessage(
             g_DriverData.FilterHandle,
@@ -3756,9 +4019,29 @@ ShadowStrikeBuildFileScanRequest(
 
     scanRequest->FileSize = 0;  // Set in post-create if needed
     scanRequest->FileAttributes = 0;
-    scanRequest->DesiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    scanRequest->ShareAccess = Data->Iopb->Parameters.Create.ShareAccess;
-    scanRequest->CreateOptions = Data->Iopb->Parameters.Create.Options;
+    //
+    // Create-only parameters: Data->Iopb->Parameters is a union whose
+    // SecurityContext / ShareAccess / Options members are only valid for
+    // IRP_MJ_CREATE.  When this builder is invoked from a SetInformation
+    // post-op (Delete/Rename notifications), the underlying parameter slot
+    // is SetFileInformation and the "Create" view is garbage — dereferencing
+    // SecurityContext was crashing with KMODE_EXCEPTION_NOT_HANDLED (0x3B)
+    // at a small bogus pointer.  Guard the access so the optional metadata
+    // is only filled in for genuine Create callbacks.
+    //
+    if (Data->Iopb != NULL &&
+        Data->Iopb->MajorFunction == IRP_MJ_CREATE) {
+        PIO_SECURITY_CONTEXT secCtx =
+            Data->Iopb->Parameters.Create.SecurityContext;
+        scanRequest->DesiredAccess =
+            (secCtx != NULL) ? secCtx->DesiredAccess : 0;
+        scanRequest->ShareAccess  = Data->Iopb->Parameters.Create.ShareAccess;
+        scanRequest->CreateOptions = Data->Iopb->Parameters.Create.Options;
+    } else {
+        scanRequest->DesiredAccess = 0;
+        scanRequest->ShareAccess   = 0;
+        scanRequest->CreateOptions = 0;
+    }
     scanRequest->VolumeSerial = 0;
     scanRequest->FileId = 0;
     scanRequest->IsDirectory = FALSE;
@@ -3945,13 +4228,12 @@ ShadowStrikeVerifyClient(
     NTSTATUS status;
     PEPROCESS process = NULL;
     PUNICODE_STRING imageName = NULL;
-    BOOLEAN isVerified = FALSE;
     BOOLEAN nameMatch = FALSE;
     BOOLEAN isSystem = FALSE;
     ULONG hash;
-    USHORT charCount;
-    PCWCH filename;
-    USHORT filenameLen;
+    USHORT charCount = 0;
+    PCWCH filename = NULL;
+    USHORT filenameLen = 0;
     USHORT expectedLen;
     PACCESS_TOKEN token = NULL;
     PTOKEN_USER tokenUser = NULL;
@@ -3968,75 +4250,86 @@ ShadowStrikeVerifyClient(
     RtlZeroMemory(ImageHash, 32);
 
     //
-    // Step 1: Get process object
+    // Step 1: Get process object.
     //
     status = PsLookupProcessByProcessId(ClientProcessId, &process);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] VerifyClient: PsLookupProcessByProcessId failed for PID=%p: 0x%08X\n",
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] VerifyClient[PID=%p] DENY: "
+                   "PsLookupProcessByProcessId failed 0x%08X\n",
                    ClientProcessId, status);
         return status;
     }
 
     //
-    // Step 2: Get process image name
+    // Step 2: Get process image name.
     //
     status = SeLocateProcessImageName(process, &imageName);
-    if (!NT_SUCCESS(status) || imageName == NULL) {
+    if (!NT_SUCCESS(status) || imageName == NULL ||
+        imageName->Buffer == NULL || imageName->Length == 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] VerifyClient[PID=%p] DENY: "
+                   "SeLocateProcessImageName failed status=0x%08X imageName=%p\n",
+                   ClientProcessId, status, imageName);
+        if (imageName) {
+            ExFreePool(imageName);
+        }
         ObDereferenceObject(process);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] VerifyClient: SeLocateProcessImageName failed: 0x%08X\n",
-                   status);
         return NT_SUCCESS(status) ? STATUS_NOT_FOUND : status;
     }
 
     //
     // Step 3: Verify image filename matches expected service executable.
-    // Use length-safe comparison â€” no wcsstr, no null-termination assumption.
+    // Use length-safe comparison — no wcsstr, no null-termination assumption.
     //
-    if (imageName->Buffer != NULL && imageName->Length > 0) {
-        charCount = imageName->Length / sizeof(WCHAR);
+    charCount = imageName->Length / sizeof(WCHAR);
+    filename = ShadowStrikepExtractFilename(imageName->Buffer, charCount, &filenameLen);
 
-        //
-        // Extract filename component from full path
-        //
-        filename = ShadowStrikepExtractFilename(imageName->Buffer, charCount, &filenameLen);
+    //
+    // Calculate expected executable name length.
+    //
+    expectedLen = 0;
+    while (SHADOWSTRIKE_SERVICE_EXECUTABLE[expectedLen] != L'\0') {
+        expectedLen++;
+    }
 
-        //
-        // Calculate expected executable name length
-        //
-        expectedLen = 0;
-        while (SHADOWSTRIKE_SERVICE_EXECUTABLE[expectedLen] != L'\0') {
-            expectedLen++;
-        }
+    //
+    // Case-insensitive filename comparison.
+    //
+    if (filenameLen == expectedLen) {
+        USHORT ci;
+        nameMatch = TRUE;
+        for (ci = 0; ci < filenameLen; ci++) {
+            WCHAR fc = filename[ci];
+            WCHAR ec = SHADOWSTRIKE_SERVICE_EXECUTABLE[ci];
 
-        //
-        // Case-insensitive filename comparison
-        //
-        if (filenameLen == expectedLen) {
-            nameMatch = TRUE;
-            {
-                USHORT ci;
-                for (ci = 0; ci < filenameLen; ci++) {
-                    WCHAR fc = filename[ci];
-                    WCHAR ec = SHADOWSTRIKE_SERVICE_EXECUTABLE[ci];
+            if (fc >= L'A' && fc <= L'Z') { fc += 32; }
+            if (ec >= L'A' && ec <= L'Z') { ec += 32; }
 
-                    if (fc >= L'A' && fc <= L'Z') { fc += 32; }
-                    if (ec >= L'A' && ec <= L'Z') { ec += 32; }
-
-                    if (fc != ec) {
-                        nameMatch = FALSE;
-                        break;
-                    }
-                }
+            if (fc != ec) {
+                nameMatch = FALSE;
+                break;
             }
         }
+    }
 
+    //
+    // Compute FNV-1a hash of full image path for audit tracking.
+    //
+    hash = ShadowStrikepFnv1aHashW(imageName->Buffer, charCount);
+    RtlCopyMemory(ImageHash, &hash, sizeof(hash));
+
+    if (!nameMatch) {
         //
-        // Compute FNV-1a hash of full image path for audit tracking
+        // ACTIONABLE LOG: emit the full NT path so post-mortem can compare
+        // it against SHADOWSTRIKE_SERVICE_EXECUTABLE byte-for-byte. %wZ is
+        // safe at PASSIVE_LEVEL on a kernel-owned UNICODE_STRING.
         //
-        hash = ShadowStrikepFnv1aHashW(imageName->Buffer, charCount);
-        RtlCopyMemory(ImageHash, &hash, sizeof(hash));
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] VerifyClient[PID=%p] DENY name: "
+                   "got=\"%wZ\" expected=\"%ws\" filenameLen=%u expectedLen=%u\n",
+                   ClientProcessId, imageName, SHADOWSTRIKE_SERVICE_EXECUTABLE,
+                   (UINT)filenameLen, (UINT)expectedLen);
     }
 
     ExFreePool(imageName);
@@ -4044,58 +4337,81 @@ ShadowStrikeVerifyClient(
 
     //
     // Step 4: Verify process is running as LocalSystem (S-1-5-18).
-    // Only SYSTEM processes should control the sensor.
+    // Every failure site below logs an explicit DENY token: line so a
+    // post-mortem can identify which sub-check failed without speculation.
     //
     token = PsReferencePrimaryToken(process);
-    if (token != NULL) {
-        status = SeQueryInformationToken(token, TokenUser, (PVOID*)&tokenUser);
-        if (NT_SUCCESS(status) && tokenUser != NULL) {
-            //
-            // Build LocalSystem SID for comparison
-            //
-            status = CppAllocateAndInitializeSid(
+    if (token == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] VerifyClient[PID=%p] DENY token: "
+                   "PsReferencePrimaryToken returned NULL\n",
+                   ClientProcessId);
+    } else {
+        NTSTATUS qstatus = SeQueryInformationToken(token, TokenUser, (PVOID*)&tokenUser);
+        if (!NT_SUCCESS(qstatus) || tokenUser == NULL) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] VerifyClient[PID=%p] DENY token: "
+                       "SeQueryInformationToken failed 0x%08X tokenUser=%p\n",
+                       ClientProcessId, qstatus, tokenUser);
+        } else {
+            NTSTATUS sidStatus = CppAllocateAndInitializeSid(
                 &ntAuthority,
                 1,
                 SECURITY_LOCAL_SYSTEM_RID,
                 &systemSid
             );
 
-            if (NT_SUCCESS(status) && systemSid != NULL) {
+            if (!NT_SUCCESS(sidStatus) || systemSid == NULL) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] VerifyClient[PID=%p] DENY token: "
+                           "BuildSystemSid failed 0x%08X\n",
+                           ClientProcessId, sidStatus);
+            } else {
                 if (RtlEqualSid(tokenUser->User.Sid, systemSid)) {
                     isSystem = TRUE;
+                } else {
+                    //
+                    // ACTIONABLE LOG: dump the first 8 raw bytes of the SID
+                    // structure so post-mortem can identify which non-SYSTEM
+                    // identity the connecting process is using (network
+                    // service, local service, an admin account, etc.).
+                    //
+                    PUCHAR observed = (PUCHAR)tokenUser->User.Sid;
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike] VerifyClient[PID=%p] DENY token: "
+                               "user-SID is NOT S-1-5-18; first bytes "
+                               "%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                               ClientProcessId,
+                               observed[0], observed[1], observed[2], observed[3],
+                               observed[4], observed[5], observed[6], observed[7]);
                 }
                 ExFreePoolWithTag(systemSid, COMMPORT_SID_POOL_TAG);
+                systemSid = NULL;
             }
 
             ExFreePool(tokenUser);
+            tokenUser = NULL;
         }
         PsDereferencePrimaryToken(token);
+        token = NULL;
     }
 
     ObDereferenceObject(process);
 
     //
-    // Step 5: Grant full capabilities only if BOTH checks pass.
+    // Step 5: Grant full capabilities only if BOTH checks pass. Both branches
+    // log conclusively so DbgView gives a single line of ground truth.
     //
     if (nameMatch && isSystem) {
-        isVerified = TRUE;
-    }
-
-    if (isVerified) {
         *Capabilities = (ULONG)ShadowStrikeCapServiceDefault;
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Client verified: PID=%p, name=%s, system=%s, caps=0x%08X\n",
-                   ClientProcessId,
-                   nameMatch ? "match" : "no",
-                   isSystem ? "yes" : "no",
-                   *Capabilities);
+                   "[ShadowStrike] Client VERIFIED: PID=%p caps=0x%08X\n",
+                   ClientProcessId, *Capabilities);
     } else {
         *Capabilities = (ULONG)ShadowStrikeCapMinimal;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Client not verified: PID=%p, name=%s, system=%s\n",
-                   ClientProcessId,
-                   nameMatch ? "match" : "no",
-                   isSystem ? "yes" : "no");
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Client REJECTED: PID=%p nameMatch=%u isSystem=%u\n",
+                   ClientProcessId, (UINT)nameMatch, (UINT)isSystem);
     }
 
     return STATUS_SUCCESS;

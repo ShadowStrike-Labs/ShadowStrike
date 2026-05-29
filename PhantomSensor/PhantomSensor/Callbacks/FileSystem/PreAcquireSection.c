@@ -101,6 +101,7 @@ REVISION HISTORY:
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Sync/TimerManager.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Utilities/FileUtils.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -1322,6 +1323,17 @@ IRQL:
     UNREFERENCED_PARAMETER(CompletionContext);
 
     //
+    // Boot-phase fast bail: PreAcquireSection fires for every kernel image
+    // mapping including winlogon/lsass/csrss DLL loads. While the FS boot
+    // latch is active (or the driver has not yet declared FullyOperational)
+    // we must not stall section acquisition, query names, or consult the
+    // scan cache. Real protection resumes the instant the latch is cleared.
+    //
+    if (ShadowFsIsBootPhase()) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
     // Check initialization state with memory barrier
     //
     KeMemoryBarrier();
@@ -1481,9 +1493,11 @@ IRQL:
     }
 
     //
-    // Acquire rundown protection for this operation
+    // Acquire rundown protection for this operation (PAS-class counter for
+    // unload-timeout diagnostics; this callback is the primary deadlock-cycle
+    // origin during shutdown).
     //
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN_PAS()) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -1664,7 +1678,7 @@ IRQL:
                         ProcessContext = NULL;
                     }
 
-                    SHADOWSTRIKE_RELEASE_RUNDOWN();
+                    SHADOWSTRIKE_RELEASE_RUNDOWN_PAS();
                     return FLT_PREOP_SUCCESS_NO_CALLBACK;
                 }
 
@@ -1778,23 +1792,37 @@ IRQL:
         InterlockedIncrement64((PLONG64)&g_PasState.Stats.Blocked);
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
 
+        //
+        // Submit the behavior event ASYNCHRONOUSLY (IsBlocking=FALSE).
+        //
+        // Rationale (audit ref: PreAcquireSection deadlock cycle):
+        //   The block decision (STATUS_ACCESS_DENIED) is already final and
+        //   enforced above; this submission is purely telemetry feeding the
+        //   chain analyzer. A synchronous submit-and-wait here, while the
+        //   PAS rundown is held, contends ERESOURCEs owned by the
+        //   BehaviorEngine worker thread - and during unload that worker
+        //   cannot terminate until the global rundown drains, producing a
+        //   hold-and-wait deadlock that hangs the OS shutdown watchdog.
+        //   Asynchronous queueing breaks the cycle without weakening the
+        //   verdict.
+        //
         BeEngineSubmitEvent(
             BehaviorEvent_NtMapViewInjection,
             BehaviorCategory_CodeInjection,
             HandleToULong(CurrentProcessId),
             NULL, 0,
             SuspicionScore,
-            TRUE,
+            FALSE,
             NULL
             );
 
-        SHADOWSTRIKE_RELEASE_RUNDOWN();
+        SHADOWSTRIKE_RELEASE_RUNDOWN_PAS();
 
         return FLT_PREOP_COMPLETE;
     }
 
     InterlockedIncrement64((PLONG64)&g_PasState.Stats.Allowed);
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
+    SHADOWSTRIKE_RELEASE_RUNDOWN_PAS();
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }

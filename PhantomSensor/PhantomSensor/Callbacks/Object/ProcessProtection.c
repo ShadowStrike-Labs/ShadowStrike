@@ -170,6 +170,65 @@ static const WCHAR g_WinlogonName[] = L"\\winlogon.exe";
 static const WCHAR g_ShadowStrikeName[] = L"ShadowStrike";
 
 // ============================================================================
+// BOOT-PHASE EARLY-BAIL HELPERS  (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// ObRegisterCallbacks fires for every handle open / duplicate against any
+// process.  Stripping access from a handle that SMSS/wininit/winlogon
+// itself opens to lsass/csrss/services WILL grey-screen the box.
+//
+// We enforce a 60-second "boot grace" measured from driver attach.  During
+// this window we never strip access from:
+//   - PsInitialSystemProcess (the "System" 4 PID)
+//   - any caller running in Session 0 (services / SYSTEM context)
+//
+// After the grace expires, normal policy resumes.
+//
+#define PP_BOOT_GRACE_SECONDS 60ULL
+
+static volatile LONG64 g_PpBootDeadlineTick = 0;
+
+static FORCEINLINE BOOLEAN
+ShadowStrikeIsServiceConnected(VOID)
+{
+    return (g_DriverData.ConnectedClients > 0);
+}
+
+static BOOLEAN
+ShadowStrikePpInBootGracePeriod(VOID)
+/*++
+Routine Description:
+    Returns TRUE while we are inside the first PP_BOOT_GRACE_SECONDS of
+    driver lifetime.  Uses KeQueryTickCount + KeQueryTimeIncrement so the
+    measurement is independent of system-time adjustment.  Lazy
+    initialization is safe: first caller wins via InterlockedCompareExchange.
+--*/
+{
+    LARGE_INTEGER tick;
+    LONG64 deadline;
+    ULONG increment;
+
+    KeQueryTickCount(&tick);
+    deadline = ReadNoFence64(&g_PpBootDeadlineTick);
+
+    if (deadline == 0) {
+        increment = KeQueryTimeIncrement();
+        if (increment == 0) {
+            increment = 156250;  // 15.625 ms default
+        }
+        // 100-ns ticks per grace period / system tick increment.
+        deadline = tick.QuadPart +
+                   (LONG64)((PP_BOOT_GRACE_SECONDS * 10000000ULL) / increment);
+
+        InterlockedCompareExchange64(&g_PpBootDeadlineTick, deadline, 0);
+        deadline = ReadNoFence64(&g_PpBootDeadlineTick);
+    }
+
+    return (tick.QuadPart < deadline);
+}
+
+
+// ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 
@@ -744,6 +803,42 @@ Return Value:
     //
     Context.SourceProcessId = PsGetCurrentProcessId();
     Context.SourceProcess = PsGetCurrentProcess();
+
+    //
+    // === WINLOGON GREY-SCREEN MITIGATION (BOOT-PHASE EARLY BAIL) ===
+    //
+    // The System process (PsInitialSystemProcess, PID 4) drives kernel
+    // worker activity and posts the initial handle opens that bring up
+    // smss/csrss/wininit/lsass.  Stripping access from System causes
+    // catastrophic boot stalls (Welcome screen never paints).  Always
+    // allow.
+    //
+    if (Context.SourceProcess == PsInitialSystemProcess) {
+        goto Cleanup;
+    }
+
+    //
+    // During the first 60 seconds after driver load, suppress access
+    // stripping for any Session-0 / SYSTEM-context caller.  This window
+    // covers smss -> csrss -> wininit -> services -> lsass -> winlogon
+    // bring-up.  After the window expires, normal protection rules apply.
+    //
+    if (ShadowStrikePpInBootGracePeriod()) {
+        ULONG srcSession = (ULONG)-1;
+        PACCESS_TOKEN srcTok = PsReferencePrimaryToken(Context.SourceProcess);
+        if (srcTok != NULL) {
+            (VOID)SeQuerySessionIdToken(srcTok, &srcSession);
+            PsDereferencePrimaryToken(srcTok);
+        }
+        if (srcSession == 0) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "[ShadowStrike/PP] Boot-grace skip src=%lu target=%lu access=0x%08X\n",
+                HandleToULong(Context.SourceProcessId),
+                HandleToULong(PsGetProcessId((PEPROCESS)OperationInformation->Object)),
+                OriginalAccess);
+            goto Cleanup;
+        }
+    }
 
     //
     // Fast path: Check if source and target are the same process

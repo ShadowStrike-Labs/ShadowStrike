@@ -1068,6 +1068,178 @@ ShadowStrikeLogBootStep(
 }
 
 // ============================================================================
+// POST-INIT WORK QUEUE (v1.0.13.0 — winlogon grey-screen fix)
+// ============================================================================
+
+/**
+ * @brief Internal post-init queue entry.
+ */
+typedef struct _SHADOWSTRIKE_POST_INIT_ITEM {
+    LIST_ENTRY                  ListEntry;
+    PFN_SHADOWSTRIKE_POST_INIT  Callback;
+    PVOID                       Context;
+} SHADOWSTRIKE_POST_INIT_ITEM, *PSHADOWSTRIKE_POST_INIT_ITEM;
+
+#define SHADOWSTRIKE_POST_INIT_TAG  'IPSS'  // "SSPI"
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+ShadowStrikeQueuePostInitWork(
+    _In_ PFN_SHADOWSTRIKE_POST_INIT Callback,
+    _In_opt_ PVOID Context
+    )
+{
+    PSHADOWSTRIKE_POST_INIT_ITEM item;
+    KIRQL oldIrql;
+    BOOLEAN runInline = FALSE;
+
+    if (Callback == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Fast path: if the queue is already drained, the driver is operational
+    // and we can simply invoke the callback inline. This is also the path
+    // taken by any post-boot caller (e.g., late-loaded sub-modules).
+    //
+    // NOTE: PostInitDrained is set to 1 by ShadowStrikeDrainPostInitWork()
+    // strictly AFTER the queue has been emptied under the spinlock, so an
+    // observed value of 1 here implies no pending drain can touch our item.
+    //
+    if (InterlockedCompareExchange(&g_DriverData.PostInitDrained, 0, 0) != 0) {
+        //
+        // Drain already happened. Must be PASSIVE_LEVEL for inline invoke.
+        // Callers at DISPATCH_LEVEL should not normally reach this — but
+        // if they do, route through a fresh allocation so we don't violate
+        // the IRQL contract of the callback.
+        //
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            Callback(Context);
+            return STATUS_SUCCESS;
+        }
+        //
+        // Fall through to enqueue path even though drained — the next drain
+        // (or an explicit one) will pick it up. In practice this branch is
+        // exceptional; we still want a deterministic enqueue to avoid loss.
+        //
+    }
+
+    item = (PSHADOWSTRIKE_POST_INIT_ITEM)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(SHADOWSTRIKE_POST_INIT_ITEM),
+        SHADOWSTRIKE_POST_INIT_TAG);
+
+    if (item == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] PostInitWork: allocation failed\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    item->Callback = Callback;
+    item->Context  = Context;
+
+    KeAcquireSpinLock(&g_DriverData.PostInitWorkLock, &oldIrql);
+
+    if (InterlockedCompareExchange(&g_DriverData.PostInitDrained, 0, 0) != 0) {
+        //
+        // Race: drain completed between our outer check and the lock acquire.
+        // Run inline at PASSIVE_LEVEL only.
+        //
+        runInline = (KeGetCurrentIrql() == PASSIVE_LEVEL);
+    }
+
+    if (!runInline) {
+        InsertTailList(&g_DriverData.PostInitWorkList, &item->ListEntry);
+    }
+
+    KeReleaseSpinLock(&g_DriverData.PostInitWorkLock, oldIrql);
+
+    if (runInline) {
+        Callback(Context);
+        ExFreePoolWithTag(item, SHADOWSTRIKE_POST_INIT_TAG);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeDrainPostInitWork(VOID)
+{
+    LIST_ENTRY localList;
+    KIRQL oldIrql;
+    ULONG drained = 0;
+
+    PAGED_CODE();
+
+    InitializeListHead(&localList);
+
+    //
+    // Detach the queue under the spinlock so concurrent producers either
+    // see the empty post-drain queue (and follow the inline path) or
+    // append to a queue that we will drain on the next pass. We loop
+    // until we observe an empty queue while holding the lock.
+    //
+    for (;;) {
+        BOOLEAN gotItems = FALSE;
+
+        KeAcquireSpinLock(&g_DriverData.PostInitWorkLock, &oldIrql);
+
+        if (!IsListEmpty(&g_DriverData.PostInitWorkList)) {
+            PLIST_ENTRY head = g_DriverData.PostInitWorkList.Flink;
+            PLIST_ENTRY tail = g_DriverData.PostInitWorkList.Blink;
+
+            //
+            // Splice the entire list into our local list, then re-init
+            // the global list. This is the standard kernel idiom for
+            // an atomic list-steal under a spinlock.
+            //
+            head->Blink = &localList;
+            tail->Flink = &localList;
+            localList.Flink = head;
+            localList.Blink = tail;
+
+            InitializeListHead(&g_DriverData.PostInitWorkList);
+            gotItems = TRUE;
+        } else {
+            //
+            // No more items. Mark drained while still holding the lock
+            // so concurrent producers see the transition atomically.
+            //
+            InterlockedExchange(&g_DriverData.PostInitDrained, 1);
+        }
+
+        KeReleaseSpinLock(&g_DriverData.PostInitWorkLock, oldIrql);
+
+        if (!gotItems) {
+            break;
+        }
+
+        while (!IsListEmpty(&localList)) {
+            PLIST_ENTRY entry = RemoveHeadList(&localList);
+            PSHADOWSTRIKE_POST_INIT_ITEM item =
+                CONTAINING_RECORD(entry, SHADOWSTRIKE_POST_INIT_ITEM, ListEntry);
+
+            __try {
+                item->Callback(item->Context);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] PostInitWork: callback %p faulted "
+                           "(code 0x%08X) — continuing drain\n",
+                           item->Callback, GetExceptionCode());
+            }
+
+            ExFreePoolWithTag(item, SHADOWSTRIKE_POST_INIT_TAG);
+            drained++;
+        }
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] PostInitWork: drained %lu deferred item(s)\n",
+               drained);
+}
+
+// ============================================================================
 // DRIVER ENTRY
 // ============================================================================
 
@@ -1132,6 +1304,7 @@ DriverEntry(
     //  23  = PreAcquire + PreCreate + PreSetInfo + PreWrite init
     //  24  = FltStartFiltering
     //  25  = Init complete (driver READY)
+    //  26  = FullyOperational gate set (post-init periodic workers running)
     //
     ShadowStrikeLogBootStep(RegistryPath, 0);
 
@@ -1171,6 +1344,49 @@ DriverEntry(
     ExInitializePushLock(&g_DriverData.ProtectedProcessLock);
 
     InitializeListHead(&g_DriverData.ProtectedProcessList);
+
+    //
+    // Step 2.1: Boot-phase tracking initialization (v1.0.13.0).
+    //
+    // Capture the performance-counter tick at the start of DriverEntry and
+    // compute the 90-second boot-grace deadline. All callback modules use
+    // ShadowStrikeInBootGrace() to skip expensive scanning during early boot,
+    // and ShadowStrikeIsFullyOperational() to skip ALL work until the driver
+    // has transitioned to fully operational.
+    //
+    // FullyOperational is set to 0 here and flipped to 1 strictly AFTER
+    // FltStartFiltering returns success AND the CommPort is created.
+    //
+    InterlockedExchange(&g_DriverData.FullyOperational, 0);
+    InterlockedExchange(&g_DriverData.PostInitDrained, 0);
+    KeInitializeSpinLock(&g_DriverData.PostInitWorkLock);
+    InitializeListHead(&g_DriverData.PostInitWorkList);
+
+    g_DriverData.BootPhaseStartTick = KeQueryPerformanceCounter(&g_DriverData.PerfFrequency);
+    {
+        //
+        // BootGraceUntilTick = now + 90 seconds. Use cached frequency.
+        // PerfFrequency.QuadPart is guaranteed non-zero on Windows >= XP.
+        //
+        LONGLONG ticksPerSecond = g_DriverData.PerfFrequency.QuadPart;
+        if (ticksPerSecond <= 0) {
+            //
+            // Defensive: paranoia path. Should not happen on supported builds.
+            // Use a conservative fallback of 10 MHz so the grace window
+            // still exists rather than collapsing to zero.
+            //
+            ticksPerSecond = 10000000LL;
+        }
+        g_DriverData.BootGraceUntilTick.QuadPart =
+            g_DriverData.BootPhaseStartTick.QuadPart + (ticksPerSecond * 90LL);
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Boot-phase tracking armed: StartTick=0x%llX "
+               "GraceUntil=0x%llX Freq=%lld Hz (90s grace window)\n",
+               g_DriverData.BootPhaseStartTick.QuadPart,
+               g_DriverData.BootGraceUntilTick.QuadPart,
+               g_DriverData.PerfFrequency.QuadPart);
 
     //
     // Step 2.4: Initialize WPP tracing (earliest possible, before any trace calls)
@@ -2331,11 +2547,14 @@ DriverEntry(
             ShadowStrikeLogInitStatus("Integrity Monitor", STATUS_SUCCESS);
 
             //
-            // Enable periodic integrity checks (30-second interval).
-            // Without this call, the worker thread waits indefinitely
-            // and never performs any integrity verification.
+            // NOTE (v1.0.13.0 — winlogon grey-screen fix):
+            // ImEnablePeriodicCheck() spawns a periodic worker that, on
+            // its first tick, may issue file IO to re-hash the driver
+            // image. If armed BEFORE FltStartFiltering, that IO can race
+            // with winlogon's boot IO. Periodic checks are now deferred
+            // to the post-FltStartFiltering block — see "POST-INIT
+            // PERIODIC WORKERS" near the end of DriverEntry.
             //
-            ImEnablePeriodicCheck(g_IntegrityMonitor, 30000);
         }
     }
 
@@ -2484,10 +2703,13 @@ DriverEntry(
         }
 
         //
-        // Enable periodic integrity verification (every 5 seconds)
-        // This detects callback code patching by rootkits
+        // NOTE (v1.0.13.0 — winlogon grey-screen fix):
+        // CpEnablePeriodicVerify() arms a 5-second timer whose first tick
+        // hashes registered callback code. This must NOT race with the
+        // boot-phase IO storm from winlogon/csrss/smss, so it is deferred
+        // to the post-FltStartFiltering block — see "POST-INIT PERIODIC
+        // WORKERS" near the end of DriverEntry.
         //
-        (VOID)CpEnablePeriodicVerify(g_CallbackProtector, 5000);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike] Callback protection wired: %u callbacks protected with 5s verification\n",
@@ -2565,34 +2787,16 @@ DriverEntry(
     }
 
     //
-    // Step 14.23: Enable performance monitoring collection
+    // Step 14.23: Performance monitoring collection — DEFERRED (v1.0.13.0).
+    // Periodic collection worker is started in the post-FltStartFiltering
+    // block to keep the boot path quiescent. See "POST-INIT PERIODIC WORKERS".
     //
-    if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
-        status = SsPmEnableCollection(g_PerformanceMonitor, 5000);
-        if (!NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] WARNING: Failed to enable performance collection: 0x%08X (continuing)\n",
-                       status);
-        } else {
-            ShadowStrikeLogInitStatus("Performance Collection", STATUS_SUCCESS);
-        }
-        status = STATUS_SUCCESS;
-    }
 
     //
-    // Step 14.24: Start resource throttling monitoring
+    // Step 14.24: Resource throttling monitoring — DEFERRED (v1.0.13.0).
+    // Started in the post-FltStartFiltering block. See "POST-INIT PERIODIC
+    // WORKERS" near the end of DriverEntry.
     //
-    if (g_SubsystemFlags & SubsysFlag_ResourceThrottling) {
-        status = RtStartMonitoring(g_ResourceThrottler, 10000);
-        if (!NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] WARNING: Failed to start resource throttling: 0x%08X (continuing)\n",
-                       status);
-        } else {
-            ShadowStrikeLogInitStatus("Resource Throttling Monitor", STATUS_SUCCESS);
-        }
-        status = STATUS_SUCCESS;
-    }
 
     //
     // Step 14.25: Register power-to-behavior bridge callback
@@ -2771,6 +2975,99 @@ DriverEntry(
     ShadowStrikeLogBootStep(RegistryPath, 25); // Init complete — driver READY
 
     //
+    // =========================================================================
+    // POST-INIT PERIODIC WORKERS (v1.0.13.0 — winlogon grey-screen fix)
+    // =========================================================================
+    //
+    // These periodic workers are launched ONLY AFTER FltStartFiltering has
+    // returned and the core driver state booleans (FilteringStarted,
+    // Initialized) are set. Launching them earlier produced a boot-time
+    // race where their first tick performed file IO that contended with
+    // winlogon/csrss/smss boot IO, producing a permanent grey "Welcome"
+    // screen on low-RAM VMs.
+    //
+    // Each call is best-effort and non-fatal; failures are logged but do
+    // not block the post-init transition.
+    //
+
+    if (g_SubsystemFlags & SubsysFlag_IntegrityMonitor) {
+        ImEnablePeriodicCheck(g_IntegrityMonitor, 30000);
+        ShadowStrikeLogInitStatus("Integrity Monitor periodic check (post-init)",
+                                  STATUS_SUCCESS);
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_CallbackProtection) {
+        (VOID)CpEnablePeriodicVerify(g_CallbackProtector, 5000);
+        ShadowStrikeLogInitStatus("Callback Protection periodic verify (post-init)",
+                                  STATUS_SUCCESS);
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_PerformanceMonitor) {
+        NTSTATUS pmStatus = SsPmEnableCollection(g_PerformanceMonitor, 5000);
+        if (!NT_SUCCESS(pmStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Post-init SsPmEnableCollection "
+                       "failed: 0x%08X (continuing)\n", pmStatus);
+        } else {
+            ShadowStrikeLogInitStatus("Performance Collection (post-init)",
+                                      STATUS_SUCCESS);
+        }
+    }
+
+    if (g_SubsystemFlags & SubsysFlag_ResourceThrottling) {
+        NTSTATUS rtStatus = RtStartMonitoring(g_ResourceThrottler, 10000);
+        if (!NT_SUCCESS(rtStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Post-init RtStartMonitoring "
+                       "failed: 0x%08X (continuing)\n", rtStatus);
+        } else {
+            ShadowStrikeLogInitStatus("Resource Throttling Monitor (post-init)",
+                                      STATUS_SUCCESS);
+        }
+    }
+
+    //
+    // Drain any work items queued by foreign agents during their own init
+    // phase. Each callback is invoked at PASSIVE_LEVEL; after this point
+    // ShadowStrikeQueuePostInitWork() invokes callbacks inline.
+    //
+    ShadowStrikeDrainPostInitWork();
+
+    //
+    // FINAL TRANSITION: mark driver fully operational.
+    // This is the gate that callbacks in foreign modules consult via
+    // ShadowStrikeIsFullyOperational(). It is set AFTER:
+    //   * FltStartFiltering returned success
+    //   * CommPort exists (InitFlag_CommPortCreated set above)
+    //   * Driver Initialized/FilteringStarted booleans are set
+    //   * All deferred periodic workers and post-init items have run
+    //
+    NT_ASSERT(g_InitFlags & InitFlag_CommPortCreated);
+    NT_ASSERT(g_InitFlags & InitFlag_FilteringStarted);
+
+    MemoryBarrier();
+    InterlockedExchange(&g_DriverData.FullyOperational, 1);
+
+    //
+    // Cross-scope bridge: drop the FS callback boot-phase latch in lockstep
+    // with FullyOperational so that PreCreate/PreWrite/PreSetInfo/etc. can
+    // transition out of their fast-bail path at the same instant the rest
+    // of the driver is declared healthy. WriteRelease pairs with the
+    // ReadAcquire inside ShadowFsIsBootPhase().
+    //
+    {
+        extern volatile LONG g_ShadowFsBootPhaseActive;
+        InterlockedExchange(&g_ShadowFsBootPhaseActive, 0);
+    }
+
+    ShadowStrikeLogBootStep(RegistryPath, 26); // FullyOperational = TRUE
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Driver FULLY OPERATIONAL — boot-grace window "
+               "active for 90s from tick 0x%llX\n",
+               g_DriverData.BootPhaseStartTick.QuadPart);
+
+    //
     // Emit ETW diagnostic event: driver started successfully
     //
     EtwWriteDiagnosticEvent(
@@ -2820,13 +3117,17 @@ ShadowStrikeUnload(
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
     )
 {
+    BOOLEAN mandatoryUnload;
+
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(Flags);
+    mandatoryUnload = (Flags & FLTFL_FILTER_UNLOAD_MANDATORY) != 0;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Unload: Starting driver unload (InitFlags=0x%08X)\n",
-               g_InitFlags);
+               "[ShadowStrike] Unload: Starting (InitFlags=0x%08X, "
+               "Flags=0x%08X, Mandatory=%s)\n",
+               g_InitFlags, (ULONG)Flags,
+               mandatoryUnload ? "TRUE" : "FALSE");
 
     //
     // Emit ETW diagnostic event: driver shutting down (Unload path)
@@ -2835,27 +3136,246 @@ ShadowStrikeUnload(
         EtwEventId_DriverStopping,
         TRACE_LEVEL_WARNING,
         0,
-        L"Driver unloading",
+        mandatoryUnload
+            ? L"Driver unloading (mandatory)"
+            : L"Driver unloading (voluntary)",
         STATUS_SUCCESS);
 
     //
-    // Step 1: Signal shutdown - stop accepting new work
-    // Use memory barrier to ensure visibility
+    // Step 1: Signal shutdown - stop accepting new work.
+    // Use memory barrier to ensure visibility. Callbacks that have not
+    // yet acquired rundown will bail at the SHADOWSTRIKE_IS_READY() gate;
+    // callbacks already past the gate continue to hold the global rundown
+    // until they unwind.
     //
+    // Also clear FullyOperational so that callbacks consulting the v1.0.13.0
+    // ShadowStrikeIsFullyOperational() gate observe the unload immediately,
+    // without having to re-read three separate booleans.
+    //
+    InterlockedExchange(&g_DriverData.FullyOperational, 0);
     WriteBooleanRelease(&g_DriverData.ShuttingDown, TRUE);
     MemoryBarrier();
 
     //
-    // Step 2: Wait for rundown protection to drain
-    // This ensures ALL callbacks complete before we free anything
+    // Step 2: Drain worker-thread / ERESOURCE-owning subsystems BEFORE
+    // waiting on the global rundown. Each of these subsystems is gated
+    // by its OWN local rundown / stopping flag and will refuse new public
+    // API calls once shut down, which lets callbacks that still hold the
+    // global rundown unwind through DEVICE_NOT_READY (etc.) and release
+    // it - breaking the hold-and-wait deadlock cycle around BehaviorEngine
+    // and ScanBridge ERESOURCEs that previously hung the OS shutdown
+    // watchdog (Event 41 / 6008).
+    //
+    // Audit reference: bounded-wait subsystem reorder list. Each call
+    // site below mirrors the original later-in-function ordering in
+    // EXACT reverse-init order; the in-place duplicate later in this
+    // function becomes a no-op via the cleared flag.
     //
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Waiting for rundown protection to drain...\n");
+               "[ShadowStrike] Unload step 2: draining self-gated "
+               "subsystems (pre-rundown-wait).\n");
 
-    ShadowStrikeWaitForRundownComplete();
+    //
+    // Unregister power-to-behavior bridge BEFORE shutting down
+    // BehaviorEngine - the power callback can submit events to BE.
+    //
+    if (g_PowerBehaviorBridgeHandle != NULL) {
+        ShadowPowerUnregisterCallback(g_PowerBehaviorBridgeHandle);
+        g_PowerBehaviorBridgeHandle = NULL;
+    }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Rundown complete, proceeding with cleanup.\n");
+    //
+    // BehaviorEngine: PRIMARY deadlock site. Must shut down FIRST so its
+    // worker thread releases ChainLock/ProcessLock and any in-flight
+    // PreAcquireSection callback can unwind off those ERESOURCEs.
+    //
+    if (g_SubsystemFlags & SubsysFlag_BehaviorEngine) {
+        BeEngineShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_BehaviorEngine;
+    }
+
+    //
+    // Detection subsystems - their workers contend on BehaviorEngine
+    // state and on each other; bring them down in reverse-init order.
+    //
+    if (g_SubsystemFlags & SubsysFlag_MemoryMonitor) {
+        MmMonitorShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_MemoryMonitor;
+    }
+    if (g_SubsystemFlags & SubsysFlag_MemoryScanner) {
+        MsShutdown(g_MemoryScanner);
+        g_MemoryScanner = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_MemoryScanner;
+    }
+    if (g_SubsystemFlags & SubsysFlag_SyscallMonitor) {
+        ScMonitorShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_SyscallMonitor;
+    }
+    if (g_SubsystemFlags & SubsysFlag_NetworkFilter) {
+        NfFilterShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_NetworkFilter;
+    }
+
+    //
+    // Communication subsystems - process analyzer + message routing.
+    // Their senders may be blocked in FltSendMessage, but ScanBridge
+    // Shutdown internally aborts those waiters.
+    //
+    if (g_SubsystemFlags & SubsysFlag_ProcessAnalyzer) {
+        PaShutdown(&g_ProcessAnalyzer);
+        g_ProcessAnalyzer = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_ProcessAnalyzer;
+    }
+    if (g_SubsystemFlags & SubsysFlag_MessageHandler) {
+        MhShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_MessageHandler;
+    }
+    if (g_SubsystemFlags & SubsysFlag_ScanBridge) {
+        ShadowStrikeScanBridgeShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_ScanBridge;
+    }
+    if (g_SubsystemFlags & SubsysFlag_MessageQueue) {
+        MqShutdown();
+        g_SubsystemFlags &= ~SubsysFlag_MessageQueue;
+    }
+
+    //
+    // ThreatScoring publishes to BehaviorEngine - safe to drop once BE
+    // is down.
+    //
+    if (g_SubsystemFlags & SubsysFlag_ThreatScoring) {
+        TsShutdown(g_ThreatScoring);
+        g_ThreatScoring = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_ThreatScoring;
+    }
+
+    //
+    // ETW consumer (worker thread for batched event emit).
+    //
+    if (g_EtwConsumer != NULL) {
+        EcShutdown(&g_EtwConsumer);
+        g_EtwConsumer = NULL;
+    }
+
+    //
+    // Batch processor (owns its own worker thread).
+    //
+    if (g_SubsystemFlags & SubsysFlag_BatchProcessing) {
+        BpStop(g_BatchProcessor);
+        BpShutdown(g_BatchProcessor);
+        g_BatchProcessor = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_BatchProcessing;
+    }
+
+    //
+    // Resource throttler (owns worker thread).
+    //
+    if (g_SubsystemFlags & SubsysFlag_ResourceThrottling) {
+        RtShutdown(&g_ResourceThrottler);
+        g_ResourceThrottler = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_ResourceThrottling;
+    }
+
+    //
+    // Generic work infrastructure - callbacks queue work here; must
+    // drain before they can finish releasing rundown.
+    //
+    if (g_SubsystemFlags & SubsysFlag_AsyncWorkQueue) {
+        AwqShutdown(g_AsyncWorkQueue);
+        g_AsyncWorkQueue = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_AsyncWorkQueue;
+    }
+    if (g_SubsystemFlags & SubsysFlag_ThreadPool) {
+        TpDestroy(&g_ThreadPool, TRUE);
+        g_ThreadPool = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_ThreadPool;
+    }
+    if (g_SubsystemFlags & SubsysFlag_WorkQueue) {
+        ShadowStrikeWorkQueueShutdown(TRUE);
+        g_SubsystemFlags &= ~SubsysFlag_WorkQueue;
+    }
+
+    //
+    // DPC infrastructure - flush queued DPCs first so any DPC-bound
+    // callback state is consumed, then tear down the DPC manager.
+    //
+    KeFlushQueuedDpcs();
+    if (g_SubsystemFlags & SubsysFlag_DeferredProcedure) {
+        DpcShutdown(&g_DpcManager);
+        g_DpcManager = NULL;
+        g_SubsystemFlags &= ~SubsysFlag_DeferredProcedure;
+    }
+
+    //
+    // Step 3: Bounded wait for the global rundown to drain. The pre-drain
+    // above should have eliminated the hold-and-wait cycle; if anything
+    // is still stuck we will know it within the bounded budget instead
+    // of hanging the OS shutdown watchdog indefinitely.
+    //
+    // Budgets:
+    //   Mandatory unload (OS forcing us out): 10 s; proceed past timeout
+    //     - the alternative is hanging shutdown.
+    //   Voluntary unload (admin requested): 5 s; REFUSE unload on
+    //     timeout via STATUS_FLT_DO_NOT_DETACH. The driver is left
+    //     half-quiesced and a reboot is required to restore service;
+    //     proceeding past a stuck callback would UAF.
+    //
+    {
+        ULONGLONG timeoutMs = mandatoryUnload ? 10000ULL : 5000ULL;
+        NTSTATUS  waitStatus;
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Unload: InFlight(P=%ld T=%ld PAS=%ld) - "
+                   "bounded rundown wait %llums\n",
+                   ReadAcquire(&g_DriverData.InFlightProcess),
+                   ReadAcquire(&g_DriverData.InFlightThread),
+                   ReadAcquire(&g_DriverData.InFlightPreAcquireSection),
+                   timeoutMs);
+
+        waitStatus = ShadowStrikeWaitForRundownCompleteBounded(timeoutMs);
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            LONG procIn = ReadAcquire(&g_DriverData.InFlightProcess);
+            LONG thrIn  = ReadAcquire(&g_DriverData.InFlightThread);
+            LONG pasIn  = ReadAcquire(&g_DriverData.InFlightPreAcquireSection);
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] RUNDOWN DRAIN TIMEOUT (%llums). "
+                       "Flags=0x%08X Mandatory=%s "
+                       "InFlight: Process=%ld Thread=%ld "
+                       "PreAcquireSection=%ld\n",
+                       timeoutMs, (ULONG)Flags,
+                       mandatoryUnload ? "TRUE" : "FALSE",
+                       procIn, thrIn, pasIn);
+
+            EtwWriteDiagnosticEvent(
+                EtwEventId_DriverStopping,
+                TRACE_LEVEL_ERROR,
+                0,
+                mandatoryUnload
+                    ? L"Rundown drain timeout (mandatory unload - proceeding)"
+                    : L"Rundown drain timeout (voluntary unload - refused)",
+                (UINT32)STATUS_TIMEOUT);
+
+            if (!mandatoryUnload) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] Voluntary unload TIMEOUT - "
+                           "returning STATUS_FLT_DO_NOT_DETACH. Reboot "
+                           "required to restore service.\n");
+                return STATUS_FLT_DO_NOT_DETACH;
+            }
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] Mandatory unload TIMEOUT - "
+                       "proceeding past stuck callback (OS shutdown "
+                       "context).\n");
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "[ShadowStrike] Rundown drained (status=0x%08X), "
+                       "proceeding with cleanup.\n",
+                       waitStatus);
+        }
+    }
 
     //
     // Step 3: Unprotect callbacks from tamper detection before unregistering
@@ -4027,6 +4547,194 @@ ShadowStrikeWaitForRundownComplete(
                "[ShadowStrike] Rundown protection released, all callbacks complete.\n");
 }
 
+//
+// Context block for the bounded-wait worker. Heap-allocated because the
+// worker thread can outlive the calling stack frame when the wait times
+// out - we let the worker complete on its own rather than join it (joining
+// would re-introduce the unbounded wait this primitive exists to avoid).
+//
+// Lifetime ownership:
+//   - Success path: caller waits for Done, then references and joins the
+//     worker for clean object teardown, then frees the context.
+//   - Timeout path: caller drops its reference to the worker and returns;
+//     the worker frees the context itself right before
+//     PsTerminateSystemThread.
+//
+typedef struct _SHADOWSTRIKE_RUNDOWN_WAIT_CTX {
+    PEX_RUNDOWN_REF Rundown;
+    KEVENT          Done;
+    volatile LONG   OwnerDone;  // 1 once caller path completed successfully
+} SHADOWSTRIKE_RUNDOWN_WAIT_CTX, *PSHADOWSTRIKE_RUNDOWN_WAIT_CTX;
+
+static VOID
+ShadowStrikeRundownWaitWorker(
+    _In_ PVOID StartContext
+    )
+{
+    PSHADOWSTRIKE_RUNDOWN_WAIT_CTX ctx =
+        (PSHADOWSTRIKE_RUNDOWN_WAIT_CTX)StartContext;
+
+    PAGED_CODE();
+
+    //
+    // Same infinite wait the legacy code did, but now isolated on a
+    // dedicated worker thread so the unload thread can apply a timeout.
+    //
+    ExWaitForRundownProtectionRelease(ctx->Rundown);
+
+    KeSetEvent(&ctx->Done, IO_NO_INCREMENT, FALSE);
+
+    //
+    // If the caller has already completed (success path), it owns the
+    // context and will free it after joining us. Otherwise (timeout
+    // path), we own the context and must free it here before exit, since
+    // the caller has abandoned it.
+    //
+    if (InterlockedCompareExchange(&ctx->OwnerDone, 0, 0) == 0) {
+        ExFreePoolWithTag(ctx, SHADOWSTRIKE_POOL_TAG);
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeWaitForRundownCompleteBounded(
+    _In_ ULONGLONG TimeoutMs
+    )
+{
+    PSHADOWSTRIKE_RUNDOWN_WAIT_CTX ctx = NULL;
+    HANDLE                         threadHandle = NULL;
+    PETHREAD                       workerThread = NULL;
+    OBJECT_ATTRIBUTES              oa;
+    LARGE_INTEGER                  timeout;
+    NTSTATUS                       status;
+
+    PAGED_CODE();
+
+    ctx = (PSHADOWSTRIKE_RUNDOWN_WAIT_CTX)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(*ctx),
+        SHADOWSTRIKE_POOL_TAG);
+    if (ctx == NULL) {
+        //
+        // Allocation failure - degrade to the legacy unbounded wait
+        // inline. This preserves correctness (callbacks still drain)
+        // at the cost of losing the timeout, which is strictly no worse
+        // than pre-patch behavior on the rare ENOMEM path.
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Bounded-wait context alloc failed - "
+                   "falling back to unbounded wait.\n");
+        ExWaitForRundownProtectionRelease(&g_DriverData.RundownProtection);
+        return STATUS_SUCCESS;
+    }
+
+    ctx->Rundown = &g_DriverData.RundownProtection;
+    ctx->OwnerDone = 0;
+    KeInitializeEvent(&ctx->Done, NotificationEvent, FALSE);
+
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    status = PsCreateSystemThread(
+        &threadHandle,
+        THREAD_ALL_ACCESS,
+        &oa,
+        NULL,
+        NULL,
+        ShadowStrikeRundownWaitWorker,
+        ctx);
+
+    if (!NT_SUCCESS(status)) {
+        //
+        // Could not spawn worker - degrade to the unbounded wait inline.
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Bounded-wait worker spawn failed "
+                   "(0x%08X) - falling back to unbounded wait.\n",
+                   status);
+        ExFreePoolWithTag(ctx, SHADOWSTRIKE_POOL_TAG);
+        ExWaitForRundownProtectionRelease(&g_DriverData.RundownProtection);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Resolve handle -> object reference so we can wait on the worker
+    // thread after closing the handle. If this fails we still wait on
+    // Done; the worker self-terminates regardless via
+    // PsTerminateSystemThread.
+    //
+    (VOID)ObReferenceObjectByHandle(
+        threadHandle,
+        THREAD_ALL_ACCESS,
+        *PsThreadType,
+        KernelMode,
+        (PVOID*)&workerThread,
+        NULL);
+    ZwClose(threadHandle);
+    threadHandle = NULL;
+
+    //
+    // Negative LARGE_INTEGER = relative wait in 100ns units.
+    //
+    timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000LL);
+
+    status = KeWaitForSingleObject(
+        &ctx->Done,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout);
+
+    if (status == STATUS_TIMEOUT) {
+        //
+        // The worker is still parked inside ExWaitForRundownProtectionRelease.
+        // We MUST NOT join it - joining is exactly the unbounded wait this
+        // primitive exists to escape. Hand ownership of the context to the
+        // worker (it will free it after the rundown eventually drains and
+        // before calling PsTerminateSystemThread), drop our thread reference,
+        // and return.
+        //
+        // The OwnerDone CAS protects against a race where the worker is just
+        // about to wake up: if it observes OwnerDone == 0, it frees the
+        // context; if (in the success-path code below) the caller wins the
+        // CAS, the worker leaves the context alone and the caller frees it.
+        //
+        if (workerThread != NULL) {
+            ObDereferenceObject(workerThread);
+            workerThread = NULL;
+        }
+        // Context is now owned by the worker - do NOT free here.
+        return STATUS_TIMEOUT;
+    }
+
+    //
+    // Success path: worker has signaled Done and is exiting. Claim ownership
+    // of the context so the worker won't free it, briefly wait for the
+    // worker to actually finish so we can dereference cleanly, then free.
+    //
+    (VOID)InterlockedExchange(&ctx->OwnerDone, 1);
+
+    if (workerThread != NULL) {
+        KeWaitForSingleObject(
+            workerThread,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL);
+        ObDereferenceObject(workerThread);
+        workerThread = NULL;
+    }
+
+    ExFreePoolWithTag(ctx, SHADOWSTRIKE_POOL_TAG);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Bounded rundown wait complete, all "
+               "callbacks drained within %llums budget.\n", TimeoutMs);
+
+    return STATUS_SUCCESS;
+}
+
 VOID
 ShadowStrikeLogInitStatus(
     _In_ PCSTR Component,
@@ -4057,10 +4765,32 @@ ShadowStrikeCleanupByFlags(
     MemoryBarrier();
 
     //
-    // Drain rundown protection â€” wait for in-flight callback operations
+    // Drain rundown protection - wait for in-flight callback operations
     // that hold rundown refs (work items, DPCs, async operations).
+    // Use the bounded variant with a 5-second budget so a stuck callback
+    // on the partial-init failure path cannot hang the load thread (and
+    // hence the OS service-control timeout). On timeout we proceed with
+    // cleanup regardless - the failure path MUST always complete.
     //
-    ShadowStrikeWaitForRundownComplete();
+    {
+        NTSTATUS waitStatus =
+            ShadowStrikeWaitForRundownCompleteBounded(5000ULL);
+        if (waitStatus == STATUS_TIMEOUT) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] CleanupByFlags: rundown drain "
+                       "TIMEOUT - InFlight(P=%ld T=%ld PAS=%ld). "
+                       "Proceeding with cleanup (failure path).\n",
+                       ReadAcquire(&g_DriverData.InFlightProcess),
+                       ReadAcquire(&g_DriverData.InFlightThread),
+                       ReadAcquire(&g_DriverData.InFlightPreAcquireSection));
+            EtwWriteDiagnosticEvent(
+                EtwEventId_DriverStopping,
+                TRACE_LEVEL_ERROR,
+                0,
+                L"CleanupByFlags rundown drain timeout - proceeding",
+                (UINT32)STATUS_TIMEOUT);
+        }
+    }
 
     //
     // Emit ETW diagnostic event: driver cleanup starting (failure path)

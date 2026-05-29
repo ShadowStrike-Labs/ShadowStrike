@@ -89,6 +89,24 @@ char _InterlockedCompareExchange8(char volatile*, char, char);
 #define REG_MAX_BUCKET_WALK             256     // Safety cap on hash bucket iteration
 
 // ============================================================================
+// BOOT-PHASE EARLY-BAIL HELPER  (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// CmRegisterCallbackEx fires for MASSIVE registry traffic during boot,
+// dominated by HKLM\SYSTEM / HKLM\SOFTWARE reads issued from smss, csrss,
+// wininit, services and lsass.  Any synchronous user-mode IPC or contended
+// lock acquired in this path can serialize boot and grey the Welcome
+// screen.  We therefore short-circuit ALL pre-operation processing when
+// the user-mode service is not yet connected.
+//
+static FORCEINLINE BOOLEAN
+ShadowStrikeIsServiceConnected(VOID)
+{
+    return (InterlockedCompareExchange(&g_DriverData.ConnectedClients, 0, 0) > 0);
+}
+
+
+// ============================================================================
 // INTERNAL STRUCTURES
 // ============================================================================
 
@@ -283,6 +301,20 @@ RegpNotifyClassToOperation(
     _In_ REG_NOTIFY_CLASS NotifyClass
     );
 
+static BOOLEAN
+RegpTryReadDwordValue(
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize,
+    _Out_ PULONG Value
+    );
+
+static BOOLEAN
+RegpIsServiceDisabledStartValue(
+    _In_opt_ PCUNICODE_STRING ValueName,
+    _In_opt_ PVOID Data,
+    _In_ ULONG DataSize
+    );
+
 // ============================================================================
 // PAGED CODE SECTIONS
 // ============================================================================
@@ -348,6 +380,51 @@ RegpHashProcessId(
 {
     ULONG_PTR value = (ULONG_PTR)ProcessId;
     return (ULONG)((value >> 2) ^ (value >> 12));
+}
+
+static BOOLEAN
+RegpTryReadDwordValue(
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize,
+    _Out_ PULONG Value
+    )
+{
+    ULONG localValue;
+
+    if (Data == NULL || Value == NULL || DataSize < sizeof(ULONG)) {
+        return FALSE;
+    }
+
+    __try {
+        localValue = *(volatile ULONG*)Data;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+
+    *Value = localValue;
+    return TRUE;
+}
+
+static BOOLEAN
+RegpIsServiceDisabledStartValue(
+    _In_opt_ PCUNICODE_STRING ValueName,
+    _In_opt_ PVOID Data,
+    _In_ ULONG DataSize
+    )
+{
+    UNICODE_STRING startValue;
+    ULONG dwordValue;
+
+    if (ValueName == NULL || ValueName->Buffer == NULL) {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&startValue, L"Start");
+    if (!RtlEqualUnicodeString(ValueName, &startValue, TRUE)) {
+        return FALSE;
+    }
+
+    return RegpTryReadDwordValue(Data, DataSize, &dwordValue) && dwordValue == 4;
 }
 
 // ============================================================================
@@ -1164,11 +1241,15 @@ BOOLEAN
 ShadowStrikeDetectRansomwareRegistryBehavior(
     _In_ PCUNICODE_STRING KeyPath,
     _In_opt_ PCUNICODE_STRING ValueName,
-    _In_ SHADOWSTRIKE_REG_OPERATION Operation
+    _In_ SHADOWSTRIKE_REG_OPERATION Operation,
+    _In_opt_ PVOID Data,
+    _In_ ULONG DataSize
     )
 {
     UNICODE_STRING testPath;
-    UNICODE_STRING startValue;
+    UNICODE_STRING systemRestorePath;
+    UNICODE_STRING disableSrValue;
+    UNICODE_STRING disableConfigValue;
     BOOLEAN isRansomwareIndicator = FALSE;
 
     PAGED_CODE();
@@ -1178,7 +1259,9 @@ ShadowStrikeDetectRansomwareRegistryBehavior(
     }
 
     //
-    // Only care about modifications
+    // T1490 registry telemetry must represent recovery destruction or service
+    // disablement.  Normal Windows boot legitimately writes beneath Services\VSS
+    // and Services\wbengine; those maintenance writes are not ransomware prep.
     //
     if (Operation != RegOpSetValue &&
         Operation != RegOpDeleteKey &&
@@ -1186,45 +1269,45 @@ ShadowStrikeDetectRansomwareRegistryBehavior(
         return FALSE;
     }
 
-    //
-    // Check VSS service manipulation
-    //
     RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_VSS_ADMIN);
     if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
-        //
-        // Check if disabling the service (Start value = 4)
-        //
-        if (ValueName != NULL) {
-            RtlInitUnicodeString(&startValue, L"Start");
-            if (RtlEqualUnicodeString(ValueName, &startValue, TRUE)) {
-                isRansomwareIndicator = TRUE;
-            }
-        }
-
         if (Operation == RegOpDeleteKey || Operation == RegOpDeleteValue) {
             isRansomwareIndicator = TRUE;
-        }
-    }
-
-    //
-    // Check Windows Backup Engine
-    //
-    RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_WBENGINE);
-    if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
-        if (Operation == RegOpSetValue ||
-            Operation == RegOpDeleteKey ||
-            Operation == RegOpDeleteValue) {
+        } else if (RegpIsServiceDisabledStartValue(ValueName, (PVOID)Data, DataSize)) {
             isRansomwareIndicator = TRUE;
         }
     }
 
-    //
-    // Check Backup Exec
-    //
+    RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_WBENGINE);
+    if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
+        if (Operation == RegOpDeleteKey || Operation == RegOpDeleteValue) {
+            isRansomwareIndicator = TRUE;
+        } else if (RegpIsServiceDisabledStartValue(ValueName, (PVOID)Data, DataSize)) {
+            isRansomwareIndicator = TRUE;
+        }
+    }
+
+    RtlInitUnicodeString(&systemRestorePath,
+                         L"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRestore");
+    if (RtlPrefixUnicodeString(&systemRestorePath, KeyPath, TRUE) &&
+        Operation == RegOpSetValue &&
+        ValueName != NULL) {
+        ULONG dwordValue;
+
+        RtlInitUnicodeString(&disableSrValue, L"DisableSR");
+        RtlInitUnicodeString(&disableConfigValue, L"DisableConfig");
+
+        if ((RtlEqualUnicodeString(ValueName, &disableSrValue, TRUE) ||
+             RtlEqualUnicodeString(ValueName, &disableConfigValue, TRUE)) &&
+            RegpTryReadDwordValue((PVOID)Data, DataSize, &dwordValue) &&
+            dwordValue != 0) {
+            isRansomwareIndicator = TRUE;
+        }
+    }
+
     RtlInitUnicodeString(&testPath, SHADOWSTRIKE_REG_BACKUP_EXEC);
     if (RtlPrefixUnicodeString(&testPath, KeyPath, TRUE)) {
-        if (Operation == RegOpSetValue ||
-            Operation == RegOpDeleteKey) {
+        if (Operation == RegOpDeleteKey || Operation == RegOpDeleteValue) {
             isRansomwareIndicator = TRUE;
         }
     }
@@ -1559,7 +1642,7 @@ ShadowStrikeAnalyzeRegistryPersistence(
     //
     // Check for ransomware behavior
     //
-    if (ShadowStrikeDetectRansomwareRegistryBehavior(RegistryPath, ValueName, RegOpSetValue)) {
+    if (ShadowStrikeDetectRansomwareRegistryBehavior(RegistryPath, ValueName, RegOpSetValue, Data, DataSize)) {
         threatIndicators |= RegThreatRansomware;
         shouldNotify = TRUE;
     }
@@ -1683,6 +1766,9 @@ ShadowStrikeRegistryCallbackRoutine(
     PVOID keyObject = NULL;
     ULONG keyFlags;
     PUNICODE_STRING createCompleteName = NULL;
+    PUNICODE_STRING operationValueName = NULL;
+    PVOID operationData = NULL;
+    ULONG operationDataSize = 0;
 
     PAGED_CODE();
 
@@ -1694,6 +1780,21 @@ ShadowStrikeRegistryCallbackRoutine(
     // race against the driver entering a stopped state.
     //
     if (!SHADOWSTRIKE_IS_READY()) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // === WINLOGON GREY-SCREEN MITIGATION (BOOT-PHASE EARLY BAIL) ===
+    //
+    // Registry traffic during Windows boot is dominated by legitimate SCM,
+    // svchost, WinDefend, VSS and WMI service initialization under HKLM\SYSTEM
+    // and HKLM\SOFTWARE.  The correlation detector must not learn that noisy
+    // baseline before interactive logon; otherwise normal service startup can
+    // look like persistence + recovery tampering.  Returning STATUS_SUCCESS is
+    // ABI-correct (Cm treats it as "do not modify, do not block").
+    //
+    if (ShadowStrikeInBootGrace() || !ShadowStrikeIsServiceConnected()) {
+        InterlockedIncrement64(&g_RegistryMonitor.Statistics.TotalOperations);
         return STATUS_SUCCESS;
     }
 
@@ -1800,6 +1901,9 @@ ShadowStrikeRegistryCallbackRoutine(
         case RegNtPreSetValueKey: {
             PREG_SET_VALUE_KEY_INFORMATION info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
             keyObject = info->Object;
+            operationValueName = info->ValueName;
+            operationData = info->Data;
+            operationDataSize = info->DataSize;
             break;
         }
         case RegNtPreDeleteKey: {
@@ -1810,6 +1914,7 @@ ShadowStrikeRegistryCallbackRoutine(
         case RegNtPreDeleteValueKey: {
             PREG_DELETE_VALUE_KEY_INFORMATION info = (PREG_DELETE_VALUE_KEY_INFORMATION)Argument2;
             keyObject = info->Object;
+            operationValueName = info->ValueName;
             break;
         }
         case RegNtPreRenameKey: {
@@ -1959,7 +2064,12 @@ SkipCreatePathBuild:
         //
         // Ransomware detection
         //
-        if (ShadowStrikeDetectRansomwareRegistryBehavior(&keyPath, NULL, operation)) {
+        if (ShadowStrikeDetectRansomwareRegistryBehavior(
+                &keyPath,
+                operationValueName,
+                operation,
+                operationData,
+                operationDataSize)) {
             if (g_RegistryMonitor.Config.BlockHighRiskOperations) {
                 blockOperation = TRUE;
                 InterlockedIncrement64(&g_RegistryMonitor.Statistics.ThreatBlocks);
@@ -2021,38 +2131,58 @@ SkipCreatePathBuild:
                 }
 
                 //
-                // (2) Update category-specific counters from key classification
+                // (2) Update category-specific counters from key classification.
+                // High-level path flags are suitable for persistence location
+                // accounting, but impact/evasion threat indicators require value
+                // semantics to avoid treating normal boot service maintenance as
+                // ransomware preparation or Defender tampering.
                 //
-                if (keyFlags & RegFlagPersistenceKey) {
-                    InterlockedIncrement64(&procCtx->PersistenceAttempts);
-                }
-                if (keyFlags & RegFlagSecurityKey) {
-                    InterlockedIncrement64(&procCtx->SecurityKeyAccesses);
-                }
-                if (keyFlags & RegFlagRunKey) {
-                    InterlockedIncrement((volatile LONG*)&procCtx->RunKeyModifications);
-                }
-                if (keyFlags & RegFlagServiceKey) {
-                    InterlockedIncrement((volatile LONG*)&procCtx->ServiceModifications);
-                }
-                if (keyFlags & RegFlagIFEOKey) {
-                    InterlockedIncrement((volatile LONG*)&procCtx->IFEOModifications);
-                }
-                if (keyFlags & (RegFlagDefenderKey | RegFlagFirewallKey | RegFlagSecurityKey)) {
-                    InterlockedIncrement((volatile LONG*)&procCtx->SecurityPolicyModifications);
-                }
+                {
+                    ULONG semanticThreatIndicators = RegThreatNone;
 
-                //
-                // Accumulate threat indicators across the process lifetime
-                //
-                if (keyFlags & RegFlagPersistenceKey)
-                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatPersistence);
-                if (keyFlags & RegFlagVSSKey)
-                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatRansomware);
-                if (keyFlags & (RegFlagDefenderKey | RegFlagFirewallKey))
-                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatDefenseEvasion);
-                if (keyFlags & RegFlagCertificateKey)
-                    InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatPrivilegeEsc);
+                    if (keyFlags & RegFlagSecurityKey) {
+                        InterlockedIncrement64(&procCtx->SecurityKeyAccesses);
+
+                        semanticThreatIndicators |= ShadowStrikeDetectDefenseEvasionRegistry(
+                            &keyPath,
+                            operationValueName,
+                            operationData,
+                            operationDataSize);
+                    }
+
+                    if (ShadowStrikeDetectRansomwareRegistryBehavior(
+                            &keyPath,
+                            operationValueName,
+                            operation,
+                            operationData,
+                            operationDataSize)) {
+                        semanticThreatIndicators |= RegThreatRansomware;
+                    }
+
+                    if (keyFlags & RegFlagPersistenceKey) {
+                        InterlockedIncrement64(&procCtx->PersistenceAttempts);
+                        InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatPersistence);
+                    }
+                    if (keyFlags & RegFlagRunKey) {
+                        InterlockedIncrement((volatile LONG*)&procCtx->RunKeyModifications);
+                    }
+                    if (keyFlags & RegFlagServiceKey) {
+                        InterlockedIncrement((volatile LONG*)&procCtx->ServiceModifications);
+                    }
+                    if (keyFlags & RegFlagIFEOKey) {
+                        InterlockedIncrement((volatile LONG*)&procCtx->IFEOModifications);
+                    }
+                    if (semanticThreatIndicators & RegThreatDefenseEvasion) {
+                        InterlockedIncrement((volatile LONG*)&procCtx->SecurityPolicyModifications);
+                        InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatDefenseEvasion);
+                    }
+                    if (semanticThreatIndicators & RegThreatRansomware) {
+                        InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatRansomware);
+                    }
+                    if (keyFlags & RegFlagCertificateKey) {
+                        InterlockedOr((volatile LONG*)&procCtx->ThreatIndicators, RegThreatPrivilegeEsc);
+                    }
+                }
 
                 //
                 // (3) Record in temporal ring buffer for pattern analysis

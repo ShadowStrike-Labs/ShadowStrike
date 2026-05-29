@@ -72,6 +72,7 @@ Performance Characteristics:
 #include "../../Exclusions/ExclusionManager.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/StringUtils.h"
+#include "../../Utilities/FileUtils.h"
 #include <ntstrsafe.h>
 #include <wchar.h>
 #include "../../Behavioral/BehaviorEngine.h"
@@ -708,6 +709,8 @@ Return Value:
     //
     *CompletionContext = NULL;
 
+    SHADOW_FS_BOOT_TRACE("PreCreate", "enter");
+
     //
     // Zero-initialize CacheKey to prevent use of uninitialized data
     //
@@ -770,6 +773,7 @@ Return Value:
         !SHADOWSTRIKE_IS_READY() ||
         !g_DriverData.Config.FilteringEnabled ||
         !g_DriverData.Config.ScanOnOpen) {
+        SHADOW_FS_BOOT_TRACE("PreCreate", "skip-not-ready");
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -992,6 +996,36 @@ Return Value:
     // If directory, skip malware scanning (self-protect already checked)
     //
     if (IsDirectory) {
+        goto CleanupAllow;
+    }
+
+    //
+    // ====================================================================
+    // BOOT-PHASE HARDENING (winlogon grey-screen mitigation)
+    // ====================================================================
+    //
+    // For the first SHADOW_FS_BOOT_PHASE_MS ms of unbiased system uptime
+    // the user-mode ShadowStrikePhantomService is either not yet running
+    // or is mid-startup. Any synchronous scan IPC (SbSendScanRequest below
+    // -- a synchronous FltSendMessage with a 30s default timeout) would
+    // hang winlogon.exe / lsass.exe / userinit.exe / dwm.exe on EVERY
+    // boot-phase DLL load and freeze the system at the grey welcome
+    // screen.
+    //
+    // The earlier Phase 0 - 6b checks (validation, kernel-mode skip,
+    // system-PID skip, exclusion, self-protection, file-protection engine)
+    // are pure in-kernel work against static tables and never block, so
+    // they remain in effect.
+    //
+    // Threat scoring, ETW emission, behavior-engine submission, KTM
+    // tracking, cache lookup, and especially the synchronous user-mode
+    // scan -- all of which can block, allocate, or touch subsystems that
+    // are not yet fully wired during boot -- are skipped here. After the
+    // boot window expires the gate latches closed and this branch becomes
+    // a single relaxed atomic load.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PreCreate", "skip-boot-phase-postsp");
         goto CleanupAllow;
     }
 

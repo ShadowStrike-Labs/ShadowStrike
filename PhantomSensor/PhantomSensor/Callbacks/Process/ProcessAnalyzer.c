@@ -849,14 +849,39 @@ PaShutdown(
     KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
     KeSetEvent(&Internal->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
 
+    //
+    // Bounded join: an unbounded wait here can deadlock the unload path if the
+    // worker is stuck on a downed dependency.  Give the worker 30s, otherwise
+    // BugCheck — freeing Internal while the worker is alive is UAF.
+    //
     if (Internal->WorkerThread != NULL) {
-        KeWaitForSingleObject(
+        LARGE_INTEGER paTimeout;
+        NTSTATUS waitStatus;
+
+        paTimeout.QuadPart = -((LONGLONG)30 * 10000000);  // 30 seconds
+        waitStatus = KeWaitForSingleObject(
             Internal->WorkerThread,
             Executive,
             KernelMode,
             FALSE,
-            NULL
+            &paTimeout
             );
+
+        if (waitStatus != STATUS_SUCCESS) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike-PA] CRITICAL: worker thread did not exit within 30s "
+                "(waitStatus=0x%08X) — controlled BugCheck instead of UAF\n",
+                waitStatus);
+
+            KeBugCheckEx(
+                DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                (ULONG_PTR)0xBA000001u,                  // sentinel: PA worker hang
+                (ULONG_PTR)Internal->WorkerThread,
+                (ULONG_PTR)waitStatus,
+                (ULONG_PTR)Internal
+                );
+        }
+
         ObDereferenceObject(Internal->WorkerThread);
         Internal->WorkerThread = NULL;
     }

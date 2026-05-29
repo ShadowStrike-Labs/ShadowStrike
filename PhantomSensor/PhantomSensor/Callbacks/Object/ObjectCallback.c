@@ -648,6 +648,18 @@ ShadowStrikeProcessPreCallback(
     }
 
     //
+    // Boot-grace fast path: allow PsInitialSystemProcess unconditionally and
+    // any caller during the boot window so we never strip handle rights from
+    // winlogon/lsass/csrss while the user-mode policy is still spinning up.
+    //
+    if (PsGetCurrentProcess() == PsInitialSystemProcess) {
+        return OB_PREOP_SUCCESS;
+    }
+    if (ShadowStrikeInBootGrace()) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
     // Update statistics (lock-free)
     //
     InterlockedIncrement64(&context->TotalProcessOperations);
@@ -1036,6 +1048,17 @@ ShadowStrikeThreadPreCallback(
     }
 
     if (context->InitState != OB_INIT_STATE_INITIALIZED) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
+    // Boot-grace fast path: mirror process-handle callback so thread-handle
+    // accesses from SYSTEM and during boot window are never restricted.
+    //
+    if (PsGetCurrentProcess() == PsInitialSystemProcess) {
+        return OB_PREOP_SUCCESS;
+    }
+    if (ShadowStrikeInBootGrace()) {
         return OB_PREOP_SUCCESS;
     }
 

@@ -736,17 +736,50 @@ MmMonitorShutdown(
     MemoryBarrier();
 
     //
-    // Wait for outstanding references to drain â€” INFINITE wait is mandatory
-    // to prevent BSOD from freeing resources while operations still hold refs.
+    // Wait for outstanding references to drain.
     //
-    if (g_MemoryMonitor.OutstandingRefs > 0) {
-        KeWaitForSingleObject(
-            &g_MemoryMonitor.ShutdownEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            NULL
-        );
+    // BUG #5 fix: the previous unbounded KeWaitForSingleObject(Timeout=NULL)
+    // would hang the unload path forever if any sub-module path was stuck
+    // (e.g., blocked acquiring a global rundown that has already been torn
+    // down).  We now poll with a 5s timeout and escalate to a controlled
+    // BugCheck after 60s — freeing live state would BSOD with UAF, so we
+    // prefer a controlled crash with an actionable signature.
+    //
+    if (ReadNoFence(&g_MemoryMonitor.OutstandingRefs) > 0) {
+        LARGE_INTEGER timeout;
+        ULONG attempts = 0;
+
+        for (;;) {
+            NTSTATUS waitStatus;
+
+            timeout.QuadPart = -((LONGLONG)5 * 10000000);  // 5 seconds
+            waitStatus = KeWaitForSingleObject(
+                &g_MemoryMonitor.ShutdownEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                &timeout);
+
+            if (waitStatus == STATUS_SUCCESS) {
+                break;
+            }
+
+            ++attempts;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike-MM] Shutdown drain stalled: OutstandingRefs=%ld "
+                "attempt=%lu/12\n",
+                ReadNoFence(&g_MemoryMonitor.OutstandingRefs),
+                attempts);
+
+            if (attempts >= 12) {  // 12 * 5s = 60s budget
+                KeBugCheckEx(
+                    DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                    (ULONG_PTR)ReadNoFence(&g_MemoryMonitor.OutstandingRefs),
+                    (ULONG_PTR)&g_MemoryMonitor,
+                    (ULONG_PTR)&g_MemoryMonitor.ShutdownEvent,
+                    (ULONG_PTR)0x4D4D0001u);  // sentinel: MM drain timeout
+            }
+        }
     }
 
     //

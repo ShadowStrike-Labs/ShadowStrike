@@ -45,6 +45,7 @@
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Exclusions/ExclusionManager.h"
+#include "../../Utilities/FileUtils.h"
 #include <ntstrsafe.h>
 
 //
@@ -673,6 +674,29 @@ NpMonPreCreateNamedPipe(
 
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
+
+    SHADOW_FS_BOOT_TRACE("PreCreateNamedPipe", "enter");
+
+    //
+    // ====================================================================
+    // BOOT-PHASE HARDENING (winlogon grey-screen mitigation)
+    // ====================================================================
+    //
+    // csrss.exe, lsass.exe, services.exe, and the SCM all create dozens
+    // of named pipes (\Device\NamedPipe\lsass, \pipe\srvsvc, \pipe\netlogon,
+    // \pipe\epmapper, ALPC reflection pipes, ...) within the first few
+    // seconds of boot. Touching the push-locked hash table, LRU eviction,
+    // rate limiter, or event queue here BEFORE NamedPipeMonitor's globals
+    // are fully initialized -- or while those structures are racing with
+    // late driver-init paths -- can hang the OS at the welcome screen.
+    //
+    // Skip everything during the boot window; named-pipe C2 detection
+    // resumes after the OS is past initial sign-in.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PreCreateNamedPipe", "skip-boot-phase");
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     if (!NpMonIsActive()) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;

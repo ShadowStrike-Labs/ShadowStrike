@@ -85,6 +85,25 @@ typedef struct _TN_PROTECTED_PROCESS_ENTRY {
     HANDLE ProcessId;
 } TN_PROTECTED_PROCESS_ENTRY;
 
+// ============================================================================
+// BOOT-PHASE EARLY-BAIL HELPER  (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// PsSetCreateThreadNotifyRoutine fires THOUSANDS of times during boot
+// (every kernel worker, every user-mode thread in smss/csrss/wininit/
+// services/lsass/winlogon/userinit/explorer/dwm).  If any single
+// invocation performs synchronous IPC to a user-mode service that is
+// not yet running, the system deadlocks at the Welcome screen.
+//
+// This helper gates ALL heavy work on the FilterPort connection state.
+//
+static FORCEINLINE BOOLEAN
+ShadowStrikeIsServiceConnected(VOID)
+{
+    return (g_DriverData.ConnectedClients > 0);
+}
+
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, RegisterThreadNotify)
 #pragma alloc_text(PAGE, UnregisterThreadNotify)
@@ -753,6 +772,24 @@ Arguments:
     PAGED_CODE();
 
     //
+    // === WINLOGON GREY-SCREEN MITIGATION (BOOT-PHASE EARLY BAIL) ===
+    //
+    // Thread-create callbacks fire thousands of times during boot.  Until
+    // the user-mode service is connected we MUST NOT perform IPC, take
+    // contended locks, or allocate per-thread state - otherwise smss /
+    // csrss / wininit / winlogon get serialized through us and the
+    // Welcome screen never finishes painting.
+    //
+    if (!ShadowStrikeIsServiceConnected()) {
+        if (Create) {
+            InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsCreated);
+        } else {
+            InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsTerminated);
+        }
+        return;
+    }
+
+    //
     // Check if driver is ready to process requests
     //
     if (!SHADOWSTRIKE_IS_READY()) {
@@ -772,8 +809,9 @@ Arguments:
 
     //
     // Acquire rundown protection for safe shutdown coordination
+    // (Thread-class counter for unload-timeout diagnostics).
     //
-    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN()) {
+    if (!SHADOWSTRIKE_ACQUIRE_RUNDOWN_THREAD()) {
         return;
     }
 
@@ -782,7 +820,7 @@ Arguments:
     //
     if (ShadowStrikeIsProcessExcluded(ProcessId, NULL) &&
         ShadowStrikeIsProcessExcluded(PsGetCurrentProcessId(), NULL)) {
-        SHADOWSTRIKE_RELEASE_RUNDOWN();
+        SHADOWSTRIKE_RELEASE_RUNDOWN_THREAD();
         return;
     }
 
@@ -841,7 +879,7 @@ Arguments:
         TnpHandleThreadTermination(ProcessId, ThreadId);
     }
 
-    SHADOWSTRIKE_RELEASE_RUNDOWN();
+    SHADOWSTRIKE_RELEASE_RUNDOWN_THREAD();
 }
 
 

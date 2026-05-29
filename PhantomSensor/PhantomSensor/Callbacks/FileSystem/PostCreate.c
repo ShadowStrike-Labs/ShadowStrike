@@ -79,6 +79,7 @@
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Shared/BehaviorTypes.h"
 #include "../../Context/InstanceContext.h"
+#include "../../Utilities/FileUtils.h"
 #include <ntstrsafe.h>
 
 // ============================================================================
@@ -525,6 +526,17 @@ Return Value:
     }
 
     if (!SHADOWSTRIKE_IS_READY()) {
+        goto Cleanup;
+    }
+
+    //
+    // BOOT-PHASE HARDENING: PreCreate already returned NO_CALLBACK during
+    // the boot window so PostCreate should not normally run, but be
+    // defensive -- if a stale completion still reaches us, skip all
+    // context allocation and behavior submissions to keep boot fast.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PostCreate", "skip-boot-phase");
         goto Cleanup;
     }
 

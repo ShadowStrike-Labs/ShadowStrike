@@ -59,6 +59,7 @@
 #include "../Callbacks/FileSystem/PreSetInfo.h"
 #include "../Context/InstanceContext.h"
 #include "../Transactions/KtmMonitor.h"
+#include "../Utilities/FileUtils.h"
 
 //
 // Forward declarations for callback functions defined in dedicated modules.
@@ -600,7 +601,21 @@ ShadowStrikePreCleanup(
 
     NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
 
+    SHADOW_FS_BOOT_TRACE("PreCleanup", "enter");
+
     if (!ShadowStrikeIsDriverReady()) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    // BOOT-PHASE HARDENING: PreCleanup may issue a rescan via the comm
+    // port (ShadowStrikeQueueRescan -> SHADOWSTRIKE_USER_MODE_CONNECTED).
+    // During the boot window the service may be mid-startup; skip rescans
+    // until the user-mode side is fully up to avoid extending the boot
+    // grey-screen window via spurious comm-port traffic.
+    //
+    if (ShadowFsIsBootPhase()) {
+        SHADOW_FS_BOOT_TRACE("PreCleanup", "skip-boot-phase");
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -778,6 +793,8 @@ ShadowStrikePreCreateNamedPipe(
     _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
     )
 {
+    SHADOW_FS_BOOT_TRACE("PreCreateNamedPipeWrap", "enter");
+
     if (!ShadowStrikeIsDriverReady()) {
         *CompletionContext = NULL;
         return FLT_PREOP_SUCCESS_NO_CALLBACK;

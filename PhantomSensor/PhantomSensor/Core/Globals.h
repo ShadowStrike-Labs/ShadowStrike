@@ -311,6 +311,13 @@ typedef struct _SHADOWSTRIKE_DRIVER_DATA {
     /// This REPLACES the old OutstandingOperations counter with proper kernel primitive
     EX_RUNDOWN_REF RundownProtection;
 
+    /// @brief Per-callback in-flight counters (diagnostic only - NOT for synchronization).
+    /// Read on bounded-wait timeout to identify the stuck callback class so the
+    /// driver can emit actionable telemetry instead of a silent watchdog reboot.
+    volatile LONG InFlightProcess;
+    volatile LONG InFlightThread;
+    volatile LONG InFlightPreAcquireSection;
+
     /// @brief Legacy counter for statistics only (NOT for synchronization)
     volatile LONG64 TotalOperationsProcessed;
 
@@ -374,6 +381,63 @@ typedef struct _SHADOWSTRIKE_DRIVER_DATA {
     /// @brief Driver object pointer
     PDRIVER_OBJECT DriverObject;
 
+    // =========================================================================
+    // Boot Phase Tracking (added v1.0.13.0 — winlogon grey-screen fix)
+    // =========================================================================
+    //
+    // FullyOperational is the AUTHORITATIVE flag indicating that DriverEntry
+    // has run to completion AND FltStartFiltering returned success AND the
+    // user-mode communication port is created. All callbacks must consult
+    // ShadowStrikeIsFullyOperational() — and additionally ShadowStrikeInBootGrace()
+    // for expensive boot-phase-only paths — before performing any work that
+    // could block winlogon/csrss/smss filesystem IO at boot.
+    //
+    // The legacy Initialized/FilteringStarted booleans REMAIN VALID and are
+    // still set in lockstep — FullyOperational is set strictly after both,
+    // so it is a superset gate and is safe to use alongside SHADOWSTRIKE_IS_READY().
+    //
+
+    /// @brief Driver is fully operational (atomic). 0 = not ready, 1 = ready.
+    /// Set strictly AFTER FltStartFiltering returns success AND CommPort exists.
+    /// Pre-callbacks in foreign agents MUST consult this via ShadowStrikeIsFullyOperational().
+    volatile LONG FullyOperational;
+
+    /// @brief Performance-counter tick captured at the start of DriverEntry.
+    /// Other modules compute "elapsed since DriverEntry" by subtracting from
+    /// KeQueryPerformanceCounter(NULL).QuadPart.
+    LARGE_INTEGER BootPhaseStartTick;
+
+    /// @brief Performance-counter tick at which the 90-second boot-grace window expires.
+    /// While KeQueryPerformanceCounter() < BootGraceUntilTick, modules should
+    /// skip expensive scanning to avoid stalling winlogon/csrss/smss IO.
+    LARGE_INTEGER BootGraceUntilTick;
+
+    /// @brief Cached performance counter frequency (Hz). Populated during DriverEntry.
+    LARGE_INTEGER PerfFrequency;
+
+    // -------------------------------------------------------------------------
+    // Deferred post-init work queue
+    // -------------------------------------------------------------------------
+    //
+    // Subsystems may queue work items here during their init phase that MUST
+    // NOT execute until FltStartFiltering has returned and the driver is
+    // marked FullyOperational. DriverEntry drains the list at the very end
+    // of the boot sequence by invoking each callback at PASSIVE_LEVEL.
+    //
+    // After PostInitDrained transitions to 1, the queue is permanently closed
+    // and further calls to ShadowStrikeQueuePostInitWork() will execute the
+    // callback inline (the driver is already operational).
+    //
+
+    /// @brief Spinlock guarding PostInitWorkList.
+    KSPIN_LOCK PostInitWorkLock;
+
+    /// @brief Head of deferred post-init work items.
+    LIST_ENTRY PostInitWorkList;
+
+    /// @brief 0 = queueing allowed, 1 = drain complete (queue closed).
+    volatile LONG PostInitDrained;
+
 } SHADOWSTRIKE_DRIVER_DATA, *PSHADOWSTRIKE_DRIVER_DATA;
 
 // ============================================================================
@@ -410,6 +474,57 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 #define SHADOWSTRIKE_RELEASE_RUNDOWN() \
     ExReleaseRundownProtection(&g_DriverData.RundownProtection)
 
+//
+// Per-callback rundown acquire/release macros. These wrap the global rundown
+// acquire with a per-callback InterlockedIncrement/Decrement on a diagnostic
+// counter so the unload path can identify which callback class is stuck on
+// the global rundown when the bounded wait times out.
+//
+// The counter is touched ONLY after a successful global acquire and BEFORE
+// the matching release, which means the counter mirrors the contribution of
+// that callback class to the global rundown refcount exactly.
+//
+
+/// @brief Per-callback rundown acquire - Process notify callback class.
+#define SHADOWSTRIKE_ACQUIRE_RUNDOWN_PROCESS()                              \
+    (ExAcquireRundownProtection(&g_DriverData.RundownProtection)            \
+        ? (InterlockedIncrement(&g_DriverData.InFlightProcess), TRUE)       \
+        : FALSE)
+
+/// @brief Per-callback rundown release - Process notify callback class.
+#define SHADOWSTRIKE_RELEASE_RUNDOWN_PROCESS()                              \
+    do {                                                                    \
+        InterlockedDecrement(&g_DriverData.InFlightProcess);                \
+        ExReleaseRundownProtection(&g_DriverData.RundownProtection);        \
+    } while (0)
+
+/// @brief Per-callback rundown acquire - Thread notify callback class.
+#define SHADOWSTRIKE_ACQUIRE_RUNDOWN_THREAD()                               \
+    (ExAcquireRundownProtection(&g_DriverData.RundownProtection)            \
+        ? (InterlockedIncrement(&g_DriverData.InFlightThread), TRUE)        \
+        : FALSE)
+
+/// @brief Per-callback rundown release - Thread notify callback class.
+#define SHADOWSTRIKE_RELEASE_RUNDOWN_THREAD()                               \
+    do {                                                                    \
+        InterlockedDecrement(&g_DriverData.InFlightThread);                 \
+        ExReleaseRundownProtection(&g_DriverData.RundownProtection);        \
+    } while (0)
+
+/// @brief Per-callback rundown acquire - PreAcquireSection callback class.
+#define SHADOWSTRIKE_ACQUIRE_RUNDOWN_PAS()                                  \
+    (ExAcquireRundownProtection(&g_DriverData.RundownProtection)            \
+        ? (InterlockedIncrement(&g_DriverData.InFlightPreAcquireSection),   \
+           TRUE)                                                            \
+        : FALSE)
+
+/// @brief Per-callback rundown release - PreAcquireSection callback class.
+#define SHADOWSTRIKE_RELEASE_RUNDOWN_PAS()                                  \
+    do {                                                                    \
+        InterlockedDecrement(&g_DriverData.InFlightPreAcquireSection);      \
+        ExReleaseRundownProtection(&g_DriverData.RundownProtection);        \
+    } while (0)
+
 /// @brief Increment total operations counter (for statistics only)
 #define SHADOWSTRIKE_COUNT_OPERATION() \
     InterlockedIncrement64(&g_DriverData.TotalOperationsProcessed)
@@ -434,6 +549,112 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 /// @brief Add to statistic counter
 #define SHADOWSTRIKE_ADD_STAT(field, value) \
     InterlockedAdd64(&g_DriverData.Stats.field, (LONG64)(value))
+
+// ============================================================================
+// BOOT-PHASE OPERATIONAL GATES (v1.0.13.0)
+// ============================================================================
+//
+// These helpers are the canonical guards that ALL callback modules must use
+// before doing any non-trivial work. They are intentionally branch-prediction
+// friendly (single atomic read / single subtraction) and safe to call at
+// IRQL <= DISPATCH_LEVEL.
+//
+// Usage from foreign callback modules (Process/Thread/Image/Registry/Object/FS):
+//
+//     if (!ShadowStrikeIsFullyOperational()) {
+//         return STATUS_SUCCESS;            // no-op until DriverEntry done
+//     }
+//     if (ShadowStrikeInBootGrace()) {
+//         return STATUS_SUCCESS;            // skip heavy scan during first 90s
+//     }
+//
+
+/**
+ * @brief Returns TRUE iff DriverEntry has completed successfully and the
+ *        driver is fully operational (FltStartFiltering returned success
+ *        AND user-mode communication port has been created).
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+static __forceinline BOOLEAN
+ShadowStrikeIsFullyOperational(VOID)
+{
+    return InterlockedCompareExchange(&g_DriverData.FullyOperational, 0, 0) != 0;
+}
+
+/**
+ * @brief Returns TRUE while the 90-second boot-grace window is still active.
+ *        Modules SHOULD short-circuit expensive scan paths while this is TRUE
+ *        so that winlogon / csrss / smss filesystem IO is not stalled.
+ *
+ *        Reads the cached BootGraceUntilTick (set once during DriverEntry)
+ *        and the live performance counter. Cheap; safe to call from hot paths.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+static __forceinline BOOLEAN
+ShadowStrikeInBootGrace(VOID)
+{
+    LARGE_INTEGER now;
+    LONGLONG until = g_DriverData.BootGraceUntilTick.QuadPart;
+
+    if (until == 0) {
+        //
+        // Grace window not yet initialized — treat as active so callers
+        // skip heavy work until DriverEntry installs the deadline.
+        //
+        return TRUE;
+    }
+
+    now = KeQueryPerformanceCounter(NULL);
+    return (BOOLEAN)(now.QuadPart < until);
+}
+
+// ============================================================================
+// DEFERRED POST-INIT WORK QUEUE (v1.0.13.0)
+// ============================================================================
+
+/**
+ * @brief Signature for deferred post-init work callbacks.
+ *
+ * Invoked at PASSIVE_LEVEL after FltStartFiltering has succeeded and the
+ * driver has transitioned to FullyOperational. Must not block.
+ */
+typedef VOID (*PFN_SHADOWSTRIKE_POST_INIT)(_In_opt_ PVOID Context);
+
+/**
+ * @brief Queue a callback to be invoked after DriverEntry completes.
+ *
+ * If the driver is already fully operational at the time of the call, the
+ * callback is invoked inline. Otherwise it is appended to the post-init
+ * queue and run when ShadowStrikeDrainPostInitWork() is called from the
+ * tail of DriverEntry.
+ *
+ * @param Callback  Required. Function to invoke.
+ * @param Context   Optional. Passed through to Callback.
+ * @return STATUS_SUCCESS on enqueue/inline success, STATUS_INSUFFICIENT_RESOURCES on alloc fail.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+ShadowStrikeQueuePostInitWork(
+    _In_ PFN_SHADOWSTRIKE_POST_INIT Callback,
+    _In_opt_ PVOID Context
+    );
+
+/**
+ * @brief Drain the post-init queue and mark it closed.
+ *
+ * Called once from DriverEntry, immediately before FullyOperational is set
+ * to 1. After this call, ShadowStrikeQueuePostInitWork() invokes callbacks
+ * inline rather than enqueueing.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowStrikeDrainPostInitWork(VOID);
 
 // ============================================================================
 // VOLATILE BOOLEAN ACCESS HELPERS

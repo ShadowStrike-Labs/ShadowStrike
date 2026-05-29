@@ -430,6 +430,27 @@ ShadowStrikeWaitForRundownComplete(
     );
 
 /**
+ * @brief Bounded-wait wrapper around ExWaitForRundownProtectionRelease.
+ *
+ * Spawns a system worker thread that performs the (potentially infinite)
+ * rundown drain wait and signals a KEVENT on completion. The caller waits
+ * on the event with a finite timeout. On timeout, the worker is left to
+ * complete on its own (and free its own context) - we never join a thread
+ * that may itself be the cycle we are trying to escape.
+ *
+ * @param TimeoutMs Maximum time to wait, in milliseconds.
+ * @return STATUS_SUCCESS if rundown drained inside the budget;
+ *         STATUS_TIMEOUT if the budget expired (caller decides whether to
+ *         proceed or refuse unload).
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeWaitForRundownCompleteBounded(
+    _In_ ULONGLONG TimeoutMs
+    );
+
+/**
  * @brief Log driver initialization status.
  *
  * @param Component  Name of the component being initialized.

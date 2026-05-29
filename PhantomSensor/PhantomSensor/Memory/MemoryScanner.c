@@ -252,6 +252,16 @@ typedef struct _MS_SCANNER_INTERNAL {
     KEVENT ShutdownEvent;
 
     //
+    // Outstanding IoQueueWorkItem count (BUG #3 fix).
+    // Incremented BEFORE IoQueueWorkItem, decremented at the END of
+    // MspAsyncScanWorker.  ActiveScanCount tracks scans-in-flight from a
+    // logical perspective; this counter tracks the work-item lifetime
+    // specifically so that MsShutdown can be certain no MspAsyncScanWorker
+    // is still touching scanner state before lookasides are deleted.
+    //
+    volatile LONG QueuedWorkItems;
+
+    //
     // Device object for work items
     //
     PDEVICE_OBJECT DeviceObject;
@@ -758,6 +768,41 @@ MsShutdown(
             delay.QuadPart = -((LONGLONG)100 * 10000);  // 100ms
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
             retries++;
+        }
+    }
+
+    //
+    // BUG #3 fix: explicit drain of in-flight IoWorkItem workers.  ActiveScanCount
+    // is decremented inside MspAsyncScanWorker BEFORE the worker finishes touching
+    // scanner state and BEFORE MspReleaseReference; QueuedWorkItems is decremented
+    // at the very end of the worker, so it is the authoritative "the worker is
+    // still touching scanner state" indicator.  Without this, the lookaside
+    // deletion below can free pool a worker is still reading from.
+    //
+    {
+        ULONG spin = 0;
+        while (ReadNoFence(&scanner->QueuedWorkItems) > 0) {
+            LARGE_INTEGER poll;
+            poll.QuadPart = -((LONGLONG)10 * 10000);  // 10ms
+            KeDelayExecutionThread(KernelMode, FALSE, &poll);
+            ++spin;
+            if (spin == 100) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "[ShadowStrike-MS] WorkItem drain slow: queued=%ld\n",
+                    ReadNoFence(&scanner->QueuedWorkItems));
+            }
+            if (spin >= 3000) {  // 30s budget
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[ShadowStrike-MS] CRITICAL: %ld IoWorkItem(s) stuck; BugCheck "
+                    "to prevent UAF on lookaside deletion\n",
+                    ReadNoFence(&scanner->QueuedWorkItems));
+                KeBugCheckEx(
+                    DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                    (ULONG_PTR)ReadNoFence(&scanner->QueuedWorkItems),
+                    (ULONG_PTR)scanner,
+                    (ULONG_PTR)&scanner->QueuedWorkItems,
+                    (ULONG_PTR)0x4D530001u);  // sentinel: MS workitem drain timeout
+            }
         }
     }
 
@@ -1906,6 +1951,11 @@ MsScanAsync(
     //
     // Queue the work item for async execution.
     //
+    // BUG #3 fix: track queued work items so MsShutdown can drain them
+    // explicitly.  Must increment BEFORE IoQueueWorkItem since the worker
+    // may run and decrement on another CPU before this call returns.
+    //
+    InterlockedIncrement(&scanner->QueuedWorkItems);
     IoQueueWorkItem(
         workItem,
         MspAsyncScanWorker,
@@ -3673,6 +3723,14 @@ Complete:
 
     ShadowStrikeFreePoolWithTag(workContext, MS_POOL_TAG_CONTEXT);
     ShadowStrikeFreePoolWithTag(activeScan, MS_POOL_TAG_CONTEXT);
+
+    //
+    // BUG #3 fix: signal MsShutdown's drain loop that this work item has
+    // released all references to scanner state.  Must come AFTER all reads
+    // of scanner pointers above and BEFORE MspReleaseReference (which may
+    // tear scanner down if we hold the last ref under shutdown).
+    //
+    InterlockedDecrement(&scanner->QueuedWorkItems);
 
     MspReleaseReference(scanner);
 }

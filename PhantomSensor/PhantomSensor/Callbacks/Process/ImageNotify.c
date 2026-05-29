@@ -70,6 +70,84 @@
 #include "../../Memory/HollowingDetector.h"
 #include "../../Memory/SectionTracker.h"
 
+// ============================================================================
+// BOOT-PHASE EARLY-BAIL HELPERS  (winlogon grey-screen mitigation)
+// ============================================================================
+//
+// PsSetLoadImageNotifyRoutine fires for EVERY image load - hundreds during
+// boot.  Synchronous SHA-256 over a whole image, plus IOC reputation lookup
+// over FilterPort, would accumulate into multiple seconds of stall and
+// hang the Welcome screen.  We bail unconditionally on:
+//
+//   - service not connected   (no FilterPort -> any IPC blocks forever)
+//   - loader process is one of the OS-critical boot processes
+//   - kernel module loads while service is not connected
+//
+static FORCEINLINE BOOLEAN
+ShadowStrikeIsServiceConnected(VOID)
+{
+    return (g_DriverData.ConnectedClients > 0);
+}
+
+static const PCWSTR g_ImgCriticalBootImageBaseNames[] = {
+    L"\\smss.exe",
+    L"\\csrss.exe",
+    L"\\wininit.exe",
+    L"\\services.exe",
+    L"\\lsass.exe",
+    L"\\winlogon.exe",
+    L"\\userinit.exe",
+    L"\\explorer.exe",
+    L"\\dwm.exe",
+    L"\\sihost.exe",
+    L"\\fontdrvhost.exe",
+    L"\\LogonUI.exe",
+};
+
+static BOOLEAN
+ShadowStrikeImgIsLoadingCriticalBootImage(
+    _In_opt_ PCUNICODE_STRING FullImageName
+    )
+/*++
+Routine Description:
+    Returns TRUE if the loaded image is one of the OS critical boot
+    binaries themselves - i.e., the load of the primary EXE for
+    smss/csrss/wininit/services/lsass/winlogon/userinit/explorer/etc.
+    DLL loads INTO those processes are filtered by the per-PID
+    creation-time exclusion path (PnpIsKnownSystemProcess and the
+    ProcessExclusion engine), not here.
+--*/
+{
+    ULONG i;
+    UNICODE_STRING needle;
+    UNICODE_STRING tail;
+
+    if (FullImageName == NULL ||
+        FullImageName->Buffer == NULL ||
+        FullImageName->Length == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(g_ImgCriticalBootImageBaseNames); i++) {
+        RtlInitUnicodeString(&needle, g_ImgCriticalBootImageBaseNames[i]);
+        if (FullImageName->Length < needle.Length) {
+            continue;
+        }
+
+        tail.Buffer = (PWCH)((PUCHAR)FullImageName->Buffer +
+                             (FullImageName->Length - needle.Length));
+        tail.Length = needle.Length;
+        tail.MaximumLength = needle.Length;
+
+        if (RtlEqualUnicodeString(&tail, &needle, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
 //
 // Forward declarations for undocumented but exported ntoskrnl APIs
 //
@@ -1916,6 +1994,43 @@ Arguments:
     //
     currentIrql = KeGetCurrentIrql();
     if (currentIrql > APC_LEVEL) {
+        return;
+    }
+
+    //
+    // === WINLOGON GREY-SCREEN MITIGATION (BOOT-PHASE EARLY BAIL) ===
+    //
+    // 1) Service-not-connected fast path: during cold boot the user-mode
+    //    PhantomService has not yet connected the FilterPort, so any
+    //    synchronous notification, hash-reputation lookup, or IOC match
+    //    that would normally route through CommPort/ScanBridge blocks
+    //    forever.  Drop the event - we will rejoin telemetry as soon as
+    //    the service connects.  PsSetLoadImageNotifyRoutine fires HUNDREDS
+    //    of times during boot; per-call IPC = guaranteed grey screen.
+    //
+    if (!ShadowStrikeIsServiceConnected()) {
+        InterlockedIncrement64(&g_ImgNotify.Stats.TotalImagesLoaded);
+        if (ProcessId == NULL) {
+            InterlockedIncrement64(&g_ImgNotify.Stats.KernelModeImages);
+        } else {
+            InterlockedIncrement64(&g_ImgNotify.Stats.UserModeImages);
+        }
+        return;
+    }
+
+    //
+    // 2) Critical-OS-image fast path: never hash, scan, or reputation-check
+    //    smss/csrss/wininit/services/lsass/winlogon/userinit/explorer
+    //    themselves.  These are integrity-checked by ELAM/CI and any
+    //    detection delay here causes user-visible boot stall.
+    //
+    if (FullImageName != NULL &&
+        ShadowStrikeImgIsLoadingCriticalBootImage(FullImageName)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/ImageNotify] CRITICAL-BOOT image skip PID=%lu\n",
+            HandleToULong(ProcessId));
+        InterlockedIncrement64(&g_ImgNotify.Stats.TotalImagesLoaded);
+        InterlockedIncrement64(&g_ImgNotify.Stats.UserModeImages);
         return;
     }
 
