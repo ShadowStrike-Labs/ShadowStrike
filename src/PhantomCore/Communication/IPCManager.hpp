@@ -893,8 +893,14 @@ private:
     
     static std::atomic<bool> s_instanceCreated;
 
-    // Primary filter connection (encrypts all kernel communication)
-    std::unique_ptr<FilterConnection> m_primaryConnection;
+    // Primary filter connection (encrypts all kernel communication).
+    // This is the kernel's designated primary-scanner port: scan requests and
+    // notifications are received on it (encrypted), and verdict replies are
+    // sent back on the SAME connection (so the WDK MessageId scope and the
+    // per-connection session key both match). shared_ptr so a worker can hold
+    // a strong reference across a blocking GetMessage while DisconnectFilterPort
+    // tears the channel down concurrently.
+    std::shared_ptr<FilterConnection> m_primaryConnection;
     mutable std::mutex m_primaryConnMutex;
 
     // Dedicated push connection (separate handle for user→kernel data push)

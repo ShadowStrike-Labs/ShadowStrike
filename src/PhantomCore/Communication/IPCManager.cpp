@@ -458,6 +458,23 @@ void IPCManager::Stop() {
         }
     }
 
+    // Worker threads block in m_primaryConnection->GetMessage(); cancelling the
+    // liveness gate handle above no longer wakes them. Cancel the encrypted
+    // primary-scanner connection's pending I/O now so each worker observes
+    // m_running == false and exits — otherwise the join() below would deadlock.
+    // Disconnect() is idempotent; DisconnectFilterPort() performs the full
+    // teardown (key scrub + handle close + reset).
+    {
+        std::shared_ptr<FilterConnection> conn;
+        {
+            std::lock_guard<std::mutex> connLock(m_primaryConnMutex);
+            conn = m_primaryConnection;
+        }
+        if (conn) {
+            conn->Disconnect();
+        }
+    }
+
     // Wait for all workers to finish
     for (auto& thread : m_workerThreads) {
         if (thread.joinable()) {
@@ -664,7 +681,73 @@ bool IPCManager::ConnectFilterPort() {
     m_filterPortPermanentlyDenied.store(false, std::memory_order_release);
     m_lastFilterPortHr = S_OK;
 
-    // Associate with IOCP for async operations
+    // Associate with IOCP AFTER the gate key-exchange drain below. The drain
+    // issues an overlapped FilterGetMessage with a stack OVERLAPPED; if the
+    // handle were associated with the completion port first, that operation's
+    // completion packet (referencing the stack OVERLAPPED) would be queued to
+    // the port and outlive this scope, leaving a dangling pointer in the IOCP
+    // queue. Associating afterward means the drain only signals its own event
+    // and queues nothing.
+    m_hPort.store(hPortTemp, std::memory_order_release);
+    m_connected.store(true, std::memory_order_release);
+    m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Connected);
+
+    // The raw m_hPort connection occupies a kernel client-port slot but is NOT
+    // the primary scanner — the kernel sends it exactly one message: the
+    // post-connect key-exchange blob, delivered via a blocking FltSendMessage.
+    // The receive workers now pump the dedicated primary-scanner connection
+    // (m_primaryConnection), not this handle, so nothing would otherwise retire
+    // that pending kernel send. Drain it once here so the kernel's
+    // FltSendMessage completes and the slot is kept alive instead of being
+    // force-closed after its 30s timeout. We intentionally do not process the
+    // key material: this handle is a connect/liveness gate only and is never
+    // used for encrypted I/O.
+    {
+        std::vector<uint8_t> kexDrain(1024, 0);
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (ov.hEvent != nullptr) {
+            HRESULT drainHr = FilterGetMessage(
+                hPortTemp,
+                reinterpret_cast<PFILTER_MESSAGE_HEADER>(kexDrain.data()),
+                static_cast<DWORD>(kexDrain.size()),
+                &ov);
+
+            if (drainHr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+                if (WaitForSingleObject(ov.hEvent, 10000) != WAIT_OBJECT_0) {
+                    // Cancel and fully drain the I/O before the OVERLAPPED on
+                    // the stack goes out of scope, so the kernel can never write
+                    // to freed memory.
+                    CancelIoEx(hPortTemp, &ov);
+                    DWORD ignored = 0;
+                    GetOverlappedResult(hPortTemp, &ov, &ignored, TRUE);
+                    Utils::Logger::Warn("[IPCManager] Gate key-exchange drain timed out "
+                                        "on liveness connection");
+                } else {
+                    DWORD drained = 0;
+                    GetOverlappedResult(hPortTemp, &ov, &drained, FALSE);
+                    Utils::Logger::Debug("[IPCManager] Gate key-exchange drained ({} bytes)",
+                                         drained);
+                }
+            } else if (SUCCEEDED(drainHr)) {
+                DWORD drained = 0;
+                GetOverlappedResult(hPortTemp, &ov, &drained, FALSE);
+                Utils::Logger::Debug("[IPCManager] Gate key-exchange drained synchronously "
+                                     "({} bytes)", drained);
+            } else {
+                Utils::Logger::Warn("[IPCManager] Gate key-exchange drain failed: 0x{:08X}",
+                                    static_cast<unsigned int>(drainHr));
+            }
+
+            CloseHandle(ov.hEvent);
+        }
+        Utils::Logger::Debug("[IPCManager] Gate key-exchange drain complete");
+        SecureZeroMemory(kexDrain.data(), kexDrain.size());
+    }
+
+    // Now that the bounded overlapped drain has fully completed (its stack
+    // OVERLAPPED is retired), associate the gate handle with the IOCP for any
+    // future async operations. No completion packet can reference freed memory.
     if (m_hIOCP != nullptr) {
         HANDLE result = CreateIoCompletionPort(
             hPortTemp,
@@ -678,10 +761,6 @@ bool IPCManager::ConnectFilterPort() {
                                GetLastError());
         }
     }
-
-    m_hPort.store(hPortTemp, std::memory_order_release);
-    m_connected.store(true, std::memory_order_release);
-    m_impl->NotifyConnectionChange(ChannelType::FilterPort, ConnectionStatus::Connected);
 
     // Create dedicated push connection + ThreatIntelPusher
     {
@@ -702,19 +781,22 @@ bool IPCManager::ConnectFilterPort() {
         }
     }
 
-    // Create primary encrypted connection for SendToKernel / ReplyToKernel.
-    // This is the ONLY path that should be used for kernel IPC — the raw
-    // m_hPort handle is kept for IOCP-based async operations and as an
-    // absolute last resort if FilterConnection is unavailable.
+    // Create primary encrypted connection for kernel scan I/O.
+    // This connection registers as the kernel's PRIMARY SCANNER port
+    // (ConnectionContext type == 1): the minifilter routes all scan requests
+    // and notifications here and gates them on this connection's established
+    // session key. The receive workers pump this connection (see WorkerRoutine)
+    // and ReplyToKernel replies on it, so the WDK MessageId scope and the
+    // session key are always consistent between receive and reply.
     {
         std::lock_guard lock(m_primaryConnMutex);
         try {
-            m_primaryConnection = std::make_unique<FilterConnection>(portName);
-            if (m_primaryConnection->Connect()) {
-                Utils::Logger::Info("[IPCManager] Primary encrypted connection established");
+            m_primaryConnection = std::make_shared<FilterConnection>(portName);
+            if (m_primaryConnection->Connect(/*registerAsPrimaryScanner=*/true)) {
+                Utils::Logger::Info("[IPCManager] Primary encrypted scanner connection established");
             } else {
-                Utils::Logger::Error("[IPCManager] Primary encrypted connection FAILED — "
-                                      "kernel IPC will be unencrypted until reconnect");
+                Utils::Logger::Error("[IPCManager] Primary encrypted scanner connection FAILED — "
+                                      "kernel scan requests cannot be served until reconnect");
                 m_primaryConnection.reset();
             }
         } catch (const std::exception& e) {
@@ -1444,9 +1526,17 @@ void IPCManager::WorkerRoutine() {
     std::vector<uint8_t> buffer(IPCConstants::MAX_MESSAGE_SIZE);
 
     while (m_running.load(std::memory_order_acquire)) {
-        // FIX [BUG #11]: Atomic snapshot of handle — prevents TOCTOU
-        HANDLE hPort = m_hPort.load(std::memory_order_acquire);
-        if (hPort == nullptr) {
+        // Snapshot the encrypted primary-scanner connection. The kernel routes
+        // scan requests and notifications exclusively to the primary-scanner
+        // slot, so this is the connection we must receive on. shared_ptr keeps
+        // the object alive across the (possibly blocking) receive even if
+        // DisconnectFilterPort resets m_primaryConnection concurrently.
+        std::shared_ptr<FilterConnection> conn;
+        {
+            std::lock_guard<std::mutex> connLock(m_primaryConnMutex);
+            conn = m_primaryConnection;
+        }
+        if (!conn || !conn->IsConnected()) {
             // If the filter port has been *permanently* denied by the
             // kernel driver, do not even attempt to reconnect — the only
             // outcomes are wasted CPU and log spam. Sleep in short chunks
@@ -1529,45 +1619,37 @@ void IPCManager::WorkerRoutine() {
             continue;
         }
 
-        // Cast buffer start to WDK FILTER_MESSAGE_HEADER for FilterGetMessage
-        PFILTER_MESSAGE_HEADER pWdkHeader =
-            reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer.data());
-
-        HRESULT hr = FilterGetMessage(
-            hPort,
-            pWdkHeader,
-            static_cast<DWORD>(buffer.size()),
-            nullptr  // Synchronous
-        );
-
-        if (FAILED(hr)) {
-            if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
-                hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                Utils::Logger::Debug("[IPCManager] Worker: Operation aborted (shutdown)");
+        // Receive the next message on the encrypted primary-scanner connection.
+        // GetMessage verifies the message HMAC and performs in-place
+        // AES-256-GCM decryption, rewriting the SHADOWSTRIKE_MESSAGE_HEADER to
+        // plaintext sizes and clearing the ENCRYPTED flag, so the two-header
+        // parsing below operates on cleartext exactly as it did on the legacy
+        // raw path. A return of 0 means shutdown/cancel, a dropped message that
+        // failed integrity/decryption, or a torn-down channel — in every case
+        // we re-evaluate the loop guard (and reconnect on the next iteration).
+        const size_t received = conn->GetMessage(
+            std::span<uint8_t>(buffer.data(), buffer.size()), 0);
+        if (received == 0) {
+            if (!m_running.load(std::memory_order_acquire)) {
+                Utils::Logger::Debug("[IPCManager] Worker: receive returned 0 during shutdown");
                 break;
             }
-
-            if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
-                Utils::Logger::Error("[IPCManager] Worker: Invalid port handle");
-                m_connected.store(false);
-                // Don't null-out m_hPort here — DisconnectFilterPort handles that.
-                // Just sleep and let reconnect logic handle it.
-                std::shared_lock lock(m_impl->configMutex);
-                if (m_impl->config.autoReconnect && m_running.load()) {
-                    lock.unlock();
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(m_impl->config.reconnectDelayMs));
-                }
-                continue;
-            }
-
-            if (hr != HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)) {
-                Utils::Logger::Warn("[IPCManager] FilterGetMessage failed: 0x{:08X}",
-                                    static_cast<unsigned int>(hr));
-                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            if (!conn->IsConnected()) {
+                m_connected.store(false, std::memory_order_release);
             }
             continue;
         }
+
+        if (received < sizeof(FILTER_MESSAGE_HEADER)) {
+            Utils::Logger::Warn("[IPCManager] Worker: truncated message ({} bytes)", received);
+            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        // FILTER_MESSAGE_HEADER (carries the WDK MessageId used for the reply)
+        // sits at the start of the decrypted buffer.
+        PFILTER_MESSAGE_HEADER pWdkHeader =
+            reinterpret_cast<PFILTER_MESSAGE_HEADER>(buffer.data());
 
         // FIX [BUG #1,#2]: Proper two-header parsing.
         // After FILTER_MESSAGE_HEADER comes SHADOWSTRIKE_MESSAGE_HEADER + payload.
@@ -1612,11 +1694,15 @@ void IPCManager::WorkerRoutine() {
             continue;
         }
 
-        // Validate DataSize against buffer bounds to prevent out-of-bounds dispatch
-        if (kWdkHeaderSize + kAppHeaderSize + pAppHeader->DataSize > buffer.size()) {
-            Utils::Logger::Error("[IPCManager] DataSize {} exceeds buffer bounds (max {})",
+        // Validate DataSize against the bytes actually received this iteration.
+        // The buffer is pooled/reused and NOT zeroed between messages, so the
+        // framed message (both headers + payload) must fit within `received`;
+        // bounding against buffer.size() instead would risk dispatching stale
+        // bytes left over from a previous, larger message.
+        if (kWdkHeaderSize + kAppHeaderSize + pAppHeader->DataSize > received) {
+            Utils::Logger::Error("[IPCManager] DataSize {} exceeds received bounds ({} bytes)",
                                  pAppHeader->DataSize,
-                                 buffer.size() - kWdkHeaderSize - kAppHeaderSize);
+                                 received);
             m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
             continue;
         }

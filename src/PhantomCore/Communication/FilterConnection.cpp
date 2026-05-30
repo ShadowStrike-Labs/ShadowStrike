@@ -256,7 +256,7 @@ public:
     // Connection Management
     //=========================================================================
 
-    [[nodiscard]] bool Connect() {
+    [[nodiscard]] bool Connect(bool registerAsPrimaryScanner) {
         std::lock_guard<std::mutex> lock(m_mutex);
 
         if (m_hPort != nullptr) {
@@ -269,11 +269,18 @@ public:
             WideToUtf8String(m_portName);
         Utils::Logger::Info(connectMessage.c_str());
 
+        // The kernel minifilter (ShadowStrikeConnectNotify) inspects the first
+        // UINT32 of the ConnectionContext: a value of 1 designates this
+        // connection as the primary scanner port, which is the ONLY connection
+        // the kernel sends scan requests / notifications to and the one whose
+        // session key gates those sends. Auxiliary connections pass 0.
+        const UINT32 connectionType = registerAsPrimaryScanner ? 1u : 0u;
+
         HRESULT hr = FilterConnectCommunicationPort(
             m_portName.c_str(),
             0,
-            nullptr,
-            0,
+            &connectionType,
+            sizeof(connectionType),
             nullptr,
             &m_hPort
         );
@@ -1356,9 +1363,9 @@ FilterConnection& FilterConnection::operator=(FilterConnection&& other) noexcept
     return *this;
 }
 
-bool FilterConnection::Connect() {
+bool FilterConnection::Connect(bool registerAsPrimaryScanner) {
     if (!m_impl) return false;
-    return m_impl->Connect();
+    return m_impl->Connect(registerAsPrimaryScanner);
 }
 
 void FilterConnection::Disconnect() {

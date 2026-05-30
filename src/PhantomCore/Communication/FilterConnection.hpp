@@ -77,9 +77,16 @@ public:
 
     /**
      * @brief Connect to the kernel filter port
+     * @param registerAsPrimaryScanner When true, the connection advertises
+     *        itself to the kernel minifilter as the primary scanner port
+     *        (ConnectionContext type == 1). The kernel routes scan requests
+     *        and notifications exclusively to this connection and requires it
+     *        to have an established session key. Exactly one connection per
+     *        client process must set this; auxiliary channels (e.g. the
+     *        threat-intel push connection) must pass false.
      * @return true if connection successful
      */
-    [[nodiscard]] bool Connect();
+    [[nodiscard]] bool Connect(bool registerAsPrimaryScanner = false);
 
     /**
      * @brief Disconnect from the kernel filter port
