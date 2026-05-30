@@ -1159,12 +1159,16 @@ private:
         std::span<const uint8_t> nonceSpan(encHeader->nonce, sizeof(encHeader->nonce));
         std::span<const uint8_t> tagSpan(encHeader->tag, sizeof(encHeader->tag));
 
-        // AAD must match what was used during encryption. The HMAC flag is set
-        // AFTER GCM encryption, so strip it from the AAD copy for decryption.
-        SHADOWSTRIKE_MESSAGE_HEADER aadHeader = *ssHeader;
-        aadHeader.Flags &= ~SHADOWSTRIKE_MSG_FLAG_HMAC;
+        // AAD must match byte-for-byte what the KERNEL authenticated when it
+        // encrypted this message. The kernel sets the HMAC flag in the on-wire
+        // SHADOWSTRIKE_MESSAGE_HEADER *before* GCM encryption and feeds that
+        // exact header — HMAC flag included — as the GCM AAD
+        // (CommPort.c:2816-2834). The received on-wire header is therefore the
+        // AAD verbatim; clearing the HMAC flag here would make the AAD differ
+        // from the kernel's by exactly that bit, causing GCM authentication to
+        // fail on every encrypted scan request (and the scanner to never reply).
         std::span<const uint8_t> aadSpan(
-            reinterpret_cast<const uint8_t*>(&aadHeader), sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+            reinterpret_cast<const uint8_t*>(ssHeader), sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
         std::span<const uint8_t> ciphertextSpan(
             encData + sizeof(KernelEncHeader), encHeader->ciphertextSize);
 
