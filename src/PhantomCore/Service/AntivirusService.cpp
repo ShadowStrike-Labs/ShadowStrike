@@ -620,6 +620,21 @@ public:
                 return false;
             }
             ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Initialize-leave");
+
+            // Register every PhantomHome UI verb handler (AuthHandshake, GetStatus,
+            // scan controls, etc.) BEFORE the pipe server starts accepting clients.
+            // The dispatcher only populates the v2 handler map (guarded by the
+            // ServiceCommunicator's handler mutex) and does not depend on the server
+            // running, so installing here closes the accept-before-register race:
+            // a UI client that connects the instant Start() opens the pipe will
+            // always find the AuthHandshake handler present and receive a reply.
+            // Without this call ProcessV2Message reports "no v2 handler" and never
+            // responds, so the UI's auth handshake times out (AUTH_TIMEOUT) and the
+            // dashboard reports the service as offline despite SCM showing RUNNING.
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-HomeIpcDispatcher-Install-enter");
+            HomeIpcDispatcher::Instance().Install(ipcSvc);
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-HomeIpcDispatcher-Install-leave");
+
             ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunicator-Start-enter");
             if (!ipcSvc.Start()) {
                 SS_LOG_FATAL(LOG_CATEGORY, L"ServiceCommunicator::Start() failed — PhantomHome UI IPC unavailable");
