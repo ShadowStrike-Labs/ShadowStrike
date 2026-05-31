@@ -344,6 +344,27 @@ bool IPCManager::Start(uint32_t workerThreadCount) {
     IPCStatus expected = IPCStatus::Stopped;
     if (!m_status.compare_exchange_strong(expected, IPCStatus::Running)) {
         IPCStatus current = m_status.load(std::memory_order_acquire);
+
+        // Idempotent start. The IPC manager has two legitimate start paths that
+        // both run during service bring-up:
+        //   * Full build: RealTimeProtection::InitializeIPCManager() initializes
+        //     the manager, registers the kernel scan/process/image/registry
+        //     handlers, starts it, and connects the filter port.
+        //   * Focused build: RealTimeProtection skips IPC, and
+        //     AntivirusService::Start() is the sole starter.
+        // In the full build AntivirusService::Start() still calls Start() a
+        // second time after RealTimeProtection has already brought the manager
+        // up. A redundant Start() against an already-running manager MUST be a
+        // no-op success: returning false here makes the second caller treat
+        // bring-up as fatal, tearing down RealTimeProtection and aborting the
+        // service before the PhantomHome UI IPC pipe (ServiceCommunicator) ever
+        // starts, which surfaces to the user as "service offline".
+        if (current == IPCStatus::Running) {
+            ::ShadowStrikeAppendBootTrace(L"ipc-Start-already-running-ok");
+            Utils::Logger::Info("[IPCManager] Start requested while already running; treating as no-op success");
+            return true;
+        }
+
         wchar_t tag[64];
         swprintf(tag, _countof(tag), L"ipc-Start-CAS-FAIL-status=%d", static_cast<int>(current));
         ::ShadowStrikeAppendBootTrace(tag);
