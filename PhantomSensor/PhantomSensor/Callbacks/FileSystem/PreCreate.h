@@ -123,9 +123,18 @@ extern "C" {
 #define PC_MAX_EXTENSION_LENGTH         32
 
 /**
- * @brief Default scan timeout in milliseconds
+ * @brief Default scan timeout in milliseconds.
+ *
+ * Per-attempt budget for the synchronous, verdict-blocking user-mode scan on
+ * IRP_MJ_CREATE. This bounds how long a single file create can stall waiting on
+ * the scanner. It is deliberately small: a stuck or slow scanner must NEVER be
+ * able to hang a hot path that every process hits (file opens during logon,
+ * DLL loads, etc.) for tens of seconds. Combined with zero retries on the
+ * create path and fail-open-on-timeout, the worst-case stall on any single
+ * create is one short timeout, after which the create is allowed. The scanner
+ * still receives and processes the request; only the in-line wait is bounded.
  */
-#define PC_DEFAULT_SCAN_TIMEOUT_MS      30000
+#define PC_DEFAULT_SCAN_TIMEOUT_MS      2000
 
 /**
  * @brief Quick scan timeout for cached/low-priority files

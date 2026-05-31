@@ -1148,6 +1148,18 @@ ShadowStrikeDeliverKexWorker(
         // (which gate on EncryptionEstablished) will start using it.
         //
         clientRef->EncryptionEstablished = TRUE;
+        if (clientRef->IsPrimaryScanner) {
+            //
+            // Publish primary-scanner readiness for the lock-free scan-path
+            // gate (ShadowStrikeIsPrimaryScannerConnected). This increment is
+            // performed while we still hold our slot reference (released just
+            // below), which guarantees it happens-before any disconnect
+            // finalize (which can only run once the reference count reaches 0),
+            // so the matching decrement in ShadowStrikeFinalizeClientDisconnect
+            // can never be lost or run first.
+            //
+            InterlockedIncrement(&g_DriverData.PrimaryScannersReady);
+        }
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike] Kex delivered for slot %ld\n", ctx->SlotIndex);
         ShadowStrikeReleaseClientPort(clientRef);
@@ -1766,6 +1778,17 @@ ShadowStrikeFinalizeClientDisconnect(
         g_ClientPortRefs[SlotIndex].SessionNoncePrefix,
         sizeof(g_ClientPortRefs[SlotIndex].SessionNoncePrefix)
     );
+    //
+    // Retire this slot from the primary-scanner readiness count if it was a
+    // KEX-completed primary scanner. Read both flags BEFORE the zeroing below.
+    // This runs under the exclusive ClientPortLock with ReferenceCount == 0,
+    // so it is strictly ordered after the matching increment in the KEX worker
+    // (which held a reference). The pair is therefore always balanced.
+    //
+    if (g_ClientPortRefs[SlotIndex].IsPrimaryScanner &&
+        g_ClientPortRefs[SlotIndex].EncryptionEstablished) {
+        InterlockedDecrement(&g_DriverData.PrimaryScannersReady);
+    }
     g_ClientPortRefs[SlotIndex].EncryptionEstablished = FALSE;
 
     RtlZeroMemory(&g_ClientPortRefs[SlotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
@@ -2599,7 +2622,8 @@ ShadowStrikeAcquireClientPortBySlot(
 
 NTSTATUS
 ShadowStrikeAcquirePrimaryScannerPort(
-    _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
+    _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef,
+    _In_ BOOLEAN AllowFallback
     )
 {
     LONG i;
@@ -2624,9 +2648,18 @@ ShadowStrikeAcquirePrimaryScannerPort(
     }
 
     //
-    // Fall back to first connected client
+    // Fall back to first connected client.
     //
-    if (targetSlot < 0) {
+    // CRITICAL: the fallback is ONLY permitted for fire-and-forget telemetry
+    // paths (process/alert notifications) where delivering to any verified
+    // client — or buffering on failure — is acceptable. The verdict-blocking
+    // scan path MUST pass AllowFallback == FALSE: routing a synchronous scan to
+    // a non-scanner connection (which has no scan-reply loop) would block
+    // FltSendMessage for the entire timeout budget on every file create and
+    // freeze the system. With fallback disabled the scan path fails fast with
+    // SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED and the caller fails open.
+    //
+    if (targetSlot < 0 && AllowFallback) {
         for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
             if (g_ClientPortRefs[i].ClientPort != NULL &&
                 g_ClientPortRefs[i].Disconnecting == 0) {
@@ -2765,7 +2798,13 @@ ShadowStrikeSendScanRequest(
     // Acquire reference to client port FIRST — needed for session key access.
     // This must precede the encryption and HMAC blocks.
     //
-    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+    // AllowFallback == FALSE: this is the verdict-blocking scan transport. It
+    // must only ever target a real primary scanner; never fall back to a
+    // non-scanner client (which would block FltSendMessage for the full timeout
+    // and freeze the system). When no primary scanner is present the acquire
+    // fails fast and the caller (ScanBridge → PreCreate) fails open.
+    //
+    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, FALSE);
     if (!NT_SUCCESS(status)) {
         InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
         return status;
@@ -3119,9 +3158,13 @@ ShadowStrikeSendNotification(
     BOOLEAN notifEncrypted = FALSE;
 
     //
-    // Acquire reference to client port
+    // Acquire reference to client port.
     //
-    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+    // AllowFallback == TRUE: this is a fire-and-forget telemetry/notification
+    // path. Delivering to any verified connected client (or buffering on
+    // failure) is acceptable, and there is no synchronous reply to block on.
+    //
+    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, TRUE);
     if (!NT_SUCCESS(status)) {
         //
         // No connected user-mode client â€” buffer the message in MessageQueue
@@ -3354,9 +3397,14 @@ ShadowStrikeSendProcessNotification(
     }
 
     //
-    // Acquire reference to client port
+    // Acquire reference to client port.
     //
-    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+    // AllowFallback == TRUE: process-notification delivery path. Fire-and-forget
+    // notifications buffer on failure; this preserves existing telemetry routing
+    // and is not the verdict-blocking file-create scan path responsible for the
+    // boot-time freeze.
+    //
+    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, TRUE);
     if (!NT_SUCCESS(status)) {
         //
         // No connected client.  For fire-and-forget notifications,
@@ -3623,6 +3671,28 @@ ShadowStrikeIsUserModeConnected(
     // Read with memory barrier for visibility
     //
     return (InterlockedCompareExchange(&g_DriverData.ConnectedClients, 0, 0) > 0);
+}
+
+BOOLEAN
+ShadowStrikeIsPrimaryScannerConnected(
+    VOID
+    )
+{
+    //
+    // Lock-free readiness gate for the verdict-blocking scan path. Returns TRUE
+    // only when at least one primary-scanner connection has completed its key
+    // exchange and can therefore decrypt and reply to scan requests. Keying the
+    // scan gate on this (instead of the raw ConnectedClients count) prevents
+    // routing synchronous file-create scans to a non-scanner connection (e.g.
+    // the bootstrap gate, UI, or tray client) — which has no scan-reply loop and
+    // would otherwise block FltSendMessage for the full timeout budget on every
+    // file create, freezing the system during the service start-up window.
+    //
+    // Read-only Interlocked load: safe at any IRQL up to DISPATCH_LEVEL, matching
+    // the SAL contract of ShadowStrikeScanBridgeIsReady, which calls this without
+    // holding ClientPortLock.
+    //
+    return (InterlockedCompareExchange(&g_DriverData.PrimaryScannersReady, 0, 0) > 0);
 }
 
 LONG

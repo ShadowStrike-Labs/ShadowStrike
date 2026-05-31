@@ -263,6 +263,16 @@ typedef struct _SHADOWSTRIKE_DRIVER_DATA {
     /// @brief Current connected client count
     volatile LONG ConnectedClients;
 
+    /// @brief Number of primary-scanner client slots that have completed the
+    ///        key exchange (IsPrimaryScanner && EncryptionEstablished). This is
+    ///        the authoritative readiness signal for the verdict-blocking scan
+    ///        path: a value > 0 means a real scanner is connected and able to
+    ///        decrypt scan requests. Maintained lock-free via Interlocked ops
+    ///        (incremented when a primary scanner's KEX is delivered,
+    ///        decremented when such a slot is finalized) so it can be read at
+    ///        DISPATCH_LEVEL without acquiring ClientPortLock.
+    volatile LONG PrimaryScannersReady;
+
     /// @brief Lock for client port array
     EX_PUSH_LOCK ClientPortLock;
 

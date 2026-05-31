@@ -949,7 +949,15 @@ SbSendScanRequest(
     options.TimeoutMs = TimeoutMs > 0 ? TimeoutMs : SB_DEFAULT_SCAN_TIMEOUT_MS;
     options.Flags = SbScanFlagSynchronous;
     options.Priority = SbPriorityNormal;
-    options.MaxRetries = SB_MAX_RETRY_COUNT;
+    //
+    // Zero retries on the synchronous verdict-blocking create path. Every retry
+    // re-runs a full FltSendMessage with the (already short) per-attempt timeout
+    // plus exponential backoff, multiplying the worst-case stall on a single
+    // IRP_MJ_CREATE. With fail-open policy a single bounded attempt is the
+    // correct trade-off: a transient miss fails open (allows the create) rather
+    // than risking a multi-second stall on a hot path that every process hits.
+    //
+    options.MaxRetries = 0;
 
     //
     // Send with extended options
@@ -1039,7 +1047,17 @@ SbSendScanRequestEx(
     //
     if (Options != NULL) {
         timeoutMs = Options->TimeoutMs > 0 ? Options->TimeoutMs : SB_DEFAULT_SCAN_TIMEOUT_MS;
-        maxRetries = Options->MaxRetries > 0 ? Options->MaxRetries : SB_MAX_RETRY_COUNT;
+        //
+        // Honor an explicit MaxRetries == 0 (no retries) rather than treating
+        // zero as "unspecified". The synchronous create path deliberately
+        // requests zero retries to bound its worst-case in-line stall; silently
+        // promoting 0 to the default would reintroduce the multi-attempt hang.
+        // The Options == NULL path below still applies the default.
+        //
+        maxRetries = Options->MaxRetries;
+        if (maxRetries > SB_MAX_RETRY_COUNT) {
+            maxRetries = SB_MAX_RETRY_COUNT;
+        }
         Result->UserContext = Options->UserContext;
     } else {
         timeoutMs = SB_DEFAULT_SCAN_TIMEOUT_MS;
@@ -2257,7 +2275,16 @@ ShadowStrikeScanBridgeIsReady(
         return FALSE;
     }
 
-    return ShadowStrikeIsUserModeConnected();
+    //
+    // Gate on a key-exchange-complete PRIMARY SCANNER, not merely on "any client
+    // connected". During service start-up the bootstrap gate / UI / tray clients
+    // connect before (or instead of) the scanner; keying readiness on the raw
+    // connected-client count let synchronous file-create scans route to those
+    // non-scanner ports, which never reply, blocking FltSendMessage for the full
+    // timeout budget on every create and freezing the system. With this gate the
+    // scan path stays fail-open until a real scanner can actually answer.
+    //
+    return ShadowStrikeIsPrimaryScannerConnected();
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2595,7 +2622,10 @@ SbpSendWithRetry(
     // use-after-free if the client disconnects between acquire
     // and FltSendMessage â€” the reference keeps the slot alive.
     //
-    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+    // AllowFallback == FALSE: scan transport. Only a real primary scanner is
+    // acceptable; never route a synchronous scan to a non-scanner client.
+    //
+    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, FALSE);
     if (!NT_SUCCESS(status)) {
         InterlockedIncrement64(&g_ScanBridge.Stats.ConnectionErrors);
         return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
@@ -2668,7 +2698,7 @@ SbpSendWithRetry(
                 //
                 // Re-acquire port with reference count for next attempt
                 //
-                status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef);
+                status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, FALSE);
                 if (!NT_SUCCESS(status)) {
                     InterlockedIncrement64(&g_ScanBridge.Stats.ConnectionErrors);
                     return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;

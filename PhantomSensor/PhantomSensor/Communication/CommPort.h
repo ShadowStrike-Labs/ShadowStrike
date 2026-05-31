@@ -379,6 +379,25 @@ ShadowStrikeIsUserModeConnected(
     );
 
 /**
+ * @brief Check if a key-exchange-complete primary scanner is connected.
+ *
+ * Authoritative readiness signal for the verdict-blocking scan path. Returns
+ * TRUE only when at least one primary-scanner connection has completed its key
+ * exchange (IsPrimaryScanner && EncryptionEstablished) and can therefore
+ * decrypt and reply to scan requests. Lock-free (Interlocked load of
+ * g_DriverData.PrimaryScannersReady), so it is safe to call from the scan
+ * readiness gate without acquiring ClientPortLock.
+ *
+ * @return TRUE if a usable primary scanner is connected, FALSE otherwise.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+BOOLEAN
+ShadowStrikeIsPrimaryScannerConnected(
+    VOID
+    );
+
+/**
  * @brief Get connected client count.
  *
  * @return Number of connected clients.
@@ -417,14 +436,22 @@ ShadowStrikeGetPrimaryScannerPort(
  * Returns a referenced client port that is safe to use for sending.
  * Caller MUST call ShadowStrikeReleaseClientPort when done.
  *
- * @param ClientRef  Receives pointer to client reference structure.
+ * @param ClientRef     Receives pointer to client reference structure.
+ * @param AllowFallback When TRUE and no primary scanner is connected, falls
+ *                      back to the first connected client (fire-and-forget
+ *                      telemetry/notification paths only). When FALSE, only a
+ *                      real primary scanner is acceptable — REQUIRED for the
+ *                      verdict-blocking scan transport so synchronous scans are
+ *                      never routed to a non-scanner client (which would block
+ *                      and freeze the system).
  * @return STATUS_SUCCESS if port acquired, error otherwise.
  *
  * @irql <= APC_LEVEL
  */
 NTSTATUS
 ShadowStrikeAcquirePrimaryScannerPort(
-    _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
+    _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef,
+    _In_ BOOLEAN AllowFallback
     );
 
 /**
