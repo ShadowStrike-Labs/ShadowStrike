@@ -831,7 +831,20 @@ bool IPCManager::ConnectFilterPort() {
     // starts retrying at the configured base interval, not at the cap.
     m_reconnectBackoffMs.store(0, std::memory_order_relaxed);
 
-    Utils::Logger::Info("[IPCManager] Successfully connected to filter port");
+    // Report the AUTHORITATIVE channel state. The control handle above can
+    // open even when the encrypted primary-scanner channel did not establish,
+    // so a blanket "Successfully connected" would mask a degraded kernel link.
+    bool encryptedChannelUp;
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        encryptedChannelUp = (m_primaryConnection != nullptr);
+    }
+    if (encryptedChannelUp) {
+        Utils::Logger::Info("[IPCManager] Filter port connected; encrypted primary scanner channel established");
+    } else {
+        Utils::Logger::Warn("[IPCManager] Filter port connected (control handle only) — encrypted primary "
+                            "scanner channel NOT established; kernel scan I/O degraded until reconnect");
+    }
     return true;
 }
 

@@ -269,18 +269,43 @@ public:
             WideToUtf8String(m_portName);
         Utils::Logger::Info(connectMessage.c_str());
 
-        // The kernel minifilter (ShadowStrikeConnectNotify) inspects the first
-        // UINT32 of the ConnectionContext: a value of 1 designates this
-        // connection as the primary scanner port, which is the ONLY connection
-        // the kernel sends scan requests / notifications to and the one whose
-        // session key gates those sends. Auxiliary connections pass 0.
-        const UINT32 connectionType = registerAsPrimaryScanner ? 1u : 0u;
+        // The kernel minifilter (ShadowStrikeConnectNotify) inspects the
+        // connection context: ConnectionType==1 designates this connection as
+        // the primary scanner port (the ONLY connection the kernel sends scan
+        // requests / notifications to and the one whose session key gates those
+        // sends); auxiliary connections pass 0. We additionally carry the
+        // SHA-256 of our OWN executable so the kernel can use the identical
+        // value as the key-exchange input WITHOUT performing any file I/O in
+        // its connect callback (file I/O there re-enters the minifilter and can
+        // deadlock the filesystem stack). The connection is independently
+        // authenticated kernel-side (exact image path + SYSTEM token).
+        SHADOWSTRIKE_CONNECTION_CONTEXT connCtx{};
+        connCtx.ConnectionType = registerAsPrimaryScanner ? 1u : 0u;
+        {
+            using namespace ShadowStrike::Security;
+            auto& crypto = CryptoManager::Instance();
+            wchar_t exePath[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            auto hashOpt = crypto.HashFile(std::wstring(exePath), HashAlgorithm::SHA256);
+            if (!hashOpt.has_value() || hashOpt->size() < sizeof(connCtx.ClientImageHash)) {
+                Utils::Logger::Error("[FilterConnection] Connect: failed to hash own "
+                                     "image for key exchange");
+                m_lastError.store(E_FAIL, std::memory_order_relaxed);
+                m_stats.errors++;
+                return false;
+            }
+            // Same SHA-256 the kernel will use as the KWK input and that
+            // ReceiveKeyExchange() recomputes to unwrap the session key.
+            std::copy(hashOpt->begin(),
+                      hashOpt->begin() + sizeof(connCtx.ClientImageHash),
+                      connCtx.ClientImageHash);
+        }
 
         HRESULT hr = FilterConnectCommunicationPort(
             m_portName.c_str(),
             0,
-            &connectionType,
-            sizeof(connectionType),
+            &connCtx,
+            sizeof(connCtx),
             nullptr,
             &m_hPort
         );
