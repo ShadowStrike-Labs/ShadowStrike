@@ -134,7 +134,21 @@ extern "C" {
  * create is one short timeout, after which the create is allowed. The scanner
  * still receives and processes the request; only the in-line wait is bounded.
  */
-#define PC_DEFAULT_SCAN_TIMEOUT_MS      2000
+#define PC_DEFAULT_SCAN_TIMEOUT_MS      500
+
+/**
+ * @brief Fail-open cache TTL (seconds).
+ *
+ * When a create-path scan times out under a fail-open policy, the verdict is
+ * cached Clean for this short window so the SAME file is not re-queried on
+ * every subsequent open while the scanner drains a backlog. Without it a
+ * timed-out scan is never cached, so each open re-times-out and the scanner
+ * never catches up — serializing every file create behind the timeout and
+ * freezing the system (Explorer fails to open). The window is intentionally
+ * short: the file is re-evaluated once it expires, and write/execute access is
+ * scanned regardless of this entry.
+ */
+#define PC_FAILOPEN_CACHE_TTL_SEC       15
 
 /**
  * @brief Quick scan timeout for cached/low-priority files

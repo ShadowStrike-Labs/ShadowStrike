@@ -1448,6 +1448,35 @@ Return Value:
             ScanAccessType = ShadowStrikeAccessExecute;
         }
 
+        //
+        // Production scope for the synchronous, create-blocking scan.
+        //
+        // Reserve the in-line user-mode round-trip for content that can carry
+        // or execute code (PE / scripts / documents / archives) plus all write
+        // and execute access. Plain READ opens of ordinary data files are by
+        // far the highest-volume create traffic — Explorer enumeration,
+        // thumbnails, icon/asset and config reads, etc. — and must not each
+        // block on a user-mode verdict, or a slow/over-subscribed scanner
+        // serializes ALL file I/O behind it (the observed Explorer-won't-open /
+        // system-wide stall). Those reads remain covered by write-time and
+        // execute-time scanning and by the asynchronous telemetry path; only
+        // the in-line wait is skipped. If the file cannot be classified we also
+        // skip the blocking scan (fail-open on the hot path).
+        //
+        if (ScanAccessType == ShadowStrikeAccessRead) {
+            PC_FILE_CLASS scopeClass = (PC_FILE_CLASS)0;
+            ULONG scopePriority = 0;
+            BOOLEAN codeBearing =
+                NT_SUCCESS(PcClassifyFile(&NameInfo->Extension, &scopeClass, &scopePriority)) &&
+                (scopeClass == PcFileClassExecutable ||
+                 scopeClass == PcFileClassScript ||
+                 scopeClass == PcFileClassDocument ||
+                 scopeClass == PcFileClassArchive);
+            if (!codeBearing) {
+                goto CleanupAllow;
+            }
+        }
+
         Status = SbBuildFileScanRequest(
             Data,
             FltObjects,
@@ -1586,6 +1615,24 @@ Return Value:
 
                     if (!g_PcState.Config.FailOpenOnTimeout) {
                         ShouldBlock = TRUE;
+                    } else if (CacheKeyValid) {
+                        //
+                        // Fail-open under load: cache the (unscanned) allow for
+                        // a short window so the SAME file is not re-queried on
+                        // every open while the scanner drains its backlog.
+                        // Without this a timed-out scan is never cached, so the
+                        // next open times out again, the scanner never catches
+                        // up, and the create path serializes system-wide. The
+                        // short TTL keeps the fail-open transient; the file is
+                        // re-evaluated after the window, and write/execute
+                        // access is scanned regardless of this entry.
+                        //
+                        ShadowStrikeCacheInsert(
+                            &CacheKey,
+                            Verdict_Clean,
+                            0,
+                            PC_FAILOPEN_CACHE_TTL_SEC
+                            );
                     }
                 } else {
                     InterlockedIncrement64(&g_PcState.Stats.ScanErrors);
