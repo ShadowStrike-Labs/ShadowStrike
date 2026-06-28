@@ -2417,20 +2417,21 @@ private:
                     break;
                 }
 
-                DWORD hashObjSize = 0, dataSize = 0;
-                if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hashObjSize),
-                                       sizeof(hashObjSize), &dataSize, 0) != 0) {
-                    break;
-                }
-
-                DWORD hashSize = 0;
+                DWORD hashSize = 0, dataSize = 0;
                 if (BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashSize),
                                        sizeof(hashSize), &dataSize, 0) != 0) {
                     break;
                 }
 
-                std::vector<uint8_t> hashObj(hashObjSize);
-                if (BCryptCreateHash(hAlg, &hHash, hashObj.data(), hashObjSize, nullptr, 0, 0) != 0) {
+                // Let CNG allocate and own the hash object (pbHashObject = NULL).
+                // The earlier version passed a caller-owned std::vector<> here that
+                // was scoped to this do/while block: it freed its backing store on
+                // block exit, and the BCryptDestroyHash() below then dereferenced
+                // that freed buffer — a use-after-free that corrupted the process
+                // heap (and faulted directly inside BCryptDestroyHash under
+                // PageHeap). Every other hash routine in this file already uses the
+                // NULL-buffer form; this brings ComputeFileHashInternal in line.
+                if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) {
                     break;
                 }
 
