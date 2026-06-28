@@ -25,6 +25,8 @@
 #endif
 
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <crtdbg.h>
 #include <signal.h>
 #include <stdio.h>
@@ -52,6 +54,41 @@ constexpr const wchar_t* kLogSource = L"ShadowStrike Phantom Service";
 // on disk for post-mortem triage.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Crash-handler watchdog. The unhandled-exception filter below writes a crash
+// minidump in-process. On a corrupt heap MiniDumpWriteDump can itself hang;
+// and when THIS process is the connected kernel scanner, a hung crash handler
+// means the process never exits, its FilterConnectCommunicationPort handle
+// never closes, and the minifilter keeps routing synchronous file-create scans
+// to a scanner that will never reply — wedging ALL system file I/O into an
+// unresettable whole-machine freeze (observed in the field; the 0-byte crash
+// dump is the tell-tale — the dump write itself stalled).
+//
+// The watchdog is a thread created at startup that idles on an event. The SEH
+// filter signals it before touching the heap/dump; if the handler has not
+// finished within a short bound, the watchdog force-terminates the process.
+// TerminateProcess is serviced entirely by the kernel and cannot be blocked by
+// a hung user thread or a corrupt heap, so the filter port ALWAYS closes
+// promptly and the kernel fails open. Net effect: a scanner crash degrades to
+// "service offline," never a frozen machine.
+// ---------------------------------------------------------------------------
+static HANDLE g_crashWatchdogEvent  = nullptr;   // manual-reset; set by the SEH filter
+static HANDLE g_crashWatchdogThread = nullptr;
+static constexpr DWORD kCrashWatchdogTimeoutMs = 4000;
+
+static DWORD WINAPI ShadowStrikeCrashWatchdogProc(LPVOID) noexcept {
+    if (g_crashWatchdogEvent != nullptr) {
+        (void)::WaitForSingleObject(g_crashWatchdogEvent, INFINITE);
+    }
+    // A crash is in progress. Allow a bounded window for the in-process dump,
+    // then force teardown regardless of the main thread's state. If the dump
+    // finished quickly the process has already exited and this never runs.
+    ::Sleep(kCrashWatchdogTimeoutMs);
+    ::ShadowStrikeAppendBootTrace(L"crash-watchdog-force-terminate");
+    ::TerminateProcess(::GetCurrentProcess(), 0xDEAD0001);
+    return 0;
+}
+
 LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
     DWORD code = 0;
     void* addr = nullptr;
@@ -65,6 +102,13 @@ LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
                          L"unhandled-seh code=0x%08X addr=%p", code, addr);
     ::ShadowStrikeAppendBootTrace(tag);
 
+    // Arm the watchdog FIRST — before any heap touch or dump — so a hung
+    // MiniDumpWriteDump can never keep this process (and thus its kernel filter
+    // port) alive and freeze system-wide file I/O behind a dead scanner.
+    if (g_crashWatchdogEvent != nullptr) {
+        (void)::SetEvent(g_crashWatchdogEvent);
+    }
+
     // Best-effort second-channel log; harmless if Logger is dead.
     __try {
         ShadowStrike::Utils::Logger::Instance().Flush();
@@ -74,6 +118,68 @@ LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
         ShadowStrike::Utils::Logger::Instance().Flush();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // Process is dying; nothing useful to do.
+    }
+
+    // Capture a crash minidump with the LIVE exception context so post-mortem
+    // analysis (WinDbg !analyze -v) can resolve the faulting instruction and
+    // every thread stack. This runs inside the crash path, so it is strictly
+    // best-effort and crash-safe: only stack buffers and direct Win32/DbgHelp
+    // calls, no heap allocation, wrapped in SEH so a failure here can never
+    // block process teardown. A timestamped name avoids overwriting prior
+    // crashes. Previously the service only logged the SEH and wrote no dump,
+    // leaving 0xC0000005 faults un-analyzable.
+    __try {
+        wchar_t dumpPath[MAX_PATH] = {};
+        SYSTEMTIME st;
+        ::GetSystemTime(&st);
+        (void)::_snwprintf_s(
+            dumpPath, _countof(dumpPath), _TRUNCATE,
+            L"C:\\ProgramData\\ShadowStrike\\Logs\\PhantomHome.Service.crash_"
+            L"%04u%02u%02u_%02u%02u%02u.dmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        HANDLE hDump = ::CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hDump != INVALID_HANDLE_VALUE) {
+            MINIDUMP_EXCEPTION_INFORMATION mei{};
+            mei.ThreadId = ::GetCurrentThreadId();
+            mei.ExceptionPointers = ep;
+            mei.ClientPointers = FALSE;
+
+            // Use MiniDumpNormal (thread stacks + loaded-module table only).
+            // The fault that brings us here is frequently heap corruption, and
+            // the richer dump types (MiniDumpWithIndirectlyReferencedMemory /
+            // DataSegs / FullMemory) walk and copy the heap — so they FAIL
+            // outright on a corrupt heap, which is exactly what produced a
+            // 0-byte dump in the field. MiniDumpNormal reads only the thread
+            // stacks and the module list, which is what is needed to resolve
+            // the faulting call stack, and avoids the corrupt heap so it
+            // actually writes.
+            //
+            const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+                MiniDumpNormal | MiniDumpWithUnloadedModules);
+
+            const BOOL dumpOk = ::MiniDumpWriteDump(
+                ::GetCurrentProcess(), ::GetCurrentProcessId(),
+                hDump, dumpType, (ep != nullptr ? &mei : nullptr),
+                nullptr, nullptr);
+            const DWORD dumpErr = dumpOk ? 0u : ::GetLastError();
+            ::FlushFileBuffers(hDump);
+            ::CloseHandle(hDump);
+
+            wchar_t doneTag[360] = {};
+            if (dumpOk) {
+                (void)::_snwprintf_s(doneTag, _countof(doneTag), _TRUNCATE,
+                                     L"crash-minidump-written %ls", dumpPath);
+            } else {
+                (void)::_snwprintf_s(doneTag, _countof(doneTag), _TRUNCATE,
+                                     L"crash-minidump-FAILED err=0x%08X (%ls)",
+                                     dumpErr, dumpPath);
+            }
+            ::ShadowStrikeAppendBootTrace(doneTag);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Dump capture failed; the boot trace + SEH log above still mark the crash.
     }
 
     // Returning EXCEPTION_EXECUTE_HANDLER terminates the process normally.
@@ -121,8 +227,36 @@ void __cdecl ShadowStrikeSignalHandler(int sig) noexcept {
 }
 
 void InstallProcessWideHandlers() noexcept {
-    // Suppress WER dialogs that would pin a Session 0 service forever.
+    // SEM_NOGPFAULTERRORBOX MUST remain set. It tells Windows this process
+    // self-handles faults, which suppresses Windows Error Reporting for them.
+    //
+    // 1.0.30.0 cleared it (to let WER capture the ~50 s __fastfail stack-overflow
+    // crash out-of-process). That backfired into a STARTUP DEADLOCK: without this
+    // flag, ANY fault routes to WerFault.exe, which must open a handle to this
+    // process to write its dump — but our own kernel self-protection
+    // (ObRegisterCallbacks handle-stripping on the protected service process)
+    // denies that handle, so WerFault blocks indefinitely and the faulting
+    // service thread waits on it forever. Net effect observed in the field:
+    // service launches, hangs before its first boot-trace line, stays in
+    // SERVICE_START_PENDING, and wedges the SCM (Get-Service itself hangs).
+    // Keeping the flag restores the known-good 1.0.29 startup. The __fastfail
+    // crash is being addressed at its source (scan-path memory safety) instead.
     ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+
+    // Pre-create the crash watchdog (event + idle thread) BEFORE installing the
+    // unhandled-exception filter, so the filter can bound its own runtime
+    // without allocating anything in the crash path (see watchdog notes above).
+    g_crashWatchdogEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_crashWatchdogEvent != nullptr) {
+        g_crashWatchdogThread = ::CreateThread(nullptr, 0,
+                                               ShadowStrikeCrashWatchdogProc,
+                                               nullptr, 0, nullptr);
+        if (g_crashWatchdogThread == nullptr) {
+            ::ShadowStrikeAppendBootTrace(L"crash-watchdog-thread-create-FAILED");
+        }
+    } else {
+        ::ShadowStrikeAppendBootTrace(L"crash-watchdog-event-create-FAILED");
+    }
 
     ::SetUnhandledExceptionFilter(ShadowStrikeUnhandledFilter);
     std::set_terminate(ShadowStrikeTerminateHandler);
