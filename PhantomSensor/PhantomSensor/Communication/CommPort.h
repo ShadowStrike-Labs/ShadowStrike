@@ -622,6 +622,24 @@ ShadowStrikeVerifyClient(
  *
  * @irql PASSIVE_LEVEL
  */
+/**
+ * @brief Test whether a PID is the connected ShadowStrike scanner service.
+ *
+ * The file callbacks use this to exempt the scanner's OWN file I/O from
+ * synchronous on-access scanning, which would otherwise recurse into the
+ * PreCreate -> SbSendScanRequest path and deadlock all system file I/O.
+ *
+ * @param ProcessId  Process ID to test.
+ * @return TRUE if ProcessId is the registered primary scanner service.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowStrikeIsScannerProcess(
+    _In_ HANDLE ProcessId
+    );
+
 NTSTATUS
 ShadowStrikeRegisterProtectedProcess(
     _In_ ULONG ProcessId,

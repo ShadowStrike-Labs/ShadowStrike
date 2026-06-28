@@ -434,4 +434,35 @@ typedef struct _SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE {
 
 #define SHADOWSTRIKE_KEX_PROTOCOL_FLAG_MANDATORY_ENCRYPTION  0x00000001
 
+//
+// Connection context — passed by the user-mode client as the lpContext buffer
+// of FilterConnectCommunicationPort and delivered to the kernel's
+// ShadowStrikeConnectNotify as ConnectionContext.
+//
+//   ConnectionType : 1 = primary scanner connection (the only one the kernel
+//                    targets with scan requests and whose session key gates
+//                    those sends); 0 = auxiliary.
+//   ClientImageHash: SHA-256 of the connecting client's OWN executable,
+//                    computed in USER MODE. The kernel uses this as the
+//                    key-exchange / key-wrapping input so both ends derive the
+//                    identical KWK WITHOUT the kernel performing any file I/O
+//                    inside its connect callback (such I/O re-enters the
+//                    minifilter and can deadlock the filesystem stack). The
+//                    connection itself is independently authenticated by
+//                    ShadowStrikeVerifyClient (exact image path + SYSTEM
+//                    token); this hash only binds the local session-key
+//                    handoff. A later protocol revision (ephemeral ECDH)
+//                    supersedes it with forward secrecy.
+//
+// Older/auxiliary clients that pass a smaller context (or none) remain
+// supported: the kernel reads the hash only when SizeOfContext covers the full
+// structure, otherwise it falls back without failing the connection.
+//
+#define SHADOWSTRIKE_CLIENT_IMAGE_HASH_SIZE 32
+
+typedef struct _SHADOWSTRIKE_CONNECTION_CONTEXT {
+    UINT32 ConnectionType;
+    UCHAR  ClientImageHash[SHADOWSTRIKE_CLIENT_IMAGE_HASH_SIZE];
+} SHADOWSTRIKE_CONNECTION_CONTEXT, *PSHADOWSTRIKE_CONNECTION_CONTEXT;
+
 #pragma pack(pop)

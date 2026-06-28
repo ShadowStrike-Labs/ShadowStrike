@@ -50,6 +50,34 @@
 #include "../Utilities/FileUtils.h"
 
 //
+// PID of the connected primary scanner service. The kernel must NEVER issue a
+// synchronous user-mode scan for this process's OWN file I/O: while servicing a
+// scan request the scanner's worker threads open/read files (and load DLLs,
+// write logs, etc.), and scanning those opens would recurse back into the
+// synchronous IRP_MJ_CREATE -> SbSendScanRequest path, exhaust the scanner's
+// worker pool, and deadlock all file I/O on the system (every other process's
+// create then stalls on the scan timeout). Recorded directly at connect time —
+// before the encrypted channel can carry any scan traffic — so the exemption is
+// race-free, and cleared at disconnect.
+//
+// NOTE: the user-mode RegisterProtectedProcess path inserts into
+// g_DriverData.ProtectedProcessList, which is a DIFFERENT list than the one
+// ShadowStrikeIsProcessProtected() (consulted by the file callbacks) reads, so
+// it does NOT provide this exemption. This dedicated record does.
+//
+static volatile LONG g_ScannerServiceProcessId = 0;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowStrikeIsScannerProcess(
+    _In_ HANDLE ProcessId
+    )
+{
+    LONG scannerPid = ReadNoFence(&g_ScannerServiceProcessId);
+    return (BOOLEAN)(scannerPid != 0 && HandleToLong(ProcessId) == scannerPid);
+}
+
+//
 // PsGetProcessInheritedFromUniqueProcessId â€” exported by ntoskrnl.exe
 // since Windows XP. Not declared in public WDK headers but stable and
 // widely used in production security drivers (minifilters, EDR agents).
@@ -1250,26 +1278,63 @@ ShadowStrikeConnectNotify(
     }
 
     //
-    // Safely read connection context from user-mode with try/except
+    // Read the optional connection type from the connection context.
+    //
+    // CRITICAL: The Filter Manager copies the user-mode ConnectionContext
+    // (passed to FilterConnectCommunicationPort) into kernel-mode pool BEFORE
+    // invoking this callback — per the FLT_CONNECT_NOTIFY contract the pointer
+    // we receive is already a captured, validated kernel-mode buffer of
+    // SizeOfContext bytes. It is therefore WRONG to call ProbeForRead on it:
+    // ProbeForRead is for user-mode addresses and RAISES on a kernel address,
+    // which made this callback fault into the __except below and reject EVERY
+    // connection with STATUS_INVALID_PARAMETER (the user-mode side saw a
+    // perpetual 0x80070057 and the encrypted channel never came up).
+    //
+    // We read it directly with RtlCopyMemory (alignment-safe). The buffer is
+    // guaranteed valid kernel memory, so no probe/SEH is required. The context
+    // is optional: clients that omit it (or send <4 bytes) are simply treated
+    // as auxiliary (non-primary) connections rather than being rejected.
     //
     if (ConnectionContext != NULL && SizeOfContext >= sizeof(UINT32)) {
-        __try {
-            //
-            // Probe the user-mode buffer for read access
-            //
-            ProbeForRead(ConnectionContext, SizeOfContext, sizeof(UINT32));
+        UINT32 ctxConnectionType = 0;
+        RtlCopyMemory(&ctxConnectionType, ConnectionContext, sizeof(ctxConnectionType));
 
-            connectionType = *(PUINT32)ConnectionContext;
-            if (connectionType == 1) {
-                isPrimaryScanner = TRUE;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Exception reading connection context\n");
+        connectionType = ctxConnectionType;
+        if (connectionType == 1) {
+            isPrimaryScanner = TRUE;
+
             //
-            // Invalid user buffer - reject connection
+            // Record the scanner service PID so the file callbacks never issue a
+            // synchronous user-mode scan for the scanner's OWN file I/O (which
+            // would recurse into PreCreate -> SbSendScanRequest, exhaust the
+            // scanner worker pool, and deadlock all system file I/O). Set here at
+            // connect, before the encrypted channel can carry scan traffic, so
+            // there is no race with the scan flood that starts once it is live.
             //
-            return STATUS_INVALID_PARAMETER;
+            InterlockedExchange(&g_ScannerServiceProcessId, HandleToLong(clientProcessId));
+        }
+
+        //
+        // Optional client-supplied image hash (SHA-256 of the client's OWN
+        // executable, computed in USER MODE and carried in the connection
+        // context — see SHADOWSTRIKE_CONNECTION_CONTEXT). Using it as the
+        // key-exchange input lets both sides derive the identical key-wrapping
+        // key while the kernel performs ZERO file I/O in this connect callback,
+        // eliminating the filter-stack re-entrancy/deadlock risk of hashing a
+        // file here. This is a pure in-memory read from the FltMgr-captured
+        // context buffer; the connection is already authenticated by
+        // ShadowStrikeVerifyClient (exact image path + SYSTEM token), so a
+        // client-supplied value here only binds the local key handoff.
+        //
+        // If the client supplies a short/legacy context the override is skipped
+        // and the verifier's hash stands — the key exchange then simply will
+        // not match, rather than the connection being rejected or the kernel
+        // touching the filesystem.
+        //
+        if (SizeOfContext >= sizeof(SHADOWSTRIKE_CONNECTION_CONTEXT)) {
+            const SHADOWSTRIKE_CONNECTION_CONTEXT* connCtx =
+                (const SHADOWSTRIKE_CONNECTION_CONTEXT*)ConnectionContext;
+            RtlCopyMemory(imageHash, connCtx->ClientImageHash, sizeof(imageHash));
         }
     }
 
@@ -1788,6 +1853,17 @@ ShadowStrikeFinalizeClientDisconnect(
     if (g_ClientPortRefs[SlotIndex].IsPrimaryScanner &&
         g_ClientPortRefs[SlotIndex].EncryptionEstablished) {
         InterlockedDecrement(&g_DriverData.PrimaryScannersReady);
+    }
+
+    //
+    // Clear the scanner-process scan exemption if this primary scanner owned it,
+    // so a later reuse of the same PID by another process is not silently
+    // exempted from on-access scanning. Compare-exchange so we only clear our own
+    // PID (never a newer scanner's).
+    //
+    if (g_ClientPortRefs[SlotIndex].IsPrimaryScanner) {
+        InterlockedCompareExchange(&g_ScannerServiceProcessId, 0,
+                                   HandleToLong(g_ClientPortRefs[SlotIndex].ClientProcessId));
     }
     g_ClientPortRefs[SlotIndex].EncryptionEstablished = FALSE;
 
@@ -2859,14 +2935,20 @@ ShadowStrikeSendScanRequest(
                     );
 
                     //
-                    // If HMAC will be applied, include the flag in the header
-                    // BEFORE encryption so GCM AAD matches the on-wire header.
+                    // Message authentication is provided by AES-256-GCM, which
+                    // is an AEAD: the GCM tag (computed below) authenticates BOTH
+                    // the ciphertext AND the message header supplied as AAD. We
+                    // deliberately do NOT set SHADOWSTRIKE_MSG_FLAG_HMAC nor append
+                    // a separate HMAC-SHA256. That redundant second layer was
+                    // mis-keyed relative to the user-mode verifier, so every
+                    // message failed its pre-decryption HMAC check and was dropped
+                    // before it could be decrypted — collapsing the scanner channel
+                    // (observed: thousands of "HMAC verification FAILED" with a
+                    // correct, KEX-matched session key). GCM is the single, correct
+                    // authentication primitive for this transport; the header flag
+                    // therefore stays clear so the AAD the receiver authenticates
+                    // matches the on-wire header byte-for-byte.
                     //
-                    if (ShadowStrikeIsCommHmacKeyReady()) {
-                        ((PSHADOWSTRIKE_MESSAGE_HEADER)encBuf)->Flags |=
-                            SHADOWSTRIKE_MSG_FLAG_HMAC;
-                    }
-
                     ENC_OPTIONS encOpts = {0};
                     encOpts.Flags = EncFlag_IncludeHeader | EncFlag_UseAAD;
                     encOpts.AAD = encBuf;  // Header as AAD
@@ -2950,40 +3032,16 @@ ShadowStrikeSendScanRequest(
     }
 
     //
-    // Compute HMAC-SHA256 for message integrity authentication.
-    // The HMAC is appended after the original message payload so user-mode
-    // can verify the message was not tampered with in transit.
-    // Use pre-opened HMAC handle via EncGetHmacAlgHandle to avoid
-    // per-call BCryptOpenAlgorithmProvider overhead.
+    // No separate message HMAC is appended. AES-256-GCM (applied above) is an
+    // AEAD: its authentication tag already covers the ciphertext and the
+    // message header (passed as AAD), giving full integrity + authenticity with
+    // the per-session key both ends derived during the key exchange. The former
+    // HMAC-SHA256 layer was redundant with GCM and was keyed off material the
+    // user-mode receiver does not possess, so it failed verification on every
+    // message and silently dropped all encrypted scan requests before they
+    // could be decrypted or replied to. Relying on GCM alone is the correct,
+    // provably-keyed authentication for this transport.
     //
-    if (ShadowStrikeIsCommHmacKeyReady()) {
-        ULONG authenticatedSize = sendSize + SHADOWSTRIKE_HMAC_OUTPUT_SIZE;
-        PVOID authBuffer = ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, authenticatedSize, 'hmCP');
-        if (authBuffer != NULL) {
-            RtlCopyMemory(authBuffer, sendBuffer, sendSize);
-            PENC_MANAGER encMgr2 = ShadowStrikeGetEncryptionManager();
-            BCRYPT_ALG_HANDLE hmacHandle = (encMgr2 != NULL) ?
-                EncGetHmacAlgHandle(encMgr2) : NULL;
-            NTSTATUS hmacStatus = EncHmacSha256(
-                hmacHandle,
-                g_CommHmacKey,
-                SHADOWSTRIKE_HMAC_KEY_SIZE,
-                authBuffer,
-                sendSize,
-                (PUCHAR)authBuffer + sendSize
-            );
-            if (NT_SUCCESS(hmacStatus)) {
-                // HMAC flag already set in header before encryption (AAD alignment).
-                // Just swap the send buffer to the authenticated one.
-                sendBuffer = authBuffer;
-                sendSize = authenticatedSize;
-                hmacAllocated = TRUE;
-            } else {
-                ExFreePoolWithTag(authBuffer, 'hmCP');
-            }
-        }
-    }
 
     clientPort = clientRef->ClientPort;
     replySize = *ReplySize;
