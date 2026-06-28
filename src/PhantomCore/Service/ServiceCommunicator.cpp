@@ -381,8 +381,25 @@ bool ServiceCommunicatorImpl::Initialize() {
     poolConfig.maxThreads = 16;  // Cap concurrent client handlers
     m_clientThreadPool = std::make_unique<Utils::ThreadPool>(poolConfig);
 
+    // CRITICAL: the ThreadPool *constructor* only validates configuration — it
+    // does NOT spawn worker threads. Worker threads (and the monitoring thread)
+    // are created only by ThreadPool::Initialize() -> CreateWorkerThreads().
+    // Submit() simply enqueues a task; with no workers running, the task is
+    // never executed. Omitting this call left the client pool with ZERO
+    // workers, so every HandleClient task queued by ListenLoop for an accepted
+    // UI/tray connection was enqueued and never run: the AuthHandshake was
+    // never read or answered, the UI's handshake timed out, and the dashboard
+    // reported "ShadowStrike service offline" on every boot. Initialize it and
+    // fail loudly if the worker threads cannot be created.
+    if (!m_clientThreadPool->Initialize()) {
+        SS_LOG_ERROR(L"IPC",
+            L"Client-handler ThreadPool::Initialize() failed — UI IPC cannot service clients.");
+        m_clientThreadPool.reset();
+        return false;
+    }
+
     m_initialized = true;
-    SS_LOG_INFO(L"IPC", L"ServiceCommunicator initialized with secure SDDL.");
+    SS_LOG_INFO(L"IPC", L"ServiceCommunicator initialized with secure SDDL; client-handler thread pool started.");
     return true;
 }
 
@@ -639,16 +656,40 @@ void ServiceCommunicatorImpl::ListenLoop() {
 
         m_stats.activeConnections++;
 
-        // Submit client handling to bounded thread pool
-        if (m_clientThreadPool) {
-            auto future = m_clientThreadPool->Submit(
-                [this, clientCtx](const Utils::TaskContext&) {
-                    HandleClient(clientCtx);
-                });
-            (void)future;  // Fire-and-forget: client lifetime managed by HandleClient
-        } else {
-            SS_LOG_ERROR(L"IPC", L"ThreadPool unavailable, rejecting client %llu",
-                         clientCtx->clientId);
+        // Run the per-client message loop on a DEDICATED thread.
+        //
+        // ROOT-CAUSE FIX (service-offline): HandleClient() blocks in an
+        // overlapped ReadFile for the ENTIRE lifetime of the connection — it
+        // only returns when the client disconnects. That is fundamentally
+        // incompatible with a bounded, short-task work-queue thread pool:
+        //   1. A pooled worker parked in HandleClient is removed from the pool
+        //      for the whole session, so a few long-lived UI/tray clients
+        //      starve the pool.
+        //   2. Worse — proven from the live service dump (workers idle on the
+        //      pool CV, "Client connected" logged repeatedly with the handshake
+        //      NEVER serviced) — the queued HandleClient task was not dispatched
+        //      to a worker at all, so the AuthHandshake was never read or
+        //      answered and the dashboard reported "service offline" while the
+        //      service itself was healthy and RUNNING.
+        // Thread-per-connection is the canonical named-pipe server model. The
+        // accept loop already caps concurrency via MAX_CONCURRENT_CLIENTS
+        // above, so the live thread count is bounded. clientCtx (shared_ptr)
+        // keeps the connection state alive for the handler thread's lifetime;
+        // HandleClient removes itself from m_activeClients and closes the pipe
+        // on disconnect, after which the thread exits and clientCtx is freed.
+        bool handlerStarted = false;
+        try {
+            std::thread([this, clientCtx]() {
+                HandleClient(clientCtx);
+            }).detach();
+            handlerStarted = true;
+        } catch (const std::system_error& e) {
+            SS_LOG_ERROR(L"IPC",
+                L"Failed to start handler thread for client %llu (err=%d); rejecting.",
+                clientCtx->clientId, e.code().value());
+        }
+
+        if (!handlerStarted) {
             // Rollback the active-client entry we just registered.
             std::lock_guard<std::mutex> lock(m_clientsMutex);
             m_activeClients.erase(
@@ -719,30 +760,58 @@ bool ServiceCommunicatorImpl::TimedWrite(HANDLE pipe,
 void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client) {
     // Message loop
     std::vector<uint8_t> accumulator;
-    DWORD bytesRead = 0;
 
     // Overlapped I/O read loop with event-based completion
-
     HANDLE hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     client->overlapped.hEvent = hEvent;
 
-    while (m_running) {
-        if (!ReadFile(client->pipeHandle, client->buffer.data(),
-                      static_cast<DWORD>(client->buffer.size()), &bytesRead, &client->overlapped)) {
+    // [DIAG] Temporary framing instrumentation to capture the bytes behind any
+    // "Invalid protocol magic" drop. Cheap hex formatter for short prefixes.
+    auto hexDump = [](const uint8_t* p, size_t n) -> std::wstring {
+        std::wstring s; wchar_t b[8];
+        for (size_t i = 0; i < n; ++i) { swprintf(b, 8, L"%02X ", p[i]); s += b; }
+        if (!s.empty()) s.pop_back();
+        return s;
+    };
+    uint32_t diagLastCmd  = 0;
+    int      diagFrameNo  = 0;
+    DWORD    diagLastRead = 0;
 
+    while (m_running) {
+        // ROOT-CAUSE FIX: take the byte count from GetOverlappedResult, NOT from
+        // ReadFile's out-parameter. For a FILE_FLAG_OVERLAPPED handle that
+        // out-parameter is documented as unreliable (callers should pass NULL and
+        // use GetOverlappedResult); trusting it on synchronous completion — which
+        // is exactly what happens when the client has already pipelined several
+        // requests into the pipe — yielded a wrong length, so the wrong number of
+        // bytes was appended to the accumulator and every subsequent frame was
+        // mis-aligned, surfacing as "Invalid protocol magic". bytesRead is also
+        // reset every iteration so a prior value can never leak forward.
+        DWORD bytesRead = 0;
+        BOOL  readOk = ReadFile(client->pipeHandle, client->buffer.data(),
+                                static_cast<DWORD>(client->buffer.size()),
+                                nullptr, &client->overlapped);
+        if (!readOk) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
                 WaitForSingleObject(hEvent, INFINITE);
-                if (!GetOverlappedResult(client->pipeHandle, &client->overlapped, &bytesRead, FALSE)) {
-                    break; // Error or disconnected
-                }
-            } else if (err == ERROR_BROKEN_PIPE) {
+            } else if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
                 break; // Client disconnected
-            } else {
+            } else if (err != ERROR_MORE_DATA) {
                 SS_LOG_ERROR(L"IPC", L"ReadFile failed. Error: %lu", err);
                 break;
             }
+            // ERROR_MORE_DATA falls through to GetOverlappedResult below.
         }
+        if (!GetOverlappedResult(client->pipeHandle, &client->overlapped, &bytesRead, FALSE)) {
+            DWORD gerr = GetLastError();
+            if (gerr != ERROR_BROKEN_PIPE && gerr != ERROR_PIPE_NOT_CONNECTED) {
+                SS_LOG_WARN(L"IPC", L"GetOverlappedResult(read) failed for client %llu: %lu",
+                            client->clientId, gerr);
+            }
+            break; // Error or disconnected
+        }
+        diagLastRead = bytesRead;
 
         if (bytesRead > 0) {
             m_stats.bytesReceived += bytesRead;
@@ -758,7 +827,12 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                 const auto* headerPtr = reinterpret_cast<const WireHeader*>(accumulator.data());
 
                 if (headerPtr->magic != CommunicationConstants::PROTOCOL_MAGIC) {
-                    SS_LOG_WARN(L"IPC", L"Invalid protocol magic from client %llu. Dropping.", client->clientId);
+                    const size_t dn = accumulator.size() < 48 ? accumulator.size() : 48;
+                    SS_LOG_WARN(L"IPC",
+                        L"Invalid protocol magic from client %llu. Dropping. "
+                        L"[DIAG accSize=%zu lastRead=%lu lastCmd=%u frame#%d first48=%ls]",
+                        client->clientId, accumulator.size(), diagLastRead, diagLastCmd,
+                        diagFrameNo, hexDump(accumulator.data(), dn).c_str());
                     m_stats.droppedPackets++;
                     goto disconnect;
                 }
@@ -782,7 +856,23 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                     std::memcpy(&v2res,  accumulator.data() + 6, sizeof(v2res));
                     std::memcpy(&v2type, accumulator.data() + 8, sizeof(v2type));
 
-                    constexpr uint32_t kV2CommandMin = 100u;
+                    // ROOT-CAUSE FIX (service-offline reconnect loop): v2 command
+                    // IDs span the FULL CommandType enum, which begins at low values
+                    // the PhantomHome UI legitimately sends as v2 envelopes —
+                    // Heartbeat=1, GetStatus=10, Start/StopScan=20/21,
+                    // Update/GetConfig=30/31, QuarantineAction=50, etc. The previous
+                    // lower bound of 100 misclassified every such frame as legacy v1:
+                    // the 24-byte v2 envelope was reparsed as a 20-byte v1 header, so
+                    // "payloadSize" was read from the v2 *type* field and the frame
+                    // was mis-sized (e.g. GetStatus framed as 20+10=30 bytes instead
+                    // of 26). That over-consumed the next frame's leading 4 bytes —
+                    // its magic — desynchronising the stream so the following frame
+                    // failed the magic check ("Invalid protocol magic"), the server
+                    // dropped the client, and the UI looped forever reconnecting and
+                    // reporting the service offline. v2 frames are disambiguated
+                    // structurally by version==1 && reserved==0; this range is only a
+                    // sanity bound and must therefore cover the entire command enum.
+                    constexpr uint32_t kV2CommandMin = 1u;
                     constexpr uint32_t kV2CommandMax = 400u;
 
                     if (v2ver == 1u && v2res == 0u &&
@@ -820,6 +910,7 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
                         // Resolve session ID once under lock to avoid repeated contention.
                         uint32_t sessionId = GetClientSessionIdById(client->clientId);
                         ProcessV2Message(client->clientId, sessionId, v2cmd, requestId, jsonView);
+                        diagLastCmd = v2type; ++diagFrameNo;
 
                         accumulator.erase(accumulator.begin(),
                                           accumulator.begin() + static_cast<std::ptrdiff_t>(totalV2Size));

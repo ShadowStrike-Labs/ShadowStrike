@@ -90,7 +90,7 @@ namespace {
 constexpr const wchar_t* kLog          = L"PipeClient";
 constexpr std::size_t    kMaxPending   = 256;
 constexpr std::size_t    kMaxQueue     = 256;
-constexpr DWORD          kAuthTimeoutMs = 3000;
+constexpr DWORD          kAuthTimeoutMs = 15000; // tolerate slow first-handshake on a cold-boot/busy service (was 3000)
 constexpr DWORD          kWatchdogMs   = 250;
 
 // Build version string re-used in AuthHandshake payload.
@@ -776,11 +776,16 @@ bool PipeClient::Impl::PerformAuth(HANDLE hPipe, std::stop_token stoken)
     if (wr == WAIT_TIMEOUT) {
         CancelIoEx(hPipe, &readOvlp);
         DWORD tmp = 0; GetOverlappedResult(hPipe, &readOvlp, &tmp, TRUE);
-        SS_LOG_ERROR(kLog, L"Auth handshake timed out after %lu ms.", kAuthTimeoutMs);
-        TransitionState(PipeClientState::Fatal, L"Auth handshake timed out");
-        PostToMain([qObj = QPointer<PipeClient>(m_q)]() {
-            if (qObj) emit qObj->authRejected(QStringLiteral("AUTH_TIMEOUT"));
-        });
+        // A handshake timeout is TRANSIENT, not fatal. On a cold boot the
+        // service answers the first AuthHandshake late (heavy Phase-2 init:
+        // signature DBs, kernel filter-port connect, ~70% CPU). Going Fatal
+        // here made IoThreadProc exit permanently, leaving the dashboard stuck
+        // on "service offline" forever. Returning false (without setting the
+        // fatal state) lets IoThreadProc fall into its Reconnecting backoff and
+        // retry the whole connect+handshake — re-reading ui.token each attempt.
+        SS_LOG_WARN(kLog,
+            L"Auth handshake timed out after %lu ms — reconnecting and retrying.",
+            kAuthTimeoutMs);
         return false;
     }
 

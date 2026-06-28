@@ -420,8 +420,13 @@ PageHost {
                     }
 
                     StatusChip {
-                        state: root._moduleCountByMode(0) > 0 ? "warning" : (root._moduleCount() > 0 ? "on" : "loading")
-                        label: qsTr("Disabled: %1").arg(root._moduleCountByMode(0))
+                        // Disabled/off sensors = those reporting health "off" (-1):
+                        // Disabled or Stopped module states (e.g. modules turned off
+                        // by config such as the IoT and Backup groups). The previous
+                        // _moduleCountByMode(0) counted protection-mode==0, which every
+                        // module reports, so it always showed the full module total.
+                        state: root._moduleCount() > 0 ? "on" : (root._serviceConnected ? "loading" : "offline")
+                        label: qsTr("Disabled: %1").arg(root._moduleCountByHealth(-1))
                     }
 
                     StatusChip {
