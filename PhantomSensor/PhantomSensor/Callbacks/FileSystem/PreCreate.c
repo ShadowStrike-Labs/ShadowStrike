@@ -845,6 +845,21 @@ Return Value:
         goto CleanupAllow;
     }
 
+    //
+    // Skip the ShadowStrike scanner service's OWN process. While servicing a
+    // scan request the scanner's worker threads open/read files (and load DLLs,
+    // write logs, etc.); scanning those opens would recurse into this
+    // PreCreate -> SbSendScanRequest synchronous path, exhaust the scanner
+    // worker pool, and deadlock all file I/O on the system. The scanner PID is
+    // recorded at connect time (ShadowStrikeConnectNotify) so this exemption is
+    // race-free and does not depend on the user-mode RegisterProtectedProcess
+    // message (which populates a different list than ShadowStrikeIsProcessProtected
+    // consults).
+    //
+    if (ShadowStrikeIsScannerProcess(RequestorPid)) {
+        goto CleanupAllow;
+    }
+
     // ========================================================================
     // PHASE 3: GET FILE NAME INFORMATION
     // ========================================================================

@@ -1221,6 +1221,43 @@ ShadowStrikeCacheBuildKey(
     RtlZeroMemory(Key, sizeof(SHADOWSTRIKE_CACHE_KEY));
 
     //
+    // BUGCHECK GUARD — MUP_FILE_SYSTEM (0x103, MUP_BUGCHECK_NO_FILECONTEXT).
+    //
+    // The FltQueryInformationFile() calls below issue synchronous information
+    // IRPs against FltObjects->FileObject. On a network / redirector volume
+    // (e.g. a VMware shared folder, which is fronted by the Multiple UNC
+    // Provider) the target file object has no MUP file context established yet
+    // when we run inside the IRP_MJ_CREATE pre-operation path, so the query IRP
+    // reaches mup.sys with an unrecognised file object and mup!MupFsdIrpPassThrough
+    // bugchecks the box. The local scan cache is keyed on volume serial + NTFS
+    // file ID and is meaningless for remote files anyway, so for any network
+    // file system we simply decline to build a cache key. Every caller already
+    // treats a non-success return as "no cache entry" and fails open, so this is
+    // safe for all five call sites (PreCreate / PreWrite / PreSetInfo /
+    // PreAcquireSection / PostWrite).
+    //
+    {
+        FLT_FILESYSTEM_TYPE fsType = FLT_FSTYPE_UNKNOWN;
+        NTSTATUS fsStatus = FltGetFileSystemType(FltObjects->Instance, &fsType);
+        if (!NT_SUCCESS(fsStatus) ||
+            fsType == FLT_FSTYPE_MUP     ||
+            fsType == FLT_FSTYPE_LANMAN  ||
+            fsType == FLT_FSTYPE_RDPDR   ||
+            fsType == FLT_FSTYPE_WEBDAV  ||
+            fsType == FLT_FSTYPE_NFS     ||
+            fsType == FLT_FSTYPE_NETWARE ||
+            fsType == FLT_FSTYPE_MS_NETWARE ||
+            fsType == FLT_FSTYPE_CSVFS   ||
+            fsType == FLT_FSTYPE_OPENAFS) {
+            //
+            // Remote / redirector / unknown filesystem: do NOT issue file-info
+            // IRPs here. Decline the cache key (fail-open).
+            //
+            return STATUS_NOT_SUPPORTED;
+        }
+    }
+
+    //
     // Get file ID (REQUIRED)
     //
     status = FltQueryInformationFile(

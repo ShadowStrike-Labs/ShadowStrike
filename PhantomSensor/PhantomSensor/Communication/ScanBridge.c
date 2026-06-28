@@ -635,11 +635,24 @@ SbBuildFileScanRequestEx(
     }
 
     //
-    // Get file name information
+    // Get file name information.
+    //
+    // CACHE_ONLY (not QUERY_DEFAULT): the caller (ShadowStrikePreCreate) has
+    // ALREADY queried the normalized name for this create with QUERY_DEFAULT,
+    // which populates the Filter Manager name cache. Re-issuing a normalized
+    // QUERY_DEFAULT here performs a SECOND filesystem name query on the same
+    // in-flight IRP_MJ_CREATE; on a network/UNC path that nested query is sent
+    // to mup.sys for a file object that has no MUP file context yet, which
+    // bugchecks the system (0x103 MUP_FILE_SYSTEM / NO_FILECONTEXT, observed in
+    // SbBuildFileScanRequestEx). CACHE_ONLY reads only the in-memory cache that
+    // the caller just populated and never issues an IRP, so it cannot trigger
+    // that path. On a cache miss we fall back to the OPENED name, which the
+    // Filter Manager constructs from the create parameters without a filesystem
+    // query.
     //
     status = FltGetFileNameInformation(
         Data,
-        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_CACHE_ONLY,
         &nameInfo
     );
 
