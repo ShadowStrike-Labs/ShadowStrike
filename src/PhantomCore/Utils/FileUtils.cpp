@@ -156,6 +156,84 @@ namespace ShadowStrike {
 
 
             /**
+             * @brief Resolve a kernel NT device path to an openable Win32 DOS path.
+             *
+             * The minifilter delivers file paths in NT device form, e.g.
+             * "\Device\HarddiskVolume3\Windows\System32\foo.dll". The Win32 file
+             * APIs every scanner relies on (CreateFileW, memory-map, hashing, PE
+             * parsing) cannot open that form, so without translation each scan
+             * fails "file not found" and nothing is actually scanned. This maps the
+             * leading volume device to its DOS drive letter via QueryDosDevice
+             * (-> "C:\Windows\System32\foo.dll"). For a volume with no drive letter
+             * it falls back to the "\\?\GLOBALROOT" form, which Win32 can still open.
+             * Non-device paths are returned unchanged.
+             *
+             * Intended for TRUSTED kernel-originated paths only (not user input):
+             * unlike NormalizePath it deliberately accepts the device namespace.
+             */
+            std::wstring DevicePathToDosPath(std::wstring_view ntPath) {
+                if (ntPath.empty()) {
+                    return std::wstring();
+                }
+
+                auto startsWithCi = [](std::wstring_view s, std::wstring_view p) noexcept {
+                    if (s.size() < p.size()) return false;
+                    for (size_t i = 0; i < p.size(); ++i) {
+                        wchar_t a = s[i];
+                        wchar_t b = p[i];
+                        if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+                        if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+                        if (a != b) return false;
+                    }
+                    return true;
+                };
+
+                // Only \Device\ paths need translation; drive-letter / \\?\ / UNC
+                // forms are already openable and returned untouched.
+                if (!startsWithCi(ntPath, std::wstring_view(L"\\Device\\"))) {
+                    return std::wstring(ntPath);
+                }
+
+                // Map the leading volume device (e.g. \Device\HarddiskVolume3) to its
+                // DOS drive letter, scanning only drives that currently exist.
+                const DWORD driveMask = ::GetLogicalDrives();
+                wchar_t target[MAX_PATH];
+                for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
+                    if (!(driveMask & (1u << (letter - L'A')))) {
+                        continue;
+                    }
+                    const wchar_t dosName[3] = { letter, L':', L'\0' };
+                    const DWORD len = ::QueryDosDeviceW(dosName, target, MAX_PATH);
+                    if (len == 0) {
+                        continue;  // buffer too small / no mapping — skip this drive
+                    }
+                    // QueryDosDevice may return multiple NUL-separated targets; the
+                    // first is the active mapping.
+                    const std::wstring_view dev(target);
+                    if (dev.empty() || ntPath.size() <= dev.size()) {
+                        continue;
+                    }
+                    // Require an exact device match terminated by a path separator so
+                    // "...Volume3" does not spuriously match "...Volume30\...".
+                    if (startsWithCi(ntPath, dev) && ntPath[dev.size()] == L'\\') {
+                        std::wstring dos;
+                        dos.reserve(2 + (ntPath.size() - dev.size()));
+                        dos.push_back(letter);
+                        dos.push_back(L':');
+                        dos.append(ntPath.substr(dev.size()));
+                        return dos;
+                    }
+                }
+
+                // Letterless volume: \\?\GLOBALROOT opens the raw NT path directly.
+                std::wstring global;
+                global.reserve(14 + ntPath.size());
+                global.append(L"\\\\?\\GLOBALROOT");
+                global.append(ntPath);
+                return global;
+            }
+
+            /**
              * @brief Normalize path and optionally resolve to final target.
              * 
              * Validates input for dangerous patterns, resolves relative paths,

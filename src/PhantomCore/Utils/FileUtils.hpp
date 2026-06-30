@@ -176,6 +176,21 @@ namespace ShadowStrike {
 			[[nodiscard]] std::wstring NormalizePath(std::wstring_view path, bool resolveFinal = false, Error* err = nullptr);
 
 			/**
+			 * @brief Resolve a kernel NT device path to an openable Win32 DOS path.
+			 *
+			 * Maps "\Device\HarddiskVolumeN\..." (as delivered by the minifilter) to
+			 * its DOS form "X:\..." via QueryDosDevice, with a "\\?\GLOBALROOT"
+			 * fallback for letterless volumes. Non-device paths are returned
+			 * unchanged. TRUSTED kernel-originated paths only — unlike NormalizePath
+			 * it intentionally accepts the device namespace so scanners can open the
+			 * file the kernel asked about.
+			 *
+			 * @param ntPath NT device path from a kernel scan request.
+			 * @return An openable Win32 path, or the input unchanged if not a device path.
+			 */
+			[[nodiscard]] std::wstring DevicePathToDosPath(std::wstring_view ntPath);
+
+			/**
 			 * @brief Verify that a path resides within an expected root directory.
 			 * 
 			 * SECURITY: This function provides protection against path traversal attacks.

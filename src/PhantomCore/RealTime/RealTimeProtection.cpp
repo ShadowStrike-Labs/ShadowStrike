@@ -2170,6 +2170,14 @@ public:
                 reinterpret_cast<const uint8_t*>(&req) + sizeof(FILE_SCAN_REQUEST)),
             req.PathLength / sizeof(wchar_t));
 
+        // The kernel delivers the path in NT device form
+        // (\Device\HarddiskVolumeN\...), which the Win32 file APIs used by every
+        // scanner below — exclusions, ransomware/script dispatch, metamorphic,
+        // packer, ExecutableAnalyzer, ScanEngine — cannot open. Resolve it to a
+        // DOS path once, here at the boundary; without this each scan fails
+        // "file not found" and the product never actually inspects anything.
+        filePath = Utils::FileUtils::DevicePathToDosPath(filePath);
+
         // 1. Check Exclusions
         if (IsExcluded(filePath, req.ProcessId)) {
             m_stats.excludedByPath++;
