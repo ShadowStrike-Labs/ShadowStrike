@@ -134,9 +134,11 @@ typedef struct _SB_CIRCUIT_BREAKER {
     volatile LONG State;            ///< SB_CIRCUIT_STATE
     volatile LONG ConsecutiveFailures;
     volatile LONG ConsecutiveSuccesses;
+    volatile LONG RecentTimeouts;   ///< reply-timeouts in the current window (latency trip)
     LARGE_INTEGER LastFailureTime;
     LARGE_INTEGER LastStateTransition;
     LARGE_INTEGER OpenedTime;
+    LARGE_INTEGER TimeoutWindowStart; ///< start of the current reply-timeout window (100ns)
     volatile LONG64 TotalTrips;
     volatile LONG64 TotalRecoveries;
     EX_PUSH_LOCK Lock;
@@ -231,6 +233,11 @@ SbpRecordSuccess(
 
 static VOID
 SbpRecordFailure(
+    _Inout_ PSB_CIRCUIT_BREAKER CircuitBreaker
+);
+
+static VOID
+SbpRecordTimeout(
     _Inout_ PSB_CIRCUIT_BREAKER CircuitBreaker
 );
 
@@ -1211,9 +1218,13 @@ SbSendScanRequestEx(
         Result->Verdict = Verdict_Timeout;
 
         //
-        // Record failure with circuit breaker
+        // Record the timeout with the circuit breaker. SbpRecordTimeout keeps
+        // the consecutive-failure accounting AND applies the windowed timeout-
+        // rate trip, so a connected-but-slow scanner (slow successes interleaved
+        // with timeouts) still opens the breaker instead of taxing every create
+        // with the full scan timeout.
         //
-        SbpRecordFailure(&g_ScanBridge.CircuitBreaker);
+        SbpRecordTimeout(&g_ScanBridge.CircuitBreaker);
         InterlockedIncrement64(&g_ScanBridge.Stats.TimeoutScans);
         InterlockedIncrement64(&g_ScanBridge.Stats.FailedScans);
 
@@ -2407,6 +2418,7 @@ SbpInitializeCircuitBreaker(
     CircuitBreaker->State = SbCircuitClosed;
     ExInitializePushLock(&CircuitBreaker->Lock);
     KeQuerySystemTime(&CircuitBreaker->LastStateTransition);
+    CircuitBreaker->TimeoutWindowStart = CircuitBreaker->LastStateTransition;
 }
 
 static BOOLEAN
@@ -2473,6 +2485,7 @@ SbpRecordSuccess(
         // Success in half-open - close the circuit
         //
         SbpTransitionCircuitState(CircuitBreaker, SbCircuitClosed);
+        InterlockedExchange(&CircuitBreaker->RecentTimeouts, 0);
         InterlockedIncrement64(&CircuitBreaker->TotalRecoveries);
         BeEngineSubmitEvent(
             BehaviorEvent_CircuitBreakerRecovered,
@@ -2522,6 +2535,89 @@ SbpRecordFailure(
         SbpTransitionCircuitState(CircuitBreaker, SbCircuitOpen);
         InterlockedIncrement64(&CircuitBreaker->TotalTrips);
         InterlockedIncrement(&g_ScanBridge.Stats.CircuitBreakerTrips);
+        BeEngineSubmitEvent(
+            BehaviorEvent_CircuitBreakerTripped,
+            BehaviorCategory_DefenseEvasion,
+            HandleToULong(PsGetCurrentProcessId()),
+            NULL,
+            0,
+            50,
+            FALSE,
+            NULL
+        );
+    }
+}
+
+//
+// Latency/health-aware trip for the *connected-but-slow* scanner.
+//
+// SbpRecordFailure opens the breaker only after SB_CIRCUIT_BREAKER_THRESHOLD
+// CONSECUTIVE failures, and SbpRecordSuccess resets that counter on every
+// success. When the user-mode scanner is connected but saturated it answers
+// some create-path scans slowly (recorded as success) and lets others time out,
+// so the consecutive counter never reaches the threshold — yet every
+// IRP_MJ_CREATE still pays the full per-create scan timeout and aggregate file
+// I/O stalls system-wide. (Field symptom: a flood of user-mode FilterReplyMessage
+// NO_WAITER_FOR_REPLY with the machine frozen but no bugcheck.)
+//
+// This records the timeout with the existing consecutive logic AND trips on the
+// timeout RATE — SB_CIRCUIT_TIMEOUT_TRIP_COUNT reply-timeouts within
+// SB_CIRCUIT_TIMEOUT_WINDOW_MS — independent of interleaved successes. Once the
+// breaker is open, SbpCheckCircuitBreaker short-circuits the create path before
+// FltSendMessage, so a slow scanner degrades to "not scanned, allowed" for the
+// recovery window instead of freezing every file open behind it.
+//
+static VOID
+SbpRecordTimeout(
+    _Inout_ PSB_CIRCUIT_BREAKER CircuitBreaker
+)
+{
+    LARGE_INTEGER now;
+    LONG64 elapsedMs;
+    LONG count;
+
+    //
+    // Preserve consecutive-failure accounting: this still trips a hard-down
+    // scanner quickly and drives the half-open re-open path.
+    //
+    SbpRecordFailure(CircuitBreaker);
+
+    KeQuerySystemTime(&now);
+    elapsedMs = (now.QuadPart - CircuitBreaker->TimeoutWindowStart.QuadPart) / 10000;
+
+    if (elapsedMs < 0 || elapsedMs > (LONG64)SB_CIRCUIT_TIMEOUT_WINDOW_MS) {
+        //
+        // Start a fresh observation window. The aligned 8-byte store is atomic
+        // on the x64 target; a benign race only shifts the window boundary by a
+        // single sample, which the count threshold tolerates. Runs at
+        // PASSIVE_LEVEL on the scan path (no lock held, no allocation).
+        //
+        CircuitBreaker->TimeoutWindowStart = now;
+        InterlockedExchange(&CircuitBreaker->RecentTimeouts, 1);
+        return;
+    }
+
+    count = InterlockedIncrement(&CircuitBreaker->RecentTimeouts);
+
+    if (count >= SB_CIRCUIT_TIMEOUT_TRIP_COUNT &&
+        (SB_CIRCUIT_STATE)CircuitBreaker->State == SbCircuitClosed) {
+        //
+        // Sustained slowness — open the breaker so the create path fails open
+        // (fast) for the recovery window instead of taxing every file open.
+        // If SbpRecordFailure above already opened it via the consecutive path,
+        // the state check makes this a no-op (no double trip).
+        //
+        SbpTransitionCircuitState(CircuitBreaker, SbCircuitOpen);
+        InterlockedIncrement64(&CircuitBreaker->TotalTrips);
+        InterlockedIncrement(&g_ScanBridge.Stats.CircuitBreakerTrips);
+        InterlockedExchange(&CircuitBreaker->RecentTimeouts, 0);
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/SB] Circuit breaker: Closed -> Open "
+                   "(scanner slow: %ld reply-timeouts within %u ms; create-path "
+                   "scans fail open until recovery)\n",
+                   count, (ULONG)SB_CIRCUIT_TIMEOUT_WINDOW_MS);
+
         BeEngineSubmitEvent(
             BehaviorEvent_CircuitBreakerTripped,
             BehaviorCategory_DefenseEvasion,

@@ -160,6 +160,26 @@ extern "C" {
 #define SB_CIRCUIT_BREAKER_RECOVERY_MS      30000
 
 /**
+ * @brief Sliding observation window for the latency/health trip (milliseconds)
+ *
+ * The consecutive-failure trip (SB_CIRCUIT_BREAKER_THRESHOLD) never fires when
+ * the scanner is connected but slow: reply-timeouts interleave with slow
+ * successes, and each success resets the consecutive counter. This window
+ * measures the reply-timeout *rate* instead, so a saturated scanner still trips
+ * the breaker while every create is otherwise paying the full scan timeout.
+ */
+#define SB_CIRCUIT_TIMEOUT_WINDOW_MS        2000
+
+/**
+ * @brief Reply-timeouts within SB_CIRCUIT_TIMEOUT_WINDOW_MS that open the circuit
+ *
+ * A healthy scanner answers create-path scans well under the per-create timeout,
+ * so timeouts are rare; this many within the window means the scanner cannot
+ * keep up and the create path must fail open until it recovers.
+ */
+#define SB_CIRCUIT_TIMEOUT_TRIP_COUNT       6
+
+/**
  * @brief Message lookaside list depth
  */
 #define SB_LOOKASIDE_DEPTH                  256
