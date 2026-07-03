@@ -2467,6 +2467,15 @@ public:
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
         std::wstring commandLine(req.commandLineData(), req.commandLineCharLen());
 
+        // Resolve the kernel NT device path to an openable Win32 DOS path before
+        // any consumer touches it. CertificateValidator::OnKernelProcessCreate
+        // opens the image to verify its signature, and the debugger-evasion pass
+        // and telemetry key off the path too — the process-image route has the
+        // same "\Device\HarddiskVolumeN\..." problem as the file-scan and
+        // image-load routes. LOLBin/command-line substring checks are unaffected
+        // by the path form, so this is a safe, single-point normalization.
+        imagePath = Utils::FileUtils::DevicePathToDosPath(imagePath);
+
         // =====================================================================
         // ANTI-DEBUG: Forward every process create/terminate to AntiDebug
         // so it can detect hostile debugger launches (OllyDbg, x64dbg, etc.)
@@ -2952,6 +2961,17 @@ public:
         }
 
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
+
+        // The kernel delivers the image path in NT device form
+        // (\Device\HarddiskVolumeN\...). Every consumer below — signature
+        // validation, certificate + packer analysis, KernelExploitDetector,
+        // ScanEngine, injection correlation — opens the file through Win32 APIs
+        // that cannot address the device namespace, so without this each one
+        // fails "file not found" on every module load (the dominant scan flood)
+        // while still burning CPU. Resolve to a DOS path once, here at the
+        // boundary, exactly as OnKernelFileScan does; network/redirector devices
+        // are deliberately left raw so a stalled share can't wedge the scan path.
+        imagePath = Utils::FileUtils::DevicePathToDosPath(imagePath);
 
         // ================================================================
         // ANTI-DEBUG: Detect hostile debugger DLLs being loaded into our
