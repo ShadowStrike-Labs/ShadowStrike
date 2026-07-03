@@ -194,6 +194,23 @@ namespace ShadowStrike {
                     return std::wstring(ntPath);
                 }
 
+                // Network / remote redirector devices must NOT be resolved to an
+                // openable form. Opening a remote file performs unbounded network
+                // I/O; doing that synchronously from the on-access scan path lets a
+                // stalled remote server wedge every file operation behind it (the
+                // Explorer "Network" lock-up). Leaving them in raw NT form makes the
+                // scan fail-open fast — the correct policy, since remote content is
+                // the serving host's responsibility, not local on-access scanning.
+                for (const std::wstring_view netDev : {
+                        std::wstring_view(L"\\Device\\Mup\\"),
+                        std::wstring_view(L"\\Device\\LanmanRedirector\\"),
+                        std::wstring_view(L"\\Device\\WebDavRedirector\\"),
+                        std::wstring_view(L"\\Device\\NfsRdr\\") }) {
+                    if (startsWithCi(ntPath, netDev)) {
+                        return std::wstring(ntPath);
+                    }
+                }
+
                 // Map the leading volume device (e.g. \Device\HarddiskVolume3) to its
                 // DOS drive letter, scanning only drives that currently exist.
                 const DWORD driveMask = ::GetLogicalDrives();

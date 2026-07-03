@@ -749,6 +749,14 @@ struct FileSystemFilter::Impl {
 
         if (request->pathLength > 0) {
             event.filePath = std::wstring(strings, request->pathLength);
+            // The kernel delivers NT device paths (\Device\HarddiskVolumeN\...).
+            // This filesystem-filter route feeds event.filePath straight to
+            // ScanEngine / DigitalSignatureValidator / hashing, all of which open
+            // the file with Win32 APIs — which cannot open the NT form, so every
+            // scan on this (dominant) route failed "file not found". Resolve to a
+            // DOS path once, here at the boundary, matching RealTimeProtection's
+            // OnKernelFileScan.
+            event.filePath = Utils::FileUtils::DevicePathToDosPath(event.filePath);
         }
 
         if (request->processNameLength > 0) {
