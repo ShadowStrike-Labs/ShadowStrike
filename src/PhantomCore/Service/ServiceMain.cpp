@@ -89,6 +89,103 @@ static DWORD WINAPI ShadowStrikeCrashWatchdogProc(LPVOID) noexcept {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Stack-overflow-safe crash dump capture.
+//
+// A STATUS_STACK_OVERFLOW (0xC00000FD) leaves the faulting thread with no
+// usable stack, so calling MiniDumpWriteDump directly from the exception
+// filter — which runs on that same exhausted stack — silently fails and yields
+// a 0-byte dump (exactly what we saw in the field). Two measures fix this:
+//   1. SetThreadStackGuarantee reserves a stack region so the filter itself can
+//      still run after the overflow (applied to the main thread here and to
+//      every scan worker at its entry point).
+//   2. The MiniDumpWriteDump call is performed by a dedicated dumper thread
+//      that owns a fresh, healthy stack. The filter only publishes the
+//      EXCEPTION_POINTERS, signals the dumper, and waits (bounded) for it.
+//      MiniDumpWriteDump captures every thread, so the faulting thread's full
+//      overflowed call stack is still recorded for post-mortem analysis.
+// ---------------------------------------------------------------------------
+static HANDLE g_crashDumpRequest  = nullptr;   // auto-reset; set by the SEH filter
+static HANDLE g_crashDumpDone     = nullptr;   // auto-reset; set by the dumper
+static HANDLE g_crashDumperThread = nullptr;
+static EXCEPTION_POINTERS* volatile g_crashEp = nullptr;
+static volatile DWORD g_crashThreadId = 0;
+
+// Write a crash minidump. Safe to call from either the dumper thread (normal
+// case) or inline (fallback). Uses only stack buffers and direct Win32/DbgHelp
+// calls, wrapped in SEH so a failure here can never block process teardown.
+static void ShadowStrikeWriteCrashMinidump(EXCEPTION_POINTERS* ep, DWORD threadId) noexcept {
+    __try {
+        wchar_t dumpPath[MAX_PATH] = {};
+        SYSTEMTIME st;
+        ::GetSystemTime(&st);
+        (void)::_snwprintf_s(
+            dumpPath, _countof(dumpPath), _TRUNCATE,
+            L"C:\\ProgramData\\ShadowStrike\\Logs\\PhantomHome.Service.crash_"
+            L"%04u%02u%02u_%02u%02u%02u.dmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        HANDLE hDump = ::CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hDump == INVALID_HANDLE_VALUE) {
+            ::ShadowStrikeAppendBootTrace(L"crash-minidump-create-FAILED");
+            return;
+        }
+
+        MINIDUMP_EXCEPTION_INFORMATION mei{};
+        mei.ThreadId = threadId;
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+
+        // MiniDumpNormal: thread stacks + module list only (no heap walk), so it
+        // survives a corrupt heap and is enough to resolve the faulting stack.
+        const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+            MiniDumpNormal | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo);
+
+        const BOOL dumpOk = ::MiniDumpWriteDump(
+            ::GetCurrentProcess(), ::GetCurrentProcessId(),
+            hDump, dumpType, (ep != nullptr ? &mei : nullptr), nullptr, nullptr);
+        const DWORD dumpErr = dumpOk ? 0u : ::GetLastError();
+        ::FlushFileBuffers(hDump);
+        ::CloseHandle(hDump);
+
+        wchar_t doneTag[360] = {};
+        if (dumpOk) {
+            (void)::_snwprintf_s(doneTag, _countof(doneTag), _TRUNCATE,
+                                 L"crash-minidump-written %ls", dumpPath);
+        } else {
+            (void)::_snwprintf_s(doneTag, _countof(doneTag), _TRUNCATE,
+                                 L"crash-minidump-FAILED err=0x%08X (%ls)", dumpErr, dumpPath);
+        }
+        ::ShadowStrikeAppendBootTrace(doneTag);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ::ShadowStrikeAppendBootTrace(L"crash-minidump-EXCEPTION");
+    }
+}
+
+static DWORD WINAPI ShadowStrikeCrashDumperProc(LPVOID) noexcept {
+    if (g_crashDumpRequest == nullptr) {
+        return 0;
+    }
+    for (;;) {
+        if (::WaitForSingleObject(g_crashDumpRequest, INFINITE) != WAIT_OBJECT_0) {
+            return 0;
+        }
+        ShadowStrikeWriteCrashMinidump(g_crashEp, g_crashThreadId);
+        if (g_crashDumpDone != nullptr) {
+            (void)::SetEvent(g_crashDumpDone);
+        }
+    }
+}
+
+// Reserve a stack region so the unhandled-exception filter can still execute
+// after a STATUS_STACK_OVERFLOW. Called on the main thread and on every scan
+// worker; 256 KiB is ample for the filter's signal-and-wait path.
+void ShadowStrikeEnableStackOverflowDumps() noexcept {
+    ULONG guaranteeBytes = 256u * 1024u;
+    (void)::SetThreadStackGuarantee(&guaranteeBytes);
+}
+
 LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
     DWORD code = 0;
     void* addr = nullptr;
@@ -120,66 +217,28 @@ LONG WINAPI ShadowStrikeUnhandledFilter(EXCEPTION_POINTERS* ep) noexcept {
         // Process is dying; nothing useful to do.
     }
 
-    // Capture a crash minidump with the LIVE exception context so post-mortem
-    // analysis (WinDbg !analyze -v) can resolve the faulting instruction and
-    // every thread stack. This runs inside the crash path, so it is strictly
-    // best-effort and crash-safe: only stack buffers and direct Win32/DbgHelp
-    // calls, no heap allocation, wrapped in SEH so a failure here can never
-    // block process teardown. A timestamped name avoids overwriting prior
-    // crashes. Previously the service only logged the SEH and wrote no dump,
-    // leaving 0xC0000005 faults un-analyzable.
-    __try {
-        wchar_t dumpPath[MAX_PATH] = {};
-        SYSTEMTIME st;
-        ::GetSystemTime(&st);
-        (void)::_snwprintf_s(
-            dumpPath, _countof(dumpPath), _TRUNCATE,
-            L"C:\\ProgramData\\ShadowStrike\\Logs\\PhantomHome.Service.crash_"
-            L"%04u%02u%02u_%02u%02u%02u.dmp",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-        HANDLE hDump = ::CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
-                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hDump != INVALID_HANDLE_VALUE) {
-            MINIDUMP_EXCEPTION_INFORMATION mei{};
-            mei.ThreadId = ::GetCurrentThreadId();
-            mei.ExceptionPointers = ep;
-            mei.ClientPointers = FALSE;
-
-            // Use MiniDumpNormal (thread stacks + loaded-module table only).
-            // The fault that brings us here is frequently heap corruption, and
-            // the richer dump types (MiniDumpWithIndirectlyReferencedMemory /
-            // DataSegs / FullMemory) walk and copy the heap — so they FAIL
-            // outright on a corrupt heap, which is exactly what produced a
-            // 0-byte dump in the field. MiniDumpNormal reads only the thread
-            // stacks and the module list, which is what is needed to resolve
-            // the faulting call stack, and avoids the corrupt heap so it
-            // actually writes.
-            //
-            const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
-                MiniDumpNormal | MiniDumpWithUnloadedModules);
-
-            const BOOL dumpOk = ::MiniDumpWriteDump(
-                ::GetCurrentProcess(), ::GetCurrentProcessId(),
-                hDump, dumpType, (ep != nullptr ? &mei : nullptr),
-                nullptr, nullptr);
-            const DWORD dumpErr = dumpOk ? 0u : ::GetLastError();
-            ::FlushFileBuffers(hDump);
-            ::CloseHandle(hDump);
-
-            wchar_t doneTag[360] = {};
-            if (dumpOk) {
-                (void)::_snwprintf_s(doneTag, _countof(doneTag), _TRUNCATE,
-                                     L"crash-minidump-written %ls", dumpPath);
-            } else {
-                (void)::_snwprintf_s(doneTag, _countof(doneTag), _TRUNCATE,
-                                     L"crash-minidump-FAILED err=0x%08X (%ls)",
-                                     dumpErr, dumpPath);
-            }
-            ::ShadowStrikeAppendBootTrace(doneTag);
+    // Hand the dump off to the dedicated dumper thread, which owns a fresh,
+    // healthy stack. On a STATUS_STACK_OVERFLOW the faulting thread has no stack
+    // left to run MiniDumpWriteDump itself — this is why earlier dumps were
+    // 0 bytes. The filter only publishes the exception context, signals the
+    // dumper, and waits a bounded interval (shorter than the watchdog's
+    // force-terminate window) for the dump to be written. MiniDumpWriteDump
+    // captures every thread, so the faulting thread's overflowed stack is
+    // recorded regardless of which thread writes the dump.
+    bool dumpedViaThread = false;
+    if (g_crashDumpRequest != nullptr && g_crashDumpDone != nullptr &&
+        g_crashDumperThread != nullptr) {
+        g_crashEp = ep;
+        g_crashThreadId = ::GetCurrentThreadId();
+        if (::SetEvent(g_crashDumpRequest)) {
+            (void)::WaitForSingleObject(g_crashDumpDone, 3000);
+            dumpedViaThread = true;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Dump capture failed; the boot trace + SEH log above still mark the crash.
+    }
+    if (!dumpedViaThread) {
+        // Fallback for faults where the current stack is still usable (i.e. not
+        // a stack overflow) or if the dumper thread could not be created.
+        ShadowStrikeWriteCrashMinidump(ep, ::GetCurrentThreadId());
     }
 
     // Returning EXCEPTION_EXECUTE_HANDLER terminates the process normally.
@@ -257,6 +316,26 @@ void InstallProcessWideHandlers() noexcept {
     } else {
         ::ShadowStrikeAppendBootTrace(L"crash-watchdog-event-create-FAILED");
     }
+
+    // Pre-create the stack-overflow-safe crash dumper (events + idle thread)
+    // BEFORE installing the filter, so even an early fault captures a real
+    // minidump on a healthy stack instead of a 0-byte file.
+    g_crashDumpRequest = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_crashDumpDone    = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_crashDumpRequest != nullptr && g_crashDumpDone != nullptr) {
+        g_crashDumperThread = ::CreateThread(nullptr, 0,
+                                             ShadowStrikeCrashDumperProc,
+                                             nullptr, 0, nullptr);
+        if (g_crashDumperThread == nullptr) {
+            ::ShadowStrikeAppendBootTrace(L"crash-dumper-thread-create-FAILED");
+        }
+    } else {
+        ::ShadowStrikeAppendBootTrace(L"crash-dumper-event-create-FAILED");
+    }
+
+    // Reserve a stack region for THIS (main) thread so the filter can run after
+    // a stack overflow here too; scan workers set their own guarantee at entry.
+    ShadowStrikeEnableStackOverflowDumps();
 
     ::SetUnhandledExceptionFilter(ShadowStrikeUnhandledFilter);
     std::set_terminate(ShadowStrikeTerminateHandler);

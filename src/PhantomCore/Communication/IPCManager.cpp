@@ -1555,6 +1555,15 @@ void IPCManager::WorkerRoutine() {
         Utils::Logger::Debug("[IPCManager] Worker thread {} started", oss.str());
     }
 
+    // Reserve a stack region so the process-wide unhandled-exception filter can
+    // still run (and hand the crash off to the dumper thread) if a scan on this
+    // worker overflows the stack. Without this reserve the filter executes on
+    // the already-exhausted stack and the crash minidump comes back 0 bytes.
+    {
+        ULONG stackGuaranteeBytes = 256u * 1024u;
+        (void)::SetThreadStackGuarantee(&stackGuaranteeBytes);
+    }
+
     // Allocate per-thread receive buffer.
     // Wire format: [FILTER_MESSAGE_HEADER (WDK, 12 bytes)] [SHADOWSTRIKE_MESSAGE_HEADER (40 bytes)] [payload]
     std::vector<uint8_t> buffer(IPCConstants::MAX_MESSAGE_SIZE);
