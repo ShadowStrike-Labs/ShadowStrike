@@ -635,6 +635,40 @@ SbBuildFileScanRequestEx(
     }
 
     //
+    // BUGCHECK GUARD — MUP_FILE_SYSTEM (0x103, MUP_BUGCHECK_NO_FILECONTEXT).
+    //
+    // Building the request issues a synchronous information query against
+    // FltObjects->FileObject (the FltQueryInformationFile(FileStandardInformation)
+    // call further below). On a network / redirector volume (e.g. a VMware
+    // shared folder, fronted by the Multiple UNC Provider) the target file
+    // object has no MUP file context yet while we run inside the IRP_MJ_CREATE
+    // pre-operation, so that query reaches mup.sys with an unrecognised file
+    // object and mup!MupFsdIrpPassThrough bugchecks the box (0x103). Remote
+    // files are not scanned on-access inline anyway — the serving host owns that
+    // responsibility, matching the identical guard in ShadowStrikeCacheBuildKey
+    // and the user-mode device-path policy — so for any network / redirector /
+    // unknown filesystem we decline to build the request here. ShadowStrikePreCreate
+    // only scans on an NT_SUCCESS return, so a decline fails open: the create
+    // proceeds unscanned rather than crashing the system.
+    //
+    if (FltObjects->Instance != NULL) {
+        FLT_FILESYSTEM_TYPE fsType = FLT_FSTYPE_UNKNOWN;
+        NTSTATUS fsStatus = FltGetFileSystemType(FltObjects->Instance, &fsType);
+        if (!NT_SUCCESS(fsStatus)     ||
+            fsType == FLT_FSTYPE_MUP        ||
+            fsType == FLT_FSTYPE_LANMAN     ||
+            fsType == FLT_FSTYPE_RDPDR      ||
+            fsType == FLT_FSTYPE_WEBDAV     ||
+            fsType == FLT_FSTYPE_NFS        ||
+            fsType == FLT_FSTYPE_NETWARE    ||
+            fsType == FLT_FSTYPE_MS_NETWARE ||
+            fsType == FLT_FSTYPE_CSVFS      ||
+            fsType == FLT_FSTYPE_OPENAFS) {
+            return STATUS_NOT_SUPPORTED;
+        }
+    }
+
+    //
     // Acquire rundown protection
     //
     if (!SbpAcquireRundownProtection()) {
