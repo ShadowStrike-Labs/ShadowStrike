@@ -666,6 +666,18 @@ public:
     [[nodiscard]] bool Initialize(const IPCConfiguration& config = {});
     [[nodiscard]] bool Start(uint32_t workerThreadCount = std::thread::hardware_concurrency());
     void Stop();
+
+    /**
+     * @brief Gate kernel scan-request servicing on engine readiness.
+     *
+     * While false, DispatchMessage answers file-scan requests with an immediate
+     * fail-open Verdict_Clean instead of invoking the still-initializing scan
+     * handler. This prevents the cold-boot scan storm: the kernel gets fast
+     * verdicts (no reply-timeout flood, no login I/O stall) while
+     * RealTimeProtection is warming up. Set true once the engine is fully up.
+     */
+    void SetScanServicingReady(bool ready) noexcept;
+    [[nodiscard]] bool IsScanServicingReady() const noexcept;
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] bool IsConnected() const noexcept;
@@ -872,6 +884,11 @@ private:
 
     // State
     std::atomic<bool> m_connected{false};
+
+    /// Scan-servicing readiness gate (see SetScanServicingReady). While false,
+    /// DispatchMessage fail-opens kernel file-scan requests to avoid the
+    /// cold-boot scan storm during engine warm-up.
+    std::atomic<bool> m_scanServicingReady{false};
     std::atomic<bool> m_running{false};
     std::atomic<IPCStatus> m_status{IPCStatus::Uninitialized};
     

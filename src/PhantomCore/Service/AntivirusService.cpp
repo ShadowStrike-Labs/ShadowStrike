@@ -600,6 +600,13 @@ public:
         }
         ::ShadowStrikeAppendBootTrace(L"impl-Start-IPCManager-leave");
 
+        // Engine fully initialized (RealTimeProtection + IPCManager up): open the
+        // scan-servicing gate. Until this point DispatchMessage fail-opens kernel
+        // file-scan requests (immediate Verdict_Clean) so the cold-boot scan storm
+        // cannot stall login I/O while the scan engine is still warming up.
+        Communication::IPCManager::Instance().SetScanServicingReady(true);
+        ::ShadowStrikeAppendBootTrace(L"impl-Start-ScanServicingReady");
+
         // Start Communication subsystems
         ::ShadowStrikeAppendBootTrace(L"impl-Start-ServiceCommunication-enter");
         if (!Communication::ServiceCommunication::Instance().Start(true)) {

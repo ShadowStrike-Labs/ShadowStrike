@@ -459,6 +459,9 @@ void IPCManager::Stop() {
     m_status.store(IPCStatus::Stopping);
     m_running.store(false, std::memory_order_release);
 
+    // Re-gate scan servicing until the engine re-signals readiness on next start.
+    m_scanServicingReady.store(false, std::memory_order_release);
+
     // Signal shutdown event
     if (m_impl->shutdownEvent != nullptr) {
         SetEvent(m_impl->shutdownEvent);
@@ -1765,6 +1768,19 @@ void IPCManager::WorkerRoutine() {
     }
 }
 
+void IPCManager::SetScanServicingReady(bool ready) noexcept {
+    const bool prev = m_scanServicingReady.exchange(ready, std::memory_order_release);
+    if (prev != ready) {
+        Utils::Logger::Info("[IPCManager] Scan servicing {} (engine {})",
+                            ready ? "ENABLED" : "disabled",
+                            ready ? "ready" : "not ready");
+    }
+}
+
+bool IPCManager::IsScanServicingReady() const noexcept {
+    return m_scanServicingReady.load(std::memory_order_acquire);
+}
+
 void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
     if (!buffer) return;
 
@@ -1799,6 +1815,21 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
 
     switch (static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType)) {
         case FilterMessageType_ScanRequest: {
+            // READY-GATE: until RealTimeProtection has fully initialized, do not
+            // route file-create scans into the still-warming-up engine. Reply
+            // immediately with a fail-open Verdict_Clean so the kernel gets a
+            // fast verdict instead of timing out. This removes the cold-boot
+            // scan storm (reply-timeout flood -> login I/O stall) and shrinks
+            // the window that drives the concurrent-logging heap corruption.
+            if (!m_scanServicingReady.load(std::memory_order_acquire)) {
+                verdict = Verdict_Clean;
+                needsReply = true;
+                auto idxGated = static_cast<size_t>(FilterMessageType_ScanRequest);
+                if (idxGated < m_impl->stats.byMessageType.size()) {
+                    m_impl->stats.byMessageType[idxGated].fetch_add(1, std::memory_order_relaxed);
+                }
+                break;
+            }
             if (fileScanHandler) {
                 if (pAppHeader->DataSize < sizeof(FILE_SCAN_REQUEST)) {
                     Utils::Logger::Error("[IPCManager] Truncated FileScanRequest: {} < {}",
