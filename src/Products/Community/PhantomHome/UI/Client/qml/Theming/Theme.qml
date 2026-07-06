@@ -9,33 +9,36 @@ QtObject {
         highContrast || ((typeof perfBudget !== "undefined" && perfBudget !== null)
                          ? perfBudget.animationsPaused : false)
 
-    // --- Palette (locked by brand logo: dark phantom body + cyan-blue eye glow) ---
-    readonly property color bgDeep:        highContrast ? "#000000" : "#05080F"
-    readonly property color bgCanvas:      highContrast ? "#000000" : "#07101D"
-    readonly property color bgSurface:     highContrast ? "#000000" : "#0B1220"
-    readonly property color bgSurfaceAlt:  highContrast ? "#101820" : "#111B2E"
-    readonly property color bgElevated:    highContrast ? "#050A12" : "#12203A"
-    readonly property color strokeSubtle:  highContrast ? "#FFFFFF" : "#1E2A44"
-    readonly property color strokeStrong:  highContrast ? "#FFFFFF" : "#2F456A"
-    readonly property color textPrimary:   highContrast ? "#FFFFFF" : "#EAF2FF"
-    readonly property color textSecondary: highContrast ? "#FFFFFF" : "#B4C7EA"
-    readonly property color textMuted:     highContrast ? "#D8E7FF" : "#7185A8"
-    readonly property color accentCyan:    highContrast ? "#00FFFF" : "#38BDF8"
-    readonly property color accentBlue:    highContrast ? "#4DA3FF" : "#1E6FFF"
-    readonly property color accentGlow:    highContrast ? "#00FFFF" : "#3FD8FF"
-    readonly property color ok:            highContrast ? "#00FF99" : "#22D39A"
+    // --- Palette: neutral grayish-black base + calm light-blue accent ---
+    // The non-high-contrast values are a soft, low-contrast dark theme: a
+    // near-neutral charcoal base with barely-there separators and a single
+    // light-blue accent family, so surfaces read as calm rather than harsh.
+    readonly property color bgDeep:        highContrast ? "#000000" : "#0C0D0F"
+    readonly property color bgCanvas:      highContrast ? "#000000" : "#111214"
+    readonly property color bgSurface:     highContrast ? "#000000" : "#191A1D"
+    readonly property color bgSurfaceAlt:  highContrast ? "#101820" : "#212327"
+    readonly property color bgElevated:    highContrast ? "#050A12" : "#262A30"
+    readonly property color strokeSubtle:  highContrast ? "#FFFFFF" : "#24262B"
+    readonly property color strokeStrong:  highContrast ? "#FFFFFF" : "#383B42"
+    readonly property color textPrimary:   highContrast ? "#FFFFFF" : "#ECEEF1"
+    readonly property color textSecondary: highContrast ? "#FFFFFF" : "#AEB4BE"
+    readonly property color textMuted:     highContrast ? "#D8E7FF" : "#767D88"
+    readonly property color accentCyan:    highContrast ? "#00FFFF" : "#55A8F5"
+    readonly property color accentBlue:    highContrast ? "#4DA3FF" : "#3E8FE6"
+    readonly property color accentGlow:    highContrast ? "#00FFFF" : "#6FBAF7"
+    readonly property color ok:            highContrast ? "#00FF99" : "#47A9F2"
     readonly property color warn:          highContrast ? "#FFD84D" : "#F5B544"
-    readonly property color crit:          highContrast ? "#FF5C8A" : "#FF5370"
-    readonly property color info:          highContrast ? "#00FFFF" : "#60A5FA"
-    readonly property color offline:       highContrast ? "#FFFFFF" : "#8FA3C7"
+    readonly property color crit:          highContrast ? "#FF5C8A" : "#F25668"
+    readonly property color info:          highContrast ? "#00FFFF" : "#5AAEF2"
+    readonly property color offline:       highContrast ? "#FFFFFF" : "#8A919C"
 
     readonly property color overlayScrim:  highContrast ? "#000000" : "#020612"
     readonly property color focusRingColor: highContrast ? "#FFFFFF" : accentGlow
 
     // --- Gradients (usable as stop arrays for ShaderEffect / Rectangle.gradient) ---
     readonly property var heroGradientStops: [
-        { position: 0.0, color: bgSurface },
-        { position: 1.0, color: highContrast ? "#000000" : "#132642" }
+        { position: 0.0, color: bgElevated },
+        { position: 1.0, color: highContrast ? "#000000" : "#141720" }
     ]
 
     // --- Typography ---
@@ -51,8 +54,8 @@ QtObject {
 
     // --- Metrics ---
     readonly property int radiusSmall:  6
-    readonly property int radiusMedium: 10
-    readonly property int radiusLarge:  14
+    readonly property int radiusMedium: 12
+    readonly property int radiusLarge:  16
     readonly property int radiusXL:     20
     readonly property int spacingXS: 4
     readonly property int spacingS:  8
