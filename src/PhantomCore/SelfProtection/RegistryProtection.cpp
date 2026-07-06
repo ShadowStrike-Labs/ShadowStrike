@@ -944,16 +944,35 @@ public:
         opts.access = KEY_READ;
 
         if (!regKey.Open(rootKey, subKey, opts)) {
-            m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+            // A protected key that cannot be opened is only a TAMPER event if it
+            // was previously observed present (baselined). Many protected keys are
+            // DEFENSIVE — Image File Execution Options and SafeBoot service entries
+            // we guard so an attacker cannot CREATE them — whose ABSENCE is the
+            // healthy, expected state. Treating "key does not exist" as a violation
+            // produced a perpetual false-positive loop (RegOpenKeyExW code=2 on
+            // every poll), which wasted CPU, spammed the log, and raised bogus
+            // tamper alerts. Only flag when a key that was Valid on a prior check
+            // has now disappeared; otherwise its absence is benign.
             ProtectedKey keyCopy;
+            bool wasBaselined = false;
             {
                 std::unique_lock lock(m_mutex);
                 auto it = m_protectedKeys.find(normalized);
                 if (it != m_protectedKeys.end()) {
-                    it->second.integrity = RegistryIntegrityStatus::Missing;
-                    keyCopy = it->second;  // Copy BEFORE unlock
+                    wasBaselined = (it->second.integrity == RegistryIntegrityStatus::Valid);
+                    it->second.integrity = wasBaselined
+                        ? RegistryIntegrityStatus::Missing
+                        : RegistryIntegrityStatus::Unknown;
+                    if (wasBaselined) {
+                        keyCopy = it->second;  // Copy BEFORE unlock
+                    }
                 }
             }
+            if (!wasBaselined) {
+                // Never-present / defensive key: absence is not tampering.
+                return RegistryIntegrityStatus::Unknown;
+            }
+            m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
             // Fire callback outside lock, using safe copy
             FireIntegrityCallback(keyCopy);
             return RegistryIntegrityStatus::Missing;

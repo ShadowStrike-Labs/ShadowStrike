@@ -248,7 +248,13 @@ namespace ShadowStrike {
             using namespace std::chrono_literals;
             // Bounded polling interval — the inner sleep is interruptible via
             // m_sleepCv, so Stop() returns promptly even under a long sleep.
-            constexpr auto kPollInterval = 1000ms;
+            // Health polling cadence. 1s was needlessly aggressive: CollectMetrics
+            // takes a full system-wide thread snapshot (CreateToolhelp32Snapshot)
+            // plus process-time math every tick, and doing that every second was a
+            // material, continuous CPU cost on small VMs that helped starve the
+            // single-threaded IPC accept loop (surfacing as "service offline"). 5s
+            // is ample for health/heartbeat visibility.
+            constexpr auto kPollInterval = 5000ms;
 
             while (!m_stopRequested.load(std::memory_order_acquire)) {
                 try {

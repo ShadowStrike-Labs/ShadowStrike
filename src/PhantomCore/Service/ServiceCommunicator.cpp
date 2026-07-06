@@ -502,6 +502,14 @@ void ServiceCommunicatorImpl::ListenLoop() {
     // spawn auxiliary accept threads; cheap to make it correct now.
     static std::atomic<uint64_t> s_idCounter{0};
 
+    // Keep the accept/re-listen loop responsive under heavy service CPU load.
+    // The UI and tray connect here; if this single thread is starved (the service
+    // can transiently run detection + monitors hot), a dropped client cannot be
+    // re-accepted promptly and the dashboard shows "service offline" until the
+    // loop is next scheduled. The accept work itself is trivial, so above-normal
+    // priority costs nothing and guarantees a pipe instance is always re-offered.
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     while (m_running) {
         CleanupDisconnectedClients();
 
