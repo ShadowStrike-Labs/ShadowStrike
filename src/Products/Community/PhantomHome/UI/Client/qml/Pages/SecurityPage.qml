@@ -159,8 +159,7 @@ PageHost {
             "ModuleDetailPage.qml": true,
             "ZeroTrustDetailPage.qml": true,
             "PgtiDetailPage.qml": true,
-            "PrivacyPage.qml": true,
-            "PerformancePage.qml": true
+            "PrivacyPage.qml": true
         }
         if (detailPage && allowed[detailPage])
             return detailPage

@@ -641,8 +641,6 @@ PageHost {
             settingsViewModel.refreshAll();
         if (root.moduleProfile.family === "privacy" && typeof privacyViewModel !== "undefined" && privacyViewModel !== null)
             privacyViewModel.refresh();
-        if (root.moduleProfile.family === "performance" && typeof performanceViewModel !== "undefined" && performanceViewModel !== null)
-            performanceViewModel.refresh();
     }
 
     Connections {
@@ -870,44 +868,6 @@ PageHost {
                                 GhostButton {
                                     text: qsTr("Audit permissions")
                                     onClicked: privacyViewModel.auditPermissions()
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Loader {
-                    width: parent.width - Theme.spacingL * 2
-                    active: root.moduleProfile.family === "performance" && typeof performanceViewModel !== "undefined" && performanceViewModel !== null
-                    sourceComponent: Card {
-                        Column {
-                            width: parent.width
-                            spacing: Theme.spacingM
-
-                            SectionTitle {
-                                text: qsTr("Performance posture")
-                                subtitle: qsTr("Controls backed by the performance view model.")
-                                width: parent.width
-                            }
-
-                            ModePillRow {
-                                supportedModesMask: 0x07
-                                currentMode: performanceViewModel.currentPowerPlan
-                                onModeChosen: function (mode) {
-                                    performanceViewModel.setPowerPlan(mode);
-                                }
-                            }
-
-                            Flow {
-                                width: parent.width
-                                spacing: Theme.spacingS
-                                Repeater {
-                                    model: performanceViewModel.impactMetrics
-                                    delegate: StatusChip {
-                                        required property var modelData
-                                        state: modelData.state || "on"
-                                        label: qsTr("%1: %2%").arg(modelData.label || qsTr("Impact")).arg(modelData.pct || 0)
-                                    }
                                 }
                             }
                         }

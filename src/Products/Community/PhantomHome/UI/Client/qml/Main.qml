@@ -195,8 +195,7 @@ ApplicationWindow {
                 "ModuleDetailPage.qml": true,
                 "ZeroTrustDetailPage.qml": true,
                 "PgtiDetailPage.qml": true,
-                "PrivacyPage.qml": true,
-                "PerformancePage.qml": true
+                "PrivacyPage.qml": true
             }
             const requested = (page && allowed[page]) ? page : "ModuleDetailPage.qml"
             return "qrc:/qml/Pages/" + requested
@@ -241,7 +240,6 @@ ApplicationWindow {
         readonly property var titleMap: ({
             "dashboard":   qsTr("Dashboard"),
             "security":    qsTr("Security"),
-            "performance": qsTr("Performance"),
             "privacy":     qsTr("Privacy"),
             "zerotrust":   qsTr("Zero Trust"),
             "pgti":        qsTr("Threat Intelligence"),
@@ -256,7 +254,6 @@ ApplicationWindow {
         readonly property var routeMap: ({
             "dashboard":     "qrc:/qml/Pages/MainPage.qml",
             "security":      "qrc:/qml/Pages/SecurityPage.qml",
-            "performance":   "qrc:/qml/Pages/PerformancePage.qml",
             "privacy":       "qrc:/qml/Pages/PrivacyPage.qml",
             "zerotrust":     "qrc:/qml/Pages/ZeroTrustDetailPage.qml",
             "pgti":          "qrc:/qml/Pages/PgtiDetailPage.qml",

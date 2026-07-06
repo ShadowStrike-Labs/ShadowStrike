@@ -16,7 +16,6 @@ Item {
     readonly property var navRoutes: [
         "dashboard",
         "security",
-        "performance",
         "privacy"
     ]
 
@@ -48,10 +47,10 @@ Item {
                 right:  parent.right
             }
 
-            // Logo area
+            // Brand header — product logo + wordmark
             Item {
                 width:  parent.width
-                height: Theme.topBarHeight + Theme.spacingS
+                height: 72
 
                 // Collapse toggle (chevron)
                 IconButton {
@@ -65,18 +64,21 @@ Item {
                     tooltip:    root.collapsed ? qsTr("Expand sidebar") : qsTr("Collapse sidebar")
                     onClicked: {
                         root.collapsed = !root.collapsed
-                        // TODO: wire configBridge from main.cpp
                         if (typeof configBridge !== "undefined" && configBridge !== null) {
                             configBridge.setSidebarCollapsed(root.collapsed)
                         }
                     }
                 }
 
-                // Logo mark
-                Rectangle {
+                // Brand logo
+                Image {
                     id: logoMark
-                    width:  32; height: 32
-                    radius: 16
+                    width:  34; height: 34
+                    fillMode: Image.PreserveAspectFit
+                    smooth:  true
+                    mipmap:  true
+                    source:  "qrc:/qml/assets/logo.png"
+                    sourceSize.width: 68; sourceSize.height: 68
                     anchors {
                         left:           parent.left
                         leftMargin:     root.collapsed
@@ -85,46 +87,41 @@ Item {
                         verticalCenter: parent.verticalCenter
                     }
                     Behavior on anchors.leftMargin { NumberAnimation { duration: Theme.motionBase; easing.type: Theme.easingType } }
-
-                    color: Theme.bgSurfaceAlt
-                    border.color: Theme.accentCyan
-                    border.width: 2
-
-                    // Outer glow
-                    Rectangle {
-                        anchors.fill:    parent
-                        anchors.margins: -4
-                        radius:          parent.radius + 4
-                        color:           Qt.rgba(Theme.accentCyan.r, Theme.accentCyan.g, Theme.accentCyan.b, 0.18)
-                        z: -1
-                    }
-
-                    Text {
-                        anchors.centerIn: parent
-                        text:  "S"
-                        color: Theme.accentCyan
-                        font.family:    Theme.fontFamily
-                        font.pixelSize: Theme.fontSizeBody
-                        font.weight:    Theme.fontWeightBold
-                    }
-                    // TODO: assets-logo-embed — replace with actual logo raster from qml.qrc once available.
                 }
 
-                // Product name (hidden when collapsed)
-                Text {
+                // Wordmark: vendor + product edition (hidden when collapsed)
+                Column {
+                    id: wordmark
                     visible: !root.collapsed
+                    spacing: 1
                     anchors {
                         left:           logoMark.right
                         leftMargin:     Theme.spacingS
+                        right:          collapseBtn.left
+                        rightMargin:    Theme.spacingXS
                         verticalCenter: parent.verticalCenter
                     }
-                    text:  qsTr("ShadowStrike")
-                    color: Theme.textPrimary
-                    font.family:    Theme.fontFamily
-                    font.pixelSize: Theme.fontSizeBody
-                    font.weight:    Theme.fontWeightBold
                     opacity: root.collapsed ? 0 : 1
                     Behavior on opacity { NumberAnimation { duration: Theme.motionBase; easing.type: Theme.easingType } }
+
+                    Text {
+                        width: parent.width
+                        text:  qsTr("ShadowStrike-Labs")
+                        color: Theme.textPrimary
+                        font.family:    Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeBody
+                        font.weight:    Theme.fontWeightBold
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        width: parent.width
+                        text:  qsTr("Phantom Home")
+                        color: Theme.textMuted
+                        font.family:    Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeMicro
+                        font.weight:    Theme.fontWeightRegular
+                        elide: Text.ElideRight
+                    }
                 }
             }
 
@@ -132,10 +129,9 @@ Item {
             Repeater {
                 id: navRepeater
                 model: [
-                    { label: qsTr("Main"),        icon: "qrc:/icons/shield.svg"  },
-                    { label: qsTr("Security"),    icon: "qrc:/icons/lock.svg"    },
-                    { label: qsTr("Performance"), icon: "qrc:/icons/gauge.svg"   },
-                    { label: qsTr("Privacy"),     icon: "qrc:/icons/eye.svg"     }
+                    { label: qsTr("Main"),     icon: "qrc:/icons/shield.svg" },
+                    { label: qsTr("Security"), icon: "qrc:/icons/lock.svg"   },
+                    { label: qsTr("Privacy"),  icon: "qrc:/icons/eye.svg"    }
                 ]
 
                 SidebarItem {

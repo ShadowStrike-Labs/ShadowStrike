@@ -49,7 +49,6 @@ PageHost {
         { category: 1, title: qsTr("Behavioral"), detail: qsTr("Zero Trust and runtime behavior") },
         { category: 2, title: qsTr("Network"), detail: qsTr("Web, firewall, and lateral-movement sensors") },
         { category: 3, title: qsTr("Privacy"), detail: qsTr("Camera, microphone, location, and browser privacy") },
-        { category: 4, title: qsTr("Performance"), detail: qsTr("Scan scheduling and endpoint impact controls") },
         { category: 5, title: qsTr("Threat intel"), detail: qsTr("PGTI feeds and reputation sources") },
         { category: 6, title: qsTr("Other"), detail: qsTr("Additional protection modules") }
     ]
@@ -80,8 +79,6 @@ PageHost {
                 pgtiViewModel.refreshAll()
             if (typeof privacyViewModel !== "undefined" && privacyViewModel !== null)
                 privacyViewModel.refresh()
-            if (typeof performanceViewModel !== "undefined" && performanceViewModel !== null)
-                performanceViewModel.refresh()
         }
     }
 
@@ -188,8 +185,10 @@ PageHost {
     }
 
     function _categoryMatches(moduleCategory, groupCategory) {
+        // Category 4 (performance/scheduling) has no dedicated tile in Home;
+        // fold any such modules into the "Other" group so none are hidden.
         if (groupCategory === 6)
-            return moduleCategory < 0 || moduleCategory > 5
+            return moduleCategory < 0 || moduleCategory > 5 || moduleCategory === 4
         return moduleCategory === groupCategory
     }
 
@@ -249,15 +248,6 @@ PageHost {
             return 0
         return privacyViewModel.webcamAccessBlocked + privacyViewModel.micAccessBlocked +
                privacyViewModel.locationAccessBlocked + privacyViewModel.cookiesBlocked
-    }
-
-    function _performancePlanName(plan) {
-        switch (plan) {
-        case 0:  return qsTr("Balanced")
-        case 1:  return qsTr("Performance")
-        case 2:  return qsTr("Battery saver")
-        default: return qsTr("Unknown")
-        }
     }
 
     /// ScanViewModel.ScanState int → FastScanTile scanState string.
@@ -437,15 +427,6 @@ PageHost {
                     StatusChip {
                         state: root._feedIssueCount() > 0 ? "warning" : (root._feedCount() > 0 ? "on" : "loading")
                         label: qsTr("PGTI feeds: %1").arg(root._feedCount())
-                    }
-
-                    StatusChip {
-                        state: (typeof performanceViewModel !== "undefined" && performanceViewModel !== null &&
-                                performanceViewModel.loading) ? "loading" : "info"
-                        label: qsTr("Performance: %1").arg(
-                                   (typeof performanceViewModel !== "undefined" && performanceViewModel !== null)
-                                   ? root._performancePlanName(performanceViewModel.currentPowerPlan)
-                                   : qsTr("Unknown"))
                     }
                 }
             }
