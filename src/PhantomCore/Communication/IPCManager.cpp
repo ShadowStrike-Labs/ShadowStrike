@@ -2214,9 +2214,22 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
             break;
     }
 
-    // FIX [BUG #1 CRITICAL]: Reply using FilterReplyMessage, NOT FilterSendMessage.
-    // The kernel's FltSendMessage is BLOCKING until we call FilterReplyMessage.
-    if (needsReply) {
+    // Reply to the kernel ONLY when it is actually waiting for one.
+    //
+    // The WDK FILTER_MESSAGE_HEADER.ReplyLength — set by Filter Manager from the
+    // reply buffer the driver passed to FltSendMessage — is the authoritative
+    // contract: it is > 0 for a blocking scan awaiting a verdict, and 0 for
+    // one-way sends (image-load / process / registry notifications and the
+    // key-exchange), which have NO kernel waiter. Deciding by message type alone
+    // and replying unconditionally made us call FilterReplyMessage on messages
+    // with no waiter, which returns STATUS_FLT_NO_WAITER_FOR_REPLY (0x801F0020).
+    // At kernel notification rates that became a self-sustaining reply/error/log
+    // storm that pegged the CPU and starved the UI pipe (the "service offline"
+    // flapping). Honor the contract instead of guessing from the type.
+    const auto* pWdkHeader = reinterpret_cast<const FILTER_MESSAGE_HEADER*>(buffer);
+    const bool kernelAwaitingReply = (pWdkHeader->ReplyLength > 0);
+
+    if (needsReply && kernelAwaitingReply) {
         SHADOWSTRIKE_SCAN_VERDICT_REPLY verdictReply = {};
         verdictReply.MessageId  = pAppHeader->MessageId;
         verdictReply.Verdict    = static_cast<UINT8>(verdict);
@@ -2226,13 +2239,27 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         verdictReply.CacheTTL   = (verdict == Verdict_Clean) ? 300 : 0;
 
         if (!ReplyToKernel(messageId, verdictReply)) {
-            Utils::Logger::Error("[IPCManager] Failed to reply to kernel for messageId {}",
-                                 messageId);
+            // Rare benign race: a blocking scan whose kernel waiter already timed
+            // out before we finished. Not actionable, and must never be logged
+            // per-message (that was part of the storm) — Debug only.
+            Utils::Logger::Debug("[IPCManager] Reply not delivered for messageId {} "
+                                 "(kernel waiter gone)", messageId);
         }
 
         auto vIdx = static_cast<size_t>(verdict);
         if (vIdx < m_impl->stats.byVerdict.size()) {
             m_impl->stats.byVerdict[vIdx].fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (needsReply && !kernelAwaitingReply) {
+        // Kernel sent this scan-typed message one-way (ReplyLength == 0): it is
+        // NOT waiting for a verdict, so replying would fail NO_WAITER. Skipping
+        // is correct. Rate-limited so the field logs can confirm this fix
+        // without reintroducing per-message spam.
+        static std::atomic<uint64_t> s_skippedNoWaiter{ 0 };
+        const uint64_t n = s_skippedNoWaiter.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n % 2000) == 0) {
+            Utils::Logger::Info("[IPCManager] Skipped {} one-way kernel message reply(ies) "
+                                "(ReplyLength=0, no waiter) — expected, not an error", n);
         }
     }
 }
@@ -2249,9 +2276,12 @@ bool IPCManager::ReplyToKernel(
                 reinterpret_cast<const uint8_t*>(&verdictReply),
                 sizeof(verdictReply));
             if (!m_primaryConnection->ReplyMessage(replyBuf, messageId)) {
-                Utils::Logger::Error("[IPCManager] ReplyToKernel: encrypted reply failed for msgId {}",
+                // ReplyMessage already logs the precise cause at the right level
+                // (benign NO_WAITER at Debug; genuine encryption failure at Error
+                // with a stat bump). Keep this path quiet to avoid double-logging
+                // the storm we just fixed.
+                Utils::Logger::Debug("[IPCManager] ReplyToKernel: reply not delivered for msgId {}",
                                      messageId);
-                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             return true;

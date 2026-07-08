@@ -624,6 +624,20 @@ public:
                 m_connected.store(false, std::memory_order_release);
             }
 
+            // STATUS_FLT_NO_WAITER_FOR_REPLY (0x801F0020): the kernel already
+            // stopped waiting for this message — either it was sent one-way, or a
+            // blocking scan's wait timed out. This is a benign race, not a channel
+            // error. Do NOT warn per event (that was a primary contributor to the
+            // CPU/log storm) and do NOT count it as a hard error. The caller
+            // gates replies on ReplyLength, so this path should now be rare.
+            constexpr HRESULT kFltNoWaiterForReply = static_cast<HRESULT>(0x801F0020L);
+            if (hr == kFltNoWaiterForReply) {
+                Utils::Logger::Debug(
+                    "[FilterConnection] Reply had no kernel waiter (msgId={})",
+                    originalMessageId);
+                return false;
+            }
+
             Utils::Logger::Warn("[FilterConnection] FilterReplyMessage failed: 0x{:08X}",
                                static_cast<unsigned int>(hr));
             m_stats.errors++;
