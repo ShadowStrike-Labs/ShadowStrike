@@ -2028,9 +2028,39 @@ public:
                         }
                     }
                     else if (funcAddr[0] == 0xFF && funcAddr[1] == 0x25) {
-                        hooksFound++;
-                        SS_LOG_ERROR(LOG_CATEGORY,
-                            L"APT HOOK: %ls export #%u has indirect JMP [addr]", dllName, i);
+                        // FF 25 disp32 = JMP qword ptr [rip+disp32]. This is the
+                        // STANDARD encoding for forwarded exports (e.g. kernel32
+                        // -> kernelbase) and delay-load / CFG import thunks — NOT
+                        // inherently a hook. Resolve the final jump target and only
+                        // flag it when that target does NOT land inside a
+                        // legitimately loaded module image (i.e. it points into
+                        // private/allocated memory, as a real inline-hook
+                        // trampoline would). Flagging every FF25 unconditionally
+                        // false-positived on hundreds of Windows forwarded exports
+                        // (kernel32/ntdll/advapi32), spiking CPU and raising a
+                        // bogus "APT tampering detected" every sweep.
+                        const int32_t ripDisp =
+                            *reinterpret_cast<const int32_t*>(funcAddr + 2);
+                        const auto ptrSlot =
+                            funcPtr + 6 + static_cast<intptr_t>(ripDisp);
+                        const uintptr_t jumpTarget =
+                            *reinterpret_cast<const uintptr_t*>(ptrSlot);
+
+                        HMODULE targetMod = nullptr;
+                        const bool inLoadedModule =
+                            GetModuleHandleExW(
+                                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(jumpTarget),
+                                &targetMod) != 0;
+
+                        if (!inLoadedModule) {
+                            hooksFound++;
+                            SS_LOG_ERROR(LOG_CATEGORY,
+                                L"APT HOOK: %ls export #%u has indirect JMP to "
+                                L"unbacked 0x%llX", dllName, i,
+                                static_cast<uint64_t>(jumpTarget));
+                        }
                     }
                     else if (funcAddr[0] == 0x48 && funcAddr[1] == 0xB8 &&
                              funcAddr[10] == 0xFF && funcAddr[11] == 0xE0) {
