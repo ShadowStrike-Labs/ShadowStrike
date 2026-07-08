@@ -389,6 +389,19 @@ public:
     };
     std::unordered_map<std::string, CacheEntry> m_verdictCache;
 
+    // Image-load module verdict cache: identity(path|size|sigLevel) -> (verdict,
+    // expiry). Collapses repeated full re-analysis (Authenticode hash + cert
+    // chain) of the SAME system module loaded across many processes — e.g.
+    // ntdll.dll on every process start — which was the dominant idle-CPU cost.
+    // Only benign Allow verdicts are cached, and only system modules are served
+    // from it (they already return Allow after signature analysis without the
+    // per-load injection fan-out).
+    struct ImageVerdictEntry {
+        Communication::KernelVerdict verdict;
+        std::chrono::system_clock::time_point expiry;
+    };
+    std::unordered_map<std::wstring, ImageVerdictEntry> m_imageVerdictCache;
+
     // Recent Threats
     std::deque<ThreatEvent> m_recentThreats;
     static constexpr size_t MAX_RECENT_THREATS = 1000;
@@ -2973,6 +2986,24 @@ public:
         // are deliberately left raw so a stalled share can't wedge the scan path.
         imagePath = Utils::FileUtils::DevicePathToDosPath(imagePath);
 
+        // Module-identity fast-path: an identical SYSTEM module we already cleared
+        // recently. Re-running the full signature/cert/Authenticode analysis for
+        // ntdll/kernel32/etc. on every process's load was the dominant idle-CPU
+        // cost (and re-logged the same verdict each time). System modules already
+        // return Allow after signature analysis without the per-load injection/scan
+        // fan-out below, so serving them from cache is behavior-preserving. Non-
+        // system modules are intentionally NOT short-circuited — they still need
+        // per-load injection correlation.
+        std::wstring moduleCacheKey;
+        if (req.isSystemModule) {
+            moduleCacheKey = ToLowerW(imagePath) + L"|" +
+                std::to_wstring(static_cast<unsigned long long>(req.imageSize)) + L"|" +
+                std::to_wstring(static_cast<unsigned>(req.signatureLevel));
+            if (auto cached = CheckImageVerdictCache(moduleCacheKey)) {
+                return *cached;
+            }
+        }
+
         // ================================================================
         // ANTI-DEBUG: Detect hostile debugger DLLs being loaded into our
         // process (dbghelp.dll, scyllahide.dll, etc.) for early interception.
@@ -3052,6 +3083,10 @@ public:
             // Valid Microsoft/EV signature with no anomalies → fast-path allow
             if (sigAnalysis.signatureInfo.isMicrosoftSigned &&
                 sigAnalysis.riskScore == 0 && sigAnalysis.anomalies.empty()) {
+                if (!moduleCacheKey.empty()) {
+                    UpdateImageVerdictCache(moduleCacheKey,
+                                            Communication::KernelVerdict::Allow);
+                }
                 return Communication::KernelVerdict::Allow;
             }
         } catch (const std::exception& e) {
@@ -3066,6 +3101,10 @@ public:
 
         // System modules are trusted — skip analysis
         if (req.isSystemModule) {
+            if (!moduleCacheKey.empty()) {
+                UpdateImageVerdictCache(moduleCacheKey,
+                                        Communication::KernelVerdict::Allow);
+            }
             return Communication::KernelVerdict::Allow;
         }
 
@@ -3985,8 +4024,34 @@ public:
     void ClearVerdictCache() {
         std::unique_lock lock(m_cacheMutex);
         m_verdictCache.clear();
+        m_imageVerdictCache.clear();
         m_performanceMetrics.cacheSize = 0;
         Utils::Logger::Info("RealTimeProtection: Verdict cache cleared");
+    }
+
+    // ---- Image-load module verdict cache (see m_imageVerdictCache) ----------
+    std::optional<Communication::KernelVerdict>
+    CheckImageVerdictCache(const std::wstring& key) {
+        if (!m_config.useVerdictCache) return std::nullopt;
+        std::shared_lock lock(m_cacheMutex);
+        auto it = m_imageVerdictCache.find(key);
+        if (it == m_imageVerdictCache.end()) return std::nullopt;
+        if (Now() > it->second.expiry) return std::nullopt;
+        return it->second.verdict;
+    }
+
+    void UpdateImageVerdictCache(const std::wstring& key,
+                                 Communication::KernelVerdict verdict) {
+        if (!m_config.useVerdictCache) return;
+        // Never cache Block/suspicious — those modules must be re-evaluated on
+        // every load. Only benign Allow results are memoized.
+        if (verdict != Communication::KernelVerdict::Allow) return;
+        std::unique_lock lock(m_cacheMutex);
+        if (m_imageVerdictCache.size() >= m_config.maxCacheSize) {
+            m_imageVerdictCache.clear();  // cheap to re-warm; bounds memory
+        }
+        m_imageVerdictCache[key] = ImageVerdictEntry{
+            verdict, Now() + std::chrono::milliseconds(m_config.cleanCacheTTLMs) };
     }
 
     // =========================================================================
