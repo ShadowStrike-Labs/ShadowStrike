@@ -58,6 +58,12 @@ namespace {
 
 constexpr DWORD kPerCallTimeoutMs = 10'000;
 
+// A single batched Add-MpPreference call pays the (slow) Defender PowerShell
+// module load ONCE. On a fresh VM that cold-load alone can approach the 10 s
+// per-call budget, which is why the previous per-path calls timed out and lost
+// 3 of 4 exclusions. The one batched call gets a wider budget.
+constexpr DWORD kBatchTimeoutMs   = 45'000;
+
 // Strip trailing path separators so we don't pass "C:\foo\" which can be
 // rejected by some Defender code paths.
 [[nodiscard]] std::wstring NormalisePath(std::wstring p)
@@ -147,6 +153,65 @@ constexpr DWORD kPerCallTimeoutMs = 10'000;
     }
     LOG_INFO(L"DefenderExclusions: PowerShell added exclusion '%ls'.",
              target.c_str());
+    return ERROR_SUCCESS;
+}
+
+// Register ALL exclusion paths in a SINGLE powershell.exe invocation.
+// Add-MpPreference -ExclusionPath accepts an array; batching pays the heavy
+// Defender-module load once instead of once per path -- the per-path cold-start
+// was the root cause of the install-time timeouts (3 of 4 lost on a fresh VM).
+[[nodiscard]] DWORD AddAllViaPowerShell(const std::wstring& psPath,
+                                        const std::vector<std::wstring>& targets,
+                                        size_t& acceptedOut) noexcept
+{
+    acceptedOut = 0;
+
+    std::wstring list;
+    size_t counted = 0;
+    for (const auto& t : targets) {
+        if (t.empty()) {
+            continue;
+        }
+        if (!PathIsSafeForCli(t)) {
+            LOG_ERROR(L"DefenderExclusions: rejecting unsafe path '%ls'.", t.c_str());
+            continue;
+        }
+        if (!list.empty()) {
+            list.push_back(L',');
+        }
+        list.append(EscapeForPowerShellSingleQuoted(t));
+        ++counted;
+    }
+    if (counted == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    // "<psPath>" -NoProfile -NonInteractive -ExecutionPolicy Bypass
+    //   -Command "Add-MpPreference -ExclusionPath 'p1','p2',... -ErrorAction SilentlyContinue"
+    std::wstring cmd;
+    cmd.reserve(320 + list.size());
+    cmd.push_back(L'"');
+    cmd.append(psPath);
+    cmd.append(L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+               L"-Command \"Add-MpPreference -ExclusionPath ");
+    cmd.append(list);
+    cmd.append(L" -ErrorAction SilentlyContinue\"");
+
+    std::string output;
+    DWORD       exitCode = 0;
+    const DWORD spawnErr = SpawnAndCapture(cmd, output, exitCode, kBatchTimeoutMs);
+    if (spawnErr != ERROR_SUCCESS) {
+        LOG_WARN(L"DefenderExclusions: batched PowerShell spawn failed (0x%08X).",
+                 spawnErr);
+        return spawnErr;
+    }
+    if (exitCode != 0) {
+        LOG_WARN(L"DefenderExclusions: batched PowerShell exited %lu.", exitCode);
+        return ERROR_FUNCTION_FAILED;
+    }
+    acceptedOut = counted;
+    LOG_INFO(L"DefenderExclusions: batched PowerShell added %zu exclusion(s).",
+             counted);
     return ERROR_SUCCESS;
 }
 
@@ -265,28 +330,46 @@ DWORD AddPhantomDefenderExclusions(const std::wstring& installFolder) noexcept
         return ERROR_FILE_NOT_FOUND;
     }
 
-    DWORD lastErr   = ERROR_SUCCESS;
-    DWORD successes = 0;
-    for (const auto& target : targets) {
-        if (target.empty()) {
-            continue;
-        }
-        DWORD err = ERROR_FUNCTION_FAILED;
-        if (psFound == ERROR_SUCCESS) {
-            err = AddViaPowerShell(psPath, target);
-        }
-        if (err != ERROR_SUCCESS && wmicFound == ERROR_SUCCESS) {
-            err = AddViaWmic(wmicPath, target);
-        }
-        if (err == ERROR_SUCCESS) {
-            ++successes;
+    DWORD  lastErr   = ERROR_SUCCESS;
+    size_t successes = 0;
+
+    // Fast path: one batched PowerShell call for all paths (pays the slow
+    // Defender module load once instead of once per path). This is the fix for
+    // the install-time timeouts where per-path cold-starts lost most exclusions.
+    if (psFound == ERROR_SUCCESS) {
+        size_t accepted = 0;
+        const DWORD batchErr = AddAllViaPowerShell(psPath, targets, accepted);
+        if (batchErr == ERROR_SUCCESS) {
+            successes = accepted;
         } else {
-            lastErr = err;
+            lastErr = batchErr;
+        }
+    }
+
+    // Fallback: per-path attempts (PowerShell then wmic), used only if the batch
+    // did not succeed (e.g. PowerShell unavailable, or the single call failed).
+    if (successes == 0) {
+        for (const auto& target : targets) {
+            if (target.empty()) {
+                continue;
+            }
+            DWORD err = ERROR_FUNCTION_FAILED;
+            if (psFound == ERROR_SUCCESS) {
+                err = AddViaPowerShell(psPath, target);
+            }
+            if (err != ERROR_SUCCESS && wmicFound == ERROR_SUCCESS) {
+                err = AddViaWmic(wmicPath, target);
+            }
+            if (err == ERROR_SUCCESS) {
+                ++successes;
+            } else {
+                lastErr = err;
+            }
         }
     }
 
     if (successes > 0) {
-        LOG_INFO(L"DefenderExclusions: %lu of %zu exclusions accepted.",
+        LOG_INFO(L"DefenderExclusions: %zu of %zu exclusions accepted.",
                  successes, targets.size());
         return ERROR_SUCCESS;
     }
