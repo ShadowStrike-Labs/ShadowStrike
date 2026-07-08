@@ -906,7 +906,19 @@ public:
             // Stream in HASH_CHUNK_SIZE chunks to avoid OOM on large files.
             // Distinguish a real ReadFile() failure from end-of-file so we
             // never finalize a digest over a partial read.
-            uint8_t chunk[HASH_CHUNK_SIZE];
+            //
+            // The scratch buffer MUST be heap-backed, never a stack array.
+            // CalculateAuthenticodeHash runs on IPC worker threads while they
+            // service kernel image-load scans; a HASH_CHUNK_SIZE (1 MiB) stack
+            // local here overflowed the worker-thread stack in this function's
+            // prologue (__chkstk) -> STATUS_STACK_OVERFLOW (0xC00000FD) during
+            // RealTimeProtection start. A thread_local buffer removes the stack
+            // pressure and keeps the hash hot-path allocation-free after warm-up.
+            thread_local std::vector<uint8_t> chunkStorage;
+            if (chunkStorage.size() != HASH_CHUNK_SIZE) {
+                chunkStorage.resize(HASH_CHUNK_SIZE);
+            }
+            uint8_t* const chunk = chunkStorage.data();
             bool hashOk = true;
 
             for (;;) {
