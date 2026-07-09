@@ -389,10 +389,19 @@ static const std::vector<PackerSignature> g_packerSignatures = {
     {
         PackerType::Armadillo,
         "Armadillo",
-        {".data", ".rsrc"},  // Armadillo uses normal section names
+        // Armadillo uses NORMAL section names (.data/.rsrc) -- they cannot
+        // identify it, and listing them matched EVERY PE (a universal false
+        // positive that routed clean, Microsoft-signed system DLLs into the
+        // emulator). Detect the REAL Armadillo CopyMem-II entry-point stub
+        // instead: pushad; call $+5; pop ebp; push eax; push ecx; bswap edx;
+        // not edx; pushfd -- 14 distinctive bytes at the entry point (the same
+        // canonical signature the dedicated AntiEvasion::PackerDetector uses;
+        // ~zero false positives, and it detects genuine Armadillo).
         {},
+        { {0, {0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5D, 0x50, 0x51,
+               0x0F, 0xCA, 0xF7, 0xD2, 0x9C}} },
         6.9,
-        false
+        true
     },
     {
         PackerType::Obsidium,
