@@ -402,6 +402,17 @@ public:
     };
     std::unordered_map<std::wstring, ImageVerdictEntry> m_imageVerdictCache;
 
+    // On-access file verdict cache: identity(path|size|mtime) -> (verdict,
+    // expiry). The kernel re-issues a scan for the same file on every launch/
+    // open; trusted system binaries (cmd.exe, ntdll, rpcss...) were seen 20-60x
+    // each, and each event re-ran the FULL metamorphic+packer+executable+
+    // ScanEngine stack (0.5-2.3s). For read/execute opens we serve a cached
+    // benign verdict keyed by file identity so repeats are near-instant. Only
+    // Allow is cached; a changed size or mtime invalidates the entry, and
+    // write/create/rename/delete events bypass this cache entirely and are
+    // always fully analyzed. Reuses ImageVerdictEntry (same shape).
+    std::unordered_map<std::wstring, ImageVerdictEntry> m_fileVerdictCache;
+
     // Recent Threats
     std::deque<ThreatEvent> m_recentThreats;
     static constexpr size_t MAX_RECENT_THREATS = 1000;
@@ -2197,6 +2208,43 @@ public:
             return Communication::KernelVerdict::Allow;
         }
 
+        // 1.4  ON-ACCESS FAST PATH (file-identity verdict cache)
+        // The kernel re-issues a scan for the same file on every open/launch;
+        // trusted binaries (cmd.exe, ntdll, rpcss...) were re-scanned 20-60x,
+        // each re-running the full heavy pipeline (0.5-2.3s) -- the dominant
+        // idle-CPU cost. For NON-mutating access (read/execute) serve a cached
+        // benign verdict keyed by identity (path|size|mtime); repeats become
+        // near-instant. Mutating access (write/create/rename/delete) is NEVER
+        // served from cache -- it falls through to the full pipeline + the
+        // ransomware/script dispatch below, and a changed size/mtime naturally
+        // invalidates any prior entry, so a modified file is always re-analyzed.
+        // Only Allow is ever cached (see UpdateFileVerdictCache), so a malicious
+        // verdict is never cached away.
+        std::wstring fileIdentityKey;
+        {
+            const uint8_t at = req.AccessType;
+            const bool mutating =
+                at == static_cast<uint8_t>(ShadowStrikeAccessWrite)  ||
+                at == static_cast<uint8_t>(ShadowStrikeAccessCreate) ||
+                at == static_cast<uint8_t>(ShadowStrikeAccessRename) ||
+                at == static_cast<uint8_t>(ShadowStrikeAccessDelete);
+            if (!mutating) {
+                uint64_t mtime = 0;
+                WIN32_FILE_ATTRIBUTE_DATA fad{};
+                if (GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &fad)) {
+                    mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
+                          |  static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
+                }
+                fileIdentityKey = ToLowerW(filePath) + L"|" +
+                    std::to_wstring(static_cast<unsigned long long>(req.FileSize)) + L"|" +
+                    std::to_wstring(static_cast<unsigned long long>(mtime));
+                if (auto cached = CheckFileVerdictCache(fileIdentityKey)) {
+                    m_stats.cleanFiles++;
+                    return *cached;
+                }
+            }
+        }
+
         // 1.5. CPU-based scan throttling — defer low-priority scans under heavy load
         if (m_config.throttleOnHighCPU && Performance::CPUMonitor::HasInstance()) {
             if (Performance::CPUMonitor::Instance().IsSystemUnderLoad(90.0)) {
@@ -2432,6 +2480,10 @@ public:
             case Core::Engine::ScanVerdict::Clean:
             case Core::Engine::ScanVerdict::Whitelisted:
                 m_stats.cleanFiles++;
+                if (!fileIdentityKey.empty()) {
+                    UpdateFileVerdictCache(fileIdentityKey,
+                                           Communication::KernelVerdict::Allow);
+                }
                 return Communication::KernelVerdict::Allow;
 
             case Core::Engine::ScanVerdict::Infected:
@@ -4025,6 +4077,7 @@ public:
         std::unique_lock lock(m_cacheMutex);
         m_verdictCache.clear();
         m_imageVerdictCache.clear();
+        m_fileVerdictCache.clear();
         m_performanceMetrics.cacheSize = 0;
         Utils::Logger::Info("RealTimeProtection: Verdict cache cleared");
     }
@@ -4051,6 +4104,31 @@ public:
             m_imageVerdictCache.clear();  // cheap to re-warm; bounds memory
         }
         m_imageVerdictCache[key] = ImageVerdictEntry{
+            verdict, Now() + std::chrono::milliseconds(m_config.cleanCacheTTLMs) };
+    }
+
+    // ---- On-access file verdict cache (see m_fileVerdictCache) --------------
+    std::optional<Communication::KernelVerdict>
+    CheckFileVerdictCache(const std::wstring& key) {
+        if (!m_config.useVerdictCache) return std::nullopt;
+        std::shared_lock lock(m_cacheMutex);
+        auto it = m_fileVerdictCache.find(key);
+        if (it == m_fileVerdictCache.end()) return std::nullopt;
+        if (Now() > it->second.expiry) return std::nullopt;
+        return it->second.verdict;
+    }
+
+    void UpdateFileVerdictCache(const std::wstring& key,
+                                Communication::KernelVerdict verdict) {
+        if (!m_config.useVerdictCache) return;
+        // Only benign Allow verdicts are memoized. Block/Suspicious/Monitor must
+        // be re-evaluated on every access so a threat is never cached away.
+        if (verdict != Communication::KernelVerdict::Allow) return;
+        std::unique_lock lock(m_cacheMutex);
+        if (m_fileVerdictCache.size() >= m_config.maxCacheSize) {
+            m_fileVerdictCache.clear();  // cheap to re-warm; bounds memory
+        }
+        m_fileVerdictCache[key] = ImageVerdictEntry{
             verdict, Now() + std::chrono::milliseconds(m_config.cleanCacheTTLMs) };
     }
 
