@@ -680,6 +680,18 @@ static int RunStage2()
         }
     }
 
+    // Best-effort Defender coexistence: two real-time engines competing is a
+    // primary CPU/latency source. Disables Defender RTP when Tamper Protection
+    // is off; otherwise records a marker + logs guidance for the UI. Never fails
+    // the install.
+    {
+        const DWORD coexErr = ShadowStrike::Installer::ConfigureDefenderCoexistence();
+        if (coexErr != ERROR_SUCCESS) {
+            LOG_WARN(L"Stage 2: Defender coexistence step returned 0x%08X "
+                     L"(best-effort, ignoring).", coexErr);
+        }
+    }
+
     LOG_INFO(L"=== Stage 2 complete. ===");
     return kExitSuccess;
 }

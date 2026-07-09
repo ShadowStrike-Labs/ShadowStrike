@@ -380,4 +380,154 @@ DWORD AddPhantomDefenderExclusions(const std::wstring& installFolder) noexcept
     return lastErr == ERROR_SUCCESS ? ERROR_FUNCTION_FAILED : lastErr;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+//  Defender coexistence
+//
+//  Two real-time AV engines competing over the same file/image events is a
+//  primary cause of the severe CPU/latency seen when ShadowStrike runs beside
+//  Defender. The SUPPORTED way to make Defender stand down for good is Windows
+//  Security Center registration (Microsoft Virus Initiative) -- a production
+//  milestone. Until then, this best-effort step disables Defender's real-time
+//  protection via the supported Set-MpPreference API when it is permitted to
+//  (Tamper Protection OFF). When Tamper Protection is ON, no software can change
+//  it (by design), so we record a marker + log clear guidance for the user/UI.
+//  This NEVER fails the install.
+// ────────────────────────────────────────────────────────────────────────────
+namespace {
+
+struct DefenderState {
+    bool queried         = false;   // did Get-MpComputerStatus answer?
+    bool rtpEnabled      = false;
+    bool tamperProtected = false;
+};
+
+// Query Defender via Get-MpComputerStatus. queried=false means Defender is
+// absent or the query failed -- treated as "nothing to coexist with".
+[[nodiscard]] DefenderState QueryDefenderState(const std::wstring& psPath) noexcept
+{
+    DefenderState st;
+    std::wstring cmd;
+    cmd.reserve(320);
+    cmd.push_back(L'"');
+    cmd.append(psPath);
+    cmd.append(L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+               L"-Command \"$s=Get-MpComputerStatus -ErrorAction Stop; "
+               L"Write-Output ('RTP=' + $s.RealTimeProtectionEnabled + "
+               L"';TP=' + $s.IsTamperProtected)\"");
+
+    std::string output;
+    DWORD       exitCode = 0;
+    const DWORD err = SpawnAndCapture(cmd, output, exitCode, kBatchTimeoutMs);
+    if (err != ERROR_SUCCESS || exitCode != 0) {
+        LOG_INFO(L"DefenderCoexistence: Get-MpComputerStatus unavailable "
+                 L"(spawn=0x%08X exit=%lu); assuming Defender inactive.",
+                 err, exitCode);
+        return st;
+    }
+    // PowerShell renders a bool as "True"/"False"; output is ASCII/UTF-8.
+    st.rtpEnabled      = output.find("RTP=True") != std::string::npos;
+    st.tamperProtected = output.find("TP=True")  != std::string::npos;
+    st.queried         = true;
+    return st;
+}
+
+// Disable Defender real-time protection via the supported API. This succeeds
+// only while Tamper Protection is OFF (otherwise Defender reverts it).
+[[nodiscard]] DWORD DisableDefenderRealtime(const std::wstring& psPath) noexcept
+{
+    std::wstring cmd;
+    cmd.reserve(400);
+    cmd.push_back(L'"');
+    cmd.append(psPath);
+    cmd.append(L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+               L"-Command \"Set-MpPreference -DisableRealtimeMonitoring $true "
+               L"-DisableBehaviorMonitoring $true -DisableScriptScanning $true "
+               L"-DisableIOAVProtection $true -MAPSReporting Disabled "
+               L"-SubmitSamplesConsent NeverSend -ErrorAction Stop\"");
+
+    std::string output;
+    DWORD       exitCode = 0;
+    const DWORD err = SpawnAndCapture(cmd, output, exitCode, kBatchTimeoutMs);
+    if (err != ERROR_SUCCESS) return err;
+    if (exitCode != 0)        return ERROR_FUNCTION_FAILED;
+    return ERROR_SUCCESS;
+}
+
+// Record whether Defender RTP is still active so the UI can surface guidance
+// (HKLM\SOFTWARE\ShadowStrike\PhantomHome\Driver\DefenderRtpActive : DWORD).
+void WriteDefenderRtpMarker(DWORD rtpActive) noexcept
+{
+    HKEY hk = nullptr;
+    const LONG rc = RegCreateKeyExW(
+        HKEY_LOCAL_MACHINE, L"SOFTWARE\\ShadowStrike\\PhantomHome\\Driver", 0,
+        nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE | KEY_WOW64_64KEY,
+        nullptr, &hk, nullptr);
+    if (rc != ERROR_SUCCESS) {
+        LOG_WARN(L"DefenderCoexistence: cannot open marker key (%ld).", rc);
+        return;
+    }
+    RegSetValueExW(hk, L"DefenderRtpActive", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&rtpActive), sizeof(rtpActive));
+    RegCloseKey(hk);
+}
+
+} // anonymous namespace
+
+DWORD ConfigureDefenderCoexistence() noexcept
+{
+    std::wstring psPath;
+    if (ResolveSystemTool(L"WindowsPowerShell\\v1.0\\powershell.exe", psPath)
+            != ERROR_SUCCESS) {
+        LOG_INFO(L"DefenderCoexistence: PowerShell unavailable; skipping "
+                 L"(best-effort).");
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    const DefenderState st = QueryDefenderState(psPath);
+    if (!st.queried) {
+        WriteDefenderRtpMarker(0);          // Defender absent / query failed
+        return ERROR_SUCCESS;
+    }
+    if (!st.rtpEnabled) {
+        LOG_INFO(L"DefenderCoexistence: Defender real-time protection already "
+                 L"off -- nothing to do.");
+        WriteDefenderRtpMarker(0);
+        return ERROR_SUCCESS;
+    }
+
+    if (st.tamperProtected) {
+        // Cannot be changed programmatically while Tamper Protection is on.
+        WriteDefenderRtpMarker(1);
+        LOG_WARN(L"DefenderCoexistence: Defender real-time protection is ON and "
+                 L"Tamper Protection is ENABLED -- it cannot be disabled "
+                 L"programmatically (by design). Two real-time engines will "
+                 L"compete and degrade performance. ACTION REQUIRED: Windows "
+                 L"Security > Virus & threat protection > Manage settings > turn "
+                 L"OFF Tamper Protection, then real-time protection. Recorded "
+                 L"DefenderRtpActive=1 for the UI to surface.");
+        return ERROR_SUCCESS;               // best-effort; never fail install
+    }
+
+    LOG_INFO(L"DefenderCoexistence: Defender RTP on, Tamper Protection off -- "
+             L"disabling Defender real-time protection via Set-MpPreference.");
+    const DWORD dErr = DisableDefenderRealtime(psPath);
+    if (dErr != ERROR_SUCCESS) {
+        LOG_WARN(L"DefenderCoexistence: Set-MpPreference disable returned 0x%08X "
+                 L"(best-effort).", dErr);
+        WriteDefenderRtpMarker(1);
+        return ERROR_SUCCESS;
+    }
+
+    const DefenderState after = QueryDefenderState(psPath);
+    if (after.queried && !after.rtpEnabled) {
+        LOG_INFO(L"DefenderCoexistence: Defender real-time protection is now OFF.");
+        WriteDefenderRtpMarker(0);
+    } else {
+        LOG_WARN(L"DefenderCoexistence: Defender RTP still reports ON after the "
+                 L"disable attempt (Tamper Protection may have re-enabled it).");
+        WriteDefenderRtpMarker(1);
+    }
+    return ERROR_SUCCESS;
+}
+
 } // namespace ShadowStrike::Installer

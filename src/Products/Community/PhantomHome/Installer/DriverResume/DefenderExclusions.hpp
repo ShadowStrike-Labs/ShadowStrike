@@ -60,4 +60,26 @@ namespace ShadowStrike::Installer {
  */
 [[nodiscard]] DWORD AddPhantomDefenderExclusions(const std::wstring& installFolder) noexcept;
 
+/**
+ * @brief Best-effort Defender coexistence: stop two real-time AV engines from
+ *        competing (the primary cause of severe CPU/latency alongside Defender).
+ *
+ * Behaviour:
+ *   - Defender absent / real-time protection already off -> nothing to do.
+ *   - Real-time protection ON, Tamper Protection OFF -> disable it via the
+ *     supported Set-MpPreference API and re-verify.
+ *   - Real-time protection ON, Tamper Protection ON -> cannot be changed
+ *     programmatically (Windows blocks it by design); log clear guidance and
+ *     record HKLM\SOFTWARE\ShadowStrike\PhantomHome\Driver\DefenderRtpActive=1
+ *     so the UI can prompt the user to turn Tamper Protection off.
+ *
+ * The durable production mechanism is Windows Security Center registration
+ * (Microsoft Virus Initiative), after which Windows disables Defender
+ * automatically; this routine is the pre-MVI stopgap.
+ *
+ * @return ERROR_SUCCESS in all cases except when PowerShell is entirely absent.
+ *         MUST NOT fail the install. Never throws.
+ */
+[[nodiscard]] DWORD ConfigureDefenderCoexistence() noexcept;
+
 } // namespace ShadowStrike::Installer
