@@ -189,7 +189,18 @@ namespace ShadowStrike {
                 
                 if (st != ERROR_SUCCESS) {
                     SetError(err, static_cast<DWORD>(st), L"RegOpenKeyExW failed", sk);
-                    SS_LOG_ERROR(L"RegistryUtils", L"RegOpenKeyExW failed: %ls (code=%lu)", sk.c_str(), st);
+                    // A missing key (FILE/PATH_NOT_FOUND) is an EXPECTED, benign
+                    // outcome when probing optional keys -- persistence/hijack scans
+                    // deliberately check keys that legitimately may not exist. Logging
+                    // those at ERROR produced hundreds of bogus error lines per scan
+                    // cycle (measurable CPU + drowned the real errors). Downgrade
+                    // not-found to Debug; keep genuine failures (access denied, etc.)
+                    // at ERROR. Caller-visible Error state is unchanged.
+                    if (st == ERROR_FILE_NOT_FOUND || st == ERROR_PATH_NOT_FOUND) {
+                        SS_LOG_DEBUG(L"RegistryUtils", L"RegOpenKeyExW: key absent: %ls (code=%lu)", sk.c_str(), st);
+                    } else {
+                        SS_LOG_ERROR(L"RegistryUtils", L"RegOpenKeyExW failed: %ls (code=%lu)", sk.c_str(), st);
+                    }
                     m_key = nullptr;
                     return false;
                 }
