@@ -216,6 +216,48 @@ namespace {
         return result;
     }
 
+    // =========================================================================
+    // HARD-FAULT (SEH) ISOLATION FOR THE SCAN PIPELINE
+    //
+    // The scan parsers (packer / polymorphic / metamorphic / emulation) run on
+    // attacker-influenced bytes. A bug there can raise a hard structured fault
+    // (access violation, etc.) that a C++ `catch` CANNOT intercept -- which
+    // takes down the entire protection service. Observed in the field as a
+    // ~60-90s crash/restart wave that also wiped the in-memory caches and
+    // re-triggered full re-scans (the dominant residual CPU cost).
+    //
+    // RunIsolated executes `fn` under an SEH guard: a genuine hard fault is
+    // converted into a recoverable failure (returns false + the fault code, so
+    // the caller fails just that one file and logs EXACTLY which file/parser
+    // faulted for root-causing), while C++ exceptions (MSVC EH code 0xE06D7363)
+    // are deliberately allowed to propagate to the existing C++ catch handlers.
+    // This is per-file fault ISOLATION plus diagnosis -- not fault suppression:
+    // the offending file is surfaced, never silently hidden, and the underlying
+    // parser defect is still fixed at its root once identified.
+    // =========================================================================
+    inline int PhantomHardFaultFilter(unsigned long code, unsigned long* outCode) noexcept {
+        if (code == 0xE06D7363UL) {           // MSVC C++ exception magic -> not a hard fault
+            return EXCEPTION_CONTINUE_SEARCH; // let the C++ catch(...) handle it
+        }
+        if (outCode) { *outCode = code; }
+        return EXCEPTION_EXECUTE_HANDLER;     // AV / stack overflow / illegal instruction / etc.
+    }
+
+    // Invoke `fn` under SEH isolation. Returns true on normal completion; on a
+    // hard fault returns false and stores the SEH code in `sehCode`. NOT marked
+    // noexcept on purpose: C++ exceptions thrown by `fn` propagate to the caller.
+    // No unwindable locals live in this frame (the work runs in fn's own frame),
+    // so __try/__except is legal here under /EHsc.
+    template <class Fn>
+    bool RunIsolated(Fn&& fn, unsigned long& sehCode) {
+        __try {
+            std::forward<Fn>(fn)();
+            return true;
+        } __except (PhantomHardFaultFilter(GetExceptionCode(), &sehCode)) {
+            return false;
+        }
+    }
+
     // Path wildcard matching
     bool PathMatchesWildcard(const std::wstring& path, const std::wstring& pattern) {
         std::wstring lowerPath = ToLowerW(path);
@@ -2405,10 +2447,33 @@ public:
         context.timeout = std::chrono::milliseconds(
             RTPConstants::KERNEL_REPLY_TIMEOUT_MS - 100);
 
-        // 4. Perform Scan
+        // 4. Perform Scan -- isolated against hard faults (SEH). A single
+        // malformed/edge-case file must never crash the whole protection
+        // service: the packer/poly/metamorphic/emulation parsers run on
+        // attacker-influenced bytes and a fault there is not catchable by a C++
+        // `catch`. On a hard fault we log the EXACT file + fault code (so the
+        // parser bug can be root-caused), fail just this one file per policy,
+        // and keep the service alive. C++ exceptions still flow to the catch.
         Core::Engine::EngineResult engineResult;
+        unsigned long scanFaultCode = 0;
         try {
-            engineResult = Core::Engine::ScanEngine::Instance().ScanFile(filePath, context);
+            const bool scanCompleted = RunIsolated(
+                [&] {
+                    engineResult = Core::Engine::ScanEngine::Instance().ScanFile(filePath, context);
+                },
+                scanFaultCode);
+
+            if (!scanCompleted) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: HARD FAULT (SEH 0x{:08X}) in scan pipeline for '{}' "
+                    "-- file isolated, service stays up; root-cause this parser fault",
+                    static_cast<unsigned>(scanFaultCode),
+                    Utils::StringUtils::ToNarrow(filePath));
+                m_stats.scanErrors++;
+                return m_config.failurePolicy == FailurePolicy::FAIL_CLOSED ?
+                       Communication::KernelVerdict::Block :
+                       Communication::KernelVerdict::Allow;
+            }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: Scan exception: {}",
                 e.what());
