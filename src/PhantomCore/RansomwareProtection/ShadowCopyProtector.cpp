@@ -1334,11 +1334,24 @@ ShadowCopyProtector::~ShadowCopyProtector() {
         // Ensure VSS service is running
         (void)m_impl->EnsureVssServiceRunningInternal();
 
-        // Take initial snapshot count baseline
-        auto initialShadows = m_impl->EnumerateShadowCopiesInternal();
-        m_impl->m_lastKnownSnapshotCount.store(initialShadows.size(), std::memory_order_release);
-
-        Utils::Logger::Info("ShadowCopyProtector: Initial shadow copy count: {}", initialShadows.size());
+        // IMPORTANT: do NOT enumerate shadow copies synchronously here.
+        // EnumerateShadowCopiesInternal() drives the VSS COM API
+        // (CreateVssBackupComponents / InitializeForBackup / Query), which can
+        // block for a long time -- and DEADLOCKS when run on the service Start
+        // path: VSS's own file I/O (vssvc.exe + writers) is intercepted by our
+        // kernel minifilter, which holds that I/O pending a user-mode verdict
+        // that this not-yet-"online" service cannot provide until Start()
+        // returns. Field logs showed RealTimeProtection::Start() hanging here
+        // ("VSS service started successfully" with no following line for
+        // minutes), so the service never signalled ready and the kernel's
+        // bounded-but-long file-scan timeout then stalled system-wide I/O
+        // (observed as a full system freeze / lock-up).
+        //
+        // The monitoring thread below performs the enumeration on its FIRST
+        // pass and establishes the baseline safely -- its `previousCount > 0`
+        // guard means that first pass raises no false "snapshots deleted"
+        // alert. m_lastKnownSnapshotCount therefore starts at 0 and is filled
+        // in asynchronously, keeping startup fast and non-blocking.
 
         // Start monitoring thread
         m_impl->m_monitoringActive.store(true, std::memory_order_release);
