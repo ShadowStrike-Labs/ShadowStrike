@@ -365,6 +365,10 @@ public:
     std::shared_ptr<Utils::ThreadPool> m_threadPool;
     std::unique_ptr<std::thread> m_healthCheckThread;
     std::unique_ptr<std::thread> m_statsUpdateThread;
+    // One-shot deferred self-protection baseline (heavy install-tree hashing +
+    // initial APT sweep) moved OFF the Start critical path so the service reaches
+    // ScanServicingReady/online in seconds -- see RealTimeProtection::Start step 4.5.
+    std::unique_ptr<std::thread> m_deferredInitThread;
     std::atomic<bool> m_stopThreads{ false };
 
     // Synchronization
@@ -658,16 +662,61 @@ public:
                 tamperConfig.checkIntervalMs = 30000; // 30s periodic integrity scans
 
                 if (Security::TamperProtection::Instance().Initialize(tamperConfig)) {
-                    // Protect our own installation files and critical registry keys
+                    // Fast, security-critical protections stay SYNCHRONOUS: protect
+                    // our own process image and the service registry keys before we
+                    // advertise the service online.
                     (void)Security::TamperProtection::Instance().ProtectSelf();
-                    (void)Security::TamperProtection::Instance().ProtectInstallation();
                     (void)Security::TamperProtection::Instance().ProtectServiceRegistry();
 
-                    // Run initial APT tamper sweep — detect hooks/injection from before we started
-                    (void)Security::TamperProtection::Instance().RunAPTTamperSweep();
+                    // DEFER the heavy one-shot passes off the Start critical path.
+                    // ProtectInstallation() hashes EVERY file under the install dir,
+                    // which bundles the Qt runtime (thousands of QML/DLL assets) at
+                    // tens of ms each -> 20-80s of synchronous work. Running it here
+                    // blocked Start from reaching ScanServicingReady/online for that
+                    // whole window, during which the kernel minifilter had NO user-mode
+                    // verdict source and stalled system-wide file I/O (gray-screen
+                    // hang), and the overrun tripped the service watchdog -> restart
+                    // loop (field-confirmed on 1.0.49: 5 PIDs, Start never returning).
+                    // The install dir already has synchronous ACL protection
+                    // (SelfDefense::ProtectInstallationDirectory, applied in Initialize);
+                    // this background pass adds per-file hash integrity + the one-time
+                    // APT sweep. Coverage is fully preserved -- the 30s periodic
+                    // integrity checks continue regardless -- only the initial-baseline
+                    // TIMING moves off the online-critical path. Joined in the stop path.
+                    if (m_deferredInitThread && m_deferredInitThread->joinable()) {
+                        m_deferredInitThread->join();  // never overwrite a live thread
+                    }
+                    m_deferredInitThread = std::make_unique<std::thread>([this]() {
+                        // Wait until the service is actually servicing kernel scan
+                        // verdicts before hammering thousands of install-tree file
+                        // opens (each intercepted by our own minifilter). This
+                        // guarantees the heavy self-I/O happens only once a verdict
+                        // source exists, so it can never itself contribute to an I/O
+                        // stall. Bounded (a never-ready channel can't wedge the
+                        // baseline forever) and stop-flag aware (prompt shutdown).
+                        for (int waitedMs = 0;
+                             waitedMs < 60000 &&
+                             !m_stopThreads.load(std::memory_order_acquire) &&
+                             !Communication::IPCManager::Instance().IsScanServicingReady();
+                             waitedMs += 100) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (m_stopThreads.load(std::memory_order_acquire)) return;
+                        try {
+                            (void)Security::TamperProtection::Instance().ProtectInstallation();
+                            (void)Security::TamperProtection::Instance().RunAPTTamperSweep();
+                            SS_LOG_INFO(L"RealTimeProtection",
+                                L"Deferred self-protection baseline complete "
+                                L"(installation integrity + initial APT sweep)");
+                        } catch (const std::exception& ex) {
+                            SS_LOG_WARN(L"RealTimeProtection",
+                                L"Deferred self-protection baseline exception: %hs", ex.what());
+                        }
+                    });
 
                     SS_LOG_INFO(L"RealTimeProtection",
-                        L"TamperProtection initialized in Enforce mode with auto-repair + APT sweep");
+                        L"TamperProtection initialized in Enforce mode (process+registry "
+                        L"protected synchronously; installation baseline + APT sweep deferred)");
                 } else {
                     SS_LOG_WARN(L"RealTimeProtection",
                         L"TamperProtection initialization failed — running unprotected");
@@ -831,6 +880,14 @@ public:
             m_statsUpdateThread->join();
         }
         m_statsUpdateThread.reset();
+
+        // Deferred self-protection baseline (installation integrity + APT sweep).
+        // Joined here, BEFORE the detection components/kernel channel are torn down,
+        // so any file I/O it is mid-flight on still receives a verdict (no stall).
+        if (m_deferredInitThread && m_deferredInitThread->joinable()) {
+            m_deferredInitThread->join();
+        }
+        m_deferredInitThread.reset();
 
 #if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         try { NetworkTrafficFilter::Instance().Stop(); } catch (...) {}
