@@ -369,6 +369,10 @@ public:
     // initial APT sweep) moved OFF the Start critical path so the service reaches
     // ScanServicingReady/online in seconds -- see RealTimeProtection::Start step 4.5.
     std::unique_ptr<std::thread> m_deferredInitThread;
+    // Set true once FIM initialized OK during Start; the deferred worker then builds
+    // the heavy system-file baselines off the online-critical path (Start step 4.5 /
+    // FIM init). Read by the deferred worker after the readiness gate.
+    std::atomic<bool> m_deferSystemBaselines{ false };
     std::atomic<bool> m_stopThreads{ false };
 
     // Synchronization
@@ -710,9 +714,16 @@ public:
                         try {
                             (void)Security::TamperProtection::Instance().ProtectInstallation();
                             (void)Security::TamperProtection::Instance().RunAPTTamperSweep();
+                            if (m_deferSystemBaselines.load(std::memory_order_acquire)) {
+                                // FIM system-file baselines (hashing hundreds of files
+                                // under system32/drivers/boot) are ALSO heavy synchronous
+                                // self-I/O; deferred here for the same reason as
+                                // ProtectInstallation. Monitoring is already active.
+                                (void)FileIntegrityMonitor::Instance().CreateSystemBaselines();
+                            }
                             SS_LOG_INFO(L"RealTimeProtection",
                                 L"Deferred self-protection baseline complete "
-                                L"(installation integrity + initial APT sweep)");
+                                L"(installation integrity + system baselines + initial APT sweep)");
                         } catch (const std::exception& ex) {
                             SS_LOG_WARN(L"RealTimeProtection",
                                 L"Deferred self-protection baseline exception: %hs", ex.what());
@@ -1799,7 +1810,17 @@ public:
                     SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::ERROR);
                 } else {
                     (void)fim.StartMonitoring();
-                    (void)fim.CreateSystemBaselines();
+                    // DEFER system-baseline creation off the Start critical path.
+                    // CreateSystemBaselines() hashes hundreds of files under
+                    // c:\windows\system32, drivers and boot -- heavy synchronous file
+                    // I/O whose opens our own minifilter intercepts. Running it here
+                    // stalled Start for 30-70s (field-confirmed 1.0.51 lockup: FIM
+                    // hashing on the Start thread while the service was not yet
+                    // ScanServicingReady, so the kernel held system-wide file I/O and
+                    // the guest froze). Monitoring is already live via StartMonitoring()
+                    // above; the readiness-gated deferred worker (Start step 4.5) builds
+                    // the baselines once the service is online.
+                    m_deferSystemBaselines.store(true, std::memory_order_release);
                     SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::RUNNING);
                     auto fimStats = fim.GetStats();
                     Utils::Logger::Info("RealTimeProtection: FIM initialized - {} files monitored, {} dirs",
