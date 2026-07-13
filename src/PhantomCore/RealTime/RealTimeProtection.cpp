@@ -686,6 +686,11 @@ public:
                     if (m_deferredInitThread && m_deferredInitThread->joinable()) {
                         m_deferredInitThread->join();  // never overwrite a live thread
                     }
+                    // We are starting, not stopping: clear the stop flag so the
+                    // deferred worker's readiness-wait is not mistaken for shutdown
+                    // (matters only on a Start-after-Stop of the same instance; the
+                    // fresh-process path already has it false).
+                    m_stopThreads.store(false, std::memory_order_release);
                     m_deferredInitThread = std::make_unique<std::thread>([this]() {
                         // Wait until the service is actually servicing kernel scan
                         // verdicts before hammering thousands of install-tree file
