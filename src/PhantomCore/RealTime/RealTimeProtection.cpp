@@ -2242,6 +2242,32 @@ public:
                     m_stats.cleanFiles++;
                     return *cached;
                 }
+
+                // TIER 1: MICROSOFT-SIGNATURE TRUST
+                // A WinVerifyTrust-validated Microsoft Authenticode signature
+                // means this is trusted operating-system code. Trust it and skip
+                // the entire heavy pipeline below (metamorphic + deep packer +
+                // ExecutableAnalyzer + ScanEngine's emulation/polymorphic/
+                // metamorphic stages). Deep dynamic analysis of clean signed OS
+                // binaries -- ntdll, uxtheme, svchost, msxml3, ... loaded by
+                // every process -- was the dominant real-time CPU cost.
+                //
+                // This does NOT weaken detection: (a) malware cannot forge a
+                // valid Microsoft signature (IsMicrosoftSigned == WinVerifyTrust
+                // validated the chain AND publisher, it is not a name check);
+                // (b) any tampering both breaks the signature AND changes
+                // size/mtime, so a modified file misses the cache and gets a
+                // full re-scan; (c) only NON-mutating access reaches here, so
+                // writes/creates always fall through to full analysis; and
+                // (d) LOLBin *abuse* of a signed binary is detected by the
+                // process/behavioral monitors, not by scanning the clean file.
+                if (Security::DigitalSignatureValidator::Instance()
+                        .IsMicrosoftSigned(filePath)) {
+                    UpdateFileVerdictCache(fileIdentityKey,
+                                           Communication::KernelVerdict::Allow);
+                    m_stats.cleanFiles++;
+                    return Communication::KernelVerdict::Allow;
+                }
             }
         }
 
