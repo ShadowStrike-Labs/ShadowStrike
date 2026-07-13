@@ -1571,6 +1571,13 @@ void IPCManager::WorkerRoutine() {
     // Wire format: [FILTER_MESSAGE_HEADER (WDK, 12 bytes)] [SHADOWSTRIKE_MESSAGE_HEADER (40 bytes)] [payload]
     std::vector<uint8_t> buffer(IPCConstants::MAX_MESSAGE_SIZE);
 
+    // Consecutive "unusable receive" counter: GetMessage returned 0 while the
+    // channel still reports connected (integrity / decryption / framing
+    // failure). Used to bound a desync spin with escalating back-off; a healthy
+    // message resets it. See the received==0 handling below.
+    uint32_t badReceiveStreak = 0;
+    constexpr uint32_t kBadReceiveResyncThreshold = 16;
+
     while (m_running.load(std::memory_order_acquire)) {
         // Snapshot the encrypted primary-scanner connection. The kernel routes
         // scan requests and notifications exclusively to the primary-scanner
@@ -1681,10 +1688,36 @@ void IPCManager::WorkerRoutine() {
                 break;
             }
             if (!conn->IsConnected()) {
+                // Channel torn down -> the reconnect path at the top of the loop
+                // (with its own coordinated back-off) handles re-establishment.
                 m_connected.store(false, std::memory_order_release);
+                badReceiveStreak = 0;
+                continue;
             }
+            // Connected, but the delivered frame was UNUSABLE (integrity /
+            // decryption / two-header framing failure -> GetMessage returned 0).
+            // A *burst* of these means the encrypted stream has desynchronized.
+            // With no back-off the worker spun at ~1000/s: field logs showed
+            // 3392 FilterGetMessage failures in 3.3s, pegging a core, flooding
+            // the log, and immediately preceding a process death. Escalating
+            // back-off bounds it -- a rare transient bad frame costs a couple of
+            // ms, a sustained desync is capped at ~20/s instead of ~1000/s. A
+            // healthy message resets the streak. (The malformed-frame root cause
+            // is kernel-side -- driver frame framing / GCM state -- and is
+            // tracked separately for a kernel-validated fix.)
+            ++badReceiveStreak;
+            if (badReceiveStreak == kBadReceiveResyncThreshold) {
+                Utils::Logger::Warn(
+                    "[IPCManager] {} consecutive unusable receives on a connected "
+                    "channel (encrypted-stream desync?); backing off. Likely a "
+                    "kernel-side frame framing/GCM issue.", badReceiveStreak);
+                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            const uint32_t backoffMs = (std::min)(badReceiveStreak * 2u, 50u);
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
             continue;
         }
+        badReceiveStreak = 0;  // healthy frame -> reset the bad-receive streak
 
         if (received < sizeof(FILTER_MESSAGE_HEADER)) {
             Utils::Logger::Warn("[IPCManager] Worker: truncated message ({} bytes)", received);
