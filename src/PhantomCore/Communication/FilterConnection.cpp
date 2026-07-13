@@ -530,7 +530,16 @@ public:
                 // Do NOT null m_hPort — Disconnect() handles cleanup and drain.
             }
 
-            if (hr != HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)) {
+            if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_DATA)) {
+                // Delivered frame failed the two-header size/framing check (see
+                // GetDeliveredMessageSize) -- an unusable/desynced frame. The
+                // receive worker handles this with escalating back-off + a
+                // single aggregated warning, so logging EVERY occurrence at Warn
+                // only floods the log (field: 3392 lines in 3.3s). Keep per-frame
+                // at Debug; genuine transport errors (other codes) still warn.
+                Utils::Logger::Debug("[FilterConnection] FilterGetMessage: unusable frame (0x{:08X})",
+                                     static_cast<unsigned int>(hr));
+            } else if (hr != HRESULT_FROM_WIN32(ERROR_SEM_TIMEOUT)) {
                 Utils::Logger::Warn("[FilterConnection] FilterGetMessage failed: 0x{:08X}",
                                    static_cast<unsigned int>(hr));
             }
