@@ -188,6 +188,34 @@ namespace ShadowStrike {
                     return true;
                 };
 
+                // Object-manager symbolic prefixes the kernel routinely emits for
+                // image-load / process-image callbacks are NOT openable by Win32
+                // as-is. Leaving them unchanged made DigitalSignatureValidator's
+                // exists() check fail ("File does not exist") for REAL system files
+                // (e.g. \SystemRoot\System32\wbem\WINNSI.DLL), which silently lost
+                // the Microsoft-signature TRUST decision and forced full re-scans of
+                // clean signed OS binaries. Translate them to DOS form first:
+                //   \??\X:\...       -> X:\...        (drive-letter device form only)
+                //   \SystemRoot\...  -> %WinDir%\...  (= C:\Windows\...)
+                if (startsWithCi(ntPath, std::wstring_view(L"\\??\\")) &&
+                    ntPath.size() >= 7 && ntPath[5] == L':' && ntPath[6] == L'\\') {
+                    const wchar_t d = ntPath[4];
+                    if ((d >= L'A' && d <= L'Z') || (d >= L'a' && d <= L'z')) {
+                        return std::wstring(ntPath.substr(4));
+                    }
+                }
+                if (startsWithCi(ntPath, std::wstring_view(L"\\SystemRoot\\"))) {
+                    wchar_t winDir[MAX_PATH];
+                    const UINT n = ::GetWindowsDirectoryW(winDir, MAX_PATH);
+                    if (n > 0 && n < MAX_PATH) {
+                        std::wstring dos(winDir, n);
+                        while (!dos.empty() && dos.back() == L'\\') dos.pop_back();
+                        dos.append(ntPath.substr(11));  // ntPath[11] == L'\\' (after "\SystemRoot")
+                        return dos;
+                    }
+                    // Fall through (return unchanged) if the Windows dir is unavailable.
+                }
+
                 // Only \Device\ paths need translation; drive-letter / \\?\ / UNC
                 // forms are already openable and returned untouched.
                 if (!startsWithCi(ntPath, std::wstring_view(L"\\Device\\"))) {
