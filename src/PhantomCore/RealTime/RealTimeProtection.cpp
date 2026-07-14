@@ -711,6 +711,33 @@ public:
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         }
                         if (m_stopThreads.load(std::memory_order_acquire)) return;
+
+                        // Run this one-shot baseline as true BACKGROUND maintenance so
+                        // hashing + on-access scanning of the install tree can NEVER
+                        // starve foreground work (Explorer/desktop/dwm). FIELD 1.0.52:
+                        // the service came online fast (good) but this worker then ran
+                        // at NORMAL priority and drove the guest to ~85% CPU sustained;
+                        // when the user opened File Explorer the desktop could not get
+                        // CPU to paint -> gray screen while the (already-drawn)
+                        // ShadowStrike UI stayed visible. THREAD_MODE_BACKGROUND_BEGIN
+                        // drops BOTH CPU and I/O priority for this thread, so the OS
+                        // preempts it for any foreground activity. Detection is
+                        // unchanged -- every file is still baselined, just yielding.
+                        const bool bgMode =
+                            ::SetThreadPriority(::GetCurrentThread(),
+                                                THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
+                        // Let first-boot / interactive-logon activity settle before the
+                        // heavy pass begins (stop-flag aware so shutdown stays prompt).
+                        for (int settleMs = 0;
+                             settleMs < 20000 && !m_stopThreads.load(std::memory_order_acquire);
+                             settleMs += 200) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        }
+                        if (m_stopThreads.load(std::memory_order_acquire)) {
+                            if (bgMode) ::SetThreadPriority(::GetCurrentThread(),
+                                                            THREAD_MODE_BACKGROUND_END);
+                            return;
+                        }
                         try {
                             (void)Security::TamperProtection::Instance().ProtectInstallation();
                             (void)Security::TamperProtection::Instance().RunAPTTamperSweep();
@@ -727,6 +754,9 @@ public:
                         } catch (const std::exception& ex) {
                             SS_LOG_WARN(L"RealTimeProtection",
                                 L"Deferred self-protection baseline exception: %hs", ex.what());
+                        }
+                        if (bgMode) {
+                            ::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
                         }
                     });
 
