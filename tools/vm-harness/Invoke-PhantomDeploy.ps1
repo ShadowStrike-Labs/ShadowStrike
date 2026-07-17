@@ -64,7 +64,7 @@ $ResultsDir  = Join-Path $AutoDir  'results'
 $MSBuild     = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 $MsiOut      = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.msi'
 $BundleOut   = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.exe'
-$ProductVersion = '1.0.53'
+$ProductVersion = '1.0.55'
 $SigningDir  = Join-Path $RepoRoot 'packaging\signing'
 $DevPfxPath  = Join-Path $SigningDir 'ShadowStrike-Dev.pfx'
 $DevCerPath  = Join-Path $SigningDir 'ShadowStrike-Dev.cer'
@@ -107,11 +107,20 @@ function Resolve-PfxPassword {
     param([Parameter(Mandatory)][string]$PfxPath)
     Require-File -Path $PfxPath -Label 'Dev PFX'
 
+    # Validate via X509Certificate2 (authoritative: opens the private key the
+    # same way signtool does). Get-PfxData can spuriously fail on a valid PFX in
+    # a -NoProfile / non-interactive child process even with the correct
+    # password, which previously aborted an otherwise-valid signed deploy.
+    $ss_TryPfx = {
+        param($Plain)
+        try {
+            $c = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($PfxPath, $Plain)
+            $has = $c.HasPrivateKey; $c.Dispose(); return $has
+        } catch { return $false }
+    }
+
     # Try unpassworded first
-    try {
-        $null = Get-PfxData -FilePath $PfxPath -ErrorAction Stop
-        return ''
-    } catch { }
+    if (& $ss_TryPfx '') { return '' }
 
     $envPwd = $env:SHADOWSTRIKE_PFX_PASSWORD
     if ([string]::IsNullOrEmpty($envPwd)) {
@@ -119,13 +128,9 @@ function Resolve-PfxPassword {
         $envPwd = 'ShadowStrikeDev!'
     }
 
-    try {
-        $sec = ConvertTo-SecureString -String $envPwd -AsPlainText -Force
-        $null = Get-PfxData -FilePath $PfxPath -Password $sec -ErrorAction Stop
-        return $envPwd
-    } catch {
-        Die "Dev PFX at $PfxPath is password-protected and no working password is available. Set `$env:SHADOWSTRIKE_PFX_PASSWORD before running this harness."
-    }
+    if (& $ss_TryPfx $envPwd) { return $envPwd }
+
+    Die "Dev PFX at $PfxPath is password-protected and no working password is available. Set `$env:SHADOWSTRIKE_PFX_PASSWORD before running this harness."
 }
 
 function Sign-Artifact {
