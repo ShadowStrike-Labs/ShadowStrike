@@ -63,6 +63,8 @@
 #include <queue>
 #include <filesystem>
 #include <cwctype>
+#include <mscat.h>     // Catalog admin APIs: CryptCATAdminAcquireContext2 / CalcHashFromFileHandle2
+#include <bcrypt.h>    // BCRYPT_SHA256_ALGORITHM identifier (macro, no bcrypt.lib link needed)
 
 namespace ShadowStrike {
 namespace Security {
@@ -522,7 +524,16 @@ public:
 
             // Check file existence
             if (!std::filesystem::exists(pathStr)) {
-                SS_LOG_WARN(LOG_CATEGORY, L"File does not exist: %ls", pathStr.c_str());
+                // DEBUG, not WARN: callers legitimately query paths that may not
+                // exist as files — OS-loader SxS/MUI/manifest probe misses and
+                // synthetic resource identifiers surfaced by kernel image-load
+                // events (e.g. "<module>.<id>.Manifest", localized "*.mui.dll").
+                // These are expected and non-actionable; the caller receives the
+                // Error result and handles it (image-load path treats it as
+                // "inapplicable"). Logging every probe miss at WARN produced
+                // high-volume, alarming noise for a benign condition.
+                SS_LOG_DEBUG(LOG_CATEGORY, L"VerifyFile: path does not exist (skipping): %ls",
+                             pathStr.c_str());
                 result.result = SignatureValidationResult::Error;
                 result.errorMessage = "File does not exist";
                 return finalizeResult(result, startTime);
@@ -702,21 +713,26 @@ public:
                 return finalizeResult(result, startTime);
             }
 
-            // Calculate file hash
-            auto fileHash = CalculateAuthenticodeHash(filePath, SignatureHashAlgorithm::SHA256);
-            if (!fileHash.has_value()) {
+            // Compute the catalog-membership hash (NOT a flat file digest) so it
+            // matches the member digests stored inside the catalog. Using the
+            // wrong hash here is why catalog-signed files failed to validate.
+            std::vector<BYTE> memberHash;
+            if (!computeCatalogMembershipHash(filePathStr, memberHash) ||
+                memberHash.size() != sizeof(FileHash)) {
                 result.result = SignatureValidationResult::Error;
-                result.errorMessage = "Failed to calculate file hash";
+                result.errorMessage = "Failed to compute catalog membership hash";
                 return finalizeResult(result, startTime);
             }
+            FileHash fileHash{};
+            std::copy(memberHash.begin(), memberHash.end(), fileHash.begin());
 
             // Verify hash is in catalog
-            if (verifyHashInCatalog(catalogPathStr, fileHash.value())) {
+            if (verifyHashInCatalog(catalogPathStr, fileHash)) {
                 result.result = SignatureValidationResult::Valid;
                 result.isValid = true;
                 result.catalogPath = catalogPathStr;
                 result.signer = catalogResult.signer;
-                result.fileHash = fileHash.value();
+                result.fileHash = fileHash;
                 result.isMicrosoftSigned = catalogResult.isMicrosoftSigned;
             } else {
                 result.result = SignatureValidationResult::InvalidHash;
@@ -1136,47 +1152,31 @@ public:
     [[nodiscard]] std::optional<std::wstring> FindCatalogForFile(
         std::wstring_view filePath
     ) noexcept {
-        auto fileHash = CalculateAuthenticodeHash(filePath, SignatureHashAlgorithm::SHA256);
-        if (!fileHash.has_value()) {
-            return std::nullopt;
+        // Primary: the system catalog database, resolved via the correct
+        // catalog-membership hash (see resolveCatalogForFile). The previous
+        // implementation hashed the file with a flat whole-file digest, which
+        // never matches CryptCATAdminEnumCatalogFromHash and therefore failed
+        // to find the catalog for catalog-signed OS binaries.
+        std::wstring catalogPath;
+        std::vector<BYTE> catHash;
+        if (resolveCatalogForFile(std::wstring(filePath), catalogPath, catHash) &&
+            !catalogPath.empty()) {
+            return catalogPath;
         }
 
-        std::shared_lock lock(m_mutex);
-
-        // Search registered catalogs
-        for (const auto& catalogPath : m_catalogPaths) {
-            if (verifyHashInCatalog(catalogPath, fileHash.value())) {
-                return catalogPath;
+        // Secondary: honor explicitly-registered custom catalogs, using the same
+        // (correct) membership hash we just computed.
+        if (catHash.size() == sizeof(FileHash)) {
+            FileHash fh{};
+            std::copy(catHash.begin(), catHash.end(), fh.begin());
+            std::shared_lock lock(m_mutex);
+            for (const auto& regCatalog : m_catalogPaths) {
+                if (verifyHashInCatalog(regCatalog, fh)) {
+                    return regCatalog;
+                }
             }
         }
 
-        // Search system catalogs using CryptCATAdminEnumCatalogFromHash
-        HCATADMIN hCatAdmin = nullptr;
-        if (!CryptCATAdminAcquireContext(&hCatAdmin, nullptr, 0)) {
-            return std::nullopt;
-        }
-
-        CATALOG_INFO catInfo = {};
-        catInfo.cbStruct = sizeof(catInfo);
-
-        HCATINFO hCatInfo = CryptCATAdminEnumCatalogFromHash(
-            hCatAdmin,
-            const_cast<BYTE*>(fileHash->data()),
-            static_cast<DWORD>(fileHash->size()),
-            0,
-            nullptr);
-
-        if (hCatInfo) {
-            if (CryptCATCatalogInfoFromContext(hCatInfo, &catInfo, 0)) {
-                std::wstring result(catInfo.wszCatalogFile);
-                CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
-                CryptCATAdminReleaseContext(hCatAdmin, 0);
-                return result;
-            }
-            CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
-        }
-
-        CryptCATAdminReleaseContext(hCatAdmin, 0);
         return std::nullopt;
     }
 
@@ -1679,67 +1679,151 @@ private:
         return result;
     }
 
+    // Computes the *catalog-membership hash* Windows keys its security catalogs
+    // by -- the PE/Authenticode hash produced by CryptCATAdminCalcHashFromFileHandle
+    // /2, NOT a flat whole-file digest. This is the ONLY hash that matches
+    // CryptCATAdminEnumCatalogFromHash and the member digests inside a .cat, so
+    // it MUST be used for every catalog lookup. Prefers the modern SHA-256 (v2)
+    // context and falls back to the legacy context on older systems. The value
+    // is deterministic for a given algorithm, so it is safe to reuse across a
+    // subsequent same-algorithm enumeration.
+    [[nodiscard]] bool computeCatalogMembershipHash(
+        const std::wstring& filePath,
+        std::vector<BYTE>& outHash
+    ) noexcept {
+        outHash.clear();
+
+        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        HCATADMIN hCatAdmin = nullptr;
+        GUID driverActionGuid = DRIVER_ACTION_VERIFY;
+        bool useV2 = true;
+        if (!CryptCATAdminAcquireContext2(&hCatAdmin, &driverActionGuid,
+                                          BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
+            useV2 = false;
+            if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
+                CloseHandle(hFile);
+                return false;
+            }
+        }
+
+        BYTE hashBytes[64];
+        DWORD hashLen = sizeof(hashBytes);
+        const BOOL calcOk = useV2
+            ? CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile, &hashLen, hashBytes, 0)
+            : CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hashBytes, 0);
+
+        CryptCATAdminReleaseContext(hCatAdmin, 0);
+        CloseHandle(hFile);
+
+        if (!calcOk || hashLen == 0) {
+            return false;
+        }
+        outHash.assign(hashBytes, hashBytes + hashLen);
+        return true;
+    }
+
+    // Resolves the security catalog that vouches for `filePath`, if any, using
+    // the correct catalog-membership hash. `outHash` is populated whenever the
+    // hash could be computed (even if no catalog matched) so callers can reuse
+    // it. See computeCatalogMembershipHash for why the hash choice matters:
+    // catalog-signed OS binaries (most of System32 -- msxml3, imageres,
+    // wscinterop, ntdll, ...) were previously mis-classified as unsigned and
+    // pushed through the full detection pipeline on every access.
+    [[nodiscard]] bool resolveCatalogForFile(
+        const std::wstring& filePath,
+        std::wstring& outCatalogPath,
+        std::vector<BYTE>& outHash
+    ) noexcept {
+        outCatalogPath.clear();
+
+        if (!computeCatalogMembershipHash(filePath, outHash) || outHash.empty()) {
+            return false;
+        }
+
+        // Enumerate with the same algorithm preference used to hash. The hash is
+        // deterministic, so a fresh same-algorithm context matches identically.
+        HCATADMIN hCatAdmin = nullptr;
+        GUID driverActionGuid = DRIVER_ACTION_VERIFY;
+        if (!CryptCATAdminAcquireContext2(&hCatAdmin, &driverActionGuid,
+                                          BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
+            if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
+                return false;
+            }
+        }
+
+        bool found = false;
+        HCATINFO hCatInfo = CryptCATAdminEnumCatalogFromHash(
+            hCatAdmin, outHash.data(), static_cast<DWORD>(outHash.size()), 0, nullptr);
+        if (hCatInfo) {
+            CATALOG_INFO catInfo = {};
+            catInfo.cbStruct = sizeof(catInfo);
+            if (CryptCATCatalogInfoFromContext(hCatInfo, &catInfo, 0)) {
+                outCatalogPath = catInfo.wszCatalogFile;
+                found = true;
+            }
+            CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+        }
+
+        CryptCATAdminReleaseContext(hCatAdmin, 0);
+        return found;
+    }
+
     [[nodiscard]] SignatureInfo verifyCatalogSignature(
         const std::wstring& filePath
     ) noexcept {
         SignatureInfo result;
         result.type = SignatureType::Catalog;
 
-        // Calculate file hash
-        auto fileHash = CalculateAuthenticodeHash(filePath, SignatureHashAlgorithm::SHA256);
-        if (!fileHash.has_value()) {
-            result.result = SignatureValidationResult::Error;
-            result.errorMessage = "Failed to calculate file hash";
+        // Resolve the catalog via the correct catalog-membership hash.
+        std::wstring catalogPath;
+        std::vector<BYTE> catHash;
+        if (!resolveCatalogForFile(filePath, catalogPath, catHash)) {
+            // Not a member of any installed catalog => genuinely not
+            // catalog-signed. Unsigned/non-MS/tampered files land here and
+            // continue to receive the full detection pipeline upstream.
+            result.result = SignatureValidationResult::Unsigned;
             return result;
         }
 
-        // Find catalog containing this hash
-        HCATADMIN hCatAdmin = nullptr;
-        GUID driverActionGuid = DRIVER_ACTION_VERIFY;
+        result.catalogPath = catalogPath;
 
-        if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
-            // Try without driver action
-            if (!CryptCATAdminAcquireContext(&hCatAdmin, nullptr, 0)) {
-                result.result = SignatureValidationResult::Unsigned;
-                return result;
+        // Membership is proven above; now verify the catalog's own Authenticode
+        // signature + signer chain. Membership in a validly-signed catalog ==
+        // the file is validly catalog-signed by that catalog's signer. A
+        // tampered file produces a different membership hash and never reaches
+        // here, so this remains tamper-safe.
+        //
+        // Chain-validate WITHOUT mandatory revocation: the catalog still fully
+        // verifies to a trusted (Microsoft) root, but we do not hard-fail an
+        // OS-trust decision on unreachable CRL/OCSP. Revocation here is at best
+        // cache-only (offline endpoints/VMs cannot reach responders), and a
+        // hard failure would send every catalog-signed OS binary back through
+        // the full pipeline -- reintroducing the very false-positive/CPU storm
+        // this path exists to prevent. Publisher chain trust is preserved.
+        SignatureValidationOptions catOpts;
+        catOpts.flags = SignatureValidationFlags::VerifyChain |
+                        SignatureValidationFlags::CacheResult;
+        auto catalogResult = verifyWithWinTrust(catalogPath, catOpts);
+        if (catalogResult.isValid) {
+            result.result = SignatureValidationResult::Valid;
+            result.isValid = true;
+            result.signer = catalogResult.signer;
+            result.isMicrosoftSigned = catalogResult.isMicrosoftSigned;
+            result.timestamps = catalogResult.timestamps;
+            if (catHash.size() == result.fileHash.size()) {
+                std::copy(catHash.begin(), catHash.end(), result.fileHash.begin());
             }
-        }
-
-        HCATINFO hCatInfo = CryptCATAdminEnumCatalogFromHash(
-            hCatAdmin,
-            const_cast<BYTE*>(fileHash->data()),
-            static_cast<DWORD>(fileHash->size()),
-            0,
-            nullptr);
-
-        if (hCatInfo) {
-            CATALOG_INFO catInfo = {};
-            catInfo.cbStruct = sizeof(catInfo);
-
-            if (CryptCATCatalogInfoFromContext(hCatInfo, &catInfo, 0)) {
-                result.catalogPath = catInfo.wszCatalogFile;
-
-                // Verify the catalog file itself
-                auto catalogResult = verifyWithWinTrust(catInfo.wszCatalogFile, {});
-                if (catalogResult.isValid) {
-                    result.result = SignatureValidationResult::Valid;
-                    result.isValid = true;
-                    result.signer = catalogResult.signer;
-                    result.isMicrosoftSigned = catalogResult.isMicrosoftSigned;
-                    result.timestamps = catalogResult.timestamps;
-                    result.fileHash = fileHash.value();
-                } else {
-                    result.result = SignatureValidationResult::CatalogError;
-                    result.errorMessage = "Catalog signature invalid";
-                }
-            }
-
-            CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
         } else {
-            result.result = SignatureValidationResult::Unsigned;
+            result.result = SignatureValidationResult::CatalogError;
+            result.errorMessage = "Catalog signature invalid";
         }
 
-        CryptCATAdminReleaseContext(hCatAdmin, 0);
         return result;
     }
 
