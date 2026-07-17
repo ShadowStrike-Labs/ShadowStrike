@@ -714,7 +714,28 @@ public:
     // ====================================================================
 
     void CheckHighCpuAlerts(const CPUMonitorConfig& cfg) {
-        // Collect offenders under brief read-lock
+        // EDR SELF-USAGE ALERT — evaluated FIRST and independent of any external
+        // offender. This previously sat *after* the "if (offenders.empty())
+        // return;" below, so the service's own excessive CPU was only ever
+        // reported when some OTHER process happened to be above the crypto-miner
+        // threshold at the same time. The self-usage signal therefore vanished
+        // in exactly the case that matters most — the EDR itself being the sole
+        // CPU hog — which is why a 60-70% self-CPU run logged zero self-usage
+        // warnings. Emit it unconditionally.
+        {
+            double self = 0.0;
+            {
+                std::shared_lock lock(m_dataMutex);
+                self = m_selfCpuUsage;
+            }
+            if (self > cfg.selfUsageAlertThreshold) {
+                SS_LOG_WARN(L"CPUMonitor",
+                    L"EDR self-usage excessive: %.2f%% (threshold %.1f%%)",
+                    self, cfg.selfUsageAlertThreshold);
+            }
+        }
+
+        // Collect external offenders under brief read-lock
         std::vector<ProcessCpuInfo> offenders;
         {
             std::shared_lock lock(m_dataMutex);
@@ -732,16 +753,6 @@ public:
             SS_LOG_WARN(L"CPUMonitor",
                 L"High CPU detected: PID=%u Name='%s' Usage=%.1f%%",
                 p.pid, p.name.c_str(), p.cpuUsagePercent);
-        }
-
-        // Self-usage alert (separate log channel)
-        {
-            std::shared_lock lock(m_dataMutex);
-            if (m_selfCpuUsage > cfg.selfUsageAlertThreshold) {
-                SS_LOG_WARN(L"CPUMonitor",
-                    L"EDR self-usage excessive: %.2f%% (threshold %.1f%%)",
-                    m_selfCpuUsage, cfg.selfUsageAlertThreshold);
-            }
         }
 
         // Snapshot callbacks under shared lock, then dispatch WITHOUT holding
