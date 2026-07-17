@@ -169,12 +169,24 @@ struct StoreConfig {
         // TITANIUM: Use a deterministic temp path for default configuration
         wchar_t tempPath[MAX_PATH];
         if (GetTempPathW(MAX_PATH, tempPath) > 0) {
-            // Create a unique database filename based on process ID
-            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_" 
-                + std::to_wstring(GetCurrentProcessId()) + L".tidb";
+            // Unique per-INSTANCE filename: process id + a monotonic instance
+            // counter. Two ThreatIntelStore instances in the same process (e.g.
+            // a shared store plus an engine-local store) would otherwise derive
+            // the SAME per-PID path; the second Open() then fails with a sharing
+            // violation, because the memory-mapped DB is held by the first
+            // (opened GENERIC_READ|GENERIC_WRITE with FILE_SHARE_READ only).
+            static std::atomic<uint32_t> s_instanceSeq{ 0 };
+            const uint32_t seq = s_instanceSeq.fetch_add(1, std::memory_order_relaxed);
+            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_"
+                + std::to_wstring(GetCurrentProcessId()) + L"_"
+                + std::to_wstring(seq) + L".tidb";
         } else {
             // Fallback to current directory if temp path unavailable
-            config.databasePath = L".\\ShadowStrike_ThreatIntel.tidb";
+            static std::atomic<uint32_t> s_fallbackSeq{ 0 };
+            config.databasePath = L".\\ShadowStrike_ThreatIntel_"
+                + std::to_wstring(GetCurrentProcessId()) + L"_"
+                + std::to_wstring(s_fallbackSeq.fetch_add(1, std::memory_order_relaxed))
+                + L".tidb";
         }
         
         return config;
@@ -201,11 +213,14 @@ struct StoreConfig {
         config.workerThreadCount = std::thread::hardware_concurrency();
         config.maxConcurrentFeedDownloads = 8;
         
-        // Update database path to indicate high-perf variant
+        // Update database path to indicate high-perf variant (unique per instance)
         wchar_t tempPath[MAX_PATH];
         if (GetTempPathW(MAX_PATH, tempPath) > 0) {
-            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_HighPerf_" 
-                + std::to_wstring(GetCurrentProcessId()) + L".tidb";
+            static std::atomic<uint32_t> s_hpInstanceSeq{ 0 };
+            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_HighPerf_"
+                + std::to_wstring(GetCurrentProcessId()) + L"_"
+                + std::to_wstring(s_hpInstanceSeq.fetch_add(1, std::memory_order_relaxed))
+                + L".tidb";
         }
         
         return config;
