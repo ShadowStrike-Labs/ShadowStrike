@@ -1109,6 +1109,19 @@ public:
         // Detect encoding
         CertificateEncoding encoding = DetectEncoding(certData);
 
+        // A raw X.509 certificate is DER (ASN.1 SEQUENCE tag 0x30) or PEM.
+        // Anything else — most commonly a whole PE image passed in by an
+        // image-load caller — is NOT a certificate, and CertCreateCertificateContext
+        // would fail with CRYPT_E_ASN1_BADTAG (0x8009310B) once per input. Reject
+        // it cleanly here instead of emitting a per-call ERROR. Authenticode
+        // verification of PE binaries is performed by the WinVerifyTrust pipeline
+        // (DigitalSignatureValidator), not by this raw-certificate parser.
+        if (encoding == CertificateEncoding::Unknown) {
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"ParseCertificate: input is not DER/PEM-encoded (not a raw certificate); skipping");
+            return std::nullopt;
+        }
+
         // Convert PEM to DER if needed
         std::vector<uint8_t> derData;
         if (encoding == CertificateEncoding::PEM) {
