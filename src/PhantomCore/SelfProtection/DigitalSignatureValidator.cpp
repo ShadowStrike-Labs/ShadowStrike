@@ -2408,16 +2408,27 @@ public:
             }
         }
 
-        // Kernel signature level mismatch detection
-        if (kernelSigLevel == 0 && analysis.signatureInfo.isValid) {
-            // Kernel says unsigned but usermode WinTrust says valid →
-            // possible catalog-only or cross-signed bypass
+        // Kernel signature level mismatch detection.
+        //
+        // Genuinely Microsoft-signed OS binaries are EXCLUDED: the kernel's
+        // image-load signing level is routinely 0 for catalog-signed user-mode
+        // modules (ntdll, msxml3, conhost, ...), while usermode catalog
+        // verification correctly reports them valid. That combination is normal
+        // OS behaviour, not a policy bypass — flagging it forced every signed
+        // system module to riskScore 80, which defeated the Microsoft-signed
+        // trust fast-path and sent all of them through the full scan pipeline
+        // (the dominant online-CPU cost). A real bypass presents a NON-Microsoft
+        // valid signature the kernel never enforced, which still trips this.
+        if (kernelSigLevel == 0 && analysis.signatureInfo.isValid &&
+            !analysis.signatureInfo.isMicrosoftSigned) {
+            // Kernel says unsigned but usermode WinTrust says valid (non-MS) →
+            // possible cross-signed / signing-policy bypass
             SignatureAnomaly anomaly;
             anomaly.type = AnomalyType::SupplyChainAnomaly;
             anomaly.severity = AnomalySeverity::High;
             anomaly.filePath = std::wstring(imagePath);
-            anomaly.description = "Kernel reports unsigned but usermode detects valid signature — "
-                "possible signing policy bypass";
+            anomaly.description = "Kernel reports unsigned but usermode detects valid non-Microsoft "
+                "signature — possible signing policy bypass";
             anomaly.mitreAttackId = "T1553.006";
             analysis.anomalies.push_back(std::move(anomaly));
             analysis.riskScore = std::max(analysis.riskScore, 80u);
