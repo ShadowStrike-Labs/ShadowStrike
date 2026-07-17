@@ -3118,19 +3118,26 @@ public:
         // If configured, scan the process image
         if (m_config.scanOnExecute && req.isCreation) {
             try {
-                Core::Engine::ScanContext context;
-                context.type = Core::Engine::ScanType::RealTime;
-                context.priority = Core::Engine::ScanPriority::Critical;
-                context.processId = req.processId;
-                context.filePath = imagePath;
+                // Verified Microsoft-signed OS binaries are trusted operating-
+                // system code — skip the heavy ScanEngine pipeline (same TIER-1
+                // trust as the on-access file path). Tamper-safe (a modified
+                // image fails the catalog/Authenticode check) and LOLBin abuse of
+                // a signed binary is caught by the process/behavioral monitors
+                // above, not by scanning the clean image.
+                if (!Security::DigitalSignatureValidator::Instance().IsMicrosoftSigned(imagePath)) {
+                    Core::Engine::ScanContext context;
+                    context.type = Core::Engine::ScanType::RealTime;
+                    context.priority = Core::Engine::ScanPriority::Critical;
+                    context.processId = req.processId;
+                    context.filePath = imagePath;
 
-                auto result = Core::Engine::ScanEngine::Instance().ScanFile(imagePath, context);
+                    auto result = Core::Engine::ScanEngine::Instance().ScanFile(imagePath, context);
 
-                if (result.verdict == Core::Engine::ScanVerdict::Infected) {
-                    m_stats.processesBlocked++;
-                    return Communication::KernelVerdict::Block;
+                    if (result.verdict == Core::Engine::ScanVerdict::Infected) {
+                        m_stats.processesBlocked++;
+                        return Communication::KernelVerdict::Block;
+                    }
                 }
-
             } catch (...) {
                 // Continue on scan failure
             }
@@ -3417,21 +3424,27 @@ public:
             }
         }
 
-        // Scan the loaded image file
+        // Scan the loaded image file. Skip verified Microsoft-signed OS modules
+        // — trusted OS code that the signature/anomaly gate already cleared, and
+        // a tampered module fails the catalog/Authenticode check. This is what
+        // keeps module-load storms (every System32 DLL, EdgeWebView, etc.) off
+        // the heavy ScanEngine pipeline.
         if (m_config.scanOnExecute) {
             try {
-                Core::Engine::ScanContext context;
-                context.type = Core::Engine::ScanType::RealTime;
-                context.priority = Core::Engine::ScanPriority::High;
-                context.processId = req.processId;
-                context.filePath = imagePath;
+                if (!Security::DigitalSignatureValidator::Instance().IsMicrosoftSigned(imagePath)) {
+                    Core::Engine::ScanContext context;
+                    context.type = Core::Engine::ScanType::RealTime;
+                    context.priority = Core::Engine::ScanPriority::High;
+                    context.processId = req.processId;
+                    context.filePath = imagePath;
 
-                auto result = Core::Engine::ScanEngine::Instance().ScanFile(imagePath, context);
-                if (result.verdict == Core::Engine::ScanVerdict::Infected) {
-                    Utils::Logger::Warn("RealTimeProtection: Blocked malicious image load in PID {}: {}",
-                        req.processId, Utils::StringUtils::ToNarrow(imagePath));
-                    m_stats.threatsDetected++;
-                    return Communication::KernelVerdict::Block;
+                    auto result = Core::Engine::ScanEngine::Instance().ScanFile(imagePath, context);
+                    if (result.verdict == Core::Engine::ScanVerdict::Infected) {
+                        Utils::Logger::Warn("RealTimeProtection: Blocked malicious image load in PID {}: {}",
+                            req.processId, Utils::StringUtils::ToNarrow(imagePath));
+                        m_stats.threatsDetected++;
+                        return Communication::KernelVerdict::Block;
+                    }
                 }
             } catch (...) {}
         }
