@@ -696,6 +696,7 @@ Return Value:
     BOOLEAN ShouldBlock = FALSE;
     BOOLEAN CacheKeyValid = FALSE;
     BOOLEAN RundownAcquired = FALSE;
+    BOOLEAN IsScannerRequest = FALSE;
     SHADOWSTRIKE_CACHE_KEY CacheKey;
     SHADOWSTRIKE_CACHE_RESULT CacheResult;
     PSHADOWSTRIKE_MESSAGE_HEADER RequestMsg = NULL;
@@ -829,35 +830,38 @@ Return Value:
     // PHASE 2: PROCESS IDENTITY CHECKS
     // ========================================================================
 
-    RequestorPid = PsGetCurrentProcessId();
+    //
+    // Bind attribution to the operation that Filter Manager delivered, not to
+    // the process that created the thread currently executing this callback.
+    // A NULL result is a valid "no associated request thread" state: preserve
+    // it as PID 0/unknown and never substitute the callback thread's process.
+    //
+    RequestorPid = FltGetRequestorProcessIdEx(Data);
 
-    //
-    // Skip System process (PID 4) - use defined constant
-    //
-    if (RequestorPid == PC_SYSTEM_PROCESS_ID) {
-        goto CleanupAllow;
-    }
+    if (RequestorPid != NULL) {
+        //
+        // Skip System process (PID 4) - use defined constant.
+        //
+        if (RequestorPid == PC_SYSTEM_PROCESS_ID) {
+            goto CleanupAllow;
+        }
 
-    //
-    // Skip our own protected processes (prevent deadlock/loops)
-    //
-    if (ShadowStrikeIsProcessProtected(RequestorPid, NULL)) {
-        goto CleanupAllow;
-    }
+        //
+        // Skip our own protected processes (prevent deadlock/loops).
+        //
+        if (ShadowStrikeIsProcessProtected(RequestorPid, NULL)) {
+            goto CleanupAllow;
+        }
 
-    //
-    // Skip the ShadowStrike scanner service's OWN process. While servicing a
-    // scan request the scanner's worker threads open/read files (and load DLLs,
-    // write logs, etc.); scanning those opens would recurse into this
-    // PreCreate -> SbSendScanRequest synchronous path, exhaust the scanner
-    // worker pool, and deadlock all file I/O on the system. The scanner PID is
-    // recorded at connect time (ShadowStrikeConnectNotify) so this exemption is
-    // race-free and does not depend on the user-mode RegisterProtectedProcess
-    // message (which populates a different list than ShadowStrikeIsProcessProtected
-    // consults).
-    //
-    if (ShadowStrikeIsScannerProcess(RequestorPid)) {
-        goto CleanupAllow;
+        //
+        // Remember accepted scanner I/O, but do not bypass the in-kernel
+        // protection phases. The scanner exemption is applied only to the
+        // user-mode cache/round-trip below: recursively sending the scanner's
+        // own reads back to the same finite worker pool can deadlock all file
+        // I/O, while path, self-protection, behavioral, and threat-score checks
+        // remain safe and valuable.
+        //
+        IsScannerRequest = ShadowStrikeIsScannerProcess(RequestorPid);
     }
 
     // ========================================================================
@@ -907,7 +911,8 @@ Return Value:
         //
         // Check process exclusion (ExclusionManager â€” user-configured)
         //
-        if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
+        if (RequestorPid != NULL &&
+            ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
             goto CleanupAllow;
@@ -916,7 +921,8 @@ Return Value:
         //
         // Check process trust (ProcessExclusion â€” pattern-matched at creation)
         //
-        if (ShadowStrikeIsProcessTrusted(RequestorPid)) {
+        if (RequestorPid != NULL &&
+            ShadowStrikeIsProcessTrusted(RequestorPid)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
             goto CleanupAllow;
@@ -1084,7 +1090,7 @@ Return Value:
     // directories, and System32 â€” indicators of container-to-host breakout.
     // BehaviorEngine events are submitted inside WslMonCheckFileAccess.
     //
-    {
+    if (RequestorPid != NULL) {
         WSL_ESCAPE_TYPE wslEscape = WslMonCheckFileAccess(RequestorPid, &NameInfo->Name);
         if (wslEscape != WslEscape_None) {
             ThreatScore += (wslEscape == WslEscape_CredentialAccess) ? 85 : 60;
@@ -1240,7 +1246,8 @@ Return Value:
     //
     // Correlate with ransomware behavior
     //
-    if (g_PcState.Config.EnableRansomwareCorrelation) {
+    if (RequestorPid != NULL &&
+        g_PcState.Config.EnableRansomwareCorrelation) {
         Status = PcCorrelateRansomware(
             RequestorPid,
             &NameInfo->Name,
@@ -1374,7 +1381,14 @@ Return Value:
     // PHASE 8: SCAN CACHE CHECK
     // ========================================================================
 
-    if (SHADOWSTRIKE_USER_MODE_CONNECTED()) {
+    //
+    // An accepted scanner still traverses every in-kernel detector above and
+    // the Phase 10 threat-score verdict below. Skip only the user-mode verdict
+    // cache and synchronous IPC for its own I/O: a cached malicious verdict
+    // would prevent the scanner from opening the sample it must inspect, while
+    // another scan request would recursively consume the same worker pool.
+    //
+    if (!IsScannerRequest && SHADOWSTRIKE_USER_MODE_CONNECTED()) {
         //
         // Build cache key - track validity for later use
         //
@@ -1480,6 +1494,7 @@ Return Value:
         Status = SbBuildFileScanRequest(
             Data,
             FltObjects,
+            RequestorPid,
             ScanAccessType,
             &RequestMsg,
             &RequestSize

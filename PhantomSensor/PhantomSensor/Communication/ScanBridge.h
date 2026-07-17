@@ -465,6 +465,8 @@ ShadowStrikeScanBridgeShutdown(
  *
  * @param Data          Filter callback data
  * @param FltObjects    Filter related objects
+ * @param RequestorProcessId Operation requestor captured by the callback;
+ *                           NULL means unknown and is serialized as PID 0
  * @param AccessType    Type of file access
  * @param Request       Receives pointer to allocated request
  * @param RequestSize   Receives size of the request
@@ -481,6 +483,7 @@ NTSTATUS
 SbBuildFileScanRequest(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ HANDLE RequestorProcessId,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
     _Outptr_ PSHADOWSTRIKE_MESSAGE_HEADER* Request,
     _Out_ PULONG RequestSize
@@ -491,6 +494,8 @@ SbBuildFileScanRequest(
  *
  * @param Data          Filter callback data
  * @param FltObjects    Filter related objects
+ * @param RequestorProcessId Operation requestor captured by the callback;
+ *                           NULL means unknown and is serialized as PID 0
  * @param AccessType    Type of file access
  * @param Options       Extended scan options
  * @param Request       Receives pointer to allocated request
@@ -506,6 +511,7 @@ NTSTATUS
 SbBuildFileScanRequestEx(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ HANDLE RequestorProcessId,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
     _In_opt_ PSB_SCAN_OPTIONS Options,
     _Outptr_ PSHADOWSTRIKE_MESSAGE_HEADER* Request,

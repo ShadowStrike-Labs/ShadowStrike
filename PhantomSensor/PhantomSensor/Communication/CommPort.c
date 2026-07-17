@@ -50,22 +50,21 @@
 #include "../Utilities/FileUtils.h"
 
 //
-// PID of the connected primary scanner service. The kernel must NEVER issue a
-// synchronous user-mode scan for this process's OWN file I/O: while servicing a
-// scan request the scanner's worker threads open/read files (and load DLLs,
-// write logs, etc.), and scanning those opens would recurse back into the
-// synchronous IRP_MJ_CREATE -> SbSendScanRequest path, exhaust the scanner's
-// worker pool, and deadlock all file I/O on the system (every other process's
-// create then stalls on the scan timeout). Recorded directly at connect time —
-// before the encrypted channel can carry any scan traffic — so the exemption is
-// race-free, and cleared at disconnect.
+// Pointer-sized PID identity for every accepted primary scanner slot. A single
+// scalar cannot represent overlapping service lifetimes or same-PID duplicate
+// connections: publishing/clearing one connection would invalidate another.
+// Entries are published only after ConnectNotify has passed every synchronous
+// acceptance point (including successful KEX work-item queueing). The checked
+// disconnect winner retires that exact slot before any finalization wait, so
+// stale scanner identity cannot survive shutdown or slot teardown.
 //
 // NOTE: the user-mode RegisterProtectedProcess path inserts into
 // g_DriverData.ProtectedProcessList, which is a DIFFERENT list than the one
 // ShadowStrikeIsProcessProtected() (consulted by the file callbacks) reads, so
-// it does NOT provide this exemption. This dedicated record does.
+// it does NOT provide this recursion guard. This dedicated state does.
 //
-static volatile LONG g_ScannerServiceProcessId = 0;
+static PVOID volatile
+    g_AcceptedPrimaryScannerProcessIds[SHADOWSTRIKE_MAX_CONNECTIONS] = { NULL };
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
@@ -73,8 +72,25 @@ ShadowStrikeIsScannerProcess(
     _In_ HANDLE ProcessId
     )
 {
-    LONG scannerPid = ReadNoFence(&g_ScannerServiceProcessId);
-    return (BOOLEAN)(scannerPid != 0 && HandleToLong(ProcessId) == scannerPid);
+    LONG i;
+
+    if (ProcessId == NULL) {
+        return FALSE;
+    }
+
+    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+        HANDLE acceptedProcessId = (HANDLE)InterlockedCompareExchangePointer(
+            &g_AcceptedPrimaryScannerProcessIds[i],
+            NULL,
+            NULL
+            );
+
+        if (acceptedProcessId != NULL && acceptedProcessId == ProcessId) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 //
@@ -91,8 +107,8 @@ PsGetProcessInheritedFromUniqueProcessId(
     );
 
 //
-// Forward declaration for the deferred-kex work-item routine. Required
-// before its alloc_text pragma below.
+// Forward declarations for deferred KEX delivery and PASSIVE-only client
+// finalization workers. Required before their alloc_text pragmas below.
 //
 _Function_class_(FLT_GENERIC_WORKITEM_ROUTINE)
 static VOID FLTAPI
@@ -100,6 +116,52 @@ ShadowStrikeDeliverKexWorker(
     _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
     _In_ PFLT_FILTER FltObject,
     _In_opt_ PVOID Context
+    );
+
+_Function_class_(FLT_GENERIC_WORKITEM_ROUTINE)
+static VOID FLTAPI
+ShadowStrikeClientFinalizationWorker(
+    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
+    _In_ PFLT_FILTER FltObject,
+    _In_opt_ PVOID Context
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+ShadowStrikeDrainMessageQueue(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+ShadowStrikeBeginClientDisconnect(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
+    _In_ PFLT_PORT ExpectedClientPort
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+ShadowStrikeFinalizeClientDisconnect(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
+    _In_ PFLT_PORT ExpectedClientPort,
+    _In_ PFLT_GENERIC_WORKITEM FinalizationWorkItem
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+ShadowStrikeCompleteClientFinalization(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
+    _In_ PFLT_PORT ExpectedClientPort
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+ShadowStrikeReleaseSessionCryptoKey(
+    _Inout_opt_ PENC_KEY* SessionKey
     );
 
 #ifdef ALLOC_PRAGMA
@@ -110,6 +172,12 @@ ShadowStrikeDeliverKexWorker(
 #pragma alloc_text(PAGE, ShadowStrikeMessageNotify)
 #pragma alloc_text(PAGE, ShadowStrikeVerifyClient)
 #pragma alloc_text(PAGE, ShadowStrikeDeliverKexWorker)
+#pragma alloc_text(PAGE, ShadowStrikeClientFinalizationWorker)
+#pragma alloc_text(PAGE, ShadowStrikeBeginClientDisconnect)
+#pragma alloc_text(PAGE, ShadowStrikeFinalizeClientDisconnect)
+#pragma alloc_text(PAGE, ShadowStrikeCompleteClientFinalization)
+#pragma alloc_text(PAGE, ShadowStrikeDrainMessageQueue)
+#pragma alloc_text(PAGE, ShadowStrikeReleaseSessionCryptoKey)
 #pragma alloc_text(PAGE, ShadowStrikeRegisterProtectedProcess)
 #pragma alloc_text(PAGE, ShadowStrikeUnregisterProtectedProcess)
 #pragma alloc_text(PAGE, ShadowStrikeBuildFileScanRequest)
@@ -141,6 +209,125 @@ typedef struct _SHADOWSTRIKE_PROTECTED_PROCESS_ENTRY {
  */
 static SHADOWSTRIKE_CLIENT_PORT_REF g_ClientPortRefs[SHADOWSTRIKE_MAX_CONNECTIONS];
 static PENC_KEY g_ClientSessionEncKeys[SHADOWSTRIKE_MAX_CONNECTIONS];
+
+//
+// A slot's event is cleared immediately before its accepted KEX work item is
+// published and is set only after PASSIVE key teardown, finalization work-item
+// release, and the final slot reset. Shutdown waits on these events rather than
+// treating the canonical ClientPort becoming NULL as teardown completion.
+//
+static KEVENT
+    g_ClientFinalizationCompleteEvents[SHADOWSTRIKE_MAX_CONNECTIONS];
+static BOOLEAN g_ClientLifecycleInitialized = FALSE;
+
+//
+// Connection cookies are opaque pointer-width integers, never dereferenced.
+// Eight low bits encode slot+1 (zero remains an invalid/NULL cookie); all
+// remaining bits encode a nonzero per-slot generation. ULONG_PTR gives the
+// same lossless integer<->PVOID round trip on both supported targets (x64 and
+// ARM64) without allocating callback-cookie storage that could leak or UAF.
+//
+#define SHADOWSTRIKE_COOKIE_SLOT_BITS       8u
+#define SHADOWSTRIKE_COOKIE_SLOT_MASK       ((((ULONG_PTR)1u) << SHADOWSTRIKE_COOKIE_SLOT_BITS) - 1u)
+#define SHADOWSTRIKE_COOKIE_GENERATION_MAX  (~(ULONG_PTR)0 >> SHADOWSTRIKE_COOKIE_SLOT_BITS)
+
+C_ASSERT(SHADOWSTRIKE_MAX_CONNECTIONS < (1u << SHADOWSTRIKE_COOKIE_SLOT_BITS));
+C_ASSERT(sizeof(ULONG_PTR) == sizeof(PVOID));
+
+typedef enum _SHADOWSTRIKE_CLIENT_FINALIZATION_STATE {
+    ShadowStrikeClientFinalizationIdle = 0,
+    ShadowStrikeClientFinalizationClaimed = 1,
+    ShadowStrikeClientFinalizationRunning = 2
+} SHADOWSTRIKE_CLIENT_FINALIZATION_STATE;
+
+static __forceinline ULONG_PTR
+ShadowStrikeNextConnectionGeneration(
+    _In_ ULONG_PTR CurrentGeneration
+    )
+{
+    ULONG_PTR nextGeneration = CurrentGeneration + 1u;
+
+    if (nextGeneration == 0 ||
+        nextGeneration > SHADOWSTRIKE_COOKIE_GENERATION_MAX) {
+        nextGeneration = 1u;
+    }
+
+    return nextGeneration;
+}
+
+static __forceinline PVOID
+ShadowStrikeEncodeConnectionCookie(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration
+    )
+{
+    ULONG_PTR cookieValue;
+
+    NT_ASSERT(SlotIndex >= 0 && SlotIndex < SHADOWSTRIKE_MAX_CONNECTIONS);
+    NT_ASSERT(ConnectionGeneration != 0 &&
+              ConnectionGeneration <= SHADOWSTRIKE_COOKIE_GENERATION_MAX);
+
+    cookieValue = (ConnectionGeneration << SHADOWSTRIKE_COOKIE_SLOT_BITS) |
+                  ((ULONG_PTR)SlotIndex + 1u);
+    return (PVOID)cookieValue;
+}
+
+static __forceinline BOOLEAN
+ShadowStrikeDecodeConnectionCookie(
+    _In_opt_ PVOID ConnectionCookie,
+    _Out_ PLONG SlotIndex,
+    _Out_ PULONG_PTR ConnectionGeneration
+    )
+{
+    ULONG_PTR cookieValue;
+    ULONG_PTR encodedSlot;
+    ULONG_PTR generation;
+
+    if (ConnectionCookie == NULL ||
+        SlotIndex == NULL ||
+        ConnectionGeneration == NULL) {
+        return FALSE;
+    }
+
+    cookieValue = (ULONG_PTR)ConnectionCookie;
+    encodedSlot = cookieValue & SHADOWSTRIKE_COOKIE_SLOT_MASK;
+    generation = cookieValue >> SHADOWSTRIKE_COOKIE_SLOT_BITS;
+
+    if (encodedSlot == 0 ||
+        encodedSlot > SHADOWSTRIKE_MAX_CONNECTIONS ||
+        generation == 0) {
+        return FALSE;
+    }
+
+    *SlotIndex = (LONG)(encodedSlot - 1u);
+    *ConnectionGeneration = generation;
+    return TRUE;
+}
+
+static __forceinline VOID
+ShadowStrikeResetClientSlotPreservingGeneration(
+    _In_ LONG SlotIndex
+    )
+{
+    ULONG_PTR connectionGeneration =
+        g_ClientPortRefs[SlotIndex].ConnectionGeneration;
+
+    RtlZeroMemory(
+        &g_ClientPortRefs[SlotIndex],
+        sizeof(g_ClientPortRefs[SlotIndex])
+        );
+    g_ClientPortRefs[SlotIndex].SlotIndex = SlotIndex;
+    g_ClientPortRefs[SlotIndex].ConnectionGeneration = connectionGeneration;
+}
+
+static __forceinline BOOLEAN
+ShadowStrikeIsClientEncryptionEstablished(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT_REF ClientRef
+    )
+{
+    return (BOOLEAN)(InterlockedCompareExchange(
+        &ClientRef->EncryptionEstablished, 0, 0) != 0);
+}
 
 //
 // HMAC-SHA256 transport authentication key (32 bytes, generated per boot)
@@ -267,9 +454,11 @@ ShadowStrikeCopyMessagePayload(
     _In_ BOOLEAN InputBufferTrusted
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS
 ShadowStrikeAcquireClientPortBySlot(
     _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
     _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
     );
 
@@ -280,14 +469,10 @@ ShadowStrikePrepareEncryptedMessageHeader(
     _In_ ULONG EncryptedPayloadSize
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
-ShadowStrikeReleaseSessionCryptoKey(
-    _Inout_opt_ PENC_KEY* SessionKey
-    );
-
-static VOID
-ShadowStrikeFinalizeClientDisconnect(
-    _In_ LONG SlotIndex
+ShadowStrikeRequestClientFinalization(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT_REF ClientRef
     );
 
 static NTSTATUS
@@ -397,6 +582,7 @@ ShadowStrikePrepareEncryptedMessageHeader(
     DestinationHeader->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + EncryptedPayloadSize;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 ShadowStrikeReleaseSessionCryptoKey(
     _Inout_opt_ PENC_KEY* SessionKey
@@ -405,6 +591,8 @@ ShadowStrikeReleaseSessionCryptoKey(
     PENC_KEY key;
     LONG remainingRefs;
     PENC_MANAGER encMgr;
+
+    PAGED_CODE();
 
     if (SessionKey == NULL || *SessionKey == NULL) {
         return;
@@ -543,12 +731,47 @@ ShadowStrikeCreateCommunicationPort(
                SHADOWSTRIKE_PORT_NAME);
 
     //
-    // Initialize client port reference array
+    // Initialize per-slot rundown events exactly once. A later server-port
+    // recreation is legal only after every prior generation reached explicit
+    // finalization completion; never wipe a live/queued lifecycle record.
     //
-    RtlZeroMemory(g_ClientPortRefs, sizeof(g_ClientPortRefs));
+    if (!g_ClientLifecycleInitialized) {
+        for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+            KeInitializeEvent(
+                &g_ClientFinalizationCompleteEvents[i],
+                NotificationEvent,
+                TRUE
+                );
+        }
+        g_ClientLifecycleInitialized = TRUE;
+    } else {
+        for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+            if (KeReadStateEvent(
+                    &g_ClientFinalizationCompleteEvents[i]) == 0 ||
+                g_ClientPortRefs[i].ClientPort != NULL ||
+                g_ClientPortRefs[i].FinalizationExpectedPort != NULL ||
+                g_ClientPortRefs[i].FinalizationState !=
+                    ShadowStrikeClientFinalizationIdle) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] Communication port recreation rejected: slot %ld teardown is incomplete\n",
+                           i);
+                return STATUS_DEVICE_BUSY;
+            }
+        }
+    }
+
     RtlZeroMemory(g_ClientSessionEncKeys, sizeof(g_ClientSessionEncKeys));
+    InterlockedExchange(&g_DriverData.ConnectedClients, 0);
+    InterlockedExchange(&g_DriverData.PrimaryScannersReady, 0);
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        g_ClientPortRefs[i].SlotIndex = i;
+        ShadowStrikeResetClientSlotPreservingGeneration(i);
+        InterlockedExchangePointer(
+            &g_AcceptedPrimaryScannerProcessIds[i], NULL);
+        KeSetEvent(
+            &g_ClientFinalizationCompleteEvents[i],
+            IO_NO_INCREMENT,
+            FALSE
+            );
     }
 
     //
@@ -789,7 +1012,7 @@ ShadowStrikeCloseCommunicationPort(
     LONG i;
     LONG waitCount;
     LARGE_INTEGER waitInterval;
-    BOOLEAN markedForFinalize[SHADOWSTRIKE_MAX_CONNECTIONS] = {0};
+    PFLT_PORT serverPort;
 
     PAGED_CODE();
 
@@ -797,102 +1020,129 @@ ShadowStrikeCloseCommunicationPort(
                "[ShadowStrike] Closing communication port\n");
 
     //
-    // PASS 1: Atomically transition each live slot to "disconnecting".
+    // Stop publication of new connections first. Any Filter Manager
+    // DisconnectNotify callbacks caused by this close use the same checked
+    // BeginClientDisconnect transition as the explicit shutdown sweep below.
     //
-    // We track which slots WE marked (Disconnecting transitioned 0->1) so we
-    // alone are responsible for releasing the baseline reference held since
-    // ConnectNotify.  Slots already marked by a prior DisconnectNotify path
-    // are owned by that path and must not be double-decremented.
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+    serverPort = g_DriverData.ServerPort;
+    g_DriverData.ServerPort = NULL;
+    if (serverPort != NULL) {
+        FltCloseCommunicationPort(serverPort);
+    }
 
-    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        if (g_ClientPortRefs[i].ClientPort == NULL) {
-            continue;
+    if (g_ClientLifecycleInitialized) {
+        //
+        // Snapshot each live identity under the lock, then begin disconnect
+        // using both generation and expected port. The 0->1 disconnect winner
+        // retires scanner/connection publication and drops the baseline once.
+        //
+        for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+            ULONG_PTR connectionGeneration = 0;
+            PFLT_PORT expectedClientPort = NULL;
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+            if (g_ClientPortRefs[i].ClientPort != NULL) {
+                connectionGeneration =
+                    g_ClientPortRefs[i].ConnectionGeneration;
+                expectedClientPort = g_ClientPortRefs[i].ClientPort;
+            }
+            ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+            KeLeaveCriticalRegion();
+
+            if (expectedClientPort != NULL) {
+                (void)ShadowStrikeBeginClientDisconnect(
+                    i,
+                    connectionGeneration,
+                    expectedClientPort
+                    );
+            }
         }
-        if (InterlockedExchange(&g_ClientPortRefs[i].Disconnecting, 1) == 0) {
-            //
-            // Transitioned 0 -> 1; we own the baseline reference drop.
-            //
-            markedForFinalize[i] = TRUE;
+
+        //
+        // ClientPort becoming NULL is not completion: key destruction and the
+        // queued owner's FltFreeGenericWorkItem occur afterward. Wait for the
+        // explicit per-slot completion event, which is signaled only after all
+        // PASSIVE cleanup and work-item ownership are finished. Do not abandon
+        // a live slot on timeout; returning would permit FltUnregisterFilter to
+        // invalidate the filter handle beneath a late final release.
+        //
+        waitInterval.QuadPart = -10000LL * 100;  // 100ms retry cadence
+
+        for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
+            waitCount = 0;
+
+            while (KeReadStateEvent(
+                       &g_ClientFinalizationCompleteEvents[i]) == 0) {
+                BOOLEAN retryFinalization;
+                LONG finalizationState;
+                LONG referenceCount;
+
+                KeEnterCriticalRegion();
+                ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+                referenceCount = g_ClientPortRefs[i].ReferenceCount;
+                finalizationState =
+                    g_ClientPortRefs[i].FinalizationState;
+                retryFinalization = (BOOLEAN)(
+                    g_ClientPortRefs[i].ClientPort != NULL &&
+                    g_ClientPortRefs[i].ClientPort ==
+                        g_ClientPortRefs[i].FinalizationExpectedPort &&
+                    g_ClientPortRefs[i].Disconnecting != 0 &&
+                    referenceCount == 0 &&
+                    finalizationState ==
+                        ShadowStrikeClientFinalizationIdle &&
+                    g_ClientPortRefs[i].FinalizationWorkItem != NULL
+                    );
+                ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+                KeLeaveCriticalRegion();
+
+                //
+                // Retry before waiting/logging. This closes the APC queue-
+                // failure race even when Idle becomes visible at a cadence
+                // boundary.
+                //
+                if (retryFinalization) {
+                    ShadowStrikeRequestClientFinalization(
+                        &g_ClientPortRefs[i]
+                        );
+                }
+
+                if (KeReadStateEvent(
+                        &g_ClientFinalizationCompleteEvents[i]) != 0) {
+                    break;
+                }
+
+                waitCount++;
+                if (waitCount == 50) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID,
+                               DPFLTR_WARNING_LEVEL,
+                               "[ShadowStrike] Waiting for client slot %ld rundown: refs=%ld state=%ld\n",
+                               i,
+                               referenceCount,
+                               finalizationState);
+                    waitCount = 0;
+                }
+
+                (void)KeWaitForSingleObject(
+                    &g_ClientFinalizationCompleteEvents[i],
+                    Executive,
+                    KernelMode,
+                    FALSE,
+                    &waitInterval
+                    );
+            }
         }
     }
 
-    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
-    KeLeaveCriticalRegion();
+    //
+    // BeginClientDisconnect retires these observer publications exactly once;
+    // successful event rundown proves no finalizer can decrement them later.
+    //
+    NT_ASSERT(InterlockedCompareExchange(
+        &g_DriverData.ConnectedClients, 0, 0) == 0);
+    NT_ASSERT(InterlockedCompareExchange(
+        &g_DriverData.PrimaryScannersReady, 0, 0) == 0);
 
-    //
-    // PASS 2: Drop the baseline reference for every slot we marked.  The
-    // last reference releaser (could be us, could be an in-flight sender)
-    // will call ShadowStrikeFinalizeClientDisconnect, which closes the
-    // client port handle and scrubs session key material.  This restores
-    // proper cleanup semantics — previously the baseline reference was
-    // never dropped at shutdown, leaking every connected client port plus
-    // its session key for the lifetime of the OS load.
-    //
-    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        if (!markedForFinalize[i]) {
-            continue;
-        }
-        if (InterlockedDecrement(&g_ClientPortRefs[i].ReferenceCount) == 0) {
-            ShadowStrikeFinalizeClientDisconnect(i);
-        }
-    }
-
-    //
-    // PASS 3: Wait for any slots whose references are still held by
-    // in-flight senders to drain naturally.  Once their last sender
-    // releases, finalize will run and clean the slot.
-    //
-    waitInterval.QuadPart = -10000LL * 100;  // 100ms intervals
-
-    for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
-        if (g_ClientPortRefs[i].ClientPort == NULL) {
-            continue;
-        }
-        waitCount = 0;
-        while (g_ClientPortRefs[i].ClientPort != NULL && waitCount < 50) {
-            KeDelayExecutionThread(KernelMode, FALSE, &waitInterval);
-            waitCount++;
-        }
-
-        if (g_ClientPortRefs[i].ClientPort != NULL) {
-            //
-            // Drain timed out — an in-flight sender is stuck holding a
-            // reference (e.g., FltSendMessage waiting on user-mode reply).
-            // Leak the slot rather than UAF: the port handle and key
-            // material will be reclaimed by the OS at full driver unload.
-            //
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] CRITICAL: Client slot %ld still has %ld refs after drain timeout — "
-                       "leaking port to avoid use-after-free BSOD\n",
-                       i, g_ClientPortRefs[i].ReferenceCount);
-        }
-    }
-
-    //
-    // ConnectedClients is decremented inside ShadowStrikeFinalizeClientDisconnect
-    // for every successfully closed slot.  Force the global counter to zero
-    // so observers cannot see stale "connected" state for any leaked slot.
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
-    g_DriverData.ConnectedClients = 0;
-    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Close the server port
-    //
-    if (g_DriverData.ServerPort != NULL) {
-        FltCloseCommunicationPort(g_DriverData.ServerPort);
-        g_DriverData.ServerPort = NULL;
-    }
-
-    //
-    // Scrub HMAC key material from memory (crypto hygiene)
-    //
     ShadowStrikeSetCommHmacKeyReady(FALSE);
     RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
 
@@ -911,10 +1161,11 @@ ShadowStrikeCloseCommunicationPort(
 // connected.  Called at PASSIVE_LEVEL after a new client registers.
 // Encrypts each message using the session key before sending.
 //
-static
-VOID
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
 ShadowStrikeDrainMessageQueue(
-    _In_ LONG SlotIndex
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration
     )
 {
     PQUEUED_MESSAGE messages[32];
@@ -935,19 +1186,28 @@ ShadowStrikeDrainMessageQueue(
     //
     timeout.QuadPart = 0;  // fire-and-forget
 
-    status = ShadowStrikeAcquireClientPortBySlot(SlotIndex, &clientRef);
+    status = ShadowStrikeAcquireClientPortBySlot(
+        SlotIndex,
+        ConnectionGeneration,
+        &clientRef
+        );
     if (!NT_SUCCESS(status)) {
         return;
     }
 
     clientPort = clientRef->ClientPort;
-    canEncrypt = (clientRef->EncryptionEstablished != FALSE);
+    canEncrypt = ShadowStrikeIsClientEncryptionEstablished(clientRef);
     if (canEncrypt) {
         encMgr = ShadowStrikeGetEncryptionManager();
         sessionKey = g_ClientSessionEncKeys[SlotIndex];
         if (encMgr == NULL || sessionKey == NULL) {
             canEncrypt = FALSE;
         }
+    }
+
+    if (!canEncrypt) {
+        ShadowStrikeReleaseClientPort(clientRef);
+        return;
     }
 
     while (totalDrained < 512) {
@@ -1099,7 +1359,9 @@ ShadowStrikeDrainMessageQueue(
 #define SHADOWSTRIKE_KEX_POOL_TAG  'xeCS'
 
 typedef struct _SHADOWSTRIKE_KEX_DELIVERY_CONTEXT {
-    PFLT_PORT                              ClientPort;
+    PSHADOWSTRIKE_CLIENT_PORT_REF          HeldClientRef;
+    PFLT_PORT                              ExpectedClientPort;
+    ULONG_PTR                              ConnectionGeneration;
     LONG                                   SlotIndex;
     SHADOWSTRIKE_KEY_EXCHANGE_MESSAGE      KexMessage;
 } SHADOWSTRIKE_KEX_DELIVERY_CONTEXT, *PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT;
@@ -1112,10 +1374,14 @@ ShadowStrikeDeliverKexWorker(
     _In_opt_ PVOID Context
     )
 {
-    PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT ctx = (PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT)Context;
+    PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT ctx =
+        (PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT)Context;
     PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_PORT_DISCONNECTED;
     LARGE_INTEGER timeout;
+    PFLT_PORT sendPort = NULL;
+    BOOLEAN slotUsable = FALSE;
+    BOOLEAN drainQueuedMessages = FALSE;
 
     PAGED_CODE();
     UNREFERENCED_PARAMETER(FltObject);
@@ -1126,85 +1392,123 @@ ShadowStrikeDeliverKexWorker(
     }
 
     //
-    // Acquire a slot reference so the port can't be reclaimed underneath us.
-    // If the user-mode peer disconnected between ConnectNotify returning and
-    // this work item running, the slot will already be marked Disconnecting
-    // and the acquire will fail — drop the kex silently in that case.
+    // ConnectNotify reserved this exact reference before queue publication.
+    // Consume it directly: acquiring by slot here would leave a publication
+    // window in which a delayed worker could bind to a later slot occupant.
     //
-    status = ShadowStrikeAcquireClientPortBySlot(ctx->SlotIndex, &clientRef);
-    if (!NT_SUCCESS(status) || clientRef == NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Kex delivery: slot %ld no longer connectable (0x%08X)\n",
-                   ctx->SlotIndex, status);
+    clientRef = ctx->HeldClientRef;
+    if (clientRef == NULL ||
+        ctx->SlotIndex < 0 ||
+        ctx->SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
         goto Cleanup;
     }
 
-    //
-    // Confirm the slot still owns the same port. If the slot was reused for
-    // a different peer between queue and dispatch, do not send the kex to
-    // the new peer — its DH share is different.
-    //
-    if (clientRef->ClientPort != ctx->ClientPort) {
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+    slotUsable = (BOOLEAN)(
+        clientRef == &g_ClientPortRefs[ctx->SlotIndex] &&
+        clientRef->ConnectionGeneration == ctx->ConnectionGeneration &&
+        clientRef->ClientPort == ctx->ExpectedClientPort &&
+        clientRef->FinalizationExpectedPort == ctx->ExpectedClientPort &&
+        clientRef->Disconnecting == 0 &&
+        clientRef->ReferenceCount > 0
+        );
+    ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    if (!slotUsable) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Kex delivery: slot %ld port reused, skipping stale send\n",
+                   "[ShadowStrike] Kex delivery: slot %ld identity is no longer usable\n",
                    ctx->SlotIndex);
-        ShadowStrikeReleaseClientPort(clientRef);
         goto Cleanup;
     }
 
     //
-    // 30-second timeout: by the time we run, user-mode's
-    // FilterConnectCommunicationPort has already returned and its receive
-    // worker is parked in FilterGetMessage. The kex must be the first
-    // message it sees — its IPC layer waits on this before unblocking the
-    // service start-up.
+    // By dispatch time FilterConnectCommunicationPort has returned and the
+    // peer can service FilterGetMessage. The held reference prevents canonical
+    // port finalization for the entire send and any generation-bound drain.
     //
     timeout.QuadPart = -300000000LL;
+    sendPort = ctx->ExpectedClientPort;
 
     status = FltSendMessage(
         g_DriverData.FilterHandle,
-        &ctx->ClientPort,
+        &sendPort,
         &ctx->KexMessage,
         sizeof(ctx->KexMessage),
-        NULL, NULL,
+        NULL,
+        NULL,
         &timeout
-    );
+        );
 
     if (NT_SUCCESS(status)) {
+        BOOLEAN becameReady = FALSE;
+
         //
-        // Publish the "encryption is live" flag so subsequent send paths
-        // (which gate on EncryptionEstablished) will start using it.
+        // Pair readiness publication with this exact active generation while
+        // holding the shared lock. BeginClientDisconnect requires the lock
+        // exclusive, so either readiness wins and finalization later balances
+        // it, or disconnect wins and this stale completion publishes nothing.
         //
-        clientRef->EncryptionEstablished = TRUE;
-        if (clientRef->IsPrimaryScanner) {
-            //
-            // Publish primary-scanner readiness for the lock-free scan-path
-            // gate (ShadowStrikeIsPrimaryScannerConnected). This increment is
-            // performed while we still hold our slot reference (released just
-            // below), which guarantees it happens-before any disconnect
-            // finalize (which can only run once the reference count reaches 0),
-            // so the matching decrement in ShadowStrikeFinalizeClientDisconnect
-            // can never be lost or run first.
-            //
-            InterlockedIncrement(&g_DriverData.PrimaryScannersReady);
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+        if (clientRef == &g_ClientPortRefs[ctx->SlotIndex] &&
+            clientRef->ConnectionGeneration == ctx->ConnectionGeneration &&
+            clientRef->ClientPort == ctx->ExpectedClientPort &&
+            clientRef->Disconnecting == 0 &&
+            (!clientRef->IsPrimaryScanner ||
+             (InterlockedCompareExchange(
+                  &clientRef->ScannerPublicationsActive, 0, 0) != 0 &&
+              (HANDLE)InterlockedCompareExchangePointer(
+                  &g_AcceptedPrimaryScannerProcessIds[ctx->SlotIndex],
+                  NULL,
+                  NULL) == clientRef->ClientProcessId))) {
+            becameReady = (BOOLEAN)(InterlockedCompareExchange(
+                &clientRef->EncryptionEstablished, 1, 0) == 0);
+            if (becameReady && clientRef->IsPrimaryScanner) {
+                InterlockedIncrement(&g_DriverData.PrimaryScannersReady);
+                drainQueuedMessages = TRUE;
+            }
         }
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "[ShadowStrike] Kex delivered for slot %ld\n", ctx->SlotIndex);
-        ShadowStrikeReleaseClientPort(clientRef);
+        ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+        KeLeaveCriticalRegion();
+
+        if (becameReady) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "[ShadowStrike] Kex delivered for slot %ld\n",
+                       ctx->SlotIndex);
+        }
+
+        //
+        // Keep the transferred KEX reference across the drain. The drain's own
+        // acquisition additionally checks the KEX generation.
+        //
+        if (drainQueuedMessages) {
+            ShadowStrikeDrainMessageQueue(
+                ctx->SlotIndex,
+                ctx->ConnectionGeneration
+                );
+        }
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Kex delivery failed on slot %ld: 0x%08X — closing port\n",
-                   ctx->SlotIndex, status);
-        //
-        // Release our reference first, then close the port. FltCloseClientPort
-        // triggers DisconnectNotify which acquires the lock exclusive; we must
-        // not be holding any slot reference when it runs.
-        //
-        ShadowStrikeReleaseClientPort(clientRef);
-        FltCloseClientPort(g_DriverData.FilterHandle, &ctx->ClientPort);
+                   "[ShadowStrike] Kex delivery failed on slot %ld: 0x%08X — disconnecting\n",
+                   ctx->SlotIndex,
+                   status);
+
+        (void)ShadowStrikeBeginClientDisconnect(
+            ctx->SlotIndex,
+            ctx->ConnectionGeneration,
+            ctx->ExpectedClientPort
+            );
     }
 
 Cleanup:
+    if (clientRef != NULL) {
+        // Consume exactly the reference transferred to this context.
+        ShadowStrikeReleaseClientPort(clientRef);
+        ctx->HeldClientRef = NULL;
+    }
+
     RtlSecureZeroMemory(&ctx->KexMessage, sizeof(ctx->KexMessage));
     ExFreePoolWithTag(ctx, SHADOWSTRIKE_KEX_POOL_TAG);
     FltFreeGenericWorkItem(FltWorkItem);
@@ -1227,8 +1531,10 @@ ShadowStrikeConnectNotify(
     ULONG capabilities = 0;
     UCHAR imageHash[32] = {0};
     UINT32 connectionType = 0;
+    ULONG_PTR connectionGeneration = 0;
     PSHADOWSTRIKE_KEX_DELIVERY_CONTEXT kexCtx = NULL;
     PFLT_GENERIC_WORKITEM kexWorkItem = NULL;
+    PFLT_GENERIC_WORKITEM finalizationWorkItem = NULL;
 
     PAGED_CODE();
 
@@ -1302,16 +1608,6 @@ ShadowStrikeConnectNotify(
         connectionType = ctxConnectionType;
         if (connectionType == 1) {
             isPrimaryScanner = TRUE;
-
-            //
-            // Record the scanner service PID so the file callbacks never issue a
-            // synchronous user-mode scan for the scanner's OWN file I/O (which
-            // would recurse into PreCreate -> SbSendScanRequest, exhaust the
-            // scanner worker pool, and deadlock all system file I/O). Set here at
-            // connect, before the encrypted channel can carry scan traffic, so
-            // there is no race with the scan flood that starts once it is live.
-            //
-            InterlockedExchange(&g_ScannerServiceProcessId, HandleToLong(clientProcessId));
         }
 
         //
@@ -1361,7 +1657,13 @@ ShadowStrikeConnectNotify(
     //
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
         if (g_ClientPortRefs[i].ClientPort == NULL &&
-            g_ClientPortRefs[i].Disconnecting == 0) {
+            g_ClientPortRefs[i].FinalizationExpectedPort == NULL &&
+            g_ClientPortRefs[i].FinalizationWorkItem == NULL &&
+            g_ClientPortRefs[i].Disconnecting == 0 &&
+            g_ClientPortRefs[i].FinalizationState ==
+                ShadowStrikeClientFinalizationIdle &&
+            KeReadStateEvent(
+                &g_ClientFinalizationCompleteEvents[i]) != 0) {
             slotIndex = i;
             break;
         }
@@ -1377,16 +1679,30 @@ ShadowStrikeConnectNotify(
     }
 
     //
-    // Initialize client slot with reference count of 1 (for the connection itself)
+    // Initialize the slot with its next nonzero generation. Generation survives
+    // later slot resets, so a delayed callback cookie can never authorize the
+    // next occupant of this index. ReferenceCount=1 is the connection baseline.
     //
-    RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
+    connectionGeneration = ShadowStrikeNextConnectionGeneration(
+        g_ClientPortRefs[slotIndex].ConnectionGeneration
+        );
+    RtlZeroMemory(
+        &g_ClientPortRefs[slotIndex],
+        sizeof(SHADOWSTRIKE_CLIENT_PORT_REF)
+        );
     g_ClientSessionEncKeys[slotIndex] = NULL;
+    InterlockedExchangePointer(
+        &g_AcceptedPrimaryScannerProcessIds[slotIndex], NULL);
     g_ClientPortRefs[slotIndex].ClientPort = ClientPort;
+    g_ClientPortRefs[slotIndex].FinalizationExpectedPort = ClientPort;
     g_ClientPortRefs[slotIndex].ClientProcessId = clientProcessId;
     g_ClientPortRefs[slotIndex].IsPrimaryScanner = isPrimaryScanner;
     g_ClientPortRefs[slotIndex].Capabilities = capabilities;
-    g_ClientPortRefs[slotIndex].ReferenceCount = 1;  // Initial reference for connection
+    g_ClientPortRefs[slotIndex].ReferenceCount = 1;
     g_ClientPortRefs[slotIndex].Disconnecting = 0;
+    g_ClientPortRefs[slotIndex].ConnectionGeneration = connectionGeneration;
+    g_ClientPortRefs[slotIndex].FinalizationState =
+        ShadowStrikeClientFinalizationIdle;
     g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
     RtlCopyMemory(g_ClientPortRefs[slotIndex].ImagePathHash, imageHash, sizeof(imageHash));
     KeQuerySystemTime(&g_ClientPortRefs[slotIndex].ConnectedTime);
@@ -1639,13 +1955,13 @@ ShadowStrikeConnectNotify(
                 if (g_ClientSessionEncKeys[slotIndex] != NULL) {
                     ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
                 }
-                g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+                InterlockedExchange(
+                    &g_ClientPortRefs[slotIndex].EncryptionEstablished, 0);
                 RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
                                     sizeof(g_ClientPortRefs[slotIndex].SessionKey));
                 RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
                                     sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
-                RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
-                g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
+                ShadowStrikeResetClientSlotPreservingGeneration(slotIndex);
 
                 ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
                 KeLeaveCriticalRegion();
@@ -1666,37 +1982,51 @@ ShadowStrikeConnectNotify(
 
             if (kexCtx != NULL) {
                 kexWorkItem = FltAllocateGenericWorkItem();
-                if (kexWorkItem == NULL) {
+                finalizationWorkItem = FltAllocateGenericWorkItem();
+            }
+
+            if (kexCtx == NULL ||
+                kexWorkItem == NULL ||
+                finalizationWorkItem == NULL) {
+                if (finalizationWorkItem != NULL) {
+                    FltFreeGenericWorkItem(finalizationWorkItem);
+                    finalizationWorkItem = NULL;
+                }
+                if (kexWorkItem != NULL) {
+                    FltFreeGenericWorkItem(kexWorkItem);
+                    kexWorkItem = NULL;
+                }
+                if (kexCtx != NULL) {
                     ExFreePoolWithTag(kexCtx, SHADOWSTRIKE_KEX_POOL_TAG);
                     kexCtx = NULL;
                 }
-            }
 
-            if (kexCtx == NULL || kexWorkItem == NULL) {
                 RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
                 RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
                 RtlSecureZeroMemory(ikm, sizeof(ikm));
                 if (g_ClientSessionEncKeys[slotIndex] != NULL) {
                     ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
                 }
-                g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+                InterlockedExchange(
+                    &g_ClientPortRefs[slotIndex].EncryptionEstablished, 0);
                 RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
                                     sizeof(g_ClientPortRefs[slotIndex].SessionKey));
                 RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
                                     sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
-                RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
-                g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
+                ShadowStrikeResetClientSlotPreservingGeneration(slotIndex);
 
                 ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
                 KeLeaveCriticalRegion();
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "[ShadowStrike] Kex work-item allocation failed for slot %ld\n",
+                           "[ShadowStrike] Connection work-item allocation failed for slot %ld\n",
                            slotIndex);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
-            kexCtx->ClientPort = ClientPort;
-            kexCtx->SlotIndex  = slotIndex;
+            kexCtx->HeldClientRef = &g_ClientPortRefs[slotIndex];
+            kexCtx->ExpectedClientPort = ClientPort;
+            kexCtx->ConnectionGeneration = connectionGeneration;
+            kexCtx->SlotIndex = slotIndex;
             RtlCopyMemory(&kexCtx->KexMessage, &kexMsg, sizeof(kexMsg));
             RtlSecureZeroMemory(&kexMsg, sizeof(kexMsg));
 
@@ -1705,7 +2035,8 @@ ShadowStrikeConnectNotify(
             // the kex was delivered. Other kernel→user send paths gate on
             // this flag and will either queue or refuse to send unencrypted.
             //
-            g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+            InterlockedExchange(
+                &g_ClientPortRefs[slotIndex].EncryptionEstablished, 0);
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                        "[ShadowStrike] Per-session encryption key derived for slot %ld (kex delivery deferred)\n",
@@ -1716,7 +2047,8 @@ ShadowStrikeConnectNotify(
             // An enterprise security product must not operate with degraded
             // encryption. If key derivation fails, the session is unsafe.
             //
-            g_ClientPortRefs[slotIndex].EncryptionEstablished = FALSE;
+            InterlockedExchange(
+                &g_ClientPortRefs[slotIndex].EncryptionEstablished, 0);
             if (g_ClientSessionEncKeys[slotIndex] != NULL) {
                 ShadowStrikeReleaseSessionCryptoKey(&g_ClientSessionEncKeys[slotIndex]);
             }
@@ -1744,8 +2076,7 @@ ShadowStrikeConnectNotify(
                                 sizeof(g_ClientPortRefs[slotIndex].SessionKey));
             RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
                                 sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
-            RtlZeroMemory(&g_ClientPortRefs[slotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
-            g_ClientPortRefs[slotIndex].SlotIndex = slotIndex;
+            ShadowStrikeResetClientSlotPreservingGeneration(slotIndex);
             RtlSecureZeroMemory(hkdfSalt, sizeof(hkdfSalt));
             RtlSecureZeroMemory(ikm, sizeof(ikm));
 
@@ -1758,135 +2089,563 @@ ShadowStrikeConnectNotify(
     }
 
     //
-    // Update global connected count
+    // Publish all resources needed after acceptance while the slot lock remains
+    // exclusive. In particular, reserve the KEX reference BEFORE queueing: a
+    // successfully queued worker owns that reference and never reacquires by
+    // slot. Queue success, connected-count update, and scanner identity
+    // publication are therefore one ordered transition.
     //
+    // From this point, every failure path must restore the completion event.
+    // Clear it before publishing either queued owner while the slot lock is
+    // exclusive, so shutdown cannot mistake this accepted generation for a
+    // previously completed one.
+    //
+    KeClearEvent(&g_ClientFinalizationCompleteEvents[slotIndex]);
+    g_ClientPortRefs[slotIndex].FinalizationWorkItem =
+        finalizationWorkItem;
+    g_ClientPortRefs[slotIndex].FinalizationExpectedPort = ClientPort;
+
+    {
+        LONG heldReferenceCount = InterlockedIncrement(
+            &g_ClientPortRefs[slotIndex].ReferenceCount
+            );
+        NT_ASSERT(heldReferenceCount == 2);
+        UNREFERENCED_PARAMETER(heldReferenceCount);
+    }
+
+    status = FltQueueGenericWorkItem(
+        kexWorkItem,
+        g_DriverData.FilterHandle,
+        ShadowStrikeDeliverKexWorker,
+        DelayedWorkQueue,
+        kexCtx
+        );
+
+    if (!NT_SUCCESS(status)) {
+        LONG remainingReferences;
+
+        // Queue publication failed, so ownership never left ConnectNotify.
+        kexCtx->HeldClientRef = NULL;
+        remainingReferences = InterlockedDecrement(
+            &g_ClientPortRefs[slotIndex].ReferenceCount
+            );
+        NT_ASSERT(remainingReferences == 1);
+
+        RtlSecureZeroMemory(&kexCtx->KexMessage, sizeof(kexCtx->KexMessage));
+        ExFreePoolWithTag(kexCtx, SHADOWSTRIKE_KEX_POOL_TAG);
+        FltFreeGenericWorkItem(kexWorkItem);
+
+        g_ClientPortRefs[slotIndex].FinalizationWorkItem = NULL;
+        FltFreeGenericWorkItem(finalizationWorkItem);
+
+        if (g_ClientSessionEncKeys[slotIndex] != NULL) {
+            ShadowStrikeReleaseSessionCryptoKey(
+                &g_ClientSessionEncKeys[slotIndex]);
+        }
+        RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionKey,
+                            sizeof(g_ClientPortRefs[slotIndex].SessionKey));
+        RtlSecureZeroMemory(g_ClientPortRefs[slotIndex].SessionNoncePrefix,
+                            sizeof(g_ClientPortRefs[slotIndex].SessionNoncePrefix));
+        ShadowStrikeResetClientSlotPreservingGeneration(slotIndex);
+        KeSetEvent(
+            &g_ClientFinalizationCompleteEvents[slotIndex],
+            IO_NO_INCREMENT,
+            FALSE
+            );
+
+        ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+        KeLeaveCriticalRegion();
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Kex work-item queue failed for slot %ld: 0x%08X\n",
+                   slotIndex, status);
+        return status;
+    }
+
+    // KEX allocations moved to the worker; finalization item moved to the slot.
+    kexCtx = NULL;
+    kexWorkItem = NULL;
+    finalizationWorkItem = NULL;
+
+    InterlockedExchange(
+        &g_ClientPortRefs[slotIndex].ConnectionCounted, 1);
     g_DriverData.ConnectedClients++;
+    if (isPrimaryScanner) {
+        // Publication remains strictly after successful KEX queueing. The
+        // ownership flag lets the disconnect winner retire PID/readiness once.
+        InterlockedExchange(
+            &g_ClientPortRefs[slotIndex].ScannerPublicationsActive, 1);
+        InterlockedExchangePointer(
+            &g_AcceptedPrimaryScannerProcessIds[slotIndex],
+            clientProcessId);
+    }
 
     ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Queue deferred kex delivery NOW that the lock is released and the slot
-    // is published. The work item runs at PASSIVE_LEVEL on an FltMgr worker
-    // thread, calls FltSendMessage with a generous timeout, and on success
-    // flips EncryptionEstablished=TRUE for the slot. On failure it closes
-    // the client port, which surfaces a normal disconnect to user-mode.
-    //
-    // kexCtx / kexWorkItem are only non-NULL when key derivation succeeded
-    // (i.e. SizeOfContext indicated a kex-capable client). For clients that
-    // skip key derivation entirely, no kex is required.
-    //
-    if (kexCtx != NULL && kexWorkItem != NULL) {
-        FltQueueGenericWorkItem(
-            kexWorkItem,
-            g_DriverData.FilterHandle,
-            ShadowStrikeDeliverKexWorker,
-            DelayedWorkQueue,
-            kexCtx
+    *ConnectionPortCookie = ShadowStrikeEncodeConnectionCookie(
+        slotIndex,
+        connectionGeneration
         );
-    }
-
-    //
-    // Return slot index as cookie (add 1 to avoid NULL)
-    //
-    *ConnectionPortCookie = (PVOID)(ULONG_PTR)(slotIndex + 1);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Client connected: slot=%ld, primary=%d, caps=0x%08X, total=%ld\n",
                slotIndex, isPrimaryScanner, capabilities, g_DriverData.ConnectedClients);
 
-    //
-    // Drain any messages queued while no client was connected.
-    // Must happen AFTER the slot is published so concurrent senders
-    // can also reach the new port.
-    //
-    ShadowStrikeDrainMessageQueue(slotIndex);
-
-    return status;
+    return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
-ShadowStrikeFinalizeClientDisconnect(
-    _In_ LONG SlotIndex
+ShadowStrikeRequestClientFinalization(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT_REF ClientRef
     )
 {
-    PENC_KEY sessionKey = NULL;
+    KIRQL currentIrql;
+    LONG slotIndex;
+    ULONG_PTR connectionGeneration = 0;
+    PFLT_PORT expectedClientPort = NULL;
+    PFLT_GENERIC_WORKITEM finalizationWorkItem = NULL;
+    BOOLEAN claimed = FALSE;
 
-    if (SlotIndex < 0 || SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
+    if (ClientRef == NULL) {
+        return;
+    }
+
+    currentIrql = KeGetCurrentIrql();
+    NT_ASSERT(currentIrql <= APC_LEVEL);
+    if (currentIrql > APC_LEVEL) {
+        return;
+    }
+
+    slotIndex = ClientRef->SlotIndex;
+    if (slotIndex < 0 || slotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
         return;
     }
 
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+    ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
 
-    if (g_ClientPortRefs[SlotIndex].Disconnecting == 0 ||
-        g_ClientPortRefs[SlotIndex].ReferenceCount != 0 ||
-        g_ClientPortRefs[SlotIndex].ClientPort == NULL) {
-        ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
-        KeLeaveCriticalRegion();
+    if (ClientRef == &g_ClientPortRefs[slotIndex] &&
+        ClientRef->ClientPort != NULL &&
+        ClientRef->ClientPort == ClientRef->FinalizationExpectedPort &&
+        ClientRef->ConnectionGeneration != 0 &&
+        ClientRef->Disconnecting != 0 &&
+        ClientRef->ReferenceCount == 0 &&
+        ClientRef->FinalizationWorkItem != NULL &&
+        InterlockedCompareExchange(
+            &ClientRef->FinalizationState,
+            ShadowStrikeClientFinalizationClaimed,
+            ShadowStrikeClientFinalizationIdle
+            ) == ShadowStrikeClientFinalizationIdle) {
+        connectionGeneration = ClientRef->ConnectionGeneration;
+        expectedClientPort = ClientRef->FinalizationExpectedPort;
+        finalizationWorkItem = ClientRef->FinalizationWorkItem;
+        claimed = TRUE;
+    }
+
+    ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    if (!claimed) {
         return;
     }
 
-    sessionKey = g_ClientSessionEncKeys[SlotIndex];
-    g_ClientSessionEncKeys[SlotIndex] = NULL;
+    if (currentIrql == PASSIVE_LEVEL) {
+        if (ShadowStrikeFinalizeClientDisconnect(
+                slotIndex,
+                connectionGeneration,
+                expectedClientPort,
+                finalizationWorkItem)) {
+            BOOLEAN completed;
 
-    FltCloseClientPort(
-        g_DriverData.FilterHandle,
-        &g_ClientPortRefs[SlotIndex].ClientPort
-    );
-
-    RtlSecureZeroMemory(
-        g_ClientPortRefs[SlotIndex].SessionKey,
-        sizeof(g_ClientPortRefs[SlotIndex].SessionKey)
-    );
-    RtlSecureZeroMemory(
-        g_ClientPortRefs[SlotIndex].SessionNoncePrefix,
-        sizeof(g_ClientPortRefs[SlotIndex].SessionNoncePrefix)
-    );
-    //
-    // Retire this slot from the primary-scanner readiness count if it was a
-    // KEX-completed primary scanner. Read both flags BEFORE the zeroing below.
-    // This runs under the exclusive ClientPortLock with ReferenceCount == 0,
-    // so it is strictly ordered after the matching increment in the KEX worker
-    // (which held a reference). The pair is therefore always balanced.
-    //
-    if (g_ClientPortRefs[SlotIndex].IsPrimaryScanner &&
-        g_ClientPortRefs[SlotIndex].EncryptionEstablished) {
-        InterlockedDecrement(&g_DriverData.PrimaryScannersReady);
+            FltFreeGenericWorkItem(finalizationWorkItem);
+            completed = ShadowStrikeCompleteClientFinalization(
+                slotIndex,
+                connectionGeneration,
+                expectedClientPort
+                );
+            if (!completed) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike] CRITICAL: synchronous finalization completion mismatch for slot %ld\n",
+                           slotIndex);
+                NT_ASSERT(completed);
+            }
+        } else {
+            // No execution claimed the item; make a later PASSIVE retry legal.
+            (void)InterlockedCompareExchange(
+                &ClientRef->FinalizationState,
+                ShadowStrikeClientFinalizationIdle,
+                ShadowStrikeClientFinalizationClaimed
+                );
+        }
+        return;
     }
 
     //
-    // Clear the scanner-process scan exemption if this primary scanner owned it,
-    // so a later reuse of the same PID by another process is not silently
-    // exempted from on-access scanning. Compare-exchange so we only clear our own
-    // PID (never a newer scanner's).
+    // APC_LEVEL: the item was preallocated before connection acceptance, so
+    // teardown never depends on an elevated-IRQL allocation.
     //
-    if (g_ClientPortRefs[SlotIndex].IsPrimaryScanner) {
-        InterlockedCompareExchange(&g_ScannerServiceProcessId, 0,
-                                   HandleToLong(g_ClientPortRefs[SlotIndex].ClientProcessId));
+    {
+        NTSTATUS queueStatus = FltQueueGenericWorkItem(
+            finalizationWorkItem,
+            g_DriverData.FilterHandle,
+            ShadowStrikeClientFinalizationWorker,
+            DelayedWorkQueue,
+            ClientRef
+            );
+
+        if (!NT_SUCCESS(queueStatus)) {
+            // Queue failure did not publish the item. Retain it in the slot and
+            // reset the claim so CloseCommunicationPort can retry at PASSIVE.
+            (void)InterlockedCompareExchange(
+                &ClientRef->FinalizationState,
+                ShadowStrikeClientFinalizationIdle,
+                ShadowStrikeClientFinalizationClaimed
+                );
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] Finalization queue failed for slot %ld: 0x%08X; PASSIVE retry required\n",
+                       slotIndex,
+                       queueStatus);
+        }
     }
-    g_ClientPortRefs[SlotIndex].EncryptionEstablished = FALSE;
+}
 
-    RtlZeroMemory(&g_ClientPortRefs[SlotIndex], sizeof(SHADOWSTRIKE_CLIENT_PORT_REF));
-    g_ClientPortRefs[SlotIndex].SlotIndex = SlotIndex;
+_Function_class_(FLT_GENERIC_WORKITEM_ROUTINE)
+static VOID FLTAPI
+ShadowStrikeClientFinalizationWorker(
+    _In_ PFLT_GENERIC_WORKITEM FltWorkItem,
+    _In_ PFLT_FILTER FltObject,
+    _In_opt_ PVOID Context
+    )
+{
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef =
+        (PSHADOWSTRIKE_CLIENT_PORT_REF)Context;
+    LONG slotIndex = -1;
+    ULONG_PTR connectionGeneration = 0;
+    PFLT_PORT expectedClientPort = NULL;
+    BOOLEAN itemConsumed = FALSE;
 
-    if (g_DriverData.ConnectedClients > 0) {
-        g_DriverData.ConnectedClients--;
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(FltObject);
+
+    if (clientRef != NULL) {
+        slotIndex = clientRef->SlotIndex;
+        connectionGeneration = clientRef->ConnectionGeneration;
+        expectedClientPort = clientRef->FinalizationExpectedPort;
+
+        itemConsumed = ShadowStrikeFinalizeClientDisconnect(
+            slotIndex,
+            connectionGeneration,
+            expectedClientPort,
+            FltWorkItem
+            );
+    }
+
+    //
+    // A successfully queued callback owns this work item. Finalize transfers
+    // it out of the slot before closing the canonical port. Free it before
+    // signaling completion so shutdown cannot outrun worker ownership cleanup.
+    //
+    if (!itemConsumed) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: queued finalization identity mismatch for slot %ld\n",
+                   slotIndex);
+        NT_ASSERT(itemConsumed);
+    }
+
+    FltFreeGenericWorkItem(FltWorkItem);
+
+    if (itemConsumed &&
+        !ShadowStrikeCompleteClientFinalization(
+            slotIndex,
+            connectionGeneration,
+            expectedClientPort)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: queued finalization completion mismatch for slot %ld\n",
+                   slotIndex);
+        NT_ASSERT(FALSE);
+    }
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+ShadowStrikeFinalizeClientDisconnect(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
+    _In_ PFLT_PORT ExpectedClientPort,
+    _In_ PFLT_GENERIC_WORKITEM FinalizationWorkItem
+    )
+{
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef;
+    PENC_KEY sessionKey = NULL;
+    BOOLEAN ownsFinalization = FALSE;
+    BOOLEAN cleanupPrepared = FALSE;
+
+    PAGED_CODE();
+
+    if (SlotIndex < 0 ||
+        SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS ||
+        ConnectionGeneration == 0 ||
+        ExpectedClientPort == NULL ||
+        FinalizationWorkItem == NULL) {
+        return FALSE;
+    }
+
+    clientRef = &g_ClientPortRefs[SlotIndex];
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+
+    if (clientRef->ConnectionGeneration == ConnectionGeneration &&
+        clientRef->ClientPort == ExpectedClientPort &&
+        clientRef->FinalizationExpectedPort == ExpectedClientPort &&
+        clientRef->Disconnecting != 0 &&
+        clientRef->ReferenceCount == 0 &&
+        clientRef->FinalizationWorkItem == FinalizationWorkItem &&
+        InterlockedCompareExchange(
+            &clientRef->FinalizationState,
+            ShadowStrikeClientFinalizationRunning,
+            ShadowStrikeClientFinalizationClaimed
+            ) == ShadowStrikeClientFinalizationClaimed) {
+        // Transfer the preallocated item to this execution before invoking a
+        // potentially reentrant close. DisconnectNotify will observe Running.
+        clientRef->FinalizationWorkItem = NULL;
+        ownsFinalization = TRUE;
     }
 
     ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
     KeLeaveCriticalRegion();
 
+    if (!ownsFinalization) {
+        return FALSE;
+    }
+
+    //
+    // PASSIVE-only canonical close. No alias is ever passed to
+    // FltCloseClientPort, and no slot lock is held across a callback-capable
+    // Filter Manager operation.
+    //
+    FltCloseClientPort(
+        g_DriverData.FilterHandle,
+        &g_ClientPortRefs[SlotIndex].ClientPort
+        );
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+
+    if (clientRef->ConnectionGeneration == ConnectionGeneration &&
+        clientRef->ClientPort == NULL &&
+        clientRef->FinalizationExpectedPort == ExpectedClientPort &&
+        clientRef->FinalizationState ==
+            ShadowStrikeClientFinalizationRunning &&
+        clientRef->ReferenceCount == 0 &&
+        clientRef->ConnectionCounted == 0 &&
+        clientRef->ScannerPublicationsActive == 0) {
+        sessionKey = g_ClientSessionEncKeys[SlotIndex];
+        g_ClientSessionEncKeys[SlotIndex] = NULL;
+
+        RtlSecureZeroMemory(
+            clientRef->SessionKey,
+            sizeof(clientRef->SessionKey)
+            );
+        RtlSecureZeroMemory(
+            clientRef->SessionNoncePrefix,
+            sizeof(clientRef->SessionNoncePrefix)
+            );
+        InterlockedExchange(&clientRef->EncryptionEstablished, 0);
+        cleanupPrepared = TRUE;
+    }
+
+    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    if (!cleanupPrepared) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: canonical close cleanup invariant failed for slot %ld; slot remains non-reusable\n",
+                   SlotIndex);
+    }
+
     if (sessionKey != NULL) {
+        // EncDestroyKey is reached only here at PASSIVE for accepted sessions.
         ShadowStrikeReleaseSessionCryptoKey(&sessionKey);
     }
 
-    DbgPrintEx(
-        DPFLTR_IHVDRIVER_ID,
-        DPFLTR_INFO_LEVEL,
-        "[ShadowStrike] Client disconnected, remaining=%ld\n",
-        g_DriverData.ConnectedClients
-    );
+    if (cleanupPrepared) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Client slot %ld PASSIVE cleanup complete, remaining=%ld\n",
+                   SlotIndex,
+                   InterlockedCompareExchange(
+                       &g_DriverData.ConnectedClients, 0, 0));
+    }
+
+    // The caller owns/frees FinalizationWorkItem and only then invokes
+    // ShadowStrikeCompleteClientFinalization to reset and signal rundown.
+    return TRUE;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+ShadowStrikeCompleteClientFinalization(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
+    _In_ PFLT_PORT ExpectedClientPort
+    )
+{
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef;
+    BOOLEAN completed = FALSE;
+
+    PAGED_CODE();
+
+    if (SlotIndex < 0 ||
+        SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS ||
+        ConnectionGeneration == 0 ||
+        ExpectedClientPort == NULL) {
+        return FALSE;
+    }
+
+    clientRef = &g_ClientPortRefs[SlotIndex];
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+
+    if (clientRef->ConnectionGeneration == ConnectionGeneration &&
+        clientRef->ClientPort == NULL &&
+        clientRef->FinalizationExpectedPort == ExpectedClientPort &&
+        clientRef->Disconnecting != 0 &&
+        clientRef->ReferenceCount == 0 &&
+        clientRef->FinalizationState ==
+            ShadowStrikeClientFinalizationRunning &&
+        clientRef->FinalizationWorkItem == NULL &&
+        clientRef->ConnectionCounted == 0 &&
+        clientRef->ScannerPublicationsActive == 0 &&
+        g_ClientSessionEncKeys[SlotIndex] == NULL &&
+        InterlockedCompareExchangePointer(
+            &g_AcceptedPrimaryScannerProcessIds[SlotIndex],
+            NULL,
+            NULL) == NULL) {
+        // The caller has already destroyed the key and freed the work item.
+        // Reset and signal while still exclusive so a new connection cannot
+        // clear/reuse this event between those two operations.
+        ShadowStrikeResetClientSlotPreservingGeneration(SlotIndex);
+        KeSetEvent(
+            &g_ClientFinalizationCompleteEvents[SlotIndex],
+            IO_NO_INCREMENT,
+            FALSE
+            );
+        completed = TRUE;
+    }
+
+    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    return completed;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+ShadowStrikeBeginClientDisconnect(
+    _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
+    _In_ PFLT_PORT ExpectedClientPort
+    )
+{
+    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef;
+    LONG remainingReferences = 0;
+    BOOLEAN identityMatched = FALSE;
+    BOOLEAN droppedBaseline = FALSE;
+
+    PAGED_CODE();
+
+    if (SlotIndex < 0 ||
+        SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS ||
+        ConnectionGeneration == 0 ||
+        ExpectedClientPort == NULL) {
+        return FALSE;
+    }
+
+    clientRef = &g_ClientPortRefs[SlotIndex];
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_DriverData.ClientPortLock);
+
+    if (clientRef->ConnectionGeneration == ConnectionGeneration &&
+        clientRef->ClientPort == ExpectedClientPort &&
+        clientRef->FinalizationExpectedPort == ExpectedClientPort) {
+        identityMatched = TRUE;
+
+        if (InterlockedCompareExchange(
+                &clientRef->Disconnecting, 1, 0) == 0) {
+            //
+            // This 0->1 winner owns every accepted-publication retirement as
+            // well as the baseline. KEX readiness publication takes the lock
+            // shared and checks Disconnecting/ScannerPublicationsActive, so it
+            // is ordered wholly before or wholly after this transition.
+            //
+            if (InterlockedExchange(
+                    &clientRef->ScannerPublicationsActive, 0) != 0) {
+                BOOLEAN wasEncryptionEstablished = (BOOLEAN)(
+                    InterlockedExchange(
+                        &clientRef->EncryptionEstablished, 0) != 0);
+
+                if (clientRef->IsPrimaryScanner &&
+                    wasEncryptionEstablished) {
+                    LONG readyCount = InterlockedDecrement(
+                        &g_DriverData.PrimaryScannersReady);
+                    NT_ASSERT(readyCount >= 0);
+                    UNREFERENCED_PARAMETER(readyCount);
+                }
+
+                // Clear only this slot. Same/different-PID overlapping primary
+                // connections keep their independent identity publications.
+                InterlockedExchangePointer(
+                    &g_AcceptedPrimaryScannerProcessIds[SlotIndex],
+                    NULL
+                    );
+            }
+
+            if (InterlockedExchange(
+                    &clientRef->ConnectionCounted, 0) != 0) {
+                NT_ASSERT(g_DriverData.ConnectedClients > 0);
+                if (g_DriverData.ConnectedClients > 0) {
+                    g_DriverData.ConnectedClients--;
+                }
+            }
+
+            remainingReferences = InterlockedDecrement(
+                &clientRef->ReferenceCount);
+            droppedBaseline = TRUE;
+        } else {
+            remainingReferences = InterlockedCompareExchange(
+                &clientRef->ReferenceCount, 0, 0);
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
+
+    if (!identityMatched) {
+        return FALSE;
+    }
+
+    if (remainingReferences < 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] CRITICAL: negative baseline refcount on slot %ld\n",
+                   SlotIndex);
+        NT_ASSERT(remainingReferences >= 0);
+        return TRUE;
+    }
+
+    if (remainingReferences == 0) {
+        ShadowStrikeRequestClientFinalization(clientRef);
+    } else if (droppedBaseline) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Deferring disconnect cleanup for slot %ld until %ld references drain\n",
+                   SlotIndex,
+                   remainingReferences);
+    }
+
+    return TRUE;
 }
 
 VOID
@@ -1895,42 +2654,45 @@ ShadowStrikeDisconnectNotify(
     )
 {
     LONG slotIndex;
-    LONG remainingRefs;
+    ULONG_PTR connectionGeneration;
+    PFLT_PORT expectedClientPort = NULL;
 
     PAGED_CODE();
 
-    if (ConnectionCookie == NULL) {
+    if (!ShadowStrikeDecodeConnectionCookie(
+            ConnectionCookie,
+            &slotIndex,
+            &connectionGeneration)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Invalid disconnect cookie: %p\n",
+                   ConnectionCookie);
         return;
     }
 
-    slotIndex = (LONG)(ULONG_PTR)ConnectionCookie - 1;
+    // Resolve the expected port only if the generation still names this slot.
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
+    if (g_ClientPortRefs[slotIndex].ConnectionGeneration ==
+            connectionGeneration) {
+        expectedClientPort = g_ClientPortRefs[slotIndex].ClientPort;
+    }
+    ExReleasePushLockShared(&g_DriverData.ClientPortLock);
+    KeLeaveCriticalRegion();
 
-    if (slotIndex < 0 || slotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Invalid disconnect cookie: %p\n", ConnectionCookie);
+    if (expectedClientPort == NULL ||
+        !ShadowStrikeBeginClientDisconnect(
+            slotIndex,
+            connectionGeneration,
+            expectedClientPort)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Ignoring stale disconnect callback for slot %ld\n",
+                   slotIndex);
         return;
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Client disconnecting: slot=%ld\n", slotIndex);
-
-    //
-    // Mark as disconnecting - prevents new references from being acquired
-    //
-    InterlockedExchange(&g_ClientPortRefs[slotIndex].Disconnecting, 1);
-
-    //
-    // Decrement the initial connection reference
-    //
-    remainingRefs = InterlockedDecrement(&g_ClientPortRefs[slotIndex].ReferenceCount);
-
-    if (remainingRefs > 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Deferring disconnect cleanup for slot %ld until %ld references drain\n",
-                   slotIndex, remainingRefs);
-    }
-
-    ShadowStrikeFinalizeClientDisconnect(slotIndex);
+               "[ShadowStrike] Client disconnecting: slot=%ld\n",
+               slotIndex);
 }
 
 // ============================================================================
@@ -1957,20 +2719,21 @@ ShadowStrikeMessageNotify(
     PVOID decryptedBuffer = NULL;
     BOOLEAN dispatchBufferTrusted = FALSE;
     LONG slotIndex;
+    ULONG_PTR connectionGeneration;
 
     PAGED_CODE();
 
     *ReturnOutputBufferLength = 0;
 
     //
-    // Validate slot index from cookie
+    // Decode the pointer-width integer cookie. The generation is validated by
+    // the referenced acquire below, preventing a delayed message callback from
+    // binding to a later occupant of the same slot.
     //
-    if (PortCookie == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    slotIndex = (LONG)(ULONG_PTR)PortCookie - 1;
-    if (slotIndex < 0 || slotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
+    if (!ShadowStrikeDecodeConnectionCookie(
+            PortCookie,
+            &slotIndex,
+            &connectionGeneration)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1984,7 +2747,11 @@ ShadowStrikeMessageNotify(
 
     header = &localHeader;
 
-    status = ShadowStrikeAcquireClientPortBySlot(slotIndex, &clientRef);
+    status = ShadowStrikeAcquireClientPortBySlot(
+        slotIndex,
+        connectionGeneration,
+        &clientRef
+        );
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -2108,7 +2875,7 @@ ShadowStrikeMessageNotify(
         localHeader = *decryptedHeader;
         header = &localHeader;
     }
-    else if (clientRef->EncryptionEstablished) {
+    else if (ShadowStrikeIsClientEncryptionEstablished(clientRef)) {
         //
         // Reject plaintext messages when encryption has been established.
         // A legitimate client always encrypts after KEX succeeds.
@@ -2626,7 +3393,13 @@ ShadowStrikeGetPrimaryScannerPort(
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
         if (g_ClientPortRefs[i].ClientPort != NULL &&
             g_ClientPortRefs[i].Disconnecting == 0 &&
-            g_ClientPortRefs[i].IsPrimaryScanner) {
+            g_ClientPortRefs[i].IsPrimaryScanner &&
+            (g_ClientPortRefs[i].Capabilities & ShadowStrikeCapScanFiles) != 0 &&
+            ShadowStrikeIsClientEncryptionEstablished(&g_ClientPortRefs[i]) &&
+            g_ClientSessionEncKeys[i] != NULL &&
+            (HANDLE)InterlockedCompareExchangePointer(
+                &g_AcceptedPrimaryScannerProcessIds[i], NULL, NULL) ==
+                g_ClientPortRefs[i].ClientProcessId) {
             port = g_ClientPortRefs[i].ClientPort;
             break;
         }
@@ -2635,7 +3408,9 @@ ShadowStrikeGetPrimaryScannerPort(
     if (port == NULL) {
         for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
             if (g_ClientPortRefs[i].ClientPort != NULL &&
-                g_ClientPortRefs[i].Disconnecting == 0) {
+                g_ClientPortRefs[i].Disconnecting == 0 &&
+                ShadowStrikeIsClientEncryptionEstablished(&g_ClientPortRefs[i]) &&
+                g_ClientSessionEncKeys[i] != NULL) {
                 port = g_ClientPortRefs[i].ClientPort;
                 break;
             }
@@ -2652,13 +3427,15 @@ ShadowStrikeGetPrimaryScannerPort(
 // MESSAGE SENDING WITH REFERENCE COUNTING
 // ============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS
 ShadowStrikeAcquireClientPortBySlot(
     _In_ LONG SlotIndex,
+    _In_ ULONG_PTR ConnectionGeneration,
     _Out_ PSHADOWSTRIKE_CLIENT_PORT_REF* ClientRef
     )
 {
-    LONG oldRefCount;
+    LONG newReferenceCount;
 
     if (ClientRef == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2666,7 +3443,9 @@ ShadowStrikeAcquireClientPortBySlot(
 
     *ClientRef = NULL;
 
-    if (SlotIndex < 0 || SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS) {
+    if (SlotIndex < 0 ||
+        SlotIndex >= SHADOWSTRIKE_MAX_CONNECTIONS ||
+        ConnectionGeneration == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -2674,16 +3453,23 @@ ShadowStrikeAcquireClientPortBySlot(
     ExAcquirePushLockShared(&g_DriverData.ClientPortLock);
 
     if (g_ClientPortRefs[SlotIndex].ClientPort == NULL ||
-        g_ClientPortRefs[SlotIndex].Disconnecting != 0) {
+        g_ClientPortRefs[SlotIndex].Disconnecting != 0 ||
+        g_ClientPortRefs[SlotIndex].ConnectionGeneration !=
+            ConnectionGeneration) {
         ExReleasePushLockShared(&g_DriverData.ClientPortLock);
         KeLeaveCriticalRegion();
         return SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED;
     }
 
-    oldRefCount = InterlockedIncrement(&g_ClientPortRefs[SlotIndex].ReferenceCount);
-    if (oldRefCount <= 0 ||
-        InterlockedCompareExchange(&g_ClientPortRefs[SlotIndex].Disconnecting, 0, 0) != 0) {
-        InterlockedDecrement(&g_ClientPortRefs[SlotIndex].ReferenceCount);
+    newReferenceCount = InterlockedIncrement(
+        &g_ClientPortRefs[SlotIndex].ReferenceCount);
+    if (newReferenceCount <= 1 ||
+        InterlockedCompareExchange(
+            &g_ClientPortRefs[SlotIndex].Disconnecting, 0, 0) != 0 ||
+        g_ClientPortRefs[SlotIndex].ConnectionGeneration !=
+            ConnectionGeneration) {
+        InterlockedDecrement(
+            &g_ClientPortRefs[SlotIndex].ReferenceCount);
         ExReleasePushLockShared(&g_DriverData.ClientPortLock);
         KeLeaveCriticalRegion();
         return SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED;
@@ -2717,7 +3503,13 @@ ShadowStrikeAcquirePrimaryScannerPort(
     for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
         if (g_ClientPortRefs[i].ClientPort != NULL &&
             g_ClientPortRefs[i].Disconnecting == 0 &&
-            g_ClientPortRefs[i].IsPrimaryScanner) {
+            g_ClientPortRefs[i].IsPrimaryScanner &&
+            (g_ClientPortRefs[i].Capabilities & ShadowStrikeCapScanFiles) != 0 &&
+            ShadowStrikeIsClientEncryptionEstablished(&g_ClientPortRefs[i]) &&
+            g_ClientSessionEncKeys[i] != NULL &&
+            (HANDLE)InterlockedCompareExchangePointer(
+                &g_AcceptedPrimaryScannerProcessIds[i], NULL, NULL) ==
+                g_ClientPortRefs[i].ClientProcessId) {
             targetSlot = i;
             break;
         }
@@ -2738,7 +3530,9 @@ ShadowStrikeAcquirePrimaryScannerPort(
     if (targetSlot < 0 && AllowFallback) {
         for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
             if (g_ClientPortRefs[i].ClientPort != NULL &&
-                g_ClientPortRefs[i].Disconnecting == 0) {
+                g_ClientPortRefs[i].Disconnecting == 0 &&
+                ShadowStrikeIsClientEncryptionEstablished(&g_ClientPortRefs[i]) &&
+                g_ClientSessionEncKeys[i] != NULL) {
                 targetSlot = i;
                 break;
             }
@@ -2778,6 +3572,7 @@ ShadowStrikeAcquirePrimaryScannerPort(
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowStrikeReleaseClientPort(
     _In_ PSHADOWSTRIKE_CLIENT_PORT_REF ClientRef
@@ -2802,7 +3597,7 @@ ShadowStrikeReleaseClientPort(
     }
 
     if (remainingRefs == 0) {
-        ShadowStrikeFinalizeClientDisconnect(slotIndex);
+        ShadowStrikeRequestClientFinalization(ClientRef);
     }
 }
 
@@ -2901,10 +3696,12 @@ ShadowStrikeSendScanRequest(
 
     if (RequestSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
-        if (!clientRef->EncryptionEstablished || encMgr == NULL) {
+        BOOLEAN encryptionReady =
+            ShadowStrikeIsClientEncryptionEstablished(clientRef);
+        if (!encryptionReady || encMgr == NULL) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] Scan request transport unavailable: slot=%ld, encReady=%d\n",
-                       clientRef->SlotIndex, clientRef->EncryptionEstablished);
+                       clientRef->SlotIndex, encryptionReady);
             ShadowStrikeReleaseClientPort(clientRef);
             InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
             SHADOWSTRIKE_INC_STAT(MessagesDropped);
@@ -3269,10 +4066,12 @@ ShadowStrikeSendNotification(
     //
     if (sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
-        if (!clientRef->EncryptionEstablished || encMgr == NULL) {
+        BOOLEAN encryptionReady =
+            ShadowStrikeIsClientEncryptionEstablished(clientRef);
+        if (!encryptionReady || encMgr == NULL) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] Notification transport unavailable: slot=%ld, encReady=%d\n",
-                       clientRef->SlotIndex, clientRef->EncryptionEstablished);
+                       clientRef->SlotIndex, encryptionReady);
             ShadowStrikeReleaseClientPort(clientRef);
             if (usedCompression) {
                 ExFreePoolWithTag(sendBuffer, 'cmCP');
@@ -3536,10 +4335,12 @@ ShadowStrikeSendProcessNotification(
 
     if (Size > 0) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
-        if (!clientRef->EncryptionEstablished || encMgr == NULL) {
+        BOOLEAN encryptionReady =
+            ShadowStrikeIsClientEncryptionEstablished(clientRef);
+        if (!encryptionReady || encMgr == NULL) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] ProcessNotification transport unavailable: slot=%ld, encReady=%d\n",
-                       clientRef->SlotIndex, clientRef->EncryptionEstablished);
+                       clientRef->SlotIndex, encryptionReady);
             ShadowStrikeFreeMessageBuffer(header);
             ShadowStrikeReleaseClientPort(clientRef);
             SHADOWSTRIKE_INC_STAT(MessagesDropped);
@@ -4005,6 +4806,7 @@ ShadowStrikeBuildFileScanRequest(
     ULONG totalSize;
     PWCHAR variableData;
     PEPROCESS process;
+    HANDLE requestorProcessId;
     WCHAR processImagePath[MAX_PROCESS_NAME_LENGTH];
     ULONG processNameLength = 0;
     PUNICODE_STRING processImageName = NULL;
@@ -4015,6 +4817,8 @@ ShadowStrikeBuildFileScanRequest(
     *RequestSize = 0;
 
     UNREFERENCED_PARAMETER(FltObjects);
+
+    requestorProcessId = FltGetRequestorProcessIdEx(Data);
 
     //
     // Get file name
@@ -4039,7 +4843,7 @@ ShadowStrikeBuildFileScanRequest(
     // Get process image name
     //
     RtlZeroMemory(processImagePath, sizeof(processImagePath));
-    process = IoThreadToProcess(Data->Thread);
+    process = FltGetRequestorProcess(Data);
 
     if (process != NULL) {
         status = SeLocateProcessImageName(process, &processImageName);
@@ -4124,8 +4928,9 @@ ShadowStrikeBuildFileScanRequest(
     scanRequest->Disposition = 0;
     scanRequest->Priority = (UINT8)ShadowStrikePriorityNormal;
     scanRequest->RequiresReply = 1;
-    scanRequest->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
-    scanRequest->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
+    scanRequest->ProcessId = HandleToULong(requestorProcessId);
+    scanRequest->ThreadId = (Data->Thread != NULL) ?
+        HandleToULong(PsGetThreadId(Data->Thread)) : 0;
 
     //
     // Get parent process ID

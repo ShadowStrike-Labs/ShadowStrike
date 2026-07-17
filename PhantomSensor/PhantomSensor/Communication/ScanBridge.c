@@ -568,6 +568,7 @@ NTSTATUS
 SbBuildFileScanRequest(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ HANDLE RequestorProcessId,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
     _Outptr_ PSHADOWSTRIKE_MESSAGE_HEADER* Request,
     _Out_ PULONG RequestSize
@@ -578,6 +579,7 @@ SbBuildFileScanRequest(
     return SbBuildFileScanRequestEx(
         Data,
         FltObjects,
+        RequestorProcessId,
         AccessType,
         NULL,  // Default options
         Request,
@@ -591,6 +593,7 @@ NTSTATUS
 SbBuildFileScanRequestEx(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ HANDLE RequestorProcessId,
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
     _In_opt_ PSB_SCAN_OPTIONS Options,
     _Outptr_ PSHADOWSTRIKE_MESSAGE_HEADER* Request,
@@ -602,7 +605,7 @@ SbBuildFileScanRequestEx(
     PFILE_SCAN_REQUEST scanRequest = NULL;
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     UNICODE_STRING processName = { 0 };
-    HANDLE processId;
+    HANDLE processId = RequestorProcessId;
     ULONG totalSize = 0;
     ULONG filePathLen = 0;
     ULONG processNameLen = 0;
@@ -729,18 +732,16 @@ SbBuildFileScanRequestEx(
     }
 
     //
-    // Get process information
+    // Resolve the operation requestor's image on a best-effort basis. A NULL
+    // requestor is an explicit unknown identity, not the current worker's PID.
     //
-    processId = PsGetCurrentProcessId();
-
-    //
-    // Get process name (best effort)
-    //
-    status = ShadowStrikeGetProcessImageName(processId, &processName);
-    if (NT_SUCCESS(status) && processName.Buffer != NULL) {
-        processNameLen = processName.Length;
-        if (processNameLen > SB_MAX_PROCESS_NAME_LENGTH) {
-            processNameLen = SB_MAX_PROCESS_NAME_LENGTH;
+    if (processId != NULL) {
+        status = ShadowStrikeGetProcessImageName(processId, &processName);
+        if (NT_SUCCESS(status) && processName.Buffer != NULL) {
+            processNameLen = processName.Length;
+            if (processNameLen > SB_MAX_PROCESS_NAME_LENGTH) {
+                processNameLen = SB_MAX_PROCESS_NAME_LENGTH;
+            }
         }
     }
 

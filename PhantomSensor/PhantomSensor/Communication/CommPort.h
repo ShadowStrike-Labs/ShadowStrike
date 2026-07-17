@@ -123,11 +123,38 @@ typedef struct _SHADOWSTRIKE_CLIENT_PORT_REF {
     /// Connection timestamp
     LARGE_INTEGER ConnectedTime;
 
-    /// Reference count for safe access (1 = connected, 0 = disconnecting)
+    /// Reference count for safe access. The accepted connection owns one
+    /// baseline reference until BeginClientDisconnect claims it exactly once.
     volatile LONG ReferenceCount;
 
-    /// Client is being disconnected (no new references allowed)
+    /// Client is being disconnected (no new references allowed). The 0->1
+    /// transition is also the exactly-once baseline-reference claim.
     volatile LONG Disconnecting;
+
+    /// Nonzero generation identifying this specific reuse of the slot.
+    /// Preserved when the rest of the slot is reset.
+    ULONG_PTR ConnectionGeneration;
+
+    /// Exactly-once finalization state (idle, claimed/queued, or running).
+    /// A slot is reusable only after its completion event is signaled.
+    volatile LONG FinalizationState;
+
+    /// Owns this accepted connection's contribution to ConnectedClients.
+    /// BeginClientDisconnect retires it exactly once with the baseline.
+    volatile LONG ConnectionCounted;
+
+    /// Owns the per-slot primary-scanner PID publication and any paired KEX
+    /// readiness increment. Retired exactly once by BeginClientDisconnect.
+    volatile LONG ScannerPublicationsActive;
+
+    /// Work item preallocated before the connection is accepted. A final
+    /// release at APC_LEVEL can therefore defer PASSIVE-only teardown without
+    /// depending on a teardown-time allocation.
+    PFLT_GENERIC_WORKITEM FinalizationWorkItem;
+
+    /// Immutable identity check for the canonical ClientPort owner. This is
+    /// never passed to FltCloseClientPort; only &ClientPort is closed.
+    PFLT_PORT FinalizationExpectedPort;
 
     /// Client capabilities/permissions
     ULONG Capabilities;
@@ -156,11 +183,10 @@ typedef struct _SHADOWSTRIKE_CLIENT_PORT_REF {
     /// Monotonic nonce counter for this session (combined with prefix for unique nonces)
     volatile LONG64 NonceCounter;
 
-    /// Whether encryption has been established for this client
-    BOOLEAN EncryptionEstablished;
-
-    /// Reserved for alignment
-    UCHAR Reserved[3];
+    /// Whether encryption has been established for this client.
+    /// Access only through interlocked operations because KEX completion,
+    /// senders, and disconnect finalization execute concurrently.
+    volatile LONG EncryptionEstablished;
 
 } SHADOWSTRIKE_CLIENT_PORT_REF, *PSHADOWSTRIKE_CLIENT_PORT_REF;
 
@@ -457,13 +483,15 @@ ShadowStrikeAcquirePrimaryScannerPort(
 /**
  * @brief Release reference to client port.
  *
- * Decrements reference count. If this is the last reference and
- * client is disconnecting, signals completion.
+ * Decrements reference count. If this is the last reference and the client is
+ * disconnecting, claims PASSIVE teardown synchronously or queues the slot's
+ * preallocated finalization work item when called at APC_LEVEL.
  *
  * @param ClientRef  Client reference to release.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowStrikeReleaseClientPort(
     _In_ PSHADOWSTRIKE_CLIENT_PORT_REF ClientRef
@@ -625,12 +653,14 @@ ShadowStrikeVerifyClient(
 /**
  * @brief Test whether a PID is the connected ShadowStrike scanner service.
  *
- * The file callbacks use this to exempt the scanner's OWN file I/O from
- * synchronous on-access scanning, which would otherwise recurse into the
- * PreCreate -> SbSendScanRequest path and deadlock all system file I/O.
+ * The file callbacks use this to exempt an accepted primary scanner's OWN
+ * file I/O from the synchronous user-mode scan round trip, which would
+ * otherwise recurse into PreCreate -> SbSendScanRequest and exhaust the
+ * scanner worker pool. Multiple overlapping/reconnecting primary slots are
+ * represented independently; PID 0/unknown never matches.
  *
- * @param ProcessId  Process ID to test.
- * @return TRUE if ProcessId is the registered primary scanner service.
+ * @param ProcessId  Process ID to test; NULL means unknown.
+ * @return TRUE if ProcessId belongs to any accepted primary scanner slot.
  *
  * @irql <= DISPATCH_LEVEL
  */
