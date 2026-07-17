@@ -304,15 +304,33 @@ public:
             memConfig.enableCodeIntegrity = true;
             memConfig.enableHeapProtection = true;
             memConfig.enableStackProtection = true;
-            // NOTE: enableAntiDump performs PE header obfuscation (wipes DOS
-            // stub and mutates OptionalHeader) on the running image. This
-            // collides with AntiDebug's code-integrity monitor, which has
-            // already registered the entire image (headers included) as a
-            // CRC-checked region — the mutation trips AntiDebug and
-            // terminates the service before Initialize() can return. Disable
-            // here until AntiDebug gains a header-exclusion token; it is a
-            // defense-in-depth feature, not a core protection.
-            memConfig.enableAntiDump = false;
+            // Anti-dump obfuscates this image's PE headers in-memory at
+            // [ImageBase, SizeOfHeaders): it wipes the DOS stub and zeroes
+            // OptionalHeader.CheckSum/LoaderFlags while PRESERVING e_magic,
+            // e_lfanew and the NT signature (see
+            // MemoryProtectionImpl::obfuscatePEHeadersInternal).
+            //
+            // It was previously disabled because a self-integrity monitor
+            // baselined an image-base-inclusive CRC region that covered those
+            // header bytes, so the mutation tripped a violation and terminated
+            // the service before Initialize() returned. That collision no
+            // longer exists in the current code, verified across all three
+            // self-integrity monitors:
+            //   * AntiDebugImpl::RegisterSelfIntegrity — baselines ONLY
+            //     executable sections at section->VirtualAddress, which begins
+            //     after SizeOfHeaders; headers are not covered.
+            //   * MemoryProtectionImpl::ProtectSelfCode — same: code sections
+            //     at their VirtualAddress only.
+            //   * TamperProtectionImpl::ScanForInlineHooks — only parses the
+            //     (preserved) e_lfanew / export RVAs to walk exports for hook
+            //     detection; it does not CRC the header bytes.
+            // MemoryProtection init failure is already handled non-fatally
+            // below, so anti-dump degrades gracefully if it ever fails.
+            //
+            // INVARIANT: self-integrity registration must remain
+            // per-executable-section (never image-base-inclusive) or this
+            // collision returns. Re-enabled as intended for the Enhanced level.
+            memConfig.enableAntiDump = true;
             if (!Security::MemoryProtection::Instance().Initialize(memConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize MemoryProtection");
                 // Non-fatal: memory protection degrades
