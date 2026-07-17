@@ -2442,6 +2442,36 @@ public:
         // 2. Check Verdict Cache
         std::string hashKey;
 
+        // =====================================================================
+        // CONTENT-AVAILABILITY GATE
+        //
+        // Everything below this point (metamorphic, packer, ExecutableAnalyzer,
+        // ScanEngine + its hash/emulation stages) reads the file's *bytes*. A
+        // path we cannot open carries no content to analyze, so running them
+        // only burns CPU re-failing the open. A single bogus / stale / already-
+        // deleted kernel path was observed driving MetamorphicDetector +
+        // MemoryUtils + ExecutableAnalyzer + ScanEngine to each independently
+        // open-and-fail ("file not found") back to back -- pure waste plus a
+        // flood of ERROR/WARN log lines. Resolve openability ONCE here and skip
+        // content analysis for absent paths / directories.
+        //
+        // This preserves detection: (a) unopenable == unanalyzable -- every
+        // analyzer already failed on it, so nothing is lost; (b) the behavioral
+        // ransomware / script dispatch above (write/create/rename/delete) has
+        // ALREADY run, so file-operation patterns are still scored; and (c) a
+        // later create/write on the path re-triggers a scan with real content.
+        {
+            const DWORD attrs = ::GetFileAttributesW(filePath.c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                // Absent / unresolvable path -- nothing to inspect.
+                return Communication::KernelVerdict::Allow;
+            }
+            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                // Directories have no file content to scan here.
+                return Communication::KernelVerdict::Allow;
+            }
+        }
+
         // Anti-Evasion: Metamorphic Analysis
         if (m_metamorphicDetector) {
             ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
