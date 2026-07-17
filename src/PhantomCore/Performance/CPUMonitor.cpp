@@ -732,6 +732,11 @@ public:
                 SS_LOG_WARN(L"CPUMonitor",
                     L"EDR self-usage excessive: %.2f%% (threshold %.1f%%)",
                     self, cfg.selfUsageAlertThreshold);
+                // Name the hottest OWN threads. The service is a protected
+                // process (PPL) with handle stripping, so nothing outside can
+                // enumerate its threads — this in-process sampler is the only
+                // way to attribute the self-CPU to a subsystem.
+                LogTopSelfThreads();
             }
         }
 
@@ -776,6 +781,121 @@ public:
                         L"Callback id=%u threw unknown exception", entry.id);
                 }
             }
+        }
+    }
+
+    // ====================================================================
+    // SELF-THREAD CPU ATTRIBUTION
+    // ====================================================================
+
+    // Name the OWN threads burning CPU. The service runs as a protected
+    // process (PPL) with handle stripping, so no external profiler can open
+    // its threads or read their Win32 start addresses — a process can always
+    // inspect its own, so this must run in-process. Rate-limited to ~3 s and
+    // only reached once the self-usage alert already tripped, so the Toolhelp
+    // snapshot cost is bounded. Deltas are computed against the previous
+    // sample; the logged start-address RVA (start - exeBase) maps back to a
+    // function offline via the .map / .pdb, which is how an otherwise-silent
+    // hot thread gets identified.
+    void LogTopSelfThreads() {
+        static std::unordered_map<DWORD, uint64_t> s_prev;  // tid -> cumulative 100ns (monitor thread only)
+        static uint64_t s_prevTick = 0;
+
+        const uint64_t nowTick = ::GetTickCount64();
+        if (s_prevTick != 0 && (nowTick - s_prevTick) < 3000) {
+            return;  // rate-limit: at most one attribution dump per ~3s
+        }
+
+        HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return;
+
+        // ThreadQuerySetWin32StartAddress (9) via ntdll — best-effort.
+        using NtQueryInformationThreadFn =
+            LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        static NtQueryInformationThreadFn ntQueryThread =
+            reinterpret_cast<NtQueryInformationThreadFn>(::GetProcAddress(
+                ::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+
+        const DWORD selfPid = ::GetCurrentProcessId();
+        struct Row { DWORD tid; uint64_t cur; uint64_t delta; uintptr_t start; };
+        std::vector<Row> rows;
+
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (::Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID == selfPid) {
+                    HANDLE ht = ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
+                                             FALSE, te.th32ThreadID);
+                    if (ht) {
+                        FILETIME c{}, e{}, k{}, u{};
+                        if (::GetThreadTimes(ht, &c, &e, &k, &u)) {
+                            ULARGE_INTEGER uk{}, uu{};
+                            uk.LowPart = k.dwLowDateTime; uk.HighPart = k.dwHighDateTime;
+                            uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+                            const uint64_t cur = uk.QuadPart + uu.QuadPart;
+                            const auto it = s_prev.find(te.th32ThreadID);
+                            const uint64_t prev = (it != s_prev.end()) ? it->second : 0;
+
+                            uintptr_t startAddr = 0;
+                            if (ntQueryThread) {
+                                PVOID a = nullptr;
+                                if (ntQueryThread(ht, 9, &a, sizeof(a), nullptr) >= 0) {
+                                    startAddr = reinterpret_cast<uintptr_t>(a);
+                                }
+                            }
+                            rows.push_back({ te.th32ThreadID, cur,
+                                             (cur >= prev) ? (cur - prev) : 0, startAddr });
+                        }
+                        ::CloseHandle(ht);
+                    }
+                }
+                te.dwSize = sizeof(te);
+            } while (::Thread32Next(snap, &te));
+        }
+        ::CloseHandle(snap);
+
+        const uint64_t dMs = (s_prevTick != 0 && nowTick > s_prevTick)
+                                 ? (nowTick - s_prevTick) : 0;
+        s_prev.clear();
+        for (const auto& r : rows) s_prev[r.tid] = r.cur;
+        s_prevTick = nowTick;
+
+        if (rows.empty()) return;
+
+        const bool haveDelta = (dMs > 0);
+        std::sort(rows.begin(), rows.end(), [haveDelta](const Row& a, const Row& b) {
+            return haveDelta ? (a.delta > b.delta) : (a.cur > b.cur);
+        });
+
+        SYSTEM_INFO si{};
+        ::GetSystemInfo(&si);
+        const double ncores = si.dwNumberOfProcessors
+                                  ? static_cast<double>(si.dwNumberOfProcessors) : 1.0;
+        const uintptr_t exeBase =
+            reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+
+        SS_LOG_WARN(L"CPUMonitor",
+            L"self-CPU thread attribution (exeBase=0x%llX interval=%llums threads=%zu):",
+            static_cast<unsigned long long>(exeBase),
+            static_cast<unsigned long long>(dMs), rows.size());
+
+        const size_t n = (rows.size() < 10) ? rows.size() : 10;
+        for (size_t i = 0; i < n; ++i) {
+            const Row& r = rows[i];
+            double pct = 0.0;
+            if (haveDelta) {
+                pct = static_cast<double>(r.delta)
+                    / (static_cast<double>(dMs) * 10000.0 * ncores) * 100.0;
+            }
+            const uintptr_t rva = (r.start && exeBase && r.start >= exeBase)
+                                      ? (r.start - exeBase) : 0;
+            SS_LOG_WARN(L"CPUMonitor",
+                L"  tid=%u cpu=%.1f%% cumMs=%llu start=0x%llX rva=0x%llX",
+                r.tid, pct,
+                static_cast<unsigned long long>(r.cur / 10000ull),
+                static_cast<unsigned long long>(r.start),
+                static_cast<unsigned long long>(rva));
         }
     }
 
