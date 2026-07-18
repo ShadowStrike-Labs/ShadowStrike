@@ -825,7 +825,12 @@ public:
         if (::Thread32First(snap, &te)) {
             do {
                 if (te.th32OwnerProcessID == selfPid) {
-                    HANDLE ht = ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
+                    // THREAD_QUERY_INFORMATION (not _LIMITED_): the Win32
+                    // start-address query below is denied under the limited
+                    // right, which is why the first cut logged start=0x0. A
+                    // process always has this access to its own threads, PPL
+                    // included.
+                    HANDLE ht = ::OpenThread(THREAD_QUERY_INFORMATION,
                                              FALSE, te.th32ThreadID);
                     if (ht) {
                         FILETIME c{}, e{}, k{}, u{};
@@ -888,14 +893,34 @@ public:
                 pct = static_cast<double>(r.delta)
                     / (static_cast<double>(dMs) * 10000.0 * ncores) * 100.0;
             }
-            const uintptr_t rva = (r.start && exeBase && r.start >= exeBase)
-                                      ? (r.start - exeBase) : 0;
+
+            // Resolve the start address to its owning module + offset. That
+            // names the code a silent hot thread runs (the service exe,
+            // onnxruntime.dll, an emulator module, ...); the offset maps to the
+            // exact function offline via the .map / .pdb.
+            wchar_t modName[MAX_PATH];
+            const wchar_t* modDisp = L"<unresolved>";
+            unsigned long long modOff = 0;
+            if (r.start) {
+                HMODULE hm = nullptr;
+                if (::GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(r.start), &hm) && hm) {
+                    if (::GetModuleBaseNameW(::GetCurrentProcess(), hm,
+                                             modName, MAX_PATH) > 0) {
+                        modDisp = modName;
+                        modOff = static_cast<unsigned long long>(
+                            r.start - reinterpret_cast<uintptr_t>(hm));
+                    }
+                }
+            }
             SS_LOG_WARN(L"CPUMonitor",
-                L"  tid=%u cpu=%.1f%% cumMs=%llu start=0x%llX rva=0x%llX",
+                L"  tid=%u cpu=%.1f%% cumMs=%llu %s+0x%llX (start=0x%llX)",
                 r.tid, pct,
                 static_cast<unsigned long long>(r.cur / 10000ull),
-                static_cast<unsigned long long>(r.start),
-                static_cast<unsigned long long>(rva));
+                modDisp, modOff,
+                static_cast<unsigned long long>(r.start));
         }
     }
 
