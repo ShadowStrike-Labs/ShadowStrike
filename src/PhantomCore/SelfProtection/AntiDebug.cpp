@@ -3663,11 +3663,35 @@ bool AntiDebugImpl::ExecuteResponse(ResponseAction action, const DetectionResult
         executed = true;
     }
 
-    // Block the attacker. Only meaningful when something is actually attached
-    // to US (result.debuggerDetected via a process-attachment technique); the
-    // caller gates this action, and we additionally require a known attacker
-    // PID so a heuristic timing hit can never get an innocent process blocked.
+    // Block the attacker.
+    //
+    // Two independent conditions must BOTH hold, because getting this wrong
+    // means blocking an innocent process:
+    //   1. A debugger is attached to THIS process right now (ProcessDebugPort
+    //      is non-zero). A debugger merely running on the machine — a developer
+    //      or administrator at work — never satisfies this.
+    //   2. We know which PID it is.
+    // A heuristic timing or PEB hit alone therefore cannot get anything blocked.
     if ((static_cast<uint32_t>(action) & static_cast<uint32_t>(ResponseAction::BlockAttacker)) != 0) {
+        bool attachedToUs = false;
+#ifdef _WIN32
+        if (m_pNtQueryInformationProcess) {
+            DWORD_PTR debugPort = 0;
+            if (NT_SUCCESS(m_pNtQueryInformationProcess(::GetCurrentProcess(),
+                    SsProcessDebugPort, &debugPort, sizeof(debugPort), nullptr))
+                && debugPort != 0) {
+                attachedToUs = true;
+            }
+            if (!attachedToUs) {
+                HANDLE dbgObject = nullptr;
+                if (NT_SUCCESS(m_pNtQueryInformationProcess(::GetCurrentProcess(),
+                        SsProcessDebugObjectHandle, &dbgObject, sizeof(dbgObject), nullptr))
+                    && dbgObject != nullptr) {
+                    attachedToUs = true;
+                }
+            }
+        }
+#endif
         uint32_t attackerPid = 0;
         {
             std::shared_lock lock(m_mutex);
@@ -3675,13 +3699,18 @@ bool AntiDebugImpl::ExecuteResponse(ResponseAction action, const DetectionResult
                 attackerPid = m_detectedDebuggers.back().processId;
             }
         }
-        if (attackerPid != 0 && attackerPid != GetCurrentProcessIdSafe()) {
+
+        if (attachedToUs && attackerPid != 0 &&
+            attackerPid != GetCurrentProcessIdSafe()) {
             SS_LOG_WARN(L"AntiDebug",
-                L"Requesting kernel block of PID %u: debugger attached to this service",
+                L"Debugger attached to this service - requesting kernel block of PID %u",
                 attackerPid);
             (void)RequestKernelProcessBlock(attackerPid,
                 "Debugger attached to ShadowStrike service (tamper attempt)");
             executed = true;
+        } else if (!attachedToUs) {
+            SS_LOG_DEBUG(L"AntiDebug",
+                L"BlockAttacker skipped: no debugger is attached to this process");
         }
     }
 
@@ -4173,7 +4202,8 @@ void AntiDebugImpl::ApplyProtectionLevel(AntiDebugProtectionLevel level) {
                                          DetectionTechnique::All_API |
                                          DetectionTechnique::All_Hardware |
                                          DetectionTechnique::All_Process;
-            m_config.responseActions = ResponseAction::Moderate;
+            // Matches FromProtectionLevel(): Enhanced enforces.
+            m_config.responseActions = ResponseAction::Enforcing;
             break;
 
         case AntiDebugProtectionLevel::Maximum:
@@ -5050,7 +5080,12 @@ AntiDebugConfiguration AntiDebugConfiguration::FromProtectionLevel(AntiDebugProt
                                        DetectionTechnique::All_API |
                                        DetectionTechnique::All_Hardware |
                                        DetectionTechnique::All_Process;
-            config.responseActions = ResponseAction::Moderate;
+            // Enforcing (not Moderate): a debugger attached to the security
+            // service is unambiguous tampering, so the attacking process is
+            // blocked through the kernel sensor rather than merely logged. The
+            // action self-gates on an actual attachment to this process, so a
+            // debugger simply running on the machine is unaffected.
+            config.responseActions = ResponseAction::Enforcing;
             config.monitoringMode = MonitoringMode::Periodic;
             config.enableCodeIntegrity = true;
             config.enableHookDetection = true;
