@@ -3663,6 +3663,28 @@ bool AntiDebugImpl::ExecuteResponse(ResponseAction action, const DetectionResult
         executed = true;
     }
 
+    // Block the attacker. Only meaningful when something is actually attached
+    // to US (result.debuggerDetected via a process-attachment technique); the
+    // caller gates this action, and we additionally require a known attacker
+    // PID so a heuristic timing hit can never get an innocent process blocked.
+    if ((static_cast<uint32_t>(action) & static_cast<uint32_t>(ResponseAction::BlockAttacker)) != 0) {
+        uint32_t attackerPid = 0;
+        {
+            std::shared_lock lock(m_mutex);
+            if (!m_detectedDebuggers.empty()) {
+                attackerPid = m_detectedDebuggers.back().processId;
+            }
+        }
+        if (attackerPid != 0 && attackerPid != GetCurrentProcessIdSafe()) {
+            SS_LOG_WARN(L"AntiDebug",
+                L"Requesting kernel block of PID %u: debugger attached to this service",
+                attackerPid);
+            (void)RequestKernelProcessBlock(attackerPid,
+                "Debugger attached to ShadowStrike service (tamper attempt)");
+            executed = true;
+        }
+    }
+
     if (executed) {
         std::unique_lock lock(m_mutex);
         m_stats.actionsExecuted += 1;
@@ -4101,7 +4123,7 @@ ResponseAction AntiDebugImpl::DetermineRecommendedAction(const DetectionResult& 
     }
 
     if (result.totalScore >= AntiDebugConstants::CRITICAL_SCORE) {
-        return ResponseAction::Aggressive;
+        return ResponseAction::Enforcing;
     } else if (result.totalScore >= AntiDebugConstants::HIGH_CONFIDENCE_SCORE) {
         return ResponseAction::Moderate;
     } else if (result.totalScore >= AntiDebugConstants::MIN_DETECTION_SCORE) {
@@ -4157,7 +4179,7 @@ void AntiDebugImpl::ApplyProtectionLevel(AntiDebugProtectionLevel level) {
         case AntiDebugProtectionLevel::Maximum:
         case AntiDebugProtectionLevel::Paranoid:
             m_config.enabledTechniques = DetectionTechnique::All;
-            m_config.responseActions = ResponseAction::Aggressive;
+            m_config.responseActions = ResponseAction::Enforcing;
             break;
     }
 }
@@ -4822,16 +4844,13 @@ void AntiDebugImpl::OnKernelProcessNotify(uint32_t processId, uint32_t parentPro
     detResult.scanTimestamp = Clock::now();
     ReportDetectionToAlertSystem(detResult);
 
-    // Request kernel to block if response actions include termination
-    ResponseAction configured;
-    {
-        std::shared_lock lock(m_mutex);
-        configured = m_config.responseActions;
-    }
-    if ((static_cast<uint32_t>(configured) &
-         static_cast<uint32_t>(ResponseAction::SuspendDebugger)) != 0) {
-        (void)RequestKernelProcessBlock(processId, "Known debugger process detected via kernel notify");
-    }
+    // A debugger merely EXISTING on this machine is not an attack on the
+    // service: developers, IT administrators and crash-dump collectors all run
+    // debuggers legitimately, and blocking them would break the endpoint. This
+    // path therefore records and reports only. Kernel-assisted blocking
+    // (ResponseAction::BlockAttacker) is reserved for the case that actually
+    // constitutes tampering — a debugger attached to THIS process — which is
+    // handled where that attachment is detected.
 }
 
 void AntiDebugImpl::OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
@@ -5040,7 +5059,7 @@ AntiDebugConfiguration AntiDebugConfiguration::FromProtectionLevel(AntiDebugProt
         case AntiDebugProtectionLevel::Maximum:
         case AntiDebugProtectionLevel::Paranoid:
             config.enabledTechniques = DetectionTechnique::All;
-            config.responseActions = ResponseAction::Aggressive;
+            config.responseActions = ResponseAction::Enforcing;
             config.monitoringMode = MonitoringMode::Continuous;
             config.enableCodeIntegrity = true;
             config.enableHookDetection = true;

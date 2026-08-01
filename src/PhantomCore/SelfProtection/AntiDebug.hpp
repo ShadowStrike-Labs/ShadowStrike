@@ -21,13 +21,37 @@
  * ============================================================================
  *
  * @file AntiDebug.hpp
- * @brief Enterprise-grade anti-debugging and anti-reverse-engineering protection
- *        for ShadowStrike antivirus self-defense mechanisms.
+ * @brief Runtime anti-tamper protection for the ShadowStrike engine: detects
+ *        and responds to debuggers, instrumentation and code patching aimed at
+ *        the running service.
  *
- * This module implements comprehensive anti-debugging techniques to prevent
- * malware from analyzing, tampering with, or disabling the antivirus engine.
- * It employs multiple detection layers to identify debuggers, sandboxes,
- * virtual machines, and instrumentation frameworks.
+ * SCOPE — WHAT THIS MODULE IS FOR
+ * ==============================
+ * ShadowStrike is open source (AGPL): the design of this engine is public by
+ * intent, and NOTHING here attempts to hide how the product works. Obscuring
+ * our own logic would be security theatre and is explicitly not a goal.
+ *
+ * What this module protects is the INTEGRITY OF THE RUNNING PROCESS. Malware
+ * that already executes on the endpoint routinely attacks the security agent
+ * itself (MITRE ATT&CK T1562.001, Impair Defenses: Disable or Modify Tools) by
+ * attaching a debugger in order to:
+ *   - patch detection logic out of memory while the service still reports healthy,
+ *   - read the AES-256-GCM kernel IPC session key and forge sensor messages,
+ *   - lift the quarantine encryption key,
+ *   - suspend scanning threads,
+ *   - place hardware breakpoints on scan entry points to alter verdicts.
+ *
+ * None of those attacks require our source code, and closed source would not
+ * prevent any of them — which is precisely why publishing the source costs us
+ * nothing here, and why this protection is still required.
+ *
+ * RESPONSE POLICY
+ * ===============
+ * Detect, alert, harden, attribute. This module never retaliates against other
+ * processes on speculation and never terminates its own service: availability of
+ * the security agent is itself a security property. A debugger merely being
+ * present on the machine is a developer/administrator reality and is reported,
+ * not blocked; only a debugger attached to THIS process is treated as tampering.
  *
  * DETECTION CATEGORIES:
  * =====================
@@ -584,23 +608,21 @@ enum class DetectionConfidence : uint8_t {
 enum class ResponseAction : uint32_t {
     None            = 0x00000000,   ///< No action (logging only)
     Log             = 0x00000001,   ///< Log the detection
-    Alert           = 0x00000002,   ///< Send alert notification
-    Notify          = 0x00000004,   ///< Notify user
-    HideThreads     = 0x00000008,   ///< Hide threads from debugger
-    ClearBreakpoints= 0x00000010,   ///< Clear debug registers
-    CorruptContext  = 0x00000020,   ///< Corrupt debugging context
-    SuspendDebugger = 0x00000040,   ///< Attempt to suspend debugger
-    TerminateSelf   = 0x00000080,   ///< Terminate own process (last resort)
-    Quarantine      = 0x00000100,   ///< Quarantine suspicious processes
-    BlockAPIs       = 0x00000200,   ///< Block debugging APIs
-    EncryptMemory   = 0x00000400,   ///< Encrypt sensitive memory regions
-    Relocate        = 0x00000800,   ///< Relocate code to evade analysis
-    
+    Alert           = 0x00000002,   ///< Raise a tamper alert through the alert system
+    HideThreads     = 0x00000008,   ///< Hide our threads from an attached debugger
+    ClearBreakpoints= 0x00000010,   ///< Clear our hardware debug registers (DR0-DR7)
+    /// @brief Ask the kernel sensor to block the process that attached a
+    ///        debugger to US. Never used for "a debugger exists on this
+    ///        machine" — that is a developer/administrator reality, not an
+    ///        attack, and blocking it would break legitimate tooling.
+    BlockAttacker   = 0x00000040,
+
     // Preset combinations
     Passive         = Log | Alert,
     Moderate        = Log | Alert | HideThreads | ClearBreakpoints,
-    Aggressive      = Log | Alert | HideThreads | ClearBreakpoints | CorruptContext | BlockAPIs,
-    Maximum         = 0xFFFFFFFF
+    /// @brief Everything above plus kernel-assisted blocking of a process that
+    ///        actively attached a debugger to this service.
+    Enforcing       = Log | Alert | HideThreads | ClearBreakpoints | BlockAttacker
 };
 
 inline constexpr ResponseAction operator|(ResponseAction a, ResponseAction b) noexcept {
