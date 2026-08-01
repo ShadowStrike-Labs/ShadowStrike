@@ -132,6 +132,7 @@
 
 #include "../../SignatureStore/SignatureStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../Utils/DataStorePaths.hpp"
 #include "../../ThreatIntel/ThreatIntelDatabase.hpp"
 #include "../../Database/QuarantineDB.hpp"
 #include "../../Database/LogDB.hpp"
@@ -562,9 +563,22 @@ struct EngineConfig {
 
     /**
      * @brief Create default configuration.
+     *
+     * The store paths are resolved here rather than left empty. ScanEngine only
+     * opens a store when its path is set, and nothing in the product ever
+     * assigned these fields - so SignatureStore, WhitelistStore and the
+     * threat-intel databases were silently never opened, leaving YARA rules,
+     * pattern matching, hash reputation, publisher trust and IOC lookups all
+     * inactive while the engine reported itself healthy. Resolving them by
+     * default means the detection layers are on unless a caller deliberately
+     * clears a path.
      */
-    [[nodiscard]] static EngineConfig CreateDefault() noexcept {
-        return EngineConfig{};
+    [[nodiscard]] static EngineConfig CreateDefault() {
+        EngineConfig config{};
+        config.signatureDbPath   = Utils::DataStorePaths::SignatureDatabase();
+        config.whitelistDbPath   = Utils::DataStorePaths::WhitelistDatabase();
+        config.threatIntelDbPath = Utils::DataStorePaths::ThreatIntelDatabase();
+        return config;
     }
 
     /**

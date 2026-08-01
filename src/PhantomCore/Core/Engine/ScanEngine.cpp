@@ -284,6 +284,86 @@ public:
     // INITIALIZATION
     // ========================================================================
 
+    /// @brief Seed a freshly created whitelist with well-known software publishers.
+    ///
+    /// These are publisher-NAME entries, and a name alone is not a trust
+    /// decision: the scan path only consults publisher trust for a file whose
+    /// Authenticode signature has already been cryptographically verified and
+    /// chains to a trusted root. A file merely *claiming* to be from Microsoft
+    /// fails signature validation long before this list is consulted, and any
+    /// tampering invalidates the signature, so a modified copy of a genuinely
+    /// signed binary fails too. What the list changes is only how much analysis
+    /// a *provably* authentic vendor binary needs.
+    ///
+    /// This is the certified-publisher tier commercial engines use, and it is
+    /// where most of the on-access performance comes from: the overwhelming
+    /// majority of executable content on a healthy Windows machine is signed by
+    /// a handful of vendors, and confirming that is far cheaper than unpacking,
+    /// emulating and pattern-matching every one of them.
+    static void SeedTrustedPublishers(Whitelist::WhitelistStore& store) {
+        // Deliberately conservative: OS and runtime publishers plus mainstream
+        // browsers, drivers and developer tooling. Security vendors are
+        // intentionally absent - a compromised security tool is a high-value
+        // attack path and should keep receiving full scrutiny.
+        static constexpr const wchar_t* kPublishers[] = {
+            L"Microsoft Corporation",
+            L"Microsoft Windows",
+            L"Microsoft Windows Publisher",
+            L"Microsoft Windows Hardware Compatibility Publisher",
+            L"Google LLC",
+            L"Mozilla Corporation",
+            L"Apple Inc.",
+            L"Adobe Inc.",
+            L"Oracle America, Inc.",
+            L"Intel Corporation",
+            L"NVIDIA Corporation",
+            L"Advanced Micro Devices, Inc.",
+            L"Realtek Semiconductor Corp.",
+            L"VMware, Inc.",
+            L"Dell Inc.",
+            L"HP Inc.",
+            L"Lenovo",
+            L"Python Software Foundation",
+            L"JetBrains s.r.o.",
+            L"Valve Corp.",
+            L"Logitech",
+            L"Citrix Systems, Inc.",
+            L"Igor Pavlov",              // 7-Zip
+            L"VideoLAN",
+        };
+
+        uint32_t seeded = 0;
+        for (const wchar_t* publisher : kPublishers) {
+            auto res = store.AddPublisher(
+                publisher,
+                Whitelist::WhitelistReason::TrustedVendor,
+                L"Seeded publisher (honoured only with a verified signature)",
+                /*expirationTime=*/0,   // never expires
+                /*policyId=*/0);
+            if (res) {
+                ++seeded;
+            } else {
+                SS_LOG_WARN(L"ScanEngine",
+                    L"Could not seed trusted publisher '%ls': %ls",
+                    publisher, StringUtils::ToWide(res.message).c_str());
+            }
+        }
+
+        auto saveResult = store.Save();
+        if (!saveResult) {
+            SS_LOG_ERROR(L"ScanEngine",
+                L"Seeded %u publishers but could not persist the whitelist (%ls); "
+                L"it will be rebuilt on next start",
+                seeded, StringUtils::ToWide(saveResult.message).c_str());
+            return;
+        }
+
+        SS_LOG_INFO(L"ScanEngine",
+            L"Whitelist seeded with %u trusted publishers - signature-verified "
+            L"vendor binaries now take the fast path",
+            seeded);
+    }
+
     [[nodiscard]] bool Initialize(const EngineConfig& config) {
         std::unique_lock lock(m_configMutex);
 
@@ -314,6 +394,16 @@ public:
             m_threadPool = std::make_shared<ThreadPool>(threadPoolConfig);
             SS_LOG_INFO(L"ScanEngine", L"Thread pool initialized with %zu threads", desiredThreadCount);
 
+            // The detection stores live in one hardened directory. Create it
+            // before opening anything so first run works without the installer
+            // having pre-created it.
+            if (!Utils::DataStorePaths::EnsureDataDirectory()) {
+                SS_LOG_ERROR(L"ScanEngine",
+                    L"Could not prepare the detection store directory '%ls'; "
+                    L"signature, whitelist and threat-intel lookups will be unavailable",
+                    Utils::DataStorePaths::GetDataDirectory().c_str());
+            }
+
             // Initialize SignatureStore (YARA + Patterns + Hashes)
             if (!m_config.signatureDbPath.empty()) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing SignatureStore at %hs",
@@ -323,30 +413,77 @@ public:
 
                 auto sigResult = m_signatureStore->Initialize(m_config.signatureDbPath);
                 if (!sigResult) {
-                    SS_LOG_ERROR(L"ScanEngine", L"SignatureStore initialization failed: %ls",
+                    // A missing or unreadable signature database must NOT take the
+                    // whole engine down: heuristics, behaviour, emulation and the
+                    // kernel telemetry paths are all still valuable, and failing
+                    // here would leave the endpoint with no protection at all
+                    // instead of reduced protection. Report the lost coverage
+                    // loudly and continue without the store.
+                    SS_LOG_ERROR(L"ScanEngine",
+                        L"SignatureStore unavailable at '%ls' (%ls) - YARA rules, "
+                        L"pattern matching and hash lookups are INACTIVE. Other "
+                        L"detection layers remain enabled.",
+                        m_config.signatureDbPath.c_str(),
                         StringUtils::ToWide(sigResult.message).c_str());
-                    return false;
+                    m_signatureStore.reset();
+                } else {
+                    SS_LOG_INFO(L"ScanEngine", L"SignatureStore initialized successfully");
                 }
-
-                SS_LOG_INFO(L"ScanEngine", L"SignatureStore initialized successfully");
             }
 
             // Initialize WhitelistStore (Bloom Filter + Trie + Certificates)
+            //
+            // This is the engine's cheapest decision: a hit costs a bloom-filter
+            // probe (sub-microsecond) and lets a known-good file skip the entire
+            // heavy pipeline. With the store closed - which is what happened
+            // while this path was never given a database - every clean file on
+            // the machine paid full analysis, so the missing whitelist was a
+            // performance defect as much as a correctness one.
             if (!m_config.whitelistDbPath.empty()) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing WhitelistStore at %hs",
                     StringUtils::ToNarrow(m_config.whitelistDbPath).c_str());
 
                 m_whitelistStore = std::make_unique<Whitelist::WhitelistStore>();
 
-                auto wlResult = m_whitelistStore->Load(m_config.whitelistDbPath);
+                // Open writable: the store is maintained at runtime as publishers
+                // are confirmed, and must be creatable on a fresh install.
+                auto wlResult = m_whitelistStore->Load(m_config.whitelistDbPath, false);
                 if (!wlResult) {
-                    SS_LOG_ERROR(L"ScanEngine", L"WhitelistStore initialization failed: %ls",
-                        StringUtils::ToWide(wlResult.message).c_str());
-                    return false;
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"No existing whitelist database; creating one at '%ls'",
+                        m_config.whitelistDbPath.c_str());
+
+                    auto createResult = m_whitelistStore->Create(m_config.whitelistDbPath);
+                    if (!createResult) {
+                        SS_LOG_ERROR(L"ScanEngine",
+                            L"WhitelistStore could not be created (%ls) - trust "
+                            L"lookups are INACTIVE, so every file will take the "
+                            L"full analysis path.",
+                            StringUtils::ToWide(createResult.message).c_str());
+                        m_whitelistStore.reset();
+                    } else {
+                        SeedTrustedPublishers(*m_whitelistStore);
+                    }
                 }
 
-                SS_LOG_INFO(L"ScanEngine", L"WhitelistStore initialized - %llu entries",
-                    m_whitelistStore->GetEntryCount());
+                if (m_whitelistStore) {
+                    // A whitelist is an allow decision. If the directory holding
+                    // it is not write-restricted, an unprivileged process could
+                    // insert its own hash and become invisible - so in that case
+                    // we keep the store for diagnostics but do not let it grant
+                    // trust. Detection integrity outranks the speed win.
+                    if (!Utils::DataStorePaths::IsDataDirectoryHardened()) {
+                        SS_LOG_WARN(L"ScanEngine",
+                            L"Whitelist directory is not write-restricted; refusing "
+                            L"to honour whitelist entries because an unprivileged "
+                            L"writer could use them to bypass detection.");
+                        m_whitelistStore.reset();
+                    } else {
+                        SS_LOG_INFO(L"ScanEngine",
+                            L"WhitelistStore initialized - %llu entries",
+                            m_whitelistStore->GetEntryCount());
+                    }
+                }
             }
 
             // Initialize ThreatIntelDatabase (Memory-mapped threat intel)
