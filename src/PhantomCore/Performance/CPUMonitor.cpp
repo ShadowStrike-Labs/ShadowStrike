@@ -924,6 +924,19 @@ public:
 
         const DWORD selfTid = ::GetCurrentThreadId();
 
+        // Address range of this executable, used to tell our own frames apart
+        // from OS frames when walking a stack slice.
+        uintptr_t ourLo = 0, ourHi = 0;
+        {
+            HMODULE hSelf = ::GetModuleHandleW(nullptr);
+            MODULEINFO mi{};
+            if (hSelf && ::GetModuleInformation(::GetCurrentProcess(), hSelf,
+                                                &mi, sizeof(mi))) {
+                ourLo = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+                ourHi = ourLo + mi.SizeOfImage;
+            }
+        }
+
         for (size_t i = 0; i < n; ++i) {
             const Row& r = rows[i];
             double pct = 0.0;
@@ -941,6 +954,7 @@ public:
             // logging, no lock acquisition in between) and never applied to the
             // sampling thread itself.
             uintptr_t rip = 0;
+            uintptr_t ourFrame = 0;
             if (pct >= 5.0 && r.tid != selfTid) {
                 HANDLE hs = ::OpenThread(
                     THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, r.tid);
@@ -949,9 +963,35 @@ public:
                         CONTEXT ctx{};
                         ctx.ContextFlags = CONTEXT_CONTROL;
                         const BOOL got = ::GetThreadContext(hs, &ctx);
+                        // Copy a slice of the stack while the thread is still
+                        // frozen; all analysis happens after it resumes.
+                        uint8_t stackCopy[1024];
+                        SIZE_T copied = 0;
+                        if (got && ctx.Rsp) {
+                            ::ReadProcessMemory(::GetCurrentProcess(),
+                                reinterpret_cast<LPCVOID>(ctx.Rsp),
+                                stackCopy, sizeof(stackCopy), &copied);
+                        }
                         ::ResumeThread(hs);
+
                         if (got) {
                             rip = static_cast<uintptr_t>(ctx.Rip);
+                            // A thread blocked or spinning in a syscall reports
+                            // an ntdll stub as RIP, which does not identify
+                            // which of OUR loops it belongs to. Recover the
+                            // nearest return address pointing back into this
+                            // executable: that is the code that made the call.
+                            if (ourLo && (rip < ourLo || rip >= ourHi) && copied) {
+                                const size_t slots = copied / sizeof(uintptr_t);
+                                const auto* words =
+                                    reinterpret_cast<const uintptr_t*>(stackCopy);
+                                for (size_t s = 0; s < slots; ++s) {
+                                    if (words[s] >= ourLo && words[s] < ourHi) {
+                                        ourFrame = words[s];
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     ::CloseHandle(hs);
@@ -960,15 +1000,17 @@ public:
 
             wchar_t startDesc[160];
             wchar_t ripDesc[160];
+            wchar_t frameDesc[160];
             describeAddr(r.start, startDesc, 160);
             describeAddr(rip, ripDesc, 160);
+            describeAddr(ourFrame, frameDesc, 160);
 
             SS_LOG_WARN(L"CPUMonitor",
-                L"  tid=%u cpu=%.1f%% cumMs=%llu name='%s' at=%s start=%s",
+                L"  tid=%u cpu=%.1f%% cumMs=%llu name='%s' at=%s via=%s start=%s",
                 r.tid, pct,
                 static_cast<unsigned long long>(r.cur / 10000ull),
                 r.name.empty() ? L"<unnamed>" : r.name.c_str(),
-                ripDesc, startDesc);
+                ripDesc, frameDesc, startDesc);
         }
     }
 
