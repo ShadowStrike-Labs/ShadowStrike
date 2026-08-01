@@ -986,7 +986,23 @@ public:
                                 const auto* words =
                                     reinterpret_cast<const uintptr_t*>(stackCopy);
                                 for (size_t s = 0; s < slots; ++s) {
-                                    if (words[s] >= ourLo && words[s] < ourHi) {
+                                    if (words[s] < ourLo || words[s] >= ourHi) {
+                                        continue;
+                                    }
+                                    // Must point at EXECUTABLE memory. Without
+                                    // this a pointer to a string literal or any
+                                    // other .rdata address inside our image gets
+                                    // reported as a caller, which is how the
+                                    // first cut produced a bogus `string' hit.
+                                    MEMORY_BASIC_INFORMATION mbi{};
+                                    if (::VirtualQuery(reinterpret_cast<LPCVOID>(words[s]),
+                                                       &mbi, sizeof(mbi)) == 0) {
+                                        continue;
+                                    }
+                                    const bool execPage = (mbi.Protect &
+                                        (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                                    if (execPage) {
                                         ourFrame = words[s];
                                         break;
                                     }
