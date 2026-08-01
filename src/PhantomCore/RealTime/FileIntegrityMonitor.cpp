@@ -469,6 +469,12 @@ struct FileIntegrityMonitor::Impl {
         std::unique_ptr<uint8_t[]>     buffer;
         bool                           recursive = true;
         bool                           active    = false;
+        /// Consecutive failed attempts to re-establish this watch. A watch is
+        /// never silently abandoned: losing it means losing integrity coverage
+        /// for that directory, so it is retried with back-off and only reported
+        /// as lost when the directory itself is gone.
+        uint32_t                       recoverFailures = 0;
+        uint64_t                       nextRecoverTick = 0;
 
         DirWatch() : buffer(std::make_unique<uint8_t[]>(DIR_NOTIFY_BUFFER_SZ)) {
             overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1169,12 +1175,110 @@ struct FileIntegrityMonitor::Impl {
     // THREADS
     // ================================================================
 
+    /// @brief Re-establish a directory watch whose handle stopped working.
+    ///
+    /// A watch that stops functioning is a hole in integrity coverage, so the
+    /// monitor repairs it rather than dropping it: the directory handle is
+    /// reopened and change notification is re-armed. Failures back off
+    /// (1s, 2s, 4s ... capped) so a directory that is genuinely gone cannot
+    /// cost CPU, and the caller is told whether coverage was restored.
+    [[nodiscard]] bool RearmDirWatch(DirWatch& dw) noexcept {
+        constexpr DWORD NOTIFY_FILTER =
+            FILE_NOTIFY_CHANGE_FILE_NAME  | FILE_NOTIFY_CHANGE_DIR_NAME   |
+            FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE       |
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SECURITY   |
+            FILE_NOTIFY_CHANGE_CREATION;
+
+        if (dw.hDir != INVALID_HANDLE_VALUE) {
+            ::CancelIoEx(dw.hDir, &dw.overlapped);
+            ::CloseHandle(dw.hDir);
+            dw.hDir = INVALID_HANDLE_VALUE;
+        }
+        if (dw.overlapped.hEvent) {
+            ::ResetEvent(dw.overlapped.hEvent);
+        }
+
+        HANDLE hDir = ::CreateFileW(
+            dw.directory.c_str(), FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (hDir == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        OVERLAPPED fresh{};
+        fresh.hEvent = dw.overlapped.hEvent;
+        dw.overlapped = fresh;
+        dw.hDir = hDir;
+
+        if (!::ReadDirectoryChangesW(dw.hDir, dw.buffer.get(), DIR_NOTIFY_BUFFER_SZ,
+                                     dw.recursive ? TRUE : FALSE, NOTIFY_FILTER,
+                                     nullptr, &dw.overlapped, nullptr)) {
+            ::CloseHandle(dw.hDir);
+            dw.hDir = INVALID_HANDLE_VALUE;
+            return false;
+        }
+
+        dw.active = true;
+        dw.recoverFailures = 0;
+        dw.nextRecoverTick = 0;
+        return true;
+    }
+
+    /// @brief Repair a watch, or schedule the next attempt if repair failed.
+    void RecoverOrSchedule(DirWatch& dw, const wchar_t* why) noexcept {
+        if (RearmDirWatch(dw)) {
+            SS_LOG_INFO(L"FIM", L"Restored directory watch after %s: %s",
+                        why, dw.directory.c_str());
+            return;
+        }
+
+        dw.active = false;
+        ++dw.recoverFailures;
+        const uint64_t backoffMs =
+            (std::min)(1000ull << (std::min)(dw.recoverFailures, 5u), 30000ull);
+        dw.nextRecoverTick = ::GetTickCount64() + backoffMs;
+
+        const DWORD attrs = ::GetFileAttributesW(dw.directory.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            SS_LOG_WARN(L"FIM",
+                L"Directory no longer present, integrity coverage dropped for: %s (%s)",
+                dw.directory.c_str(), why);
+        } else {
+            SS_LOG_WARN(L"FIM",
+                L"Could not re-arm watch for %s after %s; retrying in %llu ms "
+                L"(attempt %u) - integrity coverage is currently degraded",
+                dw.directory.c_str(), why,
+                static_cast<unsigned long long>(backoffMs), dw.recoverFailures);
+        }
+    }
+
     void DirectoryMonitorLoop() {
         SS_LOG_DEBUG(L"FIM", L"Directory monitor thread started");
 
         while (!stopFlag.load(std::memory_order_acquire)) {
             std::vector<HANDLE>       handles;
             std::vector<std::wstring> handleDirs; // [FIM-A-001] lookup key
+
+            // Try to bring degraded watches back. Integrity coverage must not
+            // stay silently reduced because a directory was briefly unavailable
+            // (a volume that went offline, a folder recreated by an installer).
+            {
+                const uint64_t nowTick = ::GetTickCount64();
+                std::unique_lock lk(dirWatchMutex);
+                for (auto& candidate : dirWatches) {
+                    if (!candidate || candidate->active) continue;
+                    if (candidate->nextRecoverTick > nowTick) continue;
+                    if (::GetFileAttributesW(candidate->directory.c_str()) ==
+                        INVALID_FILE_ATTRIBUTES) {
+                        // Still gone; schedule the next look without churning.
+                        candidate->nextRecoverTick = nowTick + 30000;
+                        continue;
+                    }
+                    RecoverOrSchedule(*candidate, L"scheduled recovery");
+                }
+            }
 
             {
                 std::shared_lock lk(dirWatchMutex);
@@ -1224,10 +1328,9 @@ struct FileIntegrityMonitor::Impl {
                         const DWORD probe =
                             ::WaitForSingleObject(candidate->overlapped.hEvent, 0);
                         if (probe == WAIT_FAILED) {
-                            SS_LOG_WARN(L"FIM",
-                                L"Deactivating watch with unusable handle: %s",
-                                candidate->directory.c_str());
-                            candidate->active = false;
+                            // Repair rather than retire: dropping the watch
+                            // would silently end integrity coverage here.
+                            RecoverOrSchedule(*candidate, L"unusable wait handle");
                             ++pruned;
                         }
                     }
@@ -1281,9 +1384,9 @@ struct FileIntegrityMonitor::Impl {
                     ::ResetEvent(dw->overlapped.hEvent);
                     if (err != ERROR_IO_INCOMPLETE) {
                         SS_LOG_WARN(L"FIM",
-                            L"GetOverlappedResult failed for %s (err=%u); deactivating watch",
+                            L"GetOverlappedResult failed for %s (err=%u); re-establishing watch",
                             dw->directory.c_str(), err);
-                        dw->active = false;
+                        RecoverOrSchedule(*dw, L"overlapped result failure");
                     }
                     continue;
                 }
@@ -1303,9 +1406,10 @@ struct FileIntegrityMonitor::Impl {
                         dw->recursive ? TRUE : FALSE, NOTIFY_FILTER,
                         nullptr, &dw->overlapped, nullptr)) {
                     SS_LOG_WARN(L"FIM",
-                        L"ReadDirectoryChangesW re-arm failed for %s (err=%u); deactivating watch",
+                        L"ReadDirectoryChangesW re-arm failed for %s (err=%u); "
+                        L"re-establishing watch",
                         dw->directory.c_str(), ::GetLastError());
-                    dw->active = false;
+                    RecoverOrSchedule(*dw, L"re-arm failure");
                 }
             }
         }
