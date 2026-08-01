@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include"pch.h"
+#include "ProcessSnapshotCache.hpp"
 #include "ProcessUtils.hpp"
 
 #ifdef _WIN32
@@ -706,44 +707,26 @@ namespace ShadowStrike {
 
             bool EnumerateProcesses(std::vector<ProcessId>& pids, Error* err) noexcept {
                 pids.clear();
-                
-                const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                if (hSnap == INVALID_HANDLE_VALUE) {
-                    SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)");
-                    return false;
-                }
-                
-                // RAII guard for snapshot handle
-                const auto snapGuard = make_unique_handle(hSnap);
-                
-                PROCESSENTRY32W pe{};
-                pe.dwSize = sizeof(pe);
-                
-                if (!Process32FirstW(hSnap, &pe)) {
-                    const DWORD lastErr = GetLastError();
-                    if (lastErr != ERROR_NO_MORE_FILES) {
-                        SetWin32Error(err, L"Process32FirstW", lastErr);
-                        return false;
-                    }
-                    return true; // Empty list is valid
-                }
-                
+
+                // Served from the shared snapshot - see GetProcessBasicInfo for
+                // why per-caller process-list walks were expensive enough to
+                // stall the machine. Callers see the same set of processes.
                 try {
-                    pids.reserve(256); // Pre-allocate for typical system
-                    do {
+                    auto snapshot = ProcessSnapshotCache::Instance().Get();
+                    pids.reserve(snapshot->processes.size());
+                    for (const auto& entry : snapshot->processes) {
                         if (pids.size() >= kMaxProcessCount) {
-                            // Safety limit reached
-                            break;
+                            break;  // Safety limit reached
                         }
-                        pids.push_back(pe.th32ProcessID);
-                    } while (Process32NextW(hSnap, &pe));
+                        pids.push_back(static_cast<ProcessId>(entry.pid));
+                    }
                 } catch (const std::bad_alloc&) {
                     pids.clear();
-                    SetWin32Error(err, L"EnumerateProcesses", ERROR_OUTOFMEMORY, 
+                    SetWin32Error(err, L"EnumerateProcesses", ERROR_OUTOFMEMORY,
                                   L"Memory allocation failed");
                     return false;
                 }
-                
+
                 return true;
             }
 
@@ -751,29 +734,29 @@ namespace ShadowStrike {
                 info = {};
                 info.pid = pid;
 
-                // Get process entry from snapshot
-                const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                if (hSnap != INVALID_HANDLE_VALUE) {
-                    const auto snapGuard = make_unique_handle(hSnap);
-                    
-                    PROCESSENTRY32W pe{};
-                    pe.dwSize = sizeof(pe);
-                    if (Process32FirstW(hSnap, &pe)) {
-                        do {
-                            if (pe.th32ProcessID == pid) {
-                                info.parentPid = pe.th32ParentProcessID;
-                                info.basePriority = pe.pcPriClassBase;
-                                info.threadCount = pe.cntThreads;
-                                try {
-                                    // Ensure null-termination safety
-                                    pe.szExeFile[MAX_PATH - 1] = L'\0';
-                                    info.name = pe.szExeFile;
-                                } catch (...) {
-                                    info.name.clear();
-                                }
-                                break;
-                            }
-                        } while (Process32NextW(hSnap, &pe));
+                // Identity fields come from the shared process snapshot.
+                //
+                // This function used to take its OWN system-wide
+                // CreateToolhelp32Snapshot and walk the entire kernel process
+                // list just to find one PID. Callers that iterate every process
+                // and ask for each one's basic info - the banking and keylogger
+                // scanners do exactly that, twice a second - therefore performed
+                // one full process-list walk PER PROCESS, on the order of a
+                // couple of hundred walks per second on a normal machine. Those
+                // walks take kernel locks that the minifilter path also needs,
+                // which is how moderate-looking CPU translated into the whole
+                // desktop stalling. The data returned is identical; it is simply
+                // read from one snapshot instead of re-enumerating per lookup.
+                {
+                    auto snapshot = ProcessSnapshotCache::Instance().Get();
+                    for (const auto& entry : snapshot->processes) {
+                        if (entry.pid == pid) {
+                            info.parentPid    = entry.parentPid;
+                            info.basePriority = entry.basePriority;
+                            info.threadCount  = entry.threadCount;
+                            info.name         = entry.name;
+                            break;
+                        }
                     }
                 }
 
