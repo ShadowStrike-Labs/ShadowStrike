@@ -431,11 +431,21 @@ public:
         UpdateProgress(package.type, SigUpdateState::Downloading, 10,
             "Preparing local staging");
 
-        // For local operations, the package file should already be in staging.
-        // We don't do actual HTTP download — log that transport is not configured.
+        // No network transport is wired in, and that is deliberate rather than an
+        // oversight: package authentication is not provisioned yet (see
+        // UpdateVerifier::VerifySignature - no update-signing trust anchor is
+        // loaded, so every signature check fails closed). Downloading definition
+        // packages we cannot authenticate would be worse than not downloading
+        // them, because a poisoned definition set can disable detection or cause
+        // mass false positives across every endpoint at once. The transport must
+        // stay absent until signing is in place.
         if (!package.downloadUrl.empty()) {
-            SS_LOG_INFO(kLogCategory,
-                L"Network transport not configured; expecting package in local staging directory for type %S",
+            SS_LOG_WARN(kLogCategory,
+                L"Update for %S declares a download URL but no network transport "
+                L"is enabled; expecting the package in the local staging "
+                L"directory. Remote updates require a provisioned signing trust "
+                L"anchor first - definitions that cannot be authenticated are not "
+                L"safe to install.",
                 std::string(GetDatabaseTypeName(package.type)).c_str());
         }
 

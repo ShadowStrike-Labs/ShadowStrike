@@ -1009,8 +1009,36 @@ bool UpdateVerifier::VerifySignature(
         }
     }
 
-    SS_LOG_DEBUG(kLogCategory,
-        L"VerifySignature: no loaded public key accepted the signature");
+    // Distinguish "the signature was rejected" from "we had nothing to check it
+    // with". Both correctly return false, but they are very different problems:
+    // the first is a bad package, the second means package authentication is not
+    // provisioned at all and no update can ever be accepted. Reporting the second
+    // at debug level made a non-functional verifier look like a working one.
+    //
+    // A fresh AsymmetricCipher holds no key (m_publicKeyLoaded defaults to false
+    // and the constructor imports nothing), so unless a trust anchor has been
+    // loaded into the crypto layer, neither branch above can run. Say so plainly.
+    {
+        Utils::CryptoUtils::AsymmetricCipher rsaProbe(
+            Utils::CryptoUtils::AsymmetricAlgorithm::RSA_4096);
+        Utils::CryptoUtils::AsymmetricCipher eccProbe(
+            Utils::CryptoUtils::AsymmetricAlgorithm::ECC_P384);
+
+        if (!rsaProbe.HasPublicKey() && !eccProbe.HasPublicKey()) {
+            SS_LOG_ERROR(kLogCategory,
+                L"VerifySignature: NO update-signing trust anchor is provisioned, "
+                L"so no package signature can be validated and every update will "
+                L"be refused. This is fail-closed and therefore safe, but package "
+                L"authentication is effectively absent - a network update "
+                L"transport MUST NOT be enabled until a vendor public key is "
+                L"provisioned and this check succeeds.");
+            return false;
+        }
+    }
+
+    SS_LOG_WARN(kLogCategory,
+        L"VerifySignature: package signature was REJECTED by every provisioned "
+        L"public key - treating the package as untrusted");
     return false;
 }
 
