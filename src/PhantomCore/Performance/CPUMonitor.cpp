@@ -817,7 +817,7 @@ public:
                 ::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
 
         const DWORD selfPid = ::GetCurrentProcessId();
-        struct Row { DWORD tid; uint64_t cur; uint64_t delta; uintptr_t start; };
+        struct Row { DWORD tid; uint64_t cur; uint64_t delta; uintptr_t start; std::wstring name; };
         std::vector<Row> rows;
 
         THREADENTRY32 te{};
@@ -849,8 +849,22 @@ public:
                                     startAddr = reinterpret_cast<uintptr_t>(a);
                                 }
                             }
+
+                            // Thread description, when the creator set one
+                            // (SetThreadDescription). Names pool/worker threads
+                            // outright without any address arithmetic.
+                            std::wstring tname;
+                            {
+                                PWSTR desc = nullptr;
+                                if (SUCCEEDED(::GetThreadDescription(ht, &desc)) && desc) {
+                                    tname.assign(desc);
+                                    ::LocalFree(desc);
+                                }
+                            }
+
                             rows.push_back({ te.th32ThreadID, cur,
-                                             (cur >= prev) ? (cur - prev) : 0, startAddr });
+                                             (cur >= prev) ? (cur - prev) : 0, startAddr,
+                                             std::move(tname) });
                         }
                         ::CloseHandle(ht);
                     }
@@ -886,6 +900,30 @@ public:
             static_cast<unsigned long long>(dMs), rows.size());
 
         const size_t n = (rows.size() < 10) ? rows.size() : 10;
+
+        // Resolve an address to "module+0xoffset". The offset is module-relative
+        // and therefore stable for a given build, so it maps to an exact
+        // function offline via the .map / .pdb.
+        auto describeAddr = [](uintptr_t addr, wchar_t* out, size_t outCch) {
+            out[0] = L'\0';
+            if (!addr) { ::wcscpy_s(out, outCch, L"<null>"); return; }
+            HMODULE hm = nullptr;
+            wchar_t base[MAX_PATH];
+            if (::GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(addr), &hm) && hm &&
+                ::GetModuleBaseNameW(::GetCurrentProcess(), hm, base, MAX_PATH) > 0) {
+                ::_snwprintf_s(out, outCch, _TRUNCATE, L"%s+0x%llX", base,
+                    static_cast<unsigned long long>(addr - reinterpret_cast<uintptr_t>(hm)));
+            } else {
+                ::_snwprintf_s(out, outCch, _TRUNCATE, L"0x%llX",
+                    static_cast<unsigned long long>(addr));
+            }
+        };
+
+        const DWORD selfTid = ::GetCurrentThreadId();
+
         for (size_t i = 0; i < n; ++i) {
             const Row& r = rows[i];
             double pct = 0.0;
@@ -894,33 +932,43 @@ public:
                     / (static_cast<double>(dMs) * 10000.0 * ncores) * 100.0;
             }
 
-            // Resolve the start address to its owning module + offset. That
-            // names the code a silent hot thread runs (the service exe,
-            // onnxruntime.dll, an emulator module, ...); the offset maps to the
-            // exact function offline via the .map / .pdb.
-            wchar_t modName[MAX_PATH];
-            const wchar_t* modDisp = L"<unresolved>";
-            unsigned long long modOff = 0;
-            if (r.start) {
-                HMODULE hm = nullptr;
-                if (::GetModuleHandleExW(
-                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                        reinterpret_cast<LPCWSTR>(r.start), &hm) && hm) {
-                    if (::GetModuleBaseNameW(::GetCurrentProcess(), hm,
-                                             modName, MAX_PATH) > 0) {
-                        modDisp = modName;
-                        modOff = static_cast<unsigned long long>(
-                            r.start - reinterpret_cast<uintptr_t>(hm));
+            // For the genuinely hot threads, sample the INSTRUCTION POINTER.
+            // Every C++ thread reports the CRT's _beginthreadex trampoline as
+            // its Win32 start address, so the start address alone cannot tell
+            // two worker threads apart. The currently-executing RIP does: for a
+            // thread spinning in a hot loop it lands in the offending function.
+            // Suspension is bounded to the context read (no allocation, no
+            // logging, no lock acquisition in between) and never applied to the
+            // sampling thread itself.
+            uintptr_t rip = 0;
+            if (pct >= 5.0 && r.tid != selfTid) {
+                HANDLE hs = ::OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, r.tid);
+                if (hs) {
+                    if (::SuspendThread(hs) != static_cast<DWORD>(-1)) {
+                        CONTEXT ctx{};
+                        ctx.ContextFlags = CONTEXT_CONTROL;
+                        const BOOL got = ::GetThreadContext(hs, &ctx);
+                        ::ResumeThread(hs);
+                        if (got) {
+                            rip = static_cast<uintptr_t>(ctx.Rip);
+                        }
                     }
+                    ::CloseHandle(hs);
                 }
             }
+
+            wchar_t startDesc[160];
+            wchar_t ripDesc[160];
+            describeAddr(r.start, startDesc, 160);
+            describeAddr(rip, ripDesc, 160);
+
             SS_LOG_WARN(L"CPUMonitor",
-                L"  tid=%u cpu=%.1f%% cumMs=%llu %s+0x%llX (start=0x%llX)",
+                L"  tid=%u cpu=%.1f%% cumMs=%llu name='%s' at=%s start=%s",
                 r.tid, pct,
                 static_cast<unsigned long long>(r.cur / 10000ull),
-                modDisp, modOff,
-                static_cast<unsigned long long>(r.start));
+                r.name.empty() ? L"<unnamed>" : r.name.c_str(),
+                ripDesc, startDesc);
         }
     }
 
