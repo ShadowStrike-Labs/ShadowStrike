@@ -443,6 +443,7 @@
     <ClCompile Include="src\PhantomCore\API\RESTServer.cpp" />
     <ClCompile Include="src\PhantomCore\API\Http\HttpServer.cpp" />
     <ClCompile Include="src\PhantomCore\API\Http\HttpTypes.cpp" />
+    <ClCompile Include="src\PhantomCore\Communication\FilterPortGate.cpp" />
     <ClCompile Include="src\PhantomCore\Communication\FilterConnection.cpp" />
     <ClCompile Include="src\PhantomCore\Communication\MessageDispatcher.cpp" />
     <ClCompile Include="src\PhantomCore\Communication\ThreatIntelPusher.cpp" />
