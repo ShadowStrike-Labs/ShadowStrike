@@ -151,7 +151,7 @@ public:
     std::unique_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::unique_ptr<Whitelist::WhitelistStore> m_whitelistStore;
     std::unique_ptr<ThreatIntel::ThreatIntelDatabase> m_threatIntelDB;
-    std::unique_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
+    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
     HeuristicAnalyzer* m_heuristicAnalyzer{ nullptr };
     std::unique_ptr<BehaviorAnalyzer> m_behaviorAnalyzer;
     MachineLearningDetector* m_mlDetector{ nullptr };
@@ -487,42 +487,39 @@ public:
             }
 
             // Initialize ThreatIntelDatabase (Memory-mapped threat intel)
-            if (!m_config.threatIntelDbPath.empty()) {
-                SS_LOG_INFO(L"ScanEngine", L"Initializing ThreatIntelDatabase at %hs",
-                    StringUtils::ToNarrow(m_config.threatIntelDbPath).c_str());
-
-                m_threatIntelDB = std::make_unique<ThreatIntel::ThreatIntelDatabase>();
-
-                ThreatIntel::DatabaseConfig tiConfig =
-                    ThreatIntel::DatabaseConfig::CreateDefault(m_config.threatIntelDbPath);
-
-                auto tiResult = m_threatIntelDB->Open(tiConfig);
-                if (!tiResult) {
-                    SS_LOG_ERROR(L"ScanEngine", L"ThreatIntelDatabase initialization failed");
-                    return false;
-                }
-
-                SS_LOG_INFO(L"ScanEngine", L"ThreatIntelDatabase initialized - %zu entries",
-                    m_threatIntelDB->GetEntryCount());
-            }
+            // The raw ThreatIntelDatabase is deliberately NOT opened here.
+            //
+            // It and ThreatIntelStore address the same file, and the database is
+            // opened exclusively for write - share mode 0 - so whichever got
+            // there first would lock the other out. ThreatIntelStore is a
+            // superset (it owns a database plus the index, lookup, IOC manager,
+            // reputation cache and feed manager), so opening a second bare
+            // handle would deny the full engine its own storage to save nothing.
+            // The member stays null and every use site is already guarded.
+            //
+            // This also removes a hard failure: the previous block returned false
+            // when the database could not be opened, which on a fresh install
+            // would have aborted engine initialization entirely.
 
             // Initialize ThreatIntelStore (Full IOC/reputation lookup engine)
-            if (!m_config.threatIntelDbPath.empty()) {
-                SS_LOG_INFO(L"ScanEngine", L"Initializing ThreatIntelStore");
-
-                m_threatIntelStore = std::make_unique<ThreatIntel::ThreatIntelStore>();
-
-                ThreatIntel::StoreConfig tiStoreConfig{};
-                tiStoreConfig.databasePath = m_config.threatIntelDbPath;
-                tiStoreConfig.enableCache = true;
-                tiStoreConfig.enableWAL = true;
-
-                if (!m_threatIntelStore->Initialize(tiStoreConfig)) {
-                    SS_LOG_WARN(L"ScanEngine",
-                        L"ThreatIntelStore initialization failed (non-fatal, basic TI DB still active)");
-                    m_threatIntelStore.reset();
+            //
+            // Deliberately the process-wide instance rather than a private one.
+            // The database is opened exclusively for write, so two instances
+            // pointing at the same file cannot both succeed - whichever opened
+            // second would silently lose its IOC lookups. Sharing also means one
+            // memory mapping and one reputation cache for the whole process
+            // instead of one per subsystem.
+            {
+                auto shared = ThreatIntel::ThreatIntelStore::Shared();
+                if (shared && shared->IsInitialized()) {
+                    m_threatIntelStore = std::move(shared);
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"ThreatIntelStore attached for IOC/reputation lookups");
                 } else {
-                    SS_LOG_INFO(L"ScanEngine", L"ThreatIntelStore initialized for IOC/reputation lookups");
+                    SS_LOG_WARN(L"ScanEngine",
+                        L"ThreatIntelStore unavailable - IOC/reputation lookups are "
+                        L"inactive; other detection layers remain enabled");
+                    m_threatIntelStore.reset();
                 }
             }
 
@@ -779,7 +776,9 @@ public:
         }
 
         if (m_threatIntelStore) {
-            m_threatIntelStore->Shutdown();
+            // Shared with the rest of the process - release our reference only.
+            // Calling Shutdown() here would close the store underneath the other
+            // subsystems still holding it (network evasion, injection detection).
             m_threatIntelStore.reset();
         }
 

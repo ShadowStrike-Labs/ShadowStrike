@@ -501,7 +501,29 @@ public:
             m_sharedHashStore = std::make_shared<HashStore::HashStore>();
             m_sharedSignatureStore = std::make_shared<SignatureStore::SignatureStore>();
             m_sharedPatternStore = std::make_shared<PatternStore::PatternStore>();
-            m_sharedThreatIntelStore = std::make_shared<ThreatIntel::ThreatIntelStore>();
+            // Use the process-wide store rather than a private instance. The
+            // previous fresh object was never initialized, so every consumer it
+            // was handed to (network evasion, process analysis, injection
+            // detection) held a store that could not answer a single lookup -
+            // IOC correlation silently matched nothing. The database is also
+            // exclusive while open for write, so a private instance could not
+            // have shared the real one even if it had been initialized.
+            m_sharedThreatIntelStore = ThreatIntel::ThreatIntelStore::Shared();
+            if (m_sharedThreatIntelStore && m_sharedThreatIntelStore->IsInitialized()) {
+                // Give the endpoint data to match against. Without registered
+                // feeds the store stays empty and every IOC lookup is a miss,
+                // which reads as "clean" and is indistinguishable from safety.
+                const uint32_t feeds = m_sharedThreatIntelStore->RegisterDefaultFeeds();
+                if (feeds > 0) {
+                    m_sharedThreatIntelStore->StartFeedUpdates();
+                    Utils::Logger::Info(
+                        "RealTimeProtection: threat intel active with {} feeds", feeds);
+                }
+            } else {
+                Utils::Logger::Error(
+                    "RealTimeProtection: shared ThreatIntel store unavailable - "
+                    "IOC and reputation correlation is INACTIVE");
+            }
         } catch (const std::exception& e) {
             Utils::Logger::Error("Failed to create shared ThreatIntel stores: {}",
                 e.what());
