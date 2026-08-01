@@ -898,6 +898,10 @@ struct alignas(64) RTPStatistics {
 
     // Exclusion statistics
     std::atomic<uint64_t> excludedByPath{ 0 };
+    /// @brief Scans whose deep stage exceeded the synchronous latency budget and
+    ///        was handed to the background deep-scan queue instead of holding the
+    ///        originating file operation.
+    std::atomic<uint64_t> scansDeferred{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
     std::atomic<uint64_t> excludedByProcess{ 0 };
     std::atomic<uint64_t> excludedByHash{ 0 };

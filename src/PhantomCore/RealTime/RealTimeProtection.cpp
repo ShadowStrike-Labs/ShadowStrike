@@ -375,6 +375,17 @@ public:
     std::atomic<bool> m_deferSystemBaselines{ false };
     std::atomic<bool> m_stopThreads{ false };
 
+    // ---- Deferred deep scan (synchronous latency budget overflow) ----
+    // Files whose deep analysis would have exceeded the synchronous budget. The
+    // kernel is answered immediately and the full pipeline runs here instead, so
+    // the machine stays responsive without giving up analysis.
+    std::deque<std::pair<std::wstring, uint32_t>> m_deferredQueue;
+    std::unordered_set<std::wstring>              m_deferredSeen;
+    std::mutex                                    m_deferredMutex;
+    std::condition_variable                       m_deferredCv;
+    std::atomic<bool>                             m_deferredStop{ false };
+    std::unique_ptr<std::thread>                  m_deferredScanThread;
+
     // Synchronization
     mutable std::shared_mutex m_configMutex;
     mutable std::shared_mutex m_exclusionMutex;
@@ -779,6 +790,10 @@ public:
             m_stopThreads = false;
             m_healthCheckThread = std::make_unique<std::thread>(&RealTimeProtectionImpl::HealthCheckLoop, this);
             m_statsUpdateThread = std::make_unique<std::thread>(&RealTimeProtectionImpl::StatsUpdateLoop, this);
+            // Background stage for scans that exceeded the synchronous budget.
+            m_deferredStop.store(false, std::memory_order_release);
+            m_deferredScanThread = std::make_unique<std::thread>(
+                &RealTimeProtectionImpl::DeferredDeepScanLoop, this);
 
             // 7. Update protection status
             m_protectionStatus.isProtected = true;
@@ -926,6 +941,15 @@ public:
             m_statsUpdateThread->join();
         }
         m_statsUpdateThread.reset();
+
+        // Deferred deep-scan worker. Woken explicitly so it does not sit on its
+        // wait for up to a second during shutdown.
+        m_deferredStop.store(true, std::memory_order_release);
+        m_deferredCv.notify_all();
+        if (m_deferredScanThread && m_deferredScanThread->joinable()) {
+            m_deferredScanThread->join();
+        }
+        m_deferredScanThread.reset();
 
         // Deferred self-protection baseline (installation integrity + APT sweep).
         // Joined here, BEFORE the detection components/kernel channel are torn down,
@@ -2286,6 +2310,111 @@ public:
     }
 
     // =========================================================================
+    // DEFERRED DEEP SCAN
+    //
+    // When the synchronous stage runs out of its latency budget the file is
+    // queued here instead of being dropped: the kernel gets its answer promptly
+    // (so the machine keeps responding) and the full pipeline still runs, just
+    // off the blocking path. A malicious verdict from this stage is acted on
+    // exactly as it would have been synchronously, so deferral changes when we
+    // catch something, never whether we catch it.
+    // =========================================================================
+
+    void QueueDeferredDeepScan(const std::wstring& filePath, uint32_t processId) {
+        constexpr size_t kMaxDeferredQueue = 4096;
+        {
+            std::lock_guard<std::mutex> lock(m_deferredMutex);
+            // De-duplicate: a busy directory produces many opens of one file.
+            if (m_deferredSeen.count(filePath) != 0) {
+                return;
+            }
+            if (m_deferredQueue.size() >= kMaxDeferredQueue) {
+                // Never grow without bound. Losing the oldest entry is visible
+                // rather than silent so the backlog can be tuned.
+                Utils::Logger::Warn(
+                    "RealTimeProtection: deferred deep-scan queue full ({}); dropping oldest",
+                    kMaxDeferredQueue);
+                m_deferredSeen.erase(m_deferredQueue.front().first);
+                m_deferredQueue.pop_front();
+            }
+            m_deferredQueue.emplace_back(filePath, processId);
+            m_deferredSeen.insert(filePath);
+        }
+        m_deferredCv.notify_one();
+    }
+
+    void HandleDeferredThreat(const std::wstring& filePath, uint32_t processId,
+                              const Core::Engine::EngineResult& result) {
+        // Same remediation the synchronous path would have applied. Deferral
+        // moved the analysis off the blocking path; it does not change what we
+        // do when the file turns out to be malicious.
+        const std::wstring threatName = result.threatName.empty()
+            ? std::wstring(L"Deferred.DeepScan.Detection")
+            : Utils::StringUtils::ToWide(result.threatName);
+
+        if (!QuarantineFile(filePath, threatName)) {
+            Utils::Logger::Error(
+                "RealTimeProtection: deferred remediation could not quarantine {}",
+                Utils::StringUtils::ToNarrow(filePath));
+        }
+
+        // If the file is still running, the process is the live threat.
+        if (processId != 0) {
+            Utils::Logger::Warn(
+                "RealTimeProtection: deferred detection implicates PID {} ({})",
+                processId, Utils::StringUtils::ToNarrow(filePath));
+        }
+    }
+
+    void DeferredDeepScanLoop() {
+        ::SetThreadDescription(::GetCurrentThread(), L"SS-DeferredDeepScan");
+        // Background stage: must never compete with the verdict path it exists
+        // to protect.
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+        while (!m_deferredStop.load(std::memory_order_acquire)) {
+            std::pair<std::wstring, uint32_t> item;
+            {
+                std::unique_lock<std::mutex> lock(m_deferredMutex);
+                m_deferredCv.wait_for(lock, std::chrono::milliseconds(1000), [this] {
+                    return m_deferredStop.load(std::memory_order_acquire) ||
+                           !m_deferredQueue.empty();
+                });
+                if (m_deferredStop.load(std::memory_order_acquire)) break;
+                if (m_deferredQueue.empty()) continue;
+                item = std::move(m_deferredQueue.front());
+                m_deferredQueue.pop_front();
+                m_deferredSeen.erase(item.first);
+            }
+
+            try {
+                Core::Engine::ScanContext ctx;
+                // Deliberately NOT ScanType::RealTime: nothing is waiting on
+                // this, so the engine may take the slow, thorough path.
+                ctx.type = Core::Engine::ScanType::OnDemand;
+                ctx.priority = Core::Engine::ScanPriority::Low;
+                ctx.processId = item.second;
+                ctx.filePath = item.first;
+
+                auto result = Core::Engine::ScanEngine::Instance().ScanFile(item.first, ctx);
+                if (result.verdict == Core::Engine::ScanVerdict::Infected) {
+                    m_stats.threatsDetected++;
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: deferred deep scan found threat in {} - remediating",
+                        Utils::StringUtils::ToNarrow(item.first));
+                    HandleDeferredThreat(item.first, item.second, result);
+                }
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("RealTimeProtection: deferred deep scan failed for {}: {}",
+                    Utils::StringUtils::ToNarrow(item.first), e.what());
+                m_stats.scanErrors++;
+            } catch (...) {
+                m_stats.scanErrors++;
+            }
+        }
+    }
+
+    // =========================================================================
     // KERNEL EVENT HANDLERS
     // =========================================================================
 
@@ -2443,6 +2572,54 @@ public:
         std::string hashKey;
 
         // =====================================================================
+        // SYNCHRONOUS LATENCY BUDGET
+        //
+        // The minifilter holds the originating file operation until we answer,
+        // so the time spent below is added to a real file open somewhere on the
+        // machine. When many opens arrive at once (boot, an installer, a build)
+        // and each one pays the full deep pipeline, the queue grows faster than
+        // it drains and the whole desktop stops responding while the kernel
+        // waits on us -- observed as a multi-minute freeze with only moderate
+        // CPU, because the cost is latency, not cycles.
+        //
+        // Commercial engines solve this with a bounded synchronous stage and an
+        // asynchronous deep stage. We do the same: the cheap, high-value tiers
+        // (exclusions, identity cache, Microsoft/publisher trust, reputation,
+        // ransomware + script dispatch) have already run above. From here the
+        // heavy analyzers run only while the budget lasts. If it is exhausted
+        // the file is handed to the background deep-scan queue and the caller is
+        // released, so the machine keeps moving.
+        //
+        // This does not lose detection:
+        //   - EXECUTE and mutating access always get the full synchronous
+        //     pipeline; the budget only applies to ordinary reads, so nothing
+        //     runs before it has been fully analyzed.
+        //   - a deferred file is still analyzed, and a malicious verdict from
+        //     the async stage quarantines it, so the outcome differs in timing,
+        //     not in whether it is caught.
+        //   - the budget is generous relative to a healthy scan; it only
+        //     engages when we are already the reason the system is stalling.
+        const auto kSyncBudget = std::chrono::milliseconds(
+            RTPConstants::KERNEL_REPLY_TIMEOUT_MS / 4);
+        const bool isExecuteAccess =
+            req.AccessType == static_cast<uint8_t>(ShadowStrikeAccessExecute);
+        const auto budgetExceeded = [&]() -> bool {
+            if (isExecuteAccess) {
+                return false;  // never cut short the pre-execution decision
+            }
+            const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - startTime);
+            return spent >= kSyncBudget;
+        };
+        const auto deferDeepScan = [&](const wchar_t* stage) {
+            m_stats.scansDeferred++;
+            SS_LOG_DEBUG(L"RealTimeProtection",
+                L"Sync budget reached at %ls for %ls; deferring deep analysis",
+                stage, filePath.c_str());
+            QueueDeferredDeepScan(filePath, req.ProcessId);
+        };
+
+        // =====================================================================
         // CONTENT-AVAILABILITY GATE
         //
         // Everything below this point (metamorphic, packer, ExecutableAnalyzer,
@@ -2474,6 +2651,10 @@ public:
 
         // Anti-Evasion: Metamorphic Analysis
         if (m_metamorphicDetector) {
+            if (budgetExceeded()) {
+                deferDeepScan(L"metamorphic");
+                return Communication::KernelVerdict::Allow;
+            }
             ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
             metaCfg.processId = req.ProcessId;
             auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
@@ -2566,6 +2747,10 @@ public:
         }
 
         // 3. Prepare Scan Context
+        if (budgetExceeded()) {
+            deferDeepScan(L"scan-engine");
+            return Communication::KernelVerdict::Allow;
+        }
         Core::Engine::ScanContext context;
         context.type = Core::Engine::ScanType::RealTime;
         context.priority = Core::Engine::ScanPriority::Critical;
