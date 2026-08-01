@@ -31,6 +31,7 @@
  */
 
 #include "pch.h"
+#include "PhantomCore/Utils/ProcessSnapshotCache.hpp"
 #include "KeyloggerProtection.hpp"
 
 // ============================================================================
@@ -768,23 +769,25 @@ public:
         const KeyloggerProtectionConfiguration& config) {
         std::vector<KeyloggerDetectionEvent> detections;
 
-        ScopedHandle hSnapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-        if (!hSnapshot.IsValid()) {
-            SS_LOG_ERROR(LOG_CATEGORY,
-                         L"CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) failed, error=%lu",
-                         ::GetLastError());
-            return detections;
-        }
+        // Use the shared process snapshot rather than taking our own.
+        //
+        // A Toolhelp process snapshot walks the kernel process list under locks
+        // the minifilter path also needs, so three modules each taking one on
+        // their own timer (twice a second here, ten times a second in the
+        // screenshot blocker) contended against file and process operations for
+        // the entire machine. Every process is still examined - only the
+        // redundant re-enumeration is gone.
+        auto snapshot = Utils::ProcessSnapshotCache::Instance().Get();
 
         PROCESSENTRY32W pe32{};
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (!::Process32FirstW(hSnapshot.Get(), &pe32)) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Process32FirstW failed, error=%lu", ::GetLastError());
-            return detections;
-        }
+        for (const auto& snapEntry : snapshot->processes) {
+            pe32.th32ProcessID       = snapEntry.pid;
+            pe32.th32ParentProcessID = snapEntry.parentPid;
+            pe32.cntThreads          = snapEntry.threadCount;
+            ::wcsncpy_s(pe32.szExeFile, snapEntry.name.c_str(), _TRUNCATE);
 
-        do {
             if (detections.size() >= KeyloggerConstants::MAX_MONITORED_PROCESSES) {
                 SS_LOG_WARN(LOG_CATEGORY,
                     L"ScanProcessesForHooks reached detection cap=%zu",
@@ -854,7 +857,7 @@ public:
 
                 detections.push_back(std::move(event));
             }
-        } while (::Process32NextW(hSnapshot.Get(), &pe32));
+        }
 
         return detections;
     }
