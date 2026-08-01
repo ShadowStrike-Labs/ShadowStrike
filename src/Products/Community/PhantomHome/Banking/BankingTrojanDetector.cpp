@@ -694,6 +694,60 @@ public:
     // PROCESS ANALYSIS
     // ========================================================================
 
+    /**
+     * @brief SHA-256 of an executable, cached by file identity.
+     *
+     * The real-time loop re-analyzes every browser process twice a second, and
+     * it used to recompute the full SHA-256 of the browser executable on every
+     * pass. Chromium-family browsers run many processes off one multi-megabyte
+     * image, so the same unchanged bytes were being hashed tens of megabytes per
+     * second — a large share of this module's CPU for zero added detection.
+     *
+     * The cache key is the file's identity (path | size | last-write time), the
+     * same identity the real-time engine uses. Detection is unaffected: if the
+     * binary is replaced or modified, its size or timestamp changes, the key
+     * misses and the file is hashed again. Only clean re-reads of identical
+     * bytes are skipped.
+     */
+    [[nodiscard]] bool ComputeExecutableHashCached(const std::wstring& path,
+                                                  std::vector<uint8_t>& outHash) {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        std::wstring key = path;
+        if (::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+            const uint64_t size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32)
+                                | static_cast<uint64_t>(fad.nFileSizeLow);
+            const uint64_t mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
+                                 | static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
+            key.append(L"|").append(std::to_wstring(size));
+            key.append(L"|").append(std::to_wstring(mtime));
+
+            {
+                std::shared_lock lock(m_hashCacheMutex);
+                const auto it = m_exeHashCache.find(key);
+                if (it != m_exeHashCache.end()) {
+                    outHash = it->second;
+                    return true;
+                }
+            }
+        }
+
+        if (!Utils::HashUtils::ComputeFile(
+                Utils::HashUtils::Algorithm::SHA256, path, outHash)) {
+            return false;
+        }
+
+        {
+            std::unique_lock lock(m_hashCacheMutex);
+            // Bounded: browsers are few, but never let a long-lived service grow
+            // this without limit (paths can churn across updates).
+            if (m_exeHashCache.size() >= 256) {
+                m_exeHashCache.clear();
+            }
+            m_exeHashCache[std::move(key)] = outHash;
+        }
+        return true;
+    }
+
     [[nodiscard]] DetectionResult AnalyzeProcess(uint32_t processId) {
         DetectionResult result;
         result.processInfo.pid = processId;
@@ -737,8 +791,7 @@ public:
             // 3. Hash-based threat intel lookup
             if (m_config.enableThreatIntel && !basicInfo.executablePath.empty()) {
                 std::vector<uint8_t> fileHash;
-                if (Utils::HashUtils::ComputeFile(
-                        Utils::HashUtils::Algorithm::SHA256, basicInfo.executablePath, fileHash)) {
+                if (ComputeExecutableHashCached(basicInfo.executablePath, fileHash)) {
                     const std::string hexHash = Utils::HashUtils::ToHexLower(fileHash.data(), fileHash.size());
 
                     // Copy hash into result
@@ -1965,6 +2018,11 @@ private:
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_historyMutex;
     mutable std::shared_mutex m_callbackMutex;
+    mutable std::shared_mutex m_hashCacheMutex;
+
+    /// SHA-256 of scanned executables, keyed by "path|size|mtime" so the
+    /// real-time loop does not re-hash unchanged browser images every pass.
+    std::unordered_map<std::wstring, std::vector<uint8_t>> m_exeHashCache;
 
     std::atomic<ModuleStatus> m_status;
     std::atomic<bool> m_initialized;
