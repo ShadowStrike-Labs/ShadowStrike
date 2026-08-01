@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -41,6 +41,7 @@
  */
 
 #include "pch.h"
+#include "../../Communication/FilterPortGate.hpp"
 #include "FileLockManager.hpp"
 
 #include "../../Utils/Logger.hpp"
@@ -695,7 +696,8 @@ public:
         if (m_kernelPortConnected && m_kernelPort != INVALID_HANDLE_VALUE) return true;
         for (uint32_t i = 0; i < FileLockManagerConstants::KERNEL_CONNECT_RETRY_COUNT; ++i) {
             HANDLE newPort = INVALID_HANDLE_VALUE;
-            HRESULT hr = FilterConnectCommunicationPort(SHADOWSTRIKE_FILTER_PORT, 0, nullptr, 0, nullptr, &newPort);
+            HRESULT hr = Communication::FilterPortGate::Connect(
+                SHADOWSTRIKE_FILTER_PORT, nullptr, 0, &newPort, "FileLockManager");
             if (SUCCEEDED(hr) && newPort != INVALID_HANDLE_VALUE) {
                 m_kernelPort = newPort;
                 m_kernelPortConnected = true;
@@ -749,7 +751,8 @@ public:
     bool CheckKernelDriver() const noexcept {
         try {
             HANDLE hPort = INVALID_HANDLE_VALUE;
-            HRESULT hr = FilterConnectCommunicationPort(SHADOWSTRIKE_FILTER_PORT, 0, nullptr, 0, nullptr, &hPort);
+            HRESULT hr = Communication::FilterPortGate::Connect(
+                SHADOWSTRIKE_FILTER_PORT, nullptr, 0, &hPort, "FileLockManager-probe");
             if (SUCCEEDED(hr) && hPort != INVALID_HANDLE_VALUE) {
                 ::CloseHandle(hPort);
                 return true;

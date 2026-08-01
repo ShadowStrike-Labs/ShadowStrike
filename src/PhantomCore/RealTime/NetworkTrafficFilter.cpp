@@ -35,6 +35,7 @@
  */
 
 #include "pch.h"
+#include "../Communication/FilterPortGate.hpp"
 #include "NetworkTrafficFilter.hpp"
 
 // ============================================================================
@@ -236,13 +237,14 @@ struct NetworkTrafficFilter::Impl {
         Utils::Logger::Info("NetworkTrafficFilter: Connecting to driver port: {}",
             Utils::StringUtils::ToNarrow(SHADOWSTRIKE_PORT_NAME));
 
-        HRESULT hr = FilterConnectCommunicationPort(
+        // Serialized through the process-wide gate - see FilterPortGate.hpp for
+        // why concurrent connects stall system I/O.
+        HRESULT hr = Communication::FilterPortGate::Connect(
             SHADOWSTRIKE_PORT_NAME,
-            0,
             nullptr,
             0,
-            nullptr,
-            &m_hPort
+            &m_hPort,
+            "NetworkTrafficFilter"
         );
 
         if (FAILED(hr)) {

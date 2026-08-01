@@ -26,6 +26,7 @@
  */
 
 #include "pch.h"
+#include "FilterPortGate.hpp"
 #include "IPCManager.hpp"
 #include "FilterConnection.hpp"
 #include "ThreatIntelPusher.hpp"
@@ -629,13 +630,12 @@ bool IPCManager::ConnectFilterPort() {
     // FIX [BUG #11]: Use temp handle — FilterConnectCommunicationPort writes
     // directly to &handle. Storing into atomic<HANDLE> address isn't portable.
     HANDLE hPortTemp = nullptr;
-    HRESULT hr = FilterConnectCommunicationPort(
-        portName.c_str(),
-        0,
+    HRESULT hr = FilterPortGate::Connect(
+        portName,
         nullptr,
         0,
-        nullptr,
-        &hPortTemp
+        &hPortTemp,
+        "IPCManager"
     );
 
     if (FAILED(hr)) {

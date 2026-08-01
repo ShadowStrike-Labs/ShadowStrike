@@ -35,6 +35,7 @@
  */
 
 #include "pch.h"
+#include "../Communication/FilterPortGate.hpp"
 #include "FileSystemFilter.hpp"
 
 // ============================================================================
@@ -407,14 +408,18 @@ struct FileSystemFilter::Impl {
         Utils::Logger::Info("FileSystemFilter: Connecting to driver port: {}",
             Utils::StringUtils::ToNarrow(m_portName));
 
-        // Connect to the minifilter communication port
-        HRESULT hr = FilterConnectCommunicationPort(
-            m_portName.c_str(),
-            0,                          // Options
+        // Connect to the minifilter communication port.
+        //
+        // Through the process-wide gate: the driver holds ClientPortLock
+        // exclusive inside ConnectNotify, so simultaneous connects from the
+        // several subsystems that each own a port would block the whole I/O
+        // path against each other. Serialized, they are cheap.
+        HRESULT hr = Communication::FilterPortGate::Connect(
+            m_portName,
             nullptr,                    // Context
             0,                          // Context size
-            nullptr,                    // Security attributes
-            &m_hPort
+            &m_hPort,
+            "FileSystemFilter"
         );
 
         if (FAILED(hr)) {

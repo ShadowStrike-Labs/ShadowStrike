@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include "pch.h"
+#include "FilterPortGate.hpp"
 
 /**
  * @file FilterConnection.cpp
@@ -301,13 +302,14 @@ public:
                       connCtx.ClientImageHash);
         }
 
-        HRESULT hr = FilterConnectCommunicationPort(
-            m_portName.c_str(),
-            0,
+        // Serialized process-wide: ConnectNotify holds the driver's
+        // ClientPortLock exclusive, so overlapping connects block the I/O path.
+        HRESULT hr = FilterPortGate::Connect(
+            m_portName,
             &connCtx,
             sizeof(connCtx),
-            nullptr,
-            &m_hPort
+            &m_hPort,
+            "FilterConnection"
         );
 
         if (FAILED(hr)) {
