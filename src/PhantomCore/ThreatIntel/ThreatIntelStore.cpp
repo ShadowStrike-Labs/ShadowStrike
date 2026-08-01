@@ -62,6 +62,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../Utils/DataStorePaths.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/Timer.hpp"
 
@@ -880,6 +881,119 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
 
 bool ThreatIntelStore::Initialize() {
     return Initialize(StoreConfig::CreateDefault());
+}
+
+std::shared_ptr<ThreatIntelStore> ThreatIntelStore::Shared() {
+    static std::mutex                          s_mutex;
+    static std::shared_ptr<ThreatIntelStore>   s_instance;
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+
+    if (!s_instance) {
+        s_instance = std::make_shared<ThreatIntelStore>();
+    }
+
+    if (!s_instance->IsInitialized()) {
+        // The persistent location is created and hardened here rather than
+        // assumed: intelligence that anyone can rewrite is worse than none,
+        // because an attacker could remove the indicators that identify them.
+        (void)Utils::DataStorePaths::EnsureDataDirectory();
+
+        StoreConfig config = StoreConfig::CreateDefault();
+        config.databasePath = Utils::DataStorePaths::ThreatIntelDatabase();
+        config.enableCache  = true;
+        config.enableWAL    = true;
+
+        if (s_instance->Initialize(config)) {
+            Utils::Logger::Info(
+                "[ThreatIntel] Shared store opened at {}",
+                Utils::StringUtils::ToNarrow(config.databasePath));
+        } else {
+            Utils::Logger::Error(
+                "[ThreatIntel] Shared store could not be opened at {} - IOC and "
+                "reputation lookups will be unavailable this session",
+                Utils::StringUtils::ToNarrow(config.databasePath));
+        }
+    }
+
+    return s_instance;
+}
+
+uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
+    if (!IsInitialized()) {
+        Utils::Logger::Warn(
+            "[ThreatIntel] RegisterDefaultFeeds called before the store was open; "
+            "no feeds registered");
+        return 0;
+    }
+
+    // Public, key-free blocklists. URLs mirror the built-in feed factories in
+    // ThreatIntelFeedManager so there is a single source of truth for endpoints.
+    //
+    // Intervals are chosen to match how often each source actually changes.
+    // Polling faster than the publisher updates costs bandwidth and CPU without
+    // improving detection, and abuse.ch explicitly asks clients not to hammer
+    // their endpoints.
+    struct DefaultFeed {
+        const char*         id;
+        const char*         name;
+        const char*         description;
+        const char*         url;
+        FeedType            type;
+        std::chrono::hours  interval;
+    };
+
+    static const DefaultFeed kFeeds[] = {
+        { "urlhaus", "URLhaus",
+          "abuse.ch URLhaus - active malware distribution URLs",
+          "https://urlhaus.abuse.ch/downloads/csv_online/",
+          FeedType::CSV, std::chrono::hours(1) },
+
+        { "feodotracker", "Feodo Tracker",
+          "abuse.ch Feodo Tracker - recommended botnet C2 IP blocklist",
+          "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt",
+          FeedType::PlainText, std::chrono::hours(2) },
+
+        { "etopen-compromised-ips", "ET Open Compromised IPs",
+          "Emerging Threats Open - known compromised hosts",
+          "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+          FeedType::PlainText, std::chrono::hours(6) },
+    };
+
+    uint32_t registered = 0;
+    for (const auto& feed : kFeeds) {
+        FeedConfiguration config{};
+        config.feedId         = feed.id;
+        config.name           = feed.name;
+        config.description    = feed.description;
+        config.url            = feed.url;
+        config.type           = feed.type;
+        config.authType       = FeedAuthType::None;   // public, no credentials
+        config.updateInterval = feed.interval;
+        config.enabled        = true;
+
+        if (AddFeed(config)) {
+            ++registered;
+            Utils::Logger::Info("[ThreatIntel] Registered feed '{}' ({}h interval)",
+                                feed.id, static_cast<long long>(feed.interval.count()));
+        } else {
+            Utils::Logger::Warn("[ThreatIntel] Could not register feed '{}'", feed.id);
+        }
+    }
+
+    if (registered == 0) {
+        Utils::Logger::Error(
+            "[ThreatIntel] No feeds registered - IOC matching has no data source "
+            "and hash/URL/IP lookups will not match anything");
+    } else {
+        Utils::Logger::Info(
+            "[ThreatIntel] {} public feeds registered (no API key required). "
+            "Credentialed sources such as VirusTotal and OTX can be added via "
+            "AddFeed() once a key is configured.",
+            registered);
+    }
+
+    return registered;
 }
 
 void ThreatIntelStore::Shutdown() {

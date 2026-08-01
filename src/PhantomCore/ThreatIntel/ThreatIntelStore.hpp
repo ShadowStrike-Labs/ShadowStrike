@@ -1036,6 +1036,39 @@ public:
      * @brief Check if store is initialized
      */
     [[nodiscard]] bool IsInitialized() const noexcept;
+
+    /**
+     * @brief Process-wide shared store backed by the persistent database.
+     *
+     * A writable database open uses share mode 0 - it is exclusive, and while it
+     * is held no other handle can open the file at all. Every consumer that
+     * constructed its own store therefore could not have shared one database;
+     * that is why the default configuration produced a unique per-process file
+     * under %TEMP%, which in turn meant collected intelligence was discarded on
+     * every service restart and could never accumulate.
+     *
+     * The fix is one instance for the process, opened once against the canonical
+     * location, shared by every consumer. This is also the faster arrangement:
+     * a single memory mapping and a single cache instead of one per subsystem.
+     *
+     * @return Shared instance (never null; check IsInitialized() for usability).
+     */
+    [[nodiscard]] static std::shared_ptr<ThreatIntelStore> Shared();
+
+    /**
+     * @brief Register the built-in public threat-intelligence feeds.
+     *
+     * Registers only feeds that need no API key, so protection works on a fresh
+     * install with no account or configuration. Feeds requiring credentials
+     * (VirusTotal, AlienVault OTX, MISP) are deliberately not registered here;
+     * they are available through AddFeed() once a key is supplied.
+     *
+     * Every registered feed is a public blocklist fetched over HTTPS. No user or
+     * endpoint data is transmitted - the requests are plain downloads.
+     *
+     * @return Number of feeds registered.
+     */
+    [[nodiscard]] uint32_t RegisterDefaultFeeds() noexcept;
     
     // =========================================================================
     // IOC Lookups
