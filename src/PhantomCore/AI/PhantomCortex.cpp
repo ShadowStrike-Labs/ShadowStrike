@@ -353,7 +353,36 @@ bool PhantomCortex::Initialize(const CortexConfig& config) noexcept {
             }
         }
 
+        // ---- Step 7: Only claim operational status if a model can actually run ----
+        //
+        // This gate is a detection-integrity requirement, not a formality. When
+        // no model loads, inference returns no output and the error path yields
+        // a Benign / 0-confidence verdict, which the scan pipeline cannot tell
+        // apart from a genuine clean result. Reporting "operational" with zero
+        // models therefore makes every file look ML-approved while no ML runs at
+        // all - strictly worse than having no ML layer, because it manufactures
+        // confidence that does not exist. Answer honestly instead: callers check
+        // IsOperational() before consulting us and will skip the layer, so a
+        // missing model degrades coverage visibly rather than silently.
+        if (modelsLoaded == 0) {
+            m_impl->operational = false;
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"PhantomCortex has NO usable models in '%ls' - ML detection is "
+                L"UNAVAILABLE. The engine is reporting itself non-operational so "
+                L"callers skip inference rather than receive benign verdicts from "
+                L"a layer that is not running. Expected layout: "
+                L"<modelDirectory>\\<slot>\\current.onnx with a matching manifest.json.",
+                config.modelDirectory.c_str());
+            return false;
+        }
+
         m_impl->operational = true;
+        if (modelsLoaded < CortexConstants::MODEL_COUNT) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"PhantomCortex operational with %u of %zu models - the missing "
+                L"slots contribute no detection and are not treated as clean.",
+                modelsLoaded, static_cast<size_t>(CortexConstants::MODEL_COUNT));
+        }
         SS_LOG_INFO(LOG_CATEGORY,
             L"PhantomCortex initialization COMPLETE — engine is operational");
         return true;
