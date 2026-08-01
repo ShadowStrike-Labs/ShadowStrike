@@ -91,7 +91,27 @@
 /**
  * @brief Maximum simultaneous client connections.
  */
-#define SHADOWSTRIKE_MAX_CONNECTIONS    4
+//
+// Maximum simultaneous user-mode clients on the communication port.
+//
+// The service opens more channels than the original limit of 4 allowed:
+// IPCManager, the primary scanner connection, the push connection, the
+// file-system filter, the network traffic filter, and a one-shot availability
+// probe from the file lock manager. With a limit of 4 the later arrivals were
+// simply refused with ERROR_CONNECTION_COUNT_LIMIT (0x800704D6) - and because
+// nothing retried, NetworkTrafficFilter ran permanently with NO kernel channel,
+// silently losing its share of detection while appearing to start normally.
+//
+// 8 covers the six real channels with headroom for a reconnect overlapping a
+// connection that has not been reaped yet. It is deliberately not larger: every
+// slot costs non-paged pool for its reference and session key, and the port is
+// reachable only by SYSTEM/administrators, so a small bounded table also limits
+// what a compromised privileged process could occupy.
+//
+// Sharing one channel across subsystems would be better still and remains the
+// preferred architecture, but that is a wider refactor than this limit fix.
+//
+#define SHADOWSTRIKE_MAX_CONNECTIONS    8
 #define SHADOWSTRIKE_PORT_MAX_CONNECTIONS SHADOWSTRIKE_MAX_CONNECTIONS
 
 // ============================================================================
