@@ -1821,6 +1821,17 @@ public:
     // ========================================================================
 
     void ScanningLoop() {
+        // This is a background sweep, not a latency-critical path. Every file
+        // open on the machine is gated on the service answering the kernel's
+        // scan requests within the IPC reply timeout, so if this loop competes
+        // for CPU with that path on a small machine the minifilter ends up
+        // holding file operations and the whole desktop stalls even though CPU
+        // is only moderately busy. Run below normal priority and name the thread
+        // so it is identifiable in self-CPU attribution. Scan cadence and depth
+        // are unchanged: this yields the CPU, it does not skip work.
+        ::SetThreadDescription(::GetCurrentThread(), L"Banking-RTScan");
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
         SS_LOG_INFO(LOG_CATEGORY, L"Real-time scanning thread started");
 
         while (m_running.load(std::memory_order_acquire)) {
