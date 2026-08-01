@@ -1197,6 +1197,50 @@ struct FileIntegrityMonitor::Impl {
 
             if (stopFlag.load(std::memory_order_relaxed)) break;
 
+            // WAIT_FAILED must be handled explicitly. It is returned
+            // IMMEDIATELY (not after the timeout), so without this branch a
+            // single unusable handle in the array — a watched directory that was
+            // deleted, a volume that went away — turns this loop into a full
+            // core spin that never ends. Drop the watches whose handles no
+            // longer wait cleanly, and back off briefly so a transient failure
+            // can never burn CPU either.
+            if (waitResult == WAIT_FAILED) {
+                const DWORD err = ::GetLastError();
+                SS_LOG_WARN(L"FIM",
+                    L"WaitForMultipleObjects failed (err=%u) over %zu watch handles; "
+                    L"pruning unusable watches", err, handles.size());
+
+                size_t pruned = 0;
+                {
+                    std::unique_lock lk(dirWatchMutex);
+                    for (auto& candidate : dirWatches) {
+                        if (!candidate || !candidate->active ||
+                            !candidate->overlapped.hEvent) {
+                            continue;
+                        }
+                        // A healthy event handle answers a zero-timeout wait
+                        // with either signalled or timeout; anything else means
+                        // the handle itself is unusable.
+                        const DWORD probe =
+                            ::WaitForSingleObject(candidate->overlapped.hEvent, 0);
+                        if (probe == WAIT_FAILED) {
+                            SS_LOG_WARN(L"FIM",
+                                L"Deactivating watch with unusable handle: %s",
+                                candidate->directory.c_str());
+                            candidate->active = false;
+                            ++pruned;
+                        }
+                    }
+                }
+
+                if (pruned == 0) {
+                    // Could not attribute the failure to a specific watch;
+                    // never retry in a tight loop.
+                    ::Sleep(500);
+                }
+                continue;
+            }
+
             if (waitResult >= WAIT_OBJECT_0 &&
                 waitResult < WAIT_OBJECT_0 + handles.size()) {
 
@@ -1206,6 +1250,7 @@ struct FileIntegrityMonitor::Impl {
                 // captured directory name guarantees we either operate on the
                 // intended watch or skip safely.
                 const std::wstring& targetDir = handleDirs[waitResult - WAIT_OBJECT_0];
+                const HANDLE signalledEvent = handles[waitResult - WAIT_OBJECT_0];
 
                 std::shared_lock lk(dirWatchMutex);
                 DirWatch* dw = nullptr;
@@ -1216,12 +1261,32 @@ struct FileIntegrityMonitor::Impl {
                         break;
                     }
                 }
-                if (!dw) continue;
+                if (!dw) {
+                    // The watch disappeared while we were waiting. The event is
+                    // still SIGNALLED, so returning here without clearing it
+                    // would make the next wait return instantly and spin the
+                    // CPU forever. Clear it before moving on.
+                    ::ResetEvent(signalledEvent);
+                    continue;
+                }
 
                 DWORD bytesReturned = 0;
                 if (!::GetOverlappedResult(dw->hDir, &dw->overlapped,
-                                            &bytesReturned, FALSE))
+                                            &bytesReturned, FALSE)) {
+                    const DWORD err = ::GetLastError();
+                    // Same hazard as above: the event is signalled and must not
+                    // be left that way. ERROR_IO_INCOMPLETE is benign (the
+                    // result is simply not ready yet), anything else means this
+                    // watch is broken and is retired rather than spun on.
+                    ::ResetEvent(dw->overlapped.hEvent);
+                    if (err != ERROR_IO_INCOMPLETE) {
+                        SS_LOG_WARN(L"FIM",
+                            L"GetOverlappedResult failed for %s (err=%u); deactivating watch",
+                            dw->directory.c_str(), err);
+                        dw->active = false;
+                    }
                     continue;
+                }
 
                 if (bytesReturned > 0)
                     ProcessDirectoryNotifications(dw->buffer.get(), bytesReturned, dw->directory);
