@@ -732,11 +732,25 @@ public:
                 SS_LOG_WARN(L"CPUMonitor",
                     L"EDR self-usage excessive: %.2f%% (threshold %.1f%%)",
                     self, cfg.selfUsageAlertThreshold);
-                // Name the hottest OWN threads. The service is a protected
-                // process (PPL) with handle stripping, so nothing outside can
-                // enumerate its threads — this in-process sampler is the only
-                // way to attribute the self-CPU to a subsystem.
-                LogTopSelfThreads();
+
+                // Thread attribution is a DIAGNOSTIC and is off unless asked for.
+                //
+                // It suspends any thread above 5% to read its context and walk a
+                // slice of its stack. SuspendThread is unsafe as a routine
+                // measure: if the target happens to hold the loader lock or a
+                // heap lock, every other thread that needs it stops until the
+                // target resumes, and this service sits on the path the kernel
+                // waits on for scan verdicts - so a stall here is a stall for
+                // the whole machine. It also dominated the log, producing about
+                // a fifth of all lines during a two-minute run.
+                //
+                // It earned its keep: it is what identified the FIM spin, the
+                // banking sweep and the keylogger hook scan by name. So it stays
+                // in the build, enabled by setting SHADOWSTRIKE_CPU_ATTRIBUTION=1
+                // in the service environment when a hot thread needs naming.
+                if (IsThreadAttributionEnabled()) {
+                    LogTopSelfThreads();
+                }
             }
         }
 
@@ -797,6 +811,21 @@ public:
     // sample; the logged start-address RVA (start - exeBase) maps back to a
     // function offline via the .map / .pdb, which is how an otherwise-silent
     // hot thread gets identified.
+    /// @brief Whether the thread-attribution diagnostic is enabled.
+    ///
+    /// Opt-in via the SHADOWSTRIKE_CPU_ATTRIBUTION environment variable set to
+    /// "1". Read once and cached: the answer cannot change for the lifetime of
+    /// the service, and this is consulted from the monitor loop.
+    [[nodiscard]] static bool IsThreadAttributionEnabled() noexcept {
+        static const bool enabled = []() noexcept {
+            wchar_t value[8]{};
+            const DWORD len = ::GetEnvironmentVariableW(
+                L"SHADOWSTRIKE_CPU_ATTRIBUTION", value, static_cast<DWORD>(std::size(value)));
+            return len == 1 && value[0] == L'1';
+        }();
+        return enabled;
+    }
+
     void LogTopSelfThreads() {
         static std::unordered_map<DWORD, uint64_t> s_prev;  // tid -> cumulative 100ns (monitor thread only)
         static uint64_t s_prevTick = 0;
