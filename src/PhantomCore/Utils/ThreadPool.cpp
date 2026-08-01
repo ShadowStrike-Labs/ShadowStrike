@@ -1112,7 +1112,16 @@ void WorkerThread::WorkerLoop() {
     
     // Constants for wait timing
     constexpr auto kPauseSleepDuration = std::chrono::milliseconds(100);
-    constexpr auto kIdleWaitDuration = std::chrono::milliseconds(10);
+    // Idle wait. EnqueueTask() calls notify_one() after every push and work
+    // stealing is disabled (single shared global queue), so a waiting worker is
+    // always woken by an actual submission — the timeout is only a liveness
+    // safety net against a missed notification, not the work-discovery
+    // mechanism. It used to be 10 ms, which made every idle worker wake 100
+    // times a second forever to find an empty queue: pure overhead, and on a
+    // small (2-vCPU) machine that background churn is measurable. One second
+    // keeps the safety net while cutting idle wake-ups by 100x; task pickup
+    // latency is unchanged because it is driven by the notification.
+    constexpr auto kIdleWaitDuration = std::chrono::milliseconds(1000);
     
     // Main work loop
     while (running_.load(std::memory_order_acquire)) {
