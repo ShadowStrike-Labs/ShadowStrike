@@ -1558,6 +1558,17 @@ void IPCManager::WorkerRoutine() {
         Utils::Logger::Debug("[IPCManager] Worker thread {} started", oss.str());
     }
 
+    // LATENCY-CRITICAL PATH.
+    //
+    // These workers answer the kernel's scan requests. The minifilter holds the
+    // originating file operation until the verdict comes back, so every file
+    // open on the machine is waiting on this thread - if it loses the CPU to a
+    // background sweep, the whole desktop stalls even while total CPU looks
+    // moderate. Name the threads and run them above normal so verdict latency
+    // is protected; background monitors run below normal for the same reason.
+    ::SetThreadDescription(::GetCurrentThread(), L"SS-KernelScanReply");
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     // Reserve a stack region so the process-wide unhandled-exception filter can
     // still run (and hand the crash off to the dumper thread) if a scan on this
     // worker overflows the stack. Without this reserve the filter executes on
