@@ -363,6 +363,7 @@
     <ClCompile Include="src\PhantomCore\Update\UpdateVerifier.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\Base64Utils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CacheManager.cpp" />
+    <ClCompile Include="src\PhantomCore\Utils\DataStorePaths.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CertUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CompressionUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CryptoUtils_AsymmetricCipher.cpp" />
