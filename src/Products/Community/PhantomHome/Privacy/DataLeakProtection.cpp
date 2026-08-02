@@ -125,6 +125,25 @@ void AtomicValueStoreRelaxed(T& target, const T& value) noexcept {
 /**
  * @brief Built-in PII patterns
  */
+/// @brief Build the regex syntax options for a pattern.
+///
+/// These patterns are compiled as ECMAScript, which has no support for inline
+/// flag groups such as "(?i)". A pattern that embedded one threw
+/// regex_error(error_syntax) and was disabled, so the detector could never fire
+/// - a silent loss of coverage that only showed up as one line in the log.
+/// Expressing case-insensitivity as a field and translating it here keeps that
+/// decision per pattern, so patterns whose letter case is meaningful are
+/// unaffected.
+[[nodiscard]] std::regex_constants::syntax_option_type RegexFlagsFor(
+    const PIIPattern& pattern) noexcept
+{
+    auto flags = std::regex_constants::ECMAScript | std::regex_constants::optimize;
+    if (pattern.caseInsensitive) {
+        flags |= std::regex_constants::icase;
+    }
+    return flags;
+}
+
 std::vector<PIIPattern> CreateBuiltInPatterns() {
     std::vector<PIIPattern> patterns;
 
@@ -233,7 +252,16 @@ std::vector<PIIPattern> CreateBuiltInPatterns() {
         pattern.patternId = "CRED_001";
         pattern.name = "Credentials";
         pattern.description = "Password or API key in code";
-        pattern.regexPattern = R"((?i)(password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*['\"]?([^\s'\"]{8,})['\"]?)";
+        // No "(?i)" here: this regex is compiled as ECMAScript, which rejects
+        // inline flag groups, and the resulting regex_error meant this detector
+        // never loaded at all. Case-insensitivity is requested explicitly below.
+        //
+        // Quotes are also no longer backslash-escaped. Inside a raw string a
+        // backslash is literal, so ['\"] was a class of apostrophe, BACKSLASH and
+        // quote - it silently treated a backslash as a value delimiter, and the
+        // matching [^\s'\"] excluded backslashes from the captured secret.
+        pattern.regexPattern = R"((password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*['"]?([^\s'"]{8,})['"]?)";
+        pattern.caseInsensitive = true;
         pattern.category = DataCategory::Credentials;
         pattern.severity = SeverityLevel::Critical;
         pattern.requiresValidation = false;
@@ -532,7 +560,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
             try {
                 pattern.compiledRegex = std::regex(
                     pattern.regexPattern,
-                    std::regex_constants::ECMAScript | std::regex_constants::optimize
+                    RegexFlagsFor(pattern)
                 );
             } catch (const std::regex_error& e) {
                 ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
@@ -546,7 +574,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
             try {
                 pattern.compiledRegex = std::regex(
                     pattern.regexPattern,
-                    std::regex_constants::ECMAScript | std::regex_constants::optimize
+                    RegexFlagsFor(pattern)
                 );
                 m_patterns.push_back(pattern);
             } catch (const std::regex_error& e) {
@@ -640,7 +668,7 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
         try {
             pattern.compiledRegex = std::regex(
                 pattern.regexPattern,
-                std::regex_constants::ECMAScript | std::regex_constants::optimize
+                RegexFlagsFor(pattern)
             );
         } catch (const std::regex_error& e) {
             ::ShadowStrike::Utils::Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
@@ -653,7 +681,7 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
         try {
             custom.compiledRegex = std::regex(
                 custom.regexPattern,
-                std::regex_constants::ECMAScript | std::regex_constants::optimize
+                RegexFlagsFor(custom)
             );
             m_patterns.push_back(custom);
         } catch (const std::regex_error& e) {
@@ -1157,7 +1185,7 @@ bool DataLeakProtectionImpl::AddPattern(const PIIPattern& pattern) {
         // Compile regex
         newPattern.compiledRegex = std::regex(
             pattern.regexPattern,
-            std::regex_constants::ECMAScript | std::regex_constants::optimize
+            RegexFlagsFor(pattern)
         );
 
         m_patterns.push_back(std::move(newPattern));

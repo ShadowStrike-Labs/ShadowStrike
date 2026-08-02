@@ -325,6 +325,17 @@ struct PIIPattern {
     
     /// @brief Requires validation (Luhn, checksum, etc.)
     bool requiresValidation = false;
+
+    /// @brief Match without regard to letter case.
+    ///
+    /// std::regex is compiled as ECMAScript, which has no support for inline
+    /// flag groups such as "(?i)". A pattern that embedded one threw
+    /// regex_error(error_syntax) at compile time and was dropped, leaving the
+    /// detector permanently unable to fire. Case-insensitivity is therefore
+    /// expressed here and translated into regex_constants::icase at compile
+    /// time, per pattern - so a keyword pattern can be case-blind without
+    /// forcing that on patterns whose letter case is meaningful.
+    bool caseInsensitive = false;
     
     /// @brief Validation function name
     std::string validationFunction;
