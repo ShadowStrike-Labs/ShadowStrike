@@ -877,6 +877,21 @@ SbBuildFileScanRequestEx(
     scanRequest->ProcessNameLength = (UINT16)processNameLen;
 
     //
+    // Establish a known state for the fields that are only filled
+    // opportunistically below.
+    //
+    // These come from pool memory that is not zeroed, so leaving them unset when
+    // the query fails hands user mode whatever bytes happened to be there. That
+    // is not cosmetic: user mode applies a maximum-size guard, and a garbage
+    // FileSize reads as an enormous file, so the scan is SKIPPED. A file whose
+    // size cannot be queried would therefore go unscanned - and an attacker who
+    // can make the query fail gets that for free. Zero means "unknown", which no
+    // size guard rejects, so the file still gets analysed.
+    //
+    scanRequest->FileSize = 0;
+    scanRequest->IsDirectory = 0;
+
+    //
     // Get file attributes if available
     //
     if (FltObjects->FileObject != NULL) {
