@@ -2772,12 +2772,40 @@ public:
         // Uses quick options + skips expensive operations
 
         if (fileSize > ExecutableAnalyzerConstants::MAX_FILE_SIZE) {
-            SS_LOG_WARN(L"ExecutableAnalyzer",
-                L"Kernel scan skipped: file too large (%llu bytes), PID %u",
-                fileSize, processId);
-            ExecutableInfo info{};
-            m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
-            return info;
+            // An oversized value is not automatically an oversized file.
+            //
+            // The size arrives in the kernel scan request, and requests have been
+            // observed carrying impossible values - 0x63D8CB7B00000000, roughly
+            // seven exabytes, with the low 32 bits zero. Trusting that number
+            // meant the file was silently skipped, so anything that produced a
+            // bad size also bought immunity from analysis. Confirm against the
+            // filesystem before declining: GetFileAttributesEx reads the
+            // directory entry without opening the file, so it neither costs a
+            // handle nor re-enters the minifilter.
+            uint64_t actualSize = 0;
+            WIN32_FILE_ATTRIBUTE_DATA attr{};
+            const bool haveActual =
+                ::GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &attr) != FALSE;
+            if (haveActual) {
+                actualSize = (static_cast<uint64_t>(attr.nFileSizeHigh) << 32) |
+                             static_cast<uint64_t>(attr.nFileSizeLow);
+            }
+
+            if (haveActual && actualSize <= ExecutableAnalyzerConstants::MAX_FILE_SIZE) {
+                SS_LOG_WARN(L"ExecutableAnalyzer",
+                    L"Kernel scan request reported an implausible size (%llu bytes) for "
+                    L"'%ls'; actual size is %llu bytes, so analysing it rather than skipping",
+                    fileSize, filePath.c_str(), actualSize);
+                // fall through and analyse
+            } else {
+                SS_LOG_WARN(L"ExecutableAnalyzer",
+                    L"Kernel scan skipped: file too large (reported %llu bytes, "
+                    L"on-disk %llu bytes, queryable=%ls), PID %u",
+                    fileSize, actualSize, haveActual ? L"yes" : L"no", processId);
+                ExecutableInfo info{};
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return info;
+            }
         }
 
         auto opts = AnalysisOptions::CreateQuick();
