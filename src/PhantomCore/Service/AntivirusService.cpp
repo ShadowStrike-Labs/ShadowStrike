@@ -150,12 +150,18 @@ void ProvisionIpcAuthToken(std::uint32_t sessionId, const wchar_t* reason) noexc
 void ProvisionInteractiveIpcAuthTokens(const wchar_t* reason) noexcept {
     PWTS_SESSION_INFOW sessions = nullptr;
     DWORD count = 0;
-    if (!::WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
+    ::ShadowStrikeAppendBootTrace(L"provision-WTSEnumerateSessions-enter");
+    const BOOL enumerated =
+        ::WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count);
+    ::ShadowStrikeAppendBootTrace(L"provision-WTSEnumerateSessions-leave");
+    if (!enumerated) {
         SS_LOG_WARN(LOG_CATEGORY,
             L"WTSEnumerateSessionsW failed during IPC token provisioning (err=%lu)",
             GetLastError());
         const DWORD activeConsole = ::WTSGetActiveConsoleSessionId();
+        ::ShadowStrikeAppendBootTrace(L"provision-fallback-console-session-enter");
         ProvisionIpcAuthToken(static_cast<std::uint32_t>(activeConsole), reason);
+        ::ShadowStrikeAppendBootTrace(L"provision-fallback-console-session-leave");
         return;
     }
 
@@ -167,7 +173,17 @@ void ProvisionInteractiveIpcAuthTokens(const wchar_t* reason) noexcept {
     for (DWORD i = 0; i < count; ++i) {
         const auto state = sessions[i].State;
         if (state == WTSActive || state == WTSConnected || state == WTSDisconnected) {
+            wchar_t tag[96]{};
+            (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                                 L"provision-session-%u-state-%d-enter",
+                                 static_cast<unsigned>(sessions[i].SessionId),
+                                 static_cast<int>(state));
+            ::ShadowStrikeAppendBootTrace(tag);
             ProvisionIpcAuthToken(static_cast<std::uint32_t>(sessions[i].SessionId), reason);
+            (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                                 L"provision-session-%u-leave",
+                                 static_cast<unsigned>(sessions[i].SessionId));
+            ::ShadowStrikeAppendBootTrace(tag);
         }
     }
 }
@@ -254,12 +270,29 @@ public:
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing security subsystems...");
 
             // Threat Intel (database-backed IOC store + facade binding)
+            //
+            // Use the process-wide instance rather than a private one. A default
+            // constructed store falls back to StoreConfig::CreateDefault(), which
+            // puts the database under %TEMP% with a per-process, per-instance
+            // filename - so the service was building a second, throwaway IOC
+            // database on every start, next to the persistent one that
+            // RealTimeProtection opens. It was always empty, it never survived a
+            // restart, and because a miss in an empty store is indistinguishable
+            // from "not a known threat", every IOC lookup through the bound
+            // facade quietly reported clean.
+            //
+            // Shared() opens the hardened persistent path once and hands the same
+            // instance to every consumer, which also avoids the sharing violation
+            // that made the per-instance temp filenames necessary in the first
+            // place: the database is memory mapped GENERIC_READ|GENERIC_WRITE with
+            // FILE_SHARE_READ only, so two writable opens of one path cannot
+            // coexist.
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-enter");
             if (!m_threatIntelStore) {
-                m_threatIntelStore = std::make_unique<ThreatIntel::ThreatIntelStore>();
+                m_threatIntelStore = ThreatIntel::ThreatIntelStore::Shared();
             }
 
-            if (!m_threatIntelStore->IsInitialized() && !m_threatIntelStore->Initialize()) {
+            if (!m_threatIntelStore || !m_threatIntelStore->IsInitialized()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize ThreatIntelStore");
                 ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-FAIL");
                 return false;
@@ -834,9 +867,11 @@ public:
 
         ThreatIntel::ThreatIntelManager::Instance().Bind(nullptr);
         if (m_threatIntelStore) {
-            if (m_threatIntelStore->IsInitialized()) {
-                m_threatIntelStore->Shutdown();
-            }
+            // Release our reference, do not shut the store down. This is the
+            // process-wide instance now, so calling Shutdown() here would close
+            // the database out from under RealTimeProtection and ScanEngine,
+            // which hold the same object. The store tears itself down when the
+            // last reference goes away.
             m_threatIntelStore.reset();
         }
 
@@ -1037,7 +1072,7 @@ private:
     bool m_initialized = false;
     bool m_running = false;
     std::unique_ptr<Utils::ThreadPool> m_threadPool;
-    std::unique_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
+    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
     std::thread m_maintenanceThread;
     std::mutex m_shutdownMutex;
     std::condition_variable m_shutdownCv;
