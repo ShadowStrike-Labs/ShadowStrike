@@ -31,6 +31,7 @@
  */
 
 #include "IpcAuthToken.hpp"
+#include "BootTrace.hpp"    // ShadowStrikeAppendBootTrace - startup hang localisation
 
 // Windows SDK — explicit inclusions after PCH
 #include <shlobj.h>         // SHGetKnownFolderPath, FOLDERID_LocalAppData
@@ -486,8 +487,16 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
     // same sessionId block until the first caller stores the result; they then
     // receive that cached value — preventing duplicate nonce generation and
     // conflicting file writes (TOCTOU fix).
-    return TokenCache::Instance().GetOrGenerate(sessionId, [sessionId]() -> std::string
+    // Startup hang localisation: the service has been observed entering
+    // ProvisionInteractive and never leaving, which stops it reporting RUNNING so
+    // SCM eventually tears it down. Every blocking call on this path is traced
+    // individually, because the trace is the only evidence available - the process
+    // strips handles to itself, so an external dumper cannot attach to it.
+    ::ShadowStrikeAppendBootTrace(L"token-cache-GetOrGenerate-enter");
+    const std::string result =
+        TokenCache::Instance().GetOrGenerate(sessionId, [sessionId]() -> std::string
     {
+        ::ShadowStrikeAppendBootTrace(L"token-generate-enter");
         std::array<std::uint8_t, kNonceBytes> nonce{};
 
         // Unconditional RAII scrub: every exit path from this block — success,
@@ -514,16 +523,21 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
         }
 
         HANDLE rawUserToken = nullptr;
+        ::ShadowStrikeAppendBootTrace(L"token-WTSQueryUserToken-enter");
         if (!::WTSQueryUserToken(sessionId, &rawUserToken)) {
             DWORD err = ::GetLastError();
+            ::ShadowStrikeAppendBootTrace(L"token-WTSQueryUserToken-FAIL");
             SS_LOG_ERROR(kLogCat,
                 L"WTSQueryUserToken failed for session %u: error=%lu",
                 sessionId, static_cast<unsigned long>(err));
             return {};
         }
+        ::ShadowStrikeAppendBootTrace(L"token-WTSQueryUserToken-leave");
         ScopedHandle hUserToken(rawUserToken);
 
+        ::ShadowStrikeAppendBootTrace(L"token-ResolveTokenPath-enter");
         std::wstring tokenPath = ResolveTokenPathForSession(hUserToken.Get());
+        ::ShadowStrikeAppendBootTrace(L"token-ResolveTokenPath-leave");
         if (tokenPath.empty()) {
             SS_LOG_ERROR(kLogCat,
                 L"EnsureForSession: failed to resolve token path for session %u", sessionId);
@@ -538,7 +552,12 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
             return {};
         }
 
-        if (!WriteTokenFile(tokenPath, tokenB64, userSid)) {
+        // This write goes through our own minifilter, so it is the strongest
+        // candidate for a self-inflicted stall on this path.
+        ::ShadowStrikeAppendBootTrace(L"token-WriteTokenFile-enter");
+        const bool wrote = WriteTokenFile(tokenPath, tokenB64, userSid);
+        ::ShadowStrikeAppendBootTrace(L"token-WriteTokenFile-leave");
+        if (!wrote) {
             SS_LOG_ERROR(kLogCat,
                 L"EnsureForSession: WriteTokenFile failed for session %u", sessionId);
             return {};
@@ -548,8 +567,11 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
             L"IPC auth token issued for session %u at '%ls'",
             sessionId, tokenPath.c_str());
 
+        ::ShadowStrikeAppendBootTrace(L"token-generate-leave-ok");
         return tokenB64;
     });
+    ::ShadowStrikeAppendBootTrace(L"token-cache-GetOrGenerate-leave");
+    return result;
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Verify  (service-side)
