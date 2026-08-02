@@ -1249,7 +1249,7 @@ SbSendScanRequestEx(
         //
         if (Result->ThreatDetected) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                "ScanBridge: Threat detected â€” verdict=%ls score=%u\n",
+                "ScanBridge: Threat detected - verdict=%ls score=%u\n",
                 ShadowStrikeGetVerdictName(Result->Verdict),
                 Result->ThreatScore);
         }

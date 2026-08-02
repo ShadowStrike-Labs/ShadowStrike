@@ -798,7 +798,7 @@ ShadowStrikeCreateCommunicationPort(
             ShadowStrikeSetCommHmacKeyReady(FALSE);
             RtlSecureZeroMemory(g_CommHmacKey, sizeof(g_CommHmacKey));
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] HMAC key generation deferred (0x%08X) — "
+                       "[ShadowStrike] HMAC key generation deferred (0x%08X) - "
                        "mandatory encryption will reject clients until reseeded\n",
                        keyStatus);
         }
@@ -1491,7 +1491,7 @@ ShadowStrikeDeliverKexWorker(
         }
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Kex delivery failed on slot %ld: 0x%08X — disconnecting\n",
+                   "[ShadowStrike] Kex delivery failed on slot %ld: 0x%08X - disconnecting\n",
                    ctx->SlotIndex,
                    status);
 
@@ -2068,7 +2068,7 @@ ShadowStrikeConnectNotify(
                        sessionKeyMaterialStatus);
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] Session key derivation FAILED for slot %ld: 0x%08X "
-                       "(connection rejected — encryption is mandatory)\n",
+                       "(connection rejected - encryption is mandatory)\n",
                        slotIndex, keyStatus);
 
             // Clean up slot
@@ -3590,7 +3590,7 @@ ShadowStrikeReleaseClientPort(
 
     if (remainingRefs < 0) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] CRITICAL: Negative refcount %ld on slot %ld — double release detected\n",
+                   "[ShadowStrike] CRITICAL: Negative refcount %ld on slot %ld - double release detected\n",
                    remainingRefs, slotIndex);
         NT_ASSERT(remainingRefs >= 0);
         return;
