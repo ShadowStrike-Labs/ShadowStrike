@@ -137,10 +137,31 @@ static void ShadowStrikeWriteCrashMinidump(EXCEPTION_POINTERS* ep, DWORD threadI
         mei.ExceptionPointers = ep;
         mei.ClientPointers = FALSE;
 
-        // MiniDumpNormal: thread stacks + module list only (no heap walk), so it
-        // survives a corrupt heap and is enough to resolve the faulting stack.
+        // Dump contents are a deliberate trade-off.
+        //
+        // MiniDumpNormal alone gives thread stacks and the module list with no
+        // heap walk, which is why it was chosen: it survives a corrupt heap. But
+        // it was not enough to diagnose the startup crash in the IPC receive
+        // path - the unwound frames were garbage and none of the pointers held in
+        // registers could be examined, so the cause stayed unknown.
+        //
+        // MiniDumpWithIndirectlyReferencedMemory closes that gap without giving up
+        // the safety property: it captures the pages that stack values and
+        // registers point AT, resolved by address, rather than enumerating heap
+        // structures the way MiniDumpWithFullMemory does. A corrupted heap header
+        // therefore cannot send the writer into a bad traversal. MiniDumpWithDataSegs
+        // adds our globals and statics, which is cheap and often decisive for
+        // "what state was this subsystem in".
+        //
+        // Cost is a larger file (megabytes rather than hundreds of kilobytes) on a
+        // path that only runs when the process is already dying, so it buys real
+        // diagnostic ability for no steady-state cost.
         const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
-            MiniDumpNormal | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo);
+            MiniDumpNormal |
+            MiniDumpWithUnloadedModules |
+            MiniDumpWithThreadInfo |
+            MiniDumpWithIndirectlyReferencedMemory |
+            MiniDumpWithDataSegs);
 
         const BOOL dumpOk = ::MiniDumpWriteDump(
             ::GetCurrentProcess(), ::GetCurrentProcessId(),
