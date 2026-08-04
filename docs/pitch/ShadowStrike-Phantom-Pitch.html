@@ -6,204 +6,262 @@
 <style>
   @page { size: 1280px 720px; margin: 0; }
   * { margin:0; padding:0; box-sizing:border-box; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
-  html,body { font-family:"Segoe UI","Helvetica Neue",Arial,sans-serif; color:#12181F; }
+  html,body { font-family:"Segoe UI","Helvetica Neue",Arial,sans-serif; color:#141A21; background:#fff; }
 
+  /* ============================ base slide ============================ */
   .slide {
     position:relative; width:1280px; height:720px; overflow:hidden;
-    page-break-after:always; break-after:page; background:#FFFFFF;
-    padding:64px 76px;
+    page-break-after:always; break-after:page;
+    background:
+      radial-gradient(1100px 420px at 88% -12%, #FAF7F1 0%, rgba(250,247,241,0) 62%),
+      linear-gradient(180deg,#FFFFFF 0%,#FCFCFD 100%);
+    padding:60px 78px 0 78px;
   }
   .slide:last-child { page-break-after:auto; }
+  .slide:before { content:""; position:absolute; top:0; left:0; right:0; height:3px;
+    background:linear-gradient(90deg,#B0761C 0%,#C9973F 38%,#E3C68A 68%,rgba(227,198,138,0) 100%); }
 
-  /* ---------- accents ---------- */
-  .rule { width:56px; height:3px; background:#B5761F; margin-bottom:26px; }
-  .kicker { font-size:13px; letter-spacing:.20em; text-transform:uppercase; color:#8A6224; font-weight:600; margin-bottom:14px; }
-  h1 { font-size:44px; line-height:1.12; font-weight:600; letter-spacing:-.015em; }
-  h2 { font-size:34px; line-height:1.18; font-weight:600; letter-spacing:-.01em; margin-bottom:8px; }
-  h3 { font-size:17px; font-weight:600; margin-bottom:6px; }
-  p  { font-size:16px; line-height:1.62; color:#39424D; }
-  .lead { font-size:19px; line-height:1.58; color:#2A323B; }
-  .foot { position:absolute; left:76px; right:76px; bottom:30px; display:flex; justify-content:space-between;
-          font-size:11.5px; color:#95A0AC; letter-spacing:.04em; border-top:1px solid #E6E9ED; padding-top:12px; }
+  /* ============================ typography ============================ */
+  .kicker { display:flex; align-items:center; gap:12px; font-size:11px; letter-spacing:.24em;
+            text-transform:uppercase; color:#9A7526; font-weight:700; margin-bottom:16px; }
+  .kicker .num { display:inline-flex; align-items:center; justify-content:center;
+                 width:20px; height:20px; border:1px solid #DCC79B; color:#9A7526;
+                 font-size:10px; letter-spacing:0; font-weight:700; }
+  h1 { font-size:46px; line-height:1.1; font-weight:600; letter-spacing:-.02em; }
+  h2 { font-size:33px; line-height:1.2; font-weight:600; letter-spacing:-.015em; color:#101720; }
+  h2 .accent { color:#B0761C; }
+  h3 { font-size:16px; font-weight:700; margin-bottom:7px; color:#101720; letter-spacing:-.005em; }
+  p  { font-size:15.5px; line-height:1.64; color:#454F5B; }
+  .lead { font-size:18.5px; line-height:1.6; color:#2B3440; font-weight:300; }
+  .note { font-size:13.5px; color:#78838F; line-height:1.55; }
 
-  /* ---------- cover ---------- */
-  .cover { background:#0C1219; color:#F2F5F8; padding:88px 76px; }
-  .cover h1 { font-size:62px; color:#FFFFFF; letter-spacing:-.02em; }
-  .cover .sub { font-size:22px; color:#B9C3CE; margin-top:20px; font-weight:300; }
-  .cover .tag { font-size:15px; color:#C89A4A; margin-top:34px; letter-spacing:.11em; text-transform:uppercase; font-weight:600; }
-  .cover .rule { background:#C89A4A; width:74px; }
-  .cover-meta { position:absolute; left:76px; bottom:64px; font-size:14px; color:#8F9BA8; line-height:1.9; }
-  .cover-badge { position:absolute; right:76px; bottom:64px; text-align:right; font-size:13px; color:#8F9BA8; line-height:1.9; }
-  .cover-badge strong { color:#E8EDF2; font-weight:600; }
+  .foot { position:absolute; left:78px; right:78px; bottom:26px; display:flex;
+          justify-content:space-between; align-items:center;
+          font-size:10.5px; color:#A3ADB8; letter-spacing:.1em; text-transform:uppercase;
+          border-top:1px solid #EAEDF0; padding-top:11px; }
+  .foot .pg { font-variant-numeric:tabular-nums; letter-spacing:.04em; color:#8C97A3; }
 
-  /* ---------- layout helpers ---------- */
-  .two { display:flex; gap:52px; margin-top:30px; }
+  /* ============================ cover ============================ */
+  .cover {
+    background:
+      radial-gradient(880px 520px at 12% 8%, #1B2836 0%, rgba(27,40,54,0) 66%),
+      radial-gradient(620px 420px at 92% 92%, #23303C 0%, rgba(35,48,60,0) 60%),
+      linear-gradient(155deg,#0A0F16 0%,#0D141C 55%,#0A0F16 100%);
+    color:#F4F7FA; padding:0 78px; display:flex; flex-direction:column; justify-content:center;
+  }
+  .cover:before { display:none; }
+  .cover .grid {
+    position:absolute; inset:0; opacity:.30;
+    background-image:
+      repeating-linear-gradient(90deg, rgba(201,151,63,.10) 0 1px, rgba(0,0,0,0) 1px 74px),
+      repeating-linear-gradient(0deg,  rgba(201,151,63,.07) 0 1px, rgba(0,0,0,0) 1px 74px);
+  }
+  .cover .glow { position:absolute; right:-140px; top:-140px; width:520px; height:520px;
+    background:radial-gradient(circle, rgba(201,151,63,.16) 0%, rgba(201,151,63,0) 68%); }
+  .cover .inner { position:relative; }
+  .cover .mark { font-size:11px; letter-spacing:.34em; text-transform:uppercase; color:#C9973F;
+                 font-weight:700; margin-bottom:26px; }
+  .cover h1 { font-size:66px; color:#FFFFFF; letter-spacing:-.028em; font-weight:600; }
+  .cover h1 .thin { font-weight:200; color:#D8E0E8; }
+  .cover .bar { width:78px; height:2px; background:linear-gradient(90deg,#C9973F,#E3C68A); margin:30px 0 26px; }
+  .cover .sub { font-size:21px; line-height:1.55; color:#AEBAC6; font-weight:300; max-width:800px; }
+  .cover .tag { margin-top:36px; display:inline-block; font-size:11.5px; letter-spacing:.2em;
+                text-transform:uppercase; color:#0A0F16; font-weight:700;
+                background:linear-gradient(90deg,#C9973F,#E0BE7E); padding:9px 18px; }
+  .cover-meta { position:absolute; left:78px; bottom:52px; font-size:13px; color:#7E8B98; line-height:1.95;
+                border-top:1px solid rgba(255,255,255,.08); padding-top:16px; width:300px; }
+  .cover-meta strong { color:#E6ECF2; font-weight:600; letter-spacing:.02em; }
+  .cover-date { position:absolute; right:78px; bottom:52px; text-align:right; font-size:13px;
+                color:#7E8B98; line-height:1.95; border-top:1px solid rgba(255,255,255,.08);
+                padding-top:16px; width:220px; }
+
+  /* ============================ layout ============================ */
+  .two   { display:flex; gap:50px; }
   .two > div { flex:1; }
-  .three { display:flex; gap:30px; margin-top:34px; }
+  .three { display:flex; gap:26px; }
   .three > div { flex:1; }
 
-  .card { background:#F7F9FA; border:1px solid #E3E8EC; border-left:3px solid #B5761F; padding:20px 22px; }
-  .card h3 { color:#12181F; }
-  .card p { font-size:14.5px; line-height:1.55; }
+  .card { background:linear-gradient(180deg,#FFFFFF 0%,#FAFBFC 100%);
+          border:1px solid #E4E8EC; border-top:2px solid #C9973F;
+          padding:20px 21px 21px; box-shadow:0 1px 2px rgba(16,23,32,.04); }
+  .card p { font-size:14px; line-height:1.58; }
 
-  table { width:100%; border-collapse:collapse; margin-top:26px; }
-  th { text-align:left; font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:#7C8794;
-       font-weight:600; padding:0 14px 10px 0; border-bottom:1.5px solid #D6DBE0; }
-  td { font-size:15px; color:#2E3742; padding:13px 14px 13px 0; border-bottom:1px solid #EDF0F2; vertical-align:top; }
-  td.n { font-variant-numeric:tabular-nums; white-space:nowrap; color:#12181F; font-weight:600; }
-  td.d { color:#5B6673; font-size:14px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:10.5px; letter-spacing:.16em; text-transform:uppercase; color:#8A95A1;
+       font-weight:700; padding:0 15px 10px 0; border-bottom:1.5px solid #D9DEE3; }
+  td { font-size:15px; color:#333C48; padding:12px 15px 12px 0; border-bottom:1px solid #EDF0F3; vertical-align:top; }
+  td strong { color:#101720; font-weight:600; }
+  td.d { color:#5D6874; font-size:13.5px; line-height:1.55; }
+  td.n { font-variant-numeric:tabular-nums; white-space:nowrap; color:#101720; font-weight:600; }
   tr:last-child td { border-bottom:none; }
-  .total td { border-top:1.5px solid #D6DBE0; font-weight:700; color:#0C1219; padding-top:15px; }
+  tbody tr:nth-child(even) td { background:#FAFBFC; }
 
-  ul { list-style:none; margin-top:8px; }
-  li { font-size:15.5px; line-height:1.55; color:#39424D; padding-left:19px; position:relative; margin-bottom:11px; }
-  li:before { content:""; position:absolute; left:0; top:9px; width:6px; height:6px; background:#B5761F; }
+  ul { list-style:none; }
+  li { font-size:15px; line-height:1.58; color:#454F5B; padding-left:20px; position:relative; margin-bottom:12px; }
+  li:before { content:""; position:absolute; left:0; top:8px; width:7px; height:7px;
+              background:linear-gradient(135deg,#C9973F,#B0761C); }
 
-  .stat { font-size:40px; font-weight:600; color:#0C1219; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
-  .stat-l { font-size:13px; color:#7C8794; letter-spacing:.05em; margin-top:5px; line-height:1.45; }
+  .stat { font-size:42px; font-weight:600; color:#101720; letter-spacing:-.03em; font-variant-numeric:tabular-nums; line-height:1; }
+  .stat .u { font-size:30px; color:#B0761C; font-weight:500; margin-left:3px; vertical-align:6px; }
+  .stat-l { font-size:12.5px; color:#78838F; letter-spacing:.03em; margin-top:8px; line-height:1.5; }
 
-  /* ---------- architecture ---------- */
-  .arch { margin-top:20px; border:1px solid #E3E8EC; }
-  .band { padding:10px 17px; border-bottom:1px solid #E3E8EC; }
+  .quote { border-left:2px solid #C9973F; padding:2px 0 2px 22px; }
+  .quote p { font-size:17.5px; line-height:1.62; color:#2B3440; font-style:italic; }
+
+  /* ============================ architecture ============================ */
+  .arch { border:1px solid #E1E5E9; background:#fff; box-shadow:0 1px 3px rgba(16,23,32,.05); }
+  .band { padding:11px 18px; border-bottom:1px solid #EAEDF0; }
   .band:last-child { border-bottom:none; }
-  .band-l { font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:#8A6224; font-weight:700; margin-bottom:7px; }
+  .band-l { font-size:9.5px; letter-spacing:.2em; text-transform:uppercase; color:#9A7526; font-weight:700; margin-bottom:8px; }
   .row { display:flex; gap:8px; }
-  .box { flex:1; background:#F7F9FA; border:1px solid #DFE4E9; padding:8px 10px; font-size:11.5px; color:#2E3742; line-height:1.38; }
-  .box b { display:block; font-size:11.5px; color:#0C1219; font-weight:600; margin-bottom:2px; }
+  .box { flex:1; background:#FAFBFC; border:1px solid #E4E8EC; padding:9px 11px;
+         font-size:11px; color:#5D6874; line-height:1.42; }
+  .box b { display:block; font-size:11.5px; color:#101720; font-weight:700; margin-bottom:2px; letter-spacing:-.005em; }
+  .band.bridge { background:linear-gradient(90deg,#FBF7EF,#FDFBF7); }
+  .band.bridge .box { background:#fff; border-color:#E6DCC6; text-align:center; }
+  .band.k { background:linear-gradient(160deg,#0C1219,#111A24); }
+  .band.k .band-l { color:#C9973F; }
+  .band.k .box { background:rgba(255,255,255,.045); border-color:rgba(255,255,255,.09); color:#9FADBB; }
+  .band.k .box b { color:#EDF2F7; }
+  .band.hw { background:#F4F6F8; text-align:center; font-size:11px; color:#78838F;
+             letter-spacing:.13em; text-transform:uppercase; padding:9px; }
 
-  /* dense slides: tighter tables so nothing reaches the footer rule */
-  .dense h2 { font-size:31px; }
-  .dense table { margin-top:18px; }
-  .dense td { font-size:14px; padding:9.5px 14px 9.5px 0; }
-  .dense td.d { font-size:13px; line-height:1.5; }
-  .dense th { padding-bottom:8px; }
-  .dense .total td { padding-top:11px; }
-  .xdense h2 { font-size:30px; }
-  .xdense table { margin-top:14px; }
-  .xdense td { font-size:13.5px; padding:7.5px 14px 7.5px 0; }
-  .xdense td.d { font-size:12.5px; line-height:1.45; }
-  .xdense th { padding-bottom:7px; font-size:11px; }
-  .xdense .total td { padding-top:9px; }
-  .band.k { background:#0C1219; }
-  .band.k .band-l { color:#C89A4A; }
-  .band.k .box { background:#161F29; border-color:#28323D; color:#B9C3CE; }
-  .band.k .box b { color:#F2F5F8; }
-  .band.hw { background:#F2F4F6; text-align:center; font-size:12px; color:#6B7683; letter-spacing:.09em; }
+  /* ============================ dense variants ============================ */
+  .dense h2 { font-size:30px; }
+  .dense td { font-size:14px; padding:9.5px 15px 9.5px 0; }
+  .dense td.d { font-size:12.8px; line-height:1.5; }
 
-  .quote { border-left:3px solid #B5761F; padding:4px 0 4px 22px; margin-top:28px; }
-  .quote p { font-size:18px; line-height:1.6; color:#2A323B; font-style:italic; }
-
-  .closing { background:#0C1219; color:#F2F5F8; }
+  /* ============================ closing ============================ */
+  .closing {
+    background:
+      radial-gradient(820px 480px at 88% 6%, #1B2836 0%, rgba(27,40,54,0) 64%),
+      linear-gradient(155deg,#0A0F16 0%,#0D141C 60%,#0A0F16 100%);
+    color:#F4F7FA;
+  }
+  .closing:before { background:linear-gradient(90deg,#C9973F 0%,#E3C68A 46%,rgba(227,198,138,0) 100%); }
+  .closing .grid { position:absolute; inset:0; opacity:.24;
+    background-image:
+      repeating-linear-gradient(90deg, rgba(201,151,63,.09) 0 1px, rgba(0,0,0,0) 1px 74px),
+      repeating-linear-gradient(0deg,  rgba(201,151,63,.06) 0 1px, rgba(0,0,0,0) 1px 74px); }
+  .closing .kicker { color:#C9973F; }
+  .closing .kicker .num { border-color:rgba(201,151,63,.45); color:#C9973F; }
   .closing h2 { color:#FFFFFF; }
-  .closing p { color:#B9C3CE; }
-  .closing .rule { background:#C89A4A; }
-  .closing .card { background:#161F29; border-color:#28323D; border-left-color:#C89A4A; }
-  .closing .card h3 { color:#F2F5F8; }
-  .closing .card p { color:#A7B2BE; }
-  .closing .foot { color:#5E6B78; border-top-color:#232D37; }
+  .closing .lead { color:#AEBAC6; }
+  .closing .card { background:rgba(255,255,255,.045); border-color:rgba(255,255,255,.10);
+                   border-top-color:#C9973F; box-shadow:none; }
+  .closing .card h3 { color:#F4F7FA; }
+  .closing .card p { color:#9FADBB; }
+  .closing .foot { color:#5C6874; border-top-color:rgba(255,255,255,.09); }
+  .closing .foot .pg { color:#7E8B98; }
+  .rel { position:relative; }
+  .vcenter { display:flex; flex-direction:column; justify-content:center; padding-top:0; padding-bottom:66px; }
 </style>
 </head>
 <body>
 
-<!-- 1 ------------------------------------------------------------------ -->
+<!-- 1 · cover ---------------------------------------------------------- -->
 <div class="slide cover">
-  <div class="rule"></div>
-  <h1>ShadowStrike Phantom</h1>
-  <div class="sub">Open-source next-generation endpoint protection for Windows.<br/>
-  Kernel sensor, on-device analysis, and full-system emulation — built from scratch.</div>
-  <div class="tag">Every line auditable</div>
+  <div class="grid"></div><div class="glow"></div>
+  <div class="inner">
+    <div class="mark">ShadowStrike-Labs</div>
+    <h1>ShadowStrike <span class="thin">Phantom</span></h1>
+    <div class="bar"></div>
+    <div class="sub">Open-source next-generation endpoint protection for Windows.
+    A custom kernel sensor, on-device analysis and a full-system emulation engine — built from scratch.</div>
+    <div class="tag">Every line auditable</div>
+  </div>
   <div class="cover-meta">
-    ShadowStrike-Labs<br/>
+    <strong>ShadowStrike-Labs</strong><br/>
     contact@shadowstrike.dev<br/>
     shadowstrike.dev
   </div>
-  <div class="cover-badge">
-    <strong>AWS Activate</strong><br/>
-    Credit application<br/>
-    August 2026
+  <div class="cover-date">
+    <strong>Company Pitch</strong><br/>
+    August 2026<br/>
+    Alpha · Beta target 2027
   </div>
 </div>
 
-<!-- 2 ------------------------------------------------------------------ -->
-<div class="slide">
-  <div class="kicker">The problem</div>
-  <div class="rule"></div>
-  <h2>Security software demands the deepest trust<br/>and offers the least transparency.</h2>
-  <p class="lead" style="margin-top:18px;">Endpoint protection runs in the Windows kernel. It sees every file, every process,
-  every network flow. It can stop a machine from booting. And at every major vendor, it is code the customer is not
-  permitted to read.</p>
+<!-- 2 · problem -------------------------------------------------------- -->
+<div class="slide vcenter">
+  <div class="kicker"><span class="num">01</span> The problem</div>
+  <h2>Security software demands the deepest trust<br/>and offers the <span class="accent">least transparency</span>.</h2>
+  <p class="lead" style="margin-top:18px; max-width:1000px;">Endpoint protection runs inside the Windows kernel.
+  It sees every file, every process and every network flow. It can stop a machine from booting. And at every major
+  vendor, it is code the customer is not permitted to read.</p>
 
-  <div class="three">
+  <div class="three" style="margin-top:38px;">
     <div class="card">
       <h3>The risk is not theoretical</h3>
-      <p>In July 2024 a single faulty kernel update disabled roughly 8.5 million Windows machines worldwide, grounding
-      airlines and interrupting hospitals. The affected organisations had no ability to inspect the code that did it.</p>
+      <p>In July 2024 a single faulty kernel update disabled roughly 8.5 million Windows machines worldwide,
+      grounding airlines and interrupting hospitals. The affected organisations had no ability to inspect the
+      code that did it.</p>
     </div>
     <div class="card">
       <h3>Verification is becoming mandatory</h3>
-      <p>Software supply-chain requirements in regulated sectors increasingly call for provenance and auditability
-      that closed-source kernel agents structurally cannot provide.</p>
+      <p>Software supply-chain requirements in regulated sectors increasingly call for provenance and
+      auditability that closed-source kernel agents structurally cannot provide.</p>
     </div>
     <div class="card">
       <h3>Open source has not filled the gap</h3>
-      <p>Existing open tools are scanners, log shippers, or rule engines. None is a complete kernel-to-user
+      <p>Existing open tools are scanners, log shippers or rule engines. None is a complete kernel-to-user-mode
       endpoint protection platform with its own detection engine.</p>
     </div>
   </div>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>2</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">02</span></div>
 </div>
 
-<!-- 3 ------------------------------------------------------------------ -->
-<div class="slide">
-  <div class="kicker">What we built</div>
-  <div class="rule"></div>
-  <h2>Five purpose-built subsystems. No third-party detection engine.</h2>
-  <p style="margin-top:14px;">ShadowStrike Phantom is not a wrapper around existing tools and not a proof of concept.
-  Each layer was written from the ground up so that the entire detection path — from the kernel callback to the
-  final verdict — is inspectable.</p>
+<!-- 3 · what we built -------------------------------------------------- -->
+<div class="slide dense">
+  <div class="kicker"><span class="num">02</span> What we built</div>
+  <h2>Five purpose-built subsystems. <span class="accent">No third-party detection engine.</span></h2>
+  <p style="margin-top:12px; max-width:1030px;">ShadowStrike Phantom is not a wrapper around existing tools and
+  not a proof of concept. Each layer was written from the ground up so that the entire detection path — from the
+  kernel callback to the final verdict — is inspectable.</p>
 
-  <table>
-    <tr><th style="width:23%">Subsystem</th><th style="width:52%">What it is</th><th style="width:25%">Scale</th></tr>
+  <table style="margin-top:22px;">
+    <thead><tr><th style="width:22%">Subsystem</th><th style="width:53%">What it is</th><th style="width:25%">Scale</th></tr></thead>
+    <tbody>
     <tr><td><strong>PhantomSensor</strong></td>
-        <td class="d">WDM minifilter kernel driver. 20 detection subsystems covering syscalls, memory, process,
-        registry, network and self-protection.</td>
+        <td class="d">WDM minifilter kernel driver. Twenty detection subsystems covering syscalls, memory,
+        process, registry, network and self-protection.</td>
         <td class="n">305,000 lines of C</td></tr>
     <tr><td><strong>PhantomCore</strong></td>
         <td class="d">Shared user-mode detection stack: real-time protection, signature and pattern stores,
         anti-evasion, script scanners, self-defence.</td>
         <td class="n">667,000 lines of C++</td></tr>
     <tr><td><strong>PhantomEmulator</strong></td>
-        <td class="d">Custom x86/x64 CPU emulator for safe malware detonation. Virtual OS, 10 emulated DLLs,
-        12 analysis engines. No hypervisor dependency.</td>
+        <td class="d">Custom x86/x64 CPU emulator for safe malware detonation. Virtual OS, ten emulated DLLs,
+        twelve analysis engines. No hypervisor dependency.</td>
         <td class="n">122,000 lines of C++</td></tr>
     <tr><td><strong>PhantomHome</strong></td>
-        <td class="d">Consumer product layer: 47 protection modules spanning banking, privacy, web, email,
-        USB and ransomware defence.</td>
+        <td class="d">Consumer product layer. Forty-seven protection modules spanning banking, privacy, web,
+        email, USB and ransomware defence.</td>
         <td class="n">167,000 lines of C++</td></tr>
     <tr><td><strong>PhantomCortex</strong></td>
         <td class="d">On-device machine learning. Five model architectures for static, behavioural, emulation,
         memory and network classification.</td>
         <td class="n">Python training pipeline</td></tr>
+    </tbody>
   </table>
 
-  <p style="margin-top:22px; font-size:14.5px; color:#6B7683;">Approximately 2.3 million lines in total across C, C++,
-  assembly and Python, including test suites and tooling.</p>
+  <p class="note" style="margin-top:18px;">Approximately 2.3 million lines in total across C, C++, assembly and
+  Python, including test suites and tooling.</p>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>3</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">03</span></div>
 </div>
 
-<!-- 4 ------------------------------------------------------------------ -->
+<!-- 4 · architecture --------------------------------------------------- -->
 <div class="slide">
-  <div class="kicker">Architecture</div>
-  <div class="rule"></div>
-  <h2 style="font-size:31px;">One detection core, three products, one kernel sensor.</h2>
+  <div class="kicker"><span class="num">03</span> Architecture</div>
+  <h2 style="font-size:30px;">One detection core, three products, <span class="accent">one kernel sensor</span>.</h2>
 
-  <div class="arch">
+  <div class="arch" style="margin-top:20px;">
     <div class="band">
-      <div class="band-l">User mode — products</div>
+      <div class="band-l">User mode · products</div>
       <div class="row">
-        <div class="box"><b>Phantom Home</b>Consumer endpoint, local desktop UI</div>
+        <div class="box"><b>Phantom Home</b>Consumer endpoint, local desktop interface</div>
         <div class="box"><b>Phantom EDR</b>Enterprise detection and response</div>
         <div class="box"><b>Phantom XDR</b>Fleet-wide extended detection</div>
         <div class="box"><b>Management dashboard</b>Planned, EDR and XDR tiers</div>
@@ -214,18 +272,18 @@
       <div class="row">
         <div class="box"><b>Real-time protection</b>On-access orchestration, exploit and behaviour blocking</div>
         <div class="box"><b>Detection stores</b>Signature B-tree, Aho-Corasick patterns, Bloom-filter hashes, threat intel</div>
-        <div class="box"><b>PhantomEmulator</b>Detonation, unpacking, OEP recovery, import reconstruction</div>
+        <div class="box"><b>PhantomEmulator</b>Detonation, unpacking, entry-point recovery, import reconstruction</div>
         <div class="box"><b>PhantomCortex</b>Five on-device models, ONNX inference, no cloud verdicts</div>
       </div>
     </div>
-    <div class="band">
+    <div class="band bridge">
       <div class="band-l">Encrypted kernel bridge</div>
       <div class="row">
-        <div class="box" style="text-align:center;"><b>AES-256-GCM over FilterConnectPort</b>Authenticated, per-session keyed channel between kernel and user mode</div>
+        <div class="box"><b>AES-256-GCM over FilterConnectPort</b>Authenticated, per-session keyed channel between kernel and user mode</div>
       </div>
     </div>
     <div class="band k">
-      <div class="band-l">Kernel mode — PhantomSensor.sys, minifilter altitude 385210</div>
+      <div class="band-l">Kernel mode · PhantomSensor.sys · minifilter altitude 385210</div>
       <div class="row">
         <div class="box"><b>File system</b>Pre and post I/O, ransomware heuristics</div>
         <div class="box"><b>Process and thread</b>Injection, hollowing, hijack detection</div>
@@ -234,41 +292,40 @@
         <div class="box"><b>Self-protection</b>Anti-tamper, callback guard, integrity</div>
       </div>
     </div>
-    <div class="band hw">Hardware and firmware — Secure Boot, TPM attestation, firmware integrity</div>
+    <div class="band hw">Hardware and firmware · Secure Boot · TPM attestation · Firmware integrity</div>
   </div>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>4</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">04</span></div>
 </div>
 
-<!-- 5 ------------------------------------------------------------------ -->
-<div class="slide">
-  <div class="kicker">Differentiation</div>
-  <div class="rule"></div>
-  <h2>Why building it ourselves is the product.</h2>
+<!-- 5 · differentiation ------------------------------------------------ -->
+<div class="slide vcenter">
+  <div class="kicker"><span class="num">04</span> Differentiation</div>
+  <h2>Why building it ourselves <span class="accent">is the product</span>.</h2>
 
-  <div class="two" style="margin-top:26px;">
+  <div class="two" style="margin-top:30px;">
     <div>
-      <h3 style="font-size:19px; margin-bottom:14px;">Owning the detection path</h3>
+      <h3 style="font-size:18px; margin-bottom:16px;">Owning the detection path</h3>
       <ul>
         <li>No licensed third-party scanning engine, so no per-seat royalty and no opaque component inside our own kernel driver.</li>
         <li>Custom minifilter, custom CPU emulator, custom instruction decoder, and a clean-room fuzzy hasher with no GPL dependency.</li>
-        <li>Detection logic, heuristics and model weights are all in the repository. A customer can read the rule that flagged their file.</li>
+        <li>Detection logic, heuristics and model weights all live in the repository. A customer can read the rule that flagged their file.</li>
         <li>Kernel and user mode share memory-mapped type definitions, so the protocol between them is verifiable rather than assumed.</li>
       </ul>
     </div>
     <div>
-      <h3 style="font-size:19px; margin-bottom:14px;">Engineering evidence</h3>
-      <div class="two" style="margin-top:0; gap:26px;">
+      <h3 style="font-size:18px; margin-bottom:20px;">Engineering evidence</h3>
+      <div class="two" style="gap:24px;">
         <div>
           <div class="stat">0.25</div>
           <div class="stat-l">Coverity defects per thousand lines, kernel driver</div>
         </div>
         <div>
-          <div class="stat">550+</div>
-          <div class="stat-l">MITRE ATT&amp;CK technique IDs mapped across 14 tactics</div>
+          <div class="stat">550<span class="u">+</span></div>
+          <div class="stat-l">MITRE ATT&amp;CK technique IDs mapped across fourteen tactics</div>
         </div>
       </div>
-      <div class="two" style="margin-top:28px; gap:26px;">
+      <div class="two" style="margin-top:30px; gap:24px;">
         <div>
           <div class="stat">103</div>
           <div class="stat-l">Packer families identified by the unpacking engine</div>
@@ -278,28 +335,28 @@
           <div class="stat-l">Independent original-entry-point recovery methods</div>
         </div>
       </div>
-      <p style="margin-top:26px; font-size:14.5px; color:#6B7683;">The kernel driver passes Windows Driver Verifier
-      with zero violations under the full standard and low-resource simulation suites.</p>
+      <p class="note" style="margin-top:28px;">The kernel driver passes Windows Driver Verifier with zero
+      violations under the full standard and low-resource simulation suites.</p>
     </div>
   </div>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>5</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">05</span></div>
 </div>
 
-<!-- 6 ------------------------------------------------------------------ -->
-<div class="slide">
-  <div class="kicker">Capability depth</div>
-  <div class="rule"></div>
-  <h2>Detection that does not depend on knowing the sample.</h2>
-  <p style="margin-top:14px;">Signature matching alone cannot address packed, obfuscated or evasion-aware malware.
-  The emulation engine executes a sample inside a fully virtual environment and draws conclusions from behaviour.</p>
+<!-- 6 · capability ----------------------------------------------------- -->
+<div class="slide vcenter">
+  <div class="kicker"><span class="num">05</span> Capability depth</div>
+  <h2>Detection that does not depend on <span class="accent">knowing the sample</span>.</h2>
+  <p style="margin-top:12px; max-width:1010px;">Signature matching alone cannot address packed, obfuscated or
+  evasion-aware malware. The emulation engine executes a sample inside a fully virtual environment and draws its
+  conclusions from behaviour.</p>
 
-  <div class="three" style="margin-top:30px;">
+  <div class="three" style="margin-top:32px;">
     <div class="card">
       <h3>Generic unpacking</h3>
-      <p>Detects the write-then-execute transition every runtime packer must perform, tracks each decryption layer
-      with entropy analysis, recovers the original entry point through eight independent heuristics, rebuilds the
-      import table from observed API calls, and dumps a clean executable image.</p>
+      <p>Detects the write-then-execute transition every runtime packer must perform, tracks each decryption
+      layer with entropy analysis, recovers the original entry point through eight independent heuristics,
+      rebuilds the import table from observed API calls, and dumps a clean executable image.</p>
     </div>
     <div class="card">
       <h3>Anti-evasion</h3>
@@ -308,148 +365,159 @@
     </div>
     <div class="card">
       <h3>On-device inference</h3>
-      <p>Five model architectures — gradient boosting, 1D convolutional, recurrent, feedforward and autoencoder —
-      score static, behavioural, emulation, memory and network features locally. Detection never requires sending
-      a customer file to a server.</p>
+      <p>Five model architectures — gradient boosting, convolutional, recurrent, feedforward and autoencoder —
+      score static, behavioural, emulation, memory and network features locally. Detection never requires
+      sending a customer file to a server.</p>
     </div>
   </div>
 
-  <div class="quote">
-    <p>A product whose selling point is transparency cannot outsource the part that matters. That constraint shaped
-    every engineering decision, and it is the reason the codebase is the size it is.</p>
+  <div class="quote" style="margin-top:34px;">
+    <p>A product whose selling point is transparency cannot outsource the part that matters. That constraint
+    shaped every engineering decision, and it is the reason the codebase is the size it is.</p>
   </div>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>6</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">06</span></div>
 </div>
 
-<!-- 7 ------------------------------------------------------------------ -->
-<div class="slide">
-  <div class="kicker">Market and model</div>
-  <div class="rule"></div>
-  <h2>Three tiers on one engine.</h2>
+<!-- 7 · market --------------------------------------------------------- -->
+<div class="slide vcenter">
+  <div class="kicker"><span class="num">06</span> Market and model</div>
+  <h2>Three tiers on <span class="accent">one engine</span>.</h2>
 
-  <table>
-    <tr><th style="width:19%">Tier</th><th style="width:25%">Customer</th><th style="width:33%">Position</th><th style="width:23%">Commercial model</th></tr>
+  <table style="margin-top:26px;">
+    <thead><tr><th style="width:18%">Tier</th><th style="width:24%">Customer</th><th style="width:34%">Position</th><th style="width:24%">Commercial model</th></tr></thead>
+    <tbody>
     <tr><td><strong>Phantom Home</strong></td><td class="d">Consumer and prosumer endpoints</td>
-        <td class="d">Lightweight local protection with desktop UI. Serves as the proving ground for the shared engine.</td>
-        <td class="d">Free and open source; paid support</td></tr>
+        <td class="d">Lightweight local protection with a desktop interface. Serves as the proving ground for the shared engine.</td>
+        <td class="d">Free and open source, paid support</td></tr>
     <tr><td><strong>Phantom EDR</strong></td><td class="d">Small and mid-sized organisations</td>
         <td class="d">Full detection and response with centralised management and forensic collection.</td>
         <td class="d">Per-endpoint subscription</td></tr>
     <tr><td><strong>Phantom XDR</strong></td><td class="d">Enterprise and regulated sectors</td>
-        <td class="d">Extended detection across endpoint, network and identity, with fleet correlation.</td>
+        <td class="d">Extended detection across endpoint, network and identity, with fleet-wide correlation.</td>
         <td class="d">Per-endpoint subscription, annual</td></tr>
+    </tbody>
   </table>
 
-  <div class="two" style="margin-top:34px;">
+  <div class="two" style="margin-top:36px;">
     <div class="card">
       <h3>Why the licence works commercially</h3>
-      <p>AGPL-3.0 makes the code auditable and makes proprietary redistribution by competitors impractical.
+      <p>AGPL-3.0 makes the code auditable while making proprietary redistribution by competitors impractical.
       Revenue comes from the managed backend, support and the enterprise tiers, not from withholding source.</p>
     </div>
     <div class="card">
       <h3>Where transparency is worth paying for</h3>
-      <p>Public sector, healthcare, finance and critical infrastructure increasingly need to demonstrate what their
-      kernel-level software does. That is a requirement no closed agent can satisfy, and it is our entry point.</p>
+      <p>Public sector, healthcare, finance and critical infrastructure increasingly need to demonstrate what
+      their kernel-level software does. No closed agent can satisfy that, and it is our entry point.</p>
     </div>
   </div>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>7</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">07</span></div>
 </div>
 
-<!-- 8 ------------------------------------------------------------------ -->
-<div class="slide dense xdense">
-  <div class="kicker">The ask</div>
-  <div class="rule"></div>
-  <h2>What the AWS credits would fund.</h2>
-  <p style="margin-top:10px;">Detection runs on the endpoint, so we carry no per-customer cloud cost. Our cloud requirement sits in three places: training the models, distributing definitions, and building and testing a Windows kernel driver safely.</p>
+<!-- 8 · infrastructure ------------------------------------------------- -->
+<div class="slide dense">
+  <div class="kicker"><span class="num">07</span> Infrastructure</div>
+  <h2>What we cannot build on <span class="accent">local hardware</span>.</h2>
+  <p style="margin-top:12px; max-width:1030px;">Detection runs entirely on the endpoint, so the product carries no
+  per-customer cloud cost and sends no customer files anywhere. Our infrastructure requirement is concentrated in
+  three places: training the models, distributing signed definitions, and building and testing a Windows kernel
+  driver without risking a user's machine.</p>
 
-  <table>
-    <tr><th style="width:31%">Workload</th><th style="width:46%">AWS services</th><th style="width:23%">Allocation</th></tr>
+  <table style="margin-top:22px;">
+    <thead><tr><th style="width:26%">Workload</th><th style="width:44%">What it involves</th><th style="width:30%">Requirement</th></tr></thead>
+    <tbody>
     <tr><td><strong>Model training</strong></td>
-        <td class="d">GPU compute for five architectures over 3.5 million labelled PE samples from EMBER 2018 and 2024, plus synthetic behavioural and emulation traces. SageMaker, EC2 accelerated instances.</td>
-        <td class="n">$11,000</td></tr>
+        <td class="d">Five architectures trained over 3.5 million labelled PE samples from the EMBER 2018 and 2024
+        corpora, plus synthetic behavioural and emulation traces.</td>
+        <td class="d">Accelerated GPU compute; the single dependency we cannot meet locally</td></tr>
     <tr><td><strong>Kernel driver CI</strong></td>
-        <td class="d">Windows build agents for WDK compilation plus an isolated Driver Verifier and boot-integrity matrix. A kernel regression must never reach a user. EC2 Windows, CodeBuild.</td>
-        <td class="n">$4,000</td></tr>
+        <td class="d">Windows build agents for WDK compilation and an isolated Driver Verifier and boot-integrity
+        matrix. A kernel regression must never reach a user.</td>
+        <td class="d">Ephemeral Windows build and test instances</td></tr>
     <tr><td><strong>Definition delivery</strong></td>
         <td class="d">Signed signature, hash and model artefacts distributed to endpoints with delta updates and
-        rollback. S3, CloudFront.</td>
-        <td class="n">$3,500</td></tr>
-    <tr><td><strong>Sample and dataset storage</strong></td>
-        <td class="d">Versioned corpora, extracted feature sets and reproducible training snapshots. S3 with
-        lifecycle tiering, KMS encryption.</td>
-        <td class="n">$3,500</td></tr>
+        verified rollback.</td>
+        <td class="d">Object storage with global edge distribution</td></tr>
+    <tr><td><strong>Dataset custody</strong></td>
+        <td class="d">Versioned sample corpora, extracted feature sets and reproducible training snapshots, so any
+        released model can be rebuilt exactly.</td>
+        <td class="d">Encrypted, lifecycle-tiered storage</td></tr>
     <tr><td><strong>Retraining automation</strong></td>
-        <td class="d">Scheduled ingestion from six threat-intelligence feeds, feature extraction, evaluation gates and model promotion. Batch, Step Functions, Lambda.</td>
-        <td class="n">$2,000</td></tr>
-    <tr><td><strong>Observability and security</strong></td>
-        <td class="d">Pipeline monitoring, artefact signing key custody, least-privilege access. CloudWatch, KMS, IAM.</td>
-        <td class="n">$1,000</td></tr>
-    <tr class="total"><td>Total requested</td><td></td><td class="n">$25,000</td></tr>
+        <td class="d">Scheduled ingestion from six threat-intelligence feeds, feature extraction, evaluation gates
+        and model promotion.</td>
+        <td class="d">Managed batch orchestration</td></tr>
+    <tr><td><strong>Artefact integrity</strong></td>
+        <td class="d">Custody of the signing keys that endpoints trust, with least-privilege access and an audit
+        trail for every promotion.</td>
+        <td class="d">Managed key custody and access control</td></tr>
+    </tbody>
   </table>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>8</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">08</span></div>
 </div>
 
-<!-- 9 ------------------------------------------------------------------ -->
+<!-- 9 · status --------------------------------------------------------- -->
 <div class="slide dense">
-  <div class="kicker">Status</div>
-  <div class="rule"></div>
-  <h2>Where the project stands today.</h2>
-  <p style="margin-top:12px;">We would rather be precise than flattering. The platform is in alpha and under active
-  daily development.</p>
+  <div class="kicker"><span class="num">08</span> Status</div>
+  <h2>Where the project <span class="accent">stands today</span>.</h2>
+  <p style="margin-top:12px;">We would rather be precise than flattering. The platform is in alpha and under
+  active daily development.</p>
 
-  <table>
-    <tr><th style="width:27%">Component</th><th style="width:17%">State</th><th style="width:56%">Detail</th></tr>
+  <table style="margin-top:20px;">
+    <thead><tr><th style="width:24%">Component</th><th style="width:18%">State</th><th style="width:58%">Detail</th></tr></thead>
+    <tbody>
     <tr><td><strong>PhantomSensor.sys</strong></td><td class="d">Complete</td>
-        <td class="d">20 subsystems. Coverity 0.25 defects per KLoC. Driver Verifier clean. Loads and runs under test signing.</td></tr>
+        <td class="d">Twenty subsystems. Coverity 0.25 defects per thousand lines. Driver Verifier clean. Loads and runs under test signing.</td></tr>
     <tr><td><strong>PhantomCore</strong></td><td class="d">Complete, hardening</td>
-        <td class="d">All module families implemented. Currently in a security and reliability audit phase.</td></tr>
+        <td class="d">All module families implemented; currently in a security and reliability audit phase.</td></tr>
     <tr><td><strong>PhantomEmulator</strong></td><td class="d">Operational</td>
         <td class="d">CPU emulation, virtual OS and the full analysis suite are functional and integrated into the scan pipeline.</td></tr>
     <tr><td><strong>PhantomCortex</strong></td><td class="d">Four of five models</td>
-        <td class="d">Trained and exported to ONNX. The fifth is pending retraining on the expanded corpus — the primary use of the requested credits.</td></tr>
+        <td class="d">Trained and exported to ONNX. The fifth awaits retraining on the expanded corpus — the primary use of additional compute.</td></tr>
     <tr><td><strong>Phantom Home</strong></td><td class="d">Integration</td>
-        <td class="d">47 modules wired to the orchestrator. End-to-end reliability work in progress ahead of beta.</td></tr>
+        <td class="d">Forty-seven modules wired to the orchestrator; end-to-end reliability work in progress ahead of beta.</td></tr>
     <tr><td><strong>EDR and XDR tiers</strong></td><td class="d">In development</td>
-        <td class="d">Share the completed sensor and detection core; management backend is the remaining work.</td></tr>
+        <td class="d">Share the completed sensor and detection core; the management backend is the remaining work.</td></tr>
+    </tbody>
   </table>
 
-  <p style="margin-top:26px; font-size:16px; color:#2A323B;"><strong>Public beta target: early 2027.</strong>
-  No paying customers yet; the Home tier ships first and free, deliberately, so the engine is proven in the open
-  before anyone is asked to pay for it.</p>
+  <p style="margin-top:22px; font-size:15.5px; color:#2B3440;"><strong style="color:#101720;">Public beta target:
+  early 2027.</strong> No paying customers yet. The Home tier ships first and free, deliberately, so the engine is
+  proven in the open before anyone is asked to pay for it.</p>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>9</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">09</span></div>
 </div>
 
-<!-- 10 ----------------------------------------------------------------- -->
+<!-- 10 · closing ------------------------------------------------------- -->
 <div class="slide closing">
-  <div class="kicker" style="color:#C89A4A;">Why it matters</div>
-  <div class="rule"></div>
-  <h2>The code with the most privilege<br/>should be the code you can read.</h2>
-  <p class="lead" style="color:#B9C3CE; margin-top:22px; max-width:880px;">Endpoint security is the one category
-  where customers are asked to grant total access on trust alone. We think that trade is avoidable, and that
-  demonstrating so requires building the whole thing in the open — kernel driver included.</p>
+  <div class="grid"></div>
+  <div class="rel">
+    <div class="kicker"><span class="num">09</span> Why it matters</div>
+    <h2>The code with the most privilege<br/>should be the code <span style="color:#C9973F;">you can read</span>.</h2>
+    <p class="lead" style="margin-top:22px; max-width:900px;">Endpoint security is the one category where customers
+    are asked to grant total access on trust alone. We believe that trade is avoidable, and that demonstrating so
+    requires building the whole thing in the open — kernel driver included.</p>
 
-  <div class="three" style="margin-top:40px;">
-    <div class="card">
-      <h3>What credits accelerate</h3>
-      <p>Model training is the single dependency we cannot satisfy on local hardware. Credits move the remaining
-      model and the retraining pipeline from constrained to continuous.</p>
-    </div>
-    <div class="card">
-      <h3>What we bring to AWS</h3>
-      <p>A reference open-source security workload: reproducible ML training, signed artefact distribution, and
-      Windows kernel CI, all publicly documented and auditable.</p>
-    </div>
-    <div class="card">
-      <h3>Contact</h3>
-      <p>ShadowStrike-Labs<br/>contact@shadowstrike.dev<br/>shadowstrike.dev<br/>github.com/ShadowStrike-Labs</p>
+    <div class="three" style="margin-top:44px;">
+      <div class="card">
+        <h3>What compute accelerates</h3>
+        <p>Model training is the one dependency we cannot satisfy on local hardware. Additional capacity moves the
+        remaining model and the retraining pipeline from constrained to continuous.</p>
+      </div>
+      <div class="card">
+        <h3>What the project offers back</h3>
+        <p>A reference open-source security workload: reproducible machine-learning training, signed artefact
+        distribution and Windows kernel CI, all publicly documented and auditable.</p>
+      </div>
+      <div class="card">
+        <h3>Contact</h3>
+        <p>ShadowStrike-Labs<br/>contact@shadowstrike.dev<br/>shadowstrike.dev<br/>github.com/ShadowStrike-Labs</p>
+      </div>
     </div>
   </div>
 
-  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>10</span></div>
+  <div class="foot"><span>ShadowStrike Phantom</span><span class="pg">10</span></div>
 </div>
 
 </body>
