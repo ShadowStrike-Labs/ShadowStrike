@@ -2362,6 +2362,13 @@ public:
             m_deferredQueue.emplace_back(filePath, processId);
             m_deferredSeen.insert(filePath);
         }
+        // Counted here rather than at the call sites. The statistic previously
+        // only incremented on the budget-exceeded path, so once every scanned
+        // file began being deferred the counter no longer reflected reality -
+        // and this counter is the evidence that work skipped on the fast path is
+        // actually being picked up rather than quietly dropped. A number that
+        // does not measure what it claims to is worse than no number.
+        m_stats.scansDeferred++;
         m_deferredCv.notify_one();
     }
 
@@ -2642,7 +2649,6 @@ public:
             return spent >= kSyncBudget;
         };
         const auto deferDeepScan = [&](const wchar_t* stage) {
-            m_stats.scansDeferred++;
             SS_LOG_DEBUG(L"RealTimeProtection",
                 L"Sync budget reached at %ls for %ls; deferring deep analysis",
                 stage, filePath.c_str());
