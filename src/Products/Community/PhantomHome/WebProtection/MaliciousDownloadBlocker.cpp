@@ -53,6 +53,8 @@
 #include <softpub.h>
 #include <mscat.h>
 #include <ShlObj.h>
+#include <wtsapi32.h>       // WTSEnumerateSessionsW / WTSQueryUserToken
+#pragma comment(lib, "wtsapi32.lib")
 
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -547,11 +549,67 @@ namespace {
 
     std::vector<fs::path> ResolveDefaultDownloadDirectories() {
         std::vector<fs::path> dirs;
-        PWSTR downloadPath = nullptr;
-        HRESULT hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &downloadPath);
-        if (SUCCEEDED(hr) && downloadPath) {
-            dirs.emplace_back(downloadPath);
-            CoTaskMemFree(downloadPath);
+
+        // This runs inside a LocalSystem service. SHGetKnownFolderPath with a
+        // null token resolves the CALLING identity's folder, which is
+        // %WINDIR%\System32\config\systemprofile\Downloads - a directory nobody
+        // ever downloads into, and which frequently does not exist at all. The
+        // result was an empty or useless monitor list, so StartMonitoring
+        // returned false and the module reported "Start() failed" on every boot.
+        // Download protection has therefore never actually run.
+        //
+        // Resolve each interactive user's real Downloads folder instead, using
+        // the same session-enumeration approach the IPC auth token path already
+        // uses. Disconnected sessions are included deliberately: a locked or
+        // switched-away desktop can still have a browser completing a download.
+        PWTS_SESSION_INFOW sessions = nullptr;
+        DWORD sessionCount = 0;
+        if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1,
+                                  &sessions, &sessionCount)) {
+            for (DWORD i = 0; i < sessionCount; ++i) {
+                if (sessions[i].State != WTSActive &&
+                    sessions[i].State != WTSDisconnected) {
+                    continue;
+                }
+
+                HANDLE userToken = nullptr;
+                if (!WTSQueryUserToken(sessions[i].SessionId, &userToken)) {
+                    // No interactive user in this session - normal for the
+                    // console session before logon.
+                    continue;
+                }
+
+                PWSTR sessionPath = nullptr;
+                if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0,
+                                                   userToken, &sessionPath)) &&
+                    sessionPath != nullptr) {
+                    fs::path resolved(sessionPath);
+                    CoTaskMemFree(sessionPath);
+
+                    // Several sessions can map to one profile; monitoring the
+                    // same directory twice would double every scan.
+                    const bool alreadyKnown =
+                        std::find(dirs.begin(), dirs.end(), resolved) != dirs.end();
+                    if (!alreadyKnown) {
+                        dirs.emplace_back(std::move(resolved));
+                    }
+                }
+
+                CloseHandle(userToken);
+            }
+            WTSFreeMemory(sessions);
+        }
+
+        // Only if no interactive user could be resolved - a headless or
+        // pre-logon machine - fall back to the calling identity, so behaviour is
+        // never worse than before.
+        if (dirs.empty()) {
+            PWSTR downloadPath = nullptr;
+            HRESULT hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &downloadPath);
+            if (SUCCEEDED(hr) && downloadPath) {
+                dirs.emplace_back(downloadPath);
+                CoTaskMemFree(downloadPath);
+            }
         }
         return dirs;
     }
