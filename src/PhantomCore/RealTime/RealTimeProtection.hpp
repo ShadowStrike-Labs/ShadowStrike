@@ -898,9 +898,12 @@ struct alignas(64) RTPStatistics {
 
     // Exclusion statistics
     std::atomic<uint64_t> excludedByPath{ 0 };
-    /// @brief Scans whose deep stage exceeded the synchronous latency budget and
-    ///        was handed to the background deep-scan queue instead of holding the
-    ///        originating file operation.
+    /// @brief Scans whose deep stages were handed to the background deep-scan
+    ///        queue instead of holding the originating file operation open.
+    ///        Counts EVERY deferral, not only budget overruns: the on-access
+    ///        path defers the expensive stages by design, so this is the measure
+    ///        of how much analysis moved off the blocking path rather than a
+    ///        measure of how often the path ran late.
     std::atomic<uint64_t> scansDeferred{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
     std::atomic<uint64_t> excludedByProcess{ 0 };

@@ -4807,6 +4807,58 @@ public:
             if (m_stopThreads) break;
 
             UpdatePerformanceMetrics();
+
+            // Periodic on-access pipeline summary.
+            //
+            // Every diagnosis of the system-wide freeze had to be reconstructed
+            // from indirect evidence because nothing ever reported how much work
+            // the pipeline actually took in and completed. The kernel counters
+            // that would answer it go to DbgPrintEx and are invisible without a
+            // debugger attached, so this is the closest observable equivalent:
+            // how many scans arrived, what they concluded, how many failed, and
+            // how many deep analyses were handed to the background worker.
+            //
+            // scansDeferred is the load-bearing number here. The fast path
+            // deliberately skips the expensive stages, so if this is not rising
+            // in step with totalScans then that analysis is being dropped rather
+            // than deferred - which would be a silent loss of coverage, and is
+            // the single thing most worth noticing early.
+            //
+            // Emitted only when something moved, so an idle machine stays quiet.
+            {
+                const uint64_t scans     = m_stats.totalScans.load(std::memory_order_relaxed);
+                const uint64_t deferred  = m_stats.scansDeferred.load(std::memory_order_relaxed);
+                const uint64_t errors    = m_stats.scanErrors.load(std::memory_order_relaxed);
+                const uint64_t threats   = m_stats.threatsDetected.load(std::memory_order_relaxed);
+                const uint64_t blocked   = m_stats.filesBlocked.load(std::memory_order_relaxed);
+
+                static uint64_t s_lastScans = 0;
+                static uint64_t s_lastDeferred = 0;
+                static uint64_t s_lastErrors = 0;
+
+                if (scans != s_lastScans || deferred != s_lastDeferred || errors != s_lastErrors) {
+                    size_t queueDepth = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(m_deferredMutex);
+                        queueDepth = m_deferredQueue.size();
+                    }
+                    Utils::Logger::Info(
+                        "RealTimeProtection: on-access pipeline - scans={} (+{}) clean={} "
+                        "suspicious={} infected={} errors={} threats={} blocked={} "
+                        "deepScansDeferred={} (+{}) queueDepth={}",
+                        scans, scans - s_lastScans,
+                        m_stats.cleanFiles.load(std::memory_order_relaxed),
+                        m_stats.suspiciousFiles.load(std::memory_order_relaxed),
+                        m_stats.infectedFiles.load(std::memory_order_relaxed),
+                        errors, threats, blocked,
+                        deferred, deferred - s_lastDeferred,
+                        queueDepth);
+
+                    s_lastScans = scans;
+                    s_lastDeferred = deferred;
+                    s_lastErrors = errors;
+                }
+            }
         }
 
         Utils::Logger::Info("RealTimeProtection: Stats update thread exiting");
