@@ -705,9 +705,29 @@ public:
             // Provision every already-present interactive session. Services
             // can start after the first user logon, in which case the SCM
             // SESSIONCHANGE event may already be gone.
-            ::ShadowStrikeAppendBootTrace(L"impl-Start-ProvisionInteractive-enter");
-            ProvisionInteractiveIpcAuthTokens(L"service-start");
-            ::ShadowStrikeAppendBootTrace(L"impl-Start-ProvisionInteractive-leave");
+            //
+            // Deliberately OFF the start thread. This call was observed entering
+            // WriteTokenFile and never returning, and because it sat on the
+            // critical start path the consequences were wildly out of proportion
+            // to the work: Start() never completed, the service never reported
+            // RUNNING, the verdict pipeline never came up, and every file create
+            // on the machine then blocked in the minifilter waiting for verdicts
+            // that could not arrive. A stalled auth-token write froze the whole
+            // system.
+            //
+            // Token provisioning is not a prerequisite for protection - it exists
+            // so the desktop UI can authenticate to the service. Running it on a
+            // detached thread keeps its blast radius proportional: if it stalls,
+            // the UI cannot authenticate, and that is all. Protection still comes
+            // up. The underlying stall is still a defect and is still being traced
+            // per-call inside WriteTokenFile; this bounds the damage, it does not
+            // excuse the bug.
+            ::ShadowStrikeAppendBootTrace(L"impl-Start-ProvisionInteractive-detach");
+            std::thread([]() noexcept {
+                ::ShadowStrikeAppendBootTrace(L"provision-thread-enter");
+                ProvisionInteractiveIpcAuthTokens(L"service-start");
+                ::ShadowStrikeAppendBootTrace(L"provision-thread-leave");
+            }).detach();
         }
 
         // Register AMSI provider

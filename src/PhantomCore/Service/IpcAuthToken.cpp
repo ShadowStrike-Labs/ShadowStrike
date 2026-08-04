@@ -432,6 +432,15 @@ private:
                                    const std::string&  tokenB64,
                                    PSID                userSid) noexcept
 {
+    // The service has been observed entering WriteTokenFile and never leaving,
+    // which wedges the start thread and therefore the whole verdict pipeline.
+    // The previous trace wrapped this function as a whole, which localised the
+    // hang to these three calls but could not say which. Each is now traced
+    // individually because all three are plausible: the CreateFileW passes
+    // through our own minifilter with write access, and SetNamedSecurityInfoW
+    // performs its own path resolution and I/O.
+    ::ShadowStrikeAppendBootTrace(L"token-write-CreateFileW-enter");
+
     // Create/overwrite the file.  No sharing during write.
     ScopedHandle hf{::CreateFileW(
         path.c_str(),
@@ -442,6 +451,7 @@ private:
         FILE_ATTRIBUTE_NORMAL,
         /*hTemplateFile=*/nullptr
     )};
+    ::ShadowStrikeAppendBootTrace(L"token-write-CreateFileW-leave");
     if (!hf.Valid()) {
         SS_LOG_LAST_ERROR(kLogCat, L"CreateFileW failed creating token file '%ls'",
             path.c_str());
@@ -450,17 +460,24 @@ private:
 
     DWORD written = 0;
     const DWORD toWrite = static_cast<DWORD>(tokenB64.size());
-    if (!::WriteFile(hf.Get(), tokenB64.c_str(), toWrite, &written, nullptr) ||
-        written != toWrite) {
+    ::ShadowStrikeAppendBootTrace(L"token-write-WriteFile-enter");
+    const bool writeOk = (::WriteFile(hf.Get(), tokenB64.c_str(), toWrite, &written, nullptr) != 0);
+    ::ShadowStrikeAppendBootTrace(L"token-write-WriteFile-leave");
+    if (!writeOk || written != toWrite) {
         SS_LOG_LAST_ERROR(kLogCat, L"WriteFile to token file '%ls' failed", path.c_str());
         return false;
     }
 
     // Close before applying the ACL (some implementations require the handle
     // to be closed before SetNamedSecurityInfoW can succeed on the same path).
+    ::ShadowStrikeAppendBootTrace(L"token-write-CloseHandle-enter");
     hf.Reset();
+    ::ShadowStrikeAppendBootTrace(L"token-write-CloseHandle-leave");
 
-    if (!SetTokenFileAcl(path, userSid)) {
+    ::ShadowStrikeAppendBootTrace(L"token-write-SetAcl-enter");
+    const bool aclOk = SetTokenFileAcl(path, userSid);
+    ::ShadowStrikeAppendBootTrace(L"token-write-SetAcl-leave");
+    if (!aclOk) {
         SS_LOG_ERROR(kLogCat,
             L"SetTokenFileAcl failed; removing insecure token file '%ls'", path.c_str());
         ::DeleteFileW(path.c_str());
