@@ -1123,6 +1123,24 @@ EngineResult ScanEngine::ScanFile(
     EngineResult result{};
     const auto scanStart = steady_clock::now();
 
+    // File-type detection is needed by two later stages - one to decide whether
+    // this is a document, one to decide whether it is a script - and each was
+    // calling FileTypeAnalyzer::Analyze independently. That is two opens and two
+    // header reads of the same file on the path the kernel is holding a file
+    // create open for. Resolve it once, lazily, and share the result, so a file
+    // that is neither a document nor a script never pays for it at all.
+    //
+    // Declared here rather than beside its first use because the stages below
+    // reach the exit path via goto, which may not jump over an initialization.
+    std::optional<FileSystem::FileTypeInfo> sharedTypeInfo;
+    const auto resolveFileType =
+        [&sharedTypeInfo, &filePath]() -> const FileSystem::FileTypeInfo& {
+            if (!sharedTypeInfo.has_value()) {
+                sharedTypeInfo = FileSystem::FileTypeAnalyzer::Instance().Analyze(filePath);
+            }
+            return *sharedTypeInfo;
+        };
+
     if (!IsInitialized()) {
         SS_LOG_ERROR(L"ScanEngine", L"Not initialized");
         result.verdict = ScanVerdict::Error;
@@ -1512,8 +1530,7 @@ EngineResult ScanEngine::ScanFile(
             const auto stage45Start = steady_clock::now();
 
             try {
-                auto& fileTypeAnalyzer = FileSystem::FileTypeAnalyzer::Instance();
-                auto typeInfo = fileTypeAnalyzer.Analyze(filePath);
+                const auto& typeInfo = resolveFileType();
 
                 bool isDocument = (typeInfo.category == FileSystem::FileCategory::Document ||
                                    typeInfo.category == FileSystem::FileCategory::Spreadsheet ||
@@ -1609,8 +1626,7 @@ EngineResult ScanEngine::ScanFile(
             const auto stage46Start = steady_clock::now();
 
             try {
-                auto& fileTypeAnalyzer = FileSystem::FileTypeAnalyzer::Instance();
-                auto scriptTypeInfo = fileTypeAnalyzer.Analyze(filePath);
+                const auto& scriptTypeInfo = resolveFileType();
 
                 const bool isScript = (scriptTypeInfo.category == FileSystem::FileCategory::Script ||
                                        scriptTypeInfo.isScript ||
@@ -1961,7 +1977,17 @@ EngineResult ScanEngine::ScanFile(
             if (execAnalyzer.IsPE(filePath)) {
                 const auto stageEAStart = steady_clock::now();
 
-                auto opts = FileSystem::AnalysisOptions::CreateFull();
+                // Full structural analysis walks imports, exports, resources, the
+                // Rich header, packer signatures and anomaly heuristics. That is the
+                // right depth for a deliberate scan and the wrong depth for one the
+                // kernel is waiting on with a file create held open. The on-access
+                // path takes the quick profile; the deferred deep-scan worker runs
+                // with deepScan set and still performs the full walk, so nothing is
+                // analysed less thoroughly - it is analysed a moment later, off the
+                // path that was stalling the machine.
+                auto opts = context.deepScan
+                    ? FileSystem::AnalysisOptions::CreateFull()
+                    : FileSystem::AnalysisOptions::CreateQuick();
                 auto execInfo = execAnalyzer.Analyze(filePath, opts);
 
                 if (execInfo.riskScore >= 75) {
@@ -2054,7 +2080,15 @@ EngineResult ScanEngine::ScanFile(
         // STAGE 6: POLYMORPHIC DETECTION + FUZZY SIMILARITY ANALYSIS
         // ====================================================================
 
-        if (m_impl->m_polymorphicDetector && m_impl->m_polymorphicDetector->IsInitialized()) {
+        // Deep scans only. This stage reads the whole file twice more - once in
+        // PolymorphicDetector::AnalyzeFile and again for the fuzzy-hash buffer -
+        // which is two additional traversals of the entire filter stack while the
+        // kernel holds a file create open. Stages 4, 7, 8 and 9 are already gated
+        // this way; this one was not, so it ran on every on-access scan. The
+        // deferred worker now runs with deepScan set, so polymorphic and fuzzy
+        // similarity analysis still happen on every scanned file.
+        if (context.deepScan &&
+            m_impl->m_polymorphicDetector && m_impl->m_polymorphicDetector->IsInitialized()) {
             const auto stage6Start = steady_clock::now();
 
             auto polyResult = m_impl->m_polymorphicDetector->AnalyzeFile(filePath);
