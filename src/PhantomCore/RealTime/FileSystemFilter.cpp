@@ -505,6 +505,44 @@ struct FileSystemFilter::Impl {
         // Maximum bytes the kernel could have written after the FILTER_MESSAGE_HEADER.
         const size_t maxPayloadBytes = bufferSize - sizeof(FILTER_MESSAGE_HEADER);
 
+        // An unparsable frame still has a driver thread blocked behind it.
+        //
+        // Every validation failure below used to `continue`, which silently
+        // abandoned a kernel thread that is sitting inside FltSendMessage
+        // waiting for our verdict. That thread only gets moving again when the
+        // request times out - and the create-path timeout is 500 ms
+        // (PC_DEFAULT_SCAN_TIMEOUT_MS). At Windows file-open rates that is not a
+        // dropped message, it is a half-second stall on an IRP_MJ_CREATE that
+        // some other process is blocked on, repeated for every bad frame.
+        //
+        // The application-level payload may be garbage, but MessageId lives in
+        // the filter manager's own FILTER_MESSAGE_HEADER, which is written by
+        // fltmgr and is therefore still trustworthy. So we can always answer.
+        //
+        // Answering Allow is the same outcome the timeout would have produced -
+        // the create path is fail-open by design - so this gives up no detection
+        // that was not already given up; it just stops making the whole machine
+        // wait for it. cacheResult is deliberately false: a verdict derived from
+        // a frame we could not even parse must never be planted in the kernel
+        // verdict cache, or one bad frame would suppress scanning of that file
+        // for the whole TTL. ReplyLength == 0 means the kernel sent this
+        // one-way and is not waiting, so replying would be wrong.
+        uint64_t framesUnparsable = 0;
+        const auto answerUnparsableFrame = [&](const char* reason) {
+            m_stats.scanErrors++;
+            ++framesUnparsable;
+            if (framesUnparsable == 1 || (framesUnparsable % 500) == 0) {
+                Utils::Logger::Warn(
+                    "FileSystemFilter: {} unparsable frame(s) answered fail-open "
+                    "(latest reason: {}) - the kernel is not left waiting, but "
+                    "these files went unscanned",
+                    framesUnparsable, reason);
+            }
+            if (pMessage->ReplyLength != 0) {
+                SendVerdictReply(pMessage->MessageId, ScanVerdict::Allow, L"", false);
+            }
+        };
+
         while (!m_stopMessageLoop) {
             if (m_hPort == INVALID_HANDLE_VALUE) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -543,6 +581,7 @@ struct FileSystemFilter::Impl {
             if (header->magic != FilterConstants::MESSAGE_MAGIC) {
                 Utils::Logger::Warn("FileSystemFilter: Invalid message magic 0x{:08X}",
                     header->magic);
+                answerUnparsableFrame("bad magic");
                 continue;
             }
 
@@ -552,6 +591,7 @@ struct FileSystemFilter::Impl {
                 Utils::Logger::Warn(
                     "FileSystemFilter: Unsupported protocol version {} (expected {})",
                     header->version, FilterConstants::PROTOCOL_VERSION);
+                answerUnparsableFrame("unsupported protocol version");
                 continue;
             }
 
@@ -563,6 +603,7 @@ struct FileSystemFilter::Impl {
                 Utils::Logger::Warn(
                     "FileSystemFilter: Declared dataSize {} exceeds buffer ({} bytes available) - dropping",
                     dataSize, maxPayloadBytes - sizeof(FilterMessageHeader));
+                answerUnparsableFrame("declared dataSize exceeds buffer");
                 continue;
             }
 
