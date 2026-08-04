@@ -697,6 +697,19 @@ namespace ShadowStrike {
             /** @brief Changes minimum log level threshold. */
             void SetMinLogLevel(LogLevel level);
             
+            /**
+             * @brief Reports whether an entry at this level would be recorded.
+             *
+             * Lets a caller skip building an entry that would be discarded.
+             * Formatting a message and serialising metadata JSON for a record
+             * that never reaches the database is pure waste, and on the scan
+             * path it is waste paid while the kernel holds a file create open.
+             * Advisory only: the level is re-checked when the entry is
+             * submitted, so a concurrent SetMinLogLevel cannot cause an entry
+             * to bypass filtering.
+             */
+            [[nodiscard]] bool WouldLog(LogLevel level) const;
+            
             /** @brief Enables or disables async logging mode. */
             void SetAsyncLogging(bool enabled);
 

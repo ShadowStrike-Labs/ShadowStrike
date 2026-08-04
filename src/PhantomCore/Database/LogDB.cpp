@@ -1890,6 +1890,19 @@ namespace ShadowStrike {
         }
 
         /**
+         * @brief Reports whether an entry at this level would be recorded.
+         *
+         * Mirrors the threshold comparison the submission paths apply, so a
+         * caller can decide not to build an entry that would be thrown away.
+         * Advisory: submission re-checks the level under its own lock, so this
+         * can never be used to slip an entry past filtering.
+         */
+        bool LogDB::WouldLog(LogLevel level) const {
+            std::shared_lock<std::shared_mutex> lock(m_configMutex);
+            return static_cast<int>(level) >= static_cast<int>(m_config.minLogLevel);
+        }
+
+        /**
          * @brief Enables or disables asynchronous logging mode.
          * 
          * @param enabled true to enable async batching, false for synchronous.

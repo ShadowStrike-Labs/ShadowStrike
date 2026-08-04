@@ -2550,28 +2550,44 @@ EngineResult ScanEngine::ScanFile(
 
         // Record scan result to persistent LogDB
         try {
+            // Decide the level BEFORE touching the database.
+            //
+            // A clean verdict is recorded at Trace, and the default minimum is
+            // Info - so for the overwhelming majority of scans every string
+            // below was formatted, every JSON fragment concatenated and the path
+            // copied, only for LogDetailed to discard the entire entry on a
+            // threshold check. That waste was being paid on the path the kernel
+            // holds a file create open for.
+            Database::LogDB::LogLevel level;
+            if (result.verdict == ScanVerdict::Clean) {
+                level = Database::LogDB::LogLevel::Trace;
+            } else if (result.verdict == ScanVerdict::Suspicious) {
+                level = Database::LogDB::LogLevel::Warn;
+            } else if (result.verdict == ScanVerdict::Infected) {
+                level = Database::LogDB::LogLevel::Error;
+            } else {
+                level = Database::LogDB::LogLevel::Debug;
+            }
+
             auto& logDb = ShadowStrike::Database::LogDB::Instance();
-            if (logDb.IsInitialized()) {
+            if (logDb.IsInitialized() && logDb.WouldLog(level)) {
                 Database::LogDB::LogEntry logEntry{};
                 logEntry.category = Database::LogDB::LogCategory::Scanner;
                 logEntry.source = L"ScanEngine";
                 logEntry.processId = GetCurrentProcessId();
                 logEntry.threadId = GetCurrentThreadId();
                 logEntry.durationMs = static_cast<int64_t>(result.scanDurationUs / 1000);
+                logEntry.level = level;
 
                 if (result.verdict == ScanVerdict::Clean) {
-                    logEntry.level = Database::LogDB::LogLevel::Trace;
                     logEntry.message = L"Scan clean: " + filePath;
                 } else if (result.verdict == ScanVerdict::Suspicious) {
-                    logEntry.level = Database::LogDB::LogLevel::Warn;
                     logEntry.message = L"Suspicious: " +
                         StringUtils::ToWide(result.threatName) + L" — " + filePath;
                 } else if (result.verdict == ScanVerdict::Infected) {
-                    logEntry.level = Database::LogDB::LogLevel::Error;
                     logEntry.message = L"INFECTED: " +
                         StringUtils::ToWide(result.threatName) + L" — " + filePath;
                 } else {
-                    logEntry.level = Database::LogDB::LogLevel::Debug;
                     logEntry.message = L"Scan completed (verdict=" +
                         std::to_wstring(static_cast<int>(result.verdict)) + L"): " + filePath;
                 }
